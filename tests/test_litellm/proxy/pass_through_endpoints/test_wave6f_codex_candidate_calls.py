@@ -12,6 +12,8 @@ import pathlib
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import unittest.mock
+
 import pytest
 
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
@@ -298,3 +300,211 @@ class TestCallbackOrdering:
         )
         kimi_host["_validate_codex_auto_agent_responses_payload"].assert_awaited_once()
         kimi_host["_record_adapted_completed_route_rollup_turn"].assert_called_once()
+
+
+# -- Fix 1 regression: namespace tool adaptation before chat-completion --
+
+
+class TestOpenRouterCompletionNamespaceToolAdaptation:
+    """_perform_codex_auto_agent_openrouter_completion_request must adapt
+    namespace tools to flat dispatchable function tools before the chat
+    completion transform, preserving tool call/result IDs."""
+
+    @pytest.mark.asyncio
+    async def test_completion_transform_receives_flat_dispatchable_tools(self):  # noqa: PLR0915
+        """The transform boundary receives flat spawn_agent/exec_command tools
+        (not functions.collaboration.*), and tool call/result IDs survive."""
+        host: dict[str, Any] = {"__builtins__": __builtins__}
+        from fastapi.responses import Response, StreamingResponse
+
+        host["Response"] = Response
+        host["StreamingResponse"] = StreamingResponse
+
+        # Representative dispatchable tool identities plus call/result IDs.
+        flat_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "spawn_agent",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ]
+        original_body = {
+            "model": "test-model",
+            "input": [
+                {
+                    "type": "function_call",
+                    "id": "call-abc-123",
+                    "call_id": "call-abc-123",
+                    "name": "functions.collaboration.spawn_agent",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "result-def-456",
+                    "call_id": "call-abc-123",
+                    "output": "ok",
+                },
+            ],
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "functions.collaboration",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "spawn_agent",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                }
+            ],
+        }
+
+        def mock_adapt_namespace(body):
+            adapted = dict(body)
+            adapted["tools"] = flat_tools
+            return adapted, [
+                {"name": "spawn_agent", "namespace": "functions.collaboration"}
+            ]
+
+        host["_adapt_codex_namespace_tools_to_functions_from_request_body"] = (
+            mock_adapt_namespace
+        )
+        host["_get_openrouter_api_key"] = MagicMock(return_value="sk-test")
+        host["_get_openrouter_completion_adapter_upstream_model"] = MagicMock(
+            return_value=None
+        )
+        host["_get_openrouter_target_base"] = MagicMock(
+            return_value="https://openrouter.ai"
+        )
+        host["_build_openrouter_default_headers"] = MagicMock(return_value={})
+        host["_get_proxy_shared_aiohttp_session"] = MagicMock(return_value=None)
+        host["_merge_litellm_metadata"] = MagicMock(
+            side_effect=lambda body, **kw: body
+        )
+        host["_add_route_family_logging_metadata"] = MagicMock(
+            side_effect=lambda body, family: body
+        )
+        host["_build_langfuse_span_descriptor"] = MagicMock(return_value={})
+        host["_build_adapted_route_rollup_kwargs"] = MagicMock(return_value={})
+        host["_emit_adapted_route_access_log"] = MagicMock()
+        host["_annotate_request_scope_for_adapted_access_log"] = MagicMock()
+        host["_record_adapted_completed_route_rollup_turn"] = MagicMock()
+        host["_apply_openrouter_completion_message_sanitization"] = MagicMock(
+            side_effect=lambda **kw: (
+                kw["request_body"],
+                kw["completion_kwargs"],
+                kw["litellm_metadata"],
+            )
+        )
+        host["_perform_openrouter_completion_adapter_operation"] = AsyncMock(
+            return_value=MagicMock()
+        )
+        host["_serialize_responses_adapter_response"] = MagicMock(
+            return_value='{"id":"resp-1","output":[],"status":"completed"}'
+        )
+        host["_is_codex_auto_agent_malformed_tool_call_text_output"] = MagicMock(
+            return_value=False
+        )
+        host["_is_codex_auto_agent_empty_success_responses_body"] = MagicMock(
+            return_value=False
+        )
+        host["_build_responses_response_from_adapter_response"] = MagicMock(
+            return_value=MagicMock()
+        )
+
+        import httpx as _httpx
+
+        host["httpx"] = _httpx
+
+        egress_calls: list[dict[str, Any]] = []
+
+        class _MockHelpers:
+            @staticmethod
+            def validate_outgoing_egress(**kwargs):
+                egress_calls.append(kwargs)
+
+        host["HttpPassThroughEndpointHelpers"] = _MockHelpers
+
+        import litellm as _litellm
+
+        host["litellm"] = _litellm
+        from typing import cast as _cast
+
+        host["cast"] = _cast
+        host["ResponsesAPIOptionalRequestParams"] = dict  # TYPE_CHECKING stub
+        import json as _json
+
+        host["json"] = _json
+
+        codex_candidate_calls.install(host)
+
+        mock_request = MagicMock()
+        mock_request.headers = {"x-test": "1"}
+
+        captured_transform_kwargs: list[dict[str, Any]] = []
+
+        def capture_transform(**kwargs):
+            captured_transform_kwargs.append(kwargs)
+            return {"model": kwargs.get("model"), "messages": [], "tools": kwargs.get("responses_api_request", {}).get("tools")}
+
+        mock_config_cls = MagicMock()
+        mock_config_cls.transform_responses_api_request_to_chat_completion_request.side_effect = (
+            capture_transform
+        )
+        mock_config_cls.transform_chat_completion_response_to_responses_api_response.return_value = (
+            MagicMock()
+        )
+        with unittest.mock.patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig",
+            mock_config_cls,
+        ):
+            await host["_perform_codex_auto_agent_openrouter_completion_request"](
+                request=mock_request,
+                adapter_model="test-model",
+                request_body=dict(original_body),
+                use_alias_candidate_probe=True,
+            )
+
+        # The completion transform must have run exactly once.
+        assert len(captured_transform_kwargs) == 1
+        transform_responses_api_request = captured_transform_kwargs[0].get(
+            "responses_api_request"
+        )
+        assert isinstance(transform_responses_api_request, dict)
+
+        # Transform boundary sees the adapted flat tools, not namespace tools.
+        transform_tools = transform_responses_api_request.get("tools")
+        assert transform_tools == flat_tools
+        tool_names = {
+            tool.get("function", {}).get("name")
+            for tool in transform_tools
+            if isinstance(tool, dict)
+        }
+        assert tool_names == {"spawn_agent", "exec_command"}
+        assert not any(
+            "functions.collaboration" in str(tool) for tool in transform_tools
+        )
+
+        # Tool call/result IDs are preserved through the transform boundary.
+        transform_input = captured_transform_kwargs[0].get("input")
+        input_ids = {
+            item.get("id")
+            for item in transform_input
+            if isinstance(item, dict)
+        }
+        assert {"call-abc-123", "result-def-456"} <= input_ids
+
+        # Egress validation is reached and observes the OpenRouter target.
+        assert len(egress_calls) == 1
+        assert egress_calls[0]["url"].endswith("/v1/chat/completions")
+        assert egress_calls[0]["credential_family"] == "openrouter"

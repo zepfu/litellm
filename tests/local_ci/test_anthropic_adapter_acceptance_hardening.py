@@ -7814,3 +7814,158 @@ def test_checked_in_config_prod_profile_resolution_uses_prod_runtime_label():
     profile = harness._target_profile_settings(config=config, target="prod")
     assert profile["expected_runtime_environment"] == "prod"
     assert profile["expected_trace_environment"] == "prod"
+
+
+# -- Fix 2 regression: child dispatch instructions contain literal marker --
+
+
+def test_read_alias_child_parallel_config_contains_literal_marker_in_dispatch():
+    """The -p prompt must contain the literal READ_ALIAS_PARALLEL_TOOLS_PASSED
+    in the child dispatch instructions, not only the parent result contract."""
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    case = config["cases"]["claude_adapter_read_alias_child_parallel_read_tools"]
+    prompt = case["command"][2]
+    # The marker must appear in the child instruction portion (before the
+    # parent result contract sentence that starts with "Your entire final").
+    parent_contract_idx = prompt.index("Your entire final output must be")
+    child_instruction_portion = prompt[:parent_contract_idx]
+    assert "READ_ALIAS_PARALLEL_TOOLS_PASSED" in child_instruction_portion, (
+        "literal marker must appear in child dispatch instructions"
+    )
+
+
+# -- Fix 3 regression: parallelism means one physical record, not message.id --
+
+
+def test_summarize_transcript_tool_uses_groups_by_physical_record_not_message_id(tmp_path):
+    """Two assistant emissions sharing message.id must NOT be merged into one
+    parallel batch.  Parallelism means tool uses in one physical transcript
+    record before any tool_result."""
+    harness = _load_harness_module()
+    transcript = tmp_path / "session-1" / "subagents" / "agent-abc.jsonl"
+    transcript.parent.mkdir(parents=True)
+    # Two separate assistant records with the SAME message.id but different
+    # lines, each with one tool_use.  A tool_result sits between them.
+    transcript.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "agentId": "abc",
+                        "message": {
+                            "id": "msg-shared",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "tool-1",
+                                    "name": "Read",
+                                    "input": {"path": "a.txt"},
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "user",
+                        "agentId": "abc",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tool-1",
+                                    "content": "ok",
+                                }
+                            ],
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "agentId": "abc",
+                        "message": {
+                            "id": "msg-shared",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "tool_use",
+                                    "id": "tool-2",
+                                    "name": "Glob",
+                                    "input": {"pattern": "*.txt"},
+                                }
+                            ],
+                        },
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    summary = harness._summarize_transcript_tool_uses([transcript])
+
+    # Each physical record has exactly 1 tool_use; they must NOT be merged.
+    assert summary["max_tool_uses_in_single_assistant_message"] == 1, (
+        "separate assistant emissions sharing message.id must not be grouped"
+    )
+    assert summary["total_tool_uses"] == 2
+
+
+# -- Fix 4 regression: session fallback must not filter by expected user_id --
+
+
+def test_validate_case_session_fallback_does_not_filter_by_user_id(monkeypatch):
+    """When name-based lookup finds nothing and session fallback fires, the
+    session discovery call must pass user_id=None so traces are discoverable.
+    Downstream validation still strictly enforces user_id."""
+    harness = _load_harness_module()
+    RA = harness.RA
+
+    captured_session_kwargs: list[dict] = []
+
+    def fake_poll_session_traces(**kwargs):
+        captured_session_kwargs.append(kwargs)
+        return [], None
+
+    # Name-based lookup returns empty to trigger the session fallback.
+    monkeypatch.setattr(RA, "_poll_langfuse_required_name_traces", lambda **kw: ([], None))
+    monkeypatch.setattr(RA, "_poll_langfuse_session_traces", fake_poll_session_traces)
+
+    config = {
+        "command": ["true"],
+        "required_trace_names": ["claude-code.orchestrator"],
+        "expected_user_ids": ["adapter-harness-tenant"],
+        "match_trace_session_id_from_stdout": True,
+        "langfuse_poll_timeout_seconds": 1,
+    }
+
+    def fake_run_command_with_retry(config):
+        import datetime as dt
+        return (
+            dt.datetime.now(dt.timezone.utc),
+            {"exit_code": 0, "stdout": '{"session_id":"sess-123"}', "stderr": "", "attempts": []},
+            [],
+        )
+
+    monkeypatch.setattr(harness, "_run_command_with_retry", fake_run_command_with_retry)
+    monkeypatch.setattr(harness, "_extract_command_session_id", lambda stdout: "sess-123")
+    monkeypatch.setattr(harness, "_extract_command_thread_id", lambda stdout: None)
+
+    harness._validate_case(
+        "test_case",
+        config,
+        query_url="http://localhost:3000",
+        public_key="pk",
+        secret_key="sk",
+        litellm_base_url="http://localhost:4001",
+    )
+
+    assert len(captured_session_kwargs) == 1, "session fallback must fire"
+    assert captured_session_kwargs[0]["user_id"] is None, (
+        "session discovery must not retain expected user_id as a lookup filter"
+    )

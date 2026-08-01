@@ -1491,6 +1491,14 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
             ],
         },
     )
+    # Restore dispatchable tool identities: adapt namespace tools to flat
+    # function tools before the chat-completion transformation so upstream
+    # sees spawn_agent / exec_command, not functions.collaboration.spawn_agent
+    # / functions.exec.  Tool call/result IDs are preserved by the adapter.
+    (
+        request_body,
+        _adapted_namespace_tools,
+    ) = _adapt_codex_namespace_tools_to_functions_from_request_body(request_body)
     request_input = request_body.get("input") or ""
     responses_api_request = cast(
         ResponsesAPIOptionalRequestParams,

@@ -4149,7 +4149,8 @@ def _summarize_transcript_tool_uses(paths: list[pathlib.Path]) -> dict[str, Any]
                 if not tool_name:
                     continue
                 by_tool_name[tool_name] = by_tool_name.get(tool_name, 0) + 1
-                message_counts = by_assistant_message_id.setdefault(message_id, {})
+                record_key = f"{path}:{line_number}"
+                message_counts = by_assistant_message_id.setdefault(record_key, {})
                 message_counts[tool_name] = message_counts.get(tool_name, 0) + 1
                 transcript_tool_count += 1
                 tool_use_id = str(block.get('id') or '')
@@ -5252,7 +5253,7 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
                 query_url=query_url,
                 public_key=public_key,
                 secret_key=secret_key,
-                user_id=lookup_user_id,
+                user_id=None,  # session discovery must not filter by expected user_id
                 start_time=started,
                 session_id=command_session_id.strip(),
                 timeout_seconds=int(config.get('langfuse_poll_timeout_seconds', 60)),
