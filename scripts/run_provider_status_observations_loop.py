@@ -5553,7 +5553,6 @@ _ALIBABA_NON_AUTH_KEYWORDS = frozenset(
         "servererror",
         "serviceunavailable",
         "badgateway",
-        "gateway",
         "upstream",
         "overloaded",
         "exhausted",

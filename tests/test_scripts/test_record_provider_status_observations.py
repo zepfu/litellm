@@ -2375,6 +2375,48 @@ def test_alibaba_auth_allowlist_bare_session_word_is_not_auth() -> None:
         {"errorMsg": "session quota usage report"}
     ) is False
 
+
+def test_alibaba_auth_allowlist_notlogin_with_generic_gateway_is_auth() -> None:
+    """Regression: live Alibaba envelope has errorCode=NotLogin with errorMsg
+    mentioning 'gateway' (the console gateway infrastructure).  The bare
+    generic 'gateway' token must NOT suppress the strong notlogin auth signal.
+    Matches secret-safe live classification: strong=[notlogin], weak=[login],
+    expiry=[], non_auth=[gateway]."""
+    # Classifier unit: NotLogin + generic gateway wording -> auth.
+    assert loop._alibaba_error_text_matches_auth_allowlist(
+        {"errorCode": "NotLogin", "errorMsg": "please login via gateway console"}
+    ) is True
+    # Full envelope path: live shape, classified as auth not contract_drift.
+    payload = _alibaba_auth_envelope_live(
+        error_code="NotLogin",
+        error_msg="please login via gateway console",
+    )
+    with pytest.raises(loop.AlibabaQuotaPollError) as exc_info:
+        loop._extract_alibaba_console_data(payload, endpoint="usage")
+    assert exc_info.value.telemetry_class == "auth"
+    assert exc_info.value.status_code == 200
+    # Redaction: raw error text never exposed.
+    rendered = str(exc_info.value)
+    assert "NotLogin" not in rendered
+    assert "please login via gateway console" not in rendered
+
+
+def test_alibaba_auth_allowlist_specific_non_auth_still_overrides_strong() -> None:
+    """Specific non-auth guards (badgateway, quota, capacity, internal, server,
+    upstream) must remain fail-closed even when a strong auth keyword is also
+    present."""
+    for non_auth_msg in (
+        "badgateway after login",
+        "quota exceeded for login session",
+        "capacity exhausted unauthorized",
+        "internal error unauthorized",
+        "server error needlogin",
+        "upstream timeout forbidden",
+    ):
+        assert loop._alibaba_error_text_matches_auth_allowlist(
+            {"errorCode": "NotLogin", "errorMsg": non_auth_msg}
+        ) is False, f"expected non-auth for: {non_auth_msg}"
+
 def test_extract_alibaba_console_data_genuine_contract_drift_still_drift() -> None:
     # success False but NO errorCode/errorMsg -> genuine contract drift, not auth.
     payload = {
