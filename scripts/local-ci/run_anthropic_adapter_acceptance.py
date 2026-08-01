@@ -7662,6 +7662,163 @@ def _cfg003_collect_availability_evidence(
     }
 
 
+# ---------------------------------------------------------------------------
+# CFG-003: Operator-asserted availability identities
+# ---------------------------------------------------------------------------
+
+_CFG003_ASSERTION_IDENTITY_RE = re.compile(
+    r"^(?P<provider>[A-Za-z0-9_]+)=(?P<model>.+)$"
+)
+
+
+def _cfg003_parse_operator_assertions(
+    raw_values: list[str] | None,
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Parse repeatable ``provider=model`` CLI tokens into exact identities.
+
+    The ``=`` separator is unambiguous because provider names are
+    ``[A-Za-z0-9_]+`` while model strings may contain slashes, colons, dots,
+    and hyphens.  Only the FIRST ``=`` splits provider from model.
+
+    Returns (parsed_identities, failures).  Any malformed token produces a
+    failure and the identity is excluded.
+    """
+    if not raw_values:
+        return [], []
+    identities: list[tuple[str, str]] = []
+    failures: list[str] = []
+    seen: set[tuple[str, str]] = set()
+    for raw in raw_values:
+        raw = raw.strip()
+        if not raw:
+            failures.append("empty assertion token")
+            continue
+        m = _CFG003_ASSERTION_IDENTITY_RE.match(raw)
+        if m is None:
+            failures.append(
+                f"malformed assertion (expected provider=model): {raw!r}"
+            )
+            continue
+        provider = m.group("provider")
+        model = m.group("model").strip()
+        if not model:
+            failures.append(f"empty model in assertion: {raw!r}")
+            continue
+        identity = (provider, model)
+        if identity in seen:
+            failures.append(f"duplicate assertion: {provider}={model}")
+            continue
+        seen.add(identity)
+        identities.append(identity)
+    return identities, failures
+
+
+def _cfg003_validate_operator_assertions(
+    identities: list[tuple[str, str]],
+    *,
+    eligible_snapshot: list[dict[str, Any]],
+) -> list[str]:
+    """Validate every asserted identity belongs to the current schedule-eligible
+    active read-alias snapshot.
+
+    ``eligible_snapshot`` is the list of candidate dicts produced by
+    ``RA._derive_eligible_candidates_from_snapshot`` (already filtered by
+    schedule windows and excluded providers).  An identity not present in this
+    snapshot is rejected (unknown, schedule-expired, or non-read-alias).
+
+    Returns a list of failure strings (empty means all valid).
+    """
+    eligible_set: set[tuple[str, str]] = {
+        (c["provider"], c["model"]) for c in eligible_snapshot
+    }
+    failures: list[str] = []
+    for provider, model in identities:
+        if (provider, model) not in eligible_set:
+            failures.append(
+                f"asserted identity ({provider}, {model}) is not in the "
+                f"current schedule-eligible active read-alias snapshot"
+            )
+    return failures
+
+
+def _cfg003_bind_asserted_candidates(
+    identities: list[tuple[str, str]],
+    *,
+    eligible_snapshot: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return the candidate dicts for exactly the asserted identities, ordered
+    by their position in the active schedule-eligible snapshot.
+
+    This binds the transactional swap candidate set to exactly the asserted
+    identities so that other positive DB evidence cannot displace the intended
+    exact pair.  Caller must have already validated the identities via
+    ``_cfg003_validate_operator_assertions``.
+    """
+    by_id = {(c["provider"], c["model"]): c for c in eligible_snapshot}
+    ordered = [by_id[key] for key in identities if key in by_id]
+    ordered.sort(key=lambda c: c["priority"], reverse=True)
+    return ordered
+
+
+def _cfg003_build_operator_assertion_evidence(
+    identities: list[tuple[str, str]],
+    *,
+    environment: str = "dev",
+    route_context: list[dict[str, Any]] | None = None,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Create boundary-valid in-memory availability evidence for operator-asserted
+    identities.  Distinct from DB evidence: source is ``operator_assertion``.
+
+    Each record satisfies ``_availability_record_is_valid`` boundary checks
+    (available=True, provider/model/environment/environment_binding present,
+    fresh observed_at).  No credentials or raw prompts are recorded.
+    """
+    now = dt.datetime.now(dt.timezone.utc)
+    evidence: dict[tuple[str, str], dict[str, Any]] = {}
+    for provider, model in identities:
+        evidence[(provider, model)] = {
+            "available": True,
+            "provider": provider,
+            "model": model,
+            "environment": environment,
+            "environment_binding": "target_db_profile",
+            "observed_at": now.isoformat(),
+            "source": "operator_assertion",
+            "assertion_timestamp": now.isoformat(),
+            "route_context": route_context or [],
+        }
+    return evidence
+
+
+def _cfg003_merge_availability_evidence(
+    db_evidence: dict[tuple[str, str], dict[str, Any]],
+    assertion_evidence: dict[tuple[str, str], dict[str, Any]],
+    *,
+    environment: str = "dev",
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Merge DB and operator-assertion evidence by exact (provider, model) identity.
+
+    A DB record is preserved ONLY when it is boundary-valid positive evidence
+    for its exact provider/model/environment (``_availability_record_is_valid``).
+    A keyed DB record that is absent, ``available=False``, stale, malformed, or
+    otherwise invalid is dropped and the exact operator assertion replaces it in
+    the in-memory effective evidence.  A boundary-valid positive DB record is
+    never overridden by an assertion (observed DB data is preserved).  No DB
+    rows are inserted or mutated; this is purely in-memory.
+    """
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for key, record in db_evidence.items():
+        provider, model = key
+        if RA._availability_record_is_valid(
+            record, provider=provider, model=model, environment=environment
+        ):
+            merged[key] = record
+    for key, record in assertion_evidence.items():
+        if key not in merged:
+            merged[key] = record
+    return merged
+
+
 def _cfg003_db_settings(
     config: dict[str, Any],
     *,
@@ -7837,6 +7994,7 @@ def _cfg003_transactional_refresh_test(  # noqa: PLR0915
     db_settings: dict[str, Any] | None = None,
     environment: str = "dev",
     container_name: str = "litellm-dev",
+    operator_assertions: list[tuple[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Execute the full CFG-003 transactional priority-swap refresh test.
 
@@ -7920,10 +8078,72 @@ def _cfg003_transactional_refresh_test(  # noqa: PLR0915
         )
         availability_evidence = avail["evidence"]
 
+        # Operator-asserted availability: validate against schedule-eligible
+        # snapshot, build in-memory evidence, merge with DB evidence.
+        if operator_assertions:
+            # Exactly two assertion identities are required for transactional
+            # assertion mode (the intended swap pair).
+            if len(operator_assertions) != 2:
+                evidence["failures"].append(
+                    f"operator assertion mode requires exactly 2 identities, "
+                    f"got {len(operator_assertions)}"
+                )
+                evidence["phases"]["operator_assertion_gate"] = {
+                    "passed": False,
+                    "failures": evidence["failures"],
+                }
+                raise _Cfg003InsufficientCandidates()
+            _assertion_validation_failures = _cfg003_validate_operator_assertions(
+                operator_assertions,
+                eligible_snapshot=all_eligible,
+            )
+            if _assertion_validation_failures:
+                evidence["failures"].extend(_assertion_validation_failures)
+                evidence["phases"]["operator_assertion_gate"] = {
+                    "passed": False,
+                    "failures": _assertion_validation_failures,
+                }
+                raise _Cfg003InsufficientCandidates()
+            _route_context = [
+                {
+                    "provider": c["provider"],
+                    "model": c["model"],
+                    "route_family": c["route_family"],
+                    "priority": c["priority"],
+                }
+                for c in all_eligible
+            ]
+            _assertion_evidence = _cfg003_build_operator_assertion_evidence(
+                operator_assertions,
+                environment=environment,
+                route_context=_route_context,
+            )
+            availability_evidence = _cfg003_merge_availability_evidence(
+                availability_evidence, _assertion_evidence,
+                environment=environment,
+            )
+            evidence["phases"]["operator_assertion_gate"] = {
+                "passed": True,
+                "asserted_identities": [
+                    {"provider": p, "model": m} for p, m in operator_assertions
+                ],
+                "assertion_evidence_records": RA._serialize_availability_evidence(
+                    _assertion_evidence
+                ),
+            }
+
         # Filter to positively-available candidates only.
         original_eligible = RA._filter_candidates_by_positive_availability(
             all_eligible, availability_evidence
         )
+
+        # When operator assertions are active, bind the swap candidate set to
+        # exactly the asserted identities (ordered by snapshot priority) so
+        # other positive DB evidence cannot displace the intended exact pair.
+        if operator_assertions:
+            original_eligible = _cfg003_bind_asserted_candidates(
+                operator_assertions, eligible_snapshot=all_eligible
+            )
         evidence["phases"]["load"] = {
             "original_semantic_hash": original_semantic_hash,
             "original_semantic_version": original_semantic_version,
@@ -8676,11 +8896,66 @@ def main() -> int:  # noqa: PLR0915
         default=False,
         help='Run the CFG-003 transactional priority-swap refresh test (dev only).',
     )
+    parser.add_argument(
+        '--cfg003-assert-availability',
+        action='append',
+        default=None,
+        metavar='PROVIDER=MODEL',
+        help=(
+            'Operator-asserted exact availability identity (repeatable). '
+            'Only valid with --cfg003-transactional-refresh on canonical dev. '
+            'Syntax: provider=model (e.g. openrouter=openrouter/cohere/north-mini-code:free).'
+        ),
+    )
     args = parser.parse_args()
 
     config_path = pathlib.Path(args.config)
     artifact_path = pathlib.Path(args.write_artifact)
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # CFG-003: Operator-asserted availability -- early parse/gate.
+    # Assertions are only valid with --cfg003-transactional-refresh.
+    _cfg003_assertion_identities: list[tuple[str, str]] = []
+    if args.cfg003_assert_availability:
+        _early_assertion_failures: list[str] = []
+        if not args.cfg003_transactional_refresh:
+            _early_assertion_failures.append(
+                "--cfg003-assert-availability requires --cfg003-transactional-refresh"
+            )
+        else:
+            _cfg003_assertion_identities, _assertion_parse_failures = (
+                _cfg003_parse_operator_assertions(args.cfg003_assert_availability)
+            )
+            _early_assertion_failures.extend(_assertion_parse_failures)
+        if _early_assertion_failures:
+            _emit_stderr(
+                f"[cfg003] operator assertion gate FAILED: "
+                f"{_early_assertion_failures}",
+                flush=True,
+            )
+            _assert_gate_artifact: dict[str, Any] = {
+                "suite_version": 1,
+                "timestamp": RA._isoformat(RA._utcnow()),
+                "git_commit": RA._git_value("rev-parse", "HEAD"),
+                "git_branch": RA._git_value("branch", "--show-current"),
+                "environment": {"target_profile": args.target or "dev"},
+                "results": {
+                    "cfg003_assertion_gate": {
+                        "passed": False,
+                        "skipped": False,
+                        "failures": _early_assertion_failures,
+                        "warnings": [],
+                    },
+                },
+                "verification_matrix": [],
+                "summary": {},
+            }
+            _assert_gate_artifact["summary"] = _build_summary(
+                _assert_gate_artifact["results"]
+            )
+            _write_artifact(artifact_path, _assert_gate_artifact)
+            _emit_stdout(json.dumps(_assert_gate_artifact["summary"], indent=2))
+            return 1
     # Finding 3 (round 8): raw-config canonical preflight BEFORE dotenv.
     # An invalid transactional target must not trigger dotenv loading or
     # credential resolution.  The resolved-profile gate after profile
@@ -8921,6 +9196,44 @@ def main() -> int:  # noqa: PLR0915
             return 1
         _write_artifact(artifact_path, artifact)
 
+    # CFG-003: Pre-TUI snapshot validation of operator assertions.
+    # Validate asserted identities against the authoritative schedule-eligible
+    # read snapshot BEFORE any selected TUI case or refresh mutation.
+    if args.cfg003_transactional_refresh and _cfg003_assertion_identities:
+        try:
+            _pre_tui_auth = RA._load_authoritative_startup_config()
+            _pre_tui_eligible = RA._derive_eligible_candidates_from_snapshot(
+                _pre_tui_auth["snapshot"], alias_name="read"
+            )
+        except Exception as _pre_tui_exc:  # noqa: BLE001
+            _pre_tui_eligible = []
+            _pre_tui_snapshot_failures = [
+                f"pre-TUI snapshot load failed: {_pre_tui_exc}"
+            ]
+        else:
+            _pre_tui_snapshot_failures = []
+        _pre_tui_assertion_failures = _cfg003_validate_operator_assertions(
+            _cfg003_assertion_identities,
+            eligible_snapshot=_pre_tui_eligible,
+        )
+        _pre_tui_all_failures = _pre_tui_snapshot_failures + _pre_tui_assertion_failures
+        if _pre_tui_all_failures:
+            _emit_stderr(
+                f"[cfg003] pre-TUI assertion snapshot gate FAILED: "
+                f"{_pre_tui_all_failures}",
+                flush=True,
+            )
+            artifact["results"]["cfg003_assertion_gate"] = {
+                "passed": False,
+                "skipped": False,
+                "failures": _pre_tui_all_failures,
+                "warnings": [],
+            }
+            artifact["summary"] = _build_summary(artifact["results"])
+            _write_artifact(artifact_path, artifact)
+            _emit_stdout(json.dumps(artifact["summary"], indent=2))
+            return 1
+
     # Finding 2 (round 9): per-case error-intake validation during CFG-003.
     # Snapshot before the first selected alias case; collect and advance a
     # per-case delta after each case using case/session/trace correlation.
@@ -9019,6 +9332,7 @@ def main() -> int:  # noqa: PLR0915
             db_settings=_cfg003_db_settings(config, profile=profile),
             environment=profile.get('expected_trace_environment', 'dev'),
             container_name=profile.get('docker_container_name', 'litellm-dev'),
+            operator_assertions=_cfg003_assertion_identities or None,
         )
         artifact['cfg003_transactional_refresh'] = cfg003_result
         artifact['results']['cfg003_transactional_refresh'] = {

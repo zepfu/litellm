@@ -6170,3 +6170,334 @@ class TestArtifactPrivacyRuntimeLogs:
         persisted_str = artifact_path.read_text(encoding="utf-8")
         assert secret not in persisted_str
         assert "visible" in persisted_str
+
+
+# ---------------------------------------------------------------------------
+# CFG-003: Operator-asserted availability identities
+# ---------------------------------------------------------------------------
+
+
+class TestOperatorAssertionParsing:
+    def test_valid_provider_model_with_slashes_and_colons(self, adapter):
+        ids, failures = adapter._cfg003_parse_operator_assertions([
+            "openrouter=openrouter/cohere/north-mini-code:free",
+        ])
+        assert failures == []
+        assert ids == [("openrouter", "openrouter/cohere/north-mini-code:free")]
+
+    def test_valid_alibaba_token_plan(self, adapter):
+        ids, failures = adapter._cfg003_parse_operator_assertions([
+            "alibaba_token_plan=alibaba_token_plan/qwen3.6-flash",
+        ])
+        assert failures == []
+        assert ids == [("alibaba_token_plan", "alibaba_token_plan/qwen3.6-flash")]
+
+    def test_malformed_no_equals(self, adapter):
+        ids, failures = adapter._cfg003_parse_operator_assertions(["just-a-model"])
+        assert len(failures) == 1
+        assert "malformed" in failures[0]
+        assert ids == []
+
+    def test_duplicate_rejected(self, adapter):
+        ids, failures = adapter._cfg003_parse_operator_assertions([
+            "openrouter=model-a",
+            "openrouter=model-a",
+        ])
+        assert len(failures) == 1
+        assert "duplicate" in failures[0]
+        assert len(ids) == 1
+
+    def test_none_input_returns_empty(self, adapter):
+        ids, failures = adapter._cfg003_parse_operator_assertions(None)
+        assert ids == []
+        assert failures == []
+
+
+class TestOperatorAssertionSnapshotValidation:
+    def _snapshot(self):
+        return [
+            {"provider": "openrouter", "model": "openrouter/cohere/north-mini-code:free",
+             "route_family": "codex_x_adapter", "priority": 10},
+            {"provider": "alibaba_token_plan", "model": "alibaba_token_plan/qwen3.6-flash",
+             "route_family": "codex_x_adapter", "priority": 5},
+        ]
+
+    def test_valid_identity_passes(self, adapter):
+        failures = adapter._cfg003_validate_operator_assertions(
+            [("openrouter", "openrouter/cohere/north-mini-code:free")],
+            eligible_snapshot=self._snapshot(),
+        )
+        assert failures == []
+
+    def test_schedule_expired_identity_rejected(self, adapter):
+        # qwen3.8-max-preview is NOT in the eligible snapshot (expired).
+        failures = adapter._cfg003_validate_operator_assertions(
+            [("alibaba_token_plan", "alibaba_token_plan/qwen3.8-max-preview")],
+            eligible_snapshot=self._snapshot(),
+        )
+        assert len(failures) == 1
+        assert "not in the current schedule-eligible" in failures[0]
+
+    def test_bind_asserted_candidates_orders_by_priority(self, adapter):
+        bound = adapter._cfg003_bind_asserted_candidates(
+            [("alibaba_token_plan", "alibaba_token_plan/qwen3.6-flash"),
+             ("openrouter", "openrouter/cohere/north-mini-code:free")],
+            eligible_snapshot=self._snapshot(),
+        )
+        # Ordered by snapshot priority desc regardless of assertion order.
+        assert [(c["provider"], c["model"]) for c in bound] == [
+            ("openrouter", "openrouter/cohere/north-mini-code:free"),
+            ("alibaba_token_plan", "alibaba_token_plan/qwen3.6-flash"),
+        ]
+
+
+def _assertion_record(provider, model, *, available=True, environment="dev",
+                      stale=False, malformed=False):
+    """Build a producer-shaped keyed availability record for merge tests."""
+    import datetime as dt
+    if malformed:
+        return {"provider": provider, "model": model, "available": available}
+    delta = dt.timedelta(hours=5) if stale else dt.timedelta(minutes=5)
+    return {
+        "provider": provider,
+        "model": model,
+        "available": available,
+        "evidence": "remaining_pct=90" if available else "no_fresh_row",
+        "observed_at": (dt.datetime.now(dt.timezone.utc) - delta).isoformat(),
+        "environment": environment,
+        "environment_binding": "target_db_profile",
+    }
+
+
+class TestOperatorAssertionMergeReplacement:
+    """Producer-shaped keyed negative/stale/malformed DB evidence must be
+    replaced by the exact operator assertion; boundary-valid positive DB
+    evidence is preserved."""
+
+    def test_keyed_negative_db_replaced_by_assertion(self, adapter):
+        db = {("prov", "model"): _assertion_record("prov", "model", available=False)}
+        assertion = {("prov", "model"): _assertion_record("prov", "model")}
+        assertion[("prov", "model")]["source"] = "operator_assertion"
+        merged = adapter._cfg003_merge_availability_evidence(
+            db, assertion, environment="dev"
+        )
+        assert merged[("prov", "model")]["source"] == "operator_assertion"
+        assert merged[("prov", "model")]["available"] is True
+
+    def test_keyed_stale_db_replaced_by_assertion(self, adapter):
+        db = {("prov", "model"): _assertion_record("prov", "model", stale=True)}
+        assertion = {("prov", "model"): _assertion_record("prov", "model")}
+        assertion[("prov", "model")]["source"] = "operator_assertion"
+        merged = adapter._cfg003_merge_availability_evidence(
+            db, assertion, environment="dev"
+        )
+        assert merged[("prov", "model")]["source"] == "operator_assertion"
+
+    def test_keyed_malformed_db_replaced_by_assertion(self, adapter):
+        db = {("prov", "model"): _assertion_record("prov", "model", malformed=True)}
+        assertion = {("prov", "model"): _assertion_record("prov", "model")}
+        assertion[("prov", "model")]["source"] = "operator_assertion"
+        merged = adapter._cfg003_merge_availability_evidence(
+            db, assertion, environment="dev"
+        )
+        assert merged[("prov", "model")]["source"] == "operator_assertion"
+
+    def test_valid_positive_db_preserved_over_assertion(self, adapter):
+        db = {("prov", "model"): _assertion_record("prov", "model")}
+        db[("prov", "model")]["source"] = "rate_limit_observations"
+        assertion = {("prov", "model"): _assertion_record("prov", "model")}
+        assertion[("prov", "model")]["source"] = "operator_assertion"
+        merged = adapter._cfg003_merge_availability_evidence(
+            db, assertion, environment="dev"
+        )
+        assert merged[("prov", "model")]["source"] == "rate_limit_observations"
+
+    def test_assertion_supplements_absent_db_key(self, adapter):
+        db = {("prov_a", "model_a"): _assertion_record("prov_a", "model_a")}
+        assertion = {("prov_b", "model_b"): _assertion_record("prov_b", "model_b")}
+        assertion[("prov_b", "model_b")]["source"] = "operator_assertion"
+        merged = adapter._cfg003_merge_availability_evidence(
+            db, assertion, environment="dev"
+        )
+        assert ("prov_a", "model_a") in merged
+        assert merged[("prov_b", "model_b")]["source"] == "operator_assertion"
+
+    def test_db_dict_not_mutated(self, adapter):
+        db = {("prov", "model"): _assertion_record("prov", "model", available=False)}
+        assertion = {("prov", "model"): _assertion_record("prov", "model")}
+        adapter._cfg003_merge_availability_evidence(db, assertion, environment="dev")
+        assert db[("prov", "model")]["available"] is False
+
+
+class TestOperatorAssertionEarlyFailureArtifact:
+    def test_non_transactional_use_writes_artifact(self, adapter, monkeypatch, tmp_path):
+        """Using --cfg003-assert-availability without --cfg003-transactional-refresh
+        must write a sanitized failure artifact before any dotenv/credential work."""
+        config_path = tmp_path / "cfg.json"
+        artifact_path = tmp_path / "out.json"
+        config_path.write_text(json.dumps({"cases": {}}), encoding="utf-8")
+
+        dotenv_calls: list[str] = []
+        cred_calls: list[dict] = []
+        monkeypatch.setattr(adapter, "_load_dotenv_into_environment",
+                            lambda path: dotenv_calls.append(str(path)))
+        monkeypatch.setattr(adapter, "_resolve_main_credentials",
+                            lambda **kw: cred_calls.append(kw) or ("pk", "sk", "q", "pe", "se"))
+        monkeypatch.setattr(sys, "argv", [
+            "run_anthropic_adapter_acceptance.py",
+            "--config", str(config_path),
+            "--write-artifact", str(artifact_path),
+            "--target", "dev",
+            "--cfg003-assert-availability", "openrouter=openrouter/m",
+        ])
+
+        assert adapter.main() == 1
+        assert dotenv_calls == []
+        assert cred_calls == []
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        gate = artifact["results"]["cfg003_assertion_gate"]
+        assert gate["passed"] is False
+        assert any("--cfg003-transactional-refresh" in f for f in gate["failures"])
+
+    def test_parse_failure_writes_artifact(self, adapter, monkeypatch, tmp_path):
+        """A malformed/duplicate assertion must write a sanitized failure
+        artifact before dotenv/credential resolution."""
+        config_path = tmp_path / "cfg.json"
+        artifact_path = tmp_path / "out.json"
+        config_path.write_text(json.dumps({"cases": {}}), encoding="utf-8")
+
+        dotenv_calls: list[str] = []
+        monkeypatch.setattr(adapter, "_load_dotenv_into_environment",
+                            lambda path: dotenv_calls.append(str(path)))
+        monkeypatch.setattr(adapter, "_resolve_main_credentials",
+                            lambda **kw: ("pk", "sk", "q", "pe", "se"))
+        monkeypatch.setattr(sys, "argv", [
+            "run_anthropic_adapter_acceptance.py",
+            "--config", str(config_path),
+            "--write-artifact", str(artifact_path),
+            "--target", "dev",
+            "--cfg003-transactional-refresh",
+            "--cfg003-assert-availability", "malformed-no-equals",
+        ])
+
+        assert adapter.main() == 1
+        assert dotenv_calls == []
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        gate = artifact["results"]["cfg003_assertion_gate"]
+        assert gate["passed"] is False
+        assert any("malformed" in f for f in gate["failures"])
+        # No credential/secret material in the artifact.
+        assert "pk" not in artifact_path.read_text(encoding="utf-8")
+
+
+class TestOperatorAssertionPreTuiOrdering:
+    def test_snapshot_validation_fails_before_any_tui_case(
+        self, adapter, ra, monkeypatch, tmp_path
+    ):
+        """An asserted identity absent from the authoritative schedule-eligible
+        snapshot must fail in main() BEFORE the selected TUI case loop."""
+        auth = ra._load_authoritative_startup_config()
+        snap = auth["snapshot"]
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        assert eligible, "need at least one eligible candidate"
+
+        config_path = tmp_path / "cfg.json"
+        artifact_path = tmp_path / "out.json"
+        config_path.write_text(json.dumps({
+            "default_target_profile": "dev",
+            "cases": {"case_a": {"command": ["codex"]}},
+        }), encoding="utf-8")
+
+        tui_calls: list[str] = []
+
+        def fake_run_case(**kw):
+            tui_calls.append(kw.get("case_name", ""))
+            return {"passed": True}
+
+        monkeypatch.setattr(adapter, "_load_dotenv_into_environment", lambda path: None)
+        monkeypatch.setattr(adapter, "_resolve_main_credentials",
+                            lambda **kw: ("pk", "sk", "http://q", "pe", "se"))
+        monkeypatch.setattr(adapter, "_cfg003_query_active_inventory",
+                            lambda url: {"healthy": True, "inventory_failures": [],
+                                         "alias_inventory": []})
+        monkeypatch.setattr(adapter.RA, "_validate_complete_coverage_map",
+                            lambda **kw: (True, []))
+        monkeypatch.setattr(adapter.RA, "_validate_alias_ingress_coverage",
+                            lambda **kw: (True, []))
+        monkeypatch.setattr(adapter.RA, "_load_authoritative_startup_config", lambda: {
+            "snapshot": snap, "merged_yaml": auth["merged_yaml"],
+            "per_file_hashes": auth["per_file_hashes"], "file_names": auth["file_names"],
+            "config_hash": auth["config_hash"], "config_version": auth["config_version"],
+            "aliases": auth["aliases"],
+        })
+        monkeypatch.setattr(adapter, "_run_selected_case", fake_run_case)
+        monkeypatch.setattr(sys, "argv", [
+            "run_anthropic_adapter_acceptance.py",
+            "--config", str(config_path),
+            "--write-artifact", str(artifact_path),
+            "--target", "dev",
+            "--cases", "case_a",
+            "--cfg003-transactional-refresh",
+            "--cfg003-assert-availability", "nonexistent_provider=nonexistent/model",
+        ])
+
+        assert adapter.main() == 1
+        assert tui_calls == [], f"Expected zero TUI calls, got {tui_calls}"
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+        gate = artifact["results"]["cfg003_assertion_gate"]
+        assert gate["passed"] is False
+        assert any("not in the current schedule-eligible" in f for f in gate["failures"])
+
+
+class TestOperatorAssertionExactPairSelection:
+    def test_intended_pair_not_displaced_by_intervening_positive_db(
+        self, adapter, ra, monkeypatch
+    ):
+        """When operator assertions are active, the swap candidate set is bound
+        to exactly the two asserted identities; an intervening positive DB
+        candidate cannot displace the intended exact pair."""
+        auth = ra._load_authoritative_startup_config()
+        snap = auth["snapshot"]
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        assert len(eligible) >= 3, "need >= 3 eligible candidates for this test"
+
+        # Intended pair = first and third by priority; the second is an
+        # intervening candidate that has positive DB evidence but is NOT asserted.
+        intended = [eligible[0], eligible[2]]
+        intervening = eligible[1]
+        asserted = [(c["provider"], c["model"]) for c in intended]
+
+        # DB evidence: all three positive (intervening included).
+        db_evidence = _avail_result([eligible[0], eligible[1], eligible[2]])
+
+        monkeypatch.setattr(adapter.RA, "_load_authoritative_startup_config", lambda: {
+            "snapshot": snap, "merged_yaml": auth["merged_yaml"],
+            "per_file_hashes": auth["per_file_hashes"], "file_names": auth["file_names"],
+            "config_hash": auth["config_hash"], "config_version": auth["config_version"],
+            "aliases": auth["aliases"],
+        })
+        monkeypatch.setattr(adapter.RA, "_recursive_yaml_source_inventory",
+                            lambda: {"read.yaml"})
+        monkeypatch.setattr(adapter.RA, "_snapshot_source_inventory",
+                            lambda: {"read.yaml": "h"})
+        monkeypatch.setattr(adapter.RA, "_snapshot_error_intake", lambda *a, **kw: {})
+        monkeypatch.setattr(adapter, "_cfg003_collect_availability_evidence",
+                            lambda *a, **kw: db_evidence)
+        # Stop right after the load phase records original_first/second.
+        monkeypatch.setattr(adapter, "_cfg003_readiness_check",
+                            lambda *a, **kw: (False, ["stop-after-load"]))
+
+        result = adapter._cfg003_transactional_refresh_test(
+            litellm_base_url="http://localhost:4001",
+            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            suite_config={}, query_url="q", public_key="pk", secret_key="sk",
+            operator_assertions=asserted,
+        )
+        load = result["phases"]["load"]
+        first = (load["original_first"]["provider"], load["original_first"]["model"])
+        second = (load["original_second"]["provider"], load["original_second"]["model"])
+        # Bound to exactly the asserted pair, ordered by snapshot priority.
+        assert [first, second] == asserted
+        # The intervening positive DB candidate is excluded from the pair.
+        assert (intervening["provider"], intervening["model"]) not in (first, second)
+        assert load["eligible_count"] == 2
