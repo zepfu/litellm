@@ -439,7 +439,9 @@ class PublicationIntentRegistry:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._intents: dict[tuple[str, str], PublicationIntent] = {}
+        self._identity_intents: dict[tuple[str, str], PublicationIntent] = {}
         self._clear_reservations: dict[tuple[str, str], ClearReservation] = {}
+        self._identity_reservations: dict[tuple[str, str], ClearReservation] = {}
 
     def create(
         self,
@@ -458,6 +460,8 @@ class PublicationIntentRegistry:
         with self._lock:
             for key in cooldown_keys:
                 self._intents[(canonical, key)] = intent
+            if identity_hash:
+                self._identity_intents[(canonical, identity_hash)] = intent
         return intent
 
     def reserve_or_claim(
@@ -494,6 +498,8 @@ class PublicationIntentRegistry:
             )
             for key in cooldown_keys:
                 self._intents[(canonical, key)] = intent
+            if identity_hash:
+                self._identity_intents[(canonical, identity_hash)] = intent
             return ReserveOrClaimResult(intent=intent, is_leader=True)
 
     def claim_publication_or_wait(
@@ -532,6 +538,15 @@ class PublicationIntentRegistry:
                         outcome=ClaimOutcome.BLOCKED_BY_CLEAR,
                         clear_reservation=res,
                     )
+            # 1b. Identity-scoped clear reservation (Finding 2): blocks
+            #     first-ever publication before any cooldown_key is known.
+            if identity_hash:
+                res = self._identity_reservations.get((canonical, identity_hash))
+                if res is not None and res.status is ClearReservationStatus.ACTIVE:
+                    return ClaimPublicationResult(
+                        outcome=ClaimOutcome.BLOCKED_BY_CLEAR,
+                        clear_reservation=res,
+                    )
             # 2. Check active publication intents.
             for key in cooldown_keys:
                 existing = self._intents.get((canonical, key))
@@ -549,6 +564,8 @@ class PublicationIntentRegistry:
             )
             for key in cooldown_keys:
                 self._intents[(canonical, key)] = intent
+            if identity_hash:
+                self._identity_intents[(canonical, identity_hash)] = intent
             return ClaimPublicationResult(
                 outcome=ClaimOutcome.LEADER,
                 intent=intent,
@@ -569,12 +586,62 @@ class PublicationIntentRegistry:
         with self._lock:
             return self._intents.get((canonical, cooldown_key))
 
+    def scan_active_intents_by_identity(
+        self,
+        alias_family: str,
+        identity_hashes: frozenset[str],
+    ) -> list[PublicationIntent]:
+        """Scan active intents matching any of the given identity hashes.
+
+        Returns deduplicated snapshots of active (not done) intents whose
+        ``identity_hash`` matches any hash in ``identity_hashes`` for the
+        canonical family.  Thread-safe.  Does NOT mutate registry state.
+
+        Finding 1: enables the clear endpoint to drain already-leading
+        unindexed publications that may not yet have cooldown_keys
+        registered in the key-based index.  Uses the identity-keyed index
+        so intents with empty cooldown_keys are still discoverable.
+        """
+        canonical = validate_alias_family(alias_family)
+        if not identity_hashes:
+            return []
+        with self._lock:
+            seen_ids: set[int] = set()
+            results: list[PublicationIntent] = []
+            # Scan identity-keyed index (catches empty-cooldown-key intents).
+            for id_hash in identity_hashes:
+                intent = self._identity_intents.get((canonical, id_hash))
+                if intent is None or intent.done.is_set():
+                    continue
+                if id(intent) in seen_ids:
+                    continue
+                seen_ids.add(id(intent))
+                results.append(intent)
+            # Also scan key-based index for intents with identity hashes.
+            for (fam, _key), intent in self._intents.items():
+                if fam != canonical:
+                    continue
+                if intent.done.is_set():
+                    continue
+                if intent.identity_hash not in identity_hashes:
+                    continue
+                if id(intent) in seen_ids:
+                    continue
+                seen_ids.add(id(intent))
+                results.append(intent)
+            return results
+
+
     def remove(self, intent: PublicationIntent) -> None:
         with self._lock:
             for key in intent.cooldown_keys:
                 composite = (intent.alias_family, key)
                 if self._intents.get(composite) is intent:
                     self._intents.pop(composite, None)
+            if intent.identity_hash:
+                id_composite = (intent.alias_family, intent.identity_hash)
+                if self._identity_intents.get(id_composite) is intent:
+                    self._identity_intents.pop(id_composite, None)
 
     # ------------------------------------------------------------------
     # Clear reservations (CFG-004 Wave A)
@@ -628,6 +695,8 @@ class PublicationIntentRegistry:
                 # Point ALL merged keys to the survivor.
                 for key in merged_keys:
                     self._clear_reservations[(canonical, key)] = survivor
+                for id_hash in merged_identities:
+                    self._identity_reservations[(canonical, id_hash)] = survivor
 
                 # Complete non-survivors so their waiters wake and reselect.
                 for res in overlapping:
@@ -645,7 +714,53 @@ class PublicationIntentRegistry:
             )
             for key in cooldown_keys:
                 self._clear_reservations[(canonical, key)] = reservation
+            for id_hash in identity_hashes:
+                self._identity_reservations[(canonical, id_hash)] = reservation
             return reservation
+
+    def extend_clear_reservation(
+        self,
+        reservation: ClearReservation,
+        *,
+        cooldown_keys: frozenset[str],
+        identity_hashes: frozenset[str] = frozenset(),
+    ) -> ClearReservation:
+        """Extend an active reservation with newly discovered cooldown keys.
+
+        Called after durable hydration discovers lane keys that were not
+        known when the identity-scoped reservation was first created
+        (Finding 2).  Thread-safe.
+        """
+        canonical = validate_alias_family(reservation.alias_family)
+        with self._lock:
+            if reservation.status is not ClearReservationStatus.ACTIVE:
+                return reservation
+            merged_keys = set(reservation.cooldown_keys) | set(cooldown_keys)
+            merged_identities = set(reservation.identity_hashes) | set(
+                identity_hashes
+            )
+            object.__setattr__(
+                reservation, "cooldown_keys", frozenset(merged_keys)
+            )
+            object.__setattr__(
+                reservation, "identity_hashes", frozenset(merged_identities)
+            )
+            for key in cooldown_keys:
+                self._clear_reservations[(canonical, key)] = reservation
+            for id_hash in identity_hashes:
+                self._identity_reservations[(canonical, id_hash)] = reservation
+            return reservation
+
+    def get_clear_reservation_by_identity(
+        self, alias_family: str, identity_hash: str
+    ) -> Optional[ClearReservation]:
+        """Return the ACTIVE clear reservation for an identity hash, or None."""
+        canonical = validate_alias_family(alias_family)
+        with self._lock:
+            res = self._identity_reservations.get((canonical, identity_hash))
+            if res is not None and res.status is ClearReservationStatus.ACTIVE:
+                return res
+            return None
 
     def get_clear_reservation(
         self, alias_family: str, cooldown_key: str
@@ -666,11 +781,17 @@ class PublicationIntentRegistry:
                 composite = (reservation.alias_family, key)
                 if self._clear_reservations.get(composite) is reservation:
                     self._clear_reservations.pop(composite, None)
+            for id_hash in reservation.identity_hashes:
+                composite = (reservation.alias_family, id_hash)
+                if self._identity_reservations.get(composite) is reservation:
+                    self._identity_reservations.pop(composite, None)
 
     def clear(self) -> None:
         with self._lock:
             self._intents.clear()
+            self._identity_intents.clear()
             self._clear_reservations.clear()
+            self._identity_reservations.clear()
 
 
 class LaneIdentityIndex:
@@ -789,6 +910,29 @@ class LaneIdentityIndex:
                 self._index.pop(identity_hash, None)
             return removed
 
+    def restore_membership(
+        self,
+        *,
+        identity_hash: str,
+        lane_keys: frozenset[str],
+    ) -> bool:
+        """Atomically replace the lane set for identity_hash (rollback helper).
+
+        Used by the CFG-004 clear rollback path to restore an exact captured
+        preimage after a local/postcondition failure.  An empty ``lane_keys``
+        removes the identity entry entirely (matching the state produced when
+        ``unregister_batch`` drains the last lane).  Returns True when the
+        stored membership differs from the requested preimage (i.e. a change
+        was applied).  Thread-safe.
+        """
+        with self._lock:
+            if not lane_keys:
+                return self._index.pop(identity_hash, None) is not None
+            existing = self._index.get(identity_hash)
+            changed = existing != lane_keys
+            self._index[identity_hash] = set(lane_keys)
+            return changed
+
     def lanes_for(self, identity_hash: str) -> frozenset[str]:
         """Return the lane keys registered for identity_hash.  Thread-safe."""
         with self._lock:
@@ -874,6 +1018,9 @@ class CooldownInspectionResult:
     exists: bool
     remaining_seconds: float
     generation: int
+    negative_cached: bool = False
+    evidence_present: bool = False
+    read_pilot_present: bool = False
 
 
 def inspect_cooldown_absence(
@@ -884,17 +1031,38 @@ def inspect_cooldown_absence(
 ) -> CooldownInspectionResult:
     """Verify local cooldown absence for a key (lock-free peek, no mutation).
 
-    Returns the current generation so callers can detect concurrent clears.
-    Does NOT acquire the family lock (safe under probe lock).
+    Checks ALL cooldown-derived process state: positive cooldown, negative
+    cache, evidence events, and read-pilot gate (codex only).  Returns the
+    current generation so callers can detect concurrent clears.  Does NOT
+    acquire the family lock (safe under probe lock).
     """
     family = mgr.family(alias_family)
     remaining = family.peek_cooldown_remaining(cooldown_key)
+    negative_cached = family.is_negative_cached(cooldown_key)
+    evidence_present = cooldown_key in family.evidence_events_by_key
+    # Read-pilot gate is codex-owned only.
+    canonical = canonicalize_alias_family(alias_family)
+    read_pilot_present = False
+    if canonical == "codex":
+        # Finding 4: read-pilot evidence can exist in the gate's family
+        # evidence map BEFORE any _key_state entry is created (marker-tier
+        # evidence accumulates before a cooldown decision).  Both maps must
+        # be inspected so classification-marker evidence cannot survive a
+        # clear or be misclassified as absent.
+        read_pilot_present = (
+            cooldown_key in mgr.read_pilot_gate._key_state
+            or cooldown_key
+            in mgr.read_pilot_gate._family_state.evidence_events_by_key
+        )
     return CooldownInspectionResult(
-        alias_family=canonicalize_alias_family(alias_family),
+        alias_family=canonical,
         cooldown_key=cooldown_key,
-        exists=remaining > 0,
+        exists=remaining > 0 or negative_cached or evidence_present or read_pilot_present,
         remaining_seconds=remaining,
         generation=family.get_generation(cooldown_key),
+        negative_cached=negative_cached,
+        evidence_present=evidence_present,
+        read_pilot_present=read_pilot_present,
     )
 
 

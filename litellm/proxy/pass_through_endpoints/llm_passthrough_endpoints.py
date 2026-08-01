@@ -36,6 +36,7 @@ from fastapi import (
     HTTPException,
     Request,
     Response,
+    Security,
     WebSocket,
     status as fastapi_status,
 )
@@ -787,6 +788,85 @@ router.post(
     "/aawm/alias-config/refresh",
     tags=["AAWM Alias Routing"],
 )(_aawm_alias_config_refresh_route_endpoint)
+
+
+# CFG-004: cooldown clear endpoint (thin authenticated route delegate).
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_clear import (
+    handle_cooldown_clear as _aawm_cooldown_clear_handler,
+)
+from litellm.proxy.auth.user_api_key_auth import (
+    api_key_header as _cfg004_api_key_header,
+)
+
+
+async def _cfg004_cooldown_clear_auth_dependency(
+    request: Request,
+    api_key: str = Security(_cfg004_api_key_header),
+) -> UserAPIKeyAuth:
+    """Finding 4: route-specific auth dependency with CFG-004 audit.
+
+    Invokes the existing ``user_api_key_auth`` implementation.  On failure,
+    emits exactly one minimal sanitized CFG-004 audit event (no headers,
+    token, body, or target strings), then re-raises the same fail-closed
+    HTTP error.  On success, returns UserAPIKeyAuth so the handler can
+    still enforce PROXY_ADMIN + exact master-key.
+    """
+    import logging as _logging
+
+    _audit_logger = _logging.getLogger("LiteLLMProxy")
+    try:
+        result = await user_api_key_auth(request=request, api_key=api_key)
+        return result
+    except Exception:
+        # Emit exactly one minimal sanitized audit event.
+        try:
+            from litellm.proxy.pass_through_endpoints.aawm_alias_routing.durable import (
+                get_aawm_alias_routing_state_namespace as _get_ns,
+            )
+            _ns = _get_ns()
+        except Exception:
+            _ns = "unavailable"
+        import os as _os
+        _env = (
+            _os.getenv("AAWM_LITELLM_ENVIRONMENT", "").strip()
+            or _os.getenv("LITELLM_ENVIRONMENT", "").strip()
+            or "unknown"
+        )
+        _audit_logger.info(
+            "aawm_cooldown_clear_audit %s",
+            {
+                "event": "aawm_cooldown_clear_auth_failure",
+                "target_description": "target_unavailable",
+                "family": "",
+                "ingress": "unavailable",
+                "candidates": [],
+                "result": "error",
+                "error_code": "auth_dependency_failure",
+                "prior_state_source": "",
+                "bounded_remaining_ttl_seconds": 0.0,
+                "environment": _env,
+                "namespace": _ns,
+            },
+        )
+        raise
+
+
+@router.post(
+    "/aawm/alias-routing/cooldowns/clear",
+    tags=["AAWM Alias Routing"],
+)
+async def _aawm_alias_routing_cooldown_clear_endpoint(
+    request: Request,
+    user_api_key_dict: UserAPIKeyAuth = Depends(_cfg004_cooldown_clear_auth_dependency),
+) -> dict[str, Any]:
+    """Clear alias-routing cooldown state for a target (CFG-004).
+
+    Requires PROXY_ADMIN role and master-key authentication.
+    Manipulates state only; never sends provider traffic.
+    Finding 4: auth dependency emits audit on failure; handler does not
+    duplicate dependency audits.
+    """
+    return await _aawm_cooldown_clear_handler(request, user_api_key_dict)
 
 
 

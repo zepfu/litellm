@@ -177,13 +177,12 @@ async def clear_alias_family_cooldown_state(
     cooldown_keys: "Sequence[str]",
     delete_durable: bool = True,
 ) -> "Any":
-    """Clear cooldown state under per-key barrier locks (Defect 3).
+    """Clear cooldown state under canonical lock order (Defect 1/3).
 
-    Acquires the per-key barrier lock for each key (sorted to prevent
-    deadlock), then performs the memory clear (generation bump) and
-    optionally deletes the durable keys.  Holding the barrier locks
-    guarantees that no concurrent durable read can capture the new
-    generation and hydrate the old durable value.
+    Canonical lock order: barrier (sorted) -> family mutation lock.
+    This matches the read path (barrier -> family) and the endpoint clear
+    path (barrier -> family -> probe), forming a consistent partial order
+    with no cycles.
 
     Returns the ``CooldownClearResult`` from the manager's sync clear.
     """
@@ -192,16 +191,21 @@ async def clear_alias_family_cooldown_state(
     mgr = _require_manager()
     canonical = validate_alias_family(alias_family)
     sorted_keys = sorted(set(cooldown_keys))
+    family_state = mgr.family(canonical)
 
     # Acquire per-key barrier locks in sorted order (deadlock-free).
     barriers = [await mgr.key_barrier_lock(k) for k in sorted_keys]
     for b in barriers:
         await b.acquire()
     try:
-        result = mgr.clear_cooldown_state(
-            alias_family=canonical,
-            cooldown_keys=sorted_keys,
-        )
+        # Acquire family mutation lock (canonical order: barrier -> family).
+        async with family_state.lock:
+            result = mgr.clear_cooldown_state(
+                alias_family=canonical,
+                cooldown_keys=sorted_keys,
+            )
+        # Durable deletion outside the family lock (barrier locks still held,
+        # preventing stale reads; family lock not needed for Redis I/O).
         if delete_durable:
             for key in sorted_keys:
                 try:

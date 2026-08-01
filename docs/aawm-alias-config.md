@@ -168,6 +168,130 @@ and readiness gating in the production image/orchestrator) remains an
 **external blocker** tracked outside this repository. The dev compose mount
 and startup wiring here are the reference implementation.
 
+## Cooldown-clear operator contract (CFG-004)
+
+The implemented operator ingress for clearing alias-routing cooldown state is:
+
+```
+POST /aawm/alias-routing/cooldowns/clear
+```
+
+This is the only supported clear path. There is no GET, wildcard/global clear,
+or supported Redis/DB side channel.
+
+### Authentication and topology
+
+The request must pass both the authenticated proxy path and explicit checks:
+
+- the authenticated token has `PROXY_ADMIN`;
+- the token is the configured LiteLLM master key, compared by safe hash;
+- `AAWM_ALIAS_ROUTING_COOLDOWN_CLEAR_SINGLE_WORKER=1` is set literally.
+
+Missing or malformed delegated auth, a missing master key, a non-master token,
+or a closed topology gate fails closed. The gate is single-worker only; this
+endpoint does not claim multi-worker support. `docker-compose.dev.yml` wires
+the flag for the single-worker `litellm-dev` environment and labels that
+environment `litellm-dev`.
+
+### Strict request and resolution
+
+The JSON object accepts only string fields `ingress`, `alias`, `provider`, and
+`model`. `ingress` is required and must be `codex` or `anthropic`. The target
+is exclusive: use `alias`, or use both `provider` and `model`. Combined,
+partial, empty, extra, or non-string fields are rejected. Raw keys, hashes,
+namespaces, patterns, global-clear fields, and internal identifiers are
+forbidden.
+
+Resolution uses only the active routing snapshot. Unknown targets are
+rejected. Exact provider/model matches resolving to multiple distinct
+identities or route-family projections are ambiguous and rejected. Codex
+uses `route_family`; Anthropic uses `anthropic_route_family` and fails closed
+if that projection is unavailable.
+
+### Clear semantics and response
+
+After snapshot resolution, each identity is reserved before local or durable
+inspection. The local lane index and authoritative durable identity membership
+are then unioned, in-flight publication intents are drained with a bounded
+wait, and prior state is inspected. Mutation uses sorted per-key barriers,
+the family mutation lock, then sorted probe locks. Durable state is removed by
+an atomic compare-and-clear transaction. Local cooldown-derived state and
+lane-index entries are invalidated, followed by strict durable, identity,
+local-state, and local-index postcondition checks.
+
+Responses include `result`, `family`, `target_description`, `ingress`,
+resolved provider/model/route-family `candidates`, `keys_cleared`,
+`members_removed`, `affinity_preserved`, `prior_state_source`,
+`bounded_remaining_ttl_seconds`, `environment`, `namespace`, and
+`timestamp_utc`. `result` is `cleared` or idempotent `not_active`; the latter
+is returned only after authoritative absence proof. Missing cache, Redis
+errors, transaction uncertainty, membership drift, publication-drain timeout,
+or failed postconditions fail closed. Each HTTP exit emits one sanitized audit
+event with target, candidates, ingress, result, prior source/TTL,
+environment, namespace, and bounded error code. Secrets, credentials, raw
+keys, hashes, and traceback locals are excluded.
+
+There is no dry-run parameter or inspection-only endpoint. Clearing stale
+state is safe after quota replenishment but does not replenish provider quota,
+budget, or rate limits; an upstream that remains exhausted can recreate
+cooldown state. The endpoint performs no provider traffic and does not restart
+workers.
+
+### Operator procedure
+
+There is no dry-run parameter or inspection-only cooldown endpoint. The clear
+request mutates local state and durable state; do not use it as a probe.
+
+Perform this non-mutating preflight first:
+
+1. Confirm the target environment is the single-worker `litellm-dev` proxy and
+   that `AAWM_ALIAS_ROUTING_COOLDOWN_CLEAR_SINGLE_WORKER=1` is configured.
+2. Check the implemented readiness surface:
+
+```bash
+curl -sS http://127.0.0.1:4001/health/readiness
+```
+
+Require HTTP 200 and inspect `aawm_alias_config.state=active`, the expected
+`environment` outside the response if your deployment labels it, and the
+snapshot's `config_hash`, `config_version`, and `aliases`. The requested alias
+must be listed there. Readiness does not expose cooldown membership or TTL.
+There is no supported remote Redis inspection command or raw-key/hash
+procedure for CFG-004.
+3. For an exact provider/model request, inspect the same active configuration
+   source that produced the snapshot:
+
+```bash
+rg -n -C 2 'alias:|provider:|model:|route_family:|anthropic_route_family:' \
+  litellm/proxy/aawm_alias_config/
+```
+
+Use only the provider and model values in that schema, and use the matching
+`route_family` for `codex` or `anthropic_route_family` for `anthropic`. Do not
+infer a target from a Redis key. Confirm the upstream quota issue has been
+addressed before clearing. The source inspection cannot prove current
+cooldown membership or TTL; those are available only in the clear operation's
+sanitized result.
+4. After the preflight evidence is recorded, send the master key with one
+   strict request:
+
+```bash
+curl -sS http://127.0.0.1:4001/aawm/alias-routing/cooldowns/clear \
+  -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"alias":"read","ingress":"codex"}'
+```
+
+An exact target uses the actual snapshot identity:
+
+```json
+{"provider":"openai","model":"gpt-5.6-luna","ingress":"codex"}
+```
+
+5. Require `cleared` or `not_active`, inspect the returned candidates, source,
+   TTL, environment, and namespace, and correlate the sanitized audit event.
+   Do not treat a 409/503 as a successful clear.
+
 ## Multi-worker refresh consensus
 
 Explicitly **out of scope**. Each worker performs its own deterministic

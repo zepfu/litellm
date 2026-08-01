@@ -798,3 +798,59 @@ smoke tests, and acceptance harnesses.
   including unmatched-opener paths.
 - Terminal audit context (host, repository, client, dispatch, trace, session,
   prior tool activity) is memoized on `request.state`.
+
+### Cooldown-clear architecture boundary (CFG-004)
+
+`POST /aawm/alias-routing/cooldowns/clear` is implemented and correct only in
+a single-worker topology.
+
+Durable cooldown state lives in the shared alias-routing Redis store and is
+visible to every worker. However, each worker also holds **process-local
+cooldown caches** (in-memory `AliasFamilyState` / cooldown maps) that are
+populated on first use and refreshed on the candidate loop's own cadence. The
+implemented clear route removes durable Redis state and the local worker's
+cache; it cannot reach into other workers' process-local caches.
+
+Consequences:
+
+- After a clear, a second worker may still serve a stale in-memory cooldown
+  until its cache entry expires or the worker restarts. During that window
+  the alias/model remains incorrectly cooled-down on that worker.
+- A "successful" clear in multi-worker mode is therefore a **partial** clear
+  and can silently diverge from operator intent.
+
+For this reason the endpoint gates execution behind the literal
+`AAWM_ALIAS_ROUTING_COOLDOWN_CLEAR_SINGLE_WORKER=1`. Any absent, malformed, or
+other value fails closed. `docker-compose.dev.yml` wires this gate for the
+single-worker `litellm-dev` environment; this is not multi-worker support.
+
+The handler resolves identities from the active snapshot, creates an
+identity-scoped reservation before local-index or durable inspection, hydrates
+the local and durable lane union, drains existing publication intents, then
+uses sorted per-key barriers, the family mutation lock, and sorted probe locks.
+It atomically compare-and-clears durable membership, invalidates local
+cooldown and lane-index state, and verifies durable and local postconditions.
+It performs no provider call and does not restart workers.
+
+There is no dry-run parameter or inspection-only cooldown endpoint. Before
+calling the mutating route, an operator can use the implemented readiness
+surface:
+
+```bash
+curl -sS http://127.0.0.1:4001/health/readiness
+```
+
+The response must be HTTP 200 with
+`aawm_alias_config.state=active`; inspect its `config_hash`,
+`config_version`, and `aliases` to confirm that the requested alias belongs to
+the active snapshot. Confirm the deployment is the single-worker
+`litellm-dev` environment with
+`AAWM_ALIAS_ROUTING_COOLDOWN_CLEAR_SINGLE_WORKER=1`. For an exact target,
+inspect the canonical YAML source and match its provider/model and ingress
+projection (`route_family` for Codex or `anthropic_route_family` for
+Anthropic). The repository provides no supported remote cooldown inspection
+surface, and operators must not query raw Redis keys or hashes through CFG-004.
+The readiness response and source inspection do not expose current cooldown
+membership or TTL. Environment, namespace, prior-state source, and bounded
+remaining TTL are exposed by the clear response only, after mutation, and must
+be recorded with the sanitized audit event.

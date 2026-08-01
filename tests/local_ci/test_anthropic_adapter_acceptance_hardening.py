@@ -7584,3 +7584,233 @@ class TestForbiddenContextPrivacySentinels:
                 assert "line_count" in ctx
                 # Must NOT be a raw string
                 assert not isinstance(ctx, str)
+
+
+def test_codex_tool_name_normalization_maps_fully_qualified_names():
+    """Fix 1: Codex 0.146.0 fully-qualified tool names normalize to canonical."""
+    harness = _load_harness_module()
+    assert harness._normalize_codex_tool_name("functions.collaboration.spawn_agent") == "spawn_agent"
+    assert harness._normalize_codex_tool_name("functions.collaboration.wait") == "wait"
+    assert harness._normalize_codex_tool_name("functions.exec") == "exec_command"
+    assert harness._normalize_codex_tool_name("functions.exec_command") == "exec_command"
+    # Already-canonical names pass through unchanged.
+    assert harness._normalize_codex_tool_name("spawn_agent") == "spawn_agent"
+    assert harness._normalize_codex_tool_name("wait") == "wait"
+    assert harness._normalize_codex_tool_name("exec_command") == "exec_command"
+    # Unknown names pass through unchanged.
+    assert harness._normalize_codex_tool_name("some_other_tool") == "some_other_tool"
+
+
+def test_codex_collaboration_validation_accepts_fully_qualified_tool_names():
+    """Fix 1: collaboration parser counts fully-qualified Codex 0.146.0 names."""
+    harness = _load_harness_module()
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "collab_tool_call",
+                        "tool": "functions.collaboration.spawn_agent",
+                        "status": "completed",
+                        "receiver_agent_ids": ["child-1"],
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "collab_tool_call",
+                        "tool": "functions.collaboration.wait",
+                        "status": "completed",
+                        "agents_states": {
+                            "child-1": {"status": "completed"},
+                        },
+                    },
+                }
+            ),
+        ]
+    )
+
+    summary, failures = harness._validate_codex_collaboration_events(
+        family="codex_read_alias",
+        stdout=stdout,
+        checks={
+            "minimum_tool_counts": {"spawn_agent": 1, "wait": 1},
+            "required_successful_tools": ["spawn_agent", "wait"],
+            "require_wait_for_spawned_agents": True,
+        },
+    )
+
+    assert failures == []
+    assert summary["tool_counts"] == {"spawn_agent": 1, "wait": 1}
+    assert summary["spawned_agent_ids"] == ["child-1"]
+    assert summary["waited_agent_statuses"] == {"child-1": "completed"}
+
+
+def test_target_profile_dev_has_separate_runtime_environment():
+    """Fix 4: dev profile separates trace env 'dev' from runtime env 'litellm-dev'."""
+    harness = _load_harness_module()
+    dev_profile = harness.BUILT_IN_TARGET_PROFILES["dev"]
+    assert dev_profile["expected_trace_environment"] == "dev"
+    assert dev_profile["expected_runtime_environment"] == "litellm-dev"
+
+    prod_profile = harness.BUILT_IN_TARGET_PROFILES["prod"]
+    assert prod_profile["expected_trace_environment"] == "prod"
+    assert prod_profile["expected_runtime_environment"] == "prod"
+
+
+def test_target_profile_settings_defaults_runtime_environment():
+    """Fix 4: _target_profile_settings defaults runtime env from container name."""
+    harness = _load_harness_module()
+    profile = harness._target_profile_settings(
+        config={},
+        target="dev",
+    )
+    assert profile["expected_runtime_environment"] == "litellm-dev"
+    assert profile["expected_trace_environment"] == "dev"
+
+
+def test_codex_collaboration_validation_enforces_maximum_tool_counts():
+    """Defect 1: duplicate fully-qualified spawn_agent/wait calls must fail."""
+    harness = _load_harness_module()
+    # Two spawn_agent calls (fully-qualified) and one wait.
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "collab_tool_call",
+                        "tool": "functions.collaboration.spawn_agent",
+                        "status": "completed",
+                        "receiver_agent_ids": ["child-1"],
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "collab_tool_call",
+                        "tool": "functions.collaboration.spawn_agent",
+                        "status": "completed",
+                        "receiver_agent_ids": ["child-2"],
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "collab_tool_call",
+                        "tool": "functions.collaboration.wait",
+                        "status": "completed",
+                        "agents_states": {
+                            "child-1": {"status": "completed"},
+                            "child-2": {"status": "completed"},
+                        },
+                    },
+                }
+            ),
+        ]
+    )
+
+    summary, failures = harness._validate_codex_collaboration_events(
+        family="codex_read_alias",
+        stdout=stdout,
+        checks={
+            "minimum_tool_counts": {"spawn_agent": 1, "wait": 1},
+            "maximum_tool_counts": {"spawn_agent": 1, "wait": 1},
+            "required_successful_tools": ["spawn_agent", "wait"],
+        },
+    )
+
+    assert summary["tool_counts"] == {"spawn_agent": 2, "wait": 1}
+    assert any(
+        "excess completed Codex collaboration calls for 'spawn_agent'" in failure
+        and "expected <= 1, got 2" in failure
+        for failure in failures
+    )
+    # wait is exactly 1, so no excess failure for wait.
+    assert not any("'wait'" in failure and "excess" in failure for failure in failures)
+
+
+def test_codex_collaboration_validation_exact_one_passes_at_boundary():
+    """Defect 1: exactly one spawn_agent and one wait passes the max contract."""
+    harness = _load_harness_module()
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "collab_tool_call",
+                        "tool": "functions.collaboration.spawn_agent",
+                        "status": "completed",
+                        "receiver_agent_ids": ["child-1"],
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "collab_tool_call",
+                        "tool": "functions.collaboration.wait",
+                        "status": "completed",
+                        "agents_states": {"child-1": {"status": "completed"}},
+                    },
+                }
+            ),
+        ]
+    )
+
+    _, failures = harness._validate_codex_collaboration_events(
+        family="codex_read_alias",
+        stdout=stdout,
+        checks={
+            "minimum_tool_counts": {"spawn_agent": 1, "wait": 1},
+            "maximum_tool_counts": {"spawn_agent": 1, "wait": 1},
+            "required_successful_tools": ["spawn_agent", "wait"],
+        },
+    )
+
+    assert failures == []
+
+
+def test_checked_in_config_read_alias_requires_exact_one_spawn_and_wait():
+    """Defect 1: the checked-in read-alias case configures exact-one max counts."""
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    collab = config["cases"][
+        "native_openai_passthrough_responses_codex_read_alias_collaboration"
+    ]["codex_collaboration_validation"]
+    assert collab["minimum_tool_counts"] == {"spawn_agent": 1, "wait": 1}
+    assert collab["maximum_tool_counts"] == {"spawn_agent": 1, "wait": 1}
+    # Existing exact command / same-turn / overlap requirements preserved.
+    assert collab["command_execution_validation"]["exact_commands"] == [
+        "pwd",
+        "git rev-parse --show-toplevel",
+        "git status --short",
+    ]
+    assert collab["command_execution_validation"]["require_same_turn"] is True
+    assert collab["command_execution_validation"]["minimum_parallel_count"] == 3
+
+
+def test_checked_in_config_prod_profile_has_expected_runtime_environment():
+    """Defect 2: checked-in JSON prod profile carries authoritative runtime label."""
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    prod = config["target_profiles"]["prod"]
+    assert prod["expected_runtime_environment"] == "prod"
+    assert prod["expected_trace_environment"] == "prod"
+    assert prod["docker_container_name"] == "aawm-litellm"
+
+
+def test_checked_in_config_prod_profile_resolution_uses_prod_runtime_label():
+    """Defect 2: profile resolution for prod yields runtime env 'prod', not container name."""
+    harness = _load_harness_module()
+    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
+    profile = harness._target_profile_settings(config=config, target="prod")
+    assert profile["expected_runtime_environment"] == "prod"
+    assert profile["expected_trace_environment"] == "prod"

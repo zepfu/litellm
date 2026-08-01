@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -1113,3 +1113,118 @@ async def test_candidate_probe_lock_canonical_identity(
     assert lock_anth_bare is lock_anth_prod
     # Different families get different locks.
     assert lock_bare is not lock_anth_bare
+
+
+# ---------------------------------------------------------------------------
+# Deadlock regression: canonical lock order (Defect 1)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_canonical_lock_order_no_deadlock_barrier_family(
+    fresh_manager: AliasRoutingStateManager,
+) -> None:
+    """Deterministic bounded deadlock regression for Defect 1.
+
+    Old code: clear acquired family -> barrier while reads acquired
+    barrier -> family, creating a lock-order cycle.  New canonical order
+    is barrier -> family -> probe for BOTH paths, eliminating the cycle.
+
+    This test simulates two concurrent actors:
+    - Reader: acquires barrier, then family (read/hydration path).
+    - Clearer: acquires barrier, then family (endpoint clear path).
+
+    With the old inverted order (clear: family -> barrier), the reader
+    holding barrier and the clearer holding family would deadlock.  With
+    the canonical order, both acquire barrier first, so one waits for the
+    other at the barrier level -- no cycle, bounded completion.
+    """
+    mgr = fresh_manager
+    key = "deadlock-regression-key"
+    family_state = mgr.family("codex")
+
+    barrier = await mgr.key_barrier_lock(key)
+    events: list[str] = []
+
+    async def reader_path():
+        """Simulate the durable-read hydration path: barrier -> family."""
+        async with barrier:
+            events.append("reader:barrier")
+            await asyncio.sleep(0.01)  # hold barrier briefly
+            async with family_state.lock:
+                events.append("reader:family")
+
+    async def clearer_path():
+        """Simulate the endpoint clear path: barrier -> family -> probe."""
+        await asyncio.sleep(0.005)  # let reader grab barrier first
+        async with barrier:
+            events.append("clearer:barrier")
+            async with family_state.lock:
+                events.append("clearer:family")
+
+    # Both must complete within bounded time (no deadlock).
+    await asyncio.wait_for(
+        asyncio.gather(reader_path(), clearer_path()),
+        timeout=3.0,
+    )
+
+    # Reader acquired barrier first (it started first).
+    assert events[0] == "reader:barrier"
+    # Clearer waited for barrier, then proceeded.
+    assert "clearer:barrier" in events
+    assert "clearer:family" in events
+    assert len(events) == 4
+
+
+@pytest.mark.asyncio
+async def test_canonical_lock_order_clear_vs_read_no_deadlock(
+    fresh_manager: AliasRoutingStateManager,
+) -> None:
+    """Full-path deadlock regression: clear_alias_family_cooldown_state
+    (barrier -> family) concurrent with a durable read (barrier -> family)
+    for the same key completes without deadlock."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_state import (
+        clear_alias_family_cooldown_state,
+        configure_cooldown_state_runtime,
+    )
+
+    mgr = fresh_manager
+    configure_cooldown_state_runtime(manager=mgr)
+    key = "openai:gpt-4o:auth:deadlock-full"
+
+    # Seed a cooldown so the read path has something to find.
+    mgr.codex.set_cooldown_memory(key, 300.0)
+
+    dual_cache = MagicMock()
+    dual_cache.redis_cache = MagicMock()
+
+    read_completed = False
+
+    async def slow_read():
+        nonlocal read_completed
+        with patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_state.get_aawm_alias_routing_dual_cache",
+            return_value=dual_cache,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_state.read_aawm_alias_routing_durable_payload",
+            new=AsyncMock(return_value=None),
+        ):
+            from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_state import (
+                _get_codex_auto_agent_active_cooldown_state,
+            )
+            await _get_codex_auto_agent_active_cooldown_state(key)
+            read_completed = True
+
+    async def do_clear():
+        await asyncio.sleep(0.005)
+        await clear_alias_family_cooldown_state(
+            alias_family="codex",
+            cooldown_keys=[key],
+            delete_durable=False,
+        )
+
+    await asyncio.wait_for(
+        asyncio.gather(slow_read(), do_clear()),
+        timeout=5.0,
+    )
+    assert read_completed

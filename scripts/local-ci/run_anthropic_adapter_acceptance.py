@@ -31,12 +31,14 @@ BUILT_IN_TARGET_PROFILES: dict[str, dict[str, str]] = {
         'anthropic_base_url': 'http://127.0.0.1:4001/anthropic',
         'docker_container_name': 'litellm-dev',
         'expected_trace_environment': 'dev',
+        'expected_runtime_environment': 'litellm-dev',
     },
     'prod': {
         'litellm_base_url': 'http://127.0.0.1:4000',
         'anthropic_base_url': 'http://127.0.0.1:4000/anthropic',
         'docker_container_name': 'aawm-litellm',
         'expected_trace_environment': 'prod',
+        'expected_runtime_environment': 'prod',
     },
 }
 DEFAULT_RUNTIME_LOG_FORBIDDEN_SUBSTRINGS = [
@@ -464,6 +466,24 @@ def _validate_command_text_checks(
     }, failures
 
 
+_CODEX_TOOL_NAME_CANONICAL_MAP: dict[str, str] = {
+    "functions.collaboration.spawn_agent": "spawn_agent",
+    "functions.collaboration.wait": "wait",
+    "functions.exec": "exec_command",
+    "functions.exec_command": "exec_command",
+}
+
+
+def _normalize_codex_tool_name(raw: str) -> str:
+    """Normalize Codex 0.146.0+ fully-qualified tool names to canonical short names.
+
+    Codex 0.146.0 emits names like ``functions.collaboration.spawn_agent`` and
+    ``functions.exec`` in collab_tool_call items.  The harness contract uses the
+    canonical short names ``spawn_agent``, ``wait``, ``exec_command``.
+    """
+    return _CODEX_TOOL_NAME_CANONICAL_MAP.get(raw, raw)
+
+
 def _validate_codex_collaboration_events(  # noqa: PLR0915
     *,
     family: str,
@@ -499,8 +519,9 @@ def _validate_codex_collaboration_events(  # noqa: PLR0915
         if item.get("type") == "collab_tool_call" and obj.get("type") == "item.completed":
             tool = item.get("tool")
             if isinstance(tool, str) and tool:
-                tool_counts[tool] = tool_counts.get(tool, 0) + 1
-                completed_tool_items.setdefault(tool, []).append(item)
+                canonical = _normalize_codex_tool_name(tool)
+                tool_counts[canonical] = tool_counts.get(canonical, 0) + 1
+                completed_tool_items.setdefault(canonical, []).append(item)
             continue
         if (
             item.get("type") != "command_execution"
@@ -540,6 +561,14 @@ def _validate_codex_collaboration_events(  # noqa: PLR0915
         if actual < int(minimum):
             failures.append(
                 f"{family} missing completed Codex collaboration calls for {tool!r}: expected >= {int(minimum)}, got {actual}"
+            )
+
+    maximum_tool_counts = checks.get("maximum_tool_counts") or {}
+    for tool, maximum in maximum_tool_counts.items():
+        actual = tool_counts.get(str(tool), 0)
+        if actual > int(maximum):
+            failures.append(
+                f"{family} excess completed Codex collaboration calls for {tool!r}: expected <= {int(maximum)}, got {actual}"
             )
 
     required_successful_tools = {
@@ -1084,6 +1113,7 @@ def _target_profile_settings(
     profile.setdefault('anthropic_base_url', f"{profile['litellm_base_url'].rstrip('/')}/anthropic")
     profile.setdefault('docker_container_name', 'litellm-dev')
     profile.setdefault('expected_trace_environment', target)
+    profile.setdefault('expected_runtime_environment', profile['docker_container_name'])
     profile['litellm_base_url'] = profile['litellm_base_url'].rstrip('/')
     profile['anthropic_base_url'] = profile['anthropic_base_url'].rstrip('/')
     return profile
@@ -1170,7 +1200,7 @@ def _apply_target_profile_to_config(  # noqa: PLR0915
         )
         session_history_validation.setdefault(
             'expected_litellm_environment',
-            profile['expected_trace_environment'],
+            profile.get('expected_runtime_environment', profile['expected_trace_environment']),
         )
         metadata_required_equals = dict(
             session_history_validation.get('metadata_required_equals') or {}
@@ -1179,9 +1209,9 @@ def _apply_target_profile_to_config(  # noqa: PLR0915
             metadata_required_equals['trace_environment'] = profile[
                 'expected_trace_environment'
             ]
-        metadata_required_equals['litellm_environment'] = profile[
-            'expected_trace_environment'
-        ]
+        metadata_required_equals['litellm_environment'] = profile.get(
+            'expected_runtime_environment', profile['expected_trace_environment']
+        )
         require_trace_user_id = (
             updated_case.get('require_trace_user_id', True) is not False
         )
@@ -5214,6 +5244,19 @@ def _validate_case(name: str, config: dict[str, Any], *, query_url: str, public_
             limit=100,
             timeout_seconds=int(config.get("langfuse_poll_timeout_seconds", 60)),
         )
+        # Fix 5: When name-based lookup finds nothing but a session ID is
+        # available, fall back to session-based lookup.  The proxy may not
+        # propagate langfuse_trace_name to the Langfuse trace name field.
+        if not traces and can_session_trace_lookup:
+            traces, lookup_error = RA._poll_langfuse_session_traces(
+                query_url=query_url,
+                public_key=public_key,
+                secret_key=secret_key,
+                user_id=lookup_user_id,
+                start_time=started,
+                session_id=command_session_id.strip(),
+                timeout_seconds=int(config.get('langfuse_poll_timeout_seconds', 60)),
+            )
     elif can_session_trace_lookup:
         traces, lookup_error = RA._poll_langfuse_session_traces(
             query_url=query_url,

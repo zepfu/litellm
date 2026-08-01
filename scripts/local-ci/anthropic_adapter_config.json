@@ -20,13 +20,15 @@
       "validation_db_password_container_env": "PGBOUNCER_AUTH_PASSWORD",
       "langfuse_public_key_container_env": "LANGFUSE_INIT_PROJECT_PUBLIC_KEY",
       "langfuse_secret_key_container_env": "LANGFUSE_INIT_PROJECT_SECRET_KEY",
-      "langfuse_credential_container": "aawm-langfuse-web"
+      "langfuse_credential_container": "aawm-langfuse-web",
+      "expected_runtime_environment": "litellm-dev"
     },
     "prod": {
       "litellm_base_url": "http://127.0.0.1:4000",
       "anthropic_base_url": "http://127.0.0.1:4000/anthropic",
       "docker_container_name": "aawm-litellm",
-      "expected_trace_environment": "prod"
+      "expected_trace_environment": "prod",
+      "expected_runtime_environment": "prod"
     }
   },
   "default_excluded_cases": [
@@ -9126,7 +9128,7 @@
         "-c",
         "model_providers.{codex_profile}.http_headers.session_id=\"{session_id}\"",
         "--json",
-        "Read alias collaboration acceptance exercise. Do not modify, create, or delete files and do not browse the web. In your first tool response call spawn_agent exactly once with agent_type=\"opencode\", model=\"read\", and fork_turns=\"none\". Supply a complete self-contained plaintext child message and do not include the legacy fork_context field. The child message must prohibit further agent spawning and require its first tool response to contain exactly three exec_command calls in one parallel batch with no text: pwd; git rev-parse --show-toplevel; git status --short. All commands must run in {repository_root}; the child must not wait for one result before issuing the other calls. After all three results succeed, the child must use no more tools and return exactly READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED. Wait for the child to terminate, verify that exact marker and all three successful command results, then return exactly CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED with no Markdown, explanation, or additional text. If spawning, any command, waiting, or child termination fails, report the exact blocker and do not emit the success marker."
+        "Read alias collaboration acceptance exercise. Do not modify, create, or delete files and do not browse the web. In your first tool response call spawn_agent exactly once with agent_type=\"opencode\", model=\"read\", and fork_turns=\"none\". Supply a complete self-contained plaintext child message and do not include the legacy fork_context field. The child message must prohibit further agent spawning and require its first tool response to contain exactly three exec_command calls in one parallel batch with no text: pwd; git rev-parse --show-toplevel; git status --short. All commands must run in {repository_root}; the child must not wait for one result before issuing the other calls. After all three results succeed, the child must use no more tools and return exactly READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED. Wait for the child to terminate, verify that exact marker and all three successful command results, then your entire final message must be the single line CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED and nothing else: no Markdown, no code fences, no explanation, no greeting, no trailing newline content. Your output will be rejected if it contains any character before or after that exact marker. If spawning, any command, waiting, or child termination fails, report the exact blocker and do not emit the success marker."
       ],
       "required_trace_names": [
         "{case_name}"
@@ -9169,6 +9171,10 @@
           "required_exit_code": 0,
           "require_same_turn": true,
           "minimum_parallel_count": 3
+        },
+        "maximum_tool_counts": {
+          "spawn_agent": 1,
+          "wait": 1
         }
       },
       "command_output_text_checks": {
@@ -9400,7 +9406,7 @@
       "command": [
         "claude",
         "-p",
-        "Dispatch to the harness-read-alias-parallel-read-tools agent. Do not perform these steps yourself; wait for the actual child response. The child agent must emit exactly one assistant message containing exactly three tool calls, with no text: Read scripts/local-ci/sequential_core_tools_fixture.txt, Glob pattern exactly `scripts/local-ci/sequential_core_tools_fixture.txt` from ., and Grep pattern exactly `sequential-core-tools-grep` with path exactly `scripts/local-ci/sequential_core_tools_fixture.txt` and output_mode exactly `content`. The child must not wait for any tool result before emitting all three tool calls. After all three tool results return, the child will produce a final marker line. Treat that marker as opaque: do not summarize it, discuss it, wrap it in Markdown, add notification text, reference injected context, or surround it with any other text. Emit exactly READ_ALIAS_PARALLEL_TOOLS_PASSED as your complete final output with nothing before or after. If the child fails or does not produce the expected marker, report the exact bounded blocker and do not emit the success marker.",
+        "Dispatch to the harness-read-alias-parallel-read-tools agent. Do not perform these steps yourself; wait for the actual child response. The child agent must emit exactly one assistant message containing exactly three tool calls, with no text: Read scripts/local-ci/sequential_core_tools_fixture.txt, Glob pattern exactly `scripts/local-ci/sequential_core_tools_fixture.txt` from ., and Grep pattern exactly `sequential-core-tools-grep` with path exactly `scripts/local-ci/sequential_core_tools_fixture.txt` and output_mode exactly `content`. The child must not wait for any tool result before emitting all three tool calls. After all three tool results return, the child will produce a final marker line. Treat that marker as opaque: do not summarize it, discuss it, wrap it in Markdown, add notification text, reference injected context, or surround it with any other text. Your entire final output must be the single line READ_ALIAS_PARALLEL_TOOLS_PASSED and nothing else: no Markdown, no code fences, no explanation, no notification text. Your output will be rejected if it contains any character before or after that exact marker. If the child fails or does not produce the expected marker, report the exact bounded blocker and do not emit the success marker.",
         "--output-format",
         "json",
         "--permission-mode",
@@ -9420,7 +9426,7 @@
             "Glob",
             "Grep"
           ],
-          "prompt": "You are a deterministic acceptance harness child. Execute only the caller's parallel tool script. This is not a repository investigation. Your first assistant message must contain exactly three tool_use blocks and no text: one Read, one Glob, and one Grep. Do not wait for any tool result before emitting all three tool calls. After all three tool results return, return only the caller's exact final line."
+          "prompt": "You are a deterministic acceptance harness child. Execute only the caller's parallel tool script. This is not a repository investigation. Your first assistant message must contain exactly three tool_use blocks and no text: one Read, one Glob, and one Grep. Do not wait for any tool result before emitting all three tool calls. After all three tool results return, your entire final response must be exactly READ_ALIAS_PARALLEL_TOOLS_PASSED with no other text, no Markdown, no code fences, and no explanation."
         }
       },
       "env": {

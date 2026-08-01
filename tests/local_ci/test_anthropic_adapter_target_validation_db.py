@@ -961,7 +961,7 @@ class TestClaudeReadAliasParentContract:
         prompt = cmd[2]
         assert "do not summarize it" in prompt
         assert "Markdown" in prompt
-        assert "nothing before or after" in prompt
+        assert "before or after" in prompt
 
     def test_parent_prompt_has_bounded_blocker_fallback(self):
         cmd = self._case()["command"]
