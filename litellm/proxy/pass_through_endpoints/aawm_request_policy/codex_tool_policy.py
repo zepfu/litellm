@@ -166,6 +166,11 @@ CODEX_SPAWN_AGENT_FANOUT_POLICY = (
     "that authorize fanout; do not treat generic depth or investigation wording "
     "as permission to launch unrelated autonomous fanout. Do not duplicate the "
     "same task across agents.\n\n"
+    "Explicitly requested agent_type, model, or fork_turns values take precedence "
+    "over all defaults. Copy each explicitly requested value exactly into every "
+    "spawn_agent payload; do not substitute or omit those values on the first "
+    "attempt or any retry. Apply defaults only when the current task did not "
+    "provide an explicit value for that field.\n\n"
     "For read-only or exploration workers, call multi_agent_v1.spawn_agent with "
     'lower-case payload fields: model="aawm-codex-agent-auto", '
     'fork_turns="none" unless context sharing is explicitly needed, and message '
@@ -331,7 +336,10 @@ def extract_openai_passthrough_tool_choice(
 
 
 def patch_codex_spawn_agent_description_text(description: str) -> tuple[str, int]:
-    """Replace restrictive spawn_agent description patterns with fanout policy."""
+    """Ensure a spawn_agent description includes the fanout policy."""
+    if CODEX_SPAWN_AGENT_FANOUT_POLICY in description:
+        return description, 0
+
     updated_description = description
     replacement_count = 0
     for pattern in CODEX_SPAWN_AGENT_RESTRICTIVE_DESCRIPTION_PATTERNS:
@@ -341,7 +349,11 @@ def patch_codex_spawn_agent_description_text(description: str) -> tuple[str, int
             count=1,
         )
         replacement_count += count
-    return updated_description, replacement_count
+    if replacement_count:
+        return updated_description, replacement_count
+    if not description.strip():
+        return CODEX_SPAWN_AGENT_FANOUT_POLICY, 0
+    return f"{description.rstrip()}\n\n{CODEX_SPAWN_AGENT_FANOUT_POLICY}", 0
 
 
 def patch_codex_spawn_agent_payload_parameters(
@@ -487,7 +499,7 @@ def patch_codex_spawn_agent_tool_description(
             updated_description,
             replacement_count,
         ) = patch_codex_spawn_agent_description_text(description)
-        if replacement_count == 0 or updated_description == description:
+        if updated_description == description:
             continue
 
         if updated_tool is tool:

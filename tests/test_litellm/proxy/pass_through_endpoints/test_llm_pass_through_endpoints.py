@@ -38,6 +38,9 @@ from litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_pre
     _compact_openai_adapter_claude_context_in_anthropic_request_body,
     _prepare_anthropic_request_body_for_passthrough,
 )
+from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
+    CODEX_SPAWN_AGENT_FANOUT_POLICY,
+)
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     BaseOpenAIPassThroughHandler,
     _add_anthropic_auto_agent_alias_metadata,
@@ -12163,7 +12166,31 @@ def test_kimi_collaboration_namespace_is_flattened_with_continuation_and_tool_ch
         "namespace": "collaboration",
         "name": "spawn_agent",
     }
-    assert [event["id"] for event in patch_events] == ["spawn-agent-payload-schema"]
+    assert patch_events == [
+        {
+            "id": "spawn-agent-fanout-policy",
+            "status": "applied",
+            "tool_name": "spawn_agent",
+            "path": "tools.1.description",
+            "occurrences": 0,
+        },
+        {
+            "id": "spawn-agent-payload-schema",
+            "status": "applied",
+            "tool_name": "spawn_agent",
+            "path": "tools.1.parameters",
+            "fields_added": ["agent_type", "model", "fork_turns"],
+            "fields_removed": [],
+            "occurrences": 0,
+        },
+    ]
+    spawn_description = patched_body["tools"][1]["description"]
+    assert spawn_description.startswith("Spawn a child agent.\n\n")
+    assert CODEX_SPAWN_AGENT_FANOUT_POLICY in spawn_description
+    assert (
+        "Explicitly requested agent_type, model, or fork_turns values take "
+        "precedence over all defaults."
+    ) in spawn_description
     spawn_parameters = patched_body["tools"][1]["parameters"]
     assert set(spawn_parameters["properties"]) == {
         "task_name",
@@ -24104,6 +24131,13 @@ async def test_openai_passthrough_route_sets_repository_trace_environment_and_se
     assert litellm_metadata["aawm_tool_definition_snapshot_storage"] == "session_history_tool_definition_snapshots"
     assert "aawm-codex-agent-auto" in prepared_body["tools"][0]["description"]
     assert 'fork_turns="none"' in prepared_body["tools"][0]["description"]
+    assert (
+        "Explicitly requested agent_type, model, or fork_turns values take "
+        "precedence over all defaults."
+    ) in prepared_body["tools"][0]["description"]
+    assert (
+        "do not substitute or omit those values on the first attempt or any retry"
+    ) in prepared_body["tools"][0]["description"]
     assert "fork_context" not in prepared_body["tools"][0]["description"]
     spawn_agent_parameters = prepared_body["tools"][0]["parameters"]
     assert set(spawn_agent_parameters["properties"]) == {

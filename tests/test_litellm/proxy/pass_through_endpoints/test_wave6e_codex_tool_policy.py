@@ -173,12 +173,29 @@ class TestSpawnAgentDescriptionPatch:
         updated, count = patch_codex_spawn_agent_description_text(desc)
         assert count == 1
         assert CODEX_SPAWN_AGENT_FANOUT_POLICY in updated
+        assert (
+            "Explicitly requested agent_type, model, or fork_turns values take "
+            "precedence over all defaults."
+        ) in updated
+        assert (
+            "Copy each explicitly requested value exactly into every spawn_agent "
+            "payload; do not substitute or omit those values on the first attempt "
+            "or any retry."
+        ) in updated
+        assert (
+            "Apply defaults only when the current task did not provide an explicit "
+            "value for that field."
+        ) in updated
 
-    def test_no_match_returns_original(self):
+    def test_non_restrictive_description_is_preserved_with_policy(self):
         desc = "A normal description."
         updated, count = patch_codex_spawn_agent_description_text(desc)
         assert count == 0
-        assert updated == desc
+        assert updated == f"{desc}\n\n{CODEX_SPAWN_AGENT_FANOUT_POLICY}"
+
+        repeated, repeated_count = patch_codex_spawn_agent_description_text(updated)
+        assert repeated_count == 0
+        assert repeated == updated
 
     def test_idempotent_after_patch(self):
         desc = (
