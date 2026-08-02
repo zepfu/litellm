@@ -869,6 +869,101 @@ async def _aawm_alias_routing_cooldown_clear_endpoint(
     return await _aawm_cooldown_clear_handler(request, user_api_key_dict)
 
 
+@router.post(
+    "/aawm/alias-routing/cooldowns/acceptance",
+    tags=["AAWM Alias Routing"],
+)
+async def _aawm_alias_routing_cooldown_acceptance_endpoint(
+    request: Request,
+    user_api_key_dict: UserAPIKeyAuth = Depends(_cfg004_cooldown_clear_auth_dependency),
+) -> dict[str, Any]:
+    """Dev-only acceptance harness for CFG-004 criterion 11.
+
+    Operations: prepare, inspect, restore.
+    Gated on exact environment, enable flag, run_id, namespace, topology,
+    PROXY_ADMIN role, and master-key authentication.
+    """
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_acceptance import (
+        handle_cooldown_acceptance,
+    )
+
+    return await handle_cooldown_acceptance(request, user_api_key_dict)
+
+
+
+# CFG-004 criterion 11: fail-closed auth bypass for the disposable
+# /openai_passthrough Responses acceptance route.  Bypasses LiteLLM key
+# auth ONLY when the complete disposable acceptance runtime contract is
+# satisfied; otherwise delegates to user_api_key_auth unchanged.
+_CFG004_ACCEPTANCE_PUBLIC_ROUTE = "/openai_passthrough/*"
+
+
+def _cfg004_acceptance_auth_bypass_active(request: Request, endpoint: str) -> bool:
+    """Return True only when ALL CFG-004 acceptance gates pass for the
+    /openai_passthrough Responses route.  Fail closed on any ambiguity."""
+    import re as _re
+
+    # Gate: exact /openai_passthrough route family (not /openai).
+    request_path = getattr(getattr(request, "url", None), "path", "") or ""
+    if not request_path.startswith("/openai_passthrough/"):
+        return False
+
+    # Gate: Responses endpoint only.
+    if not _is_openai_responses_endpoint(endpoint):
+        return False
+
+    # Gate: litellm-dev environment.
+    if os.getenv("AAWM_LITELLM_ENVIRONMENT", "").strip() != "litellm-dev":
+        return False
+
+    # Gate: AAWM_CFG004_ACCEPTANCE_ENABLED=1.
+    if os.getenv("AAWM_CFG004_ACCEPTANCE_ENABLED", "").strip() != "1":
+        return False
+
+    # Gate: single-worker topology (complete-runtime contract).
+    if os.getenv("AAWM_ALIAS_ROUTING_COOLDOWN_CLEAR_SINGLE_WORKER", "").strip() != "1":
+        return False
+
+    # Gate: valid 32-hex run_id.
+    run_id = os.getenv("AAWM_CFG004_ACCEPTANCE_RUN_ID", "").strip()
+    if not _re.fullmatch(r"[0-9a-f]{32}", run_id):
+        return False
+
+    # Gate: matching namespace.
+    try:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.durable import (
+            get_aawm_alias_routing_state_namespace as _get_ns,
+        )
+        if _get_ns() != f"aawm-routing-dev-cfg004-{run_id}":
+            return False
+    except Exception:
+        return False
+
+    # Gate: disposable config's exact public-route declaration.
+    try:
+        from litellm.proxy.proxy_server import general_settings as _gs
+        if not isinstance(_gs, dict):
+            return False
+        _pr = _gs.get("public_routes")
+        if not isinstance(_pr, list) or _CFG004_ACCEPTANCE_PUBLIC_ROUTE not in _pr:
+            return False
+    except Exception:
+        return False
+
+    return True
+
+
+async def _cfg004_openai_passthrough_auth_dependency(
+    request: Request,
+    endpoint: str,
+    api_key: str = Security(_cfg004_api_key_header),
+) -> UserAPIKeyAuth:
+    """CFG-004 acceptance: bypass LiteLLM key auth under complete disposable
+    gates; otherwise delegate to user_api_key_auth unchanged."""
+    if _cfg004_acceptance_auth_bypass_active(request, endpoint):
+        return UserAPIKeyAuth(user_role=LitellmUserRoles.INTERNAL_USER_VIEW_ONLY)
+    return await user_api_key_auth(request=request, api_key=api_key)
+
 
 
 _CLAUDE_AGENT_SPEC_DIR_ENV_VARS = (
@@ -5321,7 +5416,7 @@ async def openai_proxy_route(
     endpoint: str,
     request: Request,
     fastapi_response: Response,
-    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+    user_api_key_dict: UserAPIKeyAuth = Depends(_cfg004_openai_passthrough_auth_dependency),
 ):
     """
     Pass-through endpoint for OpenAI API calls.

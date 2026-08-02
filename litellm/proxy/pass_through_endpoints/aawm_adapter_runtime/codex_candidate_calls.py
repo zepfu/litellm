@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     def _record_adapted_completed_route_rollup_after_stream(response: Any, rollup: Any, **kwargs: Any) -> Any: ...
     def _record_adapted_completed_route_rollup_turn(rollup: Any, **kwargs: Any) -> None: ...
     def _responses_sse_from_iterator(iterator: Any, **kwargs: Any) -> Any: ...
+    def _responses_sse_from_repaired_response_body(response_body: dict[str, Any]) -> Any: ...
     def _serialize_responses_adapter_response(response_obj: Any) -> str: ...
     async def _validate_codex_auto_agent_responses_payload(response: Any, **kwargs: Any) -> Any: ...
     def _xai_oauth_candidate_unavailable_detail(exc: Exception) -> Optional[str]: ...
@@ -154,6 +155,12 @@ _HOST_FUNCTION_NAMES = (
     "_OPENCODE_ZEN_DIRECT_429_ERROR_CLASSES",
     "_OPENCODE_ZEN_DIRECT_RETRY_AFTER_CEILING_SECONDS",
     "_OPENCODE_ZEN_DIRECT_PEEK_MAX_BYTES",
+    # CFG-004 encrypted reasoning detection
+    "_is_fernet_encrypted_token",
+    "_responses_output_contains_encrypted_reasoning_arguments",
+    "_FERNET_TOKEN_PREFIX",
+    "_FERNET_MIN_TOKEN_LENGTH",
+    "_ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES",
 )
 
 
@@ -196,6 +203,72 @@ def install(
 
 
 # ── Extracted functions ─────────────────────────────────────────────
+
+
+# ── CFG-004: encrypted reasoning detection ─────────────────────────
+
+_FERNET_TOKEN_PREFIX = "gAAAA"
+_FERNET_MIN_TOKEN_LENGTH = 64
+_ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES = 1
+
+
+def _is_fernet_encrypted_token(value: str) -> bool:
+    """Detect Fernet-encrypted reasoning tokens by their version prefix.
+
+    Fernet tokens are base64url-encoded and begin with a fixed version
+    byte (0x80) that encodes to ``gAAAA...`` in base64.  Legitimate tool
+    call argument values do not start with this prefix at this length.
+    """
+    stripped = value.strip()
+    return (
+        len(stripped) >= _FERNET_MIN_TOKEN_LENGTH
+        and stripped.startswith(_FERNET_TOKEN_PREFIX)
+    )
+
+
+def _responses_output_contains_encrypted_reasoning_arguments(
+    responses_api_response: Any,
+) -> list[dict[str, Any]]:
+    """Detect Fernet-encrypted reasoning tokens in function_call arguments.
+
+    Upstream chat-completion models may leak encrypted reasoning content
+    into tool call argument values.  Returns a list of diagnostic dicts
+    naming each affected tool call (by name and argument key) so the
+    caller can fail closed via the bounded malformed-tool-call path
+    instead of dispatching an encrypted/empty child assignment.
+
+    Returns an empty list when no encrypted tokens are found.
+    """
+    output = getattr(responses_api_response, "output", None)
+    if not isinstance(output, list):
+        return []
+
+    findings: list[dict[str, Any]] = []
+    for item in output:
+        if getattr(item, "type", None) != "function_call":
+            continue
+        arguments = getattr(item, "arguments", None)
+        if not isinstance(arguments, str) or not arguments:
+            continue
+        try:
+            parsed = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+
+        for key in list(parsed):
+            value = parsed[key]
+            if isinstance(value, str) and _is_fernet_encrypted_token(value):
+                findings.append(
+                    {
+                        "name": getattr(item, "name", None) or "",
+                        "argument_key": key,
+                        "call_id": getattr(item, "call_id", None) or "",
+                    }
+                )
+
+    return findings
 
 
 async def _perform_codex_auto_agent_alias_candidate_request(
@@ -872,17 +945,14 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
     upstream_model: str,
 ) -> Response:
     """Execute Token Plan chat completions through the standard Responses wrapper."""
-    from litellm.responses.litellm_completion_transformation.streaming_iterator import (
-        LiteLLMCompletionStreamingIterator,
-    )
     from litellm.responses.litellm_completion_transformation.transformation import (
         LiteLLMCompletionResponsesConfig,
     )
 
     _ = config, adapter_model
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(str(target_url)))
-    completion_response = await litellm.acompletion(
-        **completion_kwargs,
+    _acompletion_kwargs = dict(
+        completion_kwargs,
         api_key=api_key,
         api_base=api_base,
         litellm_metadata=litellm_metadata,
@@ -892,26 +962,112 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
         },
         shared_session=_get_proxy_shared_aiohttp_session(),
     )
+    # CFG-004 streaming path: the client requested SSE, but we must inspect
+    # the full upstream response for encrypted reasoning tokens *before* any
+    # bytes reach the client.  Buffer the response as non-streaming, check
+    # for Fernet tokens in tool call arguments, retry once on the same
+    # Alibaba provider/model/route if found, and only then emit a valid
+    # Responses SSE stream from the confirmed-plaintext body.  If encrypted
+    # content persists after the bounded retry, fail closed without
+    # dispatching ciphertext.
     if client_requested_stream:
-        return StreamingResponse(
-            _responses_sse_from_iterator(
-                LiteLLMCompletionStreamingIterator(
-                    model=upstream_model,
-                    litellm_custom_stream_wrapper=completion_response,
+        _stream_acompletion_kwargs = dict(_acompletion_kwargs, stream=False)
+        _stream_completion_response = await litellm.acompletion(
+            **_stream_acompletion_kwargs
+        )
+        for _stream_attempt in range(_ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES + 1):
+            _stream_responses_api_response = (
+                LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+                    chat_completion_response=_stream_completion_response,
                     request_input=request_input,
                     responses_api_request=responses_api_request,
-                    custom_llm_provider=litellm.LlmProviders.ALIBABA_TOKEN_PLAN.value,
-                    litellm_metadata=litellm_metadata,
                 )
+            )
+            _stream_encrypted_findings = (
+                _responses_output_contains_encrypted_reasoning_arguments(
+                    _stream_responses_api_response
+                )
+            )
+            if not _stream_encrypted_findings:
+                _stream_response_body = json.loads(
+                    _serialize_responses_adapter_response(
+                        _stream_responses_api_response
+                    )
+                )
+                return StreamingResponse(
+                    _responses_sse_from_repaired_response_body(
+                        _stream_response_body
+                    ),
+                    media_type="text/event-stream",
+                )
+            if _stream_attempt < _ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES:
+                _stream_completion_response = await litellm.acompletion(
+                    **_stream_acompletion_kwargs
+                )
+        _stream_response_body = json.loads(
+            _serialize_responses_adapter_response(_stream_responses_api_response)
+        )
+        _raise_codex_auto_agent_malformed_tool_call_text_payload(
+            response_body=_stream_response_body,
+            adapter_model=adapter_model,
+            adapter="codex_alibaba_token_plan_chat_completions_adapter",
+            adapter_label="Alibaba Token Plan",
+            intake_context=_build_malformed_tool_call_intake_context(
+                request,
+                prepared_request_body,
+                adapter="codex_alibaba_token_plan_chat_completions_adapter",
+                provider="alibaba_token_plan",
             ),
+        )
+        # Unreachable: the raise helper always raises.
+        return StreamingResponse(
+            _responses_sse_from_repaired_response_body(_stream_response_body),
             media_type="text/event-stream",
         )
-    responses_api_response = (
-        LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
-            chat_completion_response=completion_response,
-            request_input=request_input,
-            responses_api_request=responses_api_request,
+    completion_response = await litellm.acompletion(**_acompletion_kwargs)
+    # CFG-004: bounded retry when encrypted reasoning occupies tool arguments.
+    # The upstream model may non-deterministically leak a Fernet token into
+    # a tool call argument (e.g. spawn_agent.message) instead of plaintext.
+    # No plaintext exists to restore.  Retry the upstream call a bounded
+    # number of times on the same Alibaba provider/model/route; if the leak
+    # persists, fail closed via the malformed-tool-call path so the caller
+    # observes the Alibaba provider and can route accordingly.
+    _last_encrypted_findings: list[dict[str, Any]] = []
+    for _attempt in range(_ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES + 1):
+        responses_api_response = (
+            LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+                chat_completion_response=completion_response,
+                request_input=request_input,
+                responses_api_request=responses_api_request,
+            )
         )
+        _encrypted_findings = (
+            _responses_output_contains_encrypted_reasoning_arguments(
+                responses_api_response
+            )
+        )
+        if not _encrypted_findings:
+            return _build_responses_response_from_adapter_response(
+                responses_api_response
+            )
+        _last_encrypted_findings = _encrypted_findings
+        if _attempt < _ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES:
+            completion_response = await litellm.acompletion(**_acompletion_kwargs)
+
+    _response_body = json.loads(
+        _serialize_responses_adapter_response(responses_api_response)
+    )
+    _raise_codex_auto_agent_malformed_tool_call_text_payload(
+        response_body=_response_body,
+        adapter_model=adapter_model,
+        adapter="codex_alibaba_token_plan_chat_completions_adapter",
+        adapter_label="Alibaba Token Plan",
+        intake_context=_build_malformed_tool_call_intake_context(
+            request,
+            prepared_request_body,
+            adapter="codex_alibaba_token_plan_chat_completions_adapter",
+            provider="alibaba_token_plan",
+        ),
     )
     return _build_responses_response_from_adapter_response(responses_api_response)
 

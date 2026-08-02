@@ -21,6 +21,7 @@ import uuid
 from typing import Any
 
 import psycopg
+import yaml
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = ROOT / 'scripts' / 'local-ci' / 'anthropic_adapter_config.json'
@@ -554,6 +555,94 @@ def _validate_codex_collaboration_events(  # noqa: PLR0915
             if isinstance(item_id, str):
                 active_expected_command_ids.discard(item_id)
 
+    # -- Codex CLI 0.146+ response_item collaboration schema ---------------
+    # Newer Codex CLI versions emit collaboration events as top-level
+    # ``response_item`` payloads with ``type: "function_call"`` and
+    # ``namespace: "collaboration"`` (names: ``spawn_agent``, ``wait_agent``,
+    # or ``wait``), plus correlated ``function_call_output`` objects linked
+    # by ``call_id``.  Normalize these into the same canonical structures
+    # (``tool_counts``, ``completed_tool_items``) that the older
+    # ``item.completed`` / ``collab_tool_call`` path populates, so all
+    # downstream validation criteria apply unchanged.
+    _CODEX_RESPONSE_ITEM_COLLAB_NAMES: dict[str, str] = {
+        "spawn_agent": "spawn_agent",
+        "wait_agent": "wait",
+        "wait": "wait",
+    }
+    spawned_agent_ids: set[str] = set()
+    collab_calls: dict[str, dict[str, Any]] = {}
+    collab_outputs: dict[str, dict[str, Any]] = {}
+    for obj in RA._parse_stdout_json_objects(stdout):
+        if obj.get("type") != "response_item":
+            continue
+        payload = obj.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        ptype = payload.get("type")
+        if (
+            ptype == "function_call"
+            and payload.get("namespace") == "collaboration"
+        ):
+            call_id = payload.get("call_id")
+            if isinstance(call_id, str) and call_id:
+                collab_calls[call_id] = payload
+        elif ptype == "function_call_output":
+            call_id = payload.get("call_id")
+            if isinstance(call_id, str) and call_id:
+                collab_outputs[call_id] = payload
+
+    for call_id, call_payload in collab_calls.items():
+        raw_name = call_payload.get("name")
+        canonical = _CODEX_RESPONSE_ITEM_COLLAB_NAMES.get(
+            raw_name if isinstance(raw_name, str) else ""
+        )
+        if canonical is None:
+            continue
+        output_payload = collab_outputs.get(call_id)
+        output_data: dict[str, Any] = {}
+        if output_payload is not None:
+            raw_output = output_payload.get("output")
+            if isinstance(raw_output, str):
+                try:
+                    parsed_output = json.loads(raw_output)
+                except (json.JSONDecodeError, ValueError):
+                    parsed_output = None
+                if isinstance(parsed_output, dict):
+                    output_data = parsed_output
+        # Derive completion state only from the actual correlated output.
+        has_output = output_payload is not None
+        if canonical == "spawn_agent":
+            task_name = output_data.get("task_name", "")
+            receiver_ids = (
+                [task_name] if isinstance(task_name, str) and task_name else []
+            )
+            synthetic_item: dict[str, Any] = {
+                "type": "collab_tool_call",
+                "tool": "spawn_agent",
+                "status": "completed" if has_output else "in_progress",
+                "receiver_agent_ids": receiver_ids,
+                "result": output_data,
+            }
+            spawned_agent_ids.update(receiver_ids)
+        else:  # canonical == "wait"
+            timed_out = output_data.get("timed_out", None)
+            wait_ok = has_output and timed_out is not True
+            synthetic_item = {
+                "type": "collab_tool_call",
+                "tool": "wait",
+                "status": "completed" if wait_ok else "failed",
+                "result": output_data,
+            }
+            # DISABLED for CFG-004 criterion 11: do not synthesize
+            # agents_states from wait-output presence. Actual transcript
+            # evidence (task_complete events) is authoritative.
+            # if wait_ok and spawned_agent_ids:
+            #     synthetic_item["agents_states"] = {
+            #         agent_id: {"status": "completed"}
+            #         for agent_id in spawned_agent_ids
+            #     }
+        tool_counts[canonical] = tool_counts.get(canonical, 0) + 1
+        completed_tool_items.setdefault(canonical, []).append(synthetic_item)
     failures: list[str] = []
     minimum_tool_counts = checks.get("minimum_tool_counts") or {}
     for tool, minimum in minimum_tool_counts.items():
@@ -574,7 +663,6 @@ def _validate_codex_collaboration_events(  # noqa: PLR0915
     required_successful_tools = {
         str(tool) for tool in checks.get("required_successful_tools") or []
     }
-    spawned_agent_ids: set[str] = set()
     waited_agent_statuses: dict[str, Any] = {}
     for tool in required_successful_tools:
         for item in completed_tool_items.get(tool, []):
@@ -7594,6 +7682,31 @@ def _cfg003_fallback_usable_record(
     return {}
 
 
+def _rerender_codex_command_session_id(
+    command: list[Any],
+    session_id: str,
+) -> list[Any]:
+    """Replace the litellm-dev ``http_headers.session_id`` value embedded in an
+    already-rendered Codex command with a fresh phase session ID.
+
+    The Codex command is rendered once during harness-context setup using the
+    profile-level session ID.  When a proof phase later assigns a fresh
+    ``phase_session_id`` to the case config, the rendered command still carries
+    the older ID, so the real HTTP request and the validation DB queries would
+    disagree.  This rewrites only the ``.http_headers.session_id=`` argument,
+    preserving every other argument and all route/session/tool/marker criteria.
+    """
+    marker = ".http_headers.session_id="
+    updated = list(command)
+    for index, item in enumerate(updated):
+        item_text = str(item)
+        if not item_text.startswith("model_providers.") or marker not in item_text:
+            continue
+        prefix = item_text[: item_text.index(marker) + len(marker)]
+        updated[index] = f'{prefix}"{session_id}"'
+    return updated
+
+
 def _cfg003_run_proof_case(
     *,
     case_name: str,
@@ -7628,6 +7741,14 @@ def _cfg003_run_proof_case(
         tav = dict(tav)
         tav["phase_start_time"] = phase_start_iso
         case_config["tool_activity_validation"] = tav
+    # Rerender the Codex command's litellm-dev http_headers.session_id to
+    # match the fresh phase_session_id.  The command was rendered earlier
+    # with the profile-level session_id; without this replacement the real
+    # HTTP request carries the old ID while validation queries the fresh one.
+    if isinstance(case_config.get("command"), list):
+        case_config["command"] = _rerender_codex_command_session_id(
+            case_config["command"], phase_session_id
+        )
     result = _run_selected_case(
         case_name=case_name,
         case_config=case_config,
@@ -9111,6 +9232,1768 @@ def _cfg003_transactional_refresh_test(  # noqa: PLR0915
     evidence["passed"] = not evidence["failures"]
     return RA._redact_sensitive_artifact_fields(evidence)
 
+
+
+# ---------------------------------------------------------------------------
+# CFG-004 criterion 11: live cooldown-clear acceptance
+# ---------------------------------------------------------------------------
+
+_CFG004_ACCEPTANCE_PATH = "/aawm/alias-routing/cooldowns/acceptance"
+_CFG004_CLEAR_PATH = "/aawm/alias-routing/cooldowns/clear"
+_CFG004_TARGET_PROVIDER = "alibaba_token_plan"
+_CFG004_TARGET_MODEL = "alibaba_token_plan/qwen3.6-flash"
+_CFG004_TARGET_ROUTE_FAMILY = "codex_alibaba_token_plan_chat_completions_adapter"
+_CFG004_NAMESPACE_PREFIX = "aawm-routing-dev-cfg004-"
+_CFG004_COMPOSE_FILE = "docker-compose.dev.yml"
+_CFG004_READINESS_TIMEOUT_SECONDS = 120.0
+_CFG004_READINESS_POLL_INTERVAL = 3.0
+_CFG004_DEV_CONFIG_PATH = ROOT / "litellm-dev-config.yaml"
+_CFG004_DISPOSABLE_CONFIG_PATH = ROOT / "litellm-dev-config.cfg004-acceptance.yaml"
+_CFG004_DISPOSABLE_CONFIG_CONTAINER_PATH = "/app/litellm-dev-config.yaml"
+_CFG004_PUBLIC_ROUTE = "/openai_passthrough/*"
+
+
+def _cfg004_generate_run_id() -> str:
+    """Generate a 32-hex run ID."""
+    return uuid.uuid4().hex
+
+
+def _cfg004_generate_master_key() -> str:
+    """Generate a temporary master key in memory only."""
+    return f"sk-cfg004-acceptance-{uuid.uuid4().hex}{uuid.uuid4().hex}"
+
+
+def _cfg004_build_disposable_config() -> str:
+    """Derive a disposable acceptance config from the canonical dev config.
+
+    Adds ONLY ``/openai_passthrough/*`` to ``general_settings.public_routes``
+    so ``user_api_key_auth`` bypasses gateway-key validation on the model
+    route while the client's OAuth Authorization header is forwarded
+    unchanged.  The canonical checked-in config is never modified.  Returns
+    the disposable config path as a string.
+    """
+    with _CFG004_DEV_CONFIG_PATH.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+    if not isinstance(config, dict):
+        raise RuntimeError("canonical dev config did not parse to a mapping")
+    general = config.get("general_settings")
+    if not isinstance(general, dict):
+        general = {}
+        config["general_settings"] = general
+    existing = general.get("public_routes")
+    routes = list(existing) if isinstance(existing, list) else []
+    if _CFG004_PUBLIC_ROUTE not in routes:
+        routes.append(_CFG004_PUBLIC_ROUTE)
+    general["public_routes"] = routes
+    with _CFG004_DISPOSABLE_CONFIG_PATH.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(config, handle, sort_keys=False)
+    return str(_CFG004_DISPOSABLE_CONFIG_PATH)
+
+
+def _cfg004_remove_disposable_config() -> None:
+    """Remove the disposable acceptance config if present (best effort)."""
+    try:
+        _CFG004_DISPOSABLE_CONFIG_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _cfg004_compose_override_yaml(
+    *,
+    master_key: str,
+    run_id: str,
+    langfuse_public_key: str = "",
+    langfuse_secret_key: str = "",
+    disposable_config_host_path: str = "",
+) -> str:
+    """Build a Compose override YAML string passed via stdin.
+
+    Sets the acceptance env vars, master key, and target-owned Langfuse
+    credentials on litellm-dev only.  When ``disposable_config_host_path``
+    is provided, mounts it over the canonical container config path so the
+    acceptance runtime uses the OAuth pass-through public route.
+    Never written to disk or CLI args.
+    """
+    namespace = f"{_CFG004_NAMESPACE_PREFIX}{run_id}"
+    parts = [
+        "services:\n"
+        "  litellm-dev:\n"
+        "    environment:\n"
+        f"      - LITELLM_MASTER_KEY={master_key}\n"
+        "      - AAWM_LITELLM_ENVIRONMENT=litellm-dev\n"
+        "      - AAWM_CFG004_ACCEPTANCE_ENABLED=1\n"
+        f"      - AAWM_CFG004_ACCEPTANCE_RUN_ID={run_id}\n"
+        f"      - AAWM_ALIAS_ROUTING_STATE_NAMESPACE={namespace}\n"
+        "      - AAWM_ALIAS_ROUTING_COOLDOWN_CLEAR_SINGLE_WORKER=1\n"
+        f"      - LANGFUSE_PUBLIC_KEY={langfuse_public_key}\n"
+        f"      - LANGFUSE_SECRET_KEY={langfuse_secret_key}\n"
+    ]
+    if disposable_config_host_path:
+        parts.append(
+            "    volumes:\n"
+            f"      - {disposable_config_host_path}:{_CFG004_DISPOSABLE_CONFIG_CONTAINER_PATH}\n"
+        )
+    return "".join(parts)
+
+
+def _cfg004_docker_compose_up(
+    *,
+    override_stdin: str | None = None,
+    timeout: float = 180.0,
+) -> tuple[bool, str]:
+    """Recreate litellm-dev with optional stdin override. Returns (ok, detail)."""
+    cmd = ["docker", "compose", "-f", _CFG004_COMPOSE_FILE]
+    if override_stdin is not None:
+        cmd += ["-f", "-"]
+    cmd += ["up", "-d", "--force-recreate", "--no-deps", "litellm-dev"]
+    try:
+        result = subprocess.run(
+            cmd,
+            input=override_stdin.encode("utf-8") if override_stdin else None,
+            capture_output=True,
+            timeout=timeout,
+            cwd=str(ROOT),
+        )
+        if result.returncode != 0:
+            return False, f"docker compose up failed: {result.stderr.decode('utf-8', errors='replace')[:500]}"
+        return True, ""
+    except subprocess.TimeoutExpired:
+        return False, "docker compose up timed out"
+    except OSError as exc:
+        return False, f"docker compose up error: {exc}"
+
+
+def _cfg004_wait_readiness(
+    litellm_base_url: str,
+    *,
+    timeout: float = _CFG004_READINESS_TIMEOUT_SECONDS,
+) -> tuple[bool, str]:
+    """Poll /health/readiness until active or timeout."""
+    readiness_url = f"{litellm_base_url}{RA._HEALTH_READINESS_PATH}"
+    deadline = time.monotonic() + timeout
+    last_error = ""
+    while time.monotonic() < deadline:
+        status, body = RA._http_get_json_plain(readiness_url, timeout=10.0)
+        if status == 200:
+            state = body.get("state", "")
+            if state == "active" or body.get("status") == "healthy":
+                return True, ""
+            last_error = f"state={state}"
+        else:
+            last_error = f"status={status}"
+        time.sleep(_CFG004_READINESS_POLL_INTERVAL)
+    return False, f"readiness not achieved within {timeout}s: {last_error}"
+
+
+def _cfg004_readiness_snapshot(litellm_base_url: str) -> dict[str, Any]:
+    """Capture readiness state/config identity from nested aawm_alias_config.
+
+    All three fields (state, config_hash, config_version) are read from the
+    nested ``aawm_alias_config`` section, matching the readiness contract.
+    """
+    readiness_url = f"{litellm_base_url}{RA._HEALTH_READINESS_PATH}"
+    status, body = RA._http_get_json_plain(readiness_url, timeout=15.0)
+    alias_section = {}
+    if isinstance(body, dict):
+        alias_section = body.get("aawm_alias_config") or {}
+    return {
+        "status": status,
+        "config_hash": str(alias_section.get("config_hash", "")),
+        "config_version": str(alias_section.get("config_version", "")),
+        "state": str(alias_section.get("state", "")),
+    }
+
+
+def _cfg004_docker_inspect_container(container_name: str) -> dict[str, Any]:
+    """Capture docker inspect fields for aawm-litellm baseline comparison."""
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", container_name],
+            capture_output=True,
+            timeout=30,
+            cwd=str(ROOT),
+        )
+        if result.returncode != 0:
+            return {"error": result.stderr.decode("utf-8", errors="replace")[:300]}
+        data = json.loads(result.stdout.decode("utf-8", errors="replace"))
+        if not data:
+            return {"error": "empty inspect result"}
+        info = data[0]
+        return {
+            "id": info.get("Id", ""),
+            "image": info.get("Config", {}).get("Image", ""),
+            "started_at": info.get("State", {}).get("StartedAt", ""),
+            "restart_count": info.get("RestartCount", 0),
+        }
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as exc:
+        return {"error": str(exc)}
+
+
+def _cfg004_docker_inspect_env_absent(container_name: str) -> list[str]:
+    """Secret-safe check that acceptance env vars are absent from litellm-dev.
+
+    Returns a list of failure strings (empty = all absent). Never dumps values.
+    """
+    _MUST_BE_ABSENT = (
+        "LITELLM_MASTER_KEY",
+        "AAWM_CFG004_ACCEPTANCE_ENABLED",
+        "AAWM_CFG004_ACCEPTANCE_RUN_ID",
+    )
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", container_name],
+            capture_output=True,
+            timeout=30,
+            cwd=str(ROOT),
+        )
+        if result.returncode != 0:
+            return [f"docker inspect {container_name} failed"]
+        data = json.loads(result.stdout.decode("utf-8", errors="replace"))
+        if not data:
+            return [f"docker inspect {container_name} returned empty"]
+        env_list = data[0].get("Config", {}).get("Env") or []
+        env_keys = set()
+        for entry in env_list:
+            if isinstance(entry, str) and "=" in entry:
+                env_keys.add(entry.split("=", 1)[0])
+        failures = []
+        for key in _MUST_BE_ABSENT:
+            if key in env_keys:
+                failures.append(f"{key} still present in {container_name}")
+        # Require the canonical namespace variable/value to be PRESENT.
+        # Absence of all namespace vars must fail (do not silently pass).
+        namespace_entries = [
+            entry for entry in env_list
+            if isinstance(entry, str)
+            and entry.startswith("AAWM_ALIAS_ROUTING_STATE_NAMESPACE=")
+        ]
+        if not namespace_entries:
+            failures.append(
+                f"canonical namespace variable absent from {container_name}"
+            )
+        for entry in env_list:
+            if isinstance(entry, str) and entry.startswith("AAWM_ALIAS_ROUTING_STATE_NAMESPACE="):
+                ns_val = entry.split("=", 1)[1]
+                if ns_val.startswith(_CFG004_NAMESPACE_PREFIX):
+                    failures.append("temporary acceptance namespace still present")
+                elif ns_val != "aawm-routing-dev-v1":
+                    failures.append("namespace is not canonical aawm-routing-dev-v1")
+        return failures
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as exc:
+        return [f"docker inspect {container_name} error: {exc}"]
+
+
+def _cfg004_post_acceptance(
+    litellm_base_url: str,
+    master_key: str,
+    payload: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    """POST to the acceptance endpoint with master-key auth."""
+    url = f"{litellm_base_url}{_CFG004_ACCEPTANCE_PATH}"
+    headers = {"Authorization": f"Bearer {master_key}"}
+    return RA._http_post_json(url, payload, headers=headers, timeout=30.0)
+
+
+def _cfg004_post_clear(
+    litellm_base_url: str,
+    master_key: str,
+    payload: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    """POST to the existing clear endpoint with master-key auth."""
+    url = f"{litellm_base_url}{_CFG004_CLEAR_PATH}"
+    headers = {"Authorization": f"Bearer {master_key}"}
+    return RA._http_post_json(url, payload, headers=headers, timeout=30.0)
+
+
+def _cfg004_validate_inspect_inventory(
+    inspect_resp: dict[str, Any],
+    prepare_resp: dict[str, Any],
+    *,
+    phase_label: str,
+) -> list[str]:
+    """Validate an inspect response contains exactly one qwen3.6 target plus
+    the exact prepared control inventory. No empty/vacuous pass.
+
+    Returns a list of failure strings (empty = valid).
+    """
+    failures: list[str] = []
+    candidates = inspect_resp.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        failures.append(f"{phase_label}: inspect returned no candidates (vacuous)")
+        return failures
+
+    targets = [
+        c for c in candidates
+        if c.get("provider") == _CFG004_TARGET_PROVIDER
+        and c.get("model") == _CFG004_TARGET_MODEL
+    ]
+    if len(targets) != 1:
+        failures.append(
+            f"{phase_label}: expected exactly 1 qwen3.6 target, got {len(targets)}"
+        )
+
+    # Build expected control identity set from the prepare response.
+    expected_controls = prepare_resp.get("controls") or []
+    if not expected_controls:
+        failures.append(f"{phase_label}: prepare reported no controls (empty inventory)")
+    expected_control_ids = {
+        (c.get("provider"), c.get("model"), c.get("route_family"))
+        for c in expected_controls
+    }
+    actual_controls = [c for c in candidates if c.get("role") == "control"]
+    actual_control_ids = {
+        (c.get("provider"), c.get("model"), c.get("route_family"))
+        for c in actual_controls
+    }
+    if actual_control_ids != expected_control_ids:
+        failures.append(
+            f"{phase_label}: control inventory mismatch: "
+            f"expected {sorted(expected_control_ids)}, got {sorted(actual_control_ids)}"
+        )
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# CFG-004 Behavior A: OAuth account descriptor (secret-safe)
+# ---------------------------------------------------------------------------
+
+_CODEX_AUTH_JSON_MAX_ACCOUNT_ID_LEN = 256
+
+
+def _cfg004_read_oauth_account_descriptor(
+    *,
+    auth_json_path: pathlib.Path | None = None,
+) -> tuple[str | None, list[str]]:
+    """Read HOME/.codex/auth.json and extract only ``tokens.account_id``.
+
+    Returns ``(account_id, failures)``.  Never reads, stores, or returns
+    ``access_token``, ``refresh_token``, ``id_token``, or ``Authorization``
+    values.  The account descriptor is validated as bounded and nonempty.
+    """
+    if auth_json_path is None:
+        home = os.environ.get("HOME", "")
+        if not home:
+            return None, ["HOME not set; cannot locate .codex/auth.json"]
+        auth_json_path = pathlib.Path(home) / ".codex" / "auth.json"
+
+    if not auth_json_path.is_file():
+        return None, [f"OAuth auth file not found: {auth_json_path}"]
+
+    try:
+        raw = auth_json_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, [f"OAuth auth file unreadable: {exc}"]
+
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return None, [f"OAuth auth file invalid JSON: {exc}"]
+
+    if not isinstance(data, dict):
+        return None, ["OAuth auth file root is not a JSON object"]
+
+    tokens = data.get("tokens")
+    if not isinstance(tokens, dict):
+        return None, ["OAuth auth file missing tokens object"]
+
+    account_id = tokens.get("account_id")
+    if not isinstance(account_id, str) or not account_id.strip():
+        return None, ["OAuth auth file tokens.account_id absent or empty"]
+
+    account_id = account_id.strip()
+    # Normalize uppercase hex digits to lowercase for canonical UUID form.
+    account_id = account_id.lower()
+    if len(account_id) > _CODEX_AUTH_JSON_MAX_ACCOUNT_ID_LEN:
+        return None, [
+            f"OAuth account_id exceeds max length "
+            f"{_CODEX_AUTH_JSON_MAX_ACCOUNT_ID_LEN}"
+        ]
+    if not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        account_id,
+    ):
+        return None, ["OAuth account_id is not a canonical lowercase UUID"]
+
+    return account_id, []
+
+
+# ---------------------------------------------------------------------------
+# CFG-004 Behavior B: Transcript-backed collaboration evidence
+# ---------------------------------------------------------------------------
+
+_TRANSCRIPT_MAX_LINES = 50_000
+
+# Regex for extracting exit code from Codex exec_command output text.
+_CODEX_EXIT_CODE_RE = re.compile(r"Process exited with code (\d+)")
+
+
+def _cfg004_locate_transcript_by_thread_id(
+    thread_id: str,
+    *,
+    sessions_dir: pathlib.Path | None = None,
+) -> tuple[pathlib.Path | None, list[str]]:
+    """Locate the rollout JSONL transcript for an exact thread ID.
+
+    Searches ``HOME/.codex/sessions/YYYY/MM/DD`` for files matching
+    ``rollout-*-{thread_id}.jsonl``.  Returns ``(path, failures)``.
+    Correlates by exact thread ID substring in the filename; never
+    guesses by newest file or broad inference.
+    """
+    if sessions_dir is None:
+        home = os.environ.get("HOME", "")
+        if not home:
+            return None, ["HOME not set; cannot locate .codex/sessions"]
+        sessions_dir = pathlib.Path(home) / ".codex" / "sessions"
+
+    if not sessions_dir.is_dir():
+        return None, [f"sessions directory not found: {sessions_dir}"]
+
+    pattern = f"rollout-*-{thread_id}.jsonl"
+    matches = sorted(sessions_dir.glob(f"*/*/*/{pattern}"))
+
+    if not matches:
+        return None, [
+            f"no transcript found for thread_id={thread_id!r} "
+            f"under {sessions_dir}"
+        ]
+    if len(matches) > 1:
+        return None, [
+            f"multiple transcripts match thread_id={thread_id!r}: "
+            f"{[str(m) for m in matches]}"
+        ]
+    return matches[0], []
+
+
+def _cfg004_parse_transcript_collaboration(  # noqa: PLR0915
+    transcript_path: pathlib.Path,
+) -> tuple[dict[str, Any], list[str]]:
+    """Parse collaboration and command events from a real Codex 0.146 rollout.
+
+    Handles actual Codex transcript shapes:
+    - Collaboration: ``response_item.function_call`` with
+      ``namespace=collaboration`` (spawn_agent, wait_agent) correlated
+      with ``function_call_output`` by ``call_id``.
+    - Child identity: ``event_msg.sub_agent_activity`` with
+      ``agent_thread_id`` correlated to spawn ``call_id``.
+    - Commands: ``response_item.function_call`` named ``exec_command``
+      with ``arguments.cmd``, correlated with ``function_call_output``
+      by ``call_id``; exit code parsed from output text.
+    - Terminal completion (outbound only): ``event_msg.agent_message``,
+      ``response_item.message(role=assistant)``, and
+      ``event_msg.task_complete.last_agent_message``.
+    - Excludes inbound ``response_item.agent_message`` (inter-agent
+      NEW_TASK/FINAL_ANSWER), encrypted payloads, and assignment text.
+    """
+    failures: list[str] = []
+    collab_calls: dict[str, dict[str, Any]] = {}
+    collab_outputs: dict[str, dict[str, Any]] = {}
+    collab_call_lines: dict[str, int] = {}
+    collab_output_lines: dict[str, int] = {}
+    collab_output_timestamps: dict[str, Any] = {}
+    sub_agent_activities: list[dict[str, Any]] = []
+    commands: list[dict[str, Any]] = []
+    command_calls: dict[str, dict[str, Any]] = {}
+    command_outputs: dict[str, dict[str, Any]] = {}
+    outbound_terminal_messages: list[str] = []
+    turn_ids: list[str] = []
+    task_complete_events: list[dict[str, Any]] = []
+    inbound_agent_messages: list[dict[str, Any]] = []
+    spawn_arguments: list[dict[str, Any]] = []
+    session_identity: dict[str, Any] = {}
+    turn_contexts: list[dict[str, Any]] = []
+    session_meta: dict[str, Any] = {}
+    line_count = 0
+
+    try:
+        with transcript_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line_count += 1
+                if line_count > _TRANSCRIPT_MAX_LINES:
+                    failures.append(
+                        f"transcript exceeds {_TRANSCRIPT_MAX_LINES} lines"
+                    )
+                    break
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    obj = json.loads(stripped)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+
+                obj_type = obj.get("type")
+                if obj_type == "session_meta":
+                    session_meta = obj.get("payload") or {}
+                    # Extract identity evidence from session_meta.
+                    _src = session_meta.get("source")
+                    if isinstance(_src, dict):
+                        _sub = _src.get("subagent")
+                        if isinstance(_sub, dict):
+                            _ts = _sub.get("thread_spawn")
+                            if isinstance(_ts, dict):
+                                session_identity["agent_role"] = _ts.get("agent_role")
+                                session_identity["agent_path"] = _ts.get("agent_path")
+                                session_identity["depth"] = _ts.get("depth")
+                    _cli_ver = session_meta.get("cli_version")
+                    if isinstance(_cli_ver, str) and _cli_ver.strip():
+                        session_identity["cli_version"] = _cli_ver.strip()
+                    _originator = session_meta.get("originator")
+                    if isinstance(_originator, str) and _originator.strip():
+                        session_identity["originator"] = _originator.strip()
+                    session_identity["thread_source"] = session_meta.get("thread_source")
+                elif obj_type == "event_msg":
+                    ev_payload = obj.get("payload")
+                    if isinstance(ev_payload, dict):
+                        ev_type = ev_payload.get("type")
+                        if ev_type == "task_started":
+                            tid = ev_payload.get("turn_id")
+                            if isinstance(tid, str) and tid:
+                                turn_ids.append(tid)
+                        elif ev_type == "turn_context":
+                            _tc: dict[str, Any] = {
+                                "turn_id": ev_payload.get("turn_id"),
+                                "line_index": line_count,
+                            }
+                            for _tc_key in (
+                                "model", "sandbox", "requested_model",
+                                "model_alias", "provider",
+                            ):
+                                _tc_val = ev_payload.get(_tc_key)
+                                if isinstance(_tc_val, str) and _tc_val.strip():
+                                    _tc[_tc_key] = _tc_val.strip()
+                            turn_contexts.append(_tc)
+                            if "resolved_model" not in session_identity and _tc.get("model"):
+                                session_identity["resolved_model"] = _tc["model"]
+                            if "sandbox" not in session_identity and _tc.get("sandbox"):
+                                session_identity["sandbox"] = _tc["sandbox"]
+                        elif ev_type == "sub_agent_activity":
+                            sub_agent_activities.append({
+                                "event_id": ev_payload.get("event_id"),
+                                "agent_thread_id": ev_payload.get(
+                                    "agent_thread_id"
+                                ),
+                                "agent_path": ev_payload.get("agent_path"),
+                                "kind": ev_payload.get("kind"),
+                            })
+                        elif ev_type == "agent_message":
+                            # Outbound terminal completion evidence.
+                            msg = ev_payload.get("message")
+                            if isinstance(msg, str) and msg.strip():
+                                outbound_terminal_messages.append(msg.strip())
+                        elif ev_type == "task_complete":
+                            task_complete_events.append({
+                                "turn_id": ev_payload.get("turn_id"),
+                                "last_agent_message": ev_payload.get(
+                                    "last_agent_message"
+                                ),
+                                "line_index": line_count,
+                                "timestamp": obj.get("timestamp"),
+                            })
+                            lam = ev_payload.get("last_agent_message")
+                            if isinstance(lam, str) and lam.strip():
+                                outbound_terminal_messages.append(lam.strip())
+                elif obj_type == "turn_context":
+                    # Real Codex 0.146 top-level turn_context record:
+                    # {type:"turn_context",payload:{turn_id,model,
+                    #  sandbox_policy:{type:"read-only"}}}.  The requested
+                    # alias is NOT carried here; it is correlated from the
+                    # authoritative parent spawn_agent ``model`` argument.
+                    _tc_payload = obj.get("payload")
+                    if isinstance(_tc_payload, dict):
+                        _tc2: dict[str, Any] = {
+                            "turn_id": _tc_payload.get("turn_id"),
+                            "line_index": line_count,
+                        }
+                        _tc2_model = _tc_payload.get("model")
+                        if isinstance(_tc2_model, str) and _tc2_model.strip():
+                            _tc2["model"] = _tc2_model.strip()
+                        _tc2_sandbox: str | None = None
+                        _tc2_sp = _tc_payload.get("sandbox_policy")
+                        if isinstance(_tc2_sp, dict):
+                            _tc2_spt = _tc2_sp.get("type")
+                            if isinstance(_tc2_spt, str) and _tc2_spt.strip():
+                                _tc2_sandbox = _tc2_spt.strip()
+                        if _tc2_sandbox is None:
+                            _tc2_flat = _tc_payload.get("sandbox")
+                            if isinstance(_tc2_flat, str) and _tc2_flat.strip():
+                                _tc2_sandbox = _tc2_flat.strip()
+                        if _tc2_sandbox:
+                            _tc2["sandbox"] = _tc2_sandbox
+                        turn_contexts.append(_tc2)
+                        if "resolved_model" not in session_identity and _tc2.get("model"):
+                            session_identity["resolved_model"] = _tc2["model"]
+                        if "sandbox" not in session_identity and _tc2.get("sandbox"):
+                            session_identity["sandbox"] = _tc2["sandbox"]
+                elif obj_type == "response_item":
+                    payload = obj.get("payload")
+                    if not isinstance(payload, dict):
+                        continue
+                    ptype = payload.get("type")
+                    # Extract turn_id from internal metadata passthrough.
+                    meta_passthrough = payload.get(
+                        "internal_chat_message_metadata_passthrough"
+                    )
+                    item_turn_id: str | None = None
+                    if isinstance(meta_passthrough, dict):
+                        raw_tid = meta_passthrough.get("turn_id")
+                        if isinstance(raw_tid, str) and raw_tid:
+                            item_turn_id = raw_tid
+
+                    if ptype == "function_call":
+                        call_id = payload.get("call_id")
+                        name = payload.get("name", "")
+                        canonical_name = _normalize_codex_tool_name(name)
+                        namespace = payload.get("namespace", "")
+                        if namespace == "collaboration" or canonical_name in (
+                            "spawn_agent", "wait", "wait_agent",
+                        ):
+                            if isinstance(call_id, str) and call_id:
+                                collab_calls[call_id] = payload
+                                collab_call_lines[call_id] = line_count
+                                # Parse and retain spawn arguments.
+                                if canonical_name == "spawn_agent":
+                                    _raw_spawn_args = payload.get("arguments")
+                                    _spawn_args_obj: dict[str, Any] = {}
+                                    if isinstance(_raw_spawn_args, str):
+                                        try:
+                                            _parsed_sa = json.loads(_raw_spawn_args)
+                                            if isinstance(_parsed_sa, dict):
+                                                _spawn_args_obj = _parsed_sa
+                                        except (json.JSONDecodeError, ValueError):
+                                            pass
+                                    spawn_arguments.append(_spawn_args_obj)
+                        elif canonical_name == "exec_command":
+                            # Parse command arguments.
+                            cmd_text = ""
+                            raw_args = payload.get("arguments")
+                            if isinstance(raw_args, str):
+                                try:
+                                    args_obj = json.loads(raw_args)
+                                    if isinstance(args_obj, dict):
+                                        cmd_text = str(
+                                            args_obj.get("cmd", "")
+                                        ).strip()
+                                except (json.JSONDecodeError, ValueError):
+                                    pass
+                            if isinstance(call_id, str) and call_id:
+                                command_calls[call_id] = {
+                                    "call_id": call_id,
+                                    "command": cmd_text,
+                                    "turn_id": item_turn_id,
+                                    "line_index": line_count,
+                                }
+                    elif ptype == "function_call_output":
+                        call_id = payload.get("call_id")
+                        if isinstance(call_id, str) and call_id:
+                            raw_output = payload.get("output")
+                            output_text = (
+                                raw_output
+                                if isinstance(raw_output, str)
+                                else ""
+                            )
+                            if call_id in collab_calls:
+                                collab_outputs[call_id] = payload
+                                collab_output_lines[call_id] = line_count
+                                collab_output_timestamps[call_id] = obj.get(
+                                    "timestamp"
+                                )
+                            elif call_id in command_calls:
+                                # Parse exit code from output text.
+                                exit_code: int | None = None
+                                ec_match = _CODEX_EXIT_CODE_RE.search(
+                                    output_text
+                                )
+                                if ec_match:
+                                    exit_code = int(ec_match.group(1))
+                                command_outputs[call_id] = {
+                                    "call_id": call_id,
+                                    "output": output_text,
+                                    "exit_code": exit_code,
+                                    "line_index": line_count,
+                                }
+                    elif ptype == "message":
+                        # Outbound assistant message (terminal completion).
+                        role = payload.get("role")
+                        if role == "assistant":
+                            for ci in payload.get("content") or []:
+                                if isinstance(ci, dict):
+                                    txt = ci.get("text")
+                                    if isinstance(txt, str) and txt.strip():
+                                        outbound_terminal_messages.append(
+                                            txt.strip()
+                                        )
+                    elif ptype == "agent_message":
+                        # Inbound inter-agent message (NEW_TASK, FINAL_ANSWER).
+                        # Captured for prompt validation, NOT terminal evidence.
+                        _inbound_content: list[str] = []
+                        for _ci in payload.get("content") or []:
+                            if isinstance(_ci, dict):
+                                _ct = _ci.get("text")
+                                if isinstance(_ct, str):
+                                    _inbound_content.append(_ct)
+                        inbound_agent_messages.append({
+                            "author": payload.get("author"),
+                            "recipient": payload.get("recipient"),
+                            "content_texts": _inbound_content,
+                            "line_index": line_count,
+                        })
+                    # NOTE: ptype == "agent_message" is INBOUND inter-agent
+                    # communication (NEW_TASK, FINAL_ANSWER) and is excluded
+                    # from terminal-marker evidence.
+    except OSError as exc:
+        return {}, [f"transcript unreadable: {exc}"]
+
+    # Correlate command calls with outputs.
+    for call_id, call_rec in command_calls.items():
+        out_rec = command_outputs.get(call_id)
+        commands.append({
+            "command": call_rec["command"],
+            "call_id": call_id,
+            "turn_id": call_rec["turn_id"],
+            "call_line_index": call_rec["line_index"],
+            "output_line_index": (
+                out_rec["line_index"] if out_rec else None
+            ),
+            "exit_code": out_rec["exit_code"] if out_rec else None,
+            "has_output": out_rec is not None,
+            "output": out_rec["output"] if out_rec else None,
+        })
+
+    # Correlate collaboration calls with outputs.
+    spawn_calls: list[dict[str, Any]] = []
+    wait_calls: list[dict[str, Any]] = []
+    for call_id, call_payload in collab_calls.items():
+        name = call_payload.get("name", "")
+        canonical = _normalize_codex_tool_name(name)
+        output_payload = collab_outputs.get(call_id)
+        output_data: dict[str, Any] = {}
+        if output_payload is not None:
+            raw_output = output_payload.get("output")
+            if isinstance(raw_output, str):
+                try:
+                    parsed = json.loads(raw_output)
+                    if isinstance(parsed, dict):
+                        output_data = parsed
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        if canonical == "spawn_agent":
+            # Extract child thread ID from sub_agent_activity events.
+            child_thread_id: str | None = None
+            for sa in sub_agent_activities:
+                if sa.get("event_id") == call_id:
+                    child_thread_id = sa.get("agent_thread_id")
+                    break
+            spawn_calls.append({
+                "call_id": call_id,
+                "task_name": output_data.get("task_name"),
+                "child_thread_id": child_thread_id,
+                "has_output": output_payload is not None,
+                "call_line_index": collab_call_lines.get(call_id),
+                "output_line_index": collab_output_lines.get(call_id),
+                "output_timestamp": collab_output_timestamps.get(call_id),
+            })
+        elif canonical in ("wait_agent", "wait"):
+            wait_calls.append({
+                "call_id": call_id,
+                "timed_out": output_data.get("timed_out"),
+                "message": output_data.get("message"),
+                "has_output": output_payload is not None,
+                "call_line_index": collab_call_lines.get(call_id),
+                "output_line_index": collab_output_lines.get(call_id),
+                "output_timestamp": collab_output_timestamps.get(call_id),
+            })
+
+    summary: dict[str, Any] = {
+        "transcript_path": str(transcript_path),
+        "session_id": session_meta.get("id") or session_meta.get("session_id"),
+        "parent_thread_id": session_meta.get("parent_thread_id"),
+        "spawn_calls": spawn_calls,
+        "wait_calls": wait_calls,
+        "command_count": len(commands),
+        "commands": commands,
+        "outbound_terminal_messages": outbound_terminal_messages,
+        "turn_ids": turn_ids,
+        "line_count": line_count,
+        "sub_agent_activities": sub_agent_activities,
+        "task_complete_events": task_complete_events,
+        "inbound_agent_messages": inbound_agent_messages,
+        "spawn_arguments": spawn_arguments,
+        "session_identity": session_identity,
+        "turn_contexts": turn_contexts,
+    }
+    return summary, failures
+
+
+def _cfg004_validate_transcript_collaboration(  # noqa: PLR0915
+    *,
+    thread_id: str | None,
+    checks: dict[str, Any],
+    sessions_dir: pathlib.Path | None = None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Validate collaboration evidence from real Codex 0.146 rollout transcripts.
+
+    Locates the parent transcript by exact ``thread_id``, parses its
+    collaboration events, extracts exact child identity from
+    ``sub_agent_activity``, locates exactly one matching child
+    transcript, and validates the full contract:
+    - Parent session_meta id matches thread_id.
+    - Exactly one successful spawn with child_thread_id.
+    - Wait completed without timeout for that child.
+    - Exact commands with exit 0 from correlated function_call/output.
+    - Non-vacuous parallel proof: same turn_id, all calls before outputs.
+    - Child terminal marker from outbound assistant completion.
+    - Parent terminal marker from outbound parent completion.
+    Fails closed on absent/mismatched transcript.
+    """
+    if not checks:
+        return {"enabled": False}, []
+
+    failures: list[str] = []
+
+    if not thread_id or not isinstance(thread_id, str) or not thread_id.strip():
+        return {"enabled": True}, [
+            "transcript validation: no thread_id from command stdout"
+        ]
+
+    # Locate parent transcript by exact thread ID.
+    parent_path, loc_failures = _cfg004_locate_transcript_by_thread_id(
+        thread_id, sessions_dir=sessions_dir,
+    )
+    if loc_failures:
+        return {"enabled": True, "thread_id": thread_id}, loc_failures
+
+    assert parent_path is not None
+    parent_summary, parse_failures = _cfg004_parse_transcript_collaboration(
+        parent_path,
+    )
+    failures.extend(parse_failures)
+
+    # Validate parent session_meta id matches emitted thread id.
+    parent_session_id = parent_summary.get("session_id")
+    if parent_session_id != thread_id:
+        failures.append(
+            f"transcript: parent session_meta id {parent_session_id!r} "
+            f"does not match emitted thread_id {thread_id!r}"
+        )
+
+    # Validate parent collaboration calls.
+    if checks.get("require_spawn_and_wait"):
+        if not parent_summary.get("spawn_calls"):
+            failures.append(
+                "transcript: parent has no spawn_agent collaboration calls"
+            )
+        if not parent_summary.get("wait_calls"):
+            failures.append(
+                "transcript: parent has no wait_agent collaboration calls"
+            )
+
+    # Validate spawn names exactly one child with extractable thread ID.
+    spawn_calls = parent_summary.get("spawn_calls") or []
+    successful_spawns = [s for s in spawn_calls if s.get("has_output")]
+    if checks.get("require_spawn_and_wait") and len(successful_spawns) != 1:
+        failures.append(
+            f"transcript: expected exactly 1 successful spawn, "
+            f"got {len(successful_spawns)}"
+        )
+
+    # Extract exact child thread ID from spawn.
+    child_thread_id: str | None = None
+    if len(successful_spawns) == 1:
+        child_thread_id = successful_spawns[0].get("child_thread_id")
+        if not child_thread_id:
+            failures.append(
+                "transcript: spawn_agent has no correlated "
+                "sub_agent_activity with agent_thread_id"
+            )
+
+    # Validate wait completed without timeout.
+    wait_calls = parent_summary.get("wait_calls") or []
+    successful_waits: list[dict[str, Any]] = []
+    for wc in wait_calls:
+        if not wc.get("has_output"):
+            failures.append(
+                "transcript: wait_agent has no correlated output"
+            )
+        elif wc.get("timed_out") is True:
+            failures.append(
+                "transcript: wait_agent timed out"
+            )
+        elif wc.get("timed_out") is not False:
+            failures.append(
+                "transcript: wait_agent output missing explicit "
+                "timed_out=false"
+            )
+        else:
+            successful_waits.append(wc)
+
+    if checks.get("require_spawn_and_wait") and len(successful_waits) != 1:
+        failures.append(
+            f"transcript: expected exactly 1 successful wait for spawned "
+            f"child, got {len(successful_waits)}"
+        )
+
+    # Validate parent terminal marker from outbound completion only.
+    parent_marker = checks.get("parent_terminal_marker")
+    if parent_marker:
+        parent_msgs = parent_summary.get("outbound_terminal_messages") or []
+        if not any(parent_marker == m for m in parent_msgs):
+            failures.append(
+                f"transcript: parent missing terminal marker "
+                f"{parent_marker!r}"
+            )
+
+    # Locate exactly one child transcript by extracted thread ID.
+    child_summary: dict[str, Any] = {}
+    total_child_commands = 0
+    if child_thread_id:
+        child_path, child_loc_failures = (
+            _cfg004_locate_transcript_by_thread_id(
+                child_thread_id, sessions_dir=sessions_dir,
+            )
+        )
+        failures.extend(child_loc_failures)
+        if child_path is not None:
+            child_summary, child_parse_failures = (
+                _cfg004_parse_transcript_collaboration(child_path)
+            )
+            failures.extend(child_parse_failures)
+            total_child_commands = child_summary.get("command_count", 0)
+
+            # Validate child parent_thread_id matches.
+            child_parent = child_summary.get("parent_thread_id")
+            if child_parent != thread_id:
+                failures.append(
+                    f"transcript: child parent_thread_id {child_parent!r} "
+                    f"does not match parent thread_id {thread_id!r}"
+                )
+    elif checks.get("require_spawn_and_wait"):
+        failures.append(
+            "transcript: cannot locate child transcript without "
+            "child_thread_id from spawn"
+        )
+
+    # Populate correlated child requested_alias from successful parent
+    # spawn args.  The requested alias is the authoritative parent spawn
+    # argument ``model``, not a child turn_context field.
+    if child_summary and successful_spawns:
+        _child_ident = child_summary.get("session_identity")
+        if isinstance(_child_ident, dict) and "requested_alias" not in _child_ident:
+            _parent_spawn_args = parent_summary.get("spawn_arguments") or []
+            if _parent_spawn_args:
+                _spawn_model = _parent_spawn_args[0].get("model")
+                if isinstance(_spawn_model, str) and _spawn_model.strip():
+                    _child_ident["requested_alias"] = _spawn_model.strip()
+
+    minimum_child_commands = int(checks.get("minimum_child_commands") or 0)
+    exact_child_commands: list[str] = [
+        str(c) for c in (checks.get("exact_child_commands") or [])
+    ]
+    child_terminal_marker: str = checks.get("child_terminal_marker") or ""
+    require_parallel_batch: bool = bool(checks.get("require_parallel_batch"))
+
+    if child_summary:
+        child_cmds = child_summary.get("commands") or []
+
+        # Validate minimum commands.
+        if total_child_commands < minimum_child_commands:
+            failures.append(
+                f"transcript: child executed {total_child_commands} "
+                f"commands, expected >= {minimum_child_commands}"
+            )
+
+        # Validate exact child commands from correlated function_call.
+        if exact_child_commands:
+            actual_cmds = [c.get("command", "") for c in child_cmds]
+            if sorted(actual_cmds) != sorted(exact_child_commands):
+                failures.append(
+                    f"transcript: child commands {actual_cmds!r} do not "
+                    f"match expected {exact_child_commands!r}"
+                )
+
+        # Validate all commands have output and exit 0.
+        for c in child_cmds:
+            if not c.get("has_output"):
+                failures.append(
+                    f"transcript: child command {c.get('command')!r} "
+                    f"has no correlated function_call_output"
+                )
+            elif c.get("exit_code") != 0:
+                failures.append(
+                    f"transcript: child command {c.get('command')!r} "
+                    f"exit_code={c.get('exit_code')!r} != 0"
+                )
+
+        # Non-vacuous parallel proof.
+        if require_parallel_batch and child_cmds:
+            # All commands must have nonempty same turn_id.
+            cmd_turn_ids = [c.get("turn_id") for c in child_cmds]
+            if any(not tid for tid in cmd_turn_ids):
+                failures.append(
+                    "transcript: parallel proof failed: one or more "
+                    "commands missing turn_id"
+                )
+            elif len(set(cmd_turn_ids)) != 1:
+                failures.append(
+                    "transcript: parallel proof failed: commands span "
+                    f"multiple turns {set(cmd_turn_ids)!r}"
+                )
+
+            # All calls must occur before any correlated output.
+            call_lines = [
+                c["call_line_index"]
+                for c in child_cmds
+                if c.get("call_line_index") is not None
+            ]
+            output_lines = [
+                c["output_line_index"]
+                for c in child_cmds
+                if c.get("output_line_index") is not None
+            ]
+            if call_lines and output_lines:
+                max_call_line = max(call_lines)
+                min_output_line = min(output_lines)
+                if max_call_line >= min_output_line:
+                    failures.append(
+                        "transcript: parallel proof failed: not all "
+                        "commands issued before first output "
+                        f"(max_call_line={max_call_line}, "
+                        f"min_output_line={min_output_line})"
+                    )
+
+        # Validate child terminal marker from outbound completion.
+        if child_terminal_marker:
+            child_msgs = (
+                child_summary.get("outbound_terminal_messages") or []
+            )
+            if not any(child_terminal_marker == m for m in child_msgs):
+                failures.append(
+                    f"transcript: child missing terminal marker "
+                    f"{child_terminal_marker!r}"
+                )
+    elif minimum_child_commands > 0:
+        failures.append(
+            f"transcript: no child transcript validated, expected "
+            f">= {minimum_child_commands} child commands"
+        )
+
+    # --- Spawn argument validation ---
+    expected_spawn_args: dict[str, Any] = checks.get("expected_spawn_args") or {}
+    exact_child_prompt: str = checks.get("exact_child_prompt") or ""
+    reject_encrypted_prefix: str = checks.get(
+        "reject_encrypted_message_prefix", "gAAAA"
+    )
+    parent_spawn_args = parent_summary.get("spawn_arguments") or []
+    if expected_spawn_args or exact_child_prompt:
+        if not parent_spawn_args:
+            failures.append(
+                "transcript: no spawn_agent arguments parsed from parent"
+            )
+        else:
+            sa = parent_spawn_args[0]
+            for key, expected_val in expected_spawn_args.items():
+                actual_val = sa.get(key)
+                if actual_val != expected_val:
+                    failures.append(
+                        f"transcript: spawn arg {key!r} expected "
+                        f"{expected_val!r}, got {actual_val!r}"
+                    )
+            # Validate exact message.
+            actual_msg = sa.get("message")
+            if not isinstance(actual_msg, str) or not actual_msg.strip():
+                failures.append(
+                    "transcript: spawn_agent message is empty or absent"
+                )
+            elif actual_msg.startswith(reject_encrypted_prefix):
+                failures.append(
+                    f"transcript: spawn_agent message is opaque/encrypted "
+                    f"(starts with {reject_encrypted_prefix!r})"
+                )
+            elif exact_child_prompt and actual_msg != exact_child_prompt:
+                failures.append(
+                    "transcript: spawn_agent message does not match "
+                    "exact child prompt literal"
+                )
+
+    # --- Child identity validation ---
+    expected_identity: dict[str, Any] = (
+        checks.get("expected_child_identity") or {}
+    )
+    if expected_identity and child_summary:
+        child_ident = child_summary.get("session_identity") or {}
+        for key, expected_val in expected_identity.items():
+            actual_val = child_ident.get(key)
+            if key == "cli_version":
+                # Nonempty is sufficient; do not freeze exact version.
+                if not actual_val:
+                    failures.append(
+                        "transcript: child cli_version is absent or empty"
+                    )
+            elif actual_val != expected_val:
+                failures.append(
+                    f"transcript: child identity {key!r} expected "
+                    f"{expected_val!r}, got {actual_val!r}"
+                )
+
+    # --- Child inbound prompt validation ---
+    if exact_child_prompt and child_summary:
+        child_inbound = child_summary.get("inbound_agent_messages") or []
+        # Find the NEW_TASK inbound message (first inbound with content).
+        new_task_texts: list[str] = []
+        for iam in child_inbound:
+            for txt in iam.get("content_texts") or []:
+                new_task_texts.append(txt)
+        if not new_task_texts:
+            failures.append(
+                "transcript: child has no inbound NEW_TASK/plaintext payload"
+            )
+        else:
+            # The exact prompt must appear in the inbound payload.
+            combined = "\n".join(new_task_texts)
+            if exact_child_prompt not in combined:
+                # Check if encrypted (prefix may appear after headers).
+                if any(
+                    reject_encrypted_prefix in t
+                    for t in new_task_texts
+                ):
+                    failures.append(
+                        "transcript: child inbound payload is "
+                        "encrypted/opaque (gAAAA)"
+                    )
+                else:
+                    failures.append(
+                        "transcript: child inbound payload does not "
+                        "contain exact child prompt"
+                    )
+
+    # --- task_complete ordering validation ---
+    require_child_tc_before_wait = bool(
+        checks.get("require_child_task_complete_before_wait")
+    )
+    require_wait_correlation = bool(
+        checks.get("require_wait_child_correlation")
+    )
+    require_parent_tc = bool(checks.get("require_parent_task_complete"))
+
+    child_task_completes = (
+        child_summary.get("task_complete_events") or []
+        if child_summary else []
+    )
+    parent_task_completes = parent_summary.get("task_complete_events") or []
+
+    if require_child_tc_before_wait:
+        if not child_task_completes:
+            failures.append(
+                "transcript: child has no explicit task_complete event"
+            )
+        elif child_terminal_marker:
+            # Verify task_complete carries the exact child marker.
+            child_tc_markers = [
+                tc.get("last_agent_message")
+                for tc in child_task_completes
+            ]
+            if child_terminal_marker not in child_tc_markers:
+                failures.append(
+                    f"transcript: child task_complete does not carry "
+                    f"exact marker {child_terminal_marker!r}"
+                )
+
+    if require_wait_correlation and successful_waits:
+        if not child_task_completes:
+            failures.append(
+                "transcript: cannot verify wait-after-child-task_complete "
+                "ordering without child task_complete"
+            )
+        elif successful_waits:
+            # Child task_complete must be no later than the successful
+            # wait function_call_output (cross-transcript: compare ISO
+            # timestamps).
+            _child_tc_ts = child_task_completes[0].get("timestamp")
+            _wait_out_ts = successful_waits[0].get("output_timestamp")
+            if (
+                isinstance(_child_tc_ts, str)
+                and isinstance(_wait_out_ts, str)
+                and _child_tc_ts > _wait_out_ts
+            ):
+                failures.append(
+                    "transcript: child task_complete occurs after wait "
+                    f"output (child_tc={_child_tc_ts!r} > "
+                    f"wait_output={_wait_out_ts!r})"
+                )
+        if child_thread_id and successful_waits:
+            if len(successful_spawns) != 1:
+                failures.append(
+                    "transcript: wait-child correlation ambiguous: "
+                    f"{len(successful_spawns)} spawns"
+                )
+            # Wait must occur after spawn (line ordering in parent).
+            _spawn_line = (
+                successful_spawns[0].get("call_line_index")
+                if successful_spawns else None
+            )
+            _wait_line = successful_waits[0].get("call_line_index")
+            if _spawn_line is not None and _wait_line is not None:
+                if _wait_line <= _spawn_line:
+                    failures.append(
+                        "transcript: wait_agent call occurs before "
+                        f"spawn_agent call (wait line {_wait_line} <= "
+                        f"spawn line {_spawn_line})"
+                    )
+
+    if require_parent_tc:
+        if not parent_task_completes:
+            failures.append(
+                "transcript: parent has no explicit task_complete event"
+            )
+        elif parent_marker:
+            parent_tc_markers = [
+                tc.get("last_agent_message")
+                for tc in parent_task_completes
+            ]
+            if parent_marker not in parent_tc_markers:
+                failures.append(
+                    f"transcript: parent task_complete does not carry "
+                    f"exact marker {parent_marker!r}"
+                )
+            # Parent task_complete must occur after wait output.
+            if successful_waits:
+                _wait_out_line = successful_waits[0].get("output_line_index")
+                _ptc_line = parent_task_completes[0].get("line_index")
+                if _wait_out_line is not None and _ptc_line is not None:
+                    if _ptc_line <= _wait_out_line:
+                        failures.append(
+                            "transcript: parent task_complete occurs "
+                            f"before wait output (tc line {_ptc_line} <= "
+                            f"wait output line {_wait_out_line})"
+                        )
+
+    result: dict[str, Any] = {
+        "enabled": True,
+        "thread_id": thread_id,
+        "parent_transcript": parent_summary,
+        "child_transcript": child_summary,
+        "child_thread_id": child_thread_id,
+        "total_child_commands": total_child_commands,
+    }
+    return result, failures
+
+
+def _cfg004_cooldown_clear_live_test(  # noqa: PLR0915
+    *,
+    litellm_base_url: str,
+    cases: dict[str, dict[str, Any]],
+    suite_config: dict[str, Any],
+    query_url: str,
+    public_key: str,
+    secret_key: str,
+) -> dict[str, Any]:
+    """Execute the CFG-004 criterion 11 live acceptance test (standalone).
+
+    Steps:
+    1. Capture baselines (litellm-dev readiness, aawm-litellm inspect).
+    2. Generate temporary master key + run_id in memory.
+    3. Recreate litellm-dev with Compose override via stdin.
+    4. Await readiness.
+    5. Prepare (seed controls + target with production lane keys).
+    6. Inspect (verify seeded local+durable state).
+    7. Clear exact target via existing endpoint; require result==cleared.
+    8. Inspect (verify target cleared local+durable, controls remain both).
+    9. Run exactly one real Codex TUI proof case (OAuth-only egress; no
+       LiteLLM/proxy API key supplied, parent OPENAI_API_KEY suppressed).
+    10. Verify observed selection matches Alibaba target + exact route family.
+    11. Inspect again: every control remains cooled.
+    12. Restore (unconditional).
+    13. Recreate base litellm-dev without override.
+    14. Verify readiness/config identity restored, temp key/flags/namespace absent.
+    15. Verify aawm-litellm unchanged.
+    """
+    evidence: dict[str, Any] = {
+        "test_name": "cfg004_cooldown_clear_live",
+        "phases": {},
+        "passed": False,
+        "failures": [],
+    }
+    run_id = _cfg004_generate_run_id()
+    master_key = _cfg004_generate_master_key()
+    disposable_config_path = _cfg004_build_disposable_config()
+    override_yaml = _cfg004_compose_override_yaml(
+        master_key=master_key, run_id=run_id,
+        langfuse_public_key=public_key, langfuse_secret_key=secret_key,
+        disposable_config_host_path=disposable_config_path,
+    )
+    proof_case = _CFG003_CODEX_PROOF_CASE
+    restored = False
+    base_recreated = False
+    override_applied = False
+
+    try:
+        # Phase 0: Baselines.
+        baseline_readiness = _cfg004_readiness_snapshot(litellm_base_url)
+        evidence["phases"]["baseline_readiness"] = baseline_readiness
+        # Require baseline HTTP 200, active state, nonempty hash+version
+        # before any mutation.
+        if baseline_readiness.get("status") != 200:
+            evidence["failures"].append(
+                f"baseline readiness not HTTP 200: {baseline_readiness.get('status')}"
+            )
+        if not baseline_readiness.get("config_hash"):
+            evidence["failures"].append("baseline readiness missing config_hash")
+        if not baseline_readiness.get("config_version"):
+            evidence["failures"].append("baseline readiness missing config_version")
+        if baseline_readiness.get("state") != "active":
+            evidence["failures"].append(
+                f"baseline readiness state not active: {baseline_readiness.get('state')!r}"
+            )
+        if evidence["failures"]:
+            return evidence
+        aawm_baseline = _cfg004_docker_inspect_container("aawm-litellm")
+        evidence["phases"]["aawm_litellm_baseline"] = aawm_baseline
+        if "error" in aawm_baseline:
+            evidence["failures"].append(
+                f"aawm-litellm baseline inspect unavailable: {aawm_baseline['error']}"
+            )
+            return evidence
+
+        # Phase 0.5: OAuth account descriptor (fail-closed before Docker).
+        _emit_stderr("[cfg004] reading OAuth account descriptor", flush=True)
+        oauth_account_id, oauth_failures = _cfg004_read_oauth_account_descriptor()
+        evidence["phases"]["oauth_descriptor"] = {
+            "account_id_present": oauth_account_id is not None,
+            "failures": oauth_failures,
+        }
+        if oauth_failures:
+            evidence["failures"].extend(oauth_failures)
+            return evidence
+
+        # Phase 1: Recreate with override.
+        _emit_stderr("[cfg004] recreating litellm-dev with acceptance override", flush=True)
+        ok, detail = _cfg004_docker_compose_up(override_stdin=override_yaml)
+        evidence["phases"]["recreate_override"] = {"ok": ok, "detail": detail}
+        if not ok:
+            evidence["failures"].append(f"recreate with override failed: {detail}")
+            return evidence
+        override_applied = True
+
+        # Phase 2: Await readiness.
+        _emit_stderr("[cfg004] awaiting readiness", flush=True)
+        ok, detail = _cfg004_wait_readiness(litellm_base_url)
+        evidence["phases"]["readiness"] = {"ok": ok, "detail": detail}
+        if not ok:
+            evidence["failures"].append(f"readiness failed: {detail}")
+            return evidence
+
+        # Phase 3: Prepare.
+        _emit_stderr("[cfg004] prepare: seeding controls + target", flush=True)
+        prepare_payload: dict[str, Any] = {
+            "operation": "prepare",
+            "run_id": run_id,
+            "alias": "read",
+            "ingress": "codex",
+            "provider": _CFG004_TARGET_PROVIDER,
+            "model": _CFG004_TARGET_MODEL,
+            "ttl_seconds": 1800,
+        }
+        if oauth_account_id is not None:
+            prepare_payload["codex_oauth_account_id"] = oauth_account_id
+        status, resp = _cfg004_post_acceptance(
+            litellm_base_url, master_key, prepare_payload,
+        )
+        evidence["phases"]["prepare"] = {"status": status, "response": resp}
+        if status != 200 or resp.get("result") != "prepared":
+            evidence["failures"].append(
+                f"prepare failed: status={status} resp={resp}"
+            )
+            return evidence
+
+        # Phase 4: Inspect (pre-clear) -- require BOTH local and durable active.
+        _emit_stderr("[cfg004] inspect: verifying seeded state", flush=True)
+        status, resp = _cfg004_post_acceptance(litellm_base_url, master_key, {
+            "operation": "inspect",
+            "run_id": run_id,
+        })
+        evidence["phases"]["inspect_pre_clear"] = {"status": status, "response": resp}
+        if status != 200:
+            evidence["failures"].append(f"inspect pre-clear failed: status={status}")
+            return evidence
+
+        # Validate inventory: exactly one target + exact controls.
+        inv_failures = _cfg004_validate_inspect_inventory(
+            resp, evidence["phases"]["prepare"]["response"], phase_label="pre-clear"
+        )
+        evidence["failures"].extend(inv_failures)
+        if inv_failures:
+            return evidence
+
+        pre_candidates = resp.get("candidates", [])
+        for c in pre_candidates:
+            label = f"{c.get('provider')}/{c.get('model')}"
+            if not c.get("local_cooldown_active"):
+                evidence["failures"].append(f"pre-clear: {label} not locally active")
+            if not c.get("durable_cooldown_active"):
+                evidence["failures"].append(f"pre-clear: {label} not durable active")
+
+        # Phase 5: Clear exact target; require result exactly "cleared".
+        _emit_stderr("[cfg004] clearing target via existing endpoint", flush=True)
+        status, resp = _cfg004_post_clear(litellm_base_url, master_key, {
+            "provider": _CFG004_TARGET_PROVIDER,
+            "model": _CFG004_TARGET_MODEL,
+            "ingress": "codex",
+        })
+        evidence["phases"]["clear"] = {"status": status, "response": resp}
+        if status != 200:
+            evidence["failures"].append(f"clear failed: status={status} resp={resp}")
+            return evidence
+        clear_result = resp.get("result", "")
+        if clear_result != "cleared":
+            evidence["failures"].append(
+                f"clear result must be exactly 'cleared', got {clear_result!r}"
+            )
+        # Exactly one target lane was seeded with one lane member, so the
+        # clear endpoint contract requires exactly 1 key cleared and 1 member
+        # removed (see test_cfg004_cooldown_clear_endpoint single-lane cases).
+        if int(resp.get("keys_cleared", 0)) != 1:
+            evidence["failures"].append(
+                f"clear: keys_cleared must be exactly 1, got {resp.get('keys_cleared')}"
+            )
+        if int(resp.get("members_removed", 0)) != 1:
+            evidence["failures"].append(
+                f"clear: members_removed must be exactly 1, got {resp.get('members_removed')}"
+            )
+
+        # Phase 6: Inspect (post-clear) -- target absent both, controls active both.
+        _emit_stderr("[cfg004] inspect: verifying target cleared, controls remain", flush=True)
+        status, resp = _cfg004_post_acceptance(litellm_base_url, master_key, {
+            "operation": "inspect",
+            "run_id": run_id,
+        })
+        evidence["phases"]["inspect_post_clear"] = {"status": status, "response": resp}
+        if status != 200:
+            evidence["failures"].append(f"inspect post-clear failed: status={status}")
+            return evidence
+
+        inv_failures = _cfg004_validate_inspect_inventory(
+            resp, evidence["phases"]["prepare"]["response"], phase_label="post-clear"
+        )
+        evidence["failures"].extend(inv_failures)
+        if inv_failures:
+            return evidence
+
+        post_candidates = resp.get("candidates", [])
+        for c in post_candidates:
+            role = c.get("role")
+            label = f"{c.get('provider')}/{c.get('model')}"
+            if role == "target":
+                if c.get("local_cooldown_active"):
+                    evidence["failures"].append(f"post-clear: target {label} still locally active")
+                if c.get("durable_cooldown_active"):
+                    evidence["failures"].append(f"post-clear: target {label} still durable active")
+            if role == "control":
+                if not c.get("local_cooldown_active"):
+                    evidence["failures"].append(f"post-clear: control {label} lost local cooldown")
+                if not c.get("durable_cooldown_active"):
+                    evidence["failures"].append(f"post-clear: control {label} lost durable cooldown")
+
+        # Phase 7: Real Codex TUI proof.
+        _emit_stderr("[cfg004] launching real Codex TUI proof", flush=True)
+        if proof_case not in cases:
+            evidence["failures"].append(f"missing proof case {proof_case!r}")
+            return evidence
+
+        # The TUI retains its existing resolved provider with
+        # requires_openai_auth=true and uses its normal Codex OAuth
+        # Authorization credential.  No LiteLLM/proxy API key is supplied.
+        # The disposable config's /openai_passthrough/* public route lets
+        # user_api_key_auth bypass gateway-key validation on the model route
+        # while the client OAuth header is forwarded unchanged.
+        # Enforce OAuth-only Codex egress: even if the parent shell exports
+        # OPENAI_API_KEY, it must not reach the TUI child.  Temporarily pop
+        # it from os.environ for the synchronous proof call and restore the
+        # exact prior value afterward (including absence).
+        _prior_openai_api_key = os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            proof = _cfg003_run_proof_case(
+                case_name=f"{proof_case}__cfg004_clear_proof",
+                case_config_key=proof_case,
+                cases=cases,
+                suite_config=suite_config,
+                query_url=query_url,
+                public_key=public_key,
+                secret_key=secret_key,
+                litellm_base_url=litellm_base_url,
+            )
+        finally:
+            if _prior_openai_api_key is not None:
+                os.environ["OPENAI_API_KEY"] = _prior_openai_api_key
+        selection = proof["selection"]
+        evidence["phases"]["proof"] = {
+            "case": f"{proof_case}__cfg004_clear_proof",
+            "passed": bool(proof["result"].get("passed")),
+            "selection": selection,
+            "phase_session_id": proof["phase_session_id"],
+        }
+        # Include redacted proof-command failure details so pre-egress
+        # failures are explicit in the artifact.
+        _proof_failures = proof["result"].get("failures") or []
+        if _proof_failures:
+            evidence["phases"]["proof"]["redacted_failures"] = (
+                RA._redact_sensitive_artifact_fields(_proof_failures)
+            )
+
+        # Verify selection: provider, model, AND exact route family.
+        sel_provider = selection.get("provider")
+        sel_model = selection.get("model")
+        sel_rf = selection.get("route_family")
+        if sel_provider != _CFG004_TARGET_PROVIDER:
+            evidence["failures"].append(
+                f"proof selection provider mismatch: expected {_CFG004_TARGET_PROVIDER}, got {sel_provider}"
+            )
+        if sel_model != _CFG004_TARGET_MODEL:
+            evidence["failures"].append(
+                f"proof selection model mismatch: expected {_CFG004_TARGET_MODEL}, got {sel_model}"
+            )
+        if sel_rf != _CFG004_TARGET_ROUTE_FAMILY:
+            evidence["failures"].append(
+                f"proof selection route_family mismatch: expected {_CFG004_TARGET_ROUTE_FAMILY}, got {sel_rf}"
+            )
+        if not proof["result"].get("passed"):
+            evidence["failures"].append("proof case did not pass endpoint/shape/session/tool validations")
+
+        # Phase 7.5: Transcript-backed collaboration evidence.
+        _emit_stderr("[cfg004] validating transcript collaboration evidence", flush=True)
+        proof_thread_id = proof["result"].get("langfuse", {}).get("command_thread_id")
+        # Build transcript checks from case config.
+        _proof_case_cfg = cases.get(proof_case) or {}
+        _tcv = _proof_case_cfg.get("transcript_collaboration_validation") or {}
+        transcript_checks: dict[str, Any] = {
+            "require_spawn_and_wait": True,
+            "minimum_child_commands": 1,
+            "exact_child_commands": [
+                "pwd",
+                "git rev-parse --show-toplevel",
+                "git status --short",
+            ],
+            "require_parallel_batch": True,
+            "child_terminal_marker": _tcv.get(
+                "child_terminal_marker",
+                "READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+            ),
+            "parent_terminal_marker": _tcv.get(
+                "parent_terminal_marker",
+                "CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+            ),
+            "expected_spawn_args": _tcv.get("expected_spawn_args") or {},
+            "exact_child_prompt": _proof_case_cfg.get("exact_child_prompt") or "",
+            "reject_encrypted_message_prefix": _tcv.get(
+                "reject_encrypted_message_prefix", "gAAAA",
+            ),
+            "expected_child_identity": _tcv.get("expected_child_identity") or {},
+            "require_child_task_complete_before_wait": _tcv.get(
+                "require_child_task_complete_before_wait", True,
+            ),
+            "require_wait_child_correlation": _tcv.get(
+                "require_wait_child_correlation", True,
+            ),
+            "require_parent_task_complete": _tcv.get(
+                "require_parent_task_complete", True,
+            ),
+        }
+        transcript_summary, transcript_failures = (
+            _cfg004_validate_transcript_collaboration(
+                thread_id=proof_thread_id,
+                checks=transcript_checks,
+            )
+        )
+        _child_transcript_summary = transcript_summary.get("child_transcript")
+        _parent_transcript_summary = transcript_summary.get("parent_transcript")
+        # Secret-safe artifact: spawn args, child identity, prompt hash.
+        import hashlib as _hashlib
+        _exact_prompt = transcript_checks.get("exact_child_prompt") or ""
+        _prompt_hash = (
+            _hashlib.sha256(_exact_prompt.encode()).hexdigest()[:16]
+            if _exact_prompt else None
+        )
+        _spawn_args_artifact = (
+            _parent_transcript_summary.get("spawn_arguments", [None])[0]
+            if isinstance(_parent_transcript_summary, dict)
+            and _parent_transcript_summary.get("spawn_arguments")
+            else None
+        )
+        _child_identity_artifact = (
+            _child_transcript_summary.get("session_identity")
+            if isinstance(_child_transcript_summary, dict)
+            else None
+        )
+        _child_tc_events = (
+            _child_transcript_summary.get("task_complete_events")
+            if isinstance(_child_transcript_summary, dict)
+            else None
+        )
+        _parent_tc_events = (
+            _parent_transcript_summary.get("task_complete_events")
+            if isinstance(_parent_transcript_summary, dict)
+            else None
+        )
+        evidence["phases"]["transcript_collaboration"] = {
+            "thread_id": proof_thread_id,
+            "summary": {
+                k: v
+                for k, v in transcript_summary.items()
+                if k not in ("parent_transcript", "child_transcript")
+            },
+            "parent_transcript_path": (
+                _parent_transcript_summary.get("transcript_path")
+                if isinstance(_parent_transcript_summary, dict)
+                else None
+            ),
+            "child_transcript_paths": [
+                _child_transcript_summary["transcript_path"],
+            ] if isinstance(_child_transcript_summary, dict) and _child_transcript_summary.get("transcript_path") else [],
+            "total_child_commands": transcript_summary.get("total_child_commands"),
+            "spawn_agent_type": (
+                _spawn_args_artifact.get("agent_type")
+                if isinstance(_spawn_args_artifact, dict) else None
+            ),
+            "spawn_model": (
+                _spawn_args_artifact.get("model")
+                if isinstance(_spawn_args_artifact, dict) else None
+            ),
+            "spawn_fork_turns": (
+                _spawn_args_artifact.get("fork_turns")
+                if isinstance(_spawn_args_artifact, dict) else None
+            ),
+            "child_requested_alias": (
+                _spawn_args_artifact.get("model")
+                if isinstance(_spawn_args_artifact, dict) else None
+            ),
+            "child_resolved_model": (
+                _child_identity_artifact.get("resolved_model")
+                if isinstance(_child_identity_artifact, dict) else None
+            ),
+            "child_agent_role": (
+                _child_identity_artifact.get("agent_role")
+                if isinstance(_child_identity_artifact, dict) else None
+            ),
+            "child_sandbox": (
+                _child_identity_artifact.get("sandbox")
+                if isinstance(_child_identity_artifact, dict) else None
+            ),
+            "child_cli_version": (
+                _child_identity_artifact.get("cli_version")
+                if isinstance(_child_identity_artifact, dict) else None
+            ),
+            "exact_prompt_sha256_prefix": _prompt_hash,
+            "exact_prompt": _exact_prompt or None,
+            "child_task_complete_events": _child_tc_events,
+            "parent_task_complete_events": _parent_tc_events,
+            "failures": transcript_failures,
+        }
+        evidence["failures"].extend(transcript_failures)
+
+        # Phase 8: Post-proof inspect -- every control remains cooled.
+        _emit_stderr("[cfg004] post-proof inspect: verifying controls remain cooled", flush=True)
+        status, resp = _cfg004_post_acceptance(litellm_base_url, master_key, {
+            "operation": "inspect",
+            "run_id": run_id,
+        })
+        evidence["phases"]["inspect_post_proof"] = {"status": status, "response": resp}
+        if status == 200:
+            inv_failures = _cfg004_validate_inspect_inventory(
+                resp, evidence["phases"]["prepare"]["response"], phase_label="post-proof"
+            )
+            evidence["failures"].extend(inv_failures)
+            for c in resp.get("candidates", []):
+                if c.get("role") == "control":
+                    label = f"{c.get('provider')}/{c.get('model')}"
+                    if not c.get("local_cooldown_active"):
+                        evidence["failures"].append(f"post-proof: control {label} lost local cooldown")
+                    if not c.get("durable_cooldown_active"):
+                        evidence["failures"].append(f"post-proof: control {label} lost durable cooldown")
+        else:
+            evidence["failures"].append(f"post-proof inspect failed: status={status}")
+
+    finally:
+        # Phase 9/10: Restore and base recreation only after override applied.
+        if override_applied:
+            _emit_stderr("[cfg004] restore: clearing prepared state", flush=True)
+            try:
+                status, resp = _cfg004_post_acceptance(litellm_base_url, master_key, {
+                    "operation": "restore",
+                    "run_id": run_id,
+                })
+                evidence["phases"]["restore"] = {"status": status, "response": resp}
+                restored = status == 200
+            except Exception as exc:
+                evidence["phases"]["restore"] = {"error": str(exc)}
+
+            _emit_stderr("[cfg004] recreating base litellm-dev", flush=True)
+            ok, detail = _cfg004_docker_compose_up(override_stdin=None)
+            evidence["phases"]["recreate_base"] = {"ok": ok, "detail": detail}
+            base_recreated = ok
+        else:
+            restored = True
+            base_recreated = True
+
+        if override_applied and base_recreated:
+            ok_r, detail_r = _cfg004_wait_readiness(litellm_base_url)
+            evidence["phases"]["base_readiness"] = {"ok": ok_r, "detail": detail_r}
+            if not ok_r:
+                evidence["failures"].append(f"base readiness not restored: {detail_r}")
+
+            # Verify config identity restored.
+            post_readiness = _cfg004_readiness_snapshot(litellm_base_url)
+            evidence["phases"]["post_readiness"] = post_readiness
+            # Strict: require HTTP 200, active state, and exact baseline
+            # hash+version after base recreation.
+            if post_readiness.get("status") != 200:
+                evidence["failures"].append(
+                    f"post-recreation readiness not HTTP 200: {post_readiness.get('status')}"
+                )
+            if post_readiness.get("state") != "active":
+                evidence["failures"].append(
+                    f"post-recreation readiness state not active: {post_readiness.get('state')!r}"
+                )
+            if post_readiness.get("config_hash") != baseline_readiness.get("config_hash"):
+                evidence["failures"].append(
+                    "config_hash not restored after base recreation"
+                )
+            if post_readiness.get("config_version") != baseline_readiness.get("config_version"):
+                evidence["failures"].append(
+                    "config_version not restored after base recreation"
+                )
+
+            # Secret-safe env check: temp key/flags/namespace must be absent.
+            env_failures = _cfg004_docker_inspect_env_absent("litellm-dev")
+            evidence["phases"]["env_absent_check"] = {"failures": env_failures}
+            evidence["failures"].extend(env_failures)
+
+        # Verify aawm-litellm unchanged.
+        aawm_post = _cfg004_docker_inspect_container("aawm-litellm")
+        evidence["phases"]["aawm_litellm_post"] = aawm_post
+        if "error" in aawm_post:
+            evidence["failures"].append(
+                f"aawm-litellm post inspect unavailable: {aawm_post['error']}"
+            )
+        if "error" not in aawm_baseline and "error" not in aawm_post:
+            for field_name in ("id", "image", "started_at", "restart_count"):
+                if aawm_post.get(field_name) != aawm_baseline.get(field_name):
+                    evidence["failures"].append(
+                        f"aawm-litellm {field_name} changed: "
+                        f"{aawm_baseline.get(field_name)!r} -> {aawm_post.get(field_name)!r}"
+                    )
+
+        if not restored:
+            evidence["failures"].append("restore did not complete successfully")
+        if not base_recreated:
+            evidence["failures"].append("base recreation failed")
+
+        # Remove the disposable acceptance config after base recreation.
+        _cfg004_remove_disposable_config()
+
+    evidence["passed"] = not evidence["failures"]
+    return RA._redact_sensitive_artifact_fields(evidence)
+
+
 def main() -> int:  # noqa: PLR0915
     parser = argparse.ArgumentParser(
         description="Run real-Claude Anthropic adapter acceptance checks through a target LiteLLM instance."
@@ -9144,6 +11027,12 @@ def main() -> int:  # noqa: PLR0915
             'Only valid with --cfg003-transactional-refresh on canonical dev. '
             'Syntax: provider=model (e.g. openrouter=openrouter/cohere/north-mini-code:free).'
         ),
+    )
+    parser.add_argument(
+        '--cfg004-cooldown-clear-live',
+        action='store_true',
+        default=False,
+        help='Run the CFG-004 criterion 11 live cooldown-clear acceptance (dev only).',
     )
     args = parser.parse_args()
 
@@ -9198,7 +11087,7 @@ def main() -> int:  # noqa: PLR0915
     # An invalid transactional target must not trigger dotenv loading or
     # credential resolution.  The resolved-profile gate after profile
     # resolution is retained as a second check.
-    if args.cfg003_transactional_refresh:
+    if args.cfg003_transactional_refresh or args.cfg004_cooldown_clear_live:
         _raw_ok, _raw_failures = _cfg003_raw_config_canonical_preflight(
             config_path=config_path,
             target_override=args.target,
@@ -9255,7 +11144,7 @@ def main() -> int:  # noqa: PLR0915
     # Finding 3 (round 7): Canonical dev isolation gate BEFORE credential
     # resolution.  A dev-labelled prod/aawm-litellm override must not trigger
     # docker exec or read target-owned credentials.
-    if args.cfg003_transactional_refresh:
+    if args.cfg003_transactional_refresh or args.cfg004_cooldown_clear_live:
         _cfg003_canonical_ok, _cfg003_canonical_failures = (
             _cfg003_validate_canonical_dev_profile(target=target, profile=profile)
         )
@@ -9315,6 +11204,36 @@ def main() -> int:  # noqa: PLR0915
         secret_key_env=secret_key_env,
     )
     _write_artifact(artifact_path, artifact)
+
+    # CFG-004 criterion 11: live cooldown-clear acceptance. Runs STANDALONE,
+    # before the ordinary case loop and CFG-003 inventory/egress. Gated by the
+    # canonical-dev checks above (raw + resolved) before credentials, normal
+    # cases, Docker actions, or provider traffic.
+    if args.cfg004_cooldown_clear_live:
+        _emit_stderr('[cfg004] starting standalone live cooldown-clear acceptance test', flush=True)
+        cfg004_result = _cfg004_cooldown_clear_live_test(
+            litellm_base_url=litellm_base_url,
+            cases=cases,
+            suite_config=config,
+            query_url=query_url,
+            public_key=public_key,
+            secret_key=secret_key,
+        )
+        artifact['cfg004_cooldown_clear_live'] = cfg004_result
+        artifact['results']['cfg004_cooldown_clear_live'] = {
+            'passed': cfg004_result.get('passed', False),
+            'skipped': False,
+            'failures': cfg004_result.get('failures', []),
+            'warnings': [],
+        }
+        artifact['summary'] = _build_summary(artifact['results'])
+        _write_artifact(artifact_path, artifact)
+        _emit_stdout(json.dumps(artifact['summary'], indent=2))
+        _emit_stderr(
+            f"[cfg004] cooldown-clear live passed={cfg004_result.get('passed')}",
+            flush=True,
+        )
+        return 0 if artifact['summary']['passed'] else 1
 
     # CFG-003: Active alias/ingress inventory (always captured for artifact).
     cfg003_inventory = _cfg003_query_active_inventory(litellm_base_url)

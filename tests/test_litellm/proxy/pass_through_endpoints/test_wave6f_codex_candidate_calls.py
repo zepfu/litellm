@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import pathlib
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -53,6 +54,12 @@ EXPECTED_PUBLIC_SYMBOLS = frozenset(
         "_OPENCODE_ZEN_DIRECT_429_ERROR_CLASSES",
         "_OPENCODE_ZEN_DIRECT_RETRY_AFTER_CEILING_SECONDS",
         "_OPENCODE_ZEN_DIRECT_PEEK_MAX_BYTES",
+        # CFG-004 encrypted reasoning detection
+        "_is_fernet_encrypted_token",
+        "_responses_output_contains_encrypted_reasoning_arguments",
+        "_FERNET_TOKEN_PREFIX",
+        "_FERNET_MIN_TOKEN_LENGTH",
+        "_ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES",
     }
 )
 
@@ -73,7 +80,7 @@ class TestSymbolInventory:
                 callable(getattr(codex_candidate_calls, name))
                 for name in codex_candidate_calls._HOST_FUNCTION_NAMES
             )
-            == 23
+            == 25
         )
 
 
@@ -162,8 +169,8 @@ class TestInstallSeam:
         codex_candidate_calls.install(host)
         for name in codex_candidate_calls._HOST_FUNCTION_NAMES:
             assert name in host, f"install() did not publish {name}"
-            # Constants like _OPENCODE_ZEN_DIRECT_429_ERROR_CLASSES are not callable
-            if not name.startswith("_OPENCODE_ZEN_DIRECT_"):
+            # Constants are not callable
+            if not name.startswith(("_OPENCODE_ZEN_DIRECT_", "_FERNET_", "_ALIBABA_ENCRYPTED_")):
                 assert callable(host[name])
 
     def test_install_rebinds_globals(self):
@@ -421,6 +428,8 @@ class TestOpenRouterCompletionNamespaceToolAdaptation:
         host["_build_responses_response_from_adapter_response"] = MagicMock(
             return_value=MagicMock()
         )
+        host["_build_malformed_tool_call_intake_context"] = MagicMock(return_value={})
+        host["_validate_codex_auto_agent_responses_payload"] = AsyncMock(return_value=MagicMock())
 
         import httpx as _httpx
 
@@ -508,3 +517,499 @@ class TestOpenRouterCompletionNamespaceToolAdaptation:
         assert len(egress_calls) == 1
         assert egress_calls[0]["url"].endswith("/v1/chat/completions")
         assert egress_calls[0]["credential_family"] == "openrouter"
+
+
+# -- CFG-004 regression: encrypted reasoning in tool call arguments --
+
+
+class TestCFG004EncryptedReasoningDetection:
+    """CFG-004: Fernet token detection in function_call arguments."""
+
+    def test_fernet_token_detected(self):
+        token = "gAAAAABn" + "A" * 200
+        assert codex_candidate_calls._is_fernet_encrypted_token(token) is True
+
+    def test_plaintext_not_detected(self):
+        assert codex_candidate_calls._is_fernet_encrypted_token("implement the fix") is False
+        assert codex_candidate_calls._is_fernet_encrypted_token("") is False
+        # Too short to be a Fernet token
+        assert codex_candidate_calls._is_fernet_encrypted_token("gAAAA") is False
+
+    def test_detection_in_spawn_agent_message(self):
+        """Reproduces the exact CFG-004 shape: spawn_agent.message is gAAAA."""
+        encrypted = "gAAAAABn" + "B" * 200
+        tool_call = MagicMock()
+        tool_call.type = "function_call"
+        tool_call.name = "spawn_agent"
+        tool_call.call_id = "call-1"
+        tool_call.arguments = json.dumps(
+            {"message": encrypted, "agent_type": "opencode", "model": "read"}
+        )
+
+        message_item = MagicMock()
+        message_item.type = "message"
+
+        response = MagicMock()
+        response.output = [message_item, tool_call]
+
+        findings = (
+            codex_candidate_calls._responses_output_contains_encrypted_reasoning_arguments(
+                response
+            )
+        )
+        assert len(findings) == 1
+        assert findings[0]["name"] == "spawn_agent"
+        assert findings[0]["argument_key"] == "message"
+        assert findings[0]["call_id"] == "call-1"
+
+    def test_plaintext_arguments_not_flagged(self):
+        tool_call = MagicMock()
+        tool_call.type = "function_call"
+        tool_call.name = "spawn_agent"
+        tool_call.call_id = "call-2"
+        tool_call.arguments = json.dumps(
+            {"message": "implement the fix", "agent_type": "opencode"}
+        )
+
+        response = MagicMock()
+        response.output = [tool_call]
+
+        findings = (
+            codex_candidate_calls._responses_output_contains_encrypted_reasoning_arguments(
+                response
+            )
+        )
+        assert findings == []
+
+
+class TestCFG004AlibabaRetryPath:
+    """CFG-004: bounded retry preserves Alibaba provider; fail closed after exhaustion."""
+
+    def _make_host(self):
+        import httpx as _httpx
+
+        host: dict[str, Any] = {"__builtins__": __builtins__}
+        host["json"] = json
+        host["httpx"] = _httpx
+        host["StreamingResponse"] = MagicMock()
+        host["_responses_sse_from_iterator"] = MagicMock()
+        host["_annotate_request_scope_for_adapted_access_log"] = MagicMock()
+        host["_get_proxy_shared_aiohttp_session"] = MagicMock(return_value=None)
+        host["_build_responses_response_from_adapter_response"] = MagicMock(
+            return_value="BUILT_RESPONSE"
+        )
+        host["_serialize_responses_adapter_response"] = MagicMock(
+            return_value='{"output":[]}'
+        )
+        host["_build_malformed_tool_call_intake_context"] = MagicMock(return_value={})
+        return host
+
+    def _make_encrypted_response(self):
+        encrypted = "gAAAAABn" + "C" * 200
+        resp = MagicMock()
+        tool_call = MagicMock()
+        tool_call.type = "function_call"
+        tool_call.name = "spawn_agent"
+        tool_call.call_id = "c1"
+        tool_call.arguments = json.dumps(
+            {"message": encrypted, "agent_type": "opencode"}
+        )
+        resp.output = [tool_call]
+        return resp
+
+    def _make_plaintext_response(self):
+        resp = MagicMock()
+        tool_call = MagicMock()
+        tool_call.type = "function_call"
+        tool_call.name = "spawn_agent"
+        tool_call.call_id = "c2"
+        tool_call.arguments = json.dumps(
+            {"message": "implement the fix", "agent_type": "opencode"}
+        )
+        resp.output = [tool_call]
+        return resp
+
+    def _call_kwargs(self):
+        return dict(
+            config=MagicMock(),
+            request=MagicMock(headers={}),
+            prepared_request_body={"model": "qwen3.7-max"},
+            adapter_model="qwen3.7-max",
+            target_url="https://token-plan.example/v1/chat/completions",
+            api_key="sk-test",
+            api_base="https://token-plan.example/v1",
+            client_requested_stream=False,
+            completion_kwargs={"model": "qwen3.7-max", "messages": []},
+            request_input="test input",
+            responses_api_request={},
+            litellm_metadata={},
+            upstream_model="qwen3.7-max",
+        )
+
+    @pytest.mark.asyncio
+    async def test_retry_recovers_plaintext_on_alibaba_provider(self):
+        """First call returns encrypted spawn_agent.message; retry returns
+        plaintext.  Response comes from the Alibaba adapter, not another
+        provider."""
+        host = self._make_host()
+        host["_raise_codex_auto_agent_malformed_tool_call_text_payload"] = MagicMock(
+            side_effect=AssertionError("should not raise")
+        )
+
+        mock_litellm = MagicMock()
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=[MagicMock(), MagicMock()]
+        )
+        mock_litellm.LlmProviders.ALIBABA_TOKEN_PLAN.value = "alibaba_token_plan"
+        host["litellm"] = mock_litellm
+
+        codex_candidate_calls.install(host)
+
+        mock_config = MagicMock()
+        mock_config.transform_chat_completion_response_to_responses_api_response.side_effect = [
+            self._make_encrypted_response(),
+            self._make_plaintext_response(),
+        ]
+
+        with unittest.mock.patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig",
+            mock_config,
+        ):
+            result = await host["_perform_codex_alibaba_token_plan_adapter_call"](
+                **self._call_kwargs()
+            )
+
+        # Two acompletion calls on the same Alibaba provider: initial + retry
+        assert mock_litellm.acompletion.await_count == 2
+        # Transform called twice (once per attempt)
+        assert (
+            mock_config.transform_chat_completion_response_to_responses_api_response.call_count
+            == 2
+        )
+        # Plaintext response built and returned by the Alibaba adapter
+        assert result == "BUILT_RESPONSE"
+        host["_raise_codex_auto_agent_malformed_tool_call_text_payload"].assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_fail_closed_after_retry_exhaustion_preserves_alibaba_attribution(self):
+        """All attempts return encrypted content; must raise malformed-tool-call
+        with Alibaba provider attribution, never dispatch encrypted content."""
+        host = self._make_host()
+
+        raised_kwargs: list[dict[str, Any]] = []
+
+        def capture_raise(**kwargs):
+            raised_kwargs.append(kwargs)
+            raise RuntimeError("malformed_tool_call")
+
+        host["_raise_codex_auto_agent_malformed_tool_call_text_payload"] = MagicMock(
+            side_effect=capture_raise
+        )
+
+        mock_litellm = MagicMock()
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=[MagicMock(), MagicMock()]
+        )
+        mock_litellm.LlmProviders.ALIBABA_TOKEN_PLAN.value = "alibaba_token_plan"
+        host["litellm"] = mock_litellm
+
+        codex_candidate_calls.install(host)
+
+        mock_config = MagicMock()
+        mock_config.transform_chat_completion_response_to_responses_api_response.return_value = (
+            self._make_encrypted_response()
+        )
+
+        with unittest.mock.patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig",
+            mock_config,
+        ):
+            with pytest.raises(RuntimeError, match="malformed_tool_call"):
+                await host["_perform_codex_alibaba_token_plan_adapter_call"](
+                    **self._call_kwargs()
+                )
+
+        # Both attempts used (initial + retry), same Alibaba provider
+        assert mock_litellm.acompletion.await_count == 2
+        # Fail-closed with Alibaba adapter attribution
+        assert len(raised_kwargs) == 1
+        assert raised_kwargs[0]["adapter"] == "codex_alibaba_token_plan_chat_completions_adapter"
+        assert raised_kwargs[0]["adapter_label"] == "Alibaba Token Plan"
+
+
+
+class TestCFG004AlibabaStreamingPath:
+    """CFG-004 streaming: encrypted content detected before any bytes reach
+    the client; same-provider retry; plaintext SSE on success; bounded
+    fail-closed when encrypted content persists."""
+
+    def _make_host(self):
+        import httpx as _httpx
+
+        host: dict[str, Any] = {"__builtins__": __builtins__}
+        host["json"] = json
+        host["httpx"] = _httpx
+        host["StreamingResponse"] = MagicMock()
+        host["_annotate_request_scope_for_adapted_access_log"] = MagicMock()
+        host["_get_proxy_shared_aiohttp_session"] = MagicMock(return_value=None)
+        host["_build_malformed_tool_call_intake_context"] = MagicMock(return_value={})
+        # Capture what body the SSE emitter receives
+        sse_bodies: list[dict[str, Any]] = []
+
+        async def _sse_gen(body):
+            yield "data: " + json.dumps(body) + chr(10) + chr(10)
+
+        def mock_sse_from_body(body):
+            # Capture at call time: StreamingResponse is mocked and never
+            # iterates the generator, so record the body argument directly.
+            sse_bodies.append(body)
+            return _sse_gen(body)
+
+        host["_responses_sse_from_repaired_response_body"] = mock_sse_from_body
+        host["_sse_bodies"] = sse_bodies
+        return host
+
+    def _make_encrypted_response(self):
+        encrypted = "gAAAAABn" + "D" * 200
+        resp = MagicMock()
+        tool_call = MagicMock()
+        tool_call.type = "function_call"
+        tool_call.name = "spawn_agent"
+        tool_call.call_id = "c-stream-1"
+        tool_call.arguments = json.dumps(
+            {"message": encrypted, "agent_type": "opencode"}
+        )
+        resp.output = [tool_call]
+        return resp
+
+    def _make_plaintext_response(self):
+        resp = MagicMock()
+        tool_call = MagicMock()
+        tool_call.type = "function_call"
+        tool_call.name = "spawn_agent"
+        tool_call.call_id = "c-stream-2"
+        tool_call.arguments = json.dumps(
+            {"message": "implement the fix", "agent_type": "opencode"}
+        )
+        resp.output = [tool_call]
+        return resp
+
+    def _call_kwargs(self, *, stream: bool = True):
+        return dict(
+            config=MagicMock(),
+            request=MagicMock(headers={}),
+            prepared_request_body={"model": "qwen3.7-max"},
+            adapter_model="qwen3.7-max",
+            target_url="https://token-plan.example/v1/chat/completions",
+            api_key="sk-test",
+            api_base="https://token-plan.example/v1",
+            client_requested_stream=stream,
+            completion_kwargs={"model": "qwen3.7-max", "messages": []},
+            request_input="test input",
+            responses_api_request={},
+            litellm_metadata={},
+            upstream_model="qwen3.7-max",
+        )
+
+    @pytest.mark.asyncio
+    async def test_streaming_plaintext_first_attempt_returns_sse(self):
+        """Plaintext on first streaming attempt: SSE emitted immediately,
+        no retry, no encrypted content."""
+        host = self._make_host()
+        host["_serialize_responses_adapter_response"] = MagicMock(
+            return_value=json.dumps(
+                {"output": [{"type": "function_call", "name": "spawn_agent",
+                  "arguments": json.dumps({"message": "implement the fix"})}],
+                 "status": "completed"}
+            )
+        )
+        host["_raise_codex_auto_agent_malformed_tool_call_text_payload"] = MagicMock(
+            side_effect=AssertionError("should not raise")
+        )
+
+        mock_litellm = MagicMock()
+        mock_litellm.acompletion = AsyncMock(return_value=MagicMock())
+        mock_litellm.LlmProviders.ALIBABA_TOKEN_PLAN.value = "alibaba_token_plan"
+        host["litellm"] = mock_litellm
+
+        codex_candidate_calls.install(host)
+
+        mock_config = MagicMock()
+        mock_config.transform_chat_completion_response_to_responses_api_response.return_value = (
+            self._make_plaintext_response()
+        )
+
+        with unittest.mock.patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig",
+            mock_config,
+        ):
+            await host["_perform_codex_alibaba_token_plan_adapter_call"](
+                **self._call_kwargs(stream=True)
+            )
+
+        # Single upstream call (no retry needed)
+        assert mock_litellm.acompletion.await_count == 1
+        # SSE emitter received the plaintext body
+        assert len(host["_sse_bodies"]) == 1
+        body = host["_sse_bodies"][0]
+        assert "gAAAA" not in json.dumps(body)
+        # StreamingResponse was constructed
+        host["StreamingResponse"].assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_streaming_encrypted_retry_recovers_plaintext(self):
+        """First streaming attempt returns encrypted spawn_agent.message;
+        retry returns plaintext.  SSE emitted only after plaintext confirmed.
+        Same Alibaba provider used for both attempts."""
+        host = self._make_host()
+        host["_serialize_responses_adapter_response"] = MagicMock(
+            return_value=json.dumps(
+                {"output": [{"type": "function_call", "name": "spawn_agent",
+                  "arguments": json.dumps({"message": "implement the fix"})}],
+                 "status": "completed"}
+            )
+        )
+        host["_raise_codex_auto_agent_malformed_tool_call_text_payload"] = MagicMock(
+            side_effect=AssertionError("should not raise")
+        )
+
+        mock_litellm = MagicMock()
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=[MagicMock(), MagicMock()]
+        )
+        mock_litellm.LlmProviders.ALIBABA_TOKEN_PLAN.value = "alibaba_token_plan"
+        host["litellm"] = mock_litellm
+
+        codex_candidate_calls.install(host)
+
+        mock_config = MagicMock()
+        mock_config.transform_chat_completion_response_to_responses_api_response.side_effect = [
+            self._make_encrypted_response(),
+            self._make_plaintext_response(),
+        ]
+
+        with unittest.mock.patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig",
+            mock_config,
+        ):
+            await host["_perform_codex_alibaba_token_plan_adapter_call"](
+                **self._call_kwargs(stream=True)
+            )
+
+        # Two upstream calls: initial + retry, same Alibaba provider
+        assert mock_litellm.acompletion.await_count == 2
+        # Transform called twice (once per attempt)
+        assert (
+            mock_config.transform_chat_completion_response_to_responses_api_response.call_count
+            == 2
+        )
+        # SSE emitter received exactly one body (the plaintext one)
+        assert len(host["_sse_bodies"]) == 1
+        body = host["_sse_bodies"][0]
+        assert "gAAAA" not in json.dumps(body)
+        host["_raise_codex_auto_agent_malformed_tool_call_text_payload"].assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_streaming_encrypted_persists_fails_closed_no_bytes_dispatched(self):
+        """All streaming attempts return encrypted content.  Must raise
+        malformed-tool-call with Alibaba attribution.  No SSE bytes dispatched."""
+        host = self._make_host()
+        host["_serialize_responses_adapter_response"] = MagicMock(
+            return_value=json.dumps(
+                {"output": [{"type": "function_call", "name": "spawn_agent",
+                  "arguments": json.dumps({"message": "gAAAAABn" + "E" * 200})}],
+                 "status": "completed"}
+            )
+        )
+
+        raised_kwargs: list[dict[str, Any]] = []
+
+        def capture_raise(**kwargs):
+            raised_kwargs.append(kwargs)
+            raise RuntimeError("malformed_tool_call")
+
+        host["_raise_codex_auto_agent_malformed_tool_call_text_payload"] = MagicMock(
+            side_effect=capture_raise
+        )
+
+        mock_litellm = MagicMock()
+        mock_litellm.acompletion = AsyncMock(
+            side_effect=[MagicMock(), MagicMock()]
+        )
+        mock_litellm.LlmProviders.ALIBABA_TOKEN_PLAN.value = "alibaba_token_plan"
+        host["litellm"] = mock_litellm
+
+        codex_candidate_calls.install(host)
+
+        mock_config = MagicMock()
+        mock_config.transform_chat_completion_response_to_responses_api_response.return_value = (
+            self._make_encrypted_response()
+        )
+
+        with unittest.mock.patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig",
+            mock_config,
+        ):
+            with pytest.raises(RuntimeError, match="malformed_tool_call"):
+                await host["_perform_codex_alibaba_token_plan_adapter_call"](
+                    **self._call_kwargs(stream=True)
+                )
+
+        # Both attempts used (initial + retry), same Alibaba provider
+        assert mock_litellm.acompletion.await_count == 2
+        # No SSE bytes dispatched
+        assert len(host["_sse_bodies"]) == 0
+        # Fail-closed with Alibaba adapter attribution
+        assert len(raised_kwargs) == 1
+        assert raised_kwargs[0]["adapter"] == "codex_alibaba_token_plan_chat_completions_adapter"
+        assert raised_kwargs[0]["adapter_label"] == "Alibaba Token Plan"
+
+    @pytest.mark.asyncio
+    async def test_streaming_no_encrypted_bytes_in_sse_output(self):
+        """End-to-end: the actual SSE bytes yielded to the client contain
+        no Fernet token prefix, proving ciphertext never reaches the wire."""
+        host = self._make_host()
+        plaintext_body = {
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "spawn_agent",
+                    "call_id": "c-stream-3",
+                    "arguments": json.dumps({"message": "implement the fix"}),
+                }
+            ],
+            "status": "completed",
+        }
+        host["_serialize_responses_adapter_response"] = MagicMock(
+            return_value=json.dumps(plaintext_body)
+        )
+        host["_raise_codex_auto_agent_malformed_tool_call_text_payload"] = MagicMock(
+            side_effect=AssertionError("should not raise")
+        )
+
+        mock_litellm = MagicMock()
+        mock_litellm.acompletion = AsyncMock(return_value=MagicMock())
+        mock_litellm.LlmProviders.ALIBABA_TOKEN_PLAN.value = "alibaba_token_plan"
+        host["litellm"] = mock_litellm
+
+        codex_candidate_calls.install(host)
+
+        mock_config = MagicMock()
+        mock_config.transform_chat_completion_response_to_responses_api_response.return_value = (
+            self._make_plaintext_response()
+        )
+
+        with unittest.mock.patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig",
+            mock_config,
+        ):
+            await host["_perform_codex_alibaba_token_plan_adapter_call"](
+                **self._call_kwargs(stream=True)
+            )
+
+        # Collect all SSE bytes from the mock emitter
+        all_sse_text = ""
+        for body in host["_sse_bodies"]:
+            all_sse_text += json.dumps(body)
+        assert "gAAAA" not in all_sse_text
+        assert "implement the fix" in all_sse_text
