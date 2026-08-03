@@ -1254,3 +1254,102 @@ async def test_installed_host_facade_patch_reaches_candidate_loader(
                 else [],
             )
         )
+
+
+def _empty_new_task_envelope() -> str:
+    return (
+        "Message Type: NEW_TASK\n"
+        "Task name: cfg-004-live\n"
+        "Sender: parent-agent\n"
+        "Payload:"
+    )
+
+
+def _encrypted_agent_message_item(
+    visible_text: str,
+    payload_part: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "type": "agent_message",
+        "content": [
+            {"type": "input_text", "text": visible_text},
+            payload_part,
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_normalize_codex_request_restores_encrypted_new_task_payload() -> None:
+    captured: dict[str, Any] = {}
+
+    def _capturing_transform(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return {}
+
+    rt = normalization.Runtime(
+        clean_secret_string=_clean_secret,
+        merge_metadata=_merge_metadata_for_tools,
+        add_logging_metadata=lambda body, **_kwargs: body,
+        build_span=lambda **kwargs: kwargs,
+        transform_responses_api_request_to_chat_completion_request=(
+            _capturing_transform
+        ),
+        async_responses_api_session_handler=_async_empty_payload,
+        iterate_responses_sse_events=_iterate_events,
+        coerce_namespace_to_mapping=lambda value: value,
+        responses_output_item_has_meaningful_content=_meaningful_output,
+        streaming_response_factory=StreamingResponse,
+    )
+    envelope = _empty_new_task_envelope()
+    payload = "Implement the CFG-004 fix."
+    body: dict[str, Any] = {
+        "model": "opencode/big-pickle",
+        "input": [
+            _encrypted_agent_message_item(
+                envelope,
+                {"type": "encrypted_content", "encrypted_content": payload},
+            )
+        ],
+    }
+    original_body = json.loads(json.dumps(body))
+
+    await normalization.normalize_codex_request(
+        rt,
+        body,
+        adapter_model="big-pickle",
+    )
+
+    assert captured["input"] == [
+        {
+            "type": "agent_message",
+            "content": [
+                {"type": "input_text", "text": f"{envelope}\n{payload}"},
+            ],
+        }
+    ]
+    assert body == original_body
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        _encrypted_agent_message_item(
+            "visible text without envelope match",
+            {"type": "encrypted_content", "encrypted_content": "payload"},
+        ),
+        {
+            "type": "agent_message",
+            "content": [
+                {"type": "input_text", "text": _empty_new_task_envelope()},
+                {"type": "encrypted_content", "encrypted_content": "payload"},
+                {"type": "input_text", "text": "extra"},
+            ],
+        },
+    ],
+)
+def test_restore_codex_agent_message_payloads_preserves_nonmatching(
+    item: dict[str, Any],
+) -> None:
+    body: dict[str, Any] = {"model": "opencode/big-pickle", "input": [item]}
+
+    assert normalization._restore_codex_agent_message_payloads(body) is body

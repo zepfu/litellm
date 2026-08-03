@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -482,6 +483,84 @@ def sanitize_completion_messages_for_chat_completion(
     return updated_kwargs, changes
 
 
+_CODEX_AGENT_MESSAGE_EMPTY_PAYLOAD_PATTERN = re.compile(
+    r"\AMessage Type: (?:NEW_TASK|MESSAGE)\n"
+    r"Task name: [^\n]+\n"
+    r"Sender: [^\n]+\n"
+    r"Payload:\n?\Z"
+)
+
+
+def _restore_codex_agent_message_payloads(
+    request_body: Payload,
+) -> Payload:
+    """Materialize encrypted Codex task payloads into visible input text.
+
+    Codex parent agents dispatch subagent assignments as ``agent_message``
+    items whose visible ``input_text`` is an empty ``NEW_TASK``/``MESSAGE``
+    envelope while the real assignment lives in a second
+    ``encrypted_content`` part.  Restore the payload before the generic
+    Responses-to-chat conversion so OpenCode models observe the full task.
+    Non-matching items and malformed shapes are preserved unchanged.
+    """
+
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
+        return request_body
+
+    updated_input_items: list[object] = []
+    restored_count = 0
+    for item in input_items:
+        if not isinstance(item, dict) or item.get("type") != "agent_message":
+            updated_input_items.append(item)
+            continue
+
+        content = item.get("content")
+        if not isinstance(content, list) or len(content) != 2:
+            updated_input_items.append(item)
+            continue
+
+        visible_part = content[0]
+        payload_part = content[1]
+        if not isinstance(visible_part, dict) or not isinstance(payload_part, dict):
+            updated_input_items.append(item)
+            continue
+        if visible_part.get("type") not in {"input_text", "text"}:
+            updated_input_items.append(item)
+            continue
+        visible_text = visible_part.get("text")
+        if not isinstance(visible_text, str) or not (
+            _CODEX_AGENT_MESSAGE_EMPTY_PAYLOAD_PATTERN.fullmatch(visible_text)
+        ):
+            updated_input_items.append(item)
+            continue
+        if payload_part.get("type") != "encrypted_content":
+            updated_input_items.append(item)
+            continue
+        payload = payload_part.get("encrypted_content")
+        if not isinstance(payload, str) or not payload:
+            updated_input_items.append(item)
+            continue
+
+        separator = "" if visible_text.endswith("\n") else "\n"
+        updated_item = dict(item)
+        updated_item["content"] = [
+            {
+                "type": visible_part.get("type"),
+                "text": f"{visible_text}{separator}{payload}",
+            }
+        ]
+        updated_input_items.append(updated_item)
+        restored_count += 1
+
+    if restored_count == 0:
+        return request_body
+
+    updated_body = dict(request_body)
+    updated_body["input"] = updated_input_items
+    return updated_body
+
+
 async def normalize_codex_request(
     runtime: Runtime,
     prepared_request_body: Payload,
@@ -491,6 +570,7 @@ async def normalize_codex_request(
     """Normalize OpenAI Responses input for OpenCode chat completions."""
     requested_model = prepared_request_body.get("model")
     request_body: Payload = copy.deepcopy(prepared_request_body)
+    request_body = _restore_codex_agent_message_payloads(request_body)
     request_body["model"] = adapter_model
     removed_format = request_body.pop("format", None)
     request_body = strip_unsupported_responses_tools(runtime, request_body)
