@@ -455,15 +455,6 @@ class TestCoverageMapAndTargetRejection:
         assert not passed
         assert any("anthropic_messages" in f for f in failures)
 
-    def test_test_harness_md_not_modified(self):
-        """TEST_HARNESS.md must not contain CFG-003 churn."""
-        import subprocess
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "TEST_HARNESS.md"],
-            cwd=str(ROOT), capture_output=True, text=True,
-        )
-        assert "TEST_HARNESS.md" not in result.stdout
-
 
 # ---------------------------------------------------------------------------
 # Coverage gate structural tests

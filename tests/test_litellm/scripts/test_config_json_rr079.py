@@ -163,7 +163,6 @@ def test_config_declares_target_profiles(config) -> None:
     dev = profiles["dev"]
     assert dev["litellm_base_url"] == "http://127.0.0.1:4001"
     assert dev["anthropic_base_url"] == "http://127.0.0.1:4001/anthropic"
-    assert dev["gemini_base_url"] == "http://127.0.0.1:4001/gemini"
     assert dev["codex_profile"] == "litellm-dev"
     assert dev["docker_container_name"] == "litellm-dev"
     assert dev["expected_trace_environment"] == "dev"
@@ -171,7 +170,6 @@ def test_config_declares_target_profiles(config) -> None:
     prod = profiles["prod"]
     assert prod["litellm_base_url"] == "http://127.0.0.1:4000"
     assert prod["anthropic_base_url"] == "http://127.0.0.1:4000/anthropic"
-    assert prod["gemini_base_url"] == "http://127.0.0.1:4000/gemini"
     assert prod["codex_profile"] == "litellm"
     assert prod["docker_container_name"] == "aawm-litellm"
     assert prod["expected_trace_environment"] == "prod"

@@ -80,11 +80,6 @@ _CHILD_ENV_ALLOW_PREFIXES = (
     "CLAUDE_",
     "CODEX_",
     "OPENAI_",
-    "GEMINI_",
-    "GOOGLE_",
-    "GOOGLE_GENAI_",
-    "GCLOUD_",
-    "CLOUDSDK_",
     "XAI_",
 )
 # Narrow non-secret LiteLLM routing / logging knobs only. Do NOT add a broad
@@ -193,7 +188,7 @@ def _is_denied_child_env_key(key: str) -> bool:
 
     Distinction:
     - Provider prefixes (ANTHROPIC_/OPENAI_/CODEX_/…): intentional allow of
-      env-based CLI credentials (API keys/tokens) so codex/claude/gemini can
+      env-based CLI credentials (API keys/tokens) so codex/claude can
       authenticate without a file-based login when the operator has only env auth.
     - LITELLM_*: default-deny except the narrow non-secret routing allowlist in
       ``_CHILD_ENV_ALLOW_KEYS``. ``LITELLM_MASTER_KEY`` and other proxy admin
@@ -339,7 +334,6 @@ BUILT_IN_TARGET_PROFILES: dict[str, dict[str, str]] = {
     "dev": {
         "litellm_base_url": "http://127.0.0.1:4001",
         "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
-        "gemini_base_url": "http://127.0.0.1:4001/gemini",
         "codex_profile": "litellm-dev",
         "docker_container_name": "litellm-dev",
         "expected_trace_environment": "dev",
@@ -347,7 +341,6 @@ BUILT_IN_TARGET_PROFILES: dict[str, dict[str, str]] = {
     "prod": {
         "litellm_base_url": "http://127.0.0.1:4000",
         "anthropic_base_url": "http://127.0.0.1:4000/anthropic",
-        "gemini_base_url": "http://127.0.0.1:4000/gemini",
         "codex_profile": "litellm",
         "docker_container_name": "aawm-litellm",
         "expected_trace_environment": "prod",
@@ -358,7 +351,6 @@ _DOCKER_SUBPROCESS_TIMEOUT_SECONDS = 15
 _TARGET_PROFILE_REQUIRED_KEYS = (
     "litellm_base_url",
     "anthropic_base_url",
-    "gemini_base_url",
     "codex_profile",
     "docker_container_name",
     "expected_trace_environment",
@@ -548,14 +540,12 @@ def _apply_target_profile(config: dict[str, Any], profile: dict[str, str]) -> No
 
     Codex: rewrites the ``-p <profile>`` argument.
     Claude: rewrites ``env.ANTHROPIC_BASE_URL``.
-    Gemini: injects ``env.CODE_ASSIST_ENDPOINT`` (OAuth Code Assist contract).
     All families: ``expected_trace_environment`` is set from the profile.
     """
     config["litellm_base_url"] = profile["litellm_base_url"]
     expected_env = profile["expected_trace_environment"]
     codex = _require_family_config(config, "codex")
     claude = _require_family_config(config, "claude")
-    gemini = _require_family_config(config, "gemini")
 
     # --- Codex: rewrite -p <profile> in command (fail closed) ---
     codex["expected_trace_environment"] = expected_env
@@ -606,11 +596,6 @@ def _apply_target_profile(config: dict[str, Any], profile: dict[str, str]) -> No
             )
         mode_cfg["expected_trace_environment"] = expected_env
         mode_env["ANTHROPIC_BASE_URL"] = profile["anthropic_base_url"]
-
-    # --- Gemini: inject CODE_ASSIST_ENDPOINT for OAuth routing ---
-    gemini["expected_trace_environment"] = expected_env
-    gemini_env = gemini.setdefault("env", {})
-    gemini_env["CODE_ASSIST_ENDPOINT"] = profile["gemini_base_url"]
 
 
 def _resolve_langfuse_credentials(
@@ -1080,10 +1065,6 @@ def _route_family_candidates_for_request_route(route: str) -> set[str]:
 
     if route_lower in {"anthropic/v1/messages", "anthropic/messages", "v1/messages"}:
         candidates.add("anthropic_messages")
-    if route_lower.startswith("gemini/") and "streamgeneratecontent" in route_lower:
-        candidates.add("gemini_stream_generate_content")
-    elif route_lower.startswith("gemini/") and "generatecontent" in route_lower:
-        candidates.add("gemini_generate_content")
     if route_lower.startswith("openai_passthrough/") and route_lower.endswith(
         "responses"
     ):
@@ -2066,19 +2047,6 @@ def _validate_logged_request_source_files(  # noqa: PLR0915 - Bounded procedural
     return summary, failures
 
 
-def _observation_has_gemini_thought_signature(observation: dict[str, Any]) -> bool:
-    output = observation.get("output")
-    if not isinstance(output, dict):
-        return False
-    provider_specific_fields = output.get("provider_specific_fields")
-    if not isinstance(provider_specific_fields, dict):
-        return False
-    thought_signatures = provider_specific_fields.get("thought_signatures")
-    return isinstance(thought_signatures, list) and any(
-        isinstance(value, str) and value.strip() for value in thought_signatures
-    )
-
-
 def _extract_claude_thinking_blocks(observation: dict[str, Any]) -> list[dict[str, Any]]:
     output = observation.get("output")
     if not isinstance(output, dict):
@@ -2597,158 +2565,6 @@ def _validate_codex(
     }
 
 
-def _validate_gemini(
-    config: dict[str, Any],
-    *,
-    query_url: str,
-    public_key: str,
-    secret_key: str,
-) -> dict[str, Any]:
-    started = _utcnow()
-    run = _run_command(
-        config["command"],
-        extra_env=config.get("env"),
-        timeout_seconds=int(config.get("timeout_seconds", 300)),
-    )
-    _record_family_run_evidence(run)
-    command_session_id = _extract_command_session_id(run["stdout"])
-    post_run_wait_seconds = float(config.get("post_run_wait_seconds", 0) or 0)
-    if post_run_wait_seconds > 0:
-        time.sleep(post_run_wait_seconds)
-    expected_trace_names = config.get("expected_trace_names", [])
-    expected_user_ids = config.get("expected_user_ids", [])
-    traces = _poll_langfuse_named_traces(
-        query_url=query_url,
-        public_key=public_key,
-        secret_key=secret_key,
-        names=expected_trace_names,
-        user_id=expected_user_ids[0] if expected_user_ids else None,
-        start_time=started,
-        limit=100,
-        timeout_seconds=int(config.get("langfuse_poll_timeout_seconds", 45)),
-    )
-    actual_trace_names = sorted({trace.get("name") for trace in traces if trace.get("name")})
-    actual_user_ids = sorted({trace.get("userId") for trace in traces if trace.get("userId")})
-    trace_ids = [trace.get("id") for trace in traces if trace.get("id")]
-    failures: list[str] = []
-    warnings: list[str] = []
-    if run.get("timed_out"):
-        failures.append(
-            f"gemini command timed out after {run.get('timeout_seconds', '?')}s"
-        )
-    elif run["exit_code"] != 0:
-        failures.append("gemini command failed")
-    failures.extend(
-        _enforce_minimum_trace_count(family="gemini", traces=traces, config=config)
-    )
-    for name in expected_trace_names:
-        if name not in actual_trace_names:
-            failures.append(f"missing Gemini trace name: {name}")
-    for user_id in expected_user_ids:
-        if user_id not in actual_user_ids:
-            failures.append(f"missing Gemini user id: {user_id}")
-    skip_quality_checks, allow_zero_cost = _generation_quality_flags(config)
-    (
-        raw_generation_observations,
-        generation_observations,
-        generation_failures,
-    ) = _validate_generation_observations(
-        family="gemini",
-        query_url=query_url,
-        public_key=public_key,
-        secret_key=secret_key,
-        trace_ids=trace_ids,
-        start_time=started,
-        allowed_request_routes=config.get("allowed_generation_routes"),
-        skip_quality_checks=skip_quality_checks,
-        allow_zero_cost=allow_zero_cost,
-        allow_reference_cost_when_invoice_unknown=bool(
-            config.get("allow_reference_cost_when_invoice_unknown")
-        ),
-    )
-    failures.extend(generation_failures)
-    filtered_trace_ids = sorted(
-        {
-            observation.get("traceId")
-            for observation in raw_generation_observations
-            if isinstance(observation.get("traceId"), str)
-        }
-    )
-    filtered_traces = [
-        trace for trace in traces if trace.get("id") in set(filtered_trace_ids)
-    ]
-    trace_enrichment_summary, trace_enrichment_failures, trace_enrichment_warnings = _validate_trace_enrichment(
-        family="gemini",
-        traces=filtered_traces,
-        required_tags=config.get("required_trace_tags"),
-        required_tag_prefixes=config.get("required_trace_tag_prefixes"),
-        warning_tag_prefixes=config.get("warning_trace_tag_prefixes"),
-    )
-    failures.extend(trace_enrichment_failures)
-    warnings.extend(trace_enrichment_warnings)
-    trace_context_summary, trace_context_failures = _validate_trace_context(
-        family="gemini",
-        traces=filtered_traces,
-        expected_environment=config.get("expected_trace_environment"),
-        require_trace_session_id=bool(config.get("require_trace_session_id")),
-        expected_trace_session_id=(
-            command_session_id
-            if config.get("match_trace_session_id_from_stdout")
-            else config.get("expected_trace_session_id")
-        ),
-        require_trace_ids_distinct_from_session_ids=bool(
-            config.get("require_trace_ids_distinct_from_session_ids")
-        ),
-    )
-    failures.extend(trace_context_failures)
-    generation_metadata_summary, generation_metadata_failures = _validate_generation_metadata(
-        family="gemini",
-        observations=raw_generation_observations,
-        required_metadata_truthy=config.get("required_generation_metadata_truthy"),
-        required_metadata_minimums=config.get("required_generation_metadata_minimums"),
-    )
-    failures.extend(generation_metadata_failures)
-    _, span_observations, span_failures = _validate_span_observations(
-        family="gemini",
-        query_url=query_url,
-        public_key=public_key,
-        secret_key=secret_key,
-        trace_ids=filtered_trace_ids,
-        start_time=started,
-        required_names=config.get("required_span_names"),
-    )
-    failures.extend(span_failures)
-    gemini_signature_observed = any(
-        _observation_has_gemini_thought_signature(observation)
-        for observation in raw_generation_observations
-    )
-    if not gemini_signature_observed:
-        failures.append("gemini missing thought_signatures in logged generation output")
-    return {
-        **run,
-        "streaming_checked": config.get("streaming_checked", False),
-        "langfuse": {
-            "expected_trace_names": expected_trace_names,
-            "actual_trace_names": actual_trace_names,
-            "expected_user_ids": expected_user_ids,
-            "actual_user_ids": actual_user_ids,
-            "trace_ids": trace_ids,
-            "trace_count": len(traces),
-            "filtered_trace_ids": filtered_trace_ids,
-            "command_session_id": command_session_id,
-            "trace_context": trace_context_summary,
-            "trace_enrichment": trace_enrichment_summary,
-            "generation_metadata": generation_metadata_summary,
-            "span_observations": span_observations,
-            "thought_signature_observed": gemini_signature_observed,
-            "generation_observations": generation_observations,
-        },
-        "passed": not failures,
-        "failures": sorted(set(failures)),
-        "warnings": sorted(set(warnings)),
-    }
-
-
 def _validate_claude(  # noqa: PLR0915 - Bounded family acceptance validator.
     config: dict[str, Any],
     *,
@@ -3137,7 +2953,7 @@ _HEALTH_READINESS_PATH = "/health/readiness"
 
 # Providers excluded from eligibility for the transactional swap test.
 _TRANSACTIONAL_SWAP_EXCLUDED_PROVIDERS = frozenset(
-    {"anthropic", "xai", "google", "gemini"}
+    {"anthropic", "xai"}
 )
 
 # Fields that must never appear in persisted artifacts.
@@ -4881,15 +4697,6 @@ def main() -> int:
         "codex",
         _validate_codex,
         config["codex"],
-        query_url=query_url,
-        public_key=public_key,
-        secret_key=secret_key,
-    )
-
-    artifact["results"]["gemini"] = _run_family_with_evidence(
-        "gemini",
-        _validate_gemini,
-        config["gemini"],
         query_url=query_url,
         public_key=public_key,
         secret_key=secret_key,

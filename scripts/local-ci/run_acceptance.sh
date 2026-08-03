@@ -118,7 +118,6 @@ exclude_prefixes = [
     ".analysis/",
     "captures/",
     "scripts/local-ci/",
-    ".gemini/",
     ".codex/",
     ".venv/",
     "venv/",

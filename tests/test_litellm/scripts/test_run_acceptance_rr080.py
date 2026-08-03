@@ -470,7 +470,7 @@ def test_should_expand_config_dir_placeholder_when_loading_suite(ra, tmp_path: P
 
 
 def _base_config() -> dict:
-    """Minimal config with all three families for target rewriting tests."""
+    """Minimal config with codex/claude families for target rewriting tests."""
     return {
         "suite_version": 1,
         "litellm_base_url": "http://127.0.0.1:4000",
@@ -488,10 +488,6 @@ def _base_config() -> dict:
                     "expected_trace_environment": "prod",
                 },
             },
-        },
-        "gemini": {
-            "command": ["gemini", "-p", "hi", "--output-format", "json"],
-            "expected_trace_environment": "prod",
         },
     }
 
@@ -522,13 +518,6 @@ def test_dev_target_rewrites_all_families(ra) -> None:
         == "dev"
     )
 
-    # Gemini: CODE_ASSIST_ENDPOINT injected
-    assert (
-        config["gemini"]["env"]["CODE_ASSIST_ENDPOINT"]
-        == "http://127.0.0.1:4001/gemini"
-    )
-    assert config["gemini"]["expected_trace_environment"] == "dev"
-
     # Top-level base URL rewritten
     assert config["litellm_base_url"] == "http://127.0.0.1:4001"
 
@@ -548,10 +537,6 @@ def test_prod_target_preserves_prod_routes(ra) -> None:
     assert (
         config["claude"]["env"]["ANTHROPIC_BASE_URL"]
         == "http://127.0.0.1:4000/anthropic"
-    )
-    assert (
-        config["gemini"]["env"]["CODE_ASSIST_ENDPOINT"]
-        == "http://127.0.0.1:4000/gemini"
     )
     assert config["litellm_base_url"] == "http://127.0.0.1:4000"
 
@@ -577,7 +562,6 @@ def test_config_target_profiles_override_built_in(ra) -> None:
         "dev": {
             "litellm_base_url": "http://10.0.0.1:4001",
             "anthropic_base_url": "http://10.0.0.1:4001/anthropic",
-            "gemini_base_url": "http://10.0.0.1:4001/gemini",
             "codex_profile": "custom-dev",
             "docker_container_name": "custom-dev",
             "expected_trace_environment": "dev",
@@ -697,7 +681,7 @@ def test_run_command_timeout_empty_partial(ra, monkeypatch) -> None:
         raise subprocess.TimeoutExpired(cmd=cmd, timeout=10)
 
     with patch.object(ra.subprocess, "run", side_effect=fake_run):
-        result = ra._run_command(["gemini", "-p", "hi"], timeout_seconds=10)
+        result = ra._run_command(["claude", "-p", "hi"], timeout_seconds=10)
 
     assert result["timed_out"] is True
     assert result["stdout"] == ""
@@ -965,7 +949,6 @@ def test_custom_profile_url_is_used_for_inference(ra, monkeypatch) -> None:
         "custom": {
             "litellm_base_url": "http://10.0.0.1:4100",
             "anthropic_base_url": "http://10.0.0.1:4100/anthropic",
-            "gemini_base_url": "http://10.0.0.1:4100/gemini",
             "codex_profile": "litellm-custom",
             "docker_container_name": "litellm-custom",
             "expected_trace_environment": "custom",
@@ -1210,7 +1193,6 @@ def test_non_string_required_target_values_are_rejected(
     [
         ("codex", None),
         ("claude", []),
-        ("gemini", "invalid"),
     ],
 )
 def test_missing_or_non_object_families_are_rejected(
@@ -1232,10 +1214,10 @@ def test_family_commands_must_be_non_empty_lists_of_strings(
     ra, invalid_command
 ) -> None:
     config = _base_config()
-    config["gemini"]["command"] = invalid_command
+    config["codex"]["command"] = invalid_command
     profile = {**ra.BUILT_IN_TARGET_PROFILES["dev"], "target_name": "dev"}
 
-    with pytest.raises(SystemExit, match=r"gemini\.command.*list\[str\]"):
+    with pytest.raises(SystemExit, match=r"codex\.command.*list\[str\]"):
         ra._apply_target_profile(config, profile)
 
 
@@ -1267,7 +1249,6 @@ def test_multiple_codex_profile_flags_are_rejected(ra) -> None:
         lambda config: config["claude"]["fanout_modes"]["minimal"].update(
             {"command": ["claude", 3]}
         ),
-        lambda config: config["gemini"].update({"env": []}),
     ],
 )
 def test_env_and_fanout_shapes_are_rejected(ra, mutation) -> None:
@@ -1284,7 +1265,7 @@ def test_resolve_target_json_validates_full_executable_config(
 ) -> None:
     monkeypatch.delenv("LITELLM_BASE_URL", raising=False)
     config = _base_config()
-    del config["gemini"]
+    del config["claude"]
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
     args = SimpleNamespace(
@@ -1297,7 +1278,7 @@ def test_resolve_target_json_validates_full_executable_config(
     )
 
     with patch.object(ra.argparse.ArgumentParser, "parse_args", return_value=args):
-        with pytest.raises(SystemExit, match="requires `gemini`"):
+        with pytest.raises(SystemExit, match="requires `claude`"):
             ra.main()
 
 
@@ -1307,7 +1288,6 @@ def test_resolve_target_json_validates_full_executable_config(
         "expected_url",
         "expected_codex_profile",
         "expected_anthropic_url",
-        "expected_gemini_url",
         "expected_environment",
     ),
     [
@@ -1316,7 +1296,6 @@ def test_resolve_target_json_validates_full_executable_config(
             "http://127.0.0.1:4001",
             "litellm-dev",
             "http://127.0.0.1:4001/anthropic",
-            "http://127.0.0.1:4001/gemini",
             "dev",
         ),
         (
@@ -1324,7 +1303,6 @@ def test_resolve_target_json_validates_full_executable_config(
             "http://127.0.0.1:4000",
             "litellm",
             "http://127.0.0.1:4000/anthropic",
-            "http://127.0.0.1:4000/gemini",
             "prod",
         ),
     ],
@@ -1337,7 +1315,6 @@ def test_main_artifact_uses_resolved_profile_and_omits_credentials(
     expected_url,
     expected_codex_profile,
     expected_anthropic_url,
-    expected_gemini_url,
     expected_environment,
 ) -> None:
     monkeypatch.delenv("LITELLM_BASE_URL", raising=False)
@@ -1387,7 +1364,6 @@ def test_main_artifact_uses_resolved_profile_and_omits_credentials(
             return_value=("pk-container-secret", "sk-container-secret"),
         ),
         patch.object(ra, "_validate_codex", side_effect=codex_failure),
-        patch.object(ra, "_validate_gemini", side_effect=successful_family("gemini")),
         patch.object(ra, "_validate_claude", side_effect=successful_family("claude")),
         patch.object(ra, "_docker_status", return_value="mocked"),
         patch.object(ra, "_git_value", return_value="mocked"),
@@ -1414,7 +1390,6 @@ def test_main_artifact_uses_resolved_profile_and_omits_credentials(
         ]
         == expected_anthropic_url
     )
-    assert captured["gemini"]["env"]["CODE_ASSIST_ENDPOINT"] == expected_gemini_url
     assert artifact["results"]["codex"]["phase"] == "observability_validation"
     assert artifact["results"]["codex"]["exit_code"] == 0
     assert artifact["results"]["codex"]["stdout"] == "codex routed"

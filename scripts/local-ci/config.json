@@ -9,7 +9,6 @@
     "dev": {
       "litellm_base_url": "http://127.0.0.1:4001",
       "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
-      "gemini_base_url": "http://127.0.0.1:4001/gemini",
       "codex_profile": "litellm-dev",
       "docker_container_name": "litellm-dev",
       "expected_trace_environment": "dev"
@@ -17,7 +16,6 @@
     "prod": {
       "litellm_base_url": "http://127.0.0.1:4000",
       "anthropic_base_url": "http://127.0.0.1:4000/anthropic",
-      "gemini_base_url": "http://127.0.0.1:4000/gemini",
       "codex_profile": "litellm",
       "docker_container_name": "aawm-litellm",
       "expected_trace_environment": "prod"
@@ -66,61 +64,6 @@
       "codex_prompt_cache_key_present"
     ],
     "streaming_checked": false,
-    "timeout_seconds": 180
-  },
-  "gemini": {
-    "command": [
-      "gemini",
-      "-p",
-      "Reply with exactly two words: gemini routed",
-      "--output-format",
-      "json"
-    ],
-    "expected_trace_names": [
-      "gemini"
-    ],
-    "expected_user_ids": [
-      "litellm"
-    ],
-    "expected_trace_environment": "prod",
-    "require_trace_session_id": true,
-    "require_trace_ids_distinct_from_session_ids": true,
-    "match_trace_session_id_from_stdout": true,
-    "post_run_wait_seconds": 8,
-    "allowed_generation_routes": [
-      "/gemini/v1internal:generateContent",
-      "/gemini/v1internal:streamGenerateContent"
-    ],
-    "required_trace_tags": [
-      "route:gemini_generate_content",
-      "gemini-thinking-config-present",
-      "gemini-thinking-budget-configured",
-      "gemini-thought-signature",
-      "gemini-thought-signature-decoded",
-      "thinking-signature-present",
-      "thinking-signature-decoded",
-      "reasoning-empty",
-      "thinking-blocks-empty"
-    ],
-    "required_trace_tag_prefixes": [
-      "gemini-tsig-records:",
-      "gemini-tsig-shape:"
-    ],
-    "required_span_names": [
-      "gemini.thought_signature_decode"
-    ],
-    "required_generation_metadata_truthy": [
-      "passthrough_route_family",
-      "gemini_thinking_config_present",
-      "gemini_thought_signature_present",
-      "gemini_tsig_shape_hash"
-    ],
-    "required_generation_metadata_minimums": {
-      "gemini_thinking_budget": 1,
-      "gemini_thought_signature_count": 1,
-      "gemini_tsig_record_count": 1
-    },
-    "streaming_checked": true,
     "timeout_seconds": 180
   },
   "claude": {

@@ -150,7 +150,6 @@ def test_should_render_repo_config_without_machine_home_paths(bhb) -> None:
     # Other harness keys remain intact.
     assert cfg.get("suite_version") is not None
     assert "codex" in cfg
-    assert "gemini" in cfg
 
 
 def test_should_package_portable_config_in_bundle_tarball(bhb, tmp_path: Path) -> None:

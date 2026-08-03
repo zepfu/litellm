@@ -113,27 +113,6 @@ D1251_PARALLEL_CASE_AGENTS = {
         "opencode_zen/big-pickle",
     ),
 }
-FORBIDDEN_D1251_GEMINI_CASE_MODELS = {
-    "google/gemini-3.1-flash-lite-preview",
-    "google/gemini-3-flash-preview",
-    "google/gemini-3.1-pro-preview",
-}
-FORBIDDEN_D1251_GOOGLE_CHILD_PARALLEL_MODEL_PREFIXES = {
-    "google/gemma",
-    "openrouter/google/gemma",
-}
-
-
-def _is_forbidden_d1251_child_parallel_model(model: str) -> bool:
-    model = model.lower()
-    if model in FORBIDDEN_D1251_GEMINI_CASE_MODELS:
-        return True
-    return any(
-        model.startswith(prefix)
-        for prefix in FORBIDDEN_D1251_GOOGLE_CHILD_PARALLEL_MODEL_PREFIXES
-    )
-
-
 D1251_REQUIRED_TRACE_TAGS = {
     "openai": {"route:anthropic_openai_responses_adapter"},
     "openrouter": {"route:anthropic_openrouter_responses_adapter"},
@@ -267,44 +246,6 @@ D1322_AAWM_LOW_CODEX_DECLARED_PROVIDER_MODELS = {
     ("openai", "gpt-5.4-mini"),
 }
 
-REMOVED_GEMINI_HARNESS_CASES = {
-    "native_gemini_passthrough_generate_content",
-    "native_gemini_passthrough_stream_generate_content",
-    "claude_adapter_gemini31_pro_read_tool_id_sanitizer",
-    "claude_adapter_gemini31_pro_bash_then_read_stream_state",
-    "claude_adapter_gemini31_pro_child_sequential_core_tools",
-    "claude_adapter_gemini31_pro_child_parallel_read_tools",
-    "claude_adapter_gemini3_flash_child_sequential_core_tools",
-    "claude_adapter_gemini3_flash_child_parallel_read_tools",
-    "claude_adapter_gemini_output_config_effort",
-    "claude_adapter_gemini_output_config_minimal_effort",
-    "claude_adapter_gemini_output_config_max_effort",
-    "claude_adapter_gemini_output_config_minimal_effort_cache",
-    "claude_adapter_gemini_output_config_max_effort_cache",
-    "claude_adapter_gemini_fanout",
-    "claude_adapter_gemini31_pro",
-    "claude_adapter_gemini31_flash",
-    "claude_adapter_gemma_31b",
-    "claude_adapter_gemma_26b_a4b",
-}
-ACTIVE_ANTHROPIC_HARNESS_SURFACES = (
-    HARNESS_PATH,
-    ANTHROPIC_ADAPTER_CONFIG_PATH,
-    ROOT / "scripts" / "local-ci" / "README.md",
-)
-FORBIDDEN_ACTIVE_GEMINI_HARNESS_SNIPPETS = (
-    ".gemini",
-    "@google/gemini-cli",
-    "gemini_oauth",
-    "litellm_gemini",
-    "gemini_cli",
-    '"cli_passthrough": "gemini"',
-    "'cli_passthrough': 'gemini'",
-    '"gemini", "prompt"',
-    "google_code_assist",
-    "google/gemini",
-    "google/gemma",
-)
 DIRECT_ANTHROPIC_MODEL_PATTERN = re.compile(
     r"(?:^|[/:\s])anthropic(?:[/:\s]|$)|^aawm-.+-anthropic$",
     re.IGNORECASE,
@@ -3561,42 +3502,6 @@ def test_default_suite_keeps_peeromega_fanout_and_native_anthropic_rate_limit_ga
     assert "anthropic_unified_7d:7d" in quota_keys
 
 
-def test_anthropic_adapter_config_removes_gemini_harness_cases():
-    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
-
-    assert REMOVED_GEMINI_HARNESS_CASES.isdisjoint(config["cases"])
-    assert REMOVED_GEMINI_HARNESS_CASES.isdisjoint(config["default_excluded_cases"])
-    cases_without_d1322_antigravity_low = {
-        name: case_config
-        for name, case_config in config["cases"].items()
-        if name not in D1322_LOW_ALIAS_REPLAY_CASES
-    }
-    serialized_cases = json.dumps(cases_without_d1322_antigravity_low).lower()
-    serialized_excluded_cases = json.dumps(config["default_excluded_cases"]).lower()
-    for forbidden_selector in ("gemini", "google/gemma", "google_code_assist"):
-        assert forbidden_selector not in serialized_cases
-        assert forbidden_selector not in serialized_excluded_cases
-
-
-def test_active_anthropic_adapter_harness_surfaces_do_not_include_gemini_paths():
-    violations = []
-    for path in ACTIVE_ANTHROPIC_HARNESS_SURFACES:
-        text = path.read_text(encoding="utf-8").lower()
-        if path == ANTHROPIC_ADAPTER_CONFIG_PATH:
-            config = json.loads(path.read_text(encoding="utf-8"))
-            config["cases"] = {
-                name: case_config
-                for name, case_config in config["cases"].items()
-                if name not in D1322_LOW_ALIAS_REPLAY_CASES
-            }
-            text = json.dumps(config).lower()
-        for snippet in FORBIDDEN_ACTIVE_GEMINI_HARNESS_SNIPPETS:
-            if snippet in text:
-                violations.append(f"{path.relative_to(ROOT)} contains {snippet}")
-
-    assert violations == []
-
-
 def _collect_codex_case_model_selectors(case_config):
     model_selectors = []
     command = case_config.get("command")
@@ -3640,21 +3545,6 @@ def _collect_codex_case_model_selectors(case_config):
     return model_selectors
 
 
-def _collect_child_parallel_case_models(case_config):
-    models = set()
-    for row in case_config.get("session_history_validation", {}).get("expected_rows", []):
-        if isinstance(row, dict) and isinstance(row.get("model"), str):
-            models.add(row["model"])
-
-    for _, agent_config in case_config.get("claude_agents", {}).items():
-        if isinstance(agent_config, dict) and isinstance(
-            agent_config.get("model"),
-            str,
-        ):
-            models.add(agent_config["model"])
-    return models
-
-
 def test_codex_harness_cases_do_not_directly_select_anthropic_models():
     config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
     violations = []
@@ -3666,14 +3556,8 @@ def test_codex_harness_cases_do_not_directly_select_anthropic_models():
         ):
             continue
 
-        case_text = json.dumps(case_config).lower()
-        antigravity_mediated = "antigravity" in case_name.lower() or (
-            "antigravity" in case_text
-        )
         for source, model in _collect_codex_case_model_selectors(case_config):
-            if DIRECT_ANTHROPIC_MODEL_PATTERN.search(model) and not (
-                antigravity_mediated and "antigravity" in model.lower()
-            ):
+            if DIRECT_ANTHROPIC_MODEL_PATTERN.search(model):
                 violations.append(f"{case_name}:{source}={model}")
 
     assert violations == []
@@ -4803,25 +4687,6 @@ def test_ms012_moonshot_transcript_requires_tool_result_continuation(tmp_path):
     records = summary["agents"][0]["records"]
     assert [record["tool_name"] for record in records] == ["Read", "Grep"]
     assert all(record["tool_result_line"] for record in records)
-
-
-def test_d1251_parallel_read_cases_do_not_include_disallowed_gemini_models():
-    config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
-
-    for case_name, (_, _, persisted_model, _, child_model_selector) in (
-        D1251_PARALLEL_CASE_AGENTS.items()
-    ):
-        for model in (persisted_model, child_model_selector):
-            assert not _is_forbidden_d1251_child_parallel_model(model), (
-                f"{case_name} uses forbidden Gemini/Google model {model}"
-            )
-
-    for case_name, case_config in config["cases"].items():
-        if case_name.endswith("_child_parallel_read_tools"):
-            for model in _collect_child_parallel_case_models(case_config):
-                assert not _is_forbidden_d1251_child_parallel_model(model), (
-                    f"{case_name} uses forbidden Gemini/Google model {model}"
-                )
 
 
 def test_claude_command_uses_settings_overlay_for_harness_headers(monkeypatch):

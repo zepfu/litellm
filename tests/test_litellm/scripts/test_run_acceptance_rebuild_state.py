@@ -99,7 +99,6 @@ def test_fingerprint_exclude_logic_skips_sample_paths() -> None:
         ".analysis/",
         "captures/",
         "scripts/local-ci/",
-        ".gemini/",
         ".codex/",
         ".venv/",
         "venv/",

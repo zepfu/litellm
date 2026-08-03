@@ -113,8 +113,6 @@ def test_non_claude_families_skip_persona_check(compare_artifacts):
     candidate = _family(actual_trace_names=["codex-only"])
     hard, _ = compare_artifacts._compare_family("codex", _family(), candidate)
     assert hard == []
-    hard, _ = compare_artifacts._compare_family("gemini", _family(), candidate)
-    assert hard == []
 
 
 def test_main_reports_hard_failure_for_unenriched_claude(
@@ -123,7 +121,6 @@ def test_main_reports_hard_failure_for_unenriched_claude(
     baseline = {
         "results": {
             "codex": _family(passed=True),
-            "gemini": _family(passed=True),
             "claude": _family(
                 passed=True,
                 actual_trace_names=[
@@ -137,7 +134,6 @@ def test_main_reports_hard_failure_for_unenriched_claude(
     candidate = {
         "results": {
             "codex": _family(passed=True),
-            "gemini": _family(passed=True),
             "claude": _family(
                 passed=True,
                 # Enrichment broken: every trace is the unenriched default.

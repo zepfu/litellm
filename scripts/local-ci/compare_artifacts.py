@@ -77,7 +77,7 @@ def main() -> int:
     hard_failures: list[str] = []
     soft_drift: list[str] = []
 
-    for family in ("codex", "gemini", "claude"):
+    for family in ("codex", "claude"):
         base_family = baseline.get("results", {}).get(family, {})
         cand_family = candidate.get("results", {}).get(family, {})
         hard, soft = _compare_family(family, base_family, cand_family)
