@@ -65,7 +65,7 @@ Current responsibilities:
 - Langfuse trace naming, tenant-only trace user ids, and request-tag normalization
 - stale Claude Code orchestrator trace-header rewrite for dispatched child
   traces while preserving unrelated explicit caller trace names
-- Claude/Gemini reasoning and signature enrichment
+- Claude reasoning and signature enrichment
 - `public.session_history` persistence into the AAWM tristore
 - `public.session_history` latency and response-gap telemetry, including
   `previous_response_to_current_request_ms` for same-session delay between a
@@ -74,13 +74,13 @@ Current responsibilities:
   provider-native tool names
 - repository and tenant fallback attribution for native CLI passthrough rows
   from explicit metadata, `x-aawm-repository`, prepared `litellm_metadata`, and
-  Codex/Gemini workspace context text
+  Codex workspace context text
 - Codex auto-agent alias selected-target, attempt, cooldown, and fallback
   metadata persistence for `session_history`
 - local biomedical REST pass-through attribution for scispaCy and TinyBERN2
   route families
 - background batching for `session_history` writes with configurable batch/flush tuning
-- Gemini/Codex usage breakout normalization for cache, reasoning, and tool-call fields
+- Codex usage breakout normalization for cache, reasoning, and tool-call fields
 - prompt-overhead token breakdown estimates in `public.session_history`,
   including system/provider-equivalent, tool-advertisement, conversation,
   residual/other, and deterministic system-classifier buckets
@@ -160,7 +160,8 @@ Artifact:
 
 Current responsibilities:
 
-- CLI routing and Langfuse trace verification across Codex, Gemini, and Claude
+- CLI routing and Langfuse trace verification across the retained supported CLI
+  providers
 - Claude request rewrite verification, including prompt-shape watchpoints like
   future `verbosity` payload adoption
 - repeatable local regression validation outside the main repo checkout

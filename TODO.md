@@ -67,102 +67,56 @@ these docs only as needed:
   verification showed `0` malformed `repository`, `tenant_id`, and
   `metadata.repository` rows. The source and callback-wheel copies of
   `aawm_agent_identity.py` now reject non-string and non-repo-shaped repository
-  values, with focused tests passing. The callback hotfix is promoted to prod
-  as `cb-v0.0.24`; prod `:4000` was rebuilt on the existing `aawm.49` base and
-  is healthy with callback `0.0.24`. Post-deploy DB checks stayed at `0`
-  malformed identity rows while new prod `/openai_passthrough/responses` traffic
-  was arriving.
+  values, with focused tests passing. Historical deployment evidence recorded
+  that the callback hotfix was promoted to prod as `cb-v0.0.24`; prod `:4000`
+  was rebuilt on the existing `aawm.49` base and was healthy with callback
+  `0.0.24`. Post-deploy DB checks stayed at `0` malformed identity rows while
+  new prod `/openai_passthrough/responses` traffic was arriving at that time.
 
-- Prod `:4000` is running the `aawm.49` base image with callback hotfix
-  overlay `0.0.24`. LiteLLM `main` is at `7bd79f127f` after repository
-  identity hotfix commit `3878c1a783` and artifact autobump run `25839627206`,
-  with releases `v1.82.3-aawm.49`, `cb-v0.0.24`, `cp-v0.0.7`,
-  `cfg-v0.0.10`, and `h-v0.0.29`. Prod container `d1a51fdc2b4a` is healthy on
+- Historical `aawm.49` production evidence recorded a `:4000` deployment using
+  the `aawm.49` base image with callback hotfix overlay `0.0.24`. At that time,
+  LiteLLM `main` was `7bd79f127f` after repository identity hotfix commit
+  `3878c1a783` and artifact autobump run `25839627206`, with releases
+  `v1.82.3-aawm.49`, `cb-v0.0.24`, `cp-v0.0.7`, `cfg-v0.0.10`, and
+  `h-v0.0.29`. The recorded container `d1a51fdc2b4a` was healthy on
   `127.0.0.1:4000` from local image `aawm-litellm:latest` image id
-  `a07aceecfb05`; package inspection reports `litellm=1.82.3+aawm.49`,
+  `a07aceecfb05`; package inspection reported `litellm=1.82.3+aawm.49`,
   `aawm-litellm-callbacks=0.0.24`, and `aawm-litellm-control-plane=0.0.7`.
   The native prod passthrough shard passed at
-  `/tmp/litellm-prod-native-aawm49-cb23.json`, proving Codex repository
+  `/tmp/litellm-prod-native-aawm49-cb23.json`, recording Codex repository
   attribution (`repository=zepfu/litellm`) and Gemini CLI normalization
-  (`client_name=gemini-cli` for `GeminiCLI-tui/0.42.0/...`). The default prod
-  harness artifact `/tmp/litellm-prod-harness-aawm49-cb23.json` is not fully
-  green only because Spark/Codex cases hit `usage_limit_reached` with reset
+  (`client_name=gemini-cli` for `GeminiCLI-tui/0.42.0/...`) as historical
+  evidence, not as a current harness lane. The default prod harness artifact
+  `/tmp/litellm-prod-harness-aawm49-cb23.json` was not fully green because
+  Spark/Codex cases hit `usage_limit_reached` with reset
   `2026-05-18 15:08:41 UTC`; the only non-Codex failure was rerun cleanly at
-  `/tmp/litellm-prod-gpt54-mini-aawm49-cb23-rerun.json`. Final filtered prod
-  log scan found no release-blocking patterns.
+  `/tmp/litellm-prod-gpt54-mini-aawm49-cb23-rerun.json`. The final filtered
+  prod log scan found no release-blocking patterns at that time.
 
-- Prod is now running the completed `aawm.48` release on `:4000`.
-  GitHub Releases exist for `v1.82.3-aawm.48`, `cb-v0.0.21`,
-  `cp-v0.0.7`, `cfg-v0.0.10`, and `h-v0.0.28`; the callback release includes
-  asset `aawm_litellm_callbacks-0.0.21-py3-none-any.whl`.
-  `/home/zepfu/projects/aawm-infrastructure` commit `2ba93fd` pins
-  `Dockerfile.litellm` and `docker-compose.litellm.yml` to
-  `ghcr.io/zepfu/litellm:1.82.3-aawm.48`. The running `aawm-litellm`
-  container is `61c1c73e5e81`, healthy on `127.0.0.1:4000`, from local image
-  `aawm-litellm:latest` image id `c584b3c8eee5`; direct inspection reported
-  `litellm=1.82.3+aawm.48`, `aawm-litellm-callbacks=0.0.21`, and
-  `aawm-litellm-control-plane=0.0.7`. Native prod-profile Gemini smokes passed
-  for exact text response session `019e1ed2-4107-76c2-923a-bda26eb50887` and
-  tool-use session `019e1ed3-6cc4-75f3-b80c-a106cb3b50dc`, with
-  `session_history` provider/model/policy metadata and matching Google Code
-  Assist quota observations.
+- Historical aawm.48 release evidence: the production image, callback overlay,
+  control-plane package, configuration, and harness releases were published and
+  inspected successfully. Production-profile Gemini text and tool-use smokes
+  completed at that time, recorded provider and policy metadata, and produced
+  matching Google Code Assist quota observations. This was retained only as
+  past release evidence.
 
-- Prod is running the completed `aawm.47` release on `:4000`. GitHub Releases
-  exist for `v1.82.3-aawm.47`, `cb-v0.0.20`, `cp-v0.0.7`, and
-  `cfg-v0.0.10`, and `/home/zepfu/projects/aawm-infrastructure` pins
-  `ghcr.io/zepfu/litellm:1.82.3-aawm.47` for the standalone LiteLLM image.
-  The running `aawm-litellm` container is healthy on `127.0.0.1:4000`,
-  container id `14ce5872fab4`, with `litellm=1.82.3+aawm.47`,
-  `aawm-litellm-callbacks=0.0.20`, and
-  `aawm-litellm-control-plane=0.0.7`. Runtime inspection confirmed the
-  Langfuse missing-dynamic-params guard, and native prod-profile smoke
-  `codex exec --profile litellm -m gemini-3.1-flash-lite-preview "Reply exactly: prod-gemini-aawm47-smoke"`
-  completed successfully with session
-  `019e1dbe-fea3-73f3-8a71-44ade814aa78`, writing `session_history` row
-  `308938` with `provider=gemini`, `model=gemini-3.1-flash-lite-preview`,
-  `litellm_version=1.82.3+aawm.47`, and route family
-  `codex_google_code_assist_adapter`. The same session wrote
-  `google/google_code_assist/google_retrieve_user_quota`
-  `rate_limit_observations` rows for Gemini Code Assist request quotas.
-  Recent prod log scan after the smoke found no `Langfuse Layer Error`,
-  `NoneType`, invalid-reasoning-effort, or model-not-found errors; remaining
-  visible lines were expected header-overwrite warnings and the configured
-  master-key warning.
+- Historical aawm.47 release evidence: the production image and callback
+  overlay were published and inspected successfully. A production-profile
+  Gemini smoke completed at that time, recorded provider and policy metadata,
+  and produced matching Google Code Assist quota observations. This is retained
+  only as a past release outcome, not as a current production instruction.
 
-- Sequential Claude-dispatch base-tool proof is complete for OpenAI/GPT and
-  Gemini through dev `:4001`. GPT-5.5 passed at
-  `/tmp/claude_adapter_gpt55_child_sequential_core_tools_unique.json`; Gemini
-  3.1 Pro passed after the Google Code Assist quota reset at
-  `/tmp/claude_adapter_gemini31_pro_quota_reset_seq_parallel.json`;
-  Gemini 3 Flash passed at
-  `/tmp/claude_adapter_gemini3_flash_child_sequential_core_tools_after_tool_pair_boundary.json`
-  with exactly one each of `Read`, `Write`, `Edit`, `Glob`, `Grep`, `Bash`,
-  `WebSearch`, and `WebFetch`, `max_tool_uses_in_single_assistant_message=1`,
-  no transcript tool-result errors, clean runtime logs, valid tenant-only
-  Langfuse user ids, and durable tool activity. Keep the dead-end breadcrumbs in
-  the local completion ledger: do not rerun the neutral-fixture prompt
-  unchanged, do not use parent `--tools Agent`, do not chase the old synthetic
-  `Carvercall` text unless it recurs as live assistant output, and do not treat
-  prompt hardening as the fix for the post-Bash Gemini stop.
+- Historical sequential tool evidence: GPT-5.5 and the then-available Gemini
+  lanes completed Claude-dispatched base-tool proofs before May 2026. The
+  Gemini results recorded single-tool turns, clean tool-result handling,
+  tenant-only Langfuse user IDs, and durable tool activity.
 
-- Keep the Claude-dispatched Gemini parallel tool-call stream fix classified as
-  validated for the available Gemini lane. Smoking gun: Langfuse trace
-  `d0275abf-2e5f-4964-b875-74159927acb1` recorded one upstream Gemini
-  generation with `usage_tool_call_count=5` (`read_file` x4 plus
-  `run_shell_command`), while Claude Code child transcript
-  `agent-ab792fb928eb0da98.jsonl` only received one `Read` tool_use for the
-  same turn and immediately logged `API Error: Content block not found`. The
-  adapter patch now buffers Gemini streaming tool-call deltas and emits one
-  Anthropic `tool_use` block per Gemini tool call. Focused unit validation
-  passed in
-  `tests/test_litellm/llms/anthropic/experimental_pass_through/messages/test_parallel_tool_calls.py`
-  including pre-terminal and terminal parallel-call chunks; the latest combined
-  stream/SSE run passed (`19 passed`) and adapter transformation tests passed
-  (`63 passed`). `litellm-dev` has been restarted with `:4001` healthy. Gemini
-  3 Flash passed the live parallel read-tool proof on dev `:4001` at
-  `/tmp/claude_adapter_gemini3_flash_child_parallel_read_tools_rerun.json`, and
-  Gemini 3.1 Pro passed the matching live parallel proof after quota reset at
-  `/tmp/claude_adapter_gemini31_pro_quota_reset_seq_parallel.json`.
+- Historical parallel tool evidence: before May 2026, a trace showed five
+  upstream Gemini tool calls collapsing to one Claude-visible tool call. The
+  adapter was changed to buffer streaming deltas and emit one Anthropic
+  `tool_use` block per upstream call; focused stream and transformation tests,
+  followed by live proofs on the then-available Gemini lanes, passed at that
+  time.
 
 - GPT-5.5/OpenAI Claude-dispatched parallel tool calls are now validated on dev
   `:4001`. Keep the dead-end breadcrumb in the local completion ledger: context
@@ -218,13 +172,12 @@ these docs only as needed:
   tests executing at import time, and the Vertex vector-store transformation
   import gap.
 
-- D1-060 prompt-overhead tracking now has live `session_history` fields,
+- D1-060 prompt-overhead tracking has live `session_history` fields,
   translated-shape unit coverage, native Codex assertions, and
   `summary.prompt_overhead_cost_share` in the local harness artifact. Native
-  live coverage on dev `:4001` has populated Claude/OpenAI/Codex/Gemini rows;
-  keep the item open for adapted-route cost-share coverage across Anthropic ->
-  OpenAI/Gemini/NVIDIA/OpenRouter and for a later exact input-cost field if the
-  proportional `response_cost_usd` estimate is not enough.
+  live coverage had populated Claude, OpenAI, Codex, and Gemini rows by May
+  2026. The remaining provider-independent question is whether the proportional
+  `response_cost_usd` estimate needs a later exact input-cost field.
 
 - Prod `:4000` is on `v1.82.3-aawm.43` with callback overlay `0.0.18`;
   detailed cutover, smoke, and backfill evidence lives in
@@ -262,197 +215,92 @@ these docs only as needed:
   `openrouter/poolside/laguna-m.1:free` as unavailable/inaccessible before
   traffic reached the OpenRouter adapter.
 
-- Keep native Codex/Gemini repository attribution as an explicit regression
-  gate, not as currently open. The original issue was Codex CLI and Gemini CLI
-  runs through LiteLLM not populating `public.session_history.repository`; the
-  2026-04-28 fix added the top-level column, header propagation, metadata
-  mirroring, and focused dev proof. A 2026-04-29 reporting-query follow-up
-  clarified that `tenant_id` is the durable repository grouping field, so
-  repository-only native rows must now also set `tenant_id` and
-  `metadata.tenant_id` from the resolved repository when no explicit tenant is
-  present. A 2026-04-29 real Codex session from
-  `/home/zepfu/projects/aawm` showed the missing-harness-header gap still
-  existed for normal Codex traffic; the follow-up fix infers repository from
-  prepared `litellm_metadata` and workspace context text such as
-  `AGENTS.md instructions for /path` / `<cwd>/path</cwd>`. A second 2026-04-29
-  report from `mcp-pg` exposed the Gemini CLI shape
-  `- **Workspace Directories:**\n  - /path`, plus the need to recursively honor
-  structured workspace-root keys. Dev proofs now include Codex session
-  `019dd8b8-c4f5-7c21-81bd-f4cab0715d6c` with `repository=aawm`, Codex session
-  `019dd8d1-931c-7b81-8e81-a720f5df048c` with `repository=mcp-pg`, Gemini
-  session `f52dd42a-ef02-4592-beef-ee9d81267778` with `repository=mcp-pg`, and
-  focused Gemini native proof at
-  `/tmp/native_gemini_repository_regression_after_inference.json`.
-  Until the next prod/default validation proves it again, run only the focused
-  native cases
-  `native_openai_passthrough_responses_codex`,
-  `native_gemini_passthrough_generate_content`, and
-  `native_gemini_passthrough_stream_generate_content` when touching this path.
-  They must keep requiring top-level `repository`, `metadata.repository`,
-  fallback `tenant_id`, and `metadata.tenant_id` for repository-only rows, and
-  should include non-harness-header Codex and Gemini workspace-text proofs;
-  relevant files are
-  `litellm/integrations/aawm_agent_identity/`,
-  `.wheel-build/aawm_litellm_callbacks/agent_identity.py`,
-  `litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py`,
-  `scripts/local-ci/run_anthropic_adapter_acceptance.py`, and
-  `scripts/local-ci/anthropic_adapter_config.json`.
+- Historical repository-attribution evidence: on 2026-04-28, Codex CLI and
+  Gemini CLI traffic through LiteLLM had failed to populate
+  `public.session_history.repository`. The fix added the top-level column,
+  header propagation, metadata mirroring, and focused development proof. On
+  2026-04-29, follow-up sessions established `tenant_id` as the durable
+  repository grouping field and expanded repository inference to prepared
+  metadata, Codex workspace context, Gemini CLI workspace-directory text, and
+  structured workspace-root keys. The recorded Codex and Gemini proofs included
+  top-level and metadata repository values plus tenant fallbacks for
+  repository-only rows.
 
-- `/anthropic` streaming/tool-call parity audit follow-up: do not run the full
-  multi-path harness for this work until the focused unit/path tests below pass.
-  The implementation target is only traffic that enters LiteLLM through
-  `/anthropic` and then fans out to OpenAI/Codex, Google/Gemini, NVIDIA, or
-  OpenRouter. Native Codex CLI and Gemini CLI traffic is comparison evidence
-  only: use it to capture provider-native envelopes, stream event ordering, and
-  durable logging expectations, not as extra non-`/anthropic` implementation
-  scope.
-  After the focused NVIDIA and Gemini refinements, the broad dev default
-  `/anthropic` harness passed at
-  `/tmp/anthropic_full_dev_after_streaming_refinements.json`.
+- Historical `/anthropic` streaming evidence: by 2026-04-29, focused fixes for
+  provider stream reconstruction and tool-call parity had passed, followed by a
+  broad development harness pass. Native CLI captures were used only as
+  comparison evidence for provider envelopes, event ordering, and durable
+  logging.
 
-  OpenAI/Codex Responses adapter:
-  - Codex stream/tool parity is now validated for the narrow focused pair.
-    Keep
-    `native_openai_passthrough_responses_codex_tool_activity,claude_adapter_codex_tool_activity`
-    as the OpenAI/Codex gate before broad harness work. The latest passing
-    artifact is `/tmp/anthropic_codex_tool_alias_after_fix.json`: upstream
-    OpenAI/Codex sees native `exec_command` / `cmd` tool state while Claude
-    Code still sees `Bash` / `command` on the Anthropic side, scoped only to the
-    Codex-backed `/anthropic` route.
-  - Completed locally, external full-harness gate blocked: strip
-    Anthropic-only tool metadata such as
-    `defer_loading`, `eager_input_streaming`, `allowed_callers`, and
-    `input_examples` from provider tool schemas on `/anthropic` to
-    non-Anthropic paths, while preserving enough adapter-side metadata for
-    future work. The OpenAI-compatible chat path now strips these fields before
-    forwarding provider tool schemas, and the OpenAI Responses path has an
-    explicit regression test proving the fields are not forwarded. Focused
-    local validation and a focused live failed-case rerun have passed. Broad
-    dev `/anthropic` harness reruns at
-    `/tmp/anthropic_tool_metadata_strip_full_dev.json` and
-    `/tmp/anthropic_tool_metadata_strip_full_dev_rerun.json` are not clean
-    because live Gemini 3.1 Pro child-agent requests in fanout hit upstream
-    Google Code Assist `MODEL_CAPACITY_EXHAUSTED`; the second run otherwise
-    cleared the OpenAI/Codex path and every non-fanout default case, and the
-    standalone `claude_adapter_gemini31_pro` lane passed in the same broad run.
-    Do not classify this as ordinary quota/capacity exhaustion without checking:
-    the user's Google usage UI showed available Flash, Flash Lite, and Pro
-    capacity. Next action is a focused fanout-only investigation comparing the
-    failing child-agent Pro request against the standalone Pro request,
-    including model, project, access-token lane, session/user-prompt ids,
-    request shape, adapter semaphore/cooldown behavior, and any child-agent
-    scheduling differences. Do not chase this as a schema-strip regression, do
-    not run the full multi-path harness again until the focused Gemini fanout
-    question is resolved, and do not start the broader deferred-search control
-    loop as part of this cleanup.
-    The focused repair now caches refreshed Gemini OAuth access tokens
-    in-process and serializes Code Assist project/prime bootstrap so fanout
-    children stay on the intended account/project lane. Focused local
-    concurrency/retry tests passed, and the two previously failing live paths
-    now pass on dev:
-    `/tmp/gemini_fanout_after_oauth_lane_cache.json` and
-    `/tmp/peeromega_fanout_after_oauth_lane_cache.json`. The first broad rerun
-    at `/tmp/anthropic_full_dev_after_oauth_lane_cache.json` narrowed the
-    remaining failure to repeated Pro model-capacity pacing in
-    `claude_adapter_peeromega_fanout`; the preceding Gemini fanout and later
-    standalone Pro case both passed. Dev now uses a longer explicit Code Assist
-    capacity retry envelope in `docker-compose.dev.yml`. After recreating
-    `litellm-dev` with the new environment, the focused peeromega rerun passed
-    at `/tmp/peeromega_fanout_after_capacity_retry_budget.json` with the
-    Gemini 3.1 Pro session-history and tool-activity rows present. Per the
-    2026-04-29 user pause, do not make additional changes or run additional
-    harness coverage in this session unless explicitly resumed. Remaining
-    validation gap: the broad default dev `/anthropic` harness has not been
-    rerun after the longer retry envelope; the latest broad artifact is still
-    `/tmp/anthropic_full_dev_after_oauth_lane_cache.json`, which failed only
-    `claude_adapter_peeromega_fanout` before the retry-envelope update.
-  - Deferred/parked: adapter-owned support for Anthropic deferred tool loading
-    on `/anthropic` to non-Anthropic paths. The preferred design is still a
-    bounded internal tool-search loop: hold `defer_loading=true` tool
-    definitions in an adapter registry, send upstream only normal tools plus a
-    compact synthetic search tool, intercept synthetic search tool calls
-    without streaming them to Claude Code, rank/select a small set of matching
-    deferred tools, and issue the follow-up provider call with those full
-    definitions expanded. Start with OpenAI Responses/Codex when this is
-    resumed, then extend to Gemini, OpenRouter, and NVIDIA after the control
-    loop, usage aggregation, and stream hiding behavior are stable. Focused
-    tests must prove deferred tool schemas are absent from the first upstream
-    request, selected deferred schemas appear only after internal search,
-    internal search calls never surface as Anthropic `tool_use` blocks,
-    explicit `tool_choice` for a deferred tool pre-expands that tool, and
-    usage/session-history metadata can represent the multi-call provider turn
-    without double-counting. Do not run the full multi-path harness until the
-    unit and one-lane focused live proof pass.
-  - Deferred/parked: revisit `eager_input_streaming`.
-    For OpenAI/OpenRouter/NVIDIA chat-style streams we already forward upstream
-    function-argument deltas as Anthropic `input_json_delta` events when the
-    provider streams them. Gemini intentionally buffers parallel tool calls
-    until terminal chunks, and the OpenAI Responses/Codex path currently buffers
-    Codex `exec_command` and `Read` until valid JSON for alias/sanitizer
-    correctness. Decide per tool/provider whether `eager_input_streaming=true`
-    should bypass that buffering, and gate it with focused fixtures using
-    large write/edit-style arguments before enabling it broadly.
+### OpenAI/Codex Responses Adapter
 
-  Google/Gemini Code Assist adapter:
-  - Native Gemini CLI Code Assist envelope gates are now live-proven for both
-    normal and stream-json CLI modes at
-    `/tmp/native_gemini_payload_gates_after_config.json`: the captured provider
-    request includes top-level `model`, `project`, `user_prompt_id`,
-    `request.session_id`, `request.contents`, `request.systemInstruction`,
-    `request.generationConfig.thinkingConfig`, and `request.tools`, with
-    `gemini-2.5-flash`, `includeThoughts=true`, and `thinkingBudget=8192`.
-    The focused `/anthropic` comparison is now live-proven by
-    `claude_adapter_gemini3_flash_child_parallel_read_tools`, including the
-    Code Assist envelope fields above plus native Gemini function declaration
-    names. Unit coverage now pins the model-scoped Code Assist `session_id`,
-    hand-built `user_prompt_id`, native function declaration aliases, full
-    Claude-core native alias mapping, `tool_choice`, assistant tool-call
-    aliases, restored streaming tool names, parallel tool-call buffering, and
-    terminal usage preservation.
-  - Track the live policy drift explicitly: native Gemini CLI defaults its
-    thinking config to `thinkingBudget=8192`, while the current `/anthropic`
-    Gemini adapter effort path has been observed using `thinkingLevel` for
-    selected Gemini 3 cases. This is currently treated as intentional
-    model/API behavior: the native capture is `gemini-2.5-flash`, while the
-    `/anthropic` effort cases target `gemini-3-flash-preview`, and the shared
-    Gemini mapper uses `thinkingLevel` rather than `thinkingBudget` for Gemini
-    3. The harness now hard-gates that the Gemini 3 effort cases include
-    `request.session_id`, `request.systemInstruction`, and `thinkingLevel`, and
-    that they do not emit a Gemini 2-style `thinkingBudget`. Native Gemini
-    tool-use capture is still only envelope evidence, not a first-party
-    tool-call parity baseline.
-  - If live Gemini captures show true partial `functionCall.args` fragments
-    across valid Code Assist SSE events, add a focused fixture for that exact
-    shape. Current focused coverage proves multiple function calls spread across
-    Code Assist chunks; add a route-level raw-transport split fixture only if
-    live captures make that shape relevant.
-  - `claude_adapter_gemini3_flash_child_parallel_read_tools` now carries and
-    passes the focused `/anthropic` Code Assist envelope comparison gate for
-    model/project/user_prompt/session/systemInstruction/tools/thinkingConfig.
-    Keep this as the Gemini tool-envelope proof before broad harness work.
+- Codex stream/tool parity is now validated for the narrow focused pair. Keep
+  `native_openai_passthrough_responses_codex_tool_activity,claude_adapter_codex_tool_activity`
+  as the OpenAI/Codex gate before broad harness work. The latest passing
+  artifact is `/tmp/anthropic_codex_tool_alias_after_fix.json`: upstream
+  OpenAI/Codex sees native `exec_command` / `cmd` tool state while Claude Code
+  still sees `Bash` / `command` on the Anthropic side, scoped only to the
+  Codex-backed `/anthropic` route.
 
-  NVIDIA/OpenRouter completion adapters:
-  - Run live focused `/anthropic` cases before broad harness work to confirm the
-    new hosted-tool policy behaves correctly against NVIDIA/OpenRouter-style
-    completion targets. Unit coverage now keeps Anthropic hosted/beta tools out
-    of OpenAI-compatible `tools`, preserves web search as `web_search_options`,
-    removes forced `tool_choice` values that target dropped hosted tools, and
-    records unsupported hosted tool downgrades in metadata.
-    The NVIDIA live gate now passes via
-    `claude_adapter_nvidia_hosted_tool_policy`; keep the remaining unresolved
-    work scoped to any future OpenRouter-style completion target that can
-    exercise the same policy. Do not restore `request_payload_checks` for the
-    NVIDIA case unless the harness gains transformed upstream-payload capture;
-    the current Langfuse generation input does not expose NVIDIA completion
-    `tools`, `web_search_options`, or adapter metadata reliably for that path.
+- Anthropic-only tool metadata stripping for non-Anthropic provider schemas was
+  completed locally. The OpenAI-compatible chat path strips `defer_loading`,
+  `eager_input_streaming`, `allowed_callers`, and `input_examples` before
+  forwarding provider tools, and the OpenAI Responses path has focused
+  regression coverage. Focused local validation and the failed-case live rerun
+  passed. Broad runs on 2026-04-29 also cleared the OpenAI/Codex path and all
+  non-fanout default cases.
 
-  OpenRouter Responses adapter:
-  - Treat it as the OpenAI Responses parity path plus OpenRouter-specific
-    routing/empty-success behavior for `/anthropic` traffic. There is no
-    first-party OpenRouter CLI baseline, so compare request/stream
-    reconstruction to the native OpenAI/Codex baseline and then run
-    `claude_adapter_openrouter_nemotron_child_parallel_read_tools` as the
-    focused replacement proof before any peeromega fanout rerun.
+### Deferred Tool Work
+
+- Deferred/parked: adapter-owned support for Anthropic deferred tool loading on
+  `/anthropic` to non-Anthropic paths. The preferred design is a bounded
+  internal tool-search loop: hold `defer_loading=true` tool definitions in an
+  adapter registry, send upstream only normal tools plus a compact synthetic
+  search tool, intercept synthetic search calls without streaming them to
+  Claude Code, rank and select matching deferred tools, and issue the follow-up
+  provider call with those definitions expanded. Start with OpenAI
+  Responses/Codex when this is resumed, then evaluate OpenRouter and NVIDIA
+  after the control loop, usage aggregation, and stream hiding behavior are
+  stable. Focused tests must prove the deferred-schema, internal-search,
+  explicit-tool-choice, and usage-accounting behavior before broad coverage.
+
+- Deferred/parked: revisit `eager_input_streaming`.
+  OpenAI/OpenRouter/NVIDIA chat-style streams already forward upstream
+  function-argument deltas as Anthropic `input_json_delta` events when the
+  provider streams them. The OpenAI Responses/Codex path currently buffers
+  Codex `exec_command` and `Read` until valid JSON for alias/sanitizer
+  correctness. Decide per tool/provider whether `eager_input_streaming=true`
+  should bypass that buffering, using focused fixtures with large
+  write/edit-style arguments before enabling it broadly.
+
+### Historical Google/Gemini Code Assist Evidence
+
+- Historical Google/Gemini Code Assist evidence: in April 2026, native and
+  `/anthropic` captures established the Code Assist request envelope,
+  model-scoped session metadata, native function aliases, streaming tool-name
+  restoration, parallel tool-call buffering, and terminal usage preservation.
+  The captures also documented the then-observed `thinkingBudget` and
+  `thinkingLevel` differences between Gemini model generations. These results
+  are retained as implementation history, not as an active harness lane.
+
+### NVIDIA/OpenRouter Completion Adapters
+
+- Current unit coverage keeps Anthropic hosted and beta tools out of
+  OpenAI-compatible `tools`, preserves web search as `web_search_options`,
+  removes forced `tool_choice` values that target dropped hosted tools, and
+  records unsupported hosted-tool downgrades in metadata. The NVIDIA focused
+  live proof passed. Remaining work is limited to an available OpenRouter-style
+  completion target that can exercise the same policy; transformed upstream
+  payload capture is required before payload assertions can cover that path.
+
+### OpenRouter Responses Adapter
+
+- Treat it as the OpenAI Responses parity path plus OpenRouter-specific
+  routing/empty-success behavior for `/anthropic` traffic. There is no
+  first-party OpenRouter CLI baseline, so compare request/stream reconstruction
+  to the native OpenAI/Codex baseline and then run
+  `claude_adapter_openrouter_nemotron_child_parallel_read_tools` as the focused
+  replacement proof before any peeromega fanout rerun.
 
 ## Ongoing
 
@@ -474,20 +322,26 @@ these docs only as needed:
   both `Bash` and `Write` tool activity for
   `/tmp/gpt55-analysis-write-probe.md`.
 
-- Keep Claude-dispatched model latency classified separately from native CLI
-  latency. For GPT-5.5, current evidence still points to large model turns plus
+- Claude-dispatched model latency remains classified separately from native CLI
+  latency. For GPT-5.5, current evidence points to large model turns plus
   Claude Code/orchestrator overhead: the focused GPT-5.5 write probe took
   `50.192s` wall clock through Claude Code while the GPT adapter session logged
   about `2.156s` proxy/upstream duration; later aawm-tap GPT spans still ran
-  `64-172s`. For Gemini, do not classify all delay as context size: the v11
-  aawm-tap trace above proved a concrete adapter stream bug where five upstream
-  Gemini tool calls collapsed to one Claude-visible `Read` and a Claude Code
-  protocol error. Native Codex CLI / Gemini CLI speed remains separate because
-  this work targets Claude Code dispatch through LiteLLM's Anthropic-compatible
-  adapter.
+  `64-172s`. Historical Gemini evidence from the v11 aawm-tap trace showed a
+  concrete adapter stream bug in which five upstream tool calls collapsed to
+  one Claude-visible `Read` and a Claude Code protocol error.
 
-- Keep the adapter harness aligned with the real stored session shapes on both `:4001` dev and `:4000` prod targets.
-  Current target: `claude_adapter_codex_tool_activity` must hard-gate the `Bash` / `pwd` persistence path, `claude_adapter_ctx_marker` must keep validating `:#port-allocation.ctx#:` via the rewritten request body instead of a brittle exact model reply, `claude_adapter_ctx_marker_escaped` must keep validating `\\:#name.ctx#\\:` literal escaping, dispatched child-agent backtick and bare-acronym lookups should stay aligned with the same `tristore_search_exact` semantics, the CommonMark system-prompt identifier list rewrite should stay aligned with the tenant/agent-scoped raw-content query until the stored procedure lands, the provider-cache canary should keep finding at least one Anthropic `hit` / `write` row in the default suite, Gemini fanout should now deliberately hard-gate child native `run_shell_command` rows rather than relying on plausible final text, and the direct Gemini Read gate is `claude_adapter_gemini31_pro_read_tool_id_sanitizer` rather than the fanout case. The post-tool-result Gemini gate is `claude_adapter_gemini31_pro_bash_then_read_stream_state`; keep it default-excluded but run it explicitly when Claude-dispatched Gemini fails after an initial tool call. Persisted Gemini tool activity uses native `read_file` / `run_shell_command` while Claude Code sees restored `Read` / `Bash`, so validators should match the stored native tool names and require the matching tool-call rows instead of the latest no-tool final row. `--target dev` / `--target prod` should continue enforcing the correct port, Docker container, and Langfuse trace environment. Claude trace-user validation should validate tenant-only Langfuse user ids (`userId=<tenant_id>`) while trace names carry the agent (`claude-code.<agent>`); do not use `project.agent` as the user id. Basic OpenAI smoke cases should validate success, usage, cost, routing, Langfuse, and session-history invariants rather than brittle exact natural-language output. Keep the prod-cutover failure guards active by default: async task exceptions, ASGI exceptions, `KeyError: choices`, stale `Content-Length` / `h11` protocol failures, upstream passthrough 429/5xx traces, and the OpenAI Responses nested-object-schema regression must fail the run instead of surfacing only as downstream session-history gaps; warning-only optional cases must not mask command timeouts or runtime-log hard failures. Before future prod promotions, add a production-style preflight that validates the exact image / installed wheel path on `:4001` plus a small explicit promotion-gate set for opt-in provider lanes, so packaging and adapter metadata gaps are caught before touching `:4000`.
+- Current generic adapter-harness invariants cover target port, container, and
+  trace-environment alignment; tenant-only Langfuse user IDs; durable tool
+  activity; usage, cost, routing, and session-history evidence; and hard
+  runtime-failure guards. Warning-only optional cases remain limited to
+  documented provider-availability failures; command timeouts and runtime-log
+  failures remain hard failures.
+
+- Historical Gemini harness evidence: retired fanout, direct-read, and
+  post-tool-result cases once matched persisted native tool names to
+  Claude-visible aliases. Those named gates are no longer current operator
+  guidance.
 
 - Keep the aawm.37 harness note historical and use `h-v0.0.27` for the prepared
   aawm.42 release candidate. `h-v0.0.21` is the minimum known-good released

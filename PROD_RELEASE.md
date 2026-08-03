@@ -527,9 +527,9 @@ print(json.dumps({"session":session,"model":response.get("model"),"content":resp
 ```
 
 For native passthrough changes, run the opt-in native shard in the existing
-harness for the retained Claude and Codex CLI paths. Native Gemini harness
-cases were removed; validate retained native Gemini passthrough behavior with
-the focused pytest coverage instead of restoring those cases.
+harness for the retained Claude and Codex CLI paths. Validate protected
+Gemini/Vertex provider behavior through the retained provider tests, not this
+harness.
 
 ```bash
 ./.venv/bin/python -m dotenv run -- \
@@ -537,12 +537,6 @@ the focused pytest coverage instead of restoring those cases.
     --target prod \
     --cases native_anthropic_passthrough_claude,native_openai_passthrough_chat,native_openai_passthrough_responses,native_openai_passthrough_responses_codex \
     --write-artifact /tmp/litellm-prod-native.json
-```
-
-```bash
-./.venv/bin/python -m pytest -p no:rerunfailures \
-  tests/test_litellm/proxy/pass_through_endpoints/llm_provider_handlers/test_gemini_passthrough_logging_handler.py \
-  -q
 ```
 
 For `/anthropic` effort/cache changes, run the opt-in shards that are

@@ -120,7 +120,7 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
       `ag_catalog.raw_content`; the raw query is temporary and will move to a
       stored procedure later
   - Mixed fanout opt-in gate: `claude_adapter_peeromega_fanout`
-    - dispatches the non-Gemini child-agent target set on `:4001`
+    - dispatches the child-agent target set on `:4001`
     - stable tool-activity invariant: expect the parent session to persist the
       delegated `Agent` rows; do not assume every child model will emit its own
       command row on every run
@@ -135,21 +135,15 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
     - explicit `nvidia/*` model names may route by wildcard for early NVIDIA NIM testing; mapped models remain preferred when release gates require non-zero cost assertions
     - use the exact `nvidia/minimaxai/minimax-m2.7` spelling for MiniMax probes; the Anthropic adapter intentionally uses upstream non-stream plus fake streaming for this model because its native stream latency is much higher than the other NVIDIA targets
   - for OpenRouter-adapted cases, rely on trace tags/metadata plus `session_history`; do not hard-gate on Langfuse generation usage fields yet
-  - OpenRouter preferred free targets under active validation: `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
-  - OpenRouter warning-only canaries: `openrouter/free`, `openai/gpt-oss-20b:free`, `google/gemma-4-31b-it:free`, `google/gemma-4-26b-a4b-it:free`, `nvidia/nemotron-3-super-120b-a12b:free`
+  - OpenRouter warning-only canaries: `openrouter/free`, `openai/gpt-oss-20b:free`, `nvidia/nemotron-3-super-120b-a12b:free`
     - warning-only semantics include subprocess timeouts; those should surface
       as harness warnings / `soft_failures`, not hard suite failures
     - `openai/gpt-oss-120b:free` is excluded from the default suite but is not
       `warning_only`; it has only the documented provider-unavailable soft-fail
       signature
-    - `google/gemma-4-31b-it:free` and `google/gemma-4-26b-a4b-it:free` are
-      no longer part of the default full suite; run them only by explicit
-      `--cases` selection when you want Gemma-specific coverage
 - OpenRouter manual-only spot checks for now: `meta-llama/llama-3.3-70b-instruct:free`, `minimax/minimax-m2.5:free`
 - Current upstream-rate-limited / unstable OpenRouter candidates:
   - `openrouter/free` (moving router)
-  - `google/gemma-4-31b-it:free`
-  - `google/gemma-4-26b-a4b-it:free`
   - `nvidia/nemotron-3-super-120b-a12b:free`
   - `minimax/minimax-m2.5:free`
   - `qwen/qwen3-coder:free`
@@ -180,7 +174,7 @@ LiteLLM is a unified interface for 100+ LLM providers with two main components:
 - Preferred Anthropic-adapter model spellings:
   - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.5`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
   - direct NVIDIA targets: `nvidia/deepseek-ai/deepseek-v3.2`, `nvidia/deepseek-ai/deepseek-v3.1-terminus`, `nvidia/mistralai/devstral-2-123b-instruct-2512`, `nvidia/z-ai/glm4.7`, `nvidia/minimaxai/minimax-m2.7`
-  - direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/google/gemma-4-31b-it:free`
+  - direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`
   - explicit NVIDIA wildcard targets: any normalized `nvidia/*` model may route through the NVIDIA completion adapter for early testing, except known OpenRouter namespace models that intentionally remain on OpenRouter
   - legacy unprefixed or vendor-only spellings still resolve for compatibility, but explicit provider prefixes are preferred because adapter routing is provider-first
   This keeps brief transient recovery local while preventing repeated manual retests from re-burning ~40 seconds on the same throttled backend.

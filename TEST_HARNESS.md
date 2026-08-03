@@ -21,8 +21,8 @@ For the production promotion process, see `PROD_RELEASE.md`.
   - native Anthropic egress is enabled again; the focused
     `native_anthropic_passthrough_claude` case validates native Anthropic
     telemetry and rate-limit observations
-  - focused native Codex and native Gemini cases validate `session_history`
-    persistence plus provider quota rows in `rate_limit_observations`
+  - focused native Codex cases validate `session_history` persistence plus
+    provider quota rows in `rate_limit_observations`
 
 Because the adapter suite is validating the Anthropic-route adapter specifically,
 top-level Claude runs without an adapted `--model` are not broad acceptance
@@ -44,7 +44,7 @@ bash scripts/local-ci/run_acceptance.sh /tmp/local-acceptance.json
 ```
 
 This suite validates the normal LiteLLM routing path, Langfuse trace shaping,
-and the current production-style expectations for Codex, Gemini, and Claude.
+and the current production-style expectations for Codex and Claude.
 
 ## Anthropic adapter suite
 
@@ -111,8 +111,8 @@ do not hard-gate the exact natural-language result string. They hard-gate comman
 success, usage/cost, routing, request payload logging, Langfuse
 trace/user/session context, runtime logs, and `session_history` invariants.
 
-Native Codex and Gemini CLI passthrough cases inject the current git repository
-identity through `x-aawm-repository` and hard-gate that
+Native Codex CLI passthrough cases inject the current git repository identity
+through `x-aawm-repository` and hard-gate that
 `public.session_history.repository` is populated for the emitted provider
 session. Codex CLI cases also inject harness-owned `x-litellm-end-user-id`,
 `langfuse_trace_user_id`, `langfuse_trace_name`, and `session_id` config
@@ -294,15 +294,6 @@ python3 scripts/local-ci/run_anthropic_adapter_acceptance.py \
   --write-artifact /tmp/native-codex-rate-limits.json
 ```
 
-Native Gemini passthrough is retained, but its removed anthropic-adapter
-harness cases are not restored. Run the current focused pytest coverage:
-
-```bash
-./.venv/bin/python -m pytest -p no:rerunfailures \
-  tests/test_litellm/proxy/pass_through_endpoints/llm_provider_handlers/test_gemini_passthrough_logging_handler.py \
-  -q
-```
-
 The OpenRouter free daily request meter has an explicit opt-in gate:
 
 ```bash
@@ -357,20 +348,155 @@ Keep these out of the standard adapter harness run for now:
     parallel-proof attempt
 - `openai/gpt-oss-20b:free`
 - `openai/gpt-oss-120b:free`
-- `google/gemma-4-31b-it:free`
-- `google/gemma-4-26b-a4b-it:free`
 - `meta-llama/llama-3.3-70b-instruct:free`
 - `minimax/minimax-m2.5:free`
 
 ### Preferred Anthropic-adapter model spellings
 
 - direct OpenAI targets: `openai/gpt-5.4`, `openai/gpt-5.5`, `openai/gpt-5.4-mini`, `openai/gpt-5.3-codex-spark`
-- direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`, `openrouter/google/gemma-4-31b-it:free`
+- direct OpenRouter targets: `openrouter/openai/gpt-oss-120b:free`
 - explicit OpenRouter wildcard targets: any normalized `openrouter/*` model may route through the OpenRouter Responses adapter, even when the exact model is not hardcoded in the local canary allowlist
 - explicit NVIDIA wildcard targets: any normalized `nvidia/*` model may route
   through the NVIDIA completion adapter for early testing, except known
   OpenRouter namespace models that intentionally remain on OpenRouter
 - legacy unprefixed or vendor-only spellings still resolve for compatibility, but explicit provider prefixes are preferred because adapter routing is provider-first
+
+## Retained Gemini/Vertex provider test keep-manifest
+
+This manifest records the protected provider-focused and native proxy tests
+established by current file inspection. It is not a local acceptance-harness
+lane and is not proof of upstream provenance.
+
+No authoritative upstream ref or tree is available locally. Commit
+`e3dc89f634a61e89aeaab98c7fbf91b7bdae896c` is only a fork-local retained-byte
+baseline consumed by
+`tests/test_litellm/proxy/pass_through_endpoints/test_upstream_baseline.py`;
+passing that guard demonstrates fork-local byte stability, not equivalence to
+an upstream tree. Preserving the provider-focused and native proxy guards below
+supports source-removal safety. Upstream provenance closeout remains blocked on
+D1-602 until an authoritative pinned upstream ref and comparison are available.
+
+### Discovery inventory
+
+Commands and source lists used:
+
+- `find tests/test_litellm/llms/gemini tests/test_litellm/llms/vertex_ai/gemini tests/test_litellm/google_genai -type f -name '*.py' -not -path '*/__pycache__/*' -print | sort`
+- `git ls-files 'tests/test_litellm/llms/gemini/*.py' 'tests/test_litellm/llms/vertex_ai/gemini/*.py' 'tests/test_litellm/google_genai/*.py' | sort`
+- `rg -n -i 'aawm|code assist|antigravity|fork|removal|reintroduction|harness|local acceptance|session_history|rate_limit_observations'` over those three directories
+- tracked-path and static marker inspection of the eight native
+  proxy/pass-through guard files listed below
+
+All 24 tracked Python candidates in the focused provider directories were
+inspected. The five Google GenAI test modules, seven Gemini test modules, and
+seven Vertex Gemini test modules are `retained-provider-focused`: current file
+inspection found no fork, harness, or removal markers. The five package files
+`tests/test_litellm/llms/gemini/__init__.py`,
+`tests/test_litellm/llms/gemini/files/__init__.py`,
+`tests/test_litellm/llms/gemini/image_edit/__init__.py`,
+`tests/test_litellm/llms/gemini/realtime/__init__.py`, and
+`tests/test_litellm/llms/gemini/videos/__init__.py` are `omitted` because they
+contain no test nodes. No candidate was classified `fork-specific/removal` or
+`unavailable`.
+
+Coverage gap: this inventory is limited to the tracked provider-focused
+directories above; broader Google/Vertex integration, proxy, pass-through,
+local-only, load, live, and historical test trees were not treated as a
+complete provider keep-set. Unified Google and interactions integration
+candidates are credentialed/live and are not part of the offline execution
+proof.
+
+### Retained focused set
+
+Retained provider-focused test files:
+
+- `tests/test_litellm/google_genai/test_google_genai_adapter.py`
+- `tests/test_litellm/google_genai/test_google_genai_adapter_fixes.py`
+- `tests/test_litellm/google_genai/test_google_genai_handler.py`
+- `tests/test_litellm/google_genai/test_google_genai_main.py`
+- `tests/test_litellm/google_genai/test_google_genai_transformation.py`
+- `tests/test_litellm/llms/gemini/files/test_gemini_files_transformation.py`
+- `tests/test_litellm/llms/gemini/image_edit/test_gemini_image_edit_transformation.py`
+- `tests/test_litellm/llms/gemini/realtime/test_gemini_realtime_transformation.py`
+- `tests/test_litellm/llms/gemini/test_gemini_client_setup.py`
+- `tests/test_litellm/llms/gemini/test_gemini_common_utils.py`
+- `tests/test_litellm/llms/gemini/test_gemini_tts.py`
+- `tests/test_litellm/llms/gemini/videos/test_gemini_video_transformation.py`
+- `tests/test_litellm/llms/vertex_ai/gemini/test_claude_tool_use_id_passthrough.py`
+- `tests/test_litellm/llms/vertex_ai/gemini/test_function_call_args_serialization.py`
+- `tests/test_litellm/llms/vertex_ai/gemini/test_gemini_streaming_tool_call_finish_reason.py`
+- `tests/test_litellm/llms/vertex_ai/gemini/test_thought_signature_in_tool_call_id.py`
+- `tests/test_litellm/llms/vertex_ai/gemini/test_vertex_ai_gemini_transformation.py`
+- `tests/test_litellm/llms/vertex_ai/gemini/test_vertex_and_google_ai_studio_gemini.py`
+- `tests/test_litellm/llms/vertex_ai/gemini/test_vertex_gemini_unbound_local_error.py`
+
+Whole-file offline-safe provider modules:
+
+- `tests/test_litellm/google_genai/test_google_genai_adapter_fixes.py`
+- `tests/test_litellm/google_genai/test_google_genai_transformation.py`
+- `tests/test_litellm/llms/gemini/files/test_gemini_files_transformation.py`
+- `tests/test_litellm/llms/gemini/image_edit/test_gemini_image_edit_transformation.py`
+- `tests/test_litellm/llms/gemini/realtime/test_gemini_realtime_transformation.py`
+- `tests/test_litellm/llms/gemini/videos/test_gemini_video_transformation.py`
+
+The following retained files are not whole-file offline-safe and require
+dependency/node selection or the named follow-up before they can be used as
+offline execution evidence:
+
+- `tests/test_litellm/google_genai/test_google_genai_adapter.py` stalls around
+  line 1131 without narrower selection and dependencies.
+- `tests/test_litellm/llms/gemini/test_gemini_common_utils.py` has two
+  `google.genai` dependency failures.
+
+The other retained provider-focused modules remain protected, but current
+static inspection does not establish each complete file as offline-safe. Use
+collection-only validation or explicit node-level deselection/mocking before
+including the Google GenAI handler/main, Gemini client-setup/TTS, or seven
+Vertex Gemini modules in offline execution evidence.
+
+### Native proxy/pass-through guards
+
+Whole-file offline-safe guards:
+
+- `tests/pass_through_unit_tests/test_gemini_streaming_handler.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/llm_provider_handlers/test_gemini_passthrough_logging_handler.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_streaming_handler_summary.py`
+
+Retained guard requiring D1-602 resolution:
+
+- `tests/test_litellm/proxy/pass_through_endpoints/test_upstream_baseline.py`
+  is retained, but its fork-local byte guard currently fails pending D1-602.
+
+Retained guards requiring explicit mock-boundary confirmation or node-level
+selection before they are used as offline execution proof:
+
+- `tests/proxy_unit_tests/test_google_gemini_proxy_request.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_vertex_ai_batch_passthrough.py`
+- `tests/test_litellm/proxy/pass_through_endpoints/test_vertex_passthrough_load_balancing.py`
+- `tests/pass_through_unit_tests/test_vertex_ai_live_passthrough.py`
+
+Run the exact remaining whole-file offline-safe selection with:
+
+```bash
+LITELLM_LOCAL_MODEL_COST_MAP=True ./.venv/bin/python -m pytest -p no:rerunfailures -p no:cacheprovider -q \
+  tests/test_litellm/google_genai/test_google_genai_adapter_fixes.py \
+  tests/test_litellm/google_genai/test_google_genai_transformation.py \
+  tests/test_litellm/llms/gemini/files/test_gemini_files_transformation.py \
+  tests/test_litellm/llms/gemini/image_edit/test_gemini_image_edit_transformation.py \
+  tests/test_litellm/llms/gemini/realtime/test_gemini_realtime_transformation.py \
+  tests/test_litellm/llms/gemini/videos/test_gemini_video_transformation.py \
+  tests/pass_through_unit_tests/test_gemini_streaming_handler.py \
+  tests/test_litellm/proxy/pass_through_endpoints/llm_provider_handlers/test_gemini_passthrough_logging_handler.py \
+  tests/test_litellm/proxy/pass_through_endpoints/test_streaming_handler_summary.py
+```
+
+The broader retained set may be collected or inspected without treating
+collection as execution evidence. Do not run provider-directory-wide pytest
+commands as offline proof: those directories contain tests that can require
+credentials, external downloads, live services, or narrower mocks.
+The keep-manifest is fork-local retained-byte documentation; no authoritative
+upstream ref or tree is available locally. D1-602 remains the explicit boundary
+for the upstream-baseline guard, and resolving it is required before that file
+can be treated as offline execution proof.
 
 ## How to interpret results
 
@@ -422,10 +548,6 @@ Warning-only free-model canaries are still allowed to soft-fail on upstream
 timeouts or provider throttling. Those outcomes should remain warnings /
 `soft_failures` in the harness artifact rather than hard suite failures.
 
-`google/gemma-4-31b-it:free` and `google/gemma-4-26b-a4b-it:free` remain
-OpenRouter-hosted manual-only candidates. No current Anthropic adapter harness
-cases are defined for them.
-
 Operational expectation:
 - adapter-managed upstream `429` / `500` / `502` / `503` / `504` responses may
   still appear as adapter warning/backoff lines in `litellm-dev` logs
@@ -433,17 +555,13 @@ Operational expectation:
   current request path
 
 Telemetry expectation:
-- when explicit Gemini reasoning token counts are missing but thought
-  signatures are present, Langfuse generation metadata and `session_history`
-  should still carry a non-null reasoning signal using the
-  `provider_signature_present` source
 - for Anthropic rows, only use `reasoning_tokens_source=provider_reported` when
   the provider reported a positive count; zero-value placeholders must fall
   through to estimation or remain unset
 - `reasoning_tokens_source` should never be left null in `public.session_history`
   after backfill / repair passes; use `not_applicable` or `not_available` when
   no positive provider or estimated reasoning count exists
-- for Anthropic, OpenAI, OpenRouter, and Gemini rows, `public.session_history`
+- for Anthropic, OpenAI, and OpenRouter rows, `public.session_history`
   should also carry normalized provider-cache telemetry:
   - `provider_cache_status` should be one of `hit`, `write`, `miss`,
     `unsupported`, or `not_attempted`
@@ -452,9 +570,9 @@ Telemetry expectation:
   - `provider_cache_miss_token_count` / `provider_cache_miss_cost_usd` are
     best-effort fields and should only be populated when the missed cache token
     count is explicit enough to price defensibly
-  - current detection uses provider-native cache hints:
-    `cache_control` for Anthropic/OpenRouter, `cachedContent` for Gemini, and
-    `input_tokens_details.cached_tokens` for OpenAI-style usage
+  - current detection uses provider-native cache hints: `cache_control` for
+    Anthropic/OpenRouter and `input_tokens_details.cached_tokens` for
+    OpenAI-style usage
 - new `public.session_history` rows should identify the LiteLLM runtime and
   initiating client:
   `litellm_environment`, `litellm_version`, `litellm_fork_version`,
