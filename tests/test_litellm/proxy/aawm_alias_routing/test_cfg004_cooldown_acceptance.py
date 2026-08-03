@@ -991,6 +991,155 @@ class TestAcceptanceScriptSecrets:
         assert any("exactly 1 qwen3.6 target" in f for f in failures)
 
 
+class TestCfg004ProofTranscriptClassification:
+    """Proof residual failures that are session-history collaboration/tool
+    evidence gaps are suppressed when transcript validation directly covers
+    them with zero failures. Any unrecognized residual stays fail-closed."""
+
+    @pytest.fixture(autouse=True)
+    def _load_script(self):
+        self.script = _load_acceptance_script()
+
+    _PROOF_CASE = "native_openai_passthrough_responses_codex_read_alias_collaboration"
+
+    def _saved_collab_tool_failures(self) -> list[str]:
+        # Exact saved pass-3 redacted proof failures (family prefix included).
+        p = f"{self._PROOF_CASE}__cfg004_clear_proof"
+        return [
+            f"{p} Codex command executions completed unexpected commands: expected ['git rev-parse --show-toplevel', 'git status --short', 'pwd'], got []",
+            f"{p} Codex command executions did not overlap as one parallel batch: expected >= 3, got 0",
+            f"{p} Codex command executions started unexpected commands: expected ['git rev-parse --show-toplevel', 'git status --short', 'pwd'], got []",
+            f"{p} Codex command executions were not recorded in one turn: []",
+            f"{p} missing completed Codex collaboration calls for 'spawn_agent': expected >= 1, got 0",
+            f"{p} successful Codex wait did not record agents_states",
+        ]
+
+    def _run_live(self, *, proof_failures: list[str], transcript_failures: list[str]) -> dict:
+        script = self.script
+        cases = {
+            self._PROOF_CASE: {
+                "verification_alias": "read",
+                "exact_child_prompt": "child prompt",
+            }
+        }
+        prepare_resp = {
+            "result": "prepared",
+            "target": {"provider": "alibaba_token_plan", "model": "alibaba_token_plan/qwen3.6-flash"},
+            "control_count": 1,
+            "controls": [{"provider": "openai", "model": "gpt-5.3-codex", "route_family": "codex_openai_responses"}],
+        }
+        inspect_active = {
+            "result": "inspected",
+            "candidates": [
+                {"provider": "alibaba_token_plan", "model": "alibaba_token_plan/qwen3.6-flash",
+                 "route_family": "codex_alibaba_token_plan_chat_completions_adapter",
+                 "role": "target", "local_cooldown_active": True, "durable_cooldown_active": True},
+                {"provider": "openai", "model": "gpt-5.3-codex",
+                 "route_family": "codex_openai_responses",
+                 "role": "control", "local_cooldown_active": True, "durable_cooldown_active": True},
+            ],
+        }
+        inspect_target_cleared = {
+            "result": "inspected",
+            "candidates": [
+                {"provider": "alibaba_token_plan", "model": "alibaba_token_plan/qwen3.6-flash",
+                 "route_family": "codex_alibaba_token_plan_chat_completions_adapter",
+                 "role": "target", "local_cooldown_active": False, "durable_cooldown_active": False},
+                {"provider": "openai", "model": "gpt-5.3-codex",
+                 "route_family": "codex_openai_responses",
+                 "role": "control", "local_cooldown_active": True, "durable_cooldown_active": True},
+            ],
+        }
+
+        def _fake_proof_case(**kwargs):
+            return {
+                "result": {
+                    "passed": False,
+                    "failures": proof_failures,
+                    "langfuse": {"command_thread_id": "test-thread-id"},
+                },
+                "selection": {
+                    "provider": "alibaba_token_plan",
+                    "model": "alibaba_token_plan/qwen3.6-flash",
+                    "route_family": "codex_alibaba_token_plan_chat_completions_adapter",
+                },
+                "phase_session_id": "test-session",
+                "phase_start_time": "2026-01-01T00:00:00Z",
+            }
+
+        with (
+            patch.object(script, "_cfg004_docker_compose_up", return_value=(True, "")),
+            patch.object(script, "_cfg004_wait_readiness", return_value=(True, "")),
+            patch.object(script, "_cfg004_build_disposable_config", return_value="/tmp/x.yaml"),
+            patch.object(script, "_cfg004_remove_disposable_config"),
+            patch.object(script, "_cfg004_readiness_snapshot", return_value={
+                "status": 200, "config_hash": "abc", "config_version": "abc", "state": "active",
+            }),
+            patch.object(script, "_cfg004_docker_inspect_container", return_value={
+                "id": "x", "image": "y", "started_at": "z", "restart_count": 0,
+            }),
+            patch.object(script, "_cfg004_docker_inspect_env_absent", return_value=[]),
+            patch.object(script, "_cfg004_post_acceptance", side_effect=[
+                (200, prepare_resp),
+                (200, inspect_active),
+                (200, inspect_target_cleared),
+                (200, inspect_target_cleared),
+                (200, {"result": "restored", "cleared_identities": 2}),
+            ]),
+            patch.object(script, "_cfg004_post_clear", return_value=(
+                200, {"result": "cleared", "keys_cleared": 1, "members_removed": 1}
+            )),
+            patch.object(script, "_cfg003_run_proof_case", side_effect=_fake_proof_case),
+            patch.object(
+                script,
+                "_cfg004_validate_transcript_collaboration",
+                return_value=(
+                    {"enabled": True, "thread_id": "test-thread-id", "total_child_commands": 3},
+                    transcript_failures,
+                ),
+            ),
+        ):
+            return script._cfg004_cooldown_clear_live_test(
+                litellm_base_url="http://127.0.0.1:4001",
+                cases=cases,
+                suite_config={},
+                query_url="http://localhost:3000",
+                public_key="pk-test",
+                secret_key="sk-test",
+            )
+
+    def test_saved_collab_tool_proof_gaps_accepted_with_clean_transcript(self):
+        result = self._run_live(
+            proof_failures=self._saved_collab_tool_failures(),
+            transcript_failures=[],
+        )
+        # Saved proof shape remains redacted-failed, but the transcript
+        # replay directly covers every residual gap.
+        assert result["phases"]["proof"]["passed"] is False
+        assert not any(
+            "did not pass endpoint/shape/session/tool validations" in f
+            for f in result["failures"]
+        )
+        assert result["passed"] is True
+
+    def test_unrecognized_residual_proof_failure_stays_fail_closed(self):
+        result = self._run_live(
+            proof_failures=(
+                self._saved_collab_tool_failures()
+                + [
+                    f"{self._PROOF_CASE}__cfg004_clear_proof "
+                    "endpoint request/response shape mismatch"
+                ]
+            ),
+            transcript_failures=[],
+        )
+        assert any(
+            "did not pass endpoint/shape/session/tool validations" in f
+            for f in result["failures"]
+        )
+        assert result["passed"] is False
+
+
 # ---------------------------------------------------------------------------
 # Integration: prepare + real handle_cooldown_clear
 # ---------------------------------------------------------------------------

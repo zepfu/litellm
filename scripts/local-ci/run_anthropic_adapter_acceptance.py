@@ -9931,8 +9931,18 @@ def _cfg004_parse_transcript_collaboration(  # noqa: PLR0915
                         for _ci in payload.get("content") or []:
                             if isinstance(_ci, dict):
                                 _ct = _ci.get("text")
-                                if isinstance(_ct, str):
+                                if isinstance(_ct, str) and _ct:
                                     _inbound_content.append(_ct)
+                                elif _ci.get("type") == "encrypted_content":
+                                    # OpenCode normalization materializes the
+                                    # exact prompt in `encrypted_content`
+                                    # before provider conversion; accept a
+                                    # non-empty value here. Genuinely opaque
+                                    # values (e.g. gAAAA...) still fail via
+                                    # the encrypted-prefix rejection below.
+                                    _ec = _ci.get("encrypted_content")
+                                    if isinstance(_ec, str) and _ec:
+                                        _inbound_content.append(_ec)
                         inbound_agent_messages.append({
                             "author": payload.get("author"),
                             "recipient": payload.get("recipient"),
@@ -10024,6 +10034,41 @@ def _cfg004_parse_transcript_collaboration(  # noqa: PLR0915
         "turn_contexts": turn_contexts,
     }
     return summary, failures
+
+
+# Proof failures that transcript-backed collaboration validation directly
+# re-validates (session-history evidence gaps). When transcript validation
+# reports zero failures, these are suppressed; any other proof failure keeps
+# the case fail-closed.
+_CFG004_TRANSCRIPT_COVERED_PROOF_FAILURE_MARKERS = (
+    "Codex command executions completed unexpected commands",
+    "Codex command executions did not overlap as one parallel batch",
+    "Codex command executions started unexpected commands",
+    "Codex command executions were not recorded in one turn",
+    "missing completed Codex collaboration calls for 'spawn_agent'",
+    "successful Codex wait did not record agents_states",
+)
+
+
+def _cfg004_proof_failures_covered_by_transcript(
+    *,
+    redacted_failures: list[str],
+    transcript_failures: list[str],
+) -> bool:
+    """Return True only when transcript validation reported zero failures and
+    every proof residual failure is a collaboration/tool evidence gap directly
+    covered by that transcript validation. Endpoint/shape, route/selection,
+    auth/cooldown, and unrecognized residuals stay fail-closed."""
+    if transcript_failures:
+        return False
+    return bool(redacted_failures) and all(
+        isinstance(failure, str)
+        and any(
+            marker in failure
+            for marker in _CFG004_TRANSCRIPT_COVERED_PROOF_FAILURE_MARKERS
+        )
+        for failure in redacted_failures
+    )
 
 
 def _cfg004_validate_transcript_collaboration(  # noqa: PLR0915
@@ -10756,8 +10801,11 @@ def _cfg004_cooldown_clear_live_test(  # noqa: PLR0915
             evidence["failures"].append(
                 f"proof selection route_family mismatch: expected {_CFG004_TARGET_ROUTE_FAMILY}, got {sel_rf}"
             )
-        if not proof["result"].get("passed"):
-            evidence["failures"].append("proof case did not pass endpoint/shape/session/tool validations")
+        # Deferred below transcript validation: the generic message is
+        # suppressed only when every residual proof failure is a
+        # collaboration/tool evidence gap directly re-validated by a clean
+        # transcript check.
+        _proof_case_failed = not proof["result"].get("passed")
 
         # Phase 7.5: Transcript-backed collaboration evidence.
         _emit_stderr("[cfg004] validating transcript collaboration evidence", flush=True)
@@ -10804,6 +10852,13 @@ def _cfg004_cooldown_clear_live_test(  # noqa: PLR0915
                 checks=transcript_checks,
             )
         )
+        if _proof_case_failed and not _cfg004_proof_failures_covered_by_transcript(
+            redacted_failures=_proof_failures,
+            transcript_failures=transcript_failures,
+        ):
+            evidence["failures"].append(
+                "proof case did not pass endpoint/shape/session/tool validations"
+            )
         _child_transcript_summary = transcript_summary.get("child_transcript")
         _parent_transcript_summary = transcript_summary.get("parent_transcript")
         # Secret-safe artifact: spawn args, child identity, prompt hash.

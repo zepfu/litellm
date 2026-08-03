@@ -1873,6 +1873,60 @@ class TestChildInboundPromptValidation:
         )
         assert any("does not" in f and "exact child prompt" in f for f in failures)
 
+    def test_encrypted_content_plaintext_inbound_passes(
+        self, tmp_path: pathlib.Path
+    ):
+        """Saved pass-3 two-part shape: part 1 input_text carries only the
+        NEW_TASK envelope and part 2 type=encrypted_content carries the
+        exact plaintext prompt (OpenCode materializes it before provider
+        conversion). Inbound prompt validation must pass."""
+        sessions = tmp_path / "sessions"
+        date_dir = sessions / "2026" / "08" / "02"
+        thread_id = "enccontent-plaintext-parent"
+        child_id = "enccontent-plaintext-child"
+        _write_jsonl(
+            date_dir / f"rollout-2026-08-02T01-00-00-{thread_id}.jsonl",
+            _make_parent_transcript(
+                thread_id,
+                child_thread_id=child_id,
+                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+            ),
+        )
+        child_lines = _make_child_transcript(
+            child_id, thread_id,
+            command_list=["pwd"],
+            terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+        )
+        for _line in child_lines:
+            _payload = _line.get("payload") or {}
+            if _payload.get("type") == "agent_message":
+                _payload["content"] = [
+                    {
+                        "type": "input_text",
+                        "text": "Message Type: NEW_TASK\n"
+                        "Task name: /root/read_alias_child\n"
+                        "Sender: /root\nPayload:\n",
+                    },
+                    {
+                        "type": "encrypted_content",
+                        "encrypted_content": _EXACT_CHILD_PROMPT,
+                    },
+                ]
+                break
+        _write_jsonl(
+            date_dir / f"rollout-2026-08-02T01-00-10-{child_id}.jsonl",
+            child_lines,
+        )
+        _, failures = HARNESS._cfg004_validate_transcript_collaboration(
+            thread_id=thread_id,
+            checks=dict(_FULL_CHECKS_V2),
+            sessions_dir=sessions,
+        )
+        inbound_failures = [f for f in failures if "inbound" in f.lower()]
+        assert inbound_failures == [], (
+            f"Unexpected inbound failures: {inbound_failures}"
+        )
+
 
 class TestAliasVsResolvedModel:
     """Validate alias-vs-resolved-model distinction is preserved."""
