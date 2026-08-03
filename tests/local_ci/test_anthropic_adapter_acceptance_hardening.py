@@ -2572,6 +2572,33 @@ def test_native_codex_case_hard_gates_spawn_agent_tool_description_patch():
     ]
     assert "GPT-5.5" not in request_text_checks["forbidden_substrings"]
 
+    from litellm.proxy.pass_through_endpoints.aawm_request_policy import (
+        codex_tool_policy as policy_module,
+    )
+
+    fanout_policy = policy_module.CODEX_SPAWN_AGENT_FANOUT_POLICY
+    assert "If the current task did not explicitly provide " in fanout_policy
+    assert 'default to model="aawm-codex-agent-auto"' in fanout_policy
+    assert "keep that provided value unchanged and do not " in fanout_policy
+    assert "substitute any default, including on retries." in fanout_policy
+    assert (
+        'lower-case payload fields: model="aawm-codex-agent-auto"'
+        not in fanout_policy
+    )
+    model_description = policy_module.CODEX_SPAWN_AGENT_PAYLOAD_FIELD_SCHEMAS[
+        "model"
+    ]["description"]
+    assert (
+        "If the current task provided a model, keep that value unchanged, "
+        in model_description
+    )
+    assert "including on retries." in model_description
+    assert "Otherwise default to aawm-codex-agent-auto" in model_description
+    assert (
+        "Use aawm-codex-agent-auto for read-only/exploration workers; use"
+        not in model_description
+    )
+
     session_history_validation = case_config["session_history_validation"]
     assert session_history_validation["metadata_required_equals"][
         "prompt_overhead_breakdown_source"

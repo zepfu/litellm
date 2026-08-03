@@ -172,7 +172,10 @@ CODEX_SPAWN_AGENT_FANOUT_POLICY = (
     "attempt or any retry. Apply defaults only when the current task did not "
     "provide an explicit value for that field.\n\n"
     "For read-only or exploration workers, call multi_agent_v1.spawn_agent with "
-    'lower-case payload fields: model="aawm-codex-agent-auto", '
+    "lower-case payload fields. If the current task did not explicitly provide "
+    'a model, default to model="aawm-codex-agent-auto". If the current task '
+    "did provide a model, keep that provided value unchanged and do not "
+    "substitute any default, including on retries. Use "
     'fork_turns="none" unless context sharing is explicitly needed, and message '
     "containing the read-only boundary plus the audit task. If a fix is needed, "
     "the worker should describe the patch only.\n\n"
@@ -202,8 +205,10 @@ CODEX_SPAWN_AGENT_PAYLOAD_FIELD_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "string",
         "description": (
             "Optional lower-case model override accepted by the orchestrator. "
-            "Use aawm-codex-agent-auto for read-only/exploration workers; use "
-            "the selected coding model for coding workers."
+            "If the current task provided a model, keep that value unchanged, "
+            "including on retries. Otherwise default to aawm-codex-agent-auto "
+            "for read-only/exploration workers and to the selected coding "
+            "model for coding workers."
         ),
     },
     "fork_turns": {
