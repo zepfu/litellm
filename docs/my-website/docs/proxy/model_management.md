@@ -63,6 +63,27 @@ concrete-model Codex passthrough uses the same rule. Alias fallback attempts
 recalculate from the original request, so a later candidate with a higher
 ceiling can retain the original effort.
 
+### Candidate-level reasoning policy
+
+An alias YAML candidate may optionally set an authoritative reasoning effort:
+
+```yaml
+candidates:
+  - model: gpt-5.6-luna
+    reasoning_effort: low
+```
+
+Accepted values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and
+`max`. A configured candidate value replaces reasoning supplied by the caller
+or TUI. If `reasoning_effort` is omitted, the candidate preserves the caller's
+original intent. Provider/model translation or clamping follows the existing
+capability policy and does not bypass provider constraints.
+
+Each failover candidate reevaluates this policy from the original caller
+intent, rather than reusing a previous candidate's transformed request.
+Request and configuration sources are recorded in audit and route metadata
+without including secrets.
+
 LiteLLM does not guess for unknown effort strings, unknown model ceilings, or
 providers without an explicit compatible capability contract. Those requests
 retain provider-native validation. A deterministic invalid-effort HTTP 400 is

@@ -706,3 +706,38 @@ def _build_typed_alias_route_services_fixture() -> AliasRouteServices:
 def test_alias_route_services_typed_assignment_fixture() -> None:
     services: AliasRouteServices = _build_typed_alias_route_services_fixture()
     assert services.publish_cooldown_memory_fn is _typed_publish_cooldown_memory
+
+
+def test_candidate_selection_bridge_carries_reasoning_effort() -> None:
+    """CFG-006: the typed bridge carries candidate reasoning_effort verbatim."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
+        CandidateSelection,
+    )
+
+    selection = CandidateSelection.from_legacy_dict(
+        {
+            "candidate": {
+                "provider": "openai",
+                "model": "gpt-5.6-luna",
+                "route_family": "codex_responses",
+                "last_resort": False,
+                "reasoning_effort": "low",
+            },
+            "lane_key": "openai:gpt-5.6-luna",
+            "cooldown_key": "cd:openai:gpt-5.6-luna",
+        }
+    )
+    assert selection.candidate.reasoning_effort == "low"
+
+    unset = CandidateSelection.from_legacy_dict(
+        {
+            "candidate": {
+                "provider": "openrouter",
+                "model": "openrouter/cohere/north-mini-code:free",
+                "route_family": "codex_openrouter_completion_adapter",
+            },
+            "lane_key": "k",
+            "cooldown_key": "ck",
+        }
+    )
+    assert unset.candidate.reasoning_effort is None

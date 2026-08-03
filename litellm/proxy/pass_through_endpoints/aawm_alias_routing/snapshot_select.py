@@ -100,6 +100,10 @@ def _routing_candidate_to_public_dict(
         "route_family": candidate.route_family,
         "last_resort": candidate.priority == 0,
     }
+    # CFG-006: carry the optional authoritative candidate reasoning effort so
+    # both ingress candidate-shaping paths can apply it uniformly.
+    if candidate.reasoning_effort is not None:
+        shaped["reasoning_effort"] = candidate.reasoning_effort
     if epoch_tag:
         shaped["config_epoch_tag"] = epoch_tag
     return shaped
@@ -438,6 +442,8 @@ def _routing_candidate_to_anthropic_public_dict(
         "route_family": anthropic_rf,
         "last_resort": candidate.priority == 0,
     }
+    if candidate.reasoning_effort is not None:
+        shaped["reasoning_effort"] = candidate.reasoning_effort
     if epoch_tag:
         shaped["config_epoch_tag"] = epoch_tag
     return shaped

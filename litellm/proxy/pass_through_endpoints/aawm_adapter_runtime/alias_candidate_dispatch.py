@@ -311,13 +311,34 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(
         )
 
     async def _native() -> "Response":
-        native_candidate_body = candidate_body
+        native_candidate_body = dict(candidate_body)
         native_custom_headers = custom_headers
         blocked_pass_through_prefixed_headers: Optional[list[str]] = None
         (
             native_candidate_body,
             _normalized_native_model_alias,
         ) = rt.normalize_native_model_alias(native_candidate_body)
+        raw_native_effort = native_candidate_body.pop("reasoning_effort", None)
+        if isinstance(raw_native_effort, str) and raw_native_effort:
+            from litellm.llms.anthropic.chat.transformation import AnthropicConfig
+            from litellm.llms.anthropic.experimental_pass_through.adapters.observability import (
+                normalize_reasoning_effort_for_provider,
+            )
+
+            native_model = str(native_candidate_body.get("model") or adapter_model)
+            normalized_native_effort = normalize_reasoning_effort_for_provider(
+                reasoning_effort=raw_native_effort,
+                model=native_model,
+                custom_llm_provider="anthropic",
+                native_provider="anthropic",
+            )
+            if normalized_native_effort and normalized_native_effort.native_value:
+                mapped_native_thinking = AnthropicConfig._map_reasoning_effort(
+                    normalized_native_effort.native_value,
+                    native_model,
+                )
+                if mapped_native_thinking:
+                    native_candidate_body["thinking"] = mapped_native_thinking
         (
             native_candidate_body,
             native_custom_headers,

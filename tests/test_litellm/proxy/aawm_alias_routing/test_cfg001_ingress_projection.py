@@ -215,6 +215,44 @@ class TestAnthropicPublicDict:
         assert shaped["route_family"] != candidate.route_family
         assert shaped["config_epoch_tag"] == "abc123"
 
+    def test_reasoning_effort_carried_by_both_ingress_shapes(self):
+        """CFG-006: configured reasoning_effort survives both ingress shapings."""
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+            RoutingCandidate,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+            _routing_candidate_to_public_dict,
+        )
+
+        configured = RoutingCandidate(
+            provider="openai",
+            model="gpt-5.6-luna",
+            route_family="codex_responses",
+            priority=40,
+            weight=1.0,
+            tui_attached=None,
+            schedule=None,
+            anthropic_route_family="anthropic_openai_responses_adapter",
+            reasoning_effort="low",
+        )
+        codex_shaped = _routing_candidate_to_public_dict(configured)
+        anthropic_shaped = _routing_candidate_to_anthropic_public_dict(configured)
+        assert codex_shaped["reasoning_effort"] == "low"
+        assert anthropic_shaped["reasoning_effort"] == "low"
+
+        unset = RoutingCandidate(
+            provider="openrouter",
+            model="openrouter/cohere/north-mini-code:free",
+            route_family="codex_openrouter_completion_adapter",
+            priority=80,
+            weight=1.0,
+            tui_attached=None,
+            schedule=None,
+            anthropic_route_family="anthropic_openrouter_completion_adapter",
+        )
+        assert "reasoning_effort" not in _routing_candidate_to_public_dict(unset)
+        assert "reasoning_effort" not in _routing_candidate_to_anthropic_public_dict(unset)
+
     def test_missing_anthropic_rf_raises(self, read_snapshot: RoutingSnapshot):
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
             RoutingCandidate,

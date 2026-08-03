@@ -125,6 +125,7 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
         schedule=schedule,
         error_rules=error_rules,
         anthropic_route_family=anthropic_rf,
+        reasoning_effort=candidate.reasoning_effort,
     )
 
 
@@ -169,6 +170,7 @@ def _canonical_snapshot_repr(aliases: dict[str, RoutingAlias]) -> str:
                     "provider": candidate.provider,
                     "anthropic_route_family": candidate.anthropic_route_family,
                     "route_family": candidate.route_family,
+                    "reasoning_effort": candidate.reasoning_effort,
                     "schedule": (
                         {
                             "end": candidate.schedule.end.isoformat(),

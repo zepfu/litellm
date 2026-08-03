@@ -133,6 +133,7 @@ class LiteLLMMessagesToCompletionTransformationHandler:
         system: Optional[str] = None,
         temperature: Optional[float] = None,
         thinking: Optional[Dict] = None,
+        reasoning_effort: Optional[str] = None,
         tool_choice: Optional[Dict] = None,
         tools: Optional[List[Dict]] = None,
         top_k: Optional[int] = None,
@@ -168,6 +169,8 @@ class LiteLLMMessagesToCompletionTransformationHandler:
             request_data["temperature"] = temperature
         if thinking:
             request_data["thinking"] = thinking
+        if reasoning_effort:
+            request_data["reasoning_effort"] = reasoning_effort
         if tool_choice:
             request_data["tool_choice"] = tool_choice
         if tools:
@@ -276,6 +279,7 @@ class LiteLLMMessagesToCompletionTransformationHandler:
         system: Optional[str] = None,
         temperature: Optional[float] = None,
         thinking: Optional[Dict] = None,
+        reasoning_effort: Optional[str] = None,
         tool_choice: Optional[Dict] = None,
         tools: Optional[List[Dict]] = None,
         top_k: Optional[int] = None,
@@ -298,6 +302,7 @@ class LiteLLMMessagesToCompletionTransformationHandler:
             system=system,
             temperature=temperature,
             thinking=thinking,
+            reasoning_effort=reasoning_effort,
             tool_choice=tool_choice,
             tools=tools,
             top_k=top_k,
@@ -327,6 +332,7 @@ class LiteLLMMessagesToCompletionTransformationHandler:
         system: Optional[str] = None,
         temperature: Optional[float] = None,
         thinking: Optional[Dict] = None,
+        reasoning_effort: Optional[str] = None,
         tool_choice: Optional[Dict] = None,
         tools: Optional[List[Dict]] = None,
         top_k: Optional[int] = None,
@@ -352,6 +358,7 @@ class LiteLLMMessagesToCompletionTransformationHandler:
                 system=system,
                 temperature=temperature,
                 thinking=thinking,
+                reasoning_effort=reasoning_effort,
                 tool_choice=tool_choice,
                 tools=tools,
                 top_k=top_k,
@@ -374,6 +381,7 @@ class LiteLLMMessagesToCompletionTransformationHandler:
             system=system,
             temperature=temperature,
             thinking=thinking,
+            reasoning_effort=reasoning_effort,
             tool_choice=tool_choice,
             tools=tools,
             top_k=top_k,

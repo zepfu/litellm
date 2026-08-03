@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 from typing_extensions import TypeGuard
 
@@ -94,6 +94,10 @@ def _build_anthropic_messages_request(
     top_p = request_body.get("top_p")
     if isinstance(top_p, (int, float)):
         anthropic_request["top_p"] = float(top_p)
+    reasoning_effort = request_body.get("reasoning_effort")
+    if isinstance(reasoning_effort, str) and reasoning_effort:
+        # Non-public intermediate field; keep the typed contract unchanged.
+        cast(Any, anthropic_request)["reasoning_effort"] = reasoning_effort
     return anthropic_request
 
 
@@ -160,6 +164,13 @@ def build_responses_request_body(
         native_provider="openai",
         native_field="reasoning.effort",
     )
+    if normalized_effort is not None and normalized_effort.native_value:
+        reasoning_block = translated_body.get("reasoning")
+        reasoning_block = (
+            dict(reasoning_block) if isinstance(reasoning_block, dict) else {}
+        )
+        reasoning_block["effort"] = normalized_effort.native_value
+        translated_body["reasoning"] = reasoning_block
     adapter_tags: list[str] = []
     adapter_extra_fields: Payload = {}
     runtime.add_native_tool_metadata(

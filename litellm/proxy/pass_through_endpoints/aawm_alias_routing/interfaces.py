@@ -58,6 +58,10 @@ class AliasCandidate:
     last_resort: bool = False
     metadata_gate: Optional[str] = None
     default_reasoning_effort: Optional[str] = None
+    # CFG-006: optional authoritative candidate-level reasoning effort
+    # (canonical vocabulary); carried verbatim from the compiled snapshot
+    # candidate shape.
+    reasoning_effort: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -97,6 +101,7 @@ class CandidateSelection:
             last_resort=bool(raw_candidate.get("last_resort")),
             metadata_gate=raw_candidate.get("metadata_gate"),
             default_reasoning_effort=raw_candidate.get("default_reasoning_effort"),
+            reasoning_effort=raw_candidate.get("reasoning_effort"),
         )
         return cls(
             candidate=candidate,

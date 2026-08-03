@@ -632,6 +632,23 @@ def _add_codex_auto_agent_alias_metadata(
     target_model = candidate["model"]
     updated_body = copy.deepcopy(request_body)
     updated_body["model"] = target_model
+    # CFG-006: an optional candidate-level YAML ``reasoning_effort`` is
+    # AUTHORITATIVE. It replaces every caller/TUI reasoning representation
+    # on the attempt body before the shared route normalizer runs, so the
+    # configured value (never the caller's) feeds provider translation and
+    # capability clamping. Omission leaves caller intent untouched.
+    configured_reasoning_effort = _normalize_low_cardinality_tag_value(
+        candidate.get("reasoning_effort")
+    )
+    if configured_reasoning_effort:
+        updated_body.pop("reasoning_effort", None)
+        prior_reasoning = updated_body.get("reasoning")
+        remaining_reasoning = (
+            {k: v for k, v in prior_reasoning.items() if k != "effort"}
+            if isinstance(prior_reasoning, dict)
+            else {}
+        )
+        updated_body["reasoning"] = {**remaining_reasoning, "effort": configured_reasoning_effort}
     default_reasoning_effort = _normalize_low_cardinality_tag_value(candidate.get("default_reasoning_effort"))
     default_reasoning_applied = False
     if default_reasoning_effort and "reasoning_effort" not in updated_body:
@@ -654,6 +671,12 @@ def _add_codex_auto_agent_alias_metadata(
         resolved_route=candidate,
         attempt_number=attempt_number,
     )
+    if configured_reasoning_effort:
+        reasoning_effort_metadata = {
+            **reasoning_effort_metadata,
+            "reasoning_effort_config_value": configured_reasoning_effort,
+            "reasoning_effort_config_source": "candidate_yaml",
+        }
     audit_selection = selection
     if reasoning_effort_metadata:
         if attempts:
@@ -684,6 +707,7 @@ def _add_codex_auto_agent_alias_metadata(
             f"model-alias:{alias_model}",
             *(["codex-auto-agent-last-resort"] if candidate.get("last_resort") else []),
             *([f"codex-auto-agent-default-effort:{default_reasoning_effort}"] if default_reasoning_applied else []),
+            *([f"codex-auto-agent-config-effort:{configured_reasoning_effort}"] if configured_reasoning_effort else []),
             f"codex-auto-agent-alias:{alias_model}",
         ],
         extra_fields={
@@ -694,6 +718,11 @@ def _add_codex_auto_agent_alias_metadata(
             "codex_auto_agent_selected_model": target_model,
             "codex_auto_agent_selected_route_family": candidate["route_family"],
             "codex_auto_agent_selected_last_resort": bool(candidate.get("last_resort")),
+            **(
+                {"codex_auto_agent_config_reasoning_effort": configured_reasoning_effort}
+                if configured_reasoning_effort
+                else {}
+            ),
             **(
                 {
                     "codex_auto_agent_default_reasoning_effort": (default_reasoning_effort),
@@ -724,6 +753,7 @@ def _add_anthropic_auto_agent_alias_metadata(
     attempts: list[dict[str, Any]],
 ) -> dict[str, Any]:
     assert _normalize_anthropic_auto_agent_alias_model is not None
+    assert _normalize_low_cardinality_tag_value is not None
     assert _merge_litellm_metadata is not None
     assert _build_auto_agent_alias_audit_events is not None
 
@@ -736,13 +766,55 @@ def _add_anthropic_auto_agent_alias_metadata(
     target_model = candidate["model"]
     updated_body = copy.deepcopy(request_body)
     updated_body["model"] = target_model
+    # CFG-006: an optional candidate-level YAML ``reasoning_effort`` is
+    # AUTHORITATIVE on the Anthropic Messages ingress as well. Conflicting
+    # caller effort/thinking representations (``thinking``, ``output_config``
+    # effort, top-level ``reasoning_effort``) are removed ONLY when a config
+    # value is set, and the canonical value is placed at the top level so the
+    # shared adapter/provider translation seams own native mapping/clamping.
+    # Omission preserves caller intent untouched.
+    configured_reasoning_effort = _normalize_low_cardinality_tag_value(
+        candidate.get("reasoning_effort")
+    )
+    if configured_reasoning_effort:
+        updated_body.pop("thinking", None)
+        output_config = updated_body.get("output_config")
+        if isinstance(output_config, dict):
+            remaining_output_config = {
+                key: value for key, value in output_config.items() if key != "effort"
+            }
+            if remaining_output_config:
+                updated_body["output_config"] = remaining_output_config
+            else:
+                updated_body.pop("output_config", None)
+        updated_body["reasoning_effort"] = configured_reasoning_effort
+    audit_selection = selection
+    if configured_reasoning_effort:
+        reasoning_effort_metadata = {
+            "reasoning_effort_config_value": configured_reasoning_effort,
+            "reasoning_effort_config_source": "candidate_yaml",
+        }
+        # Mirror the Codex seam: when an attempt record exists it is the
+        # audit source of truth, so propagate onto the final attempt; the
+        # enriched selection candidate only covers the empty-attempt
+        # fallback used by audit construction.
+        if attempts:
+            attempts[-1].update(reasoning_effort_metadata)
+        else:
+            audit_selection = {
+                **selection,
+                "candidate": {
+                    **candidate,
+                    **reasoning_effort_metadata,
+                },
+            }
     skipped = selection.get("skipped") or []
     audit_events = _build_auto_agent_alias_audit_events(
         alias_family="anthropic_auto_agent",
         alias_model=alias_model,
         request=request,
         request_body=request_body,
-        selection=selection,
+        selection=audit_selection,
         attempts=attempts,
     )
     return _merge_litellm_metadata(
@@ -753,6 +825,11 @@ def _add_anthropic_auto_agent_alias_metadata(
             f"anthropic-auto-agent-route:{candidate['route_family']}",
             f"model-alias:{alias_model}",
             *(["anthropic-auto-agent-last-resort"] if candidate.get("last_resort") else []),
+            *(
+                [f"anthropic-auto-agent-config-effort:{configured_reasoning_effort}"]
+                if configured_reasoning_effort
+                else []
+            ),
             f"anthropic-auto-agent-alias:{alias_model}",
         ],
         extra_fields={
@@ -763,6 +840,11 @@ def _add_anthropic_auto_agent_alias_metadata(
             "anthropic_auto_agent_selected_model": target_model,
             "anthropic_auto_agent_selected_route_family": candidate["route_family"],
             "anthropic_auto_agent_selected_last_resort": bool(candidate.get("last_resort")),
+            **(
+                {"anthropic_auto_agent_config_reasoning_effort": configured_reasoning_effort}
+                if configured_reasoning_effort
+                else {}
+            ),
             "anthropic_auto_agent_selection_reason": selection.get("selection_reason"),
             "anthropic_auto_agent_affinity_state_source": selection.get("affinity_state_source"),
             "anthropic_auto_agent_cooldown_state_source": selection.get("cooldown_state_source"),

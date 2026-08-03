@@ -51,6 +51,9 @@ aliases:
         model: gpt-5.6-luna
         route_family: codex_responses
         priority: 40
+        # CFG-006: authoritative candidate-level reasoning (replaces caller/TUI
+        # reasoning for this candidate only).
+        reasoning_effort: low
 
       - provider: alibaba_token_plan
         model: alibaba_token_plan/qwen3.6-flash

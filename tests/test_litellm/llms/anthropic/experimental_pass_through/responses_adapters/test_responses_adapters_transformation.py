@@ -2104,3 +2104,41 @@ class TestTranslateResponse:
         assert "text" in types
         assert "tool_use" in types
         assert result["stop_reason"] == "tool_use"
+
+
+class TestBuildResponsesRequestBodyReasoningEffort:
+    """CFG-006: raw Anthropic reasoning_effort must reach Responses egress."""
+
+    def test_reasoning_effort_sets_responses_reasoning_block(self):
+        from litellm.llms.anthropic.experimental_pass_through.providers.common import (
+            ShapingRuntime,
+            build_responses_request_body,
+        )
+
+        runtime = ShapingRuntime(
+            normalize_function_tool_schemas=lambda body: None,
+            add_native_tool_metadata=lambda tags, extra, enabled=False: None,
+            apply_tool_description_patches=lambda body: (body, {}),
+            merge_metadata=lambda body, tags_to_add=None, extra_fields=None: body,
+            add_route_family_metadata=lambda body, route_family: body,
+            build_span=lambda name=None, metadata=None: {},
+            apply_openai_parallel_policy=lambda body: (body, {}),
+            apply_forced_responses_tool_choice=lambda prepared, translated: (
+                translated,
+                {},
+            ),
+            apply_forced_completion_tool_choice=lambda body: {},
+            log_debug=lambda *args, **kwargs: None,
+        )
+        request_body = {
+            "model": "claude-x",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1024,
+            "reasoning_effort": "high",
+        }
+        translated = build_responses_request_body(
+            runtime,
+            request_body,
+            adapter_model="openai/gpt-5.1-codex",
+        )
+        assert translated["reasoning"]["effort"] == "high"

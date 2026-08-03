@@ -183,6 +183,48 @@ aliases:
         compiler.compile_yaml(raw)
 
 
+def test_reasoning_effort_snapshot_field_and_semantic_hash() -> None:
+    """CFG-006: optional reasoning_effort survives compile and feeds the hash."""
+    base_raw = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openai
+        model: gpt-5.4-mini
+        route_family: codex_responses
+        priority: 0
+"""
+    with_effort_raw = base_raw.replace(
+        "priority: 0", "priority: 0\n        reasoning_effort: low", 1
+    )
+
+    snapshot_plain = compiler.compile_yaml(base_raw)
+    snapshot_with = compiler.compile_yaml(with_effort_raw)
+
+    assert snapshot_plain.aliases["read"].candidates[0].reasoning_effort is None
+    assert snapshot_with.aliases["read"].candidates[0].reasoning_effort == "low"
+    # The configured value participates in semantic config identity.
+    assert snapshot_plain.config_hash != snapshot_with.config_hash
+
+
+def test_reasoning_effort_malformed_fails_compile_closed() -> None:
+    """CFG-006: a malformed reasoning_effort rejects the whole compile."""
+    raw = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openai
+        model: gpt-5.4-mini
+        route_family: codex_responses
+        priority: 0
+        reasoning_effort: extreme
+"""
+    with pytest.raises((ValidationError, compiler.ConfigCompileError)):
+        compiler.compile_yaml(raw)
+
+
 # ===========================================================================
 # Wave 3: R3-4 -- semantic digest stability across processes and formatting
 # ===========================================================================

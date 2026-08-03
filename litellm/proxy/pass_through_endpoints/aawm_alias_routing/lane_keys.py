@@ -119,6 +119,8 @@ _CODEX_REASONING_EFFORT_TIER_INDEX = {effort: index for index, effort in enumera
 
 _CODEX_AUTO_AGENT_REASONING_EFFORT_AUDIT_FIELDS = (
     "reasoning_effort_requested",
+    "reasoning_effort_config_value",
+    "reasoning_effort_config_source",
     "reasoning_effort_source",
     "reasoning_effort_native_provider",
     "reasoning_effort_native_value",

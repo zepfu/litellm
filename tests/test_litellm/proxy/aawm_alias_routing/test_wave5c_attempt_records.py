@@ -707,6 +707,82 @@ class TestCodexAliasMetadata:
 
         assert "codex-auto-agent-last-resort" in result["litellm_metadata"]["tags"]
 
+    def test_configured_reasoning_effort_overrides_caller(self) -> None:
+        """CFG-006: configured candidate reasoning_effort replaces caller reasoning."""
+        request = _make_request()
+        body = {
+            "model": "codex-auto-agent",
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "reasoning_effort": "high",
+        }
+        selection = self._selection()
+        selection["candidate"]["reasoning_effort"] = "low"
+
+        result = attempt_records._add_codex_auto_agent_alias_metadata(
+            body, request=request, selection=selection, attempts=[]
+        )
+
+        assert result["reasoning"] == {"effort": "low", "summary": "auto"}
+        assert "reasoning_effort" not in result
+        # Caller body is not mutated (deep-copied per attempt).
+        assert body["reasoning"] == {"effort": "high", "summary": "auto"}
+        assert body["reasoning_effort"] == "high"
+        meta = result["litellm_metadata"]
+        assert "codex-auto-agent-config-effort:low" in meta["tags"]
+        assert meta["codex_auto_agent_config_reasoning_effort"] == "low"
+
+    def test_omitted_config_preserves_caller_reasoning(self) -> None:
+        """CFG-006: no configured value leaves caller reasoning untouched."""
+        request = _make_request()
+        body = {"model": "codex-auto-agent", "reasoning": {"effort": "medium"}}
+        selection = self._selection()
+
+        result = attempt_records._add_codex_auto_agent_alias_metadata(
+            body, request=request, selection=selection, attempts=[]
+        )
+
+        assert result["reasoning"] == {"effort": "medium"}
+        meta = result["litellm_metadata"]
+        assert not any(
+            tag.startswith("codex-auto-agent-config-effort:") for tag in meta["tags"]
+        )
+
+    def test_failover_attempts_start_from_original_caller_reasoning(self) -> None:
+        """CFG-006 regression: each attempt reshapes from the original body.
+
+        A configured first candidate must not leak its provider-shaped
+        reasoning into the next attempt; an unset second candidate receives
+        the caller's original reasoning intent.
+        """
+        request = _make_request()
+        original_body = {
+            "model": "codex-auto-agent",
+            "reasoning": {"effort": "high"},
+        }
+
+        first = self._selection()
+        first["candidate"]["reasoning_effort"] = "low"
+        first_body = attempt_records._add_codex_auto_agent_alias_metadata(
+            original_body, request=request, selection=first, attempts=[]
+        )
+        assert first_body["reasoning"] == {"effort": "low"}
+
+        second = self._selection(
+            candidate={
+                "provider": "openrouter",
+                "model": "openrouter/cohere/north-mini-code:free",
+                "route_family": "codex_openrouter_completion_adapter",
+                "last_resort": False,
+            }
+        )
+        second_body = attempt_records._add_codex_auto_agent_alias_metadata(
+            original_body, request=request, selection=second, attempts=[{"status": "started"}]
+        )
+
+        # No leak from the prior attempt: caller intent is restored.
+        assert second_body["reasoning"] == {"effort": "high"}
+        assert original_body["reasoning"] == {"effort": "high"}
+
 
 # ---------------------------------------------------------------------------
 # _add_anthropic_auto_agent_alias_metadata
@@ -769,3 +845,62 @@ class TestAnthropicAliasMetadata:
         meta = result["litellm_metadata"]
         assert meta["anthropic_auto_agent_alias"] == "custom-anthropic-alias"
         assert "model-alias:custom-anthropic-alias" in meta["tags"]
+
+    def test_configured_reasoning_effort_overrides_caller_thinking(self) -> None:
+        """CFG-006: configured value clears caller effort/thinking shapes.
+
+        Conflicting caller representations (thinking, output_config.effort,
+        top-level reasoning_effort) are removed only when config is set; the
+        canonical top-level value is handed to shared provider translation.
+        """
+        request = _make_request()
+        body = {
+            "model": "claude-auto-agent",
+            "thinking": {"type": "enabled", "budget_tokens": 32000},
+            "output_config": {"effort": "high", "verbosity": "medium"},
+            "reasoning_effort": "high",
+        }
+        selection = self._selection()
+        selection["candidate"]["reasoning_effort"] = "low"
+
+        result = attempt_records._add_anthropic_auto_agent_alias_metadata(
+            body,
+            request=request,
+            selection=selection,
+            attempts=[{"status": "started"}],
+        )
+
+        assert "thinking" not in result
+        assert result["output_config"] == {"verbosity": "medium"}
+        assert result["reasoning_effort"] == "low"
+        # Caller body untouched.
+        assert body["thinking"] == {"type": "enabled", "budget_tokens": 32000}
+        assert body["reasoning_effort"] == "high"
+        meta = result["litellm_metadata"]
+        assert "anthropic-auto-agent-config-effort:low" in meta["tags"]
+        assert meta["anthropic_auto_agent_config_reasoning_effort"] == "low"
+        # Audit construction consumes the attempt record, so both
+        # low-cardinality config fields must survive onto the built event.
+        audit_events = meta["anthropic_auto_agent_audit_events"]
+        assert audit_events
+        event_attempt = audit_events[0]["attempts"][-1]
+        assert event_attempt["reasoning_effort_config_value"] == "low"
+        assert event_attempt["reasoning_effort_config_source"] == "candidate_yaml"
+
+    def test_omitted_config_preserves_caller_thinking(self) -> None:
+        """CFG-006: omission imposes no alias policy on Anthropic ingress."""
+        request = _make_request()
+        body = {
+            "model": "claude-auto-agent",
+            "thinking": {"type": "enabled", "budget_tokens": 8000},
+            "output_config": {"effort": "high"},
+        }
+        selection = self._selection()
+
+        result = attempt_records._add_anthropic_auto_agent_alias_metadata(
+            body, request=request, selection=selection, attempts=[]
+        )
+
+        assert result["thinking"] == {"type": "enabled", "budget_tokens": 8000}
+        assert result["output_config"] == {"effort": "high"}
+        assert "reasoning_effort" not in result

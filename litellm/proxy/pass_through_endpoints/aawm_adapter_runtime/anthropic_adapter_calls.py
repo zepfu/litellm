@@ -1263,6 +1263,12 @@ async def _perform_anthropic_completion_adapter_messages_call(
     )
     raw_thinking = prepared_request_body.get("thinking")
     thinking = raw_thinking if isinstance(raw_thinking, dict) else None
+    raw_reasoning_effort = prepared_request_body.get("reasoning_effort")
+    reasoning_effort = (
+        raw_reasoning_effort
+        if isinstance(raw_reasoning_effort, str) and raw_reasoning_effort
+        else None
+    )
     raw_tool_choice = prepared_request_body.get("tool_choice")
     tool_choice = raw_tool_choice if isinstance(raw_tool_choice, dict) else None
     raw_tools = prepared_request_body.get("tools")
@@ -1285,6 +1291,7 @@ async def _perform_anthropic_completion_adapter_messages_call(
         "system": system,
         "temperature": temperature,
         "thinking": thinking,
+        "reasoning_effort": reasoning_effort,
         "tool_choice": tool_choice,
         "tools": tools,
         "top_k": top_k,

@@ -48,6 +48,27 @@ def test_rejects_unknown_keys_and_malformed() -> None:
         schema.CandidateConfig.model_validate(_base_candidate(priority="not-an-int"))
 
 
+def test_reasoning_effort_optional_and_canonical() -> None:
+    """CFG-006: optional candidate reasoning_effort uses the canonical vocabulary."""
+    candidate = schema.CandidateConfig.model_validate(_base_candidate())
+    assert candidate.reasoning_effort is None
+
+    for effort in ("none", "minimal", "low", "medium", "high", "xhigh", "max"):
+        accepted = schema.CandidateConfig.model_validate(
+            _base_candidate(reasoning_effort=effort)
+        )
+        assert accepted.reasoning_effort == effort
+
+
+def test_reasoning_effort_malformed_values_rejected() -> None:
+    """CFG-006: malformed reasoning_effort values fail validation closed."""
+    for bad_value in ("extreme", "HIGH", "", 3, ["low"]):
+        with pytest.raises(ValidationError):
+            schema.CandidateConfig.model_validate(
+                _base_candidate(reasoning_effort=bad_value)
+            )
+
+
 def test_rejects_arbitrary_behavior() -> None:
     """A candidate whose route_family/provider is not a registered code behavior is rejected."""
     with pytest.raises(ValidationError):

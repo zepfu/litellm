@@ -48,6 +48,11 @@ class RoutingCandidate:
     schedule: Optional[ScheduleWindow]
     error_rules: tuple[ErrorRule, ...] = field(default_factory=tuple)
     anthropic_route_family: Optional[str] = None
+    # CFG-006: optional authoritative candidate-level reasoning effort
+    # (canonical none|minimal|low|medium|high|xhigh|max). When set it
+    # replaces caller/TUI reasoning at shaping time; when None the caller's
+    # intent is preserved.
+    reasoning_effort: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)

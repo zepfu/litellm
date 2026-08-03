@@ -153,6 +153,21 @@ def test_rr026_prepare_completion_kwargs_sets_stream_options() -> None:
     assert isinstance(mapping, dict)
 
 
+def test_cfg006_completion_reasoning_effort_maps_to_thinking_for_claude() -> None:
+    """CFG-006: Completion path maps reasoning_effort to thinking for Claude."""
+    kwargs, _ = Handler._prepare_completion_kwargs(
+        max_tokens=16,
+        messages=[{"role": "user", "content": "hi"}],
+        model="anthropic/claude-sonnet-4-5",
+        reasoning_effort="high",
+        extra_kwargs={"custom_llm_provider": "anthropic"},
+    )
+    thinking = kwargs.get("thinking")
+    assert isinstance(thinking, dict)
+    assert thinking.get("type") == "enabled"
+    assert "reasoning_effort" not in kwargs
+
+
 def test_rr026_transform_streaming_delegates_to_adapter() -> None:
     fake_stream = object()
     with patch.object(

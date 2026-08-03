@@ -544,6 +544,7 @@ class LiteLLMAnthropicMessagesAdapter:
             "thinking",
             "output_config",
             "output_format",
+            "reasoning_effort",
         ]
 
     def _should_preserve_cache_control_for_target(
@@ -1571,7 +1572,20 @@ class LiteLLMAnthropicMessagesAdapter:
             require_capability=native_provider in {"openrouter", "nvidia_nim"},
         )
         if normalized_effort is not None:
-            if (
+            if normalized_effort.native_value and self.is_anthropic_claude_model(
+                model
+            ):
+                from litellm.llms.anthropic.chat.transformation import (
+                    AnthropicConfig,
+                )
+
+                mapped_thinking = AnthropicConfig._map_reasoning_effort(
+                    normalized_effort.native_value, model
+                )
+                if mapped_thinking:
+                    new_kwargs["thinking"] = mapped_thinking  # type: ignore
+                new_kwargs.pop("reasoning_effort", None)
+            elif (
                 normalized_effort.native_value
                 and not self.is_anthropic_claude_model(model)
                 and "reasoning_effort" not in new_kwargs

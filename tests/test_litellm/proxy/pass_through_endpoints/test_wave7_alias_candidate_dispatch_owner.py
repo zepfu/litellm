@@ -410,6 +410,49 @@ class TestPerformAnthropicAutoAgentAliasCandidateRequest:
         kw = rt.perform_native_passthrough.call_args.kwargs
         assert kw["blocked_pass_through_prefixed_headers"] is None
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("effort", "expected_thinking_type"),
+        [
+            ("high", "enabled"),
+            ("xhigh", "enabled"),
+            ("max", "enabled"),
+            ("none", None),
+        ],
+    )
+    async def test_native_reasoning_effort_maps_schema_valid_thinking(
+        self, effort, expected_thinking_type
+    ):
+        """CFG-006: native path normalizes effort, strips raw field, maps valid thinking."""
+        rt = _make_runtime()
+        _install_runtime(rt)
+        candidate_body = {
+            "model": "claude-sonnet-4-5",
+            "reasoning_effort": effort,
+        }
+        await _perform_anthropic_auto_agent_alias_candidate_request(
+            endpoint="/v1/messages",
+            request=MagicMock(),
+            fastapi_response=MagicMock(),
+            user_api_key_dict=MagicMock(),
+            candidate={
+                "model": "claude-sonnet-4-5",
+                "provider": "unknown",
+                "route_family": "",
+            },
+            candidate_body=candidate_body,
+            target_url="https://api.anthropic.com",
+            custom_headers={},
+        )
+        sent_body = rt.safe_set_request_parsed_body.call_args.args[1]
+        assert "reasoning_effort" not in sent_body
+        if expected_thinking_type is None:
+            assert "thinking" not in sent_body
+        else:
+            assert sent_body["thinking"]["type"] == expected_thinking_type
+            assert isinstance(sent_body["thinking"].get("budget_tokens"), int)
+        assert candidate_body["reasoning_effort"] == effort  # original not mutated
+
 
 # ---------------------------------------------------------------------------
 # install()

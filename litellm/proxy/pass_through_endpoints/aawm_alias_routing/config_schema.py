@@ -104,6 +104,15 @@ def resolve_anthropic_route_family(
 DistributionStrategy = Literal["proportional", "round_robin"]
 
 
+# Canonical reasoning-effort vocabulary accepted at the candidate YAML level
+# (CFG-006). Matches the tier order used by the shared reasoning-effort
+# normalization seams; values are stored verbatim and translated per provider
+# route at dispatch time.
+REGISTERED_REASONING_EFFORTS: frozenset[str] = frozenset(
+    {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
+
+
 def _require_registered_provider(value: str) -> str:
     if value not in REGISTERED_PROVIDERS:
         raise ValueError(f"provider {value!r} is not a registered code behavior")
@@ -161,6 +170,7 @@ class CandidateConfig(BaseModel):
     tui_attached: Optional[str] = None
     schedule: Optional[ScheduleWindowConfig] = None
     error_rules: list[ErrorRuleConfig] = Field(default_factory=list)
+    reasoning_effort: Optional[str] = None
 
     @field_validator("provider")
     @classmethod
@@ -182,6 +192,16 @@ class CandidateConfig(BaseModel):
     def _require_non_negative_weight(cls, value: float) -> float:
         if value < 0:
             raise ValueError(f"candidate weight {value!r} must not be negative")
+        return value
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def _require_canonical_reasoning_effort(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and value not in REGISTERED_REASONING_EFFORTS:
+            raise ValueError(
+                f"candidate reasoning_effort {value!r} is not a canonical effort value; "
+                f"expected one of none|minimal|low|medium|high|xhigh|max"
+            )
         return value
 
 
