@@ -101,6 +101,13 @@ Before cutting or promoting a release:
   `/mnt/e/litellm/session_history`. Do not leave this as an unmounted
   in-container directory, because spooled retry datasets must survive container
   recreation.
+- Confirm the complete canonical directory
+  `litellm/proxy/aawm_alias_config/` is included in the production runtime and
+  mounted read-only. Startup must discover and activate its complete immutable
+  alias snapshot before readiness; invalid, duplicate, or partial config must
+  fail readiness closed. Release validation must confirm the mounted inventory,
+  active aliases and config hash, restart activation, and that no alias YAML
+  files are present outside the mounted canonical directory.
 - Confirm `PATCHES.md`, `TODO.md`, `WHEEL.md`, `TEST_HARNESS.md`, and the local
   `.analysis/completed*.md` ledger reflect the current release state when
   behavior changes. The completion ledger is intentionally not committed.
@@ -349,14 +356,22 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    docker compose -f docker-compose.litellm.yml up -d litellm
    ```
 
-4. Confirm readiness and version on `:4000`.
+4. Confirm the complete canonical alias-config directory is present in the
+   production runtime as a read-only mount, and that no alias YAML files are
+   mounted elsewhere. Confirm startup activated the complete immutable
+   snapshot by checking the active aliases and config hash, then restart the
+   container and confirm the same inventory and snapshot activate before
+   readiness. Invalid, duplicate, or partial config must leave readiness
+   failed closed.
+
+5. Confirm readiness and version on `:4000`.
 
    ```bash
    curl -sS http://127.0.0.1:4000/health/readiness
    curl -sS http://127.0.0.1:4000/health
    ```
 
-5. Confirm the rendered runtime config includes any newly exposed models.
+6. Confirm the rendered runtime config includes any newly exposed models.
 
    ```bash
    docker exec aawm-litellm sh -lc \
@@ -371,13 +386,13 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
      "grep -En 'qwen3-heretic-gguf|qwen3-4b-heretic-q8|host.docker.internal:8093' /etc/litellm/config.yaml"
    ```
 
-6. Inspect startup logs.
+7. Inspect startup logs.
 
    ```bash
    docker logs --tail 500 aawm-litellm
    ```
 
-7. Verify the Grok OIDC credential ownership split after prod restart.
+8. Verify the Grok OIDC credential ownership split after prod restart.
 
    ```bash
    docker inspect aawm-litellm --format '{{json .Mounts}} {{json .Config.Env}}'

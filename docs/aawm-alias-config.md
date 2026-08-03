@@ -163,10 +163,10 @@ scan-rescan drift check at activation and otherwise load on the next restart.
 
 ## Production parity
 
-Production deployment parity (equivalent read-only mounting, startup ordering,
-and readiness gating in the production image/orchestrator) remains an
-**external blocker** tracked outside this repository. The dev compose mount
-and startup wiring here are the reference implementation.
+`litellm-dev` is the implementation and acceptance environment. Production
+parity is enforced during the release process; see [PROD_RELEASE.md](../PROD_RELEASE.md).
+The dev compose mount and startup wiring here are the reference
+implementation.
 
 ## Cooldown-clear operator contract (CFG-004)
 
