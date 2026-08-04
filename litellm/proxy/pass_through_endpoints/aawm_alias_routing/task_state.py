@@ -29,7 +29,7 @@ DEFAULT_TASK_STATE_MARKERS: tuple[str, ...] = (
     "You must",
 )
 
-TASK_STATE_MARKERS_ENV = "AAWM_GOOGLE_ADAPTER_TASK_STATE_MARKERS"
+TASK_STATE_MARKERS_ENV = "AAWM_TASK_STATE_MARKERS"
 # Structured message metadata keys that force selection without English matching.
 STRUCTURED_TASK_STATE_FLAGS = (
     "aawm_preserve_task_state",
