@@ -61,14 +61,13 @@ passed the local acceptance suite with artifact
 
 ### D1-491 - rate_limit_intervals concurrent-refresh eligible unique index
 
-**What changed:** Both materialized-view rebuild scripts
-(`scripts/apply_rate_limit_intervals_mview_2026_05_23.sql` and
-`scripts/apply_rate_limit_intervals_mview_2026_06_03_antigravity.sql`) now
-create a plain seven-column `UNIQUE INDEX ... NULLS NOT DISTINCT` over
-`(provider, model, quota_key, quota_type, fromdate, expected_reset_at,
-remaining_pct)` with no expression wrappers. The window partition logic
-retains `COALESCE(model, ''::text)` for correct grouping semantics. A new
-one-time repair script
+**What changed:** The surviving materialized-view rebuild script
+(`scripts/apply_rate_limit_intervals_mview_2026_05_23.sql`) creates a plain
+seven-column `UNIQUE INDEX ... NULLS NOT DISTINCT` over `(provider, model,
+quota_key, quota_type, fromdate, expected_reset_at, remaining_pct)` with no
+expression wrappers. The window partition logic retains
+`COALESCE(model, ''::text)` for correct grouping semantics. A one-time repair
+script
 (`scripts/apply_rate_limit_intervals_concurrent_index_2026_07_25.sql`)
 migrates a live database from the old expression-based unique index to the
 column-only index without dropping/recreating the materialized view, using
