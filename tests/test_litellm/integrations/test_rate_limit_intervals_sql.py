@@ -2,11 +2,6 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-D1_190_SCRIPT = (
-    REPO_ROOT
-    / "scripts"
-    / "apply_rate_limit_intervals_mview_2026_06_03_antigravity.sql"
-)
 LEGACY_SCRIPT = (
     REPO_ROOT / "scripts" / "apply_rate_limit_intervals_mview_2026_05_23.sql"
 )
@@ -15,44 +10,6 @@ XAI_WEEKLY_100_PCT_EXCEPTION = (
     "provider = 'xai'\n"
     "              AND quota_key = 'xai_grok_build_weekly_credits:credits'"
 )
-
-
-def test_antigravity_rate_limit_intervals_script_projects_pool_rows() -> None:
-    sql = D1_190_SCRIPT.read_text(encoding="utf-8")
-
-    assert "'antigravity'" in sql
-    assert "'antigravity_code_assist:gemini_pool'" in sql
-    assert "'antigravity_code_assist:vertex_pool'" in sql
-    assert "provider = 'antigravity'" in sql
-    assert "WHEN rate_limit_observations.provider = 'antigravity'::text" in sql
-    assert "THEN NULL::text" in sql
-    assert "remaining_pct < 100" in sql
-    assert "provider <> 'antigravity'" in sql
-    assert (
-        "antigravity_code_assist:gemini_pool', 'antigravity_code_assist:vertex_pool']) THEN 'short'"
-        not in sql
-    )
-    assert "COALESCE(model, ''::text), quota_key, quota_type" in sql
-    assert "COALESCE(model, ''::text)," in sql
-
-
-def test_xai_grok_weekly_credits_quota_key_allowed_and_mapped_weekly() -> None:
-    sql = D1_190_SCRIPT.read_text(encoding="utf-8")
-
-    assert "'xai_grok_build_weekly_credits:credits'" in sql
-    assert (
-        "WHEN quota_key = ANY (ARRAY['anthropic_unified_7d:7d', 'codex:secondary', 'xai_grok_build_weekly_credits:credits']) THEN 'weekly'"
-        in sql
-    )
-
-
-def test_xai_grok_weekly_credits_allows_hundred_pct_remaining_antigravity_script() -> (
-    None
-):
-    sql = D1_190_SCRIPT.read_text(encoding="utf-8")
-
-    assert XAI_WEEKLY_100_PCT_EXCEPTION in sql
-    assert "remaining_pct < 100" in sql
 
 
 def test_legacy_rate_limit_intervals_script_includes_weekly_credits_key() -> None:
@@ -69,19 +26,6 @@ def test_xai_grok_weekly_credits_allows_hundred_pct_remaining_legacy_script() ->
     assert "remaining_pct < 100" in sql
 
 
-def test_anthropic_7d_oi_quota_key_allowed_in_antigravity_script() -> None:
-    sql = D1_190_SCRIPT.read_text(encoding="utf-8")
-    assert "'anthropic_unified_7d_oi:7d_oi'" in sql
-
-
-def test_anthropic_7d_oi_quota_key_mapped_weekly_overage_included_antigravity() -> None:
-    sql = D1_190_SCRIPT.read_text(encoding="utf-8")
-    assert (
-        "WHEN quota_key = ANY (ARRAY['anthropic_unified_7d_oi:7d_oi']) THEN 'weekly_overage_included'"
-        in sql
-    )
-
-
 def test_anthropic_7d_oi_quota_key_allowed_in_legacy_script() -> None:
     sql = LEGACY_SCRIPT.read_text(encoding="utf-8")
     assert "'anthropic_unified_7d_oi:7d_oi'" in sql
@@ -96,7 +40,7 @@ def test_anthropic_7d_oi_quota_key_mapped_weekly_overage_included_legacy() -> No
 
 
 def test_anthropic_7d_sonnet_weekly_special_mapping_preserved() -> None:
-    sql = D1_190_SCRIPT.read_text(encoding="utf-8")
+    sql = LEGACY_SCRIPT.read_text(encoding="utf-8")
     assert "'anthropic_unified_7d_sonnet:7d_sonnet'" in sql
     assert "THEN 'weekly_special'" in sql
 
@@ -130,13 +74,6 @@ def _assert_nullable_model_partition_and_column_unique_index(sql: str) -> None:
     assert "NULLS NOT DISTINCT" in unique_block
     assert "COALESCE" not in unique_block
     assert "WHERE" not in unique_block.upper()
-
-
-def test_antigravity_script_unique_index_is_column_only_with_nulls_not_distinct() -> (
-    None
-):
-    sql = D1_190_SCRIPT.read_text(encoding="utf-8")
-    _assert_nullable_model_partition_and_column_unique_index(sql)
 
 
 def test_legacy_script_unique_index_is_column_only_with_nulls_not_distinct() -> None:

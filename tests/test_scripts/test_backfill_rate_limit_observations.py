@@ -36,6 +36,62 @@ def test_should_format_clickhouse_datetime_without_timezone_suffix() -> None:
     )
 
 
+def test_should_prefilter_supported_grok_billing_rows_in_clickhouse_scan(
+) -> None:
+    """Supported XAI grok-build billing rows stay discoverable by the prefilter."""
+    predicates = quota_backfill._build_rate_limit_marker_predicates(
+        include_input=False
+    )
+    joined = " OR ".join(predicates)
+    for marker in (
+        "grok_cli_chat_proxy",
+        "xai_cli_chat_proxy",
+        "monthlyLimit",
+        "creditUsagePercent",
+    ):
+        assert f"'{marker}'" in joined
+
+
+def test_should_extract_grok_build_billing_from_structured_clickhouse_row() -> None:
+    """A supported XAI grok-build billing row parses into an observation."""
+    row = {
+        "observation_id": "obs-grok-billing",
+        "observation_trace_id": "trace-grok-billing",
+        "observation_start_time": "2026-07-01T12:00:00Z",
+        "observation_end_time": "2026-07-01T12:00:01Z",
+        "observation_name": "grok-billing-passthrough",
+        "observation_metadata": {
+            "grok_cli_chat_proxy": True,
+            "grok_billing": {
+                "config": {
+                    "monthlyLimit": {"val": 1000},
+                    "used": {"val": 250},
+                    "billingPeriodStart": "2026-07-01T00:00:00Z",
+                    "billingPeriodEnd": "2026-08-01T00:00:00Z",
+                }
+            },
+        },
+        "observation_input": None,
+        "observation_output": None,
+        "observation_model": "grok-build",
+        "observation_environment": "dev",
+    }
+
+    record = quota_backfill.build_record_from_clickhouse_row(row)
+
+    assert record is not None
+    [observation] = record["rate_limit_observations"]
+    assert observation["source"] == "grok_billing"
+    assert observation["provider"] == "xai"
+    assert observation["client_family"] == "grok-build"
+    assert observation["limit_id"] == "xai_grok_build_monthly_requests"
+    assert observation["used_percentage"] == 25.0
+    assert observation["remaining_pct"] == 75.0
+    assert observation["provider_resets_at"] == datetime(
+        2026, 8, 1, tzinfo=timezone.utc
+    )
+
+
 def test_should_extract_codex_rate_limits_from_structured_clickhouse_output() -> None:
     row = {
         "observation_id": "obs-codex",
@@ -159,7 +215,7 @@ def test_should_ignore_assistant_prose_keyword_matches() -> None:
             {
                 "content": (
                     "The response mentioned rate_limits, resets_at, "
-                    "usage_limit_reached, and retrieveUserQuota in prose."
+                    "and usage_limit_reached in prose."
                 )
             }
         ),
@@ -168,34 +224,6 @@ def test_should_ignore_assistant_prose_keyword_matches() -> None:
     }
 
     assert quota_backfill.build_record_from_clickhouse_row(row) is None
-
-
-def test_should_ignore_retired_google_code_assist_quota_metadata() -> None:
-    row = {
-        "observation_id": "obs-google",
-        "observation_trace_id": "trace-google",
-        "observation_start_time": "2026-05-05T15:00:00Z",
-        "observation_end_time": "2026-05-05T15:00:01Z",
-        "observation_name": "native_gemini_passthrough",
-        "observation_metadata": {
-            "custom_llm_provider": "gemini",
-            "passthrough_route_family": "google_code_assist",
-            "google_retrieve_user_quota": {
-                "remainingRequests": 1490,
-                "usedRequests": 10,
-                "totalRequests": 1500,
-                "quotaPeriod": "daily",
-            },
-        },
-        "observation_input": None,
-        "observation_output": None,
-        "observation_model": "gemini-2.5-pro",
-        "observation_environment": "dev",
-    }
-
-    record = quota_backfill.build_record_from_clickhouse_row(row)
-
-    assert record is None
 
 
 def test_should_extract_anthropic_quota_from_structured_metadata() -> None:

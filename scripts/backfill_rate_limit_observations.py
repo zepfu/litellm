@@ -90,6 +90,35 @@ _MINIO_SECRET_KEY_ENV_VARS = (
     "MINIO_ROOT_PASSWORD",
     "AWS_SECRET_ACCESS_KEY",
 )
+# Coarse ClickHouse candidate prefilter. Every marker maps 1:1 to a field the
+# retained provider-neutral rate-limit extractors consume (codex, anthropic,
+# xai oauth, xai grok-build billing); rows that match only prose are dropped
+# later unless they parse as a supported provider payload.
+CLICKHOUSE_RATE_LIMIT_SCAN_MARKERS = (
+    "rate_limits",
+    "usage_limit_reached",
+    "resets_at",
+    "used_percent",
+    "used_percentage",
+    "MODEL_CAPACITY_EXHAUSTED",
+    "RATE_LIMIT_EXCEEDED",
+    "anthropic_response_headers",
+    "anthropic-ratelimit",
+    "llm_provider-anthropic-ratelimit",
+    "codex_response_headers",
+    "x-codex-",
+    "xai_oauth_response_headers",
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-tokens",
+    # XAI grok-build billing discovery: retained context flags plus the
+    # billing-config fields consumed by the grok billing extractor.
+    "grok_cli_chat_proxy",
+    "xai_cli_chat_proxy",
+    "monthlyLimit",
+    "creditUsagePercent",
+)
 _TARGET_DB_ARG_ENV_MAP = {
     "aawm_db_host": "AAWM_DB_HOST",
     "aawm_db_port": "AAWM_DB_PORT",
@@ -256,6 +285,24 @@ def _quote_clickhouse_string(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
+def _build_rate_limit_marker_predicates(include_input: bool) -> List[str]:
+    """Render the coarse candidate prefilter over supported rate-limit markers."""
+    marker_predicates = [
+        f"positionUTF8(toString(o.metadata), {_quote_clickhouse_string(marker)}) > 0"
+        for marker in CLICKHOUSE_RATE_LIMIT_SCAN_MARKERS
+    ]
+    marker_predicates.extend(
+        f"positionUTF8(ifNull(o.output, ''), {_quote_clickhouse_string(marker)}) > 0"
+        for marker in CLICKHOUSE_RATE_LIMIT_SCAN_MARKERS
+    )
+    if include_input:
+        marker_predicates.extend(
+            f"positionUTF8(ifNull(o.input, ''), {_quote_clickhouse_string(marker)}) > 0"
+            for marker in CLICKHOUSE_RATE_LIMIT_SCAN_MARKERS
+        )
+    return marker_predicates
+
+
 def _format_clickhouse_datetime(value: datetime) -> str:
     if value.tzinfo is not None:
         value = value.astimezone(timezone.utc).replace(tzinfo=None)
@@ -306,39 +353,7 @@ class ClickHouseClient:
         include_input: bool,
     ) -> List[Dict[str, Any]]:
         predicates = ["o.type = 'GENERATION'", "o.is_deleted = 0"]
-        markers = (
-            "rate_limits",
-            "usage_limit_reached",
-            "resets_at",
-            "used_percent",
-            "used_percentage",
-            "retrieveUserQuota",
-            "MODEL_CAPACITY_EXHAUSTED",
-            "RATE_LIMIT_EXCEEDED",
-            "anthropic_response_headers",
-            "anthropic-ratelimit",
-            "llm_provider-anthropic-ratelimit",
-            "codex_response_headers",
-            "x-codex-",
-            "xai_oauth_response_headers",
-            "x-ratelimit-limit-requests",
-            "x-ratelimit-remaining-requests",
-            "x-ratelimit-limit-tokens",
-            "x-ratelimit-remaining-tokens",
-        )
-        marker_predicates = [
-            f"positionUTF8(toString(o.metadata), {_quote_clickhouse_string(marker)}) > 0"
-            for marker in markers
-        ]
-        marker_predicates.extend(
-            f"positionUTF8(ifNull(o.output, ''), {_quote_clickhouse_string(marker)}) > 0"
-            for marker in markers
-        )
-        if include_input:
-            marker_predicates.extend(
-                f"positionUTF8(ifNull(o.input, ''), {_quote_clickhouse_string(marker)}) > 0"
-                for marker in markers
-            )
+        marker_predicates = _build_rate_limit_marker_predicates(include_input)
         predicates.append("(" + " OR ".join(marker_predicates) + ")")
 
         if trace_id:
@@ -516,8 +531,6 @@ _FREEFORM_TEXT_KEYS = {
 _STRUCTURED_RATE_LIMIT_KEYS = {
     "details",
     "error",
-    "google_retrieve_user_quota",
-    "google_user_quota",
     "metadata",
     "rate_limits",
 }
