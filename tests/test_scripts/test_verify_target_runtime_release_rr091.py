@@ -205,7 +205,7 @@ def test_should_pass_row_limit_and_created_after_into_query(
                 "session_id": "sess-bound",
                 "trace_id": "trace-bound",
                 "litellm_call_id": "call-bound",
-                "inbound_model_alias": "aawm-read",
+                "inbound_model_alias": "basic",
                 "provider": "openai",
                 "model": "gpt-5",
                 "repository": "litellm",

@@ -322,7 +322,7 @@ def test_rr054_issue50_no_candidate_audit_uses_lane_scoped_session_key() -> None
     """
     session_id = "rr054-session-50"
     account_id = "acct-rr054-50"
-    alias_model = "aawm-code"
+    alias_model = "work"
     request = _minimal_request(
         headers=[
             (b"session_id", session_id.encode("utf-8")),
@@ -522,15 +522,15 @@ def test_rr054_issue50_resolve_helpers_produce_lane_scoped_keys() -> None:
     assert "auth:" in codex_key
 
     non_default = lpe._resolve_codex_auto_agent_session_key(
-        request, body, alias_model="aawm-code"
+        request, body, alias_model="work"
     )
     assert non_default is not None
-    assert non_default.startswith("aawm-code:")
+    assert non_default.startswith("work:")
     assert session_id in non_default
 
     # No credentials / no session header → no key (must not invent raw None alias).
     empty_request = _minimal_request()
     assert (
-        lpe._resolve_codex_auto_agent_session_key(empty_request, {}, alias_model="aawm-code")
+        lpe._resolve_codex_auto_agent_session_key(empty_request, {}, alias_model="work")
         is None
     )

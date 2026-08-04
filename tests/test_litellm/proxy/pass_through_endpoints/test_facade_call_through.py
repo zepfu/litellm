@@ -136,7 +136,7 @@ def test_wave6f_codex_dispatch_uses_live_host_handler(
     monkeypatch.setattr(
         lpe,
         "_resolve_codex_auto_agent_alias_model",
-        lambda body, *, endpoint: "aawm-codex-agent-auto",
+        lambda body, *, endpoint: "basic",
     )
     monkeypatch.setattr(
         lpe,
@@ -156,7 +156,7 @@ def test_wave6f_codex_dispatch_uses_live_host_handler(
     monkeypatch.setattr(lpe, "_safe_set_request_parsed_body", lambda *args: None)
     monkeypatch.setattr(lpe, "_handle_codex_auto_agent_alias_route", handle_alias)
 
-    body = {"model": "aawm-codex-agent-auto"}
+    body = {"model": "basic"}
     result = asyncio.run(
         lpe.try_dispatch_codex_request(
             endpoint="/v1/responses",
@@ -179,7 +179,7 @@ def test_wave6f_codex_dispatch_uses_live_host_handler(
     )
 
     assert result is expected
-    assert calls == ["aawm-codex-agent-auto"]
+    assert calls == ["basic"]
 
 
 def test_wave6f_anthropic_dispatch_uses_live_host_handler(

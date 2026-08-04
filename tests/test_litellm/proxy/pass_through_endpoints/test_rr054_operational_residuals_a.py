@@ -395,7 +395,7 @@ def _build_minimal_request() -> Request:
 async def test_rr054_issue42_terminal_persist_uses_executor_when_loop_running() -> None:
     request = _build_minimal_request()
     body = {
-        "model": "aawm-code",
+        "model": "work",
         "litellm_metadata": {
             "session_id": "rr054-terminal-session",
             "agent_id": "agent-rr054-terminal",
@@ -433,7 +433,7 @@ async def test_rr054_issue42_terminal_persist_uses_executor_when_loop_running() 
     ), patch.object(asyncio, "get_running_loop", return_value=mock_loop):
         audit_events_mod._emit_auto_agent_alias_no_candidate_event(
             alias_family="codex_auto_agent",
-            alias_model="aawm-code",
+            alias_model="work",
             request=request,
             request_body=body,
             exc=HTTPException(
@@ -462,7 +462,7 @@ async def test_rr054_issue42_terminal_persist_uses_executor_when_loop_running() 
     assert terminal["redispatch_required"] is False
     assert terminal["agent_session_killed"] is True
     assert terminal["error_context"]["failure_kind"] == "agent_alias_no_candidate"
-    assert terminal["error_context"]["model_alias"] == "aawm-code"
+    assert terminal["error_context"]["model_alias"] == "work"
 
 
 def test_rr054_issue42_terminal_persist_source_uses_run_in_executor() -> None:

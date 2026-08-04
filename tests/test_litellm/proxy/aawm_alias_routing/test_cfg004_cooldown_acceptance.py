@@ -73,12 +73,12 @@ def _make_snapshot() -> RoutingSnapshot:
         schedule=None,
     )
     alias = RoutingAlias(
-        name="read",
+        name="basic",
         distribution_strategy=None,
         candidates=(target, control),
     )
     return RoutingSnapshot(
-        aliases={"read": alias},
+        aliases={"basic": alias},
         config_epoch=1,
         config_hash="abcdef123456",
         config_version="abcdef123456",
@@ -214,7 +214,7 @@ def _patch_lane_keys_headers():
 class TestSchemaValidation:
     def test_valid_prepare_body(self):
         op, rid = _validate_body({
-            "operation": "prepare", "run_id": _RUN_ID, "alias": "read",
+            "operation": "prepare", "run_id": _RUN_ID, "alias": "basic",
             "ingress": "codex", "provider": "alibaba_token_plan",
             "model": "alibaba_token_plan/qwen3.6-flash", "ttl_seconds": 300,
         })
@@ -242,7 +242,7 @@ class TestSchemaValidation:
     def test_extra_fields_rejected(self):
         with pytest.raises(HTTPException) as exc_info:
             _validate_body({
-                "operation": "prepare", "run_id": _RUN_ID, "alias": "read",
+                "operation": "prepare", "run_id": _RUN_ID, "alias": "basic",
                 "ingress": "codex", "provider": "x", "model": "y",
                 "ttl_seconds": 60, "extra": "bad",
             })
@@ -407,7 +407,7 @@ class TestPrepareInspectRestore:
 
         request = _make_request()
         body = {
-            "operation": "prepare", "run_id": _RUN_ID, "alias": "read",
+            "operation": "prepare", "run_id": _RUN_ID, "alias": "basic",
             "ingress": "codex", "provider": "alibaba_token_plan",
             "model": "alibaba_token_plan/qwen3.6-flash", "ttl_seconds": 300,
         }
@@ -429,7 +429,7 @@ class TestPrepareInspectRestore:
         """No local-only acceptance: fail 503 when DualCache is None."""
         request = _make_request()
         body = {
-            "operation": "prepare", "run_id": _RUN_ID, "alias": "read",
+            "operation": "prepare", "run_id": _RUN_ID, "alias": "basic",
             "ingress": "codex", "provider": "alibaba_token_plan",
             "model": "alibaba_token_plan/qwen3.6-flash", "ttl_seconds": 300,
         }
@@ -456,7 +456,7 @@ class TestPrepareInspectRestore:
 
         request = _make_request()
         body = {
-            "operation": "prepare", "run_id": _RUN_ID, "alias": "read",
+            "operation": "prepare", "run_id": _RUN_ID, "alias": "basic",
             "ingress": "codex", "provider": "alibaba_token_plan",
             "model": "alibaba_token_plan/qwen3.6-flash", "ttl_seconds": 300,
         }
@@ -596,7 +596,7 @@ class TestPublicFields:
         state_mgr = AliasRoutingStateManager()
         request = _make_request()
         body = {
-            "operation": "prepare", "run_id": _RUN_ID, "alias": "read",
+            "operation": "prepare", "run_id": _RUN_ID, "alias": "basic",
             "ingress": "codex", "provider": "alibaba_token_plan",
             "model": "alibaba_token_plan/qwen3.6-flash", "ttl_seconds": 300,
         }
@@ -622,7 +622,7 @@ class TestTTLBounds:
         state_mgr = AliasRoutingStateManager()
         request = _make_request()
         body = {
-            "operation": "prepare", "run_id": _RUN_ID, "alias": "read",
+            "operation": "prepare", "run_id": _RUN_ID, "alias": "basic",
             "ingress": "codex", "provider": "alibaba_token_plan",
             "model": "alibaba_token_plan/qwen3.6-flash", "ttl_seconds": 5,
         }
@@ -639,7 +639,7 @@ class TestTTLBounds:
         state_mgr = AliasRoutingStateManager()
         request = _make_request()
         body = {
-            "operation": "prepare", "run_id": _RUN_ID, "alias": "read",
+            "operation": "prepare", "run_id": _RUN_ID, "alias": "basic",
             "ingress": "codex", "provider": "alibaba_token_plan",
             "model": "alibaba_token_plan/qwen3.6-flash", "ttl_seconds": 9999,
         }
@@ -720,8 +720,8 @@ class TestAcceptanceScriptSecrets:
             }
 
         cases = {
-            "native_openai_passthrough_responses_codex_read_alias_collaboration": {
-                "verification_alias": "read",
+            "native_openai_passthrough_responses_codex_basic_alias_collaboration": {
+                "verification_alias": "basic",
             }
         }
         prepare_resp = {
@@ -799,7 +799,7 @@ class TestAcceptanceScriptSecrets:
         # No LiteLLM/proxy API key reaches the TUI child.  The TUI retains
         # its existing resolved provider (requires_openai_auth=true) and uses
         # its normal Codex OAuth Authorization credential.
-        proof_key = "native_openai_passthrough_responses_codex_read_alias_collaboration"
+        proof_key = "native_openai_passthrough_responses_codex_basic_alias_collaboration"
         proof_env = captured_cases[proof_key].get("env", {})
         assert "CFG004_PROXY_API_KEY" not in proof_env
         assert "OPENAI_API_KEY" not in proof_env
@@ -825,8 +825,8 @@ class TestAcceptanceScriptSecrets:
         captured_child_env: dict[str, str] = {}
 
         cases = {
-            "native_openai_passthrough_responses_codex_read_alias_collaboration": {
-                "verification_alias": "read",
+            "native_openai_passthrough_responses_codex_basic_alias_collaboration": {
+                "verification_alias": "basic",
                 "command": ["codex", "exec", "hi"],
             }
         }
@@ -1000,7 +1000,7 @@ class TestCfg004ProofTranscriptClassification:
     def _load_script(self):
         self.script = _load_acceptance_script()
 
-    _PROOF_CASE = "native_openai_passthrough_responses_codex_read_alias_collaboration"
+    _PROOF_CASE = "native_openai_passthrough_responses_codex_basic_alias_collaboration"
 
     def _saved_collab_tool_failures(self) -> list[str]:
         # Exact saved pass-3 redacted proof failures (family prefix included).
@@ -1018,7 +1018,7 @@ class TestCfg004ProofTranscriptClassification:
         script = self.script
         cases = {
             self._PROOF_CASE: {
-                "verification_alias": "read",
+                "verification_alias": "basic",
                 "exact_child_prompt": "child prompt",
             }
         }
@@ -1182,7 +1182,7 @@ class TestPrepareThenRealClear:
         state_mgr = AliasRoutingStateManager()
         request = _make_request()
         body = {
-            "operation": "prepare", "run_id": _RUN_ID, "alias": "read",
+            "operation": "prepare", "run_id": _RUN_ID, "alias": "basic",
             "ingress": "codex", "provider": "alibaba_token_plan",
             "model": "alibaba_token_plan/qwen3.6-flash", "ttl_seconds": 300,
         }
@@ -1306,8 +1306,8 @@ class TestInventoryRejections:
 
     def test_non_200_post_tui_rejected(self):
         """Post-TUI inspect returning non-200 must fail the live test."""
-        proof_case = "native_openai_passthrough_responses_codex_read_alias_collaboration"
-        cases = {proof_case: {"verification_alias": "read"}}
+        proof_case = "native_openai_passthrough_responses_codex_basic_alias_collaboration"
+        cases = {proof_case: {"verification_alias": "basic"}}
         prepare_resp = {
             "result": "prepared",
             "target": {"provider": "alibaba_token_plan", "model": "alibaba_token_plan/qwen3.6-flash"},
@@ -1378,8 +1378,8 @@ class TestInventoryRejections:
 
     def test_count_mismatch_rejected(self):
         """keys_cleared != 1 must fail."""
-        proof_case = "native_openai_passthrough_responses_codex_read_alias_collaboration"
-        cases = {proof_case: {"verification_alias": "read"}}
+        proof_case = "native_openai_passthrough_responses_codex_basic_alias_collaboration"
+        cases = {proof_case: {"verification_alias": "basic"}}
         prepare_resp = {
             "result": "prepared",
             "target": {"provider": "alibaba_token_plan", "model": "alibaba_token_plan/qwen3.6-flash"},
@@ -2369,7 +2369,7 @@ def _codex_0146_collaboration_stdout(
                 "id": "fc_spawn_01",
                 "name": "spawn_agent",
                 "namespace": "collaboration",
-                "arguments": '{"task_name":"read_alias_child"}',
+                "arguments": '{"task_name":"basic_alias_child"}',
                 "call_id": "call_spawn_01",
             },
         }))
@@ -2379,7 +2379,7 @@ def _codex_0146_collaboration_stdout(
                 "type": "function_call_output",
                 "id": "fco_spawn_01",
                 "call_id": "call_spawn_01",
-                "output": '{"task_name":"/root/read_alias_child"}',
+                "output": '{"task_name":"/root/basic_alias_child"}',
             },
         }))
 
@@ -2420,7 +2420,7 @@ def _codex_0146_collaboration_stdout(
             "message": "Wait completed.",
             "timed_out": wait_timed_out,
             "agents_states": {
-                "/root/read_alias_child": {"status": "completed"},
+                "/root/basic_alias_child": {"status": "completed"},
             },
         })
         lines.append(_json.dumps({
@@ -2459,8 +2459,8 @@ class TestCodexCollaborationSchemaNormalization:
         assert failures == [], f"Unexpected failures: {failures}"
         assert summary["tool_counts"]["spawn_agent"] >= 1
         assert summary["tool_counts"]["wait"] >= 1
-        assert "/root/read_alias_child" in summary["spawned_agent_ids"]
-        assert summary["waited_agent_statuses"].get("/root/read_alias_child") == "completed"
+        assert "/root/basic_alias_child" in summary["spawned_agent_ids"]
+        assert summary["waited_agent_statuses"].get("/root/basic_alias_child") == "completed"
 
     def test_absent_child_exec_command_remains_failure(self):
         """When command_execution_validation expects a child command that is

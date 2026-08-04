@@ -433,7 +433,7 @@ def test_langfuse_string_input_is_truncated_without_mutating_non_input_fields() 
         "end_time": "2026-06-12T12:00:01Z",
         "input": original_input,
         "output": {"content": "raw output survives unchanged"},
-        "metadata": {"route": "aawm-code", "attempt": 1},
+        "metadata": {"route": "work", "attempt": 1},
         "usage": {"input": 100, "output": 10, "total": 110},
         "usage_details": {"input": 100, "output": 10, "total": 110},
         "cost_details": {"total": 0.01},
@@ -487,7 +487,7 @@ def test_langfuse_structured_input_keeps_head_tail_marker_without_mutation() -> 
         "model": "gpt-test",
         "input": original_input,
         "output": {"content": "output survives unchanged"},
-        "metadata": {"route": "aawm-code", "nested": {"keep": True}},
+        "metadata": {"route": "work", "nested": {"keep": True}},
         "usage": {"input": 100, "output": 10, "total": 110},
         "usage_details": {"input": 100, "output": 10, "total": 110},
         "cost_details": {"total": 0.01},
@@ -622,7 +622,7 @@ def test_langfuse_oversized_output_is_fit_after_small_input() -> None:
         "model": "gpt-test",
         "input": "small input",
         "output": original_output,
-        "metadata": {"route": "aawm-code"},
+        "metadata": {"route": "work"},
     }
 
     fitted_params, fit_summary = _fit_langfuse_generation_params_to_event_size(
@@ -743,7 +743,7 @@ def test_langfuse_still_too_large_after_fitting_reports_fail_closed(caplog) -> N
         "name": "aawm.large",
         "model": "gpt-test",
         "input": "small input",
-        "metadata": {"route": "aawm-code"},
+        "metadata": {"route": "work"},
     }
 
     fitted_params, fit_summary = _fit_langfuse_generation_params_to_event_size(
@@ -854,7 +854,7 @@ def test_langfuse_input_shape_hash_mode_disabled_keeps_default_truncation(monkey
             "model": "gpt-test",
             "input": original_input,
             "output": {"content": "output survives unchanged"},
-            "metadata": {"route": "aawm-code"},
+            "metadata": {"route": "work"},
         }
         max_event_size_bytes = {
             "string": 1_200,
@@ -897,7 +897,7 @@ def test_langfuse_input_shape_hash_mode_replaces_string_list_and_dict_inputs(mon
             "model": "gpt-test",
             "input": original_input,
             "output": "small output",
-            "metadata": {"route": "aawm-code"},
+            "metadata": {"route": "work"},
         }
 
         max_event_size_bytes = {

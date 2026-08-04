@@ -787,7 +787,7 @@ class TestTemplatePlaceholderResolution:
         ) is True
         assert harness._contains_unresolved_placeholder("concrete-value") is False
         assert harness._contains_unresolved_placeholder(
-            ["codex", "-m", "read"]
+            ["codex", "-m", "basic"]
         ) is False
 
     def test_cli_harness_context_resolves_placeholder_user_ids(self, harness):
@@ -795,7 +795,7 @@ class TestTemplatePlaceholderResolution:
         concrete ID, not pass the placeholder through."""
         config = {
             "cli_passthrough": "codex",
-            "command": ["codex", "exec", "-m", "read"],
+            "command": ["codex", "exec", "-m", "basic"],
             "expected_user_ids": ["{harness_user_id}"],
         }
         profile = {
@@ -814,7 +814,7 @@ class TestTemplatePlaceholderResolution:
         """Explicit concrete IDs must be preserved."""
         config = {
             "cli_passthrough": "codex",
-            "command": ["codex", "exec", "-m", "read"],
+            "command": ["codex", "exec", "-m", "basic"],
             "expected_user_ids": ["adapter-harness-tenant"],
         }
         profile = {
@@ -826,14 +826,14 @@ class TestTemplatePlaceholderResolution:
         )
         assert result["expected_user_ids"] == ["adapter-harness-tenant"]
 
-    def test_read_alias_codex_case_no_unresolved_placeholders_after_resolution(
+    def test_basic_alias_codex_case_no_unresolved_placeholders_after_resolution(
         self, harness
     ):
-        """The real read-alias Codex collaboration case must have no unresolved
+        """The real basic-alias Codex collaboration case must have no unresolved
         placeholders after _ensure_cli_harness_context."""
         cfg = _config()
         case = dict(
-            cfg["cases"]["native_openai_passthrough_responses_codex_read_alias_collaboration"]
+            cfg["cases"]["native_openai_passthrough_responses_codex_basic_alias_collaboration"]
         )
         profile = {
             "litellm_base_url": "http://127.0.0.1:4001",
@@ -843,25 +843,25 @@ class TestTemplatePlaceholderResolution:
             case,
             profile=profile,
             target="dev",
-            case_name="native_openai_passthrough_responses_codex_read_alias_collaboration",
+            case_name="native_openai_passthrough_responses_codex_basic_alias_collaboration",
         )
         assert not harness._contains_unresolved_placeholder(result["command"])
         assert not harness._contains_unresolved_placeholder(result["expected_user_ids"])
 
 
 # ---------------------------------------------------------------------------
-# CFG-003 Initiation 2: Fix 2 - Codex read-alias collaboration command shape
+# CFG-003 Initiation 2: Fix 2 - Codex basic-alias collaboration command shape
 # ---------------------------------------------------------------------------
 
 
-class TestCodexReadAliasCollaborationCommandShape:
-    """The read-alias Codex collaboration case must follow the proven alibaba
+class TestCodexBasicAliasCollaborationCommandShape:
+    """The basic-alias Codex collaboration case must follow the proven alibaba
     collaboration command shape with multi_agent, opencode child, catalog,
     read-only sandbox, and repository context."""
 
     def _case(self):
         return _config()["cases"][
-            "native_openai_passthrough_responses_codex_read_alias_collaboration"
+            "native_openai_passthrough_responses_codex_basic_alias_collaboration"
         ]
 
     def test_multi_agent_enabled(self):
@@ -882,7 +882,7 @@ class TestCodexReadAliasCollaborationCommandShape:
         cmd = self._case()["command"]
         cmd_str = " ".join(str(v) for v in cmd)
         assert "model_catalog_json=" in cmd_str
-        assert "codex_read_alias_model_catalog.json" in cmd_str
+        assert "codex_basic_alias_model_catalog.json" in cmd_str
 
     def test_read_only_sandbox_and_repository_context(self):
         cmd = self._case()["command"]
@@ -893,11 +893,11 @@ class TestCodexReadAliasCollaborationCommandShape:
         c_idx = cmd.index("-C")
         assert cmd[c_idx + 1] == "{repository_root}"
 
-    def test_model_is_read_alias(self):
+    def test_model_is_basic_alias(self):
         cmd = self._case()["command"]
         assert "-m" in cmd
         m_idx = cmd.index("-m")
-        assert cmd[m_idx + 1] == "read"
+        assert cmd[m_idx + 1] == "basic"
 
     def test_uses_litellm_dev_egress(self):
         cmd = self._case()["command"]
@@ -915,17 +915,17 @@ class TestCodexReadAliasCollaborationCommandShape:
         prompt = cmd[-1]
         assert "spawn_agent" in prompt
         assert 'agent_type="opencode"' in prompt
-        assert 'model="read"' in prompt
+        assert 'model="basic"' in prompt
 
-    def test_codex_read_alias_model_catalog_parses(self):
+    def test_codex_basic_alias_model_catalog_parses(self):
         catalog_path = (
-            ROOT / "scripts" / "local-ci" / "codex_read_alias_model_catalog.json"
+            ROOT / "scripts" / "local-ci" / "codex_basic_alias_model_catalog.json"
         )
         catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
         assert "models" in catalog
         assert len(catalog["models"]) == 1
         model = catalog["models"][0]
-        assert model["slug"] == "read"
+        assert model["slug"] == "basic"
         assert model["multi_agent_version"] == "v2"
         assert model["supports_parallel_tool_calls"] is True
 
@@ -941,20 +941,20 @@ class TestCodexReadAliasCollaborationCommandShape:
 # ---------------------------------------------------------------------------
 
 
-class TestClaudeReadAliasParentContract:
-    """The Claude read-alias parent prompt must treat the child marker as
-    opaque and emit exactly READ_ALIAS_PARALLEL_TOOLS_PASSED."""
+class TestClaudeBasicAliasParentContract:
+    """The Claude basic-alias parent prompt must treat the child marker as
+    opaque and emit exactly BASIC_ALIAS_PARALLEL_TOOLS_PASSED."""
 
     def _case(self):
         return _config()["cases"][
-            "claude_adapter_read_alias_child_parallel_read_tools"
+            "claude_adapter_basic_alias_child_parallel_read_tools"
         ]
 
     def test_parent_prompt_requires_opaque_marker(self):
         cmd = self._case()["command"]
         prompt = cmd[2]  # -p argument
         assert "Treat that marker as opaque" in prompt
-        assert "READ_ALIAS_PARALLEL_TOOLS_PASSED" in prompt
+        assert "BASIC_ALIAS_PARALLEL_TOOLS_PASSED" in prompt
 
     def test_parent_prompt_forbids_surrounding_text(self):
         cmd = self._case()["command"]
@@ -970,14 +970,14 @@ class TestClaudeReadAliasParentContract:
 
     def test_command_json_checks_require_exact_marker(self):
         checks = self._case()["command_json_checks"]
-        assert checks["required_equals"]["result"] == "READ_ALIAS_PARALLEL_TOOLS_PASSED"
+        assert checks["required_equals"]["result"] == "BASIC_ALIAS_PARALLEL_TOOLS_PASSED"
 
     def test_child_parallel_read_tools_preserved(self):
         """The child agent contract must still require parallel Read/Glob/Grep."""
         agents = self._case()["claude_agents"]
-        child = agents["harness-read-alias-parallel-read-tools"]
+        child = agents["harness-basic-alias-parallel-read-tools"]
         assert set(child["tools"]) == {"Read", "Glob", "Grep"}
-        assert child["model"] == "read"
+        assert child["model"] == "basic"
 
 
 # ---------------------------------------------------------------------------
@@ -1140,7 +1140,7 @@ class TestSessionIdAndHeaderPlaceholderResolution:
         with a concrete derived session ID."""
         config = {
             "cli_passthrough": "codex",
-            "command": ["codex", "exec", "-m", "read"],
+            "command": ["codex", "exec", "-m", "basic"],
             "expected_trace_session_id": "{session_id}",
         }
         profile = {
@@ -1158,7 +1158,7 @@ class TestSessionIdAndHeaderPlaceholderResolution:
         """A concrete explicit CLI session ID remains authoritative."""
         config = {
             "cli_passthrough": "codex",
-            "command": ["codex", "exec", "-m", "read"],
+            "command": ["codex", "exec", "-m", "basic"],
             "expected_trace_session_id": "explicit-cli-session",
         }
         profile = {
@@ -1170,8 +1170,8 @@ class TestSessionIdAndHeaderPlaceholderResolution:
         )
         assert result["expected_trace_session_id"] == "explicit-cli-session"
 
-    def test_read_alias_cases_fully_resolved_after_context(self, harness):
-        """Both read-alias cases must have no unresolved placeholders in
+    def test_basic_alias_cases_fully_resolved_after_context(self, harness):
+        """Both basic-alias cases must have no unresolved placeholders in
         command, expected_user_ids, session, and headers after resolution."""
         cfg = _config()
         profile = {
@@ -1179,11 +1179,11 @@ class TestSessionIdAndHeaderPlaceholderResolution:
             "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
         }
         codex_case = dict(cfg["cases"][
-            "native_openai_passthrough_responses_codex_read_alias_collaboration"
+            "native_openai_passthrough_responses_codex_basic_alias_collaboration"
         ])
         codex_result = harness._ensure_cli_harness_context(
             codex_case, profile=profile, target="dev",
-            case_name="native_openai_passthrough_responses_codex_read_alias_collaboration",
+            case_name="native_openai_passthrough_responses_codex_basic_alias_collaboration",
         )
         assert not harness._contains_unresolved_placeholder(codex_result["command"])
         assert not harness._contains_unresolved_placeholder(codex_result["expected_user_ids"])

@@ -19,7 +19,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_apply impo
     _apply_anthropic_auto_agent_alias_cooldown,
     _apply_auto_agent_alias_cooldown,
     _apply_codex_auto_agent_alias_cooldown,
-    _apply_read_pilot_gated_cooldown,
+    _apply_basic_pilot_gated_cooldown,
     _persist_anthropic_cooldown_durable,
     _persist_codex_cooldown_durable,
     _resolve_auto_agent_cooldown_publication_plan,
@@ -80,7 +80,7 @@ def configured_runtime():
             "_set_codex_cooldown",
             "_set_anthropic_cooldown",
             "_write_durable_payload",
-            "_read_pilot_gate",
+            "_basic_pilot_gate",
             "_state_manager",
         )
     }
@@ -117,7 +117,7 @@ def configured_runtime():
         set_codex_cooldown=codex_set,
         set_anthropic_cooldown=anthropic_set,
         write_durable_payload=write_durable,
-        read_pilot_gate=gate,
+        basic_pilot_gate=gate,
         state_manager=mgr,
     )
 
@@ -171,7 +171,7 @@ def test_install_then_configure_keeps_host_bindings_coherent(
             set_codex_cooldown=configured_runtime["codex_set"],
             set_anthropic_cooldown=configured_runtime["anthropic_set"],
             write_durable_payload=configured_runtime["write_durable"],
-            read_pilot_gate=configured_runtime["gate"],
+            basic_pilot_gate=configured_runtime["gate"],
             state_manager=configured_runtime["mgr"],
         )
 
@@ -295,7 +295,7 @@ class TestResolvePublicationPlan:
         assert plan.durable_keys == ("kimi:__managed__:default",)
         assert plan.kimi_failure_metadata == {"scope": "managed_account"}
 
-    def test_read_pilot_gate_should_cool(self, configured_runtime: dict) -> None:
+    def test_basic_pilot_gate_should_cool(self, configured_runtime: dict) -> None:
         configured_runtime["gate"]._decision = _FakeDecision(
             should_cool=True,
             duration_seconds=45.0,
@@ -308,14 +308,14 @@ class TestResolvePublicationPlan:
             selected_cooldown_key="rp:key",
             cooldown_seconds=0.0,
             error_class=None,
-            is_read_pilot_lane=True,
+            is_basic_pilot_lane=True,
         )
         assert plan.applied_scope == "candidate"
         assert plan.memory_keys == ("rp:key",)
         assert plan.durable_keys == ("rp:key",)
         assert plan.duration_seconds == 45.0
 
-    def test_read_pilot_gate_should_not_cool(self, configured_runtime: dict) -> None:
+    def test_basic_pilot_gate_should_not_cool(self, configured_runtime: dict) -> None:
         configured_runtime["gate"]._decision = _FakeDecision(should_cool=False)
         plan = _resolve_auto_agent_cooldown_publication_plan(
             request=None,
@@ -324,14 +324,14 @@ class TestResolvePublicationPlan:
             selected_cooldown_key="rp:key",
             cooldown_seconds=0.0,
             error_class=None,
-            is_read_pilot_lane=True,
+            is_basic_pilot_lane=True,
         )
         assert plan.applied_scope == "none"
         assert plan.memory_keys == ()
         assert plan.durable_keys == ()
         assert plan.duration_seconds == 0.0
 
-    def test_read_pilot_gate_scope_fallback(self, configured_runtime: dict) -> None:
+    def test_basic_pilot_gate_scope_fallback(self, configured_runtime: dict) -> None:
         configured_runtime["gate"]._decision = _FakeDecision(
             should_cool=True,
             duration_seconds=10.0,
@@ -344,7 +344,7 @@ class TestResolvePublicationPlan:
             selected_cooldown_key="rp:key",
             cooldown_seconds=0.0,
             error_class=None,
-            is_read_pilot_lane=True,
+            is_basic_pilot_lane=True,
         )
         assert plan.applied_scope == "candidate"
 
@@ -549,7 +549,7 @@ class TestApplyCodexWrapper:
         configured_runtime["codex_set"].assert_awaited_once_with("ck", 60.0)
 
     @pytest.mark.asyncio
-    async def test_read_pilot_lane_routes_to_gated(
+    async def test_basic_pilot_lane_routes_to_gated(
         self, configured_runtime: dict
     ) -> None:
         configured_runtime["gate"]._decision = _FakeDecision(
@@ -559,7 +559,7 @@ class TestApplyCodexWrapper:
         )
         req = _make_request()
         with patch.object(
-            cooldown_apply, "_apply_read_pilot_gated_cooldown", new_callable=AsyncMock, return_value="candidate"
+            cooldown_apply, "_apply_basic_pilot_gated_cooldown", new_callable=AsyncMock, return_value="candidate"
         ) as mock_gated:
             result = await _apply_codex_auto_agent_alias_cooldown(
                 request=req,
@@ -568,7 +568,7 @@ class TestApplyCodexWrapper:
                 selected_cooldown_key="rp:key",
                 cooldown_seconds=0.0,
                 error_class=None,
-                is_read_pilot_lane=True,
+                is_basic_pilot_lane=True,
             )
         assert result == "candidate"
         mock_gated.assert_awaited_once()
@@ -596,7 +596,7 @@ class TestApplyAnthropicWrapper:
         configured_runtime["anthropic_set"].assert_awaited_once_with("ck", 60.0)
 
     @pytest.mark.asyncio
-    async def test_ignores_read_pilot_flag(self, configured_runtime: dict) -> None:
+    async def test_ignores_basic_pilot_flag(self, configured_runtime: dict) -> None:
         configured_runtime["scope_fn"].return_value = "candidate"
         req = _make_request()
         result = await _apply_anthropic_auto_agent_alias_cooldown(
@@ -606,19 +606,19 @@ class TestApplyAnthropicWrapper:
             selected_cooldown_key="ck",
             cooldown_seconds=60.0,
             error_class="rate_limited",
-            is_read_pilot_lane=True,
+            is_basic_pilot_lane=True,
         )
-        # Should still use shared apply, not read-pilot gate
+        # Should still use shared apply, not basic-pilot gate
         assert result == "candidate"
         configured_runtime["anthropic_set"].assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
-# _apply_read_pilot_gated_cooldown
+# _apply_basic_pilot_gated_cooldown
 # ---------------------------------------------------------------------------
 
 
-class TestApplyReadPilotGated:
+class TestApplyBasicPilotGated:
     @pytest.mark.asyncio
     async def test_gate_cools_publishes_memory_and_durable(
         self, configured_runtime: dict
@@ -632,7 +632,7 @@ class TestApplyReadPilotGated:
         setter = AsyncMock()
 
         with patch.object(asyncio, "ensure_future") as mock_ensure:
-            result = await _apply_read_pilot_gated_cooldown(
+            result = await _apply_basic_pilot_gated_cooldown(
                 selected_cooldown_key="rp:key",
                 set_candidate_cooldown=setter,
             )
@@ -650,7 +650,7 @@ class TestApplyReadPilotGated:
     ) -> None:
         configured_runtime["gate"]._decision = _FakeDecision(should_cool=False)
         setter = AsyncMock()
-        result = await _apply_read_pilot_gated_cooldown(
+        result = await _apply_basic_pilot_gated_cooldown(
             selected_cooldown_key="rp:key",
             set_candidate_cooldown=setter,
         )
@@ -682,7 +682,7 @@ class TestSetCodexCandidateCooldowns:
         configured_runtime["codex_set"].assert_awaited_once_with("ck", 60.0)
 
     @pytest.mark.asyncio
-    async def test_delegates_read_pilot_flag(
+    async def test_delegates_basic_pilot_flag(
         self, configured_runtime: dict
     ) -> None:
         configured_runtime["gate"]._decision = _FakeDecision(
@@ -692,7 +692,7 @@ class TestSetCodexCandidateCooldowns:
         )
         req = _make_request()
         with patch.object(
-            cooldown_apply, "_apply_read_pilot_gated_cooldown", new_callable=AsyncMock, return_value="candidate"
+            cooldown_apply, "_apply_basic_pilot_gated_cooldown", new_callable=AsyncMock, return_value="candidate"
         ) as mock_gated:
             result = await _set_codex_auto_agent_candidate_cooldowns(
                 request=req,
@@ -701,7 +701,7 @@ class TestSetCodexCandidateCooldowns:
                 selected_cooldown_key="rp:key",
                 cooldown_seconds=0.0,
                 error_class=None,
-                is_read_pilot_lane=True,
+                is_basic_pilot_lane=True,
             )
         assert result == "candidate"
         mock_gated.assert_awaited_once()

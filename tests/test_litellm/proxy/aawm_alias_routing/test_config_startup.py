@@ -32,8 +32,8 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot imp
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
     _get_codex_auto_agent_candidates_for_alias,
-    _select_read_pilot_snapshot_candidates,
-    _select_read_pilot_snapshot_candidates_anthropic,
+    _select_basic_pilot_snapshot_candidates,
+    _select_basic_pilot_snapshot_candidates_anthropic,
     get_active_routing_snapshot,
     set_active_routing_snapshot,
 )
@@ -212,10 +212,10 @@ class TestScanInventory:
 
 class TestCompileDirectory:
     def test_single_file_compiles(self, tmp_path: Path) -> None:
-        _write_alias_yaml(tmp_path, "read.yaml", "read")
+        _write_alias_yaml(tmp_path, "basic.yaml", "basic")
         snapshot = compile_directory(tmp_path)
         assert isinstance(snapshot, RoutingSnapshot)
-        assert "read" in snapshot.aliases
+        assert "basic" in snapshot.aliases
         assert snapshot.config_hash
         assert snapshot.config_version
 
@@ -232,8 +232,8 @@ class TestCompileDirectory:
             compile_directory(tmp_path)
 
     def test_case_insensitive_duplicate_across_files_raises(self, tmp_path: Path) -> None:
-        _write_alias_yaml(tmp_path, "a.yaml", "Read")
-        _write_alias_yaml(tmp_path, "b.yaml", "read", model="gpt-5.6-luna")
+        _write_alias_yaml(tmp_path, "a.yaml", "Example")
+        _write_alias_yaml(tmp_path, "b.yaml", "example", model="gpt-5.6-luna")
         with pytest.raises(ConfigDirectoryError, match="case-insensitive"):
             compile_directory(tmp_path)
 
@@ -241,13 +241,13 @@ class TestCompileDirectory:
         doc = {
             "aliases": [
                 {
-                    "name": "Read",
+                    "name": "Example",
                     "candidates": [
                         {"provider": "openai", "model": "gpt-5.4-mini", "route_family": "codex_responses", "priority": 10}
                     ],
                 },
                 {
-                    "name": "read",
+                    "name": "example",
                     "candidates": [
                         {"provider": "openai", "model": "gpt-5.6-luna", "route_family": "codex_responses", "priority": 10}
                     ],
@@ -453,14 +453,14 @@ class TestEmptyAliases:
 
 class TestStartupActivation:
     def test_successful_activation(self, tmp_path: Path) -> None:
-        _write_alias_yaml(tmp_path, "read.yaml", "read")
+        _write_alias_yaml(tmp_path, "basic.yaml", "basic")
         activate_alias_config_directory(tmp_path)
         assert is_startup_healthy()
         status = get_startup_status()
         assert status["state"] == "active"
         assert status["alias_count"] == 1
-        assert status["aliases"] == ["read"]
-        assert status["files"] == ["read.yaml"]
+        assert status["aliases"] == ["basic"]
+        assert status["files"] == ["basic.yaml"]
         assert status["config_hash"]
         assert status["config_version"]
         assert "config_epoch" in status
@@ -489,7 +489,7 @@ class TestStartupActivation:
         assert status["state"] == "not_loaded"
 
     def test_sanitized_status_no_raw_yaml(self, tmp_path: Path) -> None:
-        _write_alias_yaml(tmp_path, "read.yaml", "read")
+        _write_alias_yaml(tmp_path, "basic.yaml", "basic")
         activate_alias_config_directory(tmp_path)
         status = get_startup_status()
         status_str = str(status)
@@ -512,7 +512,7 @@ class TestStartupActivation:
         assert is_startup_healthy()
         status = get_startup_status()
         assert status["state"] == "active"
-        assert "read" in status["aliases"]
+        assert "basic" in status["aliases"]
 
 
 # ---------------------------------------------------------------------------
@@ -539,7 +539,7 @@ class TestNotLoadedReadiness503:
 
 class TestSuccessEvidence:
     def test_success_status_contains_required_fields(self, tmp_path: Path) -> None:
-        _write_alias_yaml(tmp_path, "read.yaml", "read")
+        _write_alias_yaml(tmp_path, "basic.yaml", "basic")
         activate_alias_config_directory(tmp_path)
         status = get_startup_status()
         assert status["state"] == "active"
@@ -552,7 +552,7 @@ class TestSuccessEvidence:
         assert status["activation_result"] == "success"
 
     def test_success_status_excludes_secrets(self, tmp_path: Path) -> None:
-        _write_alias_yaml(tmp_path, "read.yaml", "read")
+        _write_alias_yaml(tmp_path, "basic.yaml", "basic")
         activate_alias_config_directory(tmp_path)
         status = get_startup_status()
         status_str = str(status)
@@ -566,11 +566,11 @@ class TestSuccessEvidence:
 
     def test_success_log_contains_relative_names(self, tmp_path: Path, caplog) -> None:
         import logging
-        _write_alias_yaml(tmp_path, "read.yaml", "read")
+        _write_alias_yaml(tmp_path, "basic.yaml", "basic")
         with caplog.at_level(logging.INFO, logger="litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup"):
             activate_alias_config_directory(tmp_path)
         log_text = caplog.text
-        assert "read.yaml" in log_text
+        assert "basic.yaml" in log_text
         assert "config_version=" in log_text
         assert "config_hash=" in log_text
         assert "result=success" in log_text
@@ -594,7 +594,7 @@ class TestDeterministicNames:
             assert ".." not in name.split("/")
 
     def test_status_files_are_relative(self, tmp_path: Path) -> None:
-        _write_alias_yaml(tmp_path, "sub/read.yaml", "read")
+        _write_alias_yaml(tmp_path, "sub/basic.yaml", "basic")
         activate_alias_config_directory(tmp_path)
         status = get_startup_status()
         for f in status["files"]:
@@ -614,7 +614,7 @@ class TestInventoryDrift:
     def _setup_good_dir(self, tmp_path: Path) -> Path:
         good = tmp_path / "cfg"
         good.mkdir()
-        _write_alias_yaml(good, "read.yaml", "read")
+        _write_alias_yaml(good, "basic.yaml", "basic")
         return good
 
     @pytest.mark.parametrize("drift_type", [
@@ -643,12 +643,12 @@ class TestInventoryDrift:
                 if drift_type == "add":
                     _write_alias_yaml(good, "injected.yaml", "injected")
                 elif drift_type == "remove":
-                    (good / "read.yaml").unlink()
+                    (good / "basic.yaml").unlink()
                 elif drift_type == "edit":
-                    _write_alias_yaml(good, "read.yaml", "read", model="gpt-5.9-edited")
+                    _write_alias_yaml(good, "basic.yaml", "basic", model="gpt-5.9-edited")
                 elif drift_type == "replace_file":
-                    (good / "read.yaml").unlink()
-                    _write_alias_yaml(good, "read.yaml", "read", model="gpt-5.9-replaced")
+                    (good / "basic.yaml").unlink()
+                    _write_alias_yaml(good, "basic.yaml", "basic", model="gpt-5.9-replaced")
                 elif drift_type == "replace_root":
                     # Replace root with symlink to external dir.
                     external = tmp_path / "external"
@@ -687,7 +687,7 @@ class TestStaleSnapshotPrevention:
     def test_failure_clears_prior_snapshot(self, tmp_path: Path) -> None:
         good_dir = tmp_path / "good"
         good_dir.mkdir()
-        _write_alias_yaml(good_dir, "read.yaml", "read")
+        _write_alias_yaml(good_dir, "basic.yaml", "basic")
         activate_alias_config_directory(good_dir)
         assert is_startup_healthy()
         assert get_active_routing_snapshot() is not None
@@ -706,7 +706,7 @@ class TestStaleSnapshotPrevention:
 
         good_dir = tmp_path / "good"
         good_dir.mkdir()
-        _write_alias_yaml(good_dir, "read.yaml", "read")
+        _write_alias_yaml(good_dir, "basic.yaml", "basic")
         activate_alias_config_directory(good_dir)
 
         bad_dir = tmp_path / "bad"
@@ -714,10 +714,10 @@ class TestStaleSnapshotPrevention:
         (bad_dir / "broken.yaml").write_text(":::bad:::", encoding="utf-8")
         activate_alias_config_directory(bad_dir)
 
-        assert _get_codex_auto_agent_candidates_for_alias("read") == ()
-        assert _select_read_pilot_snapshot_candidates() == ()
-        assert _select_read_pilot_snapshot_candidates_anthropic() == ()
-        assert _get_anthropic_auto_agent_candidates_for_alias("read") == ()
+        assert _get_codex_auto_agent_candidates_for_alias("basic") == ()
+        assert _select_basic_pilot_snapshot_candidates() == ()
+        assert _select_basic_pilot_snapshot_candidates_anthropic() == ()
+        assert _get_anthropic_auto_agent_candidates_for_alias("basic") == ()
 
 
 # ---------------------------------------------------------------------------
@@ -729,11 +729,11 @@ class TestSelectorIntegration:
     def test_codex_selector_uses_snapshot(self, tmp_path: Path) -> None:
         good_dir = tmp_path / "good"
         good_dir.mkdir()
-        _write_alias_yaml(good_dir, "read.yaml", "read")
+        _write_alias_yaml(good_dir, "basic.yaml", "basic")
         activate_alias_config_directory(good_dir)
         assert is_startup_healthy()
 
-        result = _select_read_pilot_snapshot_candidates()
+        result = _select_basic_pilot_snapshot_candidates()
         assert len(result) > 0
         assert result[0]["model"] == "gpt-5.4-mini"
 
@@ -744,15 +744,15 @@ class TestSelectorIntegration:
 
         good_dir = tmp_path / "good"
         good_dir.mkdir()
-        _write_alias_yaml(good_dir, "read.yaml", "read")
+        _write_alias_yaml(good_dir, "basic.yaml", "basic")
         activate_alias_config_directory(good_dir)
         assert is_startup_healthy()
 
-        selector_result = _select_read_pilot_snapshot_candidates_anthropic()
+        selector_result = _select_basic_pilot_snapshot_candidates_anthropic()
         assert selector_result is not None
         assert len(selector_result) > 0
 
-        wrapper_result = _get_anthropic_auto_agent_candidates_for_alias("read")
+        wrapper_result = _get_anthropic_auto_agent_candidates_for_alias("basic")
         assert len(wrapper_result) == len(selector_result)
         assert len(wrapper_result) > 0
         for w, s in zip(wrapper_result, selector_result):
@@ -762,11 +762,10 @@ class TestSelectorIntegration:
             assert w["route_family"] == "anthropic_openai_responses_adapter"
             assert "config_epoch_tag" in w
 
-    def test_legacy_anthropic_aliases_preserved_with_snapshot(
+    def test_basic_anthropic_alias_resolves_from_snapshot(
         self, tmp_path: Path
     ) -> None:
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
-            ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS,
             ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
         )
         from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
@@ -775,17 +774,16 @@ class TestSelectorIntegration:
 
         good_dir = tmp_path / "good"
         good_dir.mkdir()
-        _write_alias_yaml(good_dir, "read.yaml", "read")
+        _write_alias_yaml(good_dir, "basic.yaml", "basic")
         activate_alias_config_directory(good_dir)
         assert is_startup_healthy()
 
-        legacy = _get_anthropic_auto_agent_candidates_for_alias(
+        candidates = _get_anthropic_auto_agent_candidates_for_alias(
             ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
         )
-        assert legacy == ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS[
-            ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
-        ]
-        assert len(legacy) > 0
+        assert [candidate["model"] for candidate in candidates] == ["gpt-5.4-mini"]
+        assert candidates[0]["route_family"] == "anthropic_openai_responses_adapter"
+        assert "config_epoch_tag" in candidates[0]
 
 
 # ---------------------------------------------------------------------------
@@ -805,7 +803,7 @@ class TestFailureWindowLegacyAliasesZero:
 
         good_dir = tmp_path / "good"
         good_dir.mkdir()
-        _write_alias_yaml(good_dir, "read.yaml", "read")
+        _write_alias_yaml(good_dir, "basic.yaml", "basic")
         activate_alias_config_directory(good_dir)
 
         bad_dir = tmp_path / "bad"
@@ -814,13 +812,13 @@ class TestFailureWindowLegacyAliasesZero:
         activate_alias_config_directory(bad_dir)
         assert is_startup_failed()
 
-        assert _get_codex_auto_agent_candidates_for_alias("read") == ()
+        assert _get_codex_auto_agent_candidates_for_alias("basic") == ()
         assert _get_codex_auto_agent_candidates_for_alias(
             CODEX_AUTO_AGENT_MODEL_ALIAS
         ) == ()
-        assert _select_read_pilot_snapshot_candidates() == ()
-        assert _select_read_pilot_snapshot_candidates_anthropic() == ()
-        assert _get_anthropic_auto_agent_candidates_for_alias("read") == ()
+        assert _select_basic_pilot_snapshot_candidates() == ()
+        assert _select_basic_pilot_snapshot_candidates_anthropic() == ()
+        assert _get_anthropic_auto_agent_candidates_for_alias("basic") == ()
         assert _get_anthropic_auto_agent_candidates_for_alias(
             ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
         ) == ()
@@ -838,7 +836,7 @@ class TestFailureWindowLegacyAliasesZero:
 
         good_dir = tmp_path / "good"
         good_dir.mkdir()
-        _write_alias_yaml(good_dir, "read.yaml", "read")
+        _write_alias_yaml(good_dir, "basic.yaml", "basic")
         activate_alias_config_directory(good_dir)
 
         bad_dir = tmp_path / "bad"
@@ -852,16 +850,16 @@ class TestFailureWindowLegacyAliasesZero:
 
         def _pausing_set(snapshot):
             if snapshot is None:
-                observations["codex_read"] = _get_codex_auto_agent_candidates_for_alias("read")
+                observations["codex_basic"] = _get_codex_auto_agent_candidates_for_alias("basic")
                 observations["codex_legacy"] = _get_codex_auto_agent_candidates_for_alias(
                     CODEX_AUTO_AGENT_MODEL_ALIAS
                 )
-                observations["anthropic_read"] = _get_anthropic_auto_agent_candidates_for_alias("read")
+                observations["anthropic_basic"] = _get_anthropic_auto_agent_candidates_for_alias("basic")
                 observations["anthropic_legacy"] = _get_anthropic_auto_agent_candidates_for_alias(
                     ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
                 )
-                observations["codex_pilot"] = _select_read_pilot_snapshot_candidates()
-                observations["anthropic_pilot"] = _select_read_pilot_snapshot_candidates_anthropic()
+                observations["codex_pilot"] = _select_basic_pilot_snapshot_candidates()
+                observations["anthropic_pilot"] = _select_basic_pilot_snapshot_candidates_anthropic()
                 pause_entered.set()
                 pause_release.wait(timeout=10)
             return real_set(snapshot)
@@ -930,7 +928,7 @@ class TestShortReadOversize:
     ) -> None:
         import litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup as cs
 
-        header = b"aliases:\n- name: read\n  candidates:\n  - provider: openai\n    model: gpt-5.4-mini\n    route_family: codex_responses\n    priority: 10\n"
+        header = b"aliases:\n- name: basic\n  candidates:\n  - provider: openai\n    model: gpt-5.4-mini\n    route_family: codex_responses\n    priority: 10\n"
         pad_len = cs._MAX_CONFIG_FILE_BYTES - len(header)
         exact = tmp_path / "exact.yaml"
         exact.write_bytes(header + b"#" * pad_len)
@@ -959,25 +957,25 @@ class TestCoherentSnapshotReference:
     ) -> None:
         dir_a = tmp_path / "a"
         dir_a.mkdir()
-        _write_alias_yaml(dir_a, "read.yaml", "read", model="gpt-5.4-mini")
+        _write_alias_yaml(dir_a, "basic.yaml", "basic", model="gpt-5.4-mini")
         activate_alias_config_directory(dir_a)
         snap_a = get_active_routing_snapshot()
         assert snap_a is not None
 
-        result_a = _select_read_pilot_snapshot_candidates()
+        result_a = _select_basic_pilot_snapshot_candidates()
         assert len(result_a) > 0
         epoch_a = snap_a.config_hash
         assert all(c["config_epoch_tag"] == epoch_a for c in result_a)
 
         dir_b = tmp_path / "b"
         dir_b.mkdir()
-        _write_alias_yaml(dir_b, "read.yaml", "read", model="gpt-5.6-luna")
+        _write_alias_yaml(dir_b, "basic.yaml", "basic", model="gpt-5.6-luna")
         activate_alias_config_directory(dir_b)
         snap_b = get_active_routing_snapshot()
         assert snap_b is not None
         assert snap_b.config_hash != epoch_a
 
-        result_b = _select_read_pilot_snapshot_candidates()
+        result_b = _select_basic_pilot_snapshot_candidates()
         assert len(result_b) > 0
         epoch_b = snap_b.config_hash
         assert all(c["config_epoch_tag"] == epoch_b for c in result_b)
@@ -986,19 +984,19 @@ class TestCoherentSnapshotReference:
     def test_anthropic_clear_swap_coherent(self, tmp_path: Path) -> None:
         dir_a = tmp_path / "a"
         dir_a.mkdir()
-        _write_alias_yaml(dir_a, "read.yaml", "read", model="gpt-5.4-mini")
+        _write_alias_yaml(dir_a, "basic.yaml", "basic", model="gpt-5.4-mini")
         activate_alias_config_directory(dir_a)
         snap_a = get_active_routing_snapshot()
         assert snap_a is not None
 
-        result_a = _select_read_pilot_snapshot_candidates_anthropic()
+        result_a = _select_basic_pilot_snapshot_candidates_anthropic()
         assert result_a is not None
         assert len(result_a) > 0
         epoch_a = snap_a.config_hash
         assert all(c["config_epoch_tag"] == epoch_a for c in result_a)
 
         set_active_routing_snapshot(None)
-        result_cleared = _select_read_pilot_snapshot_candidates_anthropic()
+        result_cleared = _select_basic_pilot_snapshot_candidates_anthropic()
         assert result_cleared is None
 
     def test_single_snapshot_capture_no_second_global_fetch(
@@ -1008,7 +1006,7 @@ class TestCoherentSnapshotReference:
 
         good_dir = tmp_path / "good"
         good_dir.mkdir()
-        _write_alias_yaml(good_dir, "read.yaml", "read")
+        _write_alias_yaml(good_dir, "basic.yaml", "basic")
         activate_alias_config_directory(good_dir)
 
         call_count = [0]
@@ -1019,7 +1017,7 @@ class TestCoherentSnapshotReference:
             return real_get()
 
         monkeypatch.setattr(ss, "get_active_routing_snapshot", _counting_get)
-        result = ss._select_read_pilot_snapshot_candidates()
+        result = ss._select_basic_pilot_snapshot_candidates()
         assert len(result) > 0
         assert call_count[0] == 1
 
@@ -1055,7 +1053,7 @@ class TestTOCTOUAncestorSymlink:
         """Config root replaced by a symlink: compile must fail."""
         real_dir = tmp_path / "real_config"
         real_dir.mkdir()
-        _write_alias_yaml(real_dir, "read.yaml", "read")
+        _write_alias_yaml(real_dir, "basic.yaml", "basic")
 
         external_dir = tmp_path / "external"
         external_dir.mkdir()
@@ -1075,7 +1073,7 @@ class TestTOCTOUAncestorSymlink:
         config_root.mkdir()
         nested = config_root / "sub"
         nested.mkdir()
-        _write_alias_yaml(nested, "read.yaml", "read")
+        _write_alias_yaml(nested, "basic.yaml", "basic")
 
         external_dir = tmp_path / "external"
         external_dir.mkdir()
@@ -1092,7 +1090,7 @@ class TestTOCTOUAncestorSymlink:
     ) -> None:
         real_dir = tmp_path / "cfg"
         real_dir.mkdir()
-        _write_alias_yaml(real_dir, "read.yaml", "read")
+        _write_alias_yaml(real_dir, "basic.yaml", "basic")
 
         external_dir = tmp_path / "external"
         external_dir.mkdir()
@@ -1117,11 +1115,11 @@ class TestTOCTOUAncestorSymlink:
         """Regression: legitimate nested files still compile correctly."""
         nested = tmp_path / "sub" / "deep"
         nested.mkdir(parents=True)
-        _write_alias_yaml(nested, "read.yaml", "read")
+        _write_alias_yaml(nested, "basic.yaml", "basic")
         _write_alias_yaml(tmp_path, "top.yaml", "top")
 
         snapshot = compile_directory(tmp_path)
-        assert set(snapshot.aliases.keys()) == {"read", "top"}
+        assert set(snapshot.aliases.keys()) == {"basic", "top"}
 
 
 # ---------------------------------------------------------------------------

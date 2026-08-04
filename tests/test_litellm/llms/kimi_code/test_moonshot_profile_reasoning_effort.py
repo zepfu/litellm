@@ -2,12 +2,12 @@
 
 The moonshot agent profile must advertise a reasoning effort that is:
 1. Present in the Codex model catalog's supported_reasoning_levels for
-   aawm-sota-moonshot (low, medium, high, xhigh -- NOT max).
+   sota-moonshot (low, medium, high, xhigh -- NOT max).
 2. Correctly mapped by the kimi_code adapter to the native upstream effort.
 3. Not silently overwritten when explicitly requested by the caller.
 
 The pre-egress rejection was: "Reasoning effort max is not supported for
-model aawm-sota-moonshot. Supported reasoning efforts: low, medium, high,
+model sota-moonshot. Supported reasoning efforts: low, medium, high,
 xhigh" because the profile pinned ``max`` which is absent from the catalog.
 """
 
@@ -43,12 +43,12 @@ def _load_model_catalog() -> dict[str, Any]:
 def _catalog_supported_efforts() -> set[str]:
     catalog = _load_model_catalog()
     for model_entry in catalog["models"]:
-        if model_entry["slug"] == "aawm-sota-moonshot":
+        if model_entry["slug"] == "sota-moonshot":
             return {
                 level["effort"]
                 for level in model_entry["supported_reasoning_levels"]
             }
-    raise AssertionError("aawm-sota-moonshot not found in model catalog")
+    raise AssertionError("sota-moonshot not found in model catalog")
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +66,7 @@ def test_moonshot_profile_parses_and_uses_catalog_supported_effort() -> None:
         profile = tomllib.load(f)
 
     assert profile["name"] == "moonshot"
-    assert profile["model"] == "aawm-sota-moonshot"
+    assert profile["model"] == "sota-moonshot"
 
     effort = profile["model_reasoning_effort"]
     supported = _catalog_supported_efforts()
@@ -86,7 +86,7 @@ def test_moonshot_profile_parses_and_uses_catalog_supported_effort() -> None:
 
 
 def test_catalog_supports_xhigh_but_not_max() -> None:
-    """aawm-sota-moonshot must advertise xhigh and must NOT advertise max."""
+    """sota-moonshot must advertise xhigh and must NOT advertise max."""
     supported = _catalog_supported_efforts()
     assert "xhigh" in supported
     assert "high" in supported
@@ -99,7 +99,7 @@ def test_catalog_supports_xhigh_but_not_max() -> None:
 def test_catalog_default_reasoning_level_is_supported() -> None:
     catalog = _load_model_catalog()
     for model_entry in catalog["models"]:
-        if model_entry["slug"] == "aawm-sota-moonshot":
+        if model_entry["slug"] == "sota-moonshot":
             default = model_entry["default_reasoning_level"]
             supported = {
                 level["effort"]
@@ -107,7 +107,7 @@ def test_catalog_default_reasoning_level_is_supported() -> None:
             }
             assert default in supported
             return
-    raise AssertionError("aawm-sota-moonshot not found")
+    raise AssertionError("sota-moonshot not found")
 
 
 # ---------------------------------------------------------------------------

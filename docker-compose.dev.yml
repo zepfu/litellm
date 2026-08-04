@@ -79,6 +79,9 @@ services:
       - ./litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py:/app/litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py
       - ./litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py:/app/litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py
       - ./litellm/proxy/pass_through_endpoints/aawm_alias_routing:/app/litellm/proxy/pass_through_endpoints/aawm_alias_routing:ro
+      # CFG-010: keep the complete aawm_adapter_runtime package coherent with
+      # the bind-mounted llm_passthrough_endpoints.py during development.
+      - ./litellm/proxy/pass_through_endpoints/aawm_adapter_runtime:/app/litellm/proxy/pass_through_endpoints/aawm_adapter_runtime:ro
       # CFG-002: complete alias-config directory, read-only, for deterministic
       # startup directory loading.
       - ./litellm/proxy/aawm_alias_config:/app/litellm/proxy/aawm_alias_config:ro

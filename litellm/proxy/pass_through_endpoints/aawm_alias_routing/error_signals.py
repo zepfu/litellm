@@ -757,7 +757,7 @@ def _get_codex_auto_agent_native_grok_continuation_transient_max_attempts() -> i
         parsed = int(raw_value)
     except Exception:
         return _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_MAX_ATTEMPTS
-    # Conservative clamp: never drop below 6 (live aawm-code pool size) and
+    # Conservative clamp: never drop below 6 (live work pool size) and
     # never allow unbounded same-candidate storms.
     return max(6, min(16, parsed))
 

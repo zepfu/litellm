@@ -40,7 +40,7 @@ _ATTEMPT_RECORD_RUNTIME_NAMES = (
     "_model_cost",
     "_openai_provider_value",
     "_classify_failure",
-    "_read_pilot_gate_record",
+    "_basic_pilot_gate_record",
 )
 
 
@@ -490,7 +490,7 @@ class TestConfigureOptionalParams:
             model_cost={},
             openai_provider_value="openai",
             classify_failure=lambda *a, **kw: None,
-            read_pilot_gate_record=lambda *a, **kw: None,
+            basic_pilot_gate_record=lambda *a, **kw: None,
         )
 
         assert mod._aawm_alias_route_verbose_json_enabled is previous_verbose
@@ -618,7 +618,7 @@ class TestInstallWrapperCanonicalization:
             model_cost={},
             openai_provider_value="openai",
             classify_failure=lambda *a, **kw: None,
-            read_pilot_gate_record=lambda *a, **kw: None,
+            basic_pilot_gate_record=lambda *a, **kw: None,
         )
 
         def host_verbose() -> bool:

@@ -370,7 +370,7 @@ resolved provider model upstream, and records subscription/reference-cost
 provenance without inventing invoice cost.
 
 Dedicated Codex Responses and Anthropic Messages completion adapters support
-the `aawm-sota-alibaba`, `aawm-sota-deepseek`, and `aawm-sota-glm` aliases.
+the then-current Alibaba Qwen, DeepSeek, and GLM aliases.
 Qwen 3.6 Flash is also available in the low-tier alias chains. The Kimi and
 Alibaba completion adapters now attach canonical route-family metadata and use
 the standard stream/non-stream route-rollup lifecycle. Shared handled-error
@@ -422,8 +422,9 @@ therefore exposes the active role/model contract, including `agent_type`,
 The existing authenticated production harness explicitly registers the
 existing `~/.codex/agents/moonshot.toml` role while keeping
 `--ignore-user-config`, requires both child spawns to set
-`agent_type="moonshot"`, `model="aawm-sota-moonshot"`, and
-`fork_turns="none"`, and validates both spawns through persisted
+`agent_type="moonshot"` and `fork_turns="none"`; the harness required an
+explicit then-current Moonshot alias model for each child dispatch and
+validated both spawns through persisted
 `public.session_history_tool_activity`. Codex JSON stdout remains authoritative
 for visible completed `wait` events, but no longer incorrectly gates spawns
 that the installed CLI omits from `--json` output.
@@ -432,7 +433,7 @@ that the installed CLI omits from `--json` output.
 36,031 bytes as a bounded-peek overflow even though the configured limits were
 5,000 chunks and 8 MiB. The same acceptance run persisted two correct Moonshot
 spawn payloads, but Codex stdout omitted those spawn events and the created
-children had `agent_role=null`, selected the default `aawm-sota` role, and
+children had `agent_role=null`, selected the default SOTA role, and
 failed before tool execution. The Kimi namespace-flattening order also left the
 model-visible nested spawn schema without the role/model fields needed to make
 that selection explicit.
@@ -492,9 +493,9 @@ supported values `none` and `all`; isolated workers use `fork_turns="none"`.
 The rewrite removes legacy `fork_context` from both the property map and
 `required` while preserving runtime-provided fields such as `task_name`.
 
-The production Moonshot Codex stress prompt now sets
-`model="aawm-sota-moonshot"` and `fork_turns="none"` on both child dispatches
-and provides each child a complete self-contained plaintext task. This prevents
+The production Moonshot Codex stress prompt now requires an explicit
+then-current Moonshot alias model and sets `fork_turns="none"` on both child
+dispatches. It provides each child a complete self-contained plaintext task. This prevents
 the children from replaying inherited parent orchestration while preserving
 explicit provider-native Moonshot routing.
 
@@ -903,7 +904,7 @@ rolls up the post-`aawm.115` AAWM alias routing and logging fixes:
   passthrough routes are suppressed after route rollup capture, while non-2xx
   diagnostics remain visible.
 - Anthropic auto-agent OpenAI/Codex candidates now honor Codex-family cooldowns
-  for the same candidate key, so `aawm-code-anthropic` skips
+  for the same candidate key, so the then-current coding alias skips
   `gpt-5.3-codex-spark` when Spark has already cooled down through the Codex
   family. Spark transient 5xx failures now set a short candidate-scoped
   cooldown; non-Spark transient failures remain request-local.
@@ -917,7 +918,7 @@ rolls up the post-`aawm.115` AAWM alias routing and logging fixes:
   capacity signals still use the normal candidate cooldown/fallback path.
 
 **Why:** The `aawm.115` prod rollout exposed duplicate successful passthrough
-access logs and `aawm-code-anthropic` Spark retry behavior. After Grok 4.5 went
+access logs and the then-current coding alias Spark retry behavior. After Grok 4.5 went
 live, the old pre-release one-hour `candidate_unavailable` cooldown also caused
 transient Grok 4.5 availability blips to kill active agents and exclude a
 working route. The release keeps real usage/quota exhaustion protective while
@@ -929,7 +930,7 @@ operational behavior layered on top of LiteLLM passthrough.
 
 **Validation status:** Focused tests cover 2xx arrow-form suppression with
 429/5xx preservation; Codex-family Spark cooldown reuse by
-`aawm-code-anthropic`; Spark-only transient candidate cooldown; non-Spark
+the then-current coding alias; Spark-only transient candidate cooldown; non-Spark
 transient request-local behavior; Grok 4.5 alias order, pricing metadata, and
 candidate-unavailable cooldown removal; and explicit weekly/usage/quota
 precedence over generic `candidate_unavailable`. Dev `litellm-dev` was
@@ -942,8 +943,8 @@ generic `candidate_unavailable` scope `none`, OAuth Grok 4.5 generic
 ### aawm.115 — Anthropic SOTA/orchestration alias model selector normalization
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.115`. The
-`aawm-sota-anthropic` last-resort candidate and the
-`aawm-orchestration-anthropic` candidate now select `claude-opus-4-8[1m]`
+then-current Anthropic SOTA alias last-resort candidate and the Anthropic
+orchestration route candidate now select `claude-opus-4-8[1m]`
 instead of the base `claude-opus-4-8` label. The native Anthropic route still
 normalizes the request to the base upstream model with the 1m context beta
 header while preserving the requested alias label in routing/session metadata.
@@ -959,9 +960,9 @@ AAWM fork-local routing policy layered on top of LiteLLM passthrough behavior.
 
 **Validation status:** Focused proxy passthrough tests cover the SOTA,
 orchestration, cooldown/redispatch, and 1m-context routes. Dev container
-readiness plus in-container alias inspection proved `aawm-sota-anthropic`
-resolves to `['claude-fable-5', 'claude-opus-4-8[1m]']` and
-`aawm-orchestration-anthropic` resolves to `['claude-opus-4-8[1m]']` before prod
+readiness plus in-container alias inspection proved that the then-current
+Anthropic SOTA alias resolves to `['claude-fable-5', 'claude-opus-4-8[1m]']` and
+the Anthropic orchestration route resolves to `['claude-opus-4-8[1m]']` before prod
 promotion.
 
 ### aawm.114 — Anthropic credential diagnostics and quota/context metadata release head
@@ -1194,7 +1195,7 @@ smoke validation after restart showed same-line and multi-line serialized
 composer-call text return `True` while benign prose returns `False`, and a dev
 in-container repair probe confirmed literal `exec_command` payloads are
 rewritten to structured `function_call` output when the request advertises a
-matching tool schema. Dev route logs also showed a live `aawm-code-anthropic`
+matching tool schema. Dev route logs also showed the then-current coding alias's live
 Grok Composer candidate classified as `aawm_auto_agent_malformed_tool_call_text`
 / `provider_format_rejected` and cooled down instead of accepted as successful
 output when repair did not apply.
@@ -1250,8 +1251,8 @@ completed-stream success path and the interrupted/failed iterator path.
 
 ### aawm.104 — OpenRouter free-tier suppression for AAWM-low aliases with bounded rate-limit cache
 
-**What changed:** The fork metadata advances to `1.82.3+aawm.104`. `aawm-low`
-and `aawm-low-anthropic` now suppress retries when OpenRouter already reported
+**What changed:** The fork metadata advances to `1.82.3+aawm.104`. The two
+then-current low-tier aliases now suppress retries when OpenRouter already reported
 the free daily quota condition via `rate_limit_observations` evidence that is
 read through a bounded cached lookup. This keeps alias-probe redispatch from
 burning additional attempts on the known-suppressed OpenRouter path and preserves
@@ -1263,11 +1264,11 @@ because suppression state was not durable across requests. The bounded cached
 lookup records and reuses the cooldown/suppression signal so subsequent probes
 can fail over quickly and consistently until the cached state ages out.
 
-**Why not upstream:** This behavior is tailored to AAWM’s `aawm-low` alias
+**Why not upstream:** This behavior is tailored to AAWM’s then-current low-tier alias
 contract and `rate_limit_observations` signal usage; upstream OpenRouter fallback
 logic remains unchanged for non-AAWM alias routing.
 
-**Validation status:** Focused checks for `aawm-low` / `aawm-low-anthropic`
+**Validation status:** Focused checks for the low-tier Codex and Anthropic aliases
 confirm the free-tier suppression path is reused from cache and no longer forces
 repeated upstream OpenRouter retries under the cached suppression signal. The
 lookup now fail-opens on cache miss, read/parse errors, and stale-entry
@@ -1304,14 +1305,15 @@ logs after restart contained no `Unclosed client session`, `Traceback`,
 
 **What changed:** The fork metadata advances to `1.82.3+aawm.102`.
 OpenRouter adapter-local cooldown handling now distinguishes direct calls from
-AAWM alias candidate probes. When `aawm-low` / `aawm-low-anthropic` reaches an
+AAWM alias candidate probes. When the low-tier Codex and Anthropic aliases reach an
 OpenRouter candidate that is already cooling down inside the adapter, the
 adapter raises the existing `aawm_codex_auto_agent_candidate_unavailable`
 signal immediately instead of awaiting `asyncio.sleep` before an upstream
 attempt. Direct non-alias OpenRouter calls keep the existing sleep/backoff
 behavior.
 
-**Why:** A read-only explorer dispatch using `aawm-low` repeatedly logged
+**Why:** A read-only explorer dispatch using the then-current low-tier alias
+repeatedly logged
 `OpenRouter adapter cooldown active ... sleeping ... before upstream request`.
 That meant the subagent was waiting inside LiteLLM rather than receiving model
 output or progressing through the alias fallback chain. Alias-managed routes
@@ -1325,8 +1327,9 @@ passthrough behavior still benefits from the original direct-call backoff path.
 
 **Validation status:** Focused tests prove alias-probe OpenRouter completion
 adapter calls fail fast without sleeping when adapter-local cooldown is active,
-direct non-alias OpenRouter adapter requests still sleep, and `aawm-low` /
-`aawm-low-anthropic` skip the cooled OpenRouter candidate and progress to the
+direct non-alias OpenRouter adapter requests still sleep, and the two
+then-current low-tier aliases skip the cooled OpenRouter candidate and progress
+to the
 next declared candidate. `litellm-dev` was recreated on `:4001`; readiness
 returned healthy, an in-container probe returned
 `aawm_codex_auto_agent_candidate_unavailable` for the cooled OpenRouter
@@ -1347,11 +1350,12 @@ redispatch-required 429 responses now include bounded audit metadata
 candidate summaries) so client-visible redispatch failures can be correlated
 with the cooldown that triggered them. Grok native alias probes now classify
 the specific upstream 403 `permission-denied` response that says access to the
-chat endpoint is denied as `candidate_unavailable`, allowing `aawm-code` and
-`aawm-code-anthropic` to cool `grok-composer-2.5-fast` and progress to the next
+chat endpoint is denied as `candidate_unavailable`, allowing the two then-current
+code-agent aliases to cool `grok-composer-2.5-fast` and progress to the next
 declared xAI candidate instead of emitting repeated pass-through tracebacks.
 
-**Why:** Production `aawm-code` traffic on `v1.82.3-aawm.100` repeatedly selected
+**Why:** Production traffic through the then-current coding alias on
+`v1.82.3-aawm.100` repeatedly selected
 `grok-composer-2.5-fast`, received the Grok native 403
 `Access to the chat endpoint is denied`, and surfaced the upstream response as
 an unhandled pass-through traceback. The same broken alias route blocked worker
@@ -1366,8 +1370,9 @@ operator-facing redispatch contract used by AAWM subagent workflows.
 skips, durable cooldown recovery after memory clear, enriched in-flight
 redispatch metadata, non-durable transient Anthropic alias failures, exact Grok
 403 classifier matching for bytes/dict/string details, unrelated 403 rejection,
-Codex `aawm-code` Composer 403 failover to `oa_xai/grok-build`, and Anthropic
-`aawm-code-anthropic` parity. `litellm-dev` was restarted on `:4001`; `/health`
+Codex Composer 403 failover through the then-current coding alias to
+`oa_xai/grok-build`, and parity for the then-current Anthropic coding alias.
+`litellm-dev` was restarted on `:4001`; `/health`
 responded, an in-container probe returned `True` for the exact Grok 403
 classifier, and post-restart logs showed no fresh `Traceback`, `ERROR`,
 `permission-denied`, or `403 Forbidden` entries.
@@ -1414,7 +1419,8 @@ compact warning with
 LiteLLM traceback/error-intake record for this known provider/client condition.
 
 **Why:** Production Codex traffic after the `aawm.98` deploy hit a stale or
-invalid encrypted reasoning continuation on `aawm-code` / `gpt-5.3-codex-spark`.
+invalid encrypted reasoning continuation on the then-current coding alias /
+`gpt-5.3-codex-spark`.
 The upstream rejection was real and should remain visible to the client, but the
 generic traceback made it look like LiteLLM had crashed.
 
@@ -3202,7 +3208,7 @@ identity. Add a `session_history.created_at` index, rate-limit observation
 indexes, and a durable `public.rate_limit_intervals` materialized view for the
 no-temp usage report path. Add dev pass-through routes for local scispaCy and
 TinyBERN2 REST services and classify those route writes in `session_history` as
-`provider=local_biomed`. Add the `aawm-codex-agent-auto` OpenAI Responses alias
+`provider=local_biomed`. Add the historical Codex auto-agent OpenAI Responses alias
 for Codex agent traffic; it selects Spark first, then the three Gemini preview
 models through the Codex Google Code Assist adapter, and uses `gpt-5.4-mini` as
 the final fallback only after the preferred lanes are exhausted. The alias
@@ -3342,7 +3348,7 @@ provider than the one that created the state.
 `custom_llm_provider="openrouter"`, add direct/wildcard OpenRouter routes for
 the Qwen flash models, and allow the Anthropic-to-OpenRouter Responses adapter
 to target `qwen/qwen3.5-flash-02-23` and `qwen/qwen3.6-flash`. For
-`aawm-codex-agent-auto`, detect stateful continuation markers and session
+the historical Codex auto-agent route, detect stateful continuation markers and session
 affinity before retry selection; if the selected provider hits quota/capacity
 while an agent is in flight, set the usual cooldown and surface that provider
 error instead of selecting a different provider. If a subsequent continuation
@@ -3374,7 +3380,7 @@ routes and callback writes before prod promotion.
 it treats continuation `type` markers only when they are strings and skips
 already-seen dict/list objects while walking request payloads.
 
-**Why:** Prod showed `aawm-codex-agent-auto` could crash before candidate
+**Why:** Prod showed the historical Codex auto-agent route could crash before candidate
 fallback when a request contained a nested dict-valued `type` field, raising
 `TypeError: unhashable type: 'dict'`. That prevented the alias from reaching
 its normal first-call provider fallback behavior.
@@ -3458,7 +3464,7 @@ source integration module is missing.
 
 **Status:** AAWM local hotfix.
 
-**What changed:** `aawm-codex-agent-auto` no longer treats every
+**What changed:** The historical Codex auto-agent route no longer treats every
 `session_affinity` retryable exhaustion as terminal. If a request has
 Responses continuation state, provider `429`/quota/capacity exhaustion still
 sets cooldown and surfaces the provider error so the orchestrator can
@@ -3484,8 +3490,8 @@ candidates return retryable exhaustion, while existing in-flight affinity tests
 still prove continuation failures are terminal redispatch signals. Live dev
 validation on `litellm-dev` `:4001` showed Spark return
 `usage_limit_reached`, the alias set Spark cooldown, and the same fresh request
-completed on `gemini-3.1-flash-lite-preview` with
-`requested_model_alias=aawm-codex-agent-auto` in `session_history`.
+completed on `gemini-3.1-flash-lite-preview`, with the corresponding
+historical auto-agent alias recorded in `session_history`.
 
 ---
 
@@ -3522,7 +3528,7 @@ passed, and the dev runtime/backfill evidence is recorded in `COMPLETED.md`.
 
 **Status:** AAWM local hotfix.
 
-**What changed:** `aawm-codex-agent-auto` now treats retryable fresh-dispatch
+**What changed:** The historical Codex auto-agent route now treats retryable fresh-dispatch
 failures as per-candidate cooldowns in the explicit candidate order:
 Codex Spark, each Gemini candidate individually, OpenRouter
 `deepseek/deepseek-v4-flash:free`, then `gpt-5.4-mini` as the last resort.
@@ -3724,10 +3730,12 @@ session-history proof.
 
 **What changed:** The auto-agent selectors now support alias-keyed policy maps
 instead of one hard-coded candidate list per client family. New Codex/OpenAI
-Responses aliases are `aawm-sota`, `aawm-code`, and `aawm-low`; new
-Anthropic/Messages aliases are `aawm-sota-anthropic`,
-`aawm-code-anthropic`, and `aawm-low-anthropic`. Legacy
-`aawm-codex-agent-auto` and `aawm-anthropic-agent-auto` behavior is preserved.
+Responses aliases are the then-current SOTA alias, the then-current coding
+alias, and the then-current low-tier alias; new
+Anthropic/Messages aliases are the then-current Anthropic SOTA alias,
+the then-current coding alias, and the then-current low-tier alias. Legacy
+The historical Codex auto-agent and Anthropic orchestration route behaviors are
+preserved.
 
 The selector keeps cooldowns scoped to provider/model/lane, scopes new session
 affinity keys by requested alias, and dispatches selected candidates through
@@ -3743,7 +3751,7 @@ Anthropic auto-agent metadata and normalize session-history
 provider/model/model-group to the selected target.
 
 **Why:** New user-facing AAWM model aliases need the same ordered fallback,
-cooldown, continuation, and observability contract as `aawm-codex-agent-auto`.
+cooldown, continuation, and observability contract as the historical Codex auto-agent route.
 Static model labels would hide candidate selection and would not provide
 bounded retry/fallback behavior for transient 429, capacity, or empty-success
 failures.
@@ -3846,12 +3854,12 @@ failures as retryable candidate-unavailable conditions instead of terminal
 500s. Codex/OpenAI OpenRouter Responses candidates now pre-validate streamed
 Responses payloads before returning them to Codex; a stream with no
 `response.completed` event or an empty successful payload raises the existing
-`aawm_codex_auto_agent_empty_success` marker so `aawm-low` can cool that
+`aawm_codex_auto_agent_empty_success` marker so the then-current low-tier alias can cool that
 candidate and continue to OpenCode or the final Codex fallback. Successful
 OpenRouter streams are replayed unchanged after validation.
 
-**Why:** D1-207 live smokes showed `aawm-code` could get past Antigravity only
-to stop on stale Grok credentials, and `aawm-low` could receive an OpenRouter
+**Why:** D1-207 live smokes showed the then-current coding alias could get past Antigravity only
+to stop on stale Grok credentials, and the then-current low-tier alias could receive an OpenRouter
 stream without a usable `response.completed`, causing the client to fail before
 the alias selector could try the next candidate. These are candidate
 availability failures for fresh alias dispatches, not reasons to abandon the
@@ -3865,7 +3873,8 @@ Codex/Claude routing policy.
 rollover, Grok native `invalid_grant` rollover for Codex and Anthropic alias
 probes, OpenRouter streamed empty/no-completed rollover, and the broader
 auto-agent/Grok/OpenCode/Antigravity selection surface. Live dev smokes on
-2026-06-05 proved `aawm-sota`, `aawm-code`, and `aawm-low` return sentinels and
+2026-06-05 proved that the then-current SOTA alias, the then-current coding
+alias, and the then-current low-tier alias return sentinels and
 persist selected target/attempt metadata in `public.session_history`.
 
 ---
@@ -3874,7 +3883,7 @@ persist selected target/attempt metadata in `public.session_history`.
 
 **Status:** AAWM local release candidate.
 
-**What changed:** `aawm-sota-anthropic` now targets direct Anthropic
+**What changed:** The then-current Anthropic SOTA alias now targets direct Anthropic
 `claude-opus-4-8`, with matching model-cost entries in the primary and bundled
 fallback cost maps. The AAWM session-history callback strips PostgreSQL NUL
 bytes from text and JSON payloads at the final DB payload boundary for both
@@ -3899,12 +3908,13 @@ the async persistence flush path. Live dev proof on 2026-06-05 after restarting
 `f96d6f72395318ba39385aba679bc3f43f82d841f80394d60a5830b1de7097fa` and
 callback hash
 `138386c93f4d69ec7e3d8e61c1cabd5f43f3212b73c3bddc70e9e55f5c151d21`.
-`aawm-low-anthropic` returned `D1 208 Low Anthropic routing is ready.` and
+the then-current low-tier alias returned `D1 208 Low Anthropic routing is ready.` and
 persisted row `1154404` selecting `openrouter|google/gemma-4-31b-it:free`.
-`aawm-code-anthropic` returned `D1 208 Code Anthropic routing is ready.` and
+the then-current coding alias returned `D1 208 Code Anthropic routing is ready.` and
 persisted row `1154444` selecting `openai|gpt-5.3-codex-spark` after
 Antigravity `invalid_client` cooled as candidate-unavailable. A credentialed
-Claude CLI smoke for `aawm-sota-anthropic` returned model output and persisted
+Claude CLI smoke for the then-current Anthropic SOTA alias returned model output
+and persisted
 row `1154487` selecting `anthropic|claude-opus-4-8`. Rate-limit observations
 were recorded for the three live rows: OpenRouter daily request meter `132049`,
 Codex token pools `132061`-`132064`, and Anthropic response-header token pools
@@ -3984,7 +3994,8 @@ OpenCode/Antigravity/Grok operational policy are AAWM-specific fork behavior.
 
 **Additional release-prep fix:** During validation, OpenCode Zen returned an
 account billing/authentication failure (`CreditsError` / `No payment method`) as
-a 401 while `aawm-low` was probing alias candidates. Alias probe mode now treats
+a 401 while the then-current low-tier alias was probing alias candidates. Alias
+probe mode now treats
 that OpenCode billing/auth state as candidate unavailable so the alias can
 continue to `gpt-5.4-mini`; direct OpenCode routes still surface the upstream
 failure.
@@ -4187,7 +4198,8 @@ adapter replay repair, OpenAI-chat Anthropic replay normalization, cached
 missing-tool-call reconstruction, Claude `functionResponse.id` annotation,
 native missing-pair insertion, and content-window trimming that preserves
 valid function-call/function-response pairs without exceeding the configured
-window. A controlled `aawm-code` canary passed its second model request after
+window. A controlled canary through the then-current coding alias passed its
+second model request after
 the final runtime recreate.
 
 ---
@@ -4215,7 +4227,8 @@ still surface the auth failure.
 routing and dev-container credential handling.
 
 **Validation status:** Focused tests cover both Anthropic-style
-`aawm-code-anthropic` and Codex-style `aawm-code` fallback after the silent
+the then-current coding alias and Codex-style fallback through the then-current
+coding alias after the silent
 refresh no-token error, while existing tests preserve terminal handling for
 Vertex request-envelope 400s.
 
@@ -4223,15 +4236,18 @@ Vertex request-envelope 400s.
 
 ### aawm.D1-250 — Fail closed for tool-bearing Anthropic code-agent aliases
 
-**What changed:** `aawm-code-anthropic` requests that declare tools or carry
+**What changed:** Requests through the then-current coding alias that declare
+tools or carry
 stateful tool/reasoning continuation content now require the Antigravity Claude
 compatibility route. If Antigravity is cooling down or unavailable, the alias
-returns a structured 429 with `redispatch_model=aawm-code-anthropic` and marks
+returns a structured 429 identifying the then-current coding alias for
+redispatch and marks
 non-compatible candidates as `tool_schema_incompatible` instead of selecting
 OpenAI, xAI, OpenRouter/OpenCode, or direct native Anthropic fallbacks.
 
 **Why:** A dashboard-shell subagent (`ad13aecd1b0f72e0f`) showed the old policy
-falling through from `aawm-code-anthropic` to `openai/gpt-5.3-codex-spark` via
+falling through from the then-current coding alias to
+`openai/gpt-5.3-codex-spark` via
 `anthropic_openai_responses_adapter`. The Spark-backed session initially made
 valid Bash calls, then degraded into `Bash` tool calls with empty inputs such as
 `call_y67sWAwSpPGbqb8DLmIAx6mT`, causing repeated missing-`command` validation
@@ -4243,7 +4259,8 @@ the Claude/Codex tool contract.
 engineering workers and Antigravity-backed Claude access.
 
 **Validation status:** Focused tests cover Antigravity quota/auth failure for
-tool-bearing `aawm-code-anthropic` requests and prove neither the Spark adapter
+tool-bearing requests through the then-current coding alias and prove neither
+the Spark adapter
 nor direct native Anthropic passthrough is called.
 
 ---
@@ -4299,7 +4316,8 @@ retaining historical `/sessions/register` and
 retryable 5xx handling.
 
 **Why:** Prod/dev showed stale Grok OIDC ownership could require repeated manual
-login and could steer `aawm-code` away from Composer 2.5 Fast toward other Grok
+login and could steer the then-current coding alias away from Composer 2.5 Fast
+toward other Grok
 targets. The sidecar must refresh and repair the shared credential even during
 long idle windows, while model requests must not mutate credential files.
 

@@ -21,7 +21,7 @@ _RAW_YAML = """
 defaults:
   route_family: codex_responses
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: openrouter/cohere/north-mini-code:free
@@ -59,13 +59,13 @@ def test_rejects_unknown_keys_and_malformed_at_compile() -> None:
 def test_priority_descending_with_zero_last_resort_in_snapshot() -> None:
     """Snapshot candidate ordering is descending; priority 0 is placed last."""
     snapshot = compiler.compile_yaml(_RAW_YAML)
-    read_alias = snapshot.aliases["read"]
-    models_in_order = [c.model for c in read_alias.candidates]
+    basic_alias = snapshot.aliases["basic"]
+    models_in_order = [c.model for c in basic_alias.candidates]
     assert models_in_order == [
         "openrouter/cohere/north-mini-code:free",
         "gpt-5.4-mini",
     ]
-    assert read_alias.candidates[-1].priority == 0
+    assert basic_alias.candidates[-1].priority == 0
 
 
 def test_proportional_weights_normalized_in_snapshot() -> None:
@@ -73,7 +73,7 @@ def test_proportional_weights_normalized_in_snapshot() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     distribution_strategy: proportional
     candidates:
       - provider: openrouter
@@ -88,7 +88,7 @@ aliases:
         weight: 3
 """
     snapshot = compiler.compile_yaml(raw)
-    weights = {c.model: c.weight for c in snapshot.aliases["read"].candidates}
+    weights = {c.model: c.weight for c in snapshot.aliases["basic"].candidates}
     assert pytest.approx(sum(weights.values()), rel=1e-6) == 1.0
     assert pytest.approx(weights["a"], rel=1e-6) == 0.25
     assert pytest.approx(weights["b"], rel=1e-6) == 0.75
@@ -99,7 +99,7 @@ def test_tui_attached_flag_compiles_into_snapshot() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: gpt-5.4-mini
@@ -108,7 +108,7 @@ aliases:
         tui_attached: Claude
 """
     snapshot = compiler.compile_yaml(raw)
-    candidate = snapshot.aliases["read"].candidates[0]
+    candidate = snapshot.aliases["basic"].candidates[0]
     assert candidate.tui_attached == "Claude"
 
 
@@ -117,7 +117,7 @@ def test_tui_excluded_flag_compiles_into_snapshot_and_hash() -> None:
     base_raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: gpt-5.6-luna
@@ -131,8 +131,8 @@ aliases:
     snapshot_plain = compiler.compile_yaml(base_raw)
     snapshot_with = compiler.compile_yaml(with_excluded_raw)
 
-    assert snapshot_plain.aliases["read"].candidates[0].tui_excluded is None
-    assert snapshot_with.aliases["read"].candidates[0].tui_excluded == "Claude"
+    assert snapshot_plain.aliases["basic"].candidates[0].tui_excluded is None
+    assert snapshot_with.aliases["basic"].candidates[0].tui_excluded == "Claude"
     # The exclusion participates in semantic config identity.
     assert snapshot_plain.config_hash != snapshot_with.config_hash
 
@@ -142,7 +142,7 @@ def test_schedule_windows_utc_only_in_snapshot() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: alibaba_token_plan
         model: alibaba_token_plan/qwen3.8-max-preview
@@ -157,7 +157,7 @@ aliases:
         priority: 0
 """
     snapshot = compiler.compile_yaml(raw)
-    promo_candidate = snapshot.aliases["read"].candidates[0]
+    promo_candidate = snapshot.aliases["basic"].candidates[0]
     assert promo_candidate.schedule is not None
     assert promo_candidate.schedule.start.utcoffset().total_seconds() == 0
 
@@ -165,10 +165,10 @@ aliases:
 def test_inheritance_resolves_at_compile() -> None:
     """Typed inheritance (defaults -> alias -> candidate) compiles without ambiguity."""
     snapshot = compiler.compile_yaml(_RAW_YAML)
-    read_alias = snapshot.aliases["read"]
-    or_candidate = next(c for c in read_alias.candidates if c.provider == "openrouter")
+    basic_alias = snapshot.aliases["basic"]
+    or_candidate = next(c for c in basic_alias.candidates if c.provider == "openrouter")
     assert or_candidate.route_family == "codex_openrouter_completion_adapter"
-    fallback_candidate = next(c for c in read_alias.candidates if c.provider == "openai")
+    fallback_candidate = next(c for c in basic_alias.candidates if c.provider == "openai")
     assert fallback_candidate.route_family == "codex_responses"
 
 
@@ -177,7 +177,7 @@ def test_error_class_refs_open_vocabulary_at_compile() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: gpt-5.4-mini
@@ -188,7 +188,7 @@ aliases:
             cools: true
 """
     snapshot = compiler.compile_yaml(raw)
-    candidate = snapshot.aliases["read"].candidates[0]
+    candidate = snapshot.aliases["basic"].candidates[0]
     assert candidate.error_rules[0].class_name == "a_totally_new_future_class"
 
 
@@ -197,7 +197,7 @@ def test_rejects_arbitrary_behavior_at_compile() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: totally_unregistered_provider_xyz
         model: whatever
@@ -213,7 +213,7 @@ def test_reasoning_effort_snapshot_field_and_semantic_hash() -> None:
     base_raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: gpt-5.4-mini
@@ -227,8 +227,8 @@ aliases:
     snapshot_plain = compiler.compile_yaml(base_raw)
     snapshot_with = compiler.compile_yaml(with_effort_raw)
 
-    assert snapshot_plain.aliases["read"].candidates[0].reasoning_effort is None
-    assert snapshot_with.aliases["read"].candidates[0].reasoning_effort == "low"
+    assert snapshot_plain.aliases["basic"].candidates[0].reasoning_effort is None
+    assert snapshot_with.aliases["basic"].candidates[0].reasoning_effort == "low"
     # The configured value participates in semantic config identity.
     assert snapshot_plain.config_hash != snapshot_with.config_hash
 
@@ -238,7 +238,7 @@ def test_reasoning_effort_malformed_fails_compile_closed() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: gpt-5.4-mini
@@ -270,7 +270,7 @@ def test_semantic_key_tag_is_stable_across_processes_and_source_formatting(
     yaml_original = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: openrouter/cohere/north-mini-code:free
@@ -287,7 +287,7 @@ aliases:
 # Reformatted: comment added, key order changed, extra whitespace
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - route_family: codex_openrouter_completion_adapter
         provider: openrouter

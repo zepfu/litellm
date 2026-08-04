@@ -101,7 +101,12 @@ def resolve_anthropic_route_family(
     return None
 
 
-DistributionStrategy = Literal["proportional", "round_robin"]
+DistributionStrategy = Literal[
+    "proportional",
+    "round_robin",
+    "highest_quota_available",
+    "lowest_quota_available",
+]
 
 
 # Canonical reasoning-effort vocabulary accepted at the candidate YAML level
@@ -110,6 +115,11 @@ DistributionStrategy = Literal["proportional", "round_robin"]
 # route at dispatch time.
 REGISTERED_REASONING_EFFORTS: frozenset[str] = frozenset(
     {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+)
+
+# TUI family normalization vocabulary (CFG-007 dispatch).
+REGISTERED_TUI_FAMILIES: frozenset[str] = frozenset(
+    {"codex", "claude", "grok", "qwen", "kimi", "unknown"}
 )
 
 
@@ -154,6 +164,72 @@ class ErrorRuleConfig(BaseModel):
 
     class_name: str
     cools: bool = True
+
+class AliasReferenceCandidateConfig(BaseModel):
+    """Reference to another alias as a weighted branch (CFG-009).
+
+    Alias references are weighted at branch level and exhausted as a unit
+    before the parent marks the branch unavailable and reselects.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    alias_reference: str
+    priority: int = 1
+    weight: float = 1.0
+    tui_attached: Optional[str] = None
+    tui_excluded: Optional[str] = None
+
+    @field_validator("weight")
+    @classmethod
+    def _require_non_negative_weight(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError(f"alias_reference weight {value!r} must not be negative")
+        return value
+
+
+class DispatchRuleConfig(BaseModel):
+    """TUI-family dispatch rule for alias-to-alias routing (CFG-007)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tui_family: str
+    target_alias: str
+
+    @field_validator("tui_family")
+    @classmethod
+    def _require_registered_tui_family(cls, value: str) -> str:
+        if value not in REGISTERED_TUI_FAMILIES:
+            raise ValueError(f"tui_family {value!r} is not a registered TUI family")
+        return value
+
+
+class DispatchConfig(BaseModel):
+    """TUI-origin dispatch configuration for logical aliases (CFG-007).
+
+    by_tui maps TUI family names to target aliases. default is used
+    when no TUI rule matches or when the origin is unknown/missing.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    by_tui: list[DispatchRuleConfig] = Field(default_factory=list)
+    default: Optional[str] = None
+    blocked_tui_families: list[str] = Field(default_factory=list)
+
+    @field_validator("blocked_tui_families")
+    @classmethod
+    def _require_registered_blocked_tui_families(
+        cls, value: list[str]
+    ) -> list[str]:
+        invalid = [family for family in value if family not in REGISTERED_TUI_FAMILIES]
+        if invalid:
+            raise ValueError(
+                f"blocked_tui_families contains unregistered TUI families: {invalid!r}"
+            )
+        if len(set(value)) != len(value):
+            raise ValueError("blocked_tui_families must not contain duplicates")
+        return value
 
 
 class CandidateConfig(BaseModel):
@@ -211,14 +287,21 @@ class CandidateConfig(BaseModel):
 
 
 class AliasConfig(BaseModel):
-    """A single alias (e.g. ``read``) with its ordered candidate set."""
+    """A single alias with its candidate set or dispatch rules."""
 
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    candidates: list[CandidateConfig]
+    candidates: list[CandidateConfig | AliasReferenceCandidateConfig] = Field(
+        default_factory=list
+    )
     route_family: Optional[str] = None
     distribution_strategy: Optional[DistributionStrategy] = None
+    # CFG-009/CFG-013: public aliases are directly selectable; internal
+    # aliases (e.g. work-other) are reachable only via alias-reference.
+    visibility: Literal["public", "internal"] = "public"
+    # CFG-007: optional TUI-dispatch rules for logical aliases like sota.
+    dispatch: Optional[DispatchConfig] = None
 
     @field_validator("route_family")
     @classmethod
@@ -227,20 +310,52 @@ class AliasConfig(BaseModel):
 
     @field_validator("candidates")
     @classmethod
-    def _require_non_empty_candidates(cls, value: list[CandidateConfig]) -> list[CandidateConfig]:
-        if not value:
-            raise ValueError("alias candidates must not be empty -- at least one candidate is required")
+    def _require_unique_entries(cls, value: list) -> list:
+        seen: set[str] = set()
+        for entry in value:
+            if isinstance(entry, CandidateConfig):
+                if entry.model in seen:
+                    raise ValueError(
+                        f"duplicate model {entry.model!r} within a single alias"
+                    )
+                seen.add(entry.model)
+            elif isinstance(entry, AliasReferenceCandidateConfig):
+                if entry.alias_reference in seen:
+                    raise ValueError(
+                        f"duplicate alias_reference {entry.alias_reference!r}"
+                    )
+                seen.add(entry.alias_reference)
         return value
 
-    @field_validator("candidates")
-    @classmethod
-    def _require_unique_models(cls, value: list[CandidateConfig]) -> list[CandidateConfig]:
-        seen: set[str] = set()
-        for candidate in value:
-            if candidate.model in seen:
-                raise ValueError(f"duplicate model {candidate.model!r} within a single alias's candidate list")
-            seen.add(candidate.model)
-        return value
+    @model_validator(mode="after")
+    def _require_candidates_or_dispatch(self) -> "AliasConfig":
+        if not self.candidates and self.dispatch is None:
+            raise ValueError(
+                f"alias {self.name!r} must have either candidates or dispatch"
+            )
+        if self.candidates and self.dispatch is not None:
+            raise ValueError(
+                f"alias {self.name!r} cannot have both candidates and dispatch"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_distribution_contract(self) -> "AliasConfig":
+        if self.distribution_strategy in {
+            "highest_quota_available",
+            "lowest_quota_available",
+        }:
+            weighted = [
+                entry
+                for entry in self.candidates
+                if float(getattr(entry, "weight", 1.0)) != 1.0
+            ]
+            if weighted:
+                raise ValueError(
+                    "quota availability strategies require default weight 1.0 "
+                    "for every candidate or alias reference"
+                )
+        return self
 
 
 class DefaultsConfig(BaseModel):
@@ -291,6 +406,15 @@ def order_candidates_by_priority(
     return non_zero_sorted + zero
 
 
+def order_alias_entries_by_priority(
+    entries: Sequence[CandidateConfig | AliasReferenceCandidateConfig],
+) -> list[CandidateConfig | AliasReferenceCandidateConfig]:
+    """Order mixed concrete/reference entries by priority with zero last."""
+    non_zero = [entry for entry in entries if entry.priority != 0]
+    zero = [entry for entry in entries if entry.priority == 0]
+    return sorted(non_zero, key=lambda entry: entry.priority, reverse=True) + zero
+
+
 def normalized_weights(candidates: Sequence[CandidateConfig]) -> dict[str, float]:
     """Normalize ``weight`` across the given candidates so they sum to 1.0."""
     total = sum(candidate.weight for candidate in candidates) or 1.0
@@ -308,12 +432,68 @@ def resolve_inheritance(document: RoutingConfigDocument) -> RoutingConfigDocumen
     """
     resolved_aliases: list[AliasConfig] = []
     for alias in document.aliases:
-        alias_route_family = alias.route_family if alias.route_family is not None else document.defaults.route_family
-        resolved_candidates: list[CandidateConfig] = []
+        alias_route_family = (
+            alias.route_family
+            if alias.route_family is not None
+            else document.defaults.route_family
+        )
+        resolved_candidates: list[CandidateConfig | AliasReferenceCandidateConfig] = []
         for candidate in alias.candidates:
+            if isinstance(candidate, AliasReferenceCandidateConfig):
+                resolved_candidates.append(candidate)
+                continue
             effective_route_family = (
                 candidate.route_family if candidate.route_family is not None else alias_route_family
             )
-            resolved_candidates.append(candidate.model_copy(update={"route_family": effective_route_family}))
-        resolved_aliases.append(alias.model_copy(update={"candidates": resolved_candidates}))
+            resolved_candidates.append(
+                candidate.model_copy(update={"route_family": effective_route_family})
+            )
+        resolved_aliases.append(
+            alias.model_copy(update={"candidates": resolved_candidates})
+        )
     return document.model_copy(update={"aliases": resolved_aliases})
+
+
+def detect_alias_reference_cycles(document: RoutingConfigDocument) -> list[str]:
+    """Detect cycles across alias references and dispatch targets.
+
+    Returns list of cycle path descriptions. Raises ValueError for
+    missing-target references or dispatch targets.
+    """
+    alias_map = {alias.name: alias for alias in document.aliases}
+
+    def _walk(name: str, path: list[str]) -> Optional[str]:
+        if name in path:
+            return " -> ".join(path + [name])
+        alias = alias_map.get(name)
+        if alias is None:
+            raise ValueError(
+                f"alias_reference {name!r} not found in config document"
+            )
+        path = path + [name]
+        targets = [
+            candidate.alias_reference
+            for candidate in alias.candidates
+            if isinstance(candidate, AliasReferenceCandidateConfig)
+        ]
+        if alias.dispatch is not None:
+            targets.extend(rule.target_alias for rule in alias.dispatch.by_tui)
+            if alias.dispatch.default is not None:
+                targets.append(alias.dispatch.default)
+        for target in targets:
+            result = _walk(target, path)
+            if result is not None:
+                return result
+        return None
+
+    cycles: list[str] = []
+    seen_roots: set[str] = set()
+    for alias_name in alias_map:
+        cycle = _walk(alias_name, [])
+        if cycle is not None:
+            # Deduplicate: only report once per cycle set
+            cycle_members = set(cycle.split(" -> "))
+            if not cycle_members & seen_roots:
+                cycles.append(cycle)
+                seen_roots.update(cycle_members)
+    return cycles

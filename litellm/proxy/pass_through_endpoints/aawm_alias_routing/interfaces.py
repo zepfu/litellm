@@ -189,7 +189,7 @@ class PerformCandidateRequestFn(Protocol):
 class ResolveCooldownPublicationFn(Protocol):
     """Classify one failure and produce the immutable publication plan.
 
-    Synchronous and pure: it records read-pilot evidence and resolves the scope
+    Synchronous and pure: it records basic-pilot evidence and resolves the scope
     + target keys, but performs NO I/O. The loop owns all publishing.
     """
 
@@ -204,7 +204,7 @@ class ResolveCooldownPublicationFn(Protocol):
         error_class: Optional[str],
         grok_account_quota_exhausted: bool = False,
         kimi_failure_metadata: Optional[dict[str, Any]] = None,
-        is_read_pilot_lane: bool = False,
+        is_basic_pilot_lane: bool = False,
     ) -> CooldownPublicationPlan:
         ...
 
@@ -222,8 +222,8 @@ class PublishCooldownMemoryFn(Protocol):
 
 
 @runtime_checkable
-class RecordReadPilotEvidenceFn(Protocol):
-    """Synchronously record one read-pilot failure observation."""
+class RecordBasicPilotEvidenceFn(Protocol):
+    """Synchronously record one basic-pilot failure observation."""
 
     def __call__(
         self,

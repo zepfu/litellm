@@ -20,6 +20,11 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     error_signals,
     policy,
     selection,
+    snapshot_select,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+    DEFAULT_CONFIG_DIR,
+    compile_directory,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     alias_routing_state,
@@ -96,6 +101,8 @@ def _anthropic_body(alias: str, *, continuation: bool = False) -> dict[str, Any]
 
 @pytest.fixture(autouse=True)
 def _reset_moonshot_alias_state() -> None:
+    previous_snapshot = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(compile_directory(DEFAULT_CONFIG_DIR))
     alias_routing_state.codex.cooldown_until_monotonic_by_key.clear()
     alias_routing_state.anthropic.cooldown_until_monotonic_by_key.clear()
     alias_routing_state.codex.cooldown_negative_until_monotonic_by_key.clear()
@@ -109,85 +116,68 @@ def _reset_moonshot_alias_state() -> None:
     alias_routing_state.anthropic.cooldown_negative_until_monotonic_by_key.clear()
     alias_routing_state.codex.session_affinity_by_key.clear()
     alias_routing_state.anthropic.session_affinity_by_key.clear()
+    snapshot_select.set_active_routing_snapshot(previous_snapshot)
 
 
-def test_should_keep_the_complete_moonshot_alias_order_and_only_one_cross_ingress_alias() -> None:
-    assert [candidate["model"] for candidate in policy.CODEX_AAWM_CODE_CANDIDATES] == [
-        "gpt-5.3-codex-spark",
-        "kimi_code/k3-high",
-        "xai/grok-4.5",
-        "grok-composer-2.5-fast",
-        "oa_xai/grok-build",
-        "gpt-5.6-terra",
-        "gpt-5.5",
-    ]
-    assert [candidate["model"] for candidate in policy.ANTHROPIC_AAWM_CODE_CANDIDATES] == [
-        "gpt-5.3-codex-spark",
-        "kimi_code/k3-high",
-        "xai/grok-4.5",
-        "grok-composer-2.5-fast",
-        "oa_xai/grok-build",
-        "claude-sonnet-5[1m]",
-        "claude-sonnet-5",
-        "claude-sonnet-4-6",
-    ]
-    assert [candidate["model"] for candidate in policy.CODEX_AAWM_LOW_CANDIDATES[-2:]] == [
-        "kimi_code/kimi-for-coding",
-        "gpt-5.4-mini",
-    ]
-    assert [candidate["model"] for candidate in policy.ANTHROPIC_AAWM_LOW_CANDIDATES[-2:]] == [
-        "kimi_code/kimi-for-coding",
-        "claude-haiku-4-5-20251001",
-    ]
-
-    for candidates in (
-        policy.CODEX_AAWM_LOW_CANDIDATES,
-        policy.ANTHROPIC_AAWM_LOW_CANDIDATES,
-    ):
-        assert all(candidate["model"] != "kimi_code/kimi-for-coding-highspeed" for candidate in candidates)
-
-    assert [candidate["model"] for candidate in policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS["aawm-sota-moonshot"]] == [
-        "kimi_code/k3-max",
-        "kimi_code/k3-high",
-    ]
-    assert [
-        candidate["route_family"] for candidate in policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS["aawm-sota-moonshot"]
-    ] == [
-        "codex_kimi_chat_completions_adapter",
-        "codex_kimi_chat_completions_adapter",
-    ]
-    assert [
-        candidate["route_family"] for candidate in policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS["aawm-sota-moonshot"]
-    ] == [
-        "anthropic_kimi_chat_completions_adapter",
-        "anthropic_kimi_chat_completions_adapter",
-    ]
-    assert all(
-        candidate["metadata_gate"] == "think_effort"
-        for candidate in policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS["aawm-sota-moonshot"]
+def test_should_register_the_canonical_moonshot_alias_for_both_ingresses() -> None:
+    codex_candidates = snapshot_select._get_codex_auto_agent_candidates_for_alias(
+        "sota-moonshot"
     )
-    assert "sota-moonshot" not in policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    assert "aawm-sota-moonshot-anthropic" not in policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
+    anthropic_candidates = (
+        selection._get_anthropic_candidates_for_alias_snapshot_aware(
+            "sota-moonshot"
+        )
+    )
+
+    assert [candidate["model"] for candidate in codex_candidates] == [
+        "kimi_code/k3"
+    ]
+    assert [candidate["model"] for candidate in anthropic_candidates] == [
+        "kimi_code/k3"
+    ]
+    assert codex_candidates[0]["route_family"] == (
+        "codex_kimi_chat_completions_adapter"
+    )
+    assert anthropic_candidates[0]["route_family"] == (
+        "anthropic_kimi_chat_completions_adapter"
+    )
 
 
 @pytest.mark.asyncio
-async def test_should_select_k3_high_after_forced_spark_cooldown_for_both_code_ingresses() -> None:
+async def test_should_select_an_available_work_other_branch_after_spark_cooldown() -> None:
     spark_key = "openai:gpt-5.3-codex-spark:__default__"
     await cooldown_state._set_codex_auto_agent_cooldown(spark_key, 60.0)
 
     codex_selection = await selection._select_codex_auto_agent_candidate(
         request=_request("/v1/responses"),
-        request_body=_codex_body("aawm-code"),
+        request_body=_codex_body("work"),
     )
     anthropic_selection = await selection._select_anthropic_auto_agent_candidate(
         request=_request("/v1/messages"),
-        request_body=_anthropic_body("aawm-code-anthropic"),
+        request_body=_anthropic_body("work"),
     )
 
-    assert codex_selection["candidate"]["model"] == "kimi_code/k3-high"
-    assert codex_selection["candidate"]["route_family"] == ("codex_kimi_chat_completions_adapter")
-    assert anthropic_selection["candidate"]["model"] == "kimi_code/k3-high"
-    assert anthropic_selection["candidate"]["route_family"] == ("anthropic_kimi_chat_completions_adapter")
+    expected_codex_routes = {
+        "oa_xai/grok-4.5": "codex_xai_oauth_responses_adapter",
+        "kimi_code/k3": "codex_kimi_chat_completions_adapter",
+        "alibaba_token_plan/qwen3.8-max": (
+            "codex_alibaba_token_plan_chat_completions_adapter"
+        ),
+    }
+    expected_anthropic_routes = {
+        "oa_xai/grok-4.5": "anthropic_xai_oauth_responses_adapter",
+        "kimi_code/k3": "anthropic_kimi_chat_completions_adapter",
+        "alibaba_token_plan/qwen3.8-max": (
+            "anthropic_alibaba_token_plan_chat_completions_adapter"
+        ),
+    }
+    assert codex_selection["candidate"]["route_family"] == expected_codex_routes[
+        codex_selection["candidate"]["model"]
+    ]
+    assert (
+        anthropic_selection["candidate"]["route_family"]
+        == expected_anthropic_routes[anthropic_selection["candidate"]["model"]]
+    )
 
 
 @pytest.mark.asyncio
@@ -195,7 +185,7 @@ async def test_should_preserve_sota_moonshot_continuation_affinity_per_ingress()
     codex_request = _request("/v1/responses")
     codex_initial = await selection._select_codex_auto_agent_candidate(
         request=codex_request,
-        request_body=_codex_body("aawm-sota-moonshot"),
+        request_body=_codex_body("sota-moonshot"),
     )
     await cooldown_state._set_codex_auto_agent_session_affinity(
         codex_initial["session_key"],
@@ -203,13 +193,13 @@ async def test_should_preserve_sota_moonshot_continuation_affinity_per_ingress()
     )
     codex_continuation = await selection._select_codex_auto_agent_candidate(
         request=codex_request,
-        request_body=_codex_body("aawm-sota-moonshot", continuation=True),
+        request_body=_codex_body("sota-moonshot", continuation=True),
     )
 
     anthropic_request = _request("/v1/messages")
     anthropic_initial = await selection._select_anthropic_auto_agent_candidate(
         request=anthropic_request,
-        request_body=_anthropic_body("aawm-sota-moonshot"),
+        request_body=_anthropic_body("sota-moonshot"),
     )
     await cooldown_state._set_anthropic_auto_agent_session_affinity(
         anthropic_initial["session_key"],
@@ -217,23 +207,19 @@ async def test_should_preserve_sota_moonshot_continuation_affinity_per_ingress()
     )
     anthropic_continuation = await selection._select_anthropic_auto_agent_candidate(
         request=anthropic_request,
-        request_body=_anthropic_body("aawm-sota-moonshot", continuation=True),
+        request_body=_anthropic_body("sota-moonshot", continuation=True),
     )
 
-    assert codex_continuation["candidate"]["model"] == "kimi_code/k3-max"
+    assert codex_continuation["candidate"]["model"] == "kimi_code/k3"
     assert codex_continuation["selection_reason"] == "session_affinity"
-    assert anthropic_continuation["candidate"]["model"] == "kimi_code/k3-max"
+    assert anthropic_continuation["candidate"]["model"] == "kimi_code/k3"
     assert anthropic_continuation["selection_reason"] == "session_affinity"
 
 
 @pytest.mark.asyncio
 async def test_should_not_retry_bounded_kimi_invalid_request_for_continuation() -> None:
-    await cooldown_state._set_codex_auto_agent_cooldown(
-        "openai:gpt-5.3-codex-spark:__default__",
-        60.0,
-    )
     request = _request("/v1/responses")
-    body = _codex_body("aawm-code", continuation=True)
+    body = _codex_body("sota-moonshot", continuation=True)
     terminal_error = HTTPException(
         status_code=400,
         detail={
@@ -269,7 +255,13 @@ async def test_should_not_retry_bounded_kimi_invalid_request_for_continuation() 
 @pytest.mark.asyncio
 async def test_should_persist_one_kimi_managed_account_lane_and_continue_to_grok() -> None:
     cache = _FakeDurableAliasCache()
-    kimi_candidate = dict(policy.CODEX_AAWM_CODE_CANDIDATES[1])
+    kimi_candidate = {
+        "provider": policy.CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
+        "model": "kimi_code/k3",
+        "route_family": "codex_kimi_chat_completions_adapter",
+        "last_resort": False,
+        "reasoning_effort": "max",
+    }
     safe_quota_metadata = {
         "kind": "quota",
         "scope": "managed_account",
@@ -294,7 +286,9 @@ async def test_should_persist_one_kimi_managed_account_lane_and_continue_to_grok
             request=_request("/v1/responses"),
             candidate=kimi_candidate,
             lane_key=policy.CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
-            selected_cooldown_key=("kimi_code:kimi_code/k3-high:kimi_code_managed_account"),
+            selected_cooldown_key=(
+                "kimi_code:kimi_code/k3:kimi_code_managed_account"
+            ),
             cooldown_seconds=exact_reset_seconds,
             error_class="kimi_code_managed_account",
             kimi_failure_metadata=safe_quota_metadata,
@@ -336,11 +330,18 @@ async def test_should_persist_one_kimi_managed_account_lane_and_continue_to_grok
         )
         selection_result = await selection._select_codex_auto_agent_candidate(
             request=_request("/v1/responses"),
-            request_body=_codex_body("aawm-code"),
+            request_body=_codex_body("work"),
         )
 
-    assert selection_result["candidate"]["model"] == "xai/grok-4.5"
-    skipped_kimi = next(item for item in selection_result["skipped"] if item["model"] == "kimi_code/k3-high")
+    assert selection_result["candidate"]["model"] in {
+        "oa_xai/grok-4.5",
+        "alibaba_token_plan/qwen3.8-max",
+    }
+    skipped_kimi = next(
+        item
+        for item in selection_result["skipped"]
+        if item["model"] == "kimi_code/k3"
+    )
     assert skipped_kimi["cooldown_scope"] == "managed_account"
     assert skipped_kimi["cooldown_seconds"] <= exact_reset_seconds
     assert skipped_kimi["cooldown_seconds"] > exact_reset_seconds - 2.0
@@ -349,8 +350,14 @@ async def test_should_persist_one_kimi_managed_account_lane_and_continue_to_grok
 
 @pytest.mark.asyncio
 async def test_should_keep_kimi_capability_failures_candidate_scoped_and_malformed_telemetry_non_cooling() -> None:
-    candidate = dict(policy.CODEX_AAWM_CODE_CANDIDATES[1])
-    candidate_key = "kimi_code:kimi_code/k3-high:kimi_code_managed_account"
+    candidate = {
+        "provider": policy.CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
+        "model": "kimi_code/k3",
+        "route_family": "codex_kimi_chat_completions_adapter",
+        "last_resort": False,
+        "reasoning_effort": "max",
+    }
+    candidate_key = "kimi_code:kimi_code/k3:kimi_code_managed_account"
     capability_metadata = {
         "kind": "unsupported_effort",
         "scope": "candidate",
@@ -412,7 +419,13 @@ async def test_should_keep_kimi_capability_failures_candidate_scoped_and_malform
 def test_should_record_allowlisted_kimi_selection_telemetry_without_secrets() -> None:
     secret = "Bearer moonshot-secret-token"
     exc = RuntimeError(secret)
-    candidate = dict(policy.CODEX_AAWM_CODE_CANDIDATES[1])
+    candidate = {
+        "provider": policy.CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
+        "model": "kimi_code/k3",
+        "route_family": "codex_kimi_chat_completions_adapter",
+        "last_resort": False,
+        "reasoning_effort": "max",
+    }
     metadata = {
         "kind": "quota",
         "scope": "managed_account",
@@ -435,14 +448,14 @@ def test_should_record_allowlisted_kimi_selection_telemetry_without_secrets() ->
         error_class="kimi_code_managed_account",
         cooldown_seconds=12.0,
         cooldown_scope="managed_account",
-        alias_model="aawm-code",
+        alias_model="work",
         candidate=candidate,
         kimi_failure_metadata=safe_metadata,
     )
 
     assert attempt["kimi_code_failure"] == {
-        "alias": "aawm-code",
-        "candidate": "kimi_code/k3-high",
+        "alias": "work",
+        "candidate": "kimi_code/k3",
         "upstream_id": "k3",
         "metadata_gate": "none",
         "scope": "managed_account",

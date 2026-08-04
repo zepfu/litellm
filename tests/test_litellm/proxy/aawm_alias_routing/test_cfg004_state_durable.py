@@ -187,29 +187,29 @@ def test_manager_clear_cooldown_state_anthropic_family(
     assert result.positive_keys_cleared == ["key1"]
 
 
-def test_manager_clear_cooldown_state_clears_read_pilot_gate_codex_only(
+def test_manager_clear_cooldown_state_clears_basic_pilot_gate_codex_only(
     fresh_manager: AliasRoutingStateManager,
 ) -> None:
-    """Read-pilot gate is codex-owned; clearing anthropic must not touch it."""
+    """Basic-pilot gate is codex-owned; clearing anthropic must not touch it."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.classification import (
         _KeyCooldownState,
     )
 
     mgr = fresh_manager
-    mgr.read_pilot_gate._key_state["key1"] = _KeyCooldownState()
-    mgr.read_pilot_gate._family_state.evidence_events_by_key["key1"] = [time.monotonic()]
+    mgr.basic_pilot_gate._key_state["key1"] = _KeyCooldownState()
+    mgr.basic_pilot_gate._family_state.evidence_events_by_key["key1"] = [time.monotonic()]
 
     result_codex = mgr.clear_cooldown_state(alias_family="codex", cooldown_keys=["key1"])
-    assert result_codex.read_pilot_keys_cleared == ["key1"]
-    assert "key1" not in mgr.read_pilot_gate._key_state
+    assert result_codex.basic_pilot_keys_cleared == ["key1"]
+    assert "key1" not in mgr.basic_pilot_gate._key_state
 
-    mgr.read_pilot_gate._key_state["key2"] = _KeyCooldownState()
-    mgr.read_pilot_gate._family_state.evidence_events_by_key["key2"] = [time.monotonic()]
+    mgr.basic_pilot_gate._key_state["key2"] = _KeyCooldownState()
+    mgr.basic_pilot_gate._family_state.evidence_events_by_key["key2"] = [time.monotonic()]
     result_anthropic = mgr.clear_cooldown_state(
         alias_family="anthropic", cooldown_keys=["key2"]
     )
-    assert result_anthropic.read_pilot_keys_cleared == []
-    assert "key2" in mgr.read_pilot_gate._key_state
+    assert result_anthropic.basic_pilot_keys_cleared == []
+    assert "key2" in mgr.basic_pilot_gate._key_state
 
 
 def test_manager_clear_cooldown_state_unknown_family_raises(

@@ -36,6 +36,34 @@ class ErrorRule:
 
 
 @dataclass(frozen=True, slots=True)
+class AliasReference:
+    """Reference to another alias as a weighted branch (CFG-009)."""
+
+    alias_name: str
+    priority: int
+    weight: float
+    tui_attached: Optional[str] = None
+    tui_excluded: Optional[str] = None
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchRule:
+    """Compiled TUI-family dispatch rule (CFG-007)."""
+
+    tui_family: str
+    target_alias: str
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchSnapshot:
+    """Compiled TUI-dispatch configuration (CFG-007)."""
+
+    by_tui: tuple[DispatchRule, ...]
+    default: Optional[str]
+    blocked_tui_families: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class RoutingCandidate:
     """A single compiled routing candidate."""
 
@@ -62,11 +90,15 @@ class RoutingCandidate:
 
 @dataclass(frozen=True, slots=True)
 class RoutingAlias:
-    """A single compiled alias with its ordered, weighted candidate tuple."""
+    """A single compiled alias with its ordered, weighted candidate tuple or dispatch."""
 
     name: str
     distribution_strategy: Optional[str]
-    candidates: tuple[RoutingCandidate, ...]
+    candidates: tuple[RoutingCandidate | AliasReference, ...]
+    # CFG-009/CFG-013: public/internal visibility boundary
+    visibility: str = "public"
+    # CFG-007: optional TUI-dispatch rules
+    dispatch: Optional[DispatchSnapshot] = None
 
 
 @dataclass(frozen=True, slots=True)

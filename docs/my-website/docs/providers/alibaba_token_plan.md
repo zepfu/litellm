@@ -16,7 +16,7 @@ alias routes remain separate.
 
 ## Supported models
 
-- `alibaba_token_plan/qwen3.8-max-preview`
+- `alibaba_token_plan/qwen3.8-max`
 - `alibaba_token_plan/qwen3.7-plus`
 - `alibaba_token_plan/qwen3.7-max`
 - `alibaba_token_plan/qwen3.6-flash`
@@ -25,7 +25,7 @@ alias routes remain separate.
 
 Other model IDs are rejected locally. The provider always resolves the public
 LiteLLM model identity to the unprefixed provider model before egress. A public
-AAWM alias such as `aawm-sota-alibaba` must never appear in an upstream request
+AAWM alias such as `sota-alibaba` must never appear in an upstream request
 body.
 
 ## Credential and endpoint contract
@@ -51,7 +51,7 @@ file in place; do not copy, synthesize, refresh, or log the credential.
 from litellm import completion
 
 response = completion(
-    model="alibaba_token_plan/qwen3.8-max-preview",
+    model="alibaba_token_plan/qwen3.8-max",
     messages=[{"role": "user", "content": "Explain the result briefly."}],
 )
 print(response.choices[0].message.content)
@@ -75,9 +75,11 @@ for chunk in response:
 
 The AAWM proxy configuration may expose:
 
-- `aawm-sota-alibaba`: Qwen 3.8 Max Preview, then Qwen 3.7 Max.
-- `aawm-sota-deepseek`: DeepSeek V4 Pro.
-- `aawm-sota-glm`: GLM 5.2.
+- `sota-alibaba`: Qwen 3.8 Max, then Qwen 3.7 Max.
+- `sota-deepseek`: DeepSeek V4 Pro.
+GLM 5.2 is not exposed through public `sota-zai`; that name is reserved for
+the dedicated Z.AI Coding Plan route. Any Alibaba GLM route remains deferred
+and fail-closed pending dedicated configuration.
 
 Codex Responses ingress uses
 `codex_alibaba_token_plan_chat_completions_adapter`. Anthropic Messages ingress

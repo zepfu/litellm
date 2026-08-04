@@ -712,7 +712,7 @@ def test_aawm_route_rollup_accumulator_cooldown_line_includes_host():
     header = "litellm#Codex[0.142.5]@thoth"
     endpoint = "/openai_passthrough/responses"
     target = "openrouter.ai/api/v1/chat/completions"
-    model = "openrouter/cohere/north-mini-code:free(aawm-low)"
+    model = "openrouter/cohere/north-mini-code:free(basic)"
 
     accumulator.record(
         group_header_label=header,
@@ -741,7 +741,7 @@ def test_aawm_route_rollup_accumulator_cooldown_line_omits_host_when_unresolved(
     header = "litellm#Codex[0.142.5]"
     endpoint = "/openai_passthrough/responses"
     target = "openrouter.ai/api/v1/chat/completions"
-    model = "openrouter/cohere/north-mini-code:free(aawm-low)"
+    model = "openrouter/cohere/north-mini-code:free(basic)"
 
     accumulator.record(
         group_header_label=header,

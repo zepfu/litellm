@@ -15,7 +15,7 @@ REFRESH_PATH = "/aawm/alias-config/refresh"
 _REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 )
-_READ_YAML_PATH = os.path.join(_REPO_ROOT, "litellm", "proxy", "aawm_alias_config", "read.yaml")
+_BASIC_YAML_PATH = os.path.join(_REPO_ROOT, "litellm", "proxy", "aawm_alias_config", "basic.yaml")
 
 
 def test_module_imports() -> None:
@@ -34,20 +34,20 @@ def test_module_imports() -> None:
     assert hasattr(failure_vocabulary, "is_coolable")
 
 
-def test_read_yaml_compiles() -> None:
-    """``read.yaml`` compiles into a valid snapshot with a stable content-derived hash."""
+def test_basic_yaml_compiles() -> None:
+    """``basic.yaml`` compiles into a valid snapshot with a stable content-derived hash."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         config_compiler as compiler,
     )
 
-    with open(_READ_YAML_PATH, "r", encoding="utf-8") as handle:
+    with open(_BASIC_YAML_PATH, "r", encoding="utf-8") as handle:
         raw_yaml = handle.read()
 
     first = compiler.compile_yaml(raw_yaml)
     second = compiler.compile_yaml(raw_yaml)
 
-    assert "read" in first.aliases
-    assert len(first.aliases["read"].candidates) > 0
+    assert "basic" in first.aliases
+    assert len(first.aliases["basic"].candidates) > 0
     # config_hash is a pure content hash of the source YAML -- identical
     # input yields an identical hash across independent compiles, even
     # though config_epoch increments each time.
@@ -79,7 +79,7 @@ def test_refresh_endpoint_registered() -> None:
                     "yaml": (
                         "defaults: {}\n"
                         "aliases:\n"
-                        "  - name: read\n"
+                        "  - name: basic\n"
                         "    candidates:\n"
                         "      - provider: openai\n"
                         "        model: gpt-5.4-mini\n"

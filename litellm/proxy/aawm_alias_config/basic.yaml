@@ -1,7 +1,5 @@
-# AAWM alias-routing config -- ``read`` pilot (CFG-008).
-#
-# Go-forward replacement for aawm-read / aawm-read-anthropic once
-# operator-approved cutover happens (CFG-010 owns static-fallback removal).
+# AAWM alias-routing config -- ``basic`` pilot (CFG-008, renamed from the
+# ``read`` pilot by CFG-010).
 # Every origin shares the common OpenRouter/OpenCode/Alibaba prefix, then
 # receives a mutually exclusive TUI-specific last resort:
 #   - Claude-origin requests only: native Anthropic Haiku
@@ -18,7 +16,7 @@
 defaults: {}
 
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: openrouter/cohere/north-mini-code:free
@@ -50,7 +48,7 @@ aliases:
       # Default-branch last resort: Codex and every non-Claude/missing/
       # unknown origin. CFG-006: the configured low reasoning replaces any
       # caller-provided reasoning through the shared candidate pipeline;
-      # ``read`` routing implements no separate reasoning precedence.
+      # ``basic`` routing implements no separate reasoning precedence.
       # tui_excluded keeps Luna ineligible for Claude-origin requests.
       - provider: openai
         model: gpt-5.6-luna

@@ -113,7 +113,7 @@ def test_request_shape_422_modelinput_enrichment_is_sanitized_and_fingerprinted(
         "upstream_url": "https://chatgpt.com/backend-api/codex/responses",
         "provider": "openai",
         "model": "gpt-5.5",
-        "model_alias": "aawm-code",
+        "model_alias": "work",
         "route_family": "codex_responses",
         "status_code": 422,
         "auth_credential_source": "route_custom_header",
@@ -395,7 +395,7 @@ def test_build_request_shape_failure_request_payload_omits_raw_body_and_secrets(
         "upstream_url": "https://chatgpt.com/backend-api/codex/responses",
         "provider": "openai",
         "model": "gpt-5.5",
-        "model_alias": "aawm-code",
+        "model_alias": "work",
         "route_family": "codex_responses",
         "status_code": 422,
         "litellm_call_id": "call-shape-422",
@@ -495,7 +495,7 @@ async def test_pass_through_request_shape_422_failure_hook_payload_is_sanitized(
         "tools": [{"type": "function", "name": "run", "output": "TOOL_OUT_LEAK"}],
         "litellm_metadata": {
             "route_family": "codex_responses",
-            "inbound_model_alias": "aawm-code",
+            "inbound_model_alias": "work",
             "aawm_passthrough_body_container_type": "object",
             "aawm_passthrough_input_item_count": 1,
         },
@@ -634,7 +634,7 @@ def test_build_aawm_route_access_log_line_includes_available_context() -> None:
             "agent_name": "W4 engineer",
             "agent_id": "019ed4f2",
             "repository": "dashboard-shell",
-            "requested_model_alias": "aawm-code",
+            "requested_model_alias": "work",
         },
     }
 
@@ -647,7 +647,7 @@ def test_build_aawm_route_access_log_line_includes_available_context() -> None:
 
     assert line == (
         "20260614 19:31:05 [ROUTE] Claude/1.2.3 - "
-        "W4 engineer#019ed4f2@dashboard-shell.grok-composer-2.5-fast(aawm-code) "
+        "W4 engineer#019ed4f2@dashboard-shell.grok-composer-2.5-fast(work) "
         "POST 172.19.0.1:52834 /anthropic/v1/messages?beta=true -> "
         "chatgpt.com/backend-api/codex/responses"
     )
@@ -682,9 +682,9 @@ def test_build_aawm_route_access_log_line_omits_missing_optional_context() -> No
 def test_build_aawm_route_access_log_line_omits_alias_when_same_as_model() -> None:
     request = _build_aawm_route_log_request()
     request_body = {
-        "model": "aawm-code",
+        "model": "work",
         "litellm_metadata": {
-            "requested_model_alias": "aawm-code",
+            "requested_model_alias": "work",
         },
     }
 
@@ -696,11 +696,11 @@ def test_build_aawm_route_access_log_line_omits_alias_when_same_as_model() -> No
     )
 
     assert line == (
-        "20260614 19:31:05 [ROUTE] - aawm-code "
+        "20260614 19:31:05 [ROUTE] - work "
         "POST 172.19.0.1:52834 /anthropic/v1/messages?beta=true -> "
         "api.anthropic.com/v1/messages"
     )
-    assert "aawm-code(aawm-code)" not in line
+    assert "work(work)" not in line
 
 
 def test_build_aawm_route_access_log_line_rejects_freeform_identity_metadata() -> None:
@@ -713,7 +713,7 @@ def test_build_aawm_route_access_log_line_rejects_freeform_identity_metadata() -
                 "This is prompt-like prose"
             ),
             "repository": ("litellm; reuse_rule=safe for similar queue-shaping work"),
-            "requested_model_alias": "aawm-code",
+            "requested_model_alias": "work",
         },
     }
 
@@ -725,7 +725,7 @@ def test_build_aawm_route_access_log_line_rejects_freeform_identity_metadata() -
     )
 
     assert line == (
-        "20260614 19:31:05 [ROUTE] - gpt-5.5(aawm-code) "
+        "20260614 19:31:05 [ROUTE] - gpt-5.5(work) "
         "POST 172.19.0.1:52834 /anthropic/v1/messages?beta=true -> "
         "chatgpt.com/backend-api/codex/responses"
     )
@@ -926,7 +926,7 @@ def test_emit_aawm_route_access_log_is_scoped_once(caplog, monkeypatch) -> None:
     native_query_string = request.scope["query_string"]
     request_body = {
         "model": "gpt-5.3-codex-spark",
-        "metadata": {"model_alias_label": "aawm-code-anthropic"},
+        "metadata": {"model_alias_label": "work"},
     }
 
     with _capture_aawm_route_logs(caplog):
@@ -982,7 +982,7 @@ def test_emit_aawm_route_access_log_is_scoped_once(caplog, monkeypatch) -> None:
     assert len(route_records) == 1
     assert re.fullmatch(
         r"\d{8} \d{2}:\d{2}:\d{2} \[ROUTE\] - "
-        r"gpt-5\.3-codex-spark\(aawm-code-anthropic\) "
+        r"gpt-5\.3-codex-spark\(work\) "
         r"POST 172\.19\.0\.1:52834 /openai_passthrough/responses\?stream=false "
         r"-> chatgpt\.com/backend-api/codex/responses",
         route_records[0],
@@ -999,7 +999,7 @@ def test_emit_aawm_route_access_log_refreshes_suppression_for_same_scope(
     request = _build_aawm_route_log_request()
     request_body = {
         "model": "gpt-5.3-codex-spark",
-        "metadata": {"model_alias_label": "aawm-code-anthropic"},
+        "metadata": {"model_alias_label": "work"},
     }
 
     with _capture_aawm_route_logs(caplog):
@@ -1205,7 +1205,7 @@ async def test_pass_through_request_emits_aawm_route_access_log(
         "litellm_metadata": {
             "agent_name": "W2 tester",
             "repository": "litellm",
-            "requested_model_alias": "aawm-code",
+            "requested_model_alias": "work",
             "codex_auto_agent_selected_model": "gpt-5.3-codex-spark",
         },
     }
@@ -1291,7 +1291,7 @@ async def test_pass_through_request_emits_aawm_route_access_log(
     assert len(route_records) == 1
     assert re.fullmatch(
         r"\d{8} \d{2}:\d{2}:\d{2} \[ROUTE\] Codex/0\.119\.0-alpha\.29 - "
-        r"W2 tester@litellm\.gpt-5\.3-codex-spark\(aawm-code\) "
+        r"W2 tester@litellm\.gpt-5\.3-codex-spark\(work\) "
         r"POST 172\.19\.0\.1:44766 /openai_passthrough/responses\?stream=false "
         r"-> api\.openai\.com/v1/responses",
         route_records[0],
@@ -1315,7 +1315,7 @@ async def test_pass_through_async_success_handler_records_completed_route_rollup
                     "group_header_label": "litellm@Codex[0.119.0-alpha.29]",
                     "incoming_endpoint": "/openai_passthrough/responses",
                     "outgoing_target": "api.openai.com/v1/responses",
-                    "model_label": "gpt-5.3-codex-spark(aawm-code)",
+                    "model_label": "gpt-5.3-codex-spark(work)",
                 }
             }
         }
@@ -1355,7 +1355,7 @@ async def test_pass_through_async_success_handler_records_completed_route_rollup
     assert len(flushed) == 2
     assert ("litellm@Codex[0.119.0-alpha.29] /openai_passthrough/responses") in rendered
     assert (
-        " - gpt-5.3-codex-spark(aawm-code) - Turns: 1 -> " "api.openai.com/v1/responses"
+        " - gpt-5.3-codex-spark(work) - Turns: 1 -> " "api.openai.com/v1/responses"
     ) in rendered
     assert (
         kwargs["litellm_params"]["metadata"]["aawm_route_rollup_turn_recorded"] is True
@@ -5305,7 +5305,7 @@ class TestPassThroughTerminalFailureLogging:
 
         target_url = "https://api.openai.com/v1/responses"
         upstream_detail = (
-            b'{"error":{"message":"The requested model \'aawm-code\' does not '
+            b'{"error":{"message":"The requested model \'work\' does not '
             b'exist.","type":"invalid_request_error","param":"model",'
             b'"code":"model_not_found"}}'
         )
@@ -5318,7 +5318,7 @@ class TestPassThroughTerminalFailureLogging:
 
         with patch(
             "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
-            return_value={"model": "aawm-code"},
+            return_value={"model": "work"},
         ), patch(
             "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
             new=handler,
@@ -5339,7 +5339,7 @@ class TestPassThroughTerminalFailureLogging:
             mock_client_obj.client = MagicMock()
             mock_get_client.return_value = mock_client_obj
             mock_logging_obj.pre_call_hook = AsyncMock(
-                return_value={"model": "aawm-code"}
+                return_value={"model": "work"}
             )
             mock_logging_obj.post_call_failure_hook = AsyncMock()
 
@@ -5362,7 +5362,7 @@ class TestPassThroughTerminalFailureLogging:
         )
         assert warning_call.args[1] == 400
         assert warning_call.args[2] == (
-            "The requested model 'aawm-code' does not exist."
+            "The requested model 'work' does not exist."
         )
         assert "{" not in warning_call.args[2]
         assert (
@@ -5371,7 +5371,7 @@ class TestPassThroughTerminalFailureLogging:
         )
         mock_rollup_failure.assert_called_once()
         assert mock_rollup_failure.call_args.kwargs == {
-            "message": "The requested model 'aawm-code' does not exist."
+            "message": "The requested model 'work' does not exist."
         }
         mock_logging_obj.post_call_failure_hook.assert_awaited_once()
         assert (
@@ -8359,7 +8359,7 @@ def _assert_request_shape_422_terminal_call_has_agent_attribution(
     assert terminal_kwargs["agent_session_killed"] is True
     assert error_context["failure_kind"] == "request_shape_deserialization_failed"
     assert error_context["status_code"] == 422
-    assert error_context["model_alias"] == "aawm-code"
+    assert error_context["model_alias"] == "work"
     assert error_context["route_family"] == "codex_responses"
     assert error_context["endpoint"] == "/openai_passthrough/responses"
     assert error_context["agent_id"] == "agent-route-modelinput"
@@ -8391,7 +8391,7 @@ def _assert_request_shape_422_terminal_jsonl_record(
     assert record["session_id"] == "session-route-modelinput"
     assert record["terminal_outcome"] == "request_rejected"
     assert record["agent_session_killed"] is True
-    assert record["context"]["model_alias"] == "aawm-code"
+    assert record["context"]["model_alias"] == "work"
     assert record["context"]["route_family"] == "codex_responses"
     assert record["context"]["agent_role"] == "worker"
     assert record["context"]["thread_source"] == "subagent"
@@ -8431,7 +8431,7 @@ def _build_request_shape_422_route_level_fixture(
         "tools": [{"type": "function", "name": "exec_command"}],
         "litellm_metadata": {
             "route_family": "codex_responses",
-            "inbound_model_alias": "aawm-code",
+            "inbound_model_alias": "work",
             "provider": "openai",
             "repository": "litellm",
             "agent_name": "worker",
@@ -8532,7 +8532,7 @@ def test_agent_terminal_422_intake_is_redacted_and_agent_correlated(
         "upstream_url": "https://chatgpt.com/backend-api/codex/responses",
         "provider": "openai",
         "model": "gpt-5.5",
-        "model_alias": "aawm-code",
+        "model_alias": "work",
         "route_family": "codex_responses",
         "status_code": 422,
         "repository": "litellm",
@@ -8679,7 +8679,7 @@ async def test_pass_through_alias_managed_xai_safety_403_skips_generic_failure_h
         "model": "xai/grok-4.5",
         "input": [{"type": "message", "content": "hello"}],
         "litellm_metadata": {
-            "inbound_model_alias": "aawm-code",
+            "inbound_model_alias": "work",
             "route_family": "codex_grok_native_responses_adapter",
             "provider": "xai",
         },
@@ -8752,7 +8752,7 @@ async def test_pass_through_alias_managed_xai_safety_403_skips_generic_failure_h
     ]
     assert deferred_debug
     assert deferred_debug[0].kwargs["extra"]["failure_kind"] == "safety_policy_denied"
-    assert deferred_debug[0].kwargs["extra"]["model_alias"] == "aawm-code"
+    assert deferred_debug[0].kwargs["extra"]["model_alias"] == "work"
 
 
 @pytest.mark.asyncio
@@ -8880,7 +8880,7 @@ def test_passthrough_agent_terminal_error_context_requires_alias_or_agent_identi
         _is_passthrough_agent_terminal_error_context,
     )
 
-    assert _is_passthrough_agent_terminal_error_context({"model_alias": "aawm-code"})
+    assert _is_passthrough_agent_terminal_error_context({"model_alias": "work"})
     assert _is_passthrough_agent_terminal_error_context({"model_alias": "direct-openai", "agent_id": "agent-123"})
     assert not _is_passthrough_agent_terminal_error_context({"model_alias": "direct-openai"})
 
@@ -8900,7 +8900,7 @@ def test_passthrough_alias_managed_safety_denial_is_deferred_to_alias_terminal()
     assert _is_passthrough_alias_managed_safety_policy_denial(
         exc=exc,
         status_code=403,
-        error_log_context={"model_alias": "aawm-code"},
+        error_log_context={"model_alias": "work"},
     )
     assert not _is_passthrough_alias_managed_safety_policy_denial(
         exc=exc,
@@ -8910,5 +8910,5 @@ def test_passthrough_alias_managed_safety_denial_is_deferred_to_alias_terminal()
     assert not _is_passthrough_alias_managed_safety_policy_denial(
         exc=HTTPException(status_code=403, detail="Forbidden"),
         status_code=403,
-        error_log_context={"model_alias": "aawm-code"},
+        error_log_context={"model_alias": "work"},
     )

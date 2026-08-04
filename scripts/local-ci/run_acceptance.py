@@ -3118,7 +3118,7 @@ def _extract_refresh_response_version(response: dict[str, Any]) -> str:
 
 
 def _load_checked_in_alias_config_yaml(
-    alias_name: str = "read",
+    alias_name: str = "basic",
 ) -> tuple[str, str]:
     """Load the exact checked-in YAML bytes for *alias_name*.
 
@@ -3257,7 +3257,7 @@ def _derive_ingresses_from_snapshot(
 def _derive_eligible_candidates_from_snapshot(
     snapshot: Any,
     *,
-    alias_name: str = "read",
+    alias_name: str = "basic",
     excluded_providers: frozenset[str] | None = None,
     availability_evidence: dict[str, str] | None = None,
     positive_availability: dict[Any, Any] | None = None,
@@ -3337,7 +3337,7 @@ def _derive_eligible_candidates_from_snapshot(
 def _derive_eligible_candidates_from_yaml(
     raw_yaml: str,
     *,
-    alias_name: str = "read",
+    alias_name: str = "basic",
     excluded_providers: frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Parse YAML and derive ordered currently-eligible candidates.
@@ -3407,7 +3407,7 @@ def _derive_eligible_candidates_from_yaml(
 def _build_priority_swap_yaml(
     raw_yaml: str,
     *,
-    alias_name: str = "read",
+    alias_name: str = "basic",
     excluded_providers: frozenset[str] | None = None,
 ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
     """Build an in-memory YAML copy swapping only the first two eligible
@@ -3459,7 +3459,7 @@ def _build_exact_pair_priority_swap_yaml(
     raw_yaml: str,
     *,
     pair: tuple[tuple[str, str], tuple[str, str]],
-    alias_name: str = "read",
+    alias_name: str = "basic",
     excluded_providers: frozenset[str] | None = None,
 ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
     """Build a YAML copy swapping priorities of an EXACT (provider, model) pair.
@@ -4560,7 +4560,7 @@ def _candidate_order_matches(
 
 def _derive_full_order_from_snapshot(
     snapshot: Any,
-    alias_name: str = "read",
+    alias_name: str = "basic",
 ) -> list[dict[str, Any]]:
     """Derive the COMPLETE candidate order directly from the snapshot.
 

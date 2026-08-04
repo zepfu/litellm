@@ -377,7 +377,7 @@ def test_rr054_issue51_audit_events_use_per_attempt_cooldown_key() -> None:
     ):
         events = _build_auto_agent_alias_audit_events(
             alias_family="codex",
-            alias_model="aawm-code",
+            alias_model="work",
             request=request,
             request_body={},
             selection=selection,
@@ -462,7 +462,7 @@ def test_rr054_issue51_early_attempt_with_own_key_not_overwritten_by_selection()
     ):
         events = _build_auto_agent_alias_audit_events(
             alias_family="codex",
-            alias_model="aawm-code",
+            alias_model="work",
             request=request,
             request_body={},
             selection=selection,

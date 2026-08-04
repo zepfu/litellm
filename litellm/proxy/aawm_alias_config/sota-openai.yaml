@@ -1,0 +1,10 @@
+defaults: {}
+
+aliases:
+  - name: sota-openai
+    candidates:
+      - provider: openai
+        model: gpt-5.6-sol
+        route_family: codex_responses
+        priority: 100
+        reasoning_effort: max

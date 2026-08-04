@@ -277,7 +277,7 @@ def test_should_not_repair_null_repository_from_mixed_session() -> None:
             "model": "gemini-3-flash-preview",
             "repository": None,
             "tenant_id": None,
-            "metadata": {"codex_auto_agent_alias": "aawm-codex-agent-auto"},
+            "metadata": {"codex_auto_agent_alias": "basic"},
         },
         {"aawm-tap", "litellm"},
         session_repositories,

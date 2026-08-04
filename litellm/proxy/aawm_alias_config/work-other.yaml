@@ -1,0 +1,16 @@
+defaults: {}
+
+aliases:
+  - name: work-other
+    visibility: internal
+    distribution_strategy: proportional
+    candidates:
+      - alias_reference: sota-xai
+        priority: 100
+        weight: 1
+      - alias_reference: sota-moonshot
+        priority: 100
+        weight: 1
+      - alias_reference: sota-alibaba
+        priority: 100
+        weight: 1

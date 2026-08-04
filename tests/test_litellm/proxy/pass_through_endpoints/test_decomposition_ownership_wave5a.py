@@ -69,8 +69,8 @@ SNAPSHOT_SELECT_SYMBOLS: set[str] = {
     "_is_tui_attached_candidate_eligible",
     "_is_snapshot_candidate_in_schedule_window",
     # Snapshot-driven resolution
-    "_resolve_read_pilot_eligible_candidates",
-    "_select_read_pilot_snapshot_candidates",
+    "_resolve_basic_pilot_eligible_candidates",
+    "_select_basic_pilot_snapshot_candidates",
     "_derive_round_robin_commit_token",
     # Selection-context memoization
     "_get_aawm_alias_selection_context",
@@ -162,7 +162,7 @@ OPENROUTER_QUOTA_CONSTANTS: set[str] = {
 }
 
 SNAPSHOT_SELECT_CONSTANTS: set[str] = {
-    "_READ_PILOT_ALIAS_NAME",
+    "_BASIC_PILOT_ALIAS_NAME",
 }
 
 # Unified inventory: target_key -> function/type symbols
@@ -460,8 +460,8 @@ class TestW5ASignatureContracts:
             "_apply_snapshot_alias_distribution_strategy",
             "_is_tui_attached_candidate_eligible",
             "_is_snapshot_candidate_in_schedule_window",
-            "_resolve_read_pilot_eligible_candidates",
-            "_select_read_pilot_snapshot_candidates",
+            "_resolve_basic_pilot_eligible_candidates",
+            "_select_basic_pilot_snapshot_candidates",
             "_derive_round_robin_commit_token",
             "_get_aawm_alias_selection_context",
             "_resolve_aawm_alias_selection_enumeration",
@@ -643,7 +643,7 @@ class TestSnapshotSelectParity:
         assert result is None or hasattr(result, "config_hash")
 
     def test_get_codex_auto_agent_candidates_for_alias_static(self):
-        """Non-read alias returns static table candidates."""
+        """Non-basic alias returns static table candidates."""
         result = lpe._get_codex_auto_agent_candidates_for_alias("nonexistent_alias")
         assert isinstance(result, tuple)
         assert len(result) > 0
@@ -674,14 +674,14 @@ class TestConfigRefreshParity:
         assert result == "test: true"
 
     def test_load_yaml_default_file(self):
-        """Default path reads the checked-in read.yaml."""
+        """Default path reads the checked-in basic.yaml."""
         result = lpe._load_aawm_alias_routing_source_yaml(inline_yaml=None)
         assert isinstance(result, str)
         assert len(result) > 0
 
     def test_default_config_path_is_path(self):
         assert isinstance(lpe._DEFAULT_AAWM_ALIAS_CONFIG_PATH, Path)
-        assert lpe._DEFAULT_AAWM_ALIAS_CONFIG_PATH.name == "read.yaml"
+        assert lpe._DEFAULT_AAWM_ALIAS_CONFIG_PATH.name == "basic.yaml"
 
     def test_refresh_route_is_fastapi_route(self):
         """The refresh route must be registered on the god-module router."""
@@ -886,8 +886,8 @@ class TestOpenRouterQuotaParity:
             lpe._raise_openrouter_auto_agent_candidate_unavailable("test message")
         assert getattr(exc_info.value, "message", str(exc_info.value)) == "test message"
 
-    def test_read_pilot_alias_name_value(self):
-        assert lpe._READ_PILOT_ALIAS_NAME == "read"
+    def test_basic_pilot_alias_name_value(self):
+        assert lpe._BASIC_PILOT_ALIAS_NAME == "basic"
 
 
 # ===========================================================================

@@ -30,7 +30,7 @@ REFRESH_PATH = "/aawm/alias-config/refresh"
 _VALID_YAML = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: openrouter/refresh-test-model
@@ -45,7 +45,7 @@ aliases:
 _INVALID_YAML = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: totally_unregistered_provider_xyz
         model: whatever
@@ -148,7 +148,7 @@ def test_in_flight_uses_prior_snapshot() -> None:
 
     # The reference captured before the swap must remain unmutated (immutability
     # + atomic swap — not a mutation of the same object in place).
-    prior_models = [c.model for c in prior_snapshot.aliases["read"].candidates]
+    prior_models = [c.model for c in prior_snapshot.aliases["basic"].candidates]
     assert "openrouter/refresh-test-model" in prior_models
     assert "openrouter/refresh-test-model-v2" not in prior_models
 
@@ -176,7 +176,7 @@ def test_response_omits_secrets() -> None:
 _STARTUP_YAML = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: gpt-5.4-mini
@@ -187,7 +187,7 @@ aliases:
 _REFRESH_YAML = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: openrouter/pass3-model
@@ -205,7 +205,7 @@ def _startup_dir(tmp_path: Path) -> Iterator[Path]:
     """Create a temp config directory with a startup YAML and activate it."""
     config_dir = tmp_path / "alias_config"
     config_dir.mkdir()
-    (config_dir / "read.yaml").write_text(_STARTUP_YAML, encoding="utf-8")
+    (config_dir / "basic.yaml").write_text(_STARTUP_YAML, encoding="utf-8")
     config_startup.reset_startup_state()
     config_startup.activate_alias_config_directory(config_dir)
     assert config_startup.is_startup_healthy()

@@ -187,7 +187,7 @@ def test_should_send_the_raw_provider_model_with_the_existing_key(
     assert request.headers["Authorization"] == "Bearer existing-token-plan-key"
     assert request_body["model"] == "qwen3.8-max-preview"
     assert "alibaba_token_plan/" not in request.content.decode()
-    assert "aawm-sota-alibaba" not in request.content.decode()
+    assert "sota-alibaba" not in request.content.decode()
 
 
 def test_should_load_all_token_plan_models_from_the_bundled_catalog(

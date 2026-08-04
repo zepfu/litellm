@@ -241,8 +241,8 @@ sequencing, stream validation, and response finalization, are package-owned:
 | Codex auth-file discovery, JWT decode, token validation, Codex-native-auth request detection | `aawm_alias_routing/codex_oauth.py` |
 | OpenRouter free-daily-quota probe, durable cooldown helpers, alias-probe cooldown gate | `aawm_alias_routing/openrouter_quota.py` |
 | Failure token extraction, retryable-exhaustion classification, cooldown scope/duration derivation, Kimi safe metadata, Grok account-lane keys, native-Grok continuation retry planning | `aawm_alias_routing/error_signals.py` |
-| Immutable cooldown publication-plan resolution, post-lock durable persistence, Codex/Anthropic cooldown application, read-pilot gated application | `aawm_alias_routing/cooldown_apply.py` |
-| Attempt lifecycle mutation, read-pilot evidence recording, reasoning-effort normalization, Codex/Anthropic alias metadata composition | `aawm_alias_routing/attempt_records.py` |
+| Immutable cooldown publication-plan resolution, post-lock durable persistence, Codex/Anthropic cooldown application, basic-pilot gated application | `aawm_alias_routing/cooldown_apply.py` |
+| Attempt lifecycle mutation, basic-pilot evidence recording, reasoning-effort normalization, Codex/Anthropic alias metadata composition | `aawm_alias_routing/attempt_records.py` |
 | Route registration, process-local routing call sites, compatibility re-exports, and residual provider orchestration | `llm_passthrough_endpoints.py` |
 
 The legacy `aawm_alias_routing_policy.py` module is a compatibility facade over
@@ -298,7 +298,7 @@ methods or injected callbacks:
 | `_openrouter_free_daily_quota_cache` (tuple) | `AliasRoutingStateManager` | `get/set_openrouter_free_quota_cache()` methods; god-module `__getattr__` compat |
 | `_openrouter_free_daily_quota_lock` (asyncio.Lock) | `AliasRoutingStateManager` | shared lock object via `openrouter_free_quota_lock` |
 | `_round_robin_cursor_by_alias` (dict) | `AliasRoutingStateManager` | `round_robin_cursor` attribute; snapshot_select via injected reference |
-| `_read_pilot_cooldown_gate` (CooldownEvidenceGate) | `AliasRoutingStateManager` | `read_pilot_gate` attribute with separate `AliasFamilyState` |
+| `_basic_pilot_cooldown_gate` (CooldownEvidenceGate) | `AliasRoutingStateManager` | `basic_pilot_gate` attribute with separate `AliasFamilyState` |
 | FastAPI route registration (`@router.post`, etc.) | `llm_passthrough_endpoints.py` | decorators stay in god module; handler bodies in Wave 5A modules |
 
 #### Wave 5B ownership
@@ -307,7 +307,7 @@ methods or injected callbacks:
 |---------|--------|
 | Codex/Anthropic active cooldown reads/writes, session affinity, merged-family state, R3-1 memory publication, state-source attachment | `aawm_alias_routing/cooldown_state.py` |
 | Candidate lookup, state construction, availability shaping, request-local cooldown/exclusion, forced/adapter/Kimi/Grok lane application, Codex/Anthropic selectors, in-flight/redispatch errors | `aawm_alias_routing/selection.py` |
-| Read-pilot evidence gate, round-robin cursor, OpenRouter quota cache/lock | `aawm_alias_routing/state.py` (`AliasRoutingStateManager`) |
+| Basic-pilot evidence gate, round-robin cursor, OpenRouter quota cache/lock | `aawm_alias_routing/state.py` (`AliasRoutingStateManager`) |
 
 #### Wave 5C ownership and baseline parity
 
@@ -325,7 +325,7 @@ Raw source differences are limited to extraction mechanics:
 | Difference | Scope | Reason |
 |------------|-------|--------|
 | Fail-fast `assert` guards on configured callbacks | 25 frozen functions | Surface incomplete runtime wiring at the owning module boundary instead of failing later with an opaque `NoneType` call |
-| Renamed callback globals and direct `CooldownPublicationPlan` import | Seven `cooldown_apply.py` functions | Keep publication resolution, durable persistence, request-local application, family setters, read-pilot gate, and state manager explicit while preserving control flow and target keys |
+| Renamed callback globals and direct `CooldownPublicationPlan` import | Seven `cooldown_apply.py` functions | Keep publication resolution, durable persistence, request-local application, family setters, basic-pilot gate, and state manager explicit while preserving control flow and target keys |
 | Classification/gate/model-catalog callback names | Three `attempt_records.py` functions | Keep Wave 5D audit services and model information as configured host dependencies |
 | Local FastAPI/status imports in source-error summarization | `_get_codex_auto_agent_source_error_summary` | Avoid a module-scope god-module dependency while preserving the same `HTTPException` construction |
 | Same-object `install()` facade publication | All three Wave 5C modules | Preserve module globals and explicit callbacks; avoid host-global rebinding that breaks module imports and cross-suite isolation |

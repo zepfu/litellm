@@ -1,9 +1,9 @@
 {
   "models": [
     {
-      "slug": "read",
-      "display_name": "AAWM Read Alias",
-      "description": "Read-only alias routed through LiteLLM multi-provider candidates.",
+      "slug": "work",
+      "display_name": "AAWM Work Alias",
+      "description": "Work alias routed through LiteLLM availability-aware candidates.",
       "default_reasoning_level": "high",
       "supported_reasoning_levels": [
         {

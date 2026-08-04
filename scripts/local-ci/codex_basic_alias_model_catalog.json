@@ -1,9 +1,9 @@
 {
   "models": [
     {
-      "slug": "sota-alibaba",
-      "display_name": "AAWM SOTA Alibaba",
-      "description": "Alibaba Token Plan Qwen through LiteLLM.",
+      "slug": "basic",
+      "display_name": "AAWM Basic Alias",
+      "description": "Basic alias routed through LiteLLM multi-provider candidates.",
       "default_reasoning_level": "high",
       "supported_reasoning_levels": [
         {

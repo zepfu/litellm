@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Optional
 from fastapi import Request, Response
 
 from litellm.proxy._types import UserAPIKeyAuth
+from .model_resolution import _reject_retired_aawm_alias_model
 
 if TYPE_CHECKING:
 
@@ -110,6 +111,12 @@ def install(
     production facade.
     """
     _mod = globals()
+    # The rebound functions resolve names against *host_globals*; seed
+    # module-imported helpers so they remain available unless the host
+    # already provides (or monkeypatches) its own binding.
+    host_globals.setdefault(
+        "_reject_retired_aawm_alias_model", _reject_retired_aawm_alias_model
+    )
     for _name in _HOST_FUNCTION_NAMES:
         _obj = _mod[_name]
         if not isinstance(_obj, FunctionType):
@@ -214,6 +221,8 @@ async def try_dispatch_codex_request(
     ``BaseOpenAIPassThroughHandler._base_openai_pass_through_handler``.
     """
     import litellm
+
+    _reject_retired_aawm_alias_model(prepared_request_body.get("model"))
 
     opencode_zen_adapter_model = _resolve_codex_opencode_zen_adapter_model(
         prepared_request_body,

@@ -72,7 +72,7 @@ For every investigation file, explicitly evaluate whether LiteLLM can improve
 the end-to-end workflow by changing any of:
 
 - alias system prompting or injected instructions, including
-  `aawm-codex-agent-auto` and sibling tiered aliases;
+  `Codex auto-agent alias` and sibling tiered aliases;
 - tool advertisement shape, tool descriptions, parameter schema visibility, or
   tool filtering/patching;
 - read-only task contracts, final-answer contracts, required attestations, and

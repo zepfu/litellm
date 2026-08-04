@@ -1,0 +1,10 @@
+defaults: {}
+
+aliases:
+  - name: sota-deepseek
+    candidates:
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/deepseek-v4-pro
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 100
+        reasoning_effort: max

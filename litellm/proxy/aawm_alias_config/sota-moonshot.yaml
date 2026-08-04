@@ -1,0 +1,10 @@
+defaults: {}
+
+aliases:
+  - name: sota-moonshot
+    candidates:
+      - provider: kimi_code
+        model: kimi_code/k3
+        route_family: codex_kimi_chat_completions_adapter
+        priority: 100
+        reasoning_effort: max

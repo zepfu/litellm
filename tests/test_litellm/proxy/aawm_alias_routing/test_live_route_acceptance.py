@@ -102,7 +102,7 @@ def _reset_all_alias_routing_state() -> None:
 
     ``reset_alias_routing_state_for_tests`` clears both the manager-owned
     state (cooldown/affinity/probe-locks) and the god-module-owned
-    singletons (read-pilot gate, round-robin cursor, active snapshot).
+    singletons (basic-pilot gate, round-robin cursor, active snapshot).
     """
     lpe.reset_alias_routing_state_for_tests()
 
@@ -125,7 +125,7 @@ def _two_candidate_round_robin_yaml(
     return f"""
 defaults: {{}}
 aliases:
-  - name: read
+  - name: basic
     distribution_strategy: round_robin
     candidates:
       - provider: openrouter
@@ -143,7 +143,7 @@ def _three_candidate_round_robin_yaml(priority: int = 50) -> str:
     return f"""
 defaults: {{}}
 aliases:
-  - name: read
+  - name: basic
     distribution_strategy: round_robin
     candidates:
       - provider: openrouter
@@ -165,7 +165,7 @@ def _lower_priority_fallback_yaml() -> str:
     return """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     distribution_strategy: round_robin
     candidates:
       - provider: openrouter
@@ -214,7 +214,7 @@ def _lane_key_for_model(model: str) -> str:
         "last_resort": False,
     }
     lane_key = policy.CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
-    epoch_tag = _snapshot_epoch_tag_for_candidate("read", candidate)
+    epoch_tag = _snapshot_epoch_tag_for_candidate("basic", candidate)
     return lane_keys._codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=epoch_tag)
 
 
@@ -264,7 +264,7 @@ async def _drive_wrapper(
 ) -> Response:
     request = _minimal_request(session_id)
     body: dict[str, Any] = {
-        "model": "read",
+        "model": "basic",
         "input": [{"role": "user", "content": "hello"}],
         "stream": False,
         "litellm_metadata": {"session_id": session_id},
@@ -638,7 +638,7 @@ def _install_openrouter_and_opencode_performers(
 
 
 async def _drive_low_alias_wrapper(*, session_id: str) -> Any:
-    """Drive the real Codex wrapper for the ``aawm-low`` alias (2 OpenRouter candidates)."""
+    """Drive the real Codex wrapper for the ``basic`` alias (2 OpenRouter candidates)."""
     request = _minimal_request(session_id)
     body: dict[str, Any] = {
         "model": policy.CODEX_AAWM_LOW_ALIAS,
@@ -756,7 +756,7 @@ async def test_scenario_c1_concurrent_cold_probes_single_flight_under_contention
 
 
 async def test_scenario_c2_non_cooling_failure_does_not_false_singleflight() -> None:
-    """A read-lane single marker-only failure (gate says don't cool yet) must
+    """A basic-lane single marker-only failure (gate says don't cool yet) must
     NOT trigger single-flight suppression for concurrent waiters -- each
     waiter's own attempt is independently serialized through the probe lock
     (total == N, max_concurrent == 1), and the legacy (non-read) success path
@@ -764,7 +764,7 @@ async def test_scenario_c2_non_cooling_failure_does_not_false_singleflight() -> 
     raw_yaml = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: openrouter/c2-marker-model
@@ -788,7 +788,7 @@ aliases:
     async def _drive_read_once(session_id: str) -> Any:
         request = _minimal_request(session_id)
         body: dict[str, Any] = {
-            "model": "read",
+            "model": "basic",
             "input": [{"role": "user", "content": "hello"}],
             "stream": False,
             "litellm_metadata": {"session_id": session_id},
@@ -881,7 +881,7 @@ async def _drive_scope_target_failure(
         error_class: Optional[str],
         grok_account_quota_exhausted: bool = False,
         kimi_failure_metadata: Optional[dict[str, Any]] = None,
-        is_read_pilot_lane: bool = False,
+        is_basic_pilot_lane: bool = False,
     ) -> CooldownPublicationPlan:
         plan = original_resolver(
             request=request,
@@ -892,7 +892,7 @@ async def _drive_scope_target_failure(
             error_class=error_class,
             grok_account_quota_exhausted=grok_account_quota_exhausted,
             kimi_failure_metadata=kimi_failure_metadata,
-            is_read_pilot_lane=is_read_pilot_lane,
+            is_basic_pilot_lane=is_basic_pilot_lane,
         )
         plans.append(plan)
         return plan
@@ -960,7 +960,7 @@ async def _drive_scope_target_failure(
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body={
-                "model": "aawm-low",
+                "model": "basic",
                 "input": "hello",
                 "stream": False,
                 "litellm_metadata": {"session_id": "wave2-scope-target"},
@@ -1143,7 +1143,7 @@ async def test_scenario_e3_structured_429_cools_only_the_failing_model() -> None
     raw_yaml = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     distribution_strategy: round_robin
     candidates:
       - provider: openrouter
@@ -1181,7 +1181,7 @@ aliases:
     async def _drive_read_once(session_id: str) -> Any:
         request = _minimal_request(session_id)
         body: dict[str, Any] = {
-            "model": "read",
+            "model": "basic",
             "input": [{"role": "user", "content": "hello"}],
             "stream": False,
             "litellm_metadata": {"session_id": session_id},
@@ -1242,7 +1242,7 @@ aliases:
 
 
 async def test_scenario_b1_structured_429_cools_with_gate_duration() -> None:
-    """A structured 429 on the LIVE read-lane path (through the WRAPPER) must
+    """A structured 429 on the LIVE basic-lane path (through the WRAPPER) must
     cool the live cooldown key with the gate's retry-after-derived duration.
 
     Regression pin: passes both pre-fix AND post-fix.
@@ -1250,7 +1250,7 @@ async def test_scenario_b1_structured_429_cools_with_gate_duration() -> None:
     raw_yaml = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: openrouter/b1-live-model
@@ -1272,7 +1272,7 @@ aliases:
     async def _drive_read_once(session_id: str) -> Any:
         request = _minimal_request(session_id)
         body: dict[str, Any] = {
-            "model": "read",
+            "model": "basic",
             "input": [{"role": "user", "content": "hello"}],
             "stream": False,
             "litellm_metadata": {"session_id": session_id},
@@ -1301,7 +1301,7 @@ aliases:
 
 
 async def test_scenario_b2_single_marker_failure_does_not_cool() -> None:
-    """A single marker-only (non-structured) failure on the LIVE read-lane
+    """A single marker-only (non-structured) failure on the LIVE basic-lane
     path must NOT cool the candidate -- the N-of-M gate needs multiple marker
     events within its window before a key advances toward cooling.
 
@@ -1310,7 +1310,7 @@ async def test_scenario_b2_single_marker_failure_does_not_cool() -> None:
     raw_yaml = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: openrouter/b2-live-model
@@ -1332,7 +1332,7 @@ aliases:
     async def _drive_read_once(session_id: str) -> Any:
         request = _minimal_request(session_id)
         body: dict[str, Any] = {
-            "model": "read",
+            "model": "basic",
             "input": [{"role": "user", "content": "hello"}],
             "stream": False,
             "litellm_metadata": {"session_id": session_id},
@@ -1358,7 +1358,7 @@ aliases:
     live_key = _lane_key_for_model("openrouter/b2-live-model")
     applied_remaining = alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
     assert applied_remaining == 0.0
-    assert alias_state.alias_routing_state.read_pilot_gate.is_cooled(cooldown_key=live_key) is False
+    assert alias_state.alias_routing_state.basic_pilot_gate.is_cooled(cooldown_key=live_key) is False
 
 
 # ===========================================================================
@@ -1377,7 +1377,7 @@ async def test_snapshot_epoch_tag_requires_exact_alias_candidate_identity() -> N
     }
     lane_key = policy.CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
 
-    assert _snapshot_epoch_tag_for_candidate("read", candidate) is None
+    assert _snapshot_epoch_tag_for_candidate("basic", candidate) is None
     assert not lane_keys._codex_auto_agent_candidate_key(candidate, lane_key).startswith("h")
 
     snapshot = compiler.compile_yaml(
@@ -1390,7 +1390,7 @@ aliases:
         model: shared-model
         route_family: codex_openrouter_completion_adapter
         priority: 100
-  - name: read
+  - name: basic
     candidates:
       - provider: opencode_zen
         model: shared-model
@@ -1400,13 +1400,13 @@ aliases:
     )
     snapshot_select.set_active_routing_snapshot(snapshot)
 
-    assert _snapshot_epoch_tag_for_candidate("read", candidate) is None
-    assert _snapshot_epoch_tag_for_candidate("aawm-low", candidate) is None
+    assert _snapshot_epoch_tag_for_candidate("basic", candidate) is None
+    assert _snapshot_epoch_tag_for_candidate("basic", candidate) is None
     assert _snapshot_epoch_tag_for_candidate("other", candidate) == snapshot.config_hash
     assert not lane_keys._codex_auto_agent_candidate_key(
         candidate,
         lane_key,
-        epoch_tag=_snapshot_epoch_tag_for_candidate("read", candidate),
+        epoch_tag=_snapshot_epoch_tag_for_candidate("basic", candidate),
     ).startswith("h")
 
 
@@ -1415,7 +1415,7 @@ async def test_snapshot_selection_exposes_top_level_config_epoch_tag() -> None:
         """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: tagged-selection
@@ -1426,7 +1426,7 @@ aliases:
     snapshot_select.set_active_routing_snapshot(snapshot)
     request = _minimal_request("tagged-selection-session")
     request_body = {
-        "model": "read",
+        "model": "basic",
         "input": [{"role": "user", "content": "hello"}],
         "litellm_metadata": {"session_id": "tagged-selection-session"},
     }
@@ -1505,12 +1505,12 @@ def _snapshot_candidate_key(
 async def test_scenario_a1_refresh_activates_snapshot_and_selection_uses_it() -> None:
     """Regression pin (passes pre-fix): POST inline YAML to the REAL refresh
     HTTP route; assert 200 + changed=True; drive one wrapper request with
-    model='read'; assert the selected candidate is from the snapshot (not the
+    model='basic'; assert the selected candidate is from the snapshot (not the
     static-table fallback at policy.py:292)."""
     yaml_str = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: a1-snapshot-model
@@ -1565,7 +1565,7 @@ async def test_scenario_a2_refresh_rejects_bad_yaml_with_400() -> None:
     good_yaml = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: a2-good-model
@@ -1595,7 +1595,7 @@ aliases:
 _D1_SNAPSHOT_A = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: d1-leader
@@ -1610,7 +1610,7 @@ aliases:
 _D1_SNAPSHOT_B = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: d1-leader
@@ -1730,7 +1730,7 @@ async def test_scenario_d2_noop_refresh_retains_cooldown() -> None:
     yaml_str = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: d2-leader
@@ -1797,7 +1797,7 @@ aliases:
 _D3_YAML_ORIGINAL = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     distribution_strategy: round_robin
     candidates:
       - provider: openrouter
@@ -1815,7 +1815,7 @@ _D3_YAML_REFORMATTED = """
 # Reformatted: comment added, key order changed, extra whitespace
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     distribution_strategy: round_robin
     candidates:
       - route_family: codex_openrouter_completion_adapter
@@ -1949,7 +1949,7 @@ async def test_scenario_d3_semantically_identical_refresh_retains_state() -> Non
 _D4_SNAPSHOT_A = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: d4-pinned
@@ -1964,7 +1964,7 @@ aliases:
 _D4_SNAPSHOT_B = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: d4-pinned
@@ -2042,7 +2042,7 @@ async def test_scenario_d4_changed_refresh_preserves_compatible_continuation_aff
 _D4_SCHEDULE_SNAPSHOT_A = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: d4-scheduled-pinned
@@ -2057,7 +2057,7 @@ aliases:
 _D4_SCHEDULE_SNAPSHOT_B = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: d4-scheduled-pinned
@@ -2118,7 +2118,7 @@ async def test_scenario_d4_schedule_only_refresh_preserves_continuation_affinity
 _D5_SNAPSHOT_A = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: d5-pinned
@@ -2133,7 +2133,7 @@ aliases:
 _D5_SNAPSHOT_B = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: d5-other
@@ -2145,7 +2145,7 @@ aliases:
 _D5_SNAPSHOT_ROUTE_INCOMPATIBLE = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: d5-pinned
@@ -2238,7 +2238,7 @@ async def test_scenario_d5_none_to_concrete_route_family_requires_redispatch() -
         """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: d5-none-route-pinned
@@ -2256,14 +2256,14 @@ aliases:
 
     request = _minimal_request("d5-none-route-session")
     request_body = {
-        "model": "read",
+        "model": "basic",
         "input": [{"role": "user", "content": "hello"}],
         "litellm_metadata": {"session_id": "d5-none-route-session"},
     }
     session_key = lpe._resolve_codex_auto_agent_session_key(
         request,
         request_body,
-        alias_model="read",
+        alias_model="basic",
     )
     await cooldown_state._set_codex_auto_agent_session_affinity(
         session_key,
@@ -2315,11 +2315,11 @@ aliases:
 
 
 async def test_scenario_d6_legacy_alias_keys_unchanged() -> None:
-    """Negative control (passes pre-fix): aawm-low (static-table alias)
+    """Negative control (passes pre-fix): basic (static-table alias)
     produces identical bare cooldown keys both before and after snapshot
     activation. R3-4 epoch tagging must NOT affect legacy non-snapshot
-    aliases or the read lane's no-snapshot fallback."""
-    # Compute the expected bare key for the first aawm-low OpenRouter candidate
+    aliases or the basic lane's no-snapshot fallback."""
+    # Compute the expected bare key for the first basic OpenRouter candidate
     low_candidates = policy.CODEX_AAWM_LOW_CANDIDATES
     first_or = next(
         c for c in low_candidates
@@ -2331,7 +2331,7 @@ async def test_scenario_d6_legacy_alias_keys_unchanged() -> None:
         f"expected bare key (no epoch tag), got {bare_key_before!r}"
     )
 
-    # Drive an aawm-low request pre-snapshot with a failing performer to
+    # Drive an basic request pre-snapshot with a failing performer to
     # observe the cooldown key in the map.
     async def _failing_performer(
         *,
@@ -2357,11 +2357,11 @@ async def test_scenario_d6_legacy_alias_keys_unchanged() -> None:
     )
 
     # Activate a snapshot through the real refresh route. It must not affect
-    # the static-table aawm-low key format.
+    # the static-table basic key format.
     snapshot_yaml = f"""
 defaults: {{}}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: {first_or["model"]}

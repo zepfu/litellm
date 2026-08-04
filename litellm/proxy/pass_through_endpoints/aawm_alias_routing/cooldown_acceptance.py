@@ -355,8 +355,8 @@ def resolve_production_cooldown_key(
 
 
 def _resolve_eligible_candidates() -> list[dict[str, Any]]:
-    """Resolve the active schedule-eligible Codex read-alias candidates."""
-    from .snapshot_select import _resolve_read_pilot_eligible_candidates
+    """Resolve the active schedule-eligible Codex basic-alias candidates."""
+    from .snapshot_select import _resolve_basic_pilot_eligible_candidates
 
     snapshot = get_active_routing_snapshot()
     if snapshot is None:
@@ -365,7 +365,7 @@ def _resolve_eligible_candidates() -> list[dict[str, Any]]:
             "message": "no active routing snapshot available",
         })
 
-    eligible = _resolve_read_pilot_eligible_candidates(
+    eligible = _resolve_basic_pilot_eligible_candidates(
         client_product_label="codex",
         now_utc=datetime.now(timezone.utc),
         snapshot=snapshot,
@@ -373,7 +373,7 @@ def _resolve_eligible_candidates() -> list[dict[str, Any]]:
     if eligible is None or not eligible:
         raise HTTPException(status_code=503, detail={
             "error": "no_eligible_candidates",
-            "message": "no schedule-eligible codex candidates in read alias",
+            "message": "no schedule-eligible codex candidates in basic alias",
         })
 
     epoch_tag = snapshot.config_hash
@@ -431,10 +431,10 @@ async def _handle_prepare(  # noqa: PLR0915 - bounded acceptance handler
 ) -> dict[str, Any]:
     """Seed controls then target using production lane keys; verify state."""
     alias = body.get("alias")
-    if not isinstance(alias, str) or alias.strip() != "read":
+    if not isinstance(alias, str) or alias.strip() != "basic":
         raise HTTPException(status_code=400, detail={
             "error": "invalid_alias",
-            "message": "alias must be 'read'",
+            "message": "alias must be 'basic'",
         })
 
     ingress = body.get("ingress")

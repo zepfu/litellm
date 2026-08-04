@@ -5054,15 +5054,15 @@ def test_build_session_history_record_calculates_local_embedding_estimated_cost(
 
 def test_build_session_history_record_routes_auto_agent_alias_to_selected_provider() -> None:
     kwargs = _base_kwargs(trace_name="codex")
-    kwargs["model"] = "aawm-codex-agent-auto"
+    kwargs["model"] = "basic"
     kwargs["custom_llm_provider"] = "litellm"
     kwargs["call_type"] = "acompletion"
     kwargs["litellm_call_id"] = "call-auto-agent-openrouter-selected"
     kwargs["litellm_params"]["metadata"].update(
         {
             "session_id": "session-auto-agent-openrouter-selected",
-            "model_group": "aawm-codex-agent-auto",
-            "codex_auto_agent_alias": "aawm-codex-agent-auto",
+            "model_group": "basic",
+            "codex_auto_agent_alias": "basic",
             "codex_auto_agent_selected_provider": "openrouter",
             "codex_auto_agent_selected_model": "deepseek/deepseek-v4-flash:free",
         }
@@ -5090,25 +5090,25 @@ def test_build_session_history_record_routes_auto_agent_alias_to_selected_provid
     assert record is not None
     assert record["provider"] == "openrouter"
     assert record["model"] == "deepseek/deepseek-v4-flash:free"
-    assert record["inbound_model_alias"] == "aawm-codex-agent-auto"
+    assert record["inbound_model_alias"] == "basic"
     assert record["model_group"] == "deepseek/deepseek-v4-flash:free"
     payload = _build_session_history_db_payload(record)
     assert payload[5] == "deepseek/deepseek-v4-flash:free"
-    assert payload[127] == "aawm-codex-agent-auto"
+    assert payload[127] == "basic"
 
 
 def test_build_session_history_record_routes_anthropic_auto_agent_alias_to_selected_provider() -> None:
     kwargs = _base_kwargs(trace_name="claude")
-    kwargs["model"] = "aawm-code-anthropic"
+    kwargs["model"] = "work"
     kwargs["custom_llm_provider"] = "litellm"
     kwargs["call_type"] = "acompletion"
     kwargs["litellm_call_id"] = "call-auto-agent-anthropic-selected"
     kwargs["litellm_params"]["metadata"].update(
         {
             "session_id": "session-auto-agent-anthropic-selected",
-            "model_group": "aawm-code-anthropic",
-            "requested_model_alias": "aawm-code-anthropic",
-            "anthropic_auto_agent_alias": "aawm-code-anthropic",
+            "model_group": "work",
+            "requested_model_alias": "work",
+            "anthropic_auto_agent_alias": "work",
             "anthropic_auto_agent_selected_provider": "anthropic",
             "anthropic_auto_agent_selected_model": "claude-sonnet-4-6",
         }
@@ -5136,11 +5136,11 @@ def test_build_session_history_record_routes_anthropic_auto_agent_alias_to_selec
     assert record is not None
     assert record["provider"] == "anthropic"
     assert record["model"] == "claude-sonnet-4-6"
-    assert record["inbound_model_alias"] == "aawm-code-anthropic"
+    assert record["inbound_model_alias"] == "work"
     assert record["model_group"] == "claude-sonnet-4-6"
     payload = _build_session_history_db_payload(record)
     assert payload[5] == "claude-sonnet-4-6"
-    assert payload[127] == "aawm-code-anthropic"
+    assert payload[127] == "work"
 
 
 def test_build_session_history_record_sets_inbound_model_alias_for_direct_request() -> None:
@@ -8459,13 +8459,13 @@ def test_build_session_history_record_preserves_alias_routing_audit_metadata() -
     kwargs["litellm_params"]["metadata"].update(
         {
             "session_id": "session-alias-audit",
-            "model_alias_label": "aawm-read",
-            "requested_model_alias": "aawm-read",
+            "model_alias_label": "basic",
+            "requested_model_alias": "basic",
             "aawm_alias_routing_audit_events": [
                 {
                     "observed_at": "2026-06-06T12:00:00Z",
                     "alias_family": "codex_auto_agent",
-                    "alias_model": "aawm-read",
+                    "alias_model": "basic",
                     "session_id": "session-alias-audit",
                     "provider": "openai",
                     "model": "gpt-5.3-codex-spark",
@@ -8487,9 +8487,9 @@ def test_build_session_history_record_preserves_alias_routing_audit_metadata() -
     )
 
     assert record is not None
-    assert record["metadata"]["model_alias_label"] == "aawm-read"
+    assert record["metadata"]["model_alias_label"] == "basic"
     audit_events = record["metadata"]["aawm_alias_routing_audit_events"]
-    assert audit_events[0]["alias_model"] == "aawm-read"
+    assert audit_events[0]["alias_model"] == "basic"
     assert audit_events[0]["session_id"] == "session-alias-audit"
     assert audit_events[0]["event_type"] == "candidate_selected"
 
@@ -8501,15 +8501,15 @@ def test_build_alias_routing_audit_db_payload_includes_provider_timeout_state() 
         "trace_id": "trace-alias-timeout",
         "provider": "openai",
         "model": "gpt-5.3-codex-spark",
-        "model_group": "aawm-read",
+        "model_group": "basic",
         "repository": "litellm",
         "start_time": datetime(2026, 6, 6, 12, 0, tzinfo=timezone.utc),
-        "metadata": {"requested_model_alias": "aawm-read"},
+        "metadata": {"requested_model_alias": "basic"},
     }
     event = {
         "observed_at": "2026-06-06T12:00:00Z",
         "alias_family": "codex_auto_agent",
-        "alias_model": "aawm-read",
+        "alias_model": "basic",
         "session_id": "session-alias-timeout",
         "session_key": "session-alias-timeout:openai-lane",
         "provider": "openai",
@@ -8547,7 +8547,7 @@ def test_build_alias_routing_audit_db_payload_includes_provider_timeout_state() 
     assert payload[0].startswith("call-alias-timeout:alias-routing:")
     assert payload[2] == "session-alias-timeout"
     assert payload[3] == "session-alias-timeout:openai-lane"
-    assert payload[6] == "aawm-read"
+    assert payload[6] == "basic"
     assert payload[7] == "codex_auto_agent"
     assert payload[8] == "codex_responses"
     assert payload[9] == "openai"
@@ -8622,7 +8622,7 @@ def test_build_alias_routing_audit_only_record_skips_session_history_and_keeps_e
     events = [
         {
             "event_type": "no_candidate_available",
-            "alias_model": "aawm-sota",
+            "alias_model": "sota",
             "alias_family": "codex_auto_agent",
             "session_id": "session-audit-only",
             "litellm_call_id": "call-audit-only",
@@ -8644,7 +8644,7 @@ def test_build_alias_routing_audit_only_record_skips_session_history_and_keeps_e
         events=events,
         session_id="session-audit-only",
         litellm_call_id="call-audit-only",
-        model="aawm-sota",
+        model="sota",
         provider=None,
         metadata={"source": "unit-test"},
     )
@@ -8744,7 +8744,7 @@ async def test_persist_alias_routing_audit_best_effort_from_audit_only_record() 
         events=[
             {
                 "alias_family": "codex_auto_agent",
-                "alias_model": "aawm-sota",
+                "alias_model": "sota",
                 "event_type": "no_candidate_available",
                 "candidate_status": "all_candidates_unavailable",
                 "session_id": "session-audit-only-persist",
@@ -8765,7 +8765,7 @@ async def test_persist_alias_routing_audit_best_effort_from_audit_only_record() 
     sql, payloads = conn.executemany.await_args.args
     assert sql == aawm_agent_identity._AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL
     assert len(payloads) == 1
-    assert payloads[0][6] == "aawm-sota"
+    assert payloads[0][6] == "sota"
     assert payloads[0][14] == "no_candidate_available"
     metadata = json.loads(payloads[0][28])
     assert metadata["terminal_activity_status"] == "failed_after_partial_activity"
@@ -8781,7 +8781,7 @@ async def test_persist_alias_routing_audit_best_effort_uses_executemany() -> Non
             "aawm_alias_routing_audit_events": [
                 {
                     "alias_family": "anthropic_auto_agent",
-                    "alias_model": "aawm-code-anthropic",
+                    "alias_model": "work",
                     "provider": "anthropic",
                     "model": "claude-sonnet-4-6",
                     "route_family": "anthropic_messages",
@@ -8802,7 +8802,7 @@ async def test_persist_alias_routing_audit_best_effort_uses_executemany() -> Non
     sql, payloads = conn.executemany.await_args.args
     assert sql == aawm_agent_identity._AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL
     assert len(payloads) == 1
-    assert payloads[0][6] == "aawm-code-anthropic"
+    assert payloads[0][6] == "work"
     assert payloads[0][9] == "anthropic"
 
 
@@ -11535,7 +11535,7 @@ async def test_persist_session_history_record_strips_postgres_nul_bytes(
         ],
         "response_cost_usd": 0.0,
         "metadata": {
-            "requested_model_alias": "aawm-sota-anthropic\x00",
+            "requested_model_alias": "sota\x00",
             "anthropic_auto_agent_selected_model": "claude-opus-4-8\x00",
             "raw_response": {"text": "contains\x00nul"},
         },
@@ -11559,7 +11559,7 @@ async def test_persist_session_history_record_strips_postgres_nul_bytes(
     _assert_no_postgres_nul_bytes(executed_args[1:])
     assert json.loads(executed_args[31]) == ["Read"]
     metadata_payload = json.loads(executed_args[53])
-    assert metadata_payload["requested_model_alias"] == "aawm-sota-anthropic"
+    assert metadata_payload["requested_model_alias"] == "sota"
     assert metadata_payload["raw_response"] == {"text": "containsnul"}
 
     tool_args = mock_conn.executemany.await_args.args
@@ -13121,14 +13121,14 @@ def test_build_session_history_record_from_langfuse_preserves_inbound_model_alia
         },
         "input": {
             "messages": [{"role": "user", "content": "hello"}],
-            "model": "aawm-read",
+            "model": "basic",
         },
         "output": {"model": "gpt-5.3-codex-spark", "content": "ack"},
         "metadata": {
-            "model_alias_label": "aawm-read",
-            "requested_model_alias": "aawm-read",
+            "model_alias_label": "basic",
+            "requested_model_alias": "basic",
             "codex_auto_agent_selected_model": "gpt-5.3-codex-spark",
-            "request_tags": ["model-alias:aawm-read"],
+            "request_tags": ["model-alias:basic"],
         },
     }
 
@@ -13140,10 +13140,10 @@ def test_build_session_history_record_from_langfuse_preserves_inbound_model_alia
 
     assert record is not None
     assert record["model"] == "gpt-5.3-codex-spark"
-    assert record["inbound_model_alias"] == "aawm-read"
+    assert record["inbound_model_alias"] == "basic"
     payload = _build_session_history_db_payload(record)
     assert payload[5] == "gpt-5.3-codex-spark"
-    assert payload[127] == "aawm-read"
+    assert payload[127] == "basic"
 
 
 def test_build_session_history_record_from_langfuse_recovers_claude_model_from_exp_tag() -> None:
@@ -13896,7 +13896,7 @@ async def test_persist_session_history_records_propagates_rate_limit_side_write_
                     "aawm_alias_routing_audit_events": [
                         {
                             "alias_family": "anthropic_auto_agent",
-                            "alias_model": "aawm-code-anthropic",
+                            "alias_model": "work",
                             "provider": "anthropic",
                             "model": "claude-sonnet-4-6",
                             "route_family": "anthropic_messages",

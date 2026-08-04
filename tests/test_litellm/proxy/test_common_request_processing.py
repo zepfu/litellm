@@ -3077,7 +3077,7 @@ class TestAawmRouteRollup:
             group_header_label=header,
             incoming_endpoint="/openai_passthrough/responses",
             outgoing_target="chatgpt.com/backend-api/codex/responses",
-            model_label="grok-4-fast(aawm-low)",
+            model_label="grok-4-fast(basic)",
             turns=3,
             now=now,
         )
@@ -3088,7 +3088,7 @@ class TestAawmRouteRollup:
             flushed[0]
             == "20260623 01:06:52 litellm#Codex[0.141.0] /openai_passthrough/responses"
         )
-        assert flushed[1] == " - grok-4-fast(aawm-low) - Turns: 3"
+        assert flushed[1] == " - grok-4-fast(basic) - Turns: 3"
 
     def test_route_rollup_groups_destinations_under_local_endpoint(self):
         from datetime import datetime
@@ -3104,7 +3104,7 @@ class TestAawmRouteRollup:
             group_header_label=header,
             incoming_endpoint=endpoint,
             outgoing_target="api.x.ai/v1/responses",
-            model_label="grok-4-fast(aawm-low)",
+            model_label="grok-4-fast(basic)",
             turns=7,
             now=now,
         )
@@ -3121,7 +3121,7 @@ class TestAawmRouteRollup:
         assert flushed == [
             "20260623 02:51:23 aawm#Codex[0.141.0] /openai_passthrough/responses",
             (
-                " - grok-4-fast(aawm-low) - Turns: 7 -> "
+                " - grok-4-fast(basic) - Turns: 7 -> "
                 "api.x.ai/v1/responses"
             ),
             " - gpt-5.5 - Turns: 4",
@@ -3186,7 +3186,7 @@ class TestAawmRouteRollup:
             group_header_label=header,
             incoming_endpoint=endpoint,
             outgoing_target=grok,
-            model_label="grok-composer-2.5-fast(aawm-code-anthropic)",
+            model_label="grok-composer-2.5-fast(work)",
             turns=1,
             now=now,
         )
@@ -3204,7 +3204,7 @@ class TestAawmRouteRollup:
             "20260623 22:05:55 aegis@Claude[2.1.186] /anthropic/v1/messages?beta=true",
             " - claude-haiku-4-5-20251001 - Turns: 3",
             (
-                " - grok-composer-2.5-fast(aawm-code-anthropic) - Turns: 1 -> "
+                " - grok-composer-2.5-fast(work) - Turns: 1 -> "
                 "cli-chat-proxy.grok.com/v1/responses"
             ),
             " - claude-opus-4-8 - Turns: 4",
@@ -3220,7 +3220,7 @@ class TestAawmRouteRollup:
         header = "litellm@Codex[0.141.0]"
         endpoint = "/openai_passthrough/responses"
         target = "chatgpt.com/backend-api/codex/responses"
-        model = "gpt-5.5(aawm-low)"
+        model = "gpt-5.5(basic)"
 
         accumulator.record(
             group_header_label=header,
@@ -3241,7 +3241,7 @@ class TestAawmRouteRollup:
             now=now,
         )
         flushed = accumulator.flush(force=True, now=now)
-        assert " - gpt-5.5(aawm-low) - Turns: 3 [Exhausted]" in flushed
+        assert " - gpt-5.5(basic) - Turns: 3 [Exhausted]" in flushed
 
     def test_route_rollup_retains_sanitized_source_error(self):
         from datetime import datetime
@@ -3254,7 +3254,7 @@ class TestAawmRouteRollup:
             group_header_label="litellm#Codex[0.144.6]",
             incoming_endpoint="/openai_passthrough/responses",
             outgoing_target="codex_xai_oauth_responses_adapter",
-            model_label="oa_xai/grok-4.5(aawm-sota-xai)",
+            model_label="oa_xai/grok-4.5(sota-xai)",
             turns=0,
             status="Cooling Down",
             message="Grok Build usage balance exhausted",
@@ -3266,7 +3266,7 @@ class TestAawmRouteRollup:
         assert flushed == [
             "20260720 14:05:17 litellm#Codex[0.144.6] /openai_passthrough/responses",
             (
-                " - oa_xai/grok-4.5(aawm-sota-xai) - Turns: 0 "
+                " - oa_xai/grok-4.5(sota-xai) - Turns: 0 "
                 "[Grok Build usage balance exhausted] [Cooling Down] -> "
                 "codex_xai_oauth_responses_adapter"
             ),
@@ -3292,11 +3292,11 @@ class TestAawmRouteRollup:
                         "/openai_passthrough/responses"
                     ),
                     (
-                        " - oa_xai/grok-4.5(aawm-sota-xai) - Turns: 0 "
+                        " - oa_xai/grok-4.5(sota-xai) - Turns: 0 "
                         "[Grok Build usage balance exhausted] [Cooling Down]"
                     ),
                     (
-                        " - grok-4.5(aawm-sota-xai) - Turns: 0 "
+                        " - grok-4.5(sota-xai) - Turns: 0 "
                         "[The requested model 'grok-4.5' does not exist.] [Failed]"
                     ),
                 ]
@@ -3308,11 +3308,11 @@ class TestAawmRouteRollup:
             "/openai_passthrough/responses\n"
         )
         assert (
-            "\x1b[94m - oa_xai/grok-4.5(aawm-sota-xai) - Turns: 0 "
+            "\x1b[94m - oa_xai/grok-4.5(sota-xai) - Turns: 0 "
             "[Grok Build usage balance exhausted] [Cooling Down]\x1b[0m"
         ) in rendered
         assert (
-            "\x1b[91m - grok-4.5(aawm-sota-xai) - Turns: 0 "
+            "\x1b[91m - grok-4.5(sota-xai) - Turns: 0 "
             "[The requested model 'grok-4.5' does not exist.] [Failed]\x1b[0m"
         ) in rendered
 
@@ -3332,7 +3332,7 @@ class TestAawmRouteRollup:
                         "/openai_passthrough/responses"
                     ),
                     (
-                        " - grok-4.5(aawm-sota-xai) - Turns: 0 "
+                        " - grok-4.5(sota-xai) - Turns: 0 "
                         "[The requested model 'grok-4.5' does not exist.] [Failed]"
                     ),
                 ]
@@ -3350,7 +3350,7 @@ class TestAawmRouteRollup:
         try:
             with caplog.at_level(logging.WARNING, logger=route_logger.name):
                 aawm_route_logging.emit_aawm_route_status_event(
-                    alias_model="aawm-low",
+                    alias_model="basic",
                     model_label="gpt-5.5",
                     status="Cooling Down",
                     message="provider capacity",
@@ -3361,7 +3361,7 @@ class TestAawmRouteRollup:
 
         rendered = "\n".join(record.getMessage() for record in caplog.records)
         assert (
-            "20260623 22:07:05 - aawm-low: gpt-5.5 Status: Cooling Down "
+            "20260623 22:07:05 - basic: gpt-5.5 Status: Cooling Down "
             "- Message: provider capacity"
         ) in rendered
         assert "Turns:" not in rendered
@@ -3405,7 +3405,7 @@ class TestAawmRouteRollup:
             group_header_label=header,
             incoming_endpoint=endpoint,
             outgoing_target=target,
-            model_label="grok-4-fast(aawm-low)",
+            model_label="grok-4-fast(basic)",
             turns=1,
             now=now,
         )
@@ -3413,7 +3413,7 @@ class TestAawmRouteRollup:
             group_header_label=header,
             incoming_endpoint=endpoint,
             outgoing_target=target,
-            model_label="gpt-5.5(aawm-low)",
+            model_label="gpt-5.5(basic)",
             turns=1,
             now=now,
         )
@@ -3421,7 +3421,7 @@ class TestAawmRouteRollup:
             group_header_label=header,
             incoming_endpoint=endpoint,
             outgoing_target=target,
-            model_label="deepseek-v4-flash(aawm-low)",
+            model_label="deepseek-v4-flash(basic)",
             turns=1,
             now=now,
         )
@@ -3439,7 +3439,7 @@ class TestAawmRouteRollup:
             group_header_label="litellm@Codex[0.141.0]",
             incoming_endpoint="/openai_passthrough/responses",
             outgoing_target="chatgpt.com/backend-api/codex/responses",
-            model_label="grok-4-fast(aawm-low)",
+            model_label="grok-4-fast(basic)",
             turns=0,
             status="Degraded",
             now=now,

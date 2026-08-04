@@ -315,8 +315,8 @@ def test_rr054_policy_compat_shim_reexports_package_policy() -> None:
         policy_compat.CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS
         == policy.CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS
     )
-    assert "aawm-codex-agent-auto" in policy_compat.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    assert "aawm-code-anthropic" in policy_compat.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
+    assert "basic" in policy_compat.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
+    assert "work" in policy_compat.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
 
 
 def test_rr054_god_file_reexports_policy_and_durable_helpers() -> None:

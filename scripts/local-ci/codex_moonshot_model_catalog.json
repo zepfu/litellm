@@ -1,7 +1,7 @@
 {
   "models": [
     {
-      "slug": "aawm-sota-moonshot",
+      "slug": "sota-moonshot",
       "display_name": "AAWM SOTA Moonshot",
       "description": "Managed Kimi Moonshot through LiteLLM.",
       "default_reasoning_level": "high",

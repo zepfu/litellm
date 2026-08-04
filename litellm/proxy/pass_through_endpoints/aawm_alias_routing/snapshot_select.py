@@ -16,19 +16,23 @@ from typing import Any, Callable, Mapping, NamedTuple, Optional, Sequence, Tuple
 from fastapi import Request
 
 from .config_snapshot import (
+    AliasReference as _AliasReference,
     RoutingCandidate as _RoutingSnapshotCandidate,
     RoutingSnapshot as _RoutingSnapshot,
     active_routing_snapshot_holder as _active_routing_snapshot_holder,
 )
 from .policy import (
+    AAWM_BASIC_ALIAS as _AAWM_BASIC_ALIAS,
+    AAWM_RETIRED_ALIASES as _AAWM_RETIRED_ALIASES,
     CODEX_AUTO_AGENT_CANDIDATES as _CODEX_AUTO_AGENT_CANDIDATES,
     CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS as _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
 )
+from .request_metadata import _normalize_tui_family
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-_READ_PILOT_ALIAS_NAME = "read"
+_BASIC_PILOT_ALIAS_NAME = _AAWM_BASIC_ALIAS
 
 # CFG-008: route families that require Anthropic-native credentials. The
 # Codex/OpenAI Responses ingress has no native-Anthropic egress, so
@@ -264,7 +268,7 @@ def _apply_snapshot_alias_distribution_strategy(
 
 
 def _is_tui_attached_candidate_eligible(
-    candidate: _RoutingSnapshotCandidate,
+    candidate: _RoutingSnapshotCandidate | _AliasReference,
     *,
     client_product_label: Optional[str],
 ) -> bool:
@@ -273,12 +277,13 @@ def _is_tui_attached_candidate_eligible(
         return True
     if not client_product_label:
         return False
-    product_name = client_product_label.split("/", 1)[0]
-    return product_name == candidate.tui_attached
+    return _normalize_tui_family(client_product_label) == _normalize_tui_family(
+        candidate.tui_attached
+    )
 
 
 def _is_tui_excluded_candidate_eligible(
-    candidate: _RoutingSnapshotCandidate,
+    candidate: _RoutingSnapshotCandidate | _AliasReference,
     *,
     client_product_label: Optional[str],
 ) -> bool:
@@ -294,8 +299,9 @@ def _is_tui_excluded_candidate_eligible(
         return True
     if not client_product_label:
         return True
-    product_name = client_product_label.split("/", 1)[0]
-    return product_name != candidate.tui_excluded
+    return _normalize_tui_family(client_product_label) != _normalize_tui_family(
+        candidate.tui_excluded
+    )
 
 
 def _is_snapshot_candidate_in_schedule_window(
@@ -315,15 +321,189 @@ def _is_snapshot_candidate_in_schedule_window(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_read_pilot_eligible_candidates(
+
+def _resolve_dispatch_target(
+    alias_name: str,
+    *,
+    client_product_label: Optional[str],
+    snapshot: Optional[_RoutingSnapshot],
+) -> Optional[str]:
+    """Resolve a TUI dispatch target, returning ``None`` for blocked/no target."""
+    if snapshot is None or alias_name not in snapshot.aliases:
+        return None
+
+    alias = snapshot.aliases[alias_name]
+    if alias.dispatch is None:
+        return None
+
+    tui_family = _normalize_tui_family(client_product_label)
+    if tui_family in alias.dispatch.blocked_tui_families:
+        return None
+    for rule in alias.dispatch.by_tui:
+        if rule.tui_family == tui_family:
+            return rule.target_alias
+    return alias.dispatch.default
+
+
+def _is_internal_alias(alias_name: str, snapshot: Optional[_RoutingSnapshot]) -> bool:
+    """Check if alias has internal visibility (CFG-009)."""
+    if snapshot is None or alias_name not in snapshot.aliases:
+        return False
+    return snapshot.aliases[alias_name].visibility == "internal"
+
+
+def _order_snapshot_entries_by_priority(
+    entries: Sequence[_RoutingSnapshotCandidate | _AliasReference],
+) -> list[_RoutingSnapshotCandidate | _AliasReference]:
+    non_zero = [entry for entry in entries if entry.priority != 0]
+    zero = [entry for entry in entries if entry.priority == 0]
+    return sorted(
+        non_zero,
+        key=lambda entry: entry.priority,
+        reverse=True,
+    ) + zero
+
+
+def _shape_snapshot_candidate(
+    candidate: _RoutingSnapshotCandidate,
+    *,
+    ingress: str,
+    epoch_tag: str,
+) -> Optional[dict[str, Any]]:
+    if ingress == "codex":
+        if candidate.route_family in _ANTHROPIC_CREDENTIAL_ROUTE_FAMILIES:
+            return None
+        return _routing_candidate_to_public_dict(candidate, epoch_tag=epoch_tag)
+    try:
+        return _routing_candidate_to_anthropic_public_dict(
+            candidate,
+            epoch_tag=epoch_tag,
+        )
+    except ValueError:
+        return None
+
+
+def _resolve_snapshot_alias_candidates(
+    alias_name: str,
+    *,
+    ingress: str,
+    client_product_label: Optional[str],
+    now_utc: datetime,
+    snapshot: _RoutingSnapshot,
+    allow_internal: bool = False,
+    path: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    """Resolve one config alias to concrete candidates without nested loops."""
+    if alias_name in path:
+        return []
+    alias = snapshot.aliases.get(alias_name)
+    if alias is None or (alias.visibility == "internal" and not allow_internal):
+        return []
+
+    next_path = (*path, alias_name)
+    if alias.dispatch is not None:
+        target = _resolve_dispatch_target(
+            alias_name,
+            client_product_label=client_product_label,
+            snapshot=snapshot,
+        )
+        if target is None:
+            return []
+        return _resolve_snapshot_alias_candidates(
+            target,
+            ingress=ingress,
+            client_product_label=client_product_label,
+            now_utc=now_utc,
+            snapshot=snapshot,
+            allow_internal=True,
+            path=next_path,
+        )
+
+    resolved: list[dict[str, Any]] = []
+    for entry in _order_snapshot_entries_by_priority(alias.candidates):
+        if not _is_tui_attached_candidate_eligible(
+            entry, client_product_label=client_product_label
+        ) or not _is_tui_excluded_candidate_eligible(
+            entry, client_product_label=client_product_label
+        ):
+            continue
+        if isinstance(entry, _AliasReference):
+            children = _resolve_snapshot_alias_candidates(
+                entry.alias_name,
+                ingress=ingress,
+                client_product_label=client_product_label,
+                now_utc=now_utc,
+                snapshot=snapshot,
+                allow_internal=True,
+                path=next_path,
+            )
+            for child in children:
+                shaped = dict(child)
+                shaped["selection_priority"] = entry.priority
+                shaped["last_resort"] = entry.priority == 0
+                shaped["alias_reference"] = entry.alias_name
+                shaped["alias_path"] = [*next_path, entry.alias_name]
+                if alias.distribution_strategy is not None:
+                    shaped["selection_group"] = alias.name
+                    shaped["selection_strategy"] = alias.distribution_strategy
+                    shaped["selection_choice"] = entry.alias_name
+                    shaped["selection_weight"] = entry.weight
+                resolved.append(shaped)
+            continue
+
+        if not _is_snapshot_candidate_in_schedule_window(entry, now_utc=now_utc):
+            continue
+        shaped = _shape_snapshot_candidate(
+            entry,
+            ingress=ingress,
+            epoch_tag=snapshot.config_hash,
+        )
+        if shaped is None:
+            continue
+        shaped["selection_priority"] = entry.priority
+        shaped["resolved_alias"] = alias.name
+        shaped["alias_path"] = list(next_path)
+        if alias.distribution_strategy is not None:
+            shaped["selection_group"] = alias.name
+            shaped["selection_strategy"] = alias.distribution_strategy
+            shaped["selection_choice"] = f"{entry.provider}:{entry.model}"
+            shaped["selection_weight"] = entry.weight
+        resolved.append(shaped)
+    return resolved
+
+
+def _select_snapshot_candidates(
+    alias_name: str,
+    *,
+    ingress: str,
+    client_product_label: Optional[str] = None,
+    now_utc: Optional[datetime] = None,
+) -> tuple[dict[str, Any], ...]:
+    if _is_alias_config_startup_failed():
+        return ()
+    snapshot = get_active_routing_snapshot()
+    if snapshot is None:
+        return ()
+    return tuple(
+        _resolve_snapshot_alias_candidates(
+            alias_name,
+            ingress=ingress,
+            client_product_label=client_product_label,
+            now_utc=now_utc or datetime.now(timezone.utc),
+            snapshot=snapshot,
+        )
+    )
+
+
+def _resolve_basic_pilot_eligible_candidates(
     *,
     client_product_label: Optional[str],
     now_utc: datetime,
     snapshot: Optional[_RoutingSnapshot] = None,
 ) -> Optional[list[_RoutingSnapshotCandidate]]:
-    """Return the eligibility-filtered, priority-ordered ``read`` alias candidates.
+    """Return the eligibility-filtered, priority-ordered ``basic`` alias candidates.
 
-    ``None`` means there is no active snapshot ``read`` alias (callers use the
+    ``None`` means there is no active snapshot ``basic`` alias (callers use the
     static fallback table). An empty list means every candidate was gated out
     (TUI/schedule) -- callers fail closed rather than dispatching a rejected
     candidate. Shared by the enumeration getter and the round-robin commit-token
@@ -334,9 +514,9 @@ def _resolve_read_pilot_eligible_candidates(
     """
     if snapshot is None:
         snapshot = get_active_routing_snapshot()
-    if snapshot is None or _READ_PILOT_ALIAS_NAME not in snapshot.aliases:
+    if snapshot is None or _BASIC_PILOT_ALIAS_NAME not in snapshot.aliases:
         return None
-    alias = snapshot.aliases[_READ_PILOT_ALIAS_NAME]
+    alias = snapshot.aliases[_BASIC_PILOT_ALIAS_NAME]
     ordered = _order_snapshot_candidates_by_priority(alias.candidates)
     return [
         candidate
@@ -347,16 +527,16 @@ def _resolve_read_pilot_eligible_candidates(
     ]
 
 
-def _select_read_pilot_snapshot_candidates(
+def _select_basic_pilot_snapshot_candidates(
     *,
     client_product_label: Optional[str] = None,
     now_utc: Optional[datetime] = None,
 ) -> tuple[dict[str, Any], ...]:
-    """Resolve the ordered ``read`` alias candidate tuple from the active snapshot.
+    """Resolve the ordered ``basic`` alias candidate tuple from the active snapshot.
 
     Falls back to the hard-coded ``_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS`` table
-    when no snapshot has been activated (or the snapshot has no ``read`` alias),
-    so the pilot degrades gracefully instead of raising.
+    when no snapshot has been activated. An active snapshot without ``basic``
+    fails closed.
 
     CFG-002 Finding 2: failure state is checked FIRST, before any snapshot
     or static branch.  Once failure is published, all paths return empty.
@@ -369,7 +549,7 @@ def _select_read_pilot_snapshot_candidates(
     # Finding 5: capture exactly one snapshot reference.
     snapshot = get_active_routing_snapshot()
     resolved_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
-    eligible = _resolve_read_pilot_eligible_candidates(
+    eligible = _resolve_basic_pilot_eligible_candidates(
         client_product_label=client_product_label,
         now_utc=resolved_now,
         snapshot=snapshot,
@@ -378,10 +558,10 @@ def _select_read_pilot_snapshot_candidates(
         if snapshot is None:
             # Genuine legacy / no-config state: degrade to the static table.
             return _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
-                _READ_PILOT_ALIAS_NAME,
+                _BASIC_PILOT_ALIAS_NAME,
                 _CODEX_AUTO_AGENT_CANDIDATES,
             )
-        # Snapshot active but has no read alias: fail closed.
+        # Snapshot active but has no basic alias: fail closed.
         return ()
     # CFG-008: ingress credential eligibility -- the Codex ingress cannot
     # dispatch Anthropic-credential candidates (no Codex-native egress for
@@ -394,31 +574,31 @@ def _select_read_pilot_snapshot_candidates(
     if not eligible:
         return ()
     assert snapshot is not None
-    alias = snapshot.aliases[_READ_PILOT_ALIAS_NAME]
+    alias = snapshot.aliases[_BASIC_PILOT_ALIAS_NAME]
     epoch_tag = snapshot.config_hash
     distributed = _apply_snapshot_alias_distribution_strategy(
         eligible,
         distribution_strategy=alias.distribution_strategy,
         rng=random.Random(),
-        alias_name=_READ_PILOT_ALIAS_NAME,
+        alias_name=_BASIC_PILOT_ALIAS_NAME,
         epoch_tag=epoch_tag,
     )
     return tuple(_routing_candidate_to_public_dict(c, epoch_tag=epoch_tag) for c in distributed)
 
 
-def _select_read_pilot_snapshot_candidates_anthropic(
+def _select_basic_pilot_snapshot_candidates_anthropic(
     *,
     client_product_label: Optional[str] = None,
     now_utc: Optional[datetime] = None,
 ) -> Optional[tuple[dict[str, Any], ...]]:
-    """Resolve the ordered ``read`` alias candidates for Anthropic Messages ingress.
+    """Resolve the ordered ``basic`` alias candidates for Anthropic Messages ingress.
 
     Returns the same snapshot-resolved, priority-ordered, eligibility-filtered
     candidate set as the Codex ingress path, but with each candidate's
     ``route_family`` replaced by its ``anthropic_route_family`` projection.
 
-    Returns `None` when there is no active snapshot ``read`` alias (callers
-    fall back to the static table). Returns an empty tuple when every
+    Returns `None` when there is no active snapshot (callers fall back to the
+    static table). Returns an empty tuple when every
     candidate is gated out (fail closed, same as Codex ingress).
 
     Ingress isolation: Codex and Anthropic ingress each see only their own
@@ -433,7 +613,7 @@ def _select_read_pilot_snapshot_candidates_anthropic(
     # Finding 5: capture exactly one snapshot reference.
     snapshot = get_active_routing_snapshot()
     resolved_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
-    eligible = _resolve_read_pilot_eligible_candidates(
+    eligible = _resolve_basic_pilot_eligible_candidates(
         client_product_label=client_product_label,
         now_utc=resolved_now,
         snapshot=snapshot,
@@ -442,18 +622,18 @@ def _select_read_pilot_snapshot_candidates_anthropic(
         if snapshot is None:
             # Genuine legacy / no-config state: callers fall back to static table.
             return None
-        # Snapshot active but has no read alias: fail closed.
+        # Snapshot active but has no basic alias: fail closed.
         return ()
     if not eligible:
         return ()
     assert snapshot is not None
-    alias = snapshot.aliases[_READ_PILOT_ALIAS_NAME]
+    alias = snapshot.aliases[_BASIC_PILOT_ALIAS_NAME]
     epoch_tag = snapshot.config_hash
     distributed = _apply_snapshot_alias_distribution_strategy(
         eligible,
         distribution_strategy=alias.distribution_strategy,
         rng=random.Random(),
-        alias_name=_READ_PILOT_ALIAS_NAME,
+        alias_name=_BASIC_PILOT_ALIAS_NAME,
         epoch_tag=epoch_tag,
     )
     return tuple(
@@ -497,37 +677,38 @@ def _derive_round_robin_commit_token(
     client_product_label: Optional[str],
     now_utc: Optional[datetime] = None,
 ) -> Optional[RoundRobinCommitToken]:
-    """Build the commit token for a ``round_robin`` snapshot alias, else ``None``.
-
-    Only the snapshot-driven ``read`` alias participates in round-robin rotation;
-    every other alias (static-table lanes, non-round-robin strategies, single-
-    candidate tiers) yields ``None`` so the commit path is a no-op for them.
-    """
-    if alias_model != _READ_PILOT_ALIAS_NAME:
-        return None
+    """Build the commit token for a public snapshot round-robin alias."""
     snapshot = get_active_routing_snapshot()
-    if snapshot is None or _READ_PILOT_ALIAS_NAME not in snapshot.aliases:
+    if snapshot is None or alias_model not in snapshot.aliases:
         return None
-    alias = snapshot.aliases[_READ_PILOT_ALIAS_NAME]
+    alias = snapshot.aliases[alias_model]
     if alias.distribution_strategy != "round_robin":
         return None
-    resolved_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
-    eligible = _resolve_read_pilot_eligible_candidates(
+    candidates = _select_snapshot_candidates(
+        alias_model,
+        ingress="codex",
         client_product_label=client_product_label,
-        now_utc=resolved_now,
+        now_utc=now_utc,
     )
-    if not eligible or len(eligible) < 2:
+    if len(candidates) < 2:
         return None
-    top_priority = eligible[0].priority
-    tied = [c for c in eligible if c.priority == top_priority]
+    top_priority = candidates[0].get("selection_priority", 0)
+    tied = [
+        candidate
+        for candidate in candidates
+        if candidate.get("selection_priority", 0) == top_priority
+    ]
     if len(tied) < 2:
         return None
     epoch_tag = snapshot.config_hash
-    start_index = _rr_cursor.get((epoch_tag, _READ_PILOT_ALIAS_NAME), 0)
+    start_index = _rr_cursor.get((epoch_tag, alias_model), 0)
     return RoundRobinCommitToken(
-        alias_name=_READ_PILOT_ALIAS_NAME,
+        alias_name=alias_model,
         epoch_tag=epoch_tag,
-        tied_candidate_ids=tuple((c.provider, c.model) for c in tied),
+        tied_candidate_ids=tuple(
+            (str(candidate["provider"]), str(candidate["model"]))
+            for candidate in tied
+        ),
         start_index=start_index,
     )
 
@@ -601,17 +782,17 @@ def _get_codex_auto_agent_candidates_for_alias(
     # static branch.  Once failure is published, all aliases return empty.
     if _is_alias_config_startup_failed():
         return ()
-    if alias_model == _READ_PILOT_ALIAS_NAME:
-        return _select_read_pilot_snapshot_candidates(client_product_label=client_product_label)
-    # When a snapshot is active, only config-defined aliases (read) and
-    # explicitly registered legacy aliases are supported.  Arbitrary
-    # normalized aliases fail closed rather than receiving the generic
-    # static OpenAI fallback.
-    if get_active_routing_snapshot() is not None:
-        candidates = _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(alias_model)
-        if candidates is not None:
-            return candidates
+    if alias_model in _AAWM_RETIRED_ALIASES:
         return ()
+    snapshot = get_active_routing_snapshot()
+    if _is_internal_alias(alias_model, snapshot):
+        return ()
+    if snapshot is not None:
+        return _select_snapshot_candidates(
+            alias_model,
+            ingress="codex",
+            client_product_label=client_product_label,
+        )
     candidates = _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
         alias_model,
         _CODEX_AUTO_AGENT_CANDIDATES,

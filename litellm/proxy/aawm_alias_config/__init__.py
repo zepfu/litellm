@@ -2,8 +2,8 @@
 
 Holds the raw YAML config file(s) consumed by
 ``litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler``.
-``read.yaml`` is the additive ``read`` pilot config; other alias families
-remain hard-coded in ``aawm_alias_routing.policy`` for this wave.
+The directory contains the maintained public aliases plus internal routing
+branches loaded as one fail-closed startup inventory.
 """
 
 from __future__ import annotations

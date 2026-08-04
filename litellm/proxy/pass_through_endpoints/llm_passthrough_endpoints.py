@@ -386,7 +386,7 @@ _aawm_alias_policy_compat.install_policy_compat_aliases(globals())
 
 # ---------------------------------------------------------------------------
 # Wave 4 (D1-583): config-snapshot-driven candidate resolution for the
-# ``read`` pilot alias only. Every other alias continues to resolve from the
+# ``basic`` pilot alias only. Every other alias continues to resolve from the
 # hard-coded ``policy.py`` tables above via ``_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS``
 # / ``_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS``. No new session_history /
 # routing-decision persistence is introduced here -- selection stays
@@ -417,7 +417,7 @@ from .aawm_alias_routing import audit_persist as _aawm_audit_persist
 from .aawm_alias_routing import audit_events as _aawm_audit_events
 
 # -- snapshot_select facades --
-_READ_PILOT_ALIAS_NAME = _aawm_snapshot_select._READ_PILOT_ALIAS_NAME
+_BASIC_PILOT_ALIAS_NAME = _aawm_snapshot_select._BASIC_PILOT_ALIAS_NAME
 get_active_routing_snapshot = _aawm_snapshot_select.get_active_routing_snapshot
 set_active_routing_snapshot = _aawm_snapshot_select.set_active_routing_snapshot
 _routing_candidate_to_public_dict = _aawm_snapshot_select._routing_candidate_to_public_dict
@@ -430,8 +430,8 @@ _commit_round_robin_selection = _aawm_snapshot_select._commit_round_robin_select
 _apply_snapshot_alias_distribution_strategy = _aawm_snapshot_select._apply_snapshot_alias_distribution_strategy
 _is_tui_attached_candidate_eligible = _aawm_snapshot_select._is_tui_attached_candidate_eligible
 _is_snapshot_candidate_in_schedule_window = _aawm_snapshot_select._is_snapshot_candidate_in_schedule_window
-_resolve_read_pilot_eligible_candidates = _aawm_snapshot_select._resolve_read_pilot_eligible_candidates
-_select_read_pilot_snapshot_candidates = _aawm_snapshot_select._select_read_pilot_snapshot_candidates
+_resolve_basic_pilot_eligible_candidates = _aawm_snapshot_select._resolve_basic_pilot_eligible_candidates
+_select_basic_pilot_snapshot_candidates = _aawm_snapshot_select._select_basic_pilot_snapshot_candidates
 _derive_round_robin_commit_token = _aawm_snapshot_select._derive_round_robin_commit_token
 _get_aawm_alias_selection_context = _aawm_snapshot_select._get_aawm_alias_selection_context
 _resolve_aawm_alias_selection_enumeration = _aawm_snapshot_select._resolve_aawm_alias_selection_enumeration
@@ -480,7 +480,7 @@ _is_openrouter_free_quota_candidate = _aawm_openrouter_quota._is_openrouter_free
 _apply_openrouter_durable_quota_candidate_cooldown = _aawm_openrouter_quota._apply_openrouter_durable_quota_candidate_cooldown
 
 # Wave 5B: gate, cursor, and quota cache are now manager-owned.
-_read_pilot_cooldown_gate = _alias_routing_state.read_pilot_gate
+_basic_pilot_cooldown_gate = _alias_routing_state.basic_pilot_gate
 _round_robin_cursor_by_alias = _alias_routing_state.round_robin_cursor
 
 # Wave 5A/5B: bind the round-robin cursor into snapshot_select.
@@ -493,13 +493,13 @@ _aawm_snapshot_select.configure_snapshot_runtime(
 def reset_module_singletons() -> None:
     """Clear legacy god-module singleton state (test-support).
 
-    Wave 5B moved the read-pilot gate and round-robin cursor onto
+    Wave 5B moved the basic-pilot gate and round-robin cursor onto
     ``AliasRoutingStateManager``. Preserve this helper's historical narrow
     behavior by clearing only those manager-owned surfaces plus the active
     routing snapshot.
     """
-    _read_pilot_cooldown_gate._key_state.clear()
-    _read_pilot_cooldown_gate._family_state.evidence_events_by_key.clear()
+    _basic_pilot_cooldown_gate._key_state.clear()
+    _basic_pilot_cooldown_gate._family_state.evidence_events_by_key.clear()
     _round_robin_cursor_by_alias.clear()
     set_active_routing_snapshot(None)
 
@@ -522,14 +522,16 @@ def _get_anthropic_auto_agent_candidates_for_alias(
     # static branch.  Once failure is published, all aliases return empty.
     if _aawm_snapshot_select._is_alias_config_startup_failed():
         return ()
-    # CFG-002 Finding 1: delegate `read` to the snapshot-aware Anthropic
+    if _aawm_adapter_model_resolution._is_retired_aawm_alias_model(alias_model):
+        return ()
+    # CFG-002 Finding 1: delegate `basic` to the snapshot-aware Anthropic
     # selector so the wrapper derives the same nonzero snapshot-projected
     # candidate enumeration/order as the Anthropic selector, not legacy
-    # table zero.  Returns None in legacy mode (no snapshot read alias),
+    # table zero. Returns None in legacy mode (no active snapshot),
     # falling through to the static table below.
-    if alias_model == _aawm_snapshot_select._READ_PILOT_ALIAS_NAME:
+    if alias_model == _aawm_snapshot_select._BASIC_PILOT_ALIAS_NAME:
         snapshot_candidates = (
-            _aawm_snapshot_select._select_read_pilot_snapshot_candidates_anthropic()
+            _aawm_snapshot_select._select_basic_pilot_snapshot_candidates_anthropic()
         )
         if snapshot_candidates is not None:
             return snapshot_candidates
@@ -1652,7 +1654,7 @@ _aawm_cooldown_apply.configure_cooldown_apply_runtime(
     set_codex_cooldown=lambda *a, **kw: _set_codex_auto_agent_cooldown(*a, **kw),
     set_anthropic_cooldown=lambda *a, **kw: _set_anthropic_auto_agent_cooldown(*a, **kw),
     write_durable_payload=lambda *a, **kw: _aawm_alias_durable.write_aawm_alias_routing_durable_payload(*a, **kw),
-    read_pilot_gate=_read_pilot_cooldown_gate,
+    basic_pilot_gate=_basic_pilot_cooldown_gate,
     state_manager=_alias_routing_state,
 )
 _aawm_cooldown_apply.install(globals())
@@ -1685,7 +1687,7 @@ _aawm_attempt_records.configure_attempt_records_runtime(
     model_cost=litellm.model_cost,
     openai_provider_value=litellm.LlmProviders.OPENAI.value,
     classify_failure=lambda *a, **kw: _aawm_alias_classification.classify_failure(*a, **kw),
-    read_pilot_gate_record=lambda *a, **kw: _read_pilot_cooldown_gate.record(*a, **kw),
+    basic_pilot_gate_record=lambda *a, **kw: _basic_pilot_cooldown_gate.record(*a, **kw),
 )
 _aawm_attempt_records.install(globals())
 
@@ -4047,6 +4049,9 @@ async def anthropic_proxy_route(  # noqa: PLR0915
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None
     if request.method == "POST":
         request_body = await get_request_body(request)
+        _aawm_adapter_model_resolution._reject_retired_aawm_alias_model(
+            request_body.get("model")
+        )
         (
             prepared_request_body,
             expanded_count,

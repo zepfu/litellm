@@ -123,8 +123,8 @@ class TestFacadeIdentity:
 class TestManagerStateOwnership:
     """Gate, cursor, quota are manager-owned; reset clears them; identity preserved."""
 
-    def test_read_pilot_gate_is_manager_owned(self):
-        assert lpe._read_pilot_cooldown_gate is alias_routing_state.read_pilot_gate
+    def test_basic_pilot_gate_is_manager_owned(self):
+        assert lpe._basic_pilot_cooldown_gate is alias_routing_state.basic_pilot_gate
 
     def test_round_robin_cursor_is_manager_owned(self):
         assert lpe._round_robin_cursor_by_alias is alias_routing_state.round_robin_cursor
@@ -150,13 +150,13 @@ class TestManagerStateOwnership:
     def test_reset_clears_gate_cursor_quota(self):
         mgr = alias_routing_state
         # Seed state
-        mgr.read_pilot_gate._key_state["test_key"] = {"count": 1}
+        mgr.basic_pilot_gate._key_state["test_key"] = {"count": 1}
         mgr.round_robin_cursor[("epoch", "alias")] = 5
         mgr.set_openrouter_free_quota_cache((10.0, 20.0))
         # Reset
         mgr.reset_for_tests()
         # Verify cleared
-        assert len(mgr.read_pilot_gate._key_state) == 0
+        assert len(mgr.basic_pilot_gate._key_state) == 0
         assert len(mgr.round_robin_cursor) == 0
         assert mgr.get_openrouter_free_quota_cache() == (None, 0.0)
 
@@ -164,12 +164,12 @@ class TestManagerStateOwnership:
         """Dicts are cleared in place, never reassigned."""
         mgr = alias_routing_state
         cursor_ref = mgr.round_robin_cursor
-        gate_ks_ref = mgr.read_pilot_gate._key_state
+        gate_ks_ref = mgr.basic_pilot_gate._key_state
         lock_ref = mgr.openrouter_free_quota_lock
         codex_cd_ref = mgr.codex.cooldown_until_monotonic_by_key
         mgr.reset_for_tests()
         assert mgr.round_robin_cursor is cursor_ref
-        assert mgr.read_pilot_gate._key_state is gate_ks_ref
+        assert mgr.basic_pilot_gate._key_state is gate_ks_ref
         assert mgr.openrouter_free_quota_lock is lock_ref
         assert mgr.codex.cooldown_until_monotonic_by_key is codex_cd_ref
 
@@ -189,8 +189,8 @@ class TestManagerStateOwnership:
             mgr.codex.session_affinity_by_key[affinity_key] = {
                 "provider": "openai"
             }
-            mgr.read_pilot_gate._key_state["gate-key"] = {"count": 1}
-            mgr.read_pilot_gate._family_state.evidence_events_by_key[
+            mgr.basic_pilot_gate._key_state["gate-key"] = {"count": 1}
+            mgr.basic_pilot_gate._family_state.evidence_events_by_key[
                 "evidence-key"
             ] = []
             mgr.round_robin_cursor[("epoch", "alias")] = 3
@@ -200,8 +200,8 @@ class TestManagerStateOwnership:
 
             assert cooldown_key in mgr.codex.cooldown_until_monotonic_by_key
             assert affinity_key in mgr.codex.session_affinity_by_key
-            assert not mgr.read_pilot_gate._key_state
-            assert not mgr.read_pilot_gate._family_state.evidence_events_by_key
+            assert not mgr.basic_pilot_gate._key_state
+            assert not mgr.basic_pilot_gate._family_state.evidence_events_by_key
             assert not mgr.round_robin_cursor
             assert lpe.get_active_routing_snapshot() is None
         finally:
@@ -211,7 +211,7 @@ class TestManagerStateOwnership:
         mgr = alias_routing_state
         mgr.codex.cooldown_until_monotonic_by_key["cooldown"] = 123.0
         mgr.codex.session_affinity_by_key["affinity"] = {"provider": "openai"}
-        mgr.read_pilot_gate._key_state["gate-key"] = {"count": 1}
+        mgr.basic_pilot_gate._key_state["gate-key"] = {"count": 1}
         mgr.round_robin_cursor[("epoch", "alias")] = 3
         mgr.set_openrouter_free_quota_cache((42.0, 99.0))
         lpe.set_active_routing_snapshot(object())
@@ -220,16 +220,16 @@ class TestManagerStateOwnership:
 
         assert not mgr.codex.cooldown_until_monotonic_by_key
         assert not mgr.codex.session_affinity_by_key
-        assert not mgr.read_pilot_gate._key_state
+        assert not mgr.basic_pilot_gate._key_state
         assert not mgr.round_robin_cursor
         assert mgr.get_openrouter_free_quota_cache() == (None, 0.0)
         assert lpe.get_active_routing_snapshot() is None
 
     def test_fresh_manager_has_separate_gate_family_state(self):
-        """The read-pilot gate uses its own AliasFamilyState, not codex/anthropic."""
+        """The basic-pilot gate uses its own AliasFamilyState, not codex/anthropic."""
         mgr = AliasRoutingStateManager()
-        assert mgr.read_pilot_gate._family_state is not mgr.codex
-        assert mgr.read_pilot_gate._family_state is not mgr.anthropic
+        assert mgr.basic_pilot_gate._family_state is not mgr.codex
+        assert mgr.basic_pilot_gate._family_state is not mgr.anthropic
 
 
 # ===========================================================================

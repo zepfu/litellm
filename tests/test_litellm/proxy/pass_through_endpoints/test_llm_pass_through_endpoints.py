@@ -956,14 +956,14 @@ class TestResponsesAdapterToolChoice:
 
     def test_applies_aawm_read_agent_guidance_to_codex_read_alias(self):
         request_body = {
-            "model": "aawm-read",
+            "model": "basic",
             "instructions": "Existing instructions.",
             "litellm_metadata": {"tags": ["existing-tag"]},
         }
 
         updated_body, guidance_metadata = _apply_aawm_read_agent_guidance_to_request_body(
             request_body,
-            alias_model="aawm-read",
+            alias_model="basic",
             target_field="instructions",
         )
 
@@ -977,12 +977,12 @@ class TestResponsesAdapterToolChoice:
             "existing-tag",
             "aawm-read-agent-guidance",
             ("aawm-read-agent-guidance:" f"{_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION}"),
-            "aawm-read-agent-guidance-alias:aawm-read",
+            "aawm-read-agent-guidance-alias:basic",
         ]
         assert litellm_metadata["aawm_read_agent_guidance_policy_name"] == _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME
         assert litellm_metadata["aawm_read_agent_guidance_policy_version"] == _AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION
         assert litellm_metadata["aawm_read_agent_guidance_applied"] is True
-        assert litellm_metadata["aawm_read_agent_guidance_alias"] == "aawm-read"
+        assert litellm_metadata["aawm_read_agent_guidance_alias"] == "basic"
         assert litellm_metadata["aawm_read_agent_guidance_target_field"] == "instructions"
         read_guidance_spans = [
             span for span in litellm_metadata["langfuse_spans"] if span["name"] == "aawm.read_agent_guidance"
@@ -1000,7 +1000,7 @@ class TestResponsesAdapterToolChoice:
             "aawm_read_agent_guidance_policy_name": (_AAWM_READ_AGENT_GUIDANCE_POLICY_NAME),
             "aawm_read_agent_guidance_policy_version": (_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION),
             "aawm_read_agent_guidance_applied": True,
-            "aawm_read_agent_guidance_alias": "aawm-read",
+            "aawm_read_agent_guidance_alias": "basic",
             "aawm_read_agent_guidance_target_field": "instructions",
             "aawm_read_agent_guidance_original_chars": len("Existing instructions."),
             "aawm_read_agent_guidance_prompt_chars": len(_AAWM_READ_AGENT_GUIDANCE_PROMPT),
@@ -1008,7 +1008,7 @@ class TestResponsesAdapterToolChoice:
 
         second_body, second_metadata = _apply_aawm_read_agent_guidance_to_request_body(
             updated_body,
-            alias_model="aawm-read",
+            alias_model="basic",
             target_field="instructions",
         )
         assert second_body is updated_body
@@ -1016,14 +1016,14 @@ class TestResponsesAdapterToolChoice:
 
     def test_applies_aawm_read_agent_guidance_to_anthropic_read_alias_system(self):
         request_body = {
-            "model": "aawm-read-anthropic",
+            "model": "basic",
             "system": "Existing system.",
             "litellm_metadata": {"tags": ["existing-tag"]},
         }
 
         updated_body, guidance_metadata = _apply_aawm_read_agent_guidance_to_request_body(
             request_body,
-            alias_model="aawm-read-anthropic",
+            alias_model="basic",
             target_field="system",
         )
 
@@ -1033,21 +1033,21 @@ class TestResponsesAdapterToolChoice:
         assert "No files were modified." in updated_body["system"]
         litellm_metadata = updated_body["litellm_metadata"]
         assert "aawm-read-agent-guidance" in litellm_metadata["tags"]
-        assert "aawm-read-agent-guidance-alias:aawm-read-anthropic" in litellm_metadata["tags"]
+        assert "aawm-read-agent-guidance-alias:basic" in litellm_metadata["tags"]
         assert litellm_metadata["aawm_read_agent_guidance_policy_name"] == _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME
-        assert litellm_metadata["aawm_read_agent_guidance_alias"] == "aawm-read-anthropic"
+        assert litellm_metadata["aawm_read_agent_guidance_alias"] == "basic"
         assert litellm_metadata["aawm_read_agent_guidance_target_field"] == "system"
         assert guidance_metadata["aawm_read_agent_guidance_applied"] is True
 
     def test_appends_aawm_read_agent_guidance_to_anthropic_system_blocks(self):
         request_body = {
-            "model": "aawm-read-anthropic",
+            "model": "basic",
             "system": [{"type": "text", "text": "Existing system."}],
         }
 
         updated_body, guidance_metadata = _apply_aawm_read_agent_guidance_to_request_body(
             request_body,
-            alias_model="aawm-read-anthropic",
+            alias_model="basic",
             target_field="system",
         )
 
@@ -1060,16 +1060,16 @@ class TestResponsesAdapterToolChoice:
     @pytest.mark.parametrize(
         ("alias_model", "target_field"),
         [
-            ("aawm-codex-agent-auto", "instructions"),
-            ("aawm-sota", "instructions"),
-            ("aawm-code", "instructions"),
-            ("aawm-low", "instructions"),
-            ("aawm-orchestration", "instructions"),
-            ("aawm-anthropic-agent-auto", "system"),
-            ("aawm-sota-anthropic", "system"),
-            ("aawm-code-anthropic", "system"),
-            ("aawm-low-anthropic", "system"),
-            ("aawm-orchestration-anthropic", "system"),
+            ("basic", "instructions"),
+            ("sota", "instructions"),
+            ("work", "instructions"),
+            ("basic", "instructions"),
+            ("work", "instructions"),
+            ("basic", "system"),
+            ("sota", "system"),
+            ("work", "system"),
+            ("basic", "system"),
+            ("work", "system"),
         ],
     )
     def test_skips_aawm_read_agent_guidance_for_non_read_aliases(
@@ -2334,7 +2334,7 @@ class TestPassThroughRequestRetryableFailures:
         parsed_body = {
             "model": "claude-sonnet-4-6",
             "litellm_metadata": {
-                "requested_model_alias": "aawm-code-anthropic",
+                "requested_model_alias": "work",
                 "passthrough_route_family": "anthropic_grok_native_responses_adapter",
                 "trace_id": "trace-123",
                 "provider": "anthropic",
@@ -2401,7 +2401,7 @@ class TestPassThroughRequestRetryableFailures:
             "upstream_url": "https://cli-chat-proxy.grok.com/v1/traces",
             "provider": "xai",
             "model": "claude-sonnet-4-6",
-            "model_alias": "aawm-code-anthropic",
+            "model_alias": "work",
             "route_family": "grok_cli_chat_proxy",
             "status_code": 400,
             "auth_header_names": [],
@@ -2597,7 +2597,7 @@ class TestPassThroughRequestRetryableFailures:
         custom_body = {
             "model": "grok-composer-2.5-fast",
             "litellm_metadata": {
-                "requested_model_alias": "aawm-code-anthropic",
+                "requested_model_alias": "work",
                 "passthrough_route_family": "grok_cli_chat_proxy",
                 "trace_id": "trace-xyz",
                 "custom_llm_provider": "xai",
@@ -2653,7 +2653,7 @@ class TestPassThroughRequestRetryableFailures:
         assert payload["context"]["upstream_url"] == target_url
         assert payload["context"]["provider"] == "xai"
         assert payload["context"]["model"] == "grok-composer-2.5-fast"
-        assert payload["context"]["model_alias"] == "aawm-code-anthropic"
+        assert payload["context"]["model_alias"] == "work"
         assert payload["context"]["route_family"] == "grok_cli_chat_proxy"
         assert payload["context"]["status_code"] == 400
         assert payload["context"]["trace_id"] == "trace-xyz"
@@ -2674,7 +2674,7 @@ class TestPassThroughRequestRetryableFailures:
             "upstream_url": target_url,
             "provider": "xai",
             "model": "grok-composer-2.5-fast",
-            "model_alias": "aawm-code-anthropic",
+            "model_alias": "work",
             "route_family": "grok_cli_chat_proxy",
             "status_code": 504,
             "trace_id": "trace-stream-timeout",
@@ -2840,7 +2840,7 @@ class TestPassThroughRequestRetryableFailures:
             "upstream_url": target_url,
             "provider": "openai",
             "model": "gpt-5.4-mini",
-            "model_alias": "aawm-low",
+            "model_alias": "basic",
             "route_family": "codex_responses",
             "status_code": None,
             "trace_id": "trace-codex-after-first-byte",
@@ -2896,7 +2896,7 @@ class TestPassThroughRequestRetryableFailures:
                         "group_header_label": "Codex/litellm",
                         "incoming_endpoint": "/openai_passthrough/responses",
                         "outgoing_target": target_url,
-                        "model_label": "aawm-low",
+                        "model_label": "basic",
                     }
                 }
             }
@@ -2929,10 +2929,10 @@ class TestPassThroughRequestRetryableFailures:
         assert b"data: [DONE]" in combined
         assert status_events
         assert status_events[0]["status"] == "Failed"
-        assert status_events[0]["alias_model"] == "aawm-low"
+        assert status_events[0]["alias_model"] == "basic"
         assert rollup_events
         assert rollup_events[0]["status"] == "Failed"
-        assert rollup_events[0]["model_label"] == "aawm-low"
+        assert rollup_events[0]["model_label"] == "basic"
         assert streaming_logger_calls == []
 
     @pytest.mark.asyncio
@@ -2949,7 +2949,7 @@ class TestPassThroughRequestRetryableFailures:
             "upstream_url": target_url,
             "provider": "openai",
             "model": "gpt-5.5",
-            "model_alias": "aawm-code",
+            "model_alias": "work",
             "route_family": "codex_responses",
             "status_code": None,
             "trace_id": "trace-stream-logging",
@@ -2959,7 +2959,7 @@ class TestPassThroughRequestRetryableFailures:
             "litellm_call_id": "call-stream-logging",
             "litellm_params": {
                 "metadata": {
-                    "requested_model_alias": "aawm-code",
+                    "requested_model_alias": "work",
                     "passthrough_route_family": "codex_responses",
                 }
             },
@@ -3031,7 +3031,7 @@ class TestPassThroughRequestRetryableFailures:
             "upstream_url": target_url,
             "provider": "anthropic",
             "model": "claude-3-5-sonnet-20240620",
-            "model_alias": "aawm-code-anthropic",
+            "model_alias": "work",
             "route_family": "anthropic",
             "status_code": None,
             "trace_id": "trace-anthropic-overload",
@@ -3107,7 +3107,7 @@ class TestPassThroughRequestRetryableFailures:
         custom_body = {
             "model": "grok-composer-2.5-fast",
             "litellm_metadata": {
-                "requested_model_alias": "aawm-code-anthropic",
+                "requested_model_alias": "work",
                 "passthrough_route_family": "grok_cli_chat_proxy",
                 "trace_id": "trace-timeout",
                 "custom_llm_provider": "xai",
@@ -3167,7 +3167,7 @@ class TestPassThroughRequestRetryableFailures:
         assert payload["context"]["status_code"] == 504
         assert payload["context"]["provider"] == "xai"
         assert payload["context"]["model"] == "grok-composer-2.5-fast"
-        assert payload["context"]["model_alias"] == "aawm-code-anthropic"
+        assert payload["context"]["model_alias"] == "work"
         assert payload["context"]["route_family"] == "grok_cli_chat_proxy"
         assert payload["context"]["failure_kind"] == "transient_provider_connectivity"
         assert payload["context"]["hidden_retry_final_outcome"] == "failed_after_retry"
@@ -3189,7 +3189,7 @@ class TestPassThroughRequestRetryableFailures:
             "model": "grok-composer-2.5-fast",
             "stream": True,
             "litellm_metadata": {
-                "requested_model_alias": "aawm-code-anthropic",
+                "requested_model_alias": "work",
                 "passthrough_route_family": "grok_cli_chat_proxy",
                 "trace_id": "trace-stream-setup-timeout",
                 "custom_llm_provider": "xai",
@@ -3486,7 +3486,7 @@ class TestPassThroughRequestRetryableFailures:
             "litellm_metadata": {
                 "session_id": "session-abc",
                 "repository": "/home/zepfu/projects/litellm",
-                "requested_model_alias": "aawm-code",
+                "requested_model_alias": "work",
                 "passthrough_route_family": "codex_responses",
             },
         }
@@ -4137,29 +4137,29 @@ class TestOpenRouterAdapterRetry:
                 assert info["supports_max_reasoning_effort"] is True
 
     def test_codex_aawm_alias_candidate_model_order(self):
-        assert [candidate["model"] for candidate in _get_codex_auto_agent_candidates_for_alias("aawm-sota")] == [
+        assert [candidate["model"] for candidate in _get_codex_auto_agent_candidates_for_alias("sota")] == [
             "gpt-5.6-sol",
             "gpt-5.5",
         ]
         assert [
-            candidate["model"] for candidate in _get_codex_auto_agent_candidates_for_alias("aawm-orchestration")
+            candidate["model"] for candidate in _get_codex_auto_agent_candidates_for_alias("work")
         ] == ["gpt-5.6-terra", "gpt-5.5"]
-        assert [candidate["model"] for candidate in _get_codex_auto_agent_candidates_for_alias("aawm-sota-openai")] == [
+        assert [candidate["model"] for candidate in _get_codex_auto_agent_candidates_for_alias("sota-openai")] == [
             "gpt-5.6-sol",
             "gpt-5.5",
         ]
-        assert [candidate["model"] for candidate in _get_codex_auto_agent_candidates_for_alias("aawm-sota-xai")] == [
+        assert [candidate["model"] for candidate in _get_codex_auto_agent_candidates_for_alias("sota-xai")] == [
             "oa_xai/grok-4.5",
             "grok-4.5",
             "grok-build",
         ]
-        sota_xai = _get_codex_auto_agent_candidates_for_alias("aawm-sota-xai")
+        sota_xai = _get_codex_auto_agent_candidates_for_alias("sota-xai")
         assert sota_xai[0]["route_family"] == "codex_xai_oauth_responses_adapter"
         assert sota_xai[1]["route_family"] == "codex_grok_native_responses_adapter"
         assert sota_xai[2]["last_resort"] is True
         assert "expected_candidate_unavailable_cooldown_seconds" not in sota_xai[0]
         assert "expected_candidate_unavailable_cooldown_seconds" not in sota_xai[1]
-        assert [candidate["model"] for candidate in _get_codex_auto_agent_candidates_for_alias("aawm-code")] == [
+        assert [candidate["model"] for candidate in _get_codex_auto_agent_candidates_for_alias("work")] == [
             "gpt-5.3-codex-spark",
             "xai/grok-4.5",
             "grok-composer-2.5-fast",
@@ -4167,7 +4167,7 @@ class TestOpenRouterAdapterRetry:
             "gpt-5.6-terra",
             "gpt-5.5",
         ]
-        code = _get_codex_auto_agent_candidates_for_alias("aawm-code")
+        code = _get_codex_auto_agent_candidates_for_alias("work")
         grok45 = code[1]
         assert grok45["model"] == "xai/grok-4.5"
         assert grok45["route_family"] == "codex_grok_native_responses_adapter"
@@ -5176,7 +5176,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
             "litellm_metadata": {
                 "client_name": "codex_exec",
                 "passthrough_route_family": "codex_responses",
-                "requested_model_alias": "aawm-low",
+                "requested_model_alias": "basic",
                 "tags": ["route:codex_responses"],
             },
         }
@@ -5255,7 +5255,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         flushed = flush_aawm_route_rollups(force=True)
         rendered = "\n".join(flushed)
         assert "Codex[0.0.0] /openai_passthrough/responses" in rendered
-        assert " - big-pickle(aawm-low) - Turns: 1 -> opencode.ai/zen/v1/chat/completions" in rendered
+        assert " - big-pickle(basic) - Turns: 1 -> opencode.ai/zen/v1/chat/completions" in rendered
         clear_aawm_route_rollups()
 
     @pytest.mark.asyncio
@@ -5421,7 +5421,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
                 "client_name": "codex_exec",
                 "passthrough_route_family": "codex_responses",
                 "tags": ["route:codex_responses"],
-                "requested_model_alias": "aawm-low",
+                "requested_model_alias": "basic",
             },
         }
         fake_stream_wrapper = object()
@@ -5523,7 +5523,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         rendered = "\n".join(flushed)
         assert "Codex[0.0.0] /openai_passthrough/responses" in rendered
         assert (
-            " - openrouter/cohere/north-mini-code:free(aawm-low) - Turns: 1 -> openrouter.ai/api/v1/chat/completions"
+            " - openrouter/cohere/north-mini-code:free(basic) - Turns: 1 -> openrouter.ai/api/v1/chat/completions"
             in rendered
         )
         clear_aawm_route_rollups()
@@ -5985,14 +5985,14 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
     ):
         request = _build_codex_auto_agent_request()
         body = {
-            "model": "aawm-low",
+            "model": "basic",
             "input": "hello",
             "stream": False,
             "litellm_metadata": {"session_id": "codex-session"},
         }
         monkeypatch.setitem(
             _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-            "aawm-low",
+            "basic",
             (
                 {
                     "provider": "openrouter",
@@ -6064,7 +6064,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
     ):
         request = _build_codex_auto_agent_request()
         body = {
-            "model": "aawm-low",
+            "model": "basic",
             "input": "hello",
             "stream": False,
             "litellm_metadata": {
@@ -6074,7 +6074,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         }
         monkeypatch.setitem(
             _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-            "aawm-low",
+            "basic",
             (
                 {
                     "provider": "openrouter",
@@ -6138,7 +6138,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
     ):
         request = _build_codex_auto_agent_request()
         body = {
-            "model": "aawm-low",
+            "model": "basic",
             "input": "hello",
             "stream": False,
             "litellm_metadata": {
@@ -6148,7 +6148,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         }
         monkeypatch.setitem(
             _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-            "aawm-low",
+            "basic",
             (
                 {
                     "provider": "openrouter",
@@ -11587,7 +11587,7 @@ def test_codex_spawn_agent_tool_description_patch_replaces_restrictive_policy():
     }
     patched_description = updated_body["tools"][0]["description"]
     assert "Use subagents to parallelize independent work" in patched_description
-    assert "aawm-codex-agent-auto" in patched_description
+    assert "basic" in patched_description
     assert 'fork_turns="none"' in patched_description
     assert "fork_context" not in patched_description
     assert "read-only payload does not apply" in patched_description
@@ -11671,7 +11671,7 @@ def test_codex_spawn_agent_tool_patch_adds_function_payload_schema_fields():
     assert schema_event["fields_removed"] == ["fork_context"]
 
     function = updated_body["tools"][0]["function"]
-    assert "aawm-codex-agent-auto" in function["description"]
+    assert "basic" in function["description"]
     properties = function["parameters"]["properties"]
     assert properties["agent_type"]["type"] == "string"
     assert properties["model"]["type"] == "string"
@@ -13394,11 +13394,11 @@ def clear_codex_auto_agent_alias_state(monkeypatch):
     for candidate_map, aliases in (
         (
             _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-            ("aawm-code", "aawm-low"),
+            ("work", "basic"),
         ),
         (
             _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-            ("aawm-code-anthropic", "aawm-low-anthropic"),
+            ("work", "basic"),
         ),
     ):
         for alias in aliases:
@@ -13422,12 +13422,12 @@ def clear_codex_auto_agent_alias_state(monkeypatch):
 @pytest.mark.parametrize(
     "alias",
     [
-        "aawm-codex-agent-auto",
-        "aawm-read",
-        "aawm-sota",
-        "aawm-code",
-        "aawm-low",
-        "aawm-orchestration",
+        "basic",
+        "basic",
+        "sota",
+        "work",
+        "basic",
+        "work",
     ],
 )
 def test_resolve_codex_auto_agent_alias_model_only_for_responses(alias):
@@ -13483,7 +13483,7 @@ def _build_anthropic_auto_agent_request(session_id: str = "claude-session"):
 
 def _build_anthropic_auto_agent_body(session_id: str = "claude-session"):
     return {
-        "model": "aawm-anthropic-agent-auto",
+        "model": "basic",
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 64,
         "stream": False,
@@ -13558,12 +13558,12 @@ def test_persist_auto_agent_alias_audit_only_events_best_effort_spools_with_reas
             "model": "gpt-5.3-codex-spark",
             "litellm_call_id": "call-001",
             "session_id": "session-001",
-            "alias_model": "aawm-anthropic-agent-auto",
+            "alias_model": "basic",
         },
     ]
     request_body = {
         "litellm_metadata": {
-            "requested_model_alias": "aawm-anthropic-agent-auto",
+            "requested_model_alias": "basic",
             "model_alias_label": "aawm-anthropic-agent-auto-label",
             "repository": "litellm",
             "trace_id": "trace-001",
@@ -13598,7 +13598,7 @@ def test_persist_auto_agent_alias_audit_only_events_best_effort_spools_with_reas
     assert records[0]["litellm_call_id"] == "call-001"
     assert records[0]["model"] == "gpt-5.3-codex-spark"
     assert records[0]["provider"] == "openai"
-    assert records[0]["metadata"]["requested_model_alias"] == "aawm-anthropic-agent-auto"
+    assert records[0]["metadata"]["requested_model_alias"] == "basic"
     assert records[0]["metadata"]["model_alias_label"] == "aawm-anthropic-agent-auto-label"
     assert records[0]["metadata"]["repository"] == "litellm"
     assert mock_spool.call_count == 1
@@ -13615,7 +13615,7 @@ def test_persist_auto_agent_alias_audit_only_events_best_effort_falls_back_to_en
             "model": "gpt-5.3-codex-spark",
             "session_id": "session-spool-fallback",
             "litellm_call_id": "call-fallback",
-            "alias_model": "aawm-anthropic-agent-auto",
+            "alias_model": "basic",
         }
     ]
     enqueued: list[dict[str, Any]] = []
@@ -13640,7 +13640,7 @@ def test_persist_auto_agent_alias_audit_only_events_best_effort_falls_back_to_en
     warnings = " ".join(_format_warning_messages(mock_warning))
     assert "AAWM_ALIAS_ROUTE: failed to spool terminal alias audit event" in warnings
     assert "queue_disposition=spool_failed" in warnings
-    assert "alias=aawm-anthropic-agent-auto" in warnings
+    assert "alias=basic" in warnings
     assert "session_id_hash=" in warnings
     assert "litellm_call_id_hash=" in warnings
     assert "session-spool-fallback" not in warnings
@@ -13660,7 +13660,7 @@ def test_persist_auto_agent_alias_audit_only_events_best_effort_total_failure_sa
             "session_id": "sensitive-session-id",
             "litellm_call_id": "sensitive-call-id",
             "trace_id": "sensitive-trace-id",
-            "alias_model": "aawm-anthropic-agent-auto",
+            "alias_model": "basic",
         }
     ]
 
@@ -13682,7 +13682,7 @@ def test_persist_auto_agent_alias_audit_only_events_best_effort_total_failure_sa
     assert "sensitive-session-id" not in warnings
     assert "sensitive-call-id" not in warnings
     assert "sensitive-trace-id" not in warnings
-    assert "alias=aawm-anthropic-agent-auto" in warnings
+    assert "alias=basic" in warnings
     assert "spool_exception_class=ValueError" in warnings
     assert "enqueue_exception_class=KeyError" in warnings
     assert "event_count=1" in warnings
@@ -13737,7 +13737,7 @@ def test_persist_auto_agent_alias_audit_only_events_best_effort_build_failure_is
     events = [
         {
             "event_type": "redispatch required\nunsafe",
-            "alias_model": "aawm-code-anthropic",
+            "alias_model": "work",
             "session_id": "sensitive-build-session",
             "litellm_call_id": "sensitive-build-call",
         }
@@ -13755,7 +13755,7 @@ def test_persist_auto_agent_alias_audit_only_events_best_effort_build_failure_is
     warnings = " ".join(_format_warning_messages(mock_warning))
     assert "persistence_disposition=fail_build" in warnings
     assert "exception_class=ValueError" in warnings
-    assert "alias=aawm-code-anthropic" in warnings
+    assert "alias=work" in warnings
     assert "event_types=[redispatch_required_unsafe]" in warnings
     assert "event_count=1" in warnings
     assert "sensitive-build-session" not in warnings
@@ -13766,12 +13766,12 @@ def test_persist_auto_agent_alias_audit_only_events_best_effort_build_failure_is
 @pytest.mark.parametrize(
     "alias",
     [
-        "aawm-anthropic-agent-auto",
-        "aawm-read-anthropic",
-        "aawm-sota-anthropic",
-        "aawm-code-anthropic",
-        "aawm-low-anthropic",
-        "aawm-orchestration-anthropic",
+        "basic",
+        "basic",
+        "sota",
+        "work",
+        "basic",
+        "work",
     ],
 )
 def test_resolve_anthropic_auto_agent_alias_model_only_for_messages(alias):
@@ -13839,7 +13839,7 @@ async def test_anthropic_auto_agent_alias_selects_spark_first(monkeypatch):
 async def test_anthropic_read_agent_alias_uses_auto_candidates_and_metadata(monkeypatch):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body['model'] = 'aawm-read-anthropic'
+    body['model'] = 'basic'
     selection = await _select_anthropic_auto_agent_candidate(request=request, request_body=body)
     assert selection['candidate']['provider'] == 'openai'
     assert selection['candidate']['model'] == 'gpt-5.3-codex-spark'
@@ -13847,23 +13847,23 @@ async def test_anthropic_read_agent_alias_uses_auto_candidates_and_metadata(monk
     updated_body = _add_anthropic_auto_agent_alias_metadata(body, request=request, selection=selection, attempts=[{'provider': 'openai', 'model': 'gpt-5.3-codex-spark', 'route_family': 'anthropic_openai_responses_adapter', 'last_resort': False, 'lane_key': '__default__', 'reason': 'first_available'}])
     metadata = updated_body['litellm_metadata']
     assert updated_body['model'] == 'gpt-5.3-codex-spark'
-    assert metadata['model_alias_label'] == 'aawm-read-anthropic'
-    assert metadata['requested_model_alias'] == 'aawm-read-anthropic'
-    assert metadata['anthropic_auto_agent_alias'] == 'aawm-read-anthropic'
+    assert metadata['model_alias_label'] == 'basic'
+    assert metadata['requested_model_alias'] == 'basic'
+    assert metadata['anthropic_auto_agent_alias'] == 'basic'
     assert metadata['anthropic_auto_agent_selected_provider'] == 'openai'
     assert metadata['anthropic_auto_agent_selected_route_family'] == 'anthropic_openai_responses_adapter'
     audit_events = metadata['aawm_alias_routing_audit_events']
     assert audit_events == metadata['anthropic_auto_agent_audit_events']
     assert audit_events[0]['alias_family'] == 'anthropic_auto_agent'
-    assert audit_events[0]['alias_model'] == 'aawm-read-anthropic'
+    assert audit_events[0]['alias_model'] == 'basic'
     assert audit_events[0]['session_id'] == 'claude-session'
     assert audit_events[0]['provider'] == 'openai'
     assert audit_events[0]['model'] == 'gpt-5.3-codex-spark'
     assert audit_events[0]['event_type'] == 'candidate_selected'
     assert audit_events[0]['selected'] is True
     assert audit_events[0]['attempt_number'] == 1
-    assert 'model-alias:aawm-read-anthropic' in metadata['tags']
-    assert 'anthropic-auto-agent-alias:aawm-read-anthropic' in metadata['tags']
+    assert 'model-alias:basic' in metadata['tags']
+    assert 'anthropic-auto-agent-alias:basic' in metadata['tags']
 
 
 
@@ -13871,7 +13871,7 @@ async def test_anthropic_read_agent_alias_uses_auto_candidates_and_metadata(monk
 async def test_anthropic_auto_agent_alias_sota_selects_fable_first():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body['model'] = 'aawm-sota-anthropic'
+    body['model'] = 'sota'
     selection = await _select_anthropic_auto_agent_candidate(request=request, request_body=body)
     assert selection['candidate']['provider'] == 'anthropic'
     assert selection['candidate']['model'] == 'claude-fable-5'
@@ -13884,7 +13884,7 @@ async def test_anthropic_auto_agent_alias_sota_selects_fable_first():
 async def test_anthropic_auto_agent_alias_sota_falls_through_fable_to_opus():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body['model'] = 'aawm-sota-anthropic'
+    body['model'] = 'sota'
     selection = await _select_anthropic_auto_agent_candidate(request=request, request_body=body)
     assert selection['candidate']['model'] == 'claude-fable-5'
     await _set_anthropic_auto_agent_cooldown(selection['cooldown_key'], 60.0)
@@ -13899,7 +13899,7 @@ async def test_anthropic_auto_agent_alias_sota_falls_through_fable_to_opus():
 async def test_anthropic_auto_agent_alias_sota_all_candidates_cooling_down():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body['model'] = 'aawm-sota-anthropic'
+    body['model'] = 'sota'
     for model in ('claude-fable-5', 'claude-opus-4-8[1m]'):
         await _set_anthropic_auto_agent_cooldown(f'anthropic:{model}:__default__', 60.0)
     with pytest.raises(HTTPException) as exc_info:
@@ -13914,7 +13914,7 @@ async def test_anthropic_auto_agent_alias_sota_all_candidates_cooling_down():
 async def test_anthropic_auto_agent_alias_orchestration_selects_opus_4_8():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body['model'] = 'aawm-orchestration-anthropic'
+    body['model'] = 'work'
     selection = await _select_anthropic_auto_agent_candidate(request=request, request_body=body)
     assert selection['candidate']['provider'] == 'anthropic'
     assert selection['candidate']['model'] == 'claude-opus-4-8[1m]'
@@ -13929,7 +13929,7 @@ async def test_anthropic_auto_agent_alias_orchestration_selects_opus_4_8():
 async def test_anthropic_auto_agent_alias_orchestration_all_candidates_cooling_down():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body['model'] = 'aawm-orchestration-anthropic'
+    body['model'] = 'work'
     await _set_anthropic_auto_agent_cooldown('anthropic:claude-opus-4-8[1m]:__default__', 60.0)
     with pytest.raises(HTTPException) as exc_info:
         await _select_anthropic_auto_agent_candidate(request=request, request_body=body)
@@ -13943,7 +13943,7 @@ async def test_anthropic_auto_agent_alias_orchestration_all_candidates_cooling_d
 async def test_anthropic_auto_agent_alias_code_selects_spark_first():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
 
     selection = await _select_anthropic_auto_agent_candidate(
         request=request,
@@ -13960,7 +13960,7 @@ async def test_anthropic_auto_agent_alias_code_selects_spark_first():
 async def test_anthropic_code_anthropic_skips_spark_when_codex_family_cooldown_active():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     spark_cooldown_key = "openai:gpt-5.3-codex-spark:__default__"
     await _set_codex_auto_agent_cooldown(spark_cooldown_key, 120.0)
 
@@ -13982,7 +13982,7 @@ async def test_anthropic_code_anthropic_skips_spark_when_codex_family_cooldown_a
 async def test_anthropic_code_anthropic_merged_spark_cooldown_prefers_longer_family():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     spark_cooldown_key = "openai:gpt-5.3-codex-spark:__default__"
     await _set_anthropic_auto_agent_cooldown(spark_cooldown_key, 30.0)
     await _set_codex_auto_agent_cooldown(spark_cooldown_key, 90.0)
@@ -14002,7 +14002,7 @@ async def test_anthropic_code_anthropic_merged_spark_cooldown_prefers_longer_fam
 async def test_anthropic_auto_agent_alias_code_falls_through_ordered_candidates():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     expected_candidates = [
         (
             "openai",
@@ -14052,7 +14052,7 @@ async def test_anthropic_auto_agent_alias_code_falls_through_ordered_candidates(
 def test_anthropic_auto_agent_alias_metadata_uses_requested_alias():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     updated_body = _add_anthropic_auto_agent_alias_metadata(
         body,
         request=request,
@@ -14071,24 +14071,24 @@ def test_anthropic_auto_agent_alias_metadata_uses_requested_alias():
     )
 
     metadata = updated_body["litellm_metadata"]
-    assert metadata["model_alias_label"] == "aawm-code-anthropic"
-    assert metadata["requested_model_alias"] == "aawm-code-anthropic"
-    assert metadata["anthropic_auto_agent_alias"] == "aawm-code-anthropic"
+    assert metadata["model_alias_label"] == "work"
+    assert metadata["requested_model_alias"] == "work"
+    assert metadata["anthropic_auto_agent_alias"] == "work"
     audit_events = metadata["aawm_alias_routing_audit_events"]
     assert len(audit_events) == 1
     assert audit_events[0]["event_type"] == "candidate_selected"
     assert audit_events[0]["provider"] == "openai"
     assert audit_events[0]["model"] == "gpt-5.3-codex-spark"
-    assert "model-alias:aawm-code-anthropic" in metadata["tags"]
+    assert "model-alias:work" in metadata["tags"]
 
 
 @pytest.mark.asyncio
 async def test_anthropic_auto_agent_alias_session_affinity_reports_routing_state_sources():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body['model'] = 'aawm-code-anthropic'
+    body['model'] = 'work'
     body['messages'].append({'role': 'assistant', 'content': [{'type': 'tool_use', 'id': 'toolu_existing', 'name': 'Read', 'input': {'path': '/tmp/example'}}]})
-    session_key = 'aawm-code-anthropic:claude-session:session:claude-session'
+    session_key = 'work:claude-session:session:claude-session'
     candidate = {'provider': 'openai', 'model': 'gpt-5.3-codex-spark', 'route_family': 'anthropic_openai_responses_adapter', 'last_resort': False}
     dual_cache = _FakeAawmAliasRoutingDualCache()
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache', return_value=dual_cache):
@@ -14106,7 +14106,7 @@ async def test_anthropic_auto_agent_alias_session_affinity_reports_routing_state
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_continuation_affinity_uses_single_candidate_state_fast_path():
     request = _build_codex_auto_agent_request()
-    body = {'model': 'aawm-codex-agent-auto', 'input': [{'type': 'function_call_output', 'call_id': 'call_existing', 'output': '{}'}], 'stream': False, 'previous_response_id': 'resp_existing', 'litellm_metadata': {'session_id': 'codex-session'}}
+    body = {'model': 'basic', 'input': [{'type': 'function_call_output', 'call_id': 'call_existing', 'output': '{}'}], 'stream': False, 'previous_response_id': 'resp_existing', 'litellm_metadata': {'session_id': 'codex-session'}}
     _codex_auto_agent_session_affinity_by_key['codex-session:session:codex-session'] = {'provider': 'openrouter', 'model': 'deepseek/deepseek-v4-flash', 'route_family': 'codex_openrouter_completion_adapter', 'last_resort': False, 'expires_at_monotonic': time.monotonic() + 3600}
 
     async def _fail_full_candidate_build(*args, **kwargs):
@@ -14158,8 +14158,8 @@ async def test_anthropic_auto_agent_alias_fresh_dispatch_ignores_session_affinit
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
-    _anthropic_auto_agent_session_affinity_by_key["aawm-code-anthropic:claude-session:session:claude-session"] = {
+    body["model"] = "work"
+    _anthropic_auto_agent_session_affinity_by_key["work:claude-session:session:claude-session"] = {
         "provider": "openai",
         "model": "gpt-5.3-codex-spark",
         "route_family": "anthropic_openai_responses_adapter",
@@ -14244,7 +14244,7 @@ async def test_anthropic_auto_agent_alias_uses_haiku_only_as_last_resort(monkeyp
 async def test_anthropic_auto_agent_alias_low_uses_default_low_candidates():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-low-anthropic"
+    body["model"] = "basic"
 
     selection = await _select_anthropic_auto_agent_candidate(
         request=request,
@@ -14254,7 +14254,7 @@ async def test_anthropic_auto_agent_alias_low_uses_default_low_candidates():
     assert selection["candidate"]["provider"] == "openrouter"
     assert selection["candidate"]["model"] == "openrouter/cohere/north-mini-code:free"
     assert selection["candidate"]["route_family"] == ("anthropic_openrouter_completion_adapter")
-    candidates = _get_anthropic_auto_agent_candidates_for_alias("aawm-low-anthropic")
+    candidates = _get_anthropic_auto_agent_candidates_for_alias("basic")
     candidate_models = [candidate["model"] for candidate in candidates]
     assert candidate_models == [
         "openrouter/cohere/north-mini-code:free",
@@ -14272,7 +14272,7 @@ async def test_anthropic_auto_agent_alias_low_falls_through_ordered_candidates(
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-low-anthropic"
+    body["model"] = "basic"
     expected_candidates = [
         (
             "openrouter",
@@ -14337,7 +14337,7 @@ async def test_anthropic_auto_agent_alias_low_falls_through_ordered_candidates(
 async def test_anthropic_auto_agent_alias_code_selects_live_grok_4_5_after_spark_cooldown():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     await _set_anthropic_auto_agent_cooldown(
         "openai:gpt-5.3-codex-spark:__default__",
         60.0,
@@ -14358,7 +14358,7 @@ async def test_anthropic_auto_agent_alias_code_selects_live_grok_4_5_after_spark
 async def test_anthropic_auto_agent_alias_code_selects_sonnet_5_1m_before_plain_sonnet_5():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
 
     for cooldown_key in (
         "openai:gpt-5.3-codex-spark:__default__",
@@ -14393,7 +14393,7 @@ async def test_anthropic_auto_agent_alias_code_selects_sonnet_5_1m_before_plain_
 async def test_anthropic_auto_agent_alias_code_native_sonnet_5_1m_normalizes_model_and_context_beta():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     for cooldown_key in (
         "openai:gpt-5.3-codex-spark:__default__",
         "xai:xai/grok-4.5:xai_grok_native",
@@ -14429,7 +14429,7 @@ async def test_anthropic_auto_agent_alias_code_native_sonnet_5_1m_normalizes_mod
     parsed_body = mock_set_parsed_body.call_args.args[1]
     assert parsed_body["model"] == "claude-sonnet-5"
     metadata = parsed_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-code-anthropic"
+    assert metadata["requested_model_alias"] == "work"
     assert metadata["anthropic_auto_agent_selected_model"] == "claude-sonnet-5[1m]"
     assert metadata["anthropic_native_passthrough_model_alias"] == "claude-sonnet-5[1m]"
     assert metadata["anthropic_native_passthrough_normalized_model"] == "claude-sonnet-5"
@@ -14479,7 +14479,7 @@ async def test_anthropic_auto_agent_alias_falls_back_to_deepseek_after_spark_429
     deepseek_body = mock_openrouter.await_args.kwargs["prepared_request_body"]
     assert deepseek_body["model"] == "deepseek/deepseek-v4-flash"
     metadata = deepseek_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-anthropic-agent-auto"
+    assert metadata["requested_model_alias"] == "basic"
     assert metadata["anthropic_auto_agent_selected_provider"] == "openrouter"
     assert metadata["anthropic_auto_agent_attempts"][0]["status"] == "cooldown_set"
     audit_events = metadata["aawm_alias_routing_audit_events"]
@@ -14505,7 +14505,7 @@ async def test_anthropic_auto_agent_alias_success_preserves_attempt_metadata_wit
     mock_spark.assert_awaited_once()
     prepared_body = mock_spark.await_args.kwargs['prepared_request_body']
     metadata = prepared_body['litellm_metadata']
-    assert metadata['requested_model_alias'] == 'aawm-anthropic-agent-auto'
+    assert metadata['requested_model_alias'] == 'basic'
     assert metadata['anthropic_auto_agent_selected_provider'] == 'openai'
     assert metadata['anthropic_auto_agent_selected_model'] == 'gpt-5.3-codex-spark'
     attempts = metadata['anthropic_auto_agent_attempts']
@@ -14567,7 +14567,7 @@ async def test_anthropic_auto_agent_alias_retryable_failure_records_route_contex
     audit_events = metadata["aawm_alias_routing_audit_events"]
     failure_event = next(event for event in audit_events if event["event_type"] == "candidate_retryable_failure")
     assert failure_event["alias_family"] == "anthropic_auto_agent"
-    assert failure_event["alias_model"] == "aawm-anthropic-agent-auto"
+    assert failure_event["alias_model"] == "basic"
     assert failure_event["provider"] == "openai"
     assert failure_event["model"] == "gpt-5.3-codex-spark"
     assert failure_event["route_family"] == "anthropic_openai_responses_adapter"
@@ -14586,7 +14586,7 @@ async def test_anthropic_read_agent_alias_falls_back_after_high_demand(
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-read-anthropic"
+    body["model"] = "basic"
     spark_error = RuntimeError("We're currently experiencing high demand, which may cause temporary errors.")
     deepseek_success = Response(content='{"ok": true}', media_type="application/json")
 
@@ -14613,8 +14613,8 @@ async def test_anthropic_read_agent_alias_falls_back_after_high_demand(
     assert mock_openrouter.await_args.kwargs["adapter_model"] == ("deepseek/deepseek-v4-flash")
     deepseek_body = mock_openrouter.await_args.kwargs["prepared_request_body"]
     metadata = deepseek_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-read-anthropic"
-    assert metadata["anthropic_auto_agent_alias"] == "aawm-read-anthropic"
+    assert metadata["requested_model_alias"] == "basic"
+    assert metadata["anthropic_auto_agent_alias"] == "basic"
     assert metadata["anthropic_auto_agent_selected_provider"] == "openrouter"
     first_attempt = metadata["anthropic_auto_agent_attempts"][0]
     assert first_attempt["status"] == "cooldown_set"
@@ -14629,7 +14629,7 @@ async def test_anthropic_read_agent_alias_openai_adapter_cooldown_survives_fresh
 ):
     first_request = _build_anthropic_auto_agent_request("claude-session-1")
     first_body = _build_anthropic_auto_agent_body("claude-session-1")
-    first_body["model"] = "aawm-read-anthropic"
+    first_body["model"] = "basic"
     high_demand_error = RuntimeError("We're currently experiencing high demand, which may cause temporary errors.")
     deepseek_success = Response(content='{"ok": true}', media_type="application/json")
 
@@ -14654,7 +14654,7 @@ async def test_anthropic_read_agent_alias_openai_adapter_cooldown_survives_fresh
 
     second_request = _build_anthropic_auto_agent_request("claude-session-2")
     second_body = _build_anthropic_auto_agent_body("claude-session-2")
-    second_body["model"] = "aawm-read-anthropic"
+    second_body["model"] = "basic"
     selection = await _select_anthropic_auto_agent_candidate(
         request=second_request,
         request_body=second_body,
@@ -14670,7 +14670,7 @@ async def test_anthropic_read_agent_alias_openai_adapter_cooldown_survives_fresh
 async def test_anthropic_sota_alias_handles_terminal_high_demand_after_fallback(monkeypatch):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body['model'] = 'aawm-sota-anthropic'
+    body['model'] = 'sota'
     high_demand_error = RuntimeError("We're currently experiencing high demand, which may cause temporary errors.")
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body'), patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request', new=AsyncMock(side_effect=high_demand_error)) as mock_native:
         with pytest.raises(HTTPException) as exc_info:
@@ -14749,7 +14749,7 @@ async def test_anthropic_auto_agent_alias_code_falls_back_to_live_grok_4_5_after
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     spark_error = ProxyException(
         message="spark quota exhausted",
         type="rate_limit_error",
@@ -14792,8 +14792,8 @@ async def test_anthropic_auto_agent_alias_code_falls_back_to_live_grok_4_5_after
     assert mock_grok_native.await_args.kwargs["use_alias_candidate_probe"] is True
     grok_body = mock_grok_native.await_args.kwargs["prepared_request_body"]
     metadata = grok_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-code-anthropic"
-    assert metadata["anthropic_auto_agent_alias"] == "aawm-code-anthropic"
+    assert metadata["requested_model_alias"] == "work"
+    assert metadata["anthropic_auto_agent_alias"] == "work"
     assert metadata["anthropic_auto_agent_selected_provider"] == "xai"
     assert metadata["anthropic_auto_agent_selected_model"] == "xai/grok-4.5"
     assert metadata["anthropic_auto_agent_selected_route_family"] == ("anthropic_grok_native_responses_adapter")
@@ -14826,7 +14826,7 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_falls_back_to_live_g
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     body["tools"] = [
         {
             "type": "function",
@@ -14886,7 +14886,7 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_falls_back_to_live_g
     mock_native.assert_not_called()
     grok_body = mock_grok_native.await_args.kwargs["prepared_request_body"]
     metadata = grok_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-code-anthropic"
+    assert metadata["requested_model_alias"] == "work"
     assert metadata["anthropic_auto_agent_selected_provider"] == "xai"
     assert metadata["anthropic_auto_agent_selected_model"] == "xai/grok-4.5"
     assert metadata["anthropic_auto_agent_selected_route_family"] == ("anthropic_grok_native_responses_adapter")
@@ -14899,7 +14899,7 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_falls_back_to_live_g
 async def test_anthropic_auto_agent_alias_code_tool_bearing_cooldown_selects_live_grok_4_5(monkeypatch):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body['model'] = 'aawm-code-anthropic'
+    body['model'] = 'work'
     body['tools'] = [{'type': 'function', 'function': {'name': 'Bash', 'description': 'Run shell command', 'parameters': {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command'], 'additionalProperties': False}}}]
     body['tool_choice'] = {'type': 'function', 'name': 'Bash'}
     await _set_anthropic_auto_agent_cooldown('openai:gpt-5.3-codex-spark:__default__', 10691.0)
@@ -14925,7 +14925,7 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_cooldown_selects_liv
 async def test_anthropic_auto_agent_alias_code_stateful_cooldown_selects_live_grok_4_5(monkeypatch):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body['model'] = 'aawm-code-anthropic'
+    body['model'] = 'work'
     body['messages'] = [{'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 'toolu_existing', 'content': '{}'}]}]
     await _set_anthropic_auto_agent_cooldown('openai:gpt-5.3-codex-spark:__default__', 10691.0)
     grok45_success = Response(content='{"ok": true}', media_type='application/json')
@@ -14950,7 +14950,7 @@ async def test_anthropic_auto_agent_alias_code_stateful_cooldown_selects_live_gr
 async def test_anthropic_auto_agent_alias_code_tool_bearing_reaches_native_last_resort_without_compatibility_skip():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     body["tools"] = [
         {
             "type": "function",
@@ -14998,7 +14998,7 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_oa_xai_after_grok_un
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     spark_error = ProxyException(
         message="spark usage limit",
         type="rate_limit_error",
@@ -15052,8 +15052,8 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_oa_xai_after_grok_un
     assert mock_xai_oauth.await_args.kwargs["use_alias_candidate_probe"] is True
     xai_body = mock_xai_oauth.await_args.kwargs["prepared_request_body"]
     metadata = xai_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-code-anthropic"
-    assert metadata["anthropic_auto_agent_alias"] == "aawm-code-anthropic"
+    assert metadata["requested_model_alias"] == "work"
+    assert metadata["anthropic_auto_agent_alias"] == "work"
     assert metadata["anthropic_auto_agent_selected_provider"] == "xai"
     assert metadata["anthropic_auto_agent_selected_model"] == "oa_xai/grok-build"
     assert metadata["anthropic_auto_agent_selected_route_family"] == ("anthropic_xai_oauth_responses_adapter")
@@ -15071,7 +15071,7 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_oa_xai_after_grok_un
 async def test_anthropic_auto_agent_alias_code_uses_managed_xai_after_grok_permission_denied():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     await _set_anthropic_auto_agent_cooldown(
         "openai:gpt-5.3-codex-spark:__default__",
         60.0,
@@ -15125,7 +15125,7 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_xai_after_grok_permi
     assert mock_xai_oauth.await_args.kwargs["adapter_model"] == "oa_xai/grok-build"
     xai_body = mock_xai_oauth.await_args.kwargs["prepared_request_body"]
     metadata = xai_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-code-anthropic"
+    assert metadata["requested_model_alias"] == "work"
     assert metadata["anthropic_auto_agent_selected_provider"] == "xai"
     assert metadata["anthropic_auto_agent_selected_model"] == "oa_xai/grok-build"
     assert metadata["anthropic_auto_agent_selected_route_family"] == ("anthropic_xai_oauth_responses_adapter")
@@ -15158,7 +15158,7 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-low-anthropic"
+    body["model"] = "basic"
     success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
@@ -15194,7 +15194,7 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
     candidate_body = mock_set_body.call_args.args[1]
     assert candidate_body["model"] == "claude-haiku-4-5-20251001"
     metadata = candidate_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-low-anthropic"
+    assert metadata["requested_model_alias"] == "basic"
     assert metadata["anthropic_auto_agent_selected_provider"] == "anthropic"
     assert metadata["anthropic_auto_agent_selected_last_resort"] is True
     assert metadata["anthropic_auto_agent_attempts"][-1]["model"] == ("claude-haiku-4-5-20251001")
@@ -15241,7 +15241,7 @@ async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-low-anthropic"
+    body["model"] = "basic"
     free_usage_error = _build_opencode_zen_free_usage_limit_error()
     success = Response(content='{"ok": true}', media_type="application/json")
 
@@ -15286,7 +15286,7 @@ async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_
     candidate_body = mock_set_body.call_args.args[1]
     assert candidate_body["model"] == "claude-haiku-4-5-20251001"
     metadata = candidate_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-low-anthropic"
+    assert metadata["requested_model_alias"] == "basic"
     assert metadata["anthropic_auto_agent_selected_provider"] == "anthropic"
     assert metadata["anthropic_auto_agent_selected_last_resort"] is True
     openrouter_attempts = [
@@ -15332,7 +15332,7 @@ async def test_anthropic_auto_agent_alias_low_routes_big_pickle_through_completi
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-low-anthropic"
+    body["model"] = "basic"
     await _set_anthropic_auto_agent_cooldown(
         "openrouter:openrouter/cohere/north-mini-code:free:openrouter",
         60.0,
@@ -15370,7 +15370,7 @@ async def test_anthropic_auto_agent_alias_low_routes_big_pickle_through_completi
     assert mock_opencode.await_args.kwargs["adapter_model"] == "big-pickle"
     candidate_body = mock_opencode.await_args.kwargs["prepared_request_body"]
     metadata = candidate_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-low-anthropic"
+    assert metadata["requested_model_alias"] == "basic"
     assert metadata["anthropic_auto_agent_selected_provider"] == "opencode_zen"
     assert metadata["anthropic_auto_agent_selected_model"] == "big-pickle"
     assert metadata["anthropic_auto_agent_selected_route_family"] == ("anthropic_opencode_zen_completion_adapter")
@@ -15383,7 +15383,7 @@ async def test_anthropic_auto_agent_alias_low_routes_north_mini_through_openrout
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-low-anthropic"
+    body["model"] = "basic"
     success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
@@ -15410,7 +15410,7 @@ async def test_anthropic_auto_agent_alias_low_routes_north_mini_through_openrout
     candidate_body = mock_openrouter_completion.await_args.kwargs["prepared_request_body"]
     assert candidate_body["model"] == "openrouter/cohere/north-mini-code:free"
     metadata = candidate_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-low-anthropic"
+    assert metadata["requested_model_alias"] == "basic"
     assert metadata["anthropic_auto_agent_selected_provider"] == "openrouter"
     assert metadata["anthropic_auto_agent_selected_model"] == ("openrouter/cohere/north-mini-code:free")
     assert metadata["anthropic_auto_agent_selected_route_family"] == ("anthropic_openrouter_completion_adapter")
@@ -15644,7 +15644,7 @@ async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
     assert exc_info.value.detail["error"]["code"] == ("aawm_anthropic_auto_agent_redispatch_required")
     assert "Do not continue this child agent" in exc_info.value.detail["error"]["message"]
     assert "Redispatch a fresh subagent" in exc_info.value.detail["error"]["message"]
-    assert exc_info.value.detail["redispatch_model"] == "aawm-anthropic-agent-auto"
+    assert exc_info.value.detail["redispatch_model"] == "basic"
     assert exc_info.value.detail["redispatch_reason"] == "in_flight_retryable_provider_exhaustion"
     assert exc_info.value.detail["selected_provider"] == "openrouter"
     assert exc_info.value.detail["selected_model"] == "deepseek/deepseek-v4-flash"
@@ -15687,7 +15687,7 @@ async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
 async def test_anthropic_auto_agent_alias_in_flight_bare_502_redispatches_without_durable_cooldown():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     body["messages"] = [
         {
             "role": "user",
@@ -15700,7 +15700,7 @@ async def test_anthropic_auto_agent_alias_in_flight_bare_502_redispatches_withou
             ],
         }
     ]
-    _anthropic_auto_agent_session_affinity_by_key["aawm-code-anthropic:claude-session:session:claude-session"] = {
+    _anthropic_auto_agent_session_affinity_by_key["work:claude-session:session:claude-session"] = {
         "provider": "xai",
         "model": "grok-composer-2.5-fast",
         "route_family": "anthropic_grok_native_responses_adapter",
@@ -15761,7 +15761,7 @@ async def test_anthropic_auto_agent_alias_in_flight_bare_502_redispatches_withou
 async def test_anthropic_auto_agent_in_flight_grok_4_5_candidate_unavailable_retries_without_redispatch():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     body["messages"] = [
         {
             "role": "user",
@@ -15774,7 +15774,7 @@ async def test_anthropic_auto_agent_in_flight_grok_4_5_candidate_unavailable_ret
             ],
         }
     ]
-    _anthropic_auto_agent_session_affinity_by_key["aawm-code-anthropic:claude-session:session:claude-session"] = {
+    _anthropic_auto_agent_session_affinity_by_key["work:claude-session:session:claude-session"] = {
         "provider": "xai",
         "model": "xai/grok-4.5",
         "route_family": "anthropic_grok_native_responses_adapter",
@@ -15843,7 +15843,7 @@ async def test_anthropic_auto_agent_alias_in_flight_malformed_composer_call_redi
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     body["messages"] = [
         {
             "role": "user",
@@ -15856,7 +15856,7 @@ async def test_anthropic_auto_agent_alias_in_flight_malformed_composer_call_redi
             ],
         }
     ]
-    _anthropic_auto_agent_session_affinity_by_key["aawm-code-anthropic:claude-session:session:claude-session"] = {
+    _anthropic_auto_agent_session_affinity_by_key["work:claude-session:session:claude-session"] = {
         "provider": "xai",
         "model": "grok-composer-2.5-fast",
         "route_family": "anthropic_grok_native_responses_adapter",
@@ -15907,7 +15907,7 @@ async def test_anthropic_auto_agent_alias_in_flight_malformed_composer_call_redi
     assert exc_info.value.status_code == 429
     assert exc_info.value.detail["error"]["code"] == ("aawm_anthropic_auto_agent_redispatch_required")
     assert exc_info.value.detail["redispatch_required"] is True
-    assert exc_info.value.detail["redispatch_model"] == "aawm-code-anthropic"
+    assert exc_info.value.detail["redispatch_model"] == "work"
     assert exc_info.value.detail["selected_provider"] == "xai"
     assert exc_info.value.detail["selected_model"] == "grok-composer-2.5-fast"
     assert exc_info.value.detail["selected_route_family"] == ("anthropic_grok_native_responses_adapter")
@@ -15948,7 +15948,7 @@ async def test_anthropic_auto_agent_in_flight_native_grok_4_5_malformed_redispat
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     body["messages"] = [
         {
             "role": "user",
@@ -15961,7 +15961,7 @@ async def test_anthropic_auto_agent_in_flight_native_grok_4_5_malformed_redispat
             ],
         }
     ]
-    _anthropic_auto_agent_session_affinity_by_key["aawm-code-anthropic:claude-session:session:claude-session"] = {
+    _anthropic_auto_agent_session_affinity_by_key["work:claude-session:session:claude-session"] = {
         "provider": "xai",
         "model": "xai/grok-4.5",
         "route_family": "anthropic_grok_native_responses_adapter",
@@ -16038,7 +16038,7 @@ async def test_codex_auto_agent_in_flight_native_grok_4_5_malformed_redispatches
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-code",
+        "model": "work",
         "input": [
             {
                 "type": "function_call_output",
@@ -16050,7 +16050,7 @@ async def test_codex_auto_agent_in_flight_native_grok_4_5_malformed_redispatches
         "previous_response_id": "resp_existing",
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    _codex_auto_agent_session_affinity_by_key["aawm-code:codex-session:session:codex-session"] = {
+    _codex_auto_agent_session_affinity_by_key["work:codex-session:session:codex-session"] = {
         "provider": "xai",
         "model": "xai/grok-4.5",
         "route_family": "codex_grok_native_responses_adapter",
@@ -16121,16 +16121,16 @@ async def test_codex_auto_agent_in_flight_native_grok_4_5_malformed_redispatches
 async def test_anthropic_auto_agent_alias_in_flight_redispatch_uses_requested_alias(monkeypatch):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body['model'] = 'aawm-sota-anthropic'
+    body['model'] = 'sota'
     body['messages'] = [{'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 'toolu_existing', 'content': '{}'}]}]
-    _anthropic_auto_agent_session_affinity_by_key['aawm-sota-anthropic:claude-session:session:claude-session'] = {'provider': 'anthropic', 'model': 'claude-opus-4-8[1m]', 'route_family': 'anthropic_messages', 'last_resort': False, 'expires_at_monotonic': time.monotonic() + 3600}
+    _anthropic_auto_agent_session_affinity_by_key['sota:claude-session:session:claude-session'] = {'provider': 'anthropic', 'model': 'claude-opus-4-8[1m]', 'route_family': 'anthropic_messages', 'last_resort': False, 'expires_at_monotonic': time.monotonic() + 3600}
     opus_error = RuntimeError('Selected model is at capacity. Please try a different model.')
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request', new=AsyncMock(side_effect=opus_error)):
         with pytest.raises(HTTPException) as exc_info:
             await _handle_anthropic_auto_agent_alias_route(endpoint='/v1/messages', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://api.anthropic.com/v1/messages', custom_headers={'x-api-key': 'anthropic-key'})
     assert exc_info.value.status_code == 429
     assert exc_info.value.detail['error']['code'] == 'aawm_anthropic_auto_agent_redispatch_required'
-    assert exc_info.value.detail['redispatch_model'] == 'aawm-sota-anthropic'
+    assert exc_info.value.detail['redispatch_model'] == 'sota'
     assert exc_info.value.detail['selected_provider'] == 'anthropic'
     assert exc_info.value.detail['selected_model'] == 'claude-opus-4-8[1m]'
     assert 'MODEL_AT_CAPACITY' in exc_info.value.detail['error_tokens']
@@ -16175,7 +16175,7 @@ async def test_anthropic_proxy_route_aawm_read_alias_applies_read_guidance(
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-read-anthropic"
+    body["model"] = "basic"
     body["system"] = "Existing system."
 
     with patch(
@@ -16202,16 +16202,16 @@ async def test_anthropic_proxy_route_aawm_read_alias_applies_read_guidance(
     mock_create_pass_through_route.assert_not_called()
     prepared_body = mock_alias_handler.await_args.kwargs["prepared_request_body"]
     assert prepared_body is not body
-    assert prepared_body["model"] == "aawm-read-anthropic"
+    assert prepared_body["model"] == "basic"
     assert prepared_body["system"].startswith("Existing system.")
     assert "Do not edit files" in prepared_body["system"]
     assert "No files were modified." in prepared_body["system"]
     litellm_metadata = prepared_body["litellm_metadata"]
     assert "aawm-read-agent-guidance" in litellm_metadata["tags"]
     assert ("aawm-read-agent-guidance:" f"{_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION}") in litellm_metadata["tags"]
-    assert "aawm-read-agent-guidance-alias:aawm-read-anthropic" in litellm_metadata["tags"]
+    assert "aawm-read-agent-guidance-alias:basic" in litellm_metadata["tags"]
     assert litellm_metadata["aawm_read_agent_guidance_applied"] is True
-    assert litellm_metadata["aawm_read_agent_guidance_alias"] == "aawm-read-anthropic"
+    assert litellm_metadata["aawm_read_agent_guidance_alias"] == "basic"
     assert litellm_metadata["aawm_read_agent_guidance_target_field"] == "system"
 
 
@@ -16352,7 +16352,7 @@ async def test_anthropic_grok_native_alias_probe_sidecar_refresh_required_is_can
     )
     request = _build_anthropic_auto_agent_request()
     body = {
-        "model": "aawm-code-anthropic",
+        "model": "work",
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 64,
         "stream": False,
@@ -16394,7 +16394,7 @@ async def test_anthropic_grok_native_alias_probe_reasoning_effort_400_is_candida
     )
     request = _build_anthropic_auto_agent_request()
     body = {
-        "model": "aawm-code-anthropic",
+        "model": "work",
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 64,
         "stream": False,
@@ -16442,7 +16442,7 @@ async def test_anthropic_grok_native_alias_probe_compaction_blob_400_is_candidat
     )
     request = _build_anthropic_auto_agent_request()
     body = {
-        "model": "aawm-code-anthropic",
+        "model": "work",
         "messages": [{"role": "user", "content": "continue"}],
         "max_tokens": 64,
         "stream": False,
@@ -16621,7 +16621,7 @@ async def test_anthropic_xai_oauth_alias_probe_marks_transient_statuses_alias_ma
     monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
     request = _build_anthropic_auto_agent_request()
     body = {
-        "model": "aawm-code-anthropic",
+        "model": "work",
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 64,
         "stream": False,
@@ -16666,7 +16666,7 @@ async def test_anthropic_xai_oauth_alias_probe_reasoning_effort_400_is_candidate
     monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
     request = _build_anthropic_auto_agent_request()
     body = {
-        "model": "aawm-code-anthropic",
+        "model": "work",
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 64,
         "stream": False,
@@ -16709,7 +16709,7 @@ async def test_anthropic_xai_oauth_alias_probe_compaction_blob_400_is_candidate_
     monkeypatch.setenv("LITELLM_XAI_OAUTH_API_BASE", "https://api.x.ai/v1")
     request = _build_anthropic_auto_agent_request()
     body = {
-        "model": "aawm-code-anthropic",
+        "model": "work",
         "messages": [{"role": "user", "content": "continue"}],
         "max_tokens": 64,
         "stream": False,
@@ -16991,7 +16991,7 @@ async def test_anthropic_grok_native_oauth_responses_adapter_rejects_malformed_c
     monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
     request = _build_anthropic_auto_agent_request()
     body = {
-        "model": "aawm-code-anthropic",
+        "model": "work",
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 64,
         "stream": False,
@@ -17062,7 +17062,7 @@ async def test_anthropic_grok_native_oauth_responses_adapter_drops_prior_tool_ca
     }
     tool_use_id = "call-7b0e3b7b-composer_call_EHQUZ"
     body = {
-        "model": "aawm-code-anthropic",
+        "model": "work",
         "messages": [
             {"role": "user", "content": "continue"},
             {
@@ -17179,7 +17179,7 @@ async def test_anthropic_grok_native_alias_probe_marks_transient_statuses_alias_
     )
     request = _build_anthropic_auto_agent_request()
     body = {
-        "model": "aawm-code-anthropic",
+        "model": "work",
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 64,
         "stream": False,
@@ -17220,7 +17220,7 @@ async def test_anthropic_grok_native_alias_probe_marks_transient_statuses_alias_
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_selects_spark_first(monkeypatch):
     request = _build_codex_auto_agent_request()
-    body = {'model': 'aawm-codex-agent-auto', 'litellm_metadata': {'session_id': 'codex-session'}}
+    body = {'model': 'basic', 'litellm_metadata': {'session_id': 'codex-session'}}
     selection = await _select_codex_auto_agent_candidate(request=request, request_body=body)
     assert selection['candidate']['provider'] == 'openai'
     assert selection['candidate']['model'] == 'gpt-5.3-codex-spark'
@@ -17232,7 +17232,7 @@ async def test_codex_auto_agent_alias_selects_spark_first(monkeypatch):
 @pytest.mark.asyncio
 async def test_codex_read_agent_alias_uses_auto_candidates_and_metadata(monkeypatch):
     request = _build_codex_auto_agent_request()
-    body = {'model': 'aawm-read', 'litellm_metadata': {'session_id': 'codex-session'}}
+    body = {'model': 'basic', 'litellm_metadata': {'session_id': 'codex-session'}}
     selection = await _select_codex_auto_agent_candidate(request=request, request_body=body)
     assert selection['candidate']['provider'] == 'openai'
     assert selection['candidate']['model'] == 'gpt-5.3-codex-spark'
@@ -17240,15 +17240,15 @@ async def test_codex_read_agent_alias_uses_auto_candidates_and_metadata(monkeypa
     updated_body = _add_codex_auto_agent_alias_metadata(body, request=request, selection=selection, attempts=[{'provider': 'openai', 'model': 'gpt-5.3-codex-spark', 'route_family': 'codex_responses', 'last_resort': False, 'lane_key': '__default__', 'reason': 'first_available'}])
     metadata = updated_body['litellm_metadata']
     assert updated_body['model'] == 'gpt-5.3-codex-spark'
-    assert metadata['model_alias_label'] == 'aawm-read'
-    assert metadata['requested_model_alias'] == 'aawm-read'
-    assert metadata['codex_auto_agent_alias'] == 'aawm-read'
+    assert metadata['model_alias_label'] == 'basic'
+    assert metadata['requested_model_alias'] == 'basic'
+    assert metadata['codex_auto_agent_alias'] == 'basic'
     assert metadata['codex_auto_agent_selected_provider'] == 'openai'
     assert metadata['codex_auto_agent_selected_route_family'] == 'codex_responses'
     audit_events = metadata['aawm_alias_routing_audit_events']
     assert audit_events == metadata['codex_auto_agent_audit_events']
     assert audit_events[0]['alias_family'] == 'codex_auto_agent'
-    assert audit_events[0]['alias_model'] == 'aawm-read'
+    assert audit_events[0]['alias_model'] == 'basic'
     assert audit_events[0]['session_id'] == 'codex-session'
     assert audit_events[0]['provider'] == 'openai'
     assert audit_events[0]['model'] == 'gpt-5.3-codex-spark'
@@ -17256,16 +17256,16 @@ async def test_codex_read_agent_alias_uses_auto_candidates_and_metadata(monkeypa
     assert audit_events[0]['event_type'] == 'candidate_selected'
     assert audit_events[0]['candidate_status'] == 'selected'
     assert audit_events[0]['selected'] is True
-    assert 'model-alias:aawm-read' in metadata['tags']
-    assert 'codex-auto-agent-alias:aawm-read' in metadata['tags']
+    assert 'model-alias:basic' in metadata['tags']
+    assert 'codex-auto-agent-alias:basic' in metadata['tags']
 
 
 
 @pytest.mark.parametrize(
     ("alias_model", "target_model"),
     [
-        ("aawm-code", "gpt-5.3-codex-spark"),
-        ("aawm-low", "gpt-5.4-mini"),
+        ("work", "gpt-5.3-codex-spark"),
+        ("basic", "gpt-5.4-mini"),
     ],
 )
 def test_codex_auto_agent_alias_metadata_sets_model_alias_label(
@@ -17306,7 +17306,7 @@ def test_codex_auto_agent_alias_metadata_sets_model_alias_label(
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_sota_selects_gpt_5_6_sol_first():
     request = _build_codex_auto_agent_request()
-    body = {'model': 'aawm-sota', 'litellm_metadata': {'session_id': 'codex-session'}}
+    body = {'model': 'sota', 'litellm_metadata': {'session_id': 'codex-session'}}
     selection = await _select_codex_auto_agent_candidate(request=request, request_body=body)
     assert selection['candidate']['provider'] == 'openai'
     assert selection['candidate']['model'] == 'gpt-5.6-sol'
@@ -17318,7 +17318,7 @@ async def test_codex_auto_agent_alias_sota_selects_gpt_5_6_sol_first():
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_sota_falls_through_to_gpt_5_5_last_resort():
     request = _build_codex_auto_agent_request()
-    body = {'model': 'aawm-sota', 'litellm_metadata': {'session_id': 'codex-session'}}
+    body = {'model': 'sota', 'litellm_metadata': {'session_id': 'codex-session'}}
     selection = await _select_codex_auto_agent_candidate(request=request, request_body=body)
     await _set_codex_auto_agent_cooldown(selection['cooldown_key'], 60.0)
     fallback = await _select_codex_auto_agent_candidate(request=request, request_body=body)
@@ -17343,7 +17343,7 @@ async def test_codex_auto_agent_alias_logs_no_candidate_without_provider_attempt
     request.scope.update({'client': ('172.19.0.1', 52834), 'method': 'POST', 'http_version': '1.1'})
     clear_aawm_route_access_log_replacements()
     route_status = []
-    body = {'model': 'aawm-sota', 'litellm_metadata': {'session_id': 'codex-session', 'agent_id': 'agent-123', 'repository': 'litellm'}}
+    body = {'model': 'sota', 'litellm_metadata': {'session_id': 'codex-session', 'agent_id': 'agent-123', 'repository': 'litellm'}}
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info') as mock_info, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning') as mock_warning, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock()) as mock_pass_through, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.emit_aawm_route_status_event', side_effect=lambda **kwargs: route_status.append(kwargs)):
         selection = await _select_codex_auto_agent_candidate(request=request, request_body=body)
         await _set_codex_auto_agent_cooldown(selection['cooldown_key'], 60.0)
@@ -17355,7 +17355,7 @@ async def test_codex_auto_agent_alias_logs_no_candidate_without_provider_attempt
     mock_pass_through.assert_not_called()
     access_record = logging.LogRecord(name='uvicorn.access', level=logging.INFO, pathname=__file__, lineno=1, msg='%s - "%s %s HTTP/%s" %d', args=('172.19.0.1:52834', 'POST', '/openai_passthrough/v1/responses', '1.1', 429), exc_info=None)
     assert AawmRouteAccessLogReplacementFilter().filter(access_record) is False
-    assert route_status == [{'alias_model': 'aawm-sota', 'model_label': 'aawm-sota', 'status': 'Exhausted', 'message': 'error_status_code=429; candidate_status=all_candidates_unavailable'}, {'alias_model': 'aawm-sota', 'model_label': 'gpt-5.6-sol', 'status': 'Exhausted', 'message': 'error_status_code=429; candidate_status=all_candidates_unavailable'}, {'alias_model': 'aawm-sota', 'model_label': 'gpt-5.5', 'status': 'Exhausted', 'message': 'error_status_code=429; candidate_status=all_candidates_unavailable'}]
+    assert route_status == [{'alias_model': 'sota', 'model_label': 'sota', 'status': 'Exhausted', 'message': 'error_status_code=429; candidate_status=all_candidates_unavailable'}, {'alias_model': 'sota', 'model_label': 'gpt-5.6-sol', 'status': 'Exhausted', 'message': 'error_status_code=429; candidate_status=all_candidates_unavailable'}, {'alias_model': 'sota', 'model_label': 'gpt-5.5', 'status': 'Exhausted', 'message': 'error_status_code=429; candidate_status=all_candidates_unavailable'}]
     _assert_alias_route_logs_exclude_event_types(mock_info, 'candidate_attempt_started')
     assert _alias_route_log_payloads(mock_warning) == []
 
@@ -17404,7 +17404,7 @@ def test_auto_agent_alias_prior_tool_activity_summary_is_conservative():
 def test_auto_agent_alias_agent_dispatch_fields_prefer_metadata_and_role_fallback():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-sota",
+        "model": "sota",
         "instructions": "You are a 'worker' agent.\nImplement the scoped change.",
         "litellm_metadata": {
             "session_id": "codex-session",
@@ -17425,7 +17425,7 @@ def test_auto_agent_alias_agent_dispatch_fields_prefer_metadata_and_role_fallbac
     assert fields["agent_profile"] == "worker"
 
     explicit = {
-        "model": "aawm-sota",
+        "model": "sota",
         "instructions": "You are a 'default' agent.",
         "litellm_metadata": {
             "agent_name": "engineer",
@@ -17448,7 +17448,7 @@ def test_auto_agent_alias_agent_dispatch_fields_prefer_metadata_and_role_fallbac
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_no_candidate_persists_audit_only_with_activity_status(monkeypatch):
     request = _build_codex_auto_agent_request()
-    body = {'model': 'aawm-sota', 'instructions': "You are a 'worker' agent.", 'input': [{'type': 'function_call_output', 'call_id': 'call_existing', 'output': 'edited files'}], 'litellm_metadata': {'session_id': 'codex-session', 'agent_id': 'agent-partial', 'thread_source': 'subagent', 'redispatch_ordinal': 2, 'repository': 'litellm'}}
+    body = {'model': 'sota', 'instructions': "You are a 'worker' agent.", 'input': [{'type': 'function_call_output', 'call_id': 'call_existing', 'output': 'edited files'}], 'litellm_metadata': {'session_id': 'codex-session', 'agent_id': 'agent-partial', 'thread_source': 'subagent', 'redispatch_ordinal': 2, 'repository': 'litellm'}}
     enqueued = []
 
     def _fake_persist(events, *, request_body=None):
@@ -17485,7 +17485,7 @@ def test_auto_agent_alias_no_candidate_persists_complete_attempt_sequence(
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-code",
+        "model": "work",
         "instructions": "You are a 'worker' agent.",
         "litellm_metadata": {
             "session_id": "codex-session",
@@ -17541,7 +17541,7 @@ def test_auto_agent_alias_no_candidate_persists_complete_attempt_sequence(
 
     _emit_auto_agent_alias_no_candidate_event(
         alias_family="codex_auto_agent",
-        alias_model="aawm-code",
+        alias_model="work",
         request=request,
         request_body=body,
         exc=HTTPException(
@@ -17587,7 +17587,7 @@ async def test_codex_auto_agent_alias_redispatch_audit_event_includes_cooldown_s
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "instructions": "You are a 'explorer' agent.",
         "input": [
             {
@@ -17605,7 +17605,7 @@ async def test_codex_auto_agent_alias_redispatch_audit_event_includes_cooldown_s
             "redispatch_ordinal": 1,
         },
     }
-    _codex_auto_agent_session_affinity_by_key["aawm-low:codex-session:session:codex-session"] = {
+    _codex_auto_agent_session_affinity_by_key["basic:codex-session:session:codex-session"] = {
         "provider": "openrouter",
         "model": "openrouter/cohere/north-mini-code:free",
         "route_family": "codex_openrouter_completion_adapter",
@@ -17673,7 +17673,7 @@ async def test_anthropic_auto_agent_in_flight_cooldown_does_not_log_no_candidate
     request = _build_anthropic_auto_agent_request()
     route_status = []
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     body["messages"] = [
         {
             "role": "user",
@@ -17686,7 +17686,7 @@ async def test_anthropic_auto_agent_in_flight_cooldown_does_not_log_no_candidate
             ],
         }
     ]
-    _anthropic_auto_agent_session_affinity_by_key["aawm-code-anthropic:claude-session:session:claude-session"] = {
+    _anthropic_auto_agent_session_affinity_by_key["work:claude-session:session:claude-session"] = {
         "provider": "openai",
         "model": "gpt-5.3-codex-spark",
         "route_family": "anthropic_openai_responses_adapter",
@@ -17728,7 +17728,7 @@ async def test_anthropic_auto_agent_in_flight_cooldown_does_not_log_no_candidate
 async def test_codex_auto_agent_alias_code_falls_through_from_spark_to_live_grok_4_5():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-code",
+        "model": "work",
         "litellm_metadata": {"session_id": "codex-session"},
     }
 
@@ -17753,7 +17753,7 @@ async def test_codex_auto_agent_alias_code_falls_through_from_spark_to_live_grok
 async def test_codex_auto_agent_alias_code_falls_through_ordered_candidates():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-code",
+        "model": "work",
         "litellm_metadata": {"session_id": "codex-session"},
     }
     expected_candidates = [
@@ -17803,7 +17803,7 @@ async def test_codex_auto_agent_native_openai_keeps_shared_transient_retry_enabl
     request_body = {
         "model": "gpt-5.3-codex-spark",
         "input": "hello",
-        "litellm_metadata": {"requested_model_alias": "aawm-code"},
+        "litellm_metadata": {"requested_model_alias": "work"},
     }
     upstream_response = Response(content='{"id":"resp_123"}')
 
@@ -17842,7 +17842,7 @@ async def test_codex_auto_agent_grok_native_marks_transient_statuses_alias_manag
         "model": "grok-composer-2.5-fast",
         "input": "hello",
         "stream": False,
-        "litellm_metadata": {"requested_model_alias": "aawm-code"},
+        "litellm_metadata": {"requested_model_alias": "work"},
     }
     grok_prepared_body = {
         "model": "grok-composer-2.5-fast",
@@ -17897,11 +17897,11 @@ async def test_codex_auto_agent_grok_native_rejects_literal_composer_tool_transc
     monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "test")
     request = _build_codex_auto_agent_request("codex-grok-session")
     request_body = {
-        "model": "aawm-code",
+        "model": "work",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {
-            "requested_model_alias": "aawm-code",
+            "requested_model_alias": "work",
             "repository": "aawm-tap",
         },
     }
@@ -17978,7 +17978,7 @@ async def test_codex_auto_agent_grok_native_rejects_literal_composer_tool_transc
     assert record["environment"] == "test"
     assert record["provider"] == "grok"
     assert record["model"] == "grok-composer-2.5-fast"
-    assert record["model_alias"] == "aawm-code"
+    assert record["model_alias"] == "work"
     assert record["route_family"] == "codex_auto_agent_grok_native_responses"
     assert record["endpoint"] == "/openai_passthrough/v1/responses"
     assert record["upstream_url"] == "http://localhost:4001/grok/v1/responses"
@@ -17995,7 +17995,7 @@ async def test_codex_auto_agent_grok_native_rejects_literal_composer_tool_transc
 
 def _grok_composer_exec_command_tool_request_body() -> dict[str, Any]:
     return {
-        "model": "aawm-code",
+        "model": "work",
         "tools": [
             {
                 "type": "function",
@@ -18440,7 +18440,7 @@ async def test_codex_auto_agent_grok_native_request_repairs_literal_tool_label_e
         {
             "input": "hello",
             "stream": False,
-            "litellm_metadata": {"requested_model_alias": "aawm-code"},
+            "litellm_metadata": {"requested_model_alias": "work"},
         }
     )
     grok_prepared_body = {
@@ -18871,7 +18871,7 @@ async def test_codex_auto_agent_oa_xai_marks_transient_statuses_alias_managed():
         "model": "oa_xai/grok-build",
         "input": "hello",
         "stream": False,
-        "litellm_metadata": {"requested_model_alias": "aawm-code"},
+        "litellm_metadata": {"requested_model_alias": "work"},
     }
     oa_xai_prepared_body = {
         "model": "grok-build",
@@ -18919,7 +18919,7 @@ async def test_codex_auto_agent_oa_xai_marks_transient_statuses_alias_managed():
 def test_codex_auto_agent_alias_last_resort_sets_default_medium_reasoning():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-code",
+        "model": "work",
         "litellm_metadata": {"session_id": "codex-session"},
     }
 
@@ -18966,7 +18966,7 @@ def test_codex_auto_agent_alias_clamps_spark_max_reasoning_to_xhigh(monkeypatch)
     _use_local_reasoning_model_cost_map(monkeypatch)
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-code",
+        "model": "work",
         "reasoning": {"effort": "max", "summary": "auto"},
         "litellm_metadata": {
             "session_id": "codex-session",
@@ -19045,7 +19045,7 @@ def test_codex_auto_agent_alias_keeps_max_for_max_capable_models(
 
     updated_body = _add_codex_auto_agent_alias_metadata(
         {
-            "model": "aawm-code",
+            "model": "work",
             "reasoning": {"effort": "max"},
             "litellm_metadata": {"session_id": "codex-session"},
         },
@@ -19082,7 +19082,7 @@ def test_codex_auto_agent_alias_keeps_supported_spark_reasoning_effort(
     request = _build_codex_auto_agent_request()
     updated_body = _add_codex_auto_agent_alias_metadata(
         {
-            "model": "aawm-code",
+            "model": "work",
             "reasoning": {"effort": effort},
             "litellm_metadata": {"session_id": "codex-session"},
         },
@@ -19115,7 +19115,7 @@ def test_codex_auto_agent_alias_preserves_unrecognized_reasoning_effort(
     request = _build_codex_auto_agent_request()
     updated_body = _add_codex_auto_agent_alias_metadata(
         {
-            "model": "aawm-code",
+            "model": "work",
             "reasoning": {"effort": "hyper"},
             "litellm_metadata": {"session_id": "codex-session"},
         },
@@ -19146,7 +19146,7 @@ def test_codex_auto_agent_alias_recalculates_reasoning_for_each_candidate(
     _use_local_reasoning_model_cost_map(monkeypatch)
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-code",
+        "model": "work",
         "reasoning": {"effort": "max"},
         "litellm_metadata": {"session_id": "codex-session"},
     }
@@ -19207,8 +19207,8 @@ def test_codex_auto_agent_alias_recalculates_reasoning_for_each_candidate(
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_code_last_resort_affinity_stays_on_gpt55():
     request = _build_codex_auto_agent_request()
-    body = {'model': 'aawm-code', 'input': [{'type': 'function_call_output', 'call_id': 'call_existing', 'output': '{}'}], 'stream': False, 'previous_response_id': 'resp_existing', 'litellm_metadata': {'session_id': 'codex-session'}}
-    _codex_auto_agent_session_affinity_by_key['aawm-code:codex-session:session:codex-session'] = {'provider': 'openai', 'model': 'gpt-5.5', 'route_family': 'codex_responses', 'last_resort': True, 'expires_at_monotonic': time.monotonic() + 3600}
+    body = {'model': 'work', 'input': [{'type': 'function_call_output', 'call_id': 'call_existing', 'output': '{}'}], 'stream': False, 'previous_response_id': 'resp_existing', 'litellm_metadata': {'session_id': 'codex-session'}}
+    _codex_auto_agent_session_affinity_by_key['work:codex-session:session:codex-session'] = {'provider': 'openai', 'model': 'gpt-5.5', 'route_family': 'codex_responses', 'last_resort': True, 'expires_at_monotonic': time.monotonic() + 3600}
     success = Response(content='{"ok": true}', media_type='application/json')
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(return_value=success)) as mock_pass_through:
         response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
@@ -19228,7 +19228,7 @@ async def test_codex_auto_agent_alias_code_last_resort_affinity_stays_on_gpt55()
 async def test_codex_auto_agent_alias_low_uses_default_low_candidates():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "litellm_metadata": {"session_id": "codex-session"},
     }
 
@@ -19240,7 +19240,7 @@ async def test_codex_auto_agent_alias_low_uses_default_low_candidates():
     assert selection["candidate"]["provider"] == "openrouter"
     assert selection["candidate"]["model"] == "openrouter/cohere/north-mini-code:free"
     assert selection["candidate"]["route_family"] == ("codex_openrouter_completion_adapter")
-    candidates = _get_codex_auto_agent_candidates_for_alias("aawm-low")
+    candidates = _get_codex_auto_agent_candidates_for_alias("basic")
     candidate_models = [candidate["model"] for candidate in candidates]
     assert candidate_models == [
         "openrouter/cohere/north-mini-code:free",
@@ -19259,7 +19259,7 @@ async def test_codex_auto_agent_alias_low_falls_through_ordered_candidates(
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "litellm_metadata": {"session_id": "codex-session"},
     }
     expected_candidates = [
@@ -19321,7 +19321,7 @@ async def test_codex_auto_agent_alias_low_falls_through_ordered_candidates(
 def test_codex_auto_agent_alias_metadata_uses_requested_alias():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "litellm_metadata": {"session_id": "codex-session"},
     }
     updated_body = _add_codex_auto_agent_alias_metadata(
@@ -19361,9 +19361,9 @@ def test_codex_auto_agent_alias_metadata_uses_requested_alias():
     )
 
     metadata = updated_body["litellm_metadata"]
-    assert metadata["model_alias_label"] == "aawm-low"
-    assert metadata["requested_model_alias"] == "aawm-low"
-    assert metadata["codex_auto_agent_alias"] == "aawm-low"
+    assert metadata["model_alias_label"] == "basic"
+    assert metadata["requested_model_alias"] == "basic"
+    assert metadata["codex_auto_agent_alias"] == "basic"
     assert metadata["codex_auto_agent_selected_provider"] == "opencode_zen"
     assert metadata["codex_auto_agent_selected_model"] == "deepseek-v4-flash"
     assert metadata["codex_auto_agent_selected_route_family"] == ("codex_opencode_zen_adapter")
@@ -19377,14 +19377,14 @@ def test_codex_auto_agent_alias_metadata_uses_requested_alias():
         "candidate_selected",
     ]
     skipped_event = audit_events[0]
-    assert skipped_event["alias_model"] == "aawm-low"
+    assert skipped_event["alias_model"] == "basic"
     assert skipped_event["provider"] == "opencode_zen"
     assert skipped_event["model"] == "big-pickle"
     assert skipped_event["cooldown_key"] == ("opencode_zen:big-pickle:opencode_zen")
     assert skipped_event["cooldown_seconds"] == 60.0
     assert skipped_event["skipped"] is True
-    assert "codex-auto-agent-alias:aawm-low" in metadata["tags"]
-    assert "model-alias:aawm-low" in metadata["tags"]
+    assert "codex-auto-agent-alias:basic" in metadata["tags"]
+    assert "model-alias:basic" in metadata["tags"]
 
 
 @pytest.mark.asyncio
@@ -19393,7 +19393,7 @@ async def test_codex_auto_agent_alias_code_falls_back_to_live_grok_4_5_after_spa
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-code",
+        "model": "work",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -19438,8 +19438,8 @@ async def test_codex_auto_agent_alias_code_falls_back_to_live_grok_4_5_after_spa
     assert mock_grok_native.await_args.kwargs["request_body"]["model"] == ("xai/grok-4.5")
     grok_body = mock_grok_native.await_args.kwargs["request_body"]
     metadata = grok_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-code"
-    assert metadata["codex_auto_agent_alias"] == "aawm-code"
+    assert metadata["requested_model_alias"] == "work"
+    assert metadata["codex_auto_agent_alias"] == "work"
     assert metadata["codex_auto_agent_selected_provider"] == "xai"
     assert metadata["codex_auto_agent_selected_model"] == "xai/grok-4.5"
     assert metadata["codex_auto_agent_selected_route_family"] == ("codex_grok_native_responses_adapter")
@@ -19470,7 +19470,7 @@ async def test_codex_auto_agent_alias_code_falls_back_to_live_grok_4_5_after_spa
 async def test_codex_auto_agent_alias_code_selects_live_grok_4_5_after_spark_cooldown():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-code",
+        "model": "work",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -19495,7 +19495,7 @@ async def test_codex_auto_agent_alias_code_selects_live_grok_4_5_after_spark_coo
 async def test_codex_auto_agent_alias_code_uses_managed_xai_after_grok_permission_denied():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-code",
+        "model": "work",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -19555,7 +19555,7 @@ async def test_codex_auto_agent_alias_code_uses_managed_xai_after_grok_permissio
     xai_body = mock_xai_oauth.await_args.kwargs["request_body"]
     assert xai_body["model"] == "oa_xai/grok-build"
     metadata = xai_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-code"
+    assert metadata["requested_model_alias"] == "work"
     assert metadata["codex_auto_agent_selected_provider"] == "xai"
     assert metadata["codex_auto_agent_selected_model"] == "oa_xai/grok-build"
     assert metadata["codex_auto_agent_selected_route_family"] == ("codex_xai_oauth_responses_adapter")
@@ -20151,7 +20151,7 @@ def test_codex_auto_agent_retryable_attempt_retains_exact_source_error():
 async def test_codex_auto_agent_alias_in_flight_native_grok_4_5_bare_502_retries_without_redispatch():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-sota-xai",
+        "model": "sota-xai",
         "input": [
             {
                 "type": "function_call_output",
@@ -20163,7 +20163,7 @@ async def test_codex_auto_agent_alias_in_flight_native_grok_4_5_bare_502_retries
         "previous_response_id": "resp_existing",
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    _codex_auto_agent_session_affinity_by_key["aawm-sota-xai:codex-session:session:codex-session"] = {
+    _codex_auto_agent_session_affinity_by_key["sota-xai:codex-session:session:codex-session"] = {
         "provider": "xai",
         "model": "grok-4.5",
         "route_family": "codex_grok_native_responses_adapter",
@@ -20227,7 +20227,7 @@ async def test_codex_auto_agent_alias_in_flight_native_grok_4_5_bare_502_retries
 async def test_anthropic_auto_agent_alias_in_flight_native_grok_4_5_bare_502_retries_without_redispatch():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     body["messages"] = [
         {
             "role": "user",
@@ -20240,7 +20240,7 @@ async def test_anthropic_auto_agent_alias_in_flight_native_grok_4_5_bare_502_ret
             ],
         }
     ]
-    _anthropic_auto_agent_session_affinity_by_key["aawm-code-anthropic:claude-session:session:claude-session"] = {
+    _anthropic_auto_agent_session_affinity_by_key["work:claude-session:session:claude-session"] = {
         "provider": "xai",
         "model": "xai/grok-4.5",
         "route_family": "anthropic_grok_native_responses_adapter",
@@ -20312,7 +20312,7 @@ async def test_anthropic_auto_agent_alias_in_flight_native_grok_4_5_bare_502_ret
 async def test_codex_auto_agent_in_flight_native_grok_4_5_bare_502_recovers_after_seven_failures():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-sota-xai",
+        "model": "sota-xai",
         "input": [
             {
                 "type": "function_call_output",
@@ -20324,7 +20324,7 @@ async def test_codex_auto_agent_in_flight_native_grok_4_5_bare_502_recovers_afte
         "previous_response_id": "resp_existing",
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    _codex_auto_agent_session_affinity_by_key["aawm-sota-xai:codex-session:session:codex-session"] = {
+    _codex_auto_agent_session_affinity_by_key["sota-xai:codex-session:session:codex-session"] = {
         "provider": "xai",
         "model": "grok-4.5",
         "route_family": "codex_grok_native_responses_adapter",
@@ -20393,7 +20393,7 @@ async def test_codex_auto_agent_in_flight_native_grok_4_5_bare_502_recovers_afte
 async def test_anthropic_auto_agent_in_flight_native_grok_4_5_bare_502_recovers_after_seven_failures():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     body["messages"] = [
         {
             "role": "user",
@@ -20406,7 +20406,7 @@ async def test_anthropic_auto_agent_in_flight_native_grok_4_5_bare_502_recovers_
             ],
         }
     ]
-    _anthropic_auto_agent_session_affinity_by_key["aawm-code-anthropic:claude-session:session:claude-session"] = {
+    _anthropic_auto_agent_session_affinity_by_key["work:claude-session:session:claude-session"] = {
         "provider": "xai",
         "model": "xai/grok-4.5",
         "route_family": "anthropic_grok_native_responses_adapter",
@@ -20478,7 +20478,7 @@ async def test_anthropic_auto_agent_in_flight_native_grok_4_5_bare_502_recovers_
 async def test_codex_auto_agent_in_flight_native_grok_4_5_bare_502_exhausts_same_candidate_budget():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-sota-xai",
+        "model": "sota-xai",
         "input": [
             {
                 "type": "function_call_output",
@@ -20490,7 +20490,7 @@ async def test_codex_auto_agent_in_flight_native_grok_4_5_bare_502_exhausts_same
         "previous_response_id": "resp_existing",
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    _codex_auto_agent_session_affinity_by_key["aawm-sota-xai:codex-session:session:codex-session"] = {
+    _codex_auto_agent_session_affinity_by_key["sota-xai:codex-session:session:codex-session"] = {
         "provider": "xai",
         "model": "grok-4.5",
         "route_family": "codex_grok_native_responses_adapter",
@@ -20558,7 +20558,7 @@ async def test_codex_auto_agent_in_flight_native_grok_4_5_bare_502_exhausts_same
 async def test_anthropic_auto_agent_in_flight_native_grok_4_5_bare_502_exhausts_same_candidate_budget():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     body["messages"] = [
         {
             "role": "user",
@@ -20571,7 +20571,7 @@ async def test_anthropic_auto_agent_in_flight_native_grok_4_5_bare_502_exhausts_
             ],
         }
     ]
-    _anthropic_auto_agent_session_affinity_by_key["aawm-code-anthropic:claude-session:session:claude-session"] = {
+    _anthropic_auto_agent_session_affinity_by_key["work:claude-session:session:claude-session"] = {
         "provider": "xai",
         "model": "xai/grok-4.5",
         "route_family": "anthropic_grok_native_responses_adapter",
@@ -20773,7 +20773,7 @@ def test_native_grok_continuation_transient_plan_uses_request_scoped_provider_at
 async def test_codex_auto_agent_fresh_native_grok_4_5_bare_502_does_not_use_continuation_budget():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-sota-xai",
+        "model": "sota-xai",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -20830,8 +20830,8 @@ async def test_codex_auto_agent_fresh_native_grok_4_5_bare_502_does_not_use_cont
 async def test_anthropic_auto_agent_fresh_native_grok_4_5_bare_502_does_not_use_continuation_budget():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
-    # Force native Grok 4.5 first: spark is preferred for aawm-code-anthropic.
+    body["model"] = "work"
+    # Force native Grok 4.5 first: spark is preferred for work.
     await _set_anthropic_auto_agent_cooldown(
         "openai:gpt-5.3-codex-spark:__default__",
         60.0,
@@ -20889,7 +20889,7 @@ async def test_anthropic_auto_agent_fresh_native_grok_4_5_bare_502_does_not_use_
 async def test_codex_auto_agent_in_flight_native_grok_4_5_429_redispatches_without_same_candidate_budget():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-sota-xai",
+        "model": "sota-xai",
         "input": [
             {
                 "type": "function_call_output",
@@ -20901,7 +20901,7 @@ async def test_codex_auto_agent_in_flight_native_grok_4_5_429_redispatches_witho
         "previous_response_id": "resp_existing",
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    _codex_auto_agent_session_affinity_by_key["aawm-sota-xai:codex-session:session:codex-session"] = {
+    _codex_auto_agent_session_affinity_by_key["sota-xai:codex-session:session:codex-session"] = {
         "provider": "xai",
         "model": "grok-4.5",
         "route_family": "codex_grok_native_responses_adapter",
@@ -20962,7 +20962,7 @@ async def test_codex_auto_agent_in_flight_native_grok_4_5_429_redispatches_witho
 async def test_anthropic_auto_agent_in_flight_native_grok_4_5_429_redispatches_without_same_candidate_budget():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     body["messages"] = [
         {
             "role": "user",
@@ -20975,7 +20975,7 @@ async def test_anthropic_auto_agent_in_flight_native_grok_4_5_429_redispatches_w
             ],
         }
     ]
-    _anthropic_auto_agent_session_affinity_by_key["aawm-code-anthropic:claude-session:session:claude-session"] = {
+    _anthropic_auto_agent_session_affinity_by_key["work:claude-session:session:claude-session"] = {
         "provider": "xai",
         "model": "xai/grok-4.5",
         "route_family": "anthropic_grok_native_responses_adapter",
@@ -21039,7 +21039,7 @@ async def test_anthropic_auto_agent_in_flight_native_grok_4_5_429_redispatches_w
 async def test_codex_auto_agent_in_flight_non_native_grok_composer_502_does_not_use_continuation_budget():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-code",
+        "model": "work",
         "input": [
             {
                 "type": "function_call_output",
@@ -21051,7 +21051,7 @@ async def test_codex_auto_agent_in_flight_non_native_grok_composer_502_does_not_
         "previous_response_id": "resp_existing",
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    _codex_auto_agent_session_affinity_by_key["aawm-code:codex-session:session:codex-session"] = {
+    _codex_auto_agent_session_affinity_by_key["work:codex-session:session:codex-session"] = {
         "provider": "xai",
         "model": "grok-composer-2.5-fast",
         "route_family": "codex_grok_native_responses_adapter",
@@ -21105,7 +21105,7 @@ async def test_codex_auto_agent_in_flight_non_native_grok_composer_502_does_not_
 async def test_anthropic_auto_agent_in_flight_non_native_grok_composer_502_does_not_use_continuation_budget():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     body["messages"] = [
         {
             "role": "user",
@@ -21118,7 +21118,7 @@ async def test_anthropic_auto_agent_in_flight_non_native_grok_composer_502_does_
             ],
         }
     ]
-    _anthropic_auto_agent_session_affinity_by_key["aawm-code-anthropic:claude-session:session:claude-session"] = {
+    _anthropic_auto_agent_session_affinity_by_key["work:claude-session:session:claude-session"] = {
         "provider": "xai",
         "model": "grok-composer-2.5-fast",
         "route_family": "anthropic_grok_native_responses_adapter",
@@ -21181,7 +21181,7 @@ async def test_codex_auto_agent_native_grok_continuation_budget_survives_outer_s
     """
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-sota-xai",
+        "model": "sota-xai",
         "input": [
             {
                 "type": "function_call_output",
@@ -21193,7 +21193,7 @@ async def test_codex_auto_agent_native_grok_continuation_budget_survives_outer_s
         "previous_response_id": "resp_existing",
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    _codex_auto_agent_session_affinity_by_key["aawm-sota-xai:codex-session:session:codex-session"] = {
+    _codex_auto_agent_session_affinity_by_key["sota-xai:codex-session:session:codex-session"] = {
         "provider": "xai",
         "model": "grok-4.5",
         "route_family": "codex_grok_native_responses_adapter",
@@ -21516,7 +21516,7 @@ def test_auto_agent_alias_route_event_emits_healthy_selection_when_enabled(
             "event_type": "candidate_selected",
             "candidate_status": "selected",
             "selection_reason": "candidate_available",
-            "alias_model": "aawm-sota-moonshot",
+            "alias_model": "sota-moonshot",
             "provider": "kimi_code",
             "model": "kimi_code/k3-max",
         }
@@ -21524,7 +21524,7 @@ def test_auto_agent_alias_route_event_emits_healthy_selection_when_enabled(
 
     assert len(emitted) == 1
     assert "AAWM_ALIAS_ROUTE:" in emitted[0]
-    assert '"alias_model":"aawm-sota-moonshot"' in emitted[0]
+    assert '"alias_model":"sota-moonshot"' in emitted[0]
     assert '"model":"kimi_code/k3-max"' in emitted[0]
 
 
@@ -21538,7 +21538,7 @@ def test_auto_agent_alias_attempt_start_emits_latest_audit_event(monkeypatch):
     selected_event = {
         "event_type": "candidate_selected",
         "candidate_status": "selected",
-        "alias_model": "aawm-sota-moonshot",
+        "alias_model": "sota-moonshot",
         "provider": "kimi_code",
         "model": "kimi_code/k3-max",
     }
@@ -21552,9 +21552,9 @@ def test_auto_agent_alias_attempt_start_emits_latest_audit_event(monkeypatch):
 
     result = endpoints._record_auto_agent_alias_attempt_started(
         alias_family="codex_auto_agent",
-        alias_model="aawm-sota-moonshot",
+        alias_model="sota-moonshot",
         request=request,
-        prepared_request_body={"model": "aawm-sota-moonshot"},
+        prepared_request_body={"model": "sota-moonshot"},
         selection={
             "candidate": {
                 "provider": "kimi_code",
@@ -21607,7 +21607,7 @@ def test_auto_agent_alias_route_event_keeps_single_canonical_failure_warning(mon
             "event_type": "candidate_retryable_failure",
             "candidate_status": "cooldown_set",
             "failure_class": "rate_limited",
-            "alias_model": "aawm-low",
+            "alias_model": "basic",
             "provider": "openrouter",
             "model": "openrouter/cohere/north-mini-code:free",
         },
@@ -21618,7 +21618,7 @@ def test_auto_agent_alias_route_event_keeps_single_canonical_failure_warning(mon
     assert emitted_info == []
     assert route_status == [
         {
-            "alias_model": "aawm-low",
+            "alias_model": "basic",
             "model_label": "openrouter/cohere/north-mini-code:free",
             "status": "Cooling Down",
             "message": ("failure_class=rate_limited; candidate_status=cooldown_set"),
@@ -21644,7 +21644,7 @@ def test_auto_agent_alias_route_event_emits_verbose_json_when_enabled(monkeypatc
             "event_type": "candidate_retryable_failure",
             "candidate_status": "cooldown_set",
             "failure_class": "provider_terminal_error",
-            "alias_model": "aawm-low",
+            "alias_model": "basic",
             "provider": "openrouter",
             "model": "openrouter/cohere/north-mini-code:free",
         },
@@ -21673,7 +21673,7 @@ def test_auto_agent_alias_route_event_records_zero_turn_rollup(monkeypatch):
             "event_type": "candidate_retryable_failure",
             "candidate_status": "cooldown_set",
             "failure_class": "capacity_exhausted",
-            "alias_model": "aawm-low",
+            "alias_model": "basic",
             "model": "grok-composer-2.5-fast",
             "rollup_group_header_label": "litellm@Codex[0.141.0]",
             "incoming_endpoint": "/openai_passthrough/responses",
@@ -21687,7 +21687,7 @@ def test_auto_agent_alias_route_event_records_zero_turn_rollup(monkeypatch):
             "group_header_label": "litellm@Codex[0.141.0]",
             "incoming_endpoint": "/openai_passthrough/responses",
             "outgoing_target": "grok_cli_chat_proxy",
-            "model_label": "grok-composer-2.5-fast(aawm-low)",
+            "model_label": "grok-composer-2.5-fast(basic)",
             "turns": 0,
             "status": "Cooling Down",
             "message": None,
@@ -21713,7 +21713,7 @@ def test_auto_agent_alias_route_event_records_source_error_on_rollup(monkeypatch
             "candidate_status": "cooldown_set",
             "failure_class": "usage_limit_reached",
             "source_error": "Grok Build usage balance exhausted",
-            "alias_model": "aawm-sota-xai",
+            "alias_model": "sota-xai",
             "model": "oa_xai/grok-4.5",
             "rollup_group_header_label": "litellm#Codex[0.144.6]",
             "incoming_endpoint": "/openai_passthrough/responses",
@@ -21727,7 +21727,7 @@ def test_auto_agent_alias_route_event_records_source_error_on_rollup(monkeypatch
             "group_header_label": "litellm#Codex[0.144.6]",
             "incoming_endpoint": "/openai_passthrough/responses",
             "outgoing_target": "codex_xai_oauth_responses_adapter",
-            "model_label": "oa_xai/grok-4.5(aawm-sota-xai)",
+            "model_label": "oa_xai/grok-4.5(sota-xai)",
             "turns": 0,
             "status": "Cooling Down",
             "message": "Grok Build usage balance exhausted",
@@ -21752,7 +21752,7 @@ def test_auto_agent_alias_route_event_records_cooldown_rollup_with_host(monkeypa
             "event_type": "candidate_retryable_failure",
             "candidate_status": "cooldown_set",
             "failure_class": "rate_limited",
-            "alias_model": "aawm-low",
+            "alias_model": "basic",
             "model": "openrouter/cohere/north-mini-code:free",
             "repository": "litellm",
             "client_product_label": "codex-cli/0.142.5",
@@ -21769,7 +21769,7 @@ def test_auto_agent_alias_route_event_records_cooldown_rollup_with_host(monkeypa
             "group_header_label": "litellm#Codex[0.142.5]@thoth",
             "incoming_endpoint": "/openai_passthrough/responses",
             "outgoing_target": "openrouter.ai/api/v1/chat/completions",
-            "model_label": "openrouter/cohere/north-mini-code:free(aawm-low)",
+            "model_label": "openrouter/cohere/north-mini-code:free(basic)",
             "turns": 0,
             "status": "Cooling Down",
             "message": None,
@@ -21806,7 +21806,7 @@ def test_auto_agent_alias_audit_event_builds_cooldown_rollup_with_request_host(
 
     event = endpoints._build_auto_agent_alias_audit_event(
         alias_family="codex",
-        alias_model="aawm-low",
+        alias_model="basic",
         request=request,
         request_body=request_body,
         selection={
@@ -21847,7 +21847,7 @@ def test_auto_agent_alias_route_event_cooldown_rollup_keeps_no_host_without_cont
             "event_type": "candidate_retryable_failure",
             "candidate_status": "cooldown_set",
             "failure_class": "rate_limited",
-            "alias_model": "aawm-low",
+            "alias_model": "basic",
             "model": "openrouter/cohere/north-mini-code:free",
             "rollup_group_header_label": "litellm#Codex[0.142.5]",
             "incoming_endpoint": "/openai_passthrough/responses",
@@ -21879,7 +21879,7 @@ def test_auto_agent_alias_route_event_cooldown_rollup_preserves_existing_host_la
             "event_type": "candidate_retryable_failure",
             "candidate_status": "cooldown_set",
             "failure_class": "rate_limited",
-            "alias_model": "aawm-low",
+            "alias_model": "basic",
             "model": "openrouter/cohere/north-mini-code:free",
             "host_name": "other-host",
             "rollup_group_header_label": "litellm#Codex[0.142.5]@thoth",
@@ -21909,7 +21909,7 @@ def test_auto_agent_alias_route_event_prefers_real_opencode_zen_target(monkeypat
             "event_type": "candidate_retryable_failure",
             "candidate_status": "cooldown_set",
             "failure_class": "capacity_exhausted",
-            "alias_model": "aawm-low",
+            "alias_model": "basic",
             "model": "deepseek-v4-flash",
             "rollup_group_header_label": "litellm@Codex[0.141.0]",
             "incoming_endpoint": "/openai_passthrough/responses",
@@ -21924,7 +21924,7 @@ def test_auto_agent_alias_route_event_prefers_real_opencode_zen_target(monkeypat
             "group_header_label": "litellm@Codex[0.141.0]",
             "incoming_endpoint": "/openai_passthrough/responses",
             "outgoing_target": "opencode.ai/zen/v1/chat/completions",
-            "model_label": "deepseek-v4-flash(aawm-low)",
+            "model_label": "deepseek-v4-flash(basic)",
             "turns": 0,
             "status": "Cooling Down",
             "message": None,
@@ -21946,7 +21946,7 @@ def test_resolve_auto_agent_alias_route_rollup_outgoing_target_prefers_target_ur
 async def test_codex_read_agent_alias_falls_back_after_high_demand(monkeypatch):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-read",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -21978,8 +21978,8 @@ async def test_codex_read_agent_alias_falls_back_after_high_demand(monkeypatch):
     assert mock_openrouter.await_args.kwargs["adapter_model"] == ("deepseek/deepseek-v4-flash")
     deepseek_body = mock_openrouter.await_args.kwargs["request_body"]
     metadata = deepseek_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-read"
-    assert metadata["codex_auto_agent_alias"] == "aawm-read"
+    assert metadata["requested_model_alias"] == "basic"
+    assert metadata["codex_auto_agent_alias"] == "basic"
     assert metadata["codex_auto_agent_selected_provider"] == "openrouter"
     first_attempt = metadata["codex_auto_agent_attempts"][0]
     assert first_attempt["status"] == "cooldown_set"
@@ -21991,7 +21991,7 @@ async def test_codex_read_agent_alias_falls_back_after_high_demand(monkeypatch):
 @pytest.mark.asyncio
 async def test_codex_sota_alias_handles_terminal_high_demand_after_fallback(monkeypatch):
     request = _build_codex_auto_agent_request()
-    body = {'model': 'aawm-sota', 'input': 'hello', 'stream': False, 'litellm_metadata': {'session_id': 'codex-session'}}
+    body = {'model': 'sota', 'input': 'hello', 'stream': False, 'litellm_metadata': {'session_id': 'codex-session'}}
     gpt55_error = RuntimeError("We're currently experiencing high demand, which may cause temporary errors.")
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(side_effect=gpt55_error)) as mock_pass_through:
         with pytest.raises(HTTPException) as exc_info:
@@ -22008,7 +22008,7 @@ async def test_codex_read_agent_alias_native_cooldown_survives_fresh_session(
 ):
     first_request = _build_codex_auto_agent_request("codex-session-1")
     first_body = {
-        "model": "aawm-read",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session-1"},
@@ -22038,7 +22038,7 @@ async def test_codex_read_agent_alias_native_cooldown_survives_fresh_session(
 
     second_request = _build_codex_auto_agent_request("codex-session-2")
     second_body = {
-        "model": "aawm-read",
+        "model": "basic",
         "litellm_metadata": {"session_id": "codex-session-2"},
     }
     selection = await _select_codex_auto_agent_candidate(
@@ -22055,7 +22055,7 @@ async def test_codex_read_agent_alias_native_cooldown_survives_fresh_session(
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(monkeypatch):
     request = _build_codex_auto_agent_request()
-    body = {'model': 'aawm-code', 'input': 'hello', 'stream': False, 'tools': [_codex_apply_patch_custom_tool_definition(), {'type': 'custom', 'name': 'exec_command'}, {'type': 'function', 'name': 'read_file', 'parameters': {'type': 'object', 'properties': {}}}], 'tool_choice': {'type': 'custom', 'name': 'apply_patch'}, 'litellm_metadata': {'session_id': 'codex-session'}}
+    body = {'model': 'work', 'input': 'hello', 'stream': False, 'tools': [_codex_apply_patch_custom_tool_definition(), {'type': 'custom', 'name': 'exec_command'}, {'type': 'function', 'name': 'read_file', 'parameters': {'type': 'object', 'properties': {}}}], 'tool_choice': {'type': 'custom', 'name': 'apply_patch'}, 'litellm_metadata': {'session_id': 'codex-session'}}
     spark_error = RuntimeError('Selected model is at capacity. Please try a different model.')
     grok_success = Response(content='{"ok": true}', media_type='application/json')
     with patch.dict(os.environ, {'GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL': 'https://api.x.ai/v1', 'LITELLM_XAI_GROK_CLIENT_VERSION': '0.1.211'}), patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(side_effect=[spark_error, grok_success])) as mock_pass_through, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token', new=AsyncMock(return_value='grok-oidc-token')):
@@ -22100,7 +22100,7 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(monkeyp
 async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sidecar_refresh_required(monkeypatch):
     monkeypatch.setenv('LITELLM_XAI_OAUTH_API_BASE', 'https://api.x.ai/v1')
     request = _build_codex_auto_agent_request()
-    body = {'model': 'aawm-code', 'input': 'hello', 'stream': False, 'tools': [_codex_apply_patch_custom_tool_definition(), {'type': 'custom', 'name': 'exec_command'}, {'type': 'function', 'name': 'read_file', 'parameters': {'type': 'object', 'properties': {}}}], 'tool_choice': {'type': 'custom', 'name': 'apply_patch'}, 'litellm_metadata': {'session_id': 'codex-session'}}
+    body = {'model': 'work', 'input': 'hello', 'stream': False, 'tools': [_codex_apply_patch_custom_tool_definition(), {'type': 'custom', 'name': 'exec_command'}, {'type': 'function', 'name': 'read_file', 'parameters': {'type': 'object', 'properties': {}}}], 'tool_choice': {'type': 'custom', 'name': 'apply_patch'}, 'litellm_metadata': {'session_id': 'codex-session'}}
     spark_error = ProxyException(message='spark usage limit', type='rate_limit_error', param='model', code=429)
     spark_error.detail = {'error': {'message': 'usage_limit_reached', 'code': 'usage_limit_reached'}}
     grok_refresh_error = ValueError('Grok OIDC credential is missing, expired, or near expiry. Run the health/provider-status sidecar Grok OIDC refresh or relogin with the Grok CLI before Grok native traffic can proceed.')
@@ -22148,7 +22148,7 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -22193,7 +22193,7 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
     assert luna_body["model"] == "gpt-5.6-luna"
     assert candidate_body["model"] == "gpt-5.4-mini"
     metadata = candidate_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-low"
+    assert metadata["requested_model_alias"] == "basic"
     assert metadata["codex_auto_agent_selected_provider"] == "openai"
     assert metadata["codex_auto_agent_selected_model"] == "gpt-5.4-mini"
     assert metadata["codex_auto_agent_selected_last_resort"] is True
@@ -22250,7 +22250,7 @@ async def test_codex_auto_agent_alias_low_owl_alpha_no_endpoints_reaches_mini(
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -22466,7 +22466,7 @@ async def _run_codex_auto_agent_alias_low_opencode_error_case(
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -22518,7 +22518,7 @@ async def _run_codex_auto_agent_alias_low_opencode_error_case(
     assert luna_body["model"] == "gpt-5.6-luna"
     assert candidate_body["model"] == "gpt-5.4-mini"
     metadata = candidate_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-low"
+    assert metadata["requested_model_alias"] == "basic"
     assert metadata["codex_auto_agent_selected_provider"] == "openai"
     assert metadata["codex_auto_agent_selected_model"] == "gpt-5.4-mini"
     assert metadata["codex_auto_agent_selected_last_resort"] is True
@@ -22894,7 +22894,7 @@ async def test_codex_auto_agent_alias_openrouter_retryable_failure_reaches_mini(
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-codex-agent-auto",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -22942,7 +22942,7 @@ async def test_codex_auto_agent_alias_openrouter_retryable_failure_reaches_mini(
     mini_body = mock_pass_through.await_args.kwargs["custom_body"]
     assert mini_body["model"] == "gpt-5.4-mini"
     metadata = mini_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-codex-agent-auto"
+    assert metadata["requested_model_alias"] == "basic"
     assert metadata["codex_auto_agent_selected_provider"] == "openai"
     assert metadata["codex_auto_agent_selected_last_resort"] is True
     openrouter_attempt = metadata["codex_auto_agent_attempts"][0]
@@ -22960,7 +22960,7 @@ async def test_codex_auto_agent_alias_low_openrouter_raw_provider_error_reaches_
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -23006,7 +23006,7 @@ async def test_codex_auto_agent_alias_low_openrouter_raw_provider_error_reaches_
     assert first_call["adapter_model"] == "openrouter/cohere/north-mini-code:free"
     assert second_call["adapter_model"] == "openrouter/owl-alpha"
     metadata = second_call["request_body"]["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-low"
+    assert metadata["requested_model_alias"] == "basic"
     assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
         "openrouter/cohere/north-mini-code:free",
         "openrouter/owl-alpha",
@@ -23023,7 +23023,7 @@ async def test_codex_auto_agent_alias_low_openrouter_raw_provider_error_reaches_
 async def test_codex_auto_agent_alias_skips_cooled_down_candidates(monkeypatch):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-codex-agent-auto",
+        "model": "basic",
         "litellm_metadata": {"session_id": "codex-session"},
     }
     await _set_codex_auto_agent_cooldown(
@@ -23045,7 +23045,7 @@ async def test_codex_auto_agent_alias_skips_cooled_down_candidates(monkeypatch):
 async def test_codex_auto_agent_alias_uses_openrouter_before_last_resort(monkeypatch):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-codex-agent-auto",
+        "model": "basic",
         "litellm_metadata": {"session_id": "codex-session"},
     }
     await _set_codex_auto_agent_cooldown(
@@ -23070,7 +23070,7 @@ async def test_codex_auto_agent_alias_routes_openrouter_candidate(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_BASE", raising=False)
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-codex-agent-auto",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -23175,7 +23175,7 @@ async def test_codex_auto_agent_alias_low_routes_openrouter_completion_adapter_p
     monkeypatch.delenv("OPENROUTER_API_BASE", raising=False)
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -23245,7 +23245,7 @@ async def test_codex_auto_agent_alias_low_routes_openrouter_completion_adapter_p
     assert acompletion_kwargs["api_base"] == "https://openrouter.ai/api/v1"
     assert acompletion_kwargs["shared_session"] is shared_session
     litellm_metadata = acompletion_kwargs["litellm_metadata"]
-    assert litellm_metadata["requested_model_alias"] == "aawm-low"
+    assert litellm_metadata["requested_model_alias"] == "basic"
     assert litellm_metadata["codex_auto_agent_selected_provider"] == "openrouter"
     assert litellm_metadata["codex_auto_agent_selected_model"] == adapter_model
     assert litellm_metadata["codex_auto_agent_selected_route_family"] == ("codex_openrouter_completion_adapter")
@@ -23256,7 +23256,7 @@ async def test_codex_auto_agent_alias_low_routes_openrouter_completion_adapter_p
 async def test_codex_auto_agent_alias_uses_gpt54_mini_only_as_last_resort(monkeypatch):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-codex-agent-auto",
+        "model": "basic",
         "litellm_metadata": {"session_id": "codex-session"},
     }
     await _set_codex_auto_agent_cooldown(
@@ -23282,7 +23282,7 @@ async def test_codex_auto_agent_alias_uses_gpt54_mini_only_as_last_resort(monkey
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_native_success_sets_session_affinity_for_continuation(monkeypatch):
     request = _build_codex_auto_agent_request()
-    body = {'model': 'aawm-codex-agent-auto', 'input': 'hello', 'stream': False, 'litellm_metadata': {'session_id': 'codex-session'}}
+    body = {'model': 'basic', 'input': 'hello', 'stream': False, 'litellm_metadata': {'session_id': 'codex-session'}}
     success = Response(content='{"ok": true}', media_type='application/json')
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(return_value=success)) as mock_pass_through:
         response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
@@ -23298,7 +23298,7 @@ async def test_codex_auto_agent_alias_native_success_sets_session_affinity_for_c
     assert first_body['model'] == 'gpt-5.3-codex-spark'
     assert second_body['model'] == 'gpt-5.3-codex-spark'
     assert third_body['model'] == 'gpt-5.3-codex-spark'
-    assert first_body['litellm_metadata']['requested_model_alias'] == 'aawm-codex-agent-auto'
+    assert first_body['litellm_metadata']['requested_model_alias'] == 'basic'
     assert second_body['litellm_metadata']['codex_auto_agent_selection_reason'] == 'first_available'
     assert third_body['litellm_metadata']['codex_auto_agent_selection_reason'] == 'session_affinity'
 
@@ -23307,7 +23307,7 @@ async def test_codex_auto_agent_alias_native_success_sets_session_affinity_for_c
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_success_preserves_attempt_metadata_without_info_alias_route_logs(monkeypatch):
     request = _build_codex_auto_agent_request()
-    body = {'model': 'aawm-codex-agent-auto', 'input': 'hello', 'stream': False, 'litellm_metadata': {'session_id': 'codex-session'}}
+    body = {'model': 'basic', 'input': 'hello', 'stream': False, 'litellm_metadata': {'session_id': 'codex-session'}}
     success = Response(content='{"ok": true}', media_type='application/json')
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(return_value=success)) as mock_pass_through, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info') as mock_info, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning') as mock_warning:
         response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
@@ -23315,7 +23315,7 @@ async def test_codex_auto_agent_alias_success_preserves_attempt_metadata_without
     mock_pass_through.assert_awaited_once()
     custom_body = mock_pass_through.await_args.kwargs['custom_body']
     metadata = custom_body['litellm_metadata']
-    assert metadata['requested_model_alias'] == 'aawm-codex-agent-auto'
+    assert metadata['requested_model_alias'] == 'basic'
     assert metadata['codex_auto_agent_selected_provider'] == 'openai'
     assert metadata['codex_auto_agent_selected_model'] == 'gpt-5.3-codex-spark'
     assert metadata['codex_auto_agent_selected_route_family'] == 'codex_responses'
@@ -23340,7 +23340,7 @@ async def test_codex_auto_agent_alias_falls_back_to_deepseek_after_native_429(
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-codex-agent-auto",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -23391,7 +23391,7 @@ async def test_codex_auto_agent_alias_falls_back_to_deepseek_after_native_429(
     assert mock_openrouter.await_args.kwargs["adapter_model"] == ("deepseek/deepseek-v4-flash")
     deepseek_body = mock_openrouter.await_args.kwargs["request_body"]
     assert deepseek_body["model"] == "deepseek/deepseek-v4-flash"
-    assert deepseek_body["litellm_metadata"]["requested_model_alias"] == ("aawm-codex-agent-auto")
+    assert deepseek_body["litellm_metadata"]["requested_model_alias"] == ("basic")
     assert deepseek_body["litellm_metadata"]["codex_auto_agent_attempts"][0]["status"] == "cooldown_set"
     audit_events = deepseek_body["litellm_metadata"]["aawm_alias_routing_audit_events"]
     retryable_event = next(event for event in audit_events if event["event_type"] == "candidate_retryable_failure")
@@ -23420,7 +23420,7 @@ async def test_codex_auto_agent_alias_fresh_dispatch_affinity_429_reaches_last_r
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-codex-agent-auto",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -23507,7 +23507,7 @@ async def test_codex_auto_agent_alias_openrouter_empty_success_rolls_to_last_res
     monkeypatch.setenv("AAWM_OPENROUTER_API_KEY", "or-test-key")
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-codex-agent-auto",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -23566,7 +23566,7 @@ async def test_codex_auto_agent_alias_openrouter_empty_success_rolls_to_mini(
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-codex-agent-auto",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -23629,7 +23629,7 @@ async def test_codex_auto_agent_alias_openrouter_one_token_text_is_success(
     monkeypatch.setenv("AAWM_OPENROUTER_API_KEY", "or-test-key")
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-codex-agent-auto",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -23685,7 +23685,7 @@ async def test_codex_auto_agent_alias_openrouter_malformed_composer_call_rolls_o
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-composer-call"},
@@ -23693,7 +23693,7 @@ async def test_codex_auto_agent_alias_openrouter_malformed_composer_call_rolls_o
     monkeypatch.setenv("AAWM_OPENROUTER_API_KEY", "or-test-key")
     monkeypatch.setitem(
         _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-        "aawm-low",
+        "basic",
         (
             {
                 "provider": "openrouter",
@@ -23776,7 +23776,7 @@ async def test_codex_auto_agent_alias_openrouter_capacity_reaches_last_resort(
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-codex-agent-auto",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -23844,7 +23844,7 @@ async def test_codex_auto_agent_alias_openrouter_capacity_reaches_last_resort(
 
 def test_codex_auto_agent_continuation_detector_ignores_non_string_type() -> None:
     body = {
-        "model": "aawm-codex-agent-auto",
+        "model": "basic",
         "input": [
             {
                 "role": "user",
@@ -23863,7 +23863,7 @@ def test_codex_auto_agent_continuation_detector_ignores_non_string_type() -> Non
 
 def test_codex_auto_agent_continuation_detector_handles_cycles() -> None:
     body: dict[str, Any] = {
-        "model": "aawm-codex-agent-auto",
+        "model": "basic",
         "input": [{"type": {"nested": "not-hashable"}}],
     }
     body["self"] = body
@@ -23877,7 +23877,7 @@ def test_codex_auto_agent_continuation_detector_handles_cycles() -> None:
 async def test_codex_auto_agent_alias_in_flight_affinity_429_is_terminal(monkeypatch):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-codex-agent-auto",
+        "model": "basic",
         "input": [
             {
                 "type": "function_call_output",
@@ -23935,7 +23935,7 @@ async def test_codex_auto_agent_alias_in_flight_affinity_429_is_terminal(monkeyp
     assert exc_info.value.detail["error"]["code"] == ("aawm_codex_auto_agent_redispatch_required")
     assert "Do not continue this child agent" in exc_info.value.detail["error"]["message"]
     assert "Redispatch a fresh subagent" in exc_info.value.detail["error"]["message"]
-    assert exc_info.value.detail["redispatch_model"] == "aawm-codex-agent-auto"
+    assert exc_info.value.detail["redispatch_model"] == "basic"
     assert exc_info.value.detail["redispatch_reason"] == "in_flight_retryable_provider_exhaustion"
     assert exc_info.value.detail["selected_provider"] == "openrouter"
     assert exc_info.value.detail["selected_model"] == "deepseek/deepseek-v4-flash"
@@ -23963,15 +23963,15 @@ async def test_codex_auto_agent_alias_in_flight_affinity_429_is_terminal(monkeyp
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_in_flight_redispatch_uses_requested_alias(monkeypatch):
     request = _build_codex_auto_agent_request()
-    body = {'model': 'aawm-sota', 'input': [{'type': 'function_call_output', 'call_id': 'call_existing', 'output': '{}'}], 'stream': False, 'previous_response_id': 'resp_existing', 'litellm_metadata': {'session_id': 'codex-session'}}
-    _codex_auto_agent_session_affinity_by_key['aawm-sota:codex-session:session:codex-session'] = {'provider': 'openai', 'model': 'gpt-5.5', 'route_family': 'codex_responses', 'last_resort': False, 'expires_at_monotonic': time.monotonic() + 3600}
+    body = {'model': 'sota', 'input': [{'type': 'function_call_output', 'call_id': 'call_existing', 'output': '{}'}], 'stream': False, 'previous_response_id': 'resp_existing', 'litellm_metadata': {'session_id': 'codex-session'}}
+    _codex_auto_agent_session_affinity_by_key['sota:codex-session:session:codex-session'] = {'provider': 'openai', 'model': 'gpt-5.5', 'route_family': 'codex_responses', 'last_resort': False, 'expires_at_monotonic': time.monotonic() + 3600}
     gpt55_error = RuntimeError('Selected model is at capacity. Please try a different model.')
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(side_effect=gpt55_error)):
         with pytest.raises(HTTPException) as exc_info:
             await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
     assert exc_info.value.status_code == 429
     assert exc_info.value.detail['error']['code'] == 'aawm_codex_auto_agent_redispatch_required'
-    assert exc_info.value.detail['redispatch_model'] == 'aawm-sota'
+    assert exc_info.value.detail['redispatch_model'] == 'sota'
     assert exc_info.value.detail['selected_provider'] == 'openai'
     assert exc_info.value.detail['selected_model'] == 'gpt-5.5'
     assert 'MODEL_AT_CAPACITY' in exc_info.value.detail['error_tokens']
@@ -23984,7 +23984,7 @@ async def test_codex_auto_agent_alias_in_flight_affinity_cooldown_does_not_switc
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-codex-agent-auto",
+        "model": "basic",
         "input": [
             {
                 "type": "function_call_output",
@@ -24103,7 +24103,7 @@ async def test_openai_passthrough_route_sets_repository_trace_environment_and_se
     assert litellm_metadata["codex_tool_description_patch_count"] == 2
     assert litellm_metadata["aawm_tool_definition_names"] == ["spawn_agent"]
     assert litellm_metadata["aawm_tool_definition_snapshot_storage"] == "session_history_tool_definition_snapshots"
-    assert "aawm-codex-agent-auto" in prepared_body["tools"][0]["description"]
+    assert "basic" in prepared_body["tools"][0]["description"]
     assert 'fork_turns="none"' in prepared_body["tools"][0]["description"]
     assert (
         "Explicitly requested agent_type, model, or fork_turns values take "
@@ -24134,7 +24134,7 @@ async def test_openai_passthrough_codex_auto_agent_alias_uses_alias_router(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
         new=AsyncMock(
             return_value={
-                "model": "aawm-codex-agent-auto",
+                "model": "basic",
                 "input": "hello",
                 "instructions": "Existing instructions.",
                 "litellm_metadata": {"tags": ["existing-tag"]},
@@ -24164,7 +24164,7 @@ async def test_openai_passthrough_codex_auto_agent_alias_uses_alias_router(
     mock_alias_handler.assert_awaited_once()
     mock_create_pass_through_route.assert_not_called()
     prepared_body = mock_alias_handler.await_args.kwargs["prepared_request_body"]
-    assert prepared_body["model"] == "aawm-codex-agent-auto"
+    assert prepared_body["model"] == "basic"
     assert prepared_body["instructions"].startswith("Existing instructions.")
     assert "non-empty final answer" in prepared_body["instructions"]
     assert "required tool is unavailable or blocked" in prepared_body["instructions"]
@@ -24198,7 +24198,7 @@ async def test_openai_passthrough_recognized_alias_without_codex_headers_uses_al
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
         new=AsyncMock(
             return_value={
-                "model": "aawm-sota-xai",
+                "model": "sota-xai",
                 "input": "hello",
             }
         ),
@@ -24220,7 +24220,7 @@ async def test_openai_passthrough_recognized_alias_without_codex_headers_uses_al
 
     assert result == {"ok": True}
     mock_alias_handler.assert_awaited_once()
-    assert mock_alias_handler.await_args.kwargs["prepared_request_body"]["model"] == "aawm-sota-xai"
+    assert mock_alias_handler.await_args.kwargs["prepared_request_body"]["model"] == "sota-xai"
     mock_create_pass_through_route.assert_not_called()
 
 
@@ -24236,7 +24236,7 @@ async def test_openai_passthrough_aawm_read_alias_applies_read_guidance(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
         new=AsyncMock(
             return_value={
-                "model": "aawm-read",
+                "model": "basic",
                 "input": "hello",
                 "instructions": "Existing instructions.",
                 "litellm_metadata": {"tags": ["existing-tag"]},
@@ -24266,7 +24266,7 @@ async def test_openai_passthrough_aawm_read_alias_applies_read_guidance(
     mock_alias_handler.assert_awaited_once()
     mock_create_pass_through_route.assert_not_called()
     prepared_body = mock_alias_handler.await_args.kwargs["prepared_request_body"]
-    assert prepared_body["model"] == "aawm-read"
+    assert prepared_body["model"] == "basic"
     assert prepared_body["instructions"].startswith("Existing instructions.")
     assert "non-empty final answer" in prepared_body["instructions"]
     assert "Do not edit files" in prepared_body["instructions"]
@@ -24277,9 +24277,9 @@ async def test_openai_passthrough_aawm_read_alias_applies_read_guidance(
     assert "codex-auto-agent-prevention-guidance" in litellm_metadata["tags"]
     assert "aawm-read-agent-guidance" in litellm_metadata["tags"]
     assert ("aawm-read-agent-guidance:" f"{_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION}") in litellm_metadata["tags"]
-    assert "aawm-read-agent-guidance-alias:aawm-read" in litellm_metadata["tags"]
+    assert "aawm-read-agent-guidance-alias:basic" in litellm_metadata["tags"]
     assert litellm_metadata["aawm_read_agent_guidance_applied"] is True
-    assert litellm_metadata["aawm_read_agent_guidance_alias"] == "aawm-read"
+    assert litellm_metadata["aawm_read_agent_guidance_alias"] == "basic"
     assert litellm_metadata["aawm_read_agent_guidance_policy_name"] == _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME
     assert litellm_metadata["aawm_read_agent_guidance_policy_version"] == _AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION
 
@@ -28749,7 +28749,7 @@ class _FakeAawmAliasRoutingDualCache:
 @pytest.mark.asyncio
 async def test_aawm_alias_routing_durable_codex_affinity_recovers_after_memory_clear():
     dual_cache = _FakeAawmAliasRoutingDualCache()
-    session_key = "aawm-code:codex-session:session:codex-session"
+    session_key = "work:codex-session:session:codex-session"
     candidate = {
         "provider": "openai",
         "model": "gpt-5.5",
@@ -28773,7 +28773,7 @@ async def test_aawm_alias_routing_durable_codex_affinity_recovers_after_memory_c
 @pytest.mark.asyncio
 async def test_aawm_alias_routing_durable_anthropic_affinity_recovers_after_memory_clear():
     dual_cache = _FakeAawmAliasRoutingDualCache()
-    session_key = "aawm-code-anthropic:claude-session:session:claude-session"
+    session_key = "work:claude-session:session:claude-session"
     candidate = {
         "provider": "openai",
         "model": "gpt-5.3-codex-spark",
@@ -28797,7 +28797,7 @@ async def test_aawm_alias_routing_durable_anthropic_affinity_recovers_after_memo
 @pytest.mark.asyncio
 async def test_aawm_alias_routing_durable_affinity_payload_is_sanitized():
     dual_cache = _FakeAawmAliasRoutingDualCache()
-    session_key = "aawm-code-anthropic:claude-session:session:claude-session"
+    session_key = "work:claude-session:session:claude-session"
     candidate = {
         "provider": "openai",
         "model": "gpt-5.3-codex-spark",
@@ -28851,7 +28851,7 @@ async def test_codex_auto_agent_alias_low_openrouter_adapter_cooldown_does_not_s
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -28887,7 +28887,7 @@ async def test_codex_auto_agent_alias_low_openrouter_adapter_cooldown_does_not_s
     assert mock_openrouter.await_count == 1
     assert mock_openrouter.await_args.kwargs["adapter_model"] == "openrouter/owl-alpha"
     metadata = mock_openrouter.await_args.kwargs["request_body"]["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-low"
+    assert metadata["requested_model_alias"] == "basic"
     assert metadata["codex_auto_agent_attempts"][-1]["model"] == "openrouter/owl-alpha"
     skipped_models = {candidate["model"] for candidate in metadata.get("codex_auto_agent_skipped_candidates", [])}
     assert cooled_model in skipped_models
@@ -28900,7 +28900,7 @@ async def test_anthropic_auto_agent_alias_low_openrouter_adapter_cooldown_does_n
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-low-anthropic"
+    body["model"] = "basic"
     cooled_model = "openrouter/cohere/north-mini-code:free"
     upstream_model = "cohere/north-mini-code:free"
     success = Response(content='{"ok": true}', media_type="application/json")
@@ -28931,7 +28931,7 @@ async def test_anthropic_auto_agent_alias_low_openrouter_adapter_cooldown_does_n
     assert mock_openrouter.await_count == 1
     assert mock_openrouter.await_args.kwargs["adapter_model"] == "openrouter/owl-alpha"
     metadata = mock_openrouter.await_args.kwargs["prepared_request_body"]["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-low-anthropic"
+    assert metadata["requested_model_alias"] == "basic"
     assert metadata["anthropic_auto_agent_attempts"][-1]["model"] == "openrouter/owl-alpha"
     skipped_models = {candidate["model"] for candidate in metadata.get("anthropic_auto_agent_skipped_candidates", [])}
     assert cooled_model in skipped_models
@@ -28942,7 +28942,7 @@ async def test_anthropic_auto_agent_alias_low_openrouter_adapter_cooldown_does_n
 async def test_aawm_low_alias_skips_openrouter_candidate_with_adapter_local_cooldown():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "litellm_metadata": {"session_id": "codex-session"},
     }
     exhausted_model = "openrouter/cohere/north-mini-code:free"
@@ -28970,7 +28970,7 @@ async def test_aawm_low_alias_durable_cooldown_blocks_after_memory_clear():
     dual_cache = _FakeAawmAliasRoutingDualCache()
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "litellm_metadata": {"session_id": "codex-session"},
     }
     candidate = {
@@ -29004,7 +29004,7 @@ async def test_aawm_low_alias_skips_openrouter_candidates_with_durable_quota_exh
     _codex_auto_agent_session_affinity_by_key.clear()
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "litellm_metadata": {"session_id": "codex-session"},
     }
 
@@ -29040,7 +29040,7 @@ async def test_aawm_low_anthropic_alias_skips_openrouter_candidates_with_durable
     _anthropic_auto_agent_session_affinity_by_key.clear()
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-low-anthropic"
+    body["model"] = "basic"
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_openrouter_free_daily_quota_exhausted_cooldown_seconds",
@@ -29074,7 +29074,7 @@ async def test_aawm_low_alias_keeps_openrouter_first_without_durable_quota_exhau
     _codex_auto_agent_session_affinity_by_key.clear()
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "litellm_metadata": {"session_id": "codex-session"},
     }
 
@@ -29183,7 +29183,7 @@ async def test_codex_auto_agent_alias_in_flight_redispatch_includes_audit_metada
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "input": [
             {
                 "type": "function_call_output",
@@ -29195,7 +29195,7 @@ async def test_codex_auto_agent_alias_in_flight_redispatch_includes_audit_metada
         "previous_response_id": "resp_existing",
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    _codex_auto_agent_session_affinity_by_key["aawm-low:codex-session:session:codex-session"] = {
+    _codex_auto_agent_session_affinity_by_key["basic:codex-session:session:codex-session"] = {
         "provider": "openrouter",
         "model": "openrouter/cohere/north-mini-code:free",
         "route_family": "codex_openrouter_completion_adapter",
@@ -29247,7 +29247,7 @@ async def test_codex_auto_agent_alias_in_flight_redispatch_includes_audit_metada
 async def test_anthropic_alias_non_inflight_bare_502_does_not_persist_durable_cooldown():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     grok_error = ProxyException(
         message="Temporary upstream provider failure",
         type="None",
@@ -29356,7 +29356,7 @@ async def test_aawm_alias_routing_selector_reports_local_fallback_without_durabl
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "litellm_metadata": {"session_id": "codex-session"},
     }
     with patch(
@@ -29389,11 +29389,11 @@ async def test_aawm_alias_routing_durable_write_failure_keeps_in_memory_cooldown
 def test_codex_aawm_sota_openai_and_sota_xai_alias_normalization():
     from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as mod
 
-    assert mod._normalize_codex_auto_agent_alias_model("aawm-sota-openai") == ("aawm-sota-openai")
-    assert mod._normalize_codex_auto_agent_alias_model("AAWM-SOTA-XAI") == ("aawm-sota-xai")
-    assert mod._is_codex_auto_agent_alias_model("aawm-sota-openai") is True
-    assert mod._resolve_codex_auto_agent_alias_model({"model": "aawm-sota-xai"}, "/v1/responses") == "aawm-sota-xai"
-    assert mod._resolve_codex_auto_agent_alias_model({"model": "aawm-sota-xai"}, "/v1/chat/completions") is None
+    assert mod._normalize_codex_auto_agent_alias_model("sota-openai") == ("sota-openai")
+    assert mod._normalize_codex_auto_agent_alias_model("AAWM-SOTA-XAI") == ("sota-xai")
+    assert mod._is_codex_auto_agent_alias_model("sota-openai") is True
+    assert mod._resolve_codex_auto_agent_alias_model({"model": "sota-xai"}, "/v1/responses") == "sota-xai"
+    assert mod._resolve_codex_auto_agent_alias_model({"model": "sota-xai"}, "/v1/chat/completions") is None
 
 
 def test_codex_auto_agent_grok_4_5_candidate_unavailable_does_not_durable_cooldown():
@@ -29632,7 +29632,7 @@ def test_raise_codex_native_openai_auto_agent_candidate_unavailable_sets_proxy_d
 async def test_codex_auto_agent_alias_code_falls_back_after_gpt_5_6_terra_unsupported():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-code",
+        "model": "work",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -29660,7 +29660,7 @@ async def test_codex_auto_agent_alias_code_falls_back_after_gpt_5_6_terra_unsupp
     spark_body = mock_pass_through.await_args_list[0].kwargs["custom_body"]
     assert spark_body["model"] == "gpt-5.3-codex-spark"
     metadata = spark_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-code"
+    assert metadata["requested_model_alias"] == "work"
     assert metadata["codex_auto_agent_selected_provider"] == "openai"
     assert metadata["codex_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
     assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
@@ -29672,7 +29672,7 @@ async def test_codex_auto_agent_alias_code_falls_back_after_gpt_5_6_terra_unsupp
 async def test_codex_auto_agent_alias_code_cools_terra_when_unsupported_after_prior_failover():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-code",
+        "model": "work",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -29747,7 +29747,7 @@ async def test_codex_auto_agent_alias_code_cools_terra_when_unsupported_after_pr
 async def test_codex_auto_agent_alias_low_falls_back_after_gpt_5_6_luna_unsupported():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-low",
+        "model": "basic",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -29799,7 +29799,7 @@ async def test_codex_auto_agent_alias_low_falls_back_after_gpt_5_6_luna_unsuppor
     assert luna_body["model"] == "gpt-5.6-luna"
     assert mini_body["model"] == "gpt-5.4-mini"
     metadata = mini_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "aawm-low"
+    assert metadata["requested_model_alias"] == "basic"
     assert metadata["codex_auto_agent_selected_provider"] == "openai"
     assert metadata["codex_auto_agent_selected_model"] == "gpt-5.4-mini"
     assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
@@ -29844,7 +29844,7 @@ def test_codex_auto_agent_grok_account_quota_cooldown_is_three_hours(exc):
 async def test_codex_auto_agent_alias_code_skips_native_lane_after_grok_personal_team_spending_limit():
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-code",
+        "model": "work",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -29965,7 +29965,7 @@ async def test_codex_auto_agent_alias_code_skips_native_lane_after_grok_personal
 async def test_anthropic_auto_agent_alias_code_falls_back_after_grok_build_usage_balance_exhausted():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     grok_error = _build_grok_build_usage_balance_exhausted_error()
     managed_success = Response(content='{"ok": true}', media_type="application/json")
     dual_cache = _FakeAawmAliasRoutingDualCache()
@@ -30054,7 +30054,7 @@ async def test_anthropic_auto_agent_alias_code_falls_back_after_grok_build_usage
 async def test_anthropic_auto_agent_alias_in_flight_grok_personal_team_spending_limit_redispatches():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     body["messages"] = [
         {
             "role": "user",
@@ -30067,7 +30067,7 @@ async def test_anthropic_auto_agent_alias_in_flight_grok_personal_team_spending_
             ],
         }
     ]
-    _anthropic_auto_agent_session_affinity_by_key["aawm-code-anthropic:claude-session:session:claude-session"] = {
+    _anthropic_auto_agent_session_affinity_by_key["work:claude-session:session:claude-session"] = {
         "provider": "xai",
         "model": "grok-composer-2.5-fast",
         "route_family": "anthropic_grok_native_responses_adapter",
@@ -30155,7 +30155,7 @@ def test_codex_auto_agent_retryable_exhaustion_classifies_bare_transient_status_
 async def test_anthropic_spark_bare_502_sets_candidate_transient_cooldown(monkeypatch):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     transient_error = ProxyException(
         message="Temporary upstream provider failure",
         type="None",
@@ -30230,7 +30230,7 @@ async def test_anthropic_spark_bare_502_sets_candidate_transient_cooldown(monkey
 async def test_anthropic_code_anthropic_second_request_skips_spark_after_transient_502():
     request_first = _build_anthropic_auto_agent_request()
     body_first = _build_anthropic_auto_agent_body()
-    body_first["model"] = "aawm-code-anthropic"
+    body_first["model"] = "work"
     transient_error = ProxyException(
         message="Temporary upstream provider failure",
         type="None",
@@ -30268,7 +30268,7 @@ async def test_anthropic_code_anthropic_second_request_skips_spark_after_transie
 
     request_second = _build_anthropic_auto_agent_request()
     body_second = _build_anthropic_auto_agent_body()
-    body_second["model"] = "aawm-code-anthropic"
+    body_second["model"] = "work"
     selection = await _select_anthropic_auto_agent_candidate(
         request=request_second,
         request_body=body_second,
@@ -30285,7 +30285,7 @@ async def test_anthropic_code_anthropic_second_request_skips_spark_after_transie
 async def test_anthropic_grok_composer_bare_502_does_not_set_durable_cooldown(monkeypatch):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     transient_error = ProxyException(
         message="Temporary upstream provider failure",
         type="None",
@@ -30348,7 +30348,7 @@ async def test_anthropic_grok_composer_bare_502_does_not_set_durable_cooldown(mo
 async def test_anthropic_alias_non_inflight_bare_502_selects_next_candidate_without_durable_cooldown():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     grok_error = ProxyException(
         message="Temporary upstream provider failure",
         type="None",
@@ -30412,7 +30412,7 @@ async def test_anthropic_alias_non_inflight_bare_502_selects_next_candidate_with
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_capacity_failure_still_sets_durable_cooldown():
     request = _build_codex_auto_agent_request()
-    body = {'model': 'aawm-code', 'input': 'hello', 'stream': False, 'litellm_metadata': {'session_id': 'codex-session'}}
+    body = {'model': 'work', 'input': 'hello', 'stream': False, 'litellm_metadata': {'session_id': 'codex-session'}}
     spark_error = RuntimeError('Selected model is at capacity. Please try a different model.')
     grok_success = Response(content='{"ok": true}', media_type='application/json')
     with patch.dict(os.environ, {'GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL': 'https://api.x.ai/v1'}), patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(side_effect=[spark_error, grok_success])), patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token', new=AsyncMock(return_value='grok-oidc-token')):
@@ -30525,7 +30525,7 @@ def test_malformed_tool_call_intake_appends_single_json_object(tmp_path, monkeyp
     }
     intake_context = {
         "provider": "openrouter",
-        "model_alias": "aawm-code-anthropic",
+        "model_alias": "work",
         "route_family": "codex_openrouter_responses",
         "endpoint": "/openai_passthrough/responses",
         "upstream_url": "https://openrouter.ai/api/v1/responses",
@@ -30649,7 +30649,7 @@ def test_malformed_tool_call_intake_context_includes_endpoint_from_request():
     context = _build_malformed_tool_call_intake_context(
         request,
         {
-            "model": "aawm-codex-agent-auto",
+            "model": "basic",
             "litellm_metadata": {
                 "trace_id": "trace-from-meta",
                 "litellm_call_id": "call-from-meta",
@@ -30897,7 +30897,7 @@ def test_malformed_tool_call_intake_write_failure_does_not_break_raise(
 async def test_anthropic_grok_safety_denial_falls_back_request_locally_without_durable_cooldown():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
-    body["model"] = "aawm-code-anthropic"
+    body["model"] = "work"
     safety_error = ProxyException(
         message=(
             '{"code":"permission-denied","error":"Content violates usage guidelines. '
@@ -30957,7 +30957,7 @@ async def test_anthropic_grok_safety_denial_falls_back_request_locally_without_d
 
     fresh_request = _build_anthropic_auto_agent_request()
     fresh_body = _build_anthropic_auto_agent_body()
-    fresh_body["model"] = "aawm-code-anthropic"
+    fresh_body["model"] = "work"
     selection = await _select_anthropic_auto_agent_candidate(
         request=fresh_request,
         request_body=fresh_body,
@@ -31025,7 +31025,7 @@ async def test_codex_grok_safety_denial_falls_back_request_locally_without_durab
     """Alias-managed intermediate xAI SAFETY_CHECK_TYPE_CYBER 403 keeps request-local fallback."""
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "aawm-code",
+        "model": "work",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -31089,7 +31089,7 @@ async def test_codex_grok_safety_denial_falls_back_request_locally_without_durab
 
     fresh_request = _build_codex_auto_agent_request()
     fresh_body = {
-        "model": "aawm-code",
+        "model": "work",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session-fresh"},

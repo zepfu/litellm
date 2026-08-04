@@ -480,12 +480,6 @@ def _normalize_session_history_model_group(
         if auto_alias and group_lower == auto_alias.lower():
             return _first_non_empty_string(*selected_model_candidates, resolved_model)
 
-    if group_lower == "aawm-codex-agent-auto":
-        return _first_non_empty_string(
-            metadata.get("codex_auto_agent_selected_model"),
-            metadata.get("aawm_auto_agent_selected_model"),
-            resolved_model,
-        )
     return normalized_group
 
 

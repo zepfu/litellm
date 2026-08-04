@@ -2,7 +2,7 @@
 
 See ``.analysis/remediation-d1-583-584-2026-07-22.md`` (section "ROUND 2").
 The prior ``#2`` fix passed its tests only because they hand-built
-``read_pilot:`` cooldown keys and recorded evidence into the gate before
+``basic_pilot:`` cooldown keys and recorded evidence into the gate before
 applying -- neither of which the LIVE request path did. These tests instead
 drive the real Codex auto-agent retry handler (``_handle_auto_agent_alias_route``
 with the real selector / metadata / cooldown applicators), stubbing ONLY the
@@ -76,7 +76,7 @@ def _reset_alias_routing_ambient_state() -> Any:
 _SINGLE_CANDIDATE_YAML = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: openrouter/round2-live-model
@@ -99,12 +99,12 @@ def _marker_only_capacity_error() -> RuntimeError:
     return RuntimeError("Selected model is at capacity. Please try a different model.")
 
 
-async def _run_read_lane_once(
+async def _run_basic_lane_once(
     *,
     session_id: str,
     raise_exc: Exception,
 ) -> Any:
-    """Drive the REAL codex retry handler for ``model="read"`` with a stubbed upstream.
+    """Drive the REAL codex retry handler for ``model="basic"`` with a stubbed upstream.
 
     Only ``perform_candidate_request_fn`` is stubbed; selection, metadata,
     cooldown-state reads, and cooldown application all use the production
@@ -112,7 +112,7 @@ async def _run_read_lane_once(
     """
     request = _minimal_request(session_id)
     body = {
-        "model": "read",
+        "model": "basic",
         "input": [{"role": "user", "content": "hello"}],
         "stream": False,
         "litellm_metadata": {"session_id": session_id},
@@ -121,10 +121,10 @@ async def _run_read_lane_once(
     async def _perform_candidate_request(**_kwargs: Any) -> Response:
         raise raise_exc
 
-    max_attempts = len(snapshot_select._get_codex_auto_agent_candidates_for_alias("read"))
+    max_attempts = len(snapshot_select._get_codex_auto_agent_candidates_for_alias("basic"))
     return await lpe._handle_auto_agent_alias_route(
         alias_family="codex_auto_agent",
-        alias_model="read",
+        alias_model="basic",
         request=request,
         prepared_request_body=body,
         max_candidate_attempts=max_attempts,
@@ -137,7 +137,7 @@ async def _run_read_lane_once(
         raise_redispatch_required_fn=selection._raise_codex_auto_agent_redispatch_required,
         attempts_metadata_key="codex_auto_agent_attempts",
         skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
-        no_candidate_detail="No read-lane candidates were available.",
+        no_candidate_detail="No basic-lane candidates were available.",
         log_label="Round2-Live",
     )
 
@@ -154,7 +154,7 @@ def _live_cooldown_key() -> str:
     snapshot = snapshot_select.get_active_routing_snapshot()
     epoch_tag: str | None = None
     if snapshot is not None:
-        alias = snapshot.aliases.get("read")
+        alias = snapshot.aliases.get("basic")
         identity = (
             candidate["provider"],
             candidate["model"],
@@ -168,7 +168,7 @@ def _live_cooldown_key() -> str:
     return lane_keys._codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=epoch_tag)
 
 
-def test_live_cooldown_key_requires_exact_read_alias_ownership() -> None:
+def test_live_cooldown_key_requires_exact_basic_alias_ownership() -> None:
     assert not _live_cooldown_key().startswith("h")
 
     snapshot = compiler.compile_yaml(
@@ -181,7 +181,7 @@ aliases:
         model: openrouter/round2-live-model
         route_family: codex_openrouter_completion_adapter
         priority: 100
-  - name: read
+  - name: basic
     candidates:
       - provider: opencode_zen
         model: openrouter/round2-live-model
@@ -195,15 +195,15 @@ aliases:
 
 
 @pytest.mark.asyncio
-async def test_live_read_lane_structured_429_cools_with_gate_duration() -> None:
-    """A structured 429 on the LIVE read-lane path must cool the live cooldown key
+async def test_live_basic_lane_structured_429_cools_with_gate_duration() -> None:
+    """A structured 429 on the LIVE basic-lane path must cool the live cooldown key
     with the gate's retry-after-derived duration -- proving the gate is
     authoritative and evidence is recorded before the cooldown is applied."""
     snapshot = compiler.compile_yaml(_SINGLE_CANDIDATE_YAML)
     snapshot_select.set_active_routing_snapshot(snapshot)
 
     with pytest.raises(Exception):
-        await _run_read_lane_once(
+        await _run_basic_lane_once(
             session_id="structured-live",
             raise_exc=_StructuredUpstream429(),
         )
@@ -217,15 +217,15 @@ async def test_live_read_lane_structured_429_cools_with_gate_duration() -> None:
 
 
 @pytest.mark.asyncio
-async def test_live_read_lane_single_marker_failure_does_not_cool() -> None:
-    """A single marker-only (non-structured) failure on the LIVE read-lane path
+async def test_live_basic_lane_single_marker_failure_does_not_cool() -> None:
+    """A single marker-only (non-structured) failure on the LIVE basic-lane path
     must NOT cool the candidate -- the N-of-M gate needs multiple marker events
     within its window before a key advances toward cooling."""
     snapshot = compiler.compile_yaml(_SINGLE_CANDIDATE_YAML)
     snapshot_select.set_active_routing_snapshot(snapshot)
 
     with pytest.raises(Exception):
-        await _run_read_lane_once(
+        await _run_basic_lane_once(
             session_id="marker-live",
             raise_exc=_marker_only_capacity_error(),
         )
@@ -234,13 +234,13 @@ async def test_live_read_lane_single_marker_failure_does_not_cool() -> None:
     applied_remaining = state.alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
     assert applied_remaining == 0.0
     # And the gate itself must agree the key is not cooled after one marker event.
-    assert state.alias_routing_state.read_pilot_gate.is_cooled(cooldown_key=live_key) is False
+    assert state.alias_routing_state.basic_pilot_gate.is_cooled(cooldown_key=live_key) is False
 
 
 _ROUND_ROBIN_YAML = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     distribution_strategy: round_robin
     candidates:
       - provider: openrouter
@@ -259,7 +259,7 @@ def test_live_round_robin_rotates_across_equal_priority_candidates() -> None:
     across the equal-top-priority pair on successive LIVE selections, rather than
     always returning declaration order (the pre-fix behavior) or a random pick.
 
-    Wave-1 R3-2 purified the enumeration: ``_select_read_pilot_snapshot_candidates``
+    Wave-1 R3-2 purified the enumeration: ``_select_basic_pilot_snapshot_candidates``
     now READS the rotation cursor (it no longer self-advances), so the getter
     cannot double-count within a single request. The cursor advances exactly once
     per ACTUAL selection via ``_commit_round_robin_selection`` -- the same commit
@@ -270,8 +270,8 @@ def test_live_round_robin_rotates_across_equal_priority_candidates() -> None:
 
     leaders: list[str] = []
     for _ in range(4):
-        token = snapshot_select._derive_round_robin_commit_token("read", client_product_label=None)
-        leader = snapshot_select._select_read_pilot_snapshot_candidates()[0]
+        token = snapshot_select._derive_round_robin_commit_token("basic", client_product_label=None)
+        leader = snapshot_select._select_basic_pilot_snapshot_candidates()[0]
         leaders.append(leader["model"])
         snapshot_select._commit_round_robin_selection(token, selected_candidate=leader)
     # Deterministic rotation: consecutive leaders must alternate and both

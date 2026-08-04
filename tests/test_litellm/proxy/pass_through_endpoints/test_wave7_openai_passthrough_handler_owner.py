@@ -34,6 +34,7 @@ import httpx
 import pytest
 
 import litellm
+from litellm.proxy._types import ProxyException
 from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy import pass_through_endpoints as pass_through_package
 
@@ -534,29 +535,34 @@ class TestBaseHandlerDispatch:
         result = self._run_handler()
         assert result == "passthrough-response"
 
-    def test_post_request_reads_body(self):
-        get_body = AsyncMock(return_value={"model": "gpt-4"})
-        endpoint_func = AsyncMock(return_value="ok")
+    def test_retired_read_alias_rejected_before_dispatch(self):
+        get_body = AsyncMock(return_value={"model": "read"})
+        dispatch = AsyncMock(return_value=MagicMock())
+        create_fn = MagicMock(return_value=AsyncMock(return_value="ok"))
         install_runtime(
             _make_runtime(
                 get_request_body_fn=get_body,
-                create_pass_through_route_fn=MagicMock(
-                    return_value=endpoint_func
-                ),
+                try_dispatch_codex_request_fn=dispatch,
+                create_pass_through_route_fn=create_fn,
             )
         )
-        asyncio.run(
-            BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
-                endpoint="/v1/chat/completions",
-                request=_fake_request("POST"),
-                fastapi_response=MagicMock(),
-                user_api_key_dict=MagicMock(),
-                base_target_url="https://api.openai.com",
-                api_key="sk-test",
-                custom_llm_provider=litellm.LlmProviders.OPENAI,
+        with pytest.raises(ProxyException) as exc_info:
+            asyncio.run(
+                BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+                    endpoint="/v1/responses",
+                    request=_fake_request("POST"),
+                    fastapi_response=MagicMock(),
+                    user_api_key_dict=MagicMock(),
+                    base_target_url="https://api.openai.com",
+                    api_key="sk-test",
+                    custom_llm_provider=litellm.LlmProviders.OPENAI,
+                )
             )
-        )
+        assert exc_info.value.message == "Model alias 'read' is unsupported; use 'basic'."
+        assert exc_info.value.code == "400"
         get_body.assert_awaited_once()
+        dispatch.assert_not_awaited()
+        create_fn.assert_not_called()
 
     def test_codex_dispatch_short_circuits(self):
         dispatched = MagicMock(name="dispatched-response")
@@ -734,7 +740,7 @@ class TestBaseHandlerDispatch:
         install_runtime(
             _make_runtime(
                 resolve_codex_auto_agent_alias_model_fn=(
-                    lambda body, **kwargs: "aawm-codex-agent-auto"
+                    lambda body, **kwargs: "basic"
                 ),
                 add_route_family_logging_metadata_fn=(
                     lambda body, family: events.append("route") or body

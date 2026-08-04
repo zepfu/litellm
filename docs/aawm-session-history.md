@@ -68,7 +68,7 @@ It stores the model request value exactly as LiteLLM received it before any alia
 resolution.
 
 - For AAWM alias requests, this is the inbound alias, for example
-  `aawm-read`, `aawm-low`, or `aawm-code-anthropic`.
+  `basic`, `work`, or `sota-openai`.
 - For direct concrete requests, this is the concrete model string (and may equal
   `session_history.model`).
 
@@ -1113,8 +1113,8 @@ operators can confirm ordered failover without replaying raw transcripts.
 
 Common keys include:
 
-- `requested_model_alias` / `model_alias_label`: the inbound alias, for example
-  `aawm-code` or `aawm-code-anthropic`.
+- `requested_model_alias` / `model_alias_label`: the inbound config-driven
+  alias, such as `basic`, `work`, or `sota-openai`.
 - `aawm_alias_routing_audit_events`: ordered events for skipped, failed, and
   selected candidates.
 - `codex_auto_agent_attempts` or `anthropic_auto_agent_attempts`: candidate
@@ -1127,7 +1127,7 @@ Managed Kimi Code account/auth/quota/provider-capacity failures use the shared
 `kimi_code_managed_account` lane, so they suppress K3 and managed K2.7
 candidates that depend on the same CLI grant. Unsupported model, effort, or
 capability failures remain candidate-scoped and may continue to another
-authenticated managed candidate. Declaring `aawm-sota-moonshot` or inserting a
+authenticated managed candidate. Declaring `sota-moonshot` or inserting a
 Kimi candidate in an alias does not enable it without a configured route, the
 shared credential, and accepted authenticated `/models` capability evidence.
 
@@ -1198,7 +1198,7 @@ provider write path (all-candidates-unavailable / no-candidate, and in-flight
 
 These fields are observability-only. They do not change candidate order,
 affinity, cooldown duration, or redispatch thresholds. For tool-bearing or stateful
-`aawm-code-anthropic` requests, every declared candidate route is treated as a
+`work` requests, every declared candidate route is treated as a
 Claude Code tool-contract route: if the alias declares OpenAI, xAI,
 native Anthropic, or another provider/model target, that target must preserve
 tool calls, tool-use ids, tool arguments, tool-result replay, and ordered
@@ -1248,16 +1248,14 @@ normal upstream usage and cost calculation path.
 
 ## AAWM Alias Candidate Orders (D1-363)
 
-`aawm-sota-openai` mirrors `aawm-sota` and uses this order:
+The config-driven `sota-openai` route uses this order:
 
 1. `gpt-5.6-sol`
-2. `gpt-5.5` as the OpenAI last-resort candidate
 
-`aawm-sota-xai` uses this order:
+The config-driven `sota-xai` route uses this order:
 
 1. `oa_xai/grok-4.5` via the managed xAI OAuth Responses adapter
-2. `grok-4.5` via the native Grok OIDC Responses adapter
-3. `grok-build` as the xAI last-resort candidate
+
 
 Grok 4.5 is treated as a live candidate. Generic
 `aawm_codex_auto_agent_candidate_unavailable` probe failures do not apply a
@@ -1269,53 +1267,19 @@ path. Native Grok 4.5 `malformed_tool_call_text` remains rejected and can
 redispatch in-flight, but is request-local rather than a durable candidate
 cooldown.
 
-`aawm-sota` uses this order:
+The logical `sota` alias selects the producer-family `sota-*` alias from TUI
+origin and defaults to `sota-openai`. `sota-alibaba` uses
+`alibaba_token_plan/qwen3.8-max`, then
+`alibaba_token_plan/qwen3.7-max`. Public `sota-zai` is reserved for the
+dedicated Z.AI Coding Plan and does not represent Alibaba GLM.
 
-1. `gpt-5.6-sol`
-2. `gpt-5.5` as the OpenAI last-resort candidate
-
-`aawm-low` and `aawm-low-anthropic` use this order:
-
-1. OpenRouter North Mini (`openrouter/cohere/north-mini-code:free`)
-2. OpenRouter Owl Alpha (`openrouter/owl-alpha`)
-3. OpenCode Zen `deepseek-v4-flash`
-4. OpenCode Zen `big-pickle`
-5. `gpt-5.6-luna`
-6. `gpt-5.4-mini` as the OpenAI last-resort candidate for `aawm-low`
-7. native Anthropic Haiku as the last-resort candidate for `aawm-low-anthropic`
-
-`aawm-code` uses this order:
-
-1. `gpt-5.3-codex-spark`
-2. `xai/grok-4.5` via the native Grok OIDC Responses adapter
-3. `grok-composer-2.5-fast`
-4. `oa_xai/grok-build`
-5. `gpt-5.6-terra`
-6. `gpt-5.5` as the OpenAI last-resort candidate with medium reasoning
-
-`aawm-orchestration` uses this order:
-
-1. `gpt-5.6-terra`
-2. `gpt-5.5` as the OpenAI last-resort candidate
-
-`aawm-sota-anthropic` uses this order:
-
-1. native Anthropic `claude-fable-5`
-2. native Anthropic `claude-opus-4-8[1m]` as the last-resort candidate
-
-`aawm-code-anthropic` uses this order:
-
-1. `gpt-5.3-codex-spark`
-2. `xai/grok-4.5` via the native Grok OIDC Responses adapter
-3. `grok-composer-2.5-fast`
-4. `oa_xai/grok-build`
-5. native Anthropic `claude-sonnet-5[1m]` (1m context window)
-6. native Anthropic `claude-sonnet-5`
-7. native Anthropic `claude-sonnet-4-6` as the last-resort candidate
-
-`aawm-orchestration-anthropic` uses this order:
-
-1. native Anthropic `claude-opus-4-8[1m]` as the sole last-resort candidate
+`basic` is the config-driven low-cost alias. `work` uses
+`gpt-5.3-codex-spark`, then the internal `work-other` alias, then for Claude
+origins only the native Anthropic Sonnet tail, and finally `gpt-5.6-luna`.
+`work-other` is internal and is not selectable or advertised. `expert` remains
+structurally planned and fail-closed/deferred because native Anthropic Opus 5
+and its `[1m]` variant are unavailable. Anthropic models remain native
+Anthropic egress only.
 
 OpenAI `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` pricing in
 `model_prices_and_context_window.json` follows the official GPT-5.6 preview page
@@ -1375,9 +1339,10 @@ completion adapter must continue to send the provider-stripped model slug
 upstream (`cohere/north-mini-code:free`, `owl-alpha`) to match OpenRouter
 ingress expectations.
 
-The Codex `aawm-code` alias uses `gpt-5.5` as the OpenAI last-resort candidate after `gpt-5.3-codex-spark`, Grok adapter lanes, and `gpt-5.6-terra`,
-not plain `gpt-5.3-codex`, because ChatGPT-account Codex passthrough rejects the
-plain `gpt-5.3-codex` model. When that last-resort candidate is selected,
+Historical Codex coding-alias routes used `gpt-5.5` as the OpenAI last-resort
+candidate after `gpt-5.3-codex-spark`, Grok adapter lanes, and `gpt-5.6-terra`,
+not plain `gpt-5.3-codex`, because ChatGPT-account Codex passthrough rejected the
+plain `gpt-5.3-codex` model. When that historical last-resort candidate was selected,
 LiteLLM applies medium reasoning by default if the request did not already set a
 reasoning effort. Stateful continuation requests keep the established candidate
 through session affinity, including last-resort `gpt-5.5`, until that candidate
@@ -1983,7 +1948,7 @@ For AAWM Codex aliases, hosted-tool support is evaluated again after the alias
 has selected a concrete xAI/Grok candidate such as `grok-composer-2.5-fast` or
 `oa_xai/grok-build`. This catches provider-invalid Codex tool variants, including
 `custom`, that could not be classified while the inbound request model was still
-the abstract alias `aawm-code`.
+the abstract alias `work`.
 
 Selected Grok Responses models declare
 `custom_tool_function_adapters=["apply_patch"]` in the model metadata. For AAWM

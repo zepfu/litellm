@@ -122,7 +122,7 @@ def test_should_accept_god_call_site_signature_for_read_guidance() -> None:
     body = {"instructions": "existing"}
     result = guidance._apply_aawm_read_agent_guidance_to_request_body(
         body,
-        alias_model="aawm-read",
+        alias_model="basic",
         target_field="instructions",
     )
     assert isinstance(result, tuple)
@@ -219,7 +219,7 @@ def test_should_use_default_callbacks_without_any_configuration() -> None:
     updated_body, metadata = (
         guidance._apply_aawm_read_agent_guidance_to_request_body(
             body,
-            alias_model="aawm-read",
+            alias_model="basic",
             target_field="instructions",
         )
     )
@@ -228,7 +228,7 @@ def test_should_use_default_callbacks_without_any_configuration() -> None:
     tags = updated_body["litellm_metadata"]["tags"]
     assert "aawm-read-agent-guidance" in tags
     assert "aawm-read-agent-guidance:2026-06-06.v1" in tags
-    assert "aawm-read-agent-guidance-alias:aawm-read" in tags
+    assert "aawm-read-agent-guidance-alias:basic" in tags
     spans = updated_body["litellm_metadata"]["langfuse_spans"]
     assert len(spans) == 1
     assert spans[0]["name"] == "aawm.read_agent_guidance"
@@ -250,8 +250,8 @@ def test_should_pin_exact_default_guidance_configuration() -> None:
     assert config.aawm_read_agent_guidance_policy_name == "aawm_read_agent_guidance"
     assert config.aawm_read_agent_guidance_policy_version == "2026-06-06.v1"
     assert config.aawm_read_agent_guidance_prompt == EXPECTED_READ_GUIDANCE
-    assert config.codex_aawm_read_alias == "aawm-read"
-    assert config.anthropic_aawm_read_alias == "aawm-read-anthropic"
+    assert config.codex_aawm_read_alias == "basic"
+    assert config.anthropic_aawm_read_alias == "basic"
 
 
 # ── Append helper tests ────────────────────────────────────────────
@@ -289,10 +289,10 @@ def test_should_make_codex_guidance_idempotent_and_preserve_original_order() -> 
 @pytest.mark.parametrize(
     ("alias_model", "expected"),
     [
-        ("aawm-read", True),
-        ("aawm-read-anthropic", True),
+        ("basic", True),
+        ("basic", True),
         ("AAWM-READ", False),
-        ("aawm-read ", False),
+        ("basic ", False),
         ("read", False),
         (None, False),
         (1, False),
@@ -406,21 +406,21 @@ def test_should_noop_read_guidance_for_non_alias_invalid_field_and_malformed_val
     )
     invalid_field_result = guidance._apply_aawm_read_agent_guidance_to_request_body(
         body,
-        alias_model="aawm-read",
+        alias_model="basic",
         target_field="other",
         callbacks=recorder.callbacks,
     )
     malformed_instructions_result = (
         guidance._apply_aawm_read_agent_guidance_to_request_body(
             body,
-            alias_model="aawm-read",
+            alias_model="basic",
             target_field="instructions",
             callbacks=recorder.callbacks,
         )
     )
     malformed_system_result = guidance._apply_aawm_read_agent_guidance_to_request_body(
         body,
-        alias_model="aawm-read-anthropic",
+        alias_model="basic",
         target_field="system",
         callbacks=recorder.callbacks,
     )
@@ -439,9 +439,9 @@ def test_should_noop_read_guidance_for_non_alias_invalid_field_and_malformed_val
 @pytest.mark.parametrize(
     ("alias_model", "target_field", "field_name", "original_value"),
     [
-        ("aawm-read", "instructions", "instructions", "  existing  "),
+        ("basic", "instructions", "instructions", "  existing  "),
         (
-            "aawm-read-anthropic",
+            "basic",
             "system",
             "system",
             ["alpha", {"type": "text", "text": "beta"}],
@@ -512,7 +512,7 @@ def test_should_make_applied_read_guidance_idempotent() -> None:
     first_body, first_metadata = (
         guidance._apply_aawm_read_agent_guidance_to_request_body(
             body,
-            alias_model="aawm-read",
+            alias_model="basic",
             target_field="instructions",
             callbacks=recorder.callbacks,
         )
@@ -520,7 +520,7 @@ def test_should_make_applied_read_guidance_idempotent() -> None:
     second_body, second_metadata = (
         guidance._apply_aawm_read_agent_guidance_to_request_body(
             first_body,
-            alias_model="aawm-read",
+            alias_model="basic",
             target_field="instructions",
             callbacks=recorder.callbacks,
         )
@@ -646,7 +646,7 @@ def test_should_preserve_malformed_request_body_exception_behavior() -> None:
     with pytest.raises(TypeError):
         guidance._apply_aawm_read_agent_guidance_to_request_body(
             None,  # type: ignore[arg-type]
-            alias_model="aawm-read",
+            alias_model="basic",
             target_field="instructions",
             callbacks=recorder.callbacks,
         )
@@ -718,7 +718,7 @@ def test_should_propagate_span_and_merge_exceptions_in_original_order() -> None:
     with pytest.raises(LookupError) as merge_exc:
         guidance._apply_aawm_read_agent_guidance_to_request_body(
             {},
-            alias_model="aawm-read",
+            alias_model="basic",
             target_field="instructions",
             callbacks=callbacks,
         )

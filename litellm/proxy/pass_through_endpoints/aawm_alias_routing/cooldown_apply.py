@@ -8,7 +8,7 @@ Owns:
 - ``_persist_codex_cooldown_durable`` / ``_persist_anthropic_cooldown_durable``
 - ``_apply_auto_agent_alias_cooldown`` (shared apply)
 - ``_apply_codex_auto_agent_alias_cooldown`` / ``_apply_anthropic_auto_agent_alias_cooldown``
-- ``_apply_read_pilot_gated_cooldown``
+- ``_apply_basic_pilot_gated_cooldown``
 - ``_set_codex_auto_agent_candidate_cooldowns`` (compatibility entry point)
 
 Dependencies on error_signals.py, selection.py, cooldown_state.py, durable.py,
@@ -57,8 +57,8 @@ _set_anthropic_cooldown: Optional[Callable[[str, float], Awaitable[object]]] = N
 # durable.py owned
 _write_durable_payload: Optional[Callable[..., Awaitable[object]]] = None
 
-# state.py owned (read-pilot gate + memory publication)
-_read_pilot_gate: Optional[Any] = None
+# state.py owned (basic-pilot gate + memory publication)
+_basic_pilot_gate: Optional[Any] = None
 _state_manager: Optional[Any] = None
 
 
@@ -77,7 +77,7 @@ def configure_cooldown_apply_runtime(
     set_codex_cooldown: Callable[[str, float], Awaitable[object]],
     set_anthropic_cooldown: Callable[[str, float], Awaitable[object]],
     write_durable_payload: Callable[..., Awaitable[object]],
-    read_pilot_gate: Any,
+    basic_pilot_gate: Any,
     state_manager: Any,
 
 
@@ -101,8 +101,8 @@ def configure_cooldown_apply_runtime(
     _set_anthropic_cooldown = set_anthropic_cooldown
     global _write_durable_payload
     _write_durable_payload = write_durable_payload
-    global _read_pilot_gate
-    _read_pilot_gate = read_pilot_gate
+    global _basic_pilot_gate
+    _basic_pilot_gate = basic_pilot_gate
     global _state_manager
     _state_manager = state_manager
     # If install() has been called, also update host_globals so rebound
@@ -118,7 +118,7 @@ def configure_cooldown_apply_runtime(
         _host_globals_ref["_set_codex_cooldown"] = _mod["_set_codex_cooldown"]
         _host_globals_ref["_set_anthropic_cooldown"] = _mod["_set_anthropic_cooldown"]
         _host_globals_ref["_write_durable_payload"] = _mod["_write_durable_payload"]
-        _host_globals_ref["_read_pilot_gate"] = _mod["_read_pilot_gate"]
+        _host_globals_ref["_basic_pilot_gate"] = _mod["_basic_pilot_gate"]
         _host_globals_ref["_state_manager"] = _mod["_state_manager"]
 
 
@@ -137,7 +137,7 @@ def _resolve_auto_agent_cooldown_publication_plan(
     error_class: Optional[str],
     grok_account_quota_exhausted: bool = False,
     kimi_failure_metadata: Optional[dict[str, Any]] = None,
-    is_read_pilot_lane: bool = False,
+    is_basic_pilot_lane: bool = False,
 ) -> CooldownPublicationPlan:
     """Pure resolver: classify one failure into an immutable publication plan (R3-1).
 
@@ -153,18 +153,18 @@ def _resolve_auto_agent_cooldown_publication_plan(
       - Kimi ``managed_account`` -> the managed-account sentinel ONLY
       - Grok account-quota -> the selected key PLUS the account-lane key
 
-    The read-pilot lane resolves its scope/duration from the N-of-M evidence
+    The basic-pilot lane resolves its scope/duration from the N-of-M evidence
     gate's current decision (fed earlier by the loop via
-    ``_record_read_pilot_cooldown_evidence``); when the gate says do-not-cool,
+    ``_record_basic_pilot_cooldown_evidence``); when the gate says do-not-cool,
     the plan carries ``applied_scope="none"`` and empty key sets.
     """
     assert _get_candidate_cooldown_scope is not None
     assert _get_kimi_managed_account_cooldown_key is not None
     assert _get_grok_account_quota_lane_cooldown_key is not None
-    assert _read_pilot_gate is not None
+    assert _basic_pilot_gate is not None
 
-    if is_read_pilot_lane:
-        decision = _read_pilot_gate.current_decision(cooldown_key=selected_cooldown_key)
+    if is_basic_pilot_lane:
+        decision = _basic_pilot_gate.current_decision(cooldown_key=selected_cooldown_key)
         if not decision.should_cool:
             return CooldownPublicationPlan(
                 applied_scope="none",
@@ -360,16 +360,16 @@ async def _apply_codex_auto_agent_alias_cooldown(
     error_class: Optional[str],
     grok_account_quota_exhausted: bool = False,
     kimi_failure_metadata: Optional[dict[str, Any]] = None,
-    is_read_pilot_lane: bool = False,
+    is_basic_pilot_lane: bool = False,
 ) -> str:
-    # Route the read-alias lane to the N-of-M evidence gate by ALIAS identity
-    # (``is_read_pilot_lane``), not by a synthetic ``read_pilot:`` key prefix.
+    # Route the basic-alias lane to the N-of-M evidence gate by ALIAS identity
+    # (``is_basic_pilot_lane``), not by a synthetic ``basic_pilot:`` key prefix.
     # The live selector builds ordinary ``provider:model:lane`` cooldown keys,
-    # so the gate now drives the applied cooldown for the read lane using that
+    # so the gate now drives the applied cooldown for the basic lane using that
     # exact live key -- the same key the retry loop fed evidence to.
     assert _set_codex_cooldown is not None
-    if is_read_pilot_lane:
-        return await _apply_read_pilot_gated_cooldown(
+    if is_basic_pilot_lane:
+        return await _apply_basic_pilot_gated_cooldown(
             selected_cooldown_key=selected_cooldown_key,
             set_candidate_cooldown=_set_codex_cooldown,
         )
@@ -386,12 +386,12 @@ async def _apply_codex_auto_agent_alias_cooldown(
     )
 
 
-async def _apply_read_pilot_gated_cooldown(
+async def _apply_basic_pilot_gated_cooldown(
     *,
     selected_cooldown_key: str,
     set_candidate_cooldown: Callable[[str, float], Awaitable[object]],
 ) -> str:
-    """Apply the ``CooldownEvidenceGate``'s decision for the read-pilot lane.
+    """Apply the ``CooldownEvidenceGate``'s decision for the basic-pilot lane.
 
     Delegates to the pure publication-plan resolver
     (:func:`_resolve_auto_agent_cooldown_publication_plan`) so this applicator
@@ -399,8 +399,8 @@ async def _apply_read_pilot_gated_cooldown(
     target: the resolver derives the gate-driven scope/duration and the single
     candidate key, this function publishes the memory key synchronously, and
     the durable write is best-effort (must not block the selector-observed
-    value). The read-pilot lane's cooldown-worthiness is decided by
-    ``_read_pilot_cooldown_gate`` (fed via ``_record_read_pilot_cooldown_evidence``
+    value). The basic-pilot lane's cooldown-worthiness is decided by
+    ``_basic_pilot_cooldown_gate`` (fed via ``_record_basic_pilot_cooldown_evidence``
     on failure); when the gate says "do not cool yet", no cooldown is applied.
     """
     assert _state_manager is not None
@@ -411,7 +411,7 @@ async def _apply_read_pilot_gated_cooldown(
         selected_cooldown_key=selected_cooldown_key,
         cooldown_seconds=0.0,
         error_class=None,
-        is_read_pilot_lane=True,
+        is_basic_pilot_lane=True,
     )
     if plan.applied_scope == "none" or not plan.memory_keys:
         return "none"
@@ -435,11 +435,11 @@ async def _apply_anthropic_auto_agent_alias_cooldown(
     error_class: Optional[str],
     grok_account_quota_exhausted: bool = False,
     kimi_failure_metadata: Optional[dict[str, Any]] = None,
-    is_read_pilot_lane: bool = False,
+    is_basic_pilot_lane: bool = False,
 ) -> str:
-    # The read pilot lane is Codex-only; the Anthropic applicator accepts the
+    # The basic pilot lane is Codex-only; the Anthropic applicator accepts the
     # flag for call-site symmetry with the shared retry loop and ignores it.
-    _ = is_read_pilot_lane
+    _ = is_basic_pilot_lane
     assert _set_anthropic_cooldown is not None
     return await _apply_auto_agent_alias_cooldown(
         request=request,
@@ -469,7 +469,7 @@ async def _set_codex_auto_agent_candidate_cooldowns(
     error_class: Optional[str],
     grok_account_quota_exhausted: bool = False,
     kimi_failure_metadata: Optional[dict[str, Any]] = None,
-    is_read_pilot_lane: bool = False,
+    is_basic_pilot_lane: bool = False,
 ) -> str:
     return await _apply_codex_auto_agent_alias_cooldown(
         request=request,
@@ -480,7 +480,7 @@ async def _set_codex_auto_agent_candidate_cooldowns(
         error_class=error_class,
         grok_account_quota_exhausted=grok_account_quota_exhausted,
         kimi_failure_metadata=kimi_failure_metadata,
-        is_read_pilot_lane=is_read_pilot_lane,
+        is_basic_pilot_lane=is_basic_pilot_lane,
     )
 
 
@@ -747,7 +747,7 @@ _HOST_FUNCTION_NAMES = (
     "_persist_anthropic_cooldown_durable",
     "_apply_auto_agent_alias_cooldown",
     "_apply_codex_auto_agent_alias_cooldown",
-    "_apply_read_pilot_gated_cooldown",
+    "_apply_basic_pilot_gated_cooldown",
     "_apply_anthropic_auto_agent_alias_cooldown",
     "_set_codex_auto_agent_candidate_cooldowns",
     "resolve_lane_identity_hash",

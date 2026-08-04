@@ -27,7 +27,7 @@ def _base_candidate(**overrides: object) -> dict:
 
 def _base_alias(**overrides: object) -> dict:
     alias = {
-        "name": "read",
+        "name": "example",
         "candidates": [_base_candidate()],
     }
     alias.update(overrides)
@@ -209,7 +209,7 @@ def test_inheritance_resolves() -> None:
             "defaults": {"route_family": "codex_responses"},
             "aliases": [
                 {
-                    "name": "read",
+                    "name": "example",
                     "route_family": "codex_openrouter_completion_adapter",
                     "candidates": [
                         {
@@ -229,16 +229,16 @@ def test_inheritance_resolves() -> None:
         }
     )
     resolved = schema.resolve_inheritance(document)
-    read_alias = resolved.aliases[0]
-    assert read_alias.candidates[0].route_family == "codex_openrouter_completion_adapter"
-    assert read_alias.candidates[1].route_family == "codex_responses"
+    example_alias = resolved.aliases[0]
+    assert example_alias.candidates[0].route_family == "codex_openrouter_completion_adapter"
+    assert example_alias.candidates[1].route_family == "codex_responses"
 
 
 def test_config_epoch_and_hash_present() -> None:
     """RoutingConfigDocument-level validation exposes fields the compiler needs for epoch/hash."""
     document = schema.RoutingConfigDocument.model_validate({"defaults": {}, "aliases": [_base_alias()]})
     assert hasattr(document, "aliases")
-    assert document.aliases[0].name == "read"
+    assert document.aliases[0].name == "example"
 
 
 def test_error_class_refs_open_vocabulary() -> None:

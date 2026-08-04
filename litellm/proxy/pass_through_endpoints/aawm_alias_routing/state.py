@@ -1,7 +1,7 @@
 """Process-local alias-routing state manager (RR-054 #1).
 
 Owns cooldown and affinity maps, their asyncio.Locks, probe-lock state, the
-read-pilot evidence gate, round-robin cursor, OpenRouter caches, and
+basic-pilot evidence gate, round-robin cursor, OpenRouter caches, and
 CFG-004 publication-intent tracking so the pass-through god-module does not
 declare the state maps itself.
 """
@@ -9,12 +9,14 @@ declare the state maps itself.
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
-import uuid
 import time
+import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional, Sequence, Tuple
+from typing import Any, Mapping, Optional, Sequence, Tuple
 
 from .memory import (
     DEFAULT_MEMORY_STATE_MAX_SIZE,
@@ -359,7 +361,7 @@ class CooldownClearResult:
     positive_keys_cleared: list[str] = field(default_factory=list)
     negative_keys_cleared: list[str] = field(default_factory=list)
     evidence_keys_cleared: list[str] = field(default_factory=list)
-    read_pilot_keys_cleared: list[str] = field(default_factory=list)
+    basic_pilot_keys_cleared: list[str] = field(default_factory=list)
     affinity_keys_preserved: int = 0
 
 
@@ -1020,7 +1022,7 @@ class CooldownInspectionResult:
     generation: int
     negative_cached: bool = False
     evidence_present: bool = False
-    read_pilot_present: bool = False
+    basic_pilot_present: bool = False
 
 
 def inspect_cooldown_absence(
@@ -1032,7 +1034,7 @@ def inspect_cooldown_absence(
     """Verify local cooldown absence for a key (lock-free peek, no mutation).
 
     Checks ALL cooldown-derived process state: positive cooldown, negative
-    cache, evidence events, and read-pilot gate (codex only).  Returns the
+    cache, evidence events, and basic-pilot gate (codex only).  Returns the
     current generation so callers can detect concurrent clears.  Does NOT
     acquire the family lock (safe under probe lock).
     """
@@ -1040,29 +1042,29 @@ def inspect_cooldown_absence(
     remaining = family.peek_cooldown_remaining(cooldown_key)
     negative_cached = family.is_negative_cached(cooldown_key)
     evidence_present = cooldown_key in family.evidence_events_by_key
-    # Read-pilot gate is codex-owned only.
+    # Basic-pilot gate is codex-owned only.
     canonical = canonicalize_alias_family(alias_family)
-    read_pilot_present = False
+    basic_pilot_present = False
     if canonical == "codex":
-        # Finding 4: read-pilot evidence can exist in the gate's family
+        # Finding 4: basic-pilot evidence can exist in the gate's family
         # evidence map BEFORE any _key_state entry is created (marker-tier
         # evidence accumulates before a cooldown decision).  Both maps must
         # be inspected so classification-marker evidence cannot survive a
         # clear or be misclassified as absent.
-        read_pilot_present = (
-            cooldown_key in mgr.read_pilot_gate._key_state
+        basic_pilot_present = (
+            cooldown_key in mgr.basic_pilot_gate._key_state
             or cooldown_key
-            in mgr.read_pilot_gate._family_state.evidence_events_by_key
+            in mgr.basic_pilot_gate._family_state.evidence_events_by_key
         )
     return CooldownInspectionResult(
         alias_family=canonical,
         cooldown_key=cooldown_key,
-        exists=remaining > 0 or negative_cached or evidence_present or read_pilot_present,
+        exists=remaining > 0 or negative_cached or evidence_present or basic_pilot_present,
         remaining_seconds=remaining,
         generation=family.get_generation(cooldown_key),
         negative_cached=negative_cached,
         evidence_present=evidence_present,
-        read_pilot_present=read_pilot_present,
+        basic_pilot_present=basic_pilot_present,
     )
 
 
@@ -1091,13 +1093,17 @@ class AliasRoutingStateManager:
         self._key_barrier_locks_guard = asyncio.Lock()
         self.openrouter_rate_limit = MonotonicCooldownMap()
         self.openrouter_failure_circuit = MonotonicCooldownMap()
-        # Wave 5B: read-pilot evidence gate with its own separate AliasFamilyState
-        self.read_pilot_gate = CooldownEvidenceGate(family_state=AliasFamilyState())
+        # Wave 5B: basic-pilot evidence gate with its own separate AliasFamilyState
+        self.basic_pilot_gate = CooldownEvidenceGate(family_state=AliasFamilyState())
         # Wave 5B: per-alias round-robin rotation cursor
         self.round_robin_cursor: dict[tuple[str, str], int] = {}
         # Wave 5B: OpenRouter free-daily-quota cache (immutable tuple) + lock
         self._openrouter_free_quota_cache: Tuple[Optional[float], float] = (None, 0.0)
         self.openrouter_free_quota_lock = asyncio.Lock()
+        self._normalized_quota_observations: dict[
+            tuple[str, str, str, str, str], dict[str, Any]
+        ] = {}
+        self._normalized_quota_observations_lock = threading.Lock()
 
     async def key_barrier_lock(self, cooldown_key: str) -> asyncio.Lock:
         """Return the per-key barrier lock for read/clear serialization (Defect 3)."""
@@ -1127,7 +1133,7 @@ class AliasRoutingStateManager:
         """Targeted removal of cooldown-derived state for named keys (CFG-004).
 
         Removes positive cooldown, negative cache, evidence events, and
-        read-pilot gate state (codex only) for the given keys.  Preserves
+        basic-pilot gate state (codex only) for the given keys.  Preserves
         session affinity and all unrelated keys.  Durable/Redis state is NOT
         touched here; callers use ``durable.delete_aawm_alias_routing_durable_key``
         for that.
@@ -1141,19 +1147,19 @@ class AliasRoutingStateManager:
         positive, negative, evidence = family.clear_cooldown_state(
             cooldown_keys=cooldown_keys,
         )
-        read_pilot_cleared: list[str] = []
-        # Read-pilot gate is codex-owned; never clear it for anthropic.
+        basic_pilot_cleared: list[str] = []
+        # Basic-pilot gate is codex-owned; never clear it for anthropic.
         if normalized == "codex":
             for key in cooldown_keys:
-                if self.read_pilot_gate._key_state.pop(key, None) is not None:
-                    read_pilot_cleared.append(key)
-                self.read_pilot_gate._family_state.evidence_events_by_key.pop(key, None)
+                if self.basic_pilot_gate._key_state.pop(key, None) is not None:
+                    basic_pilot_cleared.append(key)
+                self.basic_pilot_gate._family_state.evidence_events_by_key.pop(key, None)
         return CooldownClearResult(
             alias_family=normalized,
             positive_keys_cleared=positive,
             negative_keys_cleared=negative,
             evidence_keys_cleared=evidence,
-            read_pilot_keys_cleared=read_pilot_cleared,
+            basic_pilot_keys_cleared=basic_pilot_cleared,
             affinity_keys_preserved=len(family.session_affinity_by_key),
         )
 
@@ -1164,6 +1170,127 @@ class AliasRoutingStateManager:
     def set_openrouter_free_quota_cache(self, value: Tuple[Optional[float], float]) -> None:
         """Replace the OpenRouter free-daily-quota cache tuple (immutable update)."""
         self._openrouter_free_quota_cache = value
+
+    @staticmethod
+    def _quota_observation_timestamp(value: Any) -> Optional[float]:
+        if isinstance(value, datetime):
+            resolved = value
+        elif isinstance(value, str):
+            try:
+                resolved = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        else:
+            return None
+        if resolved.tzinfo is None:
+            resolved = resolved.replace(tzinfo=timezone.utc)
+        return resolved.timestamp()
+
+    def record_normalized_quota_observations(
+        self, observations: Sequence[Mapping[str, Any]]
+    ) -> None:
+        """Cache provider-normalized quota observations for routing decisions."""
+        prepared: list[tuple[tuple[str, str, str, str, str], dict[str, Any]]] = []
+        for observation in observations:
+            provider = str(observation.get("provider") or "").strip()
+            remaining = observation.get("remaining_pct")
+            observed_at = self._quota_observation_timestamp(
+                observation.get("observed_at")
+            )
+            try:
+                remaining_pct = float(remaining)
+            except (TypeError, ValueError):
+                continue
+            if (
+                not provider
+                or observed_at is None
+                or not math.isfinite(remaining_pct)
+                or remaining_pct < 0
+                or remaining_pct > 100
+            ):
+                continue
+            model = str(observation.get("model") or "").strip()
+            account_hash = str(observation.get("account_hash") or "").strip()
+            quota_key = str(
+                observation.get("quota_key")
+                or observation.get("limit_key")
+                or observation.get("quota_type")
+                or ""
+            ).strip()
+            environment = str(observation.get("environment") or "").strip()
+            expected_reset_at = self._quota_observation_timestamp(
+                observation.get("expected_reset_at")
+                or observation.get("provider_resets_at")
+                or observation.get("billing_period_end_at")
+            )
+            key = (provider, model, account_hash, quota_key, environment)
+            prepared.append(
+                (
+                    key,
+                    {
+                        "provider": provider,
+                        "model": model,
+                        "remaining_pct": remaining_pct,
+                        "observed_at": observed_at,
+                        "expected_reset_at": expected_reset_at,
+                        "quota_key": quota_key or None,
+                        "quota_type": observation.get("quota_type"),
+                        "source": observation.get("source"),
+                    },
+                )
+            )
+        if not prepared:
+            return
+        with self._normalized_quota_observations_lock:
+            for key, observation in prepared:
+                current = self._normalized_quota_observations.get(key)
+                if current is None or observation["observed_at"] >= current["observed_at"]:
+                    self._normalized_quota_observations[key] = observation
+            bound_memory_map(
+                self._normalized_quota_observations,
+                max_size=self.max_size,
+            )
+
+    def resolve_normalized_quota_observation(
+        self,
+        *,
+        provider: str,
+        model: str,
+        max_age_seconds: float = 900.0,
+        now_epoch: Optional[float] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Return one conservative fresh quota view, or ``None`` if ambiguous."""
+        now = time.time() if now_epoch is None else now_epoch
+        with self._normalized_quota_observations_lock:
+            observations = [
+                (key, dict(observation))
+                for key, observation in self._normalized_quota_observations.items()
+                for obs_provider, obs_model, _account, _quota, _environment in (key,)
+                if obs_provider == provider and obs_model in {"", model}
+            ]
+        fresh = [
+            (key, observation)
+            for key, observation in observations
+            if 0 <= now - observation["observed_at"] <= max_age_seconds
+            and (
+                observation.get("expected_reset_at") is None
+                or observation["expected_reset_at"] > now
+            )
+        ]
+        if not fresh:
+            return None
+        account_hashes = {key[2] for key, _observation in fresh if key[2]}
+        environments = {key[4] for key, _observation in fresh if key[4]}
+        if len(account_hashes) > 1 or len(environments) > 1:
+            return None
+        _selected_key, selected = min(
+            fresh, key=lambda item: item[1]["remaining_pct"]
+        )
+        return {
+            **selected,
+            "observation_age_seconds": max(0.0, now - selected["observed_at"]),
+            "window_count": len(fresh),
+        }
 
     def reset_for_tests(self) -> None:
         """Clear all manager-owned process-local state IN PLACE (test-support only).
@@ -1180,13 +1307,15 @@ class AliasRoutingStateManager:
         self.openrouter_rate_limit.clear_for_tests()
         self.openrouter_failure_circuit.clear_for_tests()
         # Wave 5B: gate, cursor, quota
-        self.read_pilot_gate._key_state.clear()
-        self.read_pilot_gate._family_state.evidence_events_by_key.clear()
+        self.basic_pilot_gate._key_state.clear()
+        self.basic_pilot_gate._family_state.evidence_events_by_key.clear()
         self.round_robin_cursor.clear()
         self.lane_identity_index.clear()
         self.publication_intents.clear()
         self._key_barrier_locks.clear()
         self._openrouter_free_quota_cache = (None, 0.0)
+        with self._normalized_quota_observations_lock:
+            self._normalized_quota_observations.clear()
 
     async def candidate_probe_lock(
         self,

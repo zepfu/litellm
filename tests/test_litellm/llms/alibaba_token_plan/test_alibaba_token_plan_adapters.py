@@ -124,7 +124,7 @@ async def _stream_text(response: StreamingResponse) -> str:
         ("qwen3.8-max-preview", None),
         ("dashscope/qwen3.8-max-preview", None),
         ("alibaba_token_plan/unknown", None),
-        ("aawm-sota-alibaba", None),
+        ("sota-alibaba", None),
     ),
 )
 def test_should_normalize_only_exact_token_plan_adapter_models(
@@ -189,7 +189,7 @@ async def test_should_prepare_codex_collaboration_with_raw_upstream_model() -> N
     assert task_payload in str(completion_kwargs["messages"])
     assert metadata["alibaba_token_plan_codex_agent_task_payload_restored"] is True
     assert metadata["alibaba_token_plan_upstream_model"] == "qwen3.8-max-preview"
-    assert "aawm-sota-alibaba" not in json.dumps(completion_kwargs)
+    assert "sota-alibaba" not in json.dumps(completion_kwargs)
 
 
 @pytest.mark.asyncio
@@ -219,7 +219,7 @@ async def test_should_prepare_anthropic_with_raw_upstream_model() -> None:
         "route:anthropic_alibaba_token_plan_chat_completions_adapter"
         in plan.prepared_request_body["litellm_metadata"]["tags"]
     )
-    assert "aawm-sota-alibaba" not in json.dumps(plan.perform_kwargs)
+    assert "sota-alibaba" not in json.dumps(plan.perform_kwargs)
 
 
 def test_should_require_prefixed_direct_adapter_models() -> None:
@@ -246,7 +246,7 @@ def test_should_require_prefixed_direct_adapter_models() -> None:
     )
     assert (
         _resolve_anthropic_alibaba_token_plan_adapter_model(
-            {"model": "aawm-sota-alibaba"},
+            {"model": "sota-alibaba"},
             "/v1/messages",
         )
         is None
@@ -309,8 +309,8 @@ async def test_should_run_codex_nonstream_without_sending_the_alias(
             "tools": [_collaboration_namespace_tool()],
             "stream": False,
             "litellm_metadata": {
-                "model_alias": "aawm-sota-alibaba",
-                "inbound_model_alias": "aawm-sota-alibaba",
+                "model_alias": "sota-alibaba",
+                "inbound_model_alias": "sota-alibaba",
             },
         },
         adapter_model="alibaba_token_plan/qwen3.8-max-preview",
@@ -324,7 +324,7 @@ async def test_should_run_codex_nonstream_without_sending_the_alias(
         "spawn_agent",
         "wait_agent",
     ]
-    assert "aawm-sota-alibaba" not in upstream_request.content.decode()
+    assert "sota-alibaba" not in upstream_request.content.decode()
 
     response_body = json.loads(response.body)
     function_call = next(item for item in response_body["output"] if item["type"] == "function_call")

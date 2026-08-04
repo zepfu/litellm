@@ -191,7 +191,7 @@ async def handle_auto_agent_alias_route(
     legacy_error_class: Optional[str] = None
     legacy_grok_account_quota_exhausted = False
     legacy_kimi_failure_metadata: Optional[dict[str, Any]] = None
-    legacy_is_read_pilot_lane = False
+    legacy_is_basic_pilot_lane = False
     family_state = (
         runtime.anthropic_family_state
         if alias_family == "anthropic_auto_agent"
@@ -208,7 +208,7 @@ async def handle_auto_agent_alias_route(
         error_class: Optional[str],
         grok_account_quota_exhausted: bool = False,
         kimi_failure_metadata: Optional[dict[str, Any]] = None,
-        is_read_pilot_lane: bool = False,
+        is_basic_pilot_lane: bool = False,
     ) -> CooldownPublicationPlan:
         nonlocal legacy_request
         nonlocal legacy_candidate
@@ -218,7 +218,7 @@ async def handle_auto_agent_alias_route(
         nonlocal legacy_error_class
         nonlocal legacy_grok_account_quota_exhausted
         nonlocal legacy_kimi_failure_metadata
-        nonlocal legacy_is_read_pilot_lane
+        nonlocal legacy_is_basic_pilot_lane
         legacy_request = request
         legacy_candidate = candidate
         legacy_lane_key = lane_key
@@ -227,7 +227,7 @@ async def handle_auto_agent_alias_route(
         legacy_error_class = error_class
         legacy_grok_account_quota_exhausted = grok_account_quota_exhausted
         legacy_kimi_failure_metadata = kimi_failure_metadata
-        legacy_is_read_pilot_lane = is_read_pilot_lane
+        legacy_is_basic_pilot_lane = is_basic_pilot_lane
         return runtime.resolve_cooldown_publication(
             request=request,
             candidate=candidate,
@@ -237,7 +237,7 @@ async def handle_auto_agent_alias_route(
             error_class=error_class,
             grok_account_quota_exhausted=grok_account_quota_exhausted,
             kimi_failure_metadata=kimi_failure_metadata,
-            is_read_pilot_lane=is_read_pilot_lane,
+            is_basic_pilot_lane=is_basic_pilot_lane,
         )
 
     def _legacy_publish_memory(*, keys: Sequence[str], seconds: float) -> None:
@@ -256,7 +256,7 @@ async def handle_auto_agent_alias_route(
             error_class=legacy_error_class,
             grok_account_quota_exhausted=legacy_grok_account_quota_exhausted,
             kimi_failure_metadata=legacy_kimi_failure_metadata,
-            is_read_pilot_lane=legacy_is_read_pilot_lane,
+            is_basic_pilot_lane=legacy_is_basic_pilot_lane,
         )
 
     async def _legacy_get_active_cooldown_state(

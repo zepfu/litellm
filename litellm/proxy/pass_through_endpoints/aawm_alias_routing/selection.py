@@ -10,6 +10,7 @@ Direct imports from sibling Wave 4/5A modules (``lane_keys``, ``snapshot_select`
 
 from __future__ import annotations
 
+import random
 import time
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
@@ -41,16 +42,14 @@ from .policy import (
     CODEX_AUTO_AGENT_XAI_PROVIDER as _CODEX_AUTO_AGENT_XAI_PROVIDER,
 )
 from .snapshot_select import (
-    _commit_round_robin_selection,
     _get_codex_auto_agent_candidates_for_alias,
     _is_alias_config_startup_failed,
-    _READ_PILOT_ALIAS_NAME,
     _resolve_aawm_alias_selection_enumeration,
     _routing_candidate_to_anthropic_public_dict,
-    _routing_candidate_to_public_dict,
-    _select_read_pilot_snapshot_candidates_anthropic,
+    _select_snapshot_candidates,
     get_active_routing_snapshot,
 )
+from .state import alias_routing_state
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -174,16 +173,20 @@ def _normalize_anthropic_auto_agent_alias_model(model: Any) -> Optional[str]:
     if not isinstance(model, str):
         return None
     normalized = model.strip().lower()
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        AAWM_RETIRED_ALIASES,
+    )
+
+    if normalized in AAWM_RETIRED_ALIASES:
+        return None
+    snapshot = get_active_routing_snapshot()
+    if snapshot is not None:
+        alias = snapshot.aliases.get(normalized)
+        if alias is not None and alias.visibility == "public":
+            return alias.name
     for alias in _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS:
         if normalized == alias.lower():
             return alias
-    # CFG-001: recognize config-driven aliases from the active snapshot so
-    # the logical `read` alias resolves on Anthropic ingress too.
-    snapshot = get_active_routing_snapshot()
-    if snapshot is not None:
-        for alias_name in snapshot.aliases:
-            if normalized == alias_name.lower():
-                return alias_name
     return None
 
 
@@ -533,26 +536,6 @@ def _find_codex_auto_agent_affinity_candidate(
     alias membership so schedule-only changes do not evict an in-flight
     continuation. Static/legacy affinity keeps the existing lookup path.
     """
-    if (
-        alias_model == _READ_PILOT_ALIAS_NAME
-        and affinity.get("config_hash") is not None
-    ):
-        snapshot = get_active_routing_snapshot()
-        if snapshot is None:
-            return None
-        alias = snapshot.aliases.get(alias_model)
-        if alias is None:
-            return None
-        for candidate in alias.candidates:
-            if (
-                candidate.provider == affinity.get("provider")
-                and candidate.model == affinity.get("model")
-            ):
-                return _routing_candidate_to_public_dict(
-                    candidate,
-                    epoch_tag=snapshot.config_hash,
-                )
-        return None
     return _find_codex_auto_agent_candidate(
         affinity.get("provider"),
         affinity.get("model"),
@@ -567,37 +550,25 @@ def _get_anthropic_candidates_for_alias_snapshot_aware(
     *,
     client_product_label: Optional[str] = None,
 ) -> tuple[dict[str, Any], ...]:
-    """Resolve Anthropic-ingress candidates, preferring the active snapshot for `read`.
-
-    CFG-001: when the alias is the config-driven `read` pilot and a snapshot
-    is active, return the snapshot's anthropic-projected candidates. Falls
-    back to the injected static-table seam for all other aliases or when no
-    snapshot is active.
-
-    When a snapshot is active, arbitrary aliases that are neither the
-    config-driven pilot nor explicitly registered legacy aliases fail
-    closed (empty tuple) rather than delegating to the generic static
-    table.  This mirrors the Codex-side ``_get_codex_auto_agent_candidates_for_alias``
-    behavior.
-
-    CFG-002 Finding 2: failure state is checked FIRST, before any snapshot
-    or static branch.  Once failure is published, all paths return empty.
-    """
-    # CFG-002 Finding 2: check failure state FIRST.
+    """Resolve one alias through the shared immutable snapshot."""
     if _is_alias_config_startup_failed():
         return ()
-    if alias_model == _READ_PILOT_ALIAS_NAME:
-        snapshot_candidates = _select_read_pilot_snapshot_candidates_anthropic(
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        AAWM_RETIRED_ALIASES,
+    )
+
+    if alias_model in AAWM_RETIRED_ALIASES:
+        return ()
+    snapshot = get_active_routing_snapshot()
+    if snapshot is not None:
+        alias = snapshot.aliases.get(alias_model)
+        if alias is None or alias.visibility != "public":
+            return ()
+        return _select_snapshot_candidates(
+            alias_model,
+            ingress="anthropic",
             client_product_label=client_product_label,
         )
-        if snapshot_candidates is not None:
-            return snapshot_candidates
-    # CFG-001: fail closed for unsupported aliases when a snapshot is active.
-    if get_active_routing_snapshot() is not None:
-        candidates = _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(alias_model)
-        if candidates is not None:
-            return candidates
-        return ()
     assert _get_anthropic_candidates_for_alias is not None
     return _get_anthropic_candidates_for_alias(alias_model)
 
@@ -629,26 +600,6 @@ def _find_anthropic_auto_agent_affinity_candidate(
     affinity is checked against the active snapshot's full alias membership so
     schedule/TUI-only changes do not evict an in-flight continuation.
     """
-    if (
-        alias_model == _READ_PILOT_ALIAS_NAME
-        and affinity.get("config_hash") is not None
-    ):
-        snapshot = get_active_routing_snapshot()
-        if snapshot is None:
-            return None
-        alias = snapshot.aliases.get(alias_model)
-        if alias is None:
-            return None
-        for candidate in alias.candidates:
-            if (
-                candidate.provider == affinity.get("provider")
-                and candidate.model == affinity.get("model")
-            ):
-                return _routing_candidate_to_anthropic_public_dict(
-                    candidate,
-                    epoch_tag=snapshot.config_hash,
-                )
-        return None
     return _find_anthropic_auto_agent_candidate(
         affinity.get("provider"),
         affinity.get("model"),
@@ -799,6 +750,26 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     return state
 
 
+def _attach_normalized_quota_state(state: dict[str, Any]) -> dict[str, Any]:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
+        alias_routing_state as _alias_routing_state,
+    )
+
+    candidate = state["candidate"]
+    observation = _alias_routing_state.resolve_normalized_quota_observation(
+        provider=str(candidate.get("provider") or ""),
+        model=str(candidate.get("model") or ""),
+    )
+    if observation is None:
+        return state
+    state["quota_observation"] = observation
+    state["quota_remaining_pct"] = observation["remaining_pct"]
+    if observation["remaining_pct"] <= 0 and state.get("skip_reason") is None:
+        state["skip_reason"] = "quota_exhausted"
+        state["cooldown_state_source"] = "normalized_quota_observation"
+    return state
+
+
 async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
     request: Request,
     *,
@@ -944,11 +915,13 @@ async def _build_codex_auto_agent_candidate_states(
         client_product_label=client_product_label,
     ).candidates:
         states.append(
-            await _build_codex_auto_agent_candidate_state(
+            _attach_normalized_quota_state(
+                await _build_codex_auto_agent_candidate_state(
                 request,
                 candidate_template=candidate_template,
                 alias_model=alias_model,
                 openai_lane_key=openai_lane_key,
+            )
             )
         )
     return states
@@ -967,15 +940,162 @@ async def _build_anthropic_auto_agent_candidate_states(
         alias_model, client_product_label=client_product_label,
     ):
         states.append(
-            await _build_anthropic_auto_agent_candidate_state(
+            _attach_normalized_quota_state(
+                await _build_anthropic_auto_agent_candidate_state(
                 request,
                 candidate_template=candidate_template,
                 alias_model=alias_model,
                 openai_lane_key=openai_lane_key,
                 anthropic_lane_key=anthropic_lane_key,
             )
+            )
         )
     return states
+
+
+def _get_request_selection_choices(request: Request) -> dict[str, str]:
+    choices = getattr(request.state, "aawm_alias_selected_choices", None)
+    if isinstance(choices, dict):
+        return choices
+    choices = {}
+    setattr(request.state, "aawm_alias_selected_choices", choices)
+    return choices
+
+
+def _get_request_reselection_counts(request: Request) -> dict[str, int]:
+    counts = getattr(request.state, "aawm_alias_reselection_counts", None)
+    if isinstance(counts, dict):
+        return counts
+    counts = {}
+    setattr(request.state, "aawm_alias_reselection_counts", counts)
+    return counts
+
+
+def _weighted_choice(
+    choices: Sequence[str],
+    weights: dict[str, float],
+) -> str:
+    total = sum(max(0.0, weights.get(choice, 0.0)) for choice in choices)
+    if total <= 0:
+        return choices[0]
+    pick = random.random() * total
+    cumulative = 0.0
+    for choice in choices:
+        cumulative += max(0.0, weights.get(choice, 0.0))
+        if pick <= cumulative:
+            return choice
+    return choices[-1]
+
+
+def _select_available_state(
+    request: Request,
+    states: Sequence[dict[str, Any]],
+    *,
+    last_resort: bool,
+) -> Optional[dict[str, Any]]:
+    available = [
+        state
+        for state in states
+        if bool(state["candidate"].get("last_resort")) is last_resort
+        and _is_auto_agent_candidate_state_available(state)
+    ]
+    if not available:
+        return None
+    highest_priority = max(
+        int(state["candidate"].get("selection_priority", 0))
+        for state in available
+    )
+    tier = [
+        state
+        for state in available
+        if int(state["candidate"].get("selection_priority", 0))
+        == highest_priority
+    ]
+    group = tier[0]["candidate"].get("selection_group")
+    strategy = tier[0]["candidate"].get("selection_strategy")
+    if not group or not strategy:
+        return tier[0]
+
+    states_by_choice: dict[str, list[dict[str, Any]]] = {}
+    weights: dict[str, float] = {}
+    for state in tier:
+        candidate = state["candidate"]
+        choice = str(candidate.get("selection_choice") or "")
+        if not choice:
+            return tier[0]
+        states_by_choice.setdefault(choice, []).append(state)
+        weights.setdefault(
+            choice,
+            float(candidate.get("selection_weight", 1.0)),
+        )
+    choices = list(states_by_choice)
+    selected_by_group = _get_request_selection_choices(request)
+    selected_choice = selected_by_group.get(str(group))
+    if selected_choice not in states_by_choice:
+        if selected_choice is not None:
+            counts = _get_request_reselection_counts(request)
+            counts[str(group)] = counts.get(str(group), 0) + 1
+        if strategy == "proportional":
+            selected_choice = _weighted_choice(choices, weights)
+        elif strategy == "round_robin":
+            epoch = str(tier[0]["candidate"].get("config_epoch_tag") or "")
+            cursor_key = (epoch, str(group))
+            cursor = alias_routing_state.round_robin_cursor.get(cursor_key, 0)
+            selected_choice = choices[cursor % len(choices)]
+            alias_routing_state.round_robin_cursor[cursor_key] = (
+                cursor + 1
+            ) % len(choices)
+        elif strategy in {
+            "highest_quota_available",
+            "lowest_quota_available",
+        }:
+            quota_by_choice: dict[str, float] = {}
+            for choice, choice_states in states_by_choice.items():
+                values = [
+                    float(state["quota_remaining_pct"])
+                    for state in choice_states
+                    if state.get("quota_remaining_pct") is not None
+                ]
+                if values:
+                    quota_by_choice[choice] = min(values)
+            if not quota_by_choice:
+                return None
+            target = (
+                max(quota_by_choice.values())
+                if strategy == "highest_quota_available"
+                else min(quota_by_choice.values())
+            )
+            tied = [
+                choice
+                for choice in choices
+                if choice in quota_by_choice
+                and abs(quota_by_choice[choice] - target) <= 0.001
+            ]
+            selected_choice = random.choice(tied)
+        else:
+            selected_choice = choices[0]
+        selected_by_group[str(group)] = selected_choice
+
+    selected = states_by_choice[selected_choice][0]
+    total_weight = sum(max(0.0, weights[choice]) for choice in choices)
+    selected["selection_diagnostics"] = {
+        "strategy": strategy,
+        "group": group,
+        "available_choices": choices,
+        "normalized_available_weights": {
+            choice: (
+                max(0.0, weights[choice]) / total_weight
+                if total_weight > 0
+                else 1.0 / len(choices)
+            )
+            for choice in choices
+        },
+        "selected_choice": selected_choice,
+        "reselection_count": _get_request_reselection_counts(request).get(
+            str(group), 0
+        ),
+    }
+    return selected
 
 
 # ---------------------------------------------------------------------------
@@ -1248,13 +1368,6 @@ async def _select_codex_auto_agent_candidate(
     )
     has_continuation_state = _has_continuation_state(request_body)
 
-    enumeration = _resolve_aawm_alias_selection_enumeration(
-        request,
-        alias_model,
-        client_product_label=client_product_label,
-    )
-    commit_token = enumeration.commit_token
-
     affinity = await _get_codex_session_affinity(session_key)
     if affinity is not None and not has_continuation_state:
         affinity = None
@@ -1394,10 +1507,8 @@ async def _select_codex_auto_agent_candidate(
                     selected_state=matched_affinity_state,
                 )
 
-    for state in states:
-        if state["candidate"].get("last_resort") or not _is_auto_agent_candidate_state_available(state):
-            continue
-        _commit_round_robin_selection(commit_token, selected_candidate=state["candidate"])
+    state = _select_available_state(request, states, last_resort=False)
+    if state is not None:
         return _attach_aawm_alias_routing_state_sources(
             {
                 **state,
@@ -1409,9 +1520,8 @@ async def _select_codex_auto_agent_candidate(
             selected_state=state,
         )
 
-    for state in states:
-        if not state["candidate"].get("last_resort") or not _is_auto_agent_candidate_state_available(state):
-            continue
+    state = _select_available_state(request, states, last_resort=True)
+    if state is not None:
         return _attach_aawm_alias_routing_state_sources(
             {
                 **state,
@@ -1576,9 +1686,8 @@ async def _select_anthropic_auto_agent_candidate(
                         selected_state=matched_affinity_state,
                     )
 
-    for state in states:
-        if state["candidate"].get("last_resort") or not _is_auto_agent_candidate_state_available(state):
-            continue
+    state = _select_available_state(request, states, last_resort=False)
+    if state is not None:
         return _attach_aawm_alias_routing_state_sources(
             {
                 **state,
@@ -1591,9 +1700,8 @@ async def _select_anthropic_auto_agent_candidate(
             selected_state=state,
         )
 
-    for state in states:
-        if not state["candidate"].get("last_resort") or not _is_auto_agent_candidate_state_available(state):
-            continue
+    state = _select_available_state(request, states, last_resort=True)
+    if state is not None:
         return _attach_aawm_alias_routing_state_sources(
             {
                 **state,
@@ -1652,6 +1760,7 @@ _HOST_FUNCTION_NAMES = (
     "_get_anthropic_auto_agent_candidate_cooldown_state",
     "_build_codex_auto_agent_candidate_state",
     "_build_anthropic_auto_agent_candidate_state",
+    "_attach_normalized_quota_state",
     "_build_codex_auto_agent_candidate_states",
     "_build_anthropic_auto_agent_candidate_states",
     "_raise_codex_auto_agent_in_flight_cooldown",

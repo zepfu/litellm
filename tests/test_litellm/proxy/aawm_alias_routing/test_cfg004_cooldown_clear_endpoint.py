@@ -2290,13 +2290,13 @@ class TestNotActivePerKeyProof:
 
 
 # ---------------------------------------------------------------------------
-# Finding 4: Read-pilot classification-marker evidence before key state
+# Finding 4: Basic-pilot classification-marker evidence before key state
 # ---------------------------------------------------------------------------
 
 
-class TestReadPilotMarkerEvidence:
+class TestBasicPilotMarkerEvidence:
     def test_marker_evidence_before_key_state_detected_and_cleared(self, fresh_manager):
-        """Marker-tier read-pilot evidence accumulates in the gate's family
+        """Marker-tier basic-pilot evidence accumulates in the gate's family
         evidence map BEFORE any _key_state entry exists.  inspect_cooldown_absence
         must detect it (not classify it absent) and clear must remove it."""
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
@@ -2304,7 +2304,7 @@ class TestReadPilotMarkerEvidence:
         )
 
         cd_key = "hcfg:openai:gpt-4o:chatgpt-account:acct1"
-        gate = fresh_manager.read_pilot_gate
+        gate = fresh_manager.basic_pilot_gate
         # Seed marker evidence ONLY in the family evidence map -- no _key_state.
         gate._family_state.evidence_events_by_key[cd_key] = [time.monotonic()]
         assert cd_key not in gate._key_state
@@ -2313,7 +2313,7 @@ class TestReadPilotMarkerEvidence:
             fresh_manager, alias_family="codex", cooldown_key=cd_key
         )
         assert inspection.exists is True
-        assert inspection.read_pilot_present is True
+        assert inspection.basic_pilot_present is True
 
         # Clear must remove the marker evidence so it cannot survive.
         fresh_manager.clear_cooldown_state(alias_family="codex", cooldown_keys=[cd_key])
@@ -2322,7 +2322,7 @@ class TestReadPilotMarkerEvidence:
             fresh_manager, alias_family="codex", cooldown_key=cd_key
         )
         assert after.exists is False
-        assert after.read_pilot_present is False
+        assert after.basic_pilot_present is False
         assert cd_key not in gate._family_state.evidence_events_by_key
 
 
@@ -3402,7 +3402,7 @@ class TestFinding3AllOrNoneRollback:
 
         Seeds EVERY targeted local state the clear path mutates (family
         positive/negative cooldown maps, evidence events, per-key generation,
-        read-pilot gate key/evidence state, lane-identity index membership,
+        basic-pilot gate key/evidence state, lane-identity index membership,
         and targeted OpenRouter rate-limit/failure-circuit entries) plus
         unrelated state and session affinity.  On postcondition failure the
         durable receipts are rolled back AND every captured local preimage is
@@ -3438,13 +3438,13 @@ class TestFinding3AllOrNoneRollback:
         fam.cooldown_negative_until_monotonic_by_key["k1"] = now + 50.0
         fam.evidence_events_by_key["k1"] = [now - 5.0, now - 1.0]
         fam.cooldown_generation_by_key["k1"] = 3
-        # Read-pilot gate (codex-owned) key + evidence state.
+        # Basic-pilot gate (codex-owned) key + evidence state.
         gate_ks = _KeyCooldownState(
             attempt=2, cooled_until_monotonic=now + 75.0,
             probe_in_flight=True, last_scope="scope-a", last_class_name="Cls",
         )
-        mgr.read_pilot_gate._key_state["k1"] = gate_ks
-        mgr.read_pilot_gate._family_state.evidence_events_by_key["k1"] = [now - 2.0]
+        mgr.basic_pilot_gate._key_state["k1"] = gate_ks
+        mgr.basic_pilot_gate._family_state.evidence_events_by_key["k1"] = [now - 2.0]
         # Lane-identity index membership: targeted lane plus an unrelated
         # lane under the SAME identity (must survive restoration).
         mgr.lane_identity_index.register(identity_hash="h1", lane_key="k1")
@@ -3504,10 +3504,10 @@ class TestFinding3AllOrNoneRollback:
         assert fam.cooldown_negative_until_monotonic_by_key["k1"] == now + 50.0
         assert fam.evidence_events_by_key["k1"] == [now - 5.0, now - 1.0]
         assert fam.cooldown_generation_by_key["k1"] == 3
-        restored_ks = mgr.read_pilot_gate._key_state["k1"]
+        restored_ks = mgr.basic_pilot_gate._key_state["k1"]
         assert restored_ks == gate_ks
         assert restored_ks is not gate_ks  # independent restored copy
-        assert mgr.read_pilot_gate._family_state.evidence_events_by_key["k1"] == [now - 2.0]
+        assert mgr.basic_pilot_gate._family_state.evidence_events_by_key["k1"] == [now - 2.0]
         assert mgr.lane_identity_index.lanes_for("h1") == frozenset({"k1", "k-unrelated-lane"})
         assert mgr.openrouter_rate_limit.until_monotonic_by_key["or-model-x"] == now + 30.0
         assert mgr.openrouter_failure_circuit.until_monotonic_by_key["or-model-x"] == now + 40.0

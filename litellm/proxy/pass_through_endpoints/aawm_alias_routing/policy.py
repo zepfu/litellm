@@ -41,24 +41,49 @@ CODEX_AUTO_AGENT_OPENCODE_LANE_KEY = OPENCODE_ZEN_PROVIDER
 ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER = "anthropic"
 ANTHROPIC_AUTO_AGENT_HAIKU_MODEL = "claude-haiku-4-5-20251001"
 
-CODEX_AUTO_AGENT_MODEL_ALIAS = "aawm-codex-agent-auto"
-CODEX_AAWM_READ_ALIAS = "aawm-read"
-CODEX_AAWM_SOTA_ALIAS = "aawm-sota"
-CODEX_AAWM_CODE_ALIAS = "aawm-code"
-CODEX_AAWM_LOW_ALIAS = "aawm-low"
-CODEX_AAWM_ORCHESTRATION_ALIAS = "aawm-orchestration"
-CODEX_AAWM_SOTA_OPENAI_ALIAS = "aawm-sota-openai"
-CODEX_AAWM_SOTA_XAI_ALIAS = "aawm-sota-xai"
-CODEX_AAWM_SOTA_MOONSHOT_ALIAS = "aawm-sota-moonshot"
-CODEX_AAWM_SOTA_ALIBABA_ALIAS = "aawm-sota-alibaba"
-CODEX_AAWM_SOTA_DEEPSEEK_ALIAS = "aawm-sota-deepseek"
-CODEX_AAWM_SOTA_GLM_ALIAS = "aawm-sota-glm"
-ANTHROPIC_AUTO_AGENT_MODEL_ALIAS = "aawm-anthropic-agent-auto"
-ANTHROPIC_AAWM_READ_ALIAS = "aawm-read-anthropic"
-ANTHROPIC_AAWM_SOTA_ALIAS = "aawm-sota-anthropic"
-ANTHROPIC_AAWM_CODE_ALIAS = "aawm-code-anthropic"
-ANTHROPIC_AAWM_LOW_ALIAS = "aawm-low-anthropic"
-ANTHROPIC_AAWM_ORCHESTRATION_ALIAS = "aawm-orchestration-anthropic"
+AAWM_BASIC_ALIAS = "basic"
+AAWM_RETIRED_ALIASES = frozenset({"read"})
+AAWM_RETIRED_ALIAS_HASHES = frozenset(
+    {
+        "f50865badf3ac5ba1d3e91eb4681a4f4e004ff2e38d2f99c2cd0006b1be191bc",
+        "7df3de3d02c2afaaa9033078e0052ffec2d2b64f3d3a1d8f4a10169a9dda4368",
+        "5de379251e74acdad023aac30ea2163d54a5f5776aa868bbeeab3451126e5dda",
+        "766d4ab5594413b3b546fa11ac4d820389e5deb6cb8c353b16f18e9dddd46b62",
+        "2a9c5ad8ab80ede5ac0deb0b7f5226ff7c763df1064e7d9be2cfd7096c552ac0",
+        "aa6535a2427bb5e7d46b713541a9cafb65702546a54de35c03dc50d6441d5f37",
+        "b6a36789c8ac5815559b1bb7cd5e61c0efb9938e98121892835c291c2ae8d59b",
+        "7942fb23a14e87df30f6000c779dbc55723a18aeb2eda4e0f09610681e1685a4",
+        "91085282475e9e8d973c46d84df1c0f78c7ee3a61668432b0989b80a0cb86d67",
+        "136f3c13382b157518efaefa64e2b2d03e349416da5aac648f79bb3646d90c34",
+        "81df25742cace1a6de5fad57e0400e14b2c554d2a09e3cec3688f29b1ebbc539",
+        "2727ec8557c43176f7366e0227ae9c2f6ec62cdfc50f551f84474cffedbe179e",
+        "d5ace7473125cf5b14c582ca2fe9c318d5dcd3da507708016daf7e819f8ba005",
+        "cebe1de4946d4826cdb900f138c7ffb9051e835d8428681eeeed1c9c0abe5cbe",
+        "adc064a3db595face740b696622b748eabb5421ca77b3581a36b972343fdc317",
+        "b0bf4c425e6df7790a5753eba7326a2ecb86d5751fe5a4b5f94e68cba9e68eec",
+        "48d6b59556978de1af06e555d2c64da2f4be66bf7af09bb6c536973c40c80c5d",
+        "9028dcbe8bc7925955cb70318e5bba8860364b895f5f373cd0901894634cc52b",
+    }
+)
+
+CODEX_AUTO_AGENT_MODEL_ALIAS = AAWM_BASIC_ALIAS
+CODEX_AAWM_READ_ALIAS = AAWM_BASIC_ALIAS
+CODEX_AAWM_SOTA_ALIAS = "sota"
+CODEX_AAWM_CODE_ALIAS = "work"
+CODEX_AAWM_LOW_ALIAS = AAWM_BASIC_ALIAS
+CODEX_AAWM_ORCHESTRATION_ALIAS = "work"
+CODEX_AAWM_SOTA_OPENAI_ALIAS = "sota-openai"
+CODEX_AAWM_SOTA_XAI_ALIAS = "sota-xai"
+CODEX_AAWM_SOTA_MOONSHOT_ALIAS = "sota-moonshot"
+CODEX_AAWM_SOTA_ALIBABA_ALIAS = "sota-alibaba"
+CODEX_AAWM_SOTA_DEEPSEEK_ALIAS = "sota-deepseek"
+CODEX_AAWM_SOTA_GLM_ALIAS = "alibaba_token_plan/glm-5.2"
+ANTHROPIC_AUTO_AGENT_MODEL_ALIAS = AAWM_BASIC_ALIAS
+ANTHROPIC_AAWM_READ_ALIAS = AAWM_BASIC_ALIAS
+ANTHROPIC_AAWM_SOTA_ALIAS = "sota-anthropic"
+ANTHROPIC_AAWM_CODE_ALIAS = "work"
+ANTHROPIC_AAWM_LOW_ALIAS = AAWM_BASIC_ALIAS
+ANTHROPIC_AAWM_ORCHESTRATION_ALIAS = "work"
 
 CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
@@ -80,11 +105,11 @@ CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": True,
     },
 )
-CODEX_AAWM_READ_ALIAS = "aawm-read"
-CODEX_AAWM_SOTA_ALIAS = "aawm-sota"
-CODEX_AAWM_CODE_ALIAS = "aawm-code"
-CODEX_AAWM_LOW_ALIAS = "aawm-low"
-CODEX_AAWM_ORCHESTRATION_ALIAS = "aawm-orchestration"
+CODEX_AAWM_READ_ALIAS = AAWM_BASIC_ALIAS
+CODEX_AAWM_SOTA_ALIAS = "sota"
+CODEX_AAWM_CODE_ALIAS = "work"
+CODEX_AAWM_LOW_ALIAS = AAWM_BASIC_ALIAS
+CODEX_AAWM_ORCHESTRATION_ALIAS = "work"
 CODEX_AAWM_SOTA_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
@@ -99,8 +124,8 @@ CODEX_AAWM_SOTA_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": True,
     },
 )
-CODEX_AAWM_SOTA_OPENAI_ALIAS = "aawm-sota-openai"
-CODEX_AAWM_SOTA_XAI_ALIAS = "aawm-sota-xai"
+CODEX_AAWM_SOTA_OPENAI_ALIAS = "sota-openai"
+CODEX_AAWM_SOTA_XAI_ALIAS = "sota-xai"
 CODEX_AAWM_SOTA_OPENAI_CANDIDATES: tuple[dict[str, Any], ...] = CODEX_AAWM_SOTA_CANDIDATES
 CODEX_AAWM_SOTA_XAI_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
@@ -141,7 +166,7 @@ CODEX_AAWM_SOTA_MOONSHOT_CANDIDATES: tuple[dict[str, Any], ...] = (
 CODEX_AAWM_SOTA_ALIBABA_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
-        "model": "alibaba_token_plan/qwen3.8-max-preview",
+        "model": "alibaba_token_plan/qwen3.8-max",
         "route_family": "codex_alibaba_token_plan_chat_completions_adapter",
         "last_resort": False,
     },
@@ -280,26 +305,9 @@ CODEX_AAWM_ORCHESTRATION_CANDIDATES: tuple[dict[str, Any], ...] = (
     },
 )
 CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS: dict[str, tuple[dict[str, Any], ...]] = {
-    CODEX_AUTO_AGENT_MODEL_ALIAS: CODEX_AUTO_AGENT_CANDIDATES,
-    CODEX_AAWM_READ_ALIAS: CODEX_AUTO_AGENT_CANDIDATES,
-    # First-class "read" pilot-lane alias key: this is the recognized model
-    # name a request actually sends (``model: "read"``). The static table
-    # entry here is the no-snapshot-active fallback; when a routing snapshot
-    # is active with a ``read`` alias, ``_get_codex_auto_agent_candidates_for_alias``
-    # resolves candidates from the snapshot instead (see llm_passthrough_endpoints.py).
-    "read": CODEX_AUTO_AGENT_CANDIDATES,
-    CODEX_AAWM_SOTA_ALIAS: CODEX_AAWM_SOTA_CANDIDATES,
-    CODEX_AAWM_SOTA_OPENAI_ALIAS: CODEX_AAWM_SOTA_OPENAI_CANDIDATES,
-    CODEX_AAWM_SOTA_XAI_ALIAS: CODEX_AAWM_SOTA_XAI_CANDIDATES,
-    CODEX_AAWM_SOTA_MOONSHOT_ALIAS: CODEX_AAWM_SOTA_MOONSHOT_CANDIDATES,
-    CODEX_AAWM_SOTA_ALIBABA_ALIAS: CODEX_AAWM_SOTA_ALIBABA_CANDIDATES,
-    CODEX_AAWM_SOTA_DEEPSEEK_ALIAS: CODEX_AAWM_SOTA_DEEPSEEK_CANDIDATES,
-    CODEX_AAWM_SOTA_GLM_ALIAS: CODEX_AAWM_SOTA_GLM_CANDIDATES,
-    CODEX_AAWM_CODE_ALIAS: CODEX_AAWM_CODE_CANDIDATES,
-    CODEX_AAWM_LOW_ALIAS: CODEX_AAWM_LOW_CANDIDATES,
-    CODEX_AAWM_ORCHESTRATION_ALIAS: CODEX_AAWM_ORCHESTRATION_CANDIDATES,
+    AAWM_BASIC_ALIAS: CODEX_AUTO_AGENT_CANDIDATES,
 }
-ANTHROPIC_AUTO_AGENT_MODEL_ALIAS = "aawm-anthropic-agent-auto"
+ANTHROPIC_AUTO_AGENT_MODEL_ALIAS = AAWM_BASIC_ALIAS
 ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER = "anthropic"
 ANTHROPIC_AUTO_AGENT_HAIKU_MODEL = "claude-haiku-4-5-20251001"
 ANTHROPIC_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
@@ -322,11 +330,11 @@ ANTHROPIC_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (
         "last_resort": True,
     },
 )
-ANTHROPIC_AAWM_READ_ALIAS = "aawm-read-anthropic"
-ANTHROPIC_AAWM_SOTA_ALIAS = "aawm-sota-anthropic"
-ANTHROPIC_AAWM_CODE_ALIAS = "aawm-code-anthropic"
-ANTHROPIC_AAWM_LOW_ALIAS = "aawm-low-anthropic"
-ANTHROPIC_AAWM_ORCHESTRATION_ALIAS = "aawm-orchestration-anthropic"
+ANTHROPIC_AAWM_READ_ALIAS = AAWM_BASIC_ALIAS
+ANTHROPIC_AAWM_SOTA_ALIAS = "sota-anthropic"
+ANTHROPIC_AAWM_CODE_ALIAS = "work"
+ANTHROPIC_AAWM_LOW_ALIAS = AAWM_BASIC_ALIAS
+ANTHROPIC_AAWM_ORCHESTRATION_ALIAS = "work"
 ANTHROPIC_AAWM_SOTA_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
@@ -360,7 +368,7 @@ ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES: tuple[dict[str, Any], ...] = (
 ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
         "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
-        "model": "alibaba_token_plan/qwen3.8-max-preview",
+        "model": "alibaba_token_plan/qwen3.8-max",
         "route_family": "anthropic_alibaba_token_plan_chat_completions_adapter",
         "last_resort": False,
     },
@@ -492,16 +500,7 @@ ANTHROPIC_AAWM_LOW_CANDIDATES: tuple[dict[str, Any], ...] = (
     },
 )
 ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS: dict[str, tuple[dict[str, Any], ...]] = {
-    ANTHROPIC_AUTO_AGENT_MODEL_ALIAS: ANTHROPIC_AUTO_AGENT_CANDIDATES,
-    ANTHROPIC_AAWM_READ_ALIAS: ANTHROPIC_AUTO_AGENT_CANDIDATES,
-    ANTHROPIC_AAWM_SOTA_ALIAS: ANTHROPIC_AAWM_SOTA_CANDIDATES,
-    CODEX_AAWM_SOTA_MOONSHOT_ALIAS: ANTHROPIC_AAWM_SOTA_MOONSHOT_CANDIDATES,
-    CODEX_AAWM_SOTA_ALIBABA_ALIAS: ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES,
-    CODEX_AAWM_SOTA_DEEPSEEK_ALIAS: ANTHROPIC_AAWM_SOTA_DEEPSEEK_CANDIDATES,
-    CODEX_AAWM_SOTA_GLM_ALIAS: ANTHROPIC_AAWM_SOTA_GLM_CANDIDATES,
-    ANTHROPIC_AAWM_CODE_ALIAS: ANTHROPIC_AAWM_CODE_CANDIDATES,
-    ANTHROPIC_AAWM_LOW_ALIAS: ANTHROPIC_AAWM_LOW_CANDIDATES,
-    ANTHROPIC_AAWM_ORCHESTRATION_ALIAS: ANTHROPIC_AAWM_ORCHESTRATION_CANDIDATES,
+    AAWM_BASIC_ALIAS: ANTHROPIC_AUTO_AGENT_CANDIDATES,
 }
 
 ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS = frozenset(
@@ -559,7 +558,8 @@ KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS = frozenset(
 )
 ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS = frozenset(
     {
-        "alibaba_token_plan/qwen3.8-max-preview",
+        "alibaba_token_plan/qwen3.8-max",
+        "alibaba_token_plan/qwen3.8-max",
         "alibaba_token_plan/qwen3.7-plus",
         "alibaba_token_plan/qwen3.7-max",
         "alibaba_token_plan/qwen3.6-flash",

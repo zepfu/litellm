@@ -1,4 +1,4 @@
-"""RED-phase tests for Wave 4: selector integration for the ``read`` pilot only.
+"""RED-phase tests for Wave 4: selector integration for the ``basic`` pilot only.
 
 These tests target the selection surface Wave 4 added for candidate resolution
 from the compiled snapshot; priority/tie/TUI/schedule selection semantics;
@@ -23,16 +23,13 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AAWM_LOW_CANDIDATES,
-    CODEX_AAWM_READ_ALIAS,
-    CODEX_AAWM_SOTA_ALIAS,
-    CODEX_AAWM_LOW_ALIAS,
 )
 
 
 _SNAPSHOT_YAML = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: openrouter/snapshot-only-model
@@ -54,28 +51,19 @@ def snapshot_fixture():
     snapshot_select.set_active_routing_snapshot(previous)
 
 
-def test_read_alias_uses_snapshot(snapshot_fixture) -> None:
-    """``read`` resolves candidates from the compiled snapshot, not CODEX_AAWM_LOW_CANDIDATES."""
-    candidates = snapshot_select._get_codex_auto_agent_candidates_for_alias("read")
+def test_basic_alias_uses_snapshot(snapshot_fixture) -> None:
+    """``basic`` resolves candidates from the compiled snapshot, not CODEX_AAWM_LOW_CANDIDATES."""
+    candidates = snapshot_select._get_codex_auto_agent_candidates_for_alias("basic")
     models = [c["model"] for c in candidates]
     assert "openrouter/snapshot-only-model" in models
     low_models = [c["model"] for c in CODEX_AAWM_LOW_CANDIDATES]
     assert models != low_models
 
 
-def test_other_aliases_unchanged(snapshot_fixture) -> None:
-    """aawm-read, aawm-low, aawm-sota still resolve from the hard-coded tables."""
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import policy
-
-    assert snapshot_select._get_codex_auto_agent_candidates_for_alias(CODEX_AAWM_READ_ALIAS) == policy.CODEX_AUTO_AGENT_CANDIDATES
-    assert snapshot_select._get_codex_auto_agent_candidates_for_alias(CODEX_AAWM_LOW_ALIAS) == CODEX_AAWM_LOW_CANDIDATES
-    assert snapshot_select._get_codex_auto_agent_candidates_for_alias(CODEX_AAWM_SOTA_ALIAS) == policy.CODEX_AAWM_SOTA_CANDIDATES
-
-
 def test_priority_descending_selection(snapshot_fixture) -> None:
     """Higher priority first; priority:0 only when all others are cooled/ineligible."""
-    read_alias = snapshot_fixture.aliases["read"]
-    ordered = snapshot_select._order_snapshot_candidates_by_priority(read_alias.candidates)
+    basic_alias = snapshot_fixture.aliases["basic"]
+    ordered = snapshot_select._order_snapshot_candidates_by_priority(basic_alias.candidates)
     assert ordered[0].model == "openrouter/snapshot-only-model"
     assert ordered[-1].priority == 0
     assert ordered[-1].model == "gpt-5.4-mini"
@@ -86,7 +74,7 @@ def test_proportional_tie_distribution() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     distribution_strategy: proportional
     candidates:
       - provider: openrouter
@@ -101,7 +89,7 @@ aliases:
         weight: 3
 """
     snapshot = compiler.compile_yaml(raw)
-    candidates = snapshot.aliases["read"].candidates
+    candidates = snapshot.aliases["basic"].candidates
     weights = {c.model: c.weight for c in candidates}
 
     import random
@@ -124,7 +112,7 @@ def test_tui_attached_excluded_on_unknown_tui() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: claude-only-model
@@ -137,7 +125,7 @@ aliases:
         priority: 0
 """
     snapshot = compiler.compile_yaml(raw)
-    candidates = snapshot.aliases["read"].candidates
+    candidates = snapshot.aliases["basic"].candidates
     eligible = [c for c in candidates if snapshot_select._is_tui_attached_candidate_eligible(c, client_product_label=None)]
     eligible_models = [c.model for c in eligible]
     assert "claude-only-model" not in eligible_models
@@ -149,7 +137,7 @@ def test_tui_attached_selected_when_identified() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: claude-only-model
@@ -158,7 +146,7 @@ aliases:
         tui_attached: Claude
 """
     snapshot = compiler.compile_yaml(raw)
-    candidate = snapshot.aliases["read"].candidates[0]
+    candidate = snapshot.aliases["basic"].candidates[0]
     assert snapshot_select._is_tui_attached_candidate_eligible(candidate, client_product_label="Claude/1.2")
     assert not snapshot_select._is_tui_attached_candidate_eligible(candidate, client_product_label="Codex/1.0")
 
@@ -168,7 +156,7 @@ def test_tui_excluded_gate_version_insensitive() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: gpt-5.6-luna
@@ -177,7 +165,7 @@ aliases:
         tui_excluded: Claude
 """
     snapshot = compiler.compile_yaml(raw)
-    candidate = snapshot.aliases["read"].candidates[0]
+    candidate = snapshot.aliases["basic"].candidates[0]
     gate = snapshot_select._is_tui_excluded_candidate_eligible
     # Claude origin (any version) is excluded.
     assert not gate(candidate, client_product_label="Claude/1.2")
@@ -193,7 +181,7 @@ def test_mutually_exclusive_tails_branch_selection() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: openrouter/owl-alpha
@@ -219,13 +207,13 @@ aliases:
         # Codex ingress, Claude origin: Luna is excluded for the Claude branch
         # and the Anthropic-credential Haiku tail is Anthropic-ingress-only,
         # so only the common prefix remains (fail closed past it).
-        claude_codex = snapshot_select._select_read_pilot_snapshot_candidates(
+        claude_codex = snapshot_select._select_basic_pilot_snapshot_candidates(
             client_product_label="Claude/1.2",
         )
         assert [c["model"] for c in claude_codex] == ["openrouter/owl-alpha"]
 
         # Anthropic ingress, Claude origin: native Haiku tail, Luna ineligible.
-        claude_anthropic = snapshot_select._select_read_pilot_snapshot_candidates_anthropic(
+        claude_anthropic = snapshot_select._select_basic_pilot_snapshot_candidates_anthropic(
             client_product_label="Claude/1.2",
         )
         assert claude_anthropic is not None
@@ -237,7 +225,7 @@ aliases:
         assert claude_anthropic[-1]["route_family"] == "anthropic_messages"
 
         for label in (None, "Codex/0.31", "SomeUnknownTUI/2.0"):
-            default = snapshot_select._select_read_pilot_snapshot_candidates(
+            default = snapshot_select._select_basic_pilot_snapshot_candidates(
                 client_product_label=label,
             )
             default_models = [c["model"] for c in default]
@@ -255,7 +243,7 @@ def test_schedule_window_close_stops_new_affinity() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: alibaba_token_plan
         model: alibaba_token_plan/qwen3.8-max-preview
@@ -270,7 +258,7 @@ aliases:
         priority: 0
 """
     snapshot = compiler.compile_yaml(raw)
-    promo_candidate = snapshot.aliases["read"].candidates[0]
+    promo_candidate = snapshot.aliases["basic"].candidates[0]
 
     now_within_window = dt.datetime(2026, 7, 5, tzinfo=dt.timezone.utc)
     now_after_window = dt.datetime(2026, 7, 20, tzinfo=dt.timezone.utc)
@@ -301,14 +289,14 @@ aliases:
 
 
 def test_no_new_routing_decision_recording(snapshot_fixture) -> None:
-    """Selecting a read candidate adds no new session_history write path / hash persistence."""
+    """Selecting a basic candidate adds no new session_history write path / hash persistence."""
     # This contract intentionally inspects the facade module itself.
     source = inspect.getsource(lpe)
     # No config-hash/version persistence path introduced by the pilot.
     assert "config_hash" not in _extract_session_history_write_regions(source)
     assert "config_version" not in _extract_session_history_write_regions(source)
-    # No new session_history-recording function specific to the read pilot.
-    assert not hasattr(lpe, "_record_read_pilot_routing_decision")
+    # No new session_history-recording function specific to the basic pilot.
+    assert not hasattr(lpe, "_record_basic_pilot_routing_decision")
     assert not hasattr(lpe, "_persist_routing_snapshot_selection")
 
 

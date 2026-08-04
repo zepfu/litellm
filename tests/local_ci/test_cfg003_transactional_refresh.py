@@ -18,7 +18,7 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 RA_PATH = ROOT / "scripts" / "local-ci" / "run_acceptance.py"
 ADAPTER_PATH = ROOT / "scripts" / "local-ci" / "run_anthropic_adapter_acceptance.py"
-READ_YAML_PATH = ROOT / "litellm" / "proxy" / "aawm_alias_config" / "read.yaml"
+BASIC_YAML_PATH = ROOT / "litellm" / "proxy" / "aawm_alias_config" / "basic.yaml"
 CONFIG_JSON_PATH = ROOT / "scripts" / "local-ci" / "anthropic_adapter_config.json"
 
 
@@ -55,8 +55,8 @@ def adapter():
 
 
 @pytest.fixture()
-def read_yaml_text():
-    return READ_YAML_PATH.read_text(encoding="utf-8")
+def basic_yaml_text():
+    return BASIC_YAML_PATH.read_text(encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -106,11 +106,11 @@ class TestProofEnforcement:
 
     def test_empty_hash_from_swap_fails(self, adapter, ra, monkeypatch):
         """Swap returning empty semantic hash must hard-fail."""
-        real_yaml = READ_YAML_PATH.read_text(encoding="utf-8")
+        real_yaml = BASIC_YAML_PATH.read_text(encoding="utf-8")
         def fake_auth():
             snap = _compile_snapshot()
-            return {"snapshot": snap, "merged_yaml": real_yaml, "per_file_hashes": {"read.yaml": "h"},
-                    "file_names": ["read.yaml"], "config_hash": "semhash", "config_version": "semver", "aliases": ["read"]}
+            return {"snapshot": snap, "merged_yaml": real_yaml, "per_file_hashes": {"basic.yaml": "h"},
+                    "file_names": ["basic.yaml"], "config_hash": "semhash", "config_version": "semver", "aliases": ["basic"]}
 
         def fake_post(url, payload, **kw):
             if "not_a_list" in payload.get("yaml", ""):
@@ -119,11 +119,11 @@ class TestProofEnforcement:
 
         # Provide positive availability for at least 2 candidates.
         snap = _compile_snapshot()
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         avail_res = _avail_result(eligible[:3])
 
         monkeypatch.setattr(adapter.RA, "_load_authoritative_startup_config", fake_auth)
-        monkeypatch.setattr(adapter.RA, "_http_get_json_plain", lambda *a, **kw: (200, {"aawm_alias_config": {"state": "active", "config_hash": "semhash", "config_version": "semver", "files": ["read.yaml"], "aliases": ["read"]}}))
+        monkeypatch.setattr(adapter.RA, "_http_get_json_plain", lambda *a, **kw: (200, {"aawm_alias_config": {"state": "active", "config_hash": "semhash", "config_version": "semver", "files": ["basic.yaml"], "aliases": ["basic"]}}))
         monkeypatch.setattr(adapter.RA, "_http_post_json", fake_post)
         monkeypatch.setattr(adapter, "_cfg003_collect_availability_evidence", lambda *a, **kw: avail_res)
         monkeypatch.setattr(adapter, "_run_selected_case", lambda **kw: {"passed": True})
@@ -131,7 +131,7 @@ class TestProofEnforcement:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         assert not result["passed"]
@@ -159,11 +159,11 @@ class TestFailClosedInventory:
     def test_alias_mismatch_fails(self, adapter, ra, monkeypatch):
         monkeypatch.setattr(adapter.RA, "_http_get_json_plain", lambda *a, **kw: (200, {
             "aawm_alias_config": {"state": "active", "config_hash": "h", "config_version": "v",
-                                  "files": ["read.yaml"], "aliases": ["read", "extra"]}
+                                  "files": ["basic.yaml"], "aliases": ["basic", "extra"]}
         }))
         monkeypatch.setattr(adapter.RA, "_load_authoritative_startup_config", lambda: {
-            "snapshot": None, "merged_yaml": "", "per_file_hashes": {"read.yaml": "h"},
-            "file_names": ["read.yaml"], "config_hash": "h", "config_version": "v", "aliases": ["read"]
+            "snapshot": None, "merged_yaml": "", "per_file_hashes": {"basic.yaml": "h"},
+            "file_names": ["basic.yaml"], "config_hash": "h", "config_version": "v", "aliases": ["basic"]
         })
         result = adapter._cfg003_query_active_inventory("http://localhost:4001")
         assert not result["healthy"]
@@ -177,8 +177,8 @@ class TestFailClosedInventory:
         assert ra._is_real_tui_case({}) is False
 
     def test_http_only_case_rejected(self, ra):
-        inventory = [{"alias": "read", "supported_ingresses": ["codex_responses"]}]
-        cases = {"http_case": {"verification_alias": "read", "verification_ingress": "codex_responses", "http_request": {"method": "POST"}}}
+        inventory = [{"alias": "basic", "supported_ingresses": ["codex_responses"]}]
+        cases = {"http_case": {"verification_alias": "basic", "verification_ingress": "codex_responses", "http_request": {"method": "POST"}}}
         passed, failures = ra._validate_alias_ingress_coverage(alias_inventory=inventory, cases=cases, selected_cases=["http_case"])
         assert not passed
         assert any("not a real TUI case" in f for f in failures)
@@ -193,28 +193,28 @@ class TestAvailabilityEvidence:
     def test_parse_route_availability_evidence(self, ra):
         log = """
 20260730 06:00:00 Codex[1.0] <mock>
- - openrouter/model-a(read) - Turns: 0 [rate limited by upstream] [Cooling Down] -> route
- - openrouter/model-b(read) - Turns: 0 [Selected model is at capacity] [Failed] -> route
- - openrouter/model-c(read) - Turns: 3 [success] [Selected] -> route
+ - openrouter/model-a(basic) - Turns: 0 [rate limited by upstream] [Cooling Down] -> route
+ - openrouter/model-b(basic) - Turns: 0 [Selected model is at capacity] [Failed] -> route
+ - openrouter/model-c(basic) - Turns: 3 [success] [Selected] -> route
 """
-        evidence = ra._parse_route_availability_evidence(log, "read")
+        evidence = ra._parse_route_availability_evidence(log, "basic")
         assert evidence["openrouter/model-a"] == "Cooling Down"
         assert evidence["openrouter/model-b"] == "Failed"
         assert evidence["openrouter/model-c"] == "Selected"
 
-    def test_unavailable_candidates_filtered(self, ra, read_yaml_text):
+    def test_unavailable_candidates_filtered(self, ra, basic_yaml_text):
         """Candidates with Cooling Down/Failed/Exhausted status are excluded."""
         # Use the snapshot-based derivation with availability evidence.
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
         # Mark the first two candidates as unavailable.
-        all_eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        all_eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         assert len(all_eligible) >= 3
         first_model = all_eligible[0]["model"]
         second_model = all_eligible[1]["model"]
         availability = {first_model: "Cooling Down", second_model: "Failed"}
         filtered = ra._derive_eligible_candidates_from_snapshot(
-            snap, alias_name="read", availability_evidence=availability
+            snap, alias_name="basic", availability_evidence=availability
         )
         filtered_models = {c["model"] for c in filtered}
         assert first_model not in filtered_models
@@ -225,7 +225,7 @@ class TestAvailabilityEvidence:
         """When availability evidence leaves < 2 candidates, the test must fail."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        all_eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        all_eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         # Mark ALL but one as unavailable (positive evidence format).
         avail_res = _avail_result(all_eligible, available_count=1)
 
@@ -258,8 +258,8 @@ class TestExactRestoration:
         auth = ra._load_authoritative_startup_config()
         assert auth["config_hash"]
         assert auth["config_version"]
-        assert "read" in auth["aliases"]
-        assert "read.yaml" in auth["per_file_hashes"]
+        assert "basic" in auth["aliases"]
+        assert "basic.yaml" in auth["per_file_hashes"]
         # Merged YAML recompiles to the same semantic hash.
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import compile_yaml
         recompiled = compile_yaml(auth["merged_yaml"])
@@ -273,16 +273,16 @@ class TestExactRestoration:
 
     def test_source_file_change_detected(self, adapter, ra, tmp_path, monkeypatch):
         monkeypatch.setattr(adapter.RA, "_AAWM_ALIAS_CONFIG_DIR", tmp_path)
-        (tmp_path / "read.yaml").write_text("modified", encoding="utf-8")
-        ok, failures = adapter._cfg003_verify_source_files_unchanged({"read.yaml": "wrong_hash"})
+        (tmp_path / "basic.yaml").write_text("modified", encoding="utf-8")
+        ok, failures = adapter._cfg003_verify_source_files_unchanged({"basic.yaml": "wrong_hash"})
         assert not ok
         assert any("changed" in f for f in failures)
 
     def test_restoration_failure_primary_even_with_swap_failure(self, adapter, ra, monkeypatch):
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
-        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
+        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="basic")
         avail_res = _avail_result(eligible[:3])
 
         def fake_auth():
@@ -301,7 +301,7 @@ class TestExactRestoration:
             if call_n["n"] == 1:
                 return 200, {"changed": False, "active_config_hash": auth["config_hash"],
                              "config_version": auth["config_version"],
-                             "active_candidate_order": {"read": full_order}}
+                             "active_candidate_order": {"basic": full_order}}
             # Swap POST fails.
             if call_n["n"] == 2:
                 return 500, {"error": "swap failed"}
@@ -320,7 +320,7 @@ class TestExactRestoration:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         assert not result["passed"]
@@ -380,18 +380,18 @@ class TestArtifactPersistenceSanitization:
 class TestExactEqualityAndCorrelatedTriples:
     def test_claude_case_uses_required_equals_result(self):
         config = json.loads(CONFIG_JSON_PATH.read_text(encoding="utf-8"))
-        claude_case = config["cases"]["claude_adapter_read_alias_child_parallel_read_tools"]
+        claude_case = config["cases"]["claude_adapter_basic_alias_child_parallel_read_tools"]
         checks = claude_case["command_json_checks"]
         assert "required_equals" in checks
-        assert checks["required_equals"]["result"] == "READ_ALIAS_PARALLEL_TOOLS_PASSED"
+        assert checks["required_equals"]["result"] == "BASIC_ALIAS_PARALLEL_TOOLS_PASSED"
         # Must NOT use required_contains for result (substring is insufficient).
         assert "required_contains" not in checks or "result" not in checks.get("required_contains", {})
 
     def test_correlated_triples_in_config(self):
         config = json.loads(CONFIG_JSON_PATH.read_text(encoding="utf-8"))
         for case_name in (
-            "native_openai_passthrough_responses_codex_read_alias_collaboration",
-            "claude_adapter_read_alias_child_parallel_read_tools",
+            "native_openai_passthrough_responses_codex_basic_alias_collaboration",
+            "claude_adapter_basic_alias_child_parallel_read_tools",
         ):
             case = config["cases"][case_name]
             row = case["session_history_validation"]["expected_rows"][0]
@@ -440,16 +440,16 @@ class TestCoverageMapAndTargetRejection:
     def test_complete_coverage_map_validates_all_cases(self, ra):
         """The complete configured case map must cover every alias/ingress."""
         config = json.loads(CONFIG_JSON_PATH.read_text(encoding="utf-8"))
-        inventory = [{"alias": "read", "supported_ingresses": ["codex_responses", "anthropic_messages"]}]
+        inventory = [{"alias": "basic", "supported_ingresses": ["codex_responses", "anthropic_messages"]}]
         passed, failures = ra._validate_complete_coverage_map(
             alias_inventory=inventory, cases=config["cases"]
         )
         assert passed, f"coverage map failures: {failures}"
 
     def test_complete_coverage_map_detects_missing(self, ra):
-        inventory = [{"alias": "read", "supported_ingresses": ["codex_responses", "anthropic_messages"]}]
+        inventory = [{"alias": "basic", "supported_ingresses": ["codex_responses", "anthropic_messages"]}]
         cases = {
-            "only_codex": {"verification_alias": "read", "verification_ingress": "codex_responses", "command": ["codex", "exec"]},
+            "only_codex": {"verification_alias": "basic", "verification_ingress": "codex_responses", "command": ["codex", "exec"]},
         }
         passed, failures = ra._validate_complete_coverage_map(alias_inventory=inventory, cases=cases)
         assert not passed
@@ -463,26 +463,26 @@ class TestCoverageMapAndTargetRejection:
 
 class TestCoverageGate:
     def test_missing_coverage_detected(self, ra):
-        inventory = [{"alias": "read", "supported_ingresses": ["codex_responses", "anthropic_messages"]}]
-        cases = {"case_a": {"verification_alias": "read", "verification_ingress": "codex_responses", "command": ["codex", "exec"]}}
+        inventory = [{"alias": "basic", "supported_ingresses": ["codex_responses", "anthropic_messages"]}]
+        cases = {"case_a": {"verification_alias": "basic", "verification_ingress": "codex_responses", "command": ["codex", "exec"]}}
         passed, failures = ra._validate_alias_ingress_coverage(alias_inventory=inventory, cases=cases, selected_cases=["case_a"])
         assert not passed
 
     def test_duplicate_coverage_detected(self, ra):
-        inventory = [{"alias": "read", "supported_ingresses": ["codex_responses"]}]
+        inventory = [{"alias": "basic", "supported_ingresses": ["codex_responses"]}]
         cases = {
-            "case_a": {"verification_alias": "read", "verification_ingress": "codex_responses", "command": ["codex", "exec"]},
-            "case_b": {"verification_alias": "read", "verification_ingress": "codex_responses", "command": ["codex", "exec"]},
+            "case_a": {"verification_alias": "basic", "verification_ingress": "codex_responses", "command": ["codex", "exec"]},
+            "case_b": {"verification_alias": "basic", "verification_ingress": "codex_responses", "command": ["codex", "exec"]},
         }
         passed, failures = ra._validate_alias_ingress_coverage(alias_inventory=inventory, cases=cases, selected_cases=["case_a", "case_b"])
         assert not passed
         assert any("duplicate" in f for f in failures)
 
     def test_exact_coverage_passes(self, ra):
-        inventory = [{"alias": "read", "supported_ingresses": ["codex_responses", "anthropic_messages"]}]
+        inventory = [{"alias": "basic", "supported_ingresses": ["codex_responses", "anthropic_messages"]}]
         cases = {
-            "case_codex": {"verification_alias": "read", "verification_ingress": "codex_responses", "command": ["codex", "exec"]},
-            "case_claude": {"verification_alias": "read", "verification_ingress": "anthropic_messages", "command": ["claude", "-p"]},
+            "case_codex": {"verification_alias": "basic", "verification_ingress": "codex_responses", "command": ["codex", "exec"]},
+            "case_claude": {"verification_alias": "basic", "verification_ingress": "anthropic_messages", "command": ["claude", "-p"]},
         }
         passed, failures = ra._validate_alias_ingress_coverage(alias_inventory=inventory, cases=cases, selected_cases=["case_codex", "case_claude"])
         assert passed
@@ -498,26 +498,26 @@ class TestConfigJsonStructure:
     def config(self):
         return json.loads(CONFIG_JSON_PATH.read_text(encoding="utf-8"))
 
-    def test_read_alias_cases_exist(self, config):
-        assert "native_openai_passthrough_responses_codex_read_alias_collaboration" in config["cases"]
-        assert "claude_adapter_read_alias_child_parallel_read_tools" in config["cases"]
+    def test_basic_alias_cases_exist(self, config):
+        assert "native_openai_passthrough_responses_codex_basic_alias_collaboration" in config["cases"]
+        assert "claude_adapter_basic_alias_child_parallel_read_tools" in config["cases"]
 
-    def test_read_alias_cases_in_default_excluded(self, config):
+    def test_basic_alias_cases_in_default_excluded(self, config):
         excluded = config["default_excluded_cases"]
-        assert "native_openai_passthrough_responses_codex_read_alias_collaboration" in excluded
-        assert "claude_adapter_read_alias_child_parallel_read_tools" in excluded
+        assert "native_openai_passthrough_responses_codex_basic_alias_collaboration" in excluded
+        assert "claude_adapter_basic_alias_child_parallel_read_tools" in excluded
 
-    def test_read_alias_cases_have_real_commands(self, config):
-        codex_case = config["cases"]["native_openai_passthrough_responses_codex_read_alias_collaboration"]
+    def test_basic_alias_cases_have_real_commands(self, config):
+        codex_case = config["cases"]["native_openai_passthrough_responses_codex_basic_alias_collaboration"]
         assert codex_case["command"][0] == "codex"
-        assert "read" in codex_case["command"]
-        claude_case = config["cases"]["claude_adapter_read_alias_child_parallel_read_tools"]
+        assert "basic" in codex_case["command"]
+        claude_case = config["cases"]["claude_adapter_basic_alias_child_parallel_read_tools"]
         assert claude_case["command"][0] == "claude"
 
-    def test_read_alias_cases_have_parallel_tool_contract(self, config):
-        codex_case = config["cases"]["native_openai_passthrough_responses_codex_read_alias_collaboration"]
+    def test_basic_alias_cases_have_parallel_tool_contract(self, config):
+        codex_case = config["cases"]["native_openai_passthrough_responses_codex_basic_alias_collaboration"]
         assert codex_case["codex_collaboration_validation"]["command_execution_validation"]["minimum_parallel_count"] == 3
-        claude_case = config["cases"]["claude_adapter_read_alias_child_parallel_read_tools"]
+        claude_case = config["cases"]["claude_adapter_basic_alias_child_parallel_read_tools"]
         assert claude_case["transcript_tool_use_validation"]["expected_agents"][0]["minimum_tools_in_single_assistant_message"] == 3
 
 
@@ -561,28 +561,28 @@ class TestHttpHelpers:
 
 
 class TestEligibleCandidatesAndSwap:
-    def test_at_least_two_eligible(self, ra, read_yaml_text):
-        eligible = ra._derive_eligible_candidates_from_yaml(read_yaml_text)
+    def test_at_least_two_eligible(self, ra, basic_yaml_text):
+        eligible = ra._derive_eligible_candidates_from_yaml(basic_yaml_text)
         assert len(eligible) >= 2
 
-    def test_excluded_providers_filtered(self, ra, read_yaml_text):
-        eligible = ra._derive_eligible_candidates_from_yaml(read_yaml_text)
+    def test_excluded_providers_filtered(self, ra, basic_yaml_text):
+        eligible = ra._derive_eligible_candidates_from_yaml(basic_yaml_text)
         providers = {c["provider"] for c in eligible}
         assert "anthropic" not in providers
         assert "xai" not in providers
 
-    def test_exact_swap(self, ra, read_yaml_text):
-        swapped_yaml, original, swapped = ra._build_priority_swap_yaml(read_yaml_text)
+    def test_exact_swap(self, ra, basic_yaml_text):
+        swapped_yaml, original, swapped = ra._build_priority_swap_yaml(basic_yaml_text)
         assert swapped[0]["model"] == original[1]["model"]
         assert swapped[1]["model"] == original[0]["model"]
 
-    def test_swap_does_not_mutate_file(self, ra, read_yaml_text):
-        original_bytes = READ_YAML_PATH.read_bytes()
-        ra._build_priority_swap_yaml(read_yaml_text)
-        assert READ_YAML_PATH.read_bytes() == original_bytes
+    def test_swap_does_not_mutate_file(self, ra, basic_yaml_text):
+        original_bytes = BASIC_YAML_PATH.read_bytes()
+        ra._build_priority_swap_yaml(basic_yaml_text)
+        assert BASIC_YAML_PATH.read_bytes() == original_bytes
 
     def test_insufficient_candidates_raises(self, ra):
-        yaml_text = "aliases:\n  - name: read\n    candidates:\n      - provider: openrouter\n        model: m\n        route_family: codex_openrouter_completion_adapter\n        priority: 50\n"
+        yaml_text = "aliases:\n  - name: basic\n    candidates:\n      - provider: openrouter\n        model: m\n        route_family: codex_openrouter_completion_adapter\n        priority: 50\n"
         with pytest.raises(ValueError, match="at least 2"):
             ra._build_priority_swap_yaml(yaml_text)
 
@@ -810,24 +810,24 @@ class TestPositiveAvailability:
 class TestSingleSourceAndInventory:
     def test_snapshot_source_inventory(self, ra):
         inv = ra._snapshot_source_inventory()
-        assert "read.yaml" in inv
-        assert len(inv["read.yaml"]) == 64  # sha256 hex
+        assert "basic.yaml" in inv
+        assert len(inv["basic.yaml"]) == 64  # sha256 hex
 
     def test_multiple_sources_fail_closed(self, adapter, ra, monkeypatch):
         """Multiple source files must fail closed before egress."""
         auth = ra._load_authoritative_startup_config()
-        multi_hashes = {"read.yaml": "h1", "extra.yaml": "h2"}
+        multi_hashes = {"basic.yaml": "h1", "extra.yaml": "h2"}
 
         def fake_auth():
             return {"snapshot": auth["snapshot"], "merged_yaml": auth["merged_yaml"],
-                    "per_file_hashes": multi_hashes, "file_names": ["read.yaml", "extra.yaml"],
+                    "per_file_hashes": multi_hashes, "file_names": ["basic.yaml", "extra.yaml"],
                     "config_hash": auth["config_hash"], "config_version": auth["config_version"],
                     "aliases": auth["aliases"]}
 
         monkeypatch.setattr(adapter.RA, "_load_authoritative_startup_config", fake_auth)
         monkeypatch.setattr(
             adapter.RA, "_recursive_yaml_source_inventory",
-            lambda *a, **kw: {"read.yaml": "h1", "extra.yaml": "h2"},
+            lambda *a, **kw: {"basic.yaml": "h1", "extra.yaml": "h2"},
         )
         monkeypatch.setattr(adapter.RA, "_snapshot_error_intake", lambda *a, **kw: {})
         result = adapter._cfg003_transactional_refresh_test(
@@ -841,9 +841,9 @@ class TestSingleSourceAndInventory:
         """Restoration must require active_candidate_order match."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
-        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="read")
-        raw_text = READ_YAML_PATH.read_text(encoding="utf-8")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
+        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="basic")
+        raw_text = BASIC_YAML_PATH.read_text(encoding="utf-8")
         avail_res = _avail_result(eligible[:3])
 
         evidenced_pair = (
@@ -851,13 +851,13 @@ class TestSingleSourceAndInventory:
             (eligible[1]["provider"], eligible[1]["model"]),
         )
         swapped_yaml, _, _ = ra._build_exact_pair_priority_swap_yaml(
-            raw_text, pair=evidenced_pair, alias_name="read"
+            raw_text, pair=evidenced_pair, alias_name="basic"
         )
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import compile_yaml
         swapped_snap = compile_yaml(swapped_yaml)
         swapped_hash = swapped_snap.config_hash
         swapped_version = swapped_snap.config_version
-        swapped_full_order = ra._derive_full_order_from_snapshot(swapped_snap, alias_name="read")
+        swapped_full_order = ra._derive_full_order_from_snapshot(swapped_snap, alias_name="basic")
 
         def fake_auth():
             return {"snapshot": snap, "merged_yaml": auth["merged_yaml"],
@@ -866,7 +866,7 @@ class TestSingleSourceAndInventory:
                     "aliases": auth["aliases"]}
 
         def _full_order_response(order):
-            return {"read": [
+            return {"basic": [
                 {"provider": c["provider"], "model": c["model"],
                  "route_family": c["route_family"],
                  "anthropic_route_family": c.get("anthropic_route_family", ""),
@@ -891,7 +891,7 @@ class TestSingleSourceAndInventory:
                 return 200, {
                     "changed": True, "active_config_hash": auth["config_hash"],
                     "config_version": auth["config_version"],
-                    "active_candidate_order": {"read": [{"provider": "WRONG", "model": "WRONG", "route_family": "WRONG", "priority": 0}]},
+                    "active_candidate_order": {"basic": [{"provider": "WRONG", "model": "WRONG", "route_family": "WRONG", "priority": 0}]},
                 }
             # Swap POST: correct.
             fake_post._swap_done = True
@@ -911,7 +911,7 @@ class TestSingleSourceAndInventory:
         ))
         monkeypatch.setattr(adapter.RA, "_http_post_json", fake_post)
         monkeypatch.setattr(adapter.RA, "_snapshot_error_intake", lambda *a, **kw: {})
-        monkeypatch.setattr(adapter.RA, "_snapshot_source_inventory", lambda *a, **kw: {"read.yaml": "h"})
+        monkeypatch.setattr(adapter.RA, "_snapshot_source_inventory", lambda *a, **kw: {"basic.yaml": "h"})
         monkeypatch.setattr(adapter, "_cfg003_collect_availability_evidence",
                             lambda *a, **kw: avail_res)
         monkeypatch.setattr(adapter, "_run_selected_case", lambda **kw: {"passed": True})
@@ -920,7 +920,7 @@ class TestSingleSourceAndInventory:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         assert not result["passed"]
@@ -938,9 +938,9 @@ class TestRestorationPrecedence:
         """A failed restore_proof must become the primary restoration failure."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
-        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="read")
-        raw_text = READ_YAML_PATH.read_text(encoding="utf-8")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
+        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="basic")
+        raw_text = BASIC_YAML_PATH.read_text(encoding="utf-8")
         avail_res = _avail_result(eligible[:3])
 
         # Compute the expected swapped hash/version so the swap POST returns
@@ -950,13 +950,13 @@ class TestRestorationPrecedence:
             (eligible[1]["provider"], eligible[1]["model"]),
         )
         swapped_yaml, _, swapped_eligible = ra._build_exact_pair_priority_swap_yaml(
-            raw_text, pair=evidenced_pair, alias_name="read"
+            raw_text, pair=evidenced_pair, alias_name="basic"
         )
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import compile_yaml
         swapped_snap = compile_yaml(swapped_yaml)
         swapped_hash = swapped_snap.config_hash
         swapped_version = swapped_snap.config_version
-        swapped_full_order = ra._derive_full_order_from_snapshot(swapped_snap, alias_name="read")
+        swapped_full_order = ra._derive_full_order_from_snapshot(swapped_snap, alias_name="basic")
 
         def fake_auth():
             return {"snapshot": snap, "merged_yaml": auth["merged_yaml"],
@@ -965,7 +965,7 @@ class TestRestorationPrecedence:
                     "aliases": auth["aliases"]}
 
         def _full_order_response(order):
-            return {"read": [
+            return {"basic": [
                 {"provider": c["provider"], "model": c["model"],
                  "route_family": c["route_family"],
                  "anthropic_route_family": c.get("anthropic_route_family", ""),
@@ -1015,7 +1015,7 @@ class TestRestorationPrecedence:
             }}
         ))
         monkeypatch.setattr(adapter.RA, "_snapshot_error_intake", lambda *a, **kw: {})
-        monkeypatch.setattr(adapter.RA, "_snapshot_source_inventory", lambda *a, **kw: {"read.yaml": "h"})
+        monkeypatch.setattr(adapter.RA, "_snapshot_source_inventory", lambda *a, **kw: {"basic.yaml": "h"})
         monkeypatch.setattr(adapter, "_cfg003_collect_availability_evidence",
                             lambda *a, **kw: avail_res)
         monkeypatch.setattr(adapter, "_run_selected_case", fake_run_case)
@@ -1023,7 +1023,7 @@ class TestRestorationPrecedence:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         assert not result["passed"]
@@ -1112,7 +1112,7 @@ class TestTargetAndInventoryGates:
             "cases": {
                 "tui_case": {
                     "command": ["codex", "exec"],
-                    "verification_alias": "read",
+                    "verification_alias": "basic",
                     "verification_ingress": "codex_responses",
                 },
             },
@@ -1219,7 +1219,7 @@ class TestRecursiveSingleSourceGate:
     def test_recursive_inventory_uses_cfg002_scan(self, ra):
         """_recursive_yaml_source_inventory must use the CFG-002 scan path."""
         inv = ra._recursive_yaml_source_inventory()
-        assert "read.yaml" in inv
+        assert "basic.yaml" in inv
         assert len(inv) == 1
 
     def test_nested_source_fails_before_any_egress(self, adapter, ra, monkeypatch):
@@ -1231,15 +1231,15 @@ class TestRecursiveSingleSourceGate:
 
         def fake_auth():
             return {"snapshot": auth["snapshot"], "merged_yaml": auth["merged_yaml"],
-                    "per_file_hashes": {"read.yaml": "h1", "nested/extra.yaml": "h2"},
-                    "file_names": ["read.yaml", "nested/extra.yaml"],
+                    "per_file_hashes": {"basic.yaml": "h1", "nested/extra.yaml": "h2"},
+                    "file_names": ["basic.yaml", "nested/extra.yaml"],
                     "config_hash": auth["config_hash"], "config_version": auth["config_version"],
                     "aliases": auth["aliases"]}
 
         monkeypatch.setattr(adapter.RA, "_load_authoritative_startup_config", fake_auth)
         monkeypatch.setattr(
             adapter.RA, "_recursive_yaml_source_inventory",
-            lambda *a, **kw: {"read.yaml": "h1", "nested/extra.yaml": "h2"},
+            lambda *a, **kw: {"basic.yaml": "h1", "nested/extra.yaml": "h2"},
         )
         monkeypatch.setattr(adapter.RA, "_snapshot_error_intake", lambda *a, **kw: {})
         monkeypatch.setattr(adapter.RA, "_http_post_json",
@@ -1249,7 +1249,7 @@ class TestRecursiveSingleSourceGate:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         assert not result["passed"]
@@ -1310,18 +1310,18 @@ class TestAvailabilityIdentityFailClosed:
         snap = auth["snapshot"]
         # No positive evidence at all.
         result = ra._derive_eligible_candidates_from_snapshot(
-            snap, alias_name="read", positive_availability={}, require_availability=True
+            snap, alias_name="basic", positive_availability={}, require_availability=True
         )
         assert result == []
 
     def test_require_availability_explicit_passes(self, ra):
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        all_eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        all_eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         first = all_eligible[0]
         pos = {(first["provider"], first["model"]): _valid_avail_record(True, provider=first["provider"], model=first["model"])}
         result = ra._derive_eligible_candidates_from_snapshot(
-            snap, alias_name="read", positive_availability=pos, require_availability=True
+            snap, alias_name="basic", positive_availability=pos, require_availability=True
         )
         assert len(result) == 1
         assert result[0]["provider"] == first["provider"]
@@ -1542,8 +1542,8 @@ class TestFullOrderComparison:
         snap = compile_directory(pathlib.Path(str(ROOT / "litellm" / "proxy" / "aawm_alias_config")))
         order = _snapshot_candidate_order(snap)
         assert list(order.keys()) == sorted(order.keys())
-        assert "read" in order
-        for cand in order["read"]:
+        assert "basic" in order
+        for cand in order["basic"]:
             assert "provider" in cand
             assert "model" in cand
             assert "route_family" in cand
@@ -1816,9 +1816,9 @@ class TestErrorIntakeRestorationPhase:
         """Restore-proof session/trace IDs are captured and passed to final phase."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
-        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="read")
-        raw_text = READ_YAML_PATH.read_text(encoding="utf-8")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
+        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="basic")
+        raw_text = BASIC_YAML_PATH.read_text(encoding="utf-8")
         avail_res = _avail_result(eligible[:3])
 
         # Compute correct swapped hash/version so the swap_proof gate passes.
@@ -1827,13 +1827,13 @@ class TestErrorIntakeRestorationPhase:
             (eligible[1]["provider"], eligible[1]["model"]),
         )
         swapped_yaml, _, _ = ra._build_exact_pair_priority_swap_yaml(
-            raw_text, pair=evidenced_pair, alias_name="read"
+            raw_text, pair=evidenced_pair, alias_name="basic"
         )
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import compile_yaml
         swapped_snap = compile_yaml(swapped_yaml)
         swapped_hash = swapped_snap.config_hash
         swapped_version = swapped_snap.config_version
-        swapped_full_order = ra._derive_full_order_from_snapshot(swapped_snap, alias_name="read")
+        swapped_full_order = ra._derive_full_order_from_snapshot(swapped_snap, alias_name="basic")
 
         def fake_auth():
             return {"snapshot": snap, "merged_yaml": auth["merged_yaml"],
@@ -1842,7 +1842,7 @@ class TestErrorIntakeRestorationPhase:
                     "aliases": auth["aliases"]}
 
         def _full_order_response(order):
-            return {"read": [
+            return {"basic": [
                 {"provider": c["provider"], "model": c["model"],
                  "route_family": c["route_family"],
                  "anthropic_route_family": c.get("anthropic_route_family", ""),
@@ -1912,14 +1912,14 @@ class TestErrorIntakeRestorationPhase:
         monkeypatch.setattr(adapter.RA, "_http_post_json", tracking_post)
         monkeypatch.setattr(adapter.RA, "_http_get_json_plain", fake_get)
         monkeypatch.setattr(adapter.RA, "_snapshot_error_intake", lambda *a, **kw: {})
-        monkeypatch.setattr(adapter.RA, "_snapshot_source_inventory", lambda *a, **kw: {"read.yaml": "h"})
+        monkeypatch.setattr(adapter.RA, "_snapshot_source_inventory", lambda *a, **kw: {"basic.yaml": "h"})
         monkeypatch.setattr(adapter, "_cfg003_collect_availability_evidence", lambda *a, **kw: avail_res)
         monkeypatch.setattr(adapter, "_run_selected_case", fake_run_case)
         monkeypatch.setattr(adapter, "_cfg003_extract_observed_selection", fake_selection)
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         # Restore proof should have captured session/trace (3rd proof call).
@@ -1938,10 +1938,10 @@ class TestFullOrderFromSnapshot:
         """Full order includes all candidates regardless of provider/availability."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="read")
+        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="basic")
         # Full order should include ALL candidates from snapshot.
         # Eligible candidates are a subset (filtered by schedule/availability).
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         assert len(full_order) >= len(eligible)
         # All eligible candidates should be present in full order.
         full_keys = {(c["provider"], c["model"]) for c in full_order}
@@ -1952,7 +1952,7 @@ class TestFullOrderFromSnapshot:
         """last_resort is normalized to explicit bool."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="read")
+        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="basic")
         for cand in full_order:
             assert isinstance(cand["last_resort"], bool)
 
@@ -2083,7 +2083,7 @@ class TestAvailabilityProducerConsumerContract:
 
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         # Prefer a candidate without a required-window contract so a single
         # positive row qualifies; fall back to the first eligible and provide
         # both windows for alibaba_token_plan models.
@@ -2130,7 +2130,7 @@ class TestAvailabilityProducerConsumerContract:
         # Consumer accepts the UNMODIFIED producer output.
         qualified = ra._derive_eligible_candidates_from_snapshot(
             snap,
-            alias_name="read",
+            alias_name="basic",
             positive_availability=produced,
             require_availability=True,
         )
@@ -2143,7 +2143,7 @@ class TestAvailabilityProducerConsumerContract:
         qualify through the strict consumer."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         first = eligible[0]
 
         monkeypatch.setitem(
@@ -2160,7 +2160,7 @@ class TestAvailabilityProducerConsumerContract:
         assert rec["provider"] == first["provider"]
         assert rec["model"] == first["model"]
         qualified = ra._derive_eligible_candidates_from_snapshot(
-            snap, alias_name="read", positive_availability=produced, require_availability=True
+            snap, alias_name="basic", positive_availability=produced, require_availability=True
         )
         assert qualified == []
 
@@ -2171,7 +2171,7 @@ class TestAvailabilityProducerConsumerContract:
 
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         first = eligible[0]
         provider, model = first["provider"], first["model"]
 
@@ -2206,7 +2206,7 @@ class TestAvailabilityProducerConsumerContract:
         # Unmodified producer output through the strict consumer: excluded.
         qualified = ra._derive_eligible_candidates_from_snapshot(
             snap,
-            alias_name="read",
+            alias_name="basic",
             positive_availability=produced,
             require_availability=True,
         )
@@ -2217,7 +2217,7 @@ class TestAvailabilityProducerConsumerContract:
         identity must be rejected by the strict validator/consumer."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         first = eligible[0]
         # Keyed correctly, but the stamped provider field is wrong.
         bad = {
@@ -2226,7 +2226,7 @@ class TestAvailabilityProducerConsumerContract:
             )
         }
         qualified = ra._derive_eligible_candidates_from_snapshot(
-            snap, alias_name="read", positive_availability=bad, require_availability=True
+            snap, alias_name="basic", positive_availability=bad, require_availability=True
         )
         assert qualified == []
 
@@ -2234,7 +2234,7 @@ class TestAvailabilityProducerConsumerContract:
         """A record whose stamped ``model`` field mismatches must be rejected."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         first = eligible[0]
         bad = {
             (first["provider"], first["model"]): _valid_avail_record(
@@ -2242,7 +2242,7 @@ class TestAvailabilityProducerConsumerContract:
             )
         }
         qualified = ra._derive_eligible_candidates_from_snapshot(
-            snap, alias_name="read", positive_availability=bad, require_availability=True
+            snap, alias_name="basic", positive_availability=bad, require_availability=True
         )
         assert qualified == []
 
@@ -2429,7 +2429,7 @@ class TestMultiWindowAvailabilityAggregation:
 
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         # Find an alibaba candidate if present; else use the first eligible.
         target = next(
             (c for c in eligible if c["provider"] == self.PROVIDER),
@@ -2458,7 +2458,7 @@ class TestMultiWindowAvailabilityAggregation:
         )
         assert produced[(provider, model)]["available"] is True
         qualified = ra._derive_eligible_candidates_from_snapshot(
-            snap, alias_name="read", positive_availability=produced, require_availability=True
+            snap, alias_name="basic", positive_availability=produced, require_availability=True
         )
         assert any(
             c["provider"] == provider and c["model"] == model for c in qualified
@@ -2555,7 +2555,7 @@ def _fake_cand(provider, model, priority, rf="codex_x_adapter", arf=""):
     )
 
 
-def _fake_snapshot(candidates, alias_name="read"):
+def _fake_snapshot(candidates, alias_name="basic"):
     alias = SimpleNamespace(name=alias_name, candidates=tuple(candidates))
     return SimpleNamespace(aliases={alias_name: alias})
 
@@ -2576,7 +2576,7 @@ class TestLastResortFromPriorityZero:
             ]
         )
         order = config_refresh._snapshot_candidate_order(snap)
-        cands = order["read"]
+        cands = order["basic"]
         by_model = {c["model"]: c for c in cands}
         # Priority-zero candidate is emitted as last_resort True.
         assert by_model["al/b"]["last_resort"] is True
@@ -2592,7 +2592,7 @@ class TestLastResortFromPriorityZero:
                 _fake_cand("alibaba_token_plan", "al/b", priority=0),
             ]
         )
-        full = ra._derive_full_order_from_snapshot(snap, alias_name="read")
+        full = ra._derive_full_order_from_snapshot(snap, alias_name="basic")
         by_model = {c["model"]: c for c in full}
         assert by_model["al/b"]["last_resort"] is True
         assert by_model["or/a"]["last_resort"] is False
@@ -2836,7 +2836,7 @@ class TestValueLevelSecretSanitization:
 
 _EXACT_PAIR_YAML = """\
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: or/model-a
@@ -3021,9 +3021,9 @@ class TestFinalMutationSafety:
         the last mutation even when invalid-control raises."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         assert len(eligible) >= 2
-        raw_file_text = READ_YAML_PATH.read_text(encoding="utf-8")
+        raw_file_text = BASIC_YAML_PATH.read_text(encoding="utf-8")
 
         post_log: list[str] = []
 
@@ -3042,14 +3042,14 @@ class TestFinalMutationSafety:
                     "changed": "swap" not in post_log,
                     "active_config_hash": auth["config_hash"],
                     "config_version": auth["config_version"],
-                    "active_candidate_order": {"read": []},
+                    "active_candidate_order": {"basic": []},
                 }
             post_log.append("swap")
             return 200, {
                 "changed": True,
                 "active_config_hash": "swapped_hash",
                 "config_version": "swapped_ver",
-                "active_candidate_order": {"read": []},
+                "active_candidate_order": {"basic": []},
             }
 
         def fake_auth():
@@ -3083,7 +3083,7 @@ class TestFinalMutationSafety:
 
         adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         # Controls must appear BEFORE swap.
@@ -3106,8 +3106,8 @@ class TestFinalMutationSafety:
         must still occur and be the last mutation."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
-        raw_file_text = READ_YAML_PATH.read_text(encoding="utf-8")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
+        raw_file_text = BASIC_YAML_PATH.read_text(encoding="utf-8")
 
         post_log: list[str] = []
 
@@ -3125,14 +3125,14 @@ class TestFinalMutationSafety:
                     "changed": "swap" not in post_log,
                     "active_config_hash": auth["config_hash"],
                     "config_version": auth["config_version"],
-                    "active_candidate_order": {"read": []},
+                    "active_candidate_order": {"basic": []},
                 }
             post_log.append("swap")
             return 200, {
                 "changed": True,
                 "active_config_hash": "swapped_hash",
                 "config_version": "swapped_ver",
-                "active_candidate_order": {"read": []},
+                "active_candidate_order": {"basic": []},
             }
 
         avail_res = _avail_result(eligible[:3])
@@ -3163,7 +3163,7 @@ class TestFinalMutationSafety:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         # Invalid control exception recorded.
@@ -3184,14 +3184,14 @@ class TestExactPairSwapWiring:
         with the evidenced pair, not _build_priority_swap_yaml."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         assert len(eligible) >= 3
 
         called_with_pair = []
 
         original_exact = ra._build_exact_pair_priority_swap_yaml
 
-        def spy_exact(raw_yaml, *, pair, alias_name="read", excluded_providers=None):
+        def spy_exact(raw_yaml, *, pair, alias_name="basic", excluded_providers=None):
             called_with_pair.append(pair)
             return original_exact(raw_yaml, pair=pair, alias_name=alias_name,
                                   excluded_providers=excluded_providers)
@@ -3216,7 +3216,7 @@ class TestExactPairSwapWiring:
         monkeypatch.setattr(adapter.RA, "_http_post_json", lambda *a, **kw: (
             200, {"changed": True, "active_config_hash": "new_hash",
                   "config_version": "new_ver",
-                  "active_candidate_order": {"read": []}}
+                  "active_candidate_order": {"basic": []}}
         ))
         monkeypatch.setattr(adapter, "_cfg003_collect_availability_evidence", lambda *a, **kw: avail_res)
         monkeypatch.setattr(adapter, "_run_selected_case", lambda **kw: {"passed": True})
@@ -3229,7 +3229,7 @@ class TestExactPairSwapWiring:
 
         adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         # The exact-pair helper must have been called.
@@ -3243,7 +3243,7 @@ class TestExactPairSwapWiring:
         """If the exact-pair helper raises, no swap POST may occur."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
 
         post_log: list[str] = []
 
@@ -3284,7 +3284,7 @@ class TestExactPairSwapWiring:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         assert not result["passed"]
@@ -3374,12 +3374,12 @@ class TestSanitizedPhaseEvidence:
             "phase_start_time": "2026-07-30T12:00:00+00:00",
         }
         case_config = {
-            "command": ["codex", "exec", "-p", "my-profile", "-m", "read",
+            "command": ["codex", "exec", "-p", "my-profile", "-m", "basic",
                         "--json", "my-secret-prompt-text"],
             "verification_ingress": "codex_responses",
             "expected_parent_agent_name": "parent-agent",
             "expected_child_agent_name": "child-agent",
-            "agent_profile": "read",
+            "agent_profile": "basic",
         }
         ev = adapter._cfg003_build_phase_evidence(
             phase_name="baseline",
@@ -3403,7 +3403,7 @@ class TestSanitizedPhaseEvidence:
         assert ev["passed"] is True
         assert ev["expected_parent_agent_name"] == "parent-agent"
         assert ev["expected_child_agent_name"] == "child-agent"
-        assert ev["agent_profile"] == "read"
+        assert ev["agent_profile"] == "basic"
         # Prompt identity as SHA-256 + length, never raw.
         # For codex, -p is the profile; the final positional is the prompt.
         import hashlib
@@ -3802,8 +3802,8 @@ class TestAuthoritativeActiveState:
         locally compiled swapped YAML) must fail."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
-        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
+        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="basic")
         avail_res = _avail_result(eligible[:3])
 
         call_n = {"n": 0}
@@ -3812,17 +3812,17 @@ class TestAuthoritativeActiveState:
             yaml_text = payload.get("yaml", "")
             if "not_a_list" in yaml_text:
                 return 400, {"detail": {"active_config_hash": auth["config_hash"]}}
-            if yaml_text == READ_YAML_PATH.read_text(encoding="utf-8"):
+            if yaml_text == BASIC_YAML_PATH.read_text(encoding="utf-8"):
                 if call_n["n"] <= 2:
                     return 200, {"changed": False, "active_config_hash": auth["config_hash"],
                                  "config_version": auth["config_version"]}
                 return 200, {"changed": True, "active_config_hash": auth["config_hash"],
                              "config_version": auth["config_version"],
-                             "active_candidate_order": {"read": full_order}}
+                             "active_candidate_order": {"basic": full_order}}
             # Swap: return WRONG hash
             return 200, {"changed": True, "active_config_hash": "WRONG_SWAPPED_HASH",
                          "config_version": "WRONG_VER",
-                         "active_candidate_order": {"read": []}}
+                         "active_candidate_order": {"basic": []}}
 
         monkeypatch.setattr(adapter.RA, "_load_authoritative_startup_config", lambda: {
             "snapshot": snap, "merged_yaml": auth["merged_yaml"],
@@ -3847,7 +3847,7 @@ class TestAuthoritativeActiveState:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         assert not result["passed"]
@@ -3858,18 +3858,18 @@ class TestAuthoritativeActiveState:
         must fail even if hash/version are correct."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
-        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
+        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="basic")
         avail_res = _avail_result(eligible[:3])
 
         # Compute the expected swapped hash from the real YAML.
-        raw_text = READ_YAML_PATH.read_text(encoding="utf-8")
+        raw_text = BASIC_YAML_PATH.read_text(encoding="utf-8")
         evidenced_pair = (
             (eligible[0]["provider"], eligible[0]["model"]),
             (eligible[1]["provider"], eligible[1]["model"]),
         )
         swapped_yaml, _, _ = ra._build_exact_pair_priority_swap_yaml(
-            raw_text, pair=evidenced_pair, alias_name="read"
+            raw_text, pair=evidenced_pair, alias_name="basic"
         )
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import compile_yaml
         swapped_snap = compile_yaml(swapped_yaml)
@@ -3888,11 +3888,11 @@ class TestAuthoritativeActiveState:
                                  "config_version": auth["config_version"]}
                 return 200, {"changed": True, "active_config_hash": auth["config_hash"],
                              "config_version": auth["config_version"],
-                             "active_candidate_order": {"read": full_order}}
+                             "active_candidate_order": {"basic": full_order}}
             # Swap: correct hash/version but WRONG order
             return 200, {"changed": True, "active_config_hash": correct_hash,
                          "config_version": correct_version,
-                         "active_candidate_order": {"read": [{"provider": "WRONG", "model": "WRONG", "route_family": "WRONG", "priority": 0}]}}
+                         "active_candidate_order": {"basic": [{"provider": "WRONG", "model": "WRONG", "route_family": "WRONG", "priority": 0}]}}
 
         monkeypatch.setattr(adapter.RA, "_load_authoritative_startup_config", lambda: {
             "snapshot": snap, "merged_yaml": auth["merged_yaml"],
@@ -3917,7 +3917,7 @@ class TestAuthoritativeActiveState:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         assert not result["passed"]
@@ -4046,12 +4046,12 @@ class TestExecutableAwarePromptIdentity:
         prompt is the final positional argument."""
         import hashlib
 
-        actual_prompt = "Read alias collaboration acceptance exercise. Do not modify files."
+        actual_prompt = "Basic alias collaboration acceptance exercise. Do not modify files."
         case_config = {
             "command": [
                 "codex", "exec",
                 "-p", "my-secret-profile",
-                "-m", "read",
+                "-m", "basic",
                 "-c", "model_providers.x.http_headers.session_id=sess",
                 "--json",
                 "--dangerously-bypass-approvals-and-sandbox",
@@ -4082,11 +4082,11 @@ class TestExecutableAwarePromptIdentity:
         import hashlib
 
         config = json.loads(CONFIG_JSON_PATH.read_text(encoding="utf-8"))
-        case = config["cases"]["native_openai_passthrough_responses_codex_read_alias_collaboration"]
+        case = config["cases"]["native_openai_passthrough_responses_codex_basic_alias_collaboration"]
         command = case["command"]
         # The last element is the prompt.
         actual_prompt = command[-1]
-        assert "Read alias collaboration" in actual_prompt
+        assert "Basic alias collaboration" in actual_prompt
 
         proof = {
             "result": {"passed": True},
@@ -4138,17 +4138,17 @@ class TestTerminalMarkerDerivation:
         """Codex case: derive marker from command_output_text_checks
         required_prefix/suffix."""
         config = json.loads(CONFIG_JSON_PATH.read_text(encoding="utf-8"))
-        case = config["cases"]["native_openai_passthrough_responses_codex_read_alias_collaboration"]
+        case = config["cases"]["native_openai_passthrough_responses_codex_basic_alias_collaboration"]
         marker = adapter._cfg003_derive_terminal_marker(case)
-        assert marker == "CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED"
+        assert marker == "CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED"
 
     def test_claude_required_equals_result_marker(self, adapter):
         """Claude case: derive marker from command_json_checks
         required_equals.result."""
         config = json.loads(CONFIG_JSON_PATH.read_text(encoding="utf-8"))
-        case = config["cases"]["claude_adapter_read_alias_child_parallel_read_tools"]
+        case = config["cases"]["claude_adapter_basic_alias_child_parallel_read_tools"]
         marker = adapter._cfg003_derive_terminal_marker(case)
-        assert marker == "READ_ALIAS_PARALLEL_TOOLS_PASSED"
+        assert marker == "BASIC_ALIAS_PARALLEL_TOOLS_PASSED"
 
     def test_no_contract_returns_empty(self, adapter):
         """A case with no exact-output contract returns empty string."""
@@ -4159,7 +4159,7 @@ class TestTerminalMarkerDerivation:
         """Phase evidence must contain the derived terminal marker from the
         checked-in Codex case."""
         config = json.loads(CONFIG_JSON_PATH.read_text(encoding="utf-8"))
-        case = config["cases"]["native_openai_passthrough_responses_codex_read_alias_collaboration"]
+        case = config["cases"]["native_openai_passthrough_responses_codex_basic_alias_collaboration"]
         proof = {
             "result": {"passed": True},
             "selection": {},
@@ -4170,14 +4170,14 @@ class TestTerminalMarkerDerivation:
             phase_name="baseline", case_name="test__cfg003_baseline",
             proof=proof, case_config=case,
         )
-        assert ev["terminal_marker"] == "CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED"
+        assert ev["terminal_marker"] == "CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED"
         assert ev["terminal_marker_source"] == "derived_from_contract"
 
     def test_phase_evidence_claude_marker(self, adapter):
         """Phase evidence for the checked-in Claude case must contain the
         derived marker."""
         config = json.loads(CONFIG_JSON_PATH.read_text(encoding="utf-8"))
-        case = config["cases"]["claude_adapter_read_alias_child_parallel_read_tools"]
+        case = config["cases"]["claude_adapter_basic_alias_child_parallel_read_tools"]
         proof = {
             "result": {"passed": True},
             "selection": {},
@@ -4188,7 +4188,7 @@ class TestTerminalMarkerDerivation:
             phase_name="baseline", case_name="test__cfg003_baseline",
             proof=proof, case_config=case,
         )
-        assert ev["terminal_marker"] == "READ_ALIAS_PARALLEL_TOOLS_PASSED"
+        assert ev["terminal_marker"] == "BASIC_ALIAS_PARALLEL_TOOLS_PASSED"
         assert ev["terminal_marker_source"] == "derived_from_contract"
 
     def test_missing_contract_falls_back_to_result(self, adapter):
@@ -4394,7 +4394,7 @@ class TestFailClosedBeforeMutation:
         later swap work.  No TUI/POST calls may occur after the gate."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         assert len(eligible) >= 2
         avail_res = _avail_result(eligible[:3])
 
@@ -4435,7 +4435,7 @@ class TestFailClosedBeforeMutation:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {
                 "command": ["codex"],
             }},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
@@ -4455,9 +4455,9 @@ class TestFailClosedBeforeMutation:
         """Wrong post-swap hash must prevent swap proof TUI call."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
-        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="read")
-        raw_text = READ_YAML_PATH.read_text(encoding="utf-8")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
+        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="basic")
+        raw_text = BASIC_YAML_PATH.read_text(encoding="utf-8")
         avail_res = _avail_result(eligible[:3])
 
         tui_log: list[str] = []
@@ -4474,11 +4474,11 @@ class TestFailClosedBeforeMutation:
                                  "config_version": auth["config_version"]}
                 return 200, {"changed": True, "active_config_hash": auth["config_hash"],
                              "config_version": auth["config_version"],
-                             "active_candidate_order": {"read": full_order}}
+                             "active_candidate_order": {"basic": full_order}}
             # Swap: return WRONG hash
             return 200, {"changed": True, "active_config_hash": "WRONG_SWAP_HASH",
                          "config_version": "WRONG_VER",
-                         "active_candidate_order": {"read": []}}
+                         "active_candidate_order": {"basic": []}}
 
         def fake_run(*, case_name, case_config, suite_config, query_url,
                      public_key, secret_key, litellm_base_url,
@@ -4510,7 +4510,7 @@ class TestFailClosedBeforeMutation:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {
                 "command": ["codex"],
             }},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
@@ -4525,9 +4525,9 @@ class TestFailClosedBeforeMutation:
         """Wrong post-swap candidate order must prevent swap proof TUI call."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
-        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="read")
-        raw_text = READ_YAML_PATH.read_text(encoding="utf-8")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
+        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="basic")
+        raw_text = BASIC_YAML_PATH.read_text(encoding="utf-8")
         avail_res = _avail_result(eligible[:3])
 
         # Compute expected swapped hash.
@@ -4536,7 +4536,7 @@ class TestFailClosedBeforeMutation:
             (eligible[1]["provider"], eligible[1]["model"]),
         )
         swapped_yaml, _, _ = ra._build_exact_pair_priority_swap_yaml(
-            raw_text, pair=evidenced_pair, alias_name="read"
+            raw_text, pair=evidenced_pair, alias_name="basic"
         )
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import compile_yaml
         swapped_snap = compile_yaml(swapped_yaml)
@@ -4559,11 +4559,11 @@ class TestFailClosedBeforeMutation:
                                  "config_version": auth["config_version"]}
                 return 200, {"changed": True, "active_config_hash": auth["config_hash"],
                              "config_version": auth["config_version"],
-                             "active_candidate_order": {"read": full_order}}
+                             "active_candidate_order": {"basic": full_order}}
             # Swap: correct hash/version but WRONG order
             return 200, {"changed": True, "active_config_hash": correct_hash,
                          "config_version": correct_version,
-                         "active_candidate_order": {"read": wrong_order}}
+                         "active_candidate_order": {"basic": wrong_order}}
 
         def fake_run(*, case_name, case_config, suite_config, query_url,
                      public_key, secret_key, litellm_base_url,
@@ -4595,7 +4595,7 @@ class TestFailClosedBeforeMutation:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {
                 "command": ["codex"],
             }},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
@@ -4611,9 +4611,9 @@ class TestFailClosedBeforeMutation:
         copying the expected order."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
-        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="read")
-        raw_text = READ_YAML_PATH.read_text(encoding="utf-8")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
+        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="basic")
+        raw_text = BASIC_YAML_PATH.read_text(encoding="utf-8")
         avail_res = _avail_result(eligible[:3])
 
         evidenced_pair = (
@@ -4621,7 +4621,7 @@ class TestFailClosedBeforeMutation:
             (eligible[1]["provider"], eligible[1]["model"]),
         )
         swapped_yaml, _, _ = ra._build_exact_pair_priority_swap_yaml(
-            raw_text, pair=evidenced_pair, alias_name="read"
+            raw_text, pair=evidenced_pair, alias_name="basic"
         )
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import compile_yaml
         swapped_snap = compile_yaml(swapped_yaml)
@@ -4643,10 +4643,10 @@ class TestFailClosedBeforeMutation:
                                  "config_version": auth["config_version"]}
                 return 200, {"changed": True, "active_config_hash": auth["config_hash"],
                              "config_version": auth["config_version"],
-                             "active_candidate_order": {"read": full_order}}
+                             "active_candidate_order": {"basic": full_order}}
             return 200, {"changed": True, "active_config_hash": correct_hash,
                          "config_version": correct_version,
-                         "active_candidate_order": {"read": bad_order}}
+                         "active_candidate_order": {"basic": bad_order}}
 
         monkeypatch.setattr(adapter.RA, "_load_authoritative_startup_config", lambda: {
             "snapshot": snap, "merged_yaml": auth["merged_yaml"],
@@ -4672,7 +4672,7 @@ class TestFailClosedBeforeMutation:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {
                 "command": ["codex"],
             }},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
@@ -4891,7 +4891,7 @@ class TestPreBaselineRejectionZeroPosts:
         Restoration must NOT fire because mutation_attempted is False."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         avail_res = _avail_result(eligible[:3])
 
         post_calls: list[str] = []
@@ -4930,7 +4930,7 @@ class TestPreBaselineRejectionZeroPosts:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         assert not result["passed"]
@@ -4943,7 +4943,7 @@ class TestPreBaselineRejectionZeroPosts:
         """Pre-baseline rejection must record the readiness failures."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         avail_res = _avail_result(eligible[:3])
 
         monkeypatch.setattr(adapter.RA, "_load_authoritative_startup_config", lambda: {
@@ -4988,9 +4988,9 @@ class TestWrongSwapVersionBlocksSwapProof:
         swap_proof TUI call while restoration still fires."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
-        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="read")
-        raw_text = READ_YAML_PATH.read_text(encoding="utf-8")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
+        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="basic")
+        raw_text = BASIC_YAML_PATH.read_text(encoding="utf-8")
         avail_res = _avail_result(eligible[:3])
 
         evidenced_pair = (
@@ -4998,18 +4998,18 @@ class TestWrongSwapVersionBlocksSwapProof:
             (eligible[1]["provider"], eligible[1]["model"]),
         )
         swapped_yaml, _, _ = ra._build_exact_pair_priority_swap_yaml(
-            raw_text, pair=evidenced_pair, alias_name="read"
+            raw_text, pair=evidenced_pair, alias_name="basic"
         )
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import compile_yaml
         swapped_snap = compile_yaml(swapped_yaml)
         correct_hash = swapped_snap.config_hash
-        swapped_full_order = ra._derive_full_order_from_snapshot(swapped_snap, alias_name="read")
+        swapped_full_order = ra._derive_full_order_from_snapshot(swapped_snap, alias_name="basic")
 
         tui_calls: list[str] = []
         post_urls: list[str] = []
 
         def _full_order_response(order):
-            return {"read": [
+            return {"basic": [
                 {"provider": c["provider"], "model": c["model"],
                  "route_family": c["route_family"],
                  "anthropic_route_family": c.get("anthropic_route_family", ""),
@@ -5068,7 +5068,7 @@ class TestWrongSwapVersionBlocksSwapProof:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         assert not result["passed"]
@@ -5091,9 +5091,9 @@ class TestFailedPreSwapReadinessBlocksSwapProof:
         after swap POST), swap_proof TUI must not fire but restoration must."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
-        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="read")
-        raw_text = READ_YAML_PATH.read_text(encoding="utf-8")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
+        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="basic")
+        raw_text = BASIC_YAML_PATH.read_text(encoding="utf-8")
         avail_res = _avail_result(eligible[:3])
 
         evidenced_pair = (
@@ -5101,19 +5101,19 @@ class TestFailedPreSwapReadinessBlocksSwapProof:
             (eligible[1]["provider"], eligible[1]["model"]),
         )
         swapped_yaml, _, _ = ra._build_exact_pair_priority_swap_yaml(
-            raw_text, pair=evidenced_pair, alias_name="read"
+            raw_text, pair=evidenced_pair, alias_name="basic"
         )
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import compile_yaml
         swapped_snap = compile_yaml(swapped_yaml)
         swapped_hash = swapped_snap.config_hash
         swapped_version = swapped_snap.config_version
-        swapped_full_order = ra._derive_full_order_from_snapshot(swapped_snap, alias_name="read")
+        swapped_full_order = ra._derive_full_order_from_snapshot(swapped_snap, alias_name="basic")
 
         tui_calls: list[str] = []
         readiness_call_n = {"n": 0}
 
         def _full_order_response(order):
-            return {"read": [
+            return {"basic": [
                 {"provider": c["provider"], "model": c["model"],
                  "route_family": c["route_family"],
                  "anthropic_route_family": c.get("anthropic_route_family", ""),
@@ -5182,7 +5182,7 @@ class TestFailedPreSwapReadinessBlocksSwapProof:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         assert not result["passed"]
@@ -5279,7 +5279,7 @@ class TestCleanupVerifierExceptionIsolation:
         or mask the primary restoration failure."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         avail_res = _avail_result(eligible[:3])
 
         monkeypatch.setattr(adapter.RA, "_load_authoritative_startup_config", lambda: {
@@ -5316,7 +5316,7 @@ class TestCleanupVerifierExceptionIsolation:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         assert not result["passed"]
@@ -5331,9 +5331,9 @@ class TestCleanupVerifierExceptionIsolation:
         """Recovery artifact must be present even when restoration succeeds."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         avail_res = _avail_result(eligible[:3])
-        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="read")
+        full_order = ra._derive_full_order_from_snapshot(snap, alias_name="basic")
 
         monkeypatch.setattr(adapter.RA, "_load_authoritative_startup_config", lambda: {
             "snapshot": snap, "merged_yaml": auth["merged_yaml"],
@@ -5353,7 +5353,7 @@ class TestCleanupVerifierExceptionIsolation:
         monkeypatch.setattr(adapter.RA, "_http_post_json", lambda *a, **kw: (
             200, {"changed": True, "active_config_hash": auth["config_hash"],
                   "config_version": auth["config_version"],
-                  "active_candidate_order": {"read": full_order}}
+                  "active_candidate_order": {"basic": full_order}}
         ))
         monkeypatch.setattr(adapter, "_cfg003_collect_availability_evidence", lambda *a, **kw: avail_res)
         monkeypatch.setattr(adapter, "_run_selected_case", lambda **kw: {"passed": True})
@@ -5366,7 +5366,7 @@ class TestCleanupVerifierExceptionIsolation:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
         )
         # Recovery artifact must always be present.
@@ -5489,7 +5489,7 @@ class TestSingleSnapshotAndFailClosed:
 
 _NONADJACENT_YAML = """\
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: openrouter/owl-alpha
@@ -5552,7 +5552,7 @@ class TestNonAdjacentSwapValidation:
             _NONADJACENT_YAML, pair=pair
         )
         snapshot = compile_yaml(swapped_yaml)
-        full_order = ra._derive_full_order_from_snapshot(snapshot, alias_name="read")
+        full_order = ra._derive_full_order_from_snapshot(snapshot, alias_name="basic")
         # All four candidates present.
         assert len(full_order) == 4
         # C (openai/gpt-x) now has priority 300, A has 100.
@@ -5782,7 +5782,7 @@ class TestRuntimeLogEvidencePerCaseDerivation:
     def test_alias_case_requires_evidence(self, adapter):
         """Cases with verification_alias require runtime-log evidence."""
         assert adapter._cfg003_case_requires_runtime_evidence(
-            "some_alias_case", {"verification_alias": "read"}
+            "some_alias_case", {"verification_alias": "basic"}
         ) is True
 
     def test_proof_case_codex_requires_evidence(self, adapter):
@@ -5846,7 +5846,7 @@ class TestRuntimeLogEvidencePerCaseDerivation:
     def test_alias_transactional_case_evidence_requirement(self, adapter):
         """Positive: an alias case under cfg003_transactional=True must
         derive require_evidence=True."""
-        case_config = {"verification_alias": "read", "command": ["codex"]}
+        case_config = {"verification_alias": "basic", "command": ["codex"]}
         derived = (
             True  # cfg003_transactional flag
             and adapter._cfg003_case_requires_runtime_evidence("alias_case", case_config)
@@ -5953,7 +5953,7 @@ class TestChildProofTerminalResponse:
 
     def test_missing_terminal_text_fails(self, adapter):
         assistant_texts = []
-        required = "READ_ALIAS_PARALLEL_TOOLS_PASSED"
+        required = "BASIC_ALIAS_PARALLEL_TOOLS_PASSED"
         final_text = ""
         for item in reversed(assistant_texts):
             if isinstance(item, dict) and isinstance(item.get("text"), str):
@@ -5966,7 +5966,7 @@ class TestChildProofTerminalResponse:
 
     def test_wrong_terminal_text_fails(self, adapter):
         assistant_texts = [{"text": "SOME OTHER OUTPUT", "line": 10}]
-        required = "READ_ALIAS_PARALLEL_TOOLS_PASSED"
+        required = "BASIC_ALIAS_PARALLEL_TOOLS_PASSED"
         final_text = ""
         for item in reversed(assistant_texts):
             if isinstance(item, dict) and isinstance(item.get("text"), str):
@@ -5977,9 +5977,9 @@ class TestChildProofTerminalResponse:
     def test_exact_terminal_text_passes(self, adapter):
         assistant_texts = [
             {"text": "intermediate", "line": 5},
-            {"text": "READ_ALIAS_PARALLEL_TOOLS_PASSED", "line": 10},
+            {"text": "BASIC_ALIAS_PARALLEL_TOOLS_PASSED", "line": 10},
         ]
-        required = "READ_ALIAS_PARALLEL_TOOLS_PASSED"
+        required = "BASIC_ALIAS_PARALLEL_TOOLS_PASSED"
         final_text = ""
         for item in reversed(assistant_texts):
             if isinstance(item, dict) and isinstance(item.get("text"), str):
@@ -5998,7 +5998,7 @@ class TestChildProofBoundedOutput:
         assert total > max_chars
 
     def test_within_bound_passes(self, adapter):
-        assistant_texts = [{"text": "READ_ALIAS_PARALLEL_TOOLS_PASSED", "line": 1}]
+        assistant_texts = [{"text": "BASIC_ALIAS_PARALLEL_TOOLS_PASSED", "line": 1}]
         max_chars = 4096
         total = sum(len(i.get("text") or "") for i in assistant_texts if isinstance(i, dict))
         assert total <= max_chars
@@ -6007,14 +6007,14 @@ class TestChildProofBoundedOutput:
 class TestChildProofConfigContract:
     """The checked-in Claude alias case contract must include child proof keys."""
 
-    def test_read_alias_case_has_child_proof_keys(self):
+    def test_basic_alias_case_has_child_proof_keys(self):
         config = json.loads(CONFIG_JSON_PATH.read_text(encoding="utf-8"))
-        case = config["cases"]["claude_adapter_read_alias_child_parallel_read_tools"]
+        case = config["cases"]["claude_adapter_basic_alias_child_parallel_read_tools"]
         agents = case["transcript_tool_use_validation"]["expected_agents"]
         assert len(agents) == 1
         agent = agents[0]
         assert agent["require_all_tool_results"] is True
-        assert agent["require_child_terminal_response"] == "READ_ALIAS_PARALLEL_TOOLS_PASSED"
+        assert agent["require_child_terminal_response"] == "BASIC_ALIAS_PARALLEL_TOOLS_PASSED"
         assert agent["require_explicit_completion"] is True
         assert isinstance(agent["child_output_max_chars"], int)
         assert agent["child_output_max_chars"] > 0
@@ -6389,7 +6389,7 @@ class TestOperatorAssertionPreTuiOrdering:
         snapshot must fail in main() BEFORE the selected TUI case loop."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         assert eligible, "need at least one eligible candidate"
 
         config_path = tmp_path / "cfg.json"
@@ -6449,7 +6449,7 @@ class TestOperatorAssertionExactPairSelection:
         candidate cannot displace the intended exact pair."""
         auth = ra._load_authoritative_startup_config()
         snap = auth["snapshot"]
-        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="read")
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         assert len(eligible) >= 3, "need >= 3 eligible candidates for this test"
 
         # Intended pair = first and third by priority; the second is an
@@ -6468,9 +6468,9 @@ class TestOperatorAssertionExactPairSelection:
             "aliases": auth["aliases"],
         })
         monkeypatch.setattr(adapter.RA, "_recursive_yaml_source_inventory",
-                            lambda: {"read.yaml"})
+                            lambda: {"basic.yaml"})
         monkeypatch.setattr(adapter.RA, "_snapshot_source_inventory",
-                            lambda: {"read.yaml": "h"})
+                            lambda: {"basic.yaml": "h"})
         monkeypatch.setattr(adapter.RA, "_snapshot_error_intake", lambda *a, **kw: {})
         monkeypatch.setattr(adapter, "_cfg003_collect_availability_evidence",
                             lambda *a, **kw: db_evidence)
@@ -6480,7 +6480,7 @@ class TestOperatorAssertionExactPairSelection:
 
         result = adapter._cfg003_transactional_refresh_test(
             litellm_base_url="http://localhost:4001",
-            cases={"native_openai_passthrough_responses_codex_read_alias_collaboration": {"command": ["codex"]}},
+            cases={"native_openai_passthrough_responses_codex_basic_alias_collaboration": {"command": ["codex"]}},
             suite_config={}, query_url="q", public_key="pk", secret_key="sk",
             operator_assertions=asserted,
         )
@@ -6513,8 +6513,8 @@ class TestCfg003ExtractObservedSelectionAliasChild:
             "provider": "openrouter",
             "model": "openrouter/owl-alpha",
             "metadata": {
-                "model_alias_label": "read",
-                "anthropic_auto_agent_alias": "read",
+                "model_alias_label": "basic",
+                "anthropic_auto_agent_alias": "basic",
                 "anthropic_auto_agent_selected_route_family": "anthropic_openrouter_completion_adapter",
             },
         }
@@ -6558,7 +6558,7 @@ class TestCfg003ExtractObservedSelectionAliasChild:
             "provider": "kimi_code",
             "model": "kimi_code/kimi-for-coding",
             "metadata": {
-                "requested_model_alias": "read",
+                "requested_model_alias": "basic",
                 "codex_auto_agent_selected_route_family": "anthropic_kimi_chat_completions_adapter",
             },
         }
@@ -6582,7 +6582,7 @@ class TestCfg003ExtractObservedSelectionAliasChild:
             "provider": "",
             "model": "openrouter/owl-alpha",
             "metadata": {
-                "model_alias_label": "read",
+                "model_alias_label": "basic",
                 "anthropic_auto_agent_selected_route_family": "anthropic_openrouter_completion_adapter",
             },
         }
@@ -6590,7 +6590,7 @@ class TestCfg003ExtractObservedSelectionAliasChild:
             "provider": "openrouter",
             "model": "openrouter/north-mini-code:free",
             "metadata": {
-                "model_alias_label": "read",
+                "model_alias_label": "basic",
                 "codex_auto_agent_selected_route_family": "codex_openrouter_completion_adapter",
             },
         }
@@ -6613,7 +6613,7 @@ class TestCfg003ExtractObservedSelectionAliasChild:
             "provider": "alibaba_token_plan",
             "model": "   ",
             "metadata": {
-                "requested_model_alias": "read",
+                "requested_model_alias": "basic",
                 "codex_auto_agent_selected_route_family": "codex_alibaba_token_plan_chat_completions_adapter",
             },
         }
@@ -6621,7 +6621,7 @@ class TestCfg003ExtractObservedSelectionAliasChild:
             "provider": "alibaba_token_plan",
             "model": "alibaba_token_plan/qwen3.6-flash",
             "metadata": {
-                "requested_model_alias": "read",
+                "requested_model_alias": "basic",
                 "codex_auto_agent_selected_route_family": "codex_alibaba_token_plan_chat_completions_adapter",
             },
         }
@@ -6646,13 +6646,13 @@ class TestCfg003ExtractObservedSelectionAliasChild:
         no_route = {
             "provider": "openrouter",
             "model": "openrouter/owl-alpha",
-            "metadata": {"model_alias_label": "read"},
+            "metadata": {"model_alias_label": "basic"},
         }
         usable_alias = {
             "provider": "openrouter",
             "model": "openrouter/north-mini-code:free",
             "metadata": {
-                "model_alias_label": "read",
+                "model_alias_label": "basic",
                 "passthrough_route_family": "codex_openrouter_completion_adapter",
             },
         }

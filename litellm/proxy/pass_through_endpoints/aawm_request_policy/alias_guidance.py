@@ -13,10 +13,6 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.lane_keys import (
     _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_POLICY_VERSION,
     _CODEX_AUTO_AGENT_PREVENTION_GUIDANCE_PROMPT,
 )
-from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
-    ANTHROPIC_AAWM_READ_ALIAS,
-    CODEX_AAWM_READ_ALIAS,
-)
 from litellm.proxy.pass_through_endpoints.aawm_request_policy.observability_metadata import (
     _build_langfuse_span_descriptor as _default_build_langfuse_span_descriptor,
 )
@@ -66,8 +62,8 @@ class AliasGuidanceConfig:
         _AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION
     )
     aawm_read_agent_guidance_prompt: str = _AAWM_READ_AGENT_GUIDANCE_PROMPT
-    codex_aawm_read_alias: str = CODEX_AAWM_READ_ALIAS
-    anthropic_aawm_read_alias: str = ANTHROPIC_AAWM_READ_ALIAS
+    codex_aawm_read_alias: str = "basic"
+    anthropic_aawm_read_alias: str = "basic"
 
 
 @dataclass(frozen=True, slots=True)

@@ -191,7 +191,7 @@ Target profiles:
 
 Moonshot Anthropic Messages acceptance is an opt-in, full agentic case. It
 dispatches the `sota-moonshot` child profile through the single canonical
-`aawm-sota-moonshot` alias, requires Read then Grep with a tool-result
+`sota-moonshot` alias, requires Read then Grep with a tool-result
 continuation, and accepts the final marker only after that sequence. It is not
 a raw `/v1/messages`, chat-completions, or one-turn completion smoke test.
 Run it against dev first:
@@ -382,7 +382,7 @@ Important notes:
 - AAWM alias-routed rows keep concrete provider attribution in
   `session_history.provider` and `session_history.model`. Use
   `session_history.inbound_model_alias` as the canonical field for the requested
-  alias (for example `aawm-read`, `aawm-low`, `aawm-code-anthropic`), with
+  alias (for example `basic`, `work`, or `sota-openai`), with
   `metadata.model_alias_label` and `requested_model_alias` retained for
   compatibility. The alias is also surfaced as generic trace tag
   `model-alias:<alias>`.

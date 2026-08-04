@@ -4,7 +4,7 @@
   "adapter_label": "GrokNative",
   "adapter_model": "grok-composer-2.5-fast",
   "request_body": {
-    "model": "aawm-code",
+    "model": "work",
     "tools": [
       {
         "type": "function",
@@ -47,7 +47,7 @@
   },
   "intake_context": {
     "provider": "grok",
-    "model_alias": "aawm-codex-agent-auto",
+    "model_alias": "work",
     "route_family": "codex_auto_agent_grok_native_responses"
   }
 }

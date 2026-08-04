@@ -6,6 +6,7 @@ Do not import llm_passthrough_endpoints at module scope.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Optional
 
 from typing import TYPE_CHECKING
@@ -308,10 +309,88 @@ def _normalize_codex_auto_agent_alias_model(model: Any) -> Optional[str]:
     if not isinstance(model, str):
         return None
     normalized = model.strip().lower()
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        AAWM_RETIRED_ALIASES,
+        AAWM_RETIRED_ALIAS_HASHES,
+    )
+
+    if (
+        normalized in AAWM_RETIRED_ALIASES
+        or hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        in AAWM_RETIRED_ALIAS_HASHES
+    ):
+        return None
     for alias in _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS:  # noqa: F821
         if normalized == alias.lower():
             return alias
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+        get_active_routing_snapshot,
+    )
+
+    snapshot = get_active_routing_snapshot()
+    if snapshot is not None:
+        for alias_name, alias in snapshot.aliases.items():
+            if normalized == alias_name.lower() and alias.visibility == "public":
+                return alias_name
     return None
+
+
+def _is_retired_aawm_alias_model(model: Any) -> bool:
+    if not isinstance(model, str):
+        return False
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        AAWM_RETIRED_ALIAS_HASHES,
+    )
+
+    normalized = model.strip().lower()
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        AAWM_RETIRED_ALIASES,
+    )
+
+    return (
+        normalized in AAWM_RETIRED_ALIASES
+        or hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        in AAWM_RETIRED_ALIAS_HASHES
+    )
+
+
+def _is_internal_aawm_alias_model(model: Any) -> bool:
+    if not isinstance(model, str):
+        return False
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+        get_active_routing_snapshot,
+    )
+
+    normalized = model.strip().lower()
+    snapshot = get_active_routing_snapshot()
+    if snapshot is None:
+        return False
+    return any(
+        normalized == alias_name.lower() and alias.visibility == "internal"
+        for alias_name, alias in snapshot.aliases.items()
+    )
+
+
+def _reject_retired_aawm_alias_model(model: Any) -> None:
+    retired = _is_retired_aawm_alias_model(model)
+    internal = _is_internal_aawm_alias_model(model)
+    if not retired and not internal:
+        return
+
+    from litellm.proxy._types import ProxyException
+
+    raise ProxyException(
+        message=(
+            "This retired AAWM model alias is unsupported; use a supported "
+            "canonical alias."
+            if retired
+            else "Internal AAWM model aliases cannot be selected directly."
+        ),
+        type="invalid_request_error",
+        param="model",
+        code=400,
+    )
+
 
 def _is_codex_auto_agent_alias_model(model: Any) -> bool:
     return _normalize_codex_auto_agent_alias_model(model) is not None

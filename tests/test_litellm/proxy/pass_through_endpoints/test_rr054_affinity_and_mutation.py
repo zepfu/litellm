@@ -150,7 +150,7 @@ def test_rr054_issue56_durable_affinity_cache_key_normalizes_kind_and_family() -
 
 def test_rr054_issue56_lpe_wrapper_matches_durable_hashed_affinity_key() -> None:
     """God-file re-export must hash the same way as the durable package helper."""
-    session_scope = "aawm-code:session-header-value:auth:lane"
+    session_scope = "work:session-header-value:auth:lane"
     via_durable = durable_mod.build_aawm_alias_routing_durable_cache_key(
         alias_family="codex",
         state_kind="affinity",

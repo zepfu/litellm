@@ -101,8 +101,6 @@ def _codex_transcript_session_history_model(value: Any) -> Optional[str]:
     model = _clean(value)
     if model is None:
         return "codex-transcript"
-    if model.lower() == "aawm-codex-agent-auto":
-        return "codex-transcript"
     return model
 
 
@@ -110,7 +108,7 @@ def _codex_transcript_session_history_model_group(value: Any) -> Optional[str]:
     model = _clean(value)
     if model is None:
         return None
-    if model.lower() in {"aawm-codex-agent-auto", "codex-transcript"}:
+    if model.lower() == "codex-transcript":
         return None
     return model
 
@@ -4343,20 +4341,8 @@ ON CONFLICT (litellm_call_id) DO UPDATE SET
       THEN NULL
     ELSE COALESCE(EXCLUDED.provider, session_history.provider)
   END,
-  model = CASE
-    WHEN session_history.call_type = 'codex_transcript'
-      AND session_history.model = 'aawm-codex-agent-auto'
-      AND EXCLUDED.model IS NULL
-      THEN NULL
-    ELSE COALESCE(EXCLUDED.model, session_history.model)
-  END,
-  model_group = CASE
-    WHEN session_history.call_type = 'codex_transcript'
-      AND session_history.model_group = 'aawm-codex-agent-auto'
-      AND EXCLUDED.model_group IS NULL
-      THEN NULL
-    ELSE COALESCE(EXCLUDED.model_group, session_history.model_group)
-  END,
+  model = COALESCE(EXCLUDED.model, session_history.model),
+  model_group = COALESCE(EXCLUDED.model_group, session_history.model_group),
   agent_name = COALESCE(EXCLUDED.agent_name, session_history.agent_name),
   agent_id = COALESCE(EXCLUDED.agent_id, session_history.agent_id),
   tenant_id = COALESCE(EXCLUDED.tenant_id, session_history.tenant_id),

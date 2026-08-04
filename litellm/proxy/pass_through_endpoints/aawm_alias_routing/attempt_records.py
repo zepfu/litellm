@@ -61,9 +61,9 @@ _get_model_info: Optional[Callable[..., Any]] = None
 _model_cost: Optional[dict[str, Any]] = None
 _openai_provider_value: Optional[str] = None
 
-# --- classification / read-pilot gate seams ---
+# --- classification / basic-pilot gate seams ---
 _classify_failure: Optional[Callable[..., Any]] = None
-_read_pilot_gate_record: Optional[Callable[..., Any]] = None
+_basic_pilot_gate_record: Optional[Callable[..., Any]] = None
 
 
 # Reference to host_globals set by install(); configure updates it too.
@@ -92,7 +92,7 @@ _RUNTIME_STATE_NAMES = (
     "_model_cost",
     "_openai_provider_value",
     "_classify_failure",
-    "_read_pilot_gate_record",
+    "_basic_pilot_gate_record",
 )
 _runtime_restore_stacks: dict[str, list[tuple[object, object, object]]] = {}
 
@@ -140,9 +140,9 @@ def configure_attempt_records_runtime(  # noqa: PLR0915
     get_model_info: Callable[..., Any],
     model_cost: dict[str, Any],
     openai_provider_value: str,
-    # classification / read-pilot
+    # classification / basic-pilot
     classify_failure: Callable[..., Any],
-    read_pilot_gate_record: Callable[..., Any],
+    basic_pilot_gate_record: Callable[..., Any],
 
 
 ) -> None:
@@ -196,8 +196,8 @@ def configure_attempt_records_runtime(  # noqa: PLR0915
     _openai_provider_value = openai_provider_value
     global _classify_failure
     _classify_failure = classify_failure
-    global _read_pilot_gate_record
-    _read_pilot_gate_record = read_pilot_gate_record
+    global _basic_pilot_gate_record
+    _basic_pilot_gate_record = basic_pilot_gate_record
     # If install() has been called, also update host_globals so configured
     # callbacks remain live for facades published there.
     _mod = globals()
@@ -312,17 +312,17 @@ def _record_auto_agent_alias_attempt_started(
 
 
 # ---------------------------------------------------------------------------
-# Read-pilot evidence (exactly-once per event)
+# Basic-pilot evidence (exactly-once per event)
 # ---------------------------------------------------------------------------
 
 
-def _record_read_pilot_cooldown_evidence(
+def _record_basic_pilot_cooldown_evidence(
     *,
     cooldown_key: Optional[str],
     exc: Any,
     attempt_record: dict[str, Any],
 ) -> None:
-    """Classify + record the CURRENT read-pilot attempt's failure evidence.
+    """Classify + record the CURRENT basic-pilot attempt's failure evidence.
 
     Called from the retry loop BEFORE the cooldown is applied for the same
     attempt, so a structured failure cools immediately (N=1) and a marker
@@ -340,7 +340,7 @@ def _record_read_pilot_cooldown_evidence(
     assert _get_codex_auto_agent_source_error_summary is not None
     assert _parse_codex_auto_agent_header_wait_seconds is not None
     assert _classify_failure is not None
-    assert _read_pilot_gate_record is not None
+    assert _basic_pilot_gate_record is not None
 
     error_status_code = _extract_exception_status_code(exc)
     source_error = _get_codex_auto_agent_source_error_summary(exc, status_code=error_status_code)
@@ -352,8 +352,8 @@ def _record_read_pilot_cooldown_evidence(
         retry_after_seconds=retry_after_seconds,
     )
     attempt_record["origin"] = event.origin
-    _read_pilot_gate_record(
-        cooldown_key=cooldown_key or "read_pilot:unknown",
+    _basic_pilot_gate_record(
+        cooldown_key=cooldown_key or "basic_pilot:unknown",
         event=event,
     )
 
@@ -381,8 +381,8 @@ def _record_auto_agent_alias_attempt_failure(
     assert _emit_auto_agent_alias_route_event is not None
     assert _persist_auto_agent_alias_audit_only_events_best_effort is not None
 
-    # Read-pilot cooldown evidence is recorded in the retry loop BEFORE the
-    # cooldown is applied (see ``_record_read_pilot_cooldown_evidence``), so it
+    # Basic-pilot cooldown evidence is recorded in the retry loop BEFORE the
+    # cooldown is applied (see ``_record_basic_pilot_cooldown_evidence``), so it
     # is intentionally NOT re-recorded here -- doing so would double-count
     # marker evidence and double-advance the structured attempt counter.
     failure_body = add_alias_metadata_fn(
@@ -864,7 +864,7 @@ def _add_anthropic_auto_agent_alias_metadata(
 _HOST_FUNCTION_NAMES = (
     "_update_codex_auto_agent_retryable_attempt_record",
     "_record_auto_agent_alias_attempt_started",
-    "_record_read_pilot_cooldown_evidence",
+    "_record_basic_pilot_cooldown_evidence",
     "_record_auto_agent_alias_attempt_failure",
     "_extract_codex_reasoning_effort",
     "_get_codex_reasoning_effort_ceiling",

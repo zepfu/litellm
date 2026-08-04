@@ -1,7 +1,7 @@
-"""CFG-008 test: the compiled ``read`` pilot resolves the exact common prefix
+"""CFG-008 test: the compiled ``basic`` pilot resolves the exact common prefix
 plus the mutually exclusive TUI-specific tail on both ingress projections.
 
-``litellm/proxy/aawm_alias_config/read.yaml`` (CFG-008) no longer mirrors the
+``litellm/proxy/aawm_alias_config/basic.yaml`` (CFG-008) no longer mirrors the
 legacy ``CODEX_AAWM_LOW_CANDIDATES`` table: it carries the exact common
 OpenRouter/OpenCode/Alibaba prefix and then a branch-exclusive last resort --
 native Anthropic Haiku for Claude origins (``tui_attached``), or
@@ -12,7 +12,7 @@ the Claude branch; ``tui_attached`` keeps Haiku out of the default branch).
 Ambient state (cooldown/session-affinity dicts and the process-local active
 snapshot holder) is reset before and after via the same
 ``clear_codex_auto_agent_alias_state``-style approach used by Wave 4's
-``test_read_pilot_selection.py`` so this test cannot flap on shared,
+``test_basic_pilot_selection.py`` so this test cannot flap on shared,
 process-global state left over from other tests.
 """
 
@@ -31,12 +31,12 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     alias_routing_state,
 )
 
-_READ_YAML_PATH = os.path.join(
+_BASIC_YAML_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))),
     "litellm",
     "proxy",
     "aawm_alias_config",
-    "read.yaml",
+    "basic.yaml",
 )
 
 _REFERENCE_NOW_UTC = dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc)
@@ -74,26 +74,26 @@ def _reset_alias_routing_ambient_state():
     snapshot_select.set_active_routing_snapshot(previous_snapshot)
 
 
-def _compile_read_yaml():
-    with open(_READ_YAML_PATH, "r", encoding="utf-8") as handle:
+def _compile_basic_yaml():
+    with open(_BASIC_YAML_PATH, "r", encoding="utf-8") as handle:
         raw_yaml = handle.read()
     return compiler.compile_yaml(raw_yaml)
 
 
-def test_read_yaml_exists_and_compiles() -> None:
-    """The read.yaml pilot config file compiles into a valid snapshot with a read alias."""
-    snapshot = _compile_read_yaml()
-    assert "read" in snapshot.aliases
-    assert len(snapshot.aliases["read"].candidates) > 0
+def test_basic_yaml_exists_and_compiles() -> None:
+    """The basic.yaml pilot config file compiles into a valid snapshot with a basic alias."""
+    snapshot = _compile_basic_yaml()
+    assert "basic" in snapshot.aliases
+    assert len(snapshot.aliases["basic"].candidates) > 0
 
 
-def test_shadow_parity_read_vs_low(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_shadow_parity_basic_vs_low(monkeypatch: pytest.MonkeyPatch) -> None:
     """CFG-008 Codex/default ingress: exact common prefix + Luna low-effort tail
     for Codex and every non-Claude/missing/unknown origin."""
-    snapshot = _compile_read_yaml()
+    snapshot = _compile_basic_yaml()
     snapshot_select.set_active_routing_snapshot(snapshot)
 
-    selected = snapshot_select._select_read_pilot_snapshot_candidates(
+    selected = snapshot_select._select_basic_pilot_snapshot_candidates(
         client_product_label=None,
         now_utc=_REFERENCE_NOW_UTC,
     )
@@ -112,10 +112,10 @@ def test_cfg008_claude_branch_selects_haiku_tail() -> None:
     """CFG-008 Claude origin: Anthropic ingress gets the native Haiku tail;
     the Codex ingress keeps Luna ineligible for the branch and never routes
     Haiku through Codex credentials."""
-    snapshot = _compile_read_yaml()
+    snapshot = _compile_basic_yaml()
     snapshot_select.set_active_routing_snapshot(snapshot)
 
-    selected = snapshot_select._select_read_pilot_snapshot_candidates_anthropic(
+    selected = snapshot_select._select_basic_pilot_snapshot_candidates_anthropic(
         client_product_label="Claude/1.2",
         now_utc=_REFERENCE_NOW_UTC,
     )
@@ -136,7 +136,7 @@ def test_cfg008_claude_branch_selects_haiku_tail() -> None:
 
     # Codex ingress: the Anthropic-credential Haiku tail is not eligible, so
     # the Claude branch is the common prefix only (no Luna, no Haiku).
-    codex_side = snapshot_select._select_read_pilot_snapshot_candidates(
+    codex_side = snapshot_select._select_basic_pilot_snapshot_candidates(
         client_product_label="Claude/1.2",
         now_utc=_REFERENCE_NOW_UTC,
     )
@@ -149,10 +149,10 @@ def test_cfg008_claude_branch_selects_haiku_tail() -> None:
 def test_cfg008_codex_origin_selects_luna_tail() -> None:
     """CFG-008 identified Codex origin: common prefix + Luna tail; Haiku is
     ineligible on this branch."""
-    snapshot = _compile_read_yaml()
+    snapshot = _compile_basic_yaml()
     snapshot_select.set_active_routing_snapshot(snapshot)
 
-    selected = snapshot_select._select_read_pilot_snapshot_candidates(
+    selected = snapshot_select._select_basic_pilot_snapshot_candidates(
         client_product_label="Codex/0.31.0",
         now_utc=_REFERENCE_NOW_UTC,
     )
@@ -165,10 +165,10 @@ def test_cfg008_codex_origin_selects_luna_tail() -> None:
 def test_cfg008_anthropic_ingress_projection_branches() -> None:
     """CFG-008 Anthropic Messages ingress projection carries the same branch
     exclusivity with the anthropic-projected route families."""
-    snapshot = _compile_read_yaml()
+    snapshot = _compile_basic_yaml()
     snapshot_select.set_active_routing_snapshot(snapshot)
 
-    claude = snapshot_select._select_read_pilot_snapshot_candidates_anthropic(
+    claude = snapshot_select._select_basic_pilot_snapshot_candidates_anthropic(
         client_product_label="Claude/1.2",
         now_utc=_REFERENCE_NOW_UTC,
     )
@@ -180,7 +180,7 @@ def test_cfg008_anthropic_ingress_projection_branches() -> None:
     for candidate in claude:
         assert candidate["route_family"].startswith("anthropic_")
 
-    default = snapshot_select._select_read_pilot_snapshot_candidates_anthropic(
+    default = snapshot_select._select_basic_pilot_snapshot_candidates_anthropic(
         client_product_label=None,
         now_utc=_REFERENCE_NOW_UTC,
     )

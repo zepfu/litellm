@@ -152,16 +152,20 @@ D1256_ALIAS_REPLAY_CASE = (
 D1256_ALIAS_REPLAY_AGENT = "harness-aawm-code-anthropic-alias-parallel-read-tools"
 D1256_AAWM_CODE_ANTHROPIC_DECLARED_PROVIDER_MODELS = {
     ("openai", "gpt-5.3-codex-spark"),
-    ("xai", "grok-composer-2.5-fast"),
-    ("xai", "oa_xai/grok-build"),
-    ("anthropic", "claude-sonnet-4-6"),
+    ("xai", "oa_xai/grok-4.5"),
+    ("kimi_code", "kimi_code/k3"),
+    ("alibaba_token_plan", "alibaba_token_plan/qwen3.8-max"),
+    ("alibaba_token_plan", "alibaba_token_plan/qwen3.7-max"),
+    ("anthropic", "claude-sonnet-5[1m]"),
+    ("anthropic", "claude-sonnet-5"),
+    ("openai", "gpt-5.6-luna"),
 }
 MS012_MOONSHOT_AGENTIC_CASE = "claude_adapter_aawm_sota_moonshot_agentic_tool_continuation"
 MS012_MOONSHOT_BASH_TIME_CASE = "claude_adapter_aawm_sota_moonshot_child_bash_time"
 MS012_MOONSHOT_STRESS_CASE = "claude_adapter_aawm_sota_moonshot_parallel_stress"
 MS012_MOONSHOT_AGENT_PROFILE = "sota-moonshot"
 MS012_MOONSHOT_TIME_AGENT_PROFILE = "sota-moonshot-time"
-MS012_MOONSHOT_ALIAS = "aawm-sota-moonshot"
+MS012_MOONSHOT_ALIAS = "sota-moonshot"
 MOONSHOT_CODEX_BASH_TIME_CASE = (
     "native_openai_passthrough_responses_codex_aawm_sota_moonshot_bash_time"
 )
@@ -170,8 +174,7 @@ MOONSHOT_CODEX_COLLABORATION_CASE = (
 )
 MS012_MOONSHOT_ADAPTER_PATH = "anthropic_kimi_chat_completions_adapter"
 MS012_MOONSHOT_DECLARED_MODELS = {
-    "kimi_code/k3-max",
-    "kimi_code/k3-high",
+    "kimi_code/k3",
 }
 ALIBABA_CODEX_COLLABORATION_CASE = (
     "native_openai_passthrough_responses_codex_aawm_sota_alibaba_collaboration"
@@ -183,11 +186,11 @@ ALIBABA_CLAUDE_STRESS_CASE = "claude_adapter_aawm_sota_alibaba_parallel_stress"
 ALIBABA_CLAUDE_BASH_TIME_CASE = (
     "claude_adapter_aawm_sota_alibaba_child_bash_time"
 )
-ALIBABA_ALIAS = "aawm-sota-alibaba"
+ALIBABA_ALIAS = "sota-alibaba"
 ALIBABA_CODEX_ROUTE = "codex_alibaba_token_plan_chat_completions_adapter"
 ALIBABA_CLAUDE_ROUTE = "anthropic_alibaba_token_plan_chat_completions_adapter"
 ALIBABA_DECLARED_MODELS = {
-    "alibaba_token_plan/qwen3.8-max-preview",
+    "alibaba_token_plan/qwen3.8-max",
     "alibaba_token_plan/qwen3.7-max",
 }
 ALIBABA_MODEL_CATALOG_PATH = (
@@ -1331,7 +1334,7 @@ def test_generation_quality_accepts_explicit_unknown_subscription_invoice_cost(
         "traceId": "trace-alibaba-1",
         "type": "GENERATION",
         "startTime": "2026-07-21T00:47:15Z",
-        "model": "qwen3.8-max-preview",
+        "model": "qwen3.8-max",
         "usageDetails": {"input": 10, "output": 2, "total": 12},
         "costDetails": {},
         "calculatedTotalCost": 0,
@@ -2519,11 +2522,11 @@ def test_native_codex_case_hard_gates_spawn_agent_tool_description_patch():
 
     fanout_policy = policy_module.CODEX_SPAWN_AGENT_FANOUT_POLICY
     assert "If the current task did not explicitly provide " in fanout_policy
-    assert 'default to model="aawm-codex-agent-auto"' in fanout_policy
+    assert "require an explicit supported alias or model name" in fanout_policy
     assert "keep that provided value unchanged and do not " in fanout_policy
     assert "substitute any default, including on retries." in fanout_policy
     assert (
-        'lower-case payload fields: model="aawm-codex-agent-auto"'
+        'lower-case payload fields: model="basic"'
         not in fanout_policy
     )
     model_description = policy_module.CODEX_SPAWN_AGENT_PAYLOAD_FIELD_SCHEMAS[
@@ -2534,9 +2537,9 @@ def test_native_codex_case_hard_gates_spawn_agent_tool_description_patch():
         in model_description
     )
     assert "including on retries." in model_description
-    assert "Otherwise default to aawm-codex-agent-auto" in model_description
+    assert "Otherwise use an explicit supported alias" in model_description
     assert (
-        "Use aawm-codex-agent-auto for read-only/exploration workers; use"
+        "Use basic for read-only/exploration workers; use"
         not in model_description
     )
 
@@ -2779,7 +2782,7 @@ def test_moonshot_codex_collaboration_case_uses_production_harness_contract():
     assert 'agents.moonshot.config_file="{codex_home}/agents/moonshot.toml"' in command
     prompt = command[-1]
     assert 'agent_type="moonshot"' in prompt
-    assert 'model="aawm-sota-moonshot"' in prompt
+    assert 'model="sota-moonshot"' in prompt
     assert 'fork_turns="none"' in prompt
     assert "complete self-contained plaintext message" in prompt
     assert "do not include the legacy fork_context field" in prompt
@@ -2817,7 +2820,7 @@ def test_moonshot_codex_collaboration_case_uses_production_harness_contract():
         "minimum_count": 2,
         "each_arguments_required_substrings": [
             '"agent_type": "moonshot"',
-            '"model": "aawm-sota-moonshot"',
+            '"model": "sota-moonshot"',
             '"fork_turns": "none"',
             '"message": "',
         ],
@@ -2832,7 +2835,7 @@ def test_moonshot_codex_collaboration_case_uses_production_harness_contract():
     [session_row] = case_config["session_history_validation"]["expected_rows"]
     assert session_row["required_one_of"] == {
         "provider": ["kimi_code"],
-        "model": ["kimi_code/k3-max", "kimi_code/k3-high"],
+        "model": ["kimi_code/k3"],
     }
     assert session_row["metadata_required_equals"] == {
         "model_alias_label": MS012_MOONSHOT_ALIAS,
@@ -2916,7 +2919,7 @@ def test_alibaba_cases_are_default_excluded_with_exact_routes_and_cost_provenanc
         assert session_row["required_one_of"] == {
             "provider": ["alibaba_token_plan"],
             "model": [
-                "alibaba_token_plan/qwen3.8-max-preview",
+                "alibaba_token_plan/qwen3.8-max",
                 "alibaba_token_plan/qwen3.7-max",
             ],
         }
@@ -2954,7 +2957,7 @@ def test_alibaba_codex_collaboration_case_locks_bounded_tool_usage_contract():
 
     prompt = command[-1]
     assert 'agent_type="alibaba"' in prompt
-    assert 'model="aawm-sota-alibaba"' in prompt
+    assert 'model="sota-alibaba"' in prompt
     assert 'fork_turns="none"' in prompt
     assert "spawn exactly two children concurrently" in prompt
     assert "exactly two sequential batches of three parallel" in prompt
@@ -2979,7 +2982,7 @@ def test_alibaba_codex_collaboration_case_locks_bounded_tool_usage_contract():
     assert spawn_row["maximum_count"] == 2
     assert spawn_row["each_arguments_required_substrings"] == [
         '"agent_type": "alibaba"',
-        '"model": "aawm-sota-alibaba"',
+        '"model": "sota-alibaba"',
         '"fork_turns": "none"',
         '"message": "',
     ]
@@ -3001,7 +3004,7 @@ def test_alibaba_codex_fixtures_define_only_the_qwen_acceptance_alias():
 
     agent_config = ALIBABA_AGENT_CONFIG_PATH.read_text(encoding="utf-8")
     assert 'name = "alibaba"' in agent_config
-    assert 'model = "aawm-sota-alibaba"' in agent_config
+    assert 'model = "sota-alibaba"' in agent_config
     assert "Do not\nspawn additional agents." in agent_config
     assert "return only the exact completion marker" in agent_config
 
@@ -4047,7 +4050,7 @@ def test_d1322_openrouter_completion_adapter_cases_are_opt_in_and_target_chat_co
         assert case_name in config["cases"]
         assert case_name in config["default_excluded_cases"]
         case_config = config["cases"][case_name]
-        assert case_config["verification_alias"] == "aawm-low-anthropic"
+        assert case_config["verification_alias"] == "basic"
         assert case_config["verification_candidate_order"] == expected[
             "candidate_order"
         ]
@@ -4125,8 +4128,8 @@ def test_d1322_low_anthropic_alias_replay_case_uses_aawm_low_anthropic_child_mod
     assert transcript_agent["maximum_tool_uses_per_assistant_message"] == 3
 
     agent_config = case_config["claude_agents"][D1322_LOW_ANTHROPIC_ALIAS_REPLAY_AGENT]
-    assert agent_config["model"] == "aawm-low-anthropic"
-    assert case_config["verification_alias"] == "aawm-low-anthropic"
+    assert agent_config["model"] == "basic"
+    assert case_config["verification_alias"] == "basic"
     assert case_config["verification_candidate_order"] == -1
     assert case_config["verification_candidate_label"] == "alias-replay"
     declared_candidates = case_config["verification_declared_candidates"]
@@ -4142,8 +4145,8 @@ def test_d1322_low_anthropic_alias_replay_case_uses_aawm_low_anthropic_child_mod
     ]
     assert set(case_config["required_trace_tags"]) >= {
         "route:anthropic_messages",
-        "model-alias:aawm-low-anthropic",
-        "anthropic-auto-agent-alias:aawm-low-anthropic",
+        "model-alias:basic",
+        "anthropic-auto-agent-alias:basic",
     }
     assert "passthrough_route_family" in case_config[
         "required_generation_metadata_truthy"
@@ -4153,9 +4156,9 @@ def test_d1322_low_anthropic_alias_replay_case_uses_aawm_low_anthropic_child_mod
     session_expected_rows = case_config["session_history_validation"]["expected_rows"]
     assert len(session_expected_rows) == 1
     assert session_expected_rows[0]["metadata_required_equals"] == {
-        "model_alias_label": "aawm-low-anthropic",
-        "requested_model_alias": "aawm-low-anthropic",
-        "anthropic_auto_agent_alias": "aawm-low-anthropic",
+        "model_alias_label": "basic",
+        "requested_model_alias": "basic",
+        "anthropic_auto_agent_alias": "basic",
     }
     assert set(session_expected_rows[0]["metadata_required_truthy"]) == {
         "anthropic_auto_agent_selected_provider",
@@ -4182,7 +4185,7 @@ def test_d1322_codex_low_alias_replay_case_uses_aawm_low_and_declared_targets():
 
     assert case_name in config["default_excluded_cases"]
     assert case_config["cli_passthrough"] == "codex"
-    assert case_config["verification_alias"] == "aawm-low"
+    assert case_config["verification_alias"] == "basic"
     assert case_config["verification_candidate_order"] == -1
     assert case_config["verification_candidate_label"] == "alias-replay"
     declared_candidates = case_config["verification_declared_candidates"]
@@ -4199,12 +4202,12 @@ def test_d1322_codex_low_alias_replay_case_uses_aawm_low_and_declared_targets():
 
     command = case_config["command"]
     model_index = command.index("-m") + 1
-    assert command[model_index] == "aawm-low"
+    assert command[model_index] == "basic"
     assert "pwd" in command[-1]
     assert case_config["match_trace_session_id_from_stdout"] is False
     assert set(case_config["required_trace_tags"]) == {
-        "model-alias:aawm-low",
-        "codex-auto-agent-alias:aawm-low",
+        "model-alias:basic",
+        "codex-auto-agent-alias:basic",
     }
     assert case_config["required_generation_metadata_truthy"] == [
         "passthrough_route_family"
@@ -4214,9 +4217,9 @@ def test_d1322_codex_low_alias_replay_case_uses_aawm_low_and_declared_targets():
     session_expected_rows = case_config["session_history_validation"]["expected_rows"]
     assert len(session_expected_rows) == 1
     assert session_expected_rows[0]["metadata_required_equals"] == {
-        "model_alias_label": "aawm-low",
-        "requested_model_alias": "aawm-low",
-        "codex_auto_agent_alias": "aawm-low",
+        "model_alias_label": "basic",
+        "requested_model_alias": "basic",
+        "codex_auto_agent_alias": "basic",
     }
     assert set(session_expected_rows[0]["metadata_required_truthy"]) == {
         "codex_auto_agent_selected_provider",
@@ -4257,15 +4260,24 @@ def test_d1256_alias_replay_case_uses_aawm_code_anthropic_child_model_and_declar
     )
 
     agent_config = case_config["claude_agents"][D1256_ALIAS_REPLAY_AGENT]
-    assert agent_config["model"] == "aawm-code-anthropic"
-    assert case_config["verification_alias"] == "aawm-code-anthropic"
+    assert agent_config["model"] == "work"
+    assert case_config["verification_alias"] == "work"
     assert case_config["verification_candidate_order"] == -1
     assert case_config["verification_candidate_label"] == "alias-replay"
     declared_candidates = case_config["verification_declared_candidates"]
     assert {
         (row["provider"], row["model"]) for row in declared_candidates
     } == D1256_AAWM_CODE_ANTHROPIC_DECLARED_PROVIDER_MODELS
-    assert [row["candidate_order"] for row in declared_candidates] == [0, 1, 2, 3]
+    assert [row["candidate_order"] for row in declared_candidates] == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+    ]
     assert "route:anthropic_messages" in case_config["required_trace_tags"]
     assert "passthrough_route_family" in case_config[
         "required_generation_metadata_truthy"
@@ -4288,9 +4300,9 @@ def test_d1256_alias_replay_case_uses_aawm_code_anthropic_child_model_and_declar
         session_expected_rows[0]["required_one_of"]["model"]
     )
     assert session_expected_rows[0]["metadata_required_equals"] == {
-        "model_alias_label": "aawm-code-anthropic",
-        "requested_model_alias": "aawm-code-anthropic",
-        "anthropic_auto_agent_alias": "aawm-code-anthropic",
+        "model_alias_label": "work",
+        "requested_model_alias": "work",
+        "anthropic_auto_agent_alias": "work",
     }
     assert set(session_expected_rows[0]["metadata_required_truthy"]) == {
         "anthropic_auto_agent_selected_provider",
@@ -4370,7 +4382,7 @@ def test_ms012_moonshot_case_uses_the_canonical_alias_and_agentic_contract():
     session_row = case_config["session_history_validation"]["expected_rows"][0]
     assert session_row["required_one_of"] == {
         "provider": ["kimi_code"],
-        "model": ["kimi_code/k3-max", "kimi_code/k3-high"],
+        "model": ["kimi_code/k3"],
     }
     assert session_row["metadata_required_equals"] == {
         "model_alias_label": MS012_MOONSHOT_ALIAS,
@@ -4393,7 +4405,7 @@ def test_ms012_moonshot_case_uses_the_canonical_alias_and_agentic_contract():
         "allowed_generation_routes": ["/anthropic/v1/messages"],
         "declared_models": sorted(MS012_MOONSHOT_DECLARED_MODELS),
     }
-    assert "aawm-sota-moonshot-anthropic" not in json.dumps(config)
+    assert "sota-anthropic" not in json.dumps(config)
 
 
 def test_all_moonshot_cases_require_positive_langfuse_generation_costs():
@@ -5347,13 +5359,13 @@ def test_tool_activity_validation_requires_argument_substrings_on_every_match(
             return [
                 {
                     "provider": "kimi_code",
-                    "model": "kimi_code/k3-max",
+                    "model": "kimi_code/k3",
                     "tool_index": 0,
                     "tool_name": "spawn_agent",
                     "tool_kind": "other",
                     "command_text": "",
                     "arguments": {
-                        "model": "aawm-sota-moonshot",
+                        "model": "sota-moonshot",
                         "fork_turns": "none",
                         "message": "Child A",
                     },
@@ -5362,7 +5374,7 @@ def test_tool_activity_validation_requires_argument_substrings_on_every_match(
                 },
                 {
                     "provider": "kimi_code",
-                    "model": "kimi_code/k3-max",
+                    "model": "kimi_code/k3",
                     "tool_index": 1,
                     "tool_name": "spawn_agent",
                     "tool_kind": "other",
@@ -5399,7 +5411,7 @@ def test_tool_activity_validation_requires_argument_substrings_on_every_match(
                     "tool_kind": "other",
                     "minimum_count": 2,
                     "each_arguments_required_substrings": [
-                        '"model": "aawm-sota-moonshot"',
+                        '"model": "sota-moonshot"',
                         '"fork_turns": "none"',
                         '"message": "',
                     ],
@@ -5409,7 +5421,7 @@ def test_tool_activity_validation_requires_argument_substrings_on_every_match(
     )
 
     assert failures == [
-        "case tool_activity rows for provider='kimi_code' model=None tool_name='spawn_agent' had 1 matching row(s) without arguments containing '\"model\": \"aawm-sota-moonshot\"'"
+        "case tool_activity rows for provider='kimi_code' model=None tool_name='spawn_agent' had 1 matching row(s) without arguments containing '\"model\": \"sota-moonshot\"'"
     ]
 
     harness._close_validation_db_connections()
@@ -6913,7 +6925,7 @@ def test_verification_matrix_row_uses_runtime_session_history_for_alias_replay()
     harness = _load_harness_module()
 
     row = harness._build_case_verification_matrix_row(
-        alias="aawm-code-anthropic",
+        alias="work",
         case_name=D1256_ALIAS_REPLAY_CASE,
         candidate_order=-1,
         case_config={
@@ -6991,7 +7003,7 @@ def test_verification_matrix_row_uses_runtime_session_history_for_alias_replay()
         },
     )
 
-    assert row["alias"] == "aawm-code-anthropic"
+    assert row["alias"] == "work"
     assert row["case_name"] == D1256_ALIAS_REPLAY_CASE
     assert row["candidate_order"] == -1
     assert row["candidate_label"] == "alias-replay"
@@ -7526,7 +7538,7 @@ def test_codex_collaboration_validation_accepts_fully_qualified_tool_names():
     )
 
     summary, failures = harness._validate_codex_collaboration_events(
-        family="codex_read_alias",
+        family="codex_basic_alias",
         stdout=stdout,
         checks={
             "minimum_tool_counts": {"spawn_agent": 1, "wait": 1},
@@ -7610,7 +7622,7 @@ def test_codex_collaboration_validation_enforces_maximum_tool_counts():
     )
 
     summary, failures = harness._validate_codex_collaboration_events(
-        family="codex_read_alias",
+        family="codex_basic_alias",
         stdout=stdout,
         checks={
             "minimum_tool_counts": {"spawn_agent": 1, "wait": 1},
@@ -7660,7 +7672,7 @@ def test_codex_collaboration_validation_exact_one_passes_at_boundary():
     )
 
     _, failures = harness._validate_codex_collaboration_events(
-        family="codex_read_alias",
+        family="codex_basic_alias",
         stdout=stdout,
         checks={
             "minimum_tool_counts": {"spawn_agent": 1, "wait": 1},
@@ -7672,11 +7684,11 @@ def test_codex_collaboration_validation_exact_one_passes_at_boundary():
     assert failures == []
 
 
-def test_checked_in_config_read_alias_requires_exact_one_spawn_and_wait():
-    """Defect 1: the checked-in read-alias case configures exact-one max counts."""
+def test_checked_in_config_basic_alias_requires_exact_one_spawn_and_wait():
+    """Defect 1: the checked-in basic-alias case configures exact-one max counts."""
     config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
     collab = config["cases"][
-        "native_openai_passthrough_responses_codex_read_alias_collaboration"
+        "native_openai_passthrough_responses_codex_basic_alias_collaboration"
     ]["codex_collaboration_validation"]
     assert collab["minimum_tool_counts"] == {"spawn_agent": 1, "wait": 1}
     assert collab["maximum_tool_counts"] == {"spawn_agent": 1, "wait": 1}
@@ -7711,17 +7723,17 @@ def test_checked_in_config_prod_profile_resolution_uses_prod_runtime_label():
 # -- Fix 2 regression: child dispatch instructions contain literal marker --
 
 
-def test_read_alias_child_parallel_config_contains_literal_marker_in_dispatch():
-    """The -p prompt must contain the literal READ_ALIAS_PARALLEL_TOOLS_PASSED
+def test_basic_alias_child_parallel_config_contains_literal_marker_in_dispatch():
+    """The -p prompt must contain the literal BASIC_ALIAS_PARALLEL_TOOLS_PASSED
     in the child dispatch instructions, not only the parent result contract."""
     config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
-    case = config["cases"]["claude_adapter_read_alias_child_parallel_read_tools"]
+    case = config["cases"]["claude_adapter_basic_alias_child_parallel_read_tools"]
     prompt = case["command"][2]
     # The marker must appear in the child instruction portion (before the
     # parent result contract sentence that starts with "Your entire final").
     parent_contract_idx = prompt.index("Your entire final output must be")
     child_instruction_portion = prompt[:parent_contract_idx]
-    assert "READ_ALIAS_PARALLEL_TOOLS_PASSED" in child_instruction_portion, (
+    assert "BASIC_ALIAS_PARALLEL_TOOLS_PASSED" in child_instruction_portion, (
         "literal marker must appear in child dispatch instructions"
     )
 
@@ -7868,22 +7880,22 @@ def test_validate_case_session_fallback_does_not_filter_by_user_id(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_read_alias_config_declares_normalized_session_history_identity():
-    """Fix 1 (config contract): the read-alias case declares a normalized
+def test_basic_alias_config_declares_normalized_session_history_identity():
+    """Fix 1 (config contract): the basic-alias case declares a normalized
     session_history_identity keyed off the DB row's own metadata.trace_name,
     NOT a raw Langfuse trace name. required_trace_names still carries the raw
     parent+child Langfuse names; generation_trace_names scopes generation to
     the child. These three must be distinct concepts."""
     config = json.loads(ANTHROPIC_ADAPTER_CONFIG_PATH.read_text(encoding="utf-8"))
-    case = config["cases"]["claude_adapter_read_alias_child_parallel_read_tools"]
+    case = config["cases"]["claude_adapter_basic_alias_child_parallel_read_tools"]
 
     # Raw Langfuse expectations: parent + child.
     assert "claude-code.orchestrator" in case["required_trace_names"]
-    assert "claude-code.harness-read-alias-parallel-read-tools" in case["required_trace_names"]
+    assert "claude-code.harness-basic-alias-parallel-read-tools" in case["required_trace_names"]
 
     # Generation scoping: child Langfuse name only.
     assert case["generation_trace_names"] == [
-        "claude-code.harness-read-alias-parallel-read-tools"
+        "claude-code.harness-basic-alias-parallel-read-tools"
     ]
 
     # Normalized session-history identity: a metadata.trace_name value, which
@@ -7913,8 +7925,8 @@ def test_session_history_identity_consumer_rejects_mismatched_metadata_trace_nam
         "model": "openrouter/cohere/north-mini-code:free",
         "metadata": {
             "trace_name": "orchestrator",
-            "model_alias_label": "read",
-            "requested_model_alias": "read",
+            "model_alias_label": "basic",
+            "requested_model_alias": "basic",
         },
     }
     session_history_summary = {"record": alias_record, "records": [alias_record]}
@@ -7966,7 +7978,7 @@ def test_session_history_identity_missing_metadata_trace_name_fails():
     """Fix 1 (behavioral): a record lacking metadata.trace_name must fail a
     configured identity check rather than silently passing."""
     harness = _load_harness_module()
-    record = {"provider": "openrouter", "model": "m", "metadata": {"model_alias_label": "read"}}
+    record = {"provider": "openrouter", "model": "m", "metadata": {"model_alias_label": "basic"}}
     summary, failures = harness._validate_session_history_identity(
         family="case",
         session_history_summary={"record": record, "records": [record]},
@@ -7992,7 +8004,7 @@ def test_generation_trace_ids_scoped_to_alias_child(monkeypatch):
     def fake_poll_name_traces(**kwargs):
         return [
             {"id": "parent-trace", "name": "claude-code.orchestrator", "userId": "u1"},
-            {"id": "child-trace", "name": "claude-code.harness-read-alias-parallel-read-tools", "userId": "u1"},
+            {"id": "child-trace", "name": "claude-code.harness-basic-alias-parallel-read-tools", "userId": "u1"},
         ], None
 
     monkeypatch.setattr(harness.RA, "_validate_generation_observations", fake_validate_generation_observations)
@@ -8007,10 +8019,10 @@ def test_generation_trace_ids_scoped_to_alias_child(monkeypatch):
         "command": ["echo", "test"],
         "required_trace_names": [
             "claude-code.orchestrator",
-            "claude-code.harness-read-alias-parallel-read-tools",
+            "claude-code.harness-basic-alias-parallel-read-tools",
         ],
         "generation_trace_names": [
-            "claude-code.harness-read-alias-parallel-read-tools",
+            "claude-code.harness-basic-alias-parallel-read-tools",
         ],
         "expected_user_ids": ["u1"],
         "match_trace_session_id_from_stdout": True,

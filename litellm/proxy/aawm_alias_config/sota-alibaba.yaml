@@ -1,0 +1,16 @@
+defaults: {}
+
+aliases:
+  - name: sota-alibaba
+    candidates:
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/qwen3.8-max
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 100
+        reasoning_effort: max
+
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/qwen3.7-max
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 0
+        reasoning_effort: max

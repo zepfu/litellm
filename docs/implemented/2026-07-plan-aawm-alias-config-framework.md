@@ -10,20 +10,20 @@
 
 ## Executive Summary
 
-Today every AAWM alias (`aawm-read`, `aawm-low`, `aawm-sota*`, `aawm-code`, `aawm-orchestration`, and their `-anthropic` variants) is a **hard-coded Python tuple** in `policy.py` — ordered candidate lists with a `last_resort: bool`, consumed by a large selection engine inside the 27,418-line `llm_passthrough_endpoints.py` (`policy.py:71-509`, consumed at `llm_passthrough_endpoints.py:584-595`, selected at `:5497-5546`, dispatched at `:22886`). There is **no numeric priority, no YAML, no hot-reload, and no unified failure taxonomy** — failure→cooldown mapping is scattered across provider-specific classifiers (e.g. `_classify_kimi_code_auto_agent_probe_failure` at `:5862`) that each set a flat cooldown (e.g. `CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS = 3h`, `policy.py:14`).
+Today every AAWM alias (the distinct low-tier alias families, `sota*`, `work`, the Anthropic orchestration route, and their `-anthropic` variants) is a **hard-coded Python tuple** in `policy.py` — ordered candidate lists with a `last_resort: bool`, consumed by a large selection engine inside the 27,418-line `llm_passthrough_endpoints.py` (`policy.py:71-509`, consumed at `llm_passthrough_endpoints.py:584-595`, selected at `:5497-5546`, dispatched at `:22886`). There is **no numeric priority, no YAML, no hot-reload, and no unified failure taxonomy** — failure→cooldown mapping is scattered across provider-specific classifiers (e.g. `_classify_kimi_code_auto_agent_probe_failure` at `:5862`) that each set a flat cooldown (e.g. `CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS = 3h`, `policy.py:14`).
 
 This plan introduces, as one program built in dependency order:
 
 1. **An open error-class vocabulary + typed `FailureEvent`** (the shared seam). 584 owns and grows it; 583 keys cooldown policy on it. Class names are an **open registry**, not a closed enum, so later taxonomy growth never forces a 583 schema change.
 2. **Confidence-tiered N-of-M cooldown evidence** with a three-valued `origin` (`upstream`/`client`/`unknown`); only `upstream` cools, `unknown` never cools, replacing today's single-event flat-3h behavior.
 3. **A typed, validated YAML schema + compiler** producing an **immutable routing snapshot** with first-class numeric priority (descending; ties → declared distribution strategy → declaration order; `0` reserved = last resort), proportional routing weights, a per-model `tui_attached` flag, schedule windows, a semantic `config_hash`, diagnostic `source_hash`, and telemetry-only `config_epoch`.
-4. **Selector integration for the `read` pilot only** — the new `read` alias (go-forward replacement for `aawm-read`/`aawm-read-anthropic`, additive until operator-approved cutover) is resolved from the compiled snapshot; all other aliases keep their hard-coded tables untouched.
+4. **Selector integration for the `read` pilot only** — the new `read` alias (go-forward replacement for the low-tier alias families, additive until operator-approved cutover) is resolved from the compiled snapshot; all other aliases keep their hard-coded tables untouched.
 5. **An unauthenticated LAN refresh endpoint** that validates→compiles→atomically swaps the snapshot, fail-closed preserving last-known-good.
 6. **error-archive-seeded classification fixtures** with the unified error CSV as a coverage checklist, plus a **shadow parity harness** proving the pilot reproduces today's `read`/`low` lane selection.
 
 **No database change and no new routing-decision recording.** Per operator, routing decisions are NOT recorded beyond what `session_history` already persists as-routed (`inbound_model_alias`, `provider`, `model` — `sql.py:20-22`). The pilot adds no routing-outcome persistence, database telemetry, DDL, migration, or DB Foundation gate. `config_hash`/`config_version` remain snapshot identity surfaced by the refresh endpoint; `config_hash` is additionally stored in TTL continuation-affinity payloads as compatibility metadata, not as a routing-decision record.
 
-Out of scope (explicitly deferred, not dispatched): migrating the other six alias families to config; full error-policy enforcement beyond cooldown; multi-worker config consensus (deployment is single-worker); cutover of `aawm-read` → `read`.
+Out of scope (explicitly deferred, not dispatched): migrating the other six alias families to config; full error-policy enforcement beyond cooldown; multi-worker config consensus (deployment is single-worker); cutover of `basic` → `read`.
 
 ### Current Snapshot And Continuation Contract
 
@@ -203,7 +203,7 @@ Wave 7: Backlog reconciliation + promotion — orchestrator-inline, at close-out
   - `tests/test_litellm/proxy/aawm_alias_routing/test_read_pilot_selection.py` — unit
 **Test cases (must fail before implementation):**
   - `test_read_alias_uses_snapshot` — `read` resolves candidates from the compiled snapshot, not `CODEX_AAWM_LOW_CANDIDATES`.
-  - `test_other_aliases_unchanged` — `aawm-read`, `aawm-low`, `aawm-sota` still resolve from the hard-coded tables.
+  - `test_other_aliases_unchanged` — the distinct low-tier alias families, `sota` still resolve from the hard-coded tables.
   - `test_priority_descending_selection` — higher priority first; `priority:0` only when all others cooled/ineligible.
   - `test_proportional_tie_distribution` — equal-priority candidates split by weight over many selections within tolerance.
   - `test_tui_attached_excluded_on_unknown_tui` — with no client-product label, a `tui_attached: Claude` candidate is skipped and a non-TUI candidate is selected; alias still resolves.
@@ -287,7 +287,7 @@ Wave 7: Backlog reconciliation + promotion — orchestrator-inline, at close-out
 
 #### Source Spec (orchestrator-inline — no agent dispatch)
 1. **Write closeout entries** into `.analysis/completed-YYYY-MM-DD.md` — one `## D1-583 - <title>` and one `## D1-584 - <title>` block matching the established completed-file schema exactly: `Created on:` / `Initiated on:` / `Completed on:`, `Linked completed item:` (583↔584 + this plan), `Outcome:` (open vocabulary + `FailureEvent`; N-of-M cooldown with three-valued origin; YAML schema/compiler/immutable snapshot; `read` pilot selector integration additive/others-untouched; unauthenticated fail-closed refresh endpoint; no DB change), `Implementation and release:` (commit SHAs on `main`/`develop`, any tag), `Verification:` (QA verdicts per wave, smoke PASS, shadow-parity result — gate check intentionally skipped per operator), `Changed tracked paths:`.
-2. **Record the deferred remainder as NEW backlog items** in `.analysis/todo.md`: (a) migrate the remaining six alias families to config; (b) full error-policy enforcement beyond cooldown (retry/failover actions by class); (c) `aawm-read`/`aawm-read-anthropic` → `read` cutover after operator-approved validation; (d) multi-worker config consensus if the deployment scales past one worker. Each references completed D1-583/D1-584.
+2. **Record the deferred remainder as NEW backlog items** in `.analysis/todo.md`: (a) migrate the remaining six alias families to config; (b) full error-policy enforcement beyond cooldown (retry/failover actions by class); (c) the low-tier alias families → `read` cutover after operator-approved validation; (d) multi-worker config consensus if the deployment scales past one worker. Each references completed D1-583/D1-584.
 3. **Remove** the `D1-583` block from `todo.md` and the `D1-584` block from `todo.deferred.md` — only after step 1's entries are verified on disk.
 4. **Promote** the plan: copy to `docs/implemented/2026-07-aawm-alias-config-framework.md`, set `Status: IMPLEMENTED (YYYY-MM-DD)`, verify the copy exists non-empty, commit.
 
@@ -470,7 +470,7 @@ Required smoke assertions:
 | CSV → coverage checklist; fixtures from error-archive | Wave 6 |
 | Shadow parity (no production logic change) | Wave 6 |
 | Multi-worker consensus | Out of scope — single-worker (R-6) |
-| Migrate other 6 alias families; full error-policy enforcement; `aawm-read`→`read` cutover | Out of scope — deferred (Wave 7 spins into follow-up items) |
+| Migrate other 6 alias families; full error-policy enforcement; `basic`→`read` cutover | Out of scope — deferred (Wave 7 spins into follow-up items) |
 
 ## Alternatives Considered (Phase 3)
 
@@ -480,7 +480,7 @@ Required smoke assertions:
 
 ## Self-Critique (Phase 3)
 
-- **The weakest part of this spec is:** Wave 6's shadow-parity assertion. Because the pilot shares cooldown keys and OpenRouter's process-global free quota with the live `aawm-low` lane, a strict parity test can flap on ambient production state. It needs a documented tolerance and a way to neutralize ambient cooldown state, or it produces false failures.
+- **The weakest part of this spec is:** Wave 6's shadow-parity assertion. Because the pilot shares cooldown keys and OpenRouter's process-global free quota with the live `basic` lane, a strict parity test can flap on ambient production state. It needs a documented tolerance and a way to neutralize ambient cooldown state, or it produces false failures.
 - **The biggest assumption I made is:** that `read.yaml`'s candidate order should mirror `CODEX_AAWM_LOW_CANDIDATES` (`policy.py:227-277`) plus the promo-gated qwen, with priorities assigned descending to match. The order matches the operator's stated list, but the exact priority integers and promo-window boundaries are inferred and want confirmation.
 - **The thing most likely to need revision after the first execution attempt is:** Wave 4. Grafting numeric priority + proportional distribution + per-model TUI gating + schedule/affinity onto the existing `last_resort`-tuple selection block (`:5497-5546`) inside a 27k-line module is the highest-uncertainty work; expect a principal diagnosis and at least one re-scope of how the snapshot branch grafts on.
 
@@ -503,7 +503,7 @@ Spot-checked; all four files assert exact values a wrong implementation would fa
 ### 3. Scope containment: `read`-only gating — PASS (critical check)
 - Getter: `llm_passthrough_endpoints.py:674-682` — `_get_codex_auto_agent_candidates_for_alias` branches to `_select_read_pilot_snapshot_candidates()` ONLY when `alias_model == _READ_PILOT_ALIAS_NAME` (`"read"`, defined `:561`); all other aliases fall through to `_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(...)` unchanged. The Anthropic getter (`:685-691`) is entirely untouched by the snapshot path.
 - Failure recorder: `llm_passthrough_endpoints.py:6519-6523` — `_record_read_pilot_cooldown_evidence` invoked only under `if alias_model == _READ_PILOT_ALIAS_NAME`; the rest of `_record_auto_agent_alias_attempt_failure` is the pre-existing audit-event path for all aliases.
-- `policy.py:292-305` `CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS` contains no `"read"` key — `aawm-read`, `aawm-low`, `aawm-sota*`, `aawm-code`, `aawm-orchestration` all still resolve from the hard-coded tables, enforced by `test_read_pilot_selection.py::test_other_aliases_unchanged` (`:77-83`, exact table-identity assertions).
+- `policy.py:292-305` `CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS` contains no `"read"` key — the distinct low-tier alias families, `sota*`, `work`, the Anthropic orchestration route all still resolve from the hard-coded tables, enforced by `test_read_pilot_selection.py::test_other_aliases_unchanged` (`:77-83`, exact table-identity assertions).
 - Graceful degradation: with no active snapshot (or no `read` alias in it), `_select_read_pilot_snapshot_candidates` (`:645-651`) falls back to the hard-coded table — no raise.
 
 ### 4. No new routing-decision recording — PASS
@@ -548,4 +548,4 @@ Execution completed Waves 1–6 in ~6h; QA PASS. ≥5 hindsight items from actua
 ### Outstanding at close-out (tracked, not silently dropped)
 - **Pre-existing test contamination** (`test_rr054_package_contracts.py` leaking durable-runtime globals into `test_moonshot_alias_routing.py`) — proven wave-independent; fix or ticket per operator.
 - **Live `:4001` dev validation** — real `read` sessions + refresh endpoint against the running dev proxy; requires deploying `develop` to `litellm-dev`. This is the plan's "development validation" acceptance criterion and is not yet done.
-- **Deferred-remainder backlog items** (for Wave 7): migrate the other six alias families to config; full error-policy enforcement (retry/failover by class); `aawm-read`→`read` cutover after validation; multi-worker config consensus if scaled; expand `classify_failure` taxonomy toward the 48 known-gap classes.
+- **Deferred-remainder backlog items** (for Wave 7): migrate the other six alias families to config; full error-policy enforcement (retry/failover by class); `basic`→`read` cutover after validation; multi-worker config consensus if scaled; expand `classify_failure` taxonomy toward the 48 known-gap classes.

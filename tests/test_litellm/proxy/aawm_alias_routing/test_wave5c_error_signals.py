@@ -393,11 +393,11 @@ class TestKimiMetadata:
         metadata = dict(self._VALID_METADATA)
         candidate = {"model": "kimi-k3"}
         result = _build_safe_kimi_code_selection_telemetry(
-            alias_model="aawm-code",
+            alias_model="work",
             candidate=candidate,
             metadata=metadata,
         )
-        assert result["alias"] == "aawm-code"
+        assert result["alias"] == "work"
         assert result["candidate"] == "kimi-k3"
         assert result["upstream_id"] == "k3"
 

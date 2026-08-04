@@ -119,15 +119,15 @@ appear in status responses or structured log output.
 
 ## Alias model and ingress route families
 
-Each config-defined alias is one logical routing identity (e.g. `read`).
+Each config-defined alias is one logical routing identity (e.g. `basic`).
 A single alias carries per-candidate `route_family` and
 `anthropic_route_family` projections so that Codex ingress and Anthropic
 Messages ingress each see only their own route-family view. No cross-provider
 fallback is introduced by the alias model.
 
-## Maintained `read` alias behavior (CFG-008)
+## Maintained `basic` alias behavior (CFG-008)
 
-The maintained alias name is `read`. Every request uses this common candidate
+The maintained alias name is `basic`. Every request uses this common candidate
 order:
 
 1. OpenRouter Cohere North Mini Code free
@@ -146,7 +146,8 @@ Luna's YAML `reasoning_effort: low` is authoritative through the generic
 CFG-006 pipeline and replaces caller-provided reasoning. Haiku remains
 Anthropic-native; Luna uses the intended OpenAI/Codex OAuth route. The removed
 candidates are the `qwen3.8-max-preview` promo, `kimi-for-coding`, and
-`gpt-5.4-mini`.
+`gpt-5.4-mini`. The former `read` name is unsupported; it is not a
+compatibility alias or redirect.
 
 ## Provider-native credential boundary
 
@@ -302,7 +303,7 @@ sanitized result.
 curl -sS http://127.0.0.1:4001/aawm/alias-routing/cooldowns/clear \
   -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"alias":"read","ingress":"codex"}'
+  -d '{"alias":"basic","ingress":"codex"}'
 ```
 
 An exact target uses the actual snapshot identity:

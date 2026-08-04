@@ -543,7 +543,7 @@ class TestCFG004EncryptedReasoningDetection:
         tool_call.name = "spawn_agent"
         tool_call.call_id = "call-1"
         tool_call.arguments = json.dumps(
-            {"message": encrypted, "agent_type": "opencode", "model": "read"}
+            {"message": encrypted, "agent_type": "opencode", "model": "basic"}
         )
 
         message_item = MagicMock()

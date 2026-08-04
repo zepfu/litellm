@@ -1443,7 +1443,7 @@ def test_should_score_codex_transcript_exec_command_read_only_violation(
                 "payload": {
                     "turn_id": "019e66f6-1181-7b10-8457-1905ac7f1f08",
                     "cwd": "/home/zepfu/projects/aawm-tap",
-                    "model": "aawm-codex-agent-auto",
+                    "model": "basic",
                 },
             },
             {
@@ -1559,7 +1559,7 @@ def test_should_not_score_codex_transcript_safe_exec_command_reads(
             {
                 "timestamp": "2026-05-27T01:04:23Z",
                 "type": "turn_context",
-                "payload": {"model": "aawm-codex-agent-auto"},
+                "payload": {"model": "basic"},
             },
             {
                 "timestamp": "2026-05-27T01:05:31Z",
@@ -1626,7 +1626,7 @@ def test_should_score_codex_transcript_null_final_with_partial_progress(
             {
                 "timestamp": "2026-05-27T01:04:23Z",
                 "type": "turn_context",
-                "payload": {"model": "aawm-codex-agent-auto"},
+                "payload": {"model": "basic"},
             },
             {
                 "timestamp": "2026-05-27T01:05:00Z",
@@ -1709,7 +1709,7 @@ def test_should_score_codex_transcript_unsupported_tool_loop(
             {
                 "timestamp": "2026-05-27T01:04:23Z",
                 "type": "turn_context",
-                "payload": {"model": "aawm-codex-agent-auto"},
+                "payload": {"model": "basic"},
             },
             {
                 "timestamp": "2026-05-27T01:05:31Z",
@@ -1772,7 +1772,7 @@ def test_should_upsert_codex_transcript_session_history_for_missing_native_row(
         litellm_call_id="codex-transcript:child-session",
         source_observation_id="codex-transcript:child-session",
         provider="litellm",
-        model="aawm-codex-agent-auto",
+        model="basic",
         agent_name="Planck",
         agent_id="019e66f6-0ba8-7491-9e6a-d446cc1cab59",
         repository="aawm-tap",
@@ -1865,8 +1865,8 @@ def test_should_upsert_codex_transcript_session_history_for_missing_native_row(
     assert params["repository"] == "aawm-tap"
     assert params["agent_id"] == "019e66f6-0ba8-7491-9e6a-d446cc1cab59"
     assert params["provider"] is None
-    assert params["model"] == "codex-transcript"
-    assert params["model_group"] is None
+    assert params["model"] == "basic"
+    assert params["model_group"] == "basic"
     assert params["read_only_policy_compliance_score"] == 0.0
     metadata = json.loads(str(params["metadata"]))
     assert metadata["synthetic"] is True

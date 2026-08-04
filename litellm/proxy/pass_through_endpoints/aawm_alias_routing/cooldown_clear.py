@@ -1047,9 +1047,9 @@ class _LocalClearPreimage:
     negative_cooldown: dict[str, float] = field(default_factory=dict)
     evidence_events: dict[str, tuple[float, ...]] = field(default_factory=dict)
     generation: dict[str, int] = field(default_factory=dict)
-    read_pilot_captured: bool = False
-    read_pilot_key_state: dict[str, Any] = field(default_factory=dict)
-    read_pilot_evidence: dict[str, tuple[float, ...]] = field(default_factory=dict)
+    basic_pilot_captured: bool = False
+    basic_pilot_key_state: dict[str, Any] = field(default_factory=dict)
+    basic_pilot_evidence: dict[str, tuple[float, ...]] = field(default_factory=dict)
     lane_index_membership: dict[str, frozenset[str]] = field(default_factory=dict)
     openrouter_keys: tuple[str, ...] = ()
     openrouter_rate_limit: dict[str, float] = field(default_factory=dict)
@@ -1066,7 +1066,7 @@ async def _capture_local_preimage(
     Read-only.  Called under the clear lock regime after all durable
     identities commit and before any local mutation.  Covers exactly the
     state the clear path mutates: family positive/negative cooldown maps,
-    evidence events, per-key generation counters, read-pilot gate
+    evidence events, per-key generation counters, basic-pilot gate
     key/evidence state (codex only), lane-identity index membership, and
     targeted OpenRouter rate-limit/failure-circuit entries.  Session
     affinity and unrelated keys are intentionally excluded so they are
@@ -1097,22 +1097,22 @@ async def _capture_local_preimage(
         if k in family_state.cooldown_generation_by_key
     }
 
-    # Read-pilot gate is codex-owned; only captured for the codex family.
-    read_pilot_captured = False
-    read_pilot_key_state: dict[str, Any] = {}
-    read_pilot_evidence: dict[str, tuple[float, ...]] = {}
+    # Basic-pilot gate is codex-owned; only captured for the codex family.
+    basic_pilot_captured = False
+    basic_pilot_key_state: dict[str, Any] = {}
+    basic_pilot_evidence: dict[str, tuple[float, ...]] = {}
     if validate_alias_family(family) == "codex":
-        read_pilot_captured = True
-        gate = state_mgr.read_pilot_gate
+        basic_pilot_captured = True
+        gate = state_mgr.basic_pilot_gate
         for k in all_keys:
             ks = gate._key_state.get(k)
             if ks is not None:
                 # _KeyCooldownState is a dataclass of immutable scalars; a
                 # shallow replace() yields an independent snapshot.
-                read_pilot_key_state[k] = replace(ks)
+                basic_pilot_key_state[k] = replace(ks)
             ev = gate._family_state.evidence_events_by_key.get(k)
             if ev is not None:
-                read_pilot_evidence[k] = tuple(ev)
+                basic_pilot_evidence[k] = tuple(ev)
 
     # Lane-identity index membership per targeted identity.
     lane_membership: dict[str, frozenset[str]] = {}
@@ -1142,9 +1142,9 @@ async def _capture_local_preimage(
         negative_cooldown=negative,
         evidence_events=evidence,
         generation=generation,
-        read_pilot_captured=read_pilot_captured,
-        read_pilot_key_state=read_pilot_key_state,
-        read_pilot_evidence=read_pilot_evidence,
+        basic_pilot_captured=basic_pilot_captured,
+        basic_pilot_key_state=basic_pilot_key_state,
+        basic_pilot_evidence=basic_pilot_evidence,
         lane_index_membership=lane_membership,
         openrouter_keys=tuple(or_keys),
         openrouter_rate_limit=or_rate,
@@ -1161,7 +1161,7 @@ async def _restore_local_preimage(  # noqa: PLR0915
 
     Called under the same clear lock regime after durable receipts have been
     rolled back.  Restores family positive/negative cooldown maps, evidence
-    events, per-key generation counters, read-pilot gate state (codex),
+    events, per-key generation counters, basic-pilot gate state (codex),
     lane-identity index membership, and (under its own lock) targeted
     OpenRouter entries to their exact preimage values.  Returns True only if
     every targeted map verifies equal to its preimage afterwards; returns
@@ -1191,17 +1191,17 @@ async def _restore_local_preimage(  # noqa: PLR0915
             else:
                 family_state.cooldown_generation_by_key.pop(k, None)
 
-        # Read-pilot gate (codex only).
-        if preimage.read_pilot_captured:
-            gate = state_mgr.read_pilot_gate
+        # Basic-pilot gate (codex only).
+        if preimage.basic_pilot_captured:
+            gate = state_mgr.basic_pilot_gate
             for k in targeted:
-                if k in preimage.read_pilot_key_state:
-                    gate._key_state[k] = replace(preimage.read_pilot_key_state[k])
+                if k in preimage.basic_pilot_key_state:
+                    gate._key_state[k] = replace(preimage.basic_pilot_key_state[k])
                 else:
                     gate._key_state.pop(k, None)
-                if k in preimage.read_pilot_evidence:
+                if k in preimage.basic_pilot_evidence:
                     gate._family_state.evidence_events_by_key[k] = list(
-                        preimage.read_pilot_evidence[k]
+                        preimage.basic_pilot_evidence[k]
                     )
                 else:
                     gate._family_state.evidence_events_by_key.pop(k, None)
@@ -1275,16 +1275,16 @@ async def _restore_local_preimage(  # noqa: PLR0915
             if state_mgr.lane_identity_index.lanes_for(identity_hash) != lanes:
                 return False
 
-        # Prove read-pilot gate presence restoration (codex).
-        if preimage.read_pilot_captured:
-            gate = state_mgr.read_pilot_gate
+        # Prove basic-pilot gate presence restoration (codex).
+        if preimage.basic_pilot_captured:
+            gate = state_mgr.basic_pilot_gate
             present_ks = {k for k in targeted if k in gate._key_state}
-            if present_ks != set(preimage.read_pilot_key_state.keys()):
+            if present_ks != set(preimage.basic_pilot_key_state.keys()):
                 return False
             present_ev = {
                 k for k in targeted if k in gate._family_state.evidence_events_by_key
             }
-            if present_ev != set(preimage.read_pilot_evidence.keys()):
+            if present_ev != set(preimage.basic_pilot_evidence.keys()):
                 return False
 
         return True

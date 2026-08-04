@@ -45,7 +45,7 @@ from .interfaces import (
     GetActiveCooldownStateFn,
     GetKimiFailureMetadataFn,
     IsGrokAccountQuotaFailureFn,
-    RecordReadPilotEvidenceFn,
+    RecordBasicPilotEvidenceFn,
     ResolveCooldownPublicationFn,
 )
 from .state import alias_routing_state
@@ -140,8 +140,8 @@ async def handle_alias_route(  # noqa: PLR0915
     _classify_codex_auto_agent_retryable_exhaustion = _lpe._classify_codex_auto_agent_retryable_exhaustion
     _is_codex_auto_agent_grok_account_quota_exhaustion = _lpe._is_codex_auto_agent_grok_account_quota_exhaustion
     _get_codex_auto_agent_cooldown_seconds = _lpe._get_codex_auto_agent_cooldown_seconds
-    _READ_PILOT_ALIAS_NAME = _lpe._READ_PILOT_ALIAS_NAME
-    _record_read_pilot_cooldown_evidence = _lpe._record_read_pilot_cooldown_evidence
+    _BASIC_PILOT_ALIAS_NAME = _lpe._BASIC_PILOT_ALIAS_NAME
+    _record_basic_pilot_cooldown_evidence = _lpe._record_basic_pilot_cooldown_evidence
     _update_codex_auto_agent_retryable_attempt_record = _lpe._update_codex_auto_agent_retryable_attempt_record
     _exclude_codex_auto_agent_request_local_candidate_without_cooldown = (
         _lpe._exclude_codex_auto_agent_request_local_candidate_without_cooldown
@@ -387,14 +387,14 @@ async def handle_alias_route(  # noqa: PLR0915
                 if probe_failure_exc is not None:
                     probe_failure_plan = _resolve_failure_plan(
                         resolve_cooldown_publication_fn=resolve_cooldown_publication_fn,
-                        record_read_pilot_evidence_fn=_record_read_pilot_cooldown_evidence,
+                        record_basic_pilot_evidence_fn=_record_basic_pilot_cooldown_evidence,
                         request=request,
                         candidate=candidate,
                         selection=selection,
                         alias_model=alias_model,
                         attempt_record=attempt_record,
                         exc=probe_failure_exc,
-                        is_read_pilot_lane=(alias_model == _READ_PILOT_ALIAS_NAME),
+                        is_basic_pilot_lane=(alias_model == _BASIC_PILOT_ALIAS_NAME),
                         kimi_failure_metadata_fn=_get_safe_kimi_code_probe_failure_metadata,
                         classify_kimi_fn=_classify_kimi_code_auto_agent_probe_failure,
                         classify_retryable_fn=_classify_codex_auto_agent_retryable_exhaustion,
@@ -616,14 +616,14 @@ async def handle_alias_route(  # noqa: PLR0915
 def _resolve_failure_plan(
     *,
     resolve_cooldown_publication_fn: ResolveCooldownPublicationFn,
-    record_read_pilot_evidence_fn: RecordReadPilotEvidenceFn,
+    record_basic_pilot_evidence_fn: RecordBasicPilotEvidenceFn,
     request: "Request",
     candidate: dict[str, Any],
     selection: dict[str, Any],
     alias_model: str,
     attempt_record: dict[str, Any],
     exc: Exception,
-    is_read_pilot_lane: bool,
+    is_basic_pilot_lane: bool,
     kimi_failure_metadata_fn: GetKimiFailureMetadataFn,
     classify_kimi_fn: ClassifyKimiFailureFn,
     classify_retryable_fn: ClassifyRetryableFailureFn,
@@ -632,7 +632,7 @@ def _resolve_failure_plan(
 ) -> CooldownPublicationPlan:
     """Resolve ONE publication plan for ``exc`` (pure, no I/O).
 
-    Called while the probe lock is held. The resolver records read-pilot
+    Called while the probe lock is held. The resolver records basic-pilot
     evidence and resolves scope/target keys but performs NO memory or durable
     writes. Memory publication is deferred to
     :func:`_publish_plan_transactional` which holds the complete lock set.
@@ -643,8 +643,8 @@ def _resolve_failure_plan(
         error_class = classify_retryable_fn(exc)
     grok_account_quota_exhausted = grok_quota_fn(exc, candidate=candidate)
     cooldown_seconds = cooldown_seconds_fn(exc, candidate=candidate)
-    if is_read_pilot_lane:
-        record_read_pilot_evidence_fn(
+    if is_basic_pilot_lane:
+        record_basic_pilot_evidence_fn(
             cooldown_key=selection["cooldown_key"],
             exc=exc,
             attempt_record=attempt_record,
@@ -658,5 +658,5 @@ def _resolve_failure_plan(
         error_class=error_class,
         grok_account_quota_exhausted=grok_account_quota_exhausted,
         kimi_failure_metadata=kimi_failure_metadata,
-        is_read_pilot_lane=is_read_pilot_lane,
+        is_basic_pilot_lane=is_basic_pilot_lane,
     )

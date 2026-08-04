@@ -420,7 +420,7 @@ class TestLoggingWorkerDiagnostics:
             "trace_id": "trace-123",
             "litellm_call_id": "call-456",
             "model": "gpt-test",
-            "model_alias": "aawm-codex-agent-auto",
+            "model_alias": "basic",
             "provider": "openai",
             "custom_llm_provider": "openai",
             "route_family": "codex_responses",
@@ -453,7 +453,7 @@ class TestLoggingWorkerDiagnostics:
         assert context["trace_id"] == "trace-123"
         assert context["litellm_call_id"] == "call-456"
         assert context["model"] == "gpt-test"
-        assert context["model_alias"] == "aawm-codex-agent-auto"
+        assert context["model_alias"] == "basic"
         assert context["route_family"] == "codex_responses"
         assert context["worker_delivery_state"] == "timed_out"
         assert context["worker_timeout_seconds"] == "0.05"
@@ -518,7 +518,7 @@ class TestLoggingWorkerDiagnostics:
             custom_llm_provider = "openai"
             litellm_params = {
                 "metadata": {
-                    "requested_model_alias": "aawm-codex-agent-auto",
+                    "requested_model_alias": "basic",
                     "route_family": "codex_responses",
                     "user_api_key": "sk-redacted-should-not-emit",
                 }
@@ -534,7 +534,7 @@ class TestLoggingWorkerDiagnostics:
             "trace_id": "trace-safe",
             "litellm_call_id": "call-safe",
             "model": "gpt-safe",
-            "model_alias": "aawm-codex-agent-auto",
+            "model_alias": "basic",
             "provider": "openai",
             "custom_llm_provider": "openai",
             "route_family": "codex_responses",
@@ -575,7 +575,7 @@ class TestLoggingWorkerDiagnostics:
         logging_obj.custom_llm_provider = "openai"
         logging_obj.litellm_params = {
             "metadata": {
-                "requested_model_alias": "aawm-code",
+                "requested_model_alias": "work",
                 "passthrough_route_family": "codex_responses",
                 "user_api_key": "sk-real-path-secret",
             }
@@ -630,7 +630,7 @@ class TestLoggingWorkerDiagnostics:
         assert context["litellm_call_id"] == "call-real-path"
         assert context["trace_id"] == "trace-real-path"
         assert context["model"] == "gpt-real-path"
-        assert context["model_alias"] == "aawm-code"
+        assert context["model_alias"] == "work"
         assert context["route_family"] == "codex_responses"
         assert context["worker_delivery_state"] == "timed_out"
         assert "secret real prompt" not in json.dumps(record)

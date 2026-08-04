@@ -371,7 +371,7 @@ async def test_rr054_stream_validation_pending_stream_is_not_logged_as_overflow(
             adapter="codex_kimi_chat_completions_adapter",
             adapter_label="Kimi Code",
             intake_context={
-                "model_alias": "aawm-sota-moonshot",
+                "model_alias": "sota-moonshot",
                 "session_id": "session-pending",
                 "litellm_call_id": "call-pending",
                 "trace_id": "trace-pending",
@@ -387,7 +387,7 @@ async def test_rr054_stream_validation_pending_stream_is_not_logged_as_overflow(
     assert debug_args[1] == "pending_stream"
     assert debug_args[-5:] == (
         "kimi_code/k3-max",
-        "aawm-sota-moonshot",
+        "sota-moonshot",
         "session-pending",
         "call-pending",
         "trace-pending",

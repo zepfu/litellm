@@ -155,6 +155,7 @@ def _build_failure_observation_only_record(
         start_time=start_time,
         end_time=end_time,
     )
+    _publish_alias_routing_quota_observations(rate_limit_observations)
     provider_error_observation = _build_provider_error_observation(
         kwargs=kwargs,
         result=failure_result,
@@ -193,6 +194,22 @@ def _build_failure_observation_only_record(
     if provider_error_observation is not None:
         record["provider_error_observations"] = [provider_error_observation]
     return record
+
+
+def _publish_alias_routing_quota_observations(
+    observations: List[Dict[str, Any]],
+) -> None:
+    """Publish normalized observations to the process-local routing cache."""
+    if not observations:
+        return
+    try:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
+            alias_routing_state,
+        )
+
+        alias_routing_state.record_normalized_quota_observations(observations)
+    except Exception:
+        return
 
 # --- _derive_session_history_reasoning_fields ---
 def _derive_session_history_reasoning_fields(
@@ -1820,6 +1837,7 @@ def _handle_session_history_success_event(
             start_time=start_time,
             end_time=end_time,
         )
+        _publish_alias_routing_quota_observations(rate_limit_observations)
         if rate_limit_observations and _rate_limit_observation_only_requested(kwargs):
             _enqueue_session_history_record(
                 _build_rate_limit_observation_only_record(

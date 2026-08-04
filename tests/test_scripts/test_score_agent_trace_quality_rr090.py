@@ -337,7 +337,7 @@ def test_should_cache_parent_transcript_spawn_lookups(
                 },
                 {
                     "type": "turn_context",
-                    "payload": {"model": "aawm-codex-agent-auto"},
+                    "payload": {"model": "basic"},
                 },
                 {
                     "type": "event_msg",

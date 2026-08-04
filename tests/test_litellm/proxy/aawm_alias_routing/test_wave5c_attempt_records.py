@@ -74,7 +74,7 @@ def _configure_attempt_records():  # noqa: PLR0915
         "_model_cost",
         "_openai_provider_value",
         "_classify_failure",
-        "_read_pilot_gate_record",
+        "_basic_pilot_gate_record",
     )
     previous_runtime = {
         name: getattr(attempt_records, name)
@@ -196,7 +196,7 @@ def _configure_attempt_records():  # noqa: PLR0915
         model_cost={},
         openai_provider_value="openai",
         classify_failure=_classify_failure,
-        read_pilot_gate_record=_gate_record,
+        basic_pilot_gate_record=_gate_record,
     )
     yield state
     for name, value in previous_runtime.items():
@@ -391,11 +391,11 @@ class TestAttemptStarted:
 
 
 # ---------------------------------------------------------------------------
-# _record_read_pilot_cooldown_evidence (exactly-once)
+# _record_basic_pilot_cooldown_evidence (exactly-once)
 # ---------------------------------------------------------------------------
 
 
-class TestReadPilotEvidence:
+class TestBasicPilotEvidence:
     def test_records_once_and_stamps_origin(self, _configure_attempt_records: _StubState) -> None:
         state = _configure_attempt_records
         record: dict[str, Any] = {}
@@ -403,7 +403,7 @@ class TestReadPilotEvidence:
         exc._status_code = 429  # type: ignore[attr-defined]
         exc._retry_after = 5.0  # type: ignore[attr-defined]
 
-        attempt_records._record_read_pilot_cooldown_evidence(
+        attempt_records._record_basic_pilot_cooldown_evidence(
             cooldown_key="openai:gpt-5:lane1",
             exc=exc,
             attempt_record=record,
@@ -421,7 +421,7 @@ class TestReadPilotEvidence:
         exc._retry_after = None  # type: ignore[attr-defined]
 
         for _ in range(2):
-            attempt_records._record_read_pilot_cooldown_evidence(
+            attempt_records._record_basic_pilot_cooldown_evidence(
                 cooldown_key="key1",
                 exc=exc,
                 attempt_record={},
@@ -435,13 +435,13 @@ class TestReadPilotEvidence:
         exc._status_code = None  # type: ignore[attr-defined]
         exc._retry_after = None  # type: ignore[attr-defined]
 
-        attempt_records._record_read_pilot_cooldown_evidence(
+        attempt_records._record_basic_pilot_cooldown_evidence(
             cooldown_key=None,
             exc=exc,
             attempt_record={},
         )
 
-        assert state.gate_records[0]["cooldown_key"] == "read_pilot:unknown"
+        assert state.gate_records[0]["cooldown_key"] == "basic_pilot:unknown"
 
 
 # ---------------------------------------------------------------------------

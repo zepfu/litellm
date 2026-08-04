@@ -147,7 +147,7 @@ Moonshot cases. These values are deterministic public reference costs, not
 proof of subscription spend.
 
 The release gate uses real Codex V2 Responses and Claude CLI parents. Each
-parent must select `aawm-sota-moonshot`, dispatch multiple child agents, have
+parent must select `sota-moonshot`, dispatch multiple child agents, have
 every child complete at least two separate parallel tool-call batches, and
 return a concise deterministic marker block capped at 160 characters. This is
 a tool-usage test, not a throughput test. Correlate the run through the target
@@ -163,7 +163,7 @@ It uses the target-selected Codex profile and requires two completed
 concise three-line final marker block capped at 160 characters. The
 ignored-user-config launch explicitly
 registers the existing `~/.codex/agents/moonshot.toml` role. Both spawn calls
-must set `agent_type="moonshot"`, `model="aawm-sota-moonshot"`, and
+must set `agent_type="moonshot"`, `model="sota-moonshot"`, and
 `fork_turns="none"` and must carry complete self-contained plaintext child
 messages. The harness validates those spawn payloads through
 `public.session_history_tool_activity` because installed Codex JSON stdout can
@@ -221,8 +221,8 @@ deterministic parent markers capped at 160 characters. The Bash cases execute
 `date --iso-8601=seconds` exactly once and require the final response to equal
 the command stdout. These are tool-usage checks, not throughput checks.
 
-The cases route only through `aawm-sota-alibaba` to
-`alibaba_token_plan/qwen3.8-max-preview` or
+The cases route only through `sota-alibaba` to
+`alibaba_token_plan/qwen3.8-max` or
 `alibaba_token_plan/qwen3.7-max`. They require Alibaba subscription cost
 provenance, clean Docker logs and route rollups, Langfuse correlation, and
 exact `aawm_tristore` rows. They use the existing `ALIBABA_KEY` reference and

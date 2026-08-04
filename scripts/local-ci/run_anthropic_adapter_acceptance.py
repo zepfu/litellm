@@ -63,9 +63,9 @@ DEFAULT_WARNING_ONLY_HARD_FAILURE_SUBSTRINGS = [
 MOONSHOT_ANTHROPIC_AGENTIC_CASE = "claude_adapter_aawm_sota_moonshot_agentic_tool_continuation"
 MOONSHOT_ANTHROPIC_AGENTIC_FLAG = "moonshot_anthropic_agentic_only"
 MOONSHOT_ANTHROPIC_ADAPTER_PATH = "anthropic_kimi_chat_completions_adapter"
-MOONSHOT_CANONICAL_ALIAS = "aawm-sota-moonshot"
+MOONSHOT_CANONICAL_ALIAS = "sota-moonshot"
 MOONSHOT_AGENT_PROFILE = "sota-moonshot"
-MOONSHOT_SELECTED_MODELS = {"kimi_code/k3-max", "kimi_code/k3-high"}
+MOONSHOT_SELECTED_MODELS = {"kimi_code/k3"}
 ATTRIBUTION_SCOPED_RUNTIME_LOG_SUBSTRINGS = {
     *DEFAULT_RUNTIME_LOG_FORBIDDEN_SUBSTRINGS,
     *DEFAULT_RUNTIME_LOG_UPSTREAM_ERROR_SUBSTRINGS,
@@ -1010,7 +1010,7 @@ def _validate_moonshot_anthropic_agentic_contract(  # noqa: PLR0915
         agent_config = {}
     _require(
         agent_config.get("model") == MOONSHOT_CANONICAL_ALIAS,
-        "must select the canonical aawm-sota-moonshot alias",
+        "must select the canonical sota-moonshot alias",
     )
     _require(
         agent_config.get("tools") == ["Read", "Grep"],
@@ -1040,7 +1040,7 @@ def _validate_moonshot_anthropic_agentic_contract(  # noqa: PLR0915
     )
     _require(
         declared_pairs == {(model, MOONSHOT_ANTHROPIC_ADAPTER_PATH) for model in MOONSHOT_SELECTED_MODELS},
-        "must declare only k3-max and k3-high through the Moonshot adapter",
+        "must declare only k3 through the Moonshot adapter",
     )
 
     _require(
@@ -1108,7 +1108,7 @@ def _validate_moonshot_anthropic_agentic_contract(  # noqa: PLR0915
         isinstance(required_one_of, dict)
         and set(required_one_of.get("provider") or []) == {"kimi_code"}
         and set(required_one_of.get("model") or [])
-        == {"kimi_code/k3-max", "kimi_code/k3-high"},
+        == {"kimi_code/k3"},
         "must require provider-prefixed Kimi Code k3-max or k3-high session metadata",
     )
     _require(
@@ -7319,13 +7319,13 @@ def _run_selected_case(
 # CFG-003: Transactional live priority-swap refresh orchestration
 # ---------------------------------------------------------------------------
 
-_CFG003_INVALID_YAML = "aliases:\n  - name: read\n    candidates: not_a_list\n"
+_CFG003_INVALID_YAML = "aliases:\n  - name: basic\n    candidates: not_a_list\n"
 
 _CFG003_CODEX_PROOF_CASE = (
-    "native_openai_passthrough_responses_codex_read_alias_collaboration"
+    "native_openai_passthrough_responses_codex_basic_alias_collaboration"
 )
 _CFG003_CLAUDE_PROOF_CASE = (
-    "claude_adapter_read_alias_child_parallel_read_tools"
+    "claude_adapter_basic_alias_child_parallel_read_tools"
 )
 
 # Targets that may run the transactional refresh test (dev only).
@@ -8078,12 +8078,12 @@ def _cfg003_validate_operator_assertions(
     eligible_snapshot: list[dict[str, Any]],
 ) -> list[str]:
     """Validate every asserted identity belongs to the current schedule-eligible
-    active read-alias snapshot.
+    active basic-alias snapshot.
 
     ``eligible_snapshot`` is the list of candidate dicts produced by
     ``RA._derive_eligible_candidates_from_snapshot`` (already filtered by
     schedule windows and excluded providers).  An identity not present in this
-    snapshot is rejected (unknown, schedule-expired, or non-read-alias).
+    snapshot is rejected (unknown, schedule-expired, or non-basic-alias).
 
     Returns a list of failure strings (empty means all valid).
     """
@@ -8095,7 +8095,7 @@ def _cfg003_validate_operator_assertions(
         if (provider, model) not in eligible_set:
             failures.append(
                 f"asserted identity ({provider}, {model}) is not in the "
-                f"current schedule-eligible active read-alias snapshot"
+                f"current schedule-eligible active basic-alias snapshot"
             )
     return failures
 
@@ -8425,12 +8425,12 @@ def _cfg003_transactional_refresh_test(  # noqa: PLR0915
         # snapshot, independent of provider exclusions, availability, and
         # schedule windows (finding 3 round 5).
         original_full_order = RA._derive_full_order_from_snapshot(
-            snapshot, alias_name="read"
+            snapshot, alias_name="basic"
         )
 
         # Collect POSITIVE availability evidence from rate_limit_observations.
         all_eligible = RA._derive_eligible_candidates_from_snapshot(
-            snapshot, alias_name="read"
+            snapshot, alias_name="basic"
         )
         avail = _cfg003_collect_availability_evidence(
             all_eligible, db_settings=db_settings, environment=environment
@@ -8730,7 +8730,7 @@ def _cfg003_transactional_refresh_test(  # noqa: PLR0915
         try:
             swapped_yaml, _orig, swapped_eligible = (
                 RA._build_exact_pair_priority_swap_yaml(
-                    raw_source_text, pair=evidenced_pair, alias_name="read"
+                    raw_source_text, pair=evidenced_pair, alias_name="basic"
                 )
             )
         except (ValueError, KeyError) as swap_build_exc:
@@ -8813,7 +8813,7 @@ def _cfg003_transactional_refresh_test(  # noqa: PLR0915
         expected_swapped_hash = swapped_snapshot.config_hash
         expected_swapped_version = swapped_snapshot.config_version
         expected_swapped_full_order = RA._derive_full_order_from_snapshot(
-            swapped_snapshot, alias_name="read"
+            swapped_snapshot, alias_name="basic"
         )
         evidence["phases"]["swap_build"]["expected_swapped_hash"] = expected_swapped_hash
         evidence["phases"]["swap_build"]["expected_swapped_version"] = expected_swapped_version
@@ -8826,14 +8826,14 @@ def _cfg003_transactional_refresh_test(  # noqa: PLR0915
         swap_new_hash = RA._extract_refresh_response_hash(swap_response)
         swap_new_version = RA._extract_refresh_response_version(swap_response)
         swap_active_order = swap_response.get("active_candidate_order")
-        swap_read_order = None
+        swap_basic_order = None
         if isinstance(swap_active_order, dict):
-            swap_read_order = swap_active_order.get("read")
+            swap_basic_order = swap_active_order.get("basic")
         # Finding 2 (round 7): require exact hash, version, and full order match.
         swap_hash_matches = swap_new_hash == expected_swapped_hash
         swap_version_matches = swap_new_version == expected_swapped_version
         swap_order_matches = RA._candidate_order_matches(
-            swap_read_order, expected_swapped_full_order
+            swap_basic_order, expected_swapped_full_order
         )
         evidence["phases"]["swap_refresh"] = {
             "status_code": swap_status,
@@ -8847,7 +8847,7 @@ def _cfg003_transactional_refresh_test(  # noqa: PLR0915
             "hash_differs_from_original": (
                 bool(swap_new_hash) and swap_new_hash != original_semantic_hash
             ),
-            "active_candidate_order": swap_read_order,
+            "active_candidate_order": swap_basic_order,
             "order_matches_expected": swap_order_matches,
         }
         if swap_status != 200 or not swap_changed:
@@ -8894,7 +8894,7 @@ def _cfg003_transactional_refresh_test(  # noqa: PLR0915
                 evidence["failures"].extend(pre_swap_proof_failures)
             # Finding 2 (round 8): preserve the actually observed order in
             # readiness evidence for diagnostic clarity.
-            evidence["phases"]["pre_swap_proof_readiness"]["observed_active_order"] = swap_read_order
+            evidence["phases"]["pre_swap_proof_readiness"]["observed_active_order"] = swap_basic_order
 
         # Phase swap_proof.
         # Finding 2 (round 8): swap_proof runs ONLY when readiness, hash,
@@ -9002,14 +9002,14 @@ def _cfg003_transactional_refresh_test(  # noqa: PLR0915
                 # Finding 3: Prove active restored full candidate order from the
                 # authoritative refresh response (not a locally inferred order).
                 restored_order = restore_response.get("active_candidate_order")
-                restored_read_order = None
+                restored_basic_order = None
                 if isinstance(restored_order, dict):
-                    restored_read_order = restored_order.get("read")
+                    restored_basic_order = restored_order.get("basic")
                 # Finding 5: compare the EXACT complete ordered list against the
                 # full compiled candidate order -- no prefix acceptance, no
                 # extra tail, including anthropic_route_family and last_resort.
                 order_matches = RA._candidate_order_matches(
-                    restored_read_order, original_full_order
+                    restored_basic_order, original_full_order
                 )
                 restore_ok = restore_ok and order_matches
                 evidence["phases"]["restoration"] = {
@@ -9018,7 +9018,7 @@ def _cfg003_transactional_refresh_test(  # noqa: PLR0915
                     "restored_version": restore_version,
                     "hash_matches_original": restore_hash == original_semantic_hash,
                     "version_matches_original": restore_version == original_semantic_version,
-                    "restored_candidate_order": restored_read_order,
+                    "restored_candidate_order": restored_basic_order,
                     "expected_full_order": [
                         {
                             "provider": c["provider"],
@@ -10633,7 +10633,7 @@ def _cfg004_cooldown_clear_live_test(  # noqa: PLR0915
         prepare_payload: dict[str, Any] = {
             "operation": "prepare",
             "run_id": run_id,
-            "alias": "read",
+            "alias": "basic",
             "ingress": "codex",
             "provider": _CFG004_TARGET_PROVIDER,
             "model": _CFG004_TARGET_MODEL,
@@ -10824,11 +10824,11 @@ def _cfg004_cooldown_clear_live_test(  # noqa: PLR0915
             "require_parallel_batch": True,
             "child_terminal_marker": _tcv.get(
                 "child_terminal_marker",
-                "READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                "BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
             ),
             "parent_terminal_marker": _tcv.get(
                 "parent_terminal_marker",
-                "CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                "CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
             "expected_spawn_args": _tcv.get("expected_spawn_args") or {},
             "exact_child_prompt": _proof_case_cfg.get("exact_child_prompt") or "",
@@ -11410,12 +11410,12 @@ def main() -> int:  # noqa: PLR0915
 
     # CFG-003: Pre-TUI snapshot validation of operator assertions.
     # Validate asserted identities against the authoritative schedule-eligible
-    # read snapshot BEFORE any selected TUI case or refresh mutation.
+    # basic snapshot BEFORE any selected TUI case or refresh mutation.
     if args.cfg003_transactional_refresh and _cfg003_assertion_identities:
         try:
             _pre_tui_auth = RA._load_authoritative_startup_config()
             _pre_tui_eligible = RA._derive_eligible_candidates_from_snapshot(
-                _pre_tui_auth["snapshot"], alias_name="read"
+                _pre_tui_auth["snapshot"], alias_name="basic"
             )
         except Exception as _pre_tui_exc:  # noqa: BLE001
             _pre_tui_eligible = []

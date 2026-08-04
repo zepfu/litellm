@@ -338,7 +338,7 @@ async def test_rr054_31_same_candidate_lane_serializes_concurrent_cold_probes() 
     async def one(session_id: str) -> Any:
         return await _run_route_once(
             alias_family="codex_auto_agent",
-            alias_model="aawm-low",
+            alias_model="basic",
             session_id=session_id,
             select_candidate_fn=select_candidate_fn,
             perform_candidate_request_fn=perform_candidate_request_fn,
@@ -426,7 +426,7 @@ async def test_rr054_31_same_candidate_lane_success_probe_is_not_concurrent() ->
         *[
             _run_route_once(
                 alias_family="codex_auto_agent",
-                alias_model="aawm-low",
+                alias_model="basic",
                 session_id=f"ok-session-{i}",
                 select_candidate_fn=select_candidate_fn,
                 perform_candidate_request_fn=perform_candidate_request_fn,
@@ -504,7 +504,7 @@ async def test_rr054_31_waiter_skips_probe_after_leader_publishes_cooldown() -> 
     leader_task = asyncio.create_task(
         _run_route_once(
             alias_family="codex_auto_agent",
-            alias_model="aawm-low",
+            alias_model="basic",
             session_id="leader",
             select_candidate_fn=select_candidate_fn,
             perform_candidate_request_fn=perform_candidate_request_fn,
@@ -518,7 +518,7 @@ async def test_rr054_31_waiter_skips_probe_after_leader_publishes_cooldown() -> 
     follower_task = asyncio.create_task(
         _run_route_once(
             alias_family="codex_auto_agent",
-            alias_model="aawm-low",
+            alias_model="basic",
             session_id="follower",
             select_candidate_fn=select_candidate_fn,
             perform_candidate_request_fn=perform_candidate_request_fn,
@@ -624,7 +624,7 @@ async def test_rr054_31_distinct_candidates_or_lanes_probe_independently() -> No
     results = await asyncio.gather(
         _run_route_once(
             alias_family="codex_auto_agent",
-            alias_model="aawm-low",
+            alias_model="basic",
             session_id="lane-a",
             select_candidate_fn=select_a,
             perform_candidate_request_fn=perform_a,
@@ -634,7 +634,7 @@ async def test_rr054_31_distinct_candidates_or_lanes_probe_independently() -> No
         ),
         _run_route_once(
             alias_family="codex_auto_agent",
-            alias_model="aawm-low",
+            alias_model="basic",
             session_id="lane-b",
             select_candidate_fn=select_b,
             perform_candidate_request_fn=perform_b,
@@ -707,7 +707,7 @@ async def test_rr054_31_family_isolation_allows_parallel_probes_for_same_cooldow
     results = await asyncio.gather(
         _run_route_once(
             alias_family="codex_auto_agent",
-            alias_model="aawm-low",
+            alias_model="basic",
             session_id="family-codex",
             select_candidate_fn=select_fn,
             perform_candidate_request_fn=perform_codex,
@@ -717,7 +717,7 @@ async def test_rr054_31_family_isolation_allows_parallel_probes_for_same_cooldow
         ),
         _run_route_once(
             alias_family="anthropic_auto_agent",
-            alias_model="aawm-low-anthropic",
+            alias_model="basic",
             session_id="family-anth",
             select_candidate_fn=select_fn,
             perform_candidate_request_fn=perform_anth,
@@ -776,7 +776,7 @@ async def test_rr054_31_codex_wrapper_wires_probe_lock_path_for_concurrent_cold_
         async def one(session_id: str) -> Any:
             request = _minimal_request(session_id)
             body = {
-                "model": "aawm-low",
+                "model": "basic",
                 "input": [{"role": "user", "content": "hello"}],
                 "stream": False,
                 "litellm_metadata": {"session_id": session_id},
@@ -895,7 +895,7 @@ async def test_rr054_31_contention_variant_waiter_sees_cooldown_before_lock_rele
     leader_task = asyncio.create_task(
         _run_route_once(
             alias_family="codex_auto_agent",
-            alias_model="aawm-low",
+            alias_model="basic",
             session_id="contention-leader",
             select_candidate_fn=select_candidate_fn,
             perform_candidate_request_fn=perform_candidate_request_fn,
@@ -909,7 +909,7 @@ async def test_rr054_31_contention_variant_waiter_sees_cooldown_before_lock_rele
     follower_task = asyncio.create_task(
         _run_route_once(
             alias_family="codex_auto_agent",
-            alias_model="aawm-low",
+            alias_model="basic",
             session_id="contention-follower",
             select_candidate_fn=select_candidate_fn,
             perform_candidate_request_fn=perform_candidate_request_fn,

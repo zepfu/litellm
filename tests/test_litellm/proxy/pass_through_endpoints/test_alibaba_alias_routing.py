@@ -9,6 +9,11 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     cooldown_state,
     policy,
     selection,
+    snapshot_select,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+    DEFAULT_CONFIG_DIR,
+    compile_directory,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     alias_routing_state,
@@ -67,6 +72,8 @@ def _anthropic_body(alias: str, *, continuation: bool = False) -> dict[str, Any]
 
 @pytest.fixture(autouse=True)
 def _reset_alibaba_alias_state() -> None:
+    previous_snapshot = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(compile_directory(DEFAULT_CONFIG_DIR))
     alias_routing_state.codex.cooldown_until_monotonic_by_key.clear()
     alias_routing_state.anthropic.cooldown_until_monotonic_by_key.clear()
     alias_routing_state.codex.cooldown_negative_until_monotonic_by_key.clear()
@@ -80,28 +87,34 @@ def _reset_alibaba_alias_state() -> None:
     alias_routing_state.anthropic.cooldown_negative_until_monotonic_by_key.clear()
     alias_routing_state.codex.session_affinity_by_key.clear()
     alias_routing_state.anthropic.session_affinity_by_key.clear()
+    snapshot_select.set_active_routing_snapshot(previous_snapshot)
 
 
 def test_should_register_all_alibaba_aliases_for_both_ingresses() -> None:
     expected_models = {
-        "aawm-sota-alibaba": [
-            "alibaba_token_plan/qwen3.8-max-preview",
+        "sota-alibaba": [
+            "alibaba_token_plan/qwen3.8-max",
             "alibaba_token_plan/qwen3.7-max",
         ],
-        "aawm-sota-deepseek": ["alibaba_token_plan/deepseek-v4-pro"],
-        "aawm-sota-glm": ["alibaba_token_plan/glm-5.2"],
+        "sota-deepseek": ["alibaba_token_plan/deepseek-v4-pro"],
     }
 
     for alias, models in expected_models.items():
-        assert [candidate["model"] for candidate in policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS[alias]] == models
-        assert [candidate["model"] for candidate in policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS[alias]] == models
+        codex_candidates = snapshot_select._get_codex_auto_agent_candidates_for_alias(
+            alias
+        )
+        anthropic_candidates = (
+            selection._get_anthropic_candidates_for_alias_snapshot_aware(alias)
+        )
+        assert [candidate["model"] for candidate in codex_candidates] == models
+        assert [candidate["model"] for candidate in anthropic_candidates] == models
         assert all(
             candidate["provider"] == "alibaba_token_plan"
-            for candidate in policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS[alias]
+            for candidate in codex_candidates
         )
         assert all(
             candidate["provider"] == "alibaba_token_plan"
-            for candidate in policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS[alias]
+            for candidate in anthropic_candidates
         )
 
 
@@ -116,18 +129,12 @@ def test_should_place_qwen_flash_immediately_before_kimi_and_terminal_fallback()
         "kimi_code/kimi-for-coding",
         "claude-haiku-4-5-20251001",
     ]
-    assert [candidate["model"] for candidate in policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS["aawm-sota-moonshot"]] == [
-        "kimi_code/k3-max",
-        "kimi_code/k3-high",
-    ]
-
-
 @pytest.mark.asyncio
 async def test_should_preserve_alibaba_continuation_affinity_per_ingress() -> None:
     codex_request = _request("/v1/responses")
     codex_initial = await selection._select_codex_auto_agent_candidate(
         request=codex_request,
-        request_body=_codex_body("aawm-sota-alibaba"),
+        request_body=_codex_body("sota-alibaba"),
     )
     await cooldown_state._set_codex_auto_agent_session_affinity(
         codex_initial["session_key"],
@@ -135,13 +142,13 @@ async def test_should_preserve_alibaba_continuation_affinity_per_ingress() -> No
     )
     codex_continuation = await selection._select_codex_auto_agent_candidate(
         request=codex_request,
-        request_body=_codex_body("aawm-sota-alibaba", continuation=True),
+        request_body=_codex_body("sota-alibaba", continuation=True),
     )
 
     anthropic_request = _request("/v1/messages")
     anthropic_initial = await selection._select_anthropic_auto_agent_candidate(
         request=anthropic_request,
-        request_body=_anthropic_body("aawm-sota-alibaba"),
+        request_body=_anthropic_body("sota-alibaba"),
     )
     await cooldown_state._set_anthropic_auto_agent_session_affinity(
         anthropic_initial["session_key"],
@@ -149,12 +156,15 @@ async def test_should_preserve_alibaba_continuation_affinity_per_ingress() -> No
     )
     anthropic_continuation = await selection._select_anthropic_auto_agent_candidate(
         request=anthropic_request,
-        request_body=_anthropic_body("aawm-sota-alibaba", continuation=True),
+        request_body=_anthropic_body("sota-alibaba", continuation=True),
     )
 
-    assert codex_continuation["candidate"]["model"] == ("alibaba_token_plan/qwen3.8-max-preview")
+    assert codex_continuation["candidate"]["model"] == "alibaba_token_plan/qwen3.8-max"
     assert codex_continuation["selection_reason"] == "session_affinity"
-    assert anthropic_continuation["candidate"]["model"] == ("alibaba_token_plan/qwen3.8-max-preview")
+    assert (
+        anthropic_continuation["candidate"]["model"]
+        == "alibaba_token_plan/qwen3.8-max"
+    )
     assert anthropic_continuation["selection_reason"] == "session_affinity"
 
 

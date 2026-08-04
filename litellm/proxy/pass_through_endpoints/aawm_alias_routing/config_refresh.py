@@ -25,7 +25,10 @@ from .config_compiler import (
     ConfigCompileError as _AawmAliasConfigCompileError,
     compile_yaml as _compile_aawm_alias_routing_yaml,
 )
-from .config_snapshot import RoutingSnapshot as _RoutingSnapshot
+from .config_snapshot import (
+    AliasReference as _AliasReference,
+    RoutingSnapshot as _RoutingSnapshot,
+)
 from .snapshot_select import (
     get_active_routing_snapshot,
     set_active_routing_snapshot,
@@ -35,9 +38,9 @@ from .snapshot_select import (
 # Constants
 # ---------------------------------------------------------------------------
 # Path relative to this file: aawm_alias_routing/ -> pass_through_endpoints/
-# -> proxy/ -> proxy/aawm_alias_config/read.yaml
+# -> proxy/ -> proxy/aawm_alias_config/basic.yaml
 _DEFAULT_AAWM_ALIAS_CONFIG_PATH = (
-    Path(__file__).resolve().parents[2] / "aawm_alias_config" / "read.yaml"
+    Path(__file__).resolve().parents[2] / "aawm_alias_config" / "basic.yaml"
 )
 
 
@@ -64,6 +67,15 @@ def _snapshot_candidate_order(snapshot: Any) -> dict[str, list[dict[str, Any]]]:
         alias = aliases[alias_name]
         candidates: list[dict[str, Any]] = []
         for cand in alias.candidates:
+            if isinstance(cand, _AliasReference):
+                candidates.append(
+                    {
+                        "alias_reference": cand.alias_name,
+                        "priority": cand.priority,
+                        "last_resort": cand.priority == 0,
+                    }
+                )
+                continue
             identity: dict[str, Any] = {
                 "provider": cand.provider,
                 "model": cand.model,

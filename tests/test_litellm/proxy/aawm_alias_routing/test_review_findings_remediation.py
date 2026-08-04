@@ -74,7 +74,7 @@ def _reset_alias_routing_ambient_state():
     """Neutralize shared/process-global cooldown, affinity, and snapshot state.
 
     Mirrors ``clear_codex_auto_agent_alias_state`` /
-    ``test_read_pilot_shadow_parity``'s reset fixture so these tests cannot
+    ``test_basic_pilot_shadow_parity``'s reset fixture so these tests cannot
     flap on state left over from other tests in the same process.
     """
     previous_snapshot = snapshot_select.get_active_routing_snapshot()
@@ -89,7 +89,7 @@ def _reset_alias_routing_ambient_state():
 _SNAPSHOT_YAML = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: openrouter/snapshot-only-model
@@ -103,32 +103,32 @@ aliases:
 
 
 # ---------------------------------------------------------------------------
-# Finding #1: ``read`` is unreachable through the live model-normalization
-# path -- ``_normalize_codex_auto_agent_alias_model`` only recognizes keys of
-# ``_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS``, which has no ``read`` key, so
-# the getter's snapshot-driven ``read`` branch is dead code from any live
-# request.
+# Finding #1: the maintained ``basic`` alias must remain reachable through the
+# live model-normalization path, while the retired exact name ``read`` must not
+# normalize or receive static candidates.
 # ---------------------------------------------------------------------------
 
 
-def test_read_is_recognized_as_a_codex_auto_agent_alias_model() -> None:
-    """``read`` must be recognized by the live alias-model normalizer."""
-    assert model_resolution._is_codex_auto_agent_alias_model("read") is True
+def test_basic_is_recognized_as_a_codex_auto_agent_alias_model() -> None:
+    """``basic`` must be recognized by the live alias-model normalizer."""
+    assert model_resolution._is_codex_auto_agent_alias_model("basic") is True
 
 
-def test_read_resolves_through_the_live_request_body_resolver() -> None:
-    """A real inbound request body with ``model: "read"`` must resolve to "read"."""
+def test_retired_read_does_not_resolve_or_receive_candidates() -> None:
+    """The retired exact name must fail closed before any fallback."""
     request_body = {"model": "read"}
     resolved = model_resolution._resolve_codex_auto_agent_alias_model(request_body, "/v1/responses")
-    assert resolved == "read"
+    assert resolved is None
+    assert model_resolution._is_codex_auto_agent_alias_model("read") is False
+    assert snapshot_select._get_codex_auto_agent_candidates_for_alias("read") == ()
 
 
-def test_recognized_read_routes_to_snapshot_derived_candidates() -> None:
-    """Once reachable, a recognized ``read`` alias must resolve from the active snapshot."""
+def test_recognized_basic_routes_to_snapshot_derived_candidates() -> None:
+    """Once reachable, a recognized ``basic`` alias must resolve from the active snapshot."""
     snapshot = compiler.compile_yaml(_SNAPSHOT_YAML)
     snapshot_select.set_active_routing_snapshot(snapshot)
 
-    alias_model = model_resolution._resolve_codex_auto_agent_alias_model({"model": "read"}, "/v1/responses")
+    alias_model = model_resolution._resolve_codex_auto_agent_alias_model({"model": "basic"}, "/v1/responses")
     assert alias_model is not None
     candidates = snapshot_select._get_codex_auto_agent_candidates_for_alias(alias_model)
     models = [c["model"] for c in candidates]
@@ -140,16 +140,16 @@ def test_recognized_read_routes_to_snapshot_derived_candidates() -> None:
 # legacy ``apply_cooldown_fn`` path stays authoritative for what cooldown is
 # actually applied, regardless of what the gate decided.
 #
-# ROUND 2 update: the original reproductions here hand-built ``read_pilot:``
-# keys and called ``_record_read_pilot_cooldown_evidence`` directly -- exactly
+# ROUND 2 update: the original reproductions here hand-built ``basic_pilot:``
+# keys and called ``_record_basic_pilot_cooldown_evidence`` directly -- exactly
 # the shell the live path never exercised. The authoritative live-path
 # reproductions now live in ``test_round2_live_path_remediation.py``
-# (``test_live_read_lane_structured_429_cools_with_gate_duration`` and
-# ``test_live_read_lane_single_marker_failure_does_not_cool``), which drive the
+# (``test_live_basic_lane_structured_429_cools_with_gate_duration`` and
+# ``test_live_basic_lane_single_marker_failure_does_not_cool``), which drive the
 # real Codex retry handler so the live sequence builds the
 # ``provider:model:lane`` key and records evidence on its own. The two
 # gate-unit checks below are retained only as direct-gate assertions and no
-# longer hand-build a ``read_pilot:`` key or assert applied-cooldown behavior.
+# longer hand-build a ``basic_pilot:`` key or assert applied-cooldown behavior.
 # ---------------------------------------------------------------------------
 
 
@@ -184,7 +184,7 @@ def test_gate_structured_429_cools_with_retry_after_duration() -> None:
 
 # ---------------------------------------------------------------------------
 # Finding #3: proportional weighting is defined (``_select_proportional_snapshot_candidate``)
-# but never invoked from the live selector -- ``_select_read_pilot_snapshot_candidates``
+# but never invoked from the live selector -- ``_select_basic_pilot_snapshot_candidates``
 # always returns priority-ordered candidates regardless of ``distribution_strategy``.
 # ---------------------------------------------------------------------------
 
@@ -196,7 +196,7 @@ def test_live_selection_distribution_matches_declared_weights() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     distribution_strategy: proportional
     candidates:
       - provider: openrouter
@@ -216,7 +216,7 @@ aliases:
     counts: dict[str, int] = {"a": 0, "b": 0}
     n_trials = 2000
     for _ in range(n_trials):
-        selected = snapshot_select._select_read_pilot_snapshot_candidates()
+        selected = snapshot_select._select_basic_pilot_snapshot_candidates()
         top_model = selected[0]["model"]
         counts[top_model] = counts.get(top_model, 0) + 1
 
@@ -239,7 +239,7 @@ def test_live_getter_threads_client_product_label_into_tui_filter() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: claude-only-model
@@ -256,7 +256,7 @@ aliases:
 
     # No client_product_label supplied -- must default to "no known TUI",
     # excluding the tui_attached candidate.
-    candidates = snapshot_select._get_codex_auto_agent_candidates_for_alias("read")
+    candidates = snapshot_select._get_codex_auto_agent_candidates_for_alias("basic")
     models = [c["model"] for c in candidates]
     assert "claude-only-model" not in models
 
@@ -266,7 +266,7 @@ aliases:
     # proves the threading is real (not just an exclusion default that would
     # pass vacuously even if client_product_label were silently dropped).
     candidates_with_claude_label = snapshot_select._get_codex_auto_agent_candidates_for_alias(
-        "read",
+        "basic",
         client_product_label="Claude/1.2",
     )
     models_with_claude_label = [c["model"] for c in candidates_with_claude_label]
@@ -280,7 +280,7 @@ def test_all_ineligible_candidates_fail_closed_not_unfiltered() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: claude-only-model
@@ -291,7 +291,7 @@ aliases:
     snapshot = compiler.compile_yaml(raw)
     snapshot_select.set_active_routing_snapshot(snapshot)
 
-    selected = snapshot_select._select_read_pilot_snapshot_candidates(client_product_label=None)
+    selected = snapshot_select._select_basic_pilot_snapshot_candidates(client_product_label=None)
     models = [c["model"] for c in selected]
     # Fail-closed: the ineligible tui_attached-only candidate must not be
     # returned once all candidates are ineligible.
@@ -321,7 +321,7 @@ async def test_valid_string_yaml_payload_still_returns_200() -> None:
     valid_yaml = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: openrouter/refresh-review-findings-model
@@ -348,13 +348,13 @@ def test_schema_rejects_duplicate_alias_names() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: gpt-5.4-mini
         route_family: codex_responses
         priority: 0
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: gpt-5.4-mini
@@ -369,7 +369,7 @@ def test_schema_rejects_duplicate_models_within_an_alias() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: gpt-5.4-mini
@@ -388,7 +388,7 @@ def test_schema_rejects_negative_weights() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: gpt-5.4-mini
@@ -404,7 +404,7 @@ def test_schema_rejects_empty_candidate_lists() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates: []
 """
     with pytest.raises(Exception):
@@ -415,7 +415,7 @@ def test_schema_rejects_inverted_schedule_windows() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: gpt-5.4-mini
@@ -435,7 +435,7 @@ def test_compiled_snapshot_aliases_mapping_is_immutable() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: gpt-5.4-mini
@@ -444,7 +444,7 @@ aliases:
 """
     snapshot = compiler.compile_yaml(raw)
     with pytest.raises((TypeError, AttributeError)):
-        snapshot.aliases["read"] = None  # type: ignore[index]
+        snapshot.aliases["basic"] = None  # type: ignore[index]
 
 
 def test_compiled_snapshot_aliases_attribute_reassignment_raises() -> None:
@@ -452,7 +452,7 @@ def test_compiled_snapshot_aliases_attribute_reassignment_raises() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: gpt-5.4-mini
@@ -471,7 +471,7 @@ def test_active_snapshot_reference_unaffected_by_dict_holder_leak() -> None:
     raw = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openai
         model: gpt-5.4-mini
@@ -483,4 +483,4 @@ aliases:
     active = config_snapshot.get_active_snapshot()
     assert active is not None
     with pytest.raises((TypeError, AttributeError)):
-        active.aliases["read"] = None  # type: ignore[index]
+        active.aliases["basic"] = None  # type: ignore[index]

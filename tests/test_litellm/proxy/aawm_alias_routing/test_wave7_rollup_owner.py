@@ -138,8 +138,8 @@ class TestResolveOutgoingTarget:
 
 class TestModelRollupLabel:
     def test_model_and_alias_differ(self):
-        event = {"model": "gpt-4o", "alias_model": "aawm-codex-agent-auto"}
-        assert _auto_agent_alias_model_rollup_label(event) == "gpt-4o(aawm-codex-agent-auto)"
+        event = {"model": "gpt-4o", "alias_model": "basic"}
+        assert _auto_agent_alias_model_rollup_label(event) == "gpt-4o(basic)"
 
     def test_model_and_alias_same(self):
         event = {"model": "gpt-4o", "alias_model": "gpt-4o"}
@@ -150,8 +150,8 @@ class TestModelRollupLabel:
         assert _auto_agent_alias_model_rollup_label(event) == "gpt-4o"
 
     def test_alias_only(self):
-        event = {"alias_model": "aawm-codex-agent-auto"}
-        assert _auto_agent_alias_model_rollup_label(event) == "aawm-codex-agent-auto"
+        event = {"alias_model": "basic"}
+        assert _auto_agent_alias_model_rollup_label(event) == "basic"
 
     def test_neither(self):
         assert _auto_agent_alias_model_rollup_label({}) is None
@@ -350,7 +350,7 @@ class TestRecordRouteStatusRollup:
     def _make_event(self, **overrides: Any) -> dict[str, Any]:
         base: dict[str, Any] = {
             "event_type": "no_candidate_available",
-            "alias_model": "aawm-codex-agent-auto",
+            "alias_model": "basic",
             "model": "gpt-4o",
             "rollup_group_header_label": "myrepo",
             "host_name": "myhost",
@@ -371,7 +371,7 @@ class TestRecordRouteStatusRollup:
         _record_auto_agent_alias_route_status_rollup(event)
 
         mock_emit.assert_called_once_with(
-            alias_model="aawm-codex-agent-auto",
+            alias_model="basic",
             model_label="gpt-4o",
             status="Exhausted",
             message="route status changed",
@@ -380,7 +380,7 @@ class TestRecordRouteStatusRollup:
             group_header_label="myrepo@myhost",
             incoming_endpoint="/v1/chat/completions",
             outgoing_target="opencode.ai/zen/v1/chat/completions",
-            model_label="gpt-4o(aawm-codex-agent-auto)",
+            model_label="gpt-4o(basic)",
             turns=0,
             status="Exhausted",
             message=None,

@@ -380,7 +380,7 @@ class TestRedispatchErrors:
                 lane_key="openai:primary",
                 cooldown_seconds=60.0,
                 error_tokens={"429", "RATE_LIMIT_EXCEEDED"},
-                alias_model="aawm-codex-agent-auto",
+                alias_model="basic",
                 error_class="rate_limited",
             )
         exc = exc_info.value
@@ -399,7 +399,7 @@ class TestRedispatchErrors:
                 lane_key=None,
                 cooldown_seconds=45.0,
                 error_tokens=set(),
-                alias_model="aawm-anthropic-agent-auto",
+                alias_model="basic",
             )
         exc = exc_info.value
         assert exc.status_code == 429
@@ -432,7 +432,7 @@ class TestCodexSelectorFirstChoice:
         ):
             result = await selection._select_codex_auto_agent_candidate(
                 request=request,
-                request_body={"model": "aawm-codex-agent-auto"},
+                request_body={"model": "basic"},
             )
         assert result["selection_reason"] == "first_available"
         assert result["candidate"]["provider"] == "openai"
@@ -473,7 +473,7 @@ class TestCodexSelectorLastResort:
         ):
             result = await selection._select_codex_auto_agent_candidate(
                 request=request,
-                request_body={"model": "aawm-codex-agent-auto"},
+                request_body={"model": "basic"},
             )
         assert result["selection_reason"] == "last_resort"
         assert result["candidate"]["provider"] == "xai"
@@ -508,7 +508,7 @@ class TestCodexSelectorAllCooled:
             with pytest.raises(HTTPException) as exc_info:
                 await selection._select_codex_auto_agent_candidate(
                     request=request,
-                    request_body={"model": "aawm-codex-agent-auto"},
+                    request_body={"model": "basic"},
                 )
         exc = exc_info.value
         assert exc.status_code == 429
@@ -545,7 +545,7 @@ class TestCodexSelectorRequestLocalExclusion:
         ):
             result = await selection._select_codex_auto_agent_candidate(
                 request=request,
-                request_body={"model": "aawm-codex-agent-auto"},
+                request_body={"model": "basic"},
             )
         # openai excluded, xai selected
         assert result["candidate"]["provider"] == "xai"
@@ -571,7 +571,7 @@ class TestAnthropicSelectorFirstChoice:
 
         result = await selection._select_anthropic_auto_agent_candidate(
             request=request,
-            request_body={"model": "aawm-anthropic-agent-auto"},
+            request_body={"model": "basic"},
         )
         assert result["selection_reason"] == "first_available"
         assert result["candidate"]["provider"] == "anthropic"
@@ -607,7 +607,7 @@ class TestAnthropicSelectorAllCooled:
         with pytest.raises(HTTPException) as exc_info:
             await selection._select_anthropic_auto_agent_candidate(
                 request=request,
-                request_body={"model": "aawm-anthropic-agent-auto"},
+                request_body={"model": "basic"},
             )
         exc = exc_info.value
         assert exc.status_code == 429
@@ -660,7 +660,7 @@ class TestAnthropicInFlight:
         with pytest.raises(HTTPException) as exc_info:
             await selection._select_anthropic_auto_agent_candidate(
                 request=request,
-                request_body={"model": "aawm-anthropic-agent-auto"},
+                request_body={"model": "basic"},
             )
         exc = exc_info.value
         assert exc.status_code == 429
@@ -705,7 +705,7 @@ class TestCodexRedispatch:
             with pytest.raises(HTTPException) as exc_info:
                 await selection._select_codex_auto_agent_candidate(
                     request=request,
-                    request_body={"model": "aawm-codex-agent-auto"},
+                    request_body={"model": "basic"},
                 )
         exc = exc_info.value
         assert exc.status_code == 429
@@ -752,7 +752,7 @@ class TestCodexRedispatch:
             with pytest.raises(HTTPException) as exc_info:
                 await selection._select_codex_auto_agent_candidate(
                     request=request,
-                    request_body={"model": "aawm-codex-agent-auto"},
+                    request_body={"model": "basic"},
                 )
 
         detail = exc_info.value.detail
@@ -812,7 +812,7 @@ class TestKimiManagedAccount:
 class TestNormalizeAnthropicAlias:
     def test_normalizes_case_insensitive(self):
         result = selection._normalize_anthropic_auto_agent_alias_model("AAWM-ANTHROPIC-AGENT-AUTO")
-        assert result == "aawm-anthropic-agent-auto"
+        assert result == "basic"
 
     def test_returns_none_for_unknown(self):
         assert selection._normalize_anthropic_auto_agent_alias_model("unknown-model") is None

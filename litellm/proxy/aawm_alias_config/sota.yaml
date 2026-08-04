@@ -1,0 +1,17 @@
+defaults: {}
+
+aliases:
+  - name: sota
+    dispatch:
+      by_tui:
+        - tui_family: codex
+          target_alias: sota-openai
+        - tui_family: grok
+          target_alias: sota-xai
+        - tui_family: qwen
+          target_alias: sota-alibaba
+        - tui_family: kimi
+          target_alias: sota-moonshot
+      default: sota-openai
+      blocked_tui_families:
+        - claude

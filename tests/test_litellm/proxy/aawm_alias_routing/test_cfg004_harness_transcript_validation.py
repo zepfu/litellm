@@ -59,7 +59,7 @@ _EXACT_CHILD_PROMPT = (
     "parallel batch with no text: pwd, git rev-parse --show-toplevel, git status --short. "
     "All commands must run in the repository root. Do not wait for one result before "
     "issuing the other calls. After all three results succeed, use no more tools and "
-    "return exactly READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED with no other text, no "
+    "return exactly BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED with no other text, no "
     "Markdown, no code fences, and no explanation."
 )
 
@@ -111,9 +111,9 @@ def _make_parent_transcript(
                 "name": "spawn_agent",
                 "namespace": "collaboration",
                 "arguments": json.dumps({
-                    "task_name": "read_alias_child",
+                    "task_name": "basic_alias_child",
                     "agent_type": "opencode",
-                    "model": "read",
+                    "model": "basic",
                     "fork_turns": "none",
                     "message": spawn_message,
                 }),
@@ -133,7 +133,7 @@ def _make_parent_transcript(
                     "event_id": "call_spawn_1",
                     "occurred_at_ms": 1785650278814,
                     "agent_thread_id": child_thread_id,
-                    "agent_path": "/root/read_alias_child",
+                    "agent_path": "/root/basic_alias_child",
                     "kind": "started",
                 },
             })
@@ -145,7 +145,7 @@ def _make_parent_transcript(
                 "id": "fco_spawn_1",
                 "call_id": "call_spawn_1",
                 "output": json.dumps(
-                    {"task_name": "/root/read_alias_child"}
+                    {"task_name": "/root/basic_alias_child"}
                 ),
                 "internal_chat_message_metadata_passthrough": {
                     "turn_id": turn_id,
@@ -191,13 +191,13 @@ def _make_parent_transcript(
         "payload": {
             "type": "agent_message",
             "id": "amsg_inbound_1",
-            "author": "/root/read_alias_child",
+            "author": "/root/basic_alias_child",
             "recipient": "/root",
             "content": [
                 {
                     "type": "input_text",
                     "text": "Message Type: FINAL_ANSWER\nTask name: /root\n"
-                    "Sender: /root/read_alias_child\nPayload:\nCOMPLETE",
+                    "Sender: /root/basic_alias_child\nPayload:\nCOMPLETE",
                 }
             ],
             "internal_chat_message_metadata_passthrough": {
@@ -285,7 +285,7 @@ def _make_child_transcript(
                         "thread_spawn": {
                             "parent_thread_id": parent_thread_id,
                             "depth": 1,
-                            "agent_path": "/root/read_alias_child",
+                            "agent_path": "/root/basic_alias_child",
                             "agent_nickname": "Boyle",
                             "agent_role": "opencode",
                         }
@@ -335,12 +335,12 @@ def _make_child_transcript(
             "type": "agent_message",
             "id": "amsg_newtask_1",
             "author": "/root",
-            "recipient": "/root/read_alias_child",
+            "recipient": "/root/basic_alias_child",
             "content": [
                 {
                     "type": "input_text",
                     "text": "Message Type: NEW_TASK\n"
-                    "Task name: /root/read_alias_child\n"
+                    "Task name: /root/basic_alias_child\n"
                     "Sender: /root\nPayload:\n" + _inbound_text,
                 }
             ],
@@ -695,7 +695,7 @@ class TestTranscriptParsing:
         assert failures == []
         assert summary["session_id"] == thread_id
         assert len(summary["spawn_calls"]) == 1
-        assert summary["spawn_calls"][0]["task_name"] == "/root/read_alias_child"
+        assert summary["spawn_calls"][0]["task_name"] == "/root/basic_alias_child"
         assert summary["spawn_calls"][0]["child_thread_id"] == child_id
         assert len(summary["wait_calls"]) == 1
         assert summary["wait_calls"][0]["timed_out"] is False
@@ -861,7 +861,7 @@ class TestTranscriptCollaborationValidation:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
         )
         _write_jsonl(
@@ -874,7 +874,7 @@ class TestTranscriptCollaborationValidation:
                     "git rev-parse --show-toplevel",
                     "git status --short",
                 ],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
             ),
         )
 
@@ -890,10 +890,10 @@ class TestTranscriptCollaborationValidation:
                 ],
                 "require_parallel_batch": True,
                 "child_terminal_marker": (
-                    "READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED"
+                    "BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED"
                 ),
                 "parent_terminal_marker": (
-                    "CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED"
+                    "CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED"
                 ),
             },
             sessions_dir=sessions,
@@ -1011,8 +1011,8 @@ _FULL_CHECKS = {
         "git status --short",
     ],
     "require_parallel_batch": True,
-    "child_terminal_marker": "READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
-    "parent_terminal_marker": "CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+    "child_terminal_marker": "BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+    "parent_terminal_marker": "CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
 }
 
 
@@ -1040,7 +1040,7 @@ class TestTranscriptNegativeCases:
                 child_thread_id=child_id,
                 parent_marker=pk.pop(
                     "parent_marker",
-                    "CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                    "CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
                 ),
                 **pk,
             ),
@@ -1057,7 +1057,7 @@ class TestTranscriptNegativeCases:
                 ]),
                 terminal_marker=ck.pop(
                     "terminal_marker",
-                    "READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                    "BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
                 ),
                 **ck,
             ),
@@ -1175,7 +1175,7 @@ class TestTranscriptNegativeCases:
                 "recipient": "/root",
                 "content": [{
                     "type": "input_text",
-                    "text": "CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                    "text": "CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
                 }],
             },
         })
@@ -1189,7 +1189,7 @@ class TestTranscriptNegativeCases:
                 child_id,
                 thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
             ),
         )
         _, failures = HARNESS._cfg004_validate_transcript_collaboration(
@@ -1198,7 +1198,7 @@ class TestTranscriptNegativeCases:
                 "require_spawn_and_wait": True,
                 "minimum_child_commands": 1,
                 "parent_terminal_marker": (
-                    "CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED"
+                    "CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED"
                 ),
             },
             sessions_dir=sessions,
@@ -1420,14 +1420,14 @@ _FULL_CHECKS_V2 = {
     **_FULL_CHECKS,
     "expected_spawn_args": {
         "agent_type": "opencode",
-        "model": "read",
+        "model": "basic",
         "fork_turns": "none",
     },
     "exact_child_prompt": _EXACT_CHILD_PROMPT,
     "reject_encrypted_message_prefix": "gAAAA",
     "expected_child_identity": {
         "agent_role": "opencode",
-        "requested_alias": "read",
+        "requested_alias": "basic",
         "resolved_model": "opencode_zen/big-pickle",
         "sandbox": "read-only",
         "cli_version": "nonempty",
@@ -1458,7 +1458,7 @@ class TestSpawnArgsValidation:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
                 spawn_message=spawn_message,
             ),
         )
@@ -1472,7 +1472,7 @@ class TestSpawnArgsValidation:
                     "git rev-parse --show-toplevel",
                     "git status --short",
                 ],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
             ),
         )
         return HARNESS._cfg004_validate_transcript_collaboration(
@@ -1496,7 +1496,7 @@ class TestSpawnArgsValidation:
         parent_lines = _make_parent_transcript(
             thread_id,
             child_thread_id=child_id,
-            parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+            parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
         )
         # Patch the spawn arguments to have wrong agent_type.
         for line in parent_lines:
@@ -1517,7 +1517,7 @@ class TestSpawnArgsValidation:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
             ),
         )
         _, failures = HARNESS._cfg004_validate_transcript_collaboration(
@@ -1536,7 +1536,7 @@ class TestSpawnArgsValidation:
         parent_lines = _make_parent_transcript(
             thread_id,
             child_thread_id=child_id,
-            parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+            parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
         )
         for line in parent_lines:
             if (
@@ -1556,7 +1556,7 @@ class TestSpawnArgsValidation:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
             ),
         )
         _, failures = HARNESS._cfg004_validate_transcript_collaboration(
@@ -1585,7 +1585,7 @@ class TestMessageRejection:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
                 spawn_message=spawn_message,
             ),
         )
@@ -1594,7 +1594,7 @@ class TestMessageRejection:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
             ),
         )
         return HARNESS._cfg004_validate_transcript_collaboration(
@@ -1638,7 +1638,7 @@ class TestChildIdentityValidation:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
         )
         _write_jsonl(
@@ -1646,7 +1646,7 @@ class TestChildIdentityValidation:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
             ),
         )
         _, failures = HARNESS._cfg004_validate_transcript_collaboration(
@@ -1667,14 +1667,14 @@ class TestChildIdentityValidation:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
         )
         # Build child with wrong agent_role.
         child_lines = _make_child_transcript(
             child_id, thread_id,
             command_list=["pwd"],
-            terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+            terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
         )
         for line in child_lines:
             if line.get("type") == "session_meta":
@@ -1704,7 +1704,7 @@ class TestTaskCompleteOrdering:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
         )
         _write_jsonl(
@@ -1712,7 +1712,7 @@ class TestTaskCompleteOrdering:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
             ),
         )
         summary, failures = HARNESS._cfg004_validate_transcript_collaboration(
@@ -1733,7 +1733,7 @@ class TestTaskCompleteOrdering:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
         )
         # Child with terminal_marker=None means no task_complete event.
@@ -1771,7 +1771,7 @@ class TestTaskCompleteOrdering:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
             ),
         )
         _, failures = HARNESS._cfg004_validate_transcript_collaboration(
@@ -1795,7 +1795,7 @@ class TestChildInboundPromptValidation:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
         )
         _write_jsonl(
@@ -1803,7 +1803,7 @@ class TestChildInboundPromptValidation:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
                 inbound_prompt=_EXACT_CHILD_PROMPT,
             ),
         )
@@ -1825,7 +1825,7 @@ class TestChildInboundPromptValidation:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
         )
         _write_jsonl(
@@ -1833,7 +1833,7 @@ class TestChildInboundPromptValidation:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
                 encrypted_inbound=True,
             ),
         )
@@ -1854,7 +1854,7 @@ class TestChildInboundPromptValidation:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
         )
         _write_jsonl(
@@ -1862,7 +1862,7 @@ class TestChildInboundPromptValidation:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
                 inbound_prompt="Completely different prompt text",
             ),
         )
@@ -1889,13 +1889,13 @@ class TestChildInboundPromptValidation:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
         )
         child_lines = _make_child_transcript(
             child_id, thread_id,
             command_list=["pwd"],
-            terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+            terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
         )
         for _line in child_lines:
             _payload = _line.get("payload") or {}
@@ -1904,7 +1904,7 @@ class TestChildInboundPromptValidation:
                     {
                         "type": "input_text",
                         "text": "Message Type: NEW_TASK\n"
-                        "Task name: /root/read_alias_child\n"
+                        "Task name: /root/basic_alias_child\n"
                         "Sender: /root\nPayload:\n",
                     },
                     {
@@ -1931,8 +1931,8 @@ class TestChildInboundPromptValidation:
 class TestAliasVsResolvedModel:
     """Validate alias-vs-resolved-model distinction is preserved."""
 
-    def test_spawn_model_read_vs_child_resolved(self, tmp_path: pathlib.Path):
-        """spawn_agent model=read (public alias) while child resolves to
+    def test_spawn_model_basic_vs_child_resolved(self, tmp_path: pathlib.Path):
+        """spawn_agent model=basic (public alias) while child resolves to
         opencode_zen/big-pickle from codex_opencode_agent.toml."""
         sessions = tmp_path / "sessions"
         date_dir = sessions / "2026" / "08" / "02"
@@ -1943,7 +1943,7 @@ class TestAliasVsResolvedModel:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
         )
         _write_jsonl(
@@ -1951,7 +1951,7 @@ class TestAliasVsResolvedModel:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
             ),
         )
         summary, failures = HARNESS._cfg004_validate_transcript_collaboration(
@@ -1959,17 +1959,17 @@ class TestAliasVsResolvedModel:
             checks=dict(_FULL_CHECKS_V2),
             sessions_dir=sessions,
         )
-        # Verify spawn args preserve alias "read".
+        # Verify spawn args preserve alias "basic".
         parent_t = summary.get("parent_transcript") or {}
         spawn_args_list = parent_t.get("spawn_arguments") or []
         assert len(spawn_args_list) == 1
-        assert spawn_args_list[0]["model"] == "read"
+        assert spawn_args_list[0]["model"] == "basic"
         assert spawn_args_list[0]["agent_type"] == "opencode"
         # Child identity preserves role and alias/upstream distinction.
         child_t = summary.get("child_transcript") or {}
         child_ident = child_t.get("session_identity") or {}
         assert child_ident.get("agent_role") == "opencode"
-        assert child_ident.get("requested_alias") == "read"
+        assert child_ident.get("requested_alias") == "basic"
         assert child_ident.get("resolved_model") == "opencode_zen/big-pickle"
         assert child_ident.get("sandbox") == "read-only"
         # No identity failures.
@@ -1987,7 +1987,7 @@ class TestAliasVsResolvedModel:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
         )
         _write_jsonl(
@@ -1995,7 +1995,7 @@ class TestAliasVsResolvedModel:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
                 turn_context_overrides={"model": "openai/gpt-5.4-mini"},
             ),
         )
@@ -2020,7 +2020,7 @@ class TestAliasVsResolvedModel:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
         )
         _write_jsonl(
@@ -2028,7 +2028,7 @@ class TestAliasVsResolvedModel:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
                 turn_context_overrides={"sandbox": "danger-full-access"},
             ),
         )
@@ -2053,7 +2053,7 @@ class TestAliasVsResolvedModel:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
         )
         _write_jsonl(
@@ -2061,7 +2061,7 @@ class TestAliasVsResolvedModel:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
                 include_turn_context=False,
             ),
         )
@@ -2097,7 +2097,7 @@ class TestWaitChildCorrelation:
                 child_thread_id=child_id,
                 parent_marker=pk.pop(
                     "parent_marker",
-                    "CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                    "CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
                 ),
                 **pk,
             ),
@@ -2107,7 +2107,7 @@ class TestWaitChildCorrelation:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
             ),
         )
         return HARNESS._cfg004_validate_transcript_collaboration(
@@ -2161,7 +2161,7 @@ class TestDirectParserChildTranscript:
         path = self._write_child(
             tmp_path,
             command_list=["pwd"],
-            terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+            terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
         )
         summary, failures = HARNESS._cfg004_parse_transcript_collaboration(path)
         assert failures == []
@@ -2183,7 +2183,7 @@ class TestDirectParserChildTranscript:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
         )
         _write_jsonl(
@@ -2191,7 +2191,7 @@ class TestDirectParserChildTranscript:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
                 encrypted_inbound=True,
             ),
         )
@@ -2213,7 +2213,7 @@ class TestDirectParserChildTranscript:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
         )
         _write_jsonl(
@@ -2221,7 +2221,7 @@ class TestDirectParserChildTranscript:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=[],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
             ),
         )
         _, failures = HARNESS._cfg004_validate_transcript_collaboration(
@@ -2255,7 +2255,7 @@ class TestOrderingPassFail:
                 child_thread_id=child_id,
                 parent_marker=pk.pop(
                     "parent_marker",
-                    "CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                    "CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
                 ),
                 **pk,
             ),
@@ -2267,7 +2267,7 @@ class TestOrderingPassFail:
                 command_list=ck.pop("command_list", ["pwd"]),
                 terminal_marker=ck.pop(
                     "terminal_marker",
-                    "READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                    "BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
                 ),
                 **ck,
             ),
@@ -2302,7 +2302,7 @@ class TestOrderingPassFail:
             _make_parent_transcript(
                 thread_id,
                 child_thread_id=child_id,
-                parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+                parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
             ),
         )
         # Child: task_complete at 05:58:04.746Z (same as wait output)
@@ -2310,7 +2310,7 @@ class TestOrderingPassFail:
         child_lines = _make_child_transcript(
             child_id, thread_id,
             command_list=["pwd"],
-            terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+            terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
         )
         for line in child_lines:
             if (
@@ -2343,7 +2343,7 @@ class TestOrderingPassFail:
         parent_lines = _make_parent_transcript(
             thread_id,
             child_thread_id=child_id,
-            parent_marker="CODEX_READ_ALIAS_PARALLEL_TOOLS_PASSED",
+            parent_marker="CODEX_BASIC_ALIAS_PARALLEL_TOOLS_PASSED",
         )
         # Move parent task_complete before wait output by rewriting
         # line order: insert task_complete right after spawn output.
@@ -2371,7 +2371,7 @@ class TestOrderingPassFail:
             _make_child_transcript(
                 child_id, thread_id,
                 command_list=["pwd"],
-                terminal_marker="READ_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
+                terminal_marker="BASIC_ALIAS_CHILD_PARALLEL_TOOLS_PASSED",
             ),
         )
         _, failures = HARNESS._cfg004_validate_transcript_collaboration(

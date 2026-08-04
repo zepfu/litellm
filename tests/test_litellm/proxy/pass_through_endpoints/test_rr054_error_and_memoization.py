@@ -86,7 +86,7 @@ def _malformed_adapted_custom_tool_response_body() -> dict[str, Any]:
 
 def _request_body_with_prior_tools_and_identity() -> dict[str, Any]:
     return {
-        "model": "aawm-code",
+        "model": "work",
         "instructions": "You are a 'worker' agent.\nContinue.",
         "input": [
             {
@@ -379,7 +379,7 @@ def test_rr054_issue29_prior_tool_activity_summary_once_across_multi_event_audit
     ):
         events = audit_build._build_auto_agent_alias_audit_events(
             alias_family="codex",
-            alias_model="aawm-code",
+            alias_model="work",
             request=request,
             request_body=request_body,
             selection=selection,
@@ -474,7 +474,7 @@ def test_rr054_issue29_host_repository_client_dispatch_extract_once_per_request(
     ):
         events = audit_build._build_auto_agent_alias_audit_events(
             alias_family="codex",
-            alias_model="aawm-code",
+            alias_model="work",
             request=request,
             request_body=request_body,
             selection=selection,
@@ -607,7 +607,7 @@ def test_rr054_issue29_build_audit_event_reuses_host_attribution_on_repeated_cal
         for i in range(3):
             event = audit_build._build_auto_agent_alias_audit_event(
                 alias_family="codex",
-                alias_model="aawm-code",
+                alias_model="work",
                 request=request,
                 request_body=request_body,
                 selection=selection,

@@ -514,8 +514,8 @@ def test_rr054_issue11_policy_module_owns_candidate_tables_and_allowlists() -> N
     policy_path = Path(package_policy.__file__).resolve()
     assert policy_path.name == "policy.py"
     assert policy_path.parent.name == "aawm_alias_routing"
-    assert "aawm-codex-agent-auto" in policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    assert "aawm-code-anthropic" in policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
+    assert "basic" in policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
+    assert "work" in policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
     assert lpe._CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS is policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
     assert policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS is package_policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
     assert lpe._ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS is policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS

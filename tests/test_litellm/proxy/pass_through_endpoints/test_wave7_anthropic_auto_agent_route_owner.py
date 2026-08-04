@@ -456,7 +456,7 @@ class TestFamilyStateSelectionAndCooldownCapture:
             error_class="RateLimitError",
             grok_account_quota_exhausted=True,
             kimi_failure_metadata={"k": "v"},
-            is_read_pilot_lane=True,
+            is_basic_pilot_lane=True,
         )
         runtime.resolve_cooldown_publication.assert_called_once_with(  # type: ignore[union-attr]
             request=req,
@@ -467,7 +467,7 @@ class TestFamilyStateSelectionAndCooldownCapture:
             error_class="RateLimitError",
             grok_account_quota_exhausted=True,
             kimi_failure_metadata={"k": "v"},
-            is_read_pilot_lane=True,
+            is_basic_pilot_lane=True,
         )
         # Now persist should succeed and forward captured state to apply_cooldown_fn
         await services.persist_cooldown_fn(keys=["cd:1"], seconds=60.0)
@@ -481,7 +481,7 @@ class TestFamilyStateSelectionAndCooldownCapture:
         assert call_kw["error_class"] == "RateLimitError"
         assert call_kw["grok_account_quota_exhausted"] is True
         assert call_kw["kimi_failure_metadata"] == {"k": "v"}
-        assert call_kw["is_read_pilot_lane"] is True
+        assert call_kw["is_basic_pilot_lane"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -38,15 +38,16 @@ The user-level Codex model catalog exposes `max` for Sol, Terra, and Luna.
 combines maximum reasoning with proactive subagent delegation, not an API
 `reasoning.effort` value sent by LiteLLM.
 
-Codex alias routing uses:
+Config-driven alias routing uses:
 
-- `aawm-sota`: `gpt-5.6-sol` → `gpt-5.5`
-- `aawm-sota-openai`: same order as `aawm-sota` (`gpt-5.6-sol` → `gpt-5.5`)
-- `aawm-sota-xai`: `oa_xai/grok-4.5` → `grok-4.5` → `grok-build` (last resort); generic Grok 4.5 candidate-unavailable probe failures do not apply a durable cooldown, while explicit usage/quota/rate/capacity signals still use normal cooldown handling
+- `sota-openai`: `gpt-5.6-sol`
+- `sota-xai`: `oa_xai/grok-4.5`
+- `sota`: selects the producer-family `sota-*` alias from TUI origin, defaulting to `sota-openai`.
 - Grok 4.5 (`xai/grok-4.5`, `oa_xai/grok-4.5`): 500k context; input $2/M, output $6/M, cached input $0.50/M (`input_cost_per_token` 0.000002, `output_cost_per_token` 0.000006, `cache_read_input_token_cost` 5e-07); tiered pricing above 200k context is not modeled in the map
-- `aawm-code`: `gpt-5.3-codex-spark` → `xai/grok-4.5` → `grok-composer-2.5-fast` → `oa_xai/grok-build` → `gpt-5.6-terra` → `gpt-5.5`
-- `aawm-low`: OpenRouter/OpenCode lanes → `gpt-5.6-luna` → `gpt-5.4-mini`
-- `aawm-orchestration`: `gpt-5.6-terra` → `gpt-5.5`
+- `sota-alibaba`: `alibaba_token_plan/qwen3.8-max` → `alibaba_token_plan/qwen3.7-max`
+- `basic`: the config-driven low-cost alias
+- `work`: `gpt-5.3-codex-spark` → internal `work-other` → Claude-only native Sonnet tail → `gpt-5.6-luna`; `work-other` is internal and not selectable or advertised
+- `expert`: structurally planned only; fail-closed/deferred because native Anthropic Opus 5 and its `[1m]` variant are unavailable
 
 ### Codex reasoning effort follows the resolved model
 
@@ -56,7 +57,7 @@ The supported order is `none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
 then `max`.
 
 The mapping is capability-driven and downward-only. For example,
-`reasoning.effort=max` becomes `xhigh` when `aawm-code` resolves to
+`reasoning.effort=max` becomes `xhigh` when `work` resolves to
 `gpt-5.3-codex-spark`, while GPT-5.6 Sol, Terra, and Luna retain `max` because
 their model entries advertise `supports_max_reasoning_effort=true`. Direct
 concrete-model Codex passthrough uses the same rule. Alias fallback attempts

@@ -1,7 +1,7 @@
 name = "alibaba"
 description = "Alibaba Token Plan Qwen tool-usage acceptance worker."
 
-model = "aawm-sota-alibaba"
+model = "sota-alibaba"
 
 developer_instructions = """
 You are an 'alibaba' acceptance agent.

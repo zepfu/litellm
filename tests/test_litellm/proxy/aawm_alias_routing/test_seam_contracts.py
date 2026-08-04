@@ -69,7 +69,7 @@ _APPLY_COOLDOWN_CALL_SITE_KWARGS = [
     "error_class",
     "grok_account_quota_exhausted",
     "kimi_failure_metadata",
-    "is_read_pilot_lane",
+    "is_basic_pilot_lane",
 ]
 
 # The exact key set the loop consumes off the ``select_candidate_fn`` return
@@ -123,7 +123,7 @@ async def test_select_candidate_fn_returns_required_selection_keys() -> None:
     raw_yaml = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: openrouter/seam-contract-model
@@ -157,7 +157,7 @@ aliases:
 
         selection_result = await selection._select_codex_auto_agent_candidate(
             request=request,
-            request_body={"model": "read", "previous_response_id": "resp_seam_contract"},
+            request_body={"model": "basic", "previous_response_id": "resp_seam_contract"},
         )
     finally:
         snapshot_select.set_active_routing_snapshot(previous_snapshot)
@@ -178,7 +178,7 @@ def test_reset_alias_routing_state_for_tests_clears_everything() -> None:
 
     Once added, the helper must clear: both family (codex/anthropic)
     cooldown/negative/affinity/evidence maps, ``candidate_probe_locks``, the
-    read-pilot gate's ``_key_state`` + ``_family_state.evidence_events_by_key``,
+    basic-pilot gate's ``_key_state`` + ``_family_state.evidence_events_by_key``,
     ``_round_robin_cursor_by_alias``, and the active routing snapshot (set to
     ``None``).
     """
@@ -203,7 +203,7 @@ def test_reset_alias_routing_state_for_tests_clears_everything() -> None:
         provider="openrouter",
         message="rate limited",
     )
-    alias_routing_state.read_pilot_gate.record(
+    alias_routing_state.basic_pilot_gate.record(
         cooldown_key="seed",
         event=evidence,
     )
@@ -212,7 +212,7 @@ def test_reset_alias_routing_state_for_tests_clears_everything() -> None:
     raw_yaml = """
 defaults: {}
 aliases:
-  - name: read
+  - name: basic
     candidates:
       - provider: openrouter
         model: openrouter/reset-helper-model
@@ -232,8 +232,8 @@ aliases:
     assert alias_routing_state.anthropic.session_affinity_by_key == {}
     assert alias_routing_state.anthropic.evidence_events_by_key == {}
     assert alias_routing_state.candidate_probe_locks == {}
-    assert alias_routing_state.read_pilot_gate._key_state == {}
-    assert alias_routing_state.read_pilot_gate._family_state.evidence_events_by_key == {}
+    assert alias_routing_state.basic_pilot_gate._key_state == {}
+    assert alias_routing_state.basic_pilot_gate._family_state.evidence_events_by_key == {}
     assert alias_routing_state.round_robin_cursor == {}
     assert snapshot_select.get_active_routing_snapshot() is None
 
@@ -279,7 +279,7 @@ _CALLBACK_PARAMETER_KINDS: dict[str, dict[str, inspect._ParameterKind]] = {
         "error_class": inspect.Parameter.KEYWORD_ONLY,
         "grok_account_quota_exhausted": inspect.Parameter.KEYWORD_ONLY,
         "kimi_failure_metadata": inspect.Parameter.KEYWORD_ONLY,
-        "is_read_pilot_lane": inspect.Parameter.KEYWORD_ONLY,
+        "is_basic_pilot_lane": inspect.Parameter.KEYWORD_ONLY,
     },
     "publish_cooldown_memory_fn": {
         "keys": inspect.Parameter.KEYWORD_ONLY,
@@ -389,7 +389,7 @@ def _signature_contract_request() -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_alias_route_services_signature_contracts(
+async def test_alias_route_services_signature_contracts(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Inspect every callback actually bound by both production wrappers."""
@@ -445,7 +445,7 @@ async def test_alias_route_services_signature_contracts(
         request=request,
         fastapi_response=MagicMock(spec=Response),
         user_api_key_dict=MagicMock(),
-        prepared_request_body={"model": "aawm-low"},
+        prepared_request_body={"model": "basic"},
         target_url="https://chatgpt.com/backend-api/codex/responses",
         api_key=None,
         forward_headers=True,
@@ -455,7 +455,7 @@ async def test_alias_route_services_signature_contracts(
         request=request,
         fastapi_response=MagicMock(spec=Response),
         user_api_key_dict=MagicMock(),
-        prepared_request_body={"model": "aawm-low-anthropic"},
+        prepared_request_body={"model": "basic"},
         target_url="https://api.anthropic.com/v1/messages",
         custom_headers={},
     )
@@ -630,7 +630,7 @@ def _typed_resolve_cooldown_publication(
     error_class: Optional[str],
     grok_account_quota_exhausted: bool = False,
     kimi_failure_metadata: Optional[dict[str, Any]] = None,
-    is_read_pilot_lane: bool = False,
+    is_basic_pilot_lane: bool = False,
 ) -> CooldownPublicationPlan:
     return CooldownPublicationPlan()
 

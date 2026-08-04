@@ -44,6 +44,7 @@ _HOST_FUNCTION_NAMES = (
     "_extract_auto_agent_alias_metadata_value",
     "_normalize_auto_agent_alias_client_product",
     "_extract_auto_agent_alias_client_product_label",
+    "_normalize_tui_family",
     "_extract_auto_agent_alias_incoming_endpoint",
     "_resolve_auto_agent_alias_route_host_attribution",
     "_aresolve_auto_agent_alias_route_host_attribution",
@@ -142,6 +143,10 @@ def _normalize_auto_agent_alias_client_product(value: Any) -> Optional[str]:
         name = "Claude"
     elif normalized_name in {"grok", "grok-build", "grok-pager"}:
         name = "Grok"
+    elif normalized_name in {"qwen", "qwen-code", "qwen-code-cli"}:
+        name = "Qwen"
+    elif normalized_name in {"kimi", "kimi-code", "kimi-code-cli"}:
+        name = "Kimi"
     return f"{name}/{version}"
 
 
@@ -158,7 +163,10 @@ def _extract_auto_agent_alias_client_product_label(
             "user_agent",
         ):
             value = _normalize_auto_agent_alias_client_product(metadata.get(key))
-            if value:
+            if value and not (
+                key in {"client_user_agent", "user_agent"}
+                and _normalize_tui_family(value) == "qwen"
+            ):
                 return value
         name = _normalize_auto_agent_alias_client_product(metadata.get("client_name"))
         version = _clean_codex_auth_value(metadata.get("client_version"))
@@ -181,9 +189,38 @@ def _extract_auto_agent_alias_client_product_label(
         value = _normalize_auto_agent_alias_client_product(
             _get_codex_auto_agent_header(headers, header_name)
         )
-        if value:
+        if value and not (
+            header_name == "user-agent"
+            and _normalize_tui_family(value) == "qwen"
+        ):
             return value
     return None
+
+
+
+def _normalize_tui_family(client_product_label: Optional[str]) -> str:
+    """Normalize client product label to stable TUI family (CFG-007).
+
+    Returns one of: codex, claude, grok, qwen, kimi, or unknown.
+    Versions are stripped; only the product family matters for dispatch.
+    """
+    if not client_product_label:
+        return "unknown"
+
+    product = client_product_label.split("/", 1)[0].strip().lower()
+    product = product.replace("-", "").replace("_", "")
+
+    if product in ("codex", "codexcli", "codextui"):
+        return "codex"
+    if product in ("claude", "claudecode"):
+        return "claude"
+    if product in ("grok", "grokbuild"):
+        return "grok"
+    if product in ("qwen", "qwenchat", "qwencode", "qwencodecli"):
+        return "qwen"
+    if product in ("kimi", "kimichat", "kimicode", "kimicodecli"):
+        return "kimi"
+    return "unknown"
 
 
 def _extract_auto_agent_alias_incoming_endpoint(request: Request) -> str:
@@ -297,6 +334,7 @@ def install(host_globals: dict) -> None:
             "aresolve_aawm_route_host_attribution",
             aresolve_aawm_route_host_attribution,
         ),
+        ("_normalize_tui_family", _normalize_tui_family),
     ):
         host_globals.setdefault(_dependency_name, _dependency)
 
