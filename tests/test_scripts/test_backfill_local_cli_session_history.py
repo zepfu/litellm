@@ -375,56 +375,6 @@ def test_should_parse_codex_token_count_and_attach_pending_tool(tmp_path: Path) 
     assert record["git_commit_count"] == 1
 
 
-def test_should_parse_gemini_jsonl_tokens_and_dedupe(tmp_path: Path) -> None:
-    projects = tmp_path / ".gemini" / "projects.json"
-    projects.parent.mkdir(parents=True)
-    projects.write_text(
-        json.dumps({"projects": {"/home/zepfu/projects/litellm": "litellm"}}),
-        encoding="utf-8",
-    )
-    chat = tmp_path / ".gemini" / "tmp" / "litellm" / "chats" / "session.jsonl"
-    row = {
-        "id": "message-1",
-        "timestamp": "2026-03-01T12:00:00.000Z",
-        "type": "gemini",
-        "model": "gemini-3-flash-preview",
-        "tokens": {
-            "input": 10,
-            "output": 2,
-            "cached": 3,
-            "thoughts": 4,
-            "total": 16,
-        },
-        "toolCalls": [
-            {"id": "read-1", "name": "read_file", "args": {"file_path": "a.py"}}
-        ],
-    }
-    _write_jsonl(
-        chat,
-        [
-            {
-                "sessionId": "gemini-session",
-                "startTime": "2026-03-01T11:59:00.000Z",
-                "projectHash": "hash",
-            },
-            row,
-            row,
-        ],
-    )
-    stats = backfill.ScanStats()
-
-    [record] = list(backfill._iter_gemini_records(tmp_path, stats))
-
-    assert record["client_name"] == "gemini_cli"
-    assert record["repository"] == "/home/zepfu/projects/litellm"
-    assert record["input_tokens"] == 10
-    assert record["output_tokens"] == 2
-    assert record["cache_read_input_tokens"] == 3
-    assert record["reasoning_tokens_reported"] == 4
-    assert record["total_tokens"] == 16
-    assert record["tool_call_count"] == 1
-
-
 def test_should_bucket_summary_by_day() -> None:
     summary = backfill.DryRunSummary()
     record = backfill._base_record(

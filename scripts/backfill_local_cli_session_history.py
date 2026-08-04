@@ -3,7 +3,7 @@
 Backfill public.session_history from local CLI transcript history.
 
 The importer is dry-run first. It streams historical records from local Claude,
-Codex, Gemini, and Grok CLI state, derives aggregate session_history-compatible
+Codex, and Grok CLI state, derives aggregate session_history-compatible
 rows, and skips any transcript day that already has *this* client's
 ``source_import`` rows in public.session_history (scoped by client_name +
 metadata.source_import, not global calendar days).
@@ -58,7 +58,6 @@ DEFAULT_TARGET_DB = "aawm_tristore"
 CLIENT_NAME_BY_SOURCE = {
     "claude": "claude-code",
     "codex": "codex_tui",
-    "gemini": "gemini_cli",
     "grok": "grok_build",
 }
 
@@ -632,8 +631,6 @@ def _provider_from_model(model: Optional[str], fallback: Optional[str] = None) -
     fallback_cleaned = (fallback or "").lower()
     if "claude" in cleaned:
         return "anthropic"
-    if "gemini" in cleaned:
-        return "gemini"
     if "grok" in cleaned:
         return "xai"
     if cleaned.startswith(("gpt-", "o1", "o3", "o4", "o5")) or "codex" in cleaned:
@@ -1311,190 +1308,6 @@ def _iter_codex_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any]
             pending_tools = []
 
 
-def _load_gemini_project_roots(gemini_root: Path) -> dict[str, str]:
-    projects_path = gemini_root / "projects.json"
-    if not projects_path.exists():
-        return {}
-    try:
-        data = json.loads(projects_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    projects = data.get("projects")
-    if not isinstance(projects, dict):
-        return {}
-    return {str(project): str(path) for path, project in projects.items()}
-
-
-def _read_gemini_messages(
-    path: Path, stats: ScanStats
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    stats.files_seen["gemini"] += 1
-    if path.suffix == ".jsonl":
-        header: dict[str, Any] = {}
-        messages: list[dict[str, Any]] = []
-        try:
-            with path.open("r", encoding="utf-8", errors="replace") as handle:
-                for raw_line in handle:
-                    stripped = raw_line.strip()
-                    if not stripped:
-                        continue
-                    try:
-                        obj = json.loads(stripped)
-                    except json.JSONDecodeError:
-                        stats.parse_errors["gemini:jsonl"] += 1
-                        continue
-                    if not isinstance(obj, dict) or "$set" in obj:
-                        continue
-                    if not header and "type" not in obj and "role" not in obj:
-                        header = obj
-                    elif "type" in obj or "role" in obj:
-                        messages.append(obj)
-        except OSError:
-            stats.files_skipped["gemini:open_error"] += 1
-        return header, messages
-    try:
-        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, json.JSONDecodeError):
-        stats.files_skipped["gemini:json_error"] += 1
-        return {}, []
-    messages = data.get("messages") if isinstance(data, dict) else []
-    return (
-        data if isinstance(data, dict) else {},
-        [item for item in messages if isinstance(item, dict)]
-        if isinstance(messages, list)
-        else [],
-    )
-
-
-def _gemini_message_is_model(message: dict[str, Any]) -> bool:
-    message_type = str(message.get("type") or "").lower()
-    role = str(message.get("role") or "").lower()
-    return (
-        message_type in {"gemini", "model", "assistant"}
-        or role in {"model", "assistant"}
-        or bool(message.get("tokens") and message.get("model"))
-    )
-
-
-def _iter_gemini_records(root: Path, stats: ScanStats) -> Iterator[dict[str, Any]]:
-    gemini_root = root / ".gemini"
-    tmp_root = gemini_root / "tmp"
-    if not tmp_root.exists():
-        stats.files_skipped["gemini:missing_tmp"] += 1
-        return
-    project_roots = _load_gemini_project_roots(gemini_root)
-    seen_messages: set[tuple[str, str, str, str]] = set()
-    for path in sorted(
-        list(tmp_root.rglob("chats/*.jsonl")) + list(tmp_root.rglob("chats/*.json"))
-    ):
-        header, messages = _read_gemini_messages(path, stats)
-        try:
-            project_name = path.relative_to(tmp_root).parts[0]
-        except (IndexError, ValueError):
-            project_name = ""
-        repository = project_roots.get(project_name) or project_name or None
-        session_id = _safe_str(header.get("sessionId")) or path.stem
-        path_hash = _sha(str(path))
-        for message_index, message in enumerate(messages):
-            if not _gemini_message_is_model(message):
-                continue
-            created_at = _parse_datetime(message.get("timestamp")) or _parse_datetime(
-                header.get("lastUpdated") or header.get("startTime")
-            )
-            if created_at is None:
-                continue
-            model = _safe_str(message.get("model")) or "unknown"
-            message_id = _safe_str(message.get("id")) or str(message_index)
-            dedupe_key = (
-                session_id,
-                message_id,
-                str(message.get("timestamp") or ""),
-                model,
-            )
-            if dedupe_key in seen_messages:
-                continue
-            seen_messages.add(dedupe_key)
-            tokens = (
-                message.get("tokens") if isinstance(message.get("tokens"), dict) else {}
-            )
-            input_tokens = (
-                _safe_int(tokens.get("input"))
-                or _safe_int(tokens.get("input_tokens"))
-                or 0
-            )
-            output_tokens = (
-                _safe_int(tokens.get("output"))
-                or _safe_int(tokens.get("output_tokens"))
-                or 0
-            )
-            cache_read = (
-                _safe_int(tokens.get("cached"))
-                or _safe_int(tokens.get("cache_read_input_tokens"))
-                or 0
-            )
-            reasoning_tokens = (
-                _safe_int(tokens.get("thoughts"))
-                or _safe_int(tokens.get("reasoning"))
-                or 0
-            )
-            total_tokens = (
-                _safe_int(tokens.get("total")) or input_tokens + output_tokens
-            )
-            tool_activity: list[dict[str, Any]] = []
-            tool_calls = message.get("toolCalls")
-            if isinstance(tool_calls, list):
-                for tool_call in tool_calls:
-                    if not isinstance(tool_call, dict):
-                        continue
-                    tool_activity.append(
-                        _build_tool_activity(
-                            tool_index=len(tool_activity),
-                            tool_name=_safe_str(tool_call.get("name")) or "unknown",
-                            tool_call_id=_safe_str(tool_call.get("id")),
-                            arguments=tool_call.get("args") or {},
-                            metadata={"source": "gemini_toolCalls"},
-                        )
-                    )
-            thoughts = (
-                message.get("thoughts")
-                if isinstance(message.get("thoughts"), list)
-                else []
-            )
-            metadata = {
-                **_source_path_metadata(path),
-                "source_message_index": message_index,
-                "source_message_id": message_id,
-                "project_name": project_name,
-                "project_hash": header.get("projectHash"),
-                "session_kind": header.get("kind"),
-                "session_start_time": header.get("startTime"),
-                "session_last_updated": header.get("lastUpdated"),
-                "source_tokens": _redact_value(tokens),
-                "thought_count": len(thoughts),
-            }
-            yield _base_record(
-                source_client_name="gemini",
-                created_at=created_at,
-                litellm_call_id=f"local-cli:gemini:{session_id}:{message_id}:{path_hash}",
-                session_id=session_id,
-                provider="gemini",
-                model=model,
-                repository=repository,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                total_tokens=total_tokens,
-                cache_read_input_tokens=cache_read,
-                reasoning_tokens_reported=reasoning_tokens or None,
-                reasoning_tokens_source=(
-                    "gemini_message.tokens.thoughts" if reasoning_tokens else None
-                ),
-                reasoning_present=reasoning_tokens > 0 or bool(thoughts),
-                tool_activity=tool_activity,
-                usage_obj=tokens,
-                metadata=metadata,
-            )
-
-
 def _iter_grok_session_dirs(sessions_root: Path) -> Iterator[Path]:
     for cwd_dir in sessions_root.iterdir() if sessions_root.exists() else []:
         if not cwd_dir.is_dir():
@@ -1628,8 +1441,6 @@ def _iter_records(
         yield from _iter_claude_records(root, stats)
     if "codex" in clients:
         yield from _iter_codex_records(root, stats)
-    if "gemini" in clients:
-        yield from _iter_gemini_records(root, stats)
     if "grok" in clients:
         yield from _iter_grok_records(root, stats)
 
@@ -2317,7 +2128,7 @@ def _print_summary(
 
 def _parse_clients(value: str) -> set[str]:
     clients = {part.strip().lower() for part in value.split(",") if part.strip()}
-    valid = {"claude", "codex", "gemini", "grok"}
+    valid = {"claude", "codex", "grok"}
     unknown = clients - valid
     if unknown:
         raise argparse.ArgumentTypeError(
@@ -2336,7 +2147,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--clients",
         type=_parse_clients,
-        default=_parse_clients("claude,codex,gemini,grok"),
+        default=_parse_clients("claude,codex,grok"),
     )
     parser.add_argument("--day-timezone", default=DEFAULT_TIMEZONE)
     parser.add_argument(
