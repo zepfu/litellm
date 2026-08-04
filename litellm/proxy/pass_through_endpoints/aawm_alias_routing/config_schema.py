@@ -168,6 +168,11 @@ class CandidateConfig(BaseModel):
     priority: int
     weight: float = 1.0
     tui_attached: Optional[str] = None
+    # CFG-008: optional per-model TUI exclusion. When set, the candidate is
+    # ineligible only for requests whose identified client product name
+    # equals this value; missing/unknown origins remain eligible. Matching
+    # mirrors ``tui_attached`` (product name only, version-insensitive).
+    tui_excluded: Optional[str] = None
     schedule: Optional[ScheduleWindowConfig] = None
     error_rules: list[ErrorRuleConfig] = Field(default_factory=list)
     reasoning_effort: Optional[str] = None

@@ -1,30 +1,25 @@
-# AAWM alias-routing config -- ``read`` pilot (Wave 3, D1-583).
+# AAWM alias-routing config -- ``read`` pilot (CFG-008).
 #
-# Additive pilot alias, go-forward replacement for aawm-read /
-# aawm-read-anthropic once operator-approved cutover happens (out of scope
-# for this wave). Candidate order mirrors CODEX_AAWM_LOW_CANDIDATES
-# (policy.py:227-277) with descending integer priorities, plus a
-# schedule-windowed promo candidate (alibaba_token_plan/qwen3.8-max-preview)
-# that outranks everything else while its window is open.
+# Go-forward replacement for aawm-read / aawm-read-anthropic once
+# operator-approved cutover happens (CFG-010 owns static-fallback removal).
+# Every origin shares the common OpenRouter/OpenCode/Alibaba prefix, then
+# receives a mutually exclusive TUI-specific last resort:
+#   - Claude-origin requests only: native Anthropic Haiku
+#     (tui_attached: Claude; Luna is excluded via tui_excluded).
+#   - Codex and every non-Claude/missing/unknown origin: gpt-5.6-luna with
+#     authoritative ``reasoning_effort: low`` applied through the shared
+#     CFG-006 candidate pipeline (Haiku is gated out via tui_attached).
 #
 # Compiled by config_compiler.compile_yaml() into an immutable RoutingSnapshot.
-# priority: 0 is reserved for the last-resort candidate and is always placed
-# last in the compiled ordering, regardless of declaration order.
+# priority: 0 is reserved for last-resort candidates and is always placed
+# last in the compiled ordering; declaration order among zeros is preserved
+# (Luna before Haiku).
 
 defaults: {}
 
 aliases:
   - name: read
     candidates:
-      # Promo window: highest priority of the alias while active.
-      - provider: alibaba_token_plan
-        model: alibaba_token_plan/qwen3.8-max-preview
-        route_family: codex_alibaba_token_plan_chat_completions_adapter
-        priority: 1000
-        schedule:
-          start: "2026-07-01T00:00:00Z"
-          end: "2026-08-01T00:00:00Z"
-
       - provider: openrouter
         model: openrouter/cohere/north-mini-code:free
         route_family: codex_openrouter_completion_adapter
@@ -47,26 +42,29 @@ aliases:
         anthropic_route_family: anthropic_opencode_zen_completion_adapter
         priority: 50
 
-      - provider: openai
-        model: gpt-5.6-luna
-        route_family: codex_responses
-        priority: 40
-        # CFG-006: authoritative candidate-level reasoning (replaces caller/TUI
-        # reasoning for this candidate only).
-        reasoning_effort: low
-
       - provider: alibaba_token_plan
         model: alibaba_token_plan/qwen3.6-flash
         route_family: codex_alibaba_token_plan_chat_completions_adapter
-        priority: 30
+        priority: 40
 
-      - provider: kimi_code
-        model: kimi_code/kimi-for-coding
-        route_family: codex_kimi_chat_completions_adapter
-        priority: 20
-
-      # Last resort -- priority 0 is always placed last regardless of order.
+      # Default-branch last resort: Codex and every non-Claude/missing/
+      # unknown origin. CFG-006: the configured low reasoning replaces any
+      # caller-provided reasoning through the shared candidate pipeline;
+      # ``read`` routing implements no separate reasoning precedence.
+      # tui_excluded keeps Luna ineligible for Claude-origin requests.
       - provider: openai
-        model: gpt-5.4-mini
+        model: gpt-5.6-luna
         route_family: codex_responses
         priority: 0
+        reasoning_effort: low
+        tui_excluded: Claude
+
+      # Claude-branch last resort: native Anthropic Haiku only.
+      # Anthropic-native credentials/egress on both ingress projections
+      # (anthropic_messages on Codex ingress is fail-closed at shaping).
+      - provider: anthropic
+        model: claude-haiku-4-5-20251001
+        route_family: anthropic_messages
+        anthropic_route_family: anthropic_messages
+        priority: 0
+        tui_attached: Claude

@@ -1,23 +1,13 @@
-"""GREEN Wave 6 test: shadow-parity between the snapshot-driven ``read`` pilot
-selection and the hard-coded ``CODEX_AAWM_LOW_CANDIDATES`` policy table.
+"""CFG-008 test: the compiled ``read`` pilot resolves the exact common prefix
+plus the mutually exclusive TUI-specific tail on both ingress projections.
 
-``litellm/proxy/aawm_alias_config/read.yaml`` was authored (Wave 3) to mirror
-``CODEX_AAWM_LOW_CANDIDATES`` (policy.py:227-277) 1:1 by descending integer
-priority, plus one additional schedule-windowed promo candidate that is
-outside its active window as of this test's reference clock. This test
-compiles that YAML and asserts the resulting snapshot-driven ``read``
-selection reproduces the ``CODEX_AAWM_LOW_CANDIDATES`` ordering/eligibility
-(same providers/models/route_families, same order) -- i.e. shadow parity.
-
-Tolerance: the promo candidate (``alibaba_token_plan/qwen3.8-max-preview``,
-schedule 2026-07-01..2026-08-01) is INCLUDED in the read.yaml file and is
-outside its window relative to the fixed reference clock used here
-(2026-06-15, before the window opens), so it is excluded from the eligible
-set and the remaining ordering reproduces ``CODEX_AAWM_LOW_CANDIDATES``
-exactly. If the reference clock instead falls inside the promo window, the
-promo candidate would legitimately outrank everything else -- that is
-intentional product behavior, not a parity break, so this test pins its
-``now_utc`` outside the window to assert the steady-state parity claim.
+``litellm/proxy/aawm_alias_config/read.yaml`` (CFG-008) no longer mirrors the
+legacy ``CODEX_AAWM_LOW_CANDIDATES`` table: it carries the exact common
+OpenRouter/OpenCode/Alibaba prefix and then a branch-exclusive last resort --
+native Anthropic Haiku for Claude origins (``tui_attached``), or
+``gpt-5.6-luna`` with authoritative ``reasoning_effort: low`` for Codex and
+every non-Claude/missing/unknown origin (``tui_excluded`` keeps Luna out of
+the Claude branch; ``tui_attached`` keeps Haiku out of the default branch).
 
 Ambient state (cooldown/session-affinity dicts and the process-local active
 snapshot holder) is reset before and after via the same
@@ -37,9 +27,6 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     config_compiler as compiler,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import snapshot_select
-from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
-    CODEX_AAWM_LOW_CANDIDATES,
-)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     alias_routing_state,
 )
@@ -52,12 +39,21 @@ _READ_YAML_PATH = os.path.join(
     "read.yaml",
 )
 
-# Reference clock intentionally BEFORE the promo schedule window
-# (2026-07-01T00:00:00Z .. 2026-08-01T00:00:00Z) opens, so the promo
-# candidate is excluded from eligibility and the remaining candidates
-# reproduce CODEX_AAWM_LOW_CANDIDATES's ordering exactly (documented
-# tolerance above).
 _REFERENCE_NOW_UTC = dt.datetime(2026, 6, 15, tzinfo=dt.timezone.utc)
+
+# CFG-008 exact common prefix shared by every origin.
+_COMMON_PREFIX = [
+    ("openrouter", "openrouter/cohere/north-mini-code:free", "codex_openrouter_completion_adapter"),
+    ("openrouter", "openrouter/owl-alpha", "codex_openrouter_completion_adapter"),
+    ("opencode_zen", "deepseek-v4-flash", "codex_opencode_zen_adapter"),
+    ("opencode_zen", "big-pickle", "codex_opencode_zen_adapter"),
+    ("alibaba_token_plan", "alibaba_token_plan/qwen3.6-flash", "codex_alibaba_token_plan_chat_completions_adapter"),
+]
+_REMOVED_MODELS = {
+    "alibaba_token_plan/qwen3.8-max-preview",
+    "kimi_code/kimi-for-coding",
+    "gpt-5.4-mini",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -92,44 +88,106 @@ def test_read_yaml_exists_and_compiles() -> None:
 
 
 def test_shadow_parity_read_vs_low(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Snapshot-driven ``read`` selection (promo window closed) reproduces
-    ``CODEX_AAWM_LOW_CANDIDATES`` ordering/eligibility exactly."""
+    """CFG-008 Codex/default ingress: exact common prefix + Luna low-effort tail
+    for Codex and every non-Claude/missing/unknown origin."""
     snapshot = _compile_read_yaml()
     snapshot_select.set_active_routing_snapshot(snapshot)
 
-    # Force the auto-agent alias resolver's fallback table to resolve "read"
-    # from the snapshot regardless of the untouched hard-coded alias-name
-    # mapping (Wave 4's helper is keyed on the literal alias name "read").
     selected = snapshot_select._select_read_pilot_snapshot_candidates(
         client_product_label=None,
         now_utc=_REFERENCE_NOW_UTC,
     )
 
     selected_triples = [(c["provider"], c["model"], c["route_family"]) for c in selected]
-    low_triples = [(c["provider"], c["model"], c["route_family"]) for c in CODEX_AAWM_LOW_CANDIDATES]
-
-    assert selected_triples == low_triples, (
-        "snapshot-driven read selection diverged from CODEX_AAWM_LOW_CANDIDATES:\n"
-        f"selected={selected_triples}\nlow_candidates={low_triples}"
-    )
-
-    # last_resort parity: the last candidate in both orderings must be the
-    # last-resort (priority: 0) candidate.
+    assert selected_triples == [
+        *_COMMON_PREFIX,
+        ("openai", "gpt-5.6-luna", "codex_responses"),
+    ]
+    assert _REMOVED_MODELS.isdisjoint({c["model"] for c in selected})
     assert selected[-1]["last_resort"] is True
-    assert CODEX_AAWM_LOW_CANDIDATES[-1].get("last_resort") is True
+    assert selected[-1]["reasoning_effort"] == "low"
 
 
-def test_shadow_parity_promo_window_open_outranks_everything() -> None:
-    """Sanity check on the documented tolerance: inside the promo window, the
-    promo candidate legitimately outranks the CODEX_AAWM_LOW_CANDIDATES-parity
-    set (this is intentional product behavior, not a parity break)."""
+def test_cfg008_claude_branch_selects_haiku_tail() -> None:
+    """CFG-008 Claude origin: Anthropic ingress gets the native Haiku tail;
+    the Codex ingress keeps Luna ineligible for the branch and never routes
+    Haiku through Codex credentials."""
     snapshot = _compile_read_yaml()
     snapshot_select.set_active_routing_snapshot(snapshot)
 
-    now_within_promo_window = dt.datetime(2026, 7, 15, tzinfo=dt.timezone.utc)
-    selected = snapshot_select._select_read_pilot_snapshot_candidates(
-        client_product_label=None,
-        now_utc=now_within_promo_window,
+    selected = snapshot_select._select_read_pilot_snapshot_candidates_anthropic(
+        client_product_label="Claude/1.2",
+        now_utc=_REFERENCE_NOW_UTC,
     )
-    assert selected[0]["model"] == "alibaba_token_plan/qwen3.8-max-preview"
-    assert selected[0]["provider"] == "alibaba_token_plan"
+    assert selected is not None
+    expected_anthropic_prefix = [
+        ("openrouter", "openrouter/cohere/north-mini-code:free", "anthropic_openrouter_completion_adapter"),
+        ("openrouter", "openrouter/owl-alpha", "anthropic_openrouter_completion_adapter"),
+        ("opencode_zen", "deepseek-v4-flash", "anthropic_opencode_zen_responses_adapter"),
+        ("opencode_zen", "big-pickle", "anthropic_opencode_zen_completion_adapter"),
+        ("alibaba_token_plan", "alibaba_token_plan/qwen3.6-flash", "anthropic_alibaba_token_plan_chat_completions_adapter"),
+    ]
+    assert [(c["provider"], c["model"], c["route_family"]) for c in selected] == [
+        *expected_anthropic_prefix,
+        ("anthropic", "claude-haiku-4-5-20251001", "anthropic_messages"),
+    ]
+    assert selected[-1]["last_resort"] is True
+    assert "gpt-5.6-luna" not in {c["model"] for c in selected}
+
+    # Codex ingress: the Anthropic-credential Haiku tail is not eligible, so
+    # the Claude branch is the common prefix only (no Luna, no Haiku).
+    codex_side = snapshot_select._select_read_pilot_snapshot_candidates(
+        client_product_label="Claude/1.2",
+        now_utc=_REFERENCE_NOW_UTC,
+    )
+    codex_models = [c["model"] for c in codex_side]
+    assert codex_models == [triple[1] for triple in _COMMON_PREFIX]
+    assert "gpt-5.6-luna" not in codex_models
+    assert "claude-haiku-4-5-20251001" not in codex_models
+
+
+def test_cfg008_codex_origin_selects_luna_tail() -> None:
+    """CFG-008 identified Codex origin: common prefix + Luna tail; Haiku is
+    ineligible on this branch."""
+    snapshot = _compile_read_yaml()
+    snapshot_select.set_active_routing_snapshot(snapshot)
+
+    selected = snapshot_select._select_read_pilot_snapshot_candidates(
+        client_product_label="Codex/0.31.0",
+        now_utc=_REFERENCE_NOW_UTC,
+    )
+    models = [c["model"] for c in selected]
+    assert models == [triple[1] for triple in _COMMON_PREFIX] + ["gpt-5.6-luna"]
+    assert "claude-haiku-4-5-20251001" not in models
+    assert selected[-1]["reasoning_effort"] == "low"
+
+
+def test_cfg008_anthropic_ingress_projection_branches() -> None:
+    """CFG-008 Anthropic Messages ingress projection carries the same branch
+    exclusivity with the anthropic-projected route families."""
+    snapshot = _compile_read_yaml()
+    snapshot_select.set_active_routing_snapshot(snapshot)
+
+    claude = snapshot_select._select_read_pilot_snapshot_candidates_anthropic(
+        client_product_label="Claude/1.2",
+        now_utc=_REFERENCE_NOW_UTC,
+    )
+    assert claude is not None
+    assert [c["model"] for c in claude] == [
+        triple[1] for triple in _COMMON_PREFIX
+    ] + ["claude-haiku-4-5-20251001"]
+    assert claude[-1]["route_family"] == "anthropic_messages"
+    for candidate in claude:
+        assert candidate["route_family"].startswith("anthropic_")
+
+    default = snapshot_select._select_read_pilot_snapshot_candidates_anthropic(
+        client_product_label=None,
+        now_utc=_REFERENCE_NOW_UTC,
+    )
+    assert default is not None
+    assert [c["model"] for c in default] == [
+        triple[1] for triple in _COMMON_PREFIX
+    ] + ["gpt-5.6-luna"]
+    assert default[-1]["route_family"] == "anthropic_openai_responses_adapter"
+    assert default[-1]["reasoning_effort"] == "low"
+    assert "claude-haiku-4-5-20251001" not in {c["model"] for c in default}

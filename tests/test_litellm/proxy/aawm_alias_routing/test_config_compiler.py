@@ -112,6 +112,31 @@ aliases:
     assert candidate.tui_attached == "Claude"
 
 
+def test_tui_excluded_flag_compiles_into_snapshot_and_hash() -> None:
+    """CFG-008: tui_excluded survives compilation and feeds the semantic hash."""
+    base_raw = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openai
+        model: gpt-5.6-luna
+        route_family: codex_responses
+        priority: 0
+"""
+    with_excluded_raw = base_raw.replace(
+        "priority: 0", "priority: 0\n        tui_excluded: Claude", 1
+    )
+
+    snapshot_plain = compiler.compile_yaml(base_raw)
+    snapshot_with = compiler.compile_yaml(with_excluded_raw)
+
+    assert snapshot_plain.aliases["read"].candidates[0].tui_excluded is None
+    assert snapshot_with.aliases["read"].candidates[0].tui_excluded == "Claude"
+    # The exclusion participates in semantic config identity.
+    assert snapshot_plain.config_hash != snapshot_with.config_hash
+
+
 def test_schedule_windows_utc_only_in_snapshot() -> None:
     """Compiled snapshot preserves UTC schedule windows; overlaps resolve deterministically."""
     raw = """

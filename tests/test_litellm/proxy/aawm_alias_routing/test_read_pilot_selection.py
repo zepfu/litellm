@@ -163,6 +163,91 @@ aliases:
     assert not snapshot_select._is_tui_attached_candidate_eligible(candidate, client_product_label="Codex/1.0")
 
 
+def test_tui_excluded_gate_version_insensitive() -> None:
+    """CFG-008: tui_excluded gates only the matching identified product name."""
+    raw = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openai
+        model: gpt-5.6-luna
+        route_family: codex_responses
+        priority: 0
+        tui_excluded: Claude
+"""
+    snapshot = compiler.compile_yaml(raw)
+    candidate = snapshot.aliases["read"].candidates[0]
+    gate = snapshot_select._is_tui_excluded_candidate_eligible
+    # Claude origin (any version) is excluded.
+    assert not gate(candidate, client_product_label="Claude/1.2")
+    assert not gate(candidate, client_product_label="Claude/9.9")
+    # Other identified origins and missing/unknown origins remain eligible.
+    assert gate(candidate, client_product_label="Codex/1.0")
+    assert gate(candidate, client_product_label="Grok/0.1")
+    assert gate(candidate, client_product_label=None)
+
+
+def test_mutually_exclusive_tails_branch_selection() -> None:
+    """CFG-008: tui_attached + tui_excluded yield exactly one eligible tail."""
+    raw = """
+defaults: {}
+aliases:
+  - name: read
+    candidates:
+      - provider: openrouter
+        model: openrouter/owl-alpha
+        route_family: codex_openrouter_completion_adapter
+        priority: 80
+      - provider: openai
+        model: gpt-5.6-luna
+        route_family: codex_responses
+        priority: 0
+        reasoning_effort: low
+        tui_excluded: Claude
+      - provider: anthropic
+        model: claude-haiku-4-5-20251001
+        route_family: anthropic_messages
+        anthropic_route_family: anthropic_messages
+        priority: 0
+        tui_attached: Claude
+"""
+    snapshot = compiler.compile_yaml(raw)
+    previous = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    try:
+        # Codex ingress, Claude origin: Luna is excluded for the Claude branch
+        # and the Anthropic-credential Haiku tail is Anthropic-ingress-only,
+        # so only the common prefix remains (fail closed past it).
+        claude_codex = snapshot_select._select_read_pilot_snapshot_candidates(
+            client_product_label="Claude/1.2",
+        )
+        assert [c["model"] for c in claude_codex] == ["openrouter/owl-alpha"]
+
+        # Anthropic ingress, Claude origin: native Haiku tail, Luna ineligible.
+        claude_anthropic = snapshot_select._select_read_pilot_snapshot_candidates_anthropic(
+            client_product_label="Claude/1.2",
+        )
+        assert claude_anthropic is not None
+        assert [c["model"] for c in claude_anthropic] == [
+            "openrouter/owl-alpha",
+            "claude-haiku-4-5-20251001",
+        ]
+        assert claude_anthropic[-1]["last_resort"] is True
+        assert claude_anthropic[-1]["route_family"] == "anthropic_messages"
+
+        for label in (None, "Codex/0.31", "SomeUnknownTUI/2.0"):
+            default = snapshot_select._select_read_pilot_snapshot_candidates(
+                client_product_label=label,
+            )
+            default_models = [c["model"] for c in default]
+            assert default_models == ["openrouter/owl-alpha", "gpt-5.6-luna"], label
+            assert default[-1]["last_resort"] is True
+            assert default[-1]["reasoning_effort"] == "low"
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous)
+
+
 def test_schedule_window_close_stops_new_affinity() -> None:
     """After a window closes, no NEW affinity to the out-of-window model; existing continues."""
     import datetime as dt

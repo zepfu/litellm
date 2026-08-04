@@ -53,6 +53,11 @@ class RoutingCandidate:
     # replaces caller/TUI reasoning at shaping time; when None the caller's
     # intent is preserved.
     reasoning_effort: Optional[str] = None
+    # CFG-008: optional per-model TUI exclusion (product name, version-
+    # insensitive). When set, the candidate is gated out only for requests
+    # from the matching identified client product; complementary to
+    # ``tui_attached`` for mutually exclusive TUI tails.
+    tui_excluded: Optional[str] = None
 
 
 @dataclass(frozen=True, slots=True)

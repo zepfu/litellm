@@ -30,6 +30,18 @@ from .policy import (
 # ---------------------------------------------------------------------------
 _READ_PILOT_ALIAS_NAME = "read"
 
+# CFG-008: route families that require Anthropic-native credentials. The
+# Codex/OpenAI Responses ingress has no native-Anthropic egress, so
+# candidates carrying one of these codex-ingress route families are excluded
+# from the Codex projection (Anthropic ingress owns them via their
+# anthropic_route_family projection). This preserves the TOS boundary:
+# Anthropic/Claude models never egress through Codex/OpenAI credentials.
+_ANTHROPIC_CREDENTIAL_ROUTE_FAMILIES: frozenset[str] = frozenset(
+    {
+        "anthropic_messages",
+    }
+)
+
 # ---------------------------------------------------------------------------
 # Injected runtime state (round-robin cursor stays in god module for Wave 5A)
 # ---------------------------------------------------------------------------
@@ -265,6 +277,27 @@ def _is_tui_attached_candidate_eligible(
     return product_name == candidate.tui_attached
 
 
+def _is_tui_excluded_candidate_eligible(
+    candidate: _RoutingSnapshotCandidate,
+    *,
+    client_product_label: Optional[str],
+) -> bool:
+    """Per-model TUI exclusion gate (CFG-008).
+
+    Complementary to :func:`_is_tui_attached_candidate_eligible`: a candidate
+    carrying ``tui_excluded`` is ineligible ONLY for requests whose identified
+    client product name matches (product name only, version-insensitive).
+    Missing/unknown/undetermined origins keep the candidate eligible, so an
+    excluded-for-one-TUI candidate can serve as the default branch tail.
+    """
+    if not candidate.tui_excluded:
+        return True
+    if not client_product_label:
+        return True
+    product_name = client_product_label.split("/", 1)[0]
+    return product_name != candidate.tui_excluded
+
+
 def _is_snapshot_candidate_in_schedule_window(
     candidate: _RoutingSnapshotCandidate,
     *,
@@ -309,6 +342,7 @@ def _resolve_read_pilot_eligible_candidates(
         candidate
         for candidate in ordered
         if _is_tui_attached_candidate_eligible(candidate, client_product_label=client_product_label)
+        and _is_tui_excluded_candidate_eligible(candidate, client_product_label=client_product_label)
         and _is_snapshot_candidate_in_schedule_window(candidate, now_utc=now_utc)
     ]
 
@@ -349,6 +383,14 @@ def _select_read_pilot_snapshot_candidates(
             )
         # Snapshot active but has no read alias: fail closed.
         return ()
+    # CFG-008: ingress credential eligibility -- the Codex ingress cannot
+    # dispatch Anthropic-credential candidates (no Codex-native egress for
+    # native Anthropic models), so they are excluded from this projection.
+    eligible = [
+        candidate
+        for candidate in eligible
+        if candidate.route_family not in _ANTHROPIC_CREDENTIAL_ROUTE_FAMILIES
+    ]
     if not eligible:
         return ()
     assert snapshot is not None

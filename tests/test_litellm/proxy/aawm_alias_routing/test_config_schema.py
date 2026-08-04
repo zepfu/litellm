@@ -162,6 +162,22 @@ def test_tui_attached_flag_compiles() -> None:
     assert candidate_default.tui_attached is None
 
 
+def test_tui_excluded_flag_compiles() -> None:
+    """CFG-008: a candidate may declare tui_excluded: <client> for per-model exclusion."""
+    candidate = schema.CandidateConfig.model_validate(_base_candidate(tui_excluded="Claude"))
+    assert candidate.tui_excluded == "Claude"
+
+    candidate_default = schema.CandidateConfig.model_validate(_base_candidate())
+    assert candidate_default.tui_excluded is None
+
+    # tui_attached and tui_excluded are independent generic eligibility fields.
+    both = schema.CandidateConfig.model_validate(
+        _base_candidate(tui_attached="Codex", tui_excluded="Claude")
+    )
+    assert both.tui_attached == "Codex"
+    assert both.tui_excluded == "Claude"
+
+
 def test_schedule_windows_utc_only() -> None:
     """Schedule windows must be UTC; overlaps resolve deterministically; non-UTC rejected."""
     candidate = schema.CandidateConfig.model_validate(

@@ -122,6 +122,7 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
         priority=candidate.priority,
         weight=weight,
         tui_attached=candidate.tui_attached,
+        tui_excluded=candidate.tui_excluded,
         schedule=schedule,
         error_rules=error_rules,
         anthropic_route_family=anthropic_rf,
@@ -180,6 +181,7 @@ def _canonical_snapshot_repr(aliases: dict[str, RoutingAlias]) -> str:
                         else None
                     ),
                     "tui_attached": candidate.tui_attached,
+                    "tui_excluded": candidate.tui_excluded,
                     "weight": candidate.weight,
                 }
             )

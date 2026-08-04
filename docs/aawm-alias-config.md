@@ -125,6 +125,29 @@ A single alias carries per-candidate `route_family` and
 Messages ingress each see only their own route-family view. No cross-provider
 fallback is introduced by the alias model.
 
+## Maintained `read` alias behavior (CFG-008)
+
+The maintained alias name is `read`. Every request uses this common candidate
+order:
+
+1. OpenRouter Cohere North Mini Code free
+2. OpenRouter Owl Alpha
+3. OpenCode Zen deepseek-v4-flash
+4. OpenCode Zen big-pickle
+5. Alibaba Token Plan qwen3.6-flash
+
+The final candidate is mutually exclusive by originating TUI:
+
+- Claude-origin requests use native Anthropic Haiku only.
+- Codex, non-Claude, missing, and unknown origins use OpenAI
+  `gpt-5.6-luna` only.
+
+Luna's YAML `reasoning_effort: low` is authoritative through the generic
+CFG-006 pipeline and replaces caller-provided reasoning. Haiku remains
+Anthropic-native; Luna uses the intended OpenAI/Codex OAuth route. The removed
+candidates are the `qwen3.8-max-preview` promo, `kimi-for-coding`, and
+`gpt-5.4-mini`.
+
 ## Provider-native credential boundary
 
 Anthropic/Claude model traffic must egress exclusively through
