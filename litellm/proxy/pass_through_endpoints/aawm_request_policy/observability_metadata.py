@@ -2,7 +2,7 @@
 
 This module owns shared metadata primitives plus Claude request text,
 child-agent, post-rewrite context-file, session/repository, tool-definition
-snapshot, Claude/Gemini/Codex breakout, Anthropic billing header, and
+snapshot, Claude/Codex breakout, Anthropic billing header, and
 persisted-output metadata handling. It intentionally does not import
 ``llm_passthrough_endpoints`` at module scope.
 """
@@ -940,7 +940,7 @@ def _prepare_request_body_for_passthrough_observability(
 
 
 # ---------------------------------------------------------------------------
-# Claude / Gemini / Codex breakout extraction and logging
+# Claude / Codex breakout extraction and logging
 # ---------------------------------------------------------------------------
 
 
@@ -1026,91 +1026,6 @@ def _add_claude_request_breakout_logging_metadata(
     request_body: dict[str, Any],
 ) -> dict[str, Any]:
     tags_to_add, extra_fields = _extract_claude_request_breakout_fields(request_body)
-    if not tags_to_add and not extra_fields:
-        return request_body
-    return _merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields=extra_fields,
-    )
-
-
-def _extract_gemini_request_breakout_fields(
-    request_body: dict[str, Any],
-) -> tuple[list[str], dict[str, Any]]:
-    tags_to_add: list[str] = []
-    extra_fields: dict[str, Any] = {}
-
-    generation_config = request_body.get("generationConfig")
-    if not isinstance(generation_config, dict):
-        request_block = request_body.get("request")
-        if isinstance(request_block, dict):
-            nested_generation_config = request_block.get("generationConfig")
-            if isinstance(nested_generation_config, dict):
-                generation_config = nested_generation_config
-
-    if isinstance(generation_config, dict):
-        thinking_config = generation_config.get("thinkingConfig")
-        if isinstance(thinking_config, dict):
-            tags_to_add.append("gemini-thinking-config-present")
-            extra_fields["gemini_thinking_config_present"] = True
-
-            include_thoughts = thinking_config.get("includeThoughts")
-            if isinstance(include_thoughts, bool):
-                include_thoughts_tag = "true" if include_thoughts else "false"
-                tags_to_add.extend(
-                    [
-                        f"gemini-include-thoughts:{include_thoughts_tag}",
-                        f"include-thoughts:{include_thoughts_tag}",
-                    ]
-                )
-                extra_fields["gemini_include_thoughts"] = include_thoughts
-
-            thinking_level = thinking_config.get("thinkingLevel")
-            normalized_thinking_level = _normalize_low_cardinality_tag_value(
-                thinking_level
-            )
-            if normalized_thinking_level:
-                tags_to_add.extend(
-                    [
-                        f"gemini-thinking-level:{normalized_thinking_level}",
-                        f"thinking-level:{normalized_thinking_level}",
-                    ]
-                )
-                extra_fields["gemini_thinking_level"] = normalized_thinking_level
-
-            thinking_budget = thinking_config.get("thinkingBudget")
-            if isinstance(thinking_budget, (int, float)) and thinking_budget > 0:
-                tags_to_add.append("gemini-thinking-budget-configured")
-                extra_fields["gemini_thinking_budget"] = thinking_budget
-
-    tools = request_body.get("tools")
-    if not isinstance(tools, list):
-        request_block = request_body.get("request")
-        if isinstance(request_block, dict):
-            nested_tools = request_block.get("tools")
-            if isinstance(nested_tools, list):
-                tools = nested_tools
-
-    if isinstance(tools, list) and tools:
-        tags_to_add.append("gemini-tools-present")
-        extra_fields["gemini_tools_present"] = True
-        extra_fields["gemini_tool_count"] = len(tools)
-
-    for key in ("user_prompt_id", "project"):
-        value = request_body.get(key)
-        if not value and isinstance(request_body.get("request"), dict):
-            value = request_body["request"].get(key)
-        if isinstance(value, str) and value.strip():
-            extra_fields[f"gemini_{key}"] = value.strip()
-
-    return tags_to_add, extra_fields
-
-
-def _add_gemini_request_breakout_logging_metadata(
-    request_body: dict[str, Any],
-) -> dict[str, Any]:
-    tags_to_add, extra_fields = _extract_gemini_request_breakout_fields(request_body)
     if not tags_to_add and not extra_fields:
         return request_body
     return _merge_litellm_metadata(
@@ -1393,8 +1308,6 @@ _HOST_PUBLISHED_NAMES: tuple[str, ...] = (
     "_extract_openai_passthrough_tool_choice",
     "_extract_claude_request_breakout_fields",
     "_add_claude_request_breakout_logging_metadata",
-    "_extract_gemini_request_breakout_fields",
-    "_add_gemini_request_breakout_logging_metadata",
     "_extract_codex_request_breakout_fields",
     "_add_codex_request_breakout_logging_metadata",
     # Anthropic billing header
@@ -1490,8 +1403,6 @@ OWNED_SYMBOLS: tuple[str, ...] = (
     "_extract_openai_passthrough_tool_choice",
     "_extract_claude_request_breakout_fields",
     "_add_claude_request_breakout_logging_metadata",
-    "_extract_gemini_request_breakout_fields",
-    "_add_gemini_request_breakout_logging_metadata",
     "_extract_codex_request_breakout_fields",
     "_add_codex_request_breakout_logging_metadata",
     # Anthropic billing header

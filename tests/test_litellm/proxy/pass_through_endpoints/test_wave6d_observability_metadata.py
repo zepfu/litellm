@@ -329,7 +329,7 @@ def test_context_file_logging_returns_original_for_malformed_absent_content() ->
 
 
 def test_owned_symbols_inventory_is_exact_and_resolvable() -> None:
-    expected_count = 60
+    expected_count = 58
     assert len(metadata.OWNED_SYMBOLS) == expected_count
     assert len(set(metadata.OWNED_SYMBOLS)) == expected_count
     for symbol in metadata.OWNED_SYMBOLS:
@@ -616,62 +616,6 @@ def test_add_claude_request_breakout_logging_metadata_merges() -> None:
     result = metadata._add_claude_request_breakout_logging_metadata(body)
     assert result is not body
     assert "claude-thinking-type:enabled" in result["litellm_metadata"]["tags"]
-
-
-# ---------------------------------------------------------------------------
-# Gemini breakout extraction / logging
-# ---------------------------------------------------------------------------
-
-
-def test_extract_gemini_request_breakout_fields_full() -> None:
-    body = {
-        "generationConfig": {
-            "thinkingConfig": {
-                "includeThoughts": True,
-                "thinkingLevel": "high",
-                "thinkingBudget": 1024,
-            }
-        },
-        "tools": [{"name": "search"}],
-        "user_prompt_id": "up-1",
-        "project": "proj-1",
-    }
-    tags, fields = metadata._extract_gemini_request_breakout_fields(body)
-    assert "gemini-thinking-config-present" in tags
-    assert "gemini-include-thoughts:true" in tags
-    assert "include-thoughts:true" in tags
-    assert "gemini-thinking-level:high" in tags
-    assert "thinking-level:high" in tags
-    assert "gemini-thinking-budget-configured" in tags
-    assert "gemini-tools-present" in tags
-    assert fields["gemini_thinking_config_present"] is True
-    assert fields["gemini_include_thoughts"] is True
-    assert fields["gemini_thinking_level"] == "high"
-    assert fields["gemini_thinking_budget"] == 1024
-    assert fields["gemini_tools_present"] is True
-    assert fields["gemini_tool_count"] == 1
-    assert fields["gemini_user_prompt_id"] == "up-1"
-    assert fields["gemini_project"] == "proj-1"
-
-
-def test_extract_gemini_request_breakout_fields_nested_request() -> None:
-    body = {
-        "request": {
-            "generationConfig": {"thinkingConfig": {"thinkingLevel": "low"}},
-            "tools": [{"name": "a"}, {"name": "b"}],
-            "project": "nested-proj",
-        }
-    }
-    tags, fields = metadata._extract_gemini_request_breakout_fields(body)
-    assert "gemini-thinking-level:low" in tags
-    assert "gemini-tools-present" in tags
-    assert fields["gemini_tool_count"] == 2
-    assert fields["gemini_project"] == "nested-proj"
-
-
-def test_add_gemini_request_breakout_logging_metadata_empty_returns_original() -> None:
-    body: dict[str, Any] = {"model": "gemini"}
-    assert metadata._add_gemini_request_breakout_logging_metadata(body) is body
 
 
 # ---------------------------------------------------------------------------
