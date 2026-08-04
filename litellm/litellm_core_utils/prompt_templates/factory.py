@@ -1317,6 +1317,7 @@ def infer_protocol_value(
 
 def _gemini_tool_call_invoke_helper(
     function_call_params: ChatCompletionToolCallFunctionChunk,
+    tool_call_id: Optional[str] = None,
 ) -> Optional[VertexFunctionCall]:
     name = function_call_params.get("name", "") or ""
     arguments = function_call_params.get("arguments", "")
@@ -1332,6 +1333,10 @@ def _gemini_tool_call_invoke_helper(
         name=name,
         args=arguments_dict,
     )
+    if tool_call_id:
+        clean_id = tool_call_id.split(THOUGHT_SIGNATURE_SEPARATOR, 1)[0]
+        if clean_id:
+            function_call["id"] = clean_id
     return function_call
 
 
@@ -1423,6 +1428,7 @@ def _get_dummy_thought_signature() -> str:
 def convert_to_gemini_tool_call_invoke(
     message: ChatCompletionAssistantMessage,
     model: Optional[str] = None,
+    forward_function_call_id: bool = False,
 ) -> List[VertexPartType]:
     """
     OpenAI tool invokes:
@@ -1474,13 +1480,12 @@ def convert_to_gemini_tool_call_invoke(
                     gemini_function_call: Optional[
                         VertexFunctionCall
                     ] = _gemini_tool_call_invoke_helper(
-                        function_call_params=tool["function"]
+                        function_call_params=tool["function"],
+                        tool_call_id=(
+                            tool.get("id") if forward_function_call_id else None
+                        ),
                     )
                     if gemini_function_call is not None:
-                        if model and "claude" in model.lower():
-                            tool_call_id = tool.get("id")
-                            if isinstance(tool_call_id, str) and tool_call_id:
-                                gemini_function_call["id"] = tool_call_id
                         part_dict: VertexPartType = {
                             "function_call": gemini_function_call
                         }
@@ -1550,6 +1555,7 @@ def convert_to_gemini_tool_call_invoke(
 def convert_to_gemini_tool_call_result(  # noqa: PLR0915
     message: Union[ChatCompletionToolMessage, ChatCompletionFunctionMessage],
     last_message_with_tool_calls: Optional[dict],
+    forward_function_call_id: bool = False,
 ) -> Union[VertexPartType, List[VertexPartType]]:
     """
     OpenAI message with a tool result looks like:
@@ -1656,6 +1662,15 @@ def convert_to_gemini_tool_call_result(  # noqa: PLR0915
             ):
                 name = tool.get("function", {}).get("name", "")
 
+    # Echo the OpenAI tool_call_id on functionResponse (strip thought-signature suffix).
+    gemini_call_id: Optional[str] = None
+    if forward_function_call_id:
+        raw_tool_call_id = message.get("tool_call_id")
+        if raw_tool_call_id and isinstance(raw_tool_call_id, str):
+            stripped_id = raw_tool_call_id.split(THOUGHT_SIGNATURE_SEPARATOR, 1)[0]
+            if stripped_id:
+                gemini_call_id = stripped_id
+
     if not name:
         raise Exception(
             "Missing corresponding tool call for tool response message. Received - message={}, last_message_with_tool_calls={}".format(
@@ -1678,6 +1693,8 @@ def convert_to_gemini_tool_call_result(  # noqa: PLR0915
     _function_response = VertexFunctionResponse(
         name=name, response=response_data  # type: ignore
     )
+    if gemini_call_id:
+        _function_response["id"] = gemini_call_id
 
     # Create part with function_response, and optionally inline_data for images (Computer Use)
     _part: VertexPartType = {"function_response": _function_response}

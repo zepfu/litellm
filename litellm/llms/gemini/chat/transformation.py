@@ -1,4 +1,4 @@
-from typing import List, Optional, cast
+from typing import Dict, List, Optional, cast
 
 from litellm.litellm_core_utils.prompt_templates.factory import (
     convert_generic_image_chunk_to_openai_image_obj,
@@ -100,7 +100,10 @@ class GoogleAIStudioGeminiConfig(VertexGeminiConfig):
         return supported_params
 
     def _transform_messages(
-        self, messages: List[AllMessageValues], model: Optional[str] = None
+        self,
+        messages: List[AllMessageValues],
+        model: Optional[str] = None,
+        litellm_params: Optional[Dict] = None,
     ) -> List[ContentType]:
         """
         Google AI Studio Gemini does not support HTTP/HTTPS URLs for files.
@@ -150,4 +153,9 @@ class GoogleAIStudioGeminiConfig(VertexGeminiConfig):
                             except Exception:
                                 # If conversion fails, leave as is and let the API handle it
                                 pass
-        return _gemini_convert_messages_with_history(messages=messages, model=model)
+        return _gemini_convert_messages_with_history(
+            messages=messages,
+            model=model,
+            litellm_params=litellm_params,
+            custom_llm_provider="gemini",
+        )

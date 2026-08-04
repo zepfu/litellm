@@ -291,6 +291,8 @@ def check_if_part_exists_in_parts(
 def _gemini_convert_messages_with_history(  # noqa: PLR0915
     messages: List[AllMessageValues],
     model: Optional[str] = None,
+    litellm_params: Optional[Dict] = None,
+    custom_llm_provider: Optional[str] = None,
 ) -> List[ContentType]:
     """
     Converts given messages from OpenAI format to Gemini format
@@ -306,6 +308,13 @@ def _gemini_convert_messages_with_history(  # noqa: PLR0915
 
     msg_i = 0
     tool_call_responses = []
+
+    from .vertex_and_google_ai_studio_gemini import VertexGeminiConfig
+
+    forward_function_call_id = VertexGeminiConfig._forward_gemini_function_call_id(
+        model or ""
+    )
+
     try:
         while msg_i < len(messages):
             user_content: List[PartType] = []
@@ -528,7 +537,9 @@ def _gemini_convert_messages_with_history(  # noqa: PLR0915
                     or assistant_msg.get("function_call") is not None
                 ):  # support assistant tool invoke conversion
                     gemini_tool_call_parts = convert_to_gemini_tool_call_invoke(
-                        assistant_msg, model=model
+                        assistant_msg,
+                        model=model,
+                        forward_function_call_id=forward_function_call_id,
                     )
                     ## check if gemini_tool_call already exists in assistant_content
                     for gemini_tool_call_part in gemini_tool_call_parts:
@@ -552,7 +563,9 @@ def _gemini_convert_messages_with_history(  # noqa: PLR0915
                 and messages[msg_i]["role"] in tool_call_message_roles
             ):
                 _part = convert_to_gemini_tool_call_result(
-                    messages[msg_i], last_message_with_tool_calls  # type: ignore
+                    messages[msg_i],  # type: ignore
+                    last_message_with_tool_calls,
+                    forward_function_call_id=forward_function_call_id,
                 )
                 msg_i += 1
                 # Handle both single part and list of parts (for Computer Use with images)
@@ -658,11 +671,11 @@ def _transform_request_body(  # noqa: PLR0915
     try:
         if custom_llm_provider == "gemini":
             content = litellm.GoogleAIStudioGeminiConfig()._transform_messages(
-                messages=messages, model=model
+                messages=messages, model=model, litellm_params=litellm_params
             )
         else:
             content = litellm.VertexGeminiConfig()._transform_messages(
-                messages=messages, model=model
+                messages=messages, model=model, litellm_params=litellm_params
             )
         tools: Optional[Tools] = optional_params.pop("tools", None)
         tool_choice: Optional[ToolConfig] = optional_params.pop("tool_choice", None)

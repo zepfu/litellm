@@ -286,6 +286,16 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
             return True
         return False
 
+    @staticmethod
+    def _forward_gemini_function_call_id(model: str) -> bool:
+        """
+        Whether to include `id` on function_call / function_response parts.
+
+        Gemini 3+ accepts (and returns) `id` for strict tool-call matching, on Vertex AI and
+        Google AI Studio alike. Older Gemini models reject the field with HTTP 400.
+        """
+        return VertexGeminiConfig._is_gemini_3_or_newer(model)
+
     def _supports_penalty_parameters(self, model: str) -> bool:
         # Gemini 3 models do not support penalty parameters
         if VertexGeminiConfig._is_gemini_3_or_newer(model):
@@ -1446,6 +1456,10 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
                 }
                 # Extract thought signature if present
                 thought_signature = part.get("thoughtSignature")
+                # Gemini 3.5+ returns a stable `id` per function call to enable
+                # strict response matching. Preserve it as the OpenAI
+                # tool_call_id so it can be echoed back unchanged.
+                gemini_call_id = part["functionCall"].get("id")
 
                 if is_function_call is True:
                     function_dict: Dict[str, Any] = dict(_function_chunk)
@@ -1457,19 +1471,17 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
                         ] = thought_signature
                     function = cast(ChatCompletionToolCallFunctionChunk, function_dict)
                 else:
-                    raw_function_call_id = part["functionCall"].get("id")
-                    tool_call_id = (
-                        raw_function_call_id.strip()
-                        if isinstance(raw_function_call_id, str)
-                        and raw_function_call_id.strip()
-                        else f"call_{uuid.uuid4().hex[:28]}"
-                    )
                     _tool_response_chunk: ChatCompletionToolCallChunk = {
-                        "id": tool_call_id,
+                        "id": f"call_{uuid.uuid4().hex[:28]}",
                         "type": "function",
                         "function": _function_chunk,
                         "index": cumulative_tool_call_idx,
                     }
+                    # Gemini 3.5+ returns a stable native `id`; prefer it over
+                    # the synthetic call_<uuid> so the same value can be echoed
+                    # back on the matching `functionResponse`.
+                    if gemini_call_id:
+                        _tool_response_chunk["id"] = gemini_call_id
                     # Embed thought signature in ID for OpenAI client compatibility
                     if thought_signature:
                         _tool_response_chunk["provider_specific_fields"] = {  # type: ignore
@@ -2354,9 +2366,17 @@ class VertexGeminiConfig(VertexAIBaseConfig, BaseConfig):
         return model_response
 
     def _transform_messages(
-        self, messages: List[AllMessageValues], model: Optional[str] = None
+        self,
+        messages: List[AllMessageValues],
+        model: Optional[str] = None,
+        litellm_params: Optional[Dict] = None,
     ) -> List[ContentType]:
-        return _gemini_convert_messages_with_history(messages=messages, model=model)
+        return _gemini_convert_messages_with_history(
+            messages=messages,
+            model=model,
+            litellm_params=litellm_params,
+            custom_llm_provider="vertex_ai",
+        )
 
     def get_error_class(
         self, error_message: str, status_code: int, headers: Union[Dict, httpx.Headers]

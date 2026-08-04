@@ -2015,6 +2015,230 @@ def test_is_gemini_3_or_newer():
     assert VertexGeminiConfig._is_gemini_3_or_newer("") == False
 
 
+def _tool_call_messages(tool_call_id: str):
+    return [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": tool_call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": '{"filePath": "/tmp"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": "ok",
+        },
+    ]
+
+
+def _collect_function_call_ids(contents):
+    function_call_ids = []
+    function_response_ids = []
+    for content in contents:
+        for part in content.get("parts", []):
+            fc = part.get("function_call")
+            if fc is not None:
+                function_call_ids.append(fc.get("id"))
+            fr = part.get("function_response")
+            if fr is not None:
+                function_response_ids.append(fr.get("id"))
+    return function_call_ids, function_response_ids
+
+
+def test_forward_gemini_function_call_id_is_gated_on_model_version_only():
+    """Gemini 3+ takes `id` on Vertex AI and Google AI Studio alike; older models reject it."""
+    from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
+        VertexGeminiConfig,
+    )
+
+    assert VertexGeminiConfig._forward_gemini_function_call_id("gemini-3.5-flash") is True
+    assert VertexGeminiConfig._forward_gemini_function_call_id("gemini-3-pro") is True
+    assert VertexGeminiConfig._forward_gemini_function_call_id("gemini-2.5-flash") is False
+    assert VertexGeminiConfig._forward_gemini_function_call_id("gemini-2.0-flash") is False
+
+
+@pytest.mark.parametrize("custom_llm_provider", ["vertex_ai", "vertex_ai_beta", "gemini"])
+def test_gemini_35_tool_calls_include_function_call_id(custom_llm_provider):
+    """Vertex AI accepts `id` on Gemini 3+, so it must be sent there and not just on AI Studio.
+
+    Both parts are asserted together: Vertex pairs a result to its call by id, so emitting one
+    side without the other would break strict tool-call matching.
+    """
+    from litellm.llms.vertex_ai.gemini.transformation import (
+        _gemini_convert_messages_with_history,
+    )
+
+    tool_call_id = "call_50e7e0fe0989464a89f188eda443"
+    contents = _gemini_convert_messages_with_history(
+        messages=_tool_call_messages(tool_call_id),
+        model="gemini-3.5-flash",
+        custom_llm_provider=custom_llm_provider,
+    )
+
+    assert _collect_function_call_ids(contents) == ([tool_call_id], [tool_call_id])
+
+
+@pytest.mark.parametrize("custom_llm_provider", ["vertex_ai", "gemini"])
+def test_gemini_25_tool_calls_omit_function_call_id(custom_llm_provider):
+    """Regression: models older than Gemini 3 reject `id`, so the key must be absent entirely."""
+    from litellm.llms.vertex_ai.gemini.transformation import (
+        _gemini_convert_messages_with_history,
+    )
+
+    contents = _gemini_convert_messages_with_history(
+        messages=_tool_call_messages("call_50e7e0fe0989464a89f188eda443"),
+        model="gemini-2.5-flash",
+        custom_llm_provider=custom_llm_provider,
+    )
+
+    for content in contents:
+        for part in content.get("parts", []):
+            fc = part.get("function_call")
+            if fc is not None:
+                assert "id" not in fc, f"gemini-2.5 payload must not include id: {fc}"
+            fr = part.get("function_response")
+            if fr is not None:
+                assert "id" not in fr, f"gemini-2.5 payload must not include id: {fr}"
+
+
+def test_vertex_ai_forwarded_function_call_id_strips_thought_signature_suffix():
+    """The thought signature rides along on the OpenAI id but must not reach Vertex.
+
+    Vertex now sees this code path for the first time, so the suffix has to be stripped here too.
+    """
+    from litellm.llms.vertex_ai.gemini.transformation import (
+        _gemini_convert_messages_with_history,
+    )
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        THOUGHT_SIGNATURE_SEPARATOR,
+    )
+
+    bare_id = "call_50e7e0fe0989464a89f188eda443"
+    contents = _gemini_convert_messages_with_history(
+        messages=_tool_call_messages(f"{bare_id}{THOUGHT_SIGNATURE_SEPARATOR}sig123"),
+        model="gemini-3.5-flash",
+        custom_llm_provider="vertex_ai",
+    )
+
+    _, function_response_ids = _collect_function_call_ids(contents)
+    assert function_response_ids == [bare_id]
+
+
+def test_transform_parts_preserves_native_gemini_function_call_id():
+    """Native Gemini functionCall.id values must be preserved as the OpenAI tool_call_id.
+
+    Gemini 3.5+ returns a stable native `id` per function call for strict response
+    matching; `_transform_parts` must carry it through unchanged so it can be echoed
+    back on the matching functionResponse. The synthetic call_<uuid> format is used
+    only when the native id is absent.
+    """
+    from litellm.litellm_core_utils.prompt_templates.factory import (
+        THOUGHT_SIGNATURE_SEPARATOR,
+    )
+    from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
+        VertexGeminiConfig,
+    )
+    from litellm.types.llms.vertex_ai import HttpxPartType
+
+    native_id = "call_50e7e0fe0989464a89f188eda443"
+    function, tools, updated_idx = VertexGeminiConfig._transform_parts(
+        parts=[
+            HttpxPartType(
+                functionCall={
+                    "name": "get_weather",
+                    "args": {"location": "San Francisco"},
+                    "id": native_id,
+                }
+            )
+        ],
+        cumulative_tool_call_idx=0,
+        is_function_call=False,
+    )
+
+    assert function is None
+    assert updated_idx == 1
+    assert tools is not None and len(tools) == 1
+    assert tools[0]["id"] == native_id
+    assert tools[0]["function"]["name"] == "get_weather"
+
+    # Without a native id, fall back to the synthetic call_<uuid> format.
+    _, fallback_tools, _ = VertexGeminiConfig._transform_parts(
+        parts=[
+            HttpxPartType(
+                functionCall={"name": "get_weather", "args": {}}
+            )
+        ],
+        cumulative_tool_call_idx=0,
+        is_function_call=False,
+    )
+    assert fallback_tools is not None
+    assert re.match(r"^call_[0-9a-f]{28}$", fallback_tools[0]["id"])
+
+    # The native id must also survive thought-signature embedding: the suffix is
+    # appended to the native id and stripping it restores it exactly.
+    thought_signature = "sig123"
+    _, signed_tools, _ = VertexGeminiConfig._transform_parts(
+        parts=[
+            HttpxPartType(
+                functionCall={
+                    "name": "get_weather",
+                    "args": {},
+                    "id": native_id,
+                },
+                thoughtSignature=thought_signature,
+            )
+        ],
+        cumulative_tool_call_idx=0,
+        is_function_call=False,
+    )
+    assert signed_tools is not None
+    assert signed_tools[0]["id"] == f"{native_id}{THOUGHT_SIGNATURE_SEPARATOR}{thought_signature}"
+    assert signed_tools[0]["id"].split(THOUGHT_SIGNATURE_SEPARATOR, 1)[0] == native_id
+    assert (
+        signed_tools[0]["provider_specific_fields"]["thought_signature"]
+        == thought_signature
+    )
+
+
+def test_gemini_convert_messages_positional_compatibility_smoke():
+    """Pinned-upstream positional order: (messages, model, litellm_params, custom_llm_provider)."""
+    from litellm.llms.vertex_ai.gemini.transformation import (
+        _gemini_convert_messages_with_history,
+    )
+
+    messages = _tool_call_messages("call_50e7e0fe0989464a89f188eda443")
+
+    # 3rd positional slot is litellm_params (accepted, no misbind).
+    contents = _gemini_convert_messages_with_history(
+        messages, "gemini-3.5-flash", {"vertex_project": "p", "vertex_credentials": "c"}
+    )
+    function_call_ids, function_response_ids = _collect_function_call_ids(contents)
+    assert function_call_ids == ["call_50e7e0fe0989464a89f188eda443"]
+    assert function_response_ids == ["call_50e7e0fe0989464a89f188eda443"]
+
+    # 4th positional slot is custom_llm_provider.
+    contents = _gemini_convert_messages_with_history(
+        messages, "gemini-2.5-flash", None, "vertex_ai"
+    )
+    for content in contents:
+        for part in content.get("parts", []):
+            fc = part.get("function_call")
+            if fc is not None:
+                assert "id" not in fc, f"gemini-2.5 payload must not include id: {fc}"
+            fr = part.get("function_response")
+            if fr is not None:
+                assert "id" not in fr, f"gemini-2.5 payload must not include id: {fr}"
+
+
 def test_reasoning_effort_maps_to_thinking_level_gemini_3():
     """Test that reasoning_effort maps to thinking_level AND includeThoughts for Gemini 3+ models"""
     from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
