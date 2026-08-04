@@ -122,6 +122,9 @@ class AnthropicPassthroughLoggingHandler:
             custom_llm_provider = logging_obj.model_call_details.get(
                 "custom_llm_provider"
             )
+            cost_llm_provider = (
+                custom_llm_provider or litellm.LlmProviders.ANTHROPIC.value
+            )
 
             # Prepend custom_llm_provider to model if not already present
             model_for_cost = model
@@ -132,16 +135,24 @@ class AnthropicPassthroughLoggingHandler:
                 response_cost = litellm.completion_cost(
                     completion_response=litellm_model_response,
                     model=model_for_cost,
-                    custom_llm_provider=custom_llm_provider,
+                    custom_llm_provider=cost_llm_provider,
                 )
             except Exception as exc:
-                if custom_llm_provider != "opencode_zen":
+                if custom_llm_provider == "opencode_zen":
+                    response_cost = AnthropicPassthroughLoggingHandler._opencode_zen_cost_fallback(
+                        litellm_model_response=litellm_model_response,
+                        model=model,
+                        original_exception=exc,
+                    )
+                elif cost_llm_provider == litellm.LlmProviders.ANTHROPIC.value:
+                    verbose_proxy_logger.debug(
+                        "Anthropic passthrough cost unavailable for model=%s; recording zero cost and preserving usage: %s",
+                        model,
+                        str(exc),
+                    )
+                    response_cost = 0.0
+                else:
                     raise
-                response_cost = AnthropicPassthroughLoggingHandler._opencode_zen_cost_fallback(
-                    litellm_model_response=litellm_model_response,
-                    model=model,
-                    original_exception=exc,
-                )
 
             apply_passthrough_logging_contract(
                 litellm_response=litellm_model_response,
@@ -149,8 +160,7 @@ class AnthropicPassthroughLoggingHandler:
                 kwargs=kwargs,
                 logging_obj=logging_obj,
                 response_cost=response_cost,
-                custom_llm_provider=custom_llm_provider
-                or litellm.LlmProviders.ANTHROPIC.value,
+                custom_llm_provider=cost_llm_provider,
                 set_response_id=True,
             )
 

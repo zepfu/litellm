@@ -440,33 +440,38 @@ class TestAzureAnthropicCostCalculation:
         from litellm.types.utils import ModelResponse
         from datetime import datetime
 
-        mock_completion_cost.return_value = 0.001
+        mock_completion_cost.side_effect = Exception("unmapped native model")
 
         # No custom_llm_provider in model_call_details
-        logging_obj = self._create_mock_logging_obj(model="claude-3-sonnet-20240229")
+        logging_obj = self._create_mock_logging_obj(model="claude-opus-5")
 
         mock_response = MagicMock(spec=ModelResponse)
         mock_response.id = "test-id"
-        mock_response.model = "claude-3-sonnet-20240229"
+        mock_response.model = "claude-opus-5"
 
         kwargs = {}
         start_time = datetime.now()
         end_time = datetime.now()
 
-        AnthropicPassthroughLoggingHandler._create_anthropic_response_logging_payload(
-            litellm_model_response=mock_response,
-            model="claude-3-sonnet-20240229",
-            kwargs=kwargs,
-            start_time=start_time,
-            end_time=end_time,
-            logging_obj=logging_obj,
-        )
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_provider_handlers.anthropic_passthrough_logging_handler.verbose_proxy_logger.exception"
+        ) as mock_log_exception:
+            result = AnthropicPassthroughLoggingHandler._create_anthropic_response_logging_payload(
+                litellm_model_response=mock_response,
+                model="claude-opus-5",
+                kwargs=kwargs,
+                start_time=start_time,
+                end_time=end_time,
+                logging_obj=logging_obj,
+            )
 
-        # Verify completion_cost was called without provider prefix
         mock_completion_cost.assert_called_once()
         call_kwargs = mock_completion_cost.call_args[1]
-        assert call_kwargs["model"] == "claude-3-sonnet-20240229"
-        assert call_kwargs["custom_llm_provider"] is None
+        assert call_kwargs["model"] == "claude-opus-5"
+        assert call_kwargs["custom_llm_provider"] == "anthropic"
+        assert result["response_cost"] == 0.0
+        assert result["custom_llm_provider"] == "anthropic"
+        mock_log_exception.assert_not_called()
 
     @patch("litellm.completion_cost")
     def test_cost_calculation_does_not_duplicate_provider_prefix(
