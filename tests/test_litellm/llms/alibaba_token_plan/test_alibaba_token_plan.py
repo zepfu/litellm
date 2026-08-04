@@ -31,8 +31,9 @@ def test_should_register_alibaba_token_plan_provider_and_config() -> None:
     )
 
 
-def test_should_admit_only_the_six_token_plan_models() -> None:
+def test_should_admit_only_the_seven_token_plan_models() -> None:
     assert ALIBABA_TOKEN_PLAN_MODEL_IDS == {
+        "qwen3.8-max",
         "qwen3.8-max-preview",
         "qwen3.7-plus",
         "qwen3.7-max",
@@ -45,7 +46,6 @@ def test_should_admit_only_the_six_token_plan_models() -> None:
 @pytest.mark.parametrize(
     "model",
     (
-        "qwen3.8-max",
         "qwen/qwen3.8-max-preview",
         "dashscope/qwen3.8-max-preview",
         "alibaba_token_plan/unknown",
