@@ -8782,9 +8782,9 @@ async def test_persist_alias_routing_audit_best_effort_uses_executemany() -> Non
                 {
                     "alias_family": "anthropic_auto_agent",
                     "alias_model": "aawm-code-anthropic",
-                    "provider": "antigravity",
+                    "provider": "anthropic",
                     "model": "claude-sonnet-4-6",
-                    "route_family": "anthropic_antigravity_completion_adapter",
+                    "route_family": "anthropic_messages",
                     "event_type": "candidate_selected",
                     "candidate_status": "selected",
                     "selected": True,
@@ -8803,7 +8803,7 @@ async def test_persist_alias_routing_audit_best_effort_uses_executemany() -> Non
     assert sql == aawm_agent_identity._AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL
     assert len(payloads) == 1
     assert payloads[0][6] == "aawm-code-anthropic"
-    assert payloads[0][9] == "antigravity"
+    assert payloads[0][9] == "anthropic"
 
 
 @pytest.mark.asyncio
@@ -13612,35 +13612,6 @@ def test_rate_limit_storage_provider_preserves_opencode_zen_identity() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "record",
-    [
-        {
-            "client_family": "antigravity_code_assist",
-            "source": "antigravity_retrieve_user_quota",
-        },
-        {
-            "client_family": "google_code_assist",
-            "source": "google_retrieve_user_quota",
-        },
-    ],
-)
-def test_rate_limit_storage_provider_does_not_infer_retired_code_assist_provider(
-    record: dict[str, str],
-) -> None:
-    assert aawm_agent_identity._rate_limit_storage_provider(record) == "unknown"
-
-
-@pytest.mark.parametrize("provider", ["antigravity", "google_code_assist"])
-def test_rate_limit_storage_provider_preserves_explicit_historical_provider(
-    provider: str,
-) -> None:
-    assert (
-        aawm_agent_identity._rate_limit_storage_provider({"provider": provider})
-        == provider
-    )
-
-
 def test_derive_langfuse_trace_tags_from_langfuse_trace_merges_observation_metadata() -> None:
     trace = {
         "id": "trace-tags-123",
@@ -13926,9 +13897,9 @@ async def test_persist_session_history_records_propagates_rate_limit_side_write_
                         {
                             "alias_family": "anthropic_auto_agent",
                             "alias_model": "aawm-code-anthropic",
-                            "provider": "antigravity",
+                            "provider": "anthropic",
                             "model": "claude-sonnet-4-6",
-                            "route_family": "anthropic_antigravity_completion_adapter",
+                            "route_family": "anthropic_messages",
                             "event_type": "candidate_selected",
                             "candidate_status": "selected",
                             "selected": True,

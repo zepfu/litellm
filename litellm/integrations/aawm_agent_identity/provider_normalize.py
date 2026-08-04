@@ -46,21 +46,6 @@ if TYPE_CHECKING:
         metadata: Dict[str, Any],
     ) -> Optional[str]: ...
 
-# Inert historical retirement data. aawm_session_history/record.py still
-# publishes these constants onto the identity host namespace, so keep them as
-# plain data; no normalizer/cache/rate-limit code consumes them anymore.
-_RETIRED_GOOGLE_AGENT_PROVIDER_NAMES = frozenset(
-    {
-        "antigravity",
-        "agy",
-        "google-antigravity",
-        "google_code_assist",
-        "google-code-assist",
-    }
-)
-_RETIRED_GOOGLE_AGENT_MARKERS = ("antigravity", "code_assist", "code-assist")
-_RETIRED_GOOGLE_AGENT_API_BASE_MARKERS = ("cloudcode-pa.googleapis.com",)
-
 
 def _normalize_session_history_provider_name(candidate: Any) -> Optional[str]:
     if not isinstance(candidate, str) or not candidate.strip():

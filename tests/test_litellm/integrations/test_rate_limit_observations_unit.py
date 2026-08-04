@@ -141,7 +141,7 @@ def _xai_oauth_inputs():
 def _grok_billing_inputs():
     metadata = {
         "grok_cli_chat_proxy": True,
-        "google_retrieve_user_quota": {
+        "grok_billing_payload": {
             "config": {
                 "monthlyLimit": {"val": 1000},
                 "used": {"val": 250},

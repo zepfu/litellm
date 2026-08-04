@@ -98,19 +98,6 @@ _PROVIDER_CACHE_TARGET_FAMILIES = {
     "xai",
 }
 
-# Inert historical retirement data. aawm_session_history/record.py still
-# publishes this constant onto the identity host namespace, so keep it as
-# plain data; no cache code consumes it anymore.
-_RETIRED_PROVIDER_CACHE_NAMES = frozenset(
-    {
-        "antigravity",
-        "agy",
-        "google-antigravity",
-        "google_code_assist",
-        "google-code-assist",
-    }
-)
-
 
 def _normalize_provider_cache_family(
     provider: Any,
