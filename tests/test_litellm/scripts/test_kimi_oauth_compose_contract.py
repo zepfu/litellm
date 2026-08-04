@@ -5,9 +5,12 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import yaml
+
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _COMPOSE_PATH = _REPO_ROOT / "docker-compose.dev.yml"
+_DEV_CONFIG_PATH = _REPO_ROOT / "litellm-dev-config.yaml"
 _PROVIDER_STATUS_DOCKERFILE_PATH = _REPO_ROOT / "docker" / "Dockerfile.provider_status_observations"
 _KIMI_AUTH_FILE = "/home/zepfu/.kimi-code/credentials/kimi-code.json"
 _KIMI_CREDENTIAL_DIR = "/home/zepfu/.kimi-code/credentials"
@@ -167,3 +170,20 @@ def test_provider_status_image_packages_kimi_native_contract_module() -> None:
     ) in dockerfile
     assert "LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=false" in dockerfile
     assert "RUN mkdir -p /app/kimi-descriptor" in dockerfile
+
+
+def test_dev_config_kimi_contract_path_matches_compose_canonical_path() -> None:
+    """The dev config must point at the same canonical descriptor path that
+    docker-compose.dev.yml mounts and defaults, so the required contract gate
+    does not fail before provider egress in local dev."""
+    compose = _COMPOSE_PATH.read_text(encoding="utf-8")
+    compose_defaults = re.findall(
+        r"\$\{LITELLM_KIMI_NATIVE_CONTRACT_PATH:-([^}]+)\}", compose
+    )
+    assert compose_defaults
+
+    dev_config = yaml.safe_load(_DEV_CONFIG_PATH.read_text(encoding="utf-8"))
+    env = dev_config["environment_variables"]
+
+    assert env["LITELLM_KIMI_NATIVE_CONTRACT_PATH"] in compose_defaults
+    assert env["LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED"] == "true"
