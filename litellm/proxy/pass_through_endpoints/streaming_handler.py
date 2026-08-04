@@ -34,9 +34,6 @@ from litellm.types.utils import StandardPassThroughResponseObject
 from .llm_provider_handlers.anthropic_passthrough_logging_handler import (
     AnthropicPassthroughLoggingHandler,
 )
-from .llm_provider_handlers.gemini_passthrough_logging_handler import (
-    GeminiPassthroughLoggingHandler,
-)
 from .llm_provider_handlers.openai_passthrough_logging_handler import (
     OpenAIPassthroughLoggingHandler,
 )
@@ -1041,30 +1038,7 @@ class PassThroughStreamingHandler:
             or getattr(litellm_logging_obj, "litellm_call_id", None),
         )
 
-        if custom_llm_provider == "gemini" and passthrough_success_handler_obj.is_gemini_route(
-            url_route, custom_llm_provider
-        ):
-            handler_branch = set_branch(handler_branch_state, "gemini")
-            gemini_passthrough_logging_handler_result = (
-                GeminiPassthroughLoggingHandler._handle_logging_gemini_collected_chunks(
-                    litellm_logging_obj=litellm_logging_obj,
-                    passthrough_success_handler_obj=passthrough_success_handler_obj,
-                    url_route=url_route,
-                    request_body=request_body,
-                    endpoint_type=endpoint_type,
-                    start_time=start_time,
-                    all_chunks=all_chunks,
-                    model=model,
-                    end_time=end_time,
-                    kwargs=kwargs,
-                    custom_llm_provider=custom_llm_provider or "gemini",
-                )
-            )
-            standard_logging_response_object = (
-                gemini_passthrough_logging_handler_result["result"]
-            )
-            kwargs.update(gemini_passthrough_logging_handler_result["kwargs"])
-        elif endpoint_type == EndpointType.OPENAI:
+        if endpoint_type == EndpointType.OPENAI:
             handler_branch = set_branch(handler_branch_state, "openai")
             openai_passthrough_logging_handler_result = (
                 OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks(
