@@ -77,11 +77,6 @@ if TYPE_CHECKING:
 
     def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any: ...
 
-    def _fallback_gemini_reasoning_tokens_from_signatures(
-        metadata: Dict[str, Any],
-        message: Any = None,
-    ) -> Optional[int]: ...
-
     def _is_claude_permission_check_metadata(metadata: Any) -> bool: ...
 
     def _is_codex_default_agent_context(kwargs: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None) -> bool: ...
@@ -171,9 +166,6 @@ _WORKER_CONTEXT_EXHAUSTION_BOOL_KEYS = frozenset(
         "worker_context_exhaustion_completed",
     }
 )
-
-_GEMINI_MARKER = bytes.fromhex("8f3d6b5f")
-
 
 def _extract_reasoning_content(message: Any, thinking_blocks: List[dict]) -> str:
     reasoning_content = _maybe_get(message, "reasoning_content")
@@ -394,13 +386,6 @@ def _enrich_usage_breakout_metadata(kwargs: Dict[str, Any], result: Any) -> None
     message = _extract_first_response_message(result)
     if reported_reasoning_tokens is not None:
         reasoning_tokens_source = "provider_reported"
-    elif provider_prefix == "gemini":
-        reported_reasoning_tokens = _fallback_gemini_reasoning_tokens_from_signatures(
-            metadata,
-            message,
-        )
-        if reported_reasoning_tokens is not None:
-            reasoning_tokens_source = "provider_signature_present"
 
     tool_call_count, tool_names = _extract_tool_call_info(message)
     if tool_call_count == 0:
@@ -536,184 +521,6 @@ def _enrich_claude_thinking_metadata(metadata: Dict[str, Any], message: Any) -> 
     )
 
 
-def _read_varint(data: bytes, offset: int) -> Tuple[Optional[int], int]:
-    value = 0
-    shift = 0
-    current_offset = offset
-    while current_offset < len(data):
-        current_byte = data[current_offset]
-        value |= (current_byte & 0x7F) << shift
-        current_offset += 1
-        if current_byte < 0x80:
-            return value, current_offset
-        shift += 7
-        if shift > 63:
-            break
-    return None, offset
-
-
-def _extract_gemini_signature_summary(signature: str) -> Dict[str, Any]:
-    decoded_bytes = _decode_base64_bytes(signature)
-    signature_hash = _short_hash(decoded_bytes)
-
-    record_sizes: List[int] = []
-    prefixes: List[str] = []
-    marker_offsets: List[int] = []
-    indexed_fields: Dict[str, Any] = {}
-
-    offset = 0
-    record_index = 0
-    while offset < len(decoded_bytes):
-        if decoded_bytes[offset] != 0x0A:
-            break
-        record_size, payload_offset = _read_varint(decoded_bytes, offset + 1)
-        if record_size is None:
-            break
-        payload_end = payload_offset + record_size
-        if payload_end > len(decoded_bytes):
-            break
-
-        payload = decoded_bytes[payload_offset:payload_end]
-        marker_index = payload.find(_GEMINI_MARKER)
-        prefix_hex = ""
-        absolute_marker_offset = None
-        if marker_index >= 0:
-            prefix_hex = payload[:marker_index].hex()
-            absolute_marker_offset = payload_offset + marker_index
-            marker_offsets.append(absolute_marker_offset)
-
-        record_sizes.append(record_size)
-        prefixes.append(prefix_hex)
-        indexed_fields[f"gemini_tsig_0_record_{record_index}_size"] = record_size
-        indexed_fields[f"gemini_tsig_0_record_{record_index}_prefix"] = prefix_hex
-        if absolute_marker_offset is not None:
-            indexed_fields[f"gemini_tsig_0_record_{record_index}_marker_offset"] = absolute_marker_offset
-
-        record_index += 1
-        offset = payload_end
-
-    shape_components = {
-        "decoded_bytes": len(decoded_bytes),
-        "record_sizes": record_sizes,
-        "prefixes": prefixes,
-        "marker_offsets": marker_offsets,
-    }
-    shape_hash = _short_hash(str(shape_components).encode("utf-8"))
-
-    summary: Dict[str, Any] = {
-        "decoded_bytes": len(decoded_bytes),
-        "record_count": len(record_sizes),
-        "record_sizes": record_sizes,
-        "prefixes": prefixes,
-        "marker_offsets": marker_offsets,
-        "marker_hex": _GEMINI_MARKER.hex(),
-        "shape_hash": shape_hash,
-        "signature_hash": signature_hash,
-        "indexed_fields": indexed_fields,
-    }
-    return summary
-
-
-def _enrich_gemini_thought_signature_metadata(  # noqa: PLR0915
-    metadata: Dict[str, Any], message: Any
-) -> None:
-    span_started_at = datetime.now(timezone.utc)
-    provider_specific_fields = _extract_provider_specific_fields(message)
-    thought_signatures = provider_specific_fields.get("thought_signatures")
-    thinking_blocks = _extract_thinking_blocks(message)
-    reasoning_content = _extract_reasoning_content(message, thinking_blocks)
-
-    if not isinstance(thought_signatures, list):
-        thought_signatures = []
-    thought_signatures = [
-        signature for signature in thought_signatures if isinstance(signature, str) and signature.strip()
-    ]
-
-    if not thought_signatures:
-        return
-
-    summaries: List[Dict[str, Any]] = []
-    decode_errors: List[str] = []
-    signature_hashes: List[str] = []
-    shape_hashes: List[str] = []
-
-    for index, signature in enumerate(thought_signatures):
-        try:
-            summary = _extract_gemini_signature_summary(signature)
-            summaries.append(summary)
-            signature_hashes.append(summary["signature_hash"])
-            shape_hashes.append(summary["shape_hash"])
-            metadata[f"gemini_tsig_{index}_decoded_bytes"] = summary["decoded_bytes"]
-            metadata[f"gemini_tsig_{index}_record_count"] = summary["record_count"]
-            metadata[f"gemini_tsig_{index}_record_sizes"] = summary["record_sizes"]
-            metadata[f"gemini_tsig_{index}_prefixes"] = summary["prefixes"]
-            metadata[f"gemini_tsig_{index}_marker_offsets"] = summary["marker_offsets"]
-            metadata[f"gemini_tsig_{index}_marker_hex"] = summary["marker_hex"]
-            metadata[f"gemini_tsig_{index}_shape_hash"] = summary["shape_hash"]
-
-            indexed_fields = summary["indexed_fields"]
-            for key, value in list(indexed_fields.items()):
-                if key.startswith("gemini_tsig_0_"):
-                    metadata[key.replace("gemini_tsig_0_", f"gemini_tsig_{index}_")] = value
-        except Exception as exc:
-            decode_errors.append(str(exc))
-
-    metadata["gemini_thought_signature_present"] = len(thought_signatures) > 0
-    metadata["gemini_thought_signature_count"] = len(thought_signatures)
-    metadata["gemini_tsig_signature_hashes"] = signature_hashes
-    metadata["gemini_tsig_shape_hashes"] = sorted(set(shape_hashes))
-    metadata["gemini_reasoning_content_present"] = bool(reasoning_content.strip())
-    metadata["gemini_reasoning_content_empty_or_short"] = len(reasoning_content.strip()) < 16
-    metadata["gemini_thinking_blocks_present"] = len(thinking_blocks) > 0
-    if summaries:
-        first_summary = summaries[0]
-        metadata["gemini_tsig_decoded_bytes"] = first_summary["decoded_bytes"]
-        metadata["gemini_tsig_record_count"] = first_summary["record_count"]
-        metadata["gemini_tsig_record_sizes"] = first_summary["record_sizes"]
-        metadata["gemini_tsig_prefixes"] = first_summary["prefixes"]
-        metadata["gemini_tsig_marker_offsets"] = first_summary["marker_offsets"]
-        metadata["gemini_tsig_marker_hex"] = first_summary["marker_hex"]
-        metadata["gemini_tsig_shape_hash"] = first_summary["shape_hash"]
-    if decode_errors:
-        metadata["gemini_tsig_decode_errors"] = decode_errors
-
-    metadata["thinking_signature_present"] = True
-    metadata["thinking_signature_decoded"] = len(summaries) > 0
-    metadata["reasoning_content_present"] = bool(reasoning_content.strip())
-    metadata["reasoning_content_empty_or_short"] = len(reasoning_content.strip()) < 16
-    metadata["thinking_blocks_present"] = len(thinking_blocks) > 0
-
-    tags_to_add = ["gemini-thought-signature", "thinking-signature-present"]
-    if summaries:
-        tags_to_add.extend(["gemini-thought-signature-decoded", "thinking-signature-decoded"])
-        for shape_hash in sorted(set(shape_hashes)):
-            tags_to_add.append(f"gemini-tsig-shape:{shape_hash}")
-        for record_count in sorted({summary["record_count"] for summary in summaries}):
-            tags_to_add.append(f"gemini-tsig-records:{record_count}")
-
-    tags_to_add.extend(
-        _get_reasoning_state_tags(
-            provider_prefix="gemini",
-            reasoning_content=reasoning_content,
-            thinking_blocks=thinking_blocks,
-        )
-    )
-    _merge_tags(metadata, tags_to_add)
-    _append_langfuse_span(
-        metadata,
-        name="gemini.thought_signature_decode",
-        span_metadata={
-            "signature_count": len(thought_signatures),
-            "decoded_signature_count": len(summaries),
-            "shape_hashes": sorted(set(shape_hashes)),
-            "record_counts": sorted({summary["record_count"] for summary in summaries} if summaries else []),
-            "reasoning_content_present": bool(reasoning_content.strip()),
-        },
-        start_time=span_started_at,
-        end_time=datetime.now(timezone.utc),
-    )
-
-
 def _enrich_agent_identity_metadata(
     kwargs: Dict[str, Any],
     metadata: Dict[str, Any],
@@ -828,7 +635,6 @@ def _enrich_trace_name_and_provider_metadata(kwargs: Dict[str, Any], result: Any
     message = _extract_first_response_message(result)
     if message is not None:
         _enrich_claude_thinking_metadata(metadata, message)
-        _enrich_gemini_thought_signature_metadata(metadata, message)
     _enrich_token_count_usage_metadata(kwargs, result)
     _enrich_usage_breakout_metadata(kwargs, result)
     _enrich_provider_cache_metadata(kwargs, result)
@@ -852,9 +658,6 @@ _HOST_FUNCTION_NAMES = (
     "_infer_usage_breakout_provider_prefix",
     "_enrich_usage_breakout_metadata",
     "_enrich_claude_thinking_metadata",
-    "_read_varint",
-    "_extract_gemini_signature_summary",
-    "_enrich_gemini_thought_signature_metadata",
     "_enrich_agent_identity_metadata",
     "_enrich_trace_name_and_provider_metadata",
     "_get_reasoning_state_tags",

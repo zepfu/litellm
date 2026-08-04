@@ -729,93 +729,6 @@ def test_aawm_agent_identity_rewrites_permission_check_langfuse_headers() -> Non
     assert "claude-project:dashboard-shell" in metadata["tags"]
 
 
-def test_aawm_agent_identity_adds_gemini_thought_signature_tags() -> None:
-    logger = AawmAgentIdentity()
-    kwargs = _base_kwargs(trace_name="gemini")
-    result = {
-        "choices": [
-            {
-                "message": {
-                    "content": "gemini routed",
-                    "role": "assistant",
-                    "thinking_blocks": [],
-                    "provider_specific_fields": {
-                        "thought_signatures": [
-                            """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"""
-                        ]
-                    },
-                }
-            }
-        ]
-    }
-
-    updated_kwargs, _ = logger.logging_hook(
-        kwargs=kwargs,
-        result=result,
-        call_type="pass_through_endpoint",
-    )
-
-    metadata = updated_kwargs["litellm_params"]["metadata"]
-    tags = metadata["tags"]
-    assert metadata["trace_name"] == "gemini"
-    assert metadata["gemini_thought_signature_present"] is True
-    assert metadata["gemini_thought_signature_count"] == 1
-    assert metadata["gemini_tsig_record_count"] == 9
-    assert metadata["gemini_tsig_record_sizes"] == [
-        36,
-        104,
-        124,
-        194,
-        156,
-        280,
-        276,
-        328,
-        112,
-    ]
-    assert metadata["gemini_tsig_0_record_0_size"] == 36
-    assert metadata["gemini_tsig_marker_hex"] == "8f3d6b5f"
-    assert len(metadata["gemini_tsig_marker_offsets"]) == 9
-    assert metadata["gemini_reasoning_content_present"] is False
-    assert metadata["thinking_signature_present"] is True
-    assert metadata["thinking_signature_decoded"] is True
-    assert metadata["reasoning_content_present"] is False
-    assert metadata["thinking_blocks_present"] is False
-    assert "gemini-thought-signature" in tags
-    assert "thinking-signature-present" in tags
-    assert "thinking-signature-decoded" in tags
-    assert "gemini-thought-signature-decoded" in tags
-    assert "gemini-tsig-records:9" in tags
-    assert "reasoning-empty" in tags
-    assert "thinking-blocks-empty" in tags
-    assert "gemini-reasoning-empty" in tags
-    assert any(tag.startswith("gemini-tsig-shape:") for tag in tags)
-    assert "gemini-thought-signature" in updated_kwargs["standard_logging_object"]["request_tags"]
-    assert "thinking-signature-present" in updated_kwargs["standard_logging_object"]["request_tags"]
-    assert updated_kwargs["standard_logging_object"]["metadata"]["gemini_thought_signature_present"] is True
-    span_names = [span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)]
-    assert "gemini.thought_signature_decode" in span_names
-    gemini_span = next(
-        span
-        for span in metadata["langfuse_spans"]
-        if isinstance(span, dict) and span.get("name") == "gemini.thought_signature_decode"
-    )
-    assert gemini_span["metadata"]["signature_count"] == 1
-    assert gemini_span["metadata"]["decoded_signature_count"] == 1
-    assert gemini_span["metadata"]["record_counts"] == [9]
-    assert "start_time" in gemini_span
-    assert "end_time" in gemini_span
-    assert "claude_thinking_signature_present" not in metadata
 
 
 def test_build_session_history_record_uses_passthrough_header_session_id() -> None:
@@ -2941,15 +2854,11 @@ def test_build_session_history_record_tracks_runtime_and_client_identity() -> No
     assert record["metadata"]["client_name"] == "codex-tui"
 
 
+
+
 @pytest.mark.parametrize(
     ("user_agent", "expected_name", "expected_version"),
     [
-        ("GeminiCLI/0.9.1 darwin arm64", "gemini-cli", "0.9.1"),
-        (
-            "GeminiCLI-tui/0.42.0/gemini-2.5-flash (linux; x64; terminal)",
-            "gemini-cli",
-            "0.42.0",
-        ),
         ("OpenAI/Python 1.99.0", "openai-python", "1.99.0"),
         ("Anthropic/Python 0.67.0", "anthropic-python", "0.67.0"),
         ("example-client/2.3.4 extra", "example-client", "2.3.4"),
@@ -2966,27 +2875,6 @@ def test_parse_client_identity_from_user_agent_known_native_clients(
     )
 
 
-def test_build_session_runtime_identity_uses_native_gemini_user_agent_header() -> None:
-    identity = _build_session_runtime_identity(
-        metadata={
-            "trace_environment": "dev",
-            "litellm_version": "1.82.3+aawm.34",
-            "litellm_fork_version": "aawm.34",
-            "litellm_wheel_versions": {"aawm-litellm-callbacks": "0.0.14"},
-        },
-        kwargs={
-            "litellm_params": {"proxy_server_request": {"headers": {"user-agent": "GeminiCLI/0.9.1 (darwin; arm64)"}}}
-        },
-        allow_runtime=False,
-    )
-
-    assert identity["litellm_environment"] == "dev"
-    assert identity["litellm_version"] == "1.82.3+aawm.34"
-    assert identity["litellm_fork_version"] == "aawm.34"
-    assert identity["litellm_wheel_versions"] == {"aawm-litellm-callbacks": "0.0.14"}
-    assert identity["client_name"] == "gemini-cli"
-    assert identity["client_version"] == "0.9.1"
-    assert identity["client_user_agent"] == "GeminiCLI/0.9.1 (darwin; arm64)"
 
 
 def test_build_session_runtime_identity_prefers_live_runtime_environment(
@@ -3855,42 +3743,6 @@ def test_build_session_history_record_omits_empty_read_pages_from_tool_activity(
     }
 
 
-def test_build_session_history_record_keeps_google_prompt_policy_metadata() -> None:
-    kwargs = _base_kwargs()
-    kwargs["model"] = "gemini-3.1-pro-preview"
-    kwargs["custom_llm_provider"] = "gemini"
-    kwargs["call_type"] = "pass_through_endpoint"
-    kwargs["litellm_call_id"] = "call-google-policy"
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {"x-claude-code-session-id": "session-google-policy"}
-    }
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "google_adapter_system_prompt_policy": "replace_compact",
-            "google_adapter_system_prompt_policy_version": "2026-04-27.v2",
-            "google_adapter_system_prompt_original_chars": 1234,
-            "google_adapter_system_prompt_rewritten_chars": 456,
-        }
-    )
-
-    result = {
-        "id": "resp-google-policy",
-        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
-        "choices": [{"message": {"role": "assistant", "content": "gemini smoke"}}],
-    }
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result=result,
-        start_time="2026-04-19T21:00:00Z",
-        end_time="2026-04-19T21:00:01Z",
-    )
-
-    assert record is not None
-    assert record["metadata"]["google_adapter_system_prompt_policy"] == "replace_compact"
-    assert record["metadata"]["google_adapter_system_prompt_policy_version"] == "2026-04-27.v2"
-    assert record["metadata"]["google_adapter_system_prompt_original_chars"] == 1234
-    assert record["metadata"]["google_adapter_system_prompt_rewritten_chars"] == 456
 
 
 def test_build_session_history_record_uses_standard_logging_response_output_for_tool_activity() -> None:
@@ -4753,108 +4605,8 @@ def test_build_session_history_record_excludes_openai_responses_opaque_state_fro
     ]
 
 
-def test_build_session_history_record_estimates_gemini_prompt_overhead(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        aawm_agent_identity,
-        "_estimate_prompt_overhead_tokens",
-        _fake_prompt_overhead_token_count,
-    )
-    request_body = {
-        "model": "gemini-3-flash-preview",
-        "request": {
-            "systemInstruction": {"parts": [{"text": ("You are Gemini CLI.\n\n" "Follow repository instructions.")}]},
-            "tools": [{"functionDeclarations": [{"name": "run_shell_command"}]}],
-            "contents": [{"role": "user", "parts": [{"text": "Run date."}]}],
-        },
-    }
-    kwargs = _prompt_overhead_kwargs(
-        route_family="gemini_generate_content",
-        request_body=request_body,
-        provider="gemini",
-        model="gemini-3-flash-preview",
-    )
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result=_prompt_overhead_result(),
-        start_time=None,
-        end_time=None,
-    )
-
-    assert record is not None
-    _assert_prompt_overhead_record(record, counted_shape="gemini_generate_content")
 
 
-def test_build_session_history_record_estimates_anthropic_google_adapter_prompt_overhead(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        aawm_agent_identity,
-        "_estimate_prompt_overhead_tokens",
-        _fake_prompt_overhead_token_count,
-    )
-    request_body = {
-        "model": "gemini-3-flash-preview",
-        "project": "dev-project",
-        "user_prompt_id": "prompt-123",
-        "request": {
-            "systemInstruction": {
-                "parts": [
-                    {
-                        "text": (
-                            "You are a Google Code Assist adapter target.\n\n"
-                            "Never reveal credentials.\n\n"
-                            "Always follow repository instructions."
-                        )
-                    }
-                ]
-            },
-            "tools": [{"functionDeclarations": [{"name": "run_shell_command"}]}],
-            "contents": [{"role": "user", "parts": [{"text": "Run date."}]}],
-        },
-        "litellm_metadata": {
-            "google_adapter_system_prompt_policy": "replace_compact",
-            "google_adapter_system_prompt_policy_version": "2026-04-27.v2",
-            "google_adapter_system_prompt_original_chars": 1234,
-            "google_adapter_system_prompt_rewritten_chars": 456,
-        },
-    }
-    kwargs = _prompt_overhead_kwargs(
-        route_family="anthropic_google_completion_adapter",
-        request_body=request_body,
-        provider="gemini",
-        model="gemini-3-flash-preview",
-    )
-    kwargs["litellm_params"]["metadata"].update(request_body["litellm_metadata"])
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result=_prompt_overhead_result(),
-        start_time=None,
-        end_time=None,
-    )
-
-    assert record is not None
-    _assert_prompt_overhead_record(
-        record,
-        counted_shape="gemini_generate_content",
-        route_family="anthropic_google_completion_adapter",
-        component_paths={
-            "system": ["request.systemInstruction"],
-            "tools": ["request.tools"],
-            "conversation": ["request.contents"],
-        },
-    )
-    metadata = record["metadata"]
-    assert metadata["google_adapter_system_prompt_policy"] == "replace_compact"
-    assert metadata["google_adapter_system_prompt_policy_version"] == "2026-04-27.v2"
-    assert metadata["google_adapter_system_prompt_original_chars"] == 1234
-    assert metadata["google_adapter_system_prompt_rewritten_chars"] == 456
-    assert record["system_behavior_tokens_estimated"] > 0
-    assert record["system_safety_tokens_estimated"] > 0
-    assert record["system_instructional_tokens_estimated"] > 0
 
 
 @pytest.mark.parametrize(
@@ -6269,98 +6021,8 @@ def test_d1_169_recognizes_codex_resume_handoff_as_compact_context_not_counted()
     assert record.get("compact_summary_id") == "thread-7a7e-resume"
 
 
-def test_d1_169_detects_gemini_compact_output_state_snapshot() -> None:
-    kwargs = _base_kwargs(trace_name="gemini")
-    kwargs["model"] = "gemini-3-flash-preview"
-    kwargs["custom_llm_provider"] = "gemini"
-    kwargs["call_type"] = "pass_through_endpoint"
-    kwargs["litellm_call_id"] = "call-gemini-compact-summary"
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "session_id": "session-gemini-compact-summary",
-            "passthrough_route_family": "gemini_generate_content",
-            "gemini_user_prompt_id": "compress-1780246649610",
-        }
-    )
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {"user-agent": "GeminiCLI/0.9.1 (linux; x64; terminal)"}
-    }
-    kwargs["passthrough_logging_payload"]["request_body"] = {
-        "model": "gemini-3-flash-preview",
-        "user_prompt_id": "compress-1780246649610",
-        "contents": [{"role": "user", "parts": [{"text": "checkpoint"}]}],
-    }
-
-    result = {
-        "id": "resp-gemini-compact-summary",
-        "usageMetadata": {
-            "promptTokenCount": 100,
-            "candidatesTokenCount": 20,
-            "totalTokenCount": 120,
-        },
-        "candidates": [
-            {"content": {"parts": [{"text": ("<state_snapshot><summary>compact point</summary></state_snapshot>")}]}}
-        ],
-    }
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result=result,
-        start_time=None,
-        end_time=None,
-    )
-
-    assert record is not None
-    assert record["is_compact_summary"] is True
-    assert record["compact_summary_source"] == "gemini-cli"
-    assert record["compact_summary_role"] == "event"
-    assert record["compact_summary_id"] == "compress-1780246649610"
 
 
-def test_d1_169_recognizes_gemini_compact_verify_not_counted_with_base_id() -> None:
-    kwargs = _base_kwargs(trace_name="gemini")
-    kwargs["model"] = "gemini-3-flash-preview"
-    kwargs["custom_llm_provider"] = "gemini"
-    kwargs["call_type"] = "pass_through_endpoint"
-    kwargs["litellm_call_id"] = "call-gemini-compact-verify"
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "session_id": "session-gemini-compact-verify",
-            "passthrough_route_family": "gemini_generate_content",
-            "gemini_user_prompt_id": "compress-1780246649610-verify",
-        }
-    )
-    kwargs["litellm_params"]["proxy_server_request"] = {
-        "headers": {"user-agent": "GeminiCLI/0.9.1 (linux; x64; terminal)"}
-    }
-    kwargs["passthrough_logging_payload"]["request_body"] = {
-        "model": "gemini-3-flash-preview",
-        "user_prompt_id": "compress-1780246649610-verify",
-        "contents": [{"role": "user", "parts": [{"text": "checkpoint verification"}]}],
-    }
-
-    result = {
-        "id": "resp-gemini-compact-verify",
-        "usageMetadata": {
-            "promptTokenCount": 90,
-            "candidatesTokenCount": 10,
-            "totalTokenCount": 100,
-        },
-        "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
-    }
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result=result,
-        start_time=None,
-        end_time=None,
-    )
-
-    assert record is not None
-    assert record.get("is_compact_summary") is False
-    assert record["compact_summary_source"] == "gemini-cli"
-    assert record["compact_summary_role"] == "verify"
-    assert record["compact_summary_id"] == "compress-1780246649610"
 
 
 def test_d1_169_does_not_count_normal_compact_prose() -> None:
@@ -7228,73 +6890,6 @@ def test_build_session_history_record_uses_adapter_target_over_anthropic_ingress
         assert record["model"] == "gemini-3-flash-preview"
 
 
-def test_build_session_history_record_preserves_historical_codex_google_code_assist_metadata() -> None:
-    kwargs = _base_kwargs(trace_name="codex")
-    kwargs["model"] = "unknown"
-    kwargs["custom_llm_provider"] = "gemini"
-    kwargs["call_type"] = "pass_through_endpoint"
-    kwargs["litellm_call_id"] = "call-codex-google-code-assist"
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "session_id": "session-codex-google-code-assist",
-            "passthrough_route_family": "codex_google_code_assist_adapter",
-            "codex_adapter_model": "gemini-3.1-pro-preview",
-            "codex_adapter_input_shape": "openai_responses",
-            "codex_adapter_output_shape": "openai_responses",
-            "codex_google_code_assist_tool_contract_policy_name": ("codex_google_code_assist_tool_contract_policy"),
-            "codex_google_code_assist_tool_contract_policy": "append",
-            "codex_google_code_assist_tool_contract_policy_version": ("2026-05-12.v1"),
-            "codex_google_code_assist_tool_contract_policy_applied": True,
-            "codex_google_code_assist_tool_contract_prompt_chars": 713,
-            "google_retrieve_user_quota": {
-                "source": "google_retrieve_user_quota",
-                "buckets": {"items": []},
-            },
-        }
-    )
-    kwargs["passthrough_logging_payload"]["request_body"] = {
-        "project": "dev-project",
-        "request": {
-            "contents": [{"role": "user", "parts": [{"text": "hello"}]}],
-        },
-    }
-
-    result = {
-        "id": "provider-response-codex-google-code-assist",
-        "usage": {
-            "prompt_tokens": 42,
-            "completion_tokens": 8,
-            "total_tokens": 50,
-        },
-        "choices": [{"message": {"role": "assistant", "content": "gemini routed"}}],
-    }
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result=result,
-        start_time=None,
-        end_time=None,
-    )
-
-    assert record is not None
-    assert record["provider"] is None
-    assert record["model"] == "gemini-3.1-pro-preview"
-    assert record["metadata"]["passthrough_route_family"] == ("codex_google_code_assist_adapter")
-    assert record["metadata"]["codex_adapter_model"] == "gemini-3.1-pro-preview"
-    assert record["metadata"]["codex_adapter_input_shape"] == "openai_responses"
-    assert record["metadata"]["codex_adapter_output_shape"] == "openai_responses"
-    assert (
-        record["metadata"]["codex_google_code_assist_tool_contract_policy_name"]
-        == "codex_google_code_assist_tool_contract_policy"
-    )
-    assert record["metadata"]["codex_google_code_assist_tool_contract_policy"] == "append"
-    assert record["metadata"]["codex_google_code_assist_tool_contract_policy_version"] == "2026-05-12.v1"
-    assert record["metadata"]["codex_google_code_assist_tool_contract_policy_applied"] is True
-    assert record["metadata"]["codex_google_code_assist_tool_contract_prompt_chars"] == 713
-    assert record["metadata"]["google_retrieve_user_quota"] == {
-        "source": "google_retrieve_user_quota",
-        "buckets": {"items": []},
-    }
 
 
 def test_aawm_agent_identity_adds_codex_usage_breakout_tags() -> None:
@@ -7501,60 +7096,6 @@ def test_aawm_agent_identity_treats_codex_adapter_route_as_codex_usage() -> None
     assert "codex-tool-calls-present" in metadata["tags"]
 
 
-def test_aawm_agent_identity_uses_gemini_signature_fallback_for_usage_breakout() -> None:
-    logger = AawmAgentIdentity()
-    kwargs = _base_kwargs(trace_name="gemini")
-    kwargs["model"] = "google/gemini-3.1-flash"
-    kwargs["custom_llm_provider"] = "gemini"
-    kwargs["litellm_params"]["metadata"]["passthrough_route_family"] = "gemini_generate_content"
-
-    result = {
-        "id": "resp-gemini-usage-1",
-        "usage": {
-            "prompt_tokens": 80,
-            "completion_tokens": 24,
-            "total_tokens": 104,
-        },
-        "choices": [
-            {
-                "message": {
-                    "role": "assistant",
-                    "content": "gemini routed",
-                    "provider_specific_fields": {"thought_signatures": ["CiQBjz1rXzg04kJ2A8JC+Q=="]},
-                }
-            }
-        ],
-    }
-
-    updated_kwargs, _ = logger.logging_hook(
-        kwargs=kwargs,
-        result=result,
-        call_type="pass_through_endpoint",
-    )
-
-    metadata = updated_kwargs["litellm_params"]["metadata"]
-    request_tags = updated_kwargs["standard_logging_object"]["request_tags"]
-
-    assert metadata["usage_reasoning_tokens_reported"] == 1
-    assert metadata["usage_reasoning_tokens_source"] == "provider_signature_present"
-    assert metadata["usage_provider_cache_attempted"] is False
-    assert metadata["usage_provider_cache_status"] == "not_attempted"
-    assert metadata["usage_provider_cache_miss"] is False
-    assert "usage_provider_cache_miss_token_count" not in metadata
-    assert "usage_provider_cache_miss_cost_usd" not in metadata
-    assert metadata["gemini_reasoning_tokens_reported"] == 1
-    assert "gemini-usage-breakout" in metadata["tags"]
-    assert "gemini-reasoning-tokens-reported" in metadata["tags"]
-    assert "reasoning-tokens-reported" in request_tags
-    span_names = [span["name"] for span in metadata["langfuse_spans"] if isinstance(span, dict)]
-    assert "gemini.usage_breakout" in span_names
-    usage_span = next(
-        span
-        for span in metadata["langfuse_spans"]
-        if isinstance(span, dict) and span.get("name") == "gemini.usage_breakout"
-    )
-    assert usage_span["metadata"]["reported_reasoning_tokens"] == 1
-    assert usage_span["metadata"]["reported_reasoning_tokens_source"] == "provider_signature_present"
 
 
 def test_build_session_history_record_skips_without_session_id() -> None:
@@ -12586,65 +12127,6 @@ def test_d1_169_backfill_langfuse_marks_codex_compact_and_resume_context() -> No
     assert resume_record["compact_summary_id"] == "019e7ee9-0832-7321-906e-eceb5f2c0e2b"
 
 
-def test_d1_169_backfill_langfuse_marks_gemini_compact_and_verify_context() -> None:
-    trace: dict[str, Any] = {
-        "id": "trace-d1-169-gemini-compact",
-        "name": "gemini",
-        "sessionId": "4435b6f0-6090-47e6-8a6c-6b01be58fd3c",
-        "environment": "prod",
-    }
-    base_observation: dict[str, Any] = {
-        "traceId": "trace-d1-169-gemini-compact",
-        "type": "GENERATION",
-        "name": "litellm-pass_through_endpoint",
-        "model": "gemini-3-flash-preview",
-        "input": {"messages": None},
-        "usageDetails": {"input": 100, "output": 20, "total": 120},
-        "metadata": {
-            "client_name": "gemini-cli",
-            "passthrough_route_family": "gemini_generate_content",
-        },
-    }
-    compact_observation = {
-        **base_observation,
-        "id": "time-16-57-29-634126_960c7fa4-473e-4e4a-8aba-6835aa9f5a2f",
-        "metadata": {
-            **base_observation["metadata"],
-            "gemini_user_prompt_id": "compress-1780246649610",
-        },
-        "output": {"content": "<state_snapshot>compact point</state_snapshot>"},
-    }
-    verify_observation = {
-        **base_observation,
-        "id": "time-16-57-34-656194_cb07bb75-04bd-4da5-89a3-bc40990ea032",
-        "metadata": {
-            **base_observation["metadata"],
-            "gemini_user_prompt_id": "compress-1780246649610-verify",
-        },
-        "output": {"content": "<state_snapshot>verified</state_snapshot>"},
-    }
-
-    compact_record = _build_session_history_record_from_langfuse_trace_observation(
-        trace,
-        compact_observation,
-        backfill_run_id="run-d1-169",
-    )
-    verify_record = _build_session_history_record_from_langfuse_trace_observation(
-        trace,
-        verify_observation,
-        backfill_run_id="run-d1-169",
-    )
-
-    assert compact_record is not None
-    assert compact_record["is_compact_summary"] is True
-    assert compact_record["compact_summary_source"] == "gemini-cli"
-    assert compact_record["compact_summary_role"] == "event"
-    assert compact_record["compact_summary_id"] == "compress-1780246649610"
-    assert verify_record is not None
-    assert verify_record["is_compact_summary"] is False
-    assert verify_record["compact_summary_source"] == "gemini-cli"
-    assert verify_record["compact_summary_role"] == "verify"
-    assert verify_record["compact_summary_id"] == "compress-1780246649610"
 
 
 def test_build_session_history_record_from_langfuse_passthrough_uses_synthetic_session_id() -> None:
@@ -13597,58 +13079,6 @@ def test_build_session_history_record_from_langfuse_trace_observation_uses_metad
     assert record["tool_names"] == ["google_search"]
 
 
-def test_build_session_history_record_from_langfuse_clears_retired_antigravity_provider() -> None:
-    trace = {
-        "id": "trace-retired-antigravity",
-        "name": "gemini",
-        "sessionId": "session-retired-antigravity",
-        "environment": "dev",
-    }
-    observation = {
-        "id": "obs-retired-antigravity",
-        "type": "GENERATION",
-        "name": "litellm-pass_through_endpoint",
-        "model": "gemini-3.1-pro-low",
-        "apiBase": (
-            "https://daily-cloudcode-pa.googleapis.com/"
-            "v1internal:streamGenerateContent"
-        ),
-        "startTime": "2026-06-03T12:35:20Z",
-        "endTime": "2026-06-03T12:35:22Z",
-        "usage": {
-            "input": 10,
-            "output": 3,
-            "total": 13,
-        },
-        "output": {
-            "choices": [
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": "historical route result",
-                    }
-                }
-            ]
-        },
-        "metadata": {
-            "passthrough_route_family": "antigravity_code_assist",
-            "aawm_stream_logging_custom_llm_provider": "antigravity",
-        },
-    }
-
-    record = _build_session_history_record_from_langfuse_trace_observation(
-        trace,
-        observation,
-        backfill_run_id="run-retired-antigravity",
-    )
-
-    assert record is not None
-    assert record["provider"] is None
-    assert (
-        record["metadata"]["passthrough_route_family"]
-        == "antigravity_code_assist"
-    )
-    assert _build_session_history_db_payload(record)[4] is None
 
 
 def test_build_session_history_record_from_langfuse_trace_observation_uses_gemini_thought_modality_details() -> None:
@@ -13709,54 +13139,6 @@ def test_build_session_history_record_from_langfuse_trace_observation_uses_gemin
     assert record["reasoning_tokens_source"] == "provider_reported"
 
 
-def test_build_session_history_record_from_langfuse_trace_observation_uses_gemini_signature_fallback() -> None:
-    trace = {
-        "id": "trace-gemini-3",
-        "name": "gemini",
-        "sessionId": "session-gemini-3",
-        "environment": "dev",
-    }
-    observation = {
-        "id": "obs-gemini-3",
-        "type": "GENERATION",
-        "name": "litellm-pass_through_endpoint",
-        "model": "google/gemini-3.1-flash",
-        "startTime": "2026-04-17T14:00:00Z",
-        "endTime": "2026-04-17T14:00:02Z",
-        "usage": {
-            "input": 20,
-            "output": 15,
-            "total": 35,
-        },
-        "output": {
-            "choices": [
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": "gemini flash result",
-                        "provider_specific_fields": {"thought_signatures": ["CiQBjz1rXzg04kJ2A8JC+Q=="]},
-                    }
-                }
-            ]
-        },
-        "metadata": {
-            "passthrough_route_family": "gemini_generate_content",
-            "gemini_thought_signature_present": True,
-            "thinking_signature_present": True,
-        },
-    }
-
-    record = _build_session_history_record_from_langfuse_trace_observation(
-        trace,
-        observation,
-        backfill_run_id="run-gemini-3",
-    )
-
-    assert record is not None
-    assert record["provider"] == "gemini"
-    assert record["reasoning_tokens_reported"] == 1
-    assert record["reasoning_tokens_source"] == "provider_signature_present"
-    assert record["reasoning_present"] is True
 
 
 def test_build_session_history_record_from_langfuse_uses_adapter_target_over_anthropic_route() -> None:
@@ -14264,265 +13646,14 @@ def test_build_session_history_record_prefers_metadata_usage_object_when_result_
     assert record["reasoning_tokens_source"] == "provider_reported"
 
 
-def test_build_session_history_record_uses_gemini_signature_fallback_when_usage_sparse() -> None:
-    kwargs = _base_kwargs("gemini")
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "session_id": "session-gemini-signature-1",
-            "passthrough_route_family": "gemini_generate_content",
-            "gemini_thought_signature_present": True,
-            "thinking_signature_present": True,
-        }
-    )
-    kwargs["custom_llm_provider"] = "gemini"
-    kwargs["model"] = "google/gemini-3.1-flash"
-    result = {
-        "id": "provider-response-gemini-signature-1",
-        "model": "google/gemini-3.1-flash",
-        "usage": {
-            "prompt_tokens": 20,
-            "completion_tokens": 15,
-            "total_tokens": 35,
-        },
-        "choices": [
-            {
-                "message": {
-                    "role": "assistant",
-                    "content": "gemini result",
-                    "provider_specific_fields": {"thought_signatures": ["CiQBjz1rXzg04kJ2A8JC+Q=="]},
-                }
-            }
-        ],
-    }
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result=result,
-        start_time="2026-04-17T14:00:00Z",
-        end_time="2026-04-17T14:00:02Z",
-    )
-
-    assert record is not None
-    assert record["reasoning_tokens_reported"] == 1
-    assert record["reasoning_tokens_source"] == "provider_signature_present"
-    assert record["reasoning_present"] is True
 
 
-def test_build_session_history_record_clears_retired_antigravity_provider() -> None:
-    kwargs = _base_kwargs("orchestrator")
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "session_id": "session-antigravity-1",
-            "passthrough_route_family": "antigravity_code_assist",
-            "api_base": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
-            "aawm_stream_logging_custom_llm_provider": "antigravity",
-            "usage_object": {
-                "promptTokenCount": 10,
-                "candidatesTokenCount": 3,
-                "totalTokenCount": 13,
-            },
-        }
-    )
-    kwargs["standard_logging_object"]["metadata"] = dict(kwargs["litellm_params"]["metadata"])
-    kwargs["standard_logging_object"][
-        "api_base"
-    ] = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
-    kwargs["custom_llm_provider"] = "antigravity"
-    kwargs["model"] = "gemini-3.1-pro-low"
-    result = {
-        "id": "provider-response-antigravity-1",
-        "model": "gemini-3.1-pro-low",
-        "usage": {
-            "prompt_tokens": 10,
-            "completion_tokens": 3,
-            "total_tokens": 13,
-        },
-        "choices": [
-            {
-                "message": {
-                    "role": "assistant",
-                    "content": "antigravity result",
-                }
-            }
-        ],
-    }
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result=result,
-        start_time="2026-06-03T12:35:20Z",
-        end_time="2026-06-03T12:35:22Z",
-    )
-
-    assert record is not None
-    assert record["provider"] is None
-    assert record["model"] == "gemini-3.1-pro-low"
-    assert record["input_tokens"] == 10
-    assert record["output_tokens"] == 3
-    assert record["total_tokens"] == 13
 
 
-def test_build_session_history_record_preserves_retired_route_cost_without_provider_classification() -> None:
-    kwargs = _base_kwargs("orchestrator")
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "session_id": "session-antigravity-gemini-cost",
-            "passthrough_route_family": "antigravity_code_assist",
-            "api_base": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
-            "aawm_stream_logging_custom_llm_provider": "antigravity",
-            "usage_object": {
-                "promptTokenCount": 10,
-                "candidatesTokenCount": 3,
-                "totalTokenCount": 13,
-            },
-        }
-    )
-    kwargs["standard_logging_object"]["metadata"] = dict(kwargs["litellm_params"]["metadata"])
-    kwargs["standard_logging_object"][
-        "api_base"
-    ] = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
-    kwargs["custom_llm_provider"] = "antigravity"
-    kwargs["model"] = "gemini-3.5-flash-low"
-    kwargs["response_cost"] = 0.000027
-    result = {
-        "id": "provider-response-antigravity-gemini-cost",
-        "model": "gemini-3.5-flash-low",
-        "usage": {
-            "prompt_tokens": 10,
-            "completion_tokens": 3,
-            "total_tokens": 13,
-        },
-        "choices": [
-            {
-                "message": {
-                    "role": "assistant",
-                    "content": "antigravity gemini cost result",
-                }
-            }
-        ],
-    }
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result=result,
-        start_time="2026-06-18T20:00:00Z",
-        end_time="2026-06-18T20:00:02Z",
-    )
-
-    assert record is not None
-    assert record["provider"] is None
-    assert record["model"] == "gemini-3.5-flash-low"
-    assert record["response_cost_usd"] == pytest.approx(0.000027)
 
 
-def test_build_session_history_record_clears_retired_codex_antigravity_provider() -> None:
-    kwargs = _base_kwargs("codex")
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "session_id": "session-antigravity-codex-openai",
-            "passthrough_route_family": "codex_antigravity_code_assist_adapter",
-            "api_base": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
-            "codex_adapter_original_model": "antigravity/gemini-3.1-pro-low",
-            "codex_adapter_model": "gemini-3.1-pro-low",
-            "aawm_stream_logging_custom_llm_provider": "antigravity",
-            "usage_object": {
-                "input_tokens": 16,
-                "output_tokens": 5,
-                "total_tokens": 21,
-            },
-        }
-    )
-    kwargs["standard_logging_object"]["metadata"] = dict(kwargs["litellm_params"]["metadata"])
-    kwargs["standard_logging_object"][
-        "api_base"
-    ] = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
-    kwargs["custom_llm_provider"] = "openai"
-    kwargs["model"] = "gemini-3.1-pro-low"
-    result = {
-        "id": "provider-response-antigravity-codex",
-        "model": "gemini-3.1-pro-low",
-        "usage": {
-            "prompt_tokens": 16,
-            "completion_tokens": 5,
-            "total_tokens": 21,
-        },
-        "choices": [
-            {
-                "message": {
-                    "role": "assistant",
-                    "content": "antigravity codex result",
-                }
-            }
-        ],
-    }
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result=result,
-        start_time="2026-06-03T12:40:20Z",
-        end_time="2026-06-03T12:40:22Z",
-    )
-
-    assert record is not None
-    assert record["provider"] is None
-    assert record["model"] == "gemini-3.1-pro-low"
-    assert record["metadata"]["codex_adapter_original_model"] == ("antigravity/gemini-3.1-pro-low")
-    assert _build_session_history_db_payload(record)[4] is None
 
 
-def test_build_session_history_record_clears_retired_anthropic_antigravity_provider() -> None:
-    kwargs = _base_kwargs("claude-code")
-    kwargs["litellm_params"]["metadata"].update(
-        {
-            "session_id": "session-antigravity-anthropic-gemini",
-            "passthrough_route_family": "anthropic_antigravity_completion_adapter",
-            "api_base": "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
-            "anthropic_adapter_original_model": ("google-antigravity/claude-sonnet-4-6"),
-            "anthropic_adapter_model": "claude-sonnet-4-6",
-            "aawm_stream_logging_custom_llm_provider": "antigravity",
-            "usage_object": {
-                "input_tokens": 18,
-                "output_tokens": 6,
-                "total_tokens": 24,
-            },
-        }
-    )
-    kwargs["standard_logging_object"]["metadata"] = dict(kwargs["litellm_params"]["metadata"])
-    kwargs["standard_logging_object"][
-        "api_base"
-    ] = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
-    kwargs["custom_llm_provider"] = "gemini"
-    kwargs["model"] = "claude-sonnet-4-6"
-    result = {
-        "id": "provider-response-antigravity-anthropic",
-        "model": "claude-sonnet-4-6",
-        "usage": {
-            "prompt_tokens": 18,
-            "completion_tokens": 6,
-            "total_tokens": 24,
-        },
-        "choices": [
-            {
-                "message": {
-                    "role": "assistant",
-                    "content": "antigravity anthropic result",
-                }
-            }
-        ],
-    }
-
-    record = _build_session_history_record(
-        kwargs=kwargs,
-        result=result,
-        start_time="2026-06-03T12:45:20Z",
-        end_time="2026-06-03T12:45:22Z",
-    )
-
-    assert record is not None
-    assert record["provider"] is None
-    assert record["model"] == "claude-sonnet-4-6"
-    assert record["metadata"]["anthropic_adapter_original_model"] == ("google-antigravity/claude-sonnet-4-6")
-    assert _build_session_history_db_payload(record)[4] is None
 
 
 def test_build_session_history_record_preserves_opencode_zen_provider_identity() -> None:

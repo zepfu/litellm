@@ -616,28 +616,6 @@ def _extract_reported_reasoning_tokens(usage_obj: Any) -> Optional[int]:
     return None
 
 
-def _fallback_gemini_reasoning_tokens_from_signatures(metadata: Dict[str, Any], message: Any = None) -> Optional[int]:
-    signature_count = _safe_int(metadata.get("gemini_thought_signature_count"))
-    if signature_count is not None and signature_count > 0:
-        return signature_count
-
-    provider_specific_fields = _extract_provider_specific_fields(message) if message is not None else {}
-    thought_signatures = provider_specific_fields.get("thought_signatures")
-    if isinstance(thought_signatures, list):
-        non_empty_signatures = [
-            signature for signature in thought_signatures if isinstance(signature, str) and signature.strip()
-        ]
-        if non_empty_signatures:
-            return len(non_empty_signatures)
-
-    if metadata.get("gemini_thought_signature_present") is True:
-        return 1
-    if metadata.get("thinking_signature_present") is True:
-        return 1
-
-    return None
-
-
 def _determine_reasoning_tokens_source(
     *,
     provider_reported_reasoning_tokens: Optional[int],
@@ -754,7 +732,6 @@ _HOST_FUNCTION_NAMES = (
     "_extract_cache_creation_input_tokens",
     "_has_nested_path",
     "_extract_reported_reasoning_tokens",
-    "_fallback_gemini_reasoning_tokens_from_signatures",
     "_determine_reasoning_tokens_source",
     "_estimate_reasoning_tokens",
     "_extract_rerank_request_payload",

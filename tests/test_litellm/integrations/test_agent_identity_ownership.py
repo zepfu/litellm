@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import ast
 import asyncio
-import base64
 import builtins
 import importlib
 import json
@@ -325,7 +324,6 @@ _A4A_MOVED_NAMES_BY_MODULE: Dict[str, List[str]] = {
         "_has_nested_path",
         # 10094-10267: reasoning tokens + rerank payloads
         "_extract_reported_reasoning_tokens",
-        "_fallback_gemini_reasoning_tokens_from_signatures",
         "_determine_reasoning_tokens_source",
         "_estimate_reasoning_tokens",
         "_extract_rerank_request_payload",
@@ -400,12 +398,8 @@ _A4A_MOVED_NAMES_BY_MODULE: Dict[str, List[str]] = {
         "_extract_request_user_texts",
         "_join_compact_request_user_texts",
         "_extract_codex_compact_thread_id",
-        "_extract_gemini_compact_prompt_id",
-        "_base_gemini_compact_prompt_id",
-        "_extract_compact_output_text",
         "_is_claude_code_compact_context",
         "_is_codex_compact_context",
-        "_is_gemini_cli_compact_context",
         "_classify_compact_summary_state",
         # constants
         "_INVALID_TOOL_CALL_ERROR_RE",
@@ -414,7 +408,6 @@ _A4A_MOVED_NAMES_BY_MODULE: Dict[str, List[str]] = {
         "_STRUCTURED_OUTPUT_NESTED_REQUEST_KEYS",
         "_STRUCTURED_OUTPUT_FAILURE_PATTERNS",
         "_CODEX_THREAD_ID_RE",
-        "_GEMINI_COMPACT_PROMPT_ID_RE",
         "_CLAUDE_CODE_COMPACT_REQUEST_MARKERS",
     ],
     # Original band 10268-11019: prompt-overhead buckets/components/breakdown
@@ -467,7 +460,6 @@ _A4A_CONSTANT_NAMES = frozenset(
         "_STRUCTURED_OUTPUT_NESTED_REQUEST_KEYS",
         "_STRUCTURED_OUTPUT_FAILURE_PATTERNS",
         "_CODEX_THREAD_ID_RE",
-        "_GEMINI_COMPACT_PROMPT_ID_RE",
         "_CLAUDE_CODE_COMPACT_REQUEST_MARKERS",
         "_RESPONSES_SYSTEM_ROLES",
         "_RESPONSES_CONVERSATION_ROLES",
@@ -500,9 +492,6 @@ _A4B_SYMBOLS = frozenset(
         "_classify_anthropic_context_window_from_retained_evidence",
         "_enrich_anthropic_context_window_metadata",
         "_enrich_backfill_anthropic_context_window_metadata",
-        "_read_varint",
-        "_extract_gemini_signature_summary",
-        "_enrich_gemini_thought_signature_metadata",
         "_enrich_agent_identity_metadata",
         "_enrich_trace_name_and_provider_metadata",
         # tool_activity.py
@@ -1045,7 +1034,6 @@ def test_a4a_reasoning_and_rerank_in_usage_extract_not_prompt_overhead() -> None
     usage_extract, NOT prompt_overhead."""
     for name in (
         "_extract_reported_reasoning_tokens",
-        "_fallback_gemini_reasoning_tokens_from_signatures",
         "_determine_reasoning_tokens_source",
         "_estimate_reasoning_tokens",
         "_extract_rerank_request_payload",
@@ -1171,10 +1159,6 @@ _A4B_MOVED_NAMES_BY_MODULE: Dict[str, List[str]] = {
         "_enrich_usage_breakout_metadata",
         # claude thinking signature decode
         "_enrich_claude_thinking_metadata",
-        # gemini thought signature decode
-        "_read_varint",
-        "_extract_gemini_signature_summary",
-        "_enrich_gemini_thought_signature_metadata",
         # orchestrators (may stay as thin delegates in __init__)
         "_enrich_agent_identity_metadata",
         "_enrich_trace_name_and_provider_metadata",
@@ -1190,7 +1174,6 @@ _A4B_MOVED_NAMES_BY_MODULE: Dict[str, List[str]] = {
         "_WORKER_CONTEXT_EXHAUSTION_METADATA_KEYS",
         "_WORKER_CONTEXT_EXHAUSTION_STRING_MAX_LEN",
         "_WORKER_CONTEXT_EXHAUSTION_BOOL_KEYS",
-        "_GEMINI_MARKER",
     ],
 }
 
@@ -1226,7 +1209,6 @@ _A4B_CONSTANT_NAMES = frozenset(
         "_WORKER_CONTEXT_EXHAUSTION_METADATA_KEYS",
         "_WORKER_CONTEXT_EXHAUSTION_STRING_MAX_LEN",
         "_WORKER_CONTEXT_EXHAUSTION_BOOL_KEYS",
-        "_GEMINI_MARKER",
     }
 )
 
@@ -1806,45 +1788,6 @@ def test_a4b_golden_bound_worker_context_exhaustion_string() -> None:
     assert len(bounded) == 512
 
 
-def test_a4b_golden_enrich_gemini_thought_signature_metadata() -> None:
-    """Pin _enrich_gemini_thought_signature_metadata for present and absent
-    signatures."""
-    from litellm.integrations.aawm_agent_identity import (
-        _enrich_gemini_thought_signature_metadata,
-    )
-
-    # Construct a minimal valid gemini signature with the known marker
-    marker = bytes.fromhex("8f3d6b5f")
-    payload = b"\x00\x01\x02" + marker + b"\x03\x04"
-    record = b"\x0A" + bytes([len(payload)]) + payload
-    gemini_sig_b64 = base64.b64encode(record).decode()
-
-    message = {
-        "content": [{"type": "text", "text": "response"}],
-        "provider_specific_fields": {"thought_signatures": [gemini_sig_b64]},
-    }
-    metadata: Dict[str, Any] = {}
-    _enrich_gemini_thought_signature_metadata(metadata, message)
-    metadata.pop("langfuse_spans", None)
-
-    assert metadata["gemini_thought_signature_present"] is True
-    assert metadata["gemini_thought_signature_count"] == 1
-    assert metadata["gemini_tsig_decoded_bytes"] == 11
-    assert metadata["gemini_tsig_record_count"] == 1
-    assert metadata["gemini_tsig_record_sizes"] == [9]
-    assert metadata["gemini_tsig_prefixes"] == ["000102"]
-    assert metadata["gemini_tsig_marker_offsets"] == [5]
-    assert metadata["gemini_tsig_marker_hex"] == "8f3d6b5f"
-    assert metadata["thinking_signature_present"] is True
-    assert metadata["thinking_signature_decoded"] is True
-    assert "gemini-thought-signature" in metadata["tags"]
-
-    # Absent signatures: metadata unchanged
-    metadata_empty: Dict[str, Any] = {}
-    _enrich_gemini_thought_signature_metadata(
-        metadata_empty, {"content": [{"type": "text", "text": "hello"}]}
-    )
-    assert metadata_empty == {}
 
 
 # =========================================================================

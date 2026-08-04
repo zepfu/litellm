@@ -205,13 +205,7 @@ def _derive_session_history_reasoning_fields(
     provider_reported_reasoning_tokens: Optional[int],
 ) -> Dict[str, Any]:
     """Shared reasoning-token derivation for live and backfill builders."""
-    provider_name = str(provider or "").strip().lower()
     effective_reported = reported_reasoning_tokens
-    if effective_reported is None and provider_name in {"gemini", "google"}:
-        effective_reported = _fallback_gemini_reasoning_tokens_from_signatures(
-            metadata,
-            message,
-        )
     thinking_blocks = _extract_thinking_blocks(message) if message is not None else []
     reasoning_text = (
         _extract_reasoning_content(message, thinking_blocks)
@@ -1925,27 +1919,6 @@ def _install_record_functions() -> None:
     # verbose_logger is imported on this module; ensure host can see the same
     # object if not already present (tests often patch host.verbose_logger).
     host_globals.setdefault("verbose_logger", verbose_logger)
-    # Provider-normalization helpers are rebound to this host namespace and
-    # therefore need their module-owned constant dependencies here as well.
-    from litellm.integrations.aawm_agent_identity import (
-        provider_cache,
-        provider_normalize,
-    )
-
-    for constant_name in (
-        "_RETIRED_GOOGLE_AGENT_PROVIDER_NAMES",
-        "_RETIRED_GOOGLE_AGENT_MARKERS",
-        "_RETIRED_GOOGLE_AGENT_API_BASE_MARKERS",
-    ):
-        host_globals.setdefault(
-            constant_name,
-            getattr(provider_normalize, constant_name),
-        )
-    host_globals.setdefault(
-        "_RETIRED_PROVIDER_CACHE_NAMES",
-        provider_cache._RETIRED_PROVIDER_CACHE_NAMES,
-    )
-
     mod_globals = sys.modules[__name__].__dict__
     for name in _RECORD_API_NAMES:
         original = mod_globals.get(name)

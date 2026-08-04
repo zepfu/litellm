@@ -585,7 +585,6 @@ def _request_payload_contains(
 
     return False
 _CODEX_THREAD_ID_RE = re.compile(r"\bCODEX_THREAD_ID=(?P<thread_id>[A-Za-z0-9][A-Za-z0-9._:-]{7,})\b")
-_GEMINI_COMPACT_PROMPT_ID_RE = re.compile(r"^compress-[A-Za-z0-9._:-]+$")
 _CLAUDE_CODE_COMPACT_REQUEST_MARKERS = (
     "your task is to create a detailed summary of the conversation so far",
     "respond with text only",
@@ -663,58 +662,6 @@ def _extract_codex_compact_thread_id(
     return None
 
 
-def _extract_gemini_compact_prompt_id(
-    metadata: Dict[str, Any],
-    request_body: Any,
-) -> Optional[str]:
-    candidates = [metadata.get("gemini_user_prompt_id")]
-    if isinstance(request_body, dict):
-        candidates.extend(
-            [
-                request_body.get("user_prompt_id"),
-                _maybe_get_path(request_body, "request", "user_prompt_id"),
-            ]
-        )
-    for candidate in candidates:
-        prompt_id = _clean_non_empty_string(candidate)
-        if prompt_id and _GEMINI_COMPACT_PROMPT_ID_RE.match(prompt_id):
-            return prompt_id
-    return None
-
-
-def _base_gemini_compact_prompt_id(prompt_id: str) -> str:
-    if prompt_id.endswith("-verify"):
-        return prompt_id[: -len("-verify")]
-    return prompt_id
-
-
-def _extract_compact_output_text(output_payload: Any) -> str:
-    parsed = _safe_json_load(output_payload, output_payload)
-
-    for extractor in (_extract_first_response_message, _extract_first_langfuse_response_message):
-        message = extractor(parsed)
-        if message is None:
-            continue
-        text = _content_to_text(_maybe_get(message, "content")).strip()
-        if text:
-            return text
-
-    if isinstance(parsed, dict):
-        content = parsed.get("content")
-        if isinstance(content, str) and content.strip():
-            return content.strip()
-
-        candidates = parsed.get("candidates")
-        if isinstance(candidates, list):
-            for candidate in candidates:
-                parts = _maybe_get_path(candidate, "content", "parts")
-                text = _content_to_text(parts).strip()
-                if text:
-                    return text
-
-    return _content_to_text(parsed).strip()
-
-
 def _is_claude_code_compact_context(metadata: Dict[str, Any]) -> bool:
     client_name = str(metadata.get("client_name") or "").strip().lower()
     trace_name = str(metadata.get("trace_name") or "").strip().lower()
@@ -733,17 +680,6 @@ def _is_codex_compact_context(metadata: Dict[str, Any]) -> bool:
     return client_name == "codex-tui" or trace_name.startswith("codex") or route_family == "codex_responses"
 
 
-def _is_gemini_cli_compact_context(metadata: Dict[str, Any]) -> bool:
-    client_name = str(metadata.get("client_name") or "").strip().lower()
-    user_agent = str(metadata.get("client_user_agent") or "").strip().lower()
-    route_family = str(metadata.get("passthrough_route_family") or "").strip().lower()
-    return (
-        client_name == "gemini-cli"
-        or user_agent.startswith("geminicli-tui/")
-        or route_family == "gemini_generate_content"
-    )
-
-
 def _classify_compact_summary_state(
     *,
     metadata: Dict[str, Any],
@@ -755,8 +691,6 @@ def _classify_compact_summary_state(
 ) -> Dict[str, Any]:
     request_text = _join_compact_request_user_texts(request_body)
     request_text_lower = request_text.lower()
-    output_text = _extract_compact_output_text(output_payload)
-    output_text_lower = output_text.lower()
 
     if _is_codex_compact_context(metadata):
         compact_id = _extract_codex_compact_thread_id(
@@ -778,23 +712,6 @@ def _classify_compact_summary_state(
                 "compact_summary_role": "resume_context",
                 "compact_summary_id": compact_id or session_id,
             }
-
-    gemini_prompt_id = _extract_gemini_compact_prompt_id(metadata, request_body)
-    if gemini_prompt_id is not None and _is_gemini_cli_compact_context(metadata):
-        is_verify = gemini_prompt_id.endswith("-verify")
-        if not is_verify and not output_text_lower.startswith("<state_snapshot>"):
-            return {
-                "is_compact_summary": False,
-                "compact_summary_source": None,
-                "compact_summary_role": None,
-                "compact_summary_id": None,
-            }
-        return {
-            "is_compact_summary": not is_verify,
-            "compact_summary_source": "gemini-cli",
-            "compact_summary_role": "verify" if is_verify else "event",
-            "compact_summary_id": _base_gemini_compact_prompt_id(gemini_prompt_id),
-        }
 
     if _is_claude_code_compact_context(metadata):
         has_compact_tags = "<analysis>" in request_text_lower and "<summary>" in request_text_lower
@@ -840,18 +757,13 @@ _HOST_FUNCTION_NAMES = (
     "_extract_request_body_from_langfuse_input",
     "_request_payload_contains",
     "_CODEX_THREAD_ID_RE",
-    "_GEMINI_COMPACT_PROMPT_ID_RE",
     "_CLAUDE_CODE_COMPACT_REQUEST_MARKERS",
     "_append_request_content_text",
     "_extract_request_user_texts",
     "_join_compact_request_user_texts",
     "_extract_codex_compact_thread_id",
-    "_extract_gemini_compact_prompt_id",
-    "_base_gemini_compact_prompt_id",
-    "_extract_compact_output_text",
     "_is_claude_code_compact_context",
     "_is_codex_compact_context",
-    "_is_gemini_cli_compact_context",
     "_classify_compact_summary_state",
 )
 

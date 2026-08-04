@@ -520,35 +520,6 @@ def _extract_prompt_overhead_components(
         "excluded": [],
     }
     route_family_lower = (route_family or "").lower()
-    request_block = request_body.get("request")
-    is_nested_gemini = isinstance(request_block, dict) and (
-        "gemini" in route_family_lower
-        or "google" in route_family_lower
-        or "contents" in request_block
-        or "systemInstruction" in request_block
-    )
-    if is_nested_gemini:
-        nested_request_block = request_block if isinstance(request_block, dict) else {}
-        _append_prompt_component(
-            components,
-            "system",
-            path="request.systemInstruction",
-            value=nested_request_block.get("systemInstruction") or nested_request_block.get("system_instruction"),
-        )
-        _append_prompt_component(
-            components,
-            "tools",
-            path="request.tools",
-            value=nested_request_block.get("tools") or request_body.get("tools"),
-        )
-        _append_prompt_component(
-            components,
-            "conversation",
-            path="request.contents",
-            value=nested_request_block.get("contents"),
-        )
-        return components, "gemini_generate_content"
-
     if request_body.get("systemInstruction") is not None or request_body.get("contents") is not None:
         _append_prompt_component(
             components,

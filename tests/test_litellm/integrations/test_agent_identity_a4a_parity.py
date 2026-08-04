@@ -47,8 +47,6 @@ from litellm.integrations.aawm_agent_identity import (
     _classify_compact_summary_state,
     _is_codex_compact_context,
     _is_claude_code_compact_context,
-    _is_gemini_cli_compact_context,
-    _base_gemini_compact_prompt_id,
     # --- prompt_overhead band (10268-11019) ---
     _fallback_text_token_estimate,
     _empty_prompt_overhead_breakdown,
@@ -233,9 +231,6 @@ class TestRequestSignalsGoldens:
         assert _request_payload_contains(payload, lambda d: "cache_control" in d) is True
         assert _request_payload_contains(payload, lambda d: "missing_key" in d) is False
 
-    def test_base_gemini_compact_prompt_id(self) -> None:
-        assert _base_gemini_compact_prompt_id("compress-abc123") == "compress-abc123"
-        assert _base_gemini_compact_prompt_id("compress-abc123-verify") == "compress-abc123"
 
     def test_is_codex_compact_context(self) -> None:
         assert _is_codex_compact_context({"client_name": "codex-tui"}) is True
@@ -247,10 +242,6 @@ class TestRequestSignalsGoldens:
         assert _is_claude_code_compact_context({"trace_name": "claude-code.ops"}) is True
         assert _is_claude_code_compact_context({"client_name": "codex-tui"}) is False
 
-    def test_is_gemini_cli_compact_context(self) -> None:
-        assert _is_gemini_cli_compact_context({"client_name": "gemini-cli"}) is True
-        assert _is_gemini_cli_compact_context({"client_user_agent": "geminicli-tui/1.0"}) is True
-        assert _is_gemini_cli_compact_context({"client_name": "codex-tui"}) is False
 
     def test_classify_compact_summary_state_codex_event(self) -> None:
         result = _classify_compact_summary_state(
