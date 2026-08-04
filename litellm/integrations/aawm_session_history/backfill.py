@@ -565,8 +565,6 @@ def _derive_request_tags_from_langfuse_metadata(metadata: Dict[str, Any]) -> Lis
         normalized_tags.append("thinking-signature-present")
     if metadata.get("claude_thinking_signature_present") is True:
         normalized_tags.append("claude-thinking-signature")
-    if metadata.get("gemini_thought_signature_present") is True:
-        normalized_tags.append("gemini-thought-signature")
     if metadata.get("thinking_signature_decoded") is True:
         normalized_tags.append("thinking-signature-decoded")
     if metadata.get("claude_thinking_signature_decoded") is True:

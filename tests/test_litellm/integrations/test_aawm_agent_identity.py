@@ -619,7 +619,6 @@ def test_aawm_agent_identity_adds_claude_thinking_tags() -> None:
     assert claude_span["metadata"]["reasoning_content_present"] is True
     assert "start_time" in claude_span
     assert "end_time" in claude_span
-    assert "gemini_thought_signature_present" not in metadata
 
 
 def test_aawm_agent_identity_adds_claude_permission_check_span() -> None:
@@ -6830,11 +6829,6 @@ def test_build_session_history_record_marks_gemini_cache_miss_from_intent_metada
     ("model", "target_tag", "expected_provider"),
     [
         (
-            "unknown",
-            "anthropic-adapter-target:google:/v1internal:streamGenerateContent",
-            "gemini",
-        ),
-        (
             "gpt-oss-20b:free",
             "anthropic-adapter-target:openrouter:/v1/responses",
             "openrouter",
@@ -6860,9 +6854,7 @@ def test_build_session_history_record_uses_adapter_target_over_anthropic_ingress
         {
             "session_id": f"session-adapter-target-{expected_provider}",
             "request_tags": [
-                "anthropic-adapter-model:gemini-3-flash-preview"
-                if model == "unknown"
-                else f"anthropic-adapter-model:{model}",
+                f"anthropic-adapter-model:{model}",
                 target_tag,
             ],
             "user_api_key_request_route": "/anthropic/v1/messages",
@@ -6886,8 +6878,6 @@ def test_build_session_history_record_uses_adapter_target_over_anthropic_ingress
 
     assert record is not None
     assert record["provider"] == expected_provider
-    if model == "unknown":
-        assert record["model"] == "gemini-3-flash-preview"
 
 
 
@@ -13002,59 +12992,6 @@ def test_build_session_history_record_from_langfuse_trace_observation_uses_gemin
     assert record["output_tokens"] == 15
     assert record["reasoning_tokens_reported"] == 5
     assert record["reasoning_tokens_source"] == "provider_reported"
-
-
-
-
-def test_build_session_history_record_from_langfuse_uses_adapter_target_over_anthropic_route() -> None:
-    trace = {
-        "id": "trace-adapter-gemini",
-        "name": "claude-code.gemini-3-flash-preview",
-        "sessionId": "session-adapter-gemini",
-        "environment": "dev",
-    }
-    observation = {
-        "id": "obs-adapter-gemini",
-        "type": "GENERATION",
-        "name": "litellm-pass_through_endpoint",
-        "model": "unknown",
-        "startTime": "2026-04-17T14:00:00Z",
-        "endTime": "2026-04-17T14:00:02Z",
-        "usage": {
-            "input": 20,
-            "output": 15,
-            "total": 35,
-        },
-        "output": {
-            "choices": [
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": "gemini flash result",
-                    }
-                }
-            ]
-        },
-        "metadata": {
-            "user_api_key_request_route": "/anthropic/v1/messages",
-            "request_tags": [
-                "anthropic-adapter-model:gemini-3-flash-preview",
-                "anthropic-adapter-target:google:/v1internal:streamGenerateContent",
-            ],
-        },
-    }
-
-    record = _build_session_history_record_from_langfuse_trace_observation(
-        trace,
-        observation,
-        backfill_run_id="run-adapter-gemini",
-    )
-
-    assert record is not None
-    assert record["provider"] == "gemini"
-    assert record["model"] == "gemini-3-flash-preview"
-    assert record["call_type"] == "/anthropic/v1/messages"
-
 
 def test_build_session_history_record_from_langfuse_preserves_explicit_openrouter_model() -> None:
     trace = {

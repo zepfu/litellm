@@ -170,8 +170,6 @@ def _session_history_adapter_target_provider(
         if not tag_lower.startswith("anthropic-adapter-target:"):
             continue
         target = tag_lower.split(":", 1)[1].strip()
-        if target.startswith(("google", "gemini")):
-            return "gemini"
         if target.startswith("openrouter"):
             return "openrouter"
         if target.startswith(("opencode", "opencode_zen", "zen")):
