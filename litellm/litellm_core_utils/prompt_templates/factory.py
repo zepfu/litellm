@@ -63,84 +63,6 @@ BAD_MESSAGE_ERROR_STR = "Invalid Message "
 # See: https://ai.google.dev/gemini-api/docs/thought-signatures
 THOUGHT_SIGNATURE_SEPARATOR = "__thought__"
 
-_SYSTEM_REMINDER_BLOCK_RE = re.compile(
-    r"\s*<system-reminder>.*?</system-reminder>\s*",
-    re.DOTALL,
-)
-_EPHEMERAL_MESSAGE_BLOCK_RE = re.compile(
-    r"\s*This tool result contains the following ephemeral messages:\s*"
-    r"(?:<ephemeral_message>.*?</ephemeral_message>\s*)+",
-    re.DOTALL | re.IGNORECASE,
-)
-_EPHEMERAL_MESSAGE_TAG_RE = re.compile(
-    r"\s*</?ephemeral_message>\s*",
-    re.IGNORECASE,
-)
-
-
-def _sanitize_gemini_tool_response_text(text: str) -> str:
-    """Remove Claude-side reminder wrappers from tool results before sending to Gemini."""
-    cleaned = (
-        _SYSTEM_REMINDER_BLOCK_RE.sub("\n", text)
-        if "</system-reminder>" in text
-        else text
-    )
-    cleaned = _EPHEMERAL_MESSAGE_BLOCK_RE.sub("\n", cleaned)
-    cleaned = _EPHEMERAL_MESSAGE_TAG_RE.sub("\n", cleaned)
-    cleaned = cleaned.replace("<tool_use_error>", "")
-    cleaned = cleaned.replace("</tool_use_error>", "")
-    cleaned = cleaned.strip()
-    return cleaned or text.strip()
-
-
-def _coerce_gemini_tool_response_data(
-    text: str,
-    *,
-    is_error: Optional[bool] = None,
-) -> dict:
-    """
-    Normalize plain tool output into the response schema Gemini Code Assist uses natively.
-
-    Native requests observed on the wire use:
-    - {"output": "..."} for successful tool results
-    - {"error": "..."} for failed tool results
-
-    Prefer structured signals over text heuristics:
-    - Structured JSON payloads are returned as-is so genuine ``{"error": ...}``
-      bodies stay errors.
-    - An explicit ``is_error`` status on the tool message forces error/output.
-    - Claude-side ``<tool_use_error>`` wrappers are treated as failures.
-
-    Arbitrary successful prose that merely begins with words like "Error"/"Exception"/
-    "Traceback" must remain successful ``output``.
-    """
-    cleaned_text = _sanitize_gemini_tool_response_text(text)
-
-    try:
-        if cleaned_text.startswith(("{", "[")):
-            parsed = json.loads(cleaned_text)
-            if isinstance(parsed, dict):
-                return parsed
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    # Explicit status signal from callers that have a real success/failure bit
-    # (for example Anthropic tool_result.is_error mirrored onto the OpenAI tool
-    # message). This wins over free-text heuristics.
-    if is_error is True:
-        return {"error": cleaned_text}
-    if is_error is False:
-        return {"output": cleaned_text}
-
-    # Explicit Claude-side failure wrapper. Detect on the original text because
-    # sanitization strips the tags before the payload is returned.
-    lowered_original = text.lower()
-    if "<tool_use_error>" in lowered_original or "</tool_use_error>" in lowered_original:
-        return {"error": cleaned_text}
-
-    return {"output": cleaned_text}
-
-
 # used to interweave user messages, to ensure user/assistant alternating
 DEFAULT_USER_CONTINUE_MESSAGE = {
     "role": "user",
@@ -1586,17 +1508,49 @@ def convert_to_gemini_tool_call_result(  # noqa: PLR0915
     from litellm.types.llms.vertex_ai import BlobType
 
     content_str: str = ""
-    inline_data: Optional[BlobType] = None
+    inline_data_list: List[BlobType] = []
 
     if "content" in message:
         if isinstance(message["content"], str):
             content_str = message["content"]
+            # Detect data-URL images (e.g. from Anthropic tool_result with a single image block
+            # that was serialised as a plain string by translate_anthropic_messages_to_openai)
+            # and promote them to inline_data so Gemini receives actual image bytes.
+            if content_str[:5].lower() == "data:" and ";base64," in content_str:
+                try:
+                    mime_rest = content_str[5:].split(";base64,", 1)
+                    if len(mime_rest) == 2 and mime_rest[0].startswith("image/"):
+                        # Strip any extra parameters (e.g. ";charset=UTF-8") from the MIME segment
+                        clean_mime = mime_rest[0].split(";")[0].strip()
+                        inline_data_list.append(
+                            BlobType(data=mime_rest[1], mime_type=clean_mime)
+                        )
+                        content_str = ""
+                except Exception as e:
+                    verbose_logger.warning(
+                        f"Failed to parse data URL in tool response: {e}"
+                    )
         elif isinstance(message["content"], List):
             content_list = message["content"]
             for content in content_list:
                 content_type = content.get("type", "")
                 if content_type == "text":
                     content_str += content.get("text", "")
+                elif content_type == "image":
+                    # Anthropic-native image block: {"type": "image", "source": {"type": "base64", ...}}
+                    source = content.get("source", {})
+                    if isinstance(source, dict) and source.get("type") == "base64":
+                        try:
+                            inline_data_list.append(
+                                BlobType(
+                                    data=source.get("data", ""),
+                                    mime_type=source.get("media_type", "image/jpeg"),
+                                )
+                            )
+                        except Exception as e:
+                            verbose_logger.warning(
+                                f"Failed to process Anthropic image block in tool response: {e}"
+                            )
                 elif content_type in ("input_image", "image_url"):
                     # Extract image for inline_data (for Computer Use screenshots and tool results)
                     image_url_data = content.get("image_url", "")
@@ -1612,9 +1566,11 @@ def convert_to_gemini_tool_call_result(  # noqa: PLR0915
                             image_obj = convert_to_anthropic_image_obj(
                                 image_url, format=None
                             )
-                            inline_data = BlobType(
-                                data=image_obj["data"],
-                                mime_type=image_obj["media_type"],
+                            inline_data_list.append(
+                                BlobType(
+                                    data=image_obj["data"],
+                                    mime_type=image_obj["media_type"],
+                                )
                             )
                         except Exception as e:
                             verbose_logger.warning(
@@ -1639,9 +1595,11 @@ def convert_to_gemini_tool_call_result(  # noqa: PLR0915
                             file_obj = convert_to_anthropic_image_obj(
                                 file_data, format=None
                             )
-                            inline_data = BlobType(
-                                data=file_obj["data"],
-                                mime_type=file_obj["media_type"],
+                            inline_data_list.append(
+                                BlobType(
+                                    data=file_obj["data"],
+                                    mime_type=file_obj["media_type"],
+                                )
                             )
                         except Exception as e:
                             verbose_logger.warning(
@@ -1678,34 +1636,40 @@ def convert_to_gemini_tool_call_result(  # noqa: PLR0915
             )
         )
 
-    # Parse response data - support structured JSON while normalizing plain text
-    # to the Gemini Code Assist output/error shape observed on the native wire.
-    # Prefer an explicit is_error status when present; otherwise use conservative
-    # structured/wrapper signals rather than guessing from free text.
-    message_is_error = message.get("is_error")  # type: ignore[attr-defined]
-    if not isinstance(message_is_error, bool):
-        message_is_error = None
-    response_data: dict = _coerce_gemini_tool_response_data(
-        content_str,
-        is_error=message_is_error,
-    )
+    # Parse response data - support both JSON string and plain string
+    # For Computer Use, the response should contain structured data like {"url": "..."}
+    response_data: dict
+    try:
+        if content_str.strip().startswith("{") or content_str.strip().startswith("["):
+            # Try to parse as JSON (for Computer Use structured responses)
+            parsed = json.loads(content_str)
+            if isinstance(parsed, dict):
+                response_data = parsed  # Use the parsed JSON directly
+            else:
+                response_data = {"content": content_str}
+        else:
+            response_data = {"content": content_str}
+    except (json.JSONDecodeError, ValueError):
+        # Not valid JSON, wrap in content field
+        response_data = {"content": content_str}
 
+    # We can't determine from openai message format whether it's a successful or
+    # error call result so default to the successful result template
     _function_response = VertexFunctionResponse(
         name=name, response=response_data  # type: ignore
     )
     if gemini_call_id:
         _function_response["id"] = gemini_call_id
 
-    # Create part with function_response, and optionally inline_data for images (Computer Use)
     _part: VertexPartType = {"function_response": _function_response}
 
-    # For Computer Use, if we have an image, we need separate parts:
-    # - One part with function_response
-    # - One part with inline_data
-    # Gemini's PartType is a oneof, so we can't have both in the same part
-    if inline_data:
-        image_part: VertexPartType = {"inline_data": inline_data}
-        return [_part, image_part]
+    # For multimodal function responses, Gemini expects media parts nested
+    # inside functionResponse.parts instead of sibling content parts.
+    if inline_data_list:
+        _function_response["parts"] = [
+            {"inline_data": inline_data} for inline_data in inline_data_list
+        ]
+        return [_part]
 
     return _part
 

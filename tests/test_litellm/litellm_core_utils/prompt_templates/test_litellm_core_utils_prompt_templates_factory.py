@@ -1,3 +1,4 @@
+import base64
 from unittest.mock import MagicMock
 
 import pytest
@@ -7,9 +8,23 @@ from litellm.litellm_core_utils.prompt_templates.factory import (
     BedrockConverseMessagesProcessor,
     BedrockImageProcessor,
     _convert_to_bedrock_tool_call_invoke,
+    convert_to_gemini_tool_call_result,
     ollama_pt,
     sanitize_messages_for_tool_calling,
 )
+from litellm.types.llms.openai import ChatCompletionToolMessage
+
+
+def _get_gemini_function_response_inline_data_parts(result):
+    assert isinstance(result, list), "expected Gemini parts list"
+    assert len(result) == 1, "multimodal function responses should stay in one part"
+    function_response_part = result[0]
+    assert (
+        "inline_data" not in function_response_part
+    ), "inline_data should be nested under function_response.parts"
+    function_response = function_response_part["function_response"]
+    nested_parts = function_response["parts"]
+    return [part["inline_data"] for part in nested_parts if "inline_data" in part]
 
 
 def test_ollama_pt_simple_messages():
@@ -494,100 +509,6 @@ def test_convert_gemini_messages():
     )
 
 
-def test_convert_gemini_tool_call_result_wraps_plain_text_as_output_and_strips_reminder():
-    from litellm.litellm_core_utils.prompt_templates.factory import (
-        convert_to_gemini_tool_call_result,
-    )
-
-    message = {
-        "role": "tool",
-        "tool_call_id": "call_plain_output",
-        "content": "Mon Apr 20 09:57:31 UTC 2026\n\n<system-reminder>\n## Auto Mode Active\n\nignore me\n</system-reminder>\n",
-    }
-    last_message_with_tool_calls = {
-        "tool_calls": [
-            {
-                "id": "call_plain_output",
-                "function": {"name": "Bash", "arguments": '{"command":"date -u"}'},
-            }
-        ]
-    }
-
-    result = convert_to_gemini_tool_call_result(
-        message=message,
-        last_message_with_tool_calls=last_message_with_tool_calls,
-    )
-
-    assert result["function_response"]["name"] == "Bash"
-    assert result["function_response"]["response"] == {
-        "output": "Mon Apr 20 09:57:31 UTC 2026"
-    }
-
-
-def test_convert_gemini_tool_call_result_maps_tool_use_error_to_error():
-    from litellm.litellm_core_utils.prompt_templates.factory import (
-        convert_to_gemini_tool_call_result,
-    )
-
-    message = {
-        "role": "tool",
-        "tool_call_id": "call_tool_error",
-        "content": "<tool_use_error>InputValidationError: Bash failed due to the following issue:\nThe required parameter `command` is missing.\n",
-    }
-    last_message_with_tool_calls = {
-        "tool_calls": [
-            {
-                "id": "call_tool_error",
-                "function": {"name": "Bash", "arguments": '{"command":"date -u"}'},
-            }
-        ]
-    }
-
-    result = convert_to_gemini_tool_call_result(
-        message=message,
-        last_message_with_tool_calls=last_message_with_tool_calls,
-    )
-
-    assert result["function_response"]["name"] == "Bash"
-    assert result["function_response"]["response"] == {
-        "error": "InputValidationError: Bash failed due to the following issue:\nThe required parameter `command` is missing."
-    }
-
-
-def test_convert_gemini_tool_call_result_keeps_successful_errorlike_text_as_output():
-    """Successful tool text that merely begins with Error/Exception/Traceback is not an error."""
-    from litellm.litellm_core_utils.prompt_templates.factory import (
-        convert_to_gemini_tool_call_result,
-    )
-
-    cases = [
-        "Error rates dropped after the rollout completed successfully.",
-        "Exception handling path returned a cached value for this request.",
-        "Traceback analysis finished; no failures were found in the latest run.",
-        "InputValidationError was not raised for the corrected payload.",
-        "Command failed due to the following issue being fixed in a later attempt.",
-    ]
-    for idx, content in enumerate(cases):
-        message = {
-            "role": "tool",
-            "tool_call_id": f"call_success_errorlike_{idx}",
-            "content": content,
-        }
-        last_message_with_tool_calls = {
-            "tool_calls": [
-                {
-                    "id": f"call_success_errorlike_{idx}",
-                    "function": {"name": "Bash", "arguments": "{}"},
-                }
-            ]
-        }
-        result = convert_to_gemini_tool_call_result(
-            message=message,
-            last_message_with_tool_calls=last_message_with_tool_calls,
-        )
-        assert result["function_response"]["response"] == {"output": content}, content
-
-
 def test_convert_gemini_tool_call_result_preserves_structured_error_payload():
     from litellm.litellm_core_utils.prompt_templates.factory import (
         convert_to_gemini_tool_call_result,
@@ -616,79 +537,6 @@ def test_convert_gemini_tool_call_result_preserves_structured_error_payload():
     assert result["function_response"]["response"] == {
         "error": "weather service unavailable",
         "code": 500,
-    }
-
-
-def test_convert_gemini_tool_call_result_maps_plain_tool_use_error_wrapper_to_error():
-    from litellm.litellm_core_utils.prompt_templates.factory import (
-        convert_to_gemini_tool_call_result,
-    )
-
-    message = {
-        "role": "tool",
-        "tool_call_id": "call_wrapped_error",
-        "content": "<tool_use_error>Permission denied while reading /tmp/secret</tool_use_error>",
-    }
-    last_message_with_tool_calls = {
-        "tool_calls": [
-            {
-                "id": "call_wrapped_error",
-                "function": {"name": "Read", "arguments": "{}"},
-            }
-        ]
-    }
-
-    result = convert_to_gemini_tool_call_result(
-        message=message,
-        last_message_with_tool_calls=last_message_with_tool_calls,
-    )
-
-    assert result["function_response"]["response"] == {
-        "error": "Permission denied while reading /tmp/secret"
-    }
-
-
-def test_convert_gemini_tool_call_result_honors_is_error_status():
-    """Explicit tool-message is_error must control Gemini error/output classification."""
-    from litellm.litellm_core_utils.prompt_templates.factory import (
-        convert_to_gemini_tool_call_result,
-    )
-
-    last_message_with_tool_calls = {
-        "tool_calls": [
-            {
-                "id": "call_status",
-                "function": {"name": "Bash", "arguments": "{}"},
-            }
-        ]
-    }
-
-    # Explicit failure even when free text does not look like an error.
-    error_result = convert_to_gemini_tool_call_result(
-        message={
-            "role": "tool",
-            "tool_call_id": "call_status",
-            "content": "Permission denied while reading /tmp/secret",
-            "is_error": True,
-        },
-        last_message_with_tool_calls=last_message_with_tool_calls,
-    )
-    assert error_result["function_response"]["response"] == {
-        "error": "Permission denied while reading /tmp/secret"
-    }
-
-    # Explicit success even when free text would previously have been misclassified.
-    success_result = convert_to_gemini_tool_call_result(
-        message={
-            "role": "tool",
-            "tool_call_id": "call_status",
-            "content": "Error rates dropped after the rollout completed successfully.",
-            "is_error": False,
-        },
-        last_message_with_tool_calls=last_message_with_tool_calls,
-    )
-    assert success_result["function_response"]["response"] == {
-        "output": "Error rates dropped after the rollout completed successfully."
     }
 
 
@@ -725,14 +573,19 @@ def test_convert_gemini_tool_call_result_with_image_url():
         message=message_str_format,
         last_message_with_tool_calls=last_message_with_tool_calls,
     )
-    # Should have inline_data for the image
-    assert isinstance(result, list) and any("inline_data" in p for p in result)
+    inline_parts = _get_gemini_function_response_inline_data_parts(result)
+    assert len(inline_parts) == 1
 
     # Test with dict image_url format (OpenAI standard)
     message_dict_format = ChatCompletionToolMessage(
         role="tool",
         tool_call_id="call_456",
-        content=[{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ"}}],
+        content=[
+            {
+                "type": "image_url",
+                "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ"},
+            }
+        ],
     )
     last_message_with_tool_calls["tool_calls"][0]["id"] = "call_456"
 
@@ -740,7 +593,185 @@ def test_convert_gemini_tool_call_result_with_image_url():
         message=message_dict_format,
         last_message_with_tool_calls=last_message_with_tool_calls,
     )
-    assert isinstance(result2, list) and any("inline_data" in p for p in result2)
+    inline_parts = _get_gemini_function_response_inline_data_parts(result2)
+    assert len(inline_parts) == 1
+
+
+def test_convert_gemini_tool_call_result_with_anthropic_image_block():
+    """
+    Test that Anthropic-native image blocks in tool_result list content are
+    converted to Gemini inline_data instead of being silently dropped.
+    Fixes: https://github.com/BerriAI/litellm/issues/23712
+    """
+    tiny_png_b64 = base64.b64encode(b"PNG_PLACEHOLDER").decode()
+
+    message = ChatCompletionToolMessage(
+        role="tool",
+        tool_call_id="call_123",
+        content=[
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": tiny_png_b64,
+                },
+            }
+        ],
+    )
+    last_message_with_tool_calls = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_123",
+                "type": "function",
+                "index": 0,
+                "function": {"name": "read_file", "arguments": "{}"},
+            }
+        ],
+    }
+
+    result = convert_to_gemini_tool_call_result(
+        message=message,
+        last_message_with_tool_calls=last_message_with_tool_calls,
+    )
+    inline_parts = _get_gemini_function_response_inline_data_parts(result)
+    assert len(inline_parts) == 1, "expected exactly one inline_data part"
+    assert inline_parts[0]["mime_type"] == "image/png"
+    assert inline_parts[0]["data"] == tiny_png_b64
+
+
+def test_convert_gemini_tool_call_result_with_multiple_anthropic_image_blocks():
+    """
+    Test that multiple Anthropic-native image blocks in a single tool_result
+    are all preserved as separate inline_data parts instead of only the last
+    one being kept.
+    Fixes: https://github.com/BerriAI/litellm/issues/23712
+    """
+    png_b64 = base64.b64encode(b"PNG_PLACEHOLDER").decode()
+    jpeg_b64 = base64.b64encode(b"JPEG_PLACEHOLDER").decode()
+
+    message = ChatCompletionToolMessage(
+        role="tool",
+        tool_call_id="call_multi",
+        content=[
+            {"type": "text", "text": "here are two images"},
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": png_b64,
+                },
+            },
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/jpeg",
+                    "data": jpeg_b64,
+                },
+            },
+        ],
+    )
+    last_message_with_tool_calls = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_multi",
+                "type": "function",
+                "index": 0,
+                "function": {"name": "screenshot", "arguments": "{}"},
+            }
+        ],
+    }
+
+    result = convert_to_gemini_tool_call_result(
+        message=message,
+        last_message_with_tool_calls=last_message_with_tool_calls,
+    )
+    inline_parts = _get_gemini_function_response_inline_data_parts(result)
+    assert (
+        len(inline_parts) == 2
+    ), f"expected 2 inline_data parts, got {len(inline_parts)}"
+    mime_types = {p["mime_type"] for p in inline_parts}
+    assert mime_types == {"image/png", "image/jpeg"}
+
+
+def test_convert_gemini_tool_call_result_with_data_url_string():
+    """
+    Test that a data-URL string in tool_result content is converted to
+    Gemini inline_data instead of being passed as plain text.
+    Fixes: https://github.com/BerriAI/litellm/issues/23712
+    """
+    tiny_png_b64 = base64.b64encode(b"PNG_PLACEHOLDER").decode()
+
+    message = ChatCompletionToolMessage(
+        role="tool",
+        tool_call_id="call_456",
+        content=f"data:image/png;base64,{tiny_png_b64}",
+    )
+    last_message_with_tool_calls = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_456",
+                "type": "function",
+                "index": 0,
+                "function": {"name": "read_file", "arguments": "{}"},
+            }
+        ],
+    }
+
+    result = convert_to_gemini_tool_call_result(
+        message=message,
+        last_message_with_tool_calls=last_message_with_tool_calls,
+    )
+    inline_parts = _get_gemini_function_response_inline_data_parts(result)
+    assert (
+        len(inline_parts) == 1
+    ), "data-URL image string was not converted to inline_data"
+    assert inline_parts[0]["mime_type"] == "image/png"
+    assert inline_parts[0]["data"] == tiny_png_b64
+
+
+def test_convert_gemini_tool_call_result_with_data_url_extra_params():
+    """
+    Test that a data-URL with extra MIME parameters (e.g. charset) produces
+    a clean mime_type without the extra parameters.
+    """
+    tiny_png_b64 = base64.b64encode(b"PNG_PLACEHOLDER").decode()
+
+    message = ChatCompletionToolMessage(
+        role="tool",
+        tool_call_id="call_extra",
+        content=f"data:image/png;charset=UTF-8;base64,{tiny_png_b64}",
+    )
+    last_message_with_tool_calls = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {
+                "id": "call_extra",
+                "type": "function",
+                "index": 0,
+                "function": {"name": "read_file", "arguments": "{}"},
+            }
+        ],
+    }
+
+    result = convert_to_gemini_tool_call_result(
+        message=message,
+        last_message_with_tool_calls=last_message_with_tool_calls,
+    )
+    inline_parts = _get_gemini_function_response_inline_data_parts(result)
+    assert len(inline_parts) == 1
+    assert (
+        inline_parts[0]["mime_type"] == "image/png"
+    ), f"expected clean 'image/png', got '{inline_parts[0]['mime_type']}'"
 
 
 def test_bedrock_tools_unpack_defs():

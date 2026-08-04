@@ -3,7 +3,6 @@
 This file targets retained helpers that still apply a bare non-greedy DOTALL
 ``<system-reminder>.*?</system-reminder>`` scan over client-controlled text:
 
-- factory ``_sanitize_gemini_tool_response_text``
 - control-plane ``_extract_aawm_dispatch_context_references``
 
 Each path is exercised with:
@@ -17,7 +16,6 @@ from __future__ import annotations
 import time
 from typing import Any, Callable
 
-from litellm.litellm_core_utils.prompt_templates import factory as prompt_factory
 from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane as cp
 
 # Mirror RR-054 #54 adversarial scale used by parser/operational residual tests.
@@ -77,46 +75,6 @@ def _assert_bounded(
         f"system-reminder openers: {elapsed:.3f}s"
     )
     return result
-
-
-# ---------------------------------------------------------------------------
-# factory._sanitize_gemini_tool_response_text
-# ---------------------------------------------------------------------------
-
-
-def test_rr054_sanitize_gemini_unmatched_openers_bounded() -> None:
-    adversarial = _unmatched_openers_payload()
-
-    out = _assert_bounded(
-        "sanitize_gemini_tool_response_text",
-        lambda: prompt_factory._sanitize_gemini_tool_response_text(adversarial),
-    )
-
-    assert isinstance(out, str)
-    # No closers => regex does not strip; sanitized path still returns text.
-    assert out
-    assert "<system-reminder>" in out
-
-
-def test_rr054_sanitize_gemini_closed_blocks_strip_reminders() -> None:
-    closed = _closed_system_reminder_blocks()
-
-    out = prompt_factory._sanitize_gemini_tool_response_text(closed)
-
-    assert out == "Continue the task with tool use."
-    assert "<system-reminder>" not in out
-    assert "</system-reminder>" not in out
-
-
-def test_rr054_sanitize_gemini_closed_only_falls_back_to_stripped_original() -> None:
-    pure_closed = _closed_system_reminder_blocks(trailing_prompt="")
-
-    out = prompt_factory._sanitize_gemini_tool_response_text(pure_closed)
-
-    # After stripping only-reminder content the cleaned string is empty, so the
-    # helper falls back to the original stripped text.
-    assert out == pure_closed.strip()
-    assert "<system-reminder>" in out
 
 
 # ---------------------------------------------------------------------------

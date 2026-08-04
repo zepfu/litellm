@@ -947,62 +947,101 @@ def test_convert_tool_response_with_base64_image():
         ]
     }
 
-    # Convert tool response (returns list when image is present)
+    # Convert tool response with nested multimodal functionResponse.parts.
     result = convert_to_gemini_tool_call_result(
         tool_message, last_message_with_tool_calls
     )
 
-    # Verify results - should be a list with 2 parts (function_response + inline_data)
-    assert isinstance(result, list), f"Expected list when image present, got {type(result)}"
-    assert len(result) == 2, f"Expected 2 parts, got {len(result)}"
-
-    # Find function_response part and inline_data part
-    function_response_part = None
-    inline_data_part = None
-    for part in result:
-        if "function_response" in part:
-            function_response_part = part
-        elif "inline_data" in part:
-            inline_data_part = part
-
-    # Check function_response exists
-    assert function_response_part is not None, "Missing function_response part"
-    function_response = function_response_part["function_response"]
+    assert isinstance(result, list), "Should return a parts list when media is present"
+    assert len(result) == 1, "Should return one function_response part"
+    result_part = result[0]
+    assert "function_response" in result_part
+    assert "inline_data" not in result_part
+    function_response = result_part["function_response"]
     assert function_response["name"] == "click_at"
     assert "response" in function_response
     # Verify JSON response is parsed correctly
     assert "url" in function_response["response"]
     assert function_response["response"]["url"] == "https://example.com"
 
-    # Check inline_data exists
-    assert inline_data_part is not None, "Missing inline_data part"
-    inline_data: BlobType = inline_data_part["inline_data"]
+    # Check inline_data is nested under functionResponse.parts.
+    assert "parts" in function_response
+    assert len(function_response["parts"]) == 1
+    inline_data: BlobType = function_response["parts"][0]["inline_data"]
     assert "data" in inline_data
     assert "mime_type" in inline_data
     assert inline_data["mime_type"] == "image/png"
     assert inline_data["data"] == test_image_base64
 
 
-def test_convert_tool_response_with_url_image():
-    """Test tool response with HTTP URL image (will download and convert)."""
-    import pytest
+def test_gemini_history_nests_multimodal_tool_response_parts():
+    """Full history conversion should not emit sibling inline_data tool result parts."""
+    test_image_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    messages = [
+        {"role": "user", "content": "Get me an image"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_get_image",
+                    "type": "function",
+                    "function": {"name": "get_image", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_get_image",
+            "content": [
+                {"type": "text", "text": '{"image_ref": "inline"}'},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": test_image_base64,
+                    },
+                },
+            ],
+        },
+    ]
 
-    # Use a publicly accessible test image URL
+    contents = _gemini_convert_messages_with_history(messages=messages)
+
+    tool_response_parts = contents[-1]["parts"]
+    assert len(tool_response_parts) == 1
+    assert "inline_data" not in tool_response_parts[0]
+    function_response = tool_response_parts[0]["function_response"]
+    assert function_response["parts"] == [
+        {
+            "inline_data": {
+                "data": test_image_base64,
+                "mime_type": "image/png",
+            }
+        }
+    ]
+
+
+def test_convert_tool_response_with_url_image():
+    """Test tool response with HTTP URL image (download/conversion mocked, offline)."""
+    from unittest.mock import patch
+
+    from litellm.litellm_core_utils.prompt_templates import factory as prompt_factory
+
     test_image_url = "https://via.placeholder.com/1x1.png"
+    expected_blob = {
+        "data": "dXJsLWltYWdlLWJ5dGVz",
+        "media_type": "image/png",
+    }
 
     tool_message = {
         "role": "tool",
         "tool_call_id": "call_test456",
         "content": [
-            {
-                "type": "text",
-                "text": '{"url": "https://example.com"}'
-            },
-            {
-                "type": "input_image",
-                "image_url": test_image_url
-            }
-        ]
+            {"type": "text", "text": '{"url": "https://example.com"}'},
+            {"type": "input_image", "image_url": test_image_url},
+        ],
     }
 
     last_message_with_tool_calls = {
@@ -1011,38 +1050,39 @@ def test_convert_tool_response_with_url_image():
                 "id": "call_test456",
                 "function": {
                     "name": "type_text_at",
-                    "arguments": '{"x": 300, "y": 400, "text": "hello"}'
-                }
+                    "arguments": '{"x": 300, "y": 400, "text": "hello"}',
+                },
             }
         ]
     }
 
-    try:
+    with patch.object(
+        prompt_factory,
+        "convert_to_anthropic_image_obj",
+        return_value=expected_blob,
+    ) as mock_image_obj:
         result = convert_to_gemini_tool_call_result(
             tool_message, last_message_with_tool_calls
         )
 
-        # Should be a list with 2 parts when image is present
-        assert isinstance(result, list), f"Expected list when image present, got {type(result)}"
-        assert len(result) == 2, f"Expected 2 parts, got {len(result)}"
+    # The URL image must have been downloaded/converted via the helper.
+    mock_image_obj.assert_called_once_with(test_image_url, format=None)
 
-        # Find parts
-        function_response_part = next(p for p in result if "function_response" in p)
-        inline_data_part = next(p for p in result if "inline_data" in p)
+    assert isinstance(result, list), "Should return a parts list when media is present"
+    assert len(result) == 1, "Should return one function_response part"
+    result_part = result[0]
+    assert "function_response" in result_part
+    assert "inline_data" not in result_part
+    function_response = result_part["function_response"]
+    assert function_response["name"] == "type_text_at"
+    assert function_response["response"] == {"url": "https://example.com"}
 
-        # Check function_response exists
-        assert function_response_part is not None, "Missing function_response part"
-        function_response = function_response_part["function_response"]
-        assert function_response["name"] == "type_text_at"
-
-        # Check inline_data exists (URL should be downloaded and converted)
-        assert inline_data_part is not None, "Missing inline_data part"
-        inline_data: BlobType = inline_data_part["inline_data"]
-        assert "data" in inline_data
-        assert "mime_type" in inline_data
-    except Exception as e:
-        # Skip test if URL download fails (no internet connection, etc.)
-        pytest.skip(f"Failed to download image from URL: {e}")
+    # Check inline_data is nested under functionResponse.parts.
+    assert "parts" in function_response
+    assert len(function_response["parts"]) == 1
+    inline_data: BlobType = function_response["parts"][0]["inline_data"]
+    assert inline_data["data"] == expected_blob["data"]
+    assert inline_data["mime_type"] == expected_blob["media_type"]
 
 
 def test_convert_tool_response_text_only():
@@ -1136,8 +1176,6 @@ def test_file_data_field_order():
 
 def test_file_data_field_order_gcs_urls():
     """Test that GCS URLs also maintain correct field order."""
-    import json
-
     from litellm.llms.vertex_ai.gemini.transformation import _process_gemini_media
 
     # Test with GCS URL
@@ -1323,36 +1361,27 @@ def test_convert_tool_response_with_pdf_file():
         ]
     }
 
-    # Convert tool response (returns list when file is present)
+    # Convert tool response with nested multimodal functionResponse.parts.
     result = convert_to_gemini_tool_call_result(
         tool_message, last_message_with_tool_calls
     )
 
-    # Verify results - should be a list with 2 parts (function_response + inline_data)
-    assert isinstance(result, list), f"Expected list when file present, got {type(result)}"
-    assert len(result) == 2, f"Expected 2 parts, got {len(result)}"
-
-    # Find function_response part and inline_data part
-    function_response_part = None
-    inline_data_part = None
-    for part in result:
-        if "function_response" in part:
-            function_response_part = part
-        elif "inline_data" in part:
-            inline_data_part = part
-
-    # Check function_response exists
-    assert function_response_part is not None, "Missing function_response part"
-    function_response = function_response_part["function_response"]
+    assert isinstance(result, list), "Should return a parts list when media is present"
+    assert len(result) == 1, "Should return one function_response part"
+    result_part = result[0]
+    assert "function_response" in result_part
+    assert "inline_data" not in result_part
+    function_response = result_part["function_response"]
     assert function_response["name"] == "analyze_document"
     assert "response" in function_response
     # Verify JSON response is parsed correctly
     assert "status" in function_response["response"]
     assert function_response["response"]["status"] == "success"
 
-    # Check inline_data exists
-    assert inline_data_part is not None, "Missing inline_data part"
-    inline_data: BlobType = inline_data_part["inline_data"]
+    # Check inline_data is nested under functionResponse.parts.
+    assert "parts" in function_response
+    assert len(function_response["parts"]) == 1
+    inline_data: BlobType = function_response["parts"][0]["inline_data"]
     assert "data" in inline_data
     assert "mime_type" in inline_data
     assert inline_data["mime_type"] == "application/pdf"
@@ -1395,19 +1424,13 @@ def test_convert_tool_response_with_input_file_type():
         tool_message, last_message_with_tool_calls
     )
 
-    # Verify results
-    assert isinstance(result, list), f"Expected list when file present, got {type(result)}"
-    assert len(result) == 2, f"Expected 2 parts, got {len(result)}"
-
-    # Find inline_data part
-    inline_data_part = None
-    for part in result:
-        if "inline_data" in part:
-            inline_data_part = part
-
-    # Check inline_data exists
-    assert inline_data_part is not None, "Missing inline_data part"
-    assert inline_data_part["inline_data"]["mime_type"] == "application/pdf"
+    # Check inline_data is nested under functionResponse.parts.
+    assert isinstance(result, list), "Should return a parts list when media is present"
+    assert len(result) == 1, "Should return one function_response part"
+    function_response = result[0]["function_response"]
+    assert (
+        function_response["parts"][0]["inline_data"]["mime_type"] == "application/pdf"
+    )
 
 
 def test_convert_tool_response_with_nested_file_object():
@@ -1448,19 +1471,11 @@ def test_convert_tool_response_with_nested_file_object():
         tool_message, last_message_with_tool_calls
     )
 
-    # Verify results - should be a list with 2 parts
-    assert isinstance(result, list), f"Expected list when file present, got {type(result)}"
-    assert len(result) == 2, f"Expected 2 parts, got {len(result)}"
-
-    # Find inline_data part
-    inline_data_part = None
-    for part in result:
-        if "inline_data" in part:
-            inline_data_part = part
-
-    # Check inline_data exists
-    assert inline_data_part is not None, "Missing inline_data part"
-    inline_data: BlobType = inline_data_part["inline_data"]
+    # Check inline_data is nested under functionResponse.parts.
+    assert isinstance(result, list), "Should return a parts list when media is present"
+    assert len(result) == 1, "Should return one function_response part"
+    function_response = result[0]["function_response"]
+    inline_data: BlobType = function_response["parts"][0]["inline_data"]
     assert "data" in inline_data
     assert "mime_type" in inline_data
     assert inline_data["mime_type"] == "application/pdf"
