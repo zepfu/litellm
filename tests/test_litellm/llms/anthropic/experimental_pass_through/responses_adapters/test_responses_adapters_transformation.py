@@ -875,7 +875,7 @@ class TestTranslateMessagesToResponsesInput:
             ),
         ],
     )
-    def test_tool_use_round_trip_preserves_bash_command_for_non_antigravity_candidates(
+    def test_tool_use_round_trip_preserves_bash_command_for_supported_candidates(
         self,
         candidate: str,
         tool_name: str,

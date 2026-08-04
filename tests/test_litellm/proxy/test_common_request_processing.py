@@ -3077,7 +3077,7 @@ class TestAawmRouteRollup:
             group_header_label=header,
             incoming_endpoint="/openai_passthrough/responses",
             outgoing_target="chatgpt.com/backend-api/codex/responses",
-            model_label="gemini-3.5-flash-low(aawm-low)",
+            model_label="grok-4-fast(aawm-low)",
             turns=3,
             now=now,
         )
@@ -3088,7 +3088,7 @@ class TestAawmRouteRollup:
             flushed[0]
             == "20260623 01:06:52 litellm#Codex[0.141.0] /openai_passthrough/responses"
         )
-        assert flushed[1] == " - gemini-3.5-flash-low(aawm-low) - Turns: 3"
+        assert flushed[1] == " - grok-4-fast(aawm-low) - Turns: 3"
 
     def test_route_rollup_groups_destinations_under_local_endpoint(self):
         from datetime import datetime
@@ -3103,8 +3103,8 @@ class TestAawmRouteRollup:
         accumulator.record(
             group_header_label=header,
             incoming_endpoint=endpoint,
-            outgoing_target="daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent",
-            model_label="gemini-3.5-flash-low(aawm-low)",
+            outgoing_target="api.x.ai/v1/responses",
+            model_label="grok-4-fast(aawm-low)",
             turns=7,
             now=now,
         )
@@ -3121,8 +3121,8 @@ class TestAawmRouteRollup:
         assert flushed == [
             "20260623 02:51:23 aawm#Codex[0.141.0] /openai_passthrough/responses",
             (
-                " - gemini-3.5-flash-low(aawm-low) - Turns: 7 -> "
-                "daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
+                " - grok-4-fast(aawm-low) - Turns: 7 -> "
+                "api.x.ai/v1/responses"
             ),
             " - gpt-5.5 - Turns: 4",
         ]
@@ -3405,7 +3405,7 @@ class TestAawmRouteRollup:
             group_header_label=header,
             incoming_endpoint=endpoint,
             outgoing_target=target,
-            model_label="gemini-3.5-flash-low(aawm-low)",
+            model_label="grok-4-fast(aawm-low)",
             turns=1,
             now=now,
         )
@@ -3439,7 +3439,7 @@ class TestAawmRouteRollup:
             group_header_label="litellm@Codex[0.141.0]",
             incoming_endpoint="/openai_passthrough/responses",
             outgoing_target="chatgpt.com/backend-api/codex/responses",
-            model_label="gemini-3.5-flash-low(aawm-low)",
+            model_label="grok-4-fast(aawm-low)",
             turns=0,
             status="Degraded",
             now=now,

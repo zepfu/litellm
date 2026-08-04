@@ -6,7 +6,6 @@ Behavior-preserving extraction of:
 
 from ``llm_passthrough_endpoints.py`` (lines ~6818-7024).
 
-Omits removed Google Code Assist and Antigravity candidates.
 Do not import llm_passthrough_endpoints at module scope.
 
 Owned symbols:
@@ -211,8 +210,6 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(
     Fails closed if the runtime has not been installed.  Retained providers:
     Codex/OpenAI, OpenRouter (completion + responses), xAI/Grok (OAuth + native),
     OpenCode, Kimi, Alibaba, and native Anthropic passthrough.
-
-    Removed: Google Code Assist and Antigravity candidates.
     """
     if _runtime is None:
         raise RuntimeError(

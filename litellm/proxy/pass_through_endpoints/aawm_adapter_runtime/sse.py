@@ -24,8 +24,8 @@ Explicitly excluded (owned elsewhere):
     - Stream accumulation/finalization (_collect_responses_response_from_stream, etc.)
     - Custom/namespace tool restoration (_restore_adapted_*_tool_calls_*)
     - Bounded payload replay validation (_validate_alias_candidate_responses_stream_if_needed)
-    - All Google-specific streaming (_build_anthropic_streaming_response_from_google_code_assist_stream, etc.)
-    - Provider request preparation (_prepare_anthropic_google_completion_adapter_request, etc.)
+    - Streaming response builders for providers not retained in this runtime
+    - Provider request preparation for providers not retained in this runtime
 """
 
 from __future__ import annotations
