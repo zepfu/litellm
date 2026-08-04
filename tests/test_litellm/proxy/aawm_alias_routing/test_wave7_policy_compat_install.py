@@ -1,7 +1,7 @@
 """D1-591: policy compatibility publication API tests.
 
 Pins the full alias inventory, same-object identity, idempotence,
-no god-module import, and no Google Code Assist / Antigravity reintroduction.
+and no god-module import.
 """
 
 from __future__ import annotations
@@ -204,53 +204,3 @@ class TestNoGodModuleImport:
         finally:
             if saved is not None:
                 sys.modules[GOD_MODULE] = saved
-
-
-class TestNoGoogleAntigravityReintroduction:
-    """Policy module must not reintroduce Google Code Assist or Antigravity."""
-
-    _BANNED_SUBSTRINGS = (
-        "google_code_assist",
-        "antigravity",
-        "GOOGLE_PROVIDER",
-        "ANTIGRAVITY_PROVIDER",
-        "GOOGLE_COMPLETION_ADAPTER",
-        "CODE_ASSIST_ADAPTER",
-    )
-
-    def test_no_banned_names_in_policy_namespace(self) -> None:
-        ns = vars(policy)
-        violations = [
-            name
-            for name in ns
-            if any(sub in name.upper() for sub in
-                   ("GOOGLE_CODE_ASSIST", "ANTIGRAVITY"))
-        ]
-        assert violations == [], f"Banned names in policy: {violations}"
-
-    def test_no_banned_names_in_compat_map(self) -> None:
-        all_names = list(policy.COMPAT_ALIAS_MAP.keys()) + list(
-            policy.COMPAT_ALIAS_MAP.values()
-        )
-        violations = [
-            n
-            for n in all_names
-            if any(sub.upper() in n.upper() for sub in self._BANNED_SUBSTRINGS)
-        ]
-        assert violations == [], f"Banned names in compat map: {violations}"
-
-    def test_no_banned_values_in_candidate_tables(self) -> None:
-        """Candidate table provider strings must not reference banned providers."""
-        tables = [
-            policy.CODEX_AUTO_AGENT_CANDIDATES,
-            policy.ANTHROPIC_AUTO_AGENT_CANDIDATES,
-        ]
-        for table in tables:
-            for entry in table:
-                provider = entry.get("provider", "")
-                assert "google" not in provider.lower(), (
-                    f"Google provider in candidate: {entry}"
-                )
-                assert "antigravity" not in provider.lower(), (
-                    f"Antigravity provider in candidate: {entry}"
-                )

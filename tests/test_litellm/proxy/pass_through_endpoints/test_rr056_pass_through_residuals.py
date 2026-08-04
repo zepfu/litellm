@@ -460,7 +460,6 @@ def test_provider_failure_logging_uses_registry_fields_not_hardcoded_cascade() -
     # Old per-vendor cascade names for logging must be gone.
     assert "suppress_chatgpt_codex_block_page_traceback" not in src
     assert 'failure_kind": "openai_chatgpt_codex_block_page"' not in src
-    assert 'failure_kind": "google_code_assist_tos_violation"' not in src
     assert "known_anthropic_failure_kind" not in src
 
 

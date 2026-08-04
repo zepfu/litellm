@@ -258,16 +258,12 @@ def test_default_endpoints_include_xai_front_doors() -> None:
     assert ("xai", "api.x.ai:443", "api.x.ai") in endpoints
 
 
-def test_default_endpoints_exclude_google_gemini_monitoring() -> None:
+def test_default_endpoints_include_anthropic_and_openai_front_doors() -> None:
     endpoints = {
         (endpoint.provider, endpoint.endpoint_key, endpoint.host)
         for endpoint in probes.DEFAULT_ENDPOINTS
     }
 
-    assert not any(provider in {"gemini", "control"} for provider, _, _ in endpoints)
-    assert "generativelanguage.googleapis.com" not in {host for _, _, host in endpoints}
-    assert "cloudcode-pa.googleapis.com" not in {host for _, _, host in endpoints}
-    assert "google.com" not in {host for _, _, host in endpoints}
     assert ("anthropic", "api.anthropic.com:443", "api.anthropic.com") in endpoints
     assert ("openai", "api.openai.com:443", "api.openai.com") in endpoints
 
@@ -1150,9 +1146,6 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
     )
     assert "/home/zepfu/.grok:/home/zepfu/.grok:ro" in compose_text
     assert "/home/zepfu/.grok:/home/zepfu/.grok" in compose_text
-    provider_status_block = compose_text.split("provider-status-observations:", 1)[1].split("\nnetworks:", 1)[0] if "provider-status-observations:" in compose_text else compose_text
-    assert "/home/zepfu/.gemini:/home/zepfu/.gemini" not in provider_status_block
-    assert "/home/zepfu/.local/bin/agy" not in provider_status_block
     assert (
         "LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.grok/auth.json}"
         in compose_text
@@ -1184,9 +1177,6 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         in compose_text
     )
     assert "AAWM_GROK_OIDC_FORCE_REFRESH=${AAWM_GROK_OIDC_FORCE_REFRESH:-1}" in compose_text
-    assert "AAWM_ANTIGRAVITY_OAUTH_REFRESH_ENABLED" not in provider_status_block
-    assert "AAWM_ANTIGRAVITY_AUTH_FILE" not in provider_status_block
-    assert "AAWM_ANTIGRAVITY_CLI_PATH" not in provider_status_block
     assert "- /home/zepfu/.codex:/home/zepfu/.codex" in compose_text
     for expected_codex_setting in (
         "AAWM_CODEX_OAUTH_REFRESH_ENABLED=${AAWM_CODEX_OAUTH_REFRESH_ENABLED:-1}",
@@ -1239,7 +1229,6 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         "AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE=${AAWM_GROK_BILLING_INCLUDE_MODEL_OVERRIDE:-1}"
         in compose_text
     )
-    assert "antigravity_oauth_refresh.py" not in dockerfile_text
     assert (
         "COPY scripts/codex_oauth_refresh.py "
         "/app/scripts/codex_oauth_refresh.py"

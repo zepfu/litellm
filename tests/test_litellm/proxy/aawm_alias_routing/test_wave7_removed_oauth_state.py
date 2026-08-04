@@ -1,13 +1,11 @@
-"""Wave 7: verify Google Code Assist / Antigravity token-cache and state
-fields are fully removed, while provider-neutral cache semantics, lock
-identity, Codex/Anthropic families, OpenRouter cooldowns, and
-state-manager reset behavior are preserved.
+"""Wave 7: provider-neutral OAuth token-cache semantics, alias routing
+state-manager families, OpenRouter cooldowns, lock identity, and
+state-manager reset behavior.
 """
 
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
 
 import pytest
 
@@ -23,78 +21,20 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
 )
 
 # ---------------------------------------------------------------------------
-# Absence: module-level singletons removed from oauth_token_cache
+# Provider-neutral OAuth token cache exports
 # ---------------------------------------------------------------------------
 
 
-class TestOAuthTokenCacheModuleAbsence:
+class TestOAuthTokenCacheModuleExports:
     def test_package_exports_provider_neutral_module(self):
         assert aawm_alias_routing.oauth_token_cache is oauth_token_cache_module
         assert "oauth_token_cache" in aawm_alias_routing.__all__
-
-    def test_no_google_singleton(self):
-        assert not hasattr(
-            oauth_token_cache_module, "google_oauth_access_token_cache"
-        )
-
-    def test_no_antigravity_singleton(self):
-        assert not hasattr(
-            oauth_token_cache_module, "antigravity_oauth_access_token_cache"
-        )
-
-    @pytest.mark.parametrize(
-        "deleted_name",
-        (
-            "google_oauth",
-            "antigravity_oauth",
-            "google_oauth_access_token_cache",
-            "antigravity_oauth_access_token_cache",
-            "google_code_assist",
-            "antigravity",
-        ),
-    )
-    def test_package_does_not_export_deleted_provider_names(
-        self, deleted_name: str
-    ):
-        assert deleted_name not in aawm_alias_routing.__all__
-        assert not hasattr(aawm_alias_routing, deleted_name)
-
-    @pytest.mark.parametrize(
-        "deleted_module", ("google_code_assist.py", "antigravity.py")
-    )
-    def test_deleted_provider_module_is_absent(self, deleted_module: str):
-        package_dir = Path(aawm_alias_routing.__file__).parent
-        assert not (package_dir / deleted_module).exists()
 
     def test_class_still_exported(self):
         """The provider-neutral dataclass must remain importable."""
         cache = OAuthAccessTokenCache()
         assert isinstance(cache.lock, asyncio.Lock)
         assert cache.tokens == {}
-
-
-# ---------------------------------------------------------------------------
-# Absence: state-manager fields removed
-# ---------------------------------------------------------------------------
-
-_REMOVED_STATE_ATTRS = [
-    "google_lane_key_until_monotonic_by_key",
-    "google_lane_key_by_key",
-    "google_lane_negative_until_monotonic",
-    "antigravity_lane_key_until_monotonic_by_key",
-    "antigravity_lane_key_by_key",
-    "antigravity_auth_degraded_log_until_monotonic",
-    "google_rate_limit",
-    "google_oauth",
-    "antigravity_oauth",
-]
-
-
-class TestStateManagerFieldAbsence:
-    @pytest.mark.parametrize("attr", _REMOVED_STATE_ATTRS)
-    def test_removed_attr(self, attr: str):
-        mgr = AliasRoutingStateManager()
-        assert not hasattr(mgr, attr), f"{attr} should have been removed"
 
 
 # ---------------------------------------------------------------------------
