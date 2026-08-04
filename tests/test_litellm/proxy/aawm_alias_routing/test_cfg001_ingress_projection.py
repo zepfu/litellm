@@ -418,6 +418,67 @@ class TestInstallHostGlobals:
         selection.install(host_globals)
         assert "_routing_candidate_to_anthropic_public_dict" in host_globals
 
+    def test_install_publishes_selector_dependency_closure(self):
+        from types import SimpleNamespace
+
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import selection
+
+        dependency_names = (
+            "_get_request_selection_choices",
+            "_get_request_reselection_counts",
+            "_weighted_choice",
+            "_select_available_state",
+            "alias_routing_state",
+        )
+        host_globals = {
+            name: value
+            for name, value in vars(selection).items()
+            if name not in dependency_names
+        }
+
+        selection.install(host_globals)
+        selection.install(host_globals)
+
+        select_available = host_globals["_select_available_state"]
+        assert select_available.__globals__ is host_globals
+        for selector_name in (
+            "_select_codex_auto_agent_candidate",
+            "_select_anthropic_auto_agent_candidate",
+        ):
+            selector = host_globals[selector_name]
+            assert selector.__globals__["_select_available_state"] is select_available
+        for dependency_name in dependency_names:
+            assert dependency_name in select_available.__globals__
+
+        weighted_choices = []
+
+        def _choose_first(choices, weights):
+            weighted_choices.append((choices, weights))
+            return choices[0]
+
+        host_globals["_weighted_choice"] = _choose_first
+        state = {
+            "candidate": {
+                "last_resort": False,
+                "selection_priority": 1,
+                "selection_group": "provider",
+                "selection_strategy": "proportional",
+                "selection_choice": "openai",
+                "selection_weight": 1.0,
+            },
+            "cooldown_seconds": 0.0,
+            "skip_reason": None,
+        }
+
+        selected = select_available(
+            SimpleNamespace(state=SimpleNamespace()),
+            [state],
+            last_resort=False,
+        )
+
+        assert selected is state
+        assert weighted_choices == [(["openai"], {"openai": 1.0})]
+
 
 # ---------------------------------------------------------------------------
 # Fix 2: Compile-time credential-domain compatibility negatives

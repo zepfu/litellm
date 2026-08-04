@@ -116,6 +116,59 @@ def test_record_api_globals_host_is_identity_namespace() -> None:
         assert fn.__globals__["_extract_agent_context"] is original
 
 
+@pytest.mark.asyncio
+async def test_record_success_callback_install_publishes_quota_helper(
+    monkeypatch,
+) -> None:
+    import litellm.integrations.aawm_agent_identity as identity_module
+    from litellm.integrations.aawm_session_history import record
+
+    record.install()
+    record.install()
+
+    method = identity_module.AawmAgentIdentity.async_log_success_event
+    callback = identity_module._handle_session_history_success_event
+    publisher = identity_module._publish_alias_routing_quota_observations
+    assert method.__globals__["_publish_alias_routing_quota_observations"] is publisher
+    assert callback.__globals__["_publish_alias_routing_quota_observations"] is publisher
+
+    observations = [{"provider": "openai", "quota_key": "primary"}]
+    published = []
+    enqueued = []
+    record_payload = {"session_id": "session-install-contract"}
+    monkeypatch.setattr(
+        identity_module,
+        "_publish_alias_routing_quota_observations",
+        lambda values: published.append(values),
+    )
+    monkeypatch.setattr(
+        identity_module,
+        "_build_rate_limit_observations",
+        lambda **kwargs: observations,
+    )
+    monkeypatch.setattr(
+        identity_module,
+        "_rate_limit_observation_only_requested",
+        lambda kwargs: False,
+    )
+    monkeypatch.setattr(
+        identity_module,
+        "_build_session_history_record",
+        lambda **kwargs: record_payload,
+    )
+    monkeypatch.setattr(
+        identity_module,
+        "_enqueue_session_history_record",
+        enqueued.append,
+    )
+
+    await method(object(), {}, {}, None, None)
+
+    assert published == [observations]
+    assert enqueued == [record_payload]
+    assert record_payload["rate_limit_observations"] is observations
+
+
 def test_patch_surface_module_attrs_present() -> None:
     """Deliberate monkeypatch surfaces stay importable as module attributes."""
     import litellm.integrations.aawm_agent_identity as identity_module

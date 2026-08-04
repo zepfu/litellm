@@ -1763,6 +1763,10 @@ _HOST_FUNCTION_NAMES = (
     "_attach_normalized_quota_state",
     "_build_codex_auto_agent_candidate_states",
     "_build_anthropic_auto_agent_candidate_states",
+    "_get_request_selection_choices",
+    "_get_request_reselection_counts",
+    "_weighted_choice",
+    "_select_available_state",
     "_raise_codex_auto_agent_in_flight_cooldown",
     "_raise_anthropic_auto_agent_in_flight_cooldown",
     "_build_auto_agent_redispatch_http_exception_detail",
@@ -1807,6 +1811,7 @@ def install(host_globals: dict) -> None:
     )
     # Copy seam variables into host_globals so rebound functions resolve them.
     host_globals.update({
+        "alias_routing_state": alias_routing_state,
         "_get_codex_active_cooldown_state": _get_codex_active_cooldown_state,
         "_get_anthropic_active_cooldown_state": _get_anthropic_active_cooldown_state,
         "_get_anthropic_merged_codex_openai_cooldown_state": _get_anthropic_merged_codex_openai_cooldown_state,

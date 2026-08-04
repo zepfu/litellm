@@ -1938,7 +1938,7 @@ def _install_record_functions() -> None:
     # object if not already present (tests often patch host.verbose_logger).
     host_globals.setdefault("verbose_logger", verbose_logger)
     mod_globals = sys.modules[__name__].__dict__
-    for name in _RECORD_API_NAMES:
+    for name in ("_publish_alias_routing_quota_observations", *_RECORD_API_NAMES):
         original = mod_globals.get(name)
         if original is None:
             raise RuntimeError(f"session_history.record missing API definition: {name}")
