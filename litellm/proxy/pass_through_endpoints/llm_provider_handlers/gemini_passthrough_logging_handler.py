@@ -1,7 +1,6 @@
-import json
 import re
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
@@ -13,9 +12,6 @@ from litellm.llms.vertex_ai.gemini.vertex_and_google_ai_studio_gemini import (
     ModelResponseIterator as GeminiModelResponseIterator,
 )
 from litellm.proxy._types import PassThroughEndpointLoggingTypedDict
-from litellm.proxy.pass_through_endpoints.llm_provider_handlers.base_passthrough_logging_handler import (
-    apply_passthrough_logging_contract,
-)
 from litellm.types.utils import (
     ModelResponse,
     TextCompletionResponse,
@@ -32,131 +28,6 @@ else:
 
 class GeminiPassthroughLoggingHandler:
     @staticmethod
-    def _parse_stream_payload_json_objects(payload: str) -> List[Dict[str, Any]]:
-        normalized_payload = payload.strip()
-        if normalized_payload in {"", "[DONE]"}:
-            return []
-        try:
-            parsed_payload = json.loads(normalized_payload)
-        except json.JSONDecodeError:
-            return []
-        if isinstance(parsed_payload, list):
-            return [item for item in parsed_payload if isinstance(item, dict)]
-        if isinstance(parsed_payload, dict):
-            return [parsed_payload]
-        return []
-
-    @staticmethod
-    def _extract_sse_data_payloads(chunk: str) -> List[str]:
-        normalized_chunk = chunk.strip()
-        if not normalized_chunk:
-            return []
-
-        payloads: List[str] = []
-        frames = re.split(r"\n\s*\n", normalized_chunk)
-        for frame in frames:
-            data_lines: List[str] = []
-            for line in frame.splitlines():
-                stripped_line = line.strip()
-                if stripped_line.startswith("data:"):
-                    data_lines.append(stripped_line[len("data:") :].strip())
-            if data_lines:
-                payloads.append("\n".join(data_lines).strip())
-
-        if payloads:
-            return payloads
-        if normalized_chunk.startswith("data:"):
-            return [normalized_chunk[len("data:") :].strip()]
-        return [normalized_chunk]
-
-    @staticmethod
-    def _parse_stream_chunk_json_objects(chunk: str) -> List[Dict[str, Any]]:
-        parsed_objects: List[Dict[str, Any]] = []
-        for payload in GeminiPassthroughLoggingHandler._extract_sse_data_payloads(chunk):
-            parsed_objects.extend(
-                GeminiPassthroughLoggingHandler._parse_stream_payload_json_objects(
-                    payload
-                )
-            )
-        return parsed_objects
-
-    @staticmethod
-    def _parse_stream_chunk_json(chunk: str) -> Optional[Dict[str, Any]]:
-        parsed_objects = (
-            GeminiPassthroughLoggingHandler._parse_stream_chunk_json_objects(chunk)
-        )
-        if not parsed_objects:
-            return None
-        return parsed_objects[-1]
-
-    @staticmethod
-    def _extract_usage_object_from_response_body(
-        response_body: Any,
-    ) -> Optional[Dict[str, Any]]:
-        if isinstance(response_body, list):
-            usage_object: Optional[Dict[str, Any]] = None
-            for item in response_body:
-                if not isinstance(item, dict) or "usageMetadata" not in item:
-                    continue
-                usage_metadata = item.get("usageMetadata")
-                usage_object = (
-                    dict(usage_metadata)
-                    if isinstance(usage_metadata, dict) and usage_metadata
-                    else None
-                )
-            return usage_object
-        if not isinstance(response_body, dict):
-            return None
-        usage_metadata = response_body.get("usageMetadata")
-        if not isinstance(usage_metadata, dict) or not usage_metadata:
-            return None
-        return dict(usage_metadata)
-
-    @staticmethod
-    def _extract_usage_object_from_stream_chunks(
-        all_chunks: List[str],
-    ) -> Optional[Dict[str, Any]]:
-        usage_object: Optional[Dict[str, Any]] = None
-        for chunk in all_chunks:
-            for parsed_chunk in (
-                GeminiPassthroughLoggingHandler._parse_stream_chunk_json_objects(chunk)
-            ):
-                extracted_usage = GeminiPassthroughLoggingHandler._extract_usage_object_from_response_body(
-                    parsed_chunk
-                )
-                if extracted_usage:
-                    usage_object = extracted_usage
-        return usage_object
-
-    @staticmethod
-    def _store_usage_object_in_kwargs(
-        kwargs: dict,
-        usage_object: Optional[Dict[str, Any]],
-    ) -> dict:
-        if not isinstance(usage_object, dict) or not usage_object:
-            return kwargs
-
-        litellm_params = kwargs.get("litellm_params")
-        if not isinstance(litellm_params, dict):
-            litellm_params = {}
-            kwargs["litellm_params"] = litellm_params
-        metadata = litellm_params.get("metadata")
-        if not isinstance(metadata, dict):
-            metadata = {}
-            litellm_params["metadata"] = metadata
-        metadata["usage_object"] = dict(usage_object)
-
-        standard_logging_object = kwargs.get("standard_logging_object")
-        if isinstance(standard_logging_object, dict):
-            standard_logging_metadata = standard_logging_object.get("metadata")
-            if not isinstance(standard_logging_metadata, dict):
-                standard_logging_metadata = {}
-                standard_logging_object["metadata"] = standard_logging_metadata
-            standard_logging_metadata["usage_object"] = dict(usage_object)
-
-        return kwargs
-
-    @staticmethod
     def gemini_passthrough_handler(
         httpx_response: httpx.Response,
         response_body: dict,
@@ -167,21 +38,18 @@ class GeminiPassthroughLoggingHandler:
         end_time: datetime,
         cache_hit: bool,
         request_body: dict,
-        custom_llm_provider: str = "gemini",
         **kwargs,
     ) -> PassThroughEndpointLoggingTypedDict:
         if "predictLongRunning" in url_route:
             model = GeminiPassthroughLoggingHandler.extract_model_from_url(url_route)
 
             gemini_video_config = GeminiVideoConfig()
-            litellm_video_response = (
-                gemini_video_config.transform_video_create_response(
-                    model=model,
-                    raw_response=httpx_response,
-                    logging_obj=logging_obj,
-                    custom_llm_provider="gemini",
-                    request_data=request_body,
-                )
+            litellm_video_response = gemini_video_config.transform_video_create_response(
+                model=model,
+                raw_response=httpx_response,
+                logging_obj=logging_obj,
+                custom_llm_provider="gemini",
+                request_data=request_body,
             )
             logging_obj.model = model
             logging_obj.model_call_details["model"] = model
@@ -200,43 +68,31 @@ class GeminiPassthroughLoggingHandler:
                 litellm_video_response._hidden_params = {}
             litellm_video_response._hidden_params["response_cost"] = response_cost
 
-            apply_passthrough_logging_contract(
-                litellm_response=litellm_video_response,
-                model=model,
-                kwargs=kwargs,
-                logging_obj=logging_obj,
-                response_cost=response_cost,
-                custom_llm_provider="gemini",
-                set_response_id=True,
-            )
+            kwargs["response_cost"] = response_cost
+            kwargs["model"] = model
+            kwargs["custom_llm_provider"] = "gemini"
+            logging_obj.model_call_details["response_cost"] = response_cost
             return {
                 "result": litellm_video_response,
                 "kwargs": kwargs,
             }
 
         if "generateContent" in url_route:
-            model = GeminiPassthroughLoggingHandler.extract_model_from_url(
-                url=url_route,
-                request_body=request_body,
-            )
+            model = GeminiPassthroughLoggingHandler.extract_model_from_url(url_route)
 
             # Use Gemini config for transformation
             instance_of_gemini_llm = litellm.GoogleAIStudioGeminiConfig()
-            litellm_model_response: ModelResponse = (
-                instance_of_gemini_llm.transform_response(
-                    model=model,
-                    messages=[
-                        {"role": "user", "content": "no-message-pass-through-endpoint"}
-                    ],
-                    raw_response=httpx_response,
-                    model_response=litellm.ModelResponse(),
-                    logging_obj=logging_obj,
-                    optional_params={},
-                    litellm_params={},
-                    api_key="",
-                    request_data={},
-                    encoding=litellm.encoding,
-                )
+            litellm_model_response: ModelResponse = instance_of_gemini_llm.transform_response(
+                model=model,
+                messages=[{"role": "user", "content": "no-message-pass-through-endpoint"}],
+                raw_response=httpx_response,
+                model_response=litellm.ModelResponse(),
+                logging_obj=logging_obj,
+                optional_params={},
+                litellm_params={},
+                api_key="",
+                request_data={},
+                encoding=litellm.encoding,
             )
             kwargs = GeminiPassthroughLoggingHandler._create_gemini_response_logging_payload_for_generate_content(
                 litellm_model_response=litellm_model_response,
@@ -245,10 +101,7 @@ class GeminiPassthroughLoggingHandler:
                 start_time=start_time,
                 end_time=end_time,
                 logging_obj=logging_obj,
-                custom_llm_provider=custom_llm_provider,
-                usage_object=GeminiPassthroughLoggingHandler._extract_usage_object_from_response_body(
-                    response_body
-                ),
+                custom_llm_provider="gemini",
             )
 
             return {
@@ -269,11 +122,9 @@ class GeminiPassthroughLoggingHandler:
         request_body: dict,
         endpoint_type: EndpointType,
         start_time: datetime,
-        all_chunks: List[str],
-        model: Optional[str],
+        all_chunks: list[str],
+        model: str | None,
         end_time: datetime,
-        kwargs: Optional[Dict[str, Any]] = None,
-        custom_llm_provider: str = "gemini",
     ) -> PassThroughEndpointLoggingTypedDict:
         """
         Takes raw chunks from Gemini passthrough endpoint and logs them in litellm callbacks
@@ -282,18 +133,13 @@ class GeminiPassthroughLoggingHandler:
         - Creates standard logging object
         - Logs in litellm callbacks
         """
-        kwargs = kwargs or {}
-        model = model or GeminiPassthroughLoggingHandler.extract_model_from_url(
-            url=url_route,
-            request_body=request_body,
-        )
-        complete_streaming_response = (
-            GeminiPassthroughLoggingHandler._build_complete_streaming_response(
-                all_chunks=all_chunks,
-                litellm_logging_obj=litellm_logging_obj,
-                model=model,
-                url_route=url_route,
-            )
+        kwargs: dict[str, Any] = {}
+        model = model or GeminiPassthroughLoggingHandler.extract_model_from_url(url_route)
+        complete_streaming_response = GeminiPassthroughLoggingHandler._build_complete_streaming_response(
+            all_chunks=all_chunks,
+            litellm_logging_obj=litellm_logging_obj,
+            model=model,
+            url_route=url_route,
         )
 
         if complete_streaming_response is None:
@@ -312,10 +158,7 @@ class GeminiPassthroughLoggingHandler:
             start_time=start_time,
             end_time=end_time,
             logging_obj=litellm_logging_obj,
-            custom_llm_provider=custom_llm_provider,
-            usage_object=GeminiPassthroughLoggingHandler._extract_usage_object_from_stream_chunks(
-                all_chunks
-            ),
+            custom_llm_provider="gemini",
         )
 
         return {
@@ -325,138 +168,75 @@ class GeminiPassthroughLoggingHandler:
 
     @staticmethod
     def _build_complete_streaming_response(
-        all_chunks: List[str],
+        all_chunks: list[str],
         litellm_logging_obj: LiteLLMLoggingObj,
         model: str,
         url_route: str,
-    ) -> Optional[Union[ModelResponse, TextCompletionResponse]]:
+    ) -> ModelResponse | TextCompletionResponse | None:
+        parsed_chunks = []
         if "generateContent" in url_route or "streamGenerateContent" in url_route:
-            complete_streaming_response = (
-                GeminiPassthroughLoggingHandler._build_complete_response_from_gemini_stream_chunks(
-                    all_chunks=all_chunks,
-                    litellm_logging_obj=litellm_logging_obj,
-                )
+            gemini_iterator: Any = GeminiModelResponseIterator(
+                streaming_response=None,
+                sync_stream=False,
+                logging_obj=litellm_logging_obj,
             )
-            if complete_streaming_response is not None:
-                if getattr(complete_streaming_response, "model", None) is None:
-                    complete_streaming_response.model = model
-                return complete_streaming_response
+            chunk_parsing_logic: Any = gemini_iterator._common_chunk_parsing_logic
+            parsed_chunks = [chunk_parsing_logic(chunk) for chunk in all_chunks]
         else:
             return None
 
-        return None
-
-    @staticmethod
-    def _build_complete_response_from_gemini_stream_chunks(
-        all_chunks: List[str],
-        litellm_logging_obj: LiteLLMLoggingObj,
-    ) -> Optional[ModelResponse]:
-        gemini_iterator: Any = GeminiModelResponseIterator(
-            streaming_response=None,
-            sync_stream=False,
-            logging_obj=litellm_logging_obj,
-        )
-        chunk_parsing_logic: Any = gemini_iterator._common_chunk_parsing_logic
-        all_openai_chunks = []
-        for chunk in all_chunks:
-            parsed_chunk = chunk_parsing_logic(chunk)
-            if parsed_chunk is not None:
-                all_openai_chunks.append(parsed_chunk)
-            while gemini_iterator.pending_model_response_chunks:
-                all_openai_chunks.append(
-                    gemini_iterator.pending_model_response_chunks.pop(0)
-                )
-
-        if (
-            gemini_iterator.chunk_type == "accumulated_json"
-            and gemini_iterator.accumulated_json
-        ):
-            parsed_chunk = gemini_iterator.handle_accumulated_json_chunk(chunk="")
-            if parsed_chunk is not None:
-                all_openai_chunks.append(parsed_chunk)
-            while gemini_iterator.pending_model_response_chunks:
-                all_openai_chunks.append(
-                    gemini_iterator.pending_model_response_chunks.pop(0)
-                )
-
-        if len(all_openai_chunks) == 0:
+        if len(parsed_chunks) == 0:
             return None
 
-        return litellm.stream_chunk_builder(chunks=all_openai_chunks)
+        all_openai_chunks = []
+        for parsed_chunk in parsed_chunks:
+            if parsed_chunk is None:
+                continue
+            all_openai_chunks.append(parsed_chunk)
+
+        complete_streaming_response = litellm.stream_chunk_builder(chunks=all_openai_chunks)
+
+        return complete_streaming_response
 
     @staticmethod
-    def extract_model_from_url(
-        url: str, request_body: Optional[Dict[str, Any]] = None
-    ) -> str:
+    def extract_model_from_url(url: str) -> str:
         pattern = r"/models/([^:]+)"
         match = re.search(pattern, url)
         if match:
             return match.group(1)
-        if request_body is not None and isinstance(request_body.get("model"), str):
-            return request_body["model"]
         return "unknown"
 
     @staticmethod
     def _create_gemini_response_logging_payload_for_generate_content(
-        litellm_model_response: Union[ModelResponse, TextCompletionResponse],
+        litellm_model_response: ModelResponse | TextCompletionResponse,
         model: str,
         kwargs: dict,
         start_time: datetime,
         end_time: datetime,
         logging_obj: LiteLLMLoggingObj,
         custom_llm_provider: str,
-        usage_object: Optional[Dict[str, Any]] = None,
     ):
         """
         Create the standard logging object for Gemini passthrough generateContent (streaming and non-streaming)
         """
-        kwargs = GeminiPassthroughLoggingHandler._store_usage_object_in_kwargs(
-            kwargs,
-            usage_object,
-        )
 
-        response_cost = None
-        try:
-            cost_model, cost_provider = (
-                GeminiPassthroughLoggingHandler._get_cost_lookup_model_provider(
-                    model=model,
-                    custom_llm_provider=custom_llm_provider,
-                )
-            )
-            response_cost = litellm.completion_cost(
-                completion_response=litellm_model_response,
-                model=cost_model,
-                custom_llm_provider=cost_provider,
-            )
-        except Exception as exc:
-            verbose_proxy_logger.warning(
-                "Gemini-shaped passthrough cost calculation failed for "
-                "model=%s custom_llm_provider=%s: %s",
-                model,
-                custom_llm_provider,
-                exc,
-            )
-
-        apply_passthrough_logging_contract(
-            litellm_response=litellm_model_response,
+        response_cost = litellm.completion_cost(
+            completion_response=litellm_model_response,
             model=model,
-            kwargs=kwargs,
-            logging_obj=logging_obj,
-            response_cost=response_cost,
-            custom_llm_provider=custom_llm_provider,
-            native_usage_object=usage_object,
-            set_response_id=True,
+            custom_llm_provider="gemini",
         )
+
+        kwargs["response_cost"] = response_cost
+        kwargs["model"] = model
+        kwargs["custom_llm_provider"] = custom_llm_provider
 
         # pretty print standard logging object
         verbose_proxy_logger.debug("kwargs= %s", kwargs)
 
+        # set litellm_call_id to logging response object
+        litellm_model_response.id = logging_obj.litellm_call_id
+        logging_obj.model = litellm_model_response.model or model
+        logging_obj.model_call_details["model"] = logging_obj.model
+        logging_obj.model_call_details["custom_llm_provider"] = custom_llm_provider
+        logging_obj.model_call_details["response_cost"] = response_cost
         return kwargs
-
-    @staticmethod
-    def _get_cost_lookup_model_provider(
-        *,
-        model: str,
-        custom_llm_provider: str,
-    ) -> tuple[str, str]:
-        return model, "gemini"

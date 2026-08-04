@@ -5,15 +5,10 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 
-from litellm.integrations.aawm_agent_identity import _build_session_history_record
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
-from litellm.proxy.pass_through_endpoints.llm_provider_handlers.gemini_passthrough_logging_handler import (
-    GeminiPassthroughLoggingHandler,
-)
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
 )
-from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     PassthroughStandardLoggingPayload,
 )
@@ -116,79 +111,6 @@ def _normalize_passthrough_payload(
         "kwargs": normalized["kwargs"],
         "logging_obj": logging_obj,
     }
-
-
-def test_gemini_non_streaming_preserves_request_headers_for_aawm_metadata() -> None:
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
-    request_body = {"contents": [{"parts": [{"text": "hello"}]}]}
-    response_body = {
-        "candidates": [
-            {
-                "content": {
-                    "parts": [{"text": "hello from gemini"}],
-                    "role": "model",
-                },
-                "finishReason": "STOP",
-                "index": 0,
-            }
-        ],
-        "usageMetadata": {
-            "promptTokenCount": 5,
-            "candidatesTokenCount": 4,
-            "totalTokenCount": 9,
-        },
-    }
-
-    with patch("litellm.completion_cost", return_value=0.000009):
-        normalized = _normalize_passthrough_payload(
-            url=url,
-            request_body=request_body,
-            response_body=response_body,
-            custom_llm_provider="gemini",
-        )
-
-    assert (
-        normalized["kwargs"]["litellm_params"]["proxy_server_request"]["headers"]
-        == REQUEST_HEADERS
-    )
-
-
-def test_gemini_normalized_result_kwargs_include_aawm_logging_contract() -> None:
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
-    request_body = {"contents": [{"parts": [{"text": "hello"}]}]}
-    response_body = {
-        "candidates": [
-            {
-                "content": {
-                    "parts": [{"text": "hello from gemini"}],
-                    "role": "model",
-                },
-                "finishReason": "STOP",
-                "index": 0,
-            }
-        ],
-        "usageMetadata": {
-            "promptTokenCount": 5,
-            "candidatesTokenCount": 4,
-            "totalTokenCount": 9,
-        },
-    }
-
-    with patch("litellm.completion_cost", return_value=0.000009):
-        normalized = _normalize_passthrough_payload(
-            url=url,
-            request_body=request_body,
-            response_body=response_body,
-            custom_llm_provider="gemini",
-        )
-
-    _assert_aawm_contract(
-        normalized=normalized,
-        logging_obj=normalized["logging_obj"],
-        expected_model="gemini-1.5-flash",
-        expected_provider="gemini",
-        expected_cost=0.000009,
-    )
 
 
 def test_openai_normalized_result_kwargs_include_aawm_logging_contract() -> None:
@@ -322,46 +244,3 @@ def test_anthropic_normalized_result_kwargs_include_aawm_logging_contract() -> N
         expected_provider="anthropic",
         expected_cost=0.000009,
     )
-
-
-def test_gemini_streaming_preserves_headers_and_usage_for_aawm_session_history() -> None:
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:streamGenerateContent"
-    request_body = {"contents": [{"parts": [{"text": "hello"}]}]}
-    chunks = [
-        'data: {"candidates":[{"content":{"parts":[{"text":"hello"}],"role":"model"},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":4,"totalTokenCount":9,"cachedContentTokenCount":2,"cacheWriteInputTokens":1}}\n\n'
-    ]
-    logging_obj = _mock_logging_obj()
-
-    with patch("litellm.completion_cost", return_value=0.000009):
-        normalized = GeminiPassthroughLoggingHandler._handle_logging_gemini_collected_chunks(
-            litellm_logging_obj=logging_obj,
-            passthrough_success_handler_obj=PassThroughEndpointLogging(),
-            url_route=url,
-            request_body=request_body,
-            endpoint_type=EndpointType.GENERIC,
-            start_time=START_TIME,
-            all_chunks=chunks,
-            model="gemini-1.5-flash",
-            end_time=END_TIME,
-            kwargs={
-                "passthrough_logging_payload": _passthrough_payload(url, request_body),
-                "litellm_params": {"metadata": AAWM_METADATA.copy()},
-            },
-        )
-
-    _assert_aawm_contract(
-        normalized=normalized,
-        logging_obj=logging_obj,
-        expected_model="gemini-1.5-flash",
-        expected_provider="gemini",
-        expected_cost=0.000009,
-    )
-    record = _build_session_history_record(
-        kwargs=normalized["kwargs"],
-        result=normalized["result"],
-        start_time=START_TIME.isoformat(),
-        end_time=END_TIME.isoformat(),
-    )
-    assert record is not None
-    assert record["cache_read_input_tokens"] == 2
-    assert record["cache_creation_input_tokens"] == 1
