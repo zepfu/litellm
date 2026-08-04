@@ -212,7 +212,6 @@ from .aawm_alias_routing import classification as _aawm_alias_classification
 from .aawm_alias_routing import memory as _aawm_alias_memory
 from .aawm_alias_routing import provider_shaping as _aawm_provider_shaping  # noqa: F401 - runtime globals() binding
 from .aawm_alias_routing import responses_finalize as _aawm_responses_finalize
-# Compatibility host global for transplanted Google env-policy functions/tests.
 from .aawm_alias_routing import retry as _aawm_alias_retry  # noqa: F401
 from .aawm_alias_routing import streaming as _aawm_alias_streaming  # noqa: F401 - Wave 6F facade host binding
 from .aawm_alias_routing import candidate_loop as _aawm_alias_candidate_loop
@@ -274,30 +273,6 @@ _AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES_DEFAULT = [
 _NativeGrokContinuationRetryMetadata = dict[str, Any]
 _RetryResultT = TypeVar("_RetryResultT")
 _WalkResultT = TypeVar("_WalkResultT")
-
-
-class _ChangeAccumulator:
-    """RR-054 #8: accumulate transform change dicts without silent merge-order loss."""
-
-    def __init__(self) -> None:
-        self._changes: Payload = {}
-        self._names: list[str] = []
-
-    def record(self, name: str, changes: Optional[Payload] = None) -> None:
-        if not changes:
-            return
-        self._names.append(name)
-        for key, value in changes.items():
-            if key in self._changes and self._changes[key] != value:
-                alt_key = f"{name}:{key}"
-                self._changes[alt_key] = value
-            else:
-                self._changes[key] = value
-
-    def as_dict(self) -> Payload:
-        if self._names:
-            self._changes.setdefault("google_adapter_change_steps", list(self._names))
-        return dict(self._changes)
 
 
 # Process-local maps/locks owned by aawm_alias_routing.state.
@@ -989,7 +964,6 @@ _claude_context_replacement_template_cache: dict[Path, str] = {}
 _claude_prompt_patch_manifest_cache: dict[Path, dict[str, Any]] = {}
 _claude_agent_model_cache: dict[Path, tuple[Optional[int], Optional[str]]] = {}
 # RR-054 #1: OAuth access-token caches owned by aawm_alias_routing package.
-# RR-054 #1/#3: Google process state is constructed only by the provider owner.
 @lru_cache(maxsize=1)
 def _is_openai_responses_endpoint(endpoint: str) -> bool:
     normalized_path = httpx.URL(endpoint).path.rstrip("/")

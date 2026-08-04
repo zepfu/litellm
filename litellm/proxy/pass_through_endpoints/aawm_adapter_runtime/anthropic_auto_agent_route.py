@@ -7,8 +7,7 @@ god-module lines ~7172-7227) bodies from ``llm_passthrough_endpoints.py``.
 
 Do not import llm_passthrough_endpoints at module scope.
 
-Google Code Assist and Antigravity-only paths are omitted per operator
-removal scope.  Retained provider paths: Codex/OpenAI, Grok, OpenRouter,
+Retained provider paths: Codex/OpenAI, Grok, OpenRouter,
 NVIDIA, OpenCode, Kimi, Alibaba, and native Anthropic.
 """
 

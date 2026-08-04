@@ -424,18 +424,6 @@ def test_rr054_issue56_headers_filtered_for_metadata() -> None:
     assert all("authorization" not in s for s in sources)
 
 
-
-@pytest.mark.asyncio
-
-def test_rr054_issue8_change_accumulator_preserves_colliding_keys() -> None:
-    acc = lpe._ChangeAccumulator()
-    acc.record("a", {"flag": 1})
-    acc.record("b", {"flag": 2})
-    out = acc.as_dict()
-    assert out["flag"] == 1
-    assert out["b:flag"] == 2
-
-
 # ---------------------------------------------------------------------------
 # #16 vertex live auth-first / docstring
 # ---------------------------------------------------------------------------
