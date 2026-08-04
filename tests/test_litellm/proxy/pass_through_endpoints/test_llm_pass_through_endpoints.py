@@ -78,7 +78,6 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _anthropic_auto_agent_session_affinity_by_key,
     _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS,
     _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-    _get_gemini_passthrough_route_family,
     _get_opencode_zen_target_base,
     _join_opencode_zen_passthrough_url,
     _load_local_opencode_zen_api_key,
@@ -11452,31 +11451,6 @@ class TestClaudePersistedOutputExpansion:
         expected_route_family,
     ):
         assert _get_openai_passthrough_route_family(endpoint) == expected_route_family
-
-    @pytest.mark.parametrize(
-        ("endpoint", "expected_route_family"),
-        [
-            ("v1beta/models/gemini-2.5-flash:generateContent", "gemini_generate_content"),
-            (
-                "v1beta/models/gemini-2.5-flash:streamGenerateContent",
-                "gemini_stream_generate_content",
-            ),
-            (
-                "v1beta/models/veo-2.0-generate-001:predictLongRunning",
-                "gemini_predict_long_running",
-            ),
-            ("v1internal:loadCodeAssist", None),
-            ("v1internal:listExperiments", None),
-            ("v1internal:retrieveUserQuota", None),
-            ("v1internal:fetchAdminControls", None),
-        ],
-    )
-    def test_gemini_passthrough_route_family(
-        self,
-        endpoint,
-        expected_route_family,
-    ):
-        assert _get_gemini_passthrough_route_family(endpoint) == expected_route_family
 
     @pytest.mark.asyncio
     async def test_anthropic_proxy_route_extracts_billing_header_before_passthrough(
@@ -24726,199 +24700,89 @@ def test_opencode_zen_messages_route_uses_anthropic_stream_parser():
 
 
 @pytest.mark.asyncio
-async def test_gemini_proxy_route_sets_trace_environment_and_session(monkeypatch):  # noqa: PLR0915
-    monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
-    body = (
-        b'{"model":"gemini-3-flash-preview","request":{"session_id":"gemini-session-123"},'
-        b'"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"HIGH","thinkingBudget":512}},'
-        b'"tools":[{"googleSearch":{}}],"user_prompt_id":"prompt-123","project":"project-a",'
-        b'"contents":[{"role":"user","parts":[{"text":"hello"}]}]}'
-    )
-    scope = {
-        "type": "http",
-        "method": "POST",
-        "path": "/gemini/v1internal:generateContent",
-        "query_string": b"",
-        "headers": [
-            (b"content-type", b"application/json"),
-            (b"authorization", b"Bearer ya29.test-oauth-token"),
-            (b"x-aawm-repository", b"https://github.com/zepfu/litellm.git"),
-        ],
-    }
-
-    async def async_receive():
-        return {"type": "http.request", "body": body, "more_body": False}
-
-    request = Request(scope=scope, receive=async_receive)
+async def test_gemini_proxy_route_merges_server_gemini_api_key_into_query_params():
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "GET"
+    mock_request.query_params = {}
+    mock_request.headers = {"x-goog-api-key": "client-api-key"}
+    mock_response = MagicMock(spec=Response)
+    endpoint_func = AsyncMock(return_value={"ok": True})
 
     with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route",
-        return_value=AsyncMock(return_value={"ok": True}),
-    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
         new=AsyncMock(return_value=MagicMock()),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
-    ) as mock_set_parsed_body:
-        response = await gemini_proxy_route(
-            endpoint="v1internal:generateContent",
-            request=request,
-            fastapi_response=Response(),
-        )
-
-    assert response == {"ok": True}
-    mock_set_parsed_body.assert_called_once()
-    prepared_body = mock_set_parsed_body.call_args.args[1]
-    litellm_metadata = prepared_body["litellm_metadata"]
-    assert litellm_metadata["session_id"] == "gemini-session-123"
-    assert litellm_metadata["trace_environment"] == "dev"
-    assert litellm_metadata["repository"] == "zepfu/litellm"
-    assert litellm_metadata["gemini_thinking_config_present"] is True
-    assert litellm_metadata["gemini_include_thoughts"] is True
-    assert litellm_metadata["gemini_thinking_level"] == "high"
-    assert litellm_metadata["gemini_thinking_budget"] == 512
-    assert litellm_metadata["gemini_tools_present"] is True
-    assert litellm_metadata["gemini_tool_count"] == 1
-    assert litellm_metadata["gemini_user_prompt_id"] == "prompt-123"
-    assert litellm_metadata["gemini_project"] == "project-a"
-    assert litellm_metadata["passthrough_route_family"] == "gemini_generate_content"
-    assert "route:gemini_generate_content" in litellm_metadata["tags"]
-    assert "gemini-thinking-config-present" in litellm_metadata["tags"]
-    assert "gemini-include-thoughts:true" in litellm_metadata["tags"]
-    assert "include-thoughts:true" in litellm_metadata["tags"]
-    assert "gemini-thinking-level:high" in litellm_metadata["tags"]
-    assert "thinking-level:high" in litellm_metadata["tags"]
-    assert "gemini-thinking-budget-configured" in litellm_metadata["tags"]
-    assert "gemini-tools-present" in litellm_metadata["tags"]
-
-    def test_assemble_headers(self):
-        # Mock request
-        mock_request = MagicMock(spec=Request)
-        api_key = "test_api_key"
-
-        # Patch the _append_openai_beta_header method to avoid testing it again
-        with patch.object(
-            BaseOpenAIPassThroughHandler,
-            "_append_openai_beta_header",
-            return_value={
-                "authorization": "Bearer test_api_key",
-                "api-key": "test_api_key",
-                "test-header": "value",
-            },
-        ):
-            result = BaseOpenAIPassThroughHandler._assemble_headers(api_key, mock_request)
-            assert result["authorization"] == "Bearer test_api_key"
-            assert result["api-key"] == "test_api_key"
-            assert result["test-header"] == "value"
-
-    @patch("litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route")
-    async def test_base_openai_pass_through_handler(self, mock_create_pass_through):
-        # Mock dependencies
-        mock_request = MagicMock(spec=Request)
-        mock_request.query_params = {"model": "gpt-4"}
-        mock_response = MagicMock(spec=Response)
-        mock_user_api_key_dict = MagicMock()
-
-        # Mock the endpoint function returned by create_pass_through_route
-        mock_endpoint_func = AsyncMock(return_value={"result": "success"})
-        mock_create_pass_through.return_value = mock_endpoint_func
-
-        # Test with standard endpoint
-        result = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
-            endpoint="/chat/completions",
+    ) as mock_auth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials",
+        return_value="server-gemini-key",
+    ) as mock_get_credentials, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route",
+        return_value=endpoint_func,
+    ) as mock_create_route:
+        result = await gemini_proxy_route(
+            endpoint="v1beta/models/gemini-2.5-flash:generateContent",
             request=mock_request,
             fastapi_response=mock_response,
-            user_api_key_dict=mock_user_api_key_dict,
-            base_target_url="https://api.openai.com",
-            api_key="test_api_key",
-            custom_llm_provider=litellm.LlmProviders.OPENAI.value,
         )
 
-        # Verify the result
-        assert result == {"result": "success"}
+    assert result == {"ok": True}
+    mock_auth.assert_awaited_once()
+    assert mock_auth.await_args.kwargs["api_key"] == "Bearer client-api-key"
+    mock_get_credentials.assert_called_once_with(
+        custom_llm_provider="gemini",
+        region_name=None,
+    )
 
-        # Verify create_pass_through_route was called with correct parameters
-        call_args = mock_create_pass_through.call_args[1]
-        assert call_args["endpoint"] == "/chat/completions"
-        assert call_args["target"] == "https://api.openai.com/v1/chat/completions"
+    call_kwargs = mock_create_route.call_args.kwargs
+    assert call_kwargs["custom_llm_provider"] == "gemini"
+    assert call_kwargs["query_params"] == {"key": "server-gemini-key"}
+    assert call_kwargs["is_streaming_request"] is False
+    assert (
+        call_kwargs["target"]
+        == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+    )
+    endpoint_func.assert_awaited_once()
 
-        # Verify endpoint_func was called with correct parameters
-        mock_endpoint_func.assert_awaited_once()
 
-    @pytest.mark.asyncio
-    async def test_base_openai_pass_through_handler_sets_trace_environment_and_session(self, monkeypatch):
-        monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+@pytest.mark.asyncio
+async def test_gemini_proxy_route_preserves_gemini_api_base_path_prefix(monkeypatch):
+    monkeypatch.setenv(
+        "GEMINI_API_BASE", "https://gemini-gateway.example.com/api"
+    )
+    mock_request = MagicMock(spec=Request)
+    mock_request.method = "GET"
+    mock_request.query_params = {"key": "client-api-key"}
+    mock_request.headers = {}
+    mock_response = MagicMock(spec=Response)
+    endpoint_func = AsyncMock(return_value={"ok": True})
 
-        mock_request = MagicMock(spec=Request)
-        mock_request.method = "POST"
-        mock_request.headers = {
-            "session_id": "codex-session-123",
-            "user-agent": "codex-cli/1.0",
-        }
-        mock_request.query_params = {}
-        mock_response = MagicMock(spec=Response)
-        mock_user_api_key_dict = MagicMock()
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+        new=AsyncMock(return_value=MagicMock()),
+    ) as mock_auth, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials",
+        return_value="server-gemini-key",
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route",
+        return_value=endpoint_func,
+    ) as mock_create_route:
+        result = await gemini_proxy_route(
+            endpoint="v1beta/models/gemini-2.5-flash:streamGenerateContent",
+            request=mock_request,
+            fastapi_response=mock_response,
+        )
 
-        with patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
-            new=AsyncMock(
-                return_value={
-                    "model": "gpt-5.4",
-                    "input": "hello",
-                    "reasoning": {"effort": "xhigh"},
-                    "tool_choice": "auto",
-                    "parallel_tool_calls": True,
-                    "include": ["reasoning.encrypted_content"],
-                    "prompt_cache_key": "prompt-cache-key-123",
-                    "tools": [
-                        {
-                            "type": "function",
-                            "name": "spawn_agent",
-                            "description": _CODEX_RESTRICTIVE_SPAWN_AGENT_DESCRIPTION,
-                            "parameters": {"type": "object", "properties": {}},
-                        }
-                    ],
-                }
-            ),
-        ), patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
-        ) as mock_set_parsed_body, patch(
-            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route",
-            return_value=AsyncMock(return_value={"ok": True}),
-        ):
-            result = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
-                endpoint="/responses",
-                request=mock_request,
-                fastapi_response=mock_response,
-                user_api_key_dict=mock_user_api_key_dict,
-                base_target_url="https://api.openai.com",
-                api_key="test_api_key",
-                custom_llm_provider=litellm.LlmProviders.OPENAI.value,
-            )
+    assert result == {"ok": True}
+    mock_auth.assert_awaited_once()
+    assert mock_auth.await_args.kwargs["api_key"] == "Bearer client-api-key"
 
-        assert result == {"ok": True}
-        mock_set_parsed_body.assert_called_once()
-        prepared_body = mock_set_parsed_body.call_args.args[1]
-        litellm_metadata = prepared_body["litellm_metadata"]
-        assert litellm_metadata["session_id"] == "codex-session-123"
-        assert litellm_metadata["trace_environment"] == "dev"
-        assert litellm_metadata["codex_reasoning_effort"] == "xhigh"
-        assert litellm_metadata["codex_tool_choice"] == "auto"
-        assert litellm_metadata["codex_parallel_tool_calls"] is True
-        assert litellm_metadata["codex_include"] == ["reasoning.encrypted_content"]
-        assert litellm_metadata["codex_prompt_cache_key_present"] is True
-        assert litellm_metadata["passthrough_route_family"] == "codex_responses"
-        assert "route:codex_responses" in litellm_metadata["tags"]
-        assert "codex-tool-description-patch" in litellm_metadata["tags"]
-        assert "codex-tool-description-patch:spawn-agent-fanout-policy" in litellm_metadata["tags"]
-        assert litellm_metadata["codex_tool_description_patch_count"] == 1
-        assert "codex-effort:xhigh" in litellm_metadata["tags"]
-        assert "effort:xhigh" in litellm_metadata["tags"]
-        assert "codex-tool-choice:auto" in litellm_metadata["tags"]
-        assert "codex-parallel-tools:true" in litellm_metadata["tags"]
-        assert "codex-include:reasoning.encrypted_content" in litellm_metadata["tags"]
-        assert "Use subagents to parallelize independent work" in prepared_body["tools"][0]["description"]
-        assert "Only use `spawn_agent` if and only if" not in prepared_body["tools"][0]["description"]
+    call_kwargs = mock_create_route.call_args.kwargs
+    assert call_kwargs["custom_llm_provider"] == "gemini"
+    assert call_kwargs["query_params"] == {"key": "server-gemini-key"}
+    assert call_kwargs["is_streaming_request"] is True
+    assert (
+        call_kwargs["target"]
+        == "https://gemini-gateway.example.com/api/v1beta/models/gemini-2.5-flash:streamGenerateContent"
+    )
 
 
 @pytest.mark.asyncio

@@ -12,6 +12,7 @@ import copy
 import hashlib  # noqa: F401 - live host global for installed lane-key functions
 import json
 import os
+import posixpath
 import random  # noqa: F401 - compatibility binding for extracted Wave 5C facades
 import re
 import time
@@ -262,15 +263,6 @@ _AAWM_REQUEST_BODY_WALK_MAX_NODES = 4000
 _AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS = 5000
 _AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES = 8 * 1024 * 1024
 _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS = 5.0
-_GEMINI_OAUTH_FORWARD_HEADER_ALLOWLIST = frozenset(
-    {
-        "accept",
-        "authorization",
-        "content-type",
-        "user-agent",
-        "x-goog-api-client",
-    }
-)
 # Default probe-compatible retry set includes 429 + common 5xx.
 _AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES_DEFAULT = [
     429,
@@ -1114,22 +1106,38 @@ _add_grok_native_oauth_metadata = _wave6b_xai_request_prep._add_grok_native_oaut
 _prepare_grok_native_oauth_passthrough_request = _wave6b_xai_request_prep._prepare_grok_native_oauth_passthrough_request
 
 
-def _get_gemini_passthrough_route_family(endpoint: str) -> Optional[str]:
-    normalized_endpoint = endpoint.lower()
-    if "streamgeneratecontent" in normalized_endpoint:
-        return "gemini_stream_generate_content"
-    if "generatecontent" in normalized_endpoint:
-        return "gemini_generate_content"
-    if "predictlongrunning" in normalized_endpoint:
-        return "gemini_predict_long_running"
-    return None
-
-
 def _request_has_openai_client_auth(request: Request) -> bool:
     headers = _safe_get_request_headers(request)
     return bool(
         headers.get("authorization") or headers.get("Authorization") or headers.get("api-key") or headers.get("Api-Key")
     )
+
+
+def _join_gemini_base_and_endpoint_path(base_url: httpx.URL, endpoint_path: str) -> str:
+    """
+    Combine the path component of ``base_url`` with ``endpoint_path``.
+
+    Preserves any path prefix configured on the base URL and resolves
+    ``..`` segments in the endpoint so the result stays within the base
+    path. A trailing slash on ``endpoint_path`` is preserved.
+    """
+    trailing_slash = endpoint_path.endswith("/")
+    base_path = base_url.path or ""
+    if not base_path or base_path == "/":
+        normalized_endpoint = posixpath.normpath("/" + endpoint_path.lstrip("/"))
+        if trailing_slash and normalized_endpoint != "/":
+            normalized_endpoint += "/"
+        return normalized_endpoint
+
+    base_path = base_path.rstrip("/")
+    clean_endpoint = endpoint_path.lstrip("/")
+    combined = posixpath.normpath(base_path + "/" + clean_endpoint)
+    # If normalization climbs out of the base path, fall back to base.
+    if combined != base_path and not combined.startswith(base_path + "/"):
+        return base_path + "/"
+    if trailing_slash and not combined.endswith("/"):
+        combined += "/"
+    return combined
 
 
 def _get_request_header_or_passthrough_alias(request: Request, header_name: str) -> Optional[str]:
@@ -3243,14 +3251,6 @@ async def llm_passthrough_factory_proxy_route(
     return received_value
 
 
-def _get_gemini_passthrough_target_base(
-    endpoint: str,
-    has_google_oauth_bearer: bool,
-) -> str:
-    _ = endpoint, has_google_oauth_bearer
-    return os.getenv("GEMINI_API_BASE") or "https://generativelanguage.googleapis.com"
-
-
 @router.api_route(
     "/gemini/{endpoint:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
@@ -3279,12 +3279,9 @@ async def gemini_proxy_route(
         )
     user_api_key_dict = await user_api_key_auth(request=request, api_key=auth_api_key)
 
-    _auth_header = request.headers.get("authorization", "")
-    _is_google_oauth = _auth_header.startswith("Bearer ya29.")
-
-    base_target_url = _get_gemini_passthrough_target_base(
-        endpoint=endpoint,
-        has_google_oauth_bearer=_is_google_oauth,
+    base_target_url = (
+        os.getenv("GEMINI_API_BASE")
+        or "https://generativelanguage.googleapis.com"
     )
     encoded_endpoint = httpx.URL(endpoint).path
 
@@ -3294,58 +3291,35 @@ async def gemini_proxy_route(
 
     # Construct the full target URL using httpx
     base_url = httpx.URL(base_target_url)
-    updated_url = base_url.copy_with(path=encoded_endpoint)
+    updated_url = base_url.copy_with(
+        path=_join_gemini_base_and_endpoint_path(base_url, encoded_endpoint)
+    )
 
     # Add or update query parameters
-    merged_params = dict(request.query_params)
-    if _is_google_oauth:
-        # Remove the 'key' param if the client sent one; Google OAuth auth
-        # does not use API key query params.
-        merged_params.pop("key", None)
-    else:
-        gemini_api_key: Optional[str] = passthrough_endpoint_router.get_credentials(
-            custom_llm_provider="gemini",
-            region_name=None,
+    gemini_api_key: Optional[str] = passthrough_endpoint_router.get_credentials(
+        custom_llm_provider="gemini",
+        region_name=None,
+    )
+    if gemini_api_key is None:
+        raise Exception(
+            "Required 'GEMINI_API_KEY'/'GOOGLE_API_KEY' in environment to make pass-through calls to Google AI Studio."
         )
-        if gemini_api_key is None:
-            raise Exception(
-                "Required 'GEMINI_API_KEY'/'GOOGLE_API_KEY' in environment to make pass-through calls to Google AI Studio."
-            )
-        # Merge query parameters, giving precedence to those in updated_url
-        merged_params.update({"key": gemini_api_key})
+    # Merge query parameters, giving precedence to those in updated_url
+    merged_params = dict(request.query_params)
+    merged_params.update({"key": gemini_api_key})
 
     ## check for streaming
     is_streaming_request = False
     if "stream" in str(updated_url):
         is_streaming_request = True
 
-    if request.method == "POST":
-        request_body = await get_request_body(request)
-        prepared_request_body = _add_gemini_request_breakout_logging_metadata(request_body)
-        gemini_route_family = _get_gemini_passthrough_route_family(endpoint)
-        if gemini_route_family is not None:
-            prepared_request_body = _add_route_family_logging_metadata(
-                prepared_request_body,
-                gemini_route_family,
-            )
-        prepared_request_body = _prepare_request_body_for_passthrough_observability(
-            request=request,
-            request_body=prepared_request_body,
-        )
-        if prepared_request_body is not request_body:
-            _safe_set_request_parsed_body(request, prepared_request_body)
-
     ## CREATE PASS-THROUGH
     endpoint_func = create_pass_through_route(
         endpoint=endpoint,
         target=str(updated_url),
         custom_llm_provider="gemini",
-        _forward_headers=_is_google_oauth,
         is_streaming_request=is_streaming_request,
         query_params=merged_params,
-        egress_credential_family="google" if _is_google_oauth else None,
-        expected_target_family="google",
-        allowed_forward_headers=(list(_GEMINI_OAUTH_FORWARD_HEADER_ALLOWLIST) if _is_google_oauth else None),
     )  # dynamically construct pass-through endpoint based on incoming path
     received_value = await endpoint_func(
         request,
