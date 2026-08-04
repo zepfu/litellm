@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -204,7 +208,6 @@ async def test_session_history_repair_uses_keyset_not_offset() -> None:
     mock_pool.acquire.return_value = mock_acquire
 
     args = argparse.Namespace(
-        repair_gemini_control_plane=None,
         repair_costs=False,
         repair_tenant_ids=False,
         repair_anthropic_context_window=True,
@@ -264,7 +267,6 @@ async def test_session_history_repair_keyset_nulls_last_partition() -> None:
     mock_pool.acquire.return_value = mock_acquire
 
     args = argparse.Namespace(
-        repair_gemini_control_plane=None,
         repair_costs=False,
         repair_tenant_ids=False,
         repair_anthropic_context_window=True,
@@ -310,7 +312,6 @@ async def test_session_history_repair_batches_updates_with_executemany() -> None
     mock_pool.acquire.return_value = mock_acquire
 
     args = argparse.Namespace(
-        repair_gemini_control_plane=None,
         repair_costs=False,
         repair_tenant_ids=False,
         repair_anthropic_context_window=True,
@@ -335,68 +336,6 @@ async def test_session_history_repair_batches_updates_with_executemany() -> None
     mock_connection.executemany.assert_called_once()
     # One acquire for the page (fetch + executemany), not per-row.
     assert mock_pool.acquire.call_count == 1
-
-
-@pytest.mark.asyncio
-async def test_gemini_control_plane_repair_reuses_page_connection() -> None:
-    row = {
-        "id": 10,
-        "litellm_call_id": "g-1",
-        "provider": "gemini",
-        "model": "models/gemini-2.5-flash",
-        "model_group": None,
-        "call_type": "generateContent",
-        "start_time": datetime(2026, 1, 1, tzinfo=timezone.utc),
-        "metadata": {"passthrough_route_family": "gemini"},
-    }
-
-    mock_connection = MagicMock()
-    mock_connection.fetch = AsyncMock(side_effect=[[row], []])
-    mock_connection.execute = AsyncMock(return_value="UPDATE 1")
-    mock_connection.executemany = AsyncMock()
-    mock_connection.transaction = MagicMock()
-    mock_tx = MagicMock()
-    mock_tx.__aenter__ = AsyncMock(return_value=None)
-    mock_tx.__aexit__ = AsyncMock(return_value=None)
-    mock_connection.transaction.return_value = mock_tx
-
-    mock_pool = MagicMock()
-    mock_acquire = MagicMock()
-    mock_acquire.__aenter__ = AsyncMock(return_value=mock_connection)
-    mock_acquire.__aexit__ = AsyncMock(return_value=None)
-    mock_pool.acquire.return_value = mock_acquire
-
-    args = argparse.Namespace(
-        repair_gemini_control_plane="mark",
-        request_id=None,
-        trace_id=None,
-        session_id=None,
-        provider=None,
-        model=None,
-        from_start_time=None,
-        to_start_time=None,
-        limit=None,
-        batch_size=50,
-        apply=True,
-    )
-
-    with patch.object(
-        backfill, "_get_session_history_pool", AsyncMock(return_value=mock_pool)
-    ), patch.object(
-        backfill, "_ensure_session_history_schema_with_pool", AsyncMock()
-    ), patch.object(
-        backfill,
-        "_is_gemini_control_plane_session_history_row",
-        return_value=(True, "generateContent"),
-    ):
-        result = await backfill._run_gemini_control_plane_session_history_repair(args)
-
-    assert result["stats"]["matched_rows"] == 1
-    assert result["stats"]["updated_rows"] == 1
-    # Page select + page writes share one acquire (no per-row reacquire).
-    assert mock_pool.acquire.call_count == 1
-    mock_connection.executemany.assert_called_once()
-    mock_connection.execute.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -460,72 +399,6 @@ def test_attach_resume_cursor_omits_empty() -> None:
     assert "resume_cursor" not in result
     result2 = backfill._attach_resume_cursor({"ok": True}, {"skip": 5})
     assert result2["resume_cursor"] == {"skip": 5}
-
-
-@pytest.mark.asyncio
-async def test_gemini_control_plane_repair_batches_deletes() -> None:
-    row = {
-        "id": 11,
-        "litellm_call_id": "g-del",
-        "provider": "gemini",
-        "model": "models/gemini-2.5-flash",
-        "model_group": None,
-        "call_type": "generateContent",
-        "start_time": datetime(2026, 1, 1, tzinfo=timezone.utc),
-        "metadata": {"passthrough_route_family": "gemini"},
-    }
-
-    mock_connection = MagicMock()
-    mock_connection.fetch = AsyncMock(side_effect=[[row], []])
-    mock_connection.execute = AsyncMock(return_value="DELETE 1")
-    mock_connection.executemany = AsyncMock()
-    mock_connection.transaction = MagicMock()
-    mock_tx = MagicMock()
-    mock_tx.__aenter__ = AsyncMock(return_value=None)
-    mock_tx.__aexit__ = AsyncMock(return_value=None)
-    mock_connection.transaction.return_value = mock_tx
-
-    mock_pool = MagicMock()
-    mock_acquire = MagicMock()
-    mock_acquire.__aenter__ = AsyncMock(return_value=mock_connection)
-    mock_acquire.__aexit__ = AsyncMock(return_value=None)
-    mock_pool.acquire.return_value = mock_acquire
-
-    args = argparse.Namespace(
-        repair_gemini_control_plane="delete",
-        request_id=None,
-        trace_id=None,
-        session_id=None,
-        provider=None,
-        model=None,
-        from_start_time=None,
-        to_start_time=None,
-        limit=None,
-        batch_size=50,
-        apply=True,
-    )
-
-    with patch.object(
-        backfill, "_get_session_history_pool", AsyncMock(return_value=mock_pool)
-    ), patch.object(
-        backfill, "_ensure_session_history_schema_with_pool", AsyncMock()
-    ), patch.object(
-        backfill,
-        "_is_gemini_control_plane_session_history_row",
-        return_value=(True, "generateContent"),
-    ):
-        result = await backfill._run_gemini_control_plane_session_history_repair(args)
-
-    assert result["stats"]["matched_rows"] == 1
-    assert result["stats"]["deleted_rows"] == 1
-    assert mock_pool.acquire.call_count == 1
-    # Two batched executes: tool_activity then session_history
-    assert mock_connection.execute.await_count == 2
-    first_sql = mock_connection.execute.await_args_list[0].args[0]
-    second_sql = mock_connection.execute.await_args_list[1].args[0]
-    assert "session_history_tool_activity" in first_sql
-    assert "ANY($1::text[])" in first_sql
-    assert "session_history WHERE id = ANY" in second_sql
 
 
 @pytest.mark.asyncio
@@ -878,3 +751,127 @@ async def test_langfuse_db_mid_batch_limit_resume_uses_last_processed_row() -> N
     assert result["resume_cursor"]["cursor_id"] == "obs-newer"
     assert "2026-07-02" in str(result["resume_cursor"]["cursor_start_time"])
     assert source.closed is True
+
+
+# Provider-neutral coverage of retained cost/tenant helpers.
+def test_should_default_backfill_repairs_to_local_model_cost_map() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    env = os.environ.copy()
+    env.pop("LITELLM_LOCAL_MODEL_COST_MAP", None)
+    env.pop("LITELLM_MODEL_COST_MAP_URL", None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import scripts.backfill_session_history; "
+                "import litellm; "
+                "print(litellm.model_cost['gpt-5.5']['output_cost_per_token'])"
+            ),
+        ],
+        cwd=repo_root,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "2.5e-05"
+
+
+def test_should_price_chatgpt_rows_without_auth_provider(monkeypatch) -> None:
+    import litellm
+
+    calls = []
+
+    def fake_cost_per_token(**kwargs):
+        calls.append(kwargs)
+        return 0.1, 0.2
+
+    monkeypatch.setattr(litellm, "cost_per_token", fake_cost_per_token)
+
+    cost = backfill._recalculate_session_history_response_cost(
+        {
+            "provider": "chatgpt",
+            "model": "chatgpt/gpt-5.5",
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "cache_read_input_tokens": 50,
+            "cache_creation_input_tokens": 0,
+        }
+    )
+
+    assert cost == 0.1 + 0.2
+    assert calls[0]["model"] == "gpt-5.5"
+    assert calls[0]["custom_llm_provider"] == "openai"
+
+
+def test_should_recalculate_anthropic_cache_creation_as_one_hour() -> None:
+    cost = backfill._recalculate_session_history_response_cost(
+        {
+            "provider": "anthropic",
+            "model": "claude-opus-4-6",
+            "input_tokens": 9143,
+            "output_tokens": 7,
+            "cache_read_input_tokens": 8787,
+            "cache_creation_input_tokens": 307,
+        }
+    )
+
+    assert round(cost or 0, 10) == round(0.0078835, 10)
+
+
+def test_should_recalculate_rows_where_cache_tokens_exceed_input_tokens() -> None:
+    cost = backfill._recalculate_session_history_response_cost(
+        {
+            "provider": "anthropic",
+            "model": "claude-opus-4-6",
+            "input_tokens": 376,
+            "output_tokens": 152,
+            "cache_read_input_tokens": 478666,
+            "cache_creation_input_tokens": 375,
+        }
+    )
+
+    assert cost is not None
+    assert cost > 0
+
+
+def test_should_derive_missing_tenant_from_session_history_metadata_repository() -> None:
+    tenant_id, source = backfill._derive_session_history_tenant_identity(
+        {
+            "tenant_id": None,
+            "repository": None,
+            "metadata": {"repository": "https://github.com/zepfu/mcp-pg.git"},
+        }
+    )
+
+    assert tenant_id == "zepfu/mcp-pg"
+    assert source == "session_history.metadata.repository"
+
+
+def test_should_derive_missing_tenant_from_session_history_repository_column() -> None:
+    tenant_id, source = backfill._derive_session_history_tenant_identity(
+        {
+            "tenant_id": "",
+            "repository": "mcp-pg",
+            "metadata": {},
+        }
+    )
+
+    assert tenant_id == "mcp-pg"
+    assert source == "session_history.repository"
+
+
+def test_should_not_derive_repository_tenant_when_session_history_tenant_exists() -> None:
+    tenant_id, source = backfill._derive_session_history_tenant_identity(
+        {
+            "tenant_id": "existing-tenant",
+            "repository": "mcp-pg",
+            "metadata": {"repository": "mcp-pg"},
+        }
+    )
+
+    assert tenant_id is None
+    assert source is None
