@@ -145,7 +145,6 @@ _A4C_NORMALIZE_FUNCTIONS: List[str] = [
     "_normalize_agent_score_state_on_record",
     # latency + zero-token (:12499-12655)
     "_normalize_session_latency_state_on_record",
-    "_extract_gemini_control_plane_method_from_record",
     "_session_history_record_provider_usage_token_total",
     "_classify_zero_token_session_history_record",
     # orchestrator (:12656)
@@ -257,8 +256,8 @@ class TestA4CSymbolInventories:
     """Exact inventory checks for normalize.py and context_window.py."""
 
     def test_normalize_inventory_count(self) -> None:
-        assert len(_A4C_NORMALIZE_FUNCTIONS) == 60, (
-            f"expected 60 normalize.py functions, got {len(_A4C_NORMALIZE_FUNCTIONS)}"
+        assert len(_A4C_NORMALIZE_FUNCTIONS) == 59, (
+            f"expected 59 normalize.py functions, got {len(_A4C_NORMALIZE_FUNCTIONS)}"
         )
 
     def test_context_window_inventory_count(self) -> None:

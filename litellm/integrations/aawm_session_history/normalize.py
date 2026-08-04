@@ -131,22 +131,6 @@ _REPOSITORY_SOURCE_TEXT_SUFFIXES = (
 )
 
 
-_GEMINI_CONTROL_PLANE_METHOD_LABELS = {
-    "fetchadmincontrols": "google-fetch-admin-controls",
-    "listexperiments": "google-list-experiments",
-    "loadcodeassist": "google-load-code-assist",
-    "retrieveuserquota": "google-retrieve-user-quota",
-}
-
-
-_GEMINI_CONTROL_PLANE_METHOD_NAMES = {
-    "fetchadmincontrols": "fetchAdminControls",
-    "listexperiments": "listExperiments",
-    "loadcodeassist": "loadCodeAssist",
-    "retrieveuserquota": "retrieveUserQuota",
-}
-
-
 def _normalize_reasoning_state(record: Dict[str, Any]) -> None:
     reported = _positive_int_or_none(record.get("reasoning_tokens_reported"))
     estimated = _positive_int_or_none(record.get("reasoning_tokens_estimated"))
@@ -1448,28 +1432,6 @@ def _normalize_session_latency_state_on_record(record: Dict[str, Any]) -> None:
         record[field] = explicit_value if explicit_value is not None else derived_latency.get(field)
 
 
-def _extract_gemini_control_plane_method_from_record(
-    record: Dict[str, Any],
-    metadata: Dict[str, Any],
-) -> Optional[str]:
-    candidates = (
-        record.get("call_type"),
-        record.get("model"),
-        metadata.get("user_api_key_request_route"),
-        metadata.get("passthrough_route_family"),
-        metadata.get("aawm_local_route"),
-        metadata.get("aawm_local_endpoint"),
-    )
-    for candidate in candidates:
-        if not isinstance(candidate, str):
-            continue
-        candidate_lower = candidate.lower()
-        for method_lower in _GEMINI_CONTROL_PLANE_METHOD_LABELS:
-            if method_lower in candidate_lower:
-                return method_lower
-    return None
-
-
 def _session_history_record_provider_usage_token_total(record: Dict[str, Any]) -> int:
     total = 0
     for field in (
@@ -1499,35 +1461,7 @@ def _classify_zero_token_session_history_record(record: Dict[str, Any]) -> None:
     zero_token_class: Optional[str] = None
     zero_token_reason: Optional[str] = None
 
-    gemini_control_plane_method = _extract_gemini_control_plane_method_from_record(
-        record,
-        metadata,
-    )
-    has_gemini_quota_payload = isinstance(metadata.get("google_retrieve_user_quota"), dict)
-    if provider in {"gemini", "google"} and (
-        metadata.get("aawm_rate_limit_observation_only") is True
-        or has_gemini_quota_payload
-        or gemini_control_plane_method is not None
-    ):
-        zero_token_class = "non_usage_rate_limit_observation"
-        zero_token_reason = "gemini_control_plane_rate_limit_payload"
-        if gemini_control_plane_method is not None:
-            metadata.setdefault(
-                "gemini_control_plane_method",
-                _GEMINI_CONTROL_PLANE_METHOD_NAMES[gemini_control_plane_method],
-            )
-            metadata["gemini_control_plane_excluded"] = True
-            model = _clean_non_empty_string(record.get("model"))
-            if model is None or model.lower() in {"unknown", "null", "none"}:
-                record["model"] = _GEMINI_CONTROL_PLANE_METHOD_LABELS[gemini_control_plane_method]
-    elif (
-        provider == "gemini"
-        and metadata.get("codex_adapter_output_shape") == "openai_responses"
-        and _safe_int(metadata.get("aawm_stream_chunk_count")) is not None
-    ):
-        zero_token_class = "empty_provider_response_no_usage"
-        zero_token_reason = "gemini_code_assist_adapter_empty_response"
-    elif metadata.get("source_status") == "failure":
+    if metadata.get("source_status") == "failure":
         zero_token_class = "failed_observation_no_usage"
         zero_token_reason = "langfuse_observation_failed_without_usage"
     elif (
@@ -1742,7 +1676,6 @@ _HOST_FUNCTION_NAMES = (
     "_apply_runtime_agent_quality_scores",
     "_normalize_agent_score_state_on_record",
     "_normalize_session_latency_state_on_record",
-    "_extract_gemini_control_plane_method_from_record",
     "_session_history_record_provider_usage_token_total",
     "_classify_zero_token_session_history_record",
     "_normalize_session_history_record",

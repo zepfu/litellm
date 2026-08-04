@@ -108,12 +108,6 @@ def _rate_limit_storage_provider(record: Dict[str, Any]) -> str:
     client_family = str(record.get("client_family") or "").lower()
     if provider in {"opencode", "opencode_zen"} or client_family == "opencode_zen" or source.startswith("opencode_"):
         return "opencode_zen"
-    if (
-        provider == "gemini"
-        or client_family == "gemini"
-        or source.startswith("gemini_")
-    ):
-        return "google"
     return provider
 
 

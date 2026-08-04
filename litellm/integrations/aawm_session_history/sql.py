@@ -424,24 +424,9 @@ END $$;
 DO $$
 BEGIN
     UPDATE public.rate_limit_observations
-    SET provider = CASE
-        WHEN lower(COALESCE(provider, '')) IN ('gemini', 'google_code_assist')
-          OR lower(COALESCE(client, '')) IN ('gemini', 'google_code_assist')
-          OR source LIKE 'google_%'
-          OR source LIKE 'gemini_%'
-            THEN 'google'
-        WHEN provider IS NULL OR provider = ''
-            THEN 'unknown'
-        ELSE provider
-    END;
+    SET provider = 'unknown'
+    WHERE provider IS NULL OR provider = '';
 END $$;
-""",
-    """
-UPDATE public.rate_limit_observations
-SET client = 'google_code_assist'
-WHERE provider = 'google'
-  AND source = 'google_retrieve_user_quota'
-  AND client IN ('gemini', 'google');
 """,
     """
 DO $$

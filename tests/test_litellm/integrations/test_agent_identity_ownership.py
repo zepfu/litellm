@@ -2563,7 +2563,6 @@ _A4C_NORMALIZE_FUNCTIONS: List[str] = [
     "_normalize_agent_score_state_on_record",
     # latency + zero-token (:12499-12655)
     "_normalize_session_latency_state_on_record",
-    "_extract_gemini_control_plane_method_from_record",
     "_session_history_record_provider_usage_token_total",
     "_classify_zero_token_session_history_record",
     # orchestrator (:12656)
@@ -2623,13 +2622,13 @@ def test_a4c_inventory_has_no_duplicate_across_modules() -> None:
 
 
 def test_a4c_inventory_counts() -> None:
-    assert len(_A4C_NORMALIZE_FUNCTIONS) == 60, (
-        f"expected 60 normalize.py functions, got {len(_A4C_NORMALIZE_FUNCTIONS)}"
+    assert len(_A4C_NORMALIZE_FUNCTIONS) == 59, (
+        f"expected 59 normalize.py functions, got {len(_A4C_NORMALIZE_FUNCTIONS)}"
     )
     assert len(_A4C_CONTEXT_WINDOW_FUNCTIONS) == 10, (
         f"expected 10 context_window.py functions, got {len(_A4C_CONTEXT_WINDOW_FUNCTIONS)}"
     )
-    assert len(_A4C_ALL_MOVED_NAMES) == 70
+    assert len(_A4C_ALL_MOVED_NAMES) == 69
 
 
 def test_a4c_all_functions_callable_in_identity_pkg() -> None:

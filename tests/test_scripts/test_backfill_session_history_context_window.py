@@ -1,6 +1,5 @@
 import argparse
-import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -168,7 +167,6 @@ async def test_run_session_history_repair_dry_run_counts_anthropic_updates() -> 
     mock_pool.acquire.return_value = mock_acquire
 
     args = argparse.Namespace(
-        repair_gemini_control_plane=None,
         repair_costs=False,
         repair_tenant_ids=False,
         repair_anthropic_context_window=True,
