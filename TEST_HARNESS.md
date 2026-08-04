@@ -367,14 +367,25 @@ This manifest records the protected provider-focused and native proxy tests
 established by current file inspection. It is not a local acceptance-harness
 lane and is not proof of upstream provenance.
 
-No authoritative upstream ref or tree is available locally. Commit
-`e3dc89f634a61e89aeaab98c7fbf91b7bdae896c` is only a fork-local retained-byte
-baseline consumed by
-`tests/test_litellm/proxy/pass_through_endpoints/test_upstream_baseline.py`;
-passing that guard demonstrates fork-local byte stability, not equivalence to
-an upstream tree. Preserving the provider-focused and native proxy guards below
-supports source-removal safety. Upstream provenance closeout remains blocked on
-D1-602 until an authoritative pinned upstream ref and comparison are available.
+TEST-2 pinned the authoritative upstream baseline at
+`a79f598f692e66ce49790bfda699b7f4dccb3ca0` (BerriAI/litellm `upstream/main`
+merge, locally available through Git object reads). The fork-only
+decomposition guard
+`tests/test_litellm/proxy/pass_through_endpoints/test_upstream_baseline.py`
+and its only committed fixture
+(`fixtures/upstream_owned_baseline_e3dc89f634.json`, fork-local) were removed
+under TEST-2. `fixtures/upstream_owned_baseline_a79f598f69.json` was a
+temporary TEST-2 acceptance artifact regenerated once from the pinned
+upstream commit; it was deliberately not retained or committed, and no
+replacement fixture exists. Pinned against the
+upstream baseline the guard could not pass, because its guarded spans mixed
+unrelated fork runtime deltas that D1-602 source restoration owns with the
+upstream-owned bytes it claimed to prove; a permanently failing guard is not
+upstream proof, and the removal-verification rule keeps bounded
+acceptance-time inspection rather than permanent verification tests. TEST-2
+provenance is the one-time bounded comparison recorded below. Preserving the
+provider-focused and native proxy guards below supports source-removal
+safety.
 
 ### Discovery inventory
 
@@ -383,13 +394,19 @@ Commands and source lists used:
 - `find tests/test_litellm/llms/gemini tests/test_litellm/llms/vertex_ai/gemini tests/test_litellm/google_genai -type f -name '*.py' -not -path '*/__pycache__/*' -print | sort`
 - `git ls-files 'tests/test_litellm/llms/gemini/*.py' 'tests/test_litellm/llms/vertex_ai/gemini/*.py' 'tests/test_litellm/google_genai/*.py' | sort`
 - `rg -n -i 'aawm|code assist|antigravity|fork|removal|reintroduction|harness|local acceptance|session_history|rate_limit_observations'` over those three directories
-- tracked-path and static marker inspection of the eight native
+- tracked-path and static marker inspection of the six native
   proxy/pass-through guard files listed below
 
-All 24 tracked Python candidates in the focused provider directories were
+All 23 tracked Python candidates in the focused provider directories were
 inspected. The five Google GenAI test modules, seven Gemini test modules, and
-seven Vertex Gemini test modules are `retained-provider-focused`: current file
-inspection found no fork, harness, or removal markers. The five package files
+six Vertex Gemini test modules are `retained-provider-focused`: current file
+inspection found no fork, harness, or removal markers. The two fork-specific
+regression files removed after that inspection by TEST-2 --
+`tests/test_litellm/llms/vertex_ai/gemini/test_claude_tool_use_id_passthrough.py`
+(deleted by `6b5d3c3989`) and
+`tests/pass_through_unit_tests/test_gemini_streaming_handler.py` (deleted by
+`dfec3f308b`) -- were classified `fork-specific/removal` and are no longer
+listed. The five package files
 `tests/test_litellm/llms/gemini/__init__.py`,
 `tests/test_litellm/llms/gemini/files/__init__.py`,
 `tests/test_litellm/llms/gemini/image_edit/__init__.py`,
@@ -421,7 +438,6 @@ Retained provider-focused test files:
 - `tests/test_litellm/llms/gemini/test_gemini_common_utils.py`
 - `tests/test_litellm/llms/gemini/test_gemini_tts.py`
 - `tests/test_litellm/llms/gemini/videos/test_gemini_video_transformation.py`
-- `tests/test_litellm/llms/vertex_ai/gemini/test_claude_tool_use_id_passthrough.py`
 - `tests/test_litellm/llms/vertex_ai/gemini/test_function_call_args_serialization.py`
 - `tests/test_litellm/llms/vertex_ai/gemini/test_gemini_streaming_tool_call_finish_reason.py`
 - `tests/test_litellm/llms/vertex_ai/gemini/test_thought_signature_in_tool_call_id.py`
@@ -450,21 +466,36 @@ offline execution evidence:
 The other retained provider-focused modules remain protected, but current
 static inspection does not establish each complete file as offline-safe. Use
 collection-only validation or explicit node-level deselection/mocking before
-including the Google GenAI handler/main, Gemini client-setup/TTS, or seven
-Vertex Gemini modules in offline execution evidence.
+including the Google GenAI handler/main, Gemini client-setup/TTS, or the six
+retained Vertex Gemini modules in offline execution evidence.
 
 ### Native proxy/pass-through guards
 
 Whole-file offline-safe guards:
 
-- `tests/pass_through_unit_tests/test_gemini_streaming_handler.py`
 - `tests/test_litellm/proxy/pass_through_endpoints/llm_provider_handlers/test_gemini_passthrough_logging_handler.py`
 - `tests/test_litellm/proxy/pass_through_endpoints/test_streaming_handler_summary.py`
 
-Retained guard requiring D1-602 resolution:
+Removed fork-specific Gemini guard:
+
+- `tests/pass_through_unit_tests/test_gemini_streaming_handler.py` was
+  removed by `dfec3f308b` with its fork-specific Gemini streaming dispatch
+  source behavior and is no longer a guard.
+
+Removed fork-only upstream-baseline guard:
 
 - `tests/test_litellm/proxy/pass_through_endpoints/test_upstream_baseline.py`
-  is retained, but its fork-local byte guard currently fails pending D1-602.
+  and its only committed fixture
+  (`fixtures/upstream_owned_baseline_e3dc89f634.json`) were removed under
+  TEST-2. `fixtures/upstream_owned_baseline_a79f598f69.json` was a temporary
+  TEST-2 acceptance artifact regenerated once from the pinned upstream
+  commit; it was deliberately not retained, and no replacement fixture
+  exists. The guard was fork-only Wave-0 decomposition scaffolding, not
+  upstream proof; pinned to `a79f598f692e66ce49790bfda699b7f4dccb3ca0` it
+  could only fail because unrelated fork runtime deltas remain inside the
+  guarded spans. No replacement permanent test or fixture exists. Retention
+  of the native Google AI Studio/Gemini and Vertex passthrough symbols is
+  covered by the provider-focused and native proxy guards in this section.
 
 Retained guards requiring explicit mock-boundary confirmation or node-level
 selection before they are used as offline execution proof:
@@ -484,7 +515,6 @@ LITELLM_LOCAL_MODEL_COST_MAP=True ./.venv/bin/python -m pytest -p no:rerunfailur
   tests/test_litellm/llms/gemini/image_edit/test_gemini_image_edit_transformation.py \
   tests/test_litellm/llms/gemini/realtime/test_gemini_realtime_transformation.py \
   tests/test_litellm/llms/gemini/videos/test_gemini_video_transformation.py \
-  tests/pass_through_unit_tests/test_gemini_streaming_handler.py \
   tests/test_litellm/proxy/pass_through_endpoints/llm_provider_handlers/test_gemini_passthrough_logging_handler.py \
   tests/test_litellm/proxy/pass_through_endpoints/test_streaming_handler_summary.py
 ```
@@ -493,10 +523,27 @@ The broader retained set may be collected or inspected without treating
 collection as execution evidence. Do not run provider-directory-wide pytest
 commands as offline proof: those directories contain tests that can require
 credentials, external downloads, live services, or narrower mocks.
-The keep-manifest is fork-local retained-byte documentation; no authoritative
-upstream ref or tree is available locally. D1-602 remains the explicit boundary
-for the upstream-baseline guard, and resolving it is required before that file
-can be treated as offline execution proof.
+The keep-manifest itself remains fork-local retained-test documentation.
+TEST-2 upstream provenance was produced by bounded one-time comparisons
+against the pinned upstream tree (historical acceptance evidence, not a
+repeatable guard):
+
+```bash
+git show a79f598f692e66ce49790bfda699b7f4dccb3ca0:litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py
+git diff a79f598f692e66ce49790bfda699b7f4dccb3ca0 -- litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py
+```
+
+The comparison extracted every top-level function/decorated endpoint span by
+AST address (`function:<name>` / `decorated_function:<name>`, first decorator
+line through `end_lineno`, original line endings), hashed each span with
+SHA-256, and diffed the pinned upstream spans against the working tree. It
+confirmed that the retained native passthrough symbols `gemini_proxy_route`
+(Google AI Studio/Gemini), `vertex_proxy_route`,
+`vertex_discovery_proxy_route`, and `_base_vertex_proxy_route` exist in the
+pinned upstream tree, and it enumerated the fork-owned deltas still present
+in the working tree, which D1-602 source restoration owns. The retained
+native Google AI Studio/Gemini/Vertex keep-manifest classification above is
+unchanged by the guard removal.
 
 ## How to interpret results
 
