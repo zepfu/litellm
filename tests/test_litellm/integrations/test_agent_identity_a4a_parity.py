@@ -147,12 +147,7 @@ class TestProviderNormalizeGoldens:
             ("openai", "openai"),
             ("anthropic", "anthropic"),
             ("google", "gemini"),
-            ("google_code_assist", None),
-            ("google-code-assist", None),
             ("grok", "xai"),
-            ("antigravity", None),
-            ("agy", None),
-            ("google-antigravity", None),
             ("nvidia", "nvidia_nim"),
             ("opencode", "opencode_zen"),
             ("unknown", None),
@@ -212,12 +207,6 @@ class TestProviderNormalizeGoldens:
                 "https://us-central1-aiplatform.googleapis.com/v1"
             )
             == "gemini"
-        )
-        assert (
-            _session_history_provider_from_api_base(
-                "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"
-            )
-            is None
         )
 
 

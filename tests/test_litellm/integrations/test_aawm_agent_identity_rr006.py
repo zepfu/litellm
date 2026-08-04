@@ -12,7 +12,7 @@ import pytest
 from litellm.integrations import aawm_agent_identity
 
 
-def test_rr006_normalize_provider_cache_family_keeps_native_and_rejects_retired() -> None:
+def test_rr006_normalize_provider_cache_family_keeps_native() -> None:
     assert (
         aawm_agent_identity._normalize_provider_cache_family(None, "o4-mini")
         == "openai"
@@ -39,21 +39,6 @@ def test_rr006_normalize_provider_cache_family_keeps_native_and_rejects_retired(
             {"passthrough_route_family": "google_ai_studio_generate_content"},
         )
         == "gemini"
-    )
-    assert (
-        aawm_agent_identity._normalize_provider_cache_family(
-            "gemini",
-            "gemini-3.1-pro-preview",
-            {"passthrough_route_family": "codex_google_code_assist_adapter"},
-        )
-        is None
-    )
-    assert (
-        aawm_agent_identity._normalize_provider_cache_family(
-            "antigravity",
-            "google-antigravity/claude-sonnet-4-6",
-        )
-        is None
     )
 
 
@@ -162,18 +147,6 @@ def test_rr006_redacts_upstream_error_raw_secrets() -> None:
 
 def test_rr006_quota_period_from_window_minutes_hourly() -> None:
     assert aawm_agent_identity._quota_period_from_window_minutes(60) == "hourly"
-
-
-def test_rr006_retired_google_quota_extractors_are_not_exported() -> None:
-    for name in (
-        "_normalize_quota_period",
-        "_window_minutes_from_quota_period",
-        "_looks_like_google_quota_candidate",
-        "_antigravity_quota_pool_for_model",
-        "_extract_google_quota_observations",
-        "_extract_google_error_observations",
-    ):
-        assert not hasattr(aawm_agent_identity, name)
 
 
 def test_rr006_json_safe_rate_limit_value_allows_aliased_non_cyclic_refs() -> None:

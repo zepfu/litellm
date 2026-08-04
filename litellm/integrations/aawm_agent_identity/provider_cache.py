@@ -98,13 +98,18 @@ _PROVIDER_CACHE_TARGET_FAMILIES = {
     "xai",
 }
 
-_RETIRED_PROVIDER_CACHE_NAMES = {
-    "antigravity",
-    "agy",
-    "google-antigravity",
-    "google_code_assist",
-    "google-code-assist",
-}
+# Inert historical retirement data. aawm_session_history/record.py still
+# publishes this constant onto the identity host namespace, so keep it as
+# plain data; no cache code consumes it anymore.
+_RETIRED_PROVIDER_CACHE_NAMES = frozenset(
+    {
+        "antigravity",
+        "agy",
+        "google-antigravity",
+        "google_code_assist",
+        "google-code-assist",
+    }
+)
 
 
 def _normalize_provider_cache_family(
@@ -115,11 +120,6 @@ def _normalize_provider_cache_family(
     route_family = (metadata or {}).get("passthrough_route_family")
     if isinstance(route_family, str) and route_family.strip():
         route_family_lower = route_family.lower()
-        if any(
-            marker in route_family_lower
-            for marker in ("antigravity", "code_assist", "code-assist")
-        ):
-            return None
         if "grok" in route_family_lower or "xai" in route_family_lower:
             return "xai"
         if "nvidia" in route_family_lower:
@@ -137,8 +137,6 @@ def _normalize_provider_cache_family(
 
     if isinstance(provider, str) and provider.strip():
         provider_lower = provider.strip().lower()
-        if provider_lower in _RETIRED_PROVIDER_CACHE_NAMES:
-            return None
         if provider_lower == "google":
             return "gemini"
         if provider_lower in {"nvidia_nim", "nvidia-nim"}:
@@ -149,8 +147,6 @@ def _normalize_provider_cache_family(
             return provider_lower
 
     model_lower = str(model or "").strip().lower()
-    if model_lower.startswith(("antigravity/", "agy/", "google-antigravity/")):
-        return None
     if model_lower.startswith("nvidia_nim/") or model_lower.startswith("nvidia/"):
         return "nvidia"
     if model_lower.startswith("xai/") or model_lower.startswith("grok"):

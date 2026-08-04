@@ -388,26 +388,6 @@ def _infer_rate_limit_client_family(
         if value is not None
     ).lower()
     credential_family = str(metadata.get("credential_family") or "").lower()
-    retired_context = " ".join(
-        (
-            str(provider or ""),
-            source_lower,
-            route_family,
-            str(metadata.get("aawm_stream_logging_custom_llm_provider") or ""),
-            str(metadata.get("custom_llm_provider") or ""),
-            model_lower,
-        )
-    ).lower()
-    if any(
-        marker in retired_context
-        for marker in (
-            "antigravity",
-            "google_code_assist",
-            "google-code-assist",
-            "google_retrieve_user_quota",
-        )
-    ):
-        return None
     if (
         "opencode" in source_lower
         or credential_family == "opencode"
@@ -773,8 +753,6 @@ def _rate_limit_candidate_roots(kwargs: Dict[str, Any], result: Any) -> List[Any
         "anthropic_response_headers",
         "anthropic_rate_limit_headers",
         "xai_oauth_response_headers",
-        "gemini_model_status",
-        "google_model_status",
     ):
         if key in metadata:
             roots.append(metadata.get(key))
