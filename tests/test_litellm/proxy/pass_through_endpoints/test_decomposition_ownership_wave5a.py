@@ -938,23 +938,6 @@ class TestW5AInventoryUniqueness:
             )
 
 
-# ===========================================================================
-# SECTION 7: RR-054 removed-provider seam closure
-# ===========================================================================
-
-
-class TestW5ARR054RemovedProviderClosure:
-    """The removed Google adapter semaphore must not return as a compatibility seam."""
-
-    def test_google_adapter_semaphore_is_absent(self):
-        assert not hasattr(lpe, "_get_google_adapter_semaphore")
-
-    def test_google_adapter_semaphore_not_in_w5a_inventory(self):
-        for module_key, symbols in W5A_SYMBOL_INVENTORY.items():
-            assert "_get_google_adapter_semaphore" not in symbols, (
-                f"_get_google_adapter_semaphore incorrectly in {module_key}"
-            )
-
 
 # ===========================================================================
 # SECTION 8: God-owned quota cache authority (Wave 5A regression)

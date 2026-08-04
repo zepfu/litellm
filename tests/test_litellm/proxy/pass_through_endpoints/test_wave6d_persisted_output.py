@@ -22,16 +22,9 @@ EXPECTED_SYMBOLS = (
     "_get_claude_persisted_output_root",
     "_resolve_claude_persisted_output_path",
     "_build_claude_persisted_output_source_metadata",
-    "_compact_google_adapter_persisted_output_preview_and_expanded_text",
-    "_compact_expanded_claude_persisted_output_text_for_google_adapter",
-    "_compact_google_adapter_text_part_sequence",
-    "_compact_google_adapter_followup_request_contents",
-    "_compact_google_adapter_persisted_output_value",
-    "_compact_google_adapter_persisted_output_in_anthropic_request_body",
     "_expand_claude_persisted_output_text",
     "_expand_claude_persisted_output_value",
     "_expand_claude_persisted_output_in_anthropic_request_body",
-    "_estimate_google_content_text_chars",
 )
 
 
@@ -310,147 +303,6 @@ def test_file_read_exceptions_are_swallowed(
     )
 
 
-def test_google_delegate_compacts_split_output_items(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        po,
-        "_get_google_adapter_persisted_output_char_cap",
-        lambda: 40,
-    )
-    monkeypatch.setattr(
-        po,
-        "_get_google_adapter_auxiliary_context_char_cap",
-        lambda: 400,
-    )
-    parts: list[Any] = [
-        {"type": "text", "text": "<system-reminder>\n"},
-        {
-            "type": "text",
-            "text": (
-                "SubagentStart hook additional context: "
-                "<persisted-output>\n" + ("A" * 300)
-            ),
-        },
-        {
-            "type": "text",
-            "text": (
-                "\n</persisted-output>\n"
-                "</system-reminder>\n"
-            ),
-        },
-        {"type": "image", "source": "unchanged"},
-    ]
-
-    updated, count, hooks, metadata, changed = (
-        po._compact_google_adapter_text_part_sequence(parts)
-    )
-
-    assert changed is True
-    assert count == 1
-    assert hooks == {"subagentstart"}
-    assert len(updated) == 2
-    assert "Gemini adapter compacted persisted-output" in updated[0]["text"]
-    assert updated[1] is parts[3]
-    assert metadata[0]["original_chars"] == 300
-    assert metadata[0]["kept_chars"] <= 40
-
-
-def test_google_followup_continuation_compacts_in_place_and_reports_changes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        po,
-        "_get_google_adapter_followup_persisted_output_char_cap",
-        lambda: 30,
-    )
-    monkeypatch.setattr(
-        po,
-        "_get_google_adapter_followup_auxiliary_context_char_cap",
-        lambda: 400,
-    )
-    request_block: dict[str, Any] = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [
-                    {
-                        "text": (
-                            "<system-reminder>\n"
-                            "SessionStart hook additional context: "
-                            "<persisted-output>\n"
-                            + ("B" * 300)
-                            + "\n</persisted-output>\n"
-                            "</system-reminder>\n"
-                        )
-                    }
-                ],
-            },
-            {
-                "role": "model",
-                "parts": [{"text": "prior continuation output"}],
-            },
-        ]
-    }
-
-    changes = po._compact_google_adapter_followup_request_contents(
-        request_block
-    )
-
-    compacted_text = request_block["contents"][0]["parts"][0]["text"]
-    assert "Gemini adapter compacted persisted-output" in compacted_text
-    assert changes["followup_persisted_output_compacted_count"] == 1
-    assert changes["followup_persisted_output_hooks"] == ["sessionstart"]
-    assert changes["followup_persisted_output_char_cap"] == 30
-    assert changes["followup_persisted_output_text_chars_after"] < (
-        changes["followup_persisted_output_text_chars_before"]
-    )
-    assert request_block["contents"][1]["parts"][0]["text"] == (
-        "prior continuation output"
-    )
-
-
-@pytest.mark.parametrize(
-    "request_block",
-    [{}, {"contents": []}, {"contents": [{"role": "user", "parts": []}]}],
-)
-def test_google_followup_noop_edges_return_empty_changes(
-    request_block: dict[str, Any],
-) -> None:
-    original = dict(request_block)
-
-    assert (
-        po._compact_google_adapter_followup_request_contents(request_block)
-        == {}
-    )
-    assert request_block == original
-
-
-def test_google_delegate_exceptions_propagate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class ExpectedError(RuntimeError):
-        pass
-
-    def raise_expected(
-        _text: str,
-        *,
-        cap: int,
-    ) -> tuple[str, int, set[str], list[dict[str, Any]]]:
-        raise ExpectedError(str(cap))
-
-    monkeypatch.setattr(
-        po._anthropic_google_shaping,
-        "_compact_google_adapter_persisted_output_preview_and_expanded_text",
-        raise_expected,
-    )
-
-    with pytest.raises(ExpectedError, match="17"):
-        po._compact_google_adapter_persisted_output_preview_and_expanded_text(
-            "payload",
-            cap=17,
-        )
-
 
 # ---------------------------------------------------------------------------
 # Body-level expansion contract
@@ -665,36 +517,6 @@ def test_body_expansion_callback_four_arg_signature_and_timing_regression(
         "format:end",
     ]
 
-
-# ---------------------------------------------------------------------------
-# Installed/direct parity
-# ---------------------------------------------------------------------------
-
-
-def test_estimate_google_content_text_chars_direct_parity() -> None:
-    """Direct module function matches the canonical algorithm."""
-    block = {"parts": [{"text": "hello"}, {"text": "world"}, {"image": True}]}
-    assert po._estimate_google_content_text_chars(block) == 10
-    assert po._estimate_google_content_text_chars({}) == 0
-    assert po._estimate_google_content_text_chars("not a dict") == 0
-    assert po._estimate_google_content_text_chars({"parts": "bad"}) == 0
-    assert po._estimate_google_content_text_chars({"parts": [None, 42]}) == 0
-
-
-def test_estimate_google_content_text_chars_installed_parity(
-) -> None:
-    """Installed host facade produces same results as direct call."""
-    originals = {name: getattr(po, name) for name in po._HOST_FUNCTION_NAMES}
-    host_globals = dict(vars(po))
-    try:
-        po.install(host_globals)
-        block = {"parts": [{"text": "abc"}, {"text": "defgh"}]}
-        direct = po._estimate_google_content_text_chars(block)
-        installed = host_globals["_estimate_google_content_text_chars"](block)
-        assert direct == installed == 8
-    finally:
-        for name, original_function in originals.items():
-            setattr(po, name, original_function)
 
 
 # ---------------------------------------------------------------------------
