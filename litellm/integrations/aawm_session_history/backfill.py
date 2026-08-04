@@ -352,7 +352,6 @@ def _extract_langfuse_session_id(
         trace.get("sessionId"),
         trace.get("session_id"),
         observation_metadata.get("session_id"),
-        observation_metadata.get("google_adapter_session_id"),
         _coerce_nested_session_id(observation_metadata.get("user_id")),
         _coerce_nested_session_id(observation_metadata.get("user_api_key_end_user_id")),
     ):
@@ -363,11 +362,6 @@ def _extract_langfuse_session_id(
                 return str(candidate).strip(), "trace.session_id"
             if candidate == observation_metadata.get("session_id"):
                 return str(candidate).strip(), "observation.metadata.session_id"
-            if candidate == observation_metadata.get("google_adapter_session_id"):
-                return (
-                    str(candidate).strip(),
-                    "observation.metadata.google_adapter_session_id",
-                )
             if candidate == _coerce_nested_session_id(observation_metadata.get("user_id")):
                 return str(candidate).strip(), "observation.metadata.user_id.session_id"
             return (

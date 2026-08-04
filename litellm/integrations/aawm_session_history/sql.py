@@ -541,7 +541,6 @@ BEGIN
     SET quota_type = COALESCE(
         quota_type,
         CASE
-            WHEN source = 'google_model_capacity_error' THEN 'capacity'
             WHEN provider = 'google' THEN 'requests'
             WHEN provider IN ('openai', 'anthropic') THEN 'tokens'
             ELSE 'unknown'

@@ -2528,16 +2528,6 @@ def _extract_session_id(kwargs: Dict[str, Any]) -> Optional[str]:
 
     fallback_candidates = (
         (
-            "metadata.google_adapter_session_id",
-            metadata.get("google_adapter_session_id"),
-            False,
-        ),
-        (
-            "standard_metadata.google_adapter_session_id",
-            standard_metadata.get("google_adapter_session_id"),
-            False,
-        ),
-        (
             "litellm_params.litellm_trace_id",
             litellm_params.get("litellm_trace_id"),
             True,
