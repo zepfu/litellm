@@ -653,21 +653,110 @@ class TestProductionWrapperDelegation:
     @pytest.mark.asyncio
     async def test_max_candidate_attempts_from_candidates_list(self) -> None:
         """max_candidate_attempts equals len(get_candidates_for_alias(alias))."""
-        runtime = _make_runtime(
-            get_candidates_for_alias=MagicMock(return_value=[{"a": 1}, {"b": 2}, {"c": 3}]),
-        )
+        get_candidates = MagicMock(return_value=[{"a": 1}, {"b": 2}, {"c": 3}])
+        runtime = _make_runtime(get_candidates_for_alias=get_candidates)
+        request = MagicMock()
+        body: dict[str, Any] = {}
         await handle_anthropic_auto_agent_alias_route(
             runtime,
             endpoint="/v1/messages",
-            request=MagicMock(),
+            request=request,
             fastapi_response=MagicMock(),
             user_api_key_dict=MagicMock(),
-            prepared_request_body={},
+            prepared_request_body=body,
             target_url="https://api.anthropic.com",
             custom_headers={},
         )
         call_kwargs = runtime.handle_alias_route.call_args.kwargs  # type: ignore[union-attr]
         assert call_kwargs["max_candidate_attempts"] == 3
+        get_candidates.assert_called_once_with(
+            "claude-sonnet-4-20250514",
+            request=request,
+            request_body=body,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("alias_model", "expected_attempts"),
+        (
+            ("sota-moonshot", 1),
+            ("sota-alibaba", 2),
+            ("work", 6),
+        ),
+    )
+    async def test_installed_runtime_counts_checked_in_anthropic_alias_candidates(
+        self,
+        alias_model: str,
+        expected_attempts: int,
+    ) -> None:
+        """The production runtime uses the request-aware snapshot projection."""
+        from starlette.requests import Request
+        from starlette.responses import Response
+
+        from litellm.proxy.pass_through_endpoints import (
+            llm_passthrough_endpoints as lpe,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+            active_routing_snapshot_holder,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+            DEFAULT_CONFIG_DIR,
+            compile_directory,
+        )
+
+        snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+        previous_snapshot = active_routing_snapshot_holder.swap(snapshot)
+        handle_alias_route = AsyncMock(return_value=Response(status_code=204))
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/anthropic/v1/messages",
+                "query_string": b"",
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"x-litellm-end-user-id", b"adapter-harness-tenant"),
+                    (b"langfuse_trace_user_id", b"adapter-harness-tenant"),
+                    (b"langfuse_trace_name", b"claude-code"),
+                    (b"x-aawm-tenant-id", b"adapter-harness-tenant"),
+                ],
+            }
+        )
+        body = {
+            "model": alias_model,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "offline harness probe"}],
+            "tools": [
+                {
+                    "name": "Read",
+                    "description": "offline",
+                    "input_schema": {"type": "object"},
+                }
+            ],
+        }
+        runtime = dataclasses.replace(
+            lpe._ANTHROPIC_AUTO_AGENT_ROUTE_RUNTIME,
+            handle_alias_route=handle_alias_route,
+        )
+
+        try:
+            await handle_anthropic_auto_agent_alias_route(
+                runtime,
+                endpoint="/v1/messages",
+                request=request,
+                fastapi_response=Response(),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=body,
+                target_url="http://unused.invalid",
+                custom_headers={},
+            )
+        finally:
+            active_routing_snapshot_holder.swap(previous_snapshot)
+
+        assert (
+            handle_alias_route.await_args.kwargs["max_candidate_attempts"]
+            == expected_attempts
+        )
 
     @pytest.mark.asyncio
     async def test_services_bundle_wired_from_runtime(self) -> None:

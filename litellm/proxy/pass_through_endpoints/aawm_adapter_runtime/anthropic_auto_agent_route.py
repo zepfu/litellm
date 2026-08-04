@@ -81,8 +81,8 @@ AddAliasMetadataDirectFn = Callable[..., dict[str, Any]]
 RaiseRedispatchFn = Callable[..., None]
 """``_raise_anthropic_auto_agent_redispatch_required``."""
 
-GetCandidatesForAliasFn = Callable[[str], list[Any]]
-"""``_get_anthropic_auto_agent_candidates_for_alias``."""
+GetCandidatesForAliasFn = Callable[..., Sequence[Any]]
+"""Request-aware Anthropic alias candidate enumeration."""
 
 GetActiveCooldownStateFn = Callable[[str], Awaitable[tuple[float, str]]]
 """``_get_anthropic_auto_agent_active_cooldown_state``."""
@@ -357,7 +357,13 @@ async def handle_anthropic_auto_agent_alias_route(
         alias_model=alias_model,
         request=request,
         prepared_request_body=prepared_request_body,
-        max_candidate_attempts=len(runtime.get_candidates_for_alias(alias_model)),
+        max_candidate_attempts=len(
+            runtime.get_candidates_for_alias(
+                alias_model,
+                request=request,
+                request_body=prepared_request_body,
+            )
+        ),
         get_active_cooldown_state_fn=runtime.get_active_cooldown_state,
         attempts_metadata_key="anthropic_auto_agent_attempts",
         skipped_candidates_metadata_key="anthropic_auto_agent_skipped_candidates",

@@ -3854,8 +3854,16 @@ _ANTHROPIC_AUTO_AGENT_ROUTE_RUNTIME = (
         raise_redispatch_required=lambda *args, **kwargs: (
             _raise_anthropic_auto_agent_redispatch_required(*args, **kwargs)
         ),
-        get_candidates_for_alias=lambda *args, **kwargs: (
-            _get_anthropic_auto_agent_candidates_for_alias(*args, **kwargs)
+        get_candidates_for_alias=lambda alias_model, *, request, request_body: (
+            _get_anthropic_candidates_for_alias_snapshot_aware(
+                alias_model,
+                client_product_label=(
+                    _extract_auto_agent_alias_client_product_label(
+                        request,
+                        request_body,
+                    )
+                ),
+            )
         ),
         get_active_cooldown_state=lambda *args, **kwargs: (
             _get_anthropic_auto_agent_active_cooldown_state(*args, **kwargs)
