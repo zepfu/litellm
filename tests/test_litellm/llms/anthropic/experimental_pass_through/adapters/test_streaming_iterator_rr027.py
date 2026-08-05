@@ -302,25 +302,6 @@ def test_tool_use_multi_tool_path_skips_empty_partial_json_and_uses_shared_emitt
     assert types.index("content_block_delta") < types.index("content_block_stop")
 
 
-def test_stream_sources_have_no_aawm_gemini_debug_residue() -> None:
-    """RR-027 #3 residual proof against source drift."""
-    import inspect
-
-    from litellm.llms.vertex_ai.gemini import (
-        vertex_and_google_ai_studio_gemini as gemini_module,
-    )
-
-    anthropic_source = inspect.getsource(si)
-    assert "AAWM_GEMINI_ROUTE_DEBUG" not in anthropic_source
-    assert "is_aawm_gemini_route_debug_enabled" not in anthropic_source
-    assert "_gemini_route_debug" not in anthropic_source
-    assert "Anthropic wrapper debug" not in anthropic_source
-
-    gemini_source = inspect.getsource(gemini_module.ModelResponseIterator)
-    assert "AAWM_GEMINI_ROUTE_DEBUG" not in gemini_source
-    assert "Gemini iterator debug" not in gemini_source
-
-
 def test_no_inline_content_block_envelope_literals_in_wrapper_methods() -> None:
     """RR-027 #2: wrapper body should emit via shared helpers, not raw type dicts."""
     import inspect

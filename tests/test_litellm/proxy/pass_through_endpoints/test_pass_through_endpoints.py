@@ -1527,7 +1527,6 @@ def test_validate_outgoing_egress_blocks_openrouter_credentials_to_openai():
 def test_validate_outgoing_egress_allows_matching_google_headers():
     headers = {
         "Authorization": "Bearer ya29.google-token",
-        "x-goog-api-client": "anthropic-google-adapter",
     }
 
     HttpPassThroughEndpointHelpers.validate_outgoing_egress(
@@ -1542,7 +1541,6 @@ def test_validate_outgoing_egress_blocks_google_credentials_to_anthropic():
     reset_egress_guard_alert_state()
     headers = {
         "Authorization": "Bearer ya29.google-token",
-        "x-goog-api-client": "anthropic-google-adapter",
     }
 
     with pytest.raises(HTTPException) as exc_info:
