@@ -74,6 +74,18 @@ def _budget_to_effort(budget_tokens: Any) -> str:
     return "minimal"
 
 
+def _anthropic_model_supports_max_effort(model: Optional[str]) -> bool:
+    """Shared predicate: metadata-driven Anthropic max-effort support.
+
+    Reuses `AnthropicModelInfo._supports_max_effort` (metadata flag with the
+    Claude 4.6/4.7 name checks retained as backward-compatible fallback) so
+    chat translation, beta-header logic, and observability agree.
+    """
+    from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+
+    return AnthropicModelInfo._supports_max_effort(model)
+
+
 def _extract_requested_effort(
     *,
     thinking: Any = None,
@@ -147,6 +159,13 @@ def normalize_reasoning_effort_for_provider(
                 model=model, custom_llm_provider=custom_llm_provider
             )
         ):
+            native_value = "max"
+        elif (
+            provider == "anthropic"
+            and _anthropic_model_supports_max_effort(model)
+        ):
+            # Stable Anthropic effort models (canonical claude-opus-5 plus
+            # the Claude 4.6/4.7 fallback) accept max natively; do not clamp.
             native_value = "max"
         elif (
             provider in {"openai", "openrouter"}

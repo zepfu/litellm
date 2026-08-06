@@ -1,6 +1,7 @@
 import json
 
 import litellm
+from litellm.utils import supports_max_reasoning_effort
 
 
 def test_anthropic_sonnet_5_and_fable_5_metadata_offline(monkeypatch):
@@ -125,3 +126,48 @@ def test_anthropic_sonnet_5_and_fable_5_metadata_offline(monkeypatch):
     for model, expected_provider in provider_cases.items():
         _, provider, _, _ = litellm.get_llm_provider(model)
         assert provider == expected_provider
+
+
+def test_claude_opus_5_metadata_offline(monkeypatch):
+    """
+    Offline metadata test for claude-opus-5 (CFG-013 Body A).
+    Verifies canonical entry facts, canonical/bundled parity, absence of a
+    separate claude-opus-5[1m] entry, and capability helper resolution.
+    No live provider calls.
+    """
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    monkeypatch.setattr(litellm, "model_cost", litellm.get_model_cost_map(url=""))
+
+    expected_entry = {
+        "litellm_provider": "anthropic",
+        "mode": "chat",
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "supports_reasoning": True,
+        "supports_max_reasoning_effort": True,
+    }
+
+    with open("model_prices_and_context_window.json") as f:
+        canonical = json.load(f)
+    with open("litellm/bundled_model_prices_and_context_window_fallback.json") as f:
+        bundled = json.load(f)
+
+    # Canonical entry present in both files and identical (parity).
+    assert canonical["claude-opus-5"] == expected_entry
+    assert bundled["claude-opus-5"] == canonical["claude-opus-5"]
+
+    # No separate [1m] entry in either catalog copy.
+    assert "claude-opus-5[1m]" not in canonical
+    assert "claude-opus-5[1m]" not in bundled
+
+    # get_model_info resolves the exact verified facts.
+    info = litellm.get_model_info("claude-opus-5")
+    for key, expected_value in expected_entry.items():
+        assert info.get(key) == expected_value, (
+            f"claude-opus-5 {key} mismatch: {info.get(key)} != {expected_value}"
+        )
+
+    # Capability helpers resolve reasoning and max reasoning effort.
+    assert litellm.supports_reasoning("claude-opus-5") is True
+    assert supports_max_reasoning_effort("claude-opus-5") is True

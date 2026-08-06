@@ -265,7 +265,8 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         Check if the model uses Anthropic's stable output_config effort API.
 
         This covers Claude 4.6 models (Opus 4.6 or Sonnet 4.6) and the
-        native Claude Opus 4.7 alias.
+        native Claude Opus 4.7 alias. Retained only as a backward-compatible
+        fallback; prefer `_uses_stable_effort_api`, which is metadata-driven.
         """
         model_lower = model.lower()
         return any(
@@ -286,6 +287,66 @@ class AnthropicModelInfo(BaseLLMModelInfo):
             )
         )
 
+    @staticmethod
+    def _is_opus_4_6_model(model: str) -> bool:
+        """Check if the model is specifically Claude Opus 4.6 or 4.7."""
+        model_lower = model.lower()
+        return any(
+            v in model_lower
+            for v in (
+                "opus-4-6",
+                "opus_4_6",
+                "opus-4.6",
+                "opus_4.6",
+                "opus-4-7",
+                "opus_4_7",
+                "opus-4.7",
+                "opus_4.7",
+            )
+        )
+
+    @staticmethod
+    def _is_max_reasoning_effort_model(model: Optional[str]) -> bool:
+        """
+        Metadata-driven check for Anthropic models that support the max
+        reasoning effort value (canonical `claude-opus-5`).
+
+        Reads the `supports_max_reasoning_effort` model-info flag instead of
+        hardcoding model name checks.
+        """
+        if not model:
+            return False
+        from litellm.utils import supports_max_reasoning_effort
+
+        return supports_max_reasoning_effort(
+            model=model, custom_llm_provider="anthropic"
+        )
+
+    @staticmethod
+    def _supports_max_effort(model: Optional[str]) -> bool:
+        """
+        Models that accept `output_config.effort='max'`: metadata-flagged
+        stable models (canonical `claude-opus-5`) plus the Claude Opus
+        4.6/4.7 name checks retained as a backward-compatible fallback.
+        """
+        return AnthropicModelInfo._is_max_reasoning_effort_model(
+            model
+        ) or (model is not None and AnthropicModelInfo._is_opus_4_6_model(model))
+
+    @staticmethod
+    def _uses_stable_effort_api(model: Optional[str]) -> bool:
+        """
+        Check if the model uses Anthropic's stable output_config effort API.
+
+        Metadata-driven: anthropic models flagged with
+        `supports_max_reasoning_effort` (canonical `claude-opus-5`) use the
+        stable API. Claude 4.6/4.7 name checks are retained only as a
+        backward-compatible fallback.
+        """
+        return AnthropicModelInfo._is_max_reasoning_effort_model(model) or (
+            model is not None and AnthropicModelInfo._is_claude_4_6_model(model)
+        )
+
     def is_effort_used(
         self, optional_params: Optional[dict], model: Optional[str] = None
     ) -> bool:
@@ -293,16 +354,16 @@ class AnthropicModelInfo(BaseLLMModelInfo):
         Check if effort parameter is being used and requires a beta header.
 
         Returns True if effort-related parameters are present and
-        the model requires the effort beta header. Claude 4.6 models and
-        Claude Opus 4.7 use output_config as a stable API feature — no beta
-        header needed.
+        the model requires the effort beta header. Stable-effort models
+        (metadata-flagged, e.g. canonical claude-opus-5, and Claude 4.6/4.7)
+        use output_config as a stable API feature — no beta header needed.
         """
         if not optional_params:
             return False
 
-        # Claude 4.6 models and Claude Opus 4.7 use output_config as a stable
-        # API feature — no beta header needed
-        if model and self._is_claude_4_6_model(model):
+        # Stable-effort models use output_config as a stable API feature —
+        # no beta header needed
+        if model and self._uses_stable_effort_api(model):
             return False
 
         # Check if reasoning_effort is provided for Claude Opus 4.5

@@ -1662,7 +1662,7 @@ def test_max_effort_rejected_for_opus_45():
     messages = [{"role": "user", "content": "Test"}]
 
     with pytest.raises(
-        ValueError, match="effort='max' is only supported by Claude Opus 4.6/4.7"
+        ValueError, match="effort='max' is not supported for this Anthropic model"
     ):
         optional_params = {"output_config": {"effort": "max"}}
         config.transform_request(
@@ -1672,6 +1672,25 @@ def test_max_effort_rejected_for_opus_45():
             litellm_params={},
             headers={}
         )
+
+
+def test_max_effort_rejection_names_unsupported_model():
+    """Unsupported models get the metadata-driven rejection message naming the model."""
+    config = AnthropicConfig()
+
+    with pytest.raises(ValueError) as exc_info:
+        config.transform_request(
+            model="claude-opus-4-5-20251101",
+            messages=[{"role": "user", "content": "Test"}],
+            optional_params={"output_config": {"effort": "max"}},
+            litellm_params={},
+            headers={},
+        )
+
+    message = str(exc_info.value)
+    assert "effort='max' is not supported for this Anthropic model" in message
+    assert "claude-opus-4-5-20251101" in message
+    assert "only supported by Claude Opus 4.6/4.7" not in message
 
 
 def test_effort_with_other_features():
@@ -2220,7 +2239,7 @@ def test_max_effort_rejected_for_sonnet_46():
     messages = [{"role": "user", "content": "Test"}]
 
     with pytest.raises(
-        ValueError, match="effort='max' is only supported by Claude Opus 4.6/4.7"
+        ValueError, match="effort='max' is not supported for this Anthropic model"
     ):
         config.transform_request(
             model="claude-sonnet-4-6-20260219",
@@ -3422,3 +3441,133 @@ def test_map_tool_helper_empty_parameters_get_default():
     assert result is not None
     assert result["input_schema"]["type"] == "object"
     assert result["input_schema"].get("properties") == {}
+
+
+# ============ CFG-013 Body B: metadata-driven stable effort/max ============
+
+
+@pytest.fixture
+def opus_5_stable_effort_metadata(monkeypatch):
+    """
+    Deterministic claude-opus-5 metadata mirroring the CFG-013 Body A catalog
+    entry, so these shared-behavior tests pass regardless of catalog state.
+    """
+    import litellm
+
+    entry = {
+        "litellm_provider": "anthropic",
+        "mode": "chat",
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "supports_reasoning": True,
+        "supports_max_reasoning_effort": True,
+    }
+    monkeypatch.setitem(litellm.model_cost, "claude-opus-5", entry)
+    monkeypatch.setitem(litellm.model_cost, "anthropic/claude-opus-5", entry)
+    return entry
+
+
+def test_opus_5_reasoning_effort_max_maps_to_adaptive_thinking_and_output_config(
+    opus_5_stable_effort_metadata,
+):
+    """reasoning_effort=max maps to adaptive thinking + output_config.effort=max."""
+    config = AnthropicConfig()
+
+    result = config.map_openai_params(
+        non_default_params={"reasoning_effort": "max"},
+        optional_params={},
+        model="claude-opus-5",
+        drop_params=False,
+    )
+
+    assert result["thinking"]["type"] == "adaptive"
+    assert "budget_tokens" not in result["thinking"]
+    assert result["output_config"]["effort"] == "max"
+
+
+def test_opus_5_reasoning_effort_max_merges_into_existing_output_config(
+    opus_5_stable_effort_metadata,
+):
+    """Unrelated output_config fields survive the reasoning_effort merge."""
+    config = AnthropicConfig()
+
+    result = config.map_openai_params(
+        non_default_params={"reasoning_effort": "max"},
+        optional_params={"output_config": {"verbosity": "high"}},
+        model="claude-opus-5",
+        drop_params=False,
+    )
+
+    assert result["output_config"]["effort"] == "max"
+    assert result["output_config"]["verbosity"] == "high"
+
+
+def test_max_effort_accepted_for_metadata_capable_opus_5(
+    opus_5_stable_effort_metadata,
+):
+    """transform_request accepts output_config.effort=max for canonical opus-5."""
+    config = AnthropicConfig()
+
+    result = config.transform_request(
+        model="claude-opus-5",
+        messages=[{"role": "user", "content": "Test"}],
+        optional_params={"output_config": {"effort": "max"}},
+        litellm_params={},
+        headers={},
+    )
+
+    assert result["output_config"]["effort"] == "max"
+
+
+def test_stable_effort_model_skips_effort_beta_header(
+    opus_5_stable_effort_metadata,
+):
+    """Stable effort models do not add the obsolete effort beta header."""
+    from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+
+    model_info = AnthropicModelInfo()
+    optional_params = {"output_config": {"effort": "max"}}
+
+    assert (
+        model_info.is_effort_used(optional_params=optional_params, model="claude-opus-5")
+        is False
+    )
+    betas = model_info.get_anthropic_beta_list(
+        model="claude-opus-5", optional_params=optional_params
+    )
+    assert all("effort" not in beta for beta in betas)
+
+
+def test_stable_effort_not_keyed_on_expert_alias(
+    opus_5_stable_effort_metadata,
+):
+    """No stable/max behavior is keyed on the alias name 'expert'."""
+    from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+
+    assert AnthropicModelInfo._uses_stable_effort_api("expert") is False
+    assert AnthropicModelInfo._supports_max_effort("expert") is False
+
+
+def test_legacy_opus_45_preserves_budget_and_beta_behavior(
+    opus_5_stable_effort_metadata,
+):
+    """Non-stable Anthropic models keep budget-token thinking and beta header."""
+    from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+
+    model_info = AnthropicModelInfo()
+    optional_params = {"output_config": {"effort": "high"}}
+
+    thinking = AnthropicConfig._map_reasoning_effort(
+        "high", "claude-opus-4-5-20251101"
+    )
+    assert thinking is not None
+    assert thinking["type"] == "enabled"
+    assert "budget_tokens" in thinking
+
+    assert (
+        model_info.is_effort_used(
+            optional_params=optional_params, model="claude-opus-4-5-20251101"
+        )
+        is True
+    )

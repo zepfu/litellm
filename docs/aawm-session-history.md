@@ -1276,10 +1276,14 @@ dedicated Z.AI Coding Plan and does not represent Alibaba GLM.
 `basic` is the config-driven low-cost alias. `work` uses
 `gpt-5.3-codex-spark`, then the internal `work-other` alias, then for Claude
 origins only the native Anthropic Sonnet tail, and finally `gpt-5.6-luna`.
-`work-other` is internal and is not selectable or advertised. `expert` remains
-structurally planned and fail-closed/deferred because native Anthropic Opus 5
-and its `[1m]` variant are unavailable. Anthropic models remain native
-Anthropic egress only.
+`work-other` is internal and is not selectable or advertised. `expert` uses
+Claude-origin native Anthropic `claude-opus-5` first, then universal
+`gpt-5.6-terra` as the last resort with authoritative `reasoning_effort: max`
+on both candidates (CFG-006). Canonical Opus 5 is inherently 1M-context, so
+there is no `claude-opus-5[1m]` selector; Terra is the direct/default
+candidate for Codex/non-Claude/missing/unknown origins and remains eligible
+for Claude after an Opus failure. Anthropic models remain native Anthropic
+egress only.
 
 OpenAI `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` pricing in
 `model_prices_and_context_window.json` follows the official GPT-5.6 preview page

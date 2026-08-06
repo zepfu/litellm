@@ -9181,6 +9181,15 @@
             "fast": 6.0
         }
     },
+    "claude-opus-5": {
+        "litellm_provider": "anthropic",
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "mode": "chat",
+        "supports_max_reasoning_effort": true,
+        "supports_reasoning": true
+    },
     "claude-opus-4-6-20260205": {
         "cache_creation_input_token_cost": 6.25e-06,
         "cache_creation_input_token_cost_above_200k_tokens": 1.25e-05,

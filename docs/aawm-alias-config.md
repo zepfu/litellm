@@ -149,6 +149,33 @@ candidates are the `qwen3.8-max-preview` promo, `kimi-for-coding`, and
 `gpt-5.4-mini`. The former `read` name is unsupported; it is not a
 compatibility alias or redirect.
 
+## Maintained `expert` alias behavior (CFG-013)
+
+The `expert` alias is a public, directly selectable alias compiled from
+`expert.yaml` in the canonical directory. It has exactly two candidates:
+
+1. **Claude-origin requests only** (`tui_attached: Claude`): native Anthropic
+   `claude-opus-5`, highest priority. Canonical Opus 5 is inherently a
+   1M-context model, so there is no `claude-opus-5[1m]` selector; a second
+   selector would duplicate the same upstream model.
+2. **Universal last resort** (`priority: 0`): OpenAI/Codex `gpt-5.6-terra`.
+   Terra carries no `tui_excluded` gate, so it is the direct/default candidate
+   for Codex, non-Claude, missing, unknown, and otherwise unconfigured
+   origins, and it remains available to Claude as the fallback after an Opus
+   failure.
+
+Both candidates carry authoritative `reasoning_effort: max`. This value
+replaces caller-provided reasoning through the shared CFG-006 candidate
+pipeline; there is no expert-specific reasoning precedence.
+
+The provider-native credential boundary applies: Opus uses
+`anthropic_messages` on both ingress projections and must egress exclusively
+through Anthropic-native credentials. The Codex ingress excludes
+`anthropic_messages` candidates, so Opus never routes through Codex/OpenAI
+credentials; Terra uses `codex_responses` (projected to
+`anthropic_openai_responses_adapter` on Anthropic ingress) and keeps its
+OpenAI/Codex credential domain on both ingresses.
+
 ## Provider-native credential boundary
 
 Anthropic/Claude model traffic must egress exclusively through

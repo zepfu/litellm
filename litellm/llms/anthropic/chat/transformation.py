@@ -174,24 +174,6 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
             tool_call["caller"] = cast(Dict[str, Any], anthropic_tool_content["caller"])  # type: ignore[typeddict-item]
         return tool_call
 
-    @staticmethod
-    def _is_opus_4_6_model(model: str) -> bool:
-        """Check if the model is specifically Claude Opus 4.6 or 4.7."""
-        model_lower = model.lower()
-        return any(
-            v in model_lower
-            for v in (
-                "opus-4-6",
-                "opus_4_6",
-                "opus-4.6",
-                "opus_4.6",
-                "opus-4-7",
-                "opus_4_7",
-                "opus-4.7",
-                "opus_4.7",
-            )
-        )
-
     def get_supported_openai_params(self, model: str):
         params = [
             "stream",
@@ -757,7 +739,11 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
     ) -> Optional[AnthropicThinkingParam]:
         if reasoning_effort is None or reasoning_effort == "none":
             return None
-        if AnthropicConfig._is_claude_4_6_model(model):
+        # Stable-effort Anthropic models (metadata-flagged, e.g. canonical
+        # claude-opus-5, plus the Claude 4.6/4.7 backward-compatible
+        # fallback) use adaptive thinking; effort is controlled via
+        # output_config, not thinking budget_tokens.
+        if AnthropicConfig._uses_stable_effort_api(model):
             return AnthropicThinkingParam(
                 type="adaptive",
             )
@@ -1047,10 +1033,12 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
                 optional_params["thinking"] = AnthropicConfig._map_reasoning_effort(
                     reasoning_effort=value, model=model
                 )
-                # For Claude 4.6 models and Claude Opus 4.7, effort is controlled
-                # via output_config, not thinking budget_tokens. Map
+                # For stable-effort Anthropic models (metadata-flagged, e.g.
+                # canonical claude-opus-5, plus the Claude 4.6/4.7
+                # backward-compatible fallback), effort is controlled via
+                # output_config, not thinking budget_tokens. Map
                 # reasoning_effort to output_config.
-                if AnthropicConfig._is_claude_4_6_model(model):
+                if AnthropicConfig._uses_stable_effort_api(model):
                     effort_map = {
                         "low": "low",
                         "minimal": "low",
@@ -1059,7 +1047,14 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
                         "max": "max",
                     }
                     mapped_effort = effort_map.get(value, value)
-                    optional_params["output_config"] = {"effort": mapped_effort}
+                    output_config = optional_params.get("output_config")
+                    merged_output_config = (
+                        dict(output_config)
+                        if isinstance(output_config, dict)
+                        else {}
+                    )
+                    merged_output_config["effort"] = mapped_effort
+                    optional_params["output_config"] = merged_output_config
             elif param == "web_search_options" and isinstance(value, dict):
                 hosted_web_search_tool = self.map_web_search_tool(
                     cast(OpenAIWebSearchOptions, value)
@@ -1449,9 +1444,9 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
                     raise ValueError(
                         f"Invalid effort value: {effort}. Must be one of: 'high', 'medium', 'low', 'max'"
                     )
-                if effort == "max" and not self._is_opus_4_6_model(model):
+                if effort == "max" and not self._supports_max_effort(model):
                     raise ValueError(
-                        f"effort='max' is only supported by Claude Opus 4.6/4.7. Got model: {model}"
+                        f"effort='max' is not supported for this Anthropic model. Got model: {model}"
                     )
                 data["output_config"] = output_config
 

@@ -744,3 +744,67 @@ class TestValidateEnvironmentMissingApiKey:
             )
 
         assert "not Anthropic provider credentials" in exc_info.value.message
+
+
+class TestStableEffortPredicates:
+    """CFG-013 Body B: shared metadata-driven stable effort predicates."""
+
+    @pytest.fixture
+    def opus_5_stable_effort_metadata(self, monkeypatch):
+        import litellm
+
+        entry = {
+            "litellm_provider": "anthropic",
+            "mode": "chat",
+            "supports_reasoning": True,
+            "supports_max_reasoning_effort": True,
+        }
+        monkeypatch.setitem(litellm.model_cost, "claude-opus-5", entry)
+        monkeypatch.setitem(litellm.model_cost, "anthropic/claude-opus-5", entry)
+        return entry
+
+    def test_metadata_flagged_model_uses_stable_effort_api(
+        self, opus_5_stable_effort_metadata
+    ):
+        from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+
+        assert AnthropicModelInfo._uses_stable_effort_api("claude-opus-5") is True
+        assert AnthropicModelInfo._supports_max_effort("claude-opus-5") is True
+        # effort output_config does not trigger the beta header
+        assert (
+            AnthropicModelInfo().is_effort_used(
+                optional_params={"output_config": {"effort": "max"}},
+                model="claude-opus-5",
+            )
+            is False
+        )
+
+    def test_legacy_names_only_fallback_without_metadata(self, monkeypatch):
+        """Claude 4.6/4.7 name checks remain as backward-compatible fallback."""
+        import litellm
+        from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+
+        monkeypatch.delitem(litellm.model_cost, "claude-opus-4-6-20260205", raising=False)
+
+        assert AnthropicModelInfo._uses_stable_effort_api("claude-opus-4-6-20260205") is True
+        assert AnthropicModelInfo._supports_max_effort("claude-opus-4-6-20260205") is True
+        # Sonnet 4.6 is stable-effort but not max-capable
+        assert AnthropicModelInfo._supports_max_effort("claude-sonnet-4-6-20260219") is False
+
+    def test_unrelated_models_keep_beta_budget_behavior(
+        self, opus_5_stable_effort_metadata
+    ):
+        from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+
+        model_info = AnthropicModelInfo()
+        assert model_info._uses_stable_effort_api("claude-opus-4-5-20251101") is False
+        assert model_info._supports_max_effort("claude-opus-4-5-20251101") is False
+        assert (
+            model_info.is_effort_used(
+                optional_params={"output_config": {"effort": "high"}},
+                model="claude-opus-4-5-20251101",
+            )
+            is True
+        )
+        assert model_info._uses_stable_effort_api(None) is False
+        assert model_info._supports_max_effort(None) is False

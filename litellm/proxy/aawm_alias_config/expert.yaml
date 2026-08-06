@@ -1,0 +1,47 @@
+# AAWM alias-routing config -- ``expert`` (CFG-013).
+# Claude-origin requests lead with native Anthropic Opus 5; every origin
+# keeps OpenAI/Codex gpt-5.6-terra as the universal last resort:
+#   - Claude-origin requests only: native Anthropic claude-opus-5
+#     (tui_attached: Claude). Canonical Opus 5 is inherently a 1M-context
+#     model; there is no claude-opus-5[1m] selector because a second
+#     selector would duplicate the same upstream model.
+#   - Codex and every non-Claude/missing/unknown origin: gpt-5.6-terra is
+#     the direct/default candidate. Terra carries no tui_excluded gate, so
+#     it also remains available to Claude as the fallback after an Opus
+#     failure.
+#
+# Both candidates carry authoritative ``reasoning_effort: max`` applied
+# through the shared CFG-006 candidate pipeline.
+#
+# Compiled by config_compiler.compile_yaml() into an immutable RoutingSnapshot.
+# priority: 0 is reserved for last-resort candidates and is always placed
+# last in the compiled ordering.
+
+defaults: {}
+
+aliases:
+  - name: expert
+    candidates:
+      # Claude-branch lead: native Anthropic Opus 5 only.
+      # Anthropic-native credentials/egress on both ingress projections;
+      # the Codex ingress excludes anthropic_messages candidates, so Opus
+      # can never egress through Codex/OpenAI credentials.
+      - provider: anthropic
+        model: claude-opus-5
+        route_family: anthropic_messages
+        anthropic_route_family: anthropic_messages
+        priority: 100
+        reasoning_effort: max
+        tui_attached: Claude
+
+      # Universal last resort: direct/default candidate for Codex and every
+      # non-Claude/missing/unknown origin, and still eligible for Claude
+      # after an Opus failure. CFG-006: the configured max reasoning
+      # replaces any caller-provided reasoning through the shared candidate
+      # pipeline; Terra keeps its OpenAI/Codex credential domain on both
+      # ingress projections.
+      - provider: openai
+        model: gpt-5.6-terra
+        route_family: codex_responses
+        priority: 0
+        reasoning_effort: max

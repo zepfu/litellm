@@ -12,6 +12,12 @@ Owned symbols:
 - ``_dispatch_auto_agent_alias_candidate_request``
 - ``_perform_anthropic_auto_agent_alias_candidate_request``
 - ``AliasCandidateDispatchRuntime``
+
+CFG-013 Body C: native Anthropic alias candidates on stable-effort models
+(metadata-flagged, e.g. canonical ``claude-opus-5``) shape ``reasoning_effort``
+through the shared ``AnthropicConfig.map_openai_params`` mapper (Body B), which
+emits adaptive ``thinking`` plus a merged ``output_config.effort`` instead of a
+duplicate hardcoded mapping.
 """
 
 from __future__ import annotations
@@ -330,12 +336,47 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(
                 native_provider="anthropic",
             )
             if normalized_native_effort and normalized_native_effort.native_value:
-                mapped_native_thinking = AnthropicConfig._map_reasoning_effort(
-                    normalized_native_effort.native_value,
-                    native_model,
-                )
-                if mapped_native_thinking:
-                    native_candidate_body["thinking"] = mapped_native_thinking
+                # CFG-013 Body C: stable-effort Anthropic models
+                # (metadata-flagged, e.g. canonical claude-opus-5, plus the
+                # Claude 4.6/4.7 backward-compatible fallback) carry effort in
+                # ``output_config`` with adaptive thinking. Shape through the
+                # shared AnthropicConfig mapper introduced by Body B instead of
+                # duplicating the hardcoded effort mapping; the mapper merges
+                # into any existing ``output_config`` without mutating it.
+                if AnthropicConfig._uses_stable_effort_api(native_model):
+                    # Seed the mapper with the existing output_config (copied)
+                    # so unrelated fields survive the Body B effort merge.
+                    existing_output_config = native_candidate_body.get(
+                        "output_config"
+                    )
+                    seeded_optional_params: dict[str, Any] = {}
+                    if isinstance(existing_output_config, dict):
+                        seeded_optional_params["output_config"] = dict(
+                            existing_output_config
+                        )
+                    mapped_optional_params = AnthropicConfig().map_openai_params(
+                        non_default_params={
+                            "reasoning_effort": normalized_native_effort.native_value
+                        },
+                        optional_params=seeded_optional_params,
+                        model=native_model,
+                        drop_params=False,
+                    )
+                    mapped_thinking = mapped_optional_params.get("thinking")
+                    if isinstance(mapped_thinking, dict):
+                        native_candidate_body["thinking"] = mapped_thinking
+                    mapped_output_config = mapped_optional_params.get(
+                        "output_config"
+                    )
+                    if isinstance(mapped_output_config, dict):
+                        native_candidate_body["output_config"] = mapped_output_config
+                else:
+                    mapped_native_thinking = AnthropicConfig._map_reasoning_effort(
+                        normalized_native_effort.native_value,
+                        native_model,
+                    )
+                    if mapped_native_thinking:
+                        native_candidate_body["thinking"] = mapped_native_thinking
         (
             native_candidate_body,
             native_custom_headers,

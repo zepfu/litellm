@@ -77,6 +77,27 @@ def _restore_alias_candidate_dispatch_runtime() -> Generator[None, None, None]:
     _mod._runtime = saved
 
 
+@pytest.fixture
+def opus_5_stable_effort_metadata(monkeypatch):
+    """Deterministic claude-opus-5 metadata mirroring the CFG-013 Body A
+    catalog entry, so Body C dispatch tests pass regardless of catalog state.
+    """
+    import litellm
+
+    entry = {
+        "litellm_provider": "anthropic",
+        "mode": "chat",
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "supports_reasoning": True,
+        "supports_max_reasoning_effort": True,
+    }
+    monkeypatch.setitem(litellm.model_cost, "claude-opus-5", entry)
+    monkeypatch.setitem(litellm.model_cost, "anthropic/claude-opus-5", entry)
+    return entry
+
+
 # ---------------------------------------------------------------------------
 # _dispatch_auto_agent_alias_candidate_request
 # ---------------------------------------------------------------------------
@@ -495,3 +516,159 @@ class TestSeamDisposition:
     def test_disposition_values_reference_runtime(self):
         for key, value in ALIAS_CANDIDATE_DISPATCH_SEAM_DISPOSITION.items():
             assert value == f"runtime.{key}"
+
+
+# ---------------------------------------------------------------------------
+# CFG-013 Body C: native alias-candidate dispatch integration
+# ---------------------------------------------------------------------------
+
+
+class TestCfg013BodyCNativeDispatch:
+    """Native Anthropic alias-candidate shaping for stable-effort models.
+
+    Canonical ``claude-opus-5`` with ``reasoning_effort: max`` must egress as
+    adaptive ``thinking`` plus merged ``output_config.effort: max`` via the
+    shared Body B mapper, without mutating the input payload, and without
+    leaking transformed Opus state into a later Terra attempt.
+    """
+
+    async def _run_native(
+        self,
+        candidate_body: dict[str, Any],
+        *,
+        candidate_model: str = "claude-opus-5",
+        provider: str = "anthropic",
+        **runtime_overrides: Any,
+    ) -> dict[str, Any]:
+        rt = _make_runtime(**runtime_overrides)
+        _install_runtime(rt)
+        await _perform_anthropic_auto_agent_alias_candidate_request(
+            endpoint="/v1/messages",
+            request=MagicMock(),
+            fastapi_response=MagicMock(),
+            user_api_key_dict=MagicMock(),
+            candidate={
+                "model": candidate_model,
+                "provider": provider,
+                "route_family": "",
+            },
+            candidate_body=candidate_body,
+            target_url="https://api.anthropic.com",
+            custom_headers={},
+        )
+        return rt.safe_set_request_parsed_body.call_args.args[1]
+
+    @pytest.mark.asyncio
+    async def test_opus_5_max_shapes_adaptive_thinking_and_output_config(
+        self, opus_5_stable_effort_metadata
+    ):
+        """Opus 5 max egress: top-level reasoning_effort removed, adaptive
+        thinking plus output_config.effort=max emitted via shared mapper."""
+        sent_body = await self._run_native(
+            {"model": "claude-opus-5", "reasoning_effort": "max"}
+        )
+        assert "reasoning_effort" not in sent_body
+        assert sent_body["thinking"] == {"type": "adaptive"}
+        assert sent_body["output_config"]["effort"] == "max"
+
+    @pytest.mark.asyncio
+    async def test_opus_5_max_merges_into_existing_output_config(
+        self, opus_5_stable_effort_metadata
+    ):
+        """Unrelated existing output_config fields survive the effort merge."""
+        sent_body = await self._run_native(
+            {
+                "model": "claude-opus-5",
+                "reasoning_effort": "max",
+                "output_config": {"verbosity": "high"},
+            }
+        )
+        assert sent_body["output_config"] == {"verbosity": "high", "effort": "max"}
+
+    @pytest.mark.asyncio
+    async def test_opus_5_max_does_not_mutate_input_payload(
+        self, opus_5_stable_effort_metadata
+    ):
+        """The input candidate body is never mutated in place."""
+        original_output_config = {"verbosity": "high"}
+        candidate_body = {
+            "model": "claude-opus-5",
+            "reasoning_effort": "max",
+            "output_config": original_output_config,
+        }
+        await self._run_native(candidate_body)
+        assert candidate_body == {
+            "model": "claude-opus-5",
+            "reasoning_effort": "max",
+            "output_config": {"verbosity": "high"},
+        }
+        assert original_output_config == {"verbosity": "high"}
+
+    @pytest.mark.asyncio
+    async def test_no_raw_effort_leaks_into_a_later_terra_attempt(
+        self, opus_5_stable_effort_metadata
+    ):
+        """A fresh Terra payload built from the original body after an Opus
+        attempt carries no transformed Opus state (thinking/output_config)."""
+        candidate_body = {
+            "model": "claude-opus-5",
+            "reasoning_effort": "max",
+        }
+        await self._run_native(candidate_body)
+        terra_payload = dict(candidate_body)
+        terra_payload["model"] = "gpt-5.6-terra"
+        assert "thinking" not in terra_payload
+        assert "output_config" not in terra_payload
+        assert terra_payload.get("reasoning_effort") == "max"
+
+    @pytest.mark.asyncio
+    async def test_non_anthropic_candidates_unchanged(self):
+        """Non-native providers receive candidate_body as prepared, with no
+        Anthropic effort shaping."""
+        rt = _make_runtime()
+        _install_runtime(rt)
+        candidate_body = {"model": "gpt-5.6-terra", "reasoning_effort": "max"}
+        await _perform_anthropic_auto_agent_alias_candidate_request(
+            endpoint="/v1/responses",
+            request=MagicMock(),
+            fastapi_response=MagicMock(),
+            user_api_key_dict=MagicMock(),
+            candidate={
+                "model": "gpt-5.6-terra",
+                "provider": "codex_native",
+                "route_family": "",
+            },
+            candidate_body=candidate_body,
+            target_url="https://api.anthropic.com",
+            custom_headers={},
+        )
+        kw = rt.handle_openai_responses.call_args.kwargs
+        assert kw["prepared_request_body"] is candidate_body
+        assert candidate_body == {"model": "gpt-5.6-terra", "reasoning_effort": "max"}
+        assert "thinking" not in candidate_body
+        assert "output_config" not in candidate_body
+
+    @pytest.mark.asyncio
+    async def test_unsupported_anthropic_max_falls_back_to_high_thinking(
+        self, opus_5_stable_effort_metadata
+    ):
+        """Anthropic models without max-effort support keep the legacy
+        behavior: max is clamped to high budget thinking, no output_config."""
+        sent_body = await self._run_native(
+            {"model": "claude-sonnet-4-5", "reasoning_effort": "max"},
+            candidate_model="claude-sonnet-4-5",
+        )
+        assert "reasoning_effort" not in sent_body
+        assert sent_body["thinking"]["type"] == "enabled"
+        assert isinstance(sent_body["thinking"].get("budget_tokens"), int)
+        assert "output_config" not in sent_body
+
+    @pytest.mark.asyncio
+    async def test_no_reasoning_effort_leaves_payload_untouched(
+        self, opus_5_stable_effort_metadata
+    ):
+        """Missing reasoning_effort leaves the payload otherwise untouched."""
+        sent_body = await self._run_native({"model": "claude-opus-5"})
+        assert "reasoning_effort" not in sent_body
+        assert "thinking" not in sent_body
+        assert "output_config" not in sent_body
