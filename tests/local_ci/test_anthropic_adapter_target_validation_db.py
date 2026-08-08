@@ -834,10 +834,10 @@ class TestTemplatePlaceholderResolution:
         self, harness, monkeypatch
     ):
         """Codex harness/validation tenant aliases map to the repository
-        identity for trace correlation, while emitted headers/session keep
-        the transient harness user ID."""
+        basename label (e.g. "litellm") recorded in traces, while emitted
+        headers/session keep the transient harness user ID."""
         monkeypatch.setattr(
-            harness, "_resolve_harness_repository", lambda: "aawm/litellm"
+            harness, "_resolve_harness_repository", lambda: "zepfu/litellm"
         )
         config = {
             "cli_passthrough": "codex",
@@ -854,7 +854,7 @@ class TestTemplatePlaceholderResolution:
         harness_user_id = harness.RA._build_claude_harness_user_id(
             target="dev", case_name="test_case"
         )
-        assert result["expected_user_ids"] == ["aawm/litellm"]
+        assert result["expected_user_ids"] == ["litellm"]
         assert harness_user_id in " ".join(str(v) for v in result["command"])
         assert result["expected_trace_session_id"] == f"{harness_user_id}.session"
 

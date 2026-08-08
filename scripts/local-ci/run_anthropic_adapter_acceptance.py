@@ -1435,7 +1435,10 @@ def _resolve_expected_session_history_tenant_id(
 ) -> str:
     if _is_harness_tenant_alias(tenant_id):
         if isinstance(repository, str) and repository.strip():
-            return repository.strip()
+            # AAWM records Codex traces/session history under the basename
+            # repository label (e.g. "litellm"), not the full
+            # "owner/repository" form returned by _resolve_harness_repository.
+            return repository.strip().rsplit('/', 1)[-1]
         return 'litellm'
     return tenant_id
 
