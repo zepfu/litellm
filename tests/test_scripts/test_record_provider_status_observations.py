@@ -2535,6 +2535,73 @@ def test_alibaba_subscription_parser_rejects_inactive_plan() -> None:
         loop._parse_alibaba_subscription_payload(payload)
 
 
+def test_alibaba_quota_payloads_emit_weekly_only_for_live_weekly_payload() -> None:
+    # Live authenticated usage payload from 2026-08-08: the 5-hour pair is
+    # wholly absent; only the weekly window is present.
+    usage = {
+        "per1WeekResetTime": 1786299120000,
+        "per1WeekPercentage": 1.0,
+    }
+
+    payloads = loop._build_alibaba_quota_rate_limit_payloads(
+        _alibaba_quota_poll_config(),
+        observed_at=datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc),
+        usage_payload=usage,
+        subscription=loop._parse_alibaba_subscription_payload(
+            _alibaba_subscription_payload()
+        ),
+    )
+
+    # Only the 7-day window, one row per active model identity.
+    assert [payload[6] for payload in payloads] == [
+        loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
+        loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
+    ]
+    assert [payload[7] for payload in payloads] == ["7d", "7d"]
+    assert [payload[5] for payload in payloads] == list(
+        loop.ALIBABA_TOKEN_PLAN_ACTIVE_MODELS
+    )
+    assert [payload[10] for payload in payloads] == [0.0, 0.0]
+    assert all(
+        payload[9] == datetime(2026, 8, 9, 18, 12, tzinfo=timezone.utc)
+        for payload in payloads
+    )
+    assert all(payload[18] == loop.ALIBABA_TOKEN_PLAN_SOURCE for payload in payloads)
+    for payload in payloads:
+        raw_provider_fields = json.loads(payload[16])
+        assert raw_provider_fields["window"] == "7d"
+        assert raw_provider_fields["remaining_pct"] == 0.0
+        assert raw_provider_fields["reset_at_state"] == "valid"
+
+
+def test_alibaba_quota_payloads_reject_empty_usage_payload() -> None:
+    with pytest.raises(ValueError, match="no recognized quota window"):
+        loop._build_alibaba_quota_rate_limit_payloads(
+            _alibaba_quota_poll_config(),
+            observed_at=datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc),
+            usage_payload={},
+            subscription=loop._parse_alibaba_subscription_payload(
+                _alibaba_subscription_payload()
+            ),
+        )
+
+
+def test_alibaba_quota_payloads_reject_partial_5h_window() -> None:
+    # Reset key present but percentage key absent is partial, not absent.
+    usage = _alibaba_usage_payload()
+    usage.pop("per5HourPercentage")
+
+    with pytest.raises(ValueError, match="per5HourPercentage"):
+        loop._build_alibaba_quota_rate_limit_payloads(
+            _alibaba_quota_poll_config(),
+            observed_at=datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc),
+            usage_payload=usage,
+            subscription=loop._parse_alibaba_subscription_payload(
+                _alibaba_subscription_payload()
+            ),
+        )
+
+
 @pytest.mark.parametrize("status_code", [401, 403])
 def test_fetch_alibaba_quota_payload_does_not_retry_auth_failure(
     monkeypatch,

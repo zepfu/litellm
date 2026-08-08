@@ -257,7 +257,7 @@ ALIBABA_TOKEN_PLAN_ACTIVE_MODELS = (
     "alibaba_token_plan/qwen3.6-flash",
 )
 ALIBABA_TOKEN_PLAN_SOURCE = "alibaba_token_plan_usage"
-ALIBABA_TOKEN_PLAN_PARSER_VERSION = "alibaba_token_plan_usage_v2"
+ALIBABA_TOKEN_PLAN_PARSER_VERSION = "alibaba_token_plan_usage_v3"
 ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY = "alibaba_token_plan_5h:credits"
 ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY = "alibaba_token_plan_7d:credits"
 ALIBABA_QUOTA_RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
@@ -5991,6 +5991,12 @@ def _build_alibaba_quota_rate_limit_payloads(
     )
     payloads: list[tuple[Any, ...]] = []
     for window, percentage_field, reset_field, quota_key in definitions:
+        # A window is absent only when both its percentage and reset keys are
+        # missing from the provider payload (the console omits unused windows,
+        # e.g. the 5-hour pair on a weekly-only account).  Wholly absent
+        # windows are skipped; partial/malformed windows still fail closed.
+        if percentage_field not in usage_payload and reset_field not in usage_payload:
+            continue
         consumed_fraction = _parse_alibaba_consumed_fraction(
             usage_payload.get(percentage_field),
             field_name=percentage_field,
@@ -6063,6 +6069,10 @@ def _build_alibaba_quota_rate_limit_payloads(
                     f"alibaba-quota-poll-{observed_at.strftime('%Y%m%d%H%M%S')}",
                 )
             )
+    if not payloads:
+        raise ValueError(
+            "Alibaba usage payload has no recognized quota window."
+        )
     return payloads
 
 
