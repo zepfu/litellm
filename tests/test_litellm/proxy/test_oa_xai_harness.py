@@ -17,7 +17,7 @@ from litellm.integrations.aawm_agent_identity import (
     _build_session_history_record,
     _finalize_rate_limit_observation,
 )
-from litellm.llms.xai import oauth
+from litellm.llms.xai import oauth, route_descriptors
 from litellm.litellm_core_utils.get_litellm_params import get_litellm_params
 from litellm.litellm_core_utils.litellm_logging import StandardLoggingPayloadSetup
 from litellm.proxy.route_llm_request import route_request
@@ -137,12 +137,18 @@ class OaXaiHarness:
     "public_model,upstream_model", OaXaiHarness.public_to_upstream.items()
 )
 def test_oa_xai_harness_maps_all_public_models(public_model, upstream_model):
+    descriptor = route_descriptors.resolve_oa_xai_route_descriptor(public_model)
     metadata = oauth.build_oa_xai_metadata(public_model, upstream_model)
     catalog = json.loads(
         Path("model_prices_and_context_window.json").read_text(encoding="utf-8")
     )
 
     assert oauth.resolve_oa_xai_upstream_model(public_model) == upstream_model
+    assert descriptor.public_model == public_model
+    assert descriptor.upstream_model == upstream_model
+    assert descriptor.route_family == "xai_oauth_api"
+    assert descriptor.credential_family == "xai_oauth"
+    assert descriptor.auth_mode == "oauth"
     assert catalog[public_model]["mode"] == "responses"
     if public_model == "oa_xai/grok-4.5":
         assert catalog[public_model]["input_cost_per_token"] == 0.000002
@@ -174,8 +180,59 @@ def test_grok_native_oauth_model_selection_includes_build_0_1(
     model,
     normalized,
 ):
+    descriptor = route_descriptors.get_grok_native_route_descriptor(model)
+    metadata = oauth.build_grok_native_oauth_metadata(normalized)
+
+    assert descriptor is not None
+    assert descriptor.public_model == normalized
+    assert descriptor.upstream_model == normalized
+    assert descriptor.route_family == "grok_cli_chat_proxy"
+    assert descriptor.credential_family == "xai_grok_oidc"
+    assert descriptor.auth_mode == "grok_oidc"
+    assert metadata["route_family"] == descriptor.route_family
+    assert metadata["credential_family"] == descriptor.credential_family
+    assert metadata["auth_mode"] == descriptor.auth_mode
     assert oauth.normalize_grok_native_oauth_model(model) == normalized
     assert oauth.is_grok_native_oauth_model(model) is True
+
+
+def test_xai_route_descriptors_keep_unknown_managed_policy_and_native_boundary():
+    unknown_managed_model = "oa_xai/grok-future"
+    managed = route_descriptors.get_xai_route_descriptor(unknown_managed_model)
+    native = route_descriptors.get_xai_route_descriptor("xai/grok-4.5")
+
+    assert managed is not None
+    assert managed.public_model == unknown_managed_model
+    assert managed.upstream_model == "xai/grok-future"
+    assert managed.route_family == "xai_oauth_api"
+    assert managed.credential_family == "xai_oauth"
+    assert managed.auth_mode == "oauth"
+    assert oauth.is_oa_xai_model(unknown_managed_model) is True
+    assert (
+        oauth.resolve_oa_xai_upstream_model(unknown_managed_model)
+        == "xai/grok-future"
+    )
+    unknown_metadata = oauth.build_oa_xai_metadata(
+        unknown_managed_model,
+        managed.upstream_model,
+    )
+    assert unknown_metadata["route_family"] == managed.route_family
+    assert unknown_metadata["credential_family"] == managed.credential_family
+    assert unknown_metadata["auth_mode"] == managed.auth_mode
+    with pytest.raises(ValueError, match="authoritative route descriptor"):
+        oauth.build_oa_xai_metadata(
+            unknown_managed_model,
+            "xai/different-model",
+        )
+
+    assert native is not None
+    assert native.public_model == "grok-4.5"
+    assert native.upstream_model == "grok-4.5"
+    assert native.route_family == "grok_cli_chat_proxy"
+    assert native.credential_family == "xai_grok_oidc"
+    assert native.auth_mode == "grok_oidc"
+    assert route_descriptors.get_xai_route_descriptor("xai/grok-future") is None
+    assert oauth.normalize_grok_native_oauth_model("xai/grok-future") is None
 
 
 def test_litellm_dev_grok_native_oidc_auth_is_sidecar_refreshed_read_only() -> None:

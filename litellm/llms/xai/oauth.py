@@ -19,18 +19,28 @@ from typing import Any, Dict, Optional
 import httpx  # noqa: F401  # harness patch surface; refresh path removed (RR-040)
 
 from litellm.constants import XAI_API_BASE
+from litellm.llms.xai import route_descriptors as _xai_route_descriptors
+from litellm.llms.xai.route_descriptors import (
+    get_grok_native_route_descriptor,
+    get_oa_xai_route_descriptor,
+    resolve_oa_xai_route_descriptor,
+)
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.secret_managers.grok_oidc_auth_path import (
     resolve_grok_oidc_auth_path,
 )
 from litellm.secret_managers.main import get_secret_str
 
-OA_XAI_PROVIDER_PREFIX = "oa_xai/"
-XAI_OAUTH_ROUTE_FAMILY = "xai_oauth_api"
-XAI_OAUTH_CREDENTIAL_FAMILY = "xai_oauth"
+OA_XAI_PROVIDER_PREFIX = _xai_route_descriptors.OA_XAI_PROVIDER_PREFIX
+XAI_OAUTH_ROUTE_FAMILY = _xai_route_descriptors.XAI_OAUTH_ROUTE_FAMILY
+XAI_OAUTH_CREDENTIAL_FAMILY = _xai_route_descriptors.XAI_OAUTH_CREDENTIAL_FAMILY
 XAI_GROK_SUBSCRIPTION_QUOTA_FAMILY = "xai_grok_subscription"
-GROK_NATIVE_OAUTH_ROUTE_FAMILY = "grok_cli_chat_proxy"
-GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY = "xai_grok_oidc"
+GROK_NATIVE_OAUTH_ROUTE_FAMILY = (
+    _xai_route_descriptors.GROK_NATIVE_OAUTH_ROUTE_FAMILY
+)
+GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY = (
+    _xai_route_descriptors.GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY
+)
 GROK_NATIVE_OAUTH_CLIENT_NAME = "grok-build"
 
 _DEFAULT_XAI_OAUTH_SCOPE = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
@@ -39,23 +49,6 @@ _DEFAULT_REFRESH_BUFFER_SECONDS = 300
 _DEFAULT_HERMES_XAI_OAUTH_PROVIDER_ID = "xai-oauth"
 _DEFAULT_HERMES_AUTH_PATH = "~/.hermes/auth.json"
 _DEFAULT_LITELLM_XAI_OAUTH_AUTH_PATH = "~/.litellm/xai/oauth-auth.json"
-
-_GROK_NATIVE_OAUTH_MODELS = frozenset(
-    {
-        "grok-build",
-        "grok-build-0.1",
-        "grok-composer-2.5-fast",
-        "grok-4.5",
-    }
-)
-
-_XAI_OAUTH_MODEL_MAP = {
-    "oa_xai/grok-4.3": "xai/grok-4.3",
-    "oa_xai/grok-4.5": "xai/grok-4.5",
-    "oa_xai/grok-4.20-0309-reasoning": "xai/grok-4.20-0309-reasoning",
-    "oa_xai/grok-4.20-0309-non-reasoning": "xai/grok-4.20-0309-non-reasoning",
-    "oa_xai/grok-4.20-multi-agent-0309": "xai/grok-4.20-multi-agent-0309",
-}
 
 _XAI_RESPONSES_PREVIOUS_RESPONSE_ID_DECODED_METADATA = {
     "xai_responses_previous_response_id_decoded": True,
@@ -90,41 +83,37 @@ def _write_private_file_text(path: Path, content: str, *, mode: int = 0o600) -> 
 
 
 def is_oa_xai_model(model: Any) -> bool:
-    return isinstance(model, str) and model.startswith(OA_XAI_PROVIDER_PREFIX)
+    return get_oa_xai_route_descriptor(model) is not None
 
 
 def normalize_grok_native_oauth_model(model: Any) -> Optional[str]:
-    if not isinstance(model, str):
-        return None
-    candidate = model.strip()
-    if candidate.startswith("xai/"):
-        candidate = candidate[len("xai/") :]
-    if candidate in _GROK_NATIVE_OAUTH_MODELS:
-        return candidate
-    return None
+    descriptor = get_grok_native_route_descriptor(model)
+    return descriptor.public_model if descriptor is not None else None
 
 
 def is_grok_native_oauth_model(model: Any) -> bool:
-    return normalize_grok_native_oauth_model(model) is not None
+    return get_grok_native_route_descriptor(model) is not None
 
 
 def resolve_oa_xai_upstream_model(model: str) -> str:
-    if model in _XAI_OAUTH_MODEL_MAP:
-        return _XAI_OAUTH_MODEL_MAP[model]
-    if is_oa_xai_model(model):
-        return "xai/" + model[len(OA_XAI_PROVIDER_PREFIX) :]
-    raise ValueError(f"Unsupported xAI OAuth-managed model: {model}")
+    return resolve_oa_xai_route_descriptor(model).upstream_model
 
 
 def build_oa_xai_metadata(public_model: str, upstream_model: str) -> Dict[str, Any]:
+    descriptor = resolve_oa_xai_route_descriptor(public_model)
+    if upstream_model != descriptor.upstream_model:
+        raise ValueError(
+            "xAI OAuth upstream model does not match the authoritative route "
+            f"descriptor for {public_model}."
+        )
     return {
-        "auth_mode": "oauth",
-        "credential_family": XAI_OAUTH_CREDENTIAL_FAMILY,
-        "passthrough_route_family": XAI_OAUTH_ROUTE_FAMILY,
-        "route_family": XAI_OAUTH_ROUTE_FAMILY,
+        "auth_mode": descriptor.auth_mode,
+        "credential_family": descriptor.credential_family,
+        "passthrough_route_family": descriptor.route_family,
+        "route_family": descriptor.route_family,
         "xai_oauth_managed": True,
-        "xai_oauth_public_model": public_model,
-        "xai_oauth_upstream_model": upstream_model,
+        "xai_oauth_public_model": descriptor.public_model,
+        "xai_oauth_upstream_model": descriptor.upstream_model,
         "xai_quota_family": XAI_GROK_SUBSCRIPTION_QUOTA_FAMILY,
         "shared_quota_family": XAI_GROK_SUBSCRIPTION_QUOTA_FAMILY,
         "grok_subscription_quota_shared": True,
@@ -139,16 +128,19 @@ def build_oa_xai_metadata(public_model: str, upstream_model: str) -> Dict[str, A
 
 
 def build_grok_native_oauth_metadata(public_model: str) -> Dict[str, Any]:
+    descriptor = get_grok_native_route_descriptor(public_model)
+    if descriptor is None:
+        raise ValueError(f"Unsupported Grok native OIDC model: {public_model}")
     return {
-        "auth_mode": "grok_oidc",
-        "credential_family": GROK_NATIVE_OAUTH_CREDENTIAL_FAMILY,
+        "auth_mode": descriptor.auth_mode,
+        "credential_family": descriptor.credential_family,
         "client_name": GROK_NATIVE_OAUTH_CLIENT_NAME,
         "grok_cli_chat_proxy": True,
-        "grok_model_override": public_model,
+        "grok_model_override": descriptor.upstream_model,
         "grok_native_oauth_managed": True,
-        "model_group": public_model,
-        "passthrough_route_family": GROK_NATIVE_OAUTH_ROUTE_FAMILY,
-        "route_family": GROK_NATIVE_OAUTH_ROUTE_FAMILY,
+        "model_group": descriptor.public_model,
+        "passthrough_route_family": descriptor.route_family,
+        "route_family": descriptor.route_family,
         "shared_quota_family": XAI_GROK_SUBSCRIPTION_QUOTA_FAMILY,
         "xai_cli_chat_proxy": True,
         "xai_quota_family": XAI_GROK_SUBSCRIPTION_QUOTA_FAMILY,
@@ -158,7 +150,7 @@ def build_grok_native_oauth_metadata(public_model: str) -> Dict[str, Any]:
             "auth:grok_oidc",
             "provider:xai",
             "quota:xai_grok_subscription",
-            f"grok-model:{public_model}",
+            f"grok-model:{descriptor.public_model}",
         ],
     }
 
