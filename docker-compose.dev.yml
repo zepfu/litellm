@@ -90,6 +90,7 @@ services:
       - ./litellm/proxy/pass_through_endpoints/llm_provider_handlers/gemini_passthrough_logging_handler.py:/app/litellm/proxy/pass_through_endpoints/llm_provider_handlers/gemini_passthrough_logging_handler.py
       - ./litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py:/app/litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py
       - ./litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py:/app/litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py
+      - ./litellm/proxy/pass_through_endpoints/aawm_context_query.py:/app/litellm/proxy/pass_through_endpoints/aawm_context_query.py:ro
       - ./litellm/proxy/pass_through_endpoints/aawm_alias_routing:/app/litellm/proxy/pass_through_endpoints/aawm_alias_routing:ro
       - ./litellm/secret_managers/codex_oauth_inventory.py:/app/litellm/secret_managers/codex_oauth_inventory.py:ro
       - ./litellm/secret_managers/grok_oidc_auth_path.py:/app/litellm/secret_managers/grok_oidc_auth_path.py:ro

@@ -1118,3 +1118,7 @@ class TestDevReadOnlyMount:
             "./litellm/secret_managers/grok_oidc_auth_path.py:"
             "/app/litellm/secret_managers/grok_oidc_auth_path.py:ro"
         ) in content
+        assert (
+            "./litellm/proxy/pass_through_endpoints/aawm_context_query.py:"
+            "/app/litellm/proxy/pass_through_endpoints/aawm_context_query.py:ro"
+        ) in content
