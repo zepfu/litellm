@@ -19,6 +19,10 @@ if TYPE_CHECKING:
 
     def _clean_non_empty_string(value: Any) -> Optional[str]: ...
 
+    def _coerce_mapping(value: Any) -> Dict[str, Any]: ...
+
+    def _content_to_text(value: Any) -> str: ...
+
     def _ensure_mutable_headers(kwargs: Dict[str, Any]) -> dict: ...
 
     def _ensure_mutable_metadata(kwargs: Dict[str, Any]) -> Dict[str, Any]: ...
@@ -30,6 +34,8 @@ if TYPE_CHECKING:
     def _enrich_token_count_usage_metadata(kwargs: Dict[str, Any], result: Any) -> None: ...
 
     def _extract_agent_context(kwargs: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]: ...
+
+    def _extract_agent_context_from_text(text: str) -> Tuple[Optional[str], Optional[str]]: ...
 
     def _extract_agent_id_from_kwargs(
         kwargs: Dict[str, Any],
@@ -77,6 +83,14 @@ if TYPE_CHECKING:
 
     def _extract_usage_object(kwargs: Dict[str, Any], result: Any) -> Any: ...
 
+    def _get_header_value(headers: Any, *names: str) -> Optional[str]: ...
+
+    def _extract_claude_code_version_from_metadata(
+        metadata: Dict[str, Any],
+    ) -> Tuple[Optional[str], Optional[str]]: ...
+
+    def _extract_request_headers_from_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]: ...
+
     def _is_claude_permission_check_metadata(metadata: Any) -> bool: ...
 
     def _is_codex_default_agent_context(kwargs: Dict[str, Any], metadata: Optional[Dict[str, Any]] = None) -> bool: ...
@@ -93,6 +107,8 @@ if TYPE_CHECKING:
     def _maybe_get(obj: Any, key: str, default: Any = None) -> Any: ...
 
     def _merge_tags(metadata: Dict[str, Any], tags_to_add: List[str]) -> None: ...
+
+    def _normalize_tenant_identity(value: Any) -> Optional[str]: ...
 
     def _append_langfuse_span(
         metadata: Dict[str, Any],
@@ -340,6 +356,162 @@ def _promote_worker_context_exhaustion_metadata(
                 continue
             metadata[key] = value
     _sanitize_worker_context_exhaustion_metadata(metadata)
+
+
+def _is_claude_passthrough_context(kwargs: Dict[str, Any], metadata: Dict[str, Any]) -> bool:
+    """True only on concrete Claude Code/CLI signals.
+
+    Deliberately excludes provider/model/route-family matches so generic
+    Anthropic API callers with custom trace identity are preserved.
+    """
+    client_name = str(metadata.get("client_name") or "").strip().lower()
+    if client_name in {"claude-cli", "claude-code"}:
+        return True
+
+    cc_version, cc_entrypoint = _extract_claude_code_version_from_metadata(metadata)
+    if cc_version or (cc_entrypoint and str(cc_entrypoint).strip().lower() in {"cli", "claude-code"}):
+        return True
+
+    headers = _extract_request_headers_from_kwargs(kwargs)
+    if _get_header_value(headers, "x-claude-code-session-id") is not None:
+        return True
+
+    user_agent = _get_header_value(headers, "user-agent", "User-Agent")
+    if user_agent and "claude-code" in user_agent.lower():
+        return True
+
+    trace_name = str(metadata.get("trace_name") or "").strip().lower()
+    if trace_name.startswith("claude-code"):
+        return True
+
+    header_trace_name = _get_header_value(headers, "langfuse_trace_name")
+    if header_trace_name and header_trace_name.lower().startswith("claude-code"):
+        return True
+
+    return False
+
+
+def _extract_text_agent_context_from_kwargs(kwargs: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """Text-derived agent/tenant from request content.
+
+    Mapping sources (agent_name / trace_name) short-circuit
+    ``_extract_agent_context`` before message text is read, so a
+    synthesized ``claude-code.<agent>`` trace name can drop the richer
+    text-derived tenant. This pass reads only message/system/instructions
+    text so the tenant can be recovered into metadata before the trace
+    name is normalized.
+    """
+    messages = kwargs.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "system":
+                continue
+            agent_name, tenant_id = _extract_agent_context_from_text(
+                _content_to_text(message.get("content", ""))
+            )
+            if agent_name:
+                return agent_name, tenant_id
+
+    system_direct = kwargs.get("system")
+    if system_direct:
+        agent_name, tenant_id = _extract_agent_context_from_text(_content_to_text(system_direct))
+        if agent_name:
+            return agent_name, tenant_id
+
+    payload = kwargs.get("passthrough_logging_payload")
+    if isinstance(payload, dict):
+        request_body = payload.get("request_body")
+        if isinstance(request_body, dict):
+            instructions = request_body.get("instructions")
+            if instructions:
+                agent_name, tenant_id = _extract_agent_context_from_text(
+                    _content_to_text(instructions)
+                )
+                if agent_name:
+                    return agent_name, tenant_id
+
+            system = request_body.get("system")
+            if system:
+                agent_name, tenant_id = _extract_agent_context_from_text(
+                    _content_to_text(system)
+                )
+                if agent_name:
+                    return agent_name, tenant_id
+
+            pt_messages = request_body.get("messages")
+            if isinstance(pt_messages, list):
+                for msg in pt_messages[:3]:
+                    if not isinstance(msg, dict):
+                        continue
+                    if msg.get("role") != "user":
+                        continue
+                    agent_name, tenant_id = _extract_agent_context_from_text(
+                        _content_to_text(msg.get("content", ""))
+                    )
+                    if agent_name:
+                        return agent_name, tenant_id
+                    break
+
+    return None, None
+
+
+def _ensure_text_tenant_identity_in_metadata(
+    kwargs: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> None:
+    """Propagate the text-derived tenant into metadata when absent.
+
+    Without this, ``_extract_agent_context_from_mapping`` short-circuits
+    on the synthesized trace name and downstream extraction returns the
+    agent without the tenant that the message text supplied.
+    """
+    _text_agent, text_tenant_id = _extract_text_agent_context_from_kwargs(kwargs)
+    tenant_id = _normalize_tenant_identity(text_tenant_id)
+    if not tenant_id:
+        return
+    if _normalize_tenant_identity(
+        metadata.get("tenant_id") or metadata.get("aawm_tenant_id") or metadata.get("aawm_claude_project")
+    ):
+        return
+    metadata["tenant_id"] = tenant_id
+
+
+def _normalize_claude_trace_name_and_header(
+    kwargs: Dict[str, Any],
+    metadata: Dict[str, Any],
+    headers: Dict[str, Any],
+    agent_name: str,
+) -> None:
+    """Normalize Claude-family trace identity before Langfuse reads headers.
+
+    Missing, bare ``claude-code``, or stale non-``claude-code.*`` trace
+    names collapse to ``claude-code.<agent_name>``. The
+    ``langfuse_trace_name`` header is synchronized so Langfuse does not
+    clobber the corrected metadata with a stale value.
+    """
+    if not _is_claude_passthrough_context(kwargs, metadata):
+        return
+
+    _ensure_text_tenant_identity_in_metadata(kwargs, metadata)
+
+    target_trace_name = f"claude-code.{agent_name or _DEFAULT_AGENT}"  # type: ignore[name-defined]  # noqa: F821
+    current_trace_name = _clean_non_empty_string(metadata.get("trace_name"))
+    if (
+        current_trace_name is None
+        or current_trace_name == "claude-code"
+        or not current_trace_name.startswith("claude-code.")
+    ):
+        metadata["trace_name"] = target_trace_name
+        current_trace_name = target_trace_name
+
+    if headers:
+        current_header = _clean_non_empty_string(headers.get("langfuse_trace_name"))
+        if current_header != current_trace_name:
+            headers["langfuse_trace_name"] = current_trace_name
+            verbose_logger.debug(
+                "AawmAgentIdentity: synchronized Claude header trace_name to %s",
+                current_trace_name,
+            )
 
 
 def _infer_usage_breakout_provider_prefix(kwargs: Dict[str, Any], metadata: Dict[str, Any]) -> Optional[str]:
@@ -592,6 +764,7 @@ def _enrich_trace_name_and_provider_metadata(kwargs: Dict[str, Any], result: Any
         )
     elif not current_trace_name:
         metadata["trace_name"] = agent_name
+    _normalize_claude_trace_name_and_header(kwargs, metadata, headers, agent_name)
     child_trace_user_id = _clean_non_empty_string(metadata.get("trace_user_id"))
     child_trace_name = _clean_non_empty_string(metadata.get("trace_name"))
     if headers and child_trace_name and child_trace_name.startswith("claude-code."):
@@ -655,6 +828,10 @@ _HOST_FUNCTION_NAMES = (
     "_normalize_worker_context_exhaustion_bool",
     "_sanitize_worker_context_exhaustion_metadata",
     "_promote_worker_context_exhaustion_metadata",
+    "_is_claude_passthrough_context",
+    "_extract_text_agent_context_from_kwargs",
+    "_ensure_text_tenant_identity_in_metadata",
+    "_normalize_claude_trace_name_and_header",
     "_infer_usage_breakout_provider_prefix",
     "_enrich_usage_breakout_metadata",
     "_enrich_claude_thinking_metadata",

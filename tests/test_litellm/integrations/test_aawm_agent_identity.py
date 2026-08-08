@@ -261,6 +261,133 @@ def test_aawm_agent_identity_rewrites_stale_orchestrator_langfuse_trace_header()
     assert langfuse_metadata["trace_user_id"] == "aegis"
 
 
+def test_aawm_agent_identity_normalizes_claude_parent_trace_name_and_syncs_header() -> None:
+    """Parent Claude CLI call: missing/bare/stale trace names normalize to
+    claude-code.<agent> and a stale non-Claude langfuse_trace_name header is
+    rewritten before Langfuse can clobber metadata."""
+    logger = AawmAgentIdentity()
+    for stale_trace_name in (None, "claude-code"):
+        kwargs = _base_kwargs()
+        kwargs["model"] = "claude-opus-4-6"
+        kwargs["custom_llm_provider"] = "anthropic"
+        kwargs["litellm_params"]["metadata"]["client_name"] = "claude-cli"
+        if stale_trace_name is None:
+            kwargs["litellm_params"]["metadata"].pop("trace_name", None)
+        else:
+            kwargs["litellm_params"]["metadata"]["trace_name"] = stale_trace_name
+        kwargs["litellm_params"]["proxy_server_request"] = {
+            "headers": {"langfuse_trace_name": "orchestrator"}
+        }
+
+        updated_kwargs, result = logger.logging_hook(
+            kwargs=kwargs,
+            result={"choices": []},
+            call_type="pass_through_endpoint",
+        )
+
+        assert result == {"choices": []}
+        metadata = updated_kwargs["litellm_params"]["metadata"]
+        headers = updated_kwargs["litellm_params"]["proxy_server_request"]["headers"]
+        assert metadata["trace_name"] == "claude-code.engineer"
+        assert headers["langfuse_trace_name"] == "claude-code.engineer"
+        assert updated_kwargs["standard_logging_object"]["metadata"]["trace_name"] == "claude-code.engineer"
+
+        langfuse_metadata = LangFuseLogger.add_metadata_from_header(
+            updated_kwargs["litellm_params"],
+            dict(metadata),
+        )
+        assert langfuse_metadata["trace_name"] == "claude-code.engineer"
+
+
+def test_aawm_agent_identity_normalizes_claude_child_trace_name_and_header() -> None:
+    """Child Claude call with a stale non-claude-code.* trace name and stale
+    non-Claude header is normalized to claude-code.<agent> on both surfaces."""
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs(trace_name="orchestrator")
+    kwargs["model"] = "claude-opus-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "client_name": "claude-cli",
+            "agent_name": "reviewer",
+            "trace_name": "orchestrator",
+            "session_id": "session-child-normalize",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"langfuse_trace_name": "orchestrator"}
+    }
+
+    updated_kwargs, result = logger.logging_hook(
+        kwargs=kwargs,
+        result={"choices": []},
+        call_type="pass_through_endpoint",
+    )
+
+    assert result == {"choices": []}
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    headers = updated_kwargs["litellm_params"]["proxy_server_request"]["headers"]
+    assert metadata["trace_name"] == "claude-code.reviewer"
+    assert headers["langfuse_trace_name"] == "claude-code.reviewer"
+
+    langfuse_metadata = LangFuseLogger.add_metadata_from_header(
+        updated_kwargs["litellm_params"],
+        dict(metadata),
+    )
+    assert langfuse_metadata["trace_name"] == "claude-code.reviewer"
+
+
+def test_aawm_agent_identity_preserves_generic_anthropic_caller_trace_identity() -> None:
+    """A generic Anthropic API caller (no Claude Code/CLI signal) with a
+    custom trace name and header is preserved untouched."""
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs(trace_name="my-app.batch-scorer")
+    kwargs["model"] = "claude-opus-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["passthrough_logging_payload"]["request_body"]["messages"] = []
+    kwargs["litellm_params"]["proxy_server_request"] = {
+        "headers": {"langfuse_trace_name": "my-app.batch-scorer"}
+    }
+
+    updated_kwargs, result = logger.logging_hook(
+        kwargs=kwargs,
+        result={"choices": []},
+        call_type="pass_through_endpoint",
+    )
+
+    assert result == {"choices": []}
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    headers = updated_kwargs["litellm_params"]["proxy_server_request"]["headers"]
+    assert metadata["trace_name"] == "my-app.batch-scorer"
+    assert headers["langfuse_trace_name"] == "my-app.batch-scorer"
+
+
+def test_aawm_agent_identity_preserves_text_tenant_after_trace_name_normalization() -> None:
+    """Session-history regression: once the synthesized claude-code.<agent>
+    trace name exists, _extract_agent_context_from_mapping short-circuits on
+    it before message text can supply the tenant. The richer text-derived
+    tenant must be recovered into metadata so downstream extraction still
+    returns both agent and tenant."""
+    logger = AawmAgentIdentity()
+    kwargs = _base_kwargs()
+    kwargs["model"] = "claude-opus-4-6"
+    kwargs["custom_llm_provider"] = "anthropic"
+    kwargs["litellm_params"]["metadata"]["client_name"] = "claude-cli"
+
+    updated_kwargs, _ = logger.logging_hook(
+        kwargs=kwargs,
+        result={"choices": []},
+        call_type="pass_through_endpoint",
+    )
+
+    metadata = updated_kwargs["litellm_params"]["metadata"]
+    assert metadata["trace_name"] == "claude-code.engineer"
+    assert metadata["tenant_id"] == "aegis"
+    agent_name, tenant_id = aawm_agent_identity._extract_agent_context(updated_kwargs)
+    assert agent_name == "engineer"
+    assert tenant_id == "aegis"
+
+
 def test_aawm_agent_identity_promotes_codex_repository_over_generic_user_header() -> None:
     logger = AawmAgentIdentity()
     kwargs = _base_kwargs(trace_name="codex")
