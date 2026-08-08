@@ -13,6 +13,7 @@ from litellm.proxy.pass_through_endpoints import (
     llm_passthrough_endpoints as lpe,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    classification,
     cooldown_apply,
     cooldown_state,
     attempt_records,
@@ -120,21 +121,28 @@ def _reset_moonshot_alias_state() -> None:
 
 
 def test_should_register_the_canonical_moonshot_alias_for_both_ingresses() -> None:
-    codex_candidates = snapshot_select._get_codex_auto_agent_candidates_for_alias(
-        "sota-moonshot"
+    assert (
+        snapshot_select._lookup_active_snapshot_canonical_alias("sota-moonshot")
+        == "sota-moonshot"
     )
-    anthropic_candidates = (
-        selection._get_anthropic_candidates_for_alias_snapshot_aware(
-            "sota-moonshot"
-        )
+    codex_candidates = snapshot_select._select_snapshot_candidates(
+        "sota-moonshot",
+        ingress="codex",
+    )
+    anthropic_candidates = snapshot_select._select_snapshot_candidates(
+        "sota-moonshot",
+        ingress="anthropic",
     )
 
-    assert [candidate["model"] for candidate in codex_candidates] == [
-        "kimi_code/k3"
-    ]
-    assert [candidate["model"] for candidate in anthropic_candidates] == [
-        "kimi_code/k3"
-    ]
+    assert codex_candidates
+    assert {
+        (candidate["provider"], candidate["model"])
+        for candidate in codex_candidates
+    } == {
+        (candidate["provider"], candidate["model"])
+        for candidate in anthropic_candidates
+    }
+    assert all(candidate["provider"] == "kimi_code" for candidate in codex_candidates)
     assert codex_candidates[0]["route_family"] == (
         "codex_kimi_chat_completions_adapter"
     )
@@ -144,9 +152,28 @@ def test_should_register_the_canonical_moonshot_alias_for_both_ingresses() -> No
 
 
 @pytest.mark.asyncio
-async def test_should_select_an_available_work_other_branch_after_spark_cooldown() -> None:
-    spark_key = "openai:gpt-5.3-codex-spark:__default__"
-    await cooldown_state._set_codex_auto_agent_cooldown(spark_key, 60.0)
+async def test_should_follow_work_snapshot_candidates_after_spark_cooldown() -> None:
+    codex_candidates = snapshot_select._select_snapshot_candidates(
+        "work",
+        ingress="codex",
+    )
+    anthropic_candidates = snapshot_select._select_snapshot_candidates(
+        "work",
+        ingress="anthropic",
+    )
+    spark_candidate = next(
+        candidate
+        for candidate in codex_candidates
+        if candidate["model"] == "gpt-5.3-codex-spark"
+    )
+    spark_state = await selection._build_codex_auto_agent_candidate_state(
+        _request("/v1/responses"),
+        candidate_template=spark_candidate,
+    )
+    await cooldown_state._set_codex_auto_agent_cooldown(
+        spark_state["cooldown_key"],
+        60.0,
+    )
 
     codex_selection = await selection._select_codex_auto_agent_candidate(
         request=_request("/v1/responses"),
@@ -157,27 +184,32 @@ async def test_should_select_an_available_work_other_branch_after_spark_cooldown
         request_body=_anthropic_body("work"),
     )
 
-    expected_codex_routes = {
-        "oa_xai/grok-4.5": "codex_xai_oauth_responses_adapter",
-        "kimi_code/k3": "codex_kimi_chat_completions_adapter",
-        "alibaba_token_plan/qwen3.8-max": (
-            "codex_alibaba_token_plan_chat_completions_adapter"
-        ),
-    }
-    expected_anthropic_routes = {
-        "oa_xai/grok-4.5": "anthropic_xai_oauth_responses_adapter",
-        "kimi_code/k3": "anthropic_kimi_chat_completions_adapter",
-        "alibaba_token_plan/qwen3.8-max": (
-            "anthropic_alibaba_token_plan_chat_completions_adapter"
-        ),
-    }
-    assert codex_selection["candidate"]["route_family"] == expected_codex_routes[
-        codex_selection["candidate"]["model"]
-    ]
+    assert codex_selection["candidate"]["model"] != spark_candidate["model"]
     assert (
-        anthropic_selection["candidate"]["route_family"]
-        == expected_anthropic_routes[anthropic_selection["candidate"]["model"]]
-    )
+        codex_selection["candidate"]["provider"],
+        codex_selection["candidate"]["model"],
+        codex_selection["candidate"]["route_family"],
+    ) in {
+        (
+            candidate["provider"],
+            candidate["model"],
+            candidate["route_family"],
+        )
+        for candidate in codex_candidates
+    }
+    assert anthropic_selection["candidate"]["model"] != spark_candidate["model"]
+    assert (
+        anthropic_selection["candidate"]["provider"],
+        anthropic_selection["candidate"]["model"],
+        anthropic_selection["candidate"]["route_family"],
+    ) in {
+        (
+            candidate["provider"],
+            candidate["model"],
+            candidate["route_family"],
+        )
+        for candidate in anthropic_candidates
+    }
 
 
 @pytest.mark.asyncio
@@ -246,6 +278,7 @@ async def test_should_not_retry_bounded_kimi_invalid_request_for_continuation() 
                 target_url="https://chatgpt.com/backend-api/codex/responses",
                 api_key=None,
                 forward_headers=True,
+                canonical_alias="sota-moonshot",
             )
 
     assert caught.value is terminal_error
@@ -272,6 +305,19 @@ async def test_should_persist_one_kimi_managed_account_lane_and_continue_to_grok
         "reset_reason": "quota_exhausted",
     }
     exact_reset_seconds = 17.0
+    selected_cooldown_key = (
+        "kimi_code:kimi_code/k3:kimi_code_managed_account"
+    )
+    alias_routing_state.codex_failure_evidence_gate.record(
+        canonical_alias="sota-moonshot",
+        cooldown_key=selected_cooldown_key,
+        event=classification.classify_failure(
+            status_code=429,
+            provider="kimi_code",
+            message="managed account quota exhausted",
+            retry_after_seconds=exact_reset_seconds,
+        ),
+    )
 
     with patch.object(
         durable,
@@ -283,12 +329,11 @@ async def test_should_persist_one_kimi_managed_account_lane_and_continue_to_grok
         return_value=cache,
     ):
         scope = await cooldown_apply._set_codex_auto_agent_candidate_cooldowns(
+            canonical_alias="sota-moonshot",
             request=_request("/v1/responses"),
             candidate=kimi_candidate,
             lane_key=policy.CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
-            selected_cooldown_key=(
-                "kimi_code:kimi_code/k3:kimi_code_managed_account"
-            ),
+            selected_cooldown_key=selected_cooldown_key,
             cooldown_seconds=exact_reset_seconds,
             error_class="kimi_code_managed_account",
             kimi_failure_metadata=safe_quota_metadata,
@@ -324,8 +369,20 @@ async def test_should_persist_one_kimi_managed_account_lane_and_continue_to_grok
         assert highspeed_state["cooldown_scope"] == "managed_account"
         assert standard_state["cooldown_scope"] == "managed_account"
 
+        spark_candidate = next(
+            candidate
+            for candidate in snapshot_select._select_snapshot_candidates(
+                "work",
+                ingress="codex",
+            )
+            if candidate["model"] == "gpt-5.3-codex-spark"
+        )
+        spark_state = await selection._build_codex_auto_agent_candidate_state(
+            _request("/v1/responses"),
+            candidate_template=spark_candidate,
+        )
         await cooldown_state._set_codex_auto_agent_cooldown(
-            "openai:gpt-5.3-codex-spark:__default__",
+            spark_state["cooldown_key"],
             exact_reset_seconds,
         )
         selection_result = await selection._select_codex_auto_agent_candidate(
@@ -367,13 +424,14 @@ async def test_should_keep_kimi_capability_failures_candidate_scoped_and_malform
         "trace_id": "kimi-trace_019",
         "reset_reason": "unsupported_effort",
     }
-    scope = await cooldown_apply._set_codex_auto_agent_candidate_cooldowns(
+    scope = await cooldown_apply._apply_auto_agent_alias_cooldown(
         request=_request("/v1/responses"),
         candidate=candidate,
         lane_key=policy.CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
         selected_cooldown_key=candidate_key,
         cooldown_seconds=60.0,
         error_class="kimi_code_candidate_failure",
+        set_candidate_cooldown=cooldown_state._set_codex_auto_agent_cooldown,
         kimi_failure_metadata=capability_metadata,
     )
 
@@ -392,7 +450,7 @@ async def test_should_keep_kimi_capability_failures_candidate_scoped_and_malform
         "trace_id": "kimi-trace_020",
         "reset_reason": "malformed_provider_response",
     }
-    malformed_scope = await cooldown_apply._set_codex_auto_agent_candidate_cooldowns(
+    malformed_scope = await cooldown_apply._apply_auto_agent_alias_cooldown(
         request=_request("/v1/responses"),
         candidate={
             "provider": policy.CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
@@ -404,6 +462,7 @@ async def test_should_keep_kimi_capability_failures_candidate_scoped_and_malform
         selected_cooldown_key=("kimi_code:kimi_code/kimi-for-coding:kimi_code_managed_account"),
         cooldown_seconds=3 * 60 * 60.0,
         error_class="kimi_code_no_cooldown",
+        set_candidate_cooldown=cooldown_state._set_codex_auto_agent_cooldown,
         kimi_failure_metadata=malformed_metadata,
     )
 

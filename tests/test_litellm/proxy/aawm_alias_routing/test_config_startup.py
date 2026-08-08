@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
     ConfigDirectoryError,
@@ -31,9 +32,8 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot imp
     RoutingSnapshot,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
-    _get_codex_auto_agent_candidates_for_alias,
-    _select_basic_pilot_snapshot_candidates,
-    _select_basic_pilot_snapshot_candidates_anthropic,
+    _lookup_active_snapshot_canonical_alias,
+    _select_snapshot_candidates,
     get_active_routing_snapshot,
     set_active_routing_snapshot,
 )
@@ -255,7 +255,7 @@ class TestCompileDirectory:
             ]
         }
         (tmp_path / "a.yaml").write_text(yaml.dump(doc), encoding="utf-8")
-        with pytest.raises(ConfigDirectoryError, match="case-insensitive duplicate"):
+        with pytest.raises(ValidationError, match="duplicate alias name"):
             compile_directory(tmp_path)
 
     def test_empty_directory_raises(self, tmp_path: Path) -> None:
@@ -699,11 +699,7 @@ class TestStaleSnapshotPrevention:
         assert not is_startup_healthy()
         assert get_active_routing_snapshot() is None
 
-    def test_failure_prevents_static_fallback(self, tmp_path: Path) -> None:
-        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-            _get_anthropic_auto_agent_candidates_for_alias,
-        )
-
+    def test_failure_clears_alias_lookup_and_selection(self, tmp_path: Path) -> None:
         good_dir = tmp_path / "good"
         good_dir.mkdir()
         _write_alias_yaml(good_dir, "basic.yaml", "basic")
@@ -714,10 +710,9 @@ class TestStaleSnapshotPrevention:
         (bad_dir / "broken.yaml").write_text(":::bad:::", encoding="utf-8")
         activate_alias_config_directory(bad_dir)
 
-        assert _get_codex_auto_agent_candidates_for_alias("basic") == ()
-        assert _select_basic_pilot_snapshot_candidates() == ()
-        assert _select_basic_pilot_snapshot_candidates_anthropic() == ()
-        assert _get_anthropic_auto_agent_candidates_for_alias("basic") == ()
+        assert _lookup_active_snapshot_canonical_alias("basic") is None
+        assert _select_snapshot_candidates("basic", ingress="codex") == ()
+        assert _select_snapshot_candidates("basic", ingress="anthropic") == ()
 
 
 # ---------------------------------------------------------------------------
@@ -733,53 +728,39 @@ class TestSelectorIntegration:
         activate_alias_config_directory(good_dir)
         assert is_startup_healthy()
 
-        result = _select_basic_pilot_snapshot_candidates()
+        result = _select_snapshot_candidates("basic", ingress="codex")
         assert len(result) > 0
         assert result[0]["model"] == "gpt-5.4-mini"
 
     def test_anthropic_selector_uses_snapshot(self, tmp_path: Path) -> None:
-        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-            _get_anthropic_auto_agent_candidates_for_alias,
-        )
-
         good_dir = tmp_path / "good"
         good_dir.mkdir()
         _write_alias_yaml(good_dir, "basic.yaml", "basic")
         activate_alias_config_directory(good_dir)
         assert is_startup_healthy()
 
-        selector_result = _select_basic_pilot_snapshot_candidates_anthropic()
-        assert selector_result is not None
+        selector_result = _select_snapshot_candidates(
+            "basic",
+            ingress="anthropic",
+        )
         assert len(selector_result) > 0
-
-        wrapper_result = _get_anthropic_auto_agent_candidates_for_alias("basic")
-        assert len(wrapper_result) == len(selector_result)
-        assert len(wrapper_result) > 0
-        for w, s in zip(wrapper_result, selector_result):
-            assert w["provider"] == s["provider"]
-            assert w["model"] == s["model"]
-            assert w["route_family"] == s["route_family"]
-            assert w["route_family"] == "anthropic_openai_responses_adapter"
-            assert "config_epoch_tag" in w
+        assert selector_result[0]["route_family"] == (
+            "anthropic_openai_responses_adapter"
+        )
+        assert "config_epoch_tag" in selector_result[0]
 
     def test_basic_anthropic_alias_resolves_from_snapshot(
         self, tmp_path: Path
     ) -> None:
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
-            ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
-        )
-        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-            _get_anthropic_auto_agent_candidates_for_alias,
-        )
-
         good_dir = tmp_path / "good"
         good_dir.mkdir()
         _write_alias_yaml(good_dir, "basic.yaml", "basic")
         activate_alias_config_directory(good_dir)
         assert is_startup_healthy()
 
-        candidates = _get_anthropic_auto_agent_candidates_for_alias(
-            ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
+        candidates = _select_snapshot_candidates(
+            "basic",
+            ingress="anthropic",
         )
         assert [candidate["model"] for candidate in candidates] == ["gpt-5.4-mini"]
         assert candidates[0]["route_family"] == "anthropic_openai_responses_adapter"
@@ -791,16 +772,10 @@ class TestSelectorIntegration:
 # ---------------------------------------------------------------------------
 
 
-class TestFailureWindowLegacyAliasesZero:
-    def test_known_legacy_aliases_zero_after_failure(self, tmp_path: Path) -> None:
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
-            ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
-            CODEX_AUTO_AGENT_MODEL_ALIAS,
-        )
-        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-            _get_anthropic_auto_agent_candidates_for_alias,
-        )
-
+class TestFailureWindowAliasesUnavailable:
+    def test_alias_lookup_and_selection_fail_closed_after_failure(
+        self, tmp_path: Path
+    ) -> None:
         good_dir = tmp_path / "good"
         good_dir.mkdir()
         _write_alias_yaml(good_dir, "basic.yaml", "basic")
@@ -812,28 +787,13 @@ class TestFailureWindowLegacyAliasesZero:
         activate_alias_config_directory(bad_dir)
         assert is_startup_failed()
 
-        assert _get_codex_auto_agent_candidates_for_alias("basic") == ()
-        assert _get_codex_auto_agent_candidates_for_alias(
-            CODEX_AUTO_AGENT_MODEL_ALIAS
-        ) == ()
-        assert _select_basic_pilot_snapshot_candidates() == ()
-        assert _select_basic_pilot_snapshot_candidates_anthropic() == ()
-        assert _get_anthropic_auto_agent_candidates_for_alias("basic") == ()
-        assert _get_anthropic_auto_agent_candidates_for_alias(
-            ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
-        ) == ()
+        assert _lookup_active_snapshot_canonical_alias("basic") is None
+        assert _select_snapshot_candidates("basic", ingress="codex") == ()
+        assert _select_snapshot_candidates("basic", ingress="anthropic") == ()
 
     def test_failure_window_pause_all_getters_zero(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
-            ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
-            CODEX_AUTO_AGENT_MODEL_ALIAS,
-        )
-        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
-            _get_anthropic_auto_agent_candidates_for_alias,
-        )
-
         good_dir = tmp_path / "good"
         good_dir.mkdir()
         _write_alias_yaml(good_dir, "basic.yaml", "basic")
@@ -844,22 +804,23 @@ class TestFailureWindowLegacyAliasesZero:
         (bad_dir / "broken.yaml").write_text(":::bad:::", encoding="utf-8")
 
         real_set = set_active_routing_snapshot
-        observations: dict[str, tuple] = {}
+        observations: dict[str, object] = {}
         pause_entered = threading.Event()
         pause_release = threading.Event()
 
         def _pausing_set(snapshot):
             if snapshot is None:
-                observations["codex_basic"] = _get_codex_auto_agent_candidates_for_alias("basic")
-                observations["codex_legacy"] = _get_codex_auto_agent_candidates_for_alias(
-                    CODEX_AUTO_AGENT_MODEL_ALIAS
+                observations["lookup"] = _lookup_active_snapshot_canonical_alias(
+                    "basic"
                 )
-                observations["anthropic_basic"] = _get_anthropic_auto_agent_candidates_for_alias("basic")
-                observations["anthropic_legacy"] = _get_anthropic_auto_agent_candidates_for_alias(
-                    ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
+                observations["codex"] = _select_snapshot_candidates(
+                    "basic",
+                    ingress="codex",
                 )
-                observations["codex_pilot"] = _select_basic_pilot_snapshot_candidates()
-                observations["anthropic_pilot"] = _select_basic_pilot_snapshot_candidates_anthropic()
+                observations["anthropic"] = _select_snapshot_candidates(
+                    "basic",
+                    ingress="anthropic",
+                )
                 pause_entered.set()
                 pause_release.wait(timeout=10)
             return real_set(snapshot)
@@ -875,8 +836,11 @@ class TestFailureWindowLegacyAliasesZero:
         assert pause_entered.wait(timeout=10)
 
         assert get_active_routing_snapshot() is not None
-        for key, val in observations.items():
-            assert val == (), f"{key} returned {val} during failure window"
+        assert observations == {
+            "lookup": None,
+            "codex": (),
+            "anthropic": (),
+        }
 
         pause_release.set()
         t.join(timeout=10)
@@ -962,7 +926,7 @@ class TestCoherentSnapshotReference:
         snap_a = get_active_routing_snapshot()
         assert snap_a is not None
 
-        result_a = _select_basic_pilot_snapshot_candidates()
+        result_a = _select_snapshot_candidates("basic", ingress="codex")
         assert len(result_a) > 0
         epoch_a = snap_a.config_hash
         assert all(c["config_epoch_tag"] == epoch_a for c in result_a)
@@ -975,7 +939,7 @@ class TestCoherentSnapshotReference:
         assert snap_b is not None
         assert snap_b.config_hash != epoch_a
 
-        result_b = _select_basic_pilot_snapshot_candidates()
+        result_b = _select_snapshot_candidates("basic", ingress="codex")
         assert len(result_b) > 0
         epoch_b = snap_b.config_hash
         assert all(c["config_epoch_tag"] == epoch_b for c in result_b)
@@ -989,15 +953,14 @@ class TestCoherentSnapshotReference:
         snap_a = get_active_routing_snapshot()
         assert snap_a is not None
 
-        result_a = _select_basic_pilot_snapshot_candidates_anthropic()
-        assert result_a is not None
+        result_a = _select_snapshot_candidates("basic", ingress="anthropic")
         assert len(result_a) > 0
         epoch_a = snap_a.config_hash
         assert all(c["config_epoch_tag"] == epoch_a for c in result_a)
 
         set_active_routing_snapshot(None)
-        result_cleared = _select_basic_pilot_snapshot_candidates_anthropic()
-        assert result_cleared is None
+        result_cleared = _select_snapshot_candidates("basic", ingress="anthropic")
+        assert result_cleared == ()
 
     def test_single_snapshot_capture_no_second_global_fetch(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1017,7 +980,7 @@ class TestCoherentSnapshotReference:
             return real_get()
 
         monkeypatch.setattr(ss, "get_active_routing_snapshot", _counting_get)
-        result = ss._select_basic_pilot_snapshot_candidates()
+        result = ss._select_snapshot_candidates("basic", ingress="codex")
         assert len(result) > 0
         assert call_count[0] == 1
 

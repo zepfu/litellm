@@ -197,7 +197,6 @@ def _compile_alias(
             name=alias.name,
             distribution_strategy=alias.distribution_strategy,
             candidates=(),
-            visibility=alias.visibility,
             dispatch=dispatch_snapshot,
         )
 
@@ -236,7 +235,6 @@ def _compile_alias(
         name=alias.name,
         distribution_strategy=alias.distribution_strategy,
         candidates=tuple(compiled_entries),
-        visibility=alias.visibility,
         dispatch=dispatch_snapshot,
     )
 
@@ -312,7 +310,6 @@ def _canonical_snapshot_repr(aliases: dict[str, RoutingAlias]) -> str:
                 "candidates": canonical_candidates,
                 "distribution_strategy": alias.distribution_strategy,
                 "name": alias.name,
-                "visibility": alias.visibility,
                 "dispatch": dispatch_repr,
             }
         )

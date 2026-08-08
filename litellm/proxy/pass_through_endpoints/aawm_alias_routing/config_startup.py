@@ -22,7 +22,7 @@ merge-conflict, compile error, symlink, unsupported file type, invalid
 UTF-8, empty-aliases result, or inventory drift prevents activation and
 marks startup as failed.  A failed startup clears any prior snapshot,
 blocks ``/health/readiness`` (503), and prohibits fallback to a partial or
-stale snapshot or the static candidate table.
+stale snapshot.
 
 Hot-refresh consensus across workers is explicitly out of scope; each worker
 performs its own deterministic directory load at startup.

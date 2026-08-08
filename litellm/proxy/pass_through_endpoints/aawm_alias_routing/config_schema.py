@@ -7,11 +7,10 @@ pure ordering/weighting helpers. ``config_compiler.py`` consumes this module
 to produce the immutable ``RoutingSnapshot`` defined in ``config_snapshot.py``.
 
 Validation intentionally treats ``provider`` and ``route_family`` as
-*references* into a registered set of known code behaviors (mirrored from
-``policy.py``'s provider constants and candidate-table ``route_family``
-values) -- never as arbitrary strings that could be evaluated or dynamically
-imported. Error-class references (``ErrorRuleConfig.class_name``) are an
-OPEN vocabulary by design and are never checked against a closed registry.
+*references* into registered provider and adapter behaviors -- never as
+arbitrary strings that could be evaluated or dynamically imported. Error-class
+references (``ErrorRuleConfig.class_name``) are an OPEN vocabulary by design
+and are never checked against a closed registry.
 """
 
 from __future__ import annotations
@@ -38,9 +37,7 @@ REGISTERED_PROVIDERS: frozenset[str] = frozenset(
     }
 )
 
-# Registered route-family (dispatch adapter) identities. Mirrors the
-# ``route_family`` string values already used across policy.py's candidate
-# tables (both codex and anthropic auto-agent lanes).
+# Registered route-family (dispatch adapter) identities for both ingress lanes.
 REGISTERED_ROUTE_FAMILIES: frozenset[str] = frozenset(
     {
         "codex_responses",
@@ -297,9 +294,6 @@ class AliasConfig(BaseModel):
     )
     route_family: Optional[str] = None
     distribution_strategy: Optional[DistributionStrategy] = None
-    # CFG-009/CFG-013: public aliases are directly selectable; internal
-    # aliases (e.g. work-other) are reachable only via alias-reference.
-    visibility: Literal["public", "internal"] = "public"
     # CFG-007: optional TUI-dispatch rules for logical aliases like sota.
     dispatch: Optional[DispatchConfig] = None
 
@@ -384,9 +378,10 @@ class RoutingConfigDocument(BaseModel):
     def _require_unique_alias_names(cls, value: list[AliasConfig]) -> list[AliasConfig]:
         seen: set[str] = set()
         for alias in value:
-            if alias.name in seen:
+            normalized_name = alias.name.casefold()
+            if normalized_name in seen:
                 raise ValueError(f"duplicate alias name {alias.name!r} in routing config document")
-            seen.add(alias.name)
+            seen.add(normalized_name)
         return value
 
 

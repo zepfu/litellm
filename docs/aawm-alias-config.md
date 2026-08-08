@@ -3,7 +3,9 @@
 Deterministic, directory-based alias-routing configuration for the AAWM
 passthrough proxy. One immutable routing snapshot is built at startup from
 YAML files in a canonical directory; the snapshot gates readiness and drives
-all alias candidate selection for the worker's lifetime.
+all alias candidate selection for the worker's lifetime. The compiled YAML
+snapshot is the sole AAWM alias and candidate authority: there are no built-in
+candidate tables and no startup or no-snapshot fallback.
 
 ## Canonical directory
 
@@ -79,8 +81,8 @@ candidate sets).
    active routing snapshot.
 
 Any failure at steps 2-5 clears any prior snapshot, marks startup as failed,
-and blocks readiness. There is no fallback to a partial snapshot or the
-static candidate table after a failed directory load.
+and blocks readiness. There is no fallback to a partial snapshot, built-in
+candidate table, or other non-YAML authority after a failed directory load.
 
 ### Drift detection is not a filesystem transaction
 
@@ -100,9 +102,9 @@ defense against host-side races on the bind-mounted source.
   object.
 - When startup succeeds, the same status object is embedded in the 200
   readiness response for observability.
-- A failed startup also prevents alias routing from degrading to the legacy
-  static candidate table: all alias candidate getters return empty tuples,
-  so no traffic is dispatched on a broken config.
+- A failed startup also prevents alias routing from degrading to any
+  non-snapshot candidate source: all alias candidate getters return empty
+  tuples, so no traffic is dispatched without an active compiled snapshot.
 
 ## Secret-safe status and logging
 
@@ -125,6 +127,12 @@ A single alias carries per-candidate `route_family` and
 Messages ingress each see only their own route-family view. No cross-provider
 fallback is introduced by the alias model.
 
+Every alias compiled from YAML is an ordinary exact-name route and a valid
+`alias_reference` or dispatch target. There is no public/internal or
+visibility routing distinction in YAML or Python. Codex and Claude TUI
+selection catalogs are separate client model-definition lists; they are not
+generated from every snapshot alias and do not invent a denylist.
+
 ## Maintained `basic` alias behavior (CFG-008)
 
 The maintained alias name is `basic`. Every request uses this common candidate
@@ -146,13 +154,27 @@ Luna's YAML `reasoning_effort: low` is authoritative through the generic
 CFG-006 pipeline and replaces caller-provided reasoning. Haiku remains
 Anthropic-native; Luna uses the intended OpenAI/Codex OAuth route. The removed
 candidates are the `qwen3.8-max-preview` promo, `kimi-for-coding`, and
-`gpt-5.4-mini`. The former `read` name is unsupported; it is not a
-compatibility alias or redirect.
+`gpt-5.4-mini`.
+
+## Maintained `work` and `work-other` alias behavior
+
+The `work` alias is compiled from `work.yaml`. Candidate order is:
+
+1. OpenAI `gpt-5.3-codex-spark`
+2. Nested `alias_reference: work-other`
+3. Claude-origin only: native Anthropic Sonnet tail
+4. OpenAI `gpt-5.6-luna` last resort
+
+`work-other` is an ordinary configured alias compiled from `work-other.yaml`.
+It is a valid exact-name route and a valid `alias_reference` target. It remains
+absent from Codex and Claude TUI selection only because those clients' explicit
+model-definition inclusion lists omit it, not because YAML or Python marks it
+internal.
 
 ## Maintained `expert` alias behavior (CFG-013)
 
-The `expert` alias is a public, directly selectable alias compiled from
-`expert.yaml` in the canonical directory. It has exactly two candidates:
+The `expert` alias is compiled from `expert.yaml` in the canonical directory.
+It has exactly two candidates:
 
 1. **Claude-origin requests only** (`tui_attached: Claude`): native Anthropic
    `claude-opus-5`, highest priority. Canonical Opus 5 is inherently a
@@ -349,11 +371,14 @@ Explicitly **out of scope**. Each worker performs its own deterministic
 directory load at startup. There is no cross-worker coordination, distributed
 lock, or consensus protocol for config activation.
 
-## Legacy aliases
+## Snapshot-only alias authority
 
-Aliases registered in the static candidate table
-(`CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS`) that are not redefined in the YAML
-config continue to resolve from the static table when a snapshot is active.
-Arbitrary normalized aliases that appear in neither the config nor the static
-table fail closed (empty candidate set) rather than receiving a generic
-fallback.
+AAWM alias names and candidate sets come only from the active compiled YAML
+snapshot. There is no built-in candidate table and no startup or no-snapshot
+fallback. Missing, failed, or inactive config fails closed with empty candidate
+sets and blocked readiness.
+
+A name that is absent from the snapshot is an ordinary unknown model identity
+and follows the same generic snapshot lookup failure as every other absent
+name. No identity-specific recognition, rejection, redirect, or compatibility
+path applies.

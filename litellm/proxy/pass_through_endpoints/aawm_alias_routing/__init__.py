@@ -1,13 +1,14 @@
-"""AAWM alias-routing package (RR-054 #1/#9/#11/#12/#35).
+"""AAWM alias-routing package.
 
 Layers:
-- ``policy``: static candidate tables, allowlists, cooldown defaults
+- ``policy``: provider/lane constants, allowlists, and cooldown defaults
+- ``config_snapshot`` / ``snapshot_select``: configured alias identity and selection
 - ``state``: process-local cooldown/affinity/probe maps + locks
 - ``oauth_token_cache``: provider-neutral OAuth token memoization primitive
 - ``memory`` / ``retry``: shared map bounding and cooldown wait primitives
 - ``error_signals``: failure extraction, classification, cooldown scope, retry planning
 - ``cooldown_apply``: immutable publication plans and cooldown application
-- ``attempt_records``: attempt mutation, evidence, reasoning normalization, metadata
+- ``attempt_records``: attempt mutation, failure evidence, reasoning normalization, metadata
 - ``adapter_config``: config descriptors for Anthropic adapter routes
 - ``task_state``: structured/configurable task-state preservation contract
 - ``durable``: durable key, max-expiry, read/write, and DualCache selection

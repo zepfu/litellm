@@ -67,14 +67,12 @@ def _configure_attempt_records():  # noqa: PLR0915
         "_aawm_alias_route_healthy_json_enabled",
         "_merge_litellm_metadata",
         "_normalize_low_cardinality_tag_value",
-        "_normalize_codex_auto_agent_alias_model",
-        "_normalize_anthropic_auto_agent_alias_model",
         "_load_bundled_model_cost_map_for_codex_policy",
         "_get_model_info",
         "_model_cost",
         "_openai_provider_value",
         "_classify_failure",
-        "_basic_pilot_gate_record",
+        "_codex_failure_evidence_gate_record",
     )
     previous_runtime = {
         name: getattr(attempt_records, name)
@@ -145,16 +143,6 @@ def _configure_attempt_records():  # noqa: PLR0915
             return None
         return str(value).lower().strip() or None
 
-    def _normalize_codex_alias(model: Any) -> Optional[str]:
-        if model and "codex" in str(model).lower():
-            return "codex-auto-agent"
-        return None
-
-    def _normalize_anthropic_alias(model: Any) -> Optional[str]:
-        if model and "claude" in str(model).lower():
-            return "anthropic-auto-agent"
-        return None
-
     def _load_bundled_cost() -> dict[str, Any]:
         return {}
 
@@ -170,8 +158,19 @@ def _configure_attempt_records():  # noqa: PLR0915
     def _classify_failure(**kwargs: Any) -> _FakeClassificationEvent:
         return _FakeClassificationEvent(origin="upstream")
 
-    def _gate_record(*, cooldown_key: str, event: Any) -> None:
-        state.gate_records.append({"cooldown_key": cooldown_key, "event": event})
+    def _gate_record(
+        *,
+        canonical_alias: str,
+        cooldown_key: str,
+        event: Any,
+    ) -> None:
+        state.gate_records.append(
+            {
+                "canonical_alias": canonical_alias,
+                "cooldown_key": cooldown_key,
+                "event": event,
+            }
+        )
 
     attempt_records.configure_attempt_records_runtime(
         extract_error_tokens=_extract_tokens,
@@ -189,14 +188,12 @@ def _configure_attempt_records():  # noqa: PLR0915
         healthy_json_enabled=_healthy_enabled,
         merge_metadata=_merge_metadata,
         normalize_tag_value=_normalize_tag,
-        normalize_codex_alias_model=_normalize_codex_alias,
-        normalize_anthropic_alias_model=_normalize_anthropic_alias,
         load_bundled_model_cost=_load_bundled_cost,
         get_model_info=_get_model_info,
         model_cost={},
         openai_provider_value="openai",
         classify_failure=_classify_failure,
-        basic_pilot_gate_record=_gate_record,
+        codex_failure_evidence_gate_record=_gate_record,
     )
     yield state
     for name, value in previous_runtime.items():
@@ -251,6 +248,7 @@ class TestRetryableAttemptRecord:
             exc=exc,
             error_class="rate_limit",
             cooldown_seconds=60.0,
+            alias_model="test-alias",
             cooldown_scope="candidate",
         )
 
@@ -281,6 +279,7 @@ class TestRetryableAttemptRecord:
             exc=exc,
             error_class="transient",
             cooldown_seconds=0.0,
+            alias_model="test-alias",
             cooldown_scope="none",
         )
 
@@ -391,11 +390,11 @@ class TestAttemptStarted:
 
 
 # ---------------------------------------------------------------------------
-# _record_basic_pilot_cooldown_evidence (exactly-once)
+# _record_codex_failure_evidence (exactly-once)
 # ---------------------------------------------------------------------------
 
 
-class TestBasicPilotEvidence:
+class TestCodexFailureEvidence:
     def test_records_once_and_stamps_origin(self, _configure_attempt_records: _StubState) -> None:
         state = _configure_attempt_records
         record: dict[str, Any] = {}
@@ -403,7 +402,8 @@ class TestBasicPilotEvidence:
         exc._status_code = 429  # type: ignore[attr-defined]
         exc._retry_after = 5.0  # type: ignore[attr-defined]
 
-        attempt_records._record_basic_pilot_cooldown_evidence(
+        attempt_records._record_codex_failure_evidence(
+            canonical_alias="test-alias",
             cooldown_key="openai:gpt-5:lane1",
             exc=exc,
             attempt_record=record,
@@ -411,6 +411,7 @@ class TestBasicPilotEvidence:
 
         assert record["origin"] == "upstream"
         assert len(state.gate_records) == 1
+        assert state.gate_records[0]["canonical_alias"] == "test-alias"
         assert state.gate_records[0]["cooldown_key"] == "openai:gpt-5:lane1"
 
     def test_exactly_once_per_call(self, _configure_attempt_records: _StubState) -> None:
@@ -421,27 +422,14 @@ class TestBasicPilotEvidence:
         exc._retry_after = None  # type: ignore[attr-defined]
 
         for _ in range(2):
-            attempt_records._record_basic_pilot_cooldown_evidence(
+            attempt_records._record_codex_failure_evidence(
+                canonical_alias="test-alias",
                 cooldown_key="key1",
                 exc=exc,
                 attempt_record={},
             )
 
         assert len(state.gate_records) == 2
-
-    def test_fallback_key_when_none(self, _configure_attempt_records: _StubState) -> None:
-        state = _configure_attempt_records
-        exc = Exception("x")
-        exc._status_code = None  # type: ignore[attr-defined]
-        exc._retry_after = None  # type: ignore[attr-defined]
-
-        attempt_records._record_basic_pilot_cooldown_evidence(
-            cooldown_key=None,
-            exc=exc,
-            attempt_record={},
-        )
-
-        assert state.gate_records[0]["cooldown_key"] == "basic_pilot:unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +620,7 @@ class TestCodexAliasMetadata:
             },
             "lane_key": "openai:gpt-5",
             "cooldown_key": "cd:openai:gpt-5",
+            "alias_model": "codex-auto-agent",
             "selection_reason": "round_robin",
             "skipped": [],
         }
@@ -800,6 +789,7 @@ class TestAnthropicAliasMetadata:
             },
             "lane_key": "anthropic:claude-sonnet-4",
             "cooldown_key": "cd:anthropic:claude-sonnet-4",
+            "alias_model": "claude-auto-agent",
             "selection_reason": "round_robin",
             "skipped": [],
         }

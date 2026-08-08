@@ -1,10 +1,6 @@
 """RR-054 package ownership tests for extracted ``aawm_alias_routing``.
 
-Verifies:
-- package modules are importable and re-export a stable public surface
-- policy / state / durable DAL definitions have a single owner
-- god-module and compat shim re-exports stay identity-compatible
-- no duplicate class/function *definitions* for extracted state/DAL symbols
+Verifies package imports and the supported state/durable ownership contracts.
 
 Does not edit production code. Surfaces any remaining dual-ownership seams.
 """
@@ -90,13 +86,6 @@ DAL_FUNCTION_OWNERS = {
     "hydrate_cooldown_memory": "memory.py",
     "hydrate_affinity_memory": "memory.py",
 }
-
-POLICY_LITERAL_MARKERS = (
-    "CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (",
-    '"last_resort": True,',
-    "ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS: dict[str, tuple[dict[str, Any], ...]] = {",
-)
-
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
@@ -244,22 +233,6 @@ def test_rr054_durable_and_memory_dal_have_single_owner() -> None:
         )
 
 
-def test_rr054_policy_table_literals_live_only_in_package_policy() -> None:
-    """Candidate-table row literals are owned by package policy, not shims."""
-    package_policy_source = _read(Path(policy.__file__).resolve())
-    compat_source = _read(COMPAT_POLICY_PATH)
-    god_source = _read(GOD_PATH)
-
-    for marker in POLICY_LITERAL_MARKERS:
-        assert marker in package_policy_source, f"missing policy owner marker: {marker}"
-        assert marker not in compat_source, f"compat shim still owns marker: {marker}"
-        assert marker not in god_source, f"god-file still owns marker: {marker}"
-
-    assert "Compatibility re-export" in compat_source
-    assert "from .aawm_alias_routing import policy as _policy" in compat_source
-    assert "import *" not in compat_source
-
-
 def test_rr054_no_duplicate_state_map_construction_in_god_file() -> None:
     """God-file must bind process maps to package state, not construct new dicts."""
     assert (
@@ -301,34 +274,7 @@ def test_rr054_no_duplicate_state_map_construction_in_god_file() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_rr054_policy_compat_shim_reexports_package_policy() -> None:
-    assert policy_compat.CODEX_AUTO_AGENT_CANDIDATES is policy.CODEX_AUTO_AGENT_CANDIDATES
-    assert (
-        policy_compat.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-        is policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    )
-    assert (
-        policy_compat.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
-        is policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    )
-    assert (
-        policy_compat.CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS
-        == policy.CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS
-    )
-    assert "basic" in policy_compat.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    assert "work" in policy_compat.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
-
-
 def test_rr054_god_file_reexports_policy_and_durable_helpers() -> None:
-    assert lpe._CODEX_AUTO_AGENT_CANDIDATES is policy.CODEX_AUTO_AGENT_CANDIDATES
-    assert (
-        lpe._CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-        is policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    )
-    assert (
-        lpe._ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
-        is policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    )
     assert (
         lpe._CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS
         == policy.CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS

@@ -29,7 +29,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import inspect
-from typing import Any, Optional, Sequence
+from types import SimpleNamespace
+from typing import Any, Callable, Optional, Sequence
 from unittest.mock import MagicMock
 
 import pytest
@@ -41,7 +42,6 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     candidate_loop,
     classification,
     config_compiler as compiler,
-    cooldown_apply,
     selection,
     snapshot_select,
 )
@@ -56,22 +56,6 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     alias_routing_state,
 )
 
-# The exact kwarg set passed at the loop's ``apply_cooldown_fn`` call site
-# (``llm_passthrough_endpoints.py:22223-22233``). Encoded explicitly here so
-# a future signature drift on either applicator is a named, readable failure
-# rather than a silent ``**_kwargs`` swallow.
-_APPLY_COOLDOWN_CALL_SITE_KWARGS = [
-    "request",
-    "candidate",
-    "lane_key",
-    "selected_cooldown_key",
-    "cooldown_seconds",
-    "error_class",
-    "grok_account_quota_exhausted",
-    "kimi_failure_metadata",
-    "is_basic_pilot_lane",
-]
-
 # The exact key set the loop consumes off the ``select_candidate_fn`` return
 # value (``llm_passthrough_endpoints.py:22143-22187``).
 _SELECT_CANDIDATE_REQUIRED_KEYS = {
@@ -85,33 +69,6 @@ _SELECT_CANDIDATE_REQUIRED_KEYS = {
 }
 
 
-def _accepts_all_kwargs(fn: object, kwarg_names: list[str]) -> bool:
-    signature = inspect.signature(fn)  # type: ignore[arg-type]
-    parameters = signature.parameters
-    has_var_keyword = any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
-    if has_var_keyword:
-        return True
-    return all(name in parameters for name in kwarg_names)
-
-
-def test_apply_cooldown_fn_call_site_kwargs_match_applicators() -> None:
-    """Both production ``apply_cooldown_fn`` applicators accept the full call-site kwarg set."""
-    assert _accepts_all_kwargs(
-        cooldown_apply._set_codex_auto_agent_candidate_cooldowns,
-        _APPLY_COOLDOWN_CALL_SITE_KWARGS,
-    ), (
-        "_set_codex_auto_agent_candidate_cooldowns no longer accepts every "
-        f"kwarg the loop passes at its call site: {_APPLY_COOLDOWN_CALL_SITE_KWARGS}"
-    )
-    assert _accepts_all_kwargs(
-        cooldown_apply._apply_anthropic_auto_agent_alias_cooldown,
-        _APPLY_COOLDOWN_CALL_SITE_KWARGS,
-    ), (
-        "_apply_anthropic_auto_agent_alias_cooldown no longer accepts every "
-        f"kwarg the loop passes at its call site: {_APPLY_COOLDOWN_CALL_SITE_KWARGS}"
-    )
-
-
 @pytest.mark.asyncio
 async def test_select_candidate_fn_returns_required_selection_keys() -> None:
     """``_select_codex_auto_agent_candidate`` returns exactly the keys the loop consumes.
@@ -123,7 +80,7 @@ async def test_select_candidate_fn_returns_required_selection_keys() -> None:
     raw_yaml = """
 defaults: {}
 aliases:
-  - name: basic
+  - name: seam-contract
     candidates:
       - provider: openrouter
         model: openrouter/seam-contract-model
@@ -133,7 +90,23 @@ aliases:
     snapshot = compiler.compile_yaml(raw_yaml)
     previous_snapshot = snapshot_select.get_active_routing_snapshot()
     snapshot_select.set_active_routing_snapshot(snapshot)
-    session_key = "read:seam-contract-session:session:seam-contract-session"
+    request = MagicMock(spec=Request)
+    request.method = "POST"
+    request.headers = {"session_id": "seam-contract-session"}
+    request.query_params = {}
+    request.state = SimpleNamespace()
+    request.state.aawm_alias_request_local_cooldown_until = {}
+    request.state.aawm_alias_request_local_excluded_keys = set()
+    request_body = {
+        "model": "seam-contract",
+        "previous_response_id": "resp_seam_contract",
+    }
+    session_key = lpe._resolve_codex_auto_agent_session_key(
+        request,
+        request_body,
+        alias_model="seam-contract",
+    )
+    assert session_key is not None
     previous_affinity = alias_routing_state.codex.session_affinity_by_key.get(session_key)
     alias_routing_state.codex.session_affinity_by_key[session_key] = {
         "provider": "openrouter",
@@ -143,21 +116,9 @@ aliases:
         "expires_at_monotonic": __import__("time").monotonic() + 3600.0,
     }
     try:
-        from unittest.mock import MagicMock
-
-        from fastapi import Request
-
-        request = MagicMock(spec=Request)
-        request.method = "POST"
-        request.headers = {"session_id": "seam-contract-session"}
-        request.query_params = {}
-        request.state = MagicMock()
-        request.state.aawm_alias_request_local_cooldown_until = {}
-        request.state.aawm_alias_request_local_excluded_keys = set()
-
         selection_result = await selection._select_codex_auto_agent_candidate(
             request=request,
-            request_body={"model": "basic", "previous_response_id": "resp_seam_contract"},
+            request_body=request_body,
         )
     finally:
         snapshot_select.set_active_routing_snapshot(previous_snapshot)
@@ -178,7 +139,7 @@ def test_reset_alias_routing_state_for_tests_clears_everything() -> None:
 
     Once added, the helper must clear: both family (codex/anthropic)
     cooldown/negative/affinity/evidence maps, ``candidate_probe_locks``, the
-    basic-pilot gate's ``_key_state`` + ``_family_state.evidence_events_by_key``,
+    alias-scoped Codex failure-evidence state,
     ``_round_robin_cursor_by_alias``, and the active routing snapshot (set to
     ``None``).
     """
@@ -203,16 +164,17 @@ def test_reset_alias_routing_state_for_tests_clears_everything() -> None:
         provider="openrouter",
         message="rate limited",
     )
-    alias_routing_state.basic_pilot_gate.record(
+    alias_routing_state.codex_failure_evidence_gate.record(
+        canonical_alias="reset-alias",
         cooldown_key="seed",
         event=evidence,
     )
-    alias_routing_state.round_robin_cursor["seed"] = 1
+    alias_routing_state.round_robin_cursor[("reset-alias", "seed")] = 1
 
     raw_yaml = """
 defaults: {}
 aliases:
-  - name: basic
+  - name: reset-alias
     candidates:
       - provider: openrouter
         model: openrouter/reset-helper-model
@@ -232,8 +194,12 @@ aliases:
     assert alias_routing_state.anthropic.session_affinity_by_key == {}
     assert alias_routing_state.anthropic.evidence_events_by_key == {}
     assert alias_routing_state.candidate_probe_locks == {}
-    assert alias_routing_state.basic_pilot_gate._key_state == {}
-    assert alias_routing_state.basic_pilot_gate._family_state.evidence_events_by_key == {}
+    assert (
+        alias_routing_state.codex_failure_evidence_gate.gate_for_alias(
+            canonical_alias="reset-alias"
+        )
+        is None
+    )
     assert alias_routing_state.round_robin_cursor == {}
     assert snapshot_select.get_active_routing_snapshot() is None
 
@@ -279,7 +245,7 @@ _CALLBACK_PARAMETER_KINDS: dict[str, dict[str, inspect._ParameterKind]] = {
         "error_class": inspect.Parameter.KEYWORD_ONLY,
         "grok_account_quota_exhausted": inspect.Parameter.KEYWORD_ONLY,
         "kimi_failure_metadata": inspect.Parameter.KEYWORD_ONLY,
-        "is_basic_pilot_lane": inspect.Parameter.KEYWORD_ONLY,
+        "codex_failure_evidence_alias": inspect.Parameter.KEYWORD_ONLY,
     },
     "publish_cooldown_memory_fn": {
         "keys": inspect.Parameter.KEYWORD_ONLY,
@@ -428,14 +394,9 @@ async def test_alias_route_services_signature_contracts(  # noqa: PLR0915
     monkeypatch.setattr(
         lpe,
         "_resolve_aawm_alias_selection_enumeration",
-        lambda request, alias_model, *, client_product_label=None: MagicMock(
+        lambda request, alias_model, *, ingress, client_product_label=None: MagicMock(
             candidates=({},)
         ),
-    )
-    monkeypatch.setattr(
-        lpe,
-        "_get_anthropic_auto_agent_candidates_for_alias",
-        lambda alias_model: ({},),
     )
 
     request = _signature_contract_request()
@@ -445,19 +406,21 @@ async def test_alias_route_services_signature_contracts(  # noqa: PLR0915
         request=request,
         fastapi_response=MagicMock(spec=Response),
         user_api_key_dict=MagicMock(),
-        prepared_request_body={"model": "basic"},
+        prepared_request_body={"model": "seam-contract"},
         target_url="https://chatgpt.com/backend-api/codex/responses",
         api_key=None,
         forward_headers=True,
+        canonical_alias="seam-contract",
     )
     await lpe._handle_anthropic_auto_agent_alias_route(
         endpoint="/v1/messages",
         request=request,
         fastapi_response=MagicMock(spec=Response),
         user_api_key_dict=MagicMock(),
-        prepared_request_body={"model": "basic"},
+        prepared_request_body={"model": "seam-contract"},
         target_url="https://api.anthropic.com/v1/messages",
         custom_headers={},
+        canonical_alias="seam-contract",
     )
 
     field_names = {field.name for field in dataclasses.fields(AliasRouteServices)}
@@ -469,7 +432,7 @@ async def test_alias_route_services_signature_contracts(  # noqa: PLR0915
         # Capture every real production target up front, before any
         # monkeypatching, so Phase 2 always validates the genuine callable
         # even when a prior Phase 1 sentinel replaced the lpe global.
-        real_targets: dict[str, object] = {}
+        real_targets: dict[str, Callable[..., object]] = {}
         for fn_name in _CALLBACK_PARAMETER_KINDS:
             if fn_name in di_targets:
                 real_targets[fn_name] = getattr(lpe, di_targets[fn_name])
@@ -630,7 +593,7 @@ def _typed_resolve_cooldown_publication(
     error_class: Optional[str],
     grok_account_quota_exhausted: bool = False,
     kimi_failure_metadata: Optional[dict[str, Any]] = None,
-    is_basic_pilot_lane: bool = False,
+    codex_failure_evidence_alias: Optional[str] = None,
 ) -> CooldownPublicationPlan:
     return CooldownPublicationPlan()
 

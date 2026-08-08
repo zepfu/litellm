@@ -166,7 +166,11 @@ def test_manager_clear_cooldown_state_codex_family(
     mgr.codex.cooldown_negative_until_monotonic_by_key["key1"] = time.monotonic() + 50
     mgr.codex.evidence_events_by_key["key1"] = [time.monotonic()]
 
-    result = mgr.clear_cooldown_state(alias_family="codex", cooldown_keys=["key1"])
+    result = mgr.clear_cooldown_state(
+        alias_family="codex",
+        canonical_aliases=[],
+        cooldown_keys=["key1"],
+    )
 
     assert isinstance(result, CooldownClearResult)
     assert result.alias_family == "codex"
@@ -181,42 +185,74 @@ def test_manager_clear_cooldown_state_anthropic_family(
     mgr = fresh_manager
     mgr.anthropic.cooldown_until_monotonic_by_key["key1"] = time.monotonic() + 100
 
-    result = mgr.clear_cooldown_state(alias_family="anthropic", cooldown_keys=["key1"])
+    result = mgr.clear_cooldown_state(
+        alias_family="anthropic",
+        canonical_aliases=[],
+        cooldown_keys=["key1"],
+    )
 
     assert result.alias_family == "anthropic"
     assert result.positive_keys_cleared == ["key1"]
 
 
-def test_manager_clear_cooldown_state_clears_basic_pilot_gate_codex_only(
+def test_manager_clear_cooldown_state_clears_explicit_codex_failure_evidence(
     fresh_manager: AliasRoutingStateManager,
 ) -> None:
-    """Basic-pilot gate is codex-owned; clearing anthropic must not touch it."""
+    """Codex evidence clears only for the explicit alias and Codex family."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.classification import (
         _KeyCooldownState,
     )
 
     mgr = fresh_manager
-    mgr.basic_pilot_gate._key_state["key1"] = _KeyCooldownState()
-    mgr.basic_pilot_gate._family_state.evidence_events_by_key["key1"] = [time.monotonic()]
-
-    result_codex = mgr.clear_cooldown_state(alias_family="codex", cooldown_keys=["key1"])
-    assert result_codex.basic_pilot_keys_cleared == ["key1"]
-    assert "key1" not in mgr.basic_pilot_gate._key_state
-
-    mgr.basic_pilot_gate._key_state["key2"] = _KeyCooldownState()
-    mgr.basic_pilot_gate._family_state.evidence_events_by_key["key2"] = [time.monotonic()]
-    result_anthropic = mgr.clear_cooldown_state(
-        alias_family="anthropic", cooldown_keys=["key2"]
+    canonical_alias = "test-alias"
+    gate = mgr.codex_failure_evidence_gate.gate_for_alias(
+        canonical_alias=canonical_alias,
+        create=True,
     )
-    assert result_anthropic.basic_pilot_keys_cleared == []
-    assert "key2" in mgr.basic_pilot_gate._key_state
+    assert gate is not None
+    gate._key_state["key1"] = _KeyCooldownState()
+    gate._family_state.evidence_events_by_key["key1"] = [time.monotonic()]
+
+    result_codex = mgr.clear_cooldown_state(
+        alias_family="codex",
+        canonical_aliases=[canonical_alias],
+        cooldown_keys=["key1"],
+    )
+    assert result_codex.codex_failure_evidence_entries_cleared == [
+        (canonical_alias, "key1")
+    ]
+    assert (
+        mgr.codex_failure_evidence_gate.gate_for_alias(
+            canonical_alias=canonical_alias
+        )
+        is None
+    )
+
+    gate = mgr.codex_failure_evidence_gate.gate_for_alias(
+        canonical_alias=canonical_alias,
+        create=True,
+    )
+    assert gate is not None
+    gate._key_state["key2"] = _KeyCooldownState()
+    gate._family_state.evidence_events_by_key["key2"] = [time.monotonic()]
+    result_anthropic = mgr.clear_cooldown_state(
+        alias_family="anthropic",
+        canonical_aliases=[canonical_alias],
+        cooldown_keys=["key2"],
+    )
+    assert result_anthropic.codex_failure_evidence_entries_cleared == []
+    assert "key2" in gate._key_state
 
 
 def test_manager_clear_cooldown_state_unknown_family_raises(
     fresh_manager: AliasRoutingStateManager,
 ) -> None:
     with pytest.raises(ValueError, match="Unknown alias_family"):
-        fresh_manager.clear_cooldown_state(alias_family="openai", cooldown_keys=["k"])
+        fresh_manager.clear_cooldown_state(
+            alias_family="openai",
+            canonical_aliases=[],
+            cooldown_keys=["k"],
+        )
 
 
 def test_manager_clear_cooldown_state_reports_affinity_count(
@@ -226,7 +262,11 @@ def test_manager_clear_cooldown_state_reports_affinity_count(
     mgr.codex.session_affinity_by_key["session1"] = {"provider": "openai"}
     mgr.codex.session_affinity_by_key["session2"] = {"provider": "anthropic"}
 
-    result = mgr.clear_cooldown_state(alias_family="codex", cooldown_keys=["key1"])
+    result = mgr.clear_cooldown_state(
+        alias_family="codex",
+        canonical_aliases=[],
+        cooldown_keys=["key1"],
+    )
 
     assert result.affinity_keys_preserved == 2
 
@@ -822,7 +862,11 @@ def test_anthropic_clear_does_not_touch_codex_state(
     mgr.codex.cooldown_until_monotonic_by_key["shared-key"] = time.monotonic() + 100
     mgr.anthropic.cooldown_until_monotonic_by_key["shared-key"] = time.monotonic() + 200
 
-    result = mgr.clear_cooldown_state(alias_family="anthropic", cooldown_keys=["shared-key"])
+    result = mgr.clear_cooldown_state(
+        alias_family="anthropic",
+        canonical_aliases=[],
+        cooldown_keys=["shared-key"],
+    )
 
     assert result.positive_keys_cleared == ["shared-key"]
     assert "shared-key" in mgr.codex.cooldown_until_monotonic_by_key

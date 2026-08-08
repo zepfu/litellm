@@ -95,8 +95,6 @@ class RoutingAlias:
     name: str
     distribution_strategy: Optional[str]
     candidates: tuple[RoutingCandidate | AliasReference, ...]
-    # CFG-009/CFG-013: public/internal visibility boundary
-    visibility: str = "public"
     # CFG-007: optional TUI-dispatch rules
     dispatch: Optional[DispatchSnapshot] = None
 

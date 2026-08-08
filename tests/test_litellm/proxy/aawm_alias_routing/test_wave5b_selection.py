@@ -13,6 +13,9 @@ import pytest
 from fastapi import HTTPException, Request
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import selection
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+    SelectionEnumeration,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +50,21 @@ def _set_selection_runtime(name: str, value: Any) -> None:
     selection._select_codex_auto_agent_candidate.__globals__[name] = value
 
 
+def _set_selection_candidates(
+    candidates: tuple[dict[str, Any], ...],
+) -> None:
+    enumeration = SelectionEnumeration(
+        candidates=candidates,
+        commit_token=None,
+    )
+    _set_selection_runtime(
+        "_resolve_aawm_alias_selection_enumeration",
+        lambda request, canonical_alias, *, ingress, client_product_label=None: (
+            enumeration
+        ),
+    )
+
+
 @pytest.fixture(autouse=True)
 def _configure_selection():
     """Configure selection runtime with fresh stubs before each test."""
@@ -68,12 +86,12 @@ def _configure_selection():
         "_get_codex_session_affinity",
         "_get_anthropic_session_affinity",
         "_get_openrouter_adapter_active_cooldown_seconds",
-        "_normalize_codex_alias_model",
         "_extract_client_product_label",
         "_resolve_codex_session_key",
         "_resolve_anthropic_session_key",
         "_has_continuation_state",
-        "_get_anthropic_candidates_for_alias",
+        "_lookup_active_snapshot_canonical_alias",
+        "_resolve_aawm_alias_selection_enumeration",
         "_is_grok_account_quota_candidate",
         "_get_grok_account_quota_lane_cooldown_key",
         "_is_kimi_code_candidate",
@@ -92,12 +110,22 @@ def _configure_selection():
         "_get_codex_session_affinity": AsyncMock(return_value=None),
         "_get_anthropic_session_affinity": AsyncMock(return_value=None),
         "_get_openrouter_adapter_active_cooldown_seconds": _zero_adapter,
-        "_normalize_codex_alias_model": lambda m: None,
         "_extract_client_product_label": lambda r, b: None,
-        "_resolve_codex_session_key": lambda r, b, **kw: None,
-        "_resolve_anthropic_session_key": lambda r, b, **kw: None,
+        "_resolve_codex_session_key": lambda r, b, *, alias_model: None,
+        "_resolve_anthropic_session_key": lambda r, b, *, alias_model: None,
         "_has_continuation_state": lambda v: False,
-        "_get_anthropic_candidates_for_alias": lambda alias: (),
+        "_lookup_active_snapshot_canonical_alias": (
+            lambda model, *, request=None: (
+                "basic"
+                if isinstance(model, str) and model.strip().casefold() == "basic"
+                else None
+            )
+        ),
+        "_resolve_aawm_alias_selection_enumeration": (
+            lambda request, canonical_alias, *, ingress, client_product_label=None: (
+                SelectionEnumeration(candidates=(), commit_token=None)
+            )
+        ),
         "_is_grok_account_quota_candidate": lambda c: False,
         "_get_grok_account_quota_lane_cooldown_key": lambda c, lk: None,
         "_is_kimi_code_candidate": (
@@ -116,12 +144,10 @@ def _configure_selection():
         get_codex_session_affinity=AsyncMock(return_value=None),
         get_anthropic_session_affinity=AsyncMock(return_value=None),
         get_openrouter_adapter_active_cooldown_seconds=_zero_adapter,
-        normalize_codex_alias_model=lambda m: None,
         extract_client_product_label=lambda r, b: None,
-        resolve_codex_session_key=lambda r, b, **kw: None,
-        resolve_anthropic_session_key=lambda r, b, **kw: None,
+        resolve_codex_session_key=lambda r, b, *, alias_model: None,
+        resolve_anthropic_session_key=lambda r, b, *, alias_model: None,
         has_continuation_state=lambda v: False,
-        get_anthropic_candidates_for_alias=lambda alias: (),
         is_grok_account_quota_candidate=lambda c: False,
         get_grok_account_quota_lane_cooldown_key=lambda c, lk: None,
         is_kimi_code_candidate=lambda c: isinstance(c, dict) and c.get("provider") == "kimi_code",
@@ -428,7 +454,11 @@ class TestCodexSelectorFirstChoice:
         mock_enum = SelectionEnumeration(candidates=candidates, commit_token=None)
         with patch.dict(
             selection._select_codex_auto_agent_candidate.__globals__,
-            {"_resolve_aawm_alias_selection_enumeration": lambda *a, **kw: mock_enum},
+            {
+                "_resolve_aawm_alias_selection_enumeration": (
+                    lambda request, canonical_alias, *, ingress, client_product_label=None: mock_enum
+                )
+            },
         ):
             result = await selection._select_codex_auto_agent_candidate(
                 request=request,
@@ -469,7 +499,11 @@ class TestCodexSelectorLastResort:
 
         with patch.dict(
             selection._select_codex_auto_agent_candidate.__globals__,
-            {"_resolve_aawm_alias_selection_enumeration": lambda *a, **kw: mock_enum},
+            {
+                "_resolve_aawm_alias_selection_enumeration": (
+                    lambda request, canonical_alias, *, ingress, client_product_label=None: mock_enum
+                )
+            },
         ):
             result = await selection._select_codex_auto_agent_candidate(
                 request=request,
@@ -503,7 +537,11 @@ class TestCodexSelectorAllCooled:
 
         with patch.dict(
             selection._select_codex_auto_agent_candidate.__globals__,
-            {"_resolve_aawm_alias_selection_enumeration": lambda *a, **kw: mock_enum},
+            {
+                "_resolve_aawm_alias_selection_enumeration": (
+                    lambda request, canonical_alias, *, ingress, client_product_label=None: mock_enum
+                )
+            },
         ):
             with pytest.raises(HTTPException) as exc_info:
                 await selection._select_codex_auto_agent_candidate(
@@ -541,7 +579,11 @@ class TestCodexSelectorRequestLocalExclusion:
 
         with patch.dict(
             selection._select_codex_auto_agent_candidate.__globals__,
-            {"_resolve_aawm_alias_selection_enumeration": lambda *a, **kw: mock_enum},
+            {
+                "_resolve_aawm_alias_selection_enumeration": (
+                    lambda request, canonical_alias, *, ingress, client_product_label=None: mock_enum
+                )
+            },
         ):
             result = await selection._select_codex_auto_agent_candidate(
                 request=request,
@@ -564,10 +606,7 @@ class TestAnthropicSelectorFirstChoice:
             _candidate("anthropic", "claude-sonnet-4-20250514"),
             _candidate("openai", "gpt-4o", last_resort=True),
         )
-        _set_selection_runtime(
-            "_get_anthropic_candidates_for_alias",
-            lambda alias: candidates,
-        )
+        _set_selection_candidates(candidates)
 
         result = await selection._select_anthropic_auto_agent_candidate(
             request=request,
@@ -587,10 +626,7 @@ class TestAnthropicSelectorAllCooled:
     async def test_all_cooled_raises_429(self):
         request = _make_request()
         candidates = (_candidate("anthropic", "claude-sonnet-4-20250514"),)
-        _set_selection_runtime(
-            "_get_anthropic_candidates_for_alias",
-            lambda alias: candidates,
-        )
+        _set_selection_candidates(candidates)
 
         async def _all_cooled(key: str) -> tuple[float, str]:
             return (120.0, "memory")
@@ -631,10 +667,7 @@ class TestAnthropicInFlight:
             "affinity_state_source": "memory",
         }
         candidates = (_candidate("anthropic", "claude-sonnet-4-20250514"),)
-        _set_selection_runtime(
-            "_get_anthropic_candidates_for_alias",
-            lambda alias: candidates,
-        )
+        _set_selection_candidates(candidates)
         _set_selection_runtime(
             "_get_anthropic_session_affinity",
             AsyncMock(return_value=affinity),
@@ -642,7 +675,7 @@ class TestAnthropicInFlight:
         _set_selection_runtime("_has_continuation_state", lambda v: True)
         _set_selection_runtime(
             "_resolve_anthropic_session_key",
-            lambda r, b, **kw: "session:123",
+            lambda r, b, *, alias_model: "session:123",
         )
 
         async def _cooled(key: str) -> tuple[float, str]:
@@ -695,12 +728,16 @@ class TestCodexRedispatch:
         _set_selection_runtime("_has_continuation_state", lambda v: True)
         _set_selection_runtime(
             "_resolve_codex_session_key",
-            lambda r, b, **kw: "session:456",
+            lambda r, b, *, alias_model: "session:456",
         )
 
         with patch.dict(
             selection._select_codex_auto_agent_candidate.__globals__,
-            {"_resolve_aawm_alias_selection_enumeration": lambda *a, **kw: mock_enum},
+            {
+                "_resolve_aawm_alias_selection_enumeration": (
+                    lambda request, canonical_alias, *, ingress, client_product_label=None: mock_enum
+                )
+            },
         ):
             with pytest.raises(HTTPException) as exc_info:
                 await selection._select_codex_auto_agent_candidate(
@@ -737,14 +774,14 @@ class TestCodexRedispatch:
         _set_selection_runtime("_has_continuation_state", lambda v: True)
         _set_selection_runtime(
             "_resolve_codex_session_key",
-            lambda r, b, **kw: "session:durable-removed",
+            lambda r, b, *, alias_model: "session:durable-removed",
         )
 
         with patch.dict(
             selection._select_codex_auto_agent_candidate.__globals__,
             {
                 "_resolve_aawm_alias_selection_enumeration": (
-                    lambda *a, **kw: mock_enum
+                    lambda request, canonical_alias, *, ingress, client_product_label=None: mock_enum
                 ),
                 "_build_codex_auto_agent_candidate_states": alternate_states,
             },
@@ -805,23 +842,6 @@ class TestKimiManagedAccount:
 
 
 # ---------------------------------------------------------------------------
-# Normalize anthropic alias model
-# ---------------------------------------------------------------------------
-
-
-class TestNormalizeAnthropicAlias:
-    def test_normalizes_case_insensitive(self):
-        result = selection._normalize_anthropic_auto_agent_alias_model("AAWM-ANTHROPIC-AGENT-AUTO")
-        assert result == "basic"
-
-    def test_returns_none_for_unknown(self):
-        assert selection._normalize_anthropic_auto_agent_alias_model("unknown-model") is None
-
-    def test_returns_none_for_non_string(self):
-        assert selection._normalize_anthropic_auto_agent_alias_model(123) is None
-
-
-# ---------------------------------------------------------------------------
 # Find candidate
 # ---------------------------------------------------------------------------
 
@@ -832,18 +852,22 @@ class TestFindCandidate:
             _candidate("anthropic", "claude-sonnet-4-20250514"),
             _candidate("openai", "gpt-4o"),
         )
-        _set_selection_runtime(
-            "_get_anthropic_candidates_for_alias",
-            lambda alias: candidates,
+        _set_selection_candidates(candidates)
+        found = selection._find_anthropic_auto_agent_candidate(
+            "anthropic",
+            "claude-sonnet-4-20250514",
+            alias_model="basic",
+            request=_make_request(),
         )
-        found = selection._find_anthropic_auto_agent_candidate("anthropic", "claude-sonnet-4-20250514")
         assert found is not None
         assert found["provider"] == "anthropic"
 
     def test_find_anthropic_candidate_not_found(self):
-        _set_selection_runtime(
-            "_get_anthropic_candidates_for_alias",
-            lambda alias: (),
+        _set_selection_candidates(())
+        found = selection._find_anthropic_auto_agent_candidate(
+            "anthropic",
+            "nonexistent",
+            alias_model="basic",
+            request=_make_request(),
         )
-        found = selection._find_anthropic_auto_agent_candidate("anthropic", "nonexistent")
         assert found is None

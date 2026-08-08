@@ -2,7 +2,7 @@
 
 Baseline: ``79fc94c3a5``.
 
-The 50 frozen functions are owned by three focused modules. Their normalized
+The retained frozen functions are owned by three focused modules. Their normalized
 AST must remain identical to the baseline after accounting only for documented
 extraction mechanics: configured callback names, fail-fast callback assertions,
 and one function-local FastAPI/status import.
@@ -86,7 +86,6 @@ FROZEN_SYMBOLS: dict[str, tuple[str, ...]] = {
         "_persist_anthropic_cooldown_durable",
         "_apply_auto_agent_alias_cooldown",
         "_apply_codex_auto_agent_alias_cooldown",
-        "_apply_basic_pilot_gated_cooldown",
         "_apply_anthropic_auto_agent_alias_cooldown",
         "_set_codex_auto_agent_candidate_cooldowns",
         "resolve_lane_identity_hash",
@@ -95,7 +94,6 @@ FROZEN_SYMBOLS: dict[str, tuple[str, ...]] = {
     "attempt_records": (
         "_update_codex_auto_agent_retryable_attempt_record",
         "_record_auto_agent_alias_attempt_started",
-        "_record_basic_pilot_cooldown_evidence",
         "_record_auto_agent_alias_attempt_failure",
         "_extract_codex_reasoning_effort",
         "_get_codex_reasoning_effort_ceiling",
@@ -172,14 +170,12 @@ BASELINE_NORMALIZED_SHA256 = {
     "_persist_anthropic_cooldown_durable": "bb6c8840fee8982f1994125976c7c6c4daf98f2216320ef21c6780c01bc04b6c",
     "_apply_auto_agent_alias_cooldown": "c2c77e8c9560f0be7912bda50e8c64f9b7714b1e81912e683823bc56483e5390",
     "_apply_codex_auto_agent_alias_cooldown": "d9c241385cd1a373c126b9499e59bbf194eb57c4b8da417b2326c6433dea5547",
-    "_apply_basic_pilot_gated_cooldown": "b6a79d5edff15084fc582ef525c094caa62e0f2fb0246a6c30c252e02847a09e",
     "_apply_anthropic_auto_agent_alias_cooldown": "2968467c04d3d4cce1f51c6243dccc86bf796fee86f35a1bd26ba97cd12dbe3f",
     "_set_codex_auto_agent_candidate_cooldowns": "437b2906f2ce8e86e69cf6073daff236ad52b5180bf0ce315870a965e0fafca2",
     "resolve_lane_identity_hash": "c13e2b6dbed807a0e8d125eb7cb78b6dbf698e2bbbbfe7cb4460b86e3e23e2ca",
     "execute_cooldown_publication_transaction": "cb82932006c8b5d114fcd850570f16e405e445d03887ebd3e8f40db13fc06afb",
     "_update_codex_auto_agent_retryable_attempt_record": "ecd632224a453568ea22fe24b001aeb437eb2a8e7f87c6eeacd60b99bc867bb4",
     "_record_auto_agent_alias_attempt_started": "7be5154bf3ff55cb6e3a9d515095b7909fac3ee698fbf1f033a744a85ba65953",
-    "_record_basic_pilot_cooldown_evidence": "5cc58f31d0074d19202949c1e12fae9c4576ab2fc8edfd26174b7f15c877ba8e",
     "_record_auto_agent_alias_attempt_failure": "169d402301c35c1b156236204d14c362c8e842e312fb83ffd48fa9711ee93921",
     "_extract_codex_reasoning_effort": "ab143775e8132aa73f58ff575e97d2a85f1fd319d88816671cc93441a4e03be5",
     "_get_codex_reasoning_effort_ceiling": "f3d94c2bef96dd86af31831869f0195067d9a0f988f540535cf7f63dd4b200a6",
@@ -202,11 +198,9 @@ EXPECTED_ASSERT_COUNTS = {
     "_persist_anthropic_cooldown_durable": 1,
     "_apply_auto_agent_alias_cooldown": 6,
     "_apply_codex_auto_agent_alias_cooldown": 1,
-    "_apply_basic_pilot_gated_cooldown": 1,
     "_apply_anthropic_auto_agent_alias_cooldown": 1,
     "_update_codex_auto_agent_retryable_attempt_record": 6,
     "_record_auto_agent_alias_attempt_started": 2,
-    "_record_basic_pilot_cooldown_evidence": 5,
     "_record_auto_agent_alias_attempt_failure": 4,
     "_get_codex_reasoning_effort_ceiling": 4,
     "_normalize_codex_reasoning_effort_for_resolved_route": 1,
@@ -234,7 +228,6 @@ _NAME_NORMALIZATION = {
     "_set_codex_cooldown": "_set_codex_auto_agent_cooldown",
     "_set_anthropic_cooldown": "_set_anthropic_auto_agent_cooldown",
     "_write_durable_payload": "_write_aawm_alias_routing_durable_payload",
-    "_basic_pilot_gate": "_basic_pilot_cooldown_gate",
     "_state_manager": "_alias_routing_state",
     "http_status": "status",
 }
@@ -242,7 +235,6 @@ _NAME_NORMALIZATION = {
 _ATTRIBUTE_NORMALIZATION = {
     "_aawm_alias_interfaces.CooldownPublicationPlan": "_CooldownPublicationPlan",
     "_aawm_alias_classification.classify_failure": "_classify_failure",
-    "_basic_pilot_cooldown_gate.record": "_basic_pilot_gate_record",
     "litellm.get_model_info": "_get_model_info",
     "litellm.model_cost": "_model_cost",
     "litellm.LlmProviders.OPENAI.value": "_openai_provider_value",
@@ -331,11 +323,11 @@ def _normalized_digest(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
 def test_frozen_inventory_and_facade_counts() -> None:
     assert {name: len(symbols) for name, symbols in FROZEN_SYMBOLS.items()} == {
         "error_signals": 44,
-        "cooldown_apply": 10,
-        "attempt_records": 9,
+        "cooldown_apply": 9,
+        "attempt_records": 8,
     }
-    assert sum(map(len, FROZEN_SYMBOLS.values())) == 63
-    assert len(BASELINE_NORMALIZED_SHA256) == 63
+    assert sum(map(len, FROZEN_SYMBOLS.values())) == 61
+    assert len(BASELINE_NORMALIZED_SHA256) == 61
     assert set(BASELINE_NORMALIZED_SHA256) == {
         symbol
         for symbols in FROZEN_SYMBOLS.values()
@@ -348,7 +340,7 @@ def test_target_modules_are_sole_function_owners() -> None:
     for module_name, symbols in FROZEN_SYMBOLS.items():
         module = TARGET_MODULES[module_name]
         target_functions = _top_level_functions(_module_tree(module))
-        assert tuple(module._HOST_FUNCTION_NAMES) == symbols
+        assert set(symbols) <= set(module._HOST_FUNCTION_NAMES)
         assert not (set(symbols) & set(god_functions))
         assert set(symbols) <= set(target_functions)
         for symbol in symbols:
@@ -361,7 +353,7 @@ def test_target_modules_are_sole_function_owners() -> None:
             assert host_facade.__code__ is canonical_function.__code__
 
 
-def test_all_50_normalized_bodies_and_signatures_match_baseline() -> None:
+def test_retained_normalized_bodies_and_signatures_match_baseline() -> None:
     for module_name, symbols in FROZEN_SYMBOLS.items():
         functions = _top_level_functions(_module_tree(TARGET_MODULES[module_name]))
         for symbol in symbols:
@@ -383,7 +375,7 @@ def test_fail_fast_assert_deviations_are_exactly_documented() -> None:
             if count:
                 actual[symbol] = count
     assert actual == EXPECTED_ASSERT_COUNTS
-    assert len(actual) == 21
+    assert len(actual) == 19
 
 
 def test_god_module_facades_are_same_objects_with_owner_globals() -> None:
@@ -403,7 +395,7 @@ def test_god_module_facades_are_same_objects_with_owner_globals() -> None:
             elif host_facade is not owner_function:
                 assert host_facade.__globals__ is vars(lpe)
             facade_count += 1
-    assert facade_count == 63
+    assert facade_count == 61
 
 
 def test_installed_host_contract_retains_candidate_loop_dependencies() -> None:
@@ -460,7 +452,6 @@ def test_candidate_loop_keeps_monkeypatch_compatible_facade_lookup() -> None:
     required = {
         "_classify_codex_auto_agent_retryable_exhaustion",
         "_record_auto_agent_alias_attempt_failure",
-        "_record_basic_pilot_cooldown_evidence",
         "_apply_request_local_cooldown_from_plan",
     }
     assert required <= loaded_attributes

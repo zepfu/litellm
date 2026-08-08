@@ -88,18 +88,9 @@ def test_rr054_package_init_reexports_layers() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_rr054_policy_cooldown_defaults_and_alias_tables() -> None:
+def test_rr054_policy_cooldown_defaults_and_provider_capabilities() -> None:
     assert policy.CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS == 30.0
     assert policy.CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS == 3 * 60 * 60.0
-    assert "basic" in policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    assert "work" in policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    assert "basic" in policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    assert "work" in policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
-
-    for candidate in policy.CODEX_AUTO_AGENT_CANDIDATES:
-        assert {"provider", "model", "route_family", "last_resort"} <= set(candidate)
-    last = policy.CODEX_AUTO_AGENT_CANDIDATES[-1]
-    assert last["last_resort"] is True
 
     assert "gpt-5.3-codex" in policy.ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS or (
         len(policy.ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS) > 0

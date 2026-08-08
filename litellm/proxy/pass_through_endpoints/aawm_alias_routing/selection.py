@@ -26,14 +26,11 @@ from .lane_keys import (
 )
 from .openrouter_quota import _apply_openrouter_durable_quota_candidate_cooldown
 from .policy import (
-    ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS as _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-    ANTHROPIC_AUTO_AGENT_MODEL_ALIAS as _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
     ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER as _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
     CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY as _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
     CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER as _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
-    CODEX_AUTO_AGENT_MODEL_ALIAS as _CODEX_AUTO_AGENT_MODEL_ALIAS,
     CODEX_AUTO_AGENT_NATIVE_PROVIDER as _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
     CODEX_AUTO_AGENT_OPENCODE_LANE_KEY as _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY,
     CODEX_AUTO_AGENT_OPENCODE_PROVIDER as _CODEX_AUTO_AGENT_OPENCODE_PROVIDER,
@@ -42,12 +39,10 @@ from .policy import (
     CODEX_AUTO_AGENT_XAI_PROVIDER as _CODEX_AUTO_AGENT_XAI_PROVIDER,
 )
 from .snapshot_select import (
-    _get_codex_auto_agent_candidates_for_alias,
-    _is_alias_config_startup_failed,
+    _commit_round_robin_selection,
+    _lookup_active_snapshot_canonical_alias,
     _resolve_aawm_alias_selection_enumeration,
-    _routing_candidate_to_anthropic_public_dict,
     _select_snapshot_candidates,
-    get_active_routing_snapshot,
 )
 from .state import alias_routing_state
 
@@ -76,16 +71,12 @@ _get_anthropic_session_affinity: Optional[
 _get_openrouter_adapter_active_cooldown_seconds: Optional[
     Callable[[Optional[str]], Awaitable[float]]
 ] = None
-_normalize_codex_alias_model: Optional[Callable[[Any], Optional[str]]] = None
 _extract_client_product_label: Optional[
     Callable[[Request, dict[str, Any]], Optional[str]]
 ] = None
 _resolve_codex_session_key: Optional[Callable[..., Optional[str]]] = None
 _resolve_anthropic_session_key: Optional[Callable[..., Optional[str]]] = None
 _has_continuation_state: Optional[Callable[[Any], bool]] = None
-_get_anthropic_candidates_for_alias: Optional[
-    Callable[[str], tuple[dict[str, Any], ...]]
-] = None
 _is_grok_account_quota_candidate: Optional[
     Callable[[Optional[dict[str, Any]]], bool]
 ] = None
@@ -106,12 +97,10 @@ def configure_selection_runtime(
     get_codex_session_affinity: Callable[[Optional[str]], Awaitable[Optional[dict[str, Any]]]],
     get_anthropic_session_affinity: Callable[[Optional[str]], Awaitable[Optional[dict[str, Any]]]],
     get_openrouter_adapter_active_cooldown_seconds: Callable[[Optional[str]], Awaitable[float]],
-    normalize_codex_alias_model: Callable[[Any], Optional[str]],
     extract_client_product_label: Callable[[Request, dict[str, Any]], Optional[str]],
     resolve_codex_session_key: Callable[..., Optional[str]],
     resolve_anthropic_session_key: Callable[..., Optional[str]],
     has_continuation_state: Callable[[Any], bool],
-    get_anthropic_candidates_for_alias: Callable[[str], tuple[dict[str, Any], ...]],
     is_grok_account_quota_candidate: Callable[[Optional[dict[str, Any]]], bool],
     get_grok_account_quota_lane_cooldown_key: Callable[[Any, Optional[str]], Optional[str]],
     is_kimi_code_candidate: Callable[[Optional[dict[str, Any]]], bool],
@@ -134,8 +123,6 @@ def configure_selection_runtime(
     _get_anthropic_session_affinity = get_anthropic_session_affinity
     global _get_openrouter_adapter_active_cooldown_seconds
     _get_openrouter_adapter_active_cooldown_seconds = get_openrouter_adapter_active_cooldown_seconds
-    global _normalize_codex_alias_model
-    _normalize_codex_alias_model = normalize_codex_alias_model
     global _extract_client_product_label
     _extract_client_product_label = extract_client_product_label
     global _resolve_codex_session_key
@@ -144,8 +131,6 @@ def configure_selection_runtime(
     _resolve_anthropic_session_key = resolve_anthropic_session_key
     global _has_continuation_state
     _has_continuation_state = has_continuation_state
-    global _get_anthropic_candidates_for_alias
-    _get_anthropic_candidates_for_alias = get_anthropic_candidates_for_alias
     global _is_grok_account_quota_candidate
     _is_grok_account_quota_candidate = is_grok_account_quota_candidate
     global _get_grok_account_quota_lane_cooldown_key
@@ -167,27 +152,6 @@ def _auto_agent_alias_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
-
-
-def _normalize_anthropic_auto_agent_alias_model(model: Any) -> Optional[str]:
-    if not isinstance(model, str):
-        return None
-    normalized = model.strip().lower()
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
-        AAWM_RETIRED_ALIASES,
-    )
-
-    if normalized in AAWM_RETIRED_ALIASES:
-        return None
-    snapshot = get_active_routing_snapshot()
-    if snapshot is not None:
-        alias = snapshot.aliases.get(normalized)
-        if alias is not None and alias.visibility == "public":
-            return alias.name
-    for alias in _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS:
-        if normalized == alias.lower():
-            return alias
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -502,21 +466,16 @@ def _find_codex_auto_agent_candidate(
     provider: Any,
     model: Any,
     *,
-    alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
+    alias_model: str,
     client_product_label: Optional[str] = None,
-    request: Optional[Request] = None,
+    request: Request,
 ) -> Optional[dict[str, Any]]:
-    if request is not None:
-        candidates: Sequence[dict[str, Any]] = _resolve_aawm_alias_selection_enumeration(
-            request,
-            alias_model,
-            client_product_label=client_product_label,
-        ).candidates
-    else:
-        candidates = _get_codex_auto_agent_candidates_for_alias(
-            alias_model,
-            client_product_label=client_product_label,
-        )
+    candidates: Sequence[dict[str, Any]] = _resolve_aawm_alias_selection_enumeration(
+        request,
+        alias_model,
+        ingress="codex",
+        client_product_label=client_product_label,
+    ).candidates
     for candidate in candidates:
         if candidate["provider"] == provider and candidate["model"] == model:
             return dict(candidate)
@@ -532,57 +491,40 @@ def _find_codex_auto_agent_affinity_candidate(
 ) -> Optional[dict[str, Any]]:
     """Resolve a pinned candidate without applying new-request eligibility gates.
 
-    Snapshot-established affinity is checked against the active snapshot's full
-    alias membership so schedule-only changes do not evict an in-flight
-    continuation. Static/legacy affinity keeps the existing lookup path.
+    Snapshot-established affinity is checked against the captured snapshot's
+    full alias membership so schedule-only changes do not evict an in-flight
+    continuation.
     """
-    return _find_codex_auto_agent_candidate(
-        affinity.get("provider"),
-        affinity.get("model"),
-        alias_model=alias_model,
+    for candidate in _select_snapshot_candidates(
+        alias_model,
+        ingress="codex",
         client_product_label=client_product_label,
         request=request,
-    )
-
-
-def _get_anthropic_candidates_for_alias_snapshot_aware(
-    alias_model: str,
-    *,
-    client_product_label: Optional[str] = None,
-) -> tuple[dict[str, Any], ...]:
-    """Resolve one alias through the shared immutable snapshot."""
-    if _is_alias_config_startup_failed():
-        return ()
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
-        AAWM_RETIRED_ALIASES,
-    )
-
-    if alias_model in AAWM_RETIRED_ALIASES:
-        return ()
-    snapshot = get_active_routing_snapshot()
-    if snapshot is not None:
-        alias = snapshot.aliases.get(alias_model)
-        if alias is None or alias.visibility != "public":
-            return ()
-        return _select_snapshot_candidates(
-            alias_model,
-            ingress="anthropic",
-            client_product_label=client_product_label,
-        )
-    assert _get_anthropic_candidates_for_alias is not None
-    return _get_anthropic_candidates_for_alias(alias_model)
+        include_out_of_schedule=True,
+    ):
+        if (
+            candidate["provider"] == affinity.get("provider")
+            and candidate["model"] == affinity.get("model")
+        ):
+            return dict(candidate)
+    return None
 
 
 def _find_anthropic_auto_agent_candidate(
     provider: Any,
     model: Any,
     *,
-    alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
+    alias_model: str,
     client_product_label: Optional[str] = None,
+    request: Request,
 ) -> Optional[dict[str, Any]]:
-    for candidate in _get_anthropic_candidates_for_alias_snapshot_aware(
-        alias_model, client_product_label=client_product_label,
-    ):
+    candidates = _resolve_aawm_alias_selection_enumeration(
+        request,
+        alias_model,
+        ingress="anthropic",
+        client_product_label=client_product_label,
+    ).candidates
+    for candidate in candidates:
         if candidate["provider"] == provider and candidate["model"] == model:
             return dict(candidate)
     return None
@@ -593,6 +535,7 @@ def _find_anthropic_auto_agent_affinity_candidate(
     *,
     alias_model: str,
     client_product_label: Optional[str],
+    request: Request,
 ) -> Optional[dict[str, Any]]:
     """Resolve a pinned Anthropic candidate without applying new-request eligibility gates.
 
@@ -600,12 +543,19 @@ def _find_anthropic_auto_agent_affinity_candidate(
     affinity is checked against the active snapshot's full alias membership so
     schedule/TUI-only changes do not evict an in-flight continuation.
     """
-    return _find_anthropic_auto_agent_candidate(
-        affinity.get("provider"),
-        affinity.get("model"),
-        alias_model=alias_model,
+    for candidate in _select_snapshot_candidates(
+        alias_model,
+        ingress="anthropic",
         client_product_label=client_product_label,
-    )
+        request=request,
+        include_out_of_schedule=True,
+    ):
+        if (
+            candidate["provider"] == affinity.get("provider")
+            and candidate["model"] == affinity.get("model")
+        ):
+            return dict(candidate)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -634,7 +584,6 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     request: Request,
     *,
     candidate_template: dict[str, Any],
-    alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
     openai_lane_key: Optional[str] = None,
 ) -> dict[str, Any]:
     assert _get_codex_active_cooldown_state is not None
@@ -658,8 +607,7 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
     else:
         lane_key = openai_lane_key
-    # Wave 3 R3-4: snapshot-resolved candidates carry config_epoch_tag;
-    # static/legacy candidates do not, keeping bare keys.
+    # Snapshot-resolved candidates carry the active config epoch into state keys.
     _epoch_tag = candidate.get("config_epoch_tag")
     cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=_epoch_tag)
     (
@@ -774,7 +722,6 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
     request: Request,
     *,
     candidate_template: dict[str, Any],
-    alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
     openai_lane_key: Optional[str] = None,
     anthropic_lane_key: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -904,7 +851,7 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
 async def _build_codex_auto_agent_candidate_states(
     request: Request,
     *,
-    alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
+    alias_model: str,
     client_product_label: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
@@ -912,16 +859,16 @@ async def _build_codex_auto_agent_candidate_states(
     for candidate_template in _resolve_aawm_alias_selection_enumeration(
         request,
         alias_model,
+        ingress="codex",
         client_product_label=client_product_label,
     ).candidates:
         states.append(
             _attach_normalized_quota_state(
                 await _build_codex_auto_agent_candidate_state(
-                request,
-                candidate_template=candidate_template,
-                alias_model=alias_model,
-                openai_lane_key=openai_lane_key,
-            )
+                    request,
+                    candidate_template=candidate_template,
+                    openai_lane_key=openai_lane_key,
+                )
             )
         )
     return states
@@ -930,24 +877,26 @@ async def _build_codex_auto_agent_candidate_states(
 async def _build_anthropic_auto_agent_candidate_states(
     request: Request,
     *,
-    alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
+    alias_model: str,
     client_product_label: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
     anthropic_lane_key = _resolve_anthropic_auto_agent_native_cooldown_lane_key(request)
     states: list[dict[str, Any]] = []
-    for candidate_template in _get_anthropic_candidates_for_alias_snapshot_aware(
-        alias_model, client_product_label=client_product_label,
-    ):
+    for candidate_template in _resolve_aawm_alias_selection_enumeration(
+        request,
+        alias_model,
+        ingress="anthropic",
+        client_product_label=client_product_label,
+    ).candidates:
         states.append(
             _attach_normalized_quota_state(
                 await _build_anthropic_auto_agent_candidate_state(
-                request,
-                candidate_template=candidate_template,
-                alias_model=alias_model,
-                openai_lane_key=openai_lane_key,
-                anthropic_lane_key=anthropic_lane_key,
-            )
+                    request,
+                    candidate_template=candidate_template,
+                    openai_lane_key=openai_lane_key,
+                    anthropic_lane_key=anthropic_lane_key,
+                )
             )
         )
     return states
@@ -987,10 +936,53 @@ def _weighted_choice(
     return choices[-1]
 
 
+def _select_round_robin_available_state(
+    request: Request,
+    tier: Sequence[dict[str, Any]],
+    *,
+    group: str,
+    ingress: str,
+) -> dict[str, Any]:
+    token = _resolve_aawm_alias_selection_enumeration(
+        request,
+        group,
+        ingress=ingress,
+    ).commit_token
+    if token is None:
+        return tier[0]
+
+    cursor_key = (token.epoch_tag, token.alias_name)
+    cursor = alias_routing_state.round_robin_cursor.get(
+        cursor_key,
+        token.start_index,
+    )
+    available_by_identity = {
+        (
+            str(state["candidate"].get("provider") or ""),
+            str(state["candidate"].get("model") or ""),
+        ): state
+        for state in tier
+    }
+    selected = tier[0]
+    for offset in range(len(token.tied_candidate_ids)):
+        identity = token.tied_candidate_ids[
+            (cursor + offset) % len(token.tied_candidate_ids)
+        ]
+        if identity in available_by_identity:
+            selected = available_by_identity[identity]
+            break
+    _commit_round_robin_selection(
+        token,
+        selected_candidate=selected["candidate"],
+    )
+    return selected
+
+
 def _select_available_state(
     request: Request,
     states: Sequence[dict[str, Any]],
     *,
+    ingress: str,
     last_resort: bool,
 ) -> Optional[dict[str, Any]]:
     available = [
@@ -1031,6 +1023,7 @@ def _select_available_state(
     choices = list(states_by_choice)
     selected_by_group = _get_request_selection_choices(request)
     selected_choice = selected_by_group.get(str(group))
+    selected_state: Optional[dict[str, Any]] = None
     if selected_choice not in states_by_choice:
         if selected_choice is not None:
             counts = _get_request_reselection_counts(request)
@@ -1038,13 +1031,15 @@ def _select_available_state(
         if strategy == "proportional":
             selected_choice = _weighted_choice(choices, weights)
         elif strategy == "round_robin":
-            epoch = str(tier[0]["candidate"].get("config_epoch_tag") or "")
-            cursor_key = (epoch, str(group))
-            cursor = alias_routing_state.round_robin_cursor.get(cursor_key, 0)
-            selected_choice = choices[cursor % len(choices)]
-            alias_routing_state.round_robin_cursor[cursor_key] = (
-                cursor + 1
-            ) % len(choices)
+            selected_state = _select_round_robin_available_state(
+                request,
+                tier,
+                group=str(group),
+                ingress=ingress,
+            )
+            selected_choice = str(
+                selected_state["candidate"].get("selection_choice") or ""
+            )
         elif strategy in {
             "highest_quota_available",
             "lowest_quota_available",
@@ -1076,7 +1071,7 @@ def _select_available_state(
             selected_choice = choices[0]
         selected_by_group[str(group)] = selected_choice
 
-    selected = states_by_choice[selected_choice][0]
+    selected = selected_state or states_by_choice[selected_choice][0]
     total_weight = sum(max(0.0, weights[choice]) for choice in choices)
     selected["selection_diagnostics"] = {
         "strategy": strategy,
@@ -1246,7 +1241,7 @@ def _raise_codex_auto_agent_redispatch_required(
     lane_key: Optional[str],
     cooldown_seconds: float,
     error_tokens: set[str],
-    alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
+    alias_model: str,
     error_class: Optional[str] = None,
     cooldown_scope: Optional[str] = None,
     error_status_code: Optional[Any] = None,
@@ -1298,7 +1293,7 @@ def _raise_anthropic_auto_agent_redispatch_required(
     lane_key: Optional[str],
     cooldown_seconds: float,
     error_tokens: set[str],
-    alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
+    alias_model: str,
     error_class: Optional[str] = None,
     cooldown_scope: Optional[str] = None,
     error_status_code: Optional[Any] = None,
@@ -1354,12 +1349,25 @@ async def _select_codex_auto_agent_candidate(
     request: Request,
     request_body: dict[str, Any],
 ) -> dict[str, Any]:
-    assert _normalize_codex_alias_model is not None
     assert _extract_client_product_label is not None
     assert _resolve_codex_session_key is not None
     assert _has_continuation_state is not None
     assert _get_codex_session_affinity is not None
-    alias_model = _normalize_codex_alias_model(request_body.get("model")) or _CODEX_AUTO_AGENT_MODEL_ALIAS
+    alias_model = _lookup_active_snapshot_canonical_alias(
+        request_body.get("model"),
+        request=request,
+    )
+    if alias_model is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": "The requested model is not an active configured AAWM alias.",
+                    "type": "invalid_request_error",
+                    "code": "aawm_alias_unknown_or_config_unavailable",
+                }
+            },
+        )
     client_product_label = _extract_client_product_label(request, request_body)
     session_key = _resolve_codex_session_key(
         request,
@@ -1406,7 +1414,6 @@ async def _select_codex_auto_agent_candidate(
             affinity_state = await _build_codex_auto_agent_candidate_state(
                 request,
                 candidate_template=affinity_candidate,
-                alias_model=alias_model,
             )
             if _is_auto_agent_candidate_state_available(affinity_state):
                 return _attach_aawm_alias_routing_state_sources(
@@ -1507,7 +1514,12 @@ async def _select_codex_auto_agent_candidate(
                     selected_state=matched_affinity_state,
                 )
 
-    state = _select_available_state(request, states, last_resort=False)
+    state = _select_available_state(
+        request,
+        states,
+        ingress="codex",
+        last_resort=False,
+    )
     if state is not None:
         return _attach_aawm_alias_routing_state_sources(
             {
@@ -1520,7 +1532,12 @@ async def _select_codex_auto_agent_candidate(
             selected_state=state,
         )
 
-    state = _select_available_state(request, states, last_resort=True)
+    state = _select_available_state(
+        request,
+        states,
+        ingress="codex",
+        last_resort=True,
+    )
     if state is not None:
         return _attach_aawm_alias_routing_state_sources(
             {
@@ -1560,9 +1577,21 @@ async def _select_anthropic_auto_agent_candidate(
     assert _has_continuation_state is not None
     assert _get_anthropic_session_affinity is not None
     assert _extract_client_product_label is not None
-    alias_model = (
-        _normalize_anthropic_auto_agent_alias_model(request_body.get("model")) or _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
+    alias_model = _lookup_active_snapshot_canonical_alias(
+        request_body.get("model"),
+        request=request,
     )
+    if alias_model is None:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": "The requested model is not an active configured AAWM alias.",
+                    "type": "invalid_request_error",
+                    "code": "aawm_alias_unknown_or_config_unavailable",
+                }
+            },
+        )
     client_product_label = _extract_client_product_label(request, request_body)
     session_key = _resolve_anthropic_session_key(
         request,
@@ -1579,6 +1608,7 @@ async def _select_anthropic_auto_agent_candidate(
             affinity,
             alias_model=alias_model,
             client_product_label=client_product_label,
+            request=request,
         )
         # CFG-001: continuation-safe affinity.  If the pinned candidate
         # was removed from the active enumeration or its route_family changed
@@ -1606,7 +1636,6 @@ async def _select_anthropic_auto_agent_candidate(
             affinity_state = await _build_anthropic_auto_agent_candidate_state(
                 request,
                 candidate_template=affinity_candidate,
-                alias_model=alias_model,
             )
             if _is_auto_agent_candidate_state_available(affinity_state):
                 return _attach_aawm_alias_routing_state_sources(
@@ -1641,6 +1670,7 @@ async def _select_anthropic_auto_agent_candidate(
             affinity.get("model"),
             alias_model=alias_model,
             client_product_label=client_product_label,
+            request=request,
         )
         if affinity_candidate is not None:
             matched_affinity_state: Optional[dict[str, Any]] = None
@@ -1686,7 +1716,12 @@ async def _select_anthropic_auto_agent_candidate(
                         selected_state=matched_affinity_state,
                     )
 
-    state = _select_available_state(request, states, last_resort=False)
+    state = _select_available_state(
+        request,
+        states,
+        ingress="anthropic",
+        last_resort=False,
+    )
     if state is not None:
         return _attach_aawm_alias_routing_state_sources(
             {
@@ -1700,7 +1735,12 @@ async def _select_anthropic_auto_agent_candidate(
             selected_state=state,
         )
 
-    state = _select_available_state(request, states, last_resort=True)
+    state = _select_available_state(
+        request,
+        states,
+        ingress="anthropic",
+        last_resort=True,
+    )
     if state is not None:
         return _attach_aawm_alias_routing_state_sources(
             {
@@ -1735,7 +1775,6 @@ from types import FunctionType as _FunctionType
 
 _HOST_FUNCTION_NAMES = (
     "_auto_agent_alias_float",
-    "_normalize_anthropic_auto_agent_alias_model",
     "_codex_auto_agent_candidate_public_shape",
     "_is_auto_agent_candidate_state_available",
     "_build_auto_agent_skipped_candidates_from_states",
@@ -1766,6 +1805,7 @@ _HOST_FUNCTION_NAMES = (
     "_get_request_selection_choices",
     "_get_request_reselection_counts",
     "_weighted_choice",
+    "_select_round_robin_available_state",
     "_select_available_state",
     "_raise_codex_auto_agent_in_flight_cooldown",
     "_raise_anthropic_auto_agent_in_flight_cooldown",
@@ -1819,15 +1859,13 @@ def install(host_globals: dict) -> None:
         "_set_anthropic_cooldown": _set_anthropic_cooldown,
         "_get_codex_session_affinity": _get_codex_session_affinity,
         "_get_anthropic_session_affinity": _get_anthropic_session_affinity,
-        "_normalize_codex_alias_model": _normalize_codex_alias_model,
         "_extract_client_product_label": _extract_client_product_label,
         "_resolve_codex_session_key": _resolve_codex_session_key,
         "_resolve_anthropic_session_key": _resolve_anthropic_session_key,
         "_has_continuation_state": _has_continuation_state,
-        "_get_anthropic_candidates_for_alias": _get_anthropic_candidates_for_alias,
-        "_get_anthropic_candidates_for_alias_snapshot_aware": _get_anthropic_candidates_for_alias_snapshot_aware,
         "_find_anthropic_auto_agent_affinity_candidate": _find_anthropic_auto_agent_affinity_candidate,
-        "_routing_candidate_to_anthropic_public_dict": _routing_candidate_to_anthropic_public_dict,
+        "_lookup_active_snapshot_canonical_alias": _lookup_active_snapshot_canonical_alias,
+        "_resolve_aawm_alias_selection_enumeration": _resolve_aawm_alias_selection_enumeration,
         "_is_grok_account_quota_candidate": _is_grok_account_quota_candidate,
         "_get_grok_account_quota_lane_cooldown_key": _get_grok_account_quota_lane_cooldown_key,
         "_is_kimi_code_candidate": _is_kimi_code_candidate,

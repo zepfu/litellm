@@ -32,7 +32,6 @@ from typing import (
 import httpx
 
 import litellm
-from .model_resolution import _reject_retired_aawm_alias_model
 
 if TYPE_CHECKING:
     from fastapi import Request, Response
@@ -364,7 +363,6 @@ class BaseOpenAIPassThroughHandler:
 
         if request.method == "POST":
             request_body = await rt.get_request_body_fn(request)
-            _reject_retired_aawm_alias_model(request_body.get("model"))
             prepared_request_body = request_body
             body_was_prepared = False
             is_codex_responses_request = (
@@ -375,6 +373,7 @@ class BaseOpenAIPassThroughHandler:
                 rt.resolve_codex_auto_agent_alias_model_fn(
                     prepared_request_body,
                     endpoint=endpoint,
+                    request=request,
                 )
                 is not None
             ):

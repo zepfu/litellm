@@ -166,7 +166,7 @@ class TestNoneFallThrough:
     async def test_no_adapters_returns_none(self) -> None:
         kwargs = _dispatch_kwargs(prepared_request_body={"model": "gpt-4o"})
         host = {
-            "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint: None,
+            "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint, request: None,
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
@@ -180,7 +180,7 @@ class TestNoneFallThrough:
     async def test_empty_model_returns_none(self) -> None:
         kwargs = _dispatch_kwargs(prepared_request_body={"model": ""})
         host = {
-            "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint: None,
+            "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint, request: None,
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
@@ -194,7 +194,7 @@ class TestNoneFallThrough:
     async def test_non_string_model_returns_none(self) -> None:
         kwargs = _dispatch_kwargs(prepared_request_body={"model": 42})
         host = {
-            "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint: None,
+            "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint, request: None,
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
@@ -214,7 +214,7 @@ class TestNoneFallThrough:
             request_body=body,
         )
         host = {
-            "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint: None,
+            "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint, request: None,
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
@@ -247,7 +247,7 @@ def _make_dispatch_host(
     sentinel_response = Response(content=b"dispatched", status_code=200)
 
     resolvers: dict[str, Any] = {
-        "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint: None,
+        "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint, request: None,
         "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
         "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
         "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
@@ -264,7 +264,7 @@ def _make_dispatch_host(
     host: dict[str, Any] = {
         **resolvers,
         "_apply_codex_auto_agent_prevention_guidance_to_request_body": lambda body: (body, []),
-        "_apply_aawm_read_agent_guidance_to_request_body": lambda body, *, alias_model, target_field: (body, []),
+        "_apply_aawm_read_agent_guidance_to_request_body": lambda body, *, target_field: (body, []),
         "_prepare_request_body_for_passthrough_observability": lambda *, request, request_body: request_body,
         "_safe_set_request_parsed_body": lambda request, body: None,
         "_handle_codex_auto_agent_alias_route": _fake_alias_route,
@@ -338,12 +338,14 @@ class TestDispatchOrdering:
             return zen_resp
 
         host: dict[str, Any] = {
-            "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint: "alias-model",
+            "_resolve_codex_auto_agent_alias_model": (
+                lambda body, *, endpoint, request: "alias-model"
+            ),
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: "zen-model",
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
             "_apply_codex_auto_agent_prevention_guidance_to_request_body": lambda body: (body, []),
-            "_apply_aawm_read_agent_guidance_to_request_body": lambda body, *, alias_model, target_field: (body, []),
+            "_apply_aawm_read_agent_guidance_to_request_body": lambda body, *, target_field: (body, []),
             "_prepare_request_body_for_passthrough_observability": lambda *, request, request_body: request_body,
             "_safe_set_request_parsed_body": lambda request, body: None,
             "_handle_codex_auto_agent_alias_route": _alias_route,
@@ -371,12 +373,14 @@ class TestErrorPropagation:
             raise RuntimeError("upstream failure")
 
         host: dict[str, Any] = {
-            "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint: "alias",
+            "_resolve_codex_auto_agent_alias_model": (
+                lambda body, *, endpoint, request: "alias"
+            ),
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
             "_apply_codex_auto_agent_prevention_guidance_to_request_body": lambda body: (body, []),
-            "_apply_aawm_read_agent_guidance_to_request_body": lambda body, *, alias_model, target_field: (body, []),
+            "_apply_aawm_read_agent_guidance_to_request_body": lambda body, *, target_field: (body, []),
             "_prepare_request_body_for_passthrough_observability": lambda *, request, request_body: request_body,
             "_safe_set_request_parsed_body": lambda request, body: None,
             "_handle_codex_auto_agent_alias_route": _exploding_route,
@@ -391,7 +395,12 @@ class TestErrorPropagation:
 
     @pytest.mark.asyncio
     async def test_resolver_exception_propagates(self) -> None:
-        def _exploding_resolver(body: Any, *, endpoint: str) -> None:
+        def _exploding_resolver(
+            body: Any,
+            *,
+            endpoint: str,
+            request: Request,
+        ) -> None:
             raise ValueError("resolver boom")
 
         host: dict[str, Any] = {

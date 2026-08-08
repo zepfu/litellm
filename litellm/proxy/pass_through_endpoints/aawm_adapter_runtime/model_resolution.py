@@ -6,18 +6,16 @@ Do not import llm_passthrough_endpoints at module scope.
 
 from __future__ import annotations
 
-import hashlib
-from typing import Any, Optional
-
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Optional
 
 from litellm.llms.kimi_code.adapters import adapter as _kimi_code_adapters
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
-    CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS as _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
     KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS as _KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS,
 )
 
 if TYPE_CHECKING:
+    from fastapi import Request
+
     # Host-global modules (bound via install())
     _alibaba_token_plan_adapters: Any
 
@@ -59,8 +57,6 @@ _HOST_FUNCTION_NAMES = (
     "_resolve_anthropic_opencode_zen_adapter_model",
     "_resolve_anthropic_kimi_chat_completions_adapter_model",
     "_resolve_anthropic_alibaba_token_plan_adapter_model",
-    "_normalize_codex_auto_agent_alias_model",
-    "_is_codex_auto_agent_alias_model",
     "_resolve_codex_auto_agent_alias_model",
     "_resolve_anthropic_openai_responses_adapter_model",
     "_resolve_anthropic_xai_oauth_adapter_model",
@@ -305,103 +301,22 @@ def _resolve_anthropic_alibaba_token_plan_adapter_model(
     return None
 
 
-def _normalize_codex_auto_agent_alias_model(model: Any) -> Optional[str]:
-    if not isinstance(model, str):
-        return None
-    normalized = model.strip().lower()
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
-        AAWM_RETIRED_ALIASES,
-        AAWM_RETIRED_ALIAS_HASHES,
-    )
-
-    if (
-        normalized in AAWM_RETIRED_ALIASES
-        or hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-        in AAWM_RETIRED_ALIAS_HASHES
-    ):
-        return None
-    for alias in _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS:  # noqa: F821
-        if normalized == alias.lower():
-            return alias
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
-        get_active_routing_snapshot,
-    )
-
-    snapshot = get_active_routing_snapshot()
-    if snapshot is not None:
-        for alias_name, alias in snapshot.aliases.items():
-            if normalized == alias_name.lower() and alias.visibility == "public":
-                return alias_name
-    return None
-
-
-def _is_retired_aawm_alias_model(model: Any) -> bool:
-    if not isinstance(model, str):
-        return False
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
-        AAWM_RETIRED_ALIAS_HASHES,
-    )
-
-    normalized = model.strip().lower()
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
-        AAWM_RETIRED_ALIASES,
-    )
-
-    return (
-        normalized in AAWM_RETIRED_ALIASES
-        or hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-        in AAWM_RETIRED_ALIAS_HASHES
-    )
-
-
-def _is_internal_aawm_alias_model(model: Any) -> bool:
-    if not isinstance(model, str):
-        return False
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
-        get_active_routing_snapshot,
-    )
-
-    normalized = model.strip().lower()
-    snapshot = get_active_routing_snapshot()
-    if snapshot is None:
-        return False
-    return any(
-        normalized == alias_name.lower() and alias.visibility == "internal"
-        for alias_name, alias in snapshot.aliases.items()
-    )
-
-
-def _reject_retired_aawm_alias_model(model: Any) -> None:
-    retired = _is_retired_aawm_alias_model(model)
-    internal = _is_internal_aawm_alias_model(model)
-    if not retired and not internal:
-        return
-
-    from litellm.proxy._types import ProxyException
-
-    raise ProxyException(
-        message=(
-            "This retired AAWM model alias is unsupported; use a supported "
-            "canonical alias."
-            if retired
-            else "Internal AAWM model aliases cannot be selected directly."
-        ),
-        type="invalid_request_error",
-        param="model",
-        code=400,
-    )
-
-
-def _is_codex_auto_agent_alias_model(model: Any) -> bool:
-    return _normalize_codex_auto_agent_alias_model(model) is not None
-
 def _resolve_codex_auto_agent_alias_model(
     request_body: dict[str, Any],
     endpoint: str,
+    *,
+    request: "Request",
 ) -> Optional[str]:
     if not _is_openai_responses_endpoint(endpoint):
         return None
-    return _normalize_codex_auto_agent_alias_model(request_body.get("model"))
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+        _lookup_active_snapshot_canonical_alias,
+    )
+
+    return _lookup_active_snapshot_canonical_alias(
+        request_body.get("model"),
+        request=request,
+    )
 
 def _resolve_anthropic_openai_responses_adapter_model(
     request_body: dict[str, Any],

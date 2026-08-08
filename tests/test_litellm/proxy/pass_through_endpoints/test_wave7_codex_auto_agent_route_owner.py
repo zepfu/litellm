@@ -8,7 +8,6 @@ Covers:
 - CodexAutoAgentRouteRuntime frozen-dataclass contract
 - handle_codex_auto_agent_alias_route delegation to candidate_loop.handle_alias_route
 - perform_candidate_request closure kwarg forwarding
-- alias model normalization fallback
 - max_candidate_attempts derivation from enumeration
 - no module-scope god-module import (AST structural pin)
 - build_runtime_from_host fail-closed on missing host attributes
@@ -52,8 +51,6 @@ MODULE_PATH = Path(
 def _make_runtime(**overrides: Any) -> CodexAutoAgentRouteRuntime:
     """Build a runtime with no-op defaults; override individual seams."""
     defaults: dict[str, Any] = dict(
-        normalize_alias_model_fn=lambda m: None,
-        default_alias_model="codex-auto-agent",
         extract_client_product_label_fn=lambda req, body: None,
         perform_candidate_request_fn=AsyncMock(),
         select_candidate_fn=MagicMock(),
@@ -96,8 +93,6 @@ class TestRuntimeDataclass:
     def test_expected_field_names(self):
         names = {f.name for f in dataclasses.fields(CodexAutoAgentRouteRuntime)}
         expected = {
-            "normalize_alias_model_fn",
-            "default_alias_model",
             "extract_client_product_label_fn",
             "perform_candidate_request_fn",
             "select_candidate_fn",
@@ -115,7 +110,7 @@ class TestRuntimeDataclass:
     def test_immutable(self):
         rt = _make_runtime()
         with pytest.raises(dataclasses.FrozenInstanceError):
-            rt.default_alias_model = "other"  # type: ignore[misc]
+            rt.extract_client_product_label_fn = lambda req, body: "other"  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +124,6 @@ class TestHandleDelegation:
         sentinel_response = MagicMock(name="response")
         enum = _fake_enumeration(2)
         rt = _make_runtime(
-            normalize_alias_model_fn=lambda m: "resolved-model",
             extract_client_product_label_fn=lambda req, body: "Codex/1.0",
             resolve_selection_enumeration_fn=MagicMock(return_value=enum),
         )
@@ -154,6 +148,7 @@ class TestHandleDelegation:
                     target_url="https://example.com/v1/responses",
                     api_key="sk-test",
                     forward_headers=True,
+                    canonical_alias="resolved-model",
                 )
             )
 
@@ -179,36 +174,6 @@ class TestHandleDelegation:
         assert services.add_alias_metadata_fn is rt.add_alias_metadata_fn
         assert services.raise_redispatch_fn is rt.raise_redispatch_fn
 
-    def test_alias_model_falls_back_to_default(self):
-        """When normalize returns None, the default_alias_model is used."""
-        enum = _fake_enumeration(1)
-        rt = _make_runtime(
-            normalize_alias_model_fn=lambda m: None,
-            default_alias_model="fallback-alias",
-            resolve_selection_enumeration_fn=MagicMock(return_value=enum),
-        )
-        req = _fake_request()
-
-        with patch(
-            "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_auto_agent_route.handle_alias_route",
-            new_callable=AsyncMock,
-            return_value=MagicMock(),
-        ) as mock_loop:
-            asyncio.run(
-                handle_codex_auto_agent_alias_route(
-                    rt,
-                    endpoint="/v1/responses",
-                    request=req,
-                    fastapi_response=MagicMock(),
-                    user_api_key_dict=MagicMock(),
-                    prepared_request_body={"model": "unknown"},
-                    target_url="https://example.com",
-                    api_key=None,
-                    forward_headers=False,
-                )
-            )
-        assert mock_loop.call_args[1]["alias_model"] == "fallback-alias"
-
     def test_max_candidate_attempts_from_enumeration(self):
         """max_candidate_attempts equals len(enumeration.candidates)."""
         for n in (0, 1, 5):
@@ -232,6 +197,7 @@ class TestHandleDelegation:
                         target_url="https://example.com",
                         api_key=None,
                         forward_headers=False,
+                        canonical_alias="basic",
                     )
                 )
             assert mock_loop.call_args[1]["max_candidate_attempts"] == n
@@ -284,6 +250,7 @@ class TestPerformClosure:
                     target_url="https://target.example.com/v1/responses",
                     api_key="sk-abc",
                     forward_headers=True,
+                    canonical_alias="basic",
                 )
             )
 
@@ -394,8 +361,6 @@ class TestBuildRuntimeFailClosed:
         construction."""
         fake_host = MagicMock()
         # Provide all but one required attribute
-        fake_host._normalize_codex_auto_agent_alias_model = lambda m: None
-        fake_host._CODEX_AUTO_AGENT_MODEL_ALIAS = "codex-auto-agent"
         fake_host._extract_auto_agent_alias_client_product_label = lambda r, b: None
         fake_host._perform_codex_auto_agent_alias_candidate_request = AsyncMock()
         fake_host._select_codex_auto_agent_candidate = AsyncMock()
@@ -455,11 +420,15 @@ class TestClientProductLabelForwarding:
                     target_url="https://example.com",
                     api_key=None,
                     forward_headers=False,
+                    canonical_alias="basic",
                 )
             )
 
         resolve_enum_mock.assert_called_once_with(
-            req, "codex-auto-agent", client_product_label="Codex-CLI/2.0"
+            req,
+            "basic",
+            ingress="codex",
+            client_product_label="Codex-CLI/2.0",
         )
 
     def test_none_client_product_label_forwarded(self):
@@ -487,6 +456,7 @@ class TestClientProductLabelForwarding:
                     target_url="https://example.com",
                     api_key=None,
                     forward_headers=False,
+                    canonical_alias="basic",
                 )
             )
 
@@ -529,6 +499,7 @@ class TestCooldownStatePassthrough:
                     target_url="https://example.com",
                     api_key=None,
                     forward_headers=False,
+                    canonical_alias="basic",
                 )
             )
 
@@ -578,6 +549,7 @@ class TestPerformClosureIdentity:
                     target_url="https://example.com",
                     api_key="sk-x",
                     forward_headers=True,
+                    canonical_alias="basic",
                 )
             )
 

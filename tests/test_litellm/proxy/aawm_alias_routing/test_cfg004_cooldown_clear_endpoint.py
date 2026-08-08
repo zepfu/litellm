@@ -32,6 +32,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_clear impo
     handle_cooldown_clear,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+    AliasReference,
     RoutingAlias,
     RoutingCandidate,
     RoutingSnapshot,
@@ -565,6 +566,69 @@ class TestSnapshotResolution:
             assert len(target.identities) == 2
             providers = {i.provider for i in target.identities}
             assert providers == {"openai", "xai"}
+
+    @pytest.mark.parametrize("alias_name", ["reference-parent", "reference-branch"])
+    def test_alias_reference_expansion_resolves_concrete_candidates(
+        self,
+        fresh_manager,
+        alias_name,
+    ):
+        leaf_candidate = _make_candidate(
+            provider="xai",
+            model="grok-reference-target",
+            route_family="codex_xai_responses",
+        )
+        snapshot = RoutingSnapshot(
+            aliases={
+                "reference-parent": RoutingAlias(
+                    name="reference-parent",
+                    distribution_strategy=None,
+                    candidates=(
+                        AliasReference(
+                            alias_name="reference-branch",
+                            priority=90,
+                            weight=1.0,
+                        ),
+                    ),
+                ),
+                "reference-branch": RoutingAlias(
+                    name="reference-branch",
+                    distribution_strategy="proportional",
+                    candidates=(
+                        AliasReference(
+                            alias_name="reference-leaf",
+                            priority=100,
+                            weight=1.0,
+                        ),
+                    ),
+                ),
+                "reference-leaf": RoutingAlias(
+                    name="reference-leaf",
+                    distribution_strategy=None,
+                    candidates=(leaf_candidate,),
+                ),
+            },
+            config_epoch=1,
+            config_hash="alias-reference-hash",
+            config_version="alias-ref",
+        )
+        req = CooldownClearRequest(alias=alias_name, ingress="codex")
+
+        with patch(f"{_CLEAR_MOD}.get_active_routing_snapshot", return_value=snapshot):
+            target = _resolve_target_from_active_snapshot(req)
+
+        assert target.canonical_aliases == (alias_name,)
+        assert target.target_description == f"alias:{alias_name}"
+        assert [
+            (identity.provider, identity.model, identity.route_family)
+            for identity in target.identities
+        ] == [
+            (
+                "xai",
+                "grok-reference-target",
+                "codex_xai_responses",
+            )
+        ]
 
     def test_exact_resolution_success(self, fresh_manager):
         snapshot = _make_snapshot(provider="openai", model="gpt-4o")
@@ -2290,13 +2354,13 @@ class TestNotActivePerKeyProof:
 
 
 # ---------------------------------------------------------------------------
-# Finding 4: Basic-pilot classification-marker evidence before key state
+# Finding 4: Codex classification-marker evidence before key state
 # ---------------------------------------------------------------------------
 
 
-class TestBasicPilotMarkerEvidence:
+class TestCodexFailureMarkerEvidence:
     def test_marker_evidence_before_key_state_detected_and_cleared(self, fresh_manager):
-        """Marker-tier basic-pilot evidence accumulates in the gate's family
+        """Marker-tier Codex evidence accumulates in the alias gate's family
         evidence map BEFORE any _key_state entry exists.  inspect_cooldown_absence
         must detect it (not classify it absent) and clear must remove it."""
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
@@ -2304,25 +2368,40 @@ class TestBasicPilotMarkerEvidence:
         )
 
         cd_key = "hcfg:openai:gpt-4o:chatgpt-account:acct1"
-        gate = fresh_manager.basic_pilot_gate
+        canonical_alias = "test-alias"
+        gate = fresh_manager.codex_failure_evidence_gate.gate_for_alias(
+            canonical_alias=canonical_alias,
+            create=True,
+        )
+        assert gate is not None
         # Seed marker evidence ONLY in the family evidence map -- no _key_state.
         gate._family_state.evidence_events_by_key[cd_key] = [time.monotonic()]
         assert cd_key not in gate._key_state
 
         inspection = inspect_cooldown_absence(
-            fresh_manager, alias_family="codex", cooldown_key=cd_key
+            fresh_manager,
+            alias_family="codex",
+            canonical_aliases=[canonical_alias],
+            cooldown_key=cd_key,
         )
         assert inspection.exists is True
-        assert inspection.basic_pilot_present is True
+        assert inspection.codex_failure_evidence_present is True
 
         # Clear must remove the marker evidence so it cannot survive.
-        fresh_manager.clear_cooldown_state(alias_family="codex", cooldown_keys=[cd_key])
+        fresh_manager.clear_cooldown_state(
+            alias_family="codex",
+            canonical_aliases=[canonical_alias],
+            cooldown_keys=[cd_key],
+        )
 
         after = inspect_cooldown_absence(
-            fresh_manager, alias_family="codex", cooldown_key=cd_key
+            fresh_manager,
+            alias_family="codex",
+            canonical_aliases=[canonical_alias],
+            cooldown_key=cd_key,
         )
         assert after.exists is False
-        assert after.basic_pilot_present is False
+        assert after.codex_failure_evidence_present is False
         assert cd_key not in gate._family_state.evidence_events_by_key
 
 
@@ -3397,12 +3476,14 @@ class TestFinding3AllOrNoneRollback:
             assert exc_info.value.detail["error"] == "rollback_failure"
 
     @pytest.mark.asyncio
-    async def test_local_failure_after_durable_triggers_rollback(self, fresh_manager):
+    async def test_local_failure_after_durable_triggers_rollback(  # noqa: PLR0915
+        self, fresh_manager
+    ):
         """Local/postcondition failure after durable commits triggers rollback.
 
         Seeds EVERY targeted local state the clear path mutates (family
         positive/negative cooldown maps, evidence events, per-key generation,
-        basic-pilot gate key/evidence state, lane-identity index membership,
+        alias-scoped Codex failure evidence, lane-identity index membership,
         and targeted OpenRouter rate-limit/failure-circuit entries) plus
         unrelated state and session affinity.  On postcondition failure the
         durable receipts are rolled back AND every captured local preimage is
@@ -3427,7 +3508,9 @@ class TestFinding3AllOrNoneRollback:
             route_family="codex_openai_responses", lane_keys=["k1"],
         )
         target = _ResolvedTarget(
-            family="codex", identities=[ident],
+            family="codex",
+            canonical_aliases=("local-fail",),
+            identities=[ident],
             target_description="alias:local-fail", ingress="codex",
         )
 
@@ -3438,13 +3521,18 @@ class TestFinding3AllOrNoneRollback:
         fam.cooldown_negative_until_monotonic_by_key["k1"] = now + 50.0
         fam.evidence_events_by_key["k1"] = [now - 5.0, now - 1.0]
         fam.cooldown_generation_by_key["k1"] = 3
-        # Basic-pilot gate (codex-owned) key + evidence state.
+        # Alias-scoped Codex failure-evidence key + marker state.
         gate_ks = _KeyCooldownState(
             attempt=2, cooled_until_monotonic=now + 75.0,
             probe_in_flight=True, last_scope="scope-a", last_class_name="Cls",
         )
-        mgr.basic_pilot_gate._key_state["k1"] = gate_ks
-        mgr.basic_pilot_gate._family_state.evidence_events_by_key["k1"] = [now - 2.0]
+        failure_gate = mgr.codex_failure_evidence_gate.gate_for_alias(
+            canonical_alias="local-fail",
+            create=True,
+        )
+        assert failure_gate is not None
+        failure_gate._key_state["k1"] = gate_ks
+        failure_gate._family_state.evidence_events_by_key["k1"] = [now - 2.0]
         # Lane-identity index membership: targeted lane plus an unrelated
         # lane under the SAME identity (must survive restoration).
         mgr.lane_identity_index.register(identity_hash="h1", lane_key="k1")
@@ -3504,10 +3592,14 @@ class TestFinding3AllOrNoneRollback:
         assert fam.cooldown_negative_until_monotonic_by_key["k1"] == now + 50.0
         assert fam.evidence_events_by_key["k1"] == [now - 5.0, now - 1.0]
         assert fam.cooldown_generation_by_key["k1"] == 3
-        restored_ks = mgr.basic_pilot_gate._key_state["k1"]
+        restored_gate = mgr.codex_failure_evidence_gate.gate_for_alias(
+            canonical_alias="local-fail"
+        )
+        assert restored_gate is not None
+        restored_ks = restored_gate._key_state["k1"]
         assert restored_ks == gate_ks
         assert restored_ks is not gate_ks  # independent restored copy
-        assert mgr.basic_pilot_gate._family_state.evidence_events_by_key["k1"] == [now - 2.0]
+        assert restored_gate._family_state.evidence_events_by_key["k1"] == [now - 2.0]
         assert mgr.lane_identity_index.lanes_for("h1") == frozenset({"k1", "k-unrelated-lane"})
         assert mgr.openrouter_rate_limit.until_monotonic_by_key["or-model-x"] == now + 30.0
         assert mgr.openrouter_failure_circuit.until_monotonic_by_key["or-model-x"] == now + 40.0

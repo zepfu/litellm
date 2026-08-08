@@ -57,9 +57,6 @@ HandleAliasRouteFn = Callable[..., Awaitable["Response"]]
 ResolveCooldownPublicationFn = Callable[..., CooldownPublicationPlan]
 """Typed reference to ``_resolve_auto_agent_cooldown_publication_plan``."""
 
-NormalizeAliasModelFn = Callable[[Any], Optional[str]]
-"""``_normalize_anthropic_auto_agent_alias_model``."""
-
 PerformCandidateRequestDirectFn = Callable[..., Awaitable["Response"]]
 """``_perform_anthropic_auto_agent_alias_candidate_request``."""
 
@@ -81,8 +78,13 @@ AddAliasMetadataDirectFn = Callable[..., dict[str, Any]]
 RaiseRedispatchFn = Callable[..., None]
 """``_raise_anthropic_auto_agent_redispatch_required``."""
 
-GetCandidatesForAliasFn = Callable[..., Sequence[Any]]
-"""Request-aware Anthropic alias candidate enumeration."""
+ResolveSelectionEnumerationFn = Callable[..., Any]
+"""Request-local generic snapshot candidate enumeration."""
+
+ExtractClientProductLabelFn = Callable[
+    ["Request", dict[str, Any]], Optional[str]
+]
+"""Resolve the request's TUI/client product label."""
 
 GetActiveCooldownStateFn = Callable[[str], Awaitable[tuple[float, str]]]
 """``_get_anthropic_auto_agent_active_cooldown_state``."""
@@ -110,8 +112,6 @@ class AnthropicAutoAgentRouteRuntime:
     codex_family_state: "AliasFamilyState"
 
     # -- production wrapper (_handle_anthropic_auto_agent_alias_route) --
-    normalize_alias_model: NormalizeAliasModelFn
-    default_alias_model: str
     perform_candidate_request: PerformCandidateRequestDirectFn
     select_candidate: SelectCandidateDirectFn
     publish_cooldown_memory: PublishCooldownMemoryFn
@@ -119,7 +119,8 @@ class AnthropicAutoAgentRouteRuntime:
     set_session_affinity: SetSessionAffinityDirectFn
     add_alias_metadata: AddAliasMetadataDirectFn
     raise_redispatch_required: RaiseRedispatchFn
-    get_candidates_for_alias: GetCandidatesForAliasFn
+    extract_client_product_label: ExtractClientProductLabelFn
+    resolve_selection_enumeration: ResolveSelectionEnumerationFn
     get_active_cooldown_state: GetActiveCooldownStateFn
 
 
@@ -132,8 +133,6 @@ ANTHROPIC_AUTO_AGENT_ROUTE_SEAM_DISPOSITION: dict[str, str] = {
     "resolve_cooldown_publication": "runtime.resolve_cooldown_publication",
     "anthropic_family_state": "runtime.anthropic_family_state",
     "codex_family_state": "runtime.codex_family_state",
-    "normalize_alias_model": "runtime.normalize_alias_model",
-    "default_alias_model": "runtime.default_alias_model",
     "perform_candidate_request": "runtime.perform_candidate_request",
     "select_candidate": "runtime.select_candidate",
     "publish_cooldown_memory": "runtime.publish_cooldown_memory",
@@ -141,7 +140,8 @@ ANTHROPIC_AUTO_AGENT_ROUTE_SEAM_DISPOSITION: dict[str, str] = {
     "set_session_affinity": "runtime.set_session_affinity",
     "add_alias_metadata": "runtime.add_alias_metadata",
     "raise_redispatch_required": "runtime.raise_redispatch_required",
-    "get_candidates_for_alias": "runtime.get_candidates_for_alias",
+    "extract_client_product_label": "runtime.extract_client_product_label",
+    "resolve_selection_enumeration": "runtime.resolve_selection_enumeration",
     "get_active_cooldown_state": "runtime.get_active_cooldown_state",
 }
 
@@ -191,7 +191,7 @@ async def handle_auto_agent_alias_route(
     legacy_error_class: Optional[str] = None
     legacy_grok_account_quota_exhausted = False
     legacy_kimi_failure_metadata: Optional[dict[str, Any]] = None
-    legacy_is_basic_pilot_lane = False
+    legacy_codex_failure_evidence_alias: Optional[str] = None
     family_state = (
         runtime.anthropic_family_state
         if alias_family == "anthropic_auto_agent"
@@ -208,7 +208,7 @@ async def handle_auto_agent_alias_route(
         error_class: Optional[str],
         grok_account_quota_exhausted: bool = False,
         kimi_failure_metadata: Optional[dict[str, Any]] = None,
-        is_basic_pilot_lane: bool = False,
+        codex_failure_evidence_alias: Optional[str] = None,
     ) -> CooldownPublicationPlan:
         nonlocal legacy_request
         nonlocal legacy_candidate
@@ -218,7 +218,7 @@ async def handle_auto_agent_alias_route(
         nonlocal legacy_error_class
         nonlocal legacy_grok_account_quota_exhausted
         nonlocal legacy_kimi_failure_metadata
-        nonlocal legacy_is_basic_pilot_lane
+        nonlocal legacy_codex_failure_evidence_alias
         legacy_request = request
         legacy_candidate = candidate
         legacy_lane_key = lane_key
@@ -227,7 +227,7 @@ async def handle_auto_agent_alias_route(
         legacy_error_class = error_class
         legacy_grok_account_quota_exhausted = grok_account_quota_exhausted
         legacy_kimi_failure_metadata = kimi_failure_metadata
-        legacy_is_basic_pilot_lane = is_basic_pilot_lane
+        legacy_codex_failure_evidence_alias = codex_failure_evidence_alias
         return runtime.resolve_cooldown_publication(
             request=request,
             candidate=candidate,
@@ -237,7 +237,7 @@ async def handle_auto_agent_alias_route(
             error_class=error_class,
             grok_account_quota_exhausted=grok_account_quota_exhausted,
             kimi_failure_metadata=kimi_failure_metadata,
-            is_basic_pilot_lane=is_basic_pilot_lane,
+            codex_failure_evidence_alias=codex_failure_evidence_alias,
         )
 
     def _legacy_publish_memory(*, keys: Sequence[str], seconds: float) -> None:
@@ -247,16 +247,24 @@ async def handle_auto_agent_alias_route(
     async def _legacy_persist(*, keys: Sequence[str], seconds: float) -> None:
         if legacy_request is None:
             raise RuntimeError("legacy cooldown resolver did not capture a request")
+        apply_kwargs: dict[str, Any] = {
+            "request": legacy_request,
+            "candidate": legacy_candidate,
+            "lane_key": legacy_lane_key,
+            "selected_cooldown_key": legacy_selected_cooldown_key,
+            "cooldown_seconds": legacy_cooldown_seconds,
+            "error_class": legacy_error_class,
+            "grok_account_quota_exhausted": (
+                legacy_grok_account_quota_exhausted
+            ),
+            "kimi_failure_metadata": legacy_kimi_failure_metadata,
+        }
+        if legacy_codex_failure_evidence_alias is not None:
+            apply_kwargs["canonical_alias"] = (
+                legacy_codex_failure_evidence_alias
+            )
         await apply_cooldown_fn(
-            request=legacy_request,
-            candidate=legacy_candidate,
-            lane_key=legacy_lane_key,
-            selected_cooldown_key=legacy_selected_cooldown_key,
-            cooldown_seconds=legacy_cooldown_seconds,
-            error_class=legacy_error_class,
-            grok_account_quota_exhausted=legacy_grok_account_quota_exhausted,
-            kimi_failure_metadata=legacy_kimi_failure_metadata,
-            is_basic_pilot_lane=legacy_is_basic_pilot_lane,
+            **apply_kwargs,
         )
 
     async def _legacy_get_active_cooldown_state(
@@ -312,6 +320,7 @@ async def handle_anthropic_auto_agent_alias_route(
     prepared_request_body: dict[str, Any],
     target_url: str,
     custom_headers: dict[str, Any],
+    canonical_alias: str,
 ) -> "Response":
     """Production Anthropic auto-agent alias route (native-Anthropic fail-closed).
 
@@ -320,9 +329,10 @@ async def handle_anthropic_auto_agent_alias_route(
     selection, cooldown, affinity, attempt metadata, request mutation,
     and redispatch behavior are preserved exactly.
     """
-    alias_model = (
-        runtime.normalize_alias_model(prepared_request_body.get("model"))
-        or runtime.default_alias_model
+    alias_model = canonical_alias
+    client_product_label = runtime.extract_client_product_label(
+        request,
+        prepared_request_body,
     )
 
     async def _perform_candidate_request(
@@ -358,11 +368,12 @@ async def handle_anthropic_auto_agent_alias_route(
         request=request,
         prepared_request_body=prepared_request_body,
         max_candidate_attempts=len(
-            runtime.get_candidates_for_alias(
+            runtime.resolve_selection_enumeration(
+                request,
                 alias_model,
-                request=request,
-                request_body=prepared_request_body,
-            )
+                ingress="anthropic",
+                client_product_label=client_product_label,
+            ).candidates
         ),
         get_active_cooldown_state_fn=runtime.get_active_cooldown_state,
         attempts_metadata_key="anthropic_auto_agent_attempts",

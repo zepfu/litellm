@@ -14,7 +14,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import Request
+from fastapi import HTTPException, Request
 from starlette.responses import Response
 
 from litellm.proxy._types import ProxyException
@@ -257,8 +257,15 @@ async def test_rr054_12_codex_and_anthropic_candidate_scope_use_family_setters()
         "last_resort": False,
     }
     cooldown_key = "openrouter:openrouter/cohere/north-mini-code:free:openrouter"
+    canonical_alias = "rr054-candidate-scope"
     codex_setter = AsyncMock()
     anthropic_setter = AsyncMock()
+    lpe._record_codex_failure_evidence(
+        canonical_alias=canonical_alias,
+        cooldown_key=cooldown_key,
+        exc=HTTPException(status_code=503, detail="provider unavailable"),
+        attempt_record={},
+    )
 
     with patch.object(
         lpe, "_set_codex_auto_agent_cooldown", new=codex_setter
@@ -266,6 +273,7 @@ async def test_rr054_12_codex_and_anthropic_candidate_scope_use_family_setters()
         lpe, "_set_anthropic_auto_agent_cooldown", new=anthropic_setter
     ):
         codex_scope = await lpe._apply_codex_auto_agent_alias_cooldown(
+            canonical_alias=canonical_alias,
             request=request,
             candidate=candidate,
             lane_key="openrouter",
@@ -314,6 +322,7 @@ async def test_rr054_12_codex_and_anthropic_xai_candidate_unavailable_is_request
         lpe, "_set_anthropic_auto_agent_cooldown", new=anthropic_setter
     ):
         codex_scope = await lpe._apply_codex_auto_agent_alias_cooldown(
+            canonical_alias="rr054-xai-request-local",
             request=request_codex,
             candidate=candidate,
             lane_key="xai_grok_native",
@@ -366,6 +375,7 @@ async def test_rr054_12_codex_and_anthropic_native_grok_45_unavailable_scope_non
         lpe, "_set_anthropic_auto_agent_cooldown", new=anthropic_setter
     ):
         codex_scope = await lpe._apply_codex_auto_agent_alias_cooldown(
+            canonical_alias="rr054-native-grok-none",
             request=request_codex,
             candidate=codex_candidate,
             lane_key="xai_grok_native",

@@ -1,8 +1,5 @@
 """Cooldown and session-affinity state for Codex/Anthropic alias families.
 
-Wave 5B extraction from ``llm_passthrough_endpoints.py``.  Behavior-preserving
-relocation only; no logic changes.
-
 The ``AliasRoutingStateManager`` singleton is injected via
 :func:`configure_cooldown_state_runtime` (the integrator wires it during
 god-module facade setup).  Durable Redis helpers come from ``.durable``;
@@ -174,7 +171,8 @@ async def _set_codex_auto_agent_cooldown(
 async def clear_alias_family_cooldown_state(
     *,
     alias_family: str,
-    cooldown_keys: "Sequence[str]",
+    canonical_aliases: Sequence[str],
+    cooldown_keys: Sequence[str],
     delete_durable: bool = True,
 ) -> "Any":
     """Clear cooldown state under canonical lock order (Defect 1/3).
@@ -202,6 +200,7 @@ async def clear_alias_family_cooldown_state(
         async with family_state.lock:
             result = mgr.clear_cooldown_state(
                 alias_family=canonical,
+                canonical_aliases=canonical_aliases,
                 cooldown_keys=sorted_keys,
             )
         # Durable deletion outside the family lock (barrier locks still held,

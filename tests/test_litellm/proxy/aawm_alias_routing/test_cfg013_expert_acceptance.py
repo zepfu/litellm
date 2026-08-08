@@ -96,7 +96,6 @@ class TestCanonicalDirectoryCompile:
     ) -> None:
         assert _EXPERT_ALIAS in canonical_snapshot.aliases
         alias = canonical_snapshot.aliases[_EXPERT_ALIAS]
-        assert alias.visibility == "public"
         assert alias.dispatch is None
         identities = [
             (candidate.provider, candidate.model)

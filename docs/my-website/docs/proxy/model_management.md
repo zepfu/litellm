@@ -46,8 +46,14 @@ Config-driven alias routing uses:
 - Grok 4.5 (`xai/grok-4.5`, `oa_xai/grok-4.5`): 500k context; input $2/M, output $6/M, cached input $0.50/M (`input_cost_per_token` 0.000002, `output_cost_per_token` 0.000006, `cache_read_input_token_cost` 5e-07); tiered pricing above 200k context is not modeled in the map
 - `sota-alibaba`: `alibaba_token_plan/qwen3.8-max` → `alibaba_token_plan/qwen3.7-max`
 - `basic`: the config-driven low-cost alias
-- `work`: `gpt-5.3-codex-spark` → internal `work-other` → Claude-only native Sonnet tail → `gpt-5.6-luna`; `work-other` is internal and not selectable or advertised
+- `work`: `gpt-5.3-codex-spark` → nested `work-other` alias reference → Claude-only native Sonnet tail → `gpt-5.6-luna`
+- `work-other`: ordinary configured alias and valid exact-name / `alias_reference` target; omitted from Codex and Claude TUI selection only by those clients' explicit model-definition inclusion lists
 - `expert`: Claude-origin `claude-opus-5` (native Anthropic, highest priority) → universal `gpt-5.6-terra` last resort. Canonical Opus 5 is inherently 1M-context; there is no `claude-opus-5[1m]` selector because it would duplicate the same upstream model. Terra is the direct/default candidate for Codex, non-Claude, missing, unknown, and unconfigured origins, and stays available to Claude after an Opus failure (it is not `tui_excluded`). Both candidates use authoritative `reasoning_effort: max` via the CFG-006 candidate pipeline. Opus egresses only through Anthropic-native credentials; Terra keeps its OpenAI/Codex credential domain on both ingresses.
+
+Config-driven AAWM aliases and candidates come only from the compiled YAML
+snapshot. Missing or failed config fails closed; there is no built-in candidate
+table and no startup or no-snapshot fallback. Every configured YAML alias is an
+ordinary exact-name route with no public/internal routing distinction.
 
 ### Codex reasoning effort follows the resolved model
 

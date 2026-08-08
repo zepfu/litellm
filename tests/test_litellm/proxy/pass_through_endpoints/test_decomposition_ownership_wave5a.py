@@ -5,7 +5,7 @@ Enforces the behavior-preserving extraction contract from
 
 - ``aawm_alias_routing/snapshot_select.py``
     Snapshot ordering, distribution strategy, TUI/schedule gates,
-    selection-context memoization, and alias-candidate getters.
+    selection-context memoization, and snapshot-backed alias selection.
 - ``aawm_alias_routing/config_refresh.py``
     The ``/aawm/alias-config/refresh`` route handler body and YAML loading.
 - ``aawm_alias_routing/codex_oauth.py``
@@ -69,14 +69,10 @@ SNAPSHOT_SELECT_SYMBOLS: set[str] = {
     "_is_tui_attached_candidate_eligible",
     "_is_snapshot_candidate_in_schedule_window",
     # Snapshot-driven resolution
-    "_resolve_basic_pilot_eligible_candidates",
-    "_select_basic_pilot_snapshot_candidates",
     "_derive_round_robin_commit_token",
     # Selection-context memoization
     "_get_aawm_alias_selection_context",
     "_resolve_aawm_alias_selection_enumeration",
-    # Alias-candidate getters
-    "_get_codex_auto_agent_candidates_for_alias",
     # Public shaping
     "_routing_candidate_to_public_dict",
     # Snapshot holder accessors
@@ -161,9 +157,7 @@ OPENROUTER_QUOTA_CONSTANTS: set[str] = {
     "_OPENROUTER_FREE_DAILY_QUOTA_MODELS",
 }
 
-SNAPSHOT_SELECT_CONSTANTS: set[str] = {
-    "_BASIC_PILOT_ALIAS_NAME",
-}
+SNAPSHOT_SELECT_CONSTANTS: set[str] = set()
 
 # Unified inventory: target_key -> function/type symbols
 W5A_SYMBOL_INVENTORY: dict[str, set[str]] = {
@@ -460,12 +454,9 @@ class TestW5ASignatureContracts:
             "_apply_snapshot_alias_distribution_strategy",
             "_is_tui_attached_candidate_eligible",
             "_is_snapshot_candidate_in_schedule_window",
-            "_resolve_basic_pilot_eligible_candidates",
-            "_select_basic_pilot_snapshot_candidates",
             "_derive_round_robin_commit_token",
             "_get_aawm_alias_selection_context",
             "_resolve_aawm_alias_selection_enumeration",
-            "_get_codex_auto_agent_candidates_for_alias",
             "_routing_candidate_to_public_dict",
             "get_active_routing_snapshot",
             "set_active_routing_snapshot",
@@ -641,12 +632,6 @@ class TestSnapshotSelectParity:
         """The function must be callable and return None or a snapshot."""
         result = lpe.get_active_routing_snapshot()
         assert result is None or hasattr(result, "config_hash")
-
-    def test_get_codex_auto_agent_candidates_for_alias_static(self):
-        """Non-basic alias returns static table candidates."""
-        result = lpe._get_codex_auto_agent_candidates_for_alias("nonexistent_alias")
-        assert isinstance(result, tuple)
-        assert len(result) > 0
 
     def test_commit_round_robin_selection_none_token_noop(self):
         """None token is a no-op."""
@@ -885,10 +870,6 @@ class TestOpenRouterQuotaParity:
         with pytest.raises(Exception) as exc_info:
             lpe._raise_openrouter_auto_agent_candidate_unavailable("test message")
         assert getattr(exc_info.value, "message", str(exc_info.value)) == "test message"
-
-    def test_basic_pilot_alias_name_value(self):
-        assert lpe._BASIC_PILOT_ALIAS_NAME == "basic"
-
 
 # ===========================================================================
 # SECTION 6: Inventory uniqueness (GREEN now)

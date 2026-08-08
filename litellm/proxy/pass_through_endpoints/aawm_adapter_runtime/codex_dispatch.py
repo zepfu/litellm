@@ -14,13 +14,15 @@ from typing import TYPE_CHECKING, Any, Optional
 from fastapi import Request, Response
 
 from litellm.proxy._types import UserAPIKeyAuth
-from .model_resolution import _reject_retired_aawm_alias_model
 
 if TYPE_CHECKING:
 
     # Host-global functions (bound via install())
     def _resolve_codex_auto_agent_alias_model(
-        request_body: dict[str, Any], *, endpoint: str
+        request_body: dict[str, Any],
+        *,
+        endpoint: str,
+        request: Request,
     ) -> Optional[str]: ...
     def _apply_codex_auto_agent_prevention_guidance_to_request_body(
         request_body: dict[str, Any],
@@ -28,7 +30,6 @@ if TYPE_CHECKING:
     def _apply_aawm_read_agent_guidance_to_request_body(
         request_body: dict[str, Any],
         *,
-        alias_model: str,
         target_field: str,
     ) -> tuple[dict[str, Any], Any]: ...
     def _prepare_request_body_for_passthrough_observability(
@@ -47,6 +48,7 @@ if TYPE_CHECKING:
         target_url: str,
         api_key: Optional[str],
         forward_headers: bool,
+        canonical_alias: str,
     ) -> Response: ...
     def _resolve_codex_opencode_zen_adapter_model(
         request_body: dict[str, Any], *, endpoint: str
@@ -111,12 +113,6 @@ def install(
     production facade.
     """
     _mod = globals()
-    # The rebound functions resolve names against *host_globals*; seed
-    # module-imported helpers so they remain available unless the host
-    # already provides (or monkeypatches) its own binding.
-    host_globals.setdefault(
-        "_reject_retired_aawm_alias_model", _reject_retired_aawm_alias_model
-    )
     for _name in _HOST_FUNCTION_NAMES:
         _obj = _mod[_name]
         if not isinstance(_obj, FunctionType):
@@ -222,8 +218,6 @@ async def try_dispatch_codex_request(
     """
     import litellm
 
-    _reject_retired_aawm_alias_model(prepared_request_body.get("model"))
-
     opencode_zen_adapter_model = _resolve_codex_opencode_zen_adapter_model(
         prepared_request_body,
         endpoint=endpoint,
@@ -237,6 +231,7 @@ async def try_dispatch_codex_request(
     codex_auto_agent_alias = _resolve_codex_auto_agent_alias_model(
         prepared_request_body,
         endpoint=endpoint,
+        request=request,
     )
     if codex_auto_agent_alias is not None:
         (
@@ -248,7 +243,6 @@ async def try_dispatch_codex_request(
             _codex_read_guidance_changes,
         ) = _apply_aawm_read_agent_guidance_to_request_body(
             prepared_request_body,
-            alias_model=codex_auto_agent_alias,
             target_field="instructions",
         )
         prepared_request_body = _prepare_request_body_for_passthrough_observability(
@@ -266,6 +260,7 @@ async def try_dispatch_codex_request(
             target_url=target_url,
             api_key=api_key,
             forward_headers=forward_headers,
+            canonical_alias=codex_auto_agent_alias,
         )
 
     if opencode_zen_adapter_model is not None:

@@ -45,7 +45,10 @@ from .durable import (
     inspect_identity_set,
     verify_aawm_alias_routing_durable_absence,
 )
-from .snapshot_select import get_active_routing_snapshot
+from .snapshot_select import (
+    _resolve_snapshot_alias_candidates,
+    get_active_routing_snapshot,
+)
 from .state import (
     AliasRoutingStateManager,
     ClearReservation,
@@ -140,6 +143,7 @@ class _ResolvedTarget:
     """Internal resolution result: all identities from active snapshot."""
 
     family: str
+    canonical_aliases: tuple[str, ...] = ()
     identities: list[_ResolvedIdentity] = field(default_factory=list)
     target_description: str = ""
     ingress: str = ""
@@ -469,8 +473,31 @@ def _resolve_target_from_active_snapshot(
 
     family = validate_alias_family(req.ingress)
 
-    # Collect matched RoutingCandidate objects.
-    matched_candidates: list[Any] = []
+    # Expand aliases through the same concrete projection used by selection.
+    # Keep the top-level canonical alias alongside every concrete candidate so
+    # alias-scoped failure evidence remains targeted to the caller's alias.
+    now_utc = datetime.now(timezone.utc)
+
+    def _expand_alias(alias_name: str) -> list[tuple[str, dict[str, Any]]]:
+        alias_obj = snapshot.aliases[alias_name]
+        expanded = _resolve_snapshot_alias_candidates(
+            alias_obj.name,
+            ingress=family,
+            client_product_label=None,
+            now_utc=now_utc,
+            snapshot=snapshot,
+        )
+        if family == "anthropic" and not expanded:
+            # Preserve the existing fail-closed signal for a direct candidate
+            # whose required Anthropic projection is absent. Alias references,
+            # schedules, dispatch, and cycles remain owned by the expander.
+            for entry in alias_obj.candidates:
+                if hasattr(entry, "provider"):
+                    _project_route_family(entry, req.ingress)
+        return [(alias_obj.name, candidate) for candidate in expanded]
+
+    matched_candidates: list[tuple[str, dict[str, Any]]] = []
+    canonical_aliases: tuple[str, ...]
 
     if req.alias is not None:
         alias_obj = snapshot.aliases.get(req.alias)
@@ -482,14 +509,18 @@ def _resolve_target_from_active_snapshot(
                     "message": "alias not found in active snapshot",
                 },
             )
-        matched_candidates = list(alias_obj.candidates)
-        target_desc = f"alias:{req.alias}"
+        matched_candidates = _expand_alias(alias_obj.name)
+        canonical_aliases = (alias_obj.name,)
+        target_desc = f"alias:{alias_obj.name}"
     else:
-        # Exact provider/model: scan all aliases.
-        for _alias_name, alias_obj in snapshot.aliases.items():
-            for cand in alias_obj.candidates:
-                if cand.provider == req.provider and cand.model == req.model:
-                    matched_candidates.append(cand)
+        # Exact provider/model: scan every alias's concrete expansion.
+        for alias_name in snapshot.aliases:
+            for canonical_alias, cand in _expand_alias(alias_name):
+                if (
+                    cand.get("provider") == req.provider
+                    and cand.get("model") == req.model
+                ):
+                    matched_candidates.append((canonical_alias, cand))
         if not matched_candidates:
             raise HTTPException(
                 status_code=404,
@@ -498,21 +529,26 @@ def _resolve_target_from_active_snapshot(
                     "message": "provider/model not found in active snapshot",
                 },
             )
+        canonical_aliases = tuple(
+            dict.fromkeys(
+                canonical_alias for canonical_alias, _candidate in matched_candidates
+            )
+        )
         target_desc = f"exact:{req.provider}/{req.model}"
 
-    # Project route families and reject ambiguity (Acceptance #2).
-    projected: list[tuple[Any, str]] = []
-    for cand in matched_candidates:
-        rf = _project_route_family(cand, req.ingress)
-        projected.append((cand, rf))
+    # Candidates are already ingress-projected concrete dictionaries.
+    projected = [
+        (canonical_alias, candidate, candidate.get("route_family") or "")
+        for canonical_alias, candidate in matched_candidates
+    ]
 
     # For exact targeting, reject multiple distinct identities.
     if req.alias is None:
         distinct_identities: set[str] = set()
-        for cand, rf in projected:
+        for _canonical_alias, cand, rf in projected:
             cand_dict = {
-                "provider": cand.provider,
-                "model": cand.model,
+                "provider": cand["provider"],
+                "model": cand["model"],
                 "route_family": rf,
             }
             distinct_identities.add(
@@ -535,10 +571,10 @@ def _resolve_target_from_active_snapshot(
     identities: list[_ResolvedIdentity] = []
     seen_hashes: set[str] = set()
 
-    for cand, rf in projected:
+    for _canonical_alias, cand, rf in projected:
         cand_dict = {
-            "provider": cand.provider,
-            "model": cand.model,
+            "provider": cand["provider"],
+            "model": cand["model"],
             "route_family": rf,
         }
         id_hash = resolve_lane_identity_hash(candidate=cand_dict)
@@ -549,8 +585,8 @@ def _resolve_target_from_active_snapshot(
         identities.append(
             _ResolvedIdentity(
                 identity_hash=id_hash,
-                provider=cand.provider,
-                model=cand.model,
+                provider=cand["provider"],
+                model=cand["model"],
                 route_family=rf,
                 lane_keys=[],
             )
@@ -558,6 +594,7 @@ def _resolve_target_from_active_snapshot(
 
     return _ResolvedTarget(
         family=family,
+        canonical_aliases=canonical_aliases,
         identities=identities,
         target_description=target_desc,
         ingress=req.ingress,
@@ -664,6 +701,7 @@ async def _inspect_prior_state(
         inspection = inspect_cooldown_absence(
             state_mgr,
             alias_family=family,
+            canonical_aliases=target.canonical_aliases,
             cooldown_key=key,
         )
         if inspection.exists:
@@ -787,6 +825,7 @@ async def _verify_not_active_absence(
             inspection = inspect_cooldown_absence(
                 state_mgr,
                 alias_family=family,
+                canonical_aliases=target.canonical_aliases,
                 cooldown_key=ident.identity_hash,
             )
             if inspection.exists:
@@ -1047,9 +1086,13 @@ class _LocalClearPreimage:
     negative_cooldown: dict[str, float] = field(default_factory=dict)
     evidence_events: dict[str, tuple[float, ...]] = field(default_factory=dict)
     generation: dict[str, int] = field(default_factory=dict)
-    basic_pilot_captured: bool = False
-    basic_pilot_key_state: dict[str, Any] = field(default_factory=dict)
-    basic_pilot_evidence: dict[str, tuple[float, ...]] = field(default_factory=dict)
+    codex_failure_evidence_aliases: tuple[str, ...] = ()
+    codex_failure_evidence_key_state: dict[tuple[str, str], Any] = field(
+        default_factory=dict
+    )
+    codex_failure_evidence_events: dict[
+        tuple[str, str], tuple[float, ...]
+    ] = field(default_factory=dict)
     lane_index_membership: dict[str, frozenset[str]] = field(default_factory=dict)
     openrouter_keys: tuple[str, ...] = ()
     openrouter_rate_limit: dict[str, float] = field(default_factory=dict)
@@ -1066,9 +1109,9 @@ async def _capture_local_preimage(
     Read-only.  Called under the clear lock regime after all durable
     identities commit and before any local mutation.  Covers exactly the
     state the clear path mutates: family positive/negative cooldown maps,
-    evidence events, per-key generation counters, basic-pilot gate
-    key/evidence state (codex only), lane-identity index membership, and
-    targeted OpenRouter rate-limit/failure-circuit entries.  Session
+    evidence events, per-key generation counters, alias-scoped Codex failure
+    evidence, lane-identity index membership, and targeted OpenRouter
+    rate-limit/failure-circuit entries. Session
     affinity and unrelated keys are intentionally excluded so they are
     preserved exactly.
     """
@@ -1097,22 +1140,29 @@ async def _capture_local_preimage(
         if k in family_state.cooldown_generation_by_key
     }
 
-    # Basic-pilot gate is codex-owned; only captured for the codex family.
-    basic_pilot_captured = False
-    basic_pilot_key_state: dict[str, Any] = {}
-    basic_pilot_evidence: dict[str, tuple[float, ...]] = {}
+    codex_failure_evidence_aliases: tuple[str, ...] = ()
+    codex_failure_evidence_key_state: dict[tuple[str, str], Any] = {}
+    codex_failure_evidence_events: dict[
+        tuple[str, str], tuple[float, ...]
+    ] = {}
     if validate_alias_family(family) == "codex":
-        basic_pilot_captured = True
-        gate = state_mgr.basic_pilot_gate
-        for k in all_keys:
-            ks = gate._key_state.get(k)
-            if ks is not None:
-                # _KeyCooldownState is a dataclass of immutable scalars; a
-                # shallow replace() yields an independent snapshot.
-                basic_pilot_key_state[k] = replace(ks)
-            ev = gate._family_state.evidence_events_by_key.get(k)
-            if ev is not None:
-                basic_pilot_evidence[k] = tuple(ev)
+        codex_failure_evidence_aliases = target.canonical_aliases
+        for canonical_alias in codex_failure_evidence_aliases:
+            gate = state_mgr.codex_failure_evidence_gate.gate_for_alias(
+                canonical_alias=canonical_alias
+            )
+            if gate is None:
+                continue
+            for k in all_keys:
+                entry = (canonical_alias, k)
+                ks = gate._key_state.get(k)
+                if ks is not None:
+                    # _KeyCooldownState is a dataclass of immutable scalars; a
+                    # shallow replace() yields an independent snapshot.
+                    codex_failure_evidence_key_state[entry] = replace(ks)
+                ev = gate._family_state.evidence_events_by_key.get(k)
+                if ev is not None:
+                    codex_failure_evidence_events[entry] = tuple(ev)
 
     # Lane-identity index membership per targeted identity.
     lane_membership: dict[str, frozenset[str]] = {}
@@ -1142,9 +1192,9 @@ async def _capture_local_preimage(
         negative_cooldown=negative,
         evidence_events=evidence,
         generation=generation,
-        basic_pilot_captured=basic_pilot_captured,
-        basic_pilot_key_state=basic_pilot_key_state,
-        basic_pilot_evidence=basic_pilot_evidence,
+        codex_failure_evidence_aliases=codex_failure_evidence_aliases,
+        codex_failure_evidence_key_state=codex_failure_evidence_key_state,
+        codex_failure_evidence_events=codex_failure_evidence_events,
         lane_index_membership=lane_membership,
         openrouter_keys=tuple(or_keys),
         openrouter_rate_limit=or_rate,
@@ -1161,7 +1211,7 @@ async def _restore_local_preimage(  # noqa: PLR0915
 
     Called under the same clear lock regime after durable receipts have been
     rolled back.  Restores family positive/negative cooldown maps, evidence
-    events, per-key generation counters, basic-pilot gate state (codex),
+    events, per-key generation counters, alias-scoped Codex failure evidence,
     lane-identity index membership, and (under its own lock) targeted
     OpenRouter entries to their exact preimage values.  Returns True only if
     every targeted map verifies equal to its preimage afterwards; returns
@@ -1191,20 +1241,38 @@ async def _restore_local_preimage(  # noqa: PLR0915
             else:
                 family_state.cooldown_generation_by_key.pop(k, None)
 
-        # Basic-pilot gate (codex only).
-        if preimage.basic_pilot_captured:
-            gate = state_mgr.basic_pilot_gate
+        # Alias-scoped Codex failure evidence.
+        for canonical_alias in preimage.codex_failure_evidence_aliases:
+            has_preimage = any(
+                (canonical_alias, k)
+                in preimage.codex_failure_evidence_key_state
+                or (canonical_alias, k)
+                in preimage.codex_failure_evidence_events
+                for k in targeted
+            )
+            gate = state_mgr.codex_failure_evidence_gate.gate_for_alias(
+                canonical_alias=canonical_alias,
+                create=has_preimage,
+            )
+            if gate is None:
+                continue
             for k in targeted:
-                if k in preimage.basic_pilot_key_state:
-                    gate._key_state[k] = replace(preimage.basic_pilot_key_state[k])
+                entry = (canonical_alias, k)
+                if entry in preimage.codex_failure_evidence_key_state:
+                    gate._key_state[k] = replace(
+                        preimage.codex_failure_evidence_key_state[entry]
+                    )
                 else:
                     gate._key_state.pop(k, None)
-                if k in preimage.basic_pilot_evidence:
+                if entry in preimage.codex_failure_evidence_events:
                     gate._family_state.evidence_events_by_key[k] = list(
-                        preimage.basic_pilot_evidence[k]
+                        preimage.codex_failure_evidence_events[entry]
                     )
                 else:
                     gate._family_state.evidence_events_by_key.pop(k, None)
+            state_mgr.codex_failure_evidence_gate.drop_alias_if_empty(
+                canonical_alias=canonical_alias
+            )
 
         # Lane-identity index membership per identity.
         for identity_hash, lanes in preimage.lane_index_membership.items():
@@ -1275,17 +1343,29 @@ async def _restore_local_preimage(  # noqa: PLR0915
             if state_mgr.lane_identity_index.lanes_for(identity_hash) != lanes:
                 return False
 
-        # Prove basic-pilot gate presence restoration (codex).
-        if preimage.basic_pilot_captured:
-            gate = state_mgr.basic_pilot_gate
-            present_ks = {k for k in targeted if k in gate._key_state}
-            if present_ks != set(preimage.basic_pilot_key_state.keys()):
-                return False
-            present_ev = {
-                k for k in targeted if k in gate._family_state.evidence_events_by_key
-            }
-            if present_ev != set(preimage.basic_pilot_evidence.keys()):
-                return False
+        # Prove alias-scoped Codex failure-evidence restoration.
+        present_key_state: set[tuple[str, str]] = set()
+        present_events: set[tuple[str, str]] = set()
+        for canonical_alias in preimage.codex_failure_evidence_aliases:
+            gate = state_mgr.codex_failure_evidence_gate.gate_for_alias(
+                canonical_alias=canonical_alias
+            )
+            if gate is None:
+                continue
+            present_key_state.update(
+                (canonical_alias, k) for k in targeted if k in gate._key_state
+            )
+            present_events.update(
+                (canonical_alias, k)
+                for k in targeted
+                if k in gate._family_state.evidence_events_by_key
+            )
+        if present_key_state != set(
+            preimage.codex_failure_evidence_key_state.keys()
+        ):
+            return False
+        if present_events != set(preimage.codex_failure_evidence_events.keys()):
+            return False
 
         return True
     except Exception:
@@ -1415,6 +1495,7 @@ async def _execute_clear(  # noqa: PLR0915
                     # 5a. Clear process-local cooldown-derived state.
                     state_mgr.clear_cooldown_state(
                         alias_family=family,
+                        canonical_aliases=target.canonical_aliases,
                         cooldown_keys=all_keys,
                     )
 
@@ -1432,6 +1513,7 @@ async def _execute_clear(  # noqa: PLR0915
                     # Step 6: Strict postcondition verification.
                     await _verify_postconditions(
                         family=family,
+                        canonical_aliases=target.canonical_aliases,
                         identities=target.identities,
                         all_keys=all_keys,
                         state_mgr=state_mgr,
@@ -1666,6 +1748,7 @@ async def _execute_durable_clear(
 async def _verify_postconditions(
     *,
     family: str,
+    canonical_aliases: tuple[str, ...],
     identities: list[_ResolvedIdentity],
     all_keys: list[str],
     state_mgr: AliasRoutingStateManager,
@@ -1735,6 +1818,7 @@ async def _verify_postconditions(
         inspection = inspect_cooldown_absence(
             state_mgr,
             alias_family=family,
+            canonical_aliases=canonical_aliases,
             cooldown_key=key,
         )
         if inspection.exists:

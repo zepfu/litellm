@@ -197,6 +197,7 @@ async def test_stale_durable_read_cannot_rehydrate_after_clear(fresh_manager: Al
         await asyncio.sleep(0.01)  # clear happens mid-read
         mgr.clear_cooldown_state(
             alias_family="codex",
+            canonical_aliases=[],
             cooldown_keys=[cooldown_key],
         )
 
@@ -253,7 +254,11 @@ async def test_no_deadlock_reservation_publication_clear(fresh_manager: AliasRou
 
     async def clearer():
         await asyncio.sleep(0.02)
-        mgr.clear_cooldown_state(alias_family="codex", cooldown_keys=[key])
+        mgr.clear_cooldown_state(
+            alias_family="codex",
+            canonical_aliases=[],
+            cooldown_keys=[key],
+        )
         mgr.publication_intents.complete_clear_reservation(reservation)
 
     await asyncio.wait_for(
@@ -311,7 +316,12 @@ def test_inspect_cooldown_absence_reports_correctly(fresh_manager: AliasRoutingS
     mgr = fresh_manager
 
     # Absent key
-    result = inspect_cooldown_absence(mgr, alias_family="codex", cooldown_key="absent-key")
+    result = inspect_cooldown_absence(
+        mgr,
+        alias_family="codex",
+        canonical_aliases=[],
+        cooldown_key="absent-key",
+    )
     assert result.exists is False
     assert result.remaining_seconds == 0.0
     assert result.generation == mgr.codex.get_generation("absent-key")
@@ -319,13 +329,27 @@ def test_inspect_cooldown_absence_reports_correctly(fresh_manager: AliasRoutingS
 
     # Present key
     mgr.codex.set_cooldown_memory("present-key", 120.0)
-    result2 = inspect_cooldown_absence(mgr, alias_family="codex", cooldown_key="present-key")
+    result2 = inspect_cooldown_absence(
+        mgr,
+        alias_family="codex",
+        canonical_aliases=[],
+        cooldown_key="present-key",
+    )
     assert result2.exists is True
     assert result2.remaining_seconds > 0.0
 
     # After clear, generation advances and key is absent
-    mgr.clear_cooldown_state(alias_family="codex", cooldown_keys=["present-key"])
-    result3 = inspect_cooldown_absence(mgr, alias_family="codex", cooldown_key="present-key")
+    mgr.clear_cooldown_state(
+        alias_family="codex",
+        canonical_aliases=[],
+        cooldown_keys=["present-key"],
+    )
+    result3 = inspect_cooldown_absence(
+        mgr,
+        alias_family="codex",
+        canonical_aliases=[],
+        cooldown_key="present-key",
+    )
     assert result3.exists is False
     assert result3.generation > result.generation
 
@@ -456,7 +480,11 @@ def test_generation_guard_allows_hydration_when_unchanged(fresh_manager: AliasRo
     assert remaining > 0.0
 
     # After a clear, generation advances and a second hydration would be blocked
-    mgr.clear_cooldown_state(alias_family="codex", cooldown_keys=[cooldown_key])
+    mgr.clear_cooldown_state(
+        alias_family="codex",
+        canonical_aliases=[],
+        cooldown_keys=[cooldown_key],
+    )
     assert family.get_generation(cooldown_key) != gen_before
     assert family.cooldown_until_monotonic_by_key.get(cooldown_key) is None
 
@@ -593,7 +621,11 @@ def test_unrelated_clear_does_not_bump_other_key_generation(
     family.set_cooldown_memory("key-b", 120.0)
 
     # Clear only key A.
-    mgr.clear_cooldown_state(alias_family="codex", cooldown_keys=["key-a"])
+    mgr.clear_cooldown_state(
+        alias_family="codex",
+        canonical_aliases=[],
+        cooldown_keys=["key-a"],
+    )
 
     assert family.get_generation("key-a") == gen_a_before + 1
     # Key B generation unchanged -> a valid key B read survives.
@@ -626,7 +658,11 @@ def test_unrelated_clear_does_not_discard_valid_key_b_hydration(
 
     # Clear an unrelated key A (advances only key A's generation).
     family.set_cooldown_memory("key-a-unrelated", 120.0)
-    mgr.clear_cooldown_state(alias_family="codex", cooldown_keys=["key-a-unrelated"])
+    mgr.clear_cooldown_state(
+        alias_family="codex",
+        canonical_aliases=[],
+        cooldown_keys=["key-a-unrelated"],
+    )
 
     # Key B's generation is unchanged -> the guard permits hydration.
     assert family.get_generation(key_b) == gen_b_before
@@ -687,7 +723,11 @@ async def test_stale_miss_does_not_recreate_negative_cache(
             await asyncio.wait_for(read_started.wait(), timeout=2.0)
         except asyncio.TimeoutError:
             pass
-        mgr.clear_cooldown_state(alias_family="codex", cooldown_keys=[cooldown_key])
+        mgr.clear_cooldown_state(
+            alias_family="codex",
+            canonical_aliases=[],
+            cooldown_keys=[cooldown_key],
+        )
         clear_done.set()
 
     with patch(f"{_STATE_MOD}.get_aawm_alias_routing_dual_cache", return_value=dual_cache), \
@@ -745,7 +785,11 @@ async def test_reserve_or_claim_overlap_cleanup_no_deadlock(
         await asyncio.sleep(0.01)
         leader_a.intent.complete()
         reg.remove(leader_a.intent)
-        mgr.clear_cooldown_state(alias_family="codex", cooldown_keys=["k1", "k2", "k3"])
+        mgr.clear_cooldown_state(
+            alias_family="codex",
+            canonical_aliases=[],
+            cooldown_keys=["k1", "k2", "k3"],
+        )
         reg.complete_clear_reservation(reservation)
 
     await asyncio.wait_for(asyncio.gather(waiter(), finish()), timeout=3.0)
@@ -1052,6 +1096,7 @@ def test_clear_cooldown_state_accepts_production_labels(
     # Production labels must work.
     result_codex = mgr.clear_cooldown_state(
         alias_family="codex_auto_agent",
+        canonical_aliases=[],
         cooldown_keys=["key-codex"],
     )
     assert result_codex.alias_family == "codex"
@@ -1059,6 +1104,7 @@ def test_clear_cooldown_state_accepts_production_labels(
 
     result_anth = mgr.clear_cooldown_state(
         alias_family="anthropic_auto_agent",
+        canonical_aliases=[],
         cooldown_keys=["key-anth"],
     )
     assert result_anth.alias_family == "anthropic"
@@ -1073,6 +1119,7 @@ def test_clear_cooldown_state_bare_labels_still_work(
     mgr.codex.set_cooldown_memory("key-bare", 60.0)
     result = mgr.clear_cooldown_state(
         alias_family="codex",
+        canonical_aliases=[],
         cooldown_keys=["key-bare"],
     )
     assert result.alias_family == "codex"

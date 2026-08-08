@@ -505,49 +505,6 @@ def test_rr054_issue1_11_policy_module_exports_cooldowns() -> None:
     )
 
 
-def test_rr054_issue11_policy_module_owns_candidate_tables_and_allowlists() -> None:
-    from litellm.proxy.pass_through_endpoints import aawm_alias_routing_policy as policy
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
-        policy as package_policy,
-    )
-
-    policy_path = Path(package_policy.__file__).resolve()
-    assert policy_path.name == "policy.py"
-    assert policy_path.parent.name == "aawm_alias_routing"
-    assert "basic" in policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    assert "work" in policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    assert lpe._CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS is policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    assert policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS is package_policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    assert lpe._ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS is policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    assert (
-        lpe._ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS
-        is policy.ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS
-    )
-    assert "gpt-5.3-codex-spark" in policy.ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS
-    # God-file installs same-object policy aliases rather than defining rows.
-    god_source = Path(lpe.__file__).read_text()
-    assert "_aawm_alias_policy_compat.install_policy_compat_aliases(globals())" in god_source
-    assert "_POLICY_CODEX_AUTO_AGENT_CANDIDATES" not in god_source
-    assert "_POLICY_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS" not in god_source
-    assert (
-        package_policy.COMPAT_ALIAS_MAP["_CODEX_AUTO_AGENT_CANDIDATES"]
-        == "CODEX_AUTO_AGENT_CANDIDATES"
-    )
-    assert (
-        package_policy.COMPAT_ALIAS_MAP[
-            "_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS"
-        ]
-        == "ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS"
-    )
-    package_source = policy_path.read_text()
-    assert "CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (" in package_source
-    assert '"last_resort": True,' in package_source
-    # Compat shim must not own the table literals.
-    compat_source = Path(policy.__file__).read_text()
-    assert "Compatibility re-export" in compat_source
-    assert '"last_resort": True,' not in compat_source
-
-
 def test_rr054_issue9_responses_adapter_finalize_helper_is_shared() -> None:
     import inspect
 

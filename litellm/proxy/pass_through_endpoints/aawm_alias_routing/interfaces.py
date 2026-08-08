@@ -189,8 +189,9 @@ class PerformCandidateRequestFn(Protocol):
 class ResolveCooldownPublicationFn(Protocol):
     """Classify one failure and produce the immutable publication plan.
 
-    Synchronous and pure: it records basic-pilot evidence and resolves the scope
-    + target keys, but performs NO I/O. The loop owns all publishing.
+    Synchronous and pure: it consumes any already-recorded Codex failure
+    evidence and resolves the scope + target keys, but performs NO I/O. The
+    loop owns all publishing.
     """
 
     def __call__(
@@ -204,7 +205,7 @@ class ResolveCooldownPublicationFn(Protocol):
         error_class: Optional[str],
         grok_account_quota_exhausted: bool = False,
         kimi_failure_metadata: Optional[dict[str, Any]] = None,
-        is_basic_pilot_lane: bool = False,
+        codex_failure_evidence_alias: Optional[str] = None,
     ) -> CooldownPublicationPlan:
         ...
 
@@ -222,12 +223,13 @@ class PublishCooldownMemoryFn(Protocol):
 
 
 @runtime_checkable
-class RecordBasicPilotEvidenceFn(Protocol):
-    """Synchronously record one basic-pilot failure observation."""
+class RecordCodexFailureEvidenceFn(Protocol):
+    """Synchronously record one alias-scoped Codex failure observation."""
 
     def __call__(
         self,
         *,
+        canonical_alias: str,
         cooldown_key: str,
         exc: Exception,
         attempt_record: dict[str, Any],

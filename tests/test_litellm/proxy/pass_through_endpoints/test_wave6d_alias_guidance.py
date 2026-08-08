@@ -118,11 +118,10 @@ def test_should_source_read_constants_from_lane_keys_same_object() -> None:
 
 
 def test_should_accept_god_call_site_signature_for_read_guidance() -> None:
-    """God module calls: _apply_aawm_read_agent_guidance_to_request_body(body, alias_model=..., target_field=...)"""
-    body = {"instructions": "existing"}
+    """God module calls with a role-bearing body and explicit target field."""
+    body = {"instructions": "existing", "agent_role": "explorer"}
     result = guidance._apply_aawm_read_agent_guidance_to_request_body(
         body,
-        alias_model="basic",
         target_field="instructions",
     )
     assert isinstance(result, tuple)
@@ -215,11 +214,10 @@ def test_should_restore_defaults_when_runtime_reset_to_none() -> None:
 
 def test_should_use_default_callbacks_without_any_configuration() -> None:
     """Without configure_alias_guidance_runtime, default observability_metadata callbacks apply."""
-    body = {"instructions": "existing"}
+    body = {"instructions": "existing", "agent_role": "explorer"}
     updated_body, metadata = (
         guidance._apply_aawm_read_agent_guidance_to_request_body(
             body,
-            alias_model="basic",
             target_field="instructions",
         )
     )
@@ -228,7 +226,7 @@ def test_should_use_default_callbacks_without_any_configuration() -> None:
     tags = updated_body["litellm_metadata"]["tags"]
     assert "aawm-read-agent-guidance" in tags
     assert "aawm-read-agent-guidance:2026-06-06.v1" in tags
-    assert "aawm-read-agent-guidance-alias:basic" in tags
+    assert "aawm-read-agent-guidance-role:explorer" in tags
     spans = updated_body["litellm_metadata"]["langfuse_spans"]
     assert len(spans) == 1
     assert spans[0]["name"] == "aawm.read_agent_guidance"
@@ -250,8 +248,7 @@ def test_should_pin_exact_default_guidance_configuration() -> None:
     assert config.aawm_read_agent_guidance_policy_name == "aawm_read_agent_guidance"
     assert config.aawm_read_agent_guidance_policy_version == "2026-06-06.v1"
     assert config.aawm_read_agent_guidance_prompt == EXPECTED_READ_GUIDANCE
-    assert config.codex_aawm_read_alias == "basic"
-    assert config.anthropic_aawm_read_alias == "basic"
+    assert config.aawm_read_only_agent_roles == frozenset({"explorer"})
 
 
 # ── Append helper tests ────────────────────────────────────────────
@@ -287,22 +284,21 @@ def test_should_make_codex_guidance_idempotent_and_preserve_original_order() -> 
 
 
 @pytest.mark.parametrize(
-    ("alias_model", "expected"),
+    ("request_body", "expected"),
     [
-        ("basic", True),
-        ("basic", True),
-        ("AAWM-READ", False),
-        ("basic ", False),
-        ("read", False),
-        (None, False),
-        (1, False),
+        ({"agent_role": "explorer"}, "explorer"),
+        ({"agent_role": " Explorer "}, "explorer"),
+        ({"litellm_metadata": {"aawm_agent_role": "EXPLORER"}}, "explorer"),
+        ({"metadata": {"source": {"codex_agent_role": "explorer"}}}, "explorer"),
+        ({"agent_role": "writer"}, None),
+        ({"agent_role": None}, None),
     ],
 )
-def test_should_match_only_exact_read_alias_strings(
-    alias_model: Any,
-    expected: bool,
+def test_should_match_read_only_agent_roles(
+    request_body: dict[str, Any],
+    expected: str | None,
 ) -> None:
-    assert guidance._is_aawm_read_agent_alias_model(alias_model) is expected
+    assert guidance._get_aawm_read_only_agent_role(request_body) == expected
 
 
 @pytest.mark.parametrize("value", [None, "", "   "])
@@ -392,56 +388,52 @@ def test_should_leave_anthropic_system_list_unchanged_when_guidance_exists() -> 
 # ── Apply with explicit callbacks (existing behavior) ──────────────
 
 
-def test_should_noop_read_guidance_for_non_alias_invalid_field_and_malformed_values() -> (
+def test_should_noop_read_guidance_for_non_read_role_invalid_field_and_malformed_values() -> (
     None
 ):
     recorder = CallbackRecorder()
     body = {"instructions": ["malformed"], "system": {"malformed": True}}
 
-    non_alias_result = guidance._apply_aawm_read_agent_guidance_to_request_body(
-        body,
-        alias_model="other",
+    non_read_role_result = guidance._apply_aawm_read_agent_guidance_to_request_body(
+        {**body, "agent_role": "writer"},
         target_field="instructions",
         callbacks=recorder.callbacks,
     )
     invalid_field_result = guidance._apply_aawm_read_agent_guidance_to_request_body(
-        body,
-        alias_model="basic",
+        {**body, "agent_role": "explorer"},
         target_field="other",
         callbacks=recorder.callbacks,
     )
     malformed_instructions_result = (
         guidance._apply_aawm_read_agent_guidance_to_request_body(
-            body,
-            alias_model="basic",
+            {**body, "agent_role": "explorer"},
             target_field="instructions",
             callbacks=recorder.callbacks,
         )
     )
     malformed_system_result = guidance._apply_aawm_read_agent_guidance_to_request_body(
-        body,
-        alias_model="basic",
+        {**body, "agent_role": "explorer"},
         target_field="system",
         callbacks=recorder.callbacks,
     )
 
     for returned_body, metadata in (
-        non_alias_result,
+        non_read_role_result,
         invalid_field_result,
         malformed_instructions_result,
         malformed_system_result,
     ):
-        assert returned_body is body
+        assert returned_body["instructions"] == body["instructions"]
+        assert returned_body["system"] == body["system"]
         assert metadata == {}
     assert recorder.calls == []
 
 
 @pytest.mark.parametrize(
-    ("alias_model", "target_field", "field_name", "original_value"),
+    ("target_field", "field_name", "original_value"),
     [
-        ("basic", "instructions", "instructions", "  existing  "),
+        ("instructions", "instructions", "  existing  "),
         (
-            "basic",
             "system",
             "system",
             ["alpha", {"type": "text", "text": "beta"}],
@@ -449,25 +441,31 @@ def test_should_noop_read_guidance_for_non_alias_invalid_field_and_malformed_val
     ],
 )
 def test_should_apply_read_guidance_with_exact_metadata_and_callback_order(
-    alias_model: str,
     target_field: str,
     field_name: str,
     original_value: Any,
 ) -> None:
     recorder = CallbackRecorder()
-    body = {field_name: original_value, "untouched": True}
+    body = {
+        field_name: original_value,
+        "agent_role": "explorer",
+        "untouched": True,
+    }
 
     updated_body, metadata = (
         guidance._apply_aawm_read_agent_guidance_to_request_body(
             body,
-            alias_model=alias_model,
             target_field=target_field,
             callbacks=recorder.callbacks,
         )
     )
 
     assert updated_body is not body
-    assert body == {field_name: original_value, "untouched": True}
+    assert body == {
+        field_name: original_value,
+        "agent_role": "explorer",
+        "untouched": True,
+    }
     if target_field == "instructions":
         assert updated_body[field_name] == f"existing\n\n{EXPECTED_READ_GUIDANCE}"
         expected_original_chars = len("  existing  ")
@@ -481,7 +479,7 @@ def test_should_apply_read_guidance_with_exact_metadata_and_callback_order(
         "aawm_read_agent_guidance_policy_name": "aawm_read_agent_guidance",
         "aawm_read_agent_guidance_policy_version": "2026-06-06.v1",
         "aawm_read_agent_guidance_applied": True,
-        "aawm_read_agent_guidance_alias": alias_model,
+        "aawm_read_agent_guidance_agent_role": "explorer",
         "aawm_read_agent_guidance_target_field": target_field,
         "aawm_read_agent_guidance_original_chars": expected_original_chars,
         "aawm_read_agent_guidance_prompt_chars": len(EXPECTED_READ_GUIDANCE),
@@ -492,7 +490,7 @@ def test_should_apply_read_guidance_with_exact_metadata_and_callback_order(
     assert tags == [
         "aawm-read-agent-guidance",
         "aawm-read-agent-guidance:2026-06-06.v1",
-        f"aawm-read-agent-guidance-alias:{alias_model}",
+        "aawm-read-agent-guidance-role:explorer",
     ]
     assert extra_fields == {
         **metadata,
@@ -507,12 +505,11 @@ def test_should_apply_read_guidance_with_exact_metadata_and_callback_order(
 
 def test_should_make_applied_read_guidance_idempotent() -> None:
     recorder = CallbackRecorder()
-    body = {"instructions": "existing"}
+    body = {"instructions": "existing", "agent_role": "explorer"}
 
     first_body, first_metadata = (
         guidance._apply_aawm_read_agent_guidance_to_request_body(
             body,
-            alias_model="basic",
             target_field="instructions",
             callbacks=recorder.callbacks,
         )
@@ -520,7 +517,6 @@ def test_should_make_applied_read_guidance_idempotent() -> None:
     second_body, second_metadata = (
         guidance._apply_aawm_read_agent_guidance_to_request_body(
             first_body,
-            alias_model="basic",
             target_field="instructions",
             callbacks=recorder.callbacks,
         )
@@ -632,21 +628,9 @@ def test_should_make_applied_codex_guidance_idempotent() -> None:
 def test_should_preserve_malformed_request_body_exception_behavior() -> None:
     recorder = CallbackRecorder()
 
-    non_alias_body, metadata = (
+    with pytest.raises(AttributeError):
         guidance._apply_aawm_read_agent_guidance_to_request_body(
             None,  # type: ignore[arg-type]
-            alias_model="other",
-            target_field="instructions",
-            callbacks=recorder.callbacks,
-        )
-    )
-    assert non_alias_body is None
-    assert metadata == {}
-
-    with pytest.raises(TypeError):
-        guidance._apply_aawm_read_agent_guidance_to_request_body(
-            None,  # type: ignore[arg-type]
-            alias_model="basic",
             target_field="instructions",
             callbacks=recorder.callbacks,
         )
@@ -717,8 +701,7 @@ def test_should_propagate_span_and_merge_exceptions_in_original_order() -> None:
     )
     with pytest.raises(LookupError) as merge_exc:
         guidance._apply_aawm_read_agent_guidance_to_request_body(
-            {},
-            alias_model="basic",
+            {"agent_role": "explorer"},
             target_field="instructions",
             callbacks=callbacks,
         )

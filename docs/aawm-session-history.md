@@ -1274,9 +1274,12 @@ origin and defaults to `sota-openai`. `sota-alibaba` uses
 dedicated Z.AI Coding Plan and does not represent Alibaba GLM.
 
 `basic` is the config-driven low-cost alias. `work` uses
-`gpt-5.3-codex-spark`, then the internal `work-other` alias, then for Claude
-origins only the native Anthropic Sonnet tail, and finally `gpt-5.6-luna`.
-`work-other` is internal and is not selectable or advertised. `expert` uses
+`gpt-5.3-codex-spark`, then the nested `work-other` alias reference, then for
+Claude origins only the native Anthropic Sonnet tail, and finally
+`gpt-5.6-luna`. `work-other` is an ordinary configured alias and a valid
+exact-name / `alias_reference` target; it is omitted from Codex and Claude TUI
+selection only because those clients' explicit model-definition inclusion lists
+leave it out. `expert` uses
 Claude-origin native Anthropic `claude-opus-5` first, then universal
 `gpt-5.6-terra` as the last resort with authoritative `reasoning_effort: max`
 on both candidates (CFG-006). Canonical Opus 5 is inherently 1M-context, so

@@ -1,7 +1,7 @@
 """Process-local alias-routing state manager (RR-054 #1).
 
 Owns cooldown and affinity maps, their asyncio.Locks, probe-lock state, the
-basic-pilot evidence gate, round-robin cursor, OpenRouter caches, and
+alias-scoped Codex failure-evidence gate, round-robin cursor, OpenRouter caches, and
 CFG-004 publication-intent tracking so the pass-through god-module does not
 declare the state maps itself.
 """
@@ -353,6 +353,171 @@ class AliasFamilyState:
         self.bump_generation(list(self.cooldown_generation_by_key))
 
 
+class CodexFailureEvidenceGate:
+    """Alias-scoped facade over the generic cooldown evidence policy.
+
+    Each configured Codex alias owns an independent ``CooldownEvidenceGate``.
+    The selected cooldown key is passed through unchanged inside that alias's
+    gate, preventing aliases that share a provider/model/lane from advancing
+    one another's evidence threshold or attempt counter.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_aliases: int = DEFAULT_MEMORY_STATE_MAX_SIZE,
+    ) -> None:
+        self._max_aliases = max_aliases
+        self._gates_by_alias: dict[str, Any] = {}
+
+    @staticmethod
+    def _validate_alias(canonical_alias: str) -> str:
+        if (
+            not isinstance(canonical_alias, str)
+            or not canonical_alias
+            or canonical_alias.strip() != canonical_alias
+        ):
+            raise ValueError("canonical_alias must be an explicit non-empty alias")
+        return canonical_alias
+
+    @staticmethod
+    def _validate_cooldown_key(cooldown_key: str) -> str:
+        if not isinstance(cooldown_key, str) or not cooldown_key:
+            raise ValueError("cooldown_key must be an explicit non-empty key")
+        return cooldown_key
+
+    def gate_for_alias(
+        self,
+        *,
+        canonical_alias: str,
+        create: bool = False,
+    ) -> Optional[Any]:
+        """Return the evidence gate for exactly ``canonical_alias``."""
+        alias = self._validate_alias(canonical_alias)
+        gate = self._gates_by_alias.get(alias)
+        if gate is None and create:
+            from .classification import CooldownEvidenceGate
+
+            gate = CooldownEvidenceGate(family_state=AliasFamilyState())
+            self._gates_by_alias[alias] = gate
+            bound_memory_map(self._gates_by_alias, max_size=self._max_aliases)
+        return gate
+
+    def record(
+        self,
+        *,
+        canonical_alias: str,
+        cooldown_key: str,
+        event: Any,
+        now_monotonic: Optional[float] = None,
+    ) -> Any:
+        """Record one failure against the exact alias and cooldown key."""
+        key = self._validate_cooldown_key(cooldown_key)
+        gate = self.gate_for_alias(canonical_alias=canonical_alias, create=True)
+        assert gate is not None
+        return gate.record(
+            cooldown_key=key,
+            event=event,
+            now_monotonic=now_monotonic,
+        )
+
+    def current_decision(
+        self,
+        *,
+        canonical_alias: str,
+        cooldown_key: str,
+        now_monotonic: Optional[float] = None,
+    ) -> Any:
+        """Return the current decision for one exact alias/key pair."""
+        key = self._validate_cooldown_key(cooldown_key)
+        gate = self.gate_for_alias(canonical_alias=canonical_alias)
+        if gate is None:
+            from .classification import CooldownDecision
+
+            return CooldownDecision(should_cool=False)
+        return gate.current_decision(
+            cooldown_key=key,
+            now_monotonic=now_monotonic,
+        )
+
+    def is_cooled(
+        self,
+        *,
+        canonical_alias: str,
+        cooldown_key: str,
+        now_monotonic: Optional[float] = None,
+    ) -> bool:
+        """Return whether one exact alias/key pair is currently cooled."""
+        key = self._validate_cooldown_key(cooldown_key)
+        gate = self.gate_for_alias(canonical_alias=canonical_alias)
+        if gate is None:
+            return False
+        return bool(
+            gate.is_cooled(
+                cooldown_key=key,
+                now_monotonic=now_monotonic,
+            )
+        )
+
+    def contains(
+        self,
+        *,
+        canonical_alias: str,
+        cooldown_key: str,
+    ) -> bool:
+        """Return whether gate state or marker evidence exists for a pair."""
+        key = self._validate_cooldown_key(cooldown_key)
+        gate = self.gate_for_alias(canonical_alias=canonical_alias)
+        if gate is None:
+            return False
+        return (
+            key in gate._key_state
+            or key in gate._family_state.evidence_events_by_key
+        )
+
+    def clear_entries(
+        self,
+        *,
+        canonical_aliases: Sequence[str],
+        cooldown_keys: Sequence[str],
+    ) -> list[tuple[str, str]]:
+        """Clear only the explicit alias/key evidence entries."""
+        cleared: list[tuple[str, str]] = []
+        aliases = tuple(dict.fromkeys(canonical_aliases))
+        keys = tuple(dict.fromkeys(cooldown_keys))
+        for canonical_alias in aliases:
+            gate = self.gate_for_alias(canonical_alias=canonical_alias)
+            if gate is None:
+                continue
+            for cooldown_key in keys:
+                key = self._validate_cooldown_key(cooldown_key)
+                removed_state = gate._key_state.pop(key, None) is not None
+                removed_evidence = (
+                    gate._family_state.evidence_events_by_key.pop(key, None)
+                    is not None
+                )
+                if removed_state or removed_evidence:
+                    cleared.append((canonical_alias, key))
+            self.drop_alias_if_empty(canonical_alias=canonical_alias)
+        return cleared
+
+    def drop_alias_if_empty(self, *, canonical_alias: str) -> None:
+        """Remove an alias gate after its final state entry is cleared."""
+        alias = self._validate_alias(canonical_alias)
+        gate = self._gates_by_alias.get(alias)
+        if gate is None:
+            return
+        if not gate._key_state and not gate._family_state.evidence_events_by_key:
+            self._gates_by_alias.pop(alias, None)
+
+    def clear_for_tests(self) -> None:
+        """Clear every alias-scoped evidence gate in place."""
+        for gate in self._gates_by_alias.values():
+            gate._key_state.clear()
+            gate._family_state.evidence_events_by_key.clear()
+        self._gates_by_alias.clear()
+
+
 @dataclass
 class CooldownClearResult:
     """Typed result of a targeted cooldown-state clear operation (CFG-004)."""
@@ -361,7 +526,9 @@ class CooldownClearResult:
     positive_keys_cleared: list[str] = field(default_factory=list)
     negative_keys_cleared: list[str] = field(default_factory=list)
     evidence_keys_cleared: list[str] = field(default_factory=list)
-    basic_pilot_keys_cleared: list[str] = field(default_factory=list)
+    codex_failure_evidence_entries_cleared: list[tuple[str, str]] = field(
+        default_factory=list
+    )
     affinity_keys_preserved: int = 0
 
 
@@ -1022,49 +1189,51 @@ class CooldownInspectionResult:
     generation: int
     negative_cached: bool = False
     evidence_present: bool = False
-    basic_pilot_present: bool = False
+    codex_failure_evidence_present: bool = False
 
 
 def inspect_cooldown_absence(
     mgr: "AliasRoutingStateManager",
     *,
     alias_family: str,
+    canonical_aliases: Sequence[str],
     cooldown_key: str,
 ) -> CooldownInspectionResult:
     """Verify local cooldown absence for a key (lock-free peek, no mutation).
 
     Checks ALL cooldown-derived process state: positive cooldown, negative
-    cache, evidence events, and basic-pilot gate (codex only).  Returns the
-    current generation so callers can detect concurrent clears.  Does NOT
+    cache, evidence events, and alias-scoped Codex failure evidence. Returns
+    the current generation so callers can detect concurrent clears. Does NOT
     acquire the family lock (safe under probe lock).
     """
     family = mgr.family(alias_family)
     remaining = family.peek_cooldown_remaining(cooldown_key)
     negative_cached = family.is_negative_cached(cooldown_key)
     evidence_present = cooldown_key in family.evidence_events_by_key
-    # Basic-pilot gate is codex-owned only.
     canonical = canonicalize_alias_family(alias_family)
-    basic_pilot_present = False
+    codex_failure_evidence_present = False
     if canonical == "codex":
-        # Finding 4: basic-pilot evidence can exist in the gate's family
-        # evidence map BEFORE any _key_state entry is created (marker-tier
-        # evidence accumulates before a cooldown decision).  Both maps must
-        # be inspected so classification-marker evidence cannot survive a
-        # clear or be misclassified as absent.
-        basic_pilot_present = (
-            cooldown_key in mgr.basic_pilot_gate._key_state
-            or cooldown_key
-            in mgr.basic_pilot_gate._family_state.evidence_events_by_key
+        codex_failure_evidence_present = any(
+            mgr.codex_failure_evidence_gate.contains(
+                canonical_alias=canonical_alias,
+                cooldown_key=cooldown_key,
+            )
+            for canonical_alias in canonical_aliases
         )
     return CooldownInspectionResult(
         alias_family=canonical,
         cooldown_key=cooldown_key,
-        exists=remaining > 0 or negative_cached or evidence_present or basic_pilot_present,
+        exists=(
+            remaining > 0
+            or negative_cached
+            or evidence_present
+            or codex_failure_evidence_present
+        ),
         remaining_seconds=remaining,
         generation=family.get_generation(cooldown_key),
         negative_cached=negative_cached,
         evidence_present=evidence_present,
-        basic_pilot_present=basic_pilot_present,
+        codex_failure_evidence_present=codex_failure_evidence_present,
     )
 
 
@@ -1072,7 +1241,6 @@ class AliasRoutingStateManager:
     """Single owner of alias-routing process-local maps + locks (RR-054 #1)."""
 
     def __init__(self, *, max_size: int = DEFAULT_MEMORY_STATE_MAX_SIZE) -> None:
-        from .classification import CooldownEvidenceGate  # lazy: avoid state->classification->state cycle
         self.max_size = max_size
         self.codex = AliasFamilyState()
         self.anthropic = AliasFamilyState()
@@ -1093,8 +1261,9 @@ class AliasRoutingStateManager:
         self._key_barrier_locks_guard = asyncio.Lock()
         self.openrouter_rate_limit = MonotonicCooldownMap()
         self.openrouter_failure_circuit = MonotonicCooldownMap()
-        # Wave 5B: basic-pilot evidence gate with its own separate AliasFamilyState
-        self.basic_pilot_gate = CooldownEvidenceGate(family_state=AliasFamilyState())
+        self.codex_failure_evidence_gate = CodexFailureEvidenceGate(
+            max_aliases=max_size
+        )
         # Wave 5B: per-alias round-robin rotation cursor
         self.round_robin_cursor: dict[tuple[str, str], int] = {}
         # Wave 5B: OpenRouter free-daily-quota cache (immutable tuple) + lock
@@ -1128,15 +1297,16 @@ class AliasRoutingStateManager:
         self,
         *,
         alias_family: str,
+        canonical_aliases: Sequence[str],
         cooldown_keys: Sequence[str],
     ) -> CooldownClearResult:
         """Targeted removal of cooldown-derived state for named keys (CFG-004).
 
         Removes positive cooldown, negative cache, evidence events, and
-        basic-pilot gate state (codex only) for the given keys.  Preserves
-        session affinity and all unrelated keys.  Durable/Redis state is NOT
-        touched here; callers use ``durable.delete_aawm_alias_routing_durable_key``
-        for that.
+        alias-scoped Codex failure evidence for the given explicit aliases and
+        keys. Preserves session affinity and all unrelated keys. Durable/Redis
+        state is NOT touched here; callers use
+        ``durable.delete_aawm_alias_routing_durable_key`` for that.
 
         Accepts production family labels (``codex_auto_agent``,
         ``anthropic_auto_agent``) via canonicalization (Defect 4).
@@ -1147,19 +1317,22 @@ class AliasRoutingStateManager:
         positive, negative, evidence = family.clear_cooldown_state(
             cooldown_keys=cooldown_keys,
         )
-        basic_pilot_cleared: list[str] = []
-        # Basic-pilot gate is codex-owned; never clear it for anthropic.
+        codex_failure_evidence_cleared: list[tuple[str, str]] = []
         if normalized == "codex":
-            for key in cooldown_keys:
-                if self.basic_pilot_gate._key_state.pop(key, None) is not None:
-                    basic_pilot_cleared.append(key)
-                self.basic_pilot_gate._family_state.evidence_events_by_key.pop(key, None)
+            codex_failure_evidence_cleared = (
+                self.codex_failure_evidence_gate.clear_entries(
+                    canonical_aliases=canonical_aliases,
+                    cooldown_keys=cooldown_keys,
+                )
+            )
         return CooldownClearResult(
             alias_family=normalized,
             positive_keys_cleared=positive,
             negative_keys_cleared=negative,
             evidence_keys_cleared=evidence,
-            basic_pilot_keys_cleared=basic_pilot_cleared,
+            codex_failure_evidence_entries_cleared=(
+                codex_failure_evidence_cleared
+            ),
             affinity_keys_preserved=len(family.session_affinity_by_key),
         )
 
@@ -1307,8 +1480,7 @@ class AliasRoutingStateManager:
         self.openrouter_rate_limit.clear_for_tests()
         self.openrouter_failure_circuit.clear_for_tests()
         # Wave 5B: gate, cursor, quota
-        self.basic_pilot_gate._key_state.clear()
-        self.basic_pilot_gate._family_state.evidence_events_by_key.clear()
+        self.codex_failure_evidence_gate.clear_for_tests()
         self.round_robin_cursor.clear()
         self.lane_identity_index.clear()
         self.publication_intents.clear()

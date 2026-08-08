@@ -95,8 +95,6 @@ MODEL_RESOLUTION_SYMBOLS: set[str] = {
     "_resolve_anthropic_opencode_zen_adapter_model",
     "_resolve_anthropic_kimi_chat_completions_adapter_model",
     "_resolve_anthropic_alibaba_token_plan_adapter_model",
-    "_normalize_codex_auto_agent_alias_model",
-    "_is_codex_auto_agent_alias_model",
     "_resolve_codex_auto_agent_alias_model",
     "_resolve_anthropic_openai_responses_adapter_model",
     "_resolve_anthropic_xai_oauth_adapter_model",
@@ -685,20 +683,6 @@ class TestModelResolutionParity:
     def test_has_anthropic_responses_adapter_endpoint_no_leading_slash(self):
         assert lpe._has_anthropic_responses_adapter_endpoint("v1/messages") is True
 
-    def test_normalize_codex_auto_agent_alias_model_none(self):
-        assert lpe._normalize_codex_auto_agent_alias_model(None) is None
-
-    def test_normalize_codex_auto_agent_alias_model_non_string(self):
-        assert lpe._normalize_codex_auto_agent_alias_model(42) is None
-
-    def test_is_codex_auto_agent_alias_model_non_string(self):
-        assert lpe._is_codex_auto_agent_alias_model(None) is False
-
-    def test_resolve_codex_auto_agent_alias_model_wrong_endpoint(self):
-        result = lpe._resolve_codex_auto_agent_alias_model({"model": "codex"}, "/v1/chat/completions")
-        assert result is None
-
-
 class TestLaneKeysParity:
     """Golden behavior parity for lane key functions."""
 
@@ -799,8 +783,6 @@ class TestSignatureContracts:
             "_normalize_anthropic_adapter_model_name",
             "_split_anthropic_adapter_provider_prefix",
             "_has_anthropic_responses_adapter_endpoint",
-            "_normalize_codex_auto_agent_alias_model",
-            "_is_codex_auto_agent_alias_model",
         ]
         for name in sync_funcs:
             fn = getattr(lpe, name)
@@ -989,7 +971,7 @@ WAVE6D_MODULE_IMPORT_PATHS: dict[str, str] = {
 WAVE6D_EXPECTED_COUNTS: dict[str, int] = {
     "persisted_output": 7,
     "observability_metadata": 41,
-    "alias_guidance": 6,
+    "alias_guidance": 5,
 }
 
 WAVE6D_PERSISTED_OUTPUT_SYMBOLS: set[str] = {
@@ -1048,7 +1030,6 @@ WAVE6D_OBSERVABILITY_METADATA_SYMBOLS: set[str] = {
 
 WAVE6D_ALIAS_GUIDANCE_SYMBOLS: set[str] = {
     "_append_codex_auto_agent_prevention_guidance_to_instructions",
-    "_is_aawm_read_agent_alias_model",
     "_append_aawm_read_agent_guidance_to_text",
     "_append_aawm_read_agent_guidance_to_anthropic_system",
     "_apply_aawm_read_agent_guidance_to_request_body",
@@ -1067,7 +1048,7 @@ for _syms in WAVE6D_SYMBOL_INVENTORY.values():
 
 
 class TestWave6DRequestPolicyOwnership:
-    """Wave 6D structural ownership: 54 functions across 3 modules."""
+    """Wave 6D structural ownership for retained functions across 3 modules."""
 
     @staticmethod
     def _modules() -> dict[str, object]:
@@ -1076,7 +1057,7 @@ class TestWave6DRequestPolicyOwnership:
             for name, import_path in WAVE6D_MODULE_IMPORT_PATHS.items()
         }
 
-    def test_exact_54_symbol_union_without_duplicate_ownership(self):
+    def test_retained_symbol_union_without_duplicate_ownership(self):
         seen: dict[str, str] = {}
         duplicates: list[str] = []
 
@@ -1093,7 +1074,7 @@ class TestWave6DRequestPolicyOwnership:
                     )
                 seen[symbol] = module_name
 
-        assert len(seen) == 54
+        assert len(seen) == 53
         assert not duplicates
 
     def test_no_wave6d_symbol_remains_a_god_module_function_def(self):
@@ -1110,7 +1091,7 @@ class TestWave6DRequestPolicyOwnership:
         host_names = set(getattr(po, "_HOST_FUNCTION_NAMES"))
         assert host_names == WAVE6D_PERSISTED_OUTPUT_SYMBOLS
 
-    def test_all_54_facades_share_identity_with_god_module(self):
+    def test_retained_facades_share_identity_with_god_module(self):
         modules = self._modules()
         checked = 0
 
@@ -1141,7 +1122,7 @@ class TestWave6DRequestPolicyOwnership:
             )
             checked += 1
 
-        assert checked == 54
+        assert checked == 53
 
     def test_persisted_output_facades_use_host_globals(self):
         """Installed persisted-output functions resolve through host globals."""

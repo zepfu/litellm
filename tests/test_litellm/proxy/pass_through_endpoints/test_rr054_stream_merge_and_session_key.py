@@ -431,7 +431,7 @@ def test_rr054_issue50_no_candidate_audit_uses_lane_scoped_session_key() -> None
 def test_rr054_issue50_no_candidate_default_lane_session_key_not_none() -> None:
     """Lane-scoped default-lane key is required (not raw/None session identity)."""
     session_id = "rr054-session-50-default"
-    alias_model = lpe._CODEX_AUTO_AGENT_MODEL_ALIAS
+    alias_model = "basic"
     request = _minimal_request(
         headers=[(b"session_id", session_id.encode("utf-8"))]
     )
@@ -447,7 +447,7 @@ def test_rr054_issue50_no_candidate_default_lane_session_key_not_none() -> None:
     assert expected_session_key is not None
     assert expected_session_key != session_id
     # With only session_id present, lane falls back to session:<id> (not bare id).
-    assert expected_session_key.startswith(f"{session_id}:")
+    assert expected_session_key.startswith(f"{alias_model}:{session_id}:")
 
     captured_events: list[dict[str, Any]] = []
 
@@ -514,19 +514,19 @@ def test_rr054_issue50_resolve_helpers_produce_lane_scoped_keys() -> None:
     body = {"litellm_metadata": {"session_id": session_id}}
 
     codex_key = lpe._resolve_codex_auto_agent_session_key(
-        request, body, alias_model=lpe._CODEX_AUTO_AGENT_MODEL_ALIAS
+        request, body, alias_model="basic"
     )
     assert codex_key is not None
-    assert codex_key.startswith(f"{session_id}:")
+    assert codex_key.startswith(f"basic:{session_id}:")
     assert codex_key != session_id
     assert "auth:" in codex_key
 
-    non_default = lpe._resolve_codex_auto_agent_session_key(
+    work_key = lpe._resolve_codex_auto_agent_session_key(
         request, body, alias_model="work"
     )
-    assert non_default is not None
-    assert non_default.startswith("work:")
-    assert session_id in non_default
+    assert work_key is not None
+    assert work_key.startswith("work:")
+    assert session_id in work_key
 
     # No credentials / no session header → no key (must not invent raw None alias).
     empty_request = _minimal_request()

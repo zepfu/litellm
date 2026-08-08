@@ -12,22 +12,16 @@ for the round-2 evidence-gate live-path behaviors re-driven through the
 WRAPPER.
 
 Every scenario drives the REAL wrapper ``_handle_codex_auto_agent_alias_route``
-(the wrapper at ``llm_passthrough_endpoints.py:25381``, so the counting call
-inside it -- ``max_candidate_attempts=len(_get_codex_auto_agent_candidates_for_alias(...))``
--- actually executes), the REAL selector (``_select_codex_auto_agent_candidate``),
+(including its canonical snapshot enumeration used to derive
+``max_candidate_attempts``), the REAL selector
+(``_select_codex_auto_agent_candidate``),
 and REAL process-local state (cooldown maps, round-robin cursor, affinity map).
 Only ``perform_candidate_request`` (via the OpenRouter completion performer)
 and the durable writer are stubbed, following the ``AsyncMock`` pattern used
 by ``test_rr054_candidate_singleflight.py:786``.
 
-Pre-fix (before the Wave-1 R3-2 fix lands), the round-robin cursor is mutated
-by EVERY call to ``_get_codex_auto_agent_candidates_for_alias`` -- including
-the wrapper's own attempt-count getter call and the selector's/affinity
-resolver's internal getter calls -- so a single live request advances the
-cursor multiple times. With two tied candidates this means the cursor advances
-an even number of times per request and rotation never reaches live traffic
-(one candidate is selected on every request). These tests pin the correct
-per-request-single-commit behavior and MUST fail against pre-fix develop.
+The round-robin tests pin one request-local snapshot enumeration and one
+selection commit per request, including affinity re-selection paths.
 
 Pre-fix (before the Wave-2 R3-1/R3-3 changes land), the candidate-loop's
 cooldown apply happens OUTSIDE the probe lock -- a suspension point between
@@ -42,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from types import SimpleNamespace
 from typing import Any, Callable, Optional, Sequence
 from unittest.mock import AsyncMock, MagicMock
 
@@ -91,7 +86,7 @@ def _minimal_request(session_id: str, *, continuation: bool = False) -> MagicMoc
         "query_string": b"",
         "parsed_body": None,
     }
-    request.state = MagicMock()
+    request.state = SimpleNamespace()
     request.state.aawm_alias_request_local_cooldown_until = {}
     request.state.aawm_alias_request_local_excluded_keys = set()
     return request
@@ -102,7 +97,7 @@ def _reset_all_alias_routing_state() -> None:
 
     ``reset_alias_routing_state_for_tests`` clears both the manager-owned
     state (cooldown/affinity/probe-locks) and the god-module-owned
-    singletons (basic-pilot gate, round-robin cursor, active snapshot).
+    singletons (failure evidence, round-robin cursor, active snapshot).
     """
     lpe.reset_alias_routing_state_for_tests()
 
@@ -183,39 +178,25 @@ aliases:
 """
 
 
-def _snapshot_epoch_tag_for_candidate(
-    alias_name: str,
-    candidate: dict[str, Any],
-) -> str | None:
-    snapshot = snapshot_select.get_active_routing_snapshot()
-    if snapshot is None:
-        return None
-    alias = snapshot.aliases.get(alias_name)
-    if alias is None:
-        return None
-    identity = (
-        candidate.get("provider"),
-        candidate.get("model"),
-        candidate.get("route_family"),
-    )
-    if any(
-        (compiled.provider, compiled.model, compiled.route_family) == identity
-        for compiled in alias.candidates
-    ):
-        return snapshot.config_hash
-    return None
-
-
 def _lane_key_for_model(model: str) -> str:
-    candidate = {
-        "provider": "openrouter",
-        "model": model,
-        "route_family": "codex_openrouter_completion_adapter",
-        "last_resort": False,
-    }
+    canonical_alias = snapshot_select._lookup_active_snapshot_canonical_alias(
+        "basic"
+    )
+    assert canonical_alias is not None
+    candidate = next(
+        candidate
+        for candidate in snapshot_select._select_snapshot_candidates(
+            canonical_alias,
+            ingress="codex",
+        )
+        if candidate["model"] == model
+    )
     lane_key = policy.CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
-    epoch_tag = _snapshot_epoch_tag_for_candidate("basic", candidate)
-    return lane_keys._codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=epoch_tag)
+    return lane_keys._codex_auto_agent_candidate_key(
+        candidate,
+        lane_key,
+        epoch_tag=candidate.get("config_epoch_tag"),
+    )
 
 
 class _StructuredCapacityError(RuntimeError):
@@ -280,6 +261,7 @@ async def _drive_wrapper(
         target_url="https://chatgpt.com/backend-api/codex/responses",
         api_key=None,
         forward_headers=True,
+        canonical_alias="basic",
     )
 
 
@@ -384,12 +366,12 @@ async def test_selection_context_enumeration_called_once_per_request() -> None:
     snapshot_select.set_active_routing_snapshot(snapshot)
 
     call_count = 0
-    original_getter = lpe._get_codex_auto_agent_candidates_for_alias
+    original_selector = snapshot_select._select_snapshot_candidates
 
-    def _counting_getter(*args: Any, **kwargs: Any) -> Any:
+    def _counting_selector(*args: Any, **kwargs: Any) -> Any:
         nonlocal call_count
         call_count += 1
-        return original_getter(*args, **kwargs)
+        return original_selector(*args, **kwargs)
 
     async def _performer(
         *,
@@ -400,14 +382,14 @@ async def test_selection_context_enumeration_called_once_per_request() -> None:
     ) -> Response:
         return _SUCCESS_RESPONSE
 
-    lpe._get_codex_auto_agent_candidates_for_alias = _counting_getter  # type: ignore[assignment]
+    snapshot_select._select_snapshot_candidates = _counting_selector  # type: ignore[assignment]
     _, restore = _install_openrouter_performer(_performer)
     try:
         result = await _drive_wrapper(session_id="enum-once-session")
         assert isinstance(result, Response)
     finally:
         restore()
-        lpe._get_codex_auto_agent_candidates_for_alias = original_getter  # type: ignore[assignment]
+        snapshot_select._select_snapshot_candidates = original_selector  # type: ignore[assignment]
 
     assert call_count == 1, (
         "alias enumeration must resolve exactly once per request (memoized "
@@ -597,7 +579,13 @@ class _ProbeCounter:
         self.release = asyncio.Event()
         self.entered = asyncio.Event()
 
-    async def run(self, *, outcome: str = "fail", success_response: Optional[Response] = None) -> Response:
+    async def run(
+        self,
+        *,
+        outcome: str = "fail",
+        success_response: Optional[Response] = None,
+        structured_failure: bool = False,
+    ) -> Response:
         async with self._guard:
             self.total += 1
             self.current += 1
@@ -614,6 +602,8 @@ class _ProbeCounter:
             if outcome == "success":
                 assert success_response is not None
                 return success_response
+            if structured_failure:
+                raise _StructuredUpstream429()
             raise _StructuredCapacityError()
         finally:
             async with self._guard:
@@ -635,40 +625,6 @@ def _install_openrouter_and_opencode_performers(
         lpe._write_aawm_alias_routing_durable_payload = original_write  # type: ignore[assignment]
 
     return _restore
-
-
-async def _drive_low_alias_wrapper(*, session_id: str) -> Any:
-    """Drive the real Codex wrapper for the ``basic`` alias (2 OpenRouter candidates)."""
-    request = _minimal_request(session_id)
-    body: dict[str, Any] = {
-        "model": policy.CODEX_AAWM_LOW_ALIAS,
-        "input": [{"role": "user", "content": "hello"}],
-        "stream": False,
-        "litellm_metadata": {"session_id": session_id},
-    }
-    return await lpe._handle_codex_auto_agent_alias_route(
-        endpoint="/v1/responses",
-        request=request,
-        fastapi_response=MagicMock(spec=Response),
-        user_api_key_dict=MagicMock(),
-        prepared_request_body=body,
-        target_url="https://chatgpt.com/backend-api/codex/responses",
-        api_key=None,
-        forward_headers=True,
-    )
-
-
-def _low_alias_openrouter_lane_key_for_model(model: str) -> str:
-    candidate = {
-        "provider": policy.CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
-        "model": model,
-        "route_family": "codex_openrouter_completion_adapter",
-        "last_resort": False,
-    }
-    return lane_keys._codex_auto_agent_candidate_key(
-        candidate,
-        policy.CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -694,6 +650,24 @@ async def test_scenario_c1_concurrent_cold_probes_single_flight_under_contention
     """
     primary_model = "openrouter/cohere/north-mini-code:free"
     secondary_model = "openrouter/owl-alpha"
+    snapshot_select.set_active_routing_snapshot(
+        compiler.compile_yaml(
+            f"""
+defaults: {{}}
+aliases:
+  - name: basic
+    candidates:
+      - provider: openrouter
+        model: {primary_model}
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: openrouter
+        model: {secondary_model}
+        route_family: codex_openrouter_completion_adapter
+        priority: 50
+"""
+        )
+    )
     probe = _ProbeCounter(hold_seconds=0.05)
 
     original_set_cooldown = cooldown_state._set_codex_auto_agent_cooldown
@@ -713,17 +687,17 @@ async def test_scenario_c1_concurrent_cold_probes_single_flight_under_contention
         use_alias_candidate_probe: bool = False,
     ) -> Response:
         if adapter_model == primary_model:
-            return await probe.run(outcome="fail")
+            return await probe.run(outcome="fail", structured_failure=True)
         return _SUCCESS_RESPONSE
 
     restore = _install_openrouter_and_opencode_performers(openrouter_handler=_openrouter_performer)
     cooldown_state._set_codex_auto_agent_cooldown = _delayed_set_cooldown  # type: ignore[assignment]
     try:
         results = await asyncio.gather(
-            _drive_low_alias_wrapper(session_id="c1-session-1"),
-            _drive_low_alias_wrapper(session_id="c1-session-2"),
-            _drive_low_alias_wrapper(session_id="c1-session-3"),
-            _drive_low_alias_wrapper(session_id="c1-session-4"),
+            _drive_wrapper(session_id="c1-session-1"),
+            _drive_wrapper(session_id="c1-session-2"),
+            _drive_wrapper(session_id="c1-session-3"),
+            _drive_wrapper(session_id="c1-session-4"),
             return_exceptions=True,
         )
     finally:
@@ -802,6 +776,7 @@ aliases:
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
+            canonical_alias="basic",
         )
 
     restore = _install_openrouter_and_opencode_performers(openrouter_handler=_openrouter_performer)
@@ -850,6 +825,7 @@ async def _drive_scope_target_failure(
     """Drive one failure through the real Codex wrapper and candidate loop."""
     selection = {
         "candidate": candidate,
+        "alias_model": "scope-target-fixture",
         "lane_key": lane_key,
         "cooldown_key": selected_cooldown_key,
         "session_key": "wave2-scope-target",
@@ -881,7 +857,7 @@ async def _drive_scope_target_failure(
         error_class: Optional[str],
         grok_account_quota_exhausted: bool = False,
         kimi_failure_metadata: Optional[dict[str, Any]] = None,
-        is_basic_pilot_lane: bool = False,
+        codex_failure_evidence_alias: Optional[str] = None,
     ) -> CooldownPublicationPlan:
         plan = original_resolver(
             request=request,
@@ -892,7 +868,7 @@ async def _drive_scope_target_failure(
             error_class=error_class,
             grok_account_quota_exhausted=grok_account_quota_exhausted,
             kimi_failure_metadata=kimi_failure_metadata,
-            is_basic_pilot_lane=is_basic_pilot_lane,
+            codex_failure_evidence_alias=codex_failure_evidence_alias,
         )
         plans.append(plan)
         return plan
@@ -904,18 +880,25 @@ async def _drive_scope_target_failure(
     async def _persist_durable(*, keys: Sequence[str], seconds: float) -> None:
         publication_events.append(("durable", tuple(keys)))
 
+    snapshot_select.set_active_routing_snapshot(
+        compiler.compile_yaml(
+            f"""
+defaults: {{}}
+aliases:
+  - name: scope-target-fixture
+    candidates:
+      - provider: {candidate["provider"]}
+        model: {candidate["model"]}
+        route_family: {candidate["route_family"]}
+        priority: 100
+"""
+        )
+    )
     monkeypatch.setattr(lpe, "_select_codex_auto_agent_candidate", _select_candidate)
     monkeypatch.setattr(
         lpe,
-        "_resolve_aawm_alias_selection_enumeration",
-        lambda request, alias_model, *, client_product_label=None: MagicMock(
-            candidates=(candidate,)
-        ),
-    )
-    monkeypatch.setattr(
-        lpe,
         "_perform_codex_auto_agent_alias_candidate_request",
-        AsyncMock(side_effect=RuntimeError("wave2 scope-target failure")),
+        AsyncMock(side_effect=_StructuredUpstream429()),
     )
     monkeypatch.setattr(
         lpe,
@@ -960,7 +943,7 @@ async def _drive_scope_target_failure(
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body={
-                "model": "basic",
+                "model": "scope-target-fixture",
                 "input": "hello",
                 "stream": False,
                 "litellm_metadata": {"session_id": "wave2-scope-target"},
@@ -968,6 +951,7 @@ async def _drive_scope_target_failure(
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
+            canonical_alias="scope-target-fixture",
         )
 
     assert len(plans) == 1
@@ -1195,6 +1179,7 @@ aliases:
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
+            canonical_alias="basic",
         )
 
     restore = _install_openrouter_and_opencode_performers(openrouter_handler=_openrouter_performer)
@@ -1230,8 +1215,8 @@ aliases:
     attempts = litellm_metadata.get("codex_auto_agent_attempts", [])
     leader_attempt = next((a for a in attempts if a.get("model") == "e3-leader"), None)
     assert leader_attempt is not None, f"expected an attempt record for e3-leader: attempts={attempts!r}"
-    assert leader_attempt.get("cooldown_scope") == "model", (
-        "R3-3 (DECIDED): a structured 429 must apply/report model scope, not "
+    assert leader_attempt.get("cooldown_scope") == "candidate", (
+        "a structured 429 must apply/report generic candidate scope, not "
         f"provider scope; got {leader_attempt.get('cooldown_scope')!r}"
     )
 
@@ -1286,6 +1271,7 @@ aliases:
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
+            canonical_alias="basic",
         )
 
     restore = _install_openrouter_and_opencode_performers(openrouter_handler=_openrouter_performer)
@@ -1346,6 +1332,7 @@ aliases:
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
+            canonical_alias="basic",
         )
 
     restore = _install_openrouter_and_opencode_performers(openrouter_handler=_openrouter_performer)
@@ -1358,7 +1345,13 @@ aliases:
     live_key = _lane_key_for_model("openrouter/b2-live-model")
     applied_remaining = alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
     assert applied_remaining == 0.0
-    assert alias_state.alias_routing_state.basic_pilot_gate.is_cooled(cooldown_key=live_key) is False
+    assert (
+        alias_state.alias_routing_state.codex_failure_evidence_gate.is_cooled(
+            canonical_alias="basic",
+            cooldown_key=live_key,
+        )
+        is False
+    )
 
 
 # ===========================================================================
@@ -1368,18 +1361,7 @@ aliases:
 _REFRESH_PATH = "/aawm/alias-config/refresh"
 
 
-async def test_snapshot_epoch_tag_requires_exact_alias_candidate_identity() -> None:
-    candidate = {
-        "provider": "openrouter",
-        "model": "shared-model",
-        "route_family": "codex_openrouter_completion_adapter",
-        "last_resort": False,
-    }
-    lane_key = policy.CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
-
-    assert _snapshot_epoch_tag_for_candidate("basic", candidate) is None
-    assert not lane_keys._codex_auto_agent_candidate_key(candidate, lane_key).startswith("h")
-
+async def test_snapshot_epoch_tag_is_scoped_to_resolved_alias_candidates() -> None:
     snapshot = compiler.compile_yaml(
         """
 defaults: {}
@@ -1400,14 +1382,22 @@ aliases:
     )
     snapshot_select.set_active_routing_snapshot(snapshot)
 
-    assert _snapshot_epoch_tag_for_candidate("basic", candidate) is None
-    assert _snapshot_epoch_tag_for_candidate("basic", candidate) is None
-    assert _snapshot_epoch_tag_for_candidate("other", candidate) == snapshot.config_hash
-    assert not lane_keys._codex_auto_agent_candidate_key(
-        candidate,
-        lane_key,
-        epoch_tag=_snapshot_epoch_tag_for_candidate("basic", candidate),
-    ).startswith("h")
+    basic = snapshot_select._select_snapshot_candidates(
+        "basic",
+        ingress="codex",
+    )
+    other = snapshot_select._select_snapshot_candidates(
+        "other",
+        ingress="codex",
+    )
+    assert [(candidate["provider"], candidate["model"]) for candidate in basic] == [
+        ("opencode_zen", "shared-model")
+    ]
+    assert [(candidate["provider"], candidate["model"]) for candidate in other] == [
+        ("openrouter", "shared-model")
+    ]
+    assert basic[0]["config_epoch_tag"] == snapshot.config_hash
+    assert other[0]["config_epoch_tag"] == snapshot.config_hash
 
 
 async def test_snapshot_selection_exposes_top_level_config_epoch_tag() -> None:
@@ -1505,8 +1495,7 @@ def _snapshot_candidate_key(
 async def test_scenario_a1_refresh_activates_snapshot_and_selection_uses_it() -> None:
     """Regression pin (passes pre-fix): POST inline YAML to the REAL refresh
     HTTP route; assert 200 + changed=True; drive one wrapper request with
-    model='basic'; assert the selected candidate is from the snapshot (not the
-    static-table fallback at policy.py:292)."""
+    model='basic'; assert the selected candidate is from the active snapshot."""
     yaml_str = """
 defaults: {}
 aliases:
@@ -2307,92 +2296,3 @@ aliases:
         assert leaders == []
     finally:
         restore()
-
-
-# ---------------------------------------------------------------------------
-# (R3-4 negative control, scenario d6) legacy alias keys unchanged
-# ---------------------------------------------------------------------------
-
-
-async def test_scenario_d6_legacy_alias_keys_unchanged() -> None:
-    """Negative control (passes pre-fix): basic (static-table alias)
-    produces identical bare cooldown keys both before and after snapshot
-    activation. R3-4 epoch tagging must NOT affect legacy non-snapshot
-    aliases or the basic lane's no-snapshot fallback."""
-    # Compute the expected bare key for the first basic OpenRouter candidate
-    low_candidates = policy.CODEX_AAWM_LOW_CANDIDATES
-    first_or = next(
-        c for c in low_candidates
-        if c["provider"] == policy.CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
-    )
-    lane_key = policy.CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
-    bare_key_before = lane_keys._codex_auto_agent_candidate_key(first_or, lane_key)
-    assert not bare_key_before.startswith("h"), (
-        f"expected bare key (no epoch tag), got {bare_key_before!r}"
-    )
-
-    # Drive an basic request pre-snapshot with a failing performer to
-    # observe the cooldown key in the map.
-    async def _failing_performer(
-        *,
-        request: Request,
-        adapter_model: str,
-        request_body: dict[str, Any],
-        use_alias_candidate_probe: bool = False,
-    ) -> Response:
-        if adapter_model == first_or["model"]:
-            raise _StructuredUpstream429(retry_after_seconds=30)
-        return _SUCCESS_RESPONSE
-
-    restore = _install_openrouter_and_opencode_performers(openrouter_handler=_failing_performer)
-    try:
-        result = await _drive_low_alias_wrapper(session_id="d6-pre-snapshot")
-        assert isinstance(result, Response)
-    finally:
-        restore()
-
-    pre_keys = set(alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key.keys())
-    assert bare_key_before in pre_keys, (
-        f"expected bare key {bare_key_before!r} in cooldown map; keys={pre_keys!r}"
-    )
-
-    # Activate a snapshot through the real refresh route. It must not affect
-    # the static-table basic key format.
-    snapshot_yaml = f"""
-defaults: {{}}
-aliases:
-  - name: basic
-    candidates:
-      - provider: openrouter
-        model: {first_or["model"]}
-        route_family: codex_openrouter_completion_adapter
-        priority: 100
-"""
-    client = _refresh_client()
-    refresh = await _post_refresh(client, snapshot_yaml)
-    assert refresh.status_code == 200
-    assert refresh.json()["changed"] is True
-    assert _low_alias_openrouter_lane_key_for_model(first_or["model"]) == bare_key_before
-
-    # Clear cooldowns and drive again
-    alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key.clear()
-
-    restore2 = _install_openrouter_and_opencode_performers(openrouter_handler=_failing_performer)
-    try:
-        result = await _drive_low_alias_wrapper(session_id="d6-post-snapshot")
-        assert isinstance(result, Response)
-    finally:
-        restore2()
-
-    post_keys = set(alias_state.alias_routing_state.codex.cooldown_until_monotonic_by_key.keys())
-    bare_key_after = lane_keys._codex_auto_agent_candidate_key(first_or, lane_key)
-    assert bare_key_after == bare_key_before, (
-        f"legacy alias key must not change after snapshot activation; "
-        f"before={bare_key_before!r}, after={bare_key_after!r}"
-    )
-    assert bare_key_after in post_keys, (
-        f"expected bare key {bare_key_after!r} in cooldown map post-snapshot; keys={post_keys!r}"
-    )
-    assert not bare_key_after.startswith("h"), (
-        f"legacy alias key must remain bare (no epoch tag); got {bare_key_after!r}"
-    )

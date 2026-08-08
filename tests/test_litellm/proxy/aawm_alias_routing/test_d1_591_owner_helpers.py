@@ -33,14 +33,12 @@ _ATTEMPT_RECORD_RUNTIME_NAMES = (
     "_aawm_alias_route_healthy_json_enabled",
     "_merge_litellm_metadata",
     "_normalize_low_cardinality_tag_value",
-    "_normalize_codex_auto_agent_alias_model",
-    "_normalize_anthropic_auto_agent_alias_model",
     "_load_bundled_model_cost_map_for_codex_policy",
     "_get_model_info",
     "_model_cost",
     "_openai_provider_value",
     "_classify_failure",
-    "_basic_pilot_gate_record",
+    "_codex_failure_evidence_gate_record",
 )
 
 
@@ -414,8 +412,8 @@ class TestConfigureOptionalParams:
             format_timestamp=None,
             extract_metadata_value=lambda *a, **kw: None,
             extract_incoming_endpoint=lambda *a, **kw: "/test",
-            resolve_codex_session_key=lambda *a, **kw: None,
-            resolve_anthropic_session_key=lambda *a, **kw: None,
+            resolve_codex_session_key=lambda r, b, *, alias_model: None,
+            resolve_anthropic_session_key=lambda r, b, *, alias_model: None,
             emit_route_event=lambda *a, **kw: None,
             build_audit_events=lambda *a, **kw: [],
             persist_audit_only_events=lambda *a, **kw: "skip_empty",
@@ -483,14 +481,12 @@ class TestConfigureOptionalParams:
             healthy_json_enabled=None,
             merge_metadata=lambda request_body, **kw: request_body,
             normalize_tag_value=lambda *a, **kw: None,
-            normalize_codex_alias_model=lambda *a, **kw: None,
-            normalize_anthropic_alias_model=lambda *a, **kw: None,
             load_bundled_model_cost=lambda: {},
             get_model_info=lambda *a, **kw: {},
             model_cost={},
             openai_provider_value="openai",
             classify_failure=lambda *a, **kw: None,
-            basic_pilot_gate_record=lambda *a, **kw: None,
+            codex_failure_evidence_gate_record=lambda *a, **kw: None,
         )
 
         assert mod._aawm_alias_route_verbose_json_enabled is previous_verbose
@@ -543,8 +539,8 @@ class TestInstallWrapperCanonicalization:
             format_timestamp=owner_format,
             extract_metadata_value=lambda *a, **kw: None,
             extract_incoming_endpoint=lambda *a, **kw: "/test",
-            resolve_codex_session_key=lambda *a, **kw: None,
-            resolve_anthropic_session_key=lambda *a, **kw: None,
+            resolve_codex_session_key=lambda r, b, *, alias_model: None,
+            resolve_anthropic_session_key=lambda r, b, *, alias_model: None,
             emit_route_event=lambda *a, **kw: None,
             build_audit_events=lambda *a, **kw: [],
             persist_audit_only_events=lambda *a, **kw: "skip_empty",
@@ -611,14 +607,12 @@ class TestInstallWrapperCanonicalization:
             healthy_json_enabled=None,
             merge_metadata=lambda request_body, **kw: request_body,
             normalize_tag_value=lambda *a, **kw: None,
-            normalize_codex_alias_model=lambda *a, **kw: None,
-            normalize_anthropic_alias_model=lambda *a, **kw: None,
             load_bundled_model_cost=lambda: {},
             get_model_info=lambda *a, **kw: {},
             model_cost={},
             openai_provider_value="openai",
             classify_failure=lambda *a, **kw: None,
-            basic_pilot_gate_record=lambda *a, **kw: None,
+            codex_failure_evidence_gate_record=lambda *a, **kw: None,
         )
 
         def host_verbose() -> bool:

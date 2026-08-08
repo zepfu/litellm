@@ -57,7 +57,7 @@ PROVIDER_DIR = (
 
 # Package modules that architecture.md assigns ownership to.
 ARCHITECTURE_OWNED_MODULES = {
-    "policy": "Candidate tables, aliases, model allowlists, cooldown defaults",
+    "policy": "Provider capabilities, model allowlists, and cooldown defaults",
     "state": "Cooldown, affinity, OAuth, lane-cache, and candidate probe-lock state",
     "durable": "Durable Redis keys, max-expiry writes, negative reads, DualCache",
     "adapter_config": "Config-driven nine-route preparation/execution plans",
@@ -79,10 +79,6 @@ SUPPORTING_PACKAGE_MODULES = {
 # and must not be re-defined as FunctionDef/ClassDef on the god-file.
 SEAM_DEFINITIONS: dict[str, set[str]] = {
     "policy": {
-        "CODEX_AUTO_AGENT_CANDIDATES",
-        "CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS",
-        "ANTHROPIC_AUTO_AGENT_CANDIDATES",
-        "ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS",
         "ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS",
         "CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS",
         "OPENROUTER_FREE_DAILY_QUOTA_MODELS",
@@ -155,10 +151,9 @@ SEAM_DEFINITIONS: dict[str, set[str]] = {
 # Substance markers that prove a module owns real logic, not re-exports only.
 MODULE_SUBSTANCE_MARKERS: dict[str, tuple[str, ...]] = {
     "policy": (
-        "CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (",
-        "ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS: dict[str, tuple[dict[str, Any], ...]] = {",
-        '"last_resort": True,',
         "ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS",
+        "CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS",
+        "OPENROUTER_FREE_DAILY_QUOTA_MODELS",
     ),
     "state": (
         "class AliasFamilyState",
@@ -308,9 +303,6 @@ WAVE6F_EXTRACTED_FUNCTIONS: dict[str, str] = {
         "finalize_anthropic_responses_adapter_upstream_response"
     ),
 }
-
-POLICY_LITERAL_MARKERS = MODULE_SUBSTANCE_MARKERS["policy"][:3]
-
 
 # ---------------------------------------------------------------------------
 # AST helpers
@@ -755,39 +747,6 @@ def test_rr054_god_file_does_not_redefine_seam_function_or_class_bodies() -> Non
     )
 
 
-def test_rr054_policy_table_literals_not_duplicated_outside_package() -> None:
-    package_policy = _read(PACKAGE_DIR / "policy.py")
-    god_source = _read(GOD_PATH)
-    compat_source = _read(COMPAT_POLICY_PATH)
-
-    for marker in POLICY_LITERAL_MARKERS:
-        assert marker in package_policy, f"package policy missing {marker!r}"
-        assert marker not in god_source, (
-            f"god-file still owns candidate-table literal {marker!r}"
-        )
-        assert marker not in compat_source, (
-            f"compat shim still owns candidate-table literal {marker!r}"
-        )
-
-    assert "Compatibility re-export" in compat_source
-    assert "from .aawm_alias_routing import policy as _policy" in compat_source
-    assert "import *" not in compat_source
-
-
-def test_rr054_compat_policy_is_reexport_only() -> None:
-    tree = _parse(COMPAT_POLICY_PATH)
-    # No function/class definitions allowed on the compat shim.
-    fn_cls = _top_level_function_class_names(tree)
-    assert not fn_cls, (
-        f"compat policy shim must not define functions/classes: {sorted(fn_cls)}"
-    )
-    # Must not look like a second policy owner.
-    assert _is_reexport_only_module(_read(COMPAT_POLICY_PATH), tree) or (
-        # Allow explicit re-export assign of __all__ etc., still no owned tables.
-        "CODEX_AUTO_AGENT_CANDIDATES: tuple" not in _read(COMPAT_POLICY_PATH)
-    )
-
-
 # ---------------------------------------------------------------------------
 # God-file delegation for declared seams
 # ---------------------------------------------------------------------------
@@ -1138,21 +1097,6 @@ def test_rr054_retry_and_driver_logic_not_copied_into_god_file() -> None:
             )
 
 
-def test_rr054_policy_runtime_identity_from_package() -> None:
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import policy
-
-    assert lpe._CODEX_AUTO_AGENT_CANDIDATES is policy.CODEX_AUTO_AGENT_CANDIDATES
-    assert (
-        lpe._CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-        is policy.CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    )
-    assert (
-        lpe._ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
-        is policy.ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS
-    )
-    assert policy_compat.CODEX_AUTO_AGENT_CANDIDATES is policy.CODEX_AUTO_AGENT_CANDIDATES
-
-
 # ---------------------------------------------------------------------------
 # Explicit non-goals / accepted residuals (document honesty for #1)
 # ---------------------------------------------------------------------------
@@ -1188,8 +1132,6 @@ def test_rr054_finding1_structural_acceptance_summary() -> None:
         assert any(m in source for m in markers), module
 
     god_source = _read(GOD_PATH)
-    # No second candidate-table owner.
-    assert "CODEX_AUTO_AGENT_CANDIDATES: tuple[dict[str, Any], ...] = (" not in god_source
     # Shared drivers not redefined.
     assert "async def run_responses_adapter_route" not in god_source
     assert "async def run_completion_adapter_route" not in god_source

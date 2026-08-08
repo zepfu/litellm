@@ -91,23 +91,27 @@ def _reset_alibaba_alias_state() -> None:
 
 
 def test_should_register_all_alibaba_aliases_for_both_ingresses() -> None:
-    expected_models = {
-        "sota-alibaba": [
-            "alibaba_token_plan/qwen3.8-max",
-            "alibaba_token_plan/qwen3.7-max",
-        ],
-        "sota-deepseek": ["alibaba_token_plan/deepseek-v4-pro"],
-    }
-
-    for alias, models in expected_models.items():
-        codex_candidates = snapshot_select._get_codex_auto_agent_candidates_for_alias(
-            alias
+    for alias in ("sota-alibaba", "sota-deepseek"):
+        assert (
+            snapshot_select._lookup_active_snapshot_canonical_alias(alias)
+            == alias
         )
-        anthropic_candidates = (
-            selection._get_anthropic_candidates_for_alias_snapshot_aware(alias)
+        codex_candidates = snapshot_select._select_snapshot_candidates(
+            alias,
+            ingress="codex",
         )
-        assert [candidate["model"] for candidate in codex_candidates] == models
-        assert [candidate["model"] for candidate in anthropic_candidates] == models
+        anthropic_candidates = snapshot_select._select_snapshot_candidates(
+            alias,
+            ingress="anthropic",
+        )
+        assert codex_candidates
+        assert {
+            (candidate["provider"], candidate["model"])
+            for candidate in codex_candidates
+        } == {
+            (candidate["provider"], candidate["model"])
+            for candidate in anthropic_candidates
+        }
         assert all(
             candidate["provider"] == "alibaba_token_plan"
             for candidate in codex_candidates
@@ -116,19 +120,6 @@ def test_should_register_all_alibaba_aliases_for_both_ingresses() -> None:
             candidate["provider"] == "alibaba_token_plan"
             for candidate in anthropic_candidates
         )
-
-
-def test_should_place_qwen_flash_immediately_before_kimi_and_terminal_fallback() -> None:
-    assert [candidate["model"] for candidate in policy.CODEX_AAWM_LOW_CANDIDATES[-3:]] == [
-        "alibaba_token_plan/qwen3.6-flash",
-        "kimi_code/kimi-for-coding",
-        "gpt-5.4-mini",
-    ]
-    assert [candidate["model"] for candidate in policy.ANTHROPIC_AAWM_LOW_CANDIDATES[-3:]] == [
-        "alibaba_token_plan/qwen3.6-flash",
-        "kimi_code/kimi-for-coding",
-        "claude-haiku-4-5-20251001",
-    ]
 @pytest.mark.asyncio
 async def test_should_preserve_alibaba_continuation_affinity_per_ingress() -> None:
     codex_request = _request("/v1/responses")
@@ -170,17 +161,28 @@ async def test_should_preserve_alibaba_continuation_affinity_per_ingress() -> No
 
 @pytest.mark.asyncio
 async def test_should_share_one_alibaba_credential_lane_across_models_and_ingresses() -> None:
+    codex_candidates = snapshot_select._select_snapshot_candidates(
+        "sota-alibaba",
+        ingress="codex",
+    )
+    anthropic_candidates = snapshot_select._select_snapshot_candidates(
+        "sota-alibaba",
+        ingress="anthropic",
+    )
+    assert len(codex_candidates) >= 2
+    assert anthropic_candidates
+
     codex_state = await selection._build_codex_auto_agent_candidate_state(
         _request("/v1/responses"),
-        candidate_template=policy.CODEX_AAWM_SOTA_ALIBABA_CANDIDATES[0],
+        candidate_template=codex_candidates[0],
     )
     codex_fallback_state = await selection._build_codex_auto_agent_candidate_state(
         _request("/v1/responses"),
-        candidate_template=policy.CODEX_AAWM_SOTA_ALIBABA_CANDIDATES[1],
+        candidate_template=codex_candidates[1],
     )
     anthropic_state = await selection._build_anthropic_auto_agent_candidate_state(
         _request("/v1/messages"),
-        candidate_template=policy.ANTHROPIC_AAWM_SOTA_ALIBABA_CANDIDATES[0],
+        candidate_template=anthropic_candidates[0],
     )
 
     assert codex_state["lane_key"] == policy.CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY

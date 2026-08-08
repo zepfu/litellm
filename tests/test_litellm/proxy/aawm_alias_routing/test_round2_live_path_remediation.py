@@ -1,9 +1,9 @@
 """Live-path reproduction tests for the D1-583/D1-584 ROUND 2 findings.
 
 See ``.analysis/remediation-d1-583-584-2026-07-22.md`` (section "ROUND 2").
-The prior ``#2`` fix passed its tests only because they hand-built
-``basic_pilot:`` cooldown keys and recorded evidence into the gate before
-applying -- neither of which the LIVE request path did. These tests instead
+The prior ``#2`` fix passed its tests only because they hand-built cooldown
+keys and recorded evidence into the gate before applying -- neither of which
+the LIVE request path did. These tests instead
 drive the real Codex auto-agent retry handler (``_handle_auto_agent_alias_route``
 with the real selector / metadata / cooldown applicators), stubbing ONLY the
 upstream request, so the live sequence generates the ``provider:model:lane``
@@ -99,7 +99,7 @@ def _marker_only_capacity_error() -> RuntimeError:
     return RuntimeError("Selected model is at capacity. Please try a different model.")
 
 
-async def _run_basic_lane_once(
+async def _run_alias_once(
     *,
     session_id: str,
     raise_exc: Exception,
@@ -121,7 +121,13 @@ async def _run_basic_lane_once(
     async def _perform_candidate_request(**_kwargs: Any) -> Response:
         raise raise_exc
 
-    max_attempts = len(snapshot_select._get_codex_auto_agent_candidates_for_alias("basic"))
+    max_attempts = len(
+        snapshot_select._select_snapshot_candidates(
+            "basic",
+            ingress="codex",
+            request=request,
+        )
+    )
     return await lpe._handle_auto_agent_alias_route(
         alias_family="codex_auto_agent",
         alias_model="basic",
@@ -143,7 +149,7 @@ async def _run_basic_lane_once(
 
 
 def _live_cooldown_key() -> str:
-    """Return the exact state key for the resolved ``read`` snapshot candidate."""
+    """Return the exact state key for the resolved snapshot candidate."""
     candidate: dict[str, Any] = {
         "provider": "openrouter",
         "model": "openrouter/round2-live-model",
@@ -168,34 +174,8 @@ def _live_cooldown_key() -> str:
     return lane_keys._codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=epoch_tag)
 
 
-def test_live_cooldown_key_requires_exact_basic_alias_ownership() -> None:
-    assert not _live_cooldown_key().startswith("h")
-
-    snapshot = compiler.compile_yaml(
-        """
-defaults: {}
-aliases:
-  - name: other
-    candidates:
-      - provider: openrouter
-        model: openrouter/round2-live-model
-        route_family: codex_openrouter_completion_adapter
-        priority: 100
-  - name: basic
-    candidates:
-      - provider: opencode_zen
-        model: openrouter/round2-live-model
-        route_family: codex_opencode_zen_adapter
-        priority: 100
-"""
-    )
-    snapshot_select.set_active_routing_snapshot(snapshot)
-
-    assert not _live_cooldown_key().startswith("h")
-
-
 @pytest.mark.asyncio
-async def test_live_basic_lane_structured_429_cools_with_gate_duration() -> None:
+async def test_live_alias_structured_429_cools_with_gate_duration() -> None:
     """A structured 429 on the LIVE basic-lane path must cool the live cooldown key
     with the gate's retry-after-derived duration -- proving the gate is
     authoritative and evidence is recorded before the cooldown is applied."""
@@ -203,7 +183,7 @@ async def test_live_basic_lane_structured_429_cools_with_gate_duration() -> None
     snapshot_select.set_active_routing_snapshot(snapshot)
 
     with pytest.raises(Exception):
-        await _run_basic_lane_once(
+        await _run_alias_once(
             session_id="structured-live",
             raise_exc=_StructuredUpstream429(),
         )
@@ -217,7 +197,7 @@ async def test_live_basic_lane_structured_429_cools_with_gate_duration() -> None
 
 
 @pytest.mark.asyncio
-async def test_live_basic_lane_single_marker_failure_does_not_cool() -> None:
+async def test_live_alias_single_marker_failure_does_not_cool() -> None:
     """A single marker-only (non-structured) failure on the LIVE basic-lane path
     must NOT cool the candidate -- the N-of-M gate needs multiple marker events
     within its window before a key advances toward cooling."""
@@ -225,7 +205,7 @@ async def test_live_basic_lane_single_marker_failure_does_not_cool() -> None:
     snapshot_select.set_active_routing_snapshot(snapshot)
 
     with pytest.raises(Exception):
-        await _run_basic_lane_once(
+        await _run_alias_once(
             session_id="marker-live",
             raise_exc=_marker_only_capacity_error(),
         )
@@ -234,7 +214,13 @@ async def test_live_basic_lane_single_marker_failure_does_not_cool() -> None:
     applied_remaining = state.alias_routing_state.codex.get_memory_cooldown_remaining(live_key)
     assert applied_remaining == 0.0
     # And the gate itself must agree the key is not cooled after one marker event.
-    assert state.alias_routing_state.basic_pilot_gate.is_cooled(cooldown_key=live_key) is False
+    assert (
+        state.alias_routing_state.codex_failure_evidence_gate.is_cooled(
+            canonical_alias="basic",
+            cooldown_key=live_key,
+        )
+        is False
+    )
 
 
 _ROUND_ROBIN_YAML = """
@@ -259,7 +245,7 @@ def test_live_round_robin_rotates_across_equal_priority_candidates() -> None:
     across the equal-top-priority pair on successive LIVE selections, rather than
     always returning declaration order (the pre-fix behavior) or a random pick.
 
-    Wave-1 R3-2 purified the enumeration: ``_select_basic_pilot_snapshot_candidates``
+    Wave-1 R3-2 purified the enumeration: generic snapshot selection
     now READS the rotation cursor (it no longer self-advances), so the getter
     cannot double-count within a single request. The cursor advances exactly once
     per ACTUAL selection via ``_commit_round_robin_selection`` -- the same commit
@@ -269,9 +255,19 @@ def test_live_round_robin_rotates_across_equal_priority_candidates() -> None:
     snapshot_select.set_active_routing_snapshot(snapshot)
 
     leaders: list[str] = []
-    for _ in range(4):
-        token = snapshot_select._derive_round_robin_commit_token("basic", client_product_label=None)
-        leader = snapshot_select._select_basic_pilot_snapshot_candidates()[0]
+    for index in range(4):
+        request = _minimal_request(f"round-robin-{index}")
+        token = snapshot_select._derive_round_robin_commit_token(
+            "basic",
+            request=request,
+            ingress="codex",
+            client_product_label=None,
+        )
+        leader = snapshot_select._select_snapshot_candidates(
+            "basic",
+            ingress="codex",
+            request=request,
+        )[0]
         leaders.append(leader["model"])
         snapshot_select._commit_round_robin_selection(token, selected_candidate=leader)
     # Deterministic rotation: consecutive leaders must alternate and both

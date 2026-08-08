@@ -76,8 +76,6 @@ EXPECTED_RUNTIME_FIELDS = frozenset({
     "resolve_cooldown_publication",
     "anthropic_family_state",
     "codex_family_state",
-    "normalize_alias_model",
-    "default_alias_model",
     "perform_candidate_request",
     "select_candidate",
     "publish_cooldown_memory",
@@ -85,7 +83,8 @@ EXPECTED_RUNTIME_FIELDS = frozenset({
     "set_session_affinity",
     "add_alias_metadata",
     "raise_redispatch_required",
-    "get_candidates_for_alias",
+    "extract_client_product_label",
+    "resolve_selection_enumeration",
     "get_active_cooldown_state",
 })
 
@@ -123,8 +122,6 @@ def _make_runtime(**overrides: Any) -> AnthropicAutoAgentRouteRuntime:
         "resolve_cooldown_publication": MagicMock(),
         "anthropic_family_state": MagicMock(),
         "codex_family_state": MagicMock(),
-        "normalize_alias_model": MagicMock(return_value=None),
-        "default_alias_model": "claude-sonnet-4-20250514",
         "perform_candidate_request": AsyncMock(),
         "select_candidate": AsyncMock(),
         "publish_cooldown_memory": MagicMock(),
@@ -132,7 +129,10 @@ def _make_runtime(**overrides: Any) -> AnthropicAutoAgentRouteRuntime:
         "set_session_affinity": AsyncMock(),
         "add_alias_metadata": MagicMock(),
         "raise_redispatch_required": MagicMock(),
-        "get_candidates_for_alias": MagicMock(return_value=[{"id": "c1"}]),
+        "extract_client_product_label": MagicMock(return_value=None),
+        "resolve_selection_enumeration": MagicMock(
+            return_value=MagicMock(candidates=({"id": "c1"},))
+        ),
         "get_active_cooldown_state": AsyncMock(return_value=(0.0, "none")),
     }
     defaults.update(overrides)
@@ -456,7 +456,7 @@ class TestFamilyStateSelectionAndCooldownCapture:
             error_class="RateLimitError",
             grok_account_quota_exhausted=True,
             kimi_failure_metadata={"k": "v"},
-            is_basic_pilot_lane=True,
+            codex_failure_evidence_alias="basic",
         )
         runtime.resolve_cooldown_publication.assert_called_once_with(  # type: ignore[union-attr]
             request=req,
@@ -467,7 +467,7 @@ class TestFamilyStateSelectionAndCooldownCapture:
             error_class="RateLimitError",
             grok_account_quota_exhausted=True,
             kimi_failure_metadata={"k": "v"},
-            is_basic_pilot_lane=True,
+            codex_failure_evidence_alias="basic",
         )
         # Now persist should succeed and forward captured state to apply_cooldown_fn
         await services.persist_cooldown_fn(keys=["cd:1"], seconds=60.0)
@@ -481,7 +481,7 @@ class TestFamilyStateSelectionAndCooldownCapture:
         assert call_kw["error_class"] == "RateLimitError"
         assert call_kw["grok_account_quota_exhausted"] is True
         assert call_kw["kimi_failure_metadata"] == {"k": "v"}
-        assert call_kw["is_basic_pilot_lane"] is True
+        assert call_kw["canonical_alias"] == "basic"
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +528,7 @@ class TestPerformFunctionBinding:
             prepared_request_body={"model": "claude-sonnet-4-20250514"},
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers=headers,
+            canonical_alias="basic",
         )
         services = captured_services[0]
         candidate = {"provider": "anthropic", "model": "claude-sonnet-4-20250514"}
@@ -572,6 +573,7 @@ class TestPerformFunctionBinding:
             prepared_request_body={},
             target_url="https://api.anthropic.com",
             custom_headers={},
+            canonical_alias="basic",
         )
         services = captured_services[0]
         result = await services.perform_candidate_request_fn(
@@ -600,6 +602,7 @@ class TestProductionWrapperDelegation:
             prepared_request_body={"model": "claude-sonnet-4-20250514"},
             target_url="https://api.anthropic.com",
             custom_headers={},
+            canonical_alias="basic",
         )
         runtime.handle_alias_route.assert_awaited_once()  # type: ignore[union-attr]
         call_kwargs = runtime.handle_alias_route.call_args.kwargs  # type: ignore[union-attr]
@@ -610,51 +613,16 @@ class TestProductionWrapperDelegation:
             call_kwargs["skipped_candidates_metadata_key"]
             == "anthropic_auto_agent_skipped_candidates"
         )
+        assert call_kwargs["alias_model"] == "basic"
 
     @pytest.mark.asyncio
-    async def test_alias_model_normalization_fallback(self) -> None:
-        """When normalize returns None, default_alias_model is used."""
+    async def test_max_candidate_attempts_from_snapshot_enumeration(self) -> None:
+        enumeration = MagicMock(candidates=({"a": 1}, {"b": 2}, {"c": 3}))
+        resolve_enumeration = MagicMock(return_value=enumeration)
         runtime = _make_runtime(
-            normalize_alias_model=MagicMock(return_value=None),
-            default_alias_model="claude-fallback",
+            extract_client_product_label=MagicMock(return_value="claude-code"),
+            resolve_selection_enumeration=resolve_enumeration,
         )
-        await handle_anthropic_auto_agent_alias_route(
-            runtime,
-            endpoint="/v1/messages",
-            request=MagicMock(),
-            fastapi_response=MagicMock(),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body={"model": "unknown"},
-            target_url="https://api.anthropic.com",
-            custom_headers={},
-        )
-        call_kwargs = runtime.handle_alias_route.call_args.kwargs  # type: ignore[union-attr]
-        assert call_kwargs["alias_model"] == "claude-fallback"
-
-    @pytest.mark.asyncio
-    async def test_alias_model_normalization_hit(self) -> None:
-        """When normalize returns a model, it is used directly."""
-        runtime = _make_runtime(
-            normalize_alias_model=MagicMock(return_value="claude-opus-4-20250514"),
-        )
-        await handle_anthropic_auto_agent_alias_route(
-            runtime,
-            endpoint="/v1/messages",
-            request=MagicMock(),
-            fastapi_response=MagicMock(),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body={"model": "opus"},
-            target_url="https://api.anthropic.com",
-            custom_headers={},
-        )
-        call_kwargs = runtime.handle_alias_route.call_args.kwargs  # type: ignore[union-attr]
-        assert call_kwargs["alias_model"] == "claude-opus-4-20250514"
-
-    @pytest.mark.asyncio
-    async def test_max_candidate_attempts_from_candidates_list(self) -> None:
-        """max_candidate_attempts equals len(get_candidates_for_alias(alias))."""
-        get_candidates = MagicMock(return_value=[{"a": 1}, {"b": 2}, {"c": 3}])
-        runtime = _make_runtime(get_candidates_for_alias=get_candidates)
         request = MagicMock()
         body: dict[str, Any] = {}
         await handle_anthropic_auto_agent_alias_route(
@@ -666,96 +634,15 @@ class TestProductionWrapperDelegation:
             prepared_request_body=body,
             target_url="https://api.anthropic.com",
             custom_headers={},
+            canonical_alias="basic",
         )
         call_kwargs = runtime.handle_alias_route.call_args.kwargs  # type: ignore[union-attr]
         assert call_kwargs["max_candidate_attempts"] == 3
-        get_candidates.assert_called_once_with(
-            "claude-sonnet-4-20250514",
-            request=request,
-            request_body=body,
-        )
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        ("alias_model", "expected_attempts"),
-        (
-            ("sota-moonshot", 1),
-            ("sota-alibaba", 2),
-            ("work", 6),
-        ),
-    )
-    async def test_installed_runtime_counts_checked_in_anthropic_alias_candidates(
-        self,
-        alias_model: str,
-        expected_attempts: int,
-    ) -> None:
-        """The production runtime uses the request-aware snapshot projection."""
-        from starlette.requests import Request
-        from starlette.responses import Response
-
-        from litellm.proxy.pass_through_endpoints import (
-            llm_passthrough_endpoints as lpe,
-        )
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
-            active_routing_snapshot_holder,
-        )
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
-            DEFAULT_CONFIG_DIR,
-            compile_directory,
-        )
-
-        snapshot = compile_directory(DEFAULT_CONFIG_DIR)
-        previous_snapshot = active_routing_snapshot_holder.swap(snapshot)
-        handle_alias_route = AsyncMock(return_value=Response(status_code=204))
-        request = Request(
-            {
-                "type": "http",
-                "method": "POST",
-                "path": "/anthropic/v1/messages",
-                "query_string": b"",
-                "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"x-litellm-end-user-id", b"adapter-harness-tenant"),
-                    (b"langfuse_trace_user_id", b"adapter-harness-tenant"),
-                    (b"langfuse_trace_name", b"claude-code"),
-                    (b"x-aawm-tenant-id", b"adapter-harness-tenant"),
-                ],
-            }
-        )
-        body = {
-            "model": alias_model,
-            "max_tokens": 64,
-            "messages": [{"role": "user", "content": "offline harness probe"}],
-            "tools": [
-                {
-                    "name": "Read",
-                    "description": "offline",
-                    "input_schema": {"type": "object"},
-                }
-            ],
-        }
-        runtime = dataclasses.replace(
-            lpe._ANTHROPIC_AUTO_AGENT_ROUTE_RUNTIME,
-            handle_alias_route=handle_alias_route,
-        )
-
-        try:
-            await handle_anthropic_auto_agent_alias_route(
-                runtime,
-                endpoint="/v1/messages",
-                request=request,
-                fastapi_response=Response(),
-                user_api_key_dict=MagicMock(),
-                prepared_request_body=body,
-                target_url="http://unused.invalid",
-                custom_headers={},
-            )
-        finally:
-            active_routing_snapshot_holder.swap(previous_snapshot)
-
-        assert (
-            handle_alias_route.await_args.kwargs["max_candidate_attempts"]
-            == expected_attempts
+        resolve_enumeration.assert_called_once_with(
+            request,
+            "basic",
+            ingress="anthropic",
+            client_product_label="claude-code",
         )
 
     @pytest.mark.asyncio
@@ -771,6 +658,7 @@ class TestProductionWrapperDelegation:
             prepared_request_body={},
             target_url="https://api.anthropic.com",
             custom_headers={},
+            canonical_alias="basic",
         )
         services = runtime.handle_alias_route.call_args.args[0]  # type: ignore[union-attr]
         assert services.select_candidate_fn is runtime.select_candidate
@@ -793,6 +681,7 @@ class TestProductionWrapperDelegation:
             prepared_request_body={},
             target_url="https://api.anthropic.com",
             custom_headers={},
+            canonical_alias="basic",
         )
         call_kwargs = runtime.handle_alias_route.call_args.kwargs  # type: ignore[union-attr]
         assert (

@@ -1,4 +1,4 @@
-"""Alias-specific system instruction shaping for AAWM passthrough requests."""
+"""Request-policy instruction shaping for AAWM passthrough requests."""
 
 from __future__ import annotations
 
@@ -62,8 +62,7 @@ class AliasGuidanceConfig:
         _AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION
     )
     aawm_read_agent_guidance_prompt: str = _AAWM_READ_AGENT_GUIDANCE_PROMPT
-    codex_aawm_read_alias: str = "basic"
-    anthropic_aawm_read_alias: str = "basic"
+    aawm_read_only_agent_roles: frozenset[str] = frozenset({"explorer"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,17 +123,30 @@ def _append_codex_auto_agent_prevention_guidance_to_instructions(
     )
 
 
-def _is_aawm_read_agent_alias_model(
-    alias_model: Any,
+def _get_aawm_read_only_agent_role(
+    request_body: dict[str, Any],
     *,
     config: AliasGuidanceConfig = DEFAULT_ALIAS_GUIDANCE_CONFIG,
-) -> bool:
-    if not isinstance(alias_model, str):
-        return False
-    return alias_model in {
-        config.codex_aawm_read_alias,
-        config.anthropic_aawm_read_alias,
-    }
+) -> Optional[str]:
+    sources: list[dict[str, Any]] = [request_body]
+    for key in ("litellm_metadata", "metadata", "source"):
+        source = request_body.get(key)
+        if not isinstance(source, dict):
+            continue
+        sources.append(source)
+        nested_source = source.get("source")
+        if isinstance(nested_source, dict):
+            sources.append(nested_source)
+
+    for source in sources:
+        for key in ("agent_role", "aawm_agent_role", "codex_agent_role"):
+            value = source.get(key)
+            if not isinstance(value, str):
+                continue
+            normalized = value.strip().casefold()
+            if normalized in config.aawm_read_only_agent_roles:
+                return normalized
+    return None
 
 
 def _append_aawm_read_agent_guidance_to_text(
@@ -195,12 +207,15 @@ def _append_aawm_read_agent_guidance_to_anthropic_system(
 def _apply_aawm_read_agent_guidance_to_request_body(
     request_body: dict[str, Any],
     *,
-    alias_model: Any,
     target_field: str,
     callbacks: Optional[AliasGuidanceCallbacks] = None,
     config: AliasGuidanceConfig = DEFAULT_ALIAS_GUIDANCE_CONFIG,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    if not _is_aawm_read_agent_alias_model(alias_model, config=config):
+    agent_role = _get_aawm_read_only_agent_role(
+        request_body,
+        config=config,
+    )
+    if agent_role is None:
         return request_body, {}
 
     updated_body = dict(request_body)
@@ -244,7 +259,7 @@ def _apply_aawm_read_agent_guidance_to_request_body(
             config.aawm_read_agent_guidance_policy_version
         ),
         "aawm_read_agent_guidance_applied": True,
-        "aawm_read_agent_guidance_alias": alias_model,
+        "aawm_read_agent_guidance_agent_role": agent_role,
         "aawm_read_agent_guidance_target_field": target_field,
         "aawm_read_agent_guidance_original_chars": original_chars,
         "aawm_read_agent_guidance_prompt_chars": len(
@@ -260,7 +275,7 @@ def _apply_aawm_read_agent_guidance_to_request_body(
                 "aawm-read-agent-guidance:"
                 f"{config.aawm_read_agent_guidance_policy_version}"
             ),
-            f"aawm-read-agent-guidance-alias:{alias_model}",
+            f"aawm-read-agent-guidance-role:{agent_role}",
         ],
         extra_fields={
             **guidance_metadata,

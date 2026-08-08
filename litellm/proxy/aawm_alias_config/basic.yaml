@@ -1,5 +1,4 @@
-# AAWM alias-routing config -- ``basic`` pilot (CFG-008, renamed from the
-# ``read`` pilot by CFG-010).
+# AAWM alias-routing config for the ``basic`` alias (CFG-008).
 # Every origin shares the common OpenRouter/OpenCode/Alibaba prefix, then
 # receives a mutually exclusive TUI-specific last resort:
 #   - Claude-origin requests only: native Anthropic Haiku

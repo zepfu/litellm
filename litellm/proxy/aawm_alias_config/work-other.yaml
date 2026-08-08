@@ -2,7 +2,6 @@ defaults: {}
 
 aliases:
   - name: work-other
-    visibility: internal
     distribution_strategy: proportional
     candidates:
       - alias_reference: sota-xai

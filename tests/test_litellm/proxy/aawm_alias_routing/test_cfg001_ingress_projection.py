@@ -1,8 +1,8 @@
 """CFG-001: ingress-specific route-family projection tests.
 
-Verifies that the logical config alias ``basic`` resolves from the same active
-snapshot on both Codex/OpenAI Responses and Claude Code/Anthropic Messages
-ingress, preserving provider-native credential boundaries.
+Verifies that one synthetic config alias resolves from the same active snapshot
+on both Codex/OpenAI Responses and Claude Code/Anthropic Messages ingress,
+preserving provider-native credential boundaries.
 
 No provider egress, no synthetic LLM calls.
 """
@@ -10,6 +10,7 @@ No provider egress, no synthetic LLM calls.
 from __future__ import annotations
 
 import pytest
+from starlette.requests import Request
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import (
     ConfigCompileError,
@@ -26,7 +27,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot imp
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
     _routing_candidate_to_anthropic_public_dict,
-    _select_basic_pilot_snapshot_candidates_anthropic,
+    _select_snapshot_candidates,
 )
 
 
@@ -34,26 +35,27 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select imp
 # Fixtures
 # ---------------------------------------------------------------------------
 
-_MINIMAL_BASIC_YAML = """\
+_TEST_ALIAS = "ingress-projection"
+_SYNTHETIC_INGRESS_YAML = """\
 defaults: {}
 aliases:
-  - name: basic
+  - name: ingress-projection
     candidates:
       - provider: openai
-        model: gpt-5.6-luna
+        model: gpt-ingress-primary
         route_family: codex_responses
         priority: 40
       - provider: openrouter
-        model: openrouter/cohere/north-mini-code:free
+        model: openrouter/test/ingress-bridge
         route_family: codex_openrouter_completion_adapter
         priority: 80
       - provider: opencode_zen
-        model: deepseek-v4-flash
+        model: ingress-opencode
         route_family: codex_opencode_zen_adapter
         anthropic_route_family: anthropic_opencode_zen_responses_adapter
         priority: 60
       - provider: openai
-        model: gpt-5.4-mini
+        model: gpt-ingress-last-resort
         route_family: codex_responses
         priority: 0
 """
@@ -61,17 +63,29 @@ aliases:
 _SNAPSHOT: RoutingSnapshot | None = None
 
 
+def _request() -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/messages",
+            "headers": [],
+            "query_string": b"",
+        }
+    )
+
+
 @pytest.fixture()
-def basic_snapshot() -> RoutingSnapshot:
+def ingress_snapshot() -> RoutingSnapshot:
     global _SNAPSHOT
     if _SNAPSHOT is None:
-        _SNAPSHOT = compile_yaml(_MINIMAL_BASIC_YAML)
+        _SNAPSHOT = compile_yaml(_SYNTHETIC_INGRESS_YAML)
     return _SNAPSHOT
 
 
 @pytest.fixture(autouse=True)
-def _swap_snapshot(basic_snapshot: RoutingSnapshot):
-    previous = active_routing_snapshot_holder.swap(basic_snapshot)
+def _swap_snapshot(ingress_snapshot: RoutingSnapshot):
+    previous = active_routing_snapshot_holder.swap(ingress_snapshot)
     yield
     active_routing_snapshot_holder.swap(previous)
 
@@ -130,7 +144,7 @@ class TestCompilerFailClosed:
         yaml_str = """\
 defaults: {}
 aliases:
-  - name: basic
+  - name: ingress-projection
     candidates:
       - provider: opencode_zen
         model: deepseek-v4-flash
@@ -138,7 +152,7 @@ aliases:
         priority: 60
 """
         snapshot = compile_yaml(yaml_str)
-        candidate = snapshot.aliases["basic"].candidates[0]
+        candidate = snapshot.aliases[_TEST_ALIAS].candidates[0]
         assert candidate.anthropic_route_family is None
         # Dispatch shaping fails closed:
         with pytest.raises(ValueError, match="no anthropic_route_family"):
@@ -148,7 +162,7 @@ aliases:
         yaml_str = """\
 defaults: {}
 aliases:
-  - name: basic
+  - name: ingress-projection
     candidates:
       - provider: opencode_zen
         model: deepseek-v4-flash
@@ -157,14 +171,14 @@ aliases:
         priority: 60
 """
         snapshot = compile_yaml(yaml_str)
-        candidate = snapshot.aliases["basic"].candidates[0]
+        candidate = snapshot.aliases[_TEST_ALIAS].candidates[0]
         assert candidate.anthropic_route_family == "anthropic_opencode_zen_responses_adapter"
 
     def test_unregistered_anthropic_route_family_rejected(self):
         yaml_str = """\
 defaults: {}
 aliases:
-  - name: basic
+  - name: ingress-projection
     candidates:
       - provider: openai
         model: gpt-5.6-luna
@@ -182,24 +196,36 @@ aliases:
 
 
 class TestSnapshotAnthropicRouteFamily:
-    def test_closed_mapping_candidates_get_anthropic_rf(self, basic_snapshot: RoutingSnapshot):
-        alias = basic_snapshot.aliases["basic"]
+    def test_closed_mapping_candidates_get_anthropic_rf(
+        self,
+        ingress_snapshot: RoutingSnapshot,
+    ):
+        alias = ingress_snapshot.aliases[_TEST_ALIAS]
         by_model = {c.model: c for c in alias.candidates}
-        assert by_model["gpt-5.6-luna"].anthropic_route_family == "anthropic_openai_responses_adapter"
         assert (
-            by_model["openrouter/cohere/north-mini-code:free"].anthropic_route_family
+            by_model["gpt-ingress-primary"].anthropic_route_family
+            == "anthropic_openai_responses_adapter"
+        )
+        assert (
+            by_model["openrouter/test/ingress-bridge"].anthropic_route_family
             == "anthropic_openrouter_completion_adapter"
         )
 
-    def test_explicit_override_preserved(self, basic_snapshot: RoutingSnapshot):
-        alias = basic_snapshot.aliases["basic"]
+    def test_explicit_override_preserved(self, ingress_snapshot: RoutingSnapshot):
+        alias = ingress_snapshot.aliases[_TEST_ALIAS]
         by_model = {c.model: c for c in alias.candidates}
-        assert by_model["deepseek-v4-flash"].anthropic_route_family == "anthropic_opencode_zen_responses_adapter"
+        assert (
+            by_model["ingress-opencode"].anthropic_route_family
+            == "anthropic_opencode_zen_responses_adapter"
+        )
 
-    def test_last_resort_gets_anthropic_rf(self, basic_snapshot: RoutingSnapshot):
-        alias = basic_snapshot.aliases["basic"]
+    def test_last_resort_gets_anthropic_rf(self, ingress_snapshot: RoutingSnapshot):
+        alias = ingress_snapshot.aliases[_TEST_ALIAS]
         by_model = {c.model: c for c in alias.candidates}
-        assert by_model["gpt-5.4-mini"].anthropic_route_family == "anthropic_openai_responses_adapter"
+        assert (
+            by_model["gpt-ingress-last-resort"].anthropic_route_family
+            == "anthropic_openai_responses_adapter"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +234,8 @@ class TestSnapshotAnthropicRouteFamily:
 
 
 class TestAnthropicPublicDict:
-    def test_uses_anthropic_route_family(self, basic_snapshot: RoutingSnapshot):
-        candidate = basic_snapshot.aliases["basic"].candidates[0]
+    def test_uses_anthropic_route_family(self, ingress_snapshot: RoutingSnapshot):
+        candidate = ingress_snapshot.aliases[_TEST_ALIAS].candidates[0]
         shaped = _routing_candidate_to_anthropic_public_dict(candidate, epoch_tag="abc123")
         assert shaped["route_family"] == candidate.anthropic_route_family
         assert shaped["route_family"] != candidate.route_family
@@ -253,7 +279,7 @@ class TestAnthropicPublicDict:
         assert "reasoning_effort" not in _routing_candidate_to_public_dict(unset)
         assert "reasoning_effort" not in _routing_candidate_to_anthropic_public_dict(unset)
 
-    def test_missing_anthropic_rf_raises(self, basic_snapshot: RoutingSnapshot):
+    def test_missing_anthropic_rf_raises(self, ingress_snapshot: RoutingSnapshot):
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
             RoutingCandidate,
         )
@@ -280,55 +306,34 @@ class TestAnthropicPublicDict:
 
 class TestAnthropicIngressResolution:
     def test_returns_anthropic_projected_candidates(self):
-        result = _select_basic_pilot_snapshot_candidates_anthropic()
-        assert result is not None
+        result = _select_snapshot_candidates(_TEST_ALIAS, ingress="anthropic")
         assert len(result) > 0
         for candidate in result:
             rf = candidate["route_family"]
             assert rf.startswith("anthropic_"), f"expected anthropic route family, got {rf}"
 
     def test_same_provider_model_set_as_codex(self):
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
-            _select_basic_pilot_snapshot_candidates,
-        )
-
-        codex = _select_basic_pilot_snapshot_candidates()
-        anthropic = _select_basic_pilot_snapshot_candidates_anthropic()
-        assert anthropic is not None
+        codex = _select_snapshot_candidates(_TEST_ALIAS, ingress="codex")
+        anthropic = _select_snapshot_candidates(_TEST_ALIAS, ingress="anthropic")
         codex_ids = {(c["provider"], c["model"]) for c in codex}
         anthropic_ids = {(c["provider"], c["model"]) for c in anthropic}
         assert codex_ids == anthropic_ids
 
     def test_route_families_differ_by_ingress(self):
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
-            _select_basic_pilot_snapshot_candidates,
-        )
-
-        codex = _select_basic_pilot_snapshot_candidates()
-        anthropic = _select_basic_pilot_snapshot_candidates_anthropic()
-        assert anthropic is not None
+        codex = _select_snapshot_candidates(_TEST_ALIAS, ingress="codex")
+        anthropic = _select_snapshot_candidates(_TEST_ALIAS, ingress="anthropic")
         codex_by_model = {c["model"]: c for c in codex}
         anthropic_by_model = {c["model"]: c for c in anthropic}
         for model in codex_by_model:
             assert codex_by_model[model]["route_family"] != anthropic_by_model[model]["route_family"]
 
-    def test_no_snapshot_returns_none(self):
-        previous = active_routing_snapshot_holder.swap(None)
-        try:
-            result = _select_basic_pilot_snapshot_candidates_anthropic()
-            assert result is None
-        finally:
-            active_routing_snapshot_holder.swap(previous)
-
     def test_epoch_tag_carried(self):
-        result = _select_basic_pilot_snapshot_candidates_anthropic()
-        assert result is not None
+        result = _select_snapshot_candidates(_TEST_ALIAS, ingress="anthropic")
         for candidate in result:
             assert "config_epoch_tag" in candidate
 
     def test_priority_ordering_preserved(self):
-        result = _select_basic_pilot_snapshot_candidates_anthropic()
-        assert result is not None
+        result = _select_snapshot_candidates(_TEST_ALIAS, ingress="anthropic")
         # Last resort (priority 0) must be last
         assert result[-1]["last_resort"] is True
         for c in result[:-1]:
@@ -341,9 +346,9 @@ class TestAnthropicIngressResolution:
 
 
 class TestSnapshotIdentity:
-    def test_config_hash_stable(self, basic_snapshot: RoutingSnapshot):
-        snapshot2 = compile_yaml(_MINIMAL_BASIC_YAML)
-        assert basic_snapshot.config_hash == snapshot2.config_hash
+    def test_config_hash_stable(self, ingress_snapshot: RoutingSnapshot):
+        snapshot2 = compile_yaml(_SYNTHETIC_INGRESS_YAML)
+        assert ingress_snapshot.config_hash == snapshot2.config_hash
 
 
 # ---------------------------------------------------------------------------
@@ -353,23 +358,18 @@ class TestSnapshotIdentity:
 
 class TestIngressIsolation:
     def test_anthropic_candidates_never_use_codex_route_families(self):
-        result = _select_basic_pilot_snapshot_candidates_anthropic()
-        assert result is not None
+        result = _select_snapshot_candidates(_TEST_ALIAS, ingress="anthropic")
         for candidate in result:
             assert not candidate["route_family"].startswith("codex_")
 
     def test_codex_candidates_never_use_anthropic_route_families(self):
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
-            _select_basic_pilot_snapshot_candidates,
-        )
-
-        codex = _select_basic_pilot_snapshot_candidates()
+        codex = _select_snapshot_candidates(_TEST_ALIAS, ingress="codex")
         for candidate in codex:
             assert not candidate["route_family"].startswith("anthropic_")
 
 
 # ---------------------------------------------------------------------------
-# Fix 1: install() host globals include snapshot_aware getter
+# Fix 1: install() host globals expose supported selection seams
 # ---------------------------------------------------------------------------
 
 
@@ -391,32 +391,12 @@ class TestInstallHostGlobals:
             if fn is not None:
                 vars(selection)[name] = fn
 
-    def test_snapshot_aware_getter_published_to_host_globals(self):
-        """install() publishes the snapshot-aware getter to host_globals.
-
-        Uses a separate dict as the host so the selection module namespace
-        is not polluted with seam-variable copies.
-        """
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import selection
-
-        host_globals: dict = {}
-        selection.install(host_globals)
-        assert "_get_anthropic_candidates_for_alias_snapshot_aware" in host_globals
-        assert callable(host_globals["_get_anthropic_candidates_for_alias_snapshot_aware"])
-
     def test_install_publishes_anthropic_affinity_candidate(self):
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing import selection
 
         host_globals: dict = {}
         selection.install(host_globals)
         assert "_find_anthropic_auto_agent_affinity_candidate" in host_globals
-
-    def test_install_publishes_anthropic_public_dict_shaper(self):
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import selection
-
-        host_globals: dict = {}
-        selection.install(host_globals)
-        assert "_routing_candidate_to_anthropic_public_dict" in host_globals
 
     def test_install_publishes_selector_dependency_closure(self):
         from types import SimpleNamespace
@@ -491,7 +471,7 @@ class TestCredentialDomainCompatibility:
         yaml_str = """\
 defaults: {}
 aliases:
-  - name: basic
+  - name: ingress-projection
     candidates:
       - provider: anthropic
         model: claude-4-sonnet
@@ -506,7 +486,7 @@ aliases:
         yaml_str = """\
 defaults: {}
 aliases:
-  - name: basic
+  - name: ingress-projection
     candidates:
       - provider: openai
         model: gpt-5.6-luna
@@ -522,7 +502,7 @@ aliases:
         yaml_str = """\
 defaults: {}
 aliases:
-  - name: basic
+  - name: ingress-projection
     candidates:
       - provider: openai
         model: gpt-5.6-luna
@@ -530,7 +510,7 @@ aliases:
         priority: 40
 """
         snapshot = compile_yaml(yaml_str)
-        candidate = snapshot.aliases["basic"].candidates[0]
+        candidate = snapshot.aliases[_TEST_ALIAS].candidates[0]
         assert candidate.anthropic_route_family == "anthropic_openai_responses_adapter"
 
 
@@ -540,30 +520,37 @@ aliases:
 
 
 class TestAnthropicAffinityBypass:
-    def test_affinity_finds_schedule_gated_candidate(self, basic_snapshot: RoutingSnapshot):
+    def test_affinity_finds_schedule_gated_candidate(
+        self,
+        ingress_snapshot: RoutingSnapshot,
+    ):
         """Pinned candidate outside schedule window is still found via affinity."""
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.selection import (
             _find_anthropic_auto_agent_affinity_candidate,
         )
 
         # Use the first candidate from the snapshot
-        candidate = basic_snapshot.aliases["basic"].candidates[0]
+        candidate = ingress_snapshot.aliases[_TEST_ALIAS].candidates[0]
         affinity = {
             "provider": candidate.provider,
             "model": candidate.model,
-            "config_hash": basic_snapshot.config_hash,
+            "config_hash": ingress_snapshot.config_hash,
             "route_family": candidate.anthropic_route_family,
         }
         result = _find_anthropic_auto_agent_affinity_candidate(
             affinity,
-            alias_model="basic",
+            alias_model=_TEST_ALIAS,
             client_product_label=None,
+            request=_request(),
         )
         assert result is not None
         assert result["provider"] == candidate.provider
         assert result["model"] == candidate.model
 
-    def test_affinity_returns_none_for_removed_candidate(self, basic_snapshot: RoutingSnapshot):
+    def test_affinity_returns_none_for_removed_candidate(
+        self,
+        ingress_snapshot: RoutingSnapshot,
+    ):
         """Candidate removed from snapshot yields None (redispatch required)."""
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.selection import (
             _find_anthropic_auto_agent_affinity_candidate,
@@ -572,56 +559,16 @@ class TestAnthropicAffinityBypass:
         affinity = {
             "provider": "nonexistent",
             "model": "nonexistent-model",
-            "config_hash": basic_snapshot.config_hash,
+            "config_hash": ingress_snapshot.config_hash,
             "route_family": "anthropic_openai_responses_adapter",
         }
         result = _find_anthropic_auto_agent_affinity_candidate(
             affinity,
-            alias_model="basic",
+            alias_model=_TEST_ALIAS,
             client_product_label=None,
+            request=_request(),
         )
         assert result is None
-
-
-# ---------------------------------------------------------------------------
-# Fix 4: Non-basic aliases fail closed when snapshot active
-# ---------------------------------------------------------------------------
-
-
-class TestNonBasicAliasFailClosed:
-    def test_arbitrary_alias_fails_closed_with_snapshot(self, basic_snapshot: RoutingSnapshot):
-        """Arbitrary alias 'other' gets empty candidates when snapshot is active."""
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
-            _get_codex_auto_agent_candidates_for_alias,
-        )
-
-        result = _get_codex_auto_agent_candidates_for_alias("other")
-        assert result == ()
-
-    def test_known_legacy_alias_still_resolves_with_snapshot(self, basic_snapshot: RoutingSnapshot):
-        """Known legacy aliases (basic) still resolve from static tables."""
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
-            _get_codex_auto_agent_candidates_for_alias,
-        )
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
-            CODEX_AAWM_LOW_ALIAS,
-        )
-
-        result = _get_codex_auto_agent_candidates_for_alias(CODEX_AAWM_LOW_ALIAS)
-        assert len(result) > 0
-
-    def test_arbitrary_alias_resolves_without_snapshot(self):
-        """Without a snapshot, arbitrary aliases fall back to static table."""
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
-            _get_codex_auto_agent_candidates_for_alias,
-        )
-
-        previous = active_routing_snapshot_holder.swap(None)
-        try:
-            result = _get_codex_auto_agent_candidates_for_alias("other")
-            assert len(result) > 0  # Falls back to generic static table
-        finally:
-            active_routing_snapshot_holder.swap(previous)
 
 
 # ---------------------------------------------------------------------------
@@ -635,7 +582,7 @@ class TestClientProductLabelWiring:
         yaml_str = """\
 defaults: {}
 aliases:
-  - name: basic
+  - name: ingress-projection
     candidates:
       - provider: openai
         model: gpt-5.6-luna
@@ -650,10 +597,11 @@ aliases:
         snapshot = compile_yaml(yaml_str)
         previous = active_routing_snapshot_holder.swap(snapshot)
         try:
-            result = _select_basic_pilot_snapshot_candidates_anthropic(
+            result = _select_snapshot_candidates(
+                _TEST_ALIAS,
+                ingress="anthropic",
                 client_product_label=None,
             )
-            assert result is not None
             models = [c["model"] for c in result]
             assert "gpt-5.6-luna" not in models
             assert "openrouter/cohere/north-mini-code:free" in models
@@ -665,7 +613,7 @@ aliases:
         yaml_str = """\
 defaults: {}
 aliases:
-  - name: basic
+  - name: ingress-projection
     candidates:
       - provider: openai
         model: gpt-5.6-luna
@@ -680,24 +628,21 @@ aliases:
         snapshot = compile_yaml(yaml_str)
         previous = active_routing_snapshot_holder.swap(snapshot)
         try:
-            result = _select_basic_pilot_snapshot_candidates_anthropic(
+            result = _select_snapshot_candidates(
+                _TEST_ALIAS,
+                ingress="anthropic",
                 client_product_label="claude/1.0",
             )
-            assert result is not None
             models = [c["model"] for c in result]
             assert "gpt-5.6-luna" in models
         finally:
             active_routing_snapshot_holder.swap(previous)
 
-    def test_snapshot_aware_getter_accepts_client_product_label(self):
-        """The snapshot-aware getter accepts and forwards client_product_label."""
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.selection import (
-            _get_anthropic_candidates_for_alias_snapshot_aware,
-        )
-
-        # Should not raise with the kwarg
-        result = _get_anthropic_candidates_for_alias_snapshot_aware(
-            "basic", client_product_label=None,
+    def test_generic_selector_accepts_client_product_label(self):
+        result = _select_snapshot_candidates(
+            _TEST_ALIAS,
+            ingress="anthropic",
+            client_product_label=None,
         )
         assert isinstance(result, tuple)
 
@@ -713,7 +658,7 @@ class TestAmbiguousOpenCodeBackwardCompat:
         yaml_str = """\
 defaults: {}
 aliases:
-  - name: basic
+  - name: ingress-projection
     candidates:
       - provider: opencode_zen
         model: deepseek-v4-flash
@@ -721,14 +666,17 @@ aliases:
         priority: 60
 """
         snapshot = compile_yaml(yaml_str)
-        assert snapshot.aliases["basic"].candidates[0].anthropic_route_family is None
+        assert (
+            snapshot.aliases[_TEST_ALIAS].candidates[0].anthropic_route_family
+            is None
+        )
 
     def test_opencode_zen_anthropic_dispatch_fails_closed(self):
         """Anthropic dispatch shaping fails closed for ambiguous without override."""
         yaml_str = """\
 defaults: {}
 aliases:
-  - name: basic
+  - name: ingress-projection
     candidates:
       - provider: opencode_zen
         model: deepseek-v4-flash
@@ -736,7 +684,7 @@ aliases:
         priority: 60
 """
         snapshot = compile_yaml(yaml_str)
-        candidate = snapshot.aliases["basic"].candidates[0]
+        candidate = snapshot.aliases[_TEST_ALIAS].candidates[0]
         with pytest.raises(ValueError, match="no anthropic_route_family"):
             _routing_candidate_to_anthropic_public_dict(candidate)
 
@@ -745,7 +693,7 @@ aliases:
         yaml_str = """\
 defaults: {}
 aliases:
-  - name: basic
+  - name: ingress-projection
     candidates:
       - provider: opencode_zen
         model: deepseek-v4-flash
@@ -754,7 +702,7 @@ aliases:
         priority: 60
 """
         snapshot = compile_yaml(yaml_str)
-        candidate = snapshot.aliases["basic"].candidates[0]
+        candidate = snapshot.aliases[_TEST_ALIAS].candidates[0]
         shaped = _routing_candidate_to_anthropic_public_dict(candidate)
         assert shaped["route_family"] == "anthropic_opencode_zen_responses_adapter"
 
@@ -839,12 +787,10 @@ class TestAnthropicAffinityProductionFacade:
             "_get_codex_session_affinity",
             "_get_anthropic_session_affinity",
             "_get_openrouter_adapter_active_cooldown_seconds",
-            "_normalize_codex_alias_model",
             "_extract_client_product_label",
             "_resolve_codex_session_key",
             "_resolve_anthropic_session_key",
             "_has_continuation_state",
-            "_get_anthropic_candidates_for_alias",
             "_is_grok_account_quota_candidate",
             "_get_grok_account_quota_lane_cooldown_key",
             "_is_kimi_code_candidate",
@@ -870,12 +816,12 @@ class TestAnthropicAffinityProductionFacade:
             get_codex_session_affinity=AsyncMock(return_value=None),
             get_anthropic_session_affinity=_get_anthropic_auto_agent_session_affinity,
             get_openrouter_adapter_active_cooldown_seconds=_zero_adapter,
-            normalize_codex_alias_model=lambda m: None,
             extract_client_product_label=lambda r, b: None,
-            resolve_codex_session_key=lambda r, b, **kw: None,
-            resolve_anthropic_session_key=lambda r, b, **kw: "test-session",
+            resolve_codex_session_key=lambda r, b, *, alias_model: None,
+            resolve_anthropic_session_key=(
+                lambda r, b, *, alias_model: "test-session"
+            ),
             has_continuation_state=lambda v: True,
-            get_anthropic_candidates_for_alias=lambda alias: (),
             is_grok_account_quota_candidate=lambda c: False,
             get_grok_account_quota_lane_cooldown_key=lambda c, lk: None,
             is_kimi_code_candidate=lambda c: False,
@@ -894,12 +840,14 @@ class TestAnthropicAffinityProductionFacade:
             "_get_codex_session_affinity": AsyncMock(return_value=None),
             "_get_anthropic_session_affinity": _get_anthropic_auto_agent_session_affinity,
             "_get_openrouter_adapter_active_cooldown_seconds": _zero_adapter,
-            "_normalize_codex_alias_model": lambda m: None,
             "_extract_client_product_label": lambda r, b: None,
-            "_resolve_codex_session_key": lambda r, b, **kw: None,
-            "_resolve_anthropic_session_key": lambda r, b, **kw: "test-session",
+            "_resolve_codex_session_key": (
+                lambda r, b, *, alias_model: None
+            ),
+            "_resolve_anthropic_session_key": (
+                lambda r, b, *, alias_model: "test-session"
+            ),
             "_has_continuation_state": lambda v: True,
-            "_get_anthropic_candidates_for_alias": lambda alias: (),
             "_is_grok_account_quota_candidate": lambda c: False,
             "_get_grok_account_quota_lane_cooldown_key": lambda c, lk: None,
             "_is_kimi_code_candidate": lambda c: False,
@@ -949,7 +897,9 @@ class TestAnthropicAffinityProductionFacade:
 
     @pytest.mark.asyncio
     async def test_setter_persists_config_hash_from_epoch_tag(
-        self, fresh_manager, basic_snapshot
+        self,
+        fresh_manager,
+        ingress_snapshot,
     ):
         """Real setter persists config_hash from candidate config_epoch_tag."""
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_state import (
@@ -959,15 +909,15 @@ class TestAnthropicAffinityProductionFacade:
 
         candidate = {
             "provider": "openai",
-            "model": "gpt-5.6-luna",
+            "model": "gpt-ingress-primary",
             "route_family": "anthropic_openai_responses_adapter",
             "last_resort": False,
-            "config_epoch_tag": basic_snapshot.config_hash,
+            "config_epoch_tag": ingress_snapshot.config_hash,
         }
         await _set_anthropic_auto_agent_session_affinity("hash-session", candidate)
         affinity = await _get_anthropic_auto_agent_session_affinity("hash-session")
         assert affinity is not None
-        assert affinity["config_hash"] == basic_snapshot.config_hash
+        assert affinity["config_hash"] == ingress_snapshot.config_hash
 
     @pytest.mark.asyncio
     async def test_setter_stores_none_config_hash_without_epoch_tag(self, fresh_manager):
@@ -979,7 +929,7 @@ class TestAnthropicAffinityProductionFacade:
 
         candidate = {
             "provider": "openai",
-            "model": "gpt-5.4-mini",
+            "model": "gpt-ingress-last-resort",
             "route_family": "anthropic_openai_responses_adapter",
             "last_resort": True,
         }
@@ -990,7 +940,10 @@ class TestAnthropicAffinityProductionFacade:
 
     @pytest.mark.asyncio
     async def test_schedule_changed_candidate_preserved_via_affinity(
-        self, fresh_manager, _selection_runtime, basic_snapshot
+        self,
+        fresh_manager,
+        _selection_runtime,
+        ingress_snapshot,
     ):
         """Real setter + live selector: still-present candidate selected via affinity."""
         from fastapi import Request
@@ -1001,9 +954,10 @@ class TestAnthropicAffinityProductionFacade:
         )
 
         # Set affinity via real setter for the first snapshot candidate
-        candidate = basic_snapshot.aliases["basic"].candidates[0]
+        candidate = ingress_snapshot.aliases[_TEST_ALIAS].candidates[0]
         shaped = _routing_candidate_to_anthropic_public_dict(
-            candidate, epoch_tag=basic_snapshot.config_hash
+            candidate,
+            epoch_tag=ingress_snapshot.config_hash,
         )
         await _set_anthropic_auto_agent_session_affinity("test-session", shaped)
 
@@ -1017,7 +971,10 @@ class TestAnthropicAffinityProductionFacade:
         request = Request(scope)
         result = await selection._select_anthropic_auto_agent_candidate(
             request=request,
-            request_body={"model": "basic", "messages": [{"role": "user", "content": "hi"}]},
+            request_body={
+                "model": _TEST_ALIAS,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
         )
         assert result["selection_reason"] == "session_affinity"
         assert result["candidate"]["provider"] == candidate.provider
@@ -1025,7 +982,10 @@ class TestAnthropicAffinityProductionFacade:
 
     @pytest.mark.asyncio
     async def test_removed_candidate_raises_redispatch(
-        self, fresh_manager, _selection_runtime, basic_snapshot
+        self,
+        fresh_manager,
+        _selection_runtime,
+        ingress_snapshot,
     ):
         """Real setter + live selector: removed candidate triggers redispatch-required."""
         from fastapi import HTTPException, Request
@@ -1041,7 +1001,7 @@ class TestAnthropicAffinityProductionFacade:
             "model": "openrouter/removed-model",
             "route_family": "anthropic_openrouter_completion_adapter",
             "last_resort": False,
-            "config_epoch_tag": basic_snapshot.config_hash,
+            "config_epoch_tag": ingress_snapshot.config_hash,
         }
         await _set_anthropic_auto_agent_session_affinity("test-session", removed_candidate)
 
@@ -1056,90 +1016,12 @@ class TestAnthropicAffinityProductionFacade:
         with pytest.raises(HTTPException) as exc_info:
             await selection._select_anthropic_auto_agent_candidate(
                 request=request,
-                request_body={"model": "basic", "messages": [{"role": "user", "content": "hi"}]},
+                request_body={
+                    "model": _TEST_ALIAS,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
             )
         assert exc_info.value.status_code == 429
         detail = exc_info.value.detail
         assert detail["redispatch_required"] is True
         assert detail["failure_phase"] == "affinity_continuation_removed"
-
-    @pytest.mark.asyncio
-    async def test_retired_read_rejected_before_anthropic_dispatch(
-        self,
-        basic_snapshot,
-        monkeypatch: pytest.MonkeyPatch,
-    ):
-        """Anthropic ingress rejects ``read`` before alias, adapter, or native dispatch."""
-        from unittest.mock import AsyncMock, MagicMock
-
-        from litellm.proxy._types import ProxyException
-        from litellm.proxy.pass_through_endpoints import (
-            llm_passthrough_endpoints as lpe,
-        )
-
-        request = MagicMock()
-        request.method = "POST"
-        request.headers = {}
-        get_body = AsyncMock(return_value={"model": "read"})
-        prepare_body = AsyncMock()
-        resolve_alias = MagicMock()
-        adapter_dispatch = AsyncMock()
-        native_dispatch = AsyncMock()
-        monkeypatch.setattr(lpe, "get_request_body", get_body)
-        monkeypatch.setattr(
-            lpe.passthrough_endpoint_router,
-            "get_credentials",
-            MagicMock(return_value=None),
-        )
-        monkeypatch.setattr(
-            lpe,
-            "_prepare_anthropic_oauth_native_passthrough_headers",
-            MagicMock(return_value=({}, False)),
-        )
-        monkeypatch.setattr(
-            lpe,
-            "_prepare_anthropic_request_body_for_passthrough",
-            prepare_body,
-        )
-        monkeypatch.setattr(
-            lpe,
-            "_resolve_anthropic_auto_agent_alias_model",
-            resolve_alias,
-        )
-        monkeypatch.setattr(lpe, "try_dispatch_anthropic_adapter", adapter_dispatch)
-        monkeypatch.setattr(
-            lpe,
-            "_perform_anthropic_native_passthrough_request",
-            native_dispatch,
-        )
-
-        with pytest.raises(ProxyException) as exc_info:
-            await lpe.anthropic_proxy_route(
-                endpoint="v1/messages",
-                request=request,
-                fastapi_response=MagicMock(),
-                user_api_key_dict=MagicMock(),
-            )
-
-        assert (
-            exc_info.value.message
-            == "This retired AAWM model alias is unsupported; use a supported canonical alias."
-        )
-        assert exc_info.value.code == "400"
-        get_body.assert_awaited_once()
-        prepare_body.assert_not_awaited()
-        resolve_alias.assert_not_called()
-        adapter_dispatch.assert_not_awaited()
-        native_dispatch.assert_not_awaited()
-
-    def test_known_legacy_anthropic_alias_still_resolves_with_snapshot(self, basic_snapshot):
-        """Known legacy Anthropic aliases still resolve from static tables with snapshot active."""
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
-            ANTHROPIC_AAWM_READ_ALIAS,
-        )
-        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.selection import (
-            _get_anthropic_candidates_for_alias_snapshot_aware,
-        )
-
-        result = _get_anthropic_candidates_for_alias_snapshot_aware(ANTHROPIC_AAWM_READ_ALIAS)
-        assert len(result) > 0

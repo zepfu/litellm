@@ -787,6 +787,7 @@ async def test_rr054_31_codex_wrapper_wires_probe_lock_path_for_concurrent_cold_
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://chatgpt.com/backend-api/codex/responses",
                 api_key=None,
                 forward_headers=True,

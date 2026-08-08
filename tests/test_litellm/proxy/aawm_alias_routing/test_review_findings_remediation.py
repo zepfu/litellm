@@ -73,9 +73,7 @@ async def _client() -> AsyncIterator[httpx.AsyncClient]:
 def _reset_alias_routing_ambient_state():
     """Neutralize shared/process-global cooldown, affinity, and snapshot state.
 
-    Mirrors ``clear_codex_auto_agent_alias_state`` /
-    ``test_basic_pilot_shadow_parity``'s reset fixture so these tests cannot
-    flap on state left over from other tests in the same process.
+    Keeps these tests isolated from state left over by other tests.
     """
     previous_snapshot = snapshot_select.get_active_routing_snapshot()
     state.alias_routing_state.codex.cooldown_until_monotonic_by_key.clear()
@@ -103,34 +101,27 @@ aliases:
 
 
 # ---------------------------------------------------------------------------
-# Finding #1: the maintained ``basic`` alias must remain reachable through the
-# live model-normalization path, while the retired exact name ``read`` must not
-# normalize or receive static candidates.
+# Finding #1: a configured alias must remain reachable through the live
+# snapshot-backed model-resolution path.
 # ---------------------------------------------------------------------------
 
 
-def test_basic_is_recognized_as_a_codex_auto_agent_alias_model() -> None:
-    """``basic`` must be recognized by the live alias-model normalizer."""
-    assert model_resolution._is_codex_auto_agent_alias_model("basic") is True
-
-
-def test_retired_read_does_not_resolve_or_receive_candidates() -> None:
-    """The retired exact name must fail closed before any fallback."""
-    request_body = {"model": "read"}
-    resolved = model_resolution._resolve_codex_auto_agent_alias_model(request_body, "/v1/responses")
-    assert resolved is None
-    assert model_resolution._is_codex_auto_agent_alias_model("read") is False
-    assert snapshot_select._get_codex_auto_agent_candidates_for_alias("read") == ()
-
-
-def test_recognized_basic_routes_to_snapshot_derived_candidates() -> None:
-    """Once reachable, a recognized ``basic`` alias must resolve from the active snapshot."""
+def test_configured_alias_routes_to_snapshot_derived_candidates() -> None:
     snapshot = compiler.compile_yaml(_SNAPSHOT_YAML)
     snapshot_select.set_active_routing_snapshot(snapshot)
+    request = _minimal_request()
 
-    alias_model = model_resolution._resolve_codex_auto_agent_alias_model({"model": "basic"}, "/v1/responses")
+    alias_model = model_resolution._resolve_codex_auto_agent_alias_model(
+        {"model": "basic"},
+        "/v1/responses",
+        request=request,
+    )
     assert alias_model is not None
-    candidates = snapshot_select._get_codex_auto_agent_candidates_for_alias(alias_model)
+    candidates = snapshot_select._select_snapshot_candidates(
+        alias_model,
+        ingress="codex",
+        request=request,
+    )
     models = [c["model"] for c in candidates]
     assert "openrouter/snapshot-only-model" in models
 
@@ -140,16 +131,16 @@ def test_recognized_basic_routes_to_snapshot_derived_candidates() -> None:
 # legacy ``apply_cooldown_fn`` path stays authoritative for what cooldown is
 # actually applied, regardless of what the gate decided.
 #
-# ROUND 2 update: the original reproductions here hand-built ``basic_pilot:``
-# keys and called ``_record_basic_pilot_cooldown_evidence`` directly -- exactly
-# the shell the live path never exercised. The authoritative live-path
+# ROUND 2 update: the original reproductions hand-built evidence keys and
+# called the recorder directly rather than exercising the live path. The live
+# path reproductions
 # reproductions now live in ``test_round2_live_path_remediation.py``
 # (``test_live_basic_lane_structured_429_cools_with_gate_duration`` and
 # ``test_live_basic_lane_single_marker_failure_does_not_cool``), which drive the
 # real Codex retry handler so the live sequence builds the
 # ``provider:model:lane`` key and records evidence on its own. The two
 # gate-unit checks below are retained only as direct-gate assertions and no
-# longer hand-build a ``basic_pilot:`` key or assert applied-cooldown behavior.
+# longer hand-build a routing key or assert applied-cooldown behavior.
 # ---------------------------------------------------------------------------
 
 
@@ -183,9 +174,8 @@ def test_gate_structured_429_cools_with_retry_after_duration() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Finding #3: proportional weighting is defined (``_select_proportional_snapshot_candidate``)
-# but never invoked from the live selector -- ``_select_basic_pilot_snapshot_candidates``
-# always returns priority-ordered candidates regardless of ``distribution_strategy``.
+# Finding #3: proportional weighting must be invoked by generic snapshot
+# selection rather than returning declaration order.
 # ---------------------------------------------------------------------------
 
 
@@ -216,7 +206,10 @@ aliases:
     counts: dict[str, int] = {"a": 0, "b": 0}
     n_trials = 2000
     for _ in range(n_trials):
-        selected = snapshot_select._select_basic_pilot_snapshot_candidates()
+        selected = snapshot_select._select_snapshot_candidates(
+            "basic",
+            ingress="codex",
+        )
         top_model = selected[0]["model"]
         counts[top_model] = counts.get(top_model, 0) + 1
 
@@ -256,7 +249,10 @@ aliases:
 
     # No client_product_label supplied -- must default to "no known TUI",
     # excluding the tui_attached candidate.
-    candidates = snapshot_select._get_codex_auto_agent_candidates_for_alias("basic")
+    candidates = snapshot_select._select_snapshot_candidates(
+        "basic",
+        ingress="codex",
+    )
     models = [c["model"] for c in candidates]
     assert "claude-only-model" not in models
 
@@ -265,8 +261,9 @@ aliases:
     # eligible when the request presents a matching Claude/x.y label. This
     # proves the threading is real (not just an exclusion default that would
     # pass vacuously even if client_product_label were silently dropped).
-    candidates_with_claude_label = snapshot_select._get_codex_auto_agent_candidates_for_alias(
+    candidates_with_claude_label = snapshot_select._select_snapshot_candidates(
         "basic",
+        ingress="codex",
         client_product_label="Claude/1.2",
     )
     models_with_claude_label = [c["model"] for c in candidates_with_claude_label]
@@ -291,7 +288,11 @@ aliases:
     snapshot = compiler.compile_yaml(raw)
     snapshot_select.set_active_routing_snapshot(snapshot)
 
-    selected = snapshot_select._select_basic_pilot_snapshot_candidates(client_product_label=None)
+    selected = snapshot_select._select_snapshot_candidates(
+        "basic",
+        ingress="codex",
+        client_product_label=None,
+    )
     models = [c["model"] for c in selected]
     # Fail-closed: the ineligible tui_attached-only candidate must not be
     # returned once all candidates are ineligible.

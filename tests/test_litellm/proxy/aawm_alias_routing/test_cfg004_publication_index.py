@@ -300,6 +300,7 @@ async def test_publish_vs_clear_no_deadlock_final_clear() -> None:
             clear_ran = True
             mgr.clear_cooldown_state(
                 alias_family="codex",
+                canonical_aliases=[],
                 cooldown_keys=[primary_key, secondary_key],
             )
 

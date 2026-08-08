@@ -1,17 +1,10 @@
-"""Snapshot ordering, distribution, TUI/schedule gates, and alias-candidate getters.
-
-Wave 5A extraction from ``llm_passthrough_endpoints.py``.  Behavior-preserving
-relocation only; no logic changes.  The round-robin cursor dict
-(``_round_robin_cursor_by_alias``) remains owned by the god module and is
-injected via :func:`configure_snapshot_runtime` (deferred to Wave 5B for
-state-manager ownership).
-"""
+"""Snapshot-backed alias lookup, ordering, distribution, and candidate selection."""
 
 from __future__ import annotations
 
 import random
 from datetime import datetime, timezone
-from typing import Any, Callable, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import Any, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from fastapi import Request
 
@@ -21,18 +14,7 @@ from .config_snapshot import (
     RoutingSnapshot as _RoutingSnapshot,
     active_routing_snapshot_holder as _active_routing_snapshot_holder,
 )
-from .policy import (
-    AAWM_BASIC_ALIAS as _AAWM_BASIC_ALIAS,
-    AAWM_RETIRED_ALIASES as _AAWM_RETIRED_ALIASES,
-    CODEX_AUTO_AGENT_CANDIDATES as _CODEX_AUTO_AGENT_CANDIDATES,
-    CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS as _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-)
 from .request_metadata import _normalize_tui_family
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-_BASIC_PILOT_ALIAS_NAME = _AAWM_BASIC_ALIAS
 
 # CFG-008: route families that require Anthropic-native credentials. The
 # Codex/OpenAI Responses ingress has no native-Anthropic egress, so
@@ -47,21 +29,20 @@ _ANTHROPIC_CREDENTIAL_ROUTE_FAMILIES: frozenset[str] = frozenset(
 )
 
 # ---------------------------------------------------------------------------
-# Injected runtime state (round-robin cursor stays in god module for Wave 5A)
+# Injected runtime state
 # ---------------------------------------------------------------------------
 _rr_cursor: dict[tuple[str, str], int] = {}
-_candidates_getter: Optional[Callable[..., tuple[dict[str, Any], ...]]] = None
+_REQUEST_ROUTING_SNAPSHOT_STATE_KEY = "aawm_alias_routing_snapshot"
+_REQUEST_ROUTING_SNAPSHOT_UNSET = object()
 
 
 def configure_snapshot_runtime(
     *,
     round_robin_cursor: dict[tuple[str, str], int],
-    get_candidates_for_alias: Optional[Callable[..., tuple[dict[str, Any], ...]]] = None,
 ) -> None:
-    """Bind the god-module-owned round-robin cursor dict."""
-    global _rr_cursor, _candidates_getter
+    """Bind the state-manager-owned round-robin cursor dict."""
+    global _rr_cursor
     _rr_cursor = round_robin_cursor
-    _candidates_getter = get_candidates_for_alias
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +73,58 @@ def _is_alias_config_startup_failed() -> bool:
     from .config_startup import is_startup_failed
 
     return is_startup_failed()
+
+
+def _get_request_routing_snapshot(
+    request: Optional[Request] = None,
+) -> Optional[_RoutingSnapshot]:
+    """Capture one active snapshot reference for the lifetime of a request."""
+    if request is None:
+        if _is_alias_config_startup_failed():
+            return None
+        return get_active_routing_snapshot()
+
+    state = getattr(request, "state", None)
+    if state is None:
+        if _is_alias_config_startup_failed():
+            return None
+        return get_active_routing_snapshot()
+
+    cached = getattr(
+        state,
+        _REQUEST_ROUTING_SNAPSHOT_STATE_KEY,
+        _REQUEST_ROUTING_SNAPSHOT_UNSET,
+    )
+    if cached is not _REQUEST_ROUTING_SNAPSHOT_UNSET:
+        return cached if isinstance(cached, _RoutingSnapshot) else None
+
+    snapshot = (
+        None
+        if _is_alias_config_startup_failed()
+        else get_active_routing_snapshot()
+    )
+    setattr(state, _REQUEST_ROUTING_SNAPSHOT_STATE_KEY, snapshot)
+    return snapshot
+
+
+def _lookup_active_snapshot_canonical_alias(
+    model: Any,
+    *,
+    request: Optional[Request] = None,
+) -> Optional[str]:
+    """Return the configured alias spelling for a case-insensitive model name."""
+    if not isinstance(model, str):
+        return None
+    normalized = model.strip().casefold()
+    if not normalized:
+        return None
+    snapshot = _get_request_routing_snapshot(request)
+    if snapshot is None:
+        return None
+    for alias_name in snapshot.aliases:
+        if alias_name.casefold() == normalized:
+            return alias_name
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -319,9 +352,6 @@ def _is_snapshot_candidate_in_schedule_window(
 # ---------------------------------------------------------------------------
 # Snapshot-driven resolution
 # ---------------------------------------------------------------------------
-
-
-
 def _resolve_dispatch_target(
     alias_name: str,
     *,
@@ -343,13 +373,6 @@ def _resolve_dispatch_target(
         if rule.tui_family == tui_family:
             return rule.target_alias
     return alias.dispatch.default
-
-
-def _is_internal_alias(alias_name: str, snapshot: Optional[_RoutingSnapshot]) -> bool:
-    """Check if alias has internal visibility (CFG-009)."""
-    if snapshot is None or alias_name not in snapshot.aliases:
-        return False
-    return snapshot.aliases[alias_name].visibility == "internal"
 
 
 def _order_snapshot_entries_by_priority(
@@ -390,14 +413,14 @@ def _resolve_snapshot_alias_candidates(
     client_product_label: Optional[str],
     now_utc: datetime,
     snapshot: _RoutingSnapshot,
-    allow_internal: bool = False,
+    include_out_of_schedule: bool = False,
     path: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     """Resolve one config alias to concrete candidates without nested loops."""
     if alias_name in path:
         return []
     alias = snapshot.aliases.get(alias_name)
-    if alias is None or (alias.visibility == "internal" and not allow_internal):
+    if alias is None:
         return []
 
     next_path = (*path, alias_name)
@@ -415,7 +438,7 @@ def _resolve_snapshot_alias_candidates(
             client_product_label=client_product_label,
             now_utc=now_utc,
             snapshot=snapshot,
-            allow_internal=True,
+            include_out_of_schedule=include_out_of_schedule,
             path=next_path,
         )
 
@@ -434,7 +457,7 @@ def _resolve_snapshot_alias_candidates(
                 client_product_label=client_product_label,
                 now_utc=now_utc,
                 snapshot=snapshot,
-                allow_internal=True,
+                include_out_of_schedule=include_out_of_schedule,
                 path=next_path,
             )
             for child in children:
@@ -451,7 +474,10 @@ def _resolve_snapshot_alias_candidates(
                 resolved.append(shaped)
             continue
 
-        if not _is_snapshot_candidate_in_schedule_window(entry, now_utc=now_utc):
+        if (
+            not include_out_of_schedule
+            and not _is_snapshot_candidate_in_schedule_window(entry, now_utc=now_utc)
+        ):
             continue
         shaped = _shape_snapshot_candidate(
             entry,
@@ -473,172 +499,26 @@ def _resolve_snapshot_alias_candidates(
 
 
 def _select_snapshot_candidates(
-    alias_name: str,
+    canonical_alias: str,
     *,
     ingress: str,
     client_product_label: Optional[str] = None,
     now_utc: Optional[datetime] = None,
+    request: Optional[Request] = None,
+    include_out_of_schedule: bool = False,
 ) -> tuple[dict[str, Any], ...]:
-    if _is_alias_config_startup_failed():
-        return ()
-    snapshot = get_active_routing_snapshot()
+    snapshot = _get_request_routing_snapshot(request)
     if snapshot is None:
         return ()
     return tuple(
         _resolve_snapshot_alias_candidates(
-            alias_name,
+            canonical_alias,
             ingress=ingress,
             client_product_label=client_product_label,
             now_utc=now_utc or datetime.now(timezone.utc),
             snapshot=snapshot,
+            include_out_of_schedule=include_out_of_schedule,
         )
-    )
-
-
-def _resolve_basic_pilot_eligible_candidates(
-    *,
-    client_product_label: Optional[str],
-    now_utc: datetime,
-    snapshot: Optional[_RoutingSnapshot] = None,
-) -> Optional[list[_RoutingSnapshotCandidate]]:
-    """Return the eligibility-filtered, priority-ordered ``basic`` alias candidates.
-
-    ``None`` means there is no active snapshot ``basic`` alias (callers use the
-    static fallback table). An empty list means every candidate was gated out
-    (TUI/schedule) -- callers fail closed rather than dispatching a rejected
-    candidate. Shared by the enumeration getter and the round-robin commit-token
-    derivation so both observe the identical tied top-tier ordering.
-
-    When ``snapshot`` is provided, it is used directly instead of fetching
-    the global holder (Finding 5: single-capture coherence).
-    """
-    if snapshot is None:
-        snapshot = get_active_routing_snapshot()
-    if snapshot is None or _BASIC_PILOT_ALIAS_NAME not in snapshot.aliases:
-        return None
-    alias = snapshot.aliases[_BASIC_PILOT_ALIAS_NAME]
-    ordered = _order_snapshot_candidates_by_priority(alias.candidates)
-    return [
-        candidate
-        for candidate in ordered
-        if _is_tui_attached_candidate_eligible(candidate, client_product_label=client_product_label)
-        and _is_tui_excluded_candidate_eligible(candidate, client_product_label=client_product_label)
-        and _is_snapshot_candidate_in_schedule_window(candidate, now_utc=now_utc)
-    ]
-
-
-def _select_basic_pilot_snapshot_candidates(
-    *,
-    client_product_label: Optional[str] = None,
-    now_utc: Optional[datetime] = None,
-) -> tuple[dict[str, Any], ...]:
-    """Resolve the ordered ``basic`` alias candidate tuple from the active snapshot.
-
-    Falls back to the hard-coded ``_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS`` table
-    when no snapshot has been activated. An active snapshot without ``basic``
-    fails closed.
-
-    CFG-002 Finding 2: failure state is checked FIRST, before any snapshot
-    or static branch.  Once failure is published, all paths return empty.
-    CFG-002 Finding 5: exactly one snapshot reference is captured and used
-    for eligibility, distribution, hash, and shaping.
-    """
-    # Finding 2: fail-closed check before any snapshot/static branch.
-    if _is_alias_config_startup_failed():
-        return ()
-    # Finding 5: capture exactly one snapshot reference.
-    snapshot = get_active_routing_snapshot()
-    resolved_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
-    eligible = _resolve_basic_pilot_eligible_candidates(
-        client_product_label=client_product_label,
-        now_utc=resolved_now,
-        snapshot=snapshot,
-    )
-    if eligible is None:
-        if snapshot is None:
-            # Genuine legacy / no-config state: degrade to the static table.
-            return _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
-                _BASIC_PILOT_ALIAS_NAME,
-                _CODEX_AUTO_AGENT_CANDIDATES,
-            )
-        # Snapshot active but has no basic alias: fail closed.
-        return ()
-    # CFG-008: ingress credential eligibility -- the Codex ingress cannot
-    # dispatch Anthropic-credential candidates (no Codex-native egress for
-    # native Anthropic models), so they are excluded from this projection.
-    eligible = [
-        candidate
-        for candidate in eligible
-        if candidate.route_family not in _ANTHROPIC_CREDENTIAL_ROUTE_FAMILIES
-    ]
-    if not eligible:
-        return ()
-    assert snapshot is not None
-    alias = snapshot.aliases[_BASIC_PILOT_ALIAS_NAME]
-    epoch_tag = snapshot.config_hash
-    distributed = _apply_snapshot_alias_distribution_strategy(
-        eligible,
-        distribution_strategy=alias.distribution_strategy,
-        rng=random.Random(),
-        alias_name=_BASIC_PILOT_ALIAS_NAME,
-        epoch_tag=epoch_tag,
-    )
-    return tuple(_routing_candidate_to_public_dict(c, epoch_tag=epoch_tag) for c in distributed)
-
-
-def _select_basic_pilot_snapshot_candidates_anthropic(
-    *,
-    client_product_label: Optional[str] = None,
-    now_utc: Optional[datetime] = None,
-) -> Optional[tuple[dict[str, Any], ...]]:
-    """Resolve the ordered ``basic`` alias candidates for Anthropic Messages ingress.
-
-    Returns the same snapshot-resolved, priority-ordered, eligibility-filtered
-    candidate set as the Codex ingress path, but with each candidate's
-    ``route_family`` replaced by its ``anthropic_route_family`` projection.
-
-    Returns `None` when there is no active snapshot (callers fall back to the
-    static table). Returns an empty tuple when every
-    candidate is gated out (fail closed, same as Codex ingress).
-
-    Ingress isolation: Codex and Anthropic ingress each see only their own
-    route-family projection. No cross-provider fallback is introduced.
-
-    CFG-002 Finding 2: failure state is checked FIRST.
-    CFG-002 Finding 5: exactly one snapshot reference captured per call.
-    """
-    # Finding 2: fail-closed check before any snapshot/static branch.
-    if _is_alias_config_startup_failed():
-        return ()
-    # Finding 5: capture exactly one snapshot reference.
-    snapshot = get_active_routing_snapshot()
-    resolved_now = now_utc if now_utc is not None else datetime.now(timezone.utc)
-    eligible = _resolve_basic_pilot_eligible_candidates(
-        client_product_label=client_product_label,
-        now_utc=resolved_now,
-        snapshot=snapshot,
-    )
-    if eligible is None:
-        if snapshot is None:
-            # Genuine legacy / no-config state: callers fall back to static table.
-            return None
-        # Snapshot active but has no basic alias: fail closed.
-        return ()
-    if not eligible:
-        return ()
-    assert snapshot is not None
-    alias = snapshot.aliases[_BASIC_PILOT_ALIAS_NAME]
-    epoch_tag = snapshot.config_hash
-    distributed = _apply_snapshot_alias_distribution_strategy(
-        eligible,
-        distribution_strategy=alias.distribution_strategy,
-        rng=random.Random(),
-        alias_name=_BASIC_PILOT_ALIAS_NAME,
-        epoch_tag=epoch_tag,
-    )
-    return tuple(
-        _routing_candidate_to_anthropic_public_dict(c, epoch_tag=epoch_tag)
-        for c in distributed
     )
 
 
@@ -672,38 +552,44 @@ def _routing_candidate_to_anthropic_public_dict(
 
 
 def _derive_round_robin_commit_token(
-    alias_model: str,
+    canonical_alias: str,
     *,
+    request: Request,
+    ingress: str,
     client_product_label: Optional[str],
     now_utc: Optional[datetime] = None,
+    candidates: Optional[Sequence[dict[str, Any]]] = None,
 ) -> Optional[RoundRobinCommitToken]:
-    """Build the commit token for a public snapshot round-robin alias."""
-    snapshot = get_active_routing_snapshot()
-    if snapshot is None or alias_model not in snapshot.aliases:
+    """Build the commit token for a snapshot round-robin alias."""
+    snapshot = _get_request_routing_snapshot(request)
+    if snapshot is None or canonical_alias not in snapshot.aliases:
         return None
-    alias = snapshot.aliases[alias_model]
+    alias = snapshot.aliases[canonical_alias]
     if alias.distribution_strategy != "round_robin":
         return None
-    candidates = _select_snapshot_candidates(
-        alias_model,
-        ingress="codex",
-        client_product_label=client_product_label,
-        now_utc=now_utc,
-    )
-    if len(candidates) < 2:
+    resolved_candidates = candidates
+    if resolved_candidates is None:
+        resolved_candidates = _select_snapshot_candidates(
+            canonical_alias,
+            ingress=ingress,
+            client_product_label=client_product_label,
+            now_utc=now_utc,
+            request=request,
+        )
+    if len(resolved_candidates) < 2:
         return None
-    top_priority = candidates[0].get("selection_priority", 0)
+    top_priority = resolved_candidates[0].get("selection_priority", 0)
     tied = [
         candidate
-        for candidate in candidates
+        for candidate in resolved_candidates
         if candidate.get("selection_priority", 0) == top_priority
     ]
     if len(tied) < 2:
         return None
     epoch_tag = snapshot.config_hash
-    start_index = _rr_cursor.get((epoch_tag, alias_model), 0)
+    start_index = _rr_cursor.get((epoch_tag, canonical_alias), 0)
     return RoundRobinCommitToken(
-        alias_name=alias_model,
+        alias_name=canonical_alias,
         epoch_tag=epoch_tag,
         tied_candidate_ids=tuple(
             (str(candidate["provider"]), str(candidate["model"]))
@@ -720,8 +606,8 @@ def _derive_round_robin_commit_token(
 
 def _get_aawm_alias_selection_context(
     request: Request,
-) -> dict[str, SelectionEnumeration]:
-    """Per-request cache of ``alias_model -> SelectionEnumeration`` on ``request.state``.
+) -> dict[tuple[str, str], SelectionEnumeration]:
+    """Per-request cache of ingress/alias enumerations on ``request.state``.
 
     Mirrors the ``aawm_alias_request_local_*`` request-state cache pattern so the
     alias enumeration resolves exactly once per request even though the wrapper,
@@ -737,64 +623,35 @@ def _get_aawm_alias_selection_context(
 
 def _resolve_aawm_alias_selection_enumeration(
     request: Request,
-    alias_model: str,
+    canonical_alias: str,
     *,
+    ingress: str,
     client_product_label: Optional[str] = None,
 ) -> SelectionEnumeration:
     """Resolve (and memoize) the ordered candidate enumeration + commit token.
 
-    The underlying getter ``_get_codex_auto_agent_candidates_for_alias`` is
-    invoked exactly once per ``(request, alias_model)`` -- every subsequent call
-    site consumes the cached enumeration, so cursor reads stay consistent and the
-    getter cannot advance rotation multiple times per live request.
+    The generic snapshot selector is invoked exactly once per request, ingress,
+    and canonical alias. Every subsequent call site consumes the cached
+    enumeration.
     """
     context = _get_aawm_alias_selection_context(request)
-    cached = context.get(alias_model)
+    cache_key = (ingress, canonical_alias)
+    cached = context.get(cache_key)
     if cached is not None:
         return cached
-    getter = _candidates_getter or _get_codex_auto_agent_candidates_for_alias
-    candidates = tuple(
-        getter(
-            alias_model,
-            client_product_label=client_product_label,
-        )
+    candidates = _select_snapshot_candidates(
+        canonical_alias,
+        ingress=ingress,
+        client_product_label=client_product_label,
+        request=request,
     )
     token = _derive_round_robin_commit_token(
-        alias_model,
+        canonical_alias,
+        request=request,
+        ingress=ingress,
         client_product_label=client_product_label,
+        candidates=candidates,
     )
     enumeration = SelectionEnumeration(candidates=candidates, commit_token=token)
-    context[alias_model] = enumeration
+    context[cache_key] = enumeration
     return enumeration
-
-
-# ---------------------------------------------------------------------------
-# Alias-candidate getters
-# ---------------------------------------------------------------------------
-
-
-def _get_codex_auto_agent_candidates_for_alias(
-    alias_model: str,
-    *,
-    client_product_label: Optional[str] = None,
-) -> tuple[dict[str, Any], ...]:
-    # CFG-002 Finding 2: check failure state FIRST, before any snapshot or
-    # static branch.  Once failure is published, all aliases return empty.
-    if _is_alias_config_startup_failed():
-        return ()
-    if alias_model in _AAWM_RETIRED_ALIASES:
-        return ()
-    snapshot = get_active_routing_snapshot()
-    if _is_internal_alias(alias_model, snapshot):
-        return ()
-    if snapshot is not None:
-        return _select_snapshot_candidates(
-            alias_model,
-            ingress="codex",
-            client_product_label=client_product_label,
-        )
-    candidates = _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
-        alias_model,
-        _CODEX_AUTO_AGENT_CANDIDATES,
-    )
-    return candidates

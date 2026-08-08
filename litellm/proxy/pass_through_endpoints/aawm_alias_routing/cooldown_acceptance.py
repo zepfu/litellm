@@ -108,6 +108,7 @@ class _PreparedState:
     """Captured state from a prepare operation for restore."""
 
     run_id: str
+    canonical_alias: str
     target_identity_hash: str
     target_lane_key: str
     control_identity_hashes: list[str] = field(default_factory=list)
@@ -354,9 +355,11 @@ def resolve_production_cooldown_key(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_eligible_candidates() -> list[dict[str, Any]]:
-    """Resolve the active schedule-eligible Codex basic-alias candidates."""
-    from .snapshot_select import _resolve_basic_pilot_eligible_candidates
+def _resolve_eligible_candidates(
+    explicit_alias: str,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Resolve one explicit configured alias for Codex ingress."""
+    from .snapshot_select import _resolve_snapshot_alias_candidates
 
     snapshot = get_active_routing_snapshot()
     if snapshot is None:
@@ -365,28 +368,35 @@ def _resolve_eligible_candidates() -> list[dict[str, Any]]:
             "message": "no active routing snapshot available",
         })
 
-    eligible = _resolve_basic_pilot_eligible_candidates(
+    alias = snapshot.aliases.get(explicit_alias)
+    if alias is None:
+        raise HTTPException(status_code=404, detail={
+            "error": "alias_not_found",
+            "message": "alias not found in active routing snapshot",
+        })
+    canonical_alias = alias.name
+    eligible = _resolve_snapshot_alias_candidates(
+        canonical_alias,
+        ingress="codex",
         client_product_label="codex",
         now_utc=datetime.now(timezone.utc),
         snapshot=snapshot,
     )
-    if eligible is None or not eligible:
+    if not eligible:
         raise HTTPException(status_code=503, detail={
             "error": "no_eligible_candidates",
-            "message": "no schedule-eligible codex candidates in basic alias",
+            "message": "configured alias has no eligible Codex candidates",
         })
 
-    epoch_tag = snapshot.config_hash
     result = []
     for c in eligible:
         result.append({
-            "provider": c.provider,
-            "model": c.model,
-            "route_family": c.route_family or "",
-            "priority": c.priority,
-            "config_epoch_tag": epoch_tag,
+            "provider": c["provider"],
+            "model": c["model"],
+            "route_family": c.get("route_family") or "",
+            "config_epoch_tag": c.get("config_epoch_tag"),
         })
-    return result
+    return canonical_alias, result
 
 
 # ---------------------------------------------------------------------------
@@ -431,10 +441,10 @@ async def _handle_prepare(  # noqa: PLR0915 - bounded acceptance handler
 ) -> dict[str, Any]:
     """Seed controls then target using production lane keys; verify state."""
     alias = body.get("alias")
-    if not isinstance(alias, str) or alias.strip() != "basic":
+    if not isinstance(alias, str) or not alias.strip():
         raise HTTPException(status_code=400, detail={
             "error": "invalid_alias",
-            "message": "alias must be 'basic'",
+            "message": "alias must be a non-empty string",
         })
 
     ingress = body.get("ingress")
@@ -482,7 +492,7 @@ async def _handle_prepare(  # noqa: PLR0915 - bounded acceptance handler
     # Require usable DualCache BEFORE any local mutation (fail closed).
     _require_durable_cache()
 
-    candidates = _resolve_eligible_candidates()
+    canonical_alias, candidates = _resolve_eligible_candidates(alias.strip())
 
     target_candidates = [
         c for c in candidates
@@ -558,6 +568,7 @@ async def _handle_prepare(  # noqa: PLR0915 - bounded acceptance handler
     # failure retains the record for rollback.
     prepared_state = _PreparedState(
         run_id=run_id,
+        canonical_alias=canonical_alias,
         target_identity_hash=target_identity,
         target_lane_key=target_lane_key,
         control_identity_hashes=control_identities,
@@ -700,7 +711,7 @@ async def _handle_inspect(
             "message": "no prepared state for this run_id",
         })
 
-    candidates = _resolve_eligible_candidates()
+    _, candidates = _resolve_eligible_candidates(prepared.canonical_alias)
     family_state = state_mgr.codex
     now = time.monotonic()
 
@@ -926,6 +937,7 @@ async def _handle_restore(  # noqa: PLR0915 - bounded acceptance handler
     # Only reached after target local+durable absence is proven.
     state_mgr.clear_cooldown_state(
         alias_family="codex",
+        canonical_aliases=(prepared.canonical_alias,),
         cooldown_keys=prepared.all_lane_keys,
     )
     for ih in prepared.all_identity_hashes:

@@ -34,6 +34,16 @@ from litellm.proxy.aawm_route_logging import (
     flush_aawm_route_rollups,
 )
 from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    config_compiler as aawm_alias_config_compiler,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    snapshot_select as aawm_alias_snapshot_select,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+    DEFAULT_CONFIG_DIR as AAWM_ALIAS_CONFIG_DIR,
+    compile_directory as compile_aawm_alias_config_directory,
+)
 from litellm.proxy.pass_through_endpoints.aawm_request_policy.anthropic_body_prep import (
     _compact_openai_adapter_claude_context_in_anthropic_request_body,
     _prepare_anthropic_request_body_for_passthrough,
@@ -76,8 +86,6 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _codex_auto_agent_session_affinity_by_key,
     _anthropic_auto_agent_cooldown_until_monotonic_by_key,
     _anthropic_auto_agent_session_affinity_by_key,
-    _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-    _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
     _get_opencode_zen_target_base,
     _join_opencode_zen_passthrough_url,
     _load_local_opencode_zen_api_key,
@@ -104,8 +112,6 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _resolve_auto_agent_alias_route_rollup_outgoing_target,
     _auto_agent_alias_route_rollup_status,
     _handle_codex_auto_agent_alias_route,
-    _get_anthropic_auto_agent_candidates_for_alias,
-    _get_codex_auto_agent_candidates_for_alias,
     _is_oa_xai_responses_model,
     _is_codex_auto_agent_malformed_tool_call_text_output,
     _response_body_has_grok_composer_literal_tool_label_blocks,
@@ -119,10 +125,8 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _perform_codex_auto_agent_native_openai_request,
     _perform_codex_auto_agent_grok_native_responses_request,
     _perform_codex_auto_agent_oa_xai_responses_request,
-    _resolve_anthropic_auto_agent_alias_model,
     _resolve_anthropic_opencode_zen_adapter_model,
     _resolve_anthropic_openrouter_completion_adapter_model,
-    _resolve_codex_auto_agent_alias_model,
     _select_anthropic_auto_agent_candidate,
     _select_codex_auto_agent_candidate,
     _set_anthropic_auto_agent_cooldown,
@@ -155,6 +159,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _plan_codex_auto_agent_native_grok_continuation_transient_retry,
     _update_codex_auto_agent_retryable_attempt_record,
     _apply_codex_auto_agent_alias_cooldown,
+    _record_codex_failure_evidence,
     _build_grok_side_channel_request_shape_metadata,
     _extract_redacted_grok_json_request_shape,
     _log_grok_forward_header_compare,
@@ -223,6 +228,9 @@ _CODEX_RESTRICTIVE_SPAWN_AGENT_DESCRIPTION = (
     "spawning is already authorized; it never authorizes spawning by itself."
 )
 _AAWM_ALIAS_CANDIDATE_TRANSIENT_STATUS_CODES = [500, 502, 503, 504, 529]
+_CANONICAL_AAWM_ALIAS_SNAPSHOT = compile_aawm_alias_config_directory(
+    AAWM_ALIAS_CONFIG_DIR
+)
 
 
 def _build_test_jwt(payload: dict[str, Any]) -> str:
@@ -954,16 +962,18 @@ class TestResponsesAdapterToolChoice:
         assert second_body is updated_body
         assert second_metadata == {}
 
-    def test_applies_aawm_read_agent_guidance_to_codex_read_alias(self):
+    def test_applies_aawm_read_agent_guidance_to_codex_explorer_role(self):
         request_body = {
             "model": "basic",
             "instructions": "Existing instructions.",
-            "litellm_metadata": {"tags": ["existing-tag"]},
+            "litellm_metadata": {
+                "tags": ["existing-tag"],
+                "agent_role": "explorer",
+            },
         }
 
         updated_body, guidance_metadata = _apply_aawm_read_agent_guidance_to_request_body(
             request_body,
-            alias_model="basic",
             target_field="instructions",
         )
 
@@ -977,12 +987,12 @@ class TestResponsesAdapterToolChoice:
             "existing-tag",
             "aawm-read-agent-guidance",
             ("aawm-read-agent-guidance:" f"{_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION}"),
-            "aawm-read-agent-guidance-alias:basic",
+            "aawm-read-agent-guidance-role:explorer",
         ]
         assert litellm_metadata["aawm_read_agent_guidance_policy_name"] == _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME
         assert litellm_metadata["aawm_read_agent_guidance_policy_version"] == _AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION
         assert litellm_metadata["aawm_read_agent_guidance_applied"] is True
-        assert litellm_metadata["aawm_read_agent_guidance_alias"] == "basic"
+        assert litellm_metadata["aawm_read_agent_guidance_agent_role"] == "explorer"
         assert litellm_metadata["aawm_read_agent_guidance_target_field"] == "instructions"
         read_guidance_spans = [
             span for span in litellm_metadata["langfuse_spans"] if span["name"] == "aawm.read_agent_guidance"
@@ -1000,7 +1010,7 @@ class TestResponsesAdapterToolChoice:
             "aawm_read_agent_guidance_policy_name": (_AAWM_READ_AGENT_GUIDANCE_POLICY_NAME),
             "aawm_read_agent_guidance_policy_version": (_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION),
             "aawm_read_agent_guidance_applied": True,
-            "aawm_read_agent_guidance_alias": "basic",
+            "aawm_read_agent_guidance_agent_role": "explorer",
             "aawm_read_agent_guidance_target_field": "instructions",
             "aawm_read_agent_guidance_original_chars": len("Existing instructions."),
             "aawm_read_agent_guidance_prompt_chars": len(_AAWM_READ_AGENT_GUIDANCE_PROMPT),
@@ -1008,22 +1018,23 @@ class TestResponsesAdapterToolChoice:
 
         second_body, second_metadata = _apply_aawm_read_agent_guidance_to_request_body(
             updated_body,
-            alias_model="basic",
             target_field="instructions",
         )
         assert second_body is updated_body
         assert second_metadata == {}
 
-    def test_applies_aawm_read_agent_guidance_to_anthropic_read_alias_system(self):
+    def test_applies_aawm_read_agent_guidance_to_anthropic_explorer_role_system(self):
         request_body = {
             "model": "basic",
             "system": "Existing system.",
-            "litellm_metadata": {"tags": ["existing-tag"]},
+            "litellm_metadata": {
+                "tags": ["existing-tag"],
+                "agent_role": "explorer",
+            },
         }
 
         updated_body, guidance_metadata = _apply_aawm_read_agent_guidance_to_request_body(
             request_body,
-            alias_model="basic",
             target_field="system",
         )
 
@@ -1033,9 +1044,9 @@ class TestResponsesAdapterToolChoice:
         assert "No files were modified." in updated_body["system"]
         litellm_metadata = updated_body["litellm_metadata"]
         assert "aawm-read-agent-guidance" in litellm_metadata["tags"]
-        assert "aawm-read-agent-guidance-alias:basic" in litellm_metadata["tags"]
+        assert "aawm-read-agent-guidance-role:explorer" in litellm_metadata["tags"]
         assert litellm_metadata["aawm_read_agent_guidance_policy_name"] == _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME
-        assert litellm_metadata["aawm_read_agent_guidance_alias"] == "basic"
+        assert litellm_metadata["aawm_read_agent_guidance_agent_role"] == "explorer"
         assert litellm_metadata["aawm_read_agent_guidance_target_field"] == "system"
         assert guidance_metadata["aawm_read_agent_guidance_applied"] is True
 
@@ -1043,11 +1054,11 @@ class TestResponsesAdapterToolChoice:
         request_body = {
             "model": "basic",
             "system": [{"type": "text", "text": "Existing system."}],
+            "agent_role": "explorer",
         }
 
         updated_body, guidance_metadata = _apply_aawm_read_agent_guidance_to_request_body(
             request_body,
-            alias_model="basic",
             target_field="system",
         )
 
@@ -1058,34 +1069,24 @@ class TestResponsesAdapterToolChoice:
         assert guidance_metadata["aawm_read_agent_guidance_target_field"] == "system"
 
     @pytest.mark.parametrize(
-        ("alias_model", "target_field"),
-        [
-            ("basic", "instructions"),
-            ("sota", "instructions"),
-            ("work", "instructions"),
-            ("basic", "instructions"),
-            ("work", "instructions"),
-            ("basic", "system"),
-            ("sota", "system"),
-            ("work", "system"),
-            ("basic", "system"),
-            ("work", "system"),
-        ],
+        "target_field",
+        ["instructions", "system"],
     )
-    def test_skips_aawm_read_agent_guidance_for_non_read_aliases(
+    def test_skips_aawm_read_agent_guidance_for_non_read_role(
         self,
-        alias_model,
         target_field,
     ):
         request_body = {
-            "model": alias_model,
+            "model": "basic",
             target_field: "Existing guidance.",
-            "litellm_metadata": {"tags": ["existing-tag"]},
+            "litellm_metadata": {
+                "tags": ["existing-tag"],
+                "agent_role": "writer",
+            },
         }
 
         updated_body, guidance_metadata = _apply_aawm_read_agent_guidance_to_request_body(
             request_body,
-            alias_model=alias_model,
             target_field=target_field,
         )
 
@@ -4136,43 +4137,6 @@ class TestOpenRouterAdapterRetry:
                 assert info["supports_xhigh_reasoning_effort"] is True
                 assert info["supports_max_reasoning_effort"] is True
 
-    def test_codex_aawm_alias_candidate_model_order(self):
-        assert [candidate["model"] for candidate in _get_codex_auto_agent_candidates_for_alias("sota")] == [
-            "gpt-5.6-sol",
-            "gpt-5.5",
-        ]
-        assert [
-            candidate["model"] for candidate in _get_codex_auto_agent_candidates_for_alias("work")
-        ] == ["gpt-5.6-terra", "gpt-5.5"]
-        assert [candidate["model"] for candidate in _get_codex_auto_agent_candidates_for_alias("sota-openai")] == [
-            "gpt-5.6-sol",
-            "gpt-5.5",
-        ]
-        assert [candidate["model"] for candidate in _get_codex_auto_agent_candidates_for_alias("sota-xai")] == [
-            "oa_xai/grok-4.5",
-            "grok-4.5",
-            "grok-build",
-        ]
-        sota_xai = _get_codex_auto_agent_candidates_for_alias("sota-xai")
-        assert sota_xai[0]["route_family"] == "codex_xai_oauth_responses_adapter"
-        assert sota_xai[1]["route_family"] == "codex_grok_native_responses_adapter"
-        assert sota_xai[2]["last_resort"] is True
-        assert "expected_candidate_unavailable_cooldown_seconds" not in sota_xai[0]
-        assert "expected_candidate_unavailable_cooldown_seconds" not in sota_xai[1]
-        assert [candidate["model"] for candidate in _get_codex_auto_agent_candidates_for_alias("work")] == [
-            "gpt-5.3-codex-spark",
-            "xai/grok-4.5",
-            "grok-composer-2.5-fast",
-            "oa_xai/grok-build",
-            "gpt-5.6-terra",
-            "gpt-5.5",
-        ]
-        code = _get_codex_auto_agent_candidates_for_alias("work")
-        grok45 = code[1]
-        assert grok45["model"] == "xai/grok-4.5"
-        assert grok45["route_family"] == "codex_grok_native_responses_adapter"
-        assert "expected_candidate_unavailable_cooldown_seconds" not in grok45
-
     def test_opencode_zen_model_registries_expose_only_maintained_models(self):
         from pathlib import Path
 
@@ -5985,34 +5949,32 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
     ):
         request = _build_codex_auto_agent_request()
         body = {
-            "model": "basic",
+            "model": "format-fallback-alias",
             "input": "hello",
             "stream": False,
             "litellm_metadata": {"session_id": "codex-session"},
         }
-        monkeypatch.setitem(
-            _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-            "basic",
-            (
-                {
-                    "provider": "openrouter",
-                    "model": "openrouter/cohere/north-mini-code:free",
-                    "route_family": "codex_openrouter_completion_adapter",
-                    "last_resort": False,
-                },
-                {
-                    "provider": "openai",
-                    "model": "gpt-5.6-luna",
-                    "route_family": "codex_responses",
-                    "last_resort": False,
-                },
-                {
-                    "provider": "openai",
-                    "model": "gpt-5.4-mini",
-                    "route_family": "codex_responses",
-                    "last_resort": True,
-                },
-            ),
+        aawm_alias_snapshot_select.set_active_routing_snapshot(
+            aawm_alias_config_compiler.compile_yaml(
+                """
+defaults: {}
+aliases:
+  - name: format-fallback-alias
+    candidates:
+      - provider: openrouter
+        model: openrouter/cohere/north-mini-code:free
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: openai
+        model: gpt-5.6-luna
+        route_family: codex_responses
+        priority: 50
+      - provider: openai
+        model: gpt-5.4-mini
+        route_family: codex_responses
+        priority: 0
+"""
+            )
         )
         openrouter_format_error = RuntimeError(
             "OpenRouterException - Error from provider (Cohere): "
@@ -6040,6 +6002,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
                 target_url="https://chatgpt.com/backend-api/codex/responses",
                 api_key=None,
                 forward_headers=True,
+                canonical_alias=body["model"],
             )
 
         assert response is mini_success
@@ -6064,7 +6027,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
     ):
         request = _build_codex_auto_agent_request()
         body = {
-            "model": "basic",
+            "model": "tool-arguments-fallback-alias",
             "input": "hello",
             "stream": False,
             "litellm_metadata": {
@@ -6072,23 +6035,23 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
                 "repository": "litellm",
             },
         }
-        monkeypatch.setitem(
-            _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-            "basic",
-            (
-                {
-                    "provider": "openrouter",
-                    "model": "openrouter/cohere/north-mini-code:free",
-                    "route_family": "codex_openrouter_completion_adapter",
-                    "last_resort": False,
-                },
-                {
-                    "provider": "openai",
-                    "model": "gpt-5.4-mini",
-                    "route_family": "codex_responses",
-                    "last_resort": True,
-                },
-            ),
+        aawm_alias_snapshot_select.set_active_routing_snapshot(
+            aawm_alias_config_compiler.compile_yaml(
+                """
+defaults: {}
+aliases:
+  - name: tool-arguments-fallback-alias
+    candidates:
+      - provider: openrouter
+        model: openrouter/cohere/north-mini-code:free
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: openai
+        model: gpt-5.4-mini
+        route_family: codex_responses
+        priority: 0
+"""
+            )
         )
         openrouter_format_error = RuntimeError(
             "OpenrouterException - "
@@ -6117,6 +6080,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
                 target_url="https://chatgpt.com/backend-api/codex/responses",
                 api_key=None,
                 forward_headers=True,
+                canonical_alias=body["model"],
             )
 
         assert response is mini_success
@@ -6138,7 +6102,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
     ):
         request = _build_codex_auto_agent_request()
         body = {
-            "model": "basic",
+            "model": "terminal-format-alias",
             "input": "hello",
             "stream": False,
             "litellm_metadata": {
@@ -6146,17 +6110,19 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
                 "repository": "litellm",
             },
         }
-        monkeypatch.setitem(
-            _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-            "basic",
-            (
-                {
-                    "provider": "openrouter",
-                    "model": "openrouter/cohere/north-mini-code:free",
-                    "route_family": "codex_openrouter_completion_adapter",
-                    "last_resort": True,
-                },
-            ),
+        aawm_alias_snapshot_select.set_active_routing_snapshot(
+            aawm_alias_config_compiler.compile_yaml(
+                """
+defaults: {}
+aliases:
+  - name: terminal-format-alias
+    candidates:
+      - provider: openrouter
+        model: openrouter/cohere/north-mini-code:free
+        route_family: codex_openrouter_completion_adapter
+        priority: 0
+"""
+            )
         )
         openrouter_format_error = RuntimeError(
             "OpenrouterException - "
@@ -6183,6 +6149,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
                     fastapi_response=MagicMock(spec=Response),
                     user_api_key_dict=MagicMock(),
                     prepared_request_body=body,
+                    canonical_alias=body["model"],
                     target_url="https://chatgpt.com/backend-api/codex/responses",
                     api_key=None,
                     forward_headers=True,
@@ -13360,6 +13327,7 @@ def test_codex_non_grok_keeps_reasoning_input_item():
 def _build_codex_auto_agent_request(session_id: str = "codex-session"):
     mock_request = MagicMock(spec=Request)
     mock_request.method = "POST"
+    mock_request.state = SimpleNamespace()
     mock_request.headers = {
         "session_id": session_id,
         "user-agent": "codex-cli/1.0",
@@ -13380,6 +13348,10 @@ def clear_codex_auto_agent_alias_state(monkeypatch):
         llm_passthrough_endpoints as endpoints,
     )
 
+    previous_snapshot = aawm_alias_snapshot_select.get_active_routing_snapshot()
+    aawm_alias_snapshot_select.set_active_routing_snapshot(
+        _CANONICAL_AAWM_ALIAS_SNAPSHOT
+    )
     monkeypatch.setattr(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_auto_agent_alias_audit_only_events_best_effort",
         lambda events, *, request_body=None: None,
@@ -13391,22 +13363,6 @@ def clear_codex_auto_agent_alias_state(monkeypatch):
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
     endpoints._alias_routing_state.anthropic.cooldown_negative_until_monotonic_by_key.clear()
     _anthropic_auto_agent_session_affinity_by_key.clear()
-    for candidate_map, aliases in (
-        (
-            _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-            ("work", "basic"),
-        ),
-        (
-            _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-            ("work", "basic"),
-        ),
-    ):
-        for alias in aliases:
-            monkeypatch.setitem(
-                candidate_map,
-                alias,
-                tuple(candidate for candidate in candidate_map[alias] if candidate["provider"] != "kimi_code"),
-            )
     clear_aawm_route_rollups()
     yield
     aawm_claude_control_plane._claude_tool_advertisement_compaction_cache.clear()
@@ -13416,57 +13372,14 @@ def clear_codex_auto_agent_alias_state(monkeypatch):
     _anthropic_auto_agent_cooldown_until_monotonic_by_key.clear()
     endpoints._alias_routing_state.anthropic.cooldown_negative_until_monotonic_by_key.clear()
     _anthropic_auto_agent_session_affinity_by_key.clear()
+    aawm_alias_snapshot_select.set_active_routing_snapshot(previous_snapshot)
     clear_aawm_route_rollups()
-
-
-@pytest.mark.parametrize(
-    "alias",
-    [
-        "basic",
-        "basic",
-        "sota",
-        "work",
-        "basic",
-        "work",
-    ],
-)
-def test_resolve_codex_auto_agent_alias_model_only_for_responses(alias):
-    assert (
-        _resolve_codex_auto_agent_alias_model(
-            {"model": alias},
-            endpoint="/v1/responses",
-        )
-        == alias
-    )
-    assert (
-        _resolve_codex_auto_agent_alias_model(
-            {"model": alias},
-            endpoint="/v1/chat/completions",
-        )
-        is None
-    )
-    assert (
-        _resolve_anthropic_auto_agent_alias_model(
-            {"model": alias},
-            endpoint="/v1/messages",
-        )
-        is None
-    )
-
-
-def test_resolve_codex_auto_agent_alias_model_ignores_non_aliases():
-    assert (
-        _resolve_codex_auto_agent_alias_model(
-            {"model": "gemini-3.1-flash-lite-preview"},
-            endpoint="/v1/responses",
-        )
-        is None
-    )
 
 
 def _build_anthropic_auto_agent_request(session_id: str = "claude-session"):
     mock_request = MagicMock(spec=Request)
     mock_request.method = "POST"
+    mock_request.state = SimpleNamespace()
     mock_request.headers = {
         "session_id": session_id,
         "anthropic-version": "2023-06-01",
@@ -13763,51 +13676,6 @@ def test_persist_auto_agent_alias_audit_only_events_best_effort_build_failure_is
     assert all("exc_info" not in call.kwargs for call in mock_warning.call_args_list)
 
 
-@pytest.mark.parametrize(
-    "alias",
-    [
-        "basic",
-        "basic",
-        "sota",
-        "work",
-        "basic",
-        "work",
-    ],
-)
-def test_resolve_anthropic_auto_agent_alias_model_only_for_messages(alias):
-    assert (
-        _resolve_anthropic_auto_agent_alias_model(
-            {"model": alias},
-            endpoint="/v1/messages",
-        )
-        == alias
-    )
-    assert (
-        _resolve_anthropic_auto_agent_alias_model(
-            {"model": alias},
-            endpoint="/v1/complete",
-        )
-        is None
-    )
-    assert (
-        _resolve_codex_auto_agent_alias_model(
-            {"model": alias},
-            endpoint="/v1/responses",
-        )
-        is None
-    )
-
-
-def test_resolve_anthropic_auto_agent_alias_model_ignores_non_aliases():
-    assert (
-        _resolve_anthropic_auto_agent_alias_model(
-            {"model": "gpt-5.3-codex-spark"},
-            endpoint="/v1/messages",
-        )
-        is None
-    )
-
-
 _FORBIDDEN_ANTHROPIC_CODE_SELECTOR_SKIP_REASONS = {
     "tool_schema_incompatible",
     "no_tool_compatible_candidate",
@@ -13832,38 +13700,6 @@ async def test_anthropic_auto_agent_alias_selects_spark_first(monkeypatch):
     assert selection['candidate']['model'] == 'gpt-5.3-codex-spark'
     assert selection['selection_reason'] == 'first_available'
     assert selection['skipped'] == []
-
-
-
-@pytest.mark.asyncio
-async def test_anthropic_read_agent_alias_uses_auto_candidates_and_metadata(monkeypatch):
-    request = _build_anthropic_auto_agent_request()
-    body = _build_anthropic_auto_agent_body()
-    body['model'] = 'basic'
-    selection = await _select_anthropic_auto_agent_candidate(request=request, request_body=body)
-    assert selection['candidate']['provider'] == 'openai'
-    assert selection['candidate']['model'] == 'gpt-5.3-codex-spark'
-    assert selection['selection_reason'] == 'first_available'
-    updated_body = _add_anthropic_auto_agent_alias_metadata(body, request=request, selection=selection, attempts=[{'provider': 'openai', 'model': 'gpt-5.3-codex-spark', 'route_family': 'anthropic_openai_responses_adapter', 'last_resort': False, 'lane_key': '__default__', 'reason': 'first_available'}])
-    metadata = updated_body['litellm_metadata']
-    assert updated_body['model'] == 'gpt-5.3-codex-spark'
-    assert metadata['model_alias_label'] == 'basic'
-    assert metadata['requested_model_alias'] == 'basic'
-    assert metadata['anthropic_auto_agent_alias'] == 'basic'
-    assert metadata['anthropic_auto_agent_selected_provider'] == 'openai'
-    assert metadata['anthropic_auto_agent_selected_route_family'] == 'anthropic_openai_responses_adapter'
-    audit_events = metadata['aawm_alias_routing_audit_events']
-    assert audit_events == metadata['anthropic_auto_agent_audit_events']
-    assert audit_events[0]['alias_family'] == 'anthropic_auto_agent'
-    assert audit_events[0]['alias_model'] == 'basic'
-    assert audit_events[0]['session_id'] == 'claude-session'
-    assert audit_events[0]['provider'] == 'openai'
-    assert audit_events[0]['model'] == 'gpt-5.3-codex-spark'
-    assert audit_events[0]['event_type'] == 'candidate_selected'
-    assert audit_events[0]['selected'] is True
-    assert audit_events[0]['attempt_number'] == 1
-    assert 'model-alias:basic' in metadata['tags']
-    assert 'anthropic-auto-agent-alias:basic' in metadata['tags']
 
 
 
@@ -13996,57 +13832,6 @@ async def test_anthropic_code_anthropic_merged_spark_cooldown_prefers_longer_fam
     assert selection["skipped"][0]["cooldown_seconds"] >= 89.0
     assert "codex_family:" in selection["skipped"][0]["cooldown_state_source"]
     assert "anthropic_family:" in selection["skipped"][0]["cooldown_state_source"]
-
-
-@pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_code_falls_through_ordered_candidates():
-    request = _build_anthropic_auto_agent_request()
-    body = _build_anthropic_auto_agent_body()
-    body["model"] = "work"
-    expected_candidates = [
-        (
-            "openai",
-            "gpt-5.3-codex-spark",
-            "anthropic_openai_responses_adapter",
-            False,
-        ),
-        (
-            "xai",
-            "xai/grok-4.5",
-            "anthropic_grok_native_responses_adapter",
-            False,
-        ),
-        (
-            "xai",
-            "grok-composer-2.5-fast",
-            "anthropic_grok_native_responses_adapter",
-            False,
-        ),
-        ("xai", "oa_xai/grok-build", "anthropic_xai_oauth_responses_adapter", False),
-        ("anthropic", "claude-sonnet-5[1m]", "anthropic_messages", False),
-        ("anthropic", "claude-sonnet-5", "anthropic_messages", False),
-        ("anthropic", "claude-sonnet-4-6", "anthropic_messages", True),
-    ]
-
-    for index, (provider, model, route_family, last_resort) in enumerate(expected_candidates):
-        selection = await _select_anthropic_auto_agent_candidate(
-            request=request,
-            request_body=body,
-        )
-        candidate = selection["candidate"]
-        assert candidate["provider"] == provider
-        assert candidate["model"] == model
-        assert candidate["route_family"] == route_family
-        assert candidate["last_resort"] is last_resort
-        if last_resort:
-            assert selection["selection_reason"] == "last_resort"
-        else:
-            assert selection["selection_reason"] == "first_available"
-        if index < len(expected_candidates) - 1:
-            await _set_anthropic_auto_agent_cooldown(
-                selection["cooldown_key"],
-                60.0,
-            )
 
 
 def test_anthropic_auto_agent_alias_metadata_uses_requested_alias():
@@ -14241,99 +14026,6 @@ async def test_anthropic_auto_agent_alias_uses_haiku_only_as_last_resort(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_low_uses_default_low_candidates():
-    request = _build_anthropic_auto_agent_request()
-    body = _build_anthropic_auto_agent_body()
-    body["model"] = "basic"
-
-    selection = await _select_anthropic_auto_agent_candidate(
-        request=request,
-        request_body=body,
-    )
-
-    assert selection["candidate"]["provider"] == "openrouter"
-    assert selection["candidate"]["model"] == "openrouter/cohere/north-mini-code:free"
-    assert selection["candidate"]["route_family"] == ("anthropic_openrouter_completion_adapter")
-    candidates = _get_anthropic_auto_agent_candidates_for_alias("basic")
-    candidate_models = [candidate["model"] for candidate in candidates]
-    assert candidate_models == [
-        "openrouter/cohere/north-mini-code:free",
-        "openrouter/owl-alpha",
-        "deepseek-v4-flash",
-        "big-pickle",
-        "alibaba_token_plan/qwen3.6-flash",
-        "claude-haiku-4-5-20251001",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_anthropic_auto_agent_alias_low_falls_through_ordered_candidates(
-    monkeypatch,
-):
-    request = _build_anthropic_auto_agent_request()
-    body = _build_anthropic_auto_agent_body()
-    body["model"] = "basic"
-    expected_candidates = [
-        (
-            "openrouter",
-            "openrouter/cohere/north-mini-code:free",
-            "anthropic_openrouter_completion_adapter",
-            False,
-        ),
-        (
-            "openrouter",
-            "openrouter/owl-alpha",
-            "anthropic_openrouter_completion_adapter",
-            False,
-        ),
-        (
-            "opencode_zen",
-            "deepseek-v4-flash",
-            "anthropic_opencode_zen_responses_adapter",
-            False,
-        ),
-        (
-            "opencode_zen",
-            "big-pickle",
-            "anthropic_opencode_zen_completion_adapter",
-            False,
-        ),
-        (
-            "alibaba_token_plan",
-            "alibaba_token_plan/qwen3.6-flash",
-            "anthropic_alibaba_token_plan_chat_completions_adapter",
-            False,
-        ),
-        (
-            "anthropic",
-            "claude-haiku-4-5-20251001",
-            "anthropic_messages",
-            True,
-        ),
-    ]
-
-    for index, (provider, model, route_family, last_resort) in enumerate(expected_candidates):
-        selection = await _select_anthropic_auto_agent_candidate(
-            request=request,
-            request_body=body,
-        )
-        candidate = selection["candidate"]
-        assert candidate["provider"] == provider
-        assert candidate["model"] == model
-        assert candidate["route_family"] == route_family
-        assert candidate["last_resort"] is last_resort
-        if last_resort:
-            assert selection["selection_reason"] == "last_resort"
-        else:
-            assert selection["selection_reason"] == "first_available"
-        if index < len(expected_candidates) - 1:
-            await _set_anthropic_auto_agent_cooldown(
-                selection["cooldown_key"],
-                60.0,
-            )
-
-
-@pytest.mark.asyncio
 async def test_anthropic_auto_agent_alias_code_selects_live_grok_4_5_after_spark_cooldown():
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
@@ -14416,6 +14108,7 @@ async def test_anthropic_auto_agent_alias_code_native_sonnet_5_1m_normalizes_mod
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -14468,6 +14161,7 @@ async def test_anthropic_auto_agent_alias_falls_back_to_deepseek_after_spark_429
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -14500,7 +14194,7 @@ async def test_anthropic_auto_agent_alias_success_preserves_attempt_metadata_wit
     body = _build_anthropic_auto_agent_body()
     success = Response(content='{"ok": true}', media_type='application/json')
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route', new=AsyncMock(return_value=success)) as mock_spark, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info') as mock_info, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning') as mock_warning:
-        response = await _handle_anthropic_auto_agent_alias_route(endpoint='/v1/messages', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://api.anthropic.com/v1/messages', custom_headers={'x-api-key': 'anthropic-key'})
+        response = await _handle_anthropic_auto_agent_alias_route(endpoint='/v1/messages', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://api.anthropic.com/v1/messages', custom_headers={'x-api-key': 'anthropic-key'})
     assert response is success
     mock_spark.assert_awaited_once()
     prepared_body = mock_spark.await_args.kwargs['prepared_request_body']
@@ -14555,6 +14249,7 @@ async def test_anthropic_auto_agent_alias_retryable_failure_records_route_contex
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -14581,92 +14276,6 @@ async def test_anthropic_auto_agent_alias_retryable_failure_records_route_contex
 
 
 @pytest.mark.asyncio
-async def test_anthropic_read_agent_alias_falls_back_after_high_demand(
-    monkeypatch,
-):
-    request = _build_anthropic_auto_agent_request()
-    body = _build_anthropic_auto_agent_body()
-    body["model"] = "basic"
-    spark_error = RuntimeError("We're currently experiencing high demand, which may cause temporary errors.")
-    deepseek_success = Response(content='{"ok": true}', media_type="application/json")
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
-        new=AsyncMock(side_effect=spark_error),
-    ) as mock_spark, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openrouter_completion_adapter_route",
-        new=AsyncMock(return_value=deepseek_success),
-    ) as mock_openrouter:
-        response = await _handle_anthropic_auto_agent_alias_route(
-            endpoint="/v1/messages",
-            request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
-            target_url="https://api.anthropic.com/v1/messages",
-            custom_headers={"x-api-key": "anthropic-key"},
-        )
-
-    assert response is deepseek_success
-    mock_spark.assert_awaited_once()
-    mock_openrouter.assert_awaited_once()
-    assert mock_openrouter.await_args.kwargs["adapter_model"] == ("deepseek/deepseek-v4-flash")
-    deepseek_body = mock_openrouter.await_args.kwargs["prepared_request_body"]
-    metadata = deepseek_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "basic"
-    assert metadata["anthropic_auto_agent_alias"] == "basic"
-    assert metadata["anthropic_auto_agent_selected_provider"] == "openrouter"
-    first_attempt = metadata["anthropic_auto_agent_attempts"][0]
-    assert first_attempt["status"] == "cooldown_set"
-    assert first_attempt["error_class"] == "capacity_exhausted"
-    assert "HIGH_DEMAND" in first_attempt["error_tokens"]
-    assert metadata["anthropic_auto_agent_skipped_candidates"][0]["model"] == ("gpt-5.3-codex-spark")
-
-
-@pytest.mark.asyncio
-async def test_anthropic_read_agent_alias_openai_adapter_cooldown_survives_fresh_session(
-    monkeypatch,
-):
-    first_request = _build_anthropic_auto_agent_request("claude-session-1")
-    first_body = _build_anthropic_auto_agent_body("claude-session-1")
-    first_body["model"] = "basic"
-    high_demand_error = RuntimeError("We're currently experiencing high demand, which may cause temporary errors.")
-    deepseek_success = Response(content='{"ok": true}', media_type="application/json")
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route",
-        new=AsyncMock(side_effect=high_demand_error),
-    ) as mock_spark, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openrouter_completion_adapter_route",
-        new=AsyncMock(return_value=deepseek_success),
-    ):
-        await _handle_anthropic_auto_agent_alias_route(
-            endpoint="/v1/messages",
-            request=first_request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=first_body,
-            target_url="https://api.anthropic.com/v1/messages",
-            custom_headers={"x-api-key": "anthropic-key"},
-        )
-
-    mock_spark.assert_awaited_once()
-
-    second_request = _build_anthropic_auto_agent_request("claude-session-2")
-    second_body = _build_anthropic_auto_agent_body("claude-session-2")
-    second_body["model"] = "basic"
-    selection = await _select_anthropic_auto_agent_candidate(
-        request=second_request,
-        request_body=second_body,
-    )
-
-    assert selection["candidate"]["provider"] == "openrouter"
-    assert selection["candidate"]["model"] == "deepseek/deepseek-v4-flash"
-    assert selection["skipped"][0]["model"] == "gpt-5.3-codex-spark"
-    assert selection["skipped"][0]["lane_key"] == "__default__"
-
-
-@pytest.mark.asyncio
 async def test_anthropic_sota_alias_handles_terminal_high_demand_after_fallback(monkeypatch):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
@@ -14674,7 +14283,7 @@ async def test_anthropic_sota_alias_handles_terminal_high_demand_after_fallback(
     high_demand_error = RuntimeError("We're currently experiencing high demand, which may cause temporary errors.")
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body'), patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request', new=AsyncMock(side_effect=high_demand_error)) as mock_native:
         with pytest.raises(HTTPException) as exc_info:
-            await _handle_anthropic_auto_agent_alias_route(endpoint='/v1/messages', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://api.anthropic.com/v1/messages', custom_headers={'x-api-key': 'anthropic-key'})
+            await _handle_anthropic_auto_agent_alias_route(endpoint='/v1/messages', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://api.anthropic.com/v1/messages', custom_headers={'x-api-key': 'anthropic-key'})
     assert exc_info.value.status_code == 429
     assert exc_info.value.detail['error'] == {'message': "We're currently experiencing high demand, which may cause temporary errors.", 'type': 'capacity_exhausted', 'code': 'all_candidates_unavailable'}
     assert mock_native.await_count == 2
@@ -14779,6 +14388,7 @@ async def test_anthropic_auto_agent_alias_code_falls_back_to_live_grok_4_5_after
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://api.anthropic.com/v1/messages",
                 custom_headers={"x-api-key": "anthropic-key"},
             )
@@ -14876,6 +14486,7 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_falls_back_to_live_g
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -14905,7 +14516,7 @@ async def test_anthropic_auto_agent_alias_code_tool_bearing_cooldown_selects_liv
     await _set_anthropic_auto_agent_cooldown('openai:gpt-5.3-codex-spark:__default__', 10691.0)
     grok45_success = Response(content='{"ok": true}', media_type='application/json')
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route', new=AsyncMock()) as mock_spark, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route', new=AsyncMock(return_value=grok45_success)) as mock_grok_native, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route', new=AsyncMock()) as mock_xai_oauth, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request', new=AsyncMock()) as mock_native:
-        response = await _handle_anthropic_auto_agent_alias_route(endpoint='/v1/messages', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://api.anthropic.com/v1/messages', custom_headers={'x-api-key': 'anthropic-key'})
+        response = await _handle_anthropic_auto_agent_alias_route(endpoint='/v1/messages', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://api.anthropic.com/v1/messages', custom_headers={'x-api-key': 'anthropic-key'})
     assert response is grok45_success
     mock_spark.assert_not_called()
     mock_grok_native.assert_awaited_once()
@@ -14930,7 +14541,7 @@ async def test_anthropic_auto_agent_alias_code_stateful_cooldown_selects_live_gr
     await _set_anthropic_auto_agent_cooldown('openai:gpt-5.3-codex-spark:__default__', 10691.0)
     grok45_success = Response(content='{"ok": true}', media_type='application/json')
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_openai_responses_adapter_route', new=AsyncMock()) as mock_spark, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_grok_native_oauth_responses_adapter_route', new=AsyncMock(return_value=grok45_success)) as mock_grok_native, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_anthropic_xai_oauth_responses_adapter_route', new=AsyncMock()) as mock_xai_oauth, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request', new=AsyncMock()) as mock_native:
-        response = await _handle_anthropic_auto_agent_alias_route(endpoint='/v1/messages', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://api.anthropic.com/v1/messages', custom_headers={'x-api-key': 'anthropic-key'})
+        response = await _handle_anthropic_auto_agent_alias_route(endpoint='/v1/messages', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://api.anthropic.com/v1/messages', custom_headers={'x-api-key': 'anthropic-key'})
     assert response is grok45_success
     mock_spark.assert_not_called()
     mock_grok_native.assert_awaited_once()
@@ -15041,6 +14652,7 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_oa_xai_after_grok_un
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -15115,6 +14727,7 @@ async def test_anthropic_auto_agent_alias_code_uses_managed_xai_after_grok_permi
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -15182,6 +14795,7 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -15272,6 +14886,7 @@ async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -15360,6 +14975,7 @@ async def test_anthropic_auto_agent_alias_low_routes_big_pickle_through_completi
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -15399,6 +15015,7 @@ async def test_anthropic_auto_agent_alias_low_routes_north_mini_through_openrout
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -15507,6 +15124,7 @@ async def test_anthropic_auto_agent_alias_routes_deepseek_through_openrouter_com
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -15549,6 +15167,7 @@ async def test_anthropic_auto_agent_alias_routes_haiku_last_resort_native(
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -15636,6 +15255,7 @@ async def test_anthropic_auto_agent_alias_in_flight_tool_result_429_is_terminal(
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://api.anthropic.com/v1/messages",
                 custom_headers={"x-api-key": "anthropic-key"},
             )
@@ -15733,6 +15353,7 @@ async def test_anthropic_auto_agent_alias_in_flight_bare_502_redispatches_withou
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://api.anthropic.com/v1/messages",
                 custom_headers={"x-api-key": "anthropic-key"},
             )
@@ -15811,6 +15432,7 @@ async def test_anthropic_auto_agent_in_flight_grok_4_5_candidate_unavailable_ret
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -15900,6 +15522,7 @@ async def test_anthropic_auto_agent_alias_in_flight_malformed_composer_call_redi
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://api.anthropic.com/v1/messages",
                 custom_headers={"x-api-key": "anthropic-key"},
             )
@@ -16003,6 +15626,7 @@ async def test_anthropic_auto_agent_in_flight_native_grok_4_5_malformed_redispat
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://api.anthropic.com/v1/messages",
                 custom_headers={"x-api-key": "anthropic-key"},
             )
@@ -16089,6 +15713,7 @@ async def test_codex_auto_agent_in_flight_native_grok_4_5_malformed_redispatches
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://chatgpt.com/backend-api/codex/responses",
                 api_key=None,
                 forward_headers=True,
@@ -16127,7 +15752,7 @@ async def test_anthropic_auto_agent_alias_in_flight_redispatch_uses_requested_al
     opus_error = RuntimeError('Selected model is at capacity. Please try a different model.')
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_anthropic_native_passthrough_request', new=AsyncMock(side_effect=opus_error)):
         with pytest.raises(HTTPException) as exc_info:
-            await _handle_anthropic_auto_agent_alias_route(endpoint='/v1/messages', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://api.anthropic.com/v1/messages', custom_headers={'x-api-key': 'anthropic-key'})
+            await _handle_anthropic_auto_agent_alias_route(endpoint='/v1/messages', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://api.anthropic.com/v1/messages', custom_headers={'x-api-key': 'anthropic-key'})
     assert exc_info.value.status_code == 429
     assert exc_info.value.detail['error']['code'] == 'aawm_anthropic_auto_agent_redispatch_required'
     assert exc_info.value.detail['redispatch_model'] == 'sota'
@@ -16170,13 +15795,14 @@ async def test_anthropic_proxy_route_uses_auto_alias_only_on_anthropic_messages(
 
 
 @pytest.mark.asyncio
-async def test_anthropic_proxy_route_aawm_read_alias_applies_read_guidance(
+async def test_anthropic_proxy_route_explorer_role_applies_read_guidance(
     monkeypatch,
 ):
     request = _build_anthropic_auto_agent_request()
     body = _build_anthropic_auto_agent_body()
     body["model"] = "basic"
     body["system"] = "Existing system."
+    body["litellm_metadata"]["agent_role"] = "explorer"
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
@@ -16209,9 +15835,9 @@ async def test_anthropic_proxy_route_aawm_read_alias_applies_read_guidance(
     litellm_metadata = prepared_body["litellm_metadata"]
     assert "aawm-read-agent-guidance" in litellm_metadata["tags"]
     assert ("aawm-read-agent-guidance:" f"{_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION}") in litellm_metadata["tags"]
-    assert "aawm-read-agent-guidance-alias:basic" in litellm_metadata["tags"]
+    assert "aawm-read-agent-guidance-role:explorer" in litellm_metadata["tags"]
     assert litellm_metadata["aawm_read_agent_guidance_applied"] is True
-    assert litellm_metadata["aawm_read_agent_guidance_alias"] == "basic"
+    assert litellm_metadata["aawm_read_agent_guidance_agent_role"] == "explorer"
     assert litellm_metadata["aawm_read_agent_guidance_target_field"] == "system"
 
 
@@ -17229,38 +16855,6 @@ async def test_codex_auto_agent_alias_selects_spark_first(monkeypatch):
 
 
 
-@pytest.mark.asyncio
-async def test_codex_read_agent_alias_uses_auto_candidates_and_metadata(monkeypatch):
-    request = _build_codex_auto_agent_request()
-    body = {'model': 'basic', 'litellm_metadata': {'session_id': 'codex-session'}}
-    selection = await _select_codex_auto_agent_candidate(request=request, request_body=body)
-    assert selection['candidate']['provider'] == 'openai'
-    assert selection['candidate']['model'] == 'gpt-5.3-codex-spark'
-    assert selection['selection_reason'] == 'first_available'
-    updated_body = _add_codex_auto_agent_alias_metadata(body, request=request, selection=selection, attempts=[{'provider': 'openai', 'model': 'gpt-5.3-codex-spark', 'route_family': 'codex_responses', 'last_resort': False, 'lane_key': '__default__', 'reason': 'first_available'}])
-    metadata = updated_body['litellm_metadata']
-    assert updated_body['model'] == 'gpt-5.3-codex-spark'
-    assert metadata['model_alias_label'] == 'basic'
-    assert metadata['requested_model_alias'] == 'basic'
-    assert metadata['codex_auto_agent_alias'] == 'basic'
-    assert metadata['codex_auto_agent_selected_provider'] == 'openai'
-    assert metadata['codex_auto_agent_selected_route_family'] == 'codex_responses'
-    audit_events = metadata['aawm_alias_routing_audit_events']
-    assert audit_events == metadata['codex_auto_agent_audit_events']
-    assert audit_events[0]['alias_family'] == 'codex_auto_agent'
-    assert audit_events[0]['alias_model'] == 'basic'
-    assert audit_events[0]['session_id'] == 'codex-session'
-    assert audit_events[0]['provider'] == 'openai'
-    assert audit_events[0]['model'] == 'gpt-5.3-codex-spark'
-    assert audit_events[0]['route_family'] == 'codex_responses'
-    assert audit_events[0]['event_type'] == 'candidate_selected'
-    assert audit_events[0]['candidate_status'] == 'selected'
-    assert audit_events[0]['selected'] is True
-    assert 'model-alias:basic' in metadata['tags']
-    assert 'codex-auto-agent-alias:basic' in metadata['tags']
-
-
-
 @pytest.mark.parametrize(
     ("alias_model", "target_model"),
     [
@@ -17350,7 +16944,7 @@ async def test_codex_auto_agent_alias_logs_no_candidate_without_provider_attempt
         selection2 = await _select_codex_auto_agent_candidate(request=request, request_body=body)
         await _set_codex_auto_agent_cooldown(selection2['cooldown_key'], 60.0)
         with pytest.raises(HTTPException) as exc_info:
-            await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
+            await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
     assert exc_info.value.status_code == 429
     mock_pass_through.assert_not_called()
     access_record = logging.LogRecord(name='uvicorn.access', level=logging.INFO, pathname=__file__, lineno=1, msg='%s - "%s %s HTTP/%s" %d', args=('172.19.0.1:52834', 'POST', '/openai_passthrough/v1/responses', '1.1', 429), exc_info=None)
@@ -17460,7 +17054,7 @@ async def test_codex_auto_agent_alias_no_candidate_persists_audit_only_with_acti
         selection2 = await _select_codex_auto_agent_candidate(request=request, request_body=body)
         await _set_codex_auto_agent_cooldown(selection2['cooldown_key'], 60.0)
         with pytest.raises(HTTPException) as exc_info:
-            await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
+            await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
     assert exc_info.value.status_code == 429
     assert len(enqueued) == 1
     event = enqueued[0]['events'][0]
@@ -17646,6 +17240,7 @@ async def test_codex_auto_agent_alias_redispatch_audit_event_includes_cooldown_s
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://chatgpt.com/backend-api/codex/responses",
                 api_key=None,
                 forward_headers=True,
@@ -17714,6 +17309,7 @@ async def test_anthropic_auto_agent_in_flight_cooldown_does_not_log_no_candidate
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://api.anthropic.com/v1/messages",
                 custom_headers={"x-api-key": "anthropic-key"},
             )
@@ -17747,54 +17343,6 @@ async def test_codex_auto_agent_alias_code_falls_through_from_spark_to_live_grok
     assert fallback_selection["candidate"]["model"] == "xai/grok-4.5"
     assert fallback_selection["selection_reason"] == "first_available"
     assert fallback_selection["skipped"][0]["model"] == "gpt-5.3-codex-spark"
-
-
-@pytest.mark.asyncio
-async def test_codex_auto_agent_alias_code_falls_through_ordered_candidates():
-    request = _build_codex_auto_agent_request()
-    body = {
-        "model": "work",
-        "litellm_metadata": {"session_id": "codex-session"},
-    }
-    expected_candidates = [
-        ("openai", "gpt-5.3-codex-spark", "codex_responses", False),
-        (
-            "xai",
-            "xai/grok-4.5",
-            "codex_grok_native_responses_adapter",
-            False,
-        ),
-        (
-            "xai",
-            "grok-composer-2.5-fast",
-            "codex_grok_native_responses_adapter",
-            False,
-        ),
-        ("xai", "oa_xai/grok-build", "codex_xai_oauth_responses_adapter", False),
-        ("openai", "gpt-5.6-terra", "codex_responses", False),
-        ("openai", "gpt-5.5", "codex_responses", True),
-    ]
-
-    for index, (provider, model, route_family, last_resort) in enumerate(expected_candidates):
-        selection = await _select_codex_auto_agent_candidate(
-            request=request,
-            request_body=body,
-        )
-        candidate = selection["candidate"]
-        assert candidate["provider"] == provider
-        assert candidate["model"] == model
-        assert candidate["route_family"] == route_family
-        assert candidate["last_resort"] is last_resort
-        if last_resort:
-            assert selection["selection_reason"] == "last_resort"
-            assert candidate["default_reasoning_effort"] == "medium"
-        else:
-            assert selection["selection_reason"] == "first_available"
-        if index < len(expected_candidates) - 1:
-            await _set_codex_auto_agent_cooldown(
-                selection["cooldown_key"],
-                60.0,
-            )
 
 
 @pytest.mark.asyncio
@@ -19211,7 +18759,7 @@ async def test_codex_auto_agent_alias_code_last_resort_affinity_stays_on_gpt55()
     _codex_auto_agent_session_affinity_by_key['work:codex-session:session:codex-session'] = {'provider': 'openai', 'model': 'gpt-5.5', 'route_family': 'codex_responses', 'last_resort': True, 'expires_at_monotonic': time.monotonic() + 3600}
     success = Response(content='{"ok": true}', media_type='application/json')
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(return_value=success)) as mock_pass_through:
-        response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
+        response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
     assert response is success
     mock_pass_through.assert_awaited_once()
     candidate_body = mock_pass_through.await_args.kwargs['custom_body']
@@ -19222,100 +18770,6 @@ async def test_codex_auto_agent_alias_code_last_resort_affinity_stays_on_gpt55()
     assert metadata['codex_auto_agent_selection_reason'] == 'session_affinity'
     assert metadata['codex_auto_agent_default_reasoning_effort'] == 'medium'
 
-
-
-@pytest.mark.asyncio
-async def test_codex_auto_agent_alias_low_uses_default_low_candidates():
-    request = _build_codex_auto_agent_request()
-    body = {
-        "model": "basic",
-        "litellm_metadata": {"session_id": "codex-session"},
-    }
-
-    selection = await _select_codex_auto_agent_candidate(
-        request=request,
-        request_body=body,
-    )
-
-    assert selection["candidate"]["provider"] == "openrouter"
-    assert selection["candidate"]["model"] == "openrouter/cohere/north-mini-code:free"
-    assert selection["candidate"]["route_family"] == ("codex_openrouter_completion_adapter")
-    candidates = _get_codex_auto_agent_candidates_for_alias("basic")
-    candidate_models = [candidate["model"] for candidate in candidates]
-    assert candidate_models == [
-        "openrouter/cohere/north-mini-code:free",
-        "openrouter/owl-alpha",
-        "deepseek-v4-flash",
-        "big-pickle",
-        "gpt-5.6-luna",
-        "alibaba_token_plan/qwen3.6-flash",
-        "gpt-5.4-mini",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_codex_auto_agent_alias_low_falls_through_ordered_candidates(
-    monkeypatch,
-):
-    request = _build_codex_auto_agent_request()
-    body = {
-        "model": "basic",
-        "litellm_metadata": {"session_id": "codex-session"},
-    }
-    expected_candidates = [
-        (
-            "openrouter",
-            "openrouter/cohere/north-mini-code:free",
-            "codex_openrouter_completion_adapter",
-            False,
-        ),
-        (
-            "openrouter",
-            "openrouter/owl-alpha",
-            "codex_openrouter_completion_adapter",
-            False,
-        ),
-        (
-            "opencode_zen",
-            "deepseek-v4-flash",
-            "codex_opencode_zen_adapter",
-            False,
-        ),
-        (
-            "opencode_zen",
-            "big-pickle",
-            "codex_opencode_zen_adapter",
-            False,
-        ),
-        ("openai", "gpt-5.6-luna", "codex_responses", False),
-        (
-            "alibaba_token_plan",
-            "alibaba_token_plan/qwen3.6-flash",
-            "codex_alibaba_token_plan_chat_completions_adapter",
-            False,
-        ),
-        ("openai", "gpt-5.4-mini", "codex_responses", True),
-    ]
-
-    for index, (provider, model, route_family, last_resort) in enumerate(expected_candidates):
-        selection = await _select_codex_auto_agent_candidate(
-            request=request,
-            request_body=body,
-        )
-        candidate = selection["candidate"]
-        assert candidate["provider"] == provider
-        assert candidate["model"] == model
-        assert candidate["route_family"] == route_family
-        assert candidate["last_resort"] is last_resort
-        if last_resort:
-            assert selection["selection_reason"] == "last_resort"
-        else:
-            assert selection["selection_reason"] == "first_available"
-        if index < len(expected_candidates) - 1:
-            await _set_codex_auto_agent_cooldown(
-                selection["cooldown_key"],
-                60.0,
-            )
 
 
 def test_codex_auto_agent_alias_metadata_uses_requested_alias():
@@ -19427,6 +18881,7 @@ async def test_codex_auto_agent_alias_code_falls_back_to_live_grok_4_5_after_spa
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://chatgpt.com/backend-api/codex/responses",
                 api_key=None,
                 forward_headers=True,
@@ -19544,6 +18999,7 @@ async def test_codex_auto_agent_alias_code_uses_managed_xai_after_grok_permissio
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -20139,6 +19595,7 @@ def test_codex_auto_agent_retryable_attempt_retains_exact_source_error():
         exc=exc,
         error_class="usage_limit_reached",
         cooldown_seconds=10800.0,
+        alias_model="test-alias",
         cooldown_scope="candidate",
     )
 
@@ -20194,6 +19651,7 @@ async def test_codex_auto_agent_alias_in_flight_native_grok_4_5_bare_502_retries
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -20274,6 +19732,7 @@ async def test_anthropic_auto_agent_alias_in_flight_native_grok_4_5_bare_502_ret
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -20356,6 +19815,7 @@ async def test_codex_auto_agent_in_flight_native_grok_4_5_bare_502_recovers_afte
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -20441,6 +19901,7 @@ async def test_anthropic_auto_agent_in_flight_native_grok_4_5_bare_502_recovers_
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -20521,6 +19982,7 @@ async def test_codex_auto_agent_in_flight_native_grok_4_5_bare_502_exhausts_same
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://chatgpt.com/backend-api/codex/responses",
                 api_key=None,
                 forward_headers=True,
@@ -20605,6 +20067,7 @@ async def test_anthropic_auto_agent_in_flight_native_grok_4_5_bare_502_exhausts_
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://api.anthropic.com/v1/messages",
                 custom_headers={"x-api-key": "anthropic-key"},
             )
@@ -20807,6 +20270,7 @@ async def test_codex_auto_agent_fresh_native_grok_4_5_bare_502_does_not_use_cont
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -20863,6 +20327,7 @@ async def test_anthropic_auto_agent_fresh_native_grok_4_5_bare_502_does_not_use_
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -20939,6 +20404,7 @@ async def test_codex_auto_agent_in_flight_native_grok_4_5_429_redispatches_witho
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://chatgpt.com/backend-api/codex/responses",
                 api_key=None,
                 forward_headers=True,
@@ -21016,6 +20482,7 @@ async def test_anthropic_auto_agent_in_flight_native_grok_4_5_429_redispatches_w
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://api.anthropic.com/v1/messages",
                 custom_headers={"x-api-key": "anthropic-key"},
             )
@@ -21082,6 +20549,7 @@ async def test_codex_auto_agent_in_flight_non_native_grok_composer_502_does_not_
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://chatgpt.com/backend-api/codex/responses",
                 api_key=None,
                 forward_headers=True,
@@ -21152,6 +20620,7 @@ async def test_anthropic_auto_agent_in_flight_non_native_grok_composer_502_does_
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://api.anthropic.com/v1/messages",
                 custom_headers={"x-api-key": "anthropic-key"},
             )
@@ -21238,6 +20707,7 @@ async def test_codex_auto_agent_native_grok_continuation_budget_survives_outer_s
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -21270,6 +20740,7 @@ async def test_codex_auto_agent_native_grok_continuation_budget_survives_outer_s
 async def test_provider_terminal_error_writes_durable_cooldown():
     dual_cache = _FakeAawmAliasRoutingDualCache()
     request = _build_codex_auto_agent_request()
+    canonical_alias = "provider-terminal-test"
     candidate = {
         "provider": "openrouter",
         "model": "openrouter/cohere/north-mini-code:free",
@@ -21278,11 +20749,18 @@ async def test_provider_terminal_error_writes_durable_cooldown():
     }
     cooldown_key = "openrouter:openrouter/cohere/north-mini-code:free:openrouter"
     _codex_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+    _record_codex_failure_evidence(
+        canonical_alias=canonical_alias,
+        cooldown_key=cooldown_key,
+        exc=HTTPException(status_code=503, detail="provider unavailable"),
+        attempt_record={},
+    )
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
         return_value=dual_cache,
     ):
         scope = await _apply_codex_auto_agent_alias_cooldown(
+            canonical_alias=canonical_alias,
             request=request,
             candidate=candidate,
             lane_key="openrouter",
@@ -21323,6 +20801,7 @@ async def test_candidate_unavailable_xai_is_request_local_without_durable_write(
         return_value=dual_cache,
     ):
         scope = await _apply_codex_auto_agent_alias_cooldown(
+            canonical_alias="xai-request-local-test",
             request=request,
             candidate=candidate,
             lane_key="xai_grok_native",
@@ -21342,6 +20821,7 @@ async def test_candidate_unavailable_xai_is_request_local_without_durable_write(
 async def test_candidate_unavailable_non_xai_still_writes_durable_cooldown():
     dual_cache = _FakeAawmAliasRoutingDualCache()
     request = _build_codex_auto_agent_request()
+    canonical_alias = "non-xai-unavailable-test"
     candidate = {
         "provider": "openrouter",
         "model": "openrouter/owl-alpha",
@@ -21350,11 +20830,18 @@ async def test_candidate_unavailable_non_xai_still_writes_durable_cooldown():
     }
     cooldown_key = "openrouter:openrouter/owl-alpha:openrouter"
     _codex_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+    _record_codex_failure_evidence(
+        canonical_alias=canonical_alias,
+        cooldown_key=cooldown_key,
+        exc=HTTPException(status_code=503, detail="candidate unavailable"),
+        attempt_record={},
+    )
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
         return_value=dual_cache,
     ):
         scope = await _apply_codex_auto_agent_alias_cooldown(
+            canonical_alias=canonical_alias,
             request=request,
             candidate=candidate,
             lane_key="openrouter",
@@ -21395,6 +20882,7 @@ async def test_malformed_tool_call_text_native_grok_4_5_is_request_local_without
         return_value=dual_cache,
     ):
         scope = await _apply_codex_auto_agent_alias_cooldown(
+            canonical_alias="native-grok-malformed-test",
             request=request,
             candidate=candidate,
             lane_key="xai_grok_native",
@@ -21414,6 +20902,7 @@ async def test_malformed_tool_call_text_native_grok_4_5_is_request_local_without
 async def test_malformed_tool_call_text_writes_durable_cooldown():
     dual_cache = _FakeAawmAliasRoutingDualCache()
     request = _build_codex_auto_agent_request()
+    canonical_alias = "composer-malformed-test"
     candidate = {
         "provider": "xai",
         "model": "grok-composer-2.5-fast",
@@ -21422,11 +20911,18 @@ async def test_malformed_tool_call_text_writes_durable_cooldown():
     }
     cooldown_key = "xai:grok-composer-2.5-fast:xai_grok_native"
     _codex_auto_agent_cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+    _record_codex_failure_evidence(
+        canonical_alias=canonical_alias,
+        cooldown_key=cooldown_key,
+        exc=HTTPException(status_code=502, detail="malformed tool call"),
+        attempt_record={},
+    )
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
         return_value=dual_cache,
     ):
         scope = await _apply_codex_auto_agent_alias_cooldown(
+            canonical_alias=canonical_alias,
             request=request,
             candidate=candidate,
             lane_key="xai_grok_native",
@@ -21943,113 +21439,17 @@ def test_resolve_auto_agent_alias_route_rollup_outgoing_target_prefers_target_ur
 
 
 @pytest.mark.asyncio
-async def test_codex_read_agent_alias_falls_back_after_high_demand(monkeypatch):
-    request = _build_codex_auto_agent_request()
-    body = {
-        "model": "basic",
-        "input": "hello",
-        "stream": False,
-        "litellm_metadata": {"session_id": "codex-session"},
-    }
-    spark_error = RuntimeError("We're currently experiencing high demand, which may cause temporary errors.")
-    deepseek_success = Response(content='{"ok": true}', media_type="application/json")
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-        new=AsyncMock(side_effect=spark_error),
-    ) as mock_pass_through, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
-        new=AsyncMock(return_value=deepseek_success),
-    ) as mock_openrouter:
-        response = await _handle_codex_auto_agent_alias_route(
-            endpoint="/v1/responses",
-            request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
-            target_url="https://chatgpt.com/backend-api/codex/responses",
-            api_key=None,
-            forward_headers=True,
-        )
-
-    assert response is deepseek_success
-    mock_pass_through.assert_awaited_once()
-    mock_openrouter.assert_awaited_once()
-    assert mock_openrouter.await_args.kwargs["adapter_model"] == ("deepseek/deepseek-v4-flash")
-    deepseek_body = mock_openrouter.await_args.kwargs["request_body"]
-    metadata = deepseek_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "basic"
-    assert metadata["codex_auto_agent_alias"] == "basic"
-    assert metadata["codex_auto_agent_selected_provider"] == "openrouter"
-    first_attempt = metadata["codex_auto_agent_attempts"][0]
-    assert first_attempt["status"] == "cooldown_set"
-    assert first_attempt["error_class"] == "capacity_exhausted"
-    assert "HIGH_DEMAND" in first_attempt["error_tokens"]
-    assert metadata["codex_auto_agent_skipped_candidates"][0]["model"] == ("gpt-5.3-codex-spark")
-
-
-@pytest.mark.asyncio
 async def test_codex_sota_alias_handles_terminal_high_demand_after_fallback(monkeypatch):
     request = _build_codex_auto_agent_request()
     body = {'model': 'sota', 'input': 'hello', 'stream': False, 'litellm_metadata': {'session_id': 'codex-session'}}
     gpt55_error = RuntimeError("We're currently experiencing high demand, which may cause temporary errors.")
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(side_effect=gpt55_error)) as mock_pass_through:
         with pytest.raises(HTTPException) as exc_info:
-            await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
+            await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
     assert exc_info.value.status_code == 429
     assert exc_info.value.detail['error'] == {'message': "We're currently experiencing high demand, which may cause temporary errors.", 'type': 'capacity_exhausted', 'code': 'all_candidates_unavailable'}
     assert mock_pass_through.await_count == 2
 
-
-
-@pytest.mark.asyncio
-async def test_codex_read_agent_alias_native_cooldown_survives_fresh_session(
-    monkeypatch,
-):
-    first_request = _build_codex_auto_agent_request("codex-session-1")
-    first_body = {
-        "model": "basic",
-        "input": "hello",
-        "stream": False,
-        "litellm_metadata": {"session_id": "codex-session-1"},
-    }
-    high_demand_error = RuntimeError("We're currently experiencing high demand, which may cause temporary errors.")
-    deepseek_success = Response(content='{"ok": true}', media_type="application/json")
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-        new=AsyncMock(side_effect=high_demand_error),
-    ) as mock_pass_through, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
-        new=AsyncMock(return_value=deepseek_success),
-    ):
-        await _handle_codex_auto_agent_alias_route(
-            endpoint="/v1/responses",
-            request=first_request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=first_body,
-            target_url="https://chatgpt.com/backend-api/codex/responses",
-            api_key=None,
-            forward_headers=True,
-        )
-
-    mock_pass_through.assert_awaited_once()
-
-    second_request = _build_codex_auto_agent_request("codex-session-2")
-    second_body = {
-        "model": "basic",
-        "litellm_metadata": {"session_id": "codex-session-2"},
-    }
-    selection = await _select_codex_auto_agent_candidate(
-        request=second_request,
-        request_body=second_body,
-    )
-
-    assert selection["candidate"]["provider"] == "openrouter"
-    assert selection["candidate"]["model"] == "deepseek/deepseek-v4-flash"
-    assert selection["skipped"][0]["model"] == "gpt-5.3-codex-spark"
-    assert selection["skipped"][0]["lane_key"] == "__default__"
 
 
 @pytest.mark.asyncio
@@ -22059,7 +21459,7 @@ async def test_codex_auto_agent_alias_code_cascades_after_capacity_texts(monkeyp
     spark_error = RuntimeError('Selected model is at capacity. Please try a different model.')
     grok_success = Response(content='{"ok": true}', media_type='application/json')
     with patch.dict(os.environ, {'GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL': 'https://api.x.ai/v1', 'LITELLM_XAI_GROK_CLIENT_VERSION': '0.1.211'}), patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(side_effect=[spark_error, grok_success])) as mock_pass_through, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token', new=AsyncMock(return_value='grok-oidc-token')):
-        response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
+        response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
     assert response is grok_success
     assert mock_pass_through.await_count == 2
     grok_call = mock_pass_through.await_args_list[1].kwargs
@@ -22106,7 +21506,7 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sideca
     grok_refresh_error = ValueError('Grok OIDC credential is missing, expired, or near expiry. Run the health/provider-status sidecar Grok OIDC refresh or relogin with the Grok CLI before Grok native traffic can proceed.')
     managed_xai_success = Response(content='{"ok": true}', media_type='application/json')
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(side_effect=[spark_error, managed_xai_success])) as mock_pass_through, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token', new=AsyncMock(side_effect=grok_refresh_error)) as mock_grok_token, patch('litellm.llms.xai.oauth.get_xai_oauth_access_token', new=AsyncMock(return_value='xai-oauth-token')) as mock_xai_token:
-        response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
+        response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
     assert response is managed_xai_success
     assert mock_pass_through.await_count == 2
     assert mock_grok_token.await_count == 2
@@ -22178,6 +21578,7 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -22302,6 +21703,7 @@ async def test_codex_auto_agent_alias_low_owl_alpha_no_endpoints_reaches_mini(
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -22503,6 +21905,7 @@ async def _run_codex_auto_agent_alias_low_opencode_error_case(
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -22931,6 +22334,7 @@ async def test_codex_auto_agent_alias_openrouter_retryable_failure_reaches_mini(
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -22994,6 +22398,7 @@ async def test_codex_auto_agent_alias_low_openrouter_raw_provider_error_reaches_
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -23125,6 +22530,7 @@ async def test_codex_auto_agent_alias_routes_openrouter_candidate(monkeypatch):
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -23228,6 +22634,7 @@ async def test_codex_auto_agent_alias_low_routes_openrouter_completion_adapter_p
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -23285,11 +22692,11 @@ async def test_codex_auto_agent_alias_native_success_sets_session_affinity_for_c
     body = {'model': 'basic', 'input': 'hello', 'stream': False, 'litellm_metadata': {'session_id': 'codex-session'}}
     success = Response(content='{"ok": true}', media_type='application/json')
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(return_value=success)) as mock_pass_through:
-        response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
+        response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
         fresh_body = copy.deepcopy(body)
-        await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=fresh_body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
+        await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=fresh_body, canonical_alias=fresh_body["model"], target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
         continuation_body = {**copy.deepcopy(body), 'previous_response_id': 'resp_existing'}
-        await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=continuation_body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
+        await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=continuation_body, canonical_alias=continuation_body["model"], target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
     assert response is success
     assert mock_pass_through.await_count == 3
     first_body = mock_pass_through.await_args_list[0].kwargs['custom_body']
@@ -23310,7 +22717,7 @@ async def test_codex_auto_agent_alias_success_preserves_attempt_metadata_without
     body = {'model': 'basic', 'input': 'hello', 'stream': False, 'litellm_metadata': {'session_id': 'codex-session'}}
     success = Response(content='{"ok": true}', media_type='application/json')
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(return_value=success)) as mock_pass_through, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info') as mock_info, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning') as mock_warning:
-        response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
+        response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
     assert response is success
     mock_pass_through.assert_awaited_once()
     custom_body = mock_pass_through.await_args.kwargs['custom_body']
@@ -23376,6 +22783,7 @@ async def test_codex_auto_agent_alias_falls_back_to_deepseek_after_native_429(
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -23472,6 +22880,7 @@ async def test_codex_auto_agent_alias_fresh_dispatch_affinity_429_reaches_last_r
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -23541,6 +22950,7 @@ async def test_codex_auto_agent_alias_openrouter_empty_success_rolls_to_last_res
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -23604,6 +23014,7 @@ async def test_codex_auto_agent_alias_openrouter_empty_success_rolls_to_mini(
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -23668,6 +23079,7 @@ async def test_codex_auto_agent_alias_openrouter_one_token_text_is_success(
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -23685,29 +23097,29 @@ async def test_codex_auto_agent_alias_openrouter_malformed_composer_call_rolls_o
 ):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "basic",
+        "model": "composer-call-fallback-alias",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-composer-call"},
     }
     monkeypatch.setenv("AAWM_OPENROUTER_API_KEY", "or-test-key")
-    monkeypatch.setitem(
-        _CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS,
-        "basic",
-        (
-            {
-                "provider": "openrouter",
-                "model": "openrouter/composer-call-test",
-                "route_family": "codex_openrouter_completion_adapter",
-                "last_resort": False,
-            },
-            {
-                "provider": "openai",
-                "model": "gpt-5.4-mini",
-                "route_family": "codex_responses",
-                "last_resort": True,
-            },
-        ),
+    aawm_alias_snapshot_select.set_active_routing_snapshot(
+        aawm_alias_config_compiler.compile_yaml(
+            """
+defaults: {}
+aliases:
+  - name: composer-call-fallback-alias
+    candidates:
+      - provider: openrouter
+        model: openrouter/composer-call-test
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: openai
+        model: gpt-5.4-mini
+        route_family: codex_responses
+        priority: 0
+"""
+        )
     )
     malformed_responses_payload = {
         "id": "resp_composer_call",
@@ -23744,6 +23156,7 @@ async def test_codex_auto_agent_alias_openrouter_malformed_composer_call_rolls_o
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -23827,6 +23240,7 @@ async def test_codex_auto_agent_alias_openrouter_capacity_reaches_last_resort(
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -23926,6 +23340,7 @@ async def test_codex_auto_agent_alias_in_flight_affinity_429_is_terminal(monkeyp
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://chatgpt.com/backend-api/codex/responses",
                 api_key=None,
                 forward_headers=True,
@@ -23968,7 +23383,7 @@ async def test_codex_auto_agent_alias_in_flight_redispatch_uses_requested_alias(
     gpt55_error = RuntimeError('Selected model is at capacity. Please try a different model.')
     with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(side_effect=gpt55_error)):
         with pytest.raises(HTTPException) as exc_info:
-            await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
+            await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
     assert exc_info.value.status_code == 429
     assert exc_info.value.detail['error']['code'] == 'aawm_codex_auto_agent_redispatch_required'
     assert exc_info.value.detail['redispatch_model'] == 'sota'
@@ -24022,6 +23437,7 @@ async def test_codex_auto_agent_alias_in_flight_affinity_cooldown_does_not_switc
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://chatgpt.com/backend-api/codex/responses",
                 api_key=None,
                 forward_headers=True,
@@ -24225,7 +23641,7 @@ async def test_openai_passthrough_recognized_alias_without_codex_headers_uses_al
 
 
 @pytest.mark.asyncio
-async def test_openai_passthrough_aawm_read_alias_applies_read_guidance(
+async def test_openai_passthrough_explorer_role_applies_read_guidance(
     monkeypatch,
 ):
     mock_request = _build_codex_auto_agent_request("codex-session-123")
@@ -24239,7 +23655,10 @@ async def test_openai_passthrough_aawm_read_alias_applies_read_guidance(
                 "model": "basic",
                 "input": "hello",
                 "instructions": "Existing instructions.",
-                "litellm_metadata": {"tags": ["existing-tag"]},
+                "litellm_metadata": {
+                    "tags": ["existing-tag"],
+                    "agent_role": "explorer",
+                },
             }
         ),
     ), patch(
@@ -24277,9 +23696,9 @@ async def test_openai_passthrough_aawm_read_alias_applies_read_guidance(
     assert "codex-auto-agent-prevention-guidance" in litellm_metadata["tags"]
     assert "aawm-read-agent-guidance" in litellm_metadata["tags"]
     assert ("aawm-read-agent-guidance:" f"{_AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION}") in litellm_metadata["tags"]
-    assert "aawm-read-agent-guidance-alias:basic" in litellm_metadata["tags"]
+    assert "aawm-read-agent-guidance-role:explorer" in litellm_metadata["tags"]
     assert litellm_metadata["aawm_read_agent_guidance_applied"] is True
-    assert litellm_metadata["aawm_read_agent_guidance_alias"] == "basic"
+    assert litellm_metadata["aawm_read_agent_guidance_agent_role"] == "explorer"
     assert litellm_metadata["aawm_read_agent_guidance_policy_name"] == _AAWM_READ_AGENT_GUIDANCE_POLICY_NAME
     assert litellm_metadata["aawm_read_agent_guidance_policy_version"] == _AAWM_READ_AGENT_GUIDANCE_POLICY_VERSION
 
@@ -28876,6 +28295,7 @@ async def test_codex_auto_agent_alias_low_openrouter_adapter_cooldown_does_not_s
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://chatgpt.com/backend-api/codex/responses",
                 api_key=None,
                 forward_headers=True,
@@ -28921,6 +28341,7 @@ async def test_anthropic_auto_agent_alias_low_openrouter_adapter_cooldown_does_n
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://api.anthropic.com/v1/messages",
                 custom_headers={"x-api-key": "anthropic-key"},
             )
@@ -29227,6 +28648,7 @@ async def test_codex_auto_agent_alias_in_flight_redispatch_includes_audit_metada
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://chatgpt.com/backend-api/codex/responses",
                 api_key=None,
                 forward_headers=True,
@@ -29272,6 +28694,7 @@ async def test_anthropic_alias_non_inflight_bare_502_does_not_persist_durable_co
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -29384,16 +28807,6 @@ async def test_aawm_alias_routing_durable_write_failure_keeps_in_memory_cooldown
 
     assert seconds > 0
     assert source == "memory"
-
-
-def test_codex_aawm_sota_openai_and_sota_xai_alias_normalization():
-    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as mod
-
-    assert mod._normalize_codex_auto_agent_alias_model("sota-openai") == ("sota-openai")
-    assert mod._normalize_codex_auto_agent_alias_model("AAWM-SOTA-XAI") == ("sota-xai")
-    assert mod._is_codex_auto_agent_alias_model("sota-openai") is True
-    assert mod._resolve_codex_auto_agent_alias_model({"model": "sota-xai"}, "/v1/responses") == "sota-xai"
-    assert mod._resolve_codex_auto_agent_alias_model({"model": "sota-xai"}, "/v1/chat/completions") is None
 
 
 def test_codex_auto_agent_grok_4_5_candidate_unavailable_does_not_durable_cooldown():
@@ -29650,6 +29063,7 @@ async def test_codex_auto_agent_alias_code_falls_back_after_gpt_5_6_terra_unsupp
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -29715,6 +29129,7 @@ async def test_codex_auto_agent_alias_code_cools_terra_when_unsupported_after_pr
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -29786,6 +29201,7 @@ async def test_codex_auto_agent_alias_low_falls_back_after_gpt_5_6_luna_unsuppor
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -29877,6 +29293,7 @@ async def test_codex_auto_agent_alias_code_skips_native_lane_after_grok_personal
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,
@@ -30002,6 +29419,7 @@ async def test_anthropic_auto_agent_alias_code_falls_back_after_grok_build_usage
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -30093,6 +29511,7 @@ async def test_anthropic_auto_agent_alias_in_flight_grok_personal_team_spending_
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
+                canonical_alias=body["model"],
                 target_url="https://api.anthropic.com/v1/messages",
                 custom_headers={"x-api-key": "anthropic-key"},
             )
@@ -30187,6 +29606,7 @@ async def test_anthropic_spark_bare_502_sets_candidate_transient_cooldown(monkey
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -30262,6 +29682,7 @@ async def test_anthropic_code_anthropic_second_request_skips_spark_after_transie
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body_first,
+            canonical_alias=body_first["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -30319,6 +29740,7 @@ async def test_anthropic_grok_composer_bare_502_does_not_set_durable_cooldown(mo
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -30373,6 +29795,7 @@ async def test_anthropic_alias_non_inflight_bare_502_selects_next_candidate_with
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -30416,7 +29839,7 @@ async def test_codex_auto_agent_alias_capacity_failure_still_sets_durable_cooldo
     spark_error = RuntimeError('Selected model is at capacity. Please try a different model.')
     grok_success = Response(content='{"ok": true}', media_type='application/json')
     with patch.dict(os.environ, {'GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL': 'https://api.x.ai/v1'}), patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(side_effect=[spark_error, grok_success])), patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token', new=AsyncMock(return_value='grok-oidc-token')):
-        response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
+        response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
     assert response is grok_success
     metadata = request.scope['parsed_body'][1]['litellm_metadata']
     spark_attempt = metadata['codex_auto_agent_attempts'][0]
@@ -30934,6 +30357,7 @@ async def test_anthropic_grok_safety_denial_falls_back_request_locally_without_d
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://api.anthropic.com/v1/messages",
             custom_headers={"x-api-key": "anthropic-key"},
         )
@@ -31065,6 +30489,7 @@ async def test_codex_grok_safety_denial_falls_back_request_locally_without_durab
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
+            canonical_alias=body["model"],
             target_url="https://chatgpt.com/backend-api/codex/responses",
             api_key=None,
             forward_headers=True,

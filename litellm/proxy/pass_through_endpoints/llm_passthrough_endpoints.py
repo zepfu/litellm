@@ -317,7 +317,7 @@ _hydrate_aawm_alias_routing_affinity_memory = (
     _aawm_runtime_memory.hydrate_aawm_alias_routing_affinity_memory
 )
 
-# Policy aliases (RR-054 #11): static tables live in aawm_alias_routing.policy.
+# Retained generic provider/lane/cooldown/allowlist policy aliases.
 from .aawm_alias_routing import policy as _aawm_alias_policy_compat
 _aawm_alias_policy_compat.install_policy_compat_aliases(globals())
 
@@ -385,15 +385,6 @@ _aawm_alias_policy_compat.install_policy_compat_aliases(globals())
 
 
 # ---------------------------------------------------------------------------
-# Wave 4 (D1-583): config-snapshot-driven candidate resolution for the
-# ``basic`` pilot alias only. Every other alias continues to resolve from the
-# hard-coded ``policy.py`` tables above via ``_CODEX_AUTO_AGENT_CANDIDATES_BY_ALIAS``
-# / ``_ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS``. No new session_history /
-# routing-decision persistence is introduced here -- selection stays
-# in-memory/process-local, matching the existing auto-agent alias lanes.
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Wave 5A: facade imports from aawm_alias_routing extraction modules.
 # Each name below is the SAME object as the target module's definition.
 # ---------------------------------------------------------------------------
@@ -417,9 +408,11 @@ from .aawm_alias_routing import audit_persist as _aawm_audit_persist
 from .aawm_alias_routing import audit_events as _aawm_audit_events
 
 # -- snapshot_select facades --
-_BASIC_PILOT_ALIAS_NAME = _aawm_snapshot_select._BASIC_PILOT_ALIAS_NAME
 get_active_routing_snapshot = _aawm_snapshot_select.get_active_routing_snapshot
 set_active_routing_snapshot = _aawm_snapshot_select.set_active_routing_snapshot
+_lookup_active_snapshot_canonical_alias = (
+    _aawm_snapshot_select._lookup_active_snapshot_canonical_alias
+)
 _routing_candidate_to_public_dict = _aawm_snapshot_select._routing_candidate_to_public_dict
 _order_snapshot_candidates_by_priority = _aawm_snapshot_select._order_snapshot_candidates_by_priority
 _select_proportional_snapshot_candidate = _aawm_snapshot_select._select_proportional_snapshot_candidate
@@ -430,12 +423,10 @@ _commit_round_robin_selection = _aawm_snapshot_select._commit_round_robin_select
 _apply_snapshot_alias_distribution_strategy = _aawm_snapshot_select._apply_snapshot_alias_distribution_strategy
 _is_tui_attached_candidate_eligible = _aawm_snapshot_select._is_tui_attached_candidate_eligible
 _is_snapshot_candidate_in_schedule_window = _aawm_snapshot_select._is_snapshot_candidate_in_schedule_window
-_resolve_basic_pilot_eligible_candidates = _aawm_snapshot_select._resolve_basic_pilot_eligible_candidates
-_select_basic_pilot_snapshot_candidates = _aawm_snapshot_select._select_basic_pilot_snapshot_candidates
+_select_snapshot_candidates = _aawm_snapshot_select._select_snapshot_candidates
 _derive_round_robin_commit_token = _aawm_snapshot_select._derive_round_robin_commit_token
 _get_aawm_alias_selection_context = _aawm_snapshot_select._get_aawm_alias_selection_context
 _resolve_aawm_alias_selection_enumeration = _aawm_snapshot_select._resolve_aawm_alias_selection_enumeration
-_get_codex_auto_agent_candidates_for_alias = _aawm_snapshot_select._get_codex_auto_agent_candidates_for_alias
 
 # -- config_refresh facades --
 _DEFAULT_AAWM_ALIAS_CONFIG_PATH = _aawm_config_refresh._DEFAULT_AAWM_ALIAS_CONFIG_PATH
@@ -479,27 +470,23 @@ _get_openrouter_free_daily_quota_exhausted_cooldown_seconds = _aawm_openrouter_q
 _is_openrouter_free_quota_candidate = _aawm_openrouter_quota._is_openrouter_free_quota_candidate
 _apply_openrouter_durable_quota_candidate_cooldown = _aawm_openrouter_quota._apply_openrouter_durable_quota_candidate_cooldown
 
-# Wave 5B: gate, cursor, and quota cache are now manager-owned.
-_basic_pilot_cooldown_gate = _alias_routing_state.basic_pilot_gate
+# Wave 5B: failure evidence, cursor, and quota cache are manager-owned.
+_codex_failure_evidence_gate = _alias_routing_state.codex_failure_evidence_gate
 _round_robin_cursor_by_alias = _alias_routing_state.round_robin_cursor
 
-# Wave 5A/5B: bind the round-robin cursor into snapshot_select.
+# Bind the round-robin cursor into snapshot selection.
 _aawm_snapshot_select.configure_snapshot_runtime(
     round_robin_cursor=_round_robin_cursor_by_alias,
-    get_candidates_for_alias=lambda *a, **kw: globals()["_get_codex_auto_agent_candidates_for_alias"](*a, **kw),
 )
 
 
 def reset_module_singletons() -> None:
     """Clear legacy god-module singleton state (test-support).
 
-    Wave 5B moved the basic-pilot gate and round-robin cursor onto
-    ``AliasRoutingStateManager``. Preserve this helper's historical narrow
-    behavior by clearing only those manager-owned surfaces plus the active
-    routing snapshot.
+    Clear the manager-owned Codex failure-evidence gates and round-robin cursor
+    plus the active routing snapshot.
     """
-    _basic_pilot_cooldown_gate._key_state.clear()
-    _basic_pilot_cooldown_gate._family_state.evidence_events_by_key.clear()
+    _codex_failure_evidence_gate.clear_for_tests()
     _round_robin_cursor_by_alias.clear()
     set_active_routing_snapshot(None)
 
@@ -507,46 +494,11 @@ def reset_module_singletons() -> None:
 def reset_alias_routing_state_for_tests() -> None:
     """Reset ALL process-local alias-routing state (test-support only).
 
-    Clears manager-owned state (including gate/cursor/quota since Wave 5B)
-    via ``alias_routing_state.reset_for_tests()`` and the snapshot via
-    ``reset_module_singletons()``.
+    Clears manager-owned state via ``alias_routing_state.reset_for_tests()``
+    and the active snapshot.
     """
     _alias_routing_state.reset_for_tests()
     set_active_routing_snapshot(None)
-
-
-def _get_anthropic_auto_agent_candidates_for_alias(
-    alias_model: str,
-) -> tuple[dict[str, Any], ...]:
-    # CFG-002 Finding 2: check failure state FIRST, before any snapshot or
-    # static branch.  Once failure is published, all aliases return empty.
-    if _aawm_snapshot_select._is_alias_config_startup_failed():
-        return ()
-    if _aawm_adapter_model_resolution._is_retired_aawm_alias_model(alias_model):
-        return ()
-    # CFG-002 Finding 1: delegate `basic` to the snapshot-aware Anthropic
-    # selector so the wrapper derives the same nonzero snapshot-projected
-    # candidate enumeration/order as the Anthropic selector, not legacy
-    # table zero. Returns None in legacy mode (no active snapshot),
-    # falling through to the static table below.
-    if alias_model == _aawm_snapshot_select._BASIC_PILOT_ALIAS_NAME:
-        snapshot_candidates = (
-            _aawm_snapshot_select._select_basic_pilot_snapshot_candidates_anthropic()
-        )
-        if snapshot_candidates is not None:
-            return snapshot_candidates
-    # When a snapshot is active, only config-defined aliases and explicitly
-    # registered legacy aliases are supported.
-    if get_active_routing_snapshot() is not None:
-        candidates = _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(alias_model)
-        if candidates is not None:
-            return candidates
-        return ()
-    candidates = _ANTHROPIC_AUTO_AGENT_CANDIDATES_BY_ALIAS.get(
-        alias_model,
-        _ANTHROPIC_AUTO_AGENT_CANDIDATES,
-    )
-    return candidates
 
 
 # RR-054 durable alias-routing helpers (package-owned).
@@ -1201,12 +1153,6 @@ _resolve_anthropic_kimi_chat_completions_adapter_model = _aawm_adapter_model_res
 _resolve_anthropic_alibaba_token_plan_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_alibaba_token_plan_adapter_model
 
 
-_normalize_codex_auto_agent_alias_model = _aawm_adapter_model_resolution._normalize_codex_auto_agent_alias_model
-
-
-_is_codex_auto_agent_alias_model = _aawm_adapter_model_resolution._is_codex_auto_agent_alias_model
-
-
 _resolve_codex_auto_agent_alias_model = _aawm_adapter_model_resolution._resolve_codex_auto_agent_alias_model
 
 
@@ -1243,8 +1189,10 @@ def _resolve_codex_auto_agent_session_key(
     request: Request,
     request_body: dict[str, Any],
     *,
-    alias_model: str = _CODEX_AUTO_AGENT_MODEL_ALIAS,
+    alias_model: str,
 ) -> Optional[str]:
+    if not alias_model or alias_model.strip() != alias_model:
+        raise ValueError("alias_model must be an explicit canonical alias")
     metadata = request_body.get("litellm_metadata")
     metadata_session_id = metadata.get("session_id") if isinstance(metadata, dict) else None
     session_id = _clean_codex_auth_value(metadata_session_id)
@@ -1255,8 +1203,6 @@ def _resolve_codex_auto_agent_session_key(
         )
     if session_id is None:
         return None
-    if alias_model == _CODEX_AUTO_AGENT_MODEL_ALIAS:
-        return f"{session_id}:{_resolve_codex_auto_agent_openai_lane_key(request)}"
     return f"{alias_model}:{session_id}:" f"{_resolve_codex_auto_agent_openai_lane_key(request)}"
 
 
@@ -1461,20 +1407,18 @@ _resolve_codex_auto_agent_xai_lane_key = _aawm_lane_keys._resolve_codex_auto_age
 _apply_codex_auto_agent_grok_account_lane_cooldown = _aawm_selection._apply_codex_auto_agent_grok_account_lane_cooldown
 
 
-_normalize_anthropic_auto_agent_alias_model = _aawm_selection._normalize_anthropic_auto_agent_alias_model
-
-
-def _is_anthropic_auto_agent_alias_model(model: Any) -> bool:
-    return _normalize_anthropic_auto_agent_alias_model(model) is not None
-
-
 def _resolve_anthropic_auto_agent_alias_model(
     request_body: dict[str, Any],
     endpoint: str,
+    *,
+    request: Request,
 ) -> Optional[str]:
     if not _has_anthropic_responses_adapter_endpoint(endpoint):
         return None
-    return _normalize_anthropic_auto_agent_alias_model(request_body.get("model"))
+    return _lookup_active_snapshot_canonical_alias(
+        request_body.get("model"),
+        request=request,
+    )
 
 
 _resolve_anthropic_auto_agent_native_lane_key = _aawm_lane_keys._resolve_anthropic_auto_agent_native_lane_key
@@ -1487,8 +1431,10 @@ def _resolve_anthropic_auto_agent_session_key(
     request: Request,
     request_body: dict[str, Any],
     *,
-    alias_model: str = _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
+    alias_model: str,
 ) -> Optional[str]:
+    if not alias_model or alias_model.strip() != alias_model:
+        raise ValueError("alias_model must be an explicit canonical alias")
     metadata = request_body.get("litellm_metadata")
     metadata_session_id = metadata.get("session_id") if isinstance(metadata, dict) else None
     session_id = _clean_codex_auth_value(metadata_session_id)
@@ -1501,8 +1447,6 @@ def _resolve_anthropic_auto_agent_session_key(
         )
     if session_id is None:
         return None
-    if alias_model == _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS:
-        return f"{session_id}:{_resolve_anthropic_auto_agent_native_lane_key(request)}"
     return f"{alias_model}:{session_id}:" f"{_resolve_anthropic_auto_agent_native_lane_key(request)}"
 
 
@@ -1609,12 +1553,10 @@ _aawm_selection.configure_selection_runtime(
     get_codex_session_affinity=lambda *a, **kw: _get_codex_auto_agent_session_affinity(*a, **kw),
     get_anthropic_session_affinity=lambda *a, **kw: _get_anthropic_auto_agent_session_affinity(*a, **kw),
     get_openrouter_adapter_active_cooldown_seconds=lambda *a, **kw: _get_openrouter_adapter_active_cooldown_seconds(*a, **kw),
-    normalize_codex_alias_model=lambda *a, **kw: _normalize_codex_auto_agent_alias_model(*a, **kw),
     extract_client_product_label=lambda *a, **kw: _extract_auto_agent_alias_client_product_label(*a, **kw),
     resolve_codex_session_key=lambda *a, **kw: _resolve_codex_auto_agent_session_key(*a, **kw),
     resolve_anthropic_session_key=lambda *a, **kw: _resolve_anthropic_auto_agent_session_key(*a, **kw),
     has_continuation_state=lambda *a, **kw: _codex_auto_agent_request_has_continuation_state(*a, **kw),
-    get_anthropic_candidates_for_alias=lambda *a, **kw: _get_anthropic_auto_agent_candidates_for_alias(*a, **kw),
     is_grok_account_quota_candidate=lambda *a, **kw: _is_codex_auto_agent_grok_account_quota_candidate(*a, **kw),
     get_grok_account_quota_lane_cooldown_key=lambda *a, **kw: _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(*a, **kw),
     is_kimi_code_candidate=lambda *a, **kw: _is_kimi_code_auto_agent_candidate(*a, **kw),
@@ -1654,7 +1596,7 @@ _aawm_cooldown_apply.configure_cooldown_apply_runtime(
     set_codex_cooldown=lambda *a, **kw: _set_codex_auto_agent_cooldown(*a, **kw),
     set_anthropic_cooldown=lambda *a, **kw: _set_anthropic_auto_agent_cooldown(*a, **kw),
     write_durable_payload=lambda *a, **kw: _aawm_alias_durable.write_aawm_alias_routing_durable_payload(*a, **kw),
-    basic_pilot_gate=_basic_pilot_cooldown_gate,
+    codex_failure_evidence_gate=_codex_failure_evidence_gate,
     state_manager=_alias_routing_state,
 )
 _aawm_cooldown_apply.install(globals())
@@ -1677,8 +1619,6 @@ _aawm_attempt_records.configure_attempt_records_runtime(
     healthy_json_enabled=lambda *a, **kw: _aawm_alias_route_healthy_json_enabled(*a, **kw),
     merge_metadata=lambda *a, **kw: _merge_litellm_metadata(*a, **kw),
     normalize_tag_value=lambda *a, **kw: _normalize_low_cardinality_tag_value(*a, **kw),
-    normalize_codex_alias_model=lambda *a, **kw: _normalize_codex_auto_agent_alias_model(*a, **kw),
-    normalize_anthropic_alias_model=lambda *a, **kw: _normalize_anthropic_auto_agent_alias_model(*a, **kw),
     load_bundled_model_cost=lambda *a, **kw: cast(
         Callable[..., dict[str, Any]],
         _aawm_codex_tool_policy.load_bundled_model_cost_map_for_codex_policy,
@@ -1687,7 +1627,9 @@ _aawm_attempt_records.configure_attempt_records_runtime(
     model_cost=litellm.model_cost,
     openai_provider_value=litellm.LlmProviders.OPENAI.value,
     classify_failure=lambda *a, **kw: _aawm_alias_classification.classify_failure(*a, **kw),
-    basic_pilot_gate_record=lambda *a, **kw: _basic_pilot_cooldown_gate.record(*a, **kw),
+    codex_failure_evidence_gate_record=lambda *a, **kw: (
+        _codex_failure_evidence_gate.record(*a, **kw)
+    ),
 )
 _aawm_attempt_records.install(globals())
 
@@ -3829,10 +3771,6 @@ _ANTHROPIC_AUTO_AGENT_ROUTE_RUNTIME = (
         ),
         anthropic_family_state=_alias_routing_state.anthropic,
         codex_family_state=_alias_routing_state.codex,
-        normalize_alias_model=lambda model: (
-            _normalize_anthropic_auto_agent_alias_model(model)
-        ),
-        default_alias_model=_ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
         perform_candidate_request=lambda *args, **kwargs: (
             _perform_anthropic_auto_agent_alias_candidate_request(*args, **kwargs)
         ),
@@ -3854,16 +3792,11 @@ _ANTHROPIC_AUTO_AGENT_ROUTE_RUNTIME = (
         raise_redispatch_required=lambda *args, **kwargs: (
             _raise_anthropic_auto_agent_redispatch_required(*args, **kwargs)
         ),
-        get_candidates_for_alias=lambda alias_model, *, request, request_body: (
-            _get_anthropic_candidates_for_alias_snapshot_aware(
-                alias_model,
-                client_product_label=(
-                    _extract_auto_agent_alias_client_product_label(
-                        request,
-                        request_body,
-                    )
-                ),
-            )
+        extract_client_product_label=lambda *args, **kwargs: (
+            _extract_auto_agent_alias_client_product_label(*args, **kwargs)
+        ),
+        resolve_selection_enumeration=lambda *args, **kwargs: (
+            _resolve_aawm_alias_selection_enumeration(*args, **kwargs)
         ),
         get_active_cooldown_state=lambda *args, **kwargs: (
             _get_anthropic_auto_agent_active_cooldown_state(*args, **kwargs)
@@ -4057,9 +3990,6 @@ async def anthropic_proxy_route(  # noqa: PLR0915
     blocked_pass_through_prefixed_headers: Optional[list[str]] = None
     if request.method == "POST":
         request_body = await get_request_body(request)
-        _aawm_adapter_model_resolution._reject_retired_aawm_alias_model(
-            request_body.get("model")
-        )
         (
             prepared_request_body,
             expanded_count,
@@ -4078,6 +4008,7 @@ async def anthropic_proxy_route(  # noqa: PLR0915
         anthropic_auto_agent_alias = _resolve_anthropic_auto_agent_alias_model(
             prepared_request_body,
             endpoint=encoded_endpoint,
+            request=request,
         )
         if anthropic_auto_agent_alias is not None:
             (
@@ -4085,7 +4016,6 @@ async def anthropic_proxy_route(  # noqa: PLR0915
                 _anthropic_read_guidance_changes,
             ) = _apply_aawm_read_agent_guidance_to_request_body(
                 prepared_request_body,
-                alias_model=anthropic_auto_agent_alias,
                 target_field="system",
             )
             return await _handle_anthropic_auto_agent_alias_route(
@@ -4096,6 +4026,7 @@ async def anthropic_proxy_route(  # noqa: PLR0915
                 prepared_request_body=prepared_request_body,
                 target_url=str(updated_url),
                 custom_headers=custom_headers,
+                canonical_alias=anthropic_auto_agent_alias,
             )
 
         adapter_response = await try_dispatch_anthropic_adapter(
@@ -5478,10 +5409,6 @@ async def openai_proxy_route(
 
 _CODEX_AUTO_AGENT_ROUTE_RUNTIME = (
     _aawm_codex_auto_agent_route.CodexAutoAgentRouteRuntime(
-        normalize_alias_model_fn=lambda *args, **kwargs: (
-            _normalize_codex_auto_agent_alias_model(*args, **kwargs)
-        ),
-        default_alias_model=_CODEX_AUTO_AGENT_MODEL_ALIAS,
         extract_client_product_label_fn=lambda *args, **kwargs: (
             _extract_auto_agent_alias_client_product_label(*args, **kwargs)
         ),
@@ -5943,9 +5870,6 @@ _aawm_alias_guidance.configure_alias_guidance_runtime(
 )
 _append_codex_auto_agent_prevention_guidance_to_instructions = (
     _aawm_alias_guidance._append_codex_auto_agent_prevention_guidance_to_instructions
-)
-_is_aawm_read_agent_alias_model = (
-    _aawm_alias_guidance._is_aawm_read_agent_alias_model
 )
 _append_aawm_read_agent_guidance_to_text = (
     _aawm_alias_guidance._append_aawm_read_agent_guidance_to_text

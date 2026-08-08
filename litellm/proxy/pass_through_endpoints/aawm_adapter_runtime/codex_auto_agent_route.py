@@ -48,10 +48,6 @@ class CodexAutoAgentRouteRuntime:
     is never imported at module scope.
     """
 
-    # Model normalization
-    normalize_alias_model_fn: Callable[[Any], Optional[str]]
-    default_alias_model: str
-
     # Client product label extraction
     extract_client_product_label_fn: Callable[
         ["Request", "dict[str, Any]"], Optional[str]
@@ -92,16 +88,14 @@ async def handle_codex_auto_agent_alias_route(
     target_url: str,
     api_key: Optional[str],
     forward_headers: bool,
+    canonical_alias: str,
 ) -> "Response":
     """Handle a Codex auto-agent alias route request.
 
     Exact behavioral equivalent of the god-module
     ``_handle_codex_auto_agent_alias_route`` (lines 8915-8977).
     """
-    alias_model = (
-        runtime.normalize_alias_model_fn(prepared_request_body.get("model"))
-        or runtime.default_alias_model
-    )
+    alias_model = canonical_alias
     client_product_label = runtime.extract_client_product_label_fn(
         request, prepared_request_body
     )
@@ -143,6 +137,7 @@ async def handle_codex_auto_agent_alias_route(
             runtime.resolve_selection_enumeration_fn(
                 request,
                 alias_model,
+                ingress="codex",
                 client_product_label=client_product_label,
             ).candidates
         ),
@@ -170,8 +165,6 @@ def build_runtime_from_host() -> CodexAutoAgentRouteRuntime:
     )
 
     return CodexAutoAgentRouteRuntime(
-        normalize_alias_model_fn=_host._normalize_codex_auto_agent_alias_model,
-        default_alias_model=_host._CODEX_AUTO_AGENT_MODEL_ALIAS,
         extract_client_product_label_fn=_host._extract_auto_agent_alias_client_product_label,
         perform_candidate_request_fn=_host._perform_codex_auto_agent_alias_candidate_request,
         select_candidate_fn=_host._select_codex_auto_agent_candidate,

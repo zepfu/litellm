@@ -1,6 +1,6 @@
 """Wave 5B shared selection unit tests.
 
-Proves fresh-manager selection, manager-only reset of gate/cursor/quota,
+Proves fresh-manager selection, manager-only reset of evidence/cursor/quota,
 quota lock identity, map identity, facade identity, import boundaries,
 non-overlap with Waves 4/5A, Codex/Anthropic selector parity,
 provider-lane parity, and route/upstream contracts.
@@ -66,9 +66,14 @@ class TestFreshManagerSelection:
         assert len(mgr.codex.session_affinity_by_key) == 0
         assert len(mgr.anthropic.session_affinity_by_key) == 0
 
-    def test_fresh_manager_has_empty_gate_and_cursor(self):
+    def test_fresh_manager_has_empty_failure_evidence_and_cursor(self):
         mgr = AliasRoutingStateManager()
-        assert len(mgr.basic_pilot_gate._key_state) == 0
+        assert (
+            mgr.codex_failure_evidence_gate.gate_for_alias(
+                canonical_alias="test-alias"
+            )
+            is None
+        )
         assert len(mgr.round_robin_cursor) == 0
 
     def test_fresh_manager_quota_cache_default(self):
@@ -82,15 +87,26 @@ class TestFreshManagerSelection:
 
 
 class TestManagerOnlyReset:
-    """reset_for_tests clears gate/cursor/quota without reassignment."""
+    """reset_for_tests clears evidence/cursor/quota without reassignment."""
 
     def test_reset_clears_gate_cursor_quota(self):
         mgr = AliasRoutingStateManager()
-        mgr.basic_pilot_gate._key_state["k"] = {"count": 1}
+        evidence_gate = mgr.codex_failure_evidence_gate.gate_for_alias(
+            canonical_alias="test-alias",
+            create=True,
+        )
+        assert evidence_gate is not None
+        evidence_gate._key_state["k"] = {"count": 1}
         mgr.round_robin_cursor[("e", "a")] = 3
         mgr.set_openrouter_free_quota_cache((5.0, 10.0))
         mgr.reset_for_tests()
-        assert len(mgr.basic_pilot_gate._key_state) == 0
+        assert not evidence_gate._key_state
+        assert (
+            mgr.codex_failure_evidence_gate.gate_for_alias(
+                canonical_alias="test-alias"
+            )
+            is None
+        )
         assert len(mgr.round_robin_cursor) == 0
         assert mgr.get_openrouter_free_quota_cache() == (None, 0.0)
 
@@ -98,13 +114,11 @@ class TestManagerOnlyReset:
         mgr = AliasRoutingStateManager()
         refs = {
             "cursor": mgr.round_robin_cursor,
-            "gate_ks": mgr.basic_pilot_gate._key_state,
             "codex_cd": mgr.codex.cooldown_until_monotonic_by_key,
             "anthro_cd": mgr.anthropic.cooldown_until_monotonic_by_key,
         }
         mgr.reset_for_tests()
         assert mgr.round_robin_cursor is refs["cursor"]
-        assert mgr.basic_pilot_gate._key_state is refs["gate_ks"]
         assert mgr.codex.cooldown_until_monotonic_by_key is refs["codex_cd"]
         assert mgr.anthropic.cooldown_until_monotonic_by_key is refs["anthro_cd"]
 

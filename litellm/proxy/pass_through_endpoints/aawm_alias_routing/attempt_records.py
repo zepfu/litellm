@@ -5,8 +5,8 @@ relocation only; no logic changes.
 
 Dependencies on the god module are injected via :func:`configure_attempt_records_runtime`.
 Signal helpers are consumed from ``error_signals.py`` through explicit seams.
-Direct imports from sibling Wave 4/5 modules (``lane_keys``, ``policy``) are
-used where those modules own the symbols.
+Direct imports from sibling Wave 4/5 modules are used where those modules own
+the symbols.
 """
 
 from __future__ import annotations
@@ -17,10 +17,6 @@ from typing import Any, Callable, Mapping, Optional
 from fastapi import Request
 
 from .lane_keys import _CODEX_REASONING_EFFORT_TIER_INDEX
-from .policy import (
-    ANTHROPIC_AUTO_AGENT_MODEL_ALIAS as _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS,
-    CODEX_AUTO_AGENT_MODEL_ALIAS as _CODEX_AUTO_AGENT_MODEL_ALIAS,
-)
 
 # ---------------------------------------------------------------------------
 # Injected runtime seams (god-module / error_signals / classification / state)
@@ -52,8 +48,6 @@ _aawm_alias_route_verbose_json_enabled: Callable[[], bool] = _default_verbose_js
 _aawm_alias_route_healthy_json_enabled: Callable[[], bool] = _default_healthy_json_enabled
 _merge_litellm_metadata: Optional[Callable[..., dict[str, Any]]] = None
 _normalize_low_cardinality_tag_value: Optional[Callable[..., Optional[str]]] = None
-_normalize_codex_auto_agent_alias_model: Optional[Callable[..., Optional[str]]] = None
-_normalize_anthropic_auto_agent_alias_model: Optional[Callable[..., Optional[str]]] = None
 _load_bundled_model_cost_map_for_codex_policy: Optional[Callable[[], dict[str, Any]]] = None
 
 # --- model catalog seams ---
@@ -61,9 +55,9 @@ _get_model_info: Optional[Callable[..., Any]] = None
 _model_cost: Optional[dict[str, Any]] = None
 _openai_provider_value: Optional[str] = None
 
-# --- classification / basic-pilot gate seams ---
+# --- classification / Codex failure-evidence seams ---
 _classify_failure: Optional[Callable[..., Any]] = None
-_basic_pilot_gate_record: Optional[Callable[..., Any]] = None
+_codex_failure_evidence_gate_record: Optional[Callable[..., Any]] = None
 
 
 # Reference to host_globals set by install(); configure updates it too.
@@ -85,14 +79,12 @@ _RUNTIME_STATE_NAMES = (
     "_aawm_alias_route_healthy_json_enabled",
     "_merge_litellm_metadata",
     "_normalize_low_cardinality_tag_value",
-    "_normalize_codex_auto_agent_alias_model",
-    "_normalize_anthropic_auto_agent_alias_model",
     "_load_bundled_model_cost_map_for_codex_policy",
     "_get_model_info",
     "_model_cost",
     "_openai_provider_value",
     "_classify_failure",
-    "_basic_pilot_gate_record",
+    "_codex_failure_evidence_gate_record",
 )
 _runtime_restore_stacks: dict[str, list[tuple[object, object, object]]] = {}
 
@@ -133,16 +125,14 @@ def configure_attempt_records_runtime(  # noqa: PLR0915
     healthy_json_enabled: Optional[Callable[[], bool]] = None,
     merge_metadata: Callable[..., dict[str, Any]],
     normalize_tag_value: Callable[..., Optional[str]],
-    normalize_codex_alias_model: Callable[..., Optional[str]],
-    normalize_anthropic_alias_model: Callable[..., Optional[str]],
     load_bundled_model_cost: Callable[[], dict[str, Any]],
     # model catalog
     get_model_info: Callable[..., Any],
     model_cost: dict[str, Any],
     openai_provider_value: str,
-    # classification / basic-pilot
+    # classification / Codex failure evidence
     classify_failure: Callable[..., Any],
-    basic_pilot_gate_record: Callable[..., Any],
+    codex_failure_evidence_gate_record: Callable[..., Any],
 
 
 ) -> None:
@@ -182,10 +172,6 @@ def configure_attempt_records_runtime(  # noqa: PLR0915
     _merge_litellm_metadata = merge_metadata
     global _normalize_low_cardinality_tag_value
     _normalize_low_cardinality_tag_value = normalize_tag_value
-    global _normalize_codex_auto_agent_alias_model
-    _normalize_codex_auto_agent_alias_model = normalize_codex_alias_model
-    global _normalize_anthropic_auto_agent_alias_model
-    _normalize_anthropic_auto_agent_alias_model = normalize_anthropic_alias_model
     global _load_bundled_model_cost_map_for_codex_policy
     _load_bundled_model_cost_map_for_codex_policy = load_bundled_model_cost
     global _get_model_info
@@ -196,8 +182,8 @@ def configure_attempt_records_runtime(  # noqa: PLR0915
     _openai_provider_value = openai_provider_value
     global _classify_failure
     _classify_failure = classify_failure
-    global _basic_pilot_gate_record
-    _basic_pilot_gate_record = basic_pilot_gate_record
+    global _codex_failure_evidence_gate_record
+    _codex_failure_evidence_gate_record = codex_failure_evidence_gate_record
     # If install() has been called, also update host_globals so configured
     # callbacks remain live for facades published there.
     _mod = globals()
@@ -218,8 +204,8 @@ def _update_codex_auto_agent_retryable_attempt_record(
     exc: Any,
     error_class: str,
     cooldown_seconds: float,
+    alias_model: str,
     cooldown_scope: Optional[str] = None,
-    alias_model: Optional[str] = None,
     candidate: Optional[dict[str, Any]] = None,
     kimi_failure_metadata: Optional[dict[str, Any]] = None,
 ) -> set[str]:
@@ -257,7 +243,7 @@ def _update_codex_auto_agent_retryable_attempt_record(
         update["error_code"] = str(error_code)
     if retry_after_seconds is not None:
         update["retry_after_seconds"] = round(float(retry_after_seconds), 3)
-    if alias_model is not None and candidate is not None and kimi_failure_metadata is not None:
+    if candidate is not None and kimi_failure_metadata is not None:
         assert _build_safe_kimi_code_selection_telemetry is not None
         update["kimi_code_failure"] = _build_safe_kimi_code_selection_telemetry(
             alias_model=alias_model,
@@ -312,26 +298,27 @@ def _record_auto_agent_alias_attempt_started(
 
 
 # ---------------------------------------------------------------------------
-# Basic-pilot evidence (exactly-once per event)
+# Codex failure evidence (exactly-once per event)
 # ---------------------------------------------------------------------------
 
 
-def _record_basic_pilot_cooldown_evidence(
+def _record_codex_failure_evidence(
     *,
-    cooldown_key: Optional[str],
+    canonical_alias: str,
+    cooldown_key: str,
     exc: Any,
     attempt_record: dict[str, Any],
 ) -> None:
-    """Classify + record the CURRENT basic-pilot attempt's failure evidence.
+    """Classify and record the current Codex alias failure evidence.
 
     Called from the retry loop BEFORE the cooldown is applied for the same
     attempt, so a structured failure cools immediately (N=1) and a marker
     failure counts toward its N-of-M threshold on this attempt. The evidence
-    is keyed on the live ``provider:model:lane`` cooldown key so the gate and
-    the applied cooldown share one authoritative key. Classification inputs
-    (status code, source-error text, retry-after) are extracted directly from
-    the raised exception rather than the post-apply attempt record, because
-    those record fields are not populated until after the cooldown decision.
+    is attached to the caller-provided configured alias and exact selected
+    cooldown key. Classification inputs (status code, source-error text,
+    retry-after) are extracted directly from the raised exception rather than
+    the post-apply attempt record, because those record fields are not
+    populated until after the cooldown decision.
 
     ``origin`` (upstream/client/unknown; only ``upstream`` ever advances a key
     toward cooling) is stamped on the attempt record for downstream audit.
@@ -340,7 +327,11 @@ def _record_basic_pilot_cooldown_evidence(
     assert _get_codex_auto_agent_source_error_summary is not None
     assert _parse_codex_auto_agent_header_wait_seconds is not None
     assert _classify_failure is not None
-    assert _basic_pilot_gate_record is not None
+    assert _codex_failure_evidence_gate_record is not None
+    if not canonical_alias or canonical_alias.strip() != canonical_alias:
+        raise ValueError("canonical_alias must be an explicit non-empty alias")
+    if not cooldown_key:
+        raise ValueError("cooldown_key must be an explicit non-empty key")
 
     error_status_code = _extract_exception_status_code(exc)
     source_error = _get_codex_auto_agent_source_error_summary(exc, status_code=error_status_code)
@@ -352,8 +343,9 @@ def _record_basic_pilot_cooldown_evidence(
         retry_after_seconds=retry_after_seconds,
     )
     attempt_record["origin"] = event.origin
-    _basic_pilot_gate_record(
-        cooldown_key=cooldown_key or "basic_pilot:unknown",
+    _codex_failure_evidence_gate_record(
+        canonical_alias=canonical_alias,
+        cooldown_key=cooldown_key,
         event=event,
     )
 
@@ -381,8 +373,8 @@ def _record_auto_agent_alias_attempt_failure(
     assert _emit_auto_agent_alias_route_event is not None
     assert _persist_auto_agent_alias_audit_only_events_best_effort is not None
 
-    # Basic-pilot cooldown evidence is recorded in the retry loop BEFORE the
-    # cooldown is applied (see ``_record_basic_pilot_cooldown_evidence``), so it
+    # Codex failure evidence is recorded in the retry loop BEFORE the cooldown
+    # is applied (see ``_record_codex_failure_evidence``), so it
     # is intentionally NOT re-recorded here -- doing so would double-count
     # marker evidence and double-advance the structured attempt counter.
     failure_body = add_alias_metadata_fn(
@@ -611,6 +603,17 @@ def _normalize_codex_reasoning_effort_for_resolved_route(
 # ---------------------------------------------------------------------------
 
 
+def _require_selection_alias_model(selection: dict[str, Any]) -> str:
+    alias_model = selection.get("alias_model")
+    if (
+        not isinstance(alias_model, str)
+        or not alias_model
+        or alias_model.strip() != alias_model
+    ):
+        raise ValueError("selection must contain an explicit canonical alias_model")
+    return alias_model
+
+
 def _add_codex_auto_agent_alias_metadata(
     request_body: dict[str, Any],
     *,
@@ -618,17 +621,12 @@ def _add_codex_auto_agent_alias_metadata(
     selection: dict[str, Any],
     attempts: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    assert _normalize_codex_auto_agent_alias_model is not None
     assert _normalize_low_cardinality_tag_value is not None
     assert _merge_litellm_metadata is not None
     assert _build_auto_agent_alias_audit_events is not None
 
     candidate = selection["candidate"]
-    alias_model = (
-        selection.get("alias_model")
-        or _normalize_codex_auto_agent_alias_model(request_body.get("model"))
-        or _CODEX_AUTO_AGENT_MODEL_ALIAS
-    )
+    alias_model = _require_selection_alias_model(selection)
     target_model = candidate["model"]
     updated_body = copy.deepcopy(request_body)
     updated_body["model"] = target_model
@@ -752,17 +750,12 @@ def _add_anthropic_auto_agent_alias_metadata(
     selection: dict[str, Any],
     attempts: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    assert _normalize_anthropic_auto_agent_alias_model is not None
     assert _normalize_low_cardinality_tag_value is not None
     assert _merge_litellm_metadata is not None
     assert _build_auto_agent_alias_audit_events is not None
 
     candidate = selection["candidate"]
-    alias_model = (
-        selection.get("alias_model")
-        or _normalize_anthropic_auto_agent_alias_model(request_body.get("model"))
-        or _ANTHROPIC_AUTO_AGENT_MODEL_ALIAS
-    )
+    alias_model = _require_selection_alias_model(selection)
     target_model = candidate["model"]
     updated_body = copy.deepcopy(request_body)
     updated_body["model"] = target_model
@@ -864,7 +857,7 @@ def _add_anthropic_auto_agent_alias_metadata(
 _HOST_FUNCTION_NAMES = (
     "_update_codex_auto_agent_retryable_attempt_record",
     "_record_auto_agent_alias_attempt_started",
-    "_record_basic_pilot_cooldown_evidence",
+    "_record_codex_failure_evidence",
     "_record_auto_agent_alias_attempt_failure",
     "_extract_codex_reasoning_effort",
     "_get_codex_reasoning_effort_ceiling",
