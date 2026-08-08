@@ -204,6 +204,24 @@ class TestScanInventory:
         assert root_dir.relative_name == "."
         assert root_dir.child_names == ("a.yaml", "b.yaml")
 
+    def test_pycache_directory_compiles_and_activates(self, tmp_path: Path) -> None:
+        """Regression: a generated __pycache__/*.pyc tree is package
+        infrastructure and must not fail closed (live readiness 503 defect:
+        site-packages DEFAULT_CONFIG_DIR contained __pycache__/__init__.*.pyc)."""
+        _write_alias_yaml(tmp_path, "basic.yaml", "basic")
+        pycache = tmp_path / "__pycache__"
+        pycache.mkdir()
+        (pycache / "__init__.cpython-313.pyc").write_bytes(b"\x00compiled\x00")
+
+        snapshot = compile_directory(tmp_path)
+        assert "basic" in snapshot.aliases
+
+        activate_alias_config_directory(tmp_path)
+        assert is_startup_healthy()
+        status = get_startup_status()
+        assert status["state"] == "active"
+        assert status["files"] == ["basic.yaml"]
+
 
 # ---------------------------------------------------------------------------
 # Compile directory

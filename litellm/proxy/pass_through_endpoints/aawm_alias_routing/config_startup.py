@@ -196,6 +196,8 @@ def _scan_inventory(config_dir: Path) -> _ConfigInventory:  # noqa: PLR0915
     - Unreadable nested directories are rejected.
     - Only lowercase ``.yaml`` / ``.yml`` regular files are accepted.
     - ``__init__.py`` is silently ignored (package infrastructure).
+    - The exact ``__pycache__`` directory is silently ignored (package
+      infrastructure); its contents are never inventoried.
     - Any other regular file is rejected (fail closed).
     """
     if config_dir.is_symlink():
@@ -264,6 +266,11 @@ def _scan_inventory(config_dir: Path) -> _ConfigInventory:  # noqa: PLR0915
                         raise ConfigDirectoryError(
                             f"directory with YAML suffix not allowed: {child_rel}"
                         )
+                    if name == "__pycache__":
+                        # Python bytecode cache: package infrastructure, not
+                        # config content.  Skip without recursing so generated
+                        # ``*.pyc`` files never reach the inventory.
+                        continue
                     try:
                         child_fd = os.open(
                             name,
