@@ -1100,9 +1100,13 @@ class TestDevReadOnlyMount:
         assert "./litellm/proxy/aawm_alias_config:/app/litellm/proxy/aawm_alias_config:ro" in content
 
     def test_compose_has_read_only_alias_routing_mount(self) -> None:
-        """docker-compose.dev.yml mounts aawm_alias_routing package as :ro."""
+        """docker-compose.dev.yml mounts alias routing dependencies as :ro."""
         compose_path = Path(__file__).resolve().parents[4] / "docker-compose.dev.yml"
         if not compose_path.exists():
             pytest.skip("docker-compose.dev.yml not found")
         content = compose_path.read_text(encoding="utf-8")
         assert "aawm_alias_routing:/app/litellm/proxy/pass_through_endpoints/aawm_alias_routing:ro" in content
+        assert (
+            "./litellm/secret_managers/codex_oauth_inventory.py:"
+            "/app/litellm/secret_managers/codex_oauth_inventory.py:ro"
+        ) in content

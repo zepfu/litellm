@@ -91,6 +91,7 @@ services:
       - ./litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py:/app/litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py
       - ./litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py:/app/litellm/proxy/pass_through_endpoints/llm_passthrough_endpoints.py
       - ./litellm/proxy/pass_through_endpoints/aawm_alias_routing:/app/litellm/proxy/pass_through_endpoints/aawm_alias_routing:ro
+      - ./litellm/secret_managers/codex_oauth_inventory.py:/app/litellm/secret_managers/codex_oauth_inventory.py:ro
       # CFG-010: keep the complete aawm_adapter_runtime package coherent with
       # the bind-mounted llm_passthrough_endpoints.py during development.
       - ./litellm/proxy/pass_through_endpoints/aawm_adapter_runtime:/app/litellm/proxy/pass_through_endpoints/aawm_adapter_runtime:ro
