@@ -1122,3 +1122,9 @@ class TestDevReadOnlyMount:
             "./litellm/proxy/pass_through_endpoints/aawm_context_query.py:"
             "/app/litellm/proxy/pass_through_endpoints/aawm_context_query.py:ro"
         ) in content
+        assert (
+            "./litellm/proxy/pass_through_endpoints/aawm_request_policy/"
+            "claude_prompt_replacement.py:/app/litellm/proxy/"
+            "pass_through_endpoints/aawm_request_policy/"
+            "claude_prompt_replacement.py:ro"
+        ) in content
