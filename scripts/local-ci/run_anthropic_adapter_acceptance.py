@@ -1435,9 +1435,23 @@ def _resolve_expected_session_history_tenant_id(
 ) -> str:
     if _is_harness_tenant_alias(tenant_id):
         if isinstance(repository, str) and repository.strip():
-            # AAWM records Codex traces/session history under the basename
+            # Session-history tenant fields keep the full owner/repository
+            # identity returned by _resolve_harness_repository.
+            return repository.strip()
+        return 'litellm'
+    return tenant_id
+
+
+def _resolve_expected_trace_user_id(
+    tenant_id: str,
+    *,
+    repository: str | None = None,
+) -> str:
+    if _is_harness_tenant_alias(tenant_id):
+        if isinstance(repository, str) and repository.strip():
+            # Langfuse records Codex harness traces under the basename
             # repository label (e.g. "litellm"), not the full
-            # "owner/repository" form returned by _resolve_harness_repository.
+            # "owner/repository" form used for session-history tenants.
             return repository.strip().rsplit('/', 1)[-1]
         return 'litellm'
     return tenant_id
@@ -1666,13 +1680,13 @@ def _ensure_cli_harness_context(
         updated['require_trace_user_id'] = False
     elif cli_kind == 'codex':
         # AAWM maps harness/validation tenant aliases to the repository
-        # identity for Codex traces/session history, so the expected trace
-        # user id must match the same repository-resolved tenant identity
-        # used for session-history validation.  The emitted headers and
-        # session ID still carry the transient harness user ID.  For
-        # non-harness explicit tenant IDs the explicit tenant is preserved.
+        # basename label for Langfuse trace user ids (e.g. "litellm"),
+        # while session-history tenant fields keep the full repository
+        # identity.  The emitted headers and session ID still carry the
+        # transient harness user ID.  For non-harness explicit tenant IDs
+        # the explicit tenant is preserved.
         updated['expected_user_ids'] = [
-            _resolve_expected_session_history_tenant_id(
+            _resolve_expected_trace_user_id(
                 tenant_id,
                 repository=repository,
             )

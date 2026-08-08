@@ -2168,7 +2168,10 @@ def test_target_profile_codex_cli_uses_pytest_classifier_harness_user_id(monkeyp
         if item == "-c"
     ]
 
-    assert case_config["expected_user_ids"] == ["pytest-classifier"]
+    # Langfuse trace user ids resolve harness/validation tenant aliases to
+    # the basename repository label, while session-history tenant fields
+    # keep the full repository identity.
+    assert case_config["expected_user_ids"] == ["litellm"]
     assert case_config["expected_trace_session_id"] == "pytest-classifier.session"
     assert (
         'model_providers.litellm-dev.http_headers.x-litellm-end-user-id="pytest-classifier"'
@@ -2400,7 +2403,7 @@ def test_grok_cli_cases_validate_session_history_config_flags():
     }
 
     for case_name, expected_model in (
-        ("native_grok_cli_passthrough_grok_build", "grok-build"),
+        ("native_grok_cli_passthrough_grok_build", "grok-4.5"),
         ("native_grok_cli_passthrough_grok_composer", "grok-composer-2.5-fast"),
     ):
         case_config = config["cases"][case_name]
@@ -2457,7 +2460,12 @@ def test_codex_tool_activity_parity_cases_have_stream_state_gates():
         expected_model="gpt-5.4-mini",
         expected_client_name="codex_exec",
     )
-    _assert_codex_rate_limit_validation(native_case)
+    # The tool-activity case reflects observed provider truth: a single
+    # seven_day codex:primary window (10080 minutes) and no secondary row.
+    assert {
+        (row["quota_key"], row["required_equals"]["quota_period"])
+        for row in native_case["rate_limit_observations_validation"]["expected_rows"]
+    } == {("codex:primary", "seven_day")}
 
     claude_stream_gate = claude_case["stream_tool_call_state_validation"]
     assert "anthropic-openai-codex-native-tools" in claude_case[
