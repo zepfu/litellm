@@ -642,6 +642,16 @@ _get_codex_auth_token_expiry = _aawm_codex_oauth._get_codex_auth_token_expiry
 _codex_auth_access_token_is_valid = _aawm_codex_oauth._codex_auth_access_token_is_valid
 _load_codex_auth_data_from_path = _aawm_codex_oauth._load_codex_auth_data_from_path
 _load_local_codex_auth_headers = _aawm_codex_oauth._load_local_codex_auth_headers
+_bind_codex_oauth_candidate_to_request = (
+    _aawm_codex_oauth._bind_codex_oauth_candidate_to_request
+)
+_get_bound_codex_oauth_candidate_identity = (
+    _aawm_codex_oauth._get_bound_codex_oauth_candidate_identity
+)
+_load_bound_codex_oauth_auth = _aawm_codex_oauth._load_bound_codex_oauth_auth
+_codex_oauth_responses_target_url = (
+    _aawm_codex_oauth._codex_oauth_responses_target_url
+)
 _anthropic_adapter_request_uses_codex_native_auth = _aawm_codex_oauth._anthropic_adapter_request_uses_codex_native_auth
 _anthropic_adapter_request_has_openai_client_auth = _aawm_codex_oauth._anthropic_adapter_request_has_openai_client_auth
 _anthropic_adapter_should_forward_direct_auth_headers = _aawm_codex_oauth._anthropic_adapter_should_forward_direct_auth_headers
@@ -5529,11 +5539,20 @@ async def openai_proxy_route(
     request_body: dict[str, Any] = {}
     is_oa_xai_request = False
     is_grok_native_oauth_request = False
+    is_codex_auto_agent_alias_request = False
     if request.method == "POST":
         request_body = await get_request_body(request)
         is_oa_xai_request = _is_oa_xai_request_body(request_body)
         is_grok_native_oauth_request = _is_openai_responses_endpoint(endpoint) and _is_grok_native_oauth_request_body(
             request_body
+        )
+        is_codex_auto_agent_alias_request = (
+            _resolve_codex_auto_agent_alias_model(
+                request_body,
+                endpoint,
+                request=request,
+            )
+            is not None
         )
 
     base_target_url = _get_openai_passthrough_target_base(
@@ -5550,6 +5569,8 @@ async def openai_proxy_route(
         base_target_url = os.getenv("LITELLM_XAI_OAUTH_API_BASE") or XAI_API_BASE
     elif is_grok_native_oauth_request:
         base_target_url = _get_grok_passthrough_target_base()
+    elif is_codex_auto_agent_alias_request:
+        base_target_url = os.getenv("CHATGPT_API_BASE") or CHATGPT_API_BASE
     elif preserve_client_auth:
         forward_headers = True
     else:

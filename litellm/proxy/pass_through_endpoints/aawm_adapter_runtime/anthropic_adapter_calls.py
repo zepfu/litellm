@@ -853,6 +853,20 @@ def _get_anthropic_adapter_openrouter_target_base() -> str:
 async def _resolve_anthropic_openai_responses_adapter_auth_context(
     request: Request,
 ) -> tuple[dict[str, Any], bool, bool, Optional[str]]:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
+        _get_bound_codex_oauth_candidate_identity,
+        _load_bound_codex_oauth_auth,
+    )
+
+    if _get_bound_codex_oauth_candidate_identity(request) is not None:
+        selected_auth = await _load_bound_codex_oauth_auth(request)
+        return (
+            selected_auth.headers,
+            False,
+            True,
+            "openai",
+        )
+
     local_codex_headers = None
     has_client_auth = _anthropic_adapter_request_has_openai_client_auth(request)  # noqa: F821
     uses_codex_native_auth = _anthropic_adapter_request_uses_codex_native_auth(request)  # noqa: F821

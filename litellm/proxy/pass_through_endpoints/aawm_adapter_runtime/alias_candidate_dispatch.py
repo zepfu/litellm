@@ -222,6 +222,11 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(
             "alias_candidate_dispatch runtime not installed; "
             "call install() with AliasCandidateDispatchRuntime before use"
         )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
+        _bind_codex_oauth_candidate_to_request,
+    )
+
+    _bind_codex_oauth_candidate_to_request(request, candidate)
     rt = _runtime
     adapter_model = candidate["model"]
 

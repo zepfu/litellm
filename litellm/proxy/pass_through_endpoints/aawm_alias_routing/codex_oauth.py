@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,7 +18,10 @@ from typing import Any, Callable, Optional
 import httpx
 from fastapi import HTTPException, Request
 
-from litellm.llms.chatgpt.common_utils import get_chatgpt_default_headers
+from litellm.llms.chatgpt.common_utils import (
+    CHATGPT_API_BASE,
+    get_chatgpt_default_headers,
+)
 from litellm.proxy.common_utils.http_parsing_utils import _safe_get_request_headers
 from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialRecord,
@@ -175,7 +179,97 @@ class CodexOAuthRequestAuth:
 
     account_label: str
     account_hash: str
+    lane_key: str
     headers: dict[str, str] = field(repr=False)
+
+
+def _codex_oauth_account_lane_key(
+    *,
+    account_label: str,
+    account_hash: str,
+) -> str:
+    """Return a server-owned, secret-safe lane for one configured account."""
+    return f"codex-oauth:{account_label}:{account_hash}"
+
+
+def _codex_oauth_candidate_identity(
+    candidate: dict[str, Any],
+) -> Optional[dict[str, str]]:
+    """Return the safe selected-account identity carried by a candidate."""
+    account_label = _clean_codex_auth_value(
+        candidate.get("codex_oauth_account_label")
+    )
+    account_hash = _clean_codex_auth_value(
+        candidate.get("codex_oauth_account_hash")
+    )
+    lane_key = _clean_codex_auth_value(candidate.get("codex_oauth_lane_key"))
+    present_count = sum(
+        value is not None for value in (account_label, account_hash, lane_key)
+    )
+    if present_count == 0:
+        return None
+    if present_count != 3:
+        raise HTTPException(
+            status_code=500,
+            detail="Selected Codex OAuth account context is incomplete.",
+        )
+    assert account_label is not None
+    assert account_hash is not None
+    assert lane_key is not None
+    expected_lane = _codex_oauth_account_lane_key(
+        account_label=account_label,
+        account_hash=account_hash,
+    )
+    if lane_key != expected_lane:
+        raise HTTPException(
+            status_code=500,
+            detail="Selected Codex OAuth account lane is invalid.",
+        )
+    return {
+        "account_label": account_label,
+        "account_hash": account_hash,
+        "lane_key": lane_key,
+    }
+
+
+def _bind_codex_oauth_candidate_to_request(
+    request: Request,
+    candidate: dict[str, Any],
+) -> Optional[dict[str, str]]:
+    """Bind only the safe selected-account identity to this request."""
+    identity = _codex_oauth_candidate_identity(candidate)
+    if identity is None:
+        setattr(request.state, "aawm_codex_oauth_selected_account", None)
+        return None
+    bound = {
+        **identity,
+        "model": str(candidate.get("model") or ""),
+    }
+    setattr(request.state, "aawm_codex_oauth_selected_account", bound)
+    return dict(bound)
+
+
+def _get_bound_codex_oauth_candidate_identity(
+    request: Request,
+) -> Optional[dict[str, str]]:
+    bound = getattr(request.state, "aawm_codex_oauth_selected_account", None)
+    if not isinstance(bound, dict):
+        return None
+    candidate = {
+        "codex_oauth_account_label": bound.get("account_label"),
+        "codex_oauth_account_hash": bound.get("account_hash"),
+        "codex_oauth_lane_key": bound.get("lane_key"),
+    }
+    identity = _codex_oauth_candidate_identity(candidate)
+    if identity is None:
+        return None
+    identity["model"] = str(bound.get("model") or "")
+    return identity
+
+
+def _codex_oauth_responses_target_url() -> str:
+    """Return the OAuth-only ChatGPT Codex Responses target."""
+    return f"{(os.getenv('CHATGPT_API_BASE') or CHATGPT_API_BASE).rstrip('/')}/responses"
 
 
 def _codex_oauth_credential_snapshot_is_valid(
@@ -219,6 +313,10 @@ async def _load_codex_oauth_headers_for_record(
     return CodexOAuthRequestAuth(
         account_label=record.label,
         account_hash=credential.account_hash,
+        lane_key=_codex_oauth_account_lane_key(
+            account_label=record.label,
+            account_hash=credential.account_hash,
+        ),
         headers=get_chatgpt_default_headers(
             access_token=credential.access_token,
             account_id=credential.account_id,
@@ -240,6 +338,73 @@ async def _load_local_codex_auth_selection(
     except CodexOAuthInventoryError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from None
     return await _load_codex_oauth_headers_for_record(request, record)
+
+
+async def _load_bound_codex_oauth_auth(
+    request: Request,
+) -> CodexOAuthRequestAuth:
+    """Load exactly the server-selected account or fail closed without secrets."""
+    identity = _get_bound_codex_oauth_candidate_identity(request)
+    if identity is None:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "message": (
+                        "Codex OAuth dispatch requires a server-selected "
+                        "configured account."
+                    ),
+                    "type": "rate_limit_error",
+                    "code": "aawm_codex_auto_agent_candidate_unavailable",
+                },
+                "failure_phase": "pre_dispatch_auth",
+                "attempted_provider_call": False,
+            },
+        )
+    try:
+        selection = await _load_local_codex_auth_selection(
+            request,
+            account_label=identity["account_label"],
+            model=identity["model"] or None,
+        )
+    except HTTPException:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "message": (
+                        "Selected Codex OAuth account is not currently "
+                        "authentication-ready."
+                    ),
+                    "type": "rate_limit_error",
+                    "code": "aawm_codex_auto_agent_candidate_unavailable",
+                },
+                "account": identity,
+                "failure_phase": "pre_dispatch_auth",
+                "attempted_provider_call": False,
+            },
+        ) from None
+    if (
+        selection.account_hash != identity["account_hash"]
+        or selection.lane_key != identity["lane_key"]
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "message": (
+                        "Selected Codex OAuth account identity changed before "
+                        "dispatch."
+                    ),
+                    "type": "rate_limit_error",
+                    "code": "aawm_codex_auto_agent_candidate_unavailable",
+                },
+                "account": identity,
+                "failure_phase": "pre_dispatch_auth",
+                "attempted_provider_call": False,
+            },
+        )
+    return selection
 
 
 async def _load_local_codex_auth_headers(request: Request) -> dict[str, str]:

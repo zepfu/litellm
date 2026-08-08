@@ -73,6 +73,14 @@ def hydrate_affinity_memory(
             "last_resort": bool(payload.get("last_resort")),
             "expires_at_monotonic": float("inf"),
         }
+        for field in (
+            "codex_oauth_account_label",
+            "codex_oauth_account_hash",
+            "codex_oauth_lane_key",
+        ):
+            value = payload.get(field)
+            if isinstance(value, str) and value:
+                affinity[field] = value
         memory_map[session_key] = affinity
         bound_memory_map(memory_map, max_size=max_size)
         return dict(affinity)
@@ -86,6 +94,14 @@ def hydrate_affinity_memory(
         "last_resort": bool(payload.get("last_resort")),
         "expires_at_monotonic": time.monotonic() + remaining,
     }
+    for field in (
+        "codex_oauth_account_label",
+        "codex_oauth_account_hash",
+        "codex_oauth_lane_key",
+    ):
+        value = payload.get(field)
+        if isinstance(value, str) and value:
+            affinity[field] = value
     # Do not clobber a fresher in-memory affinity written while Redis read ran.
     existing = memory_map.get(session_key)
     if isinstance(existing, dict):

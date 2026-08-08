@@ -283,6 +283,11 @@ async def _perform_codex_auto_agent_alias_candidate_request(
     api_key: Optional[str],
     forward_headers: bool,
 ) -> Response:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
+        _bind_codex_oauth_candidate_to_request,
+    )
+
+    _bind_codex_oauth_candidate_to_request(request, candidate)
     adapter_model = candidate["model"]
 
     async def _openrouter_completion() -> Response:
@@ -353,14 +358,21 @@ async def _perform_codex_auto_agent_alias_candidate_request(
         )
 
     async def _native() -> Response:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
+            _codex_oauth_responses_target_url,
+            _load_bound_codex_oauth_auth,
+        )
+
+        selected_auth = await _load_bound_codex_oauth_auth(request)
         return await _perform_codex_auto_agent_native_openai_request(
             request=request,
             fastapi_response=fastapi_response,
             user_api_key_dict=user_api_key_dict,
-            target_url=target_url,
-            api_key=api_key,
-            forward_headers=forward_headers,
+            target_url=_codex_oauth_responses_target_url(),
+            api_key=None,
+            forward_headers=False,
             request_body=candidate_body,
+            custom_headers=selected_auth.headers,
         )
 
     return await _dispatch_auto_agent_alias_candidate_request(
@@ -393,22 +405,32 @@ async def _perform_codex_auto_agent_native_openai_request(
     api_key: Optional[str],
     forward_headers: bool,
     request_body: dict[str, Any],
+    custom_headers: Optional[dict[str, str]] = None,
 ) -> Response:
     is_streaming_request = "stream" in str(target_url)
+    resolved_headers = (
+        dict(custom_headers)
+        if custom_headers is not None
+        else BaseOpenAIPassThroughHandler._assemble_headers(
+            api_key=api_key,
+            request=request,
+        )
+    )
     try:
         return await pass_through_request(
             request=request,
             target=target_url,
-            custom_headers=BaseOpenAIPassThroughHandler._assemble_headers(
-                api_key=api_key,
-                request=request,
-            ),
+            custom_headers=resolved_headers,
             user_api_key_dict=user_api_key_dict,
             forward_headers=forward_headers,
             stream=is_streaming_request,
             custom_body=request_body,
             custom_llm_provider=litellm.LlmProviders.OPENAI.value,
-            egress_credential_family="openai" if forward_headers else None,
+            egress_credential_family=(
+                "openai"
+                if custom_headers is not None or forward_headers
+                else None
+            ),
             expected_target_family="openai",
             # RR-054 #24
             retryable_upstream_status_codes=list(_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES_DEFAULT),

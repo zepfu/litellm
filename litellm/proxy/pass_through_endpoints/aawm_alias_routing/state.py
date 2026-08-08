@@ -1403,11 +1403,18 @@ class AliasRoutingStateManager:
                     {
                         "provider": provider,
                         "model": model,
+                        "account_hash": account_hash or None,
+                        "environment": environment or None,
                         "remaining_pct": remaining_pct,
                         "observed_at": observed_at,
                         "expected_reset_at": expected_reset_at,
                         "quota_key": quota_key or None,
                         "quota_type": observation.get("quota_type"),
+                        "limit_scope": observation.get("limit_scope"),
+                        "quota_period": observation.get("quota_period"),
+                        "window_minutes": observation.get("window_minutes"),
+                        "status": observation.get("status"),
+                        "exhausted": observation.get("exhausted"),
                         "source": observation.get("source"),
                     },
                 )
@@ -1429,17 +1436,23 @@ class AliasRoutingStateManager:
         *,
         provider: str,
         model: str,
+        account_hash: Optional[str] = None,
         max_age_seconds: float = 900.0,
         now_epoch: Optional[float] = None,
     ) -> Optional[dict[str, Any]]:
         """Return one conservative fresh quota view, or ``None`` if ambiguous."""
         now = time.time() if now_epoch is None else now_epoch
+        selected_account_hash = str(account_hash or "").strip()
         with self._normalized_quota_observations_lock:
             observations = [
                 (key, dict(observation))
                 for key, observation in self._normalized_quota_observations.items()
-                for obs_provider, obs_model, _account, _quota, _environment in (key,)
+                for obs_provider, obs_model, obs_account, _quota, _environment in (key,)
                 if obs_provider == provider and obs_model in {"", model}
+                and (
+                    not selected_account_hash
+                    or obs_account == selected_account_hash
+                )
             ]
         fresh = [
             (key, observation)
@@ -1459,10 +1472,32 @@ class AliasRoutingStateManager:
         _selected_key, selected = min(
             fresh, key=lambda item: item[1]["remaining_pct"]
         )
+        windows = [
+            {
+                **observation,
+                "account_hash": key[2] or None,
+                "environment": key[4] or None,
+                "observation_age_seconds": max(
+                    0.0,
+                    now - observation["observed_at"],
+                ),
+            }
+            for key, observation in sorted(
+                fresh,
+                key=lambda item: (
+                    str(item[1].get("quota_period") or ""),
+                    str(item[1].get("limit_scope") or ""),
+                    str(item[1].get("quota_key") or ""),
+                ),
+            )
+        ]
         return {
             **selected,
+            "account_hash": _selected_key[2] or None,
+            "environment": _selected_key[4] or None,
             "observation_age_seconds": max(0.0, now - selected["observed_at"]),
             "window_count": len(fresh),
+            "windows": windows,
         }
 
     def reset_for_tests(self) -> None:

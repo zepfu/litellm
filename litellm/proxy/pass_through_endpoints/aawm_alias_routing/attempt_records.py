@@ -735,6 +735,27 @@ def _add_codex_auto_agent_alias_metadata(
             "codex_auto_agent_affinity_state_source": selection.get("affinity_state_source"),
             "codex_auto_agent_cooldown_state_source": selection.get("cooldown_state_source"),
             "codex_auto_agent_lane_key": selection.get("lane_key"),
+            "codex_auto_agent_selected_account_label": candidate.get(
+                "codex_oauth_account_label"
+            ),
+            "codex_auto_agent_selected_account_hash": candidate.get(
+                "codex_oauth_account_hash"
+            ),
+            "codex_auto_agent_selected_account_lane": candidate.get(
+                "codex_oauth_lane_key"
+            ),
+            "codex_auto_agent_quota_snapshot_age_seconds": selection.get(
+                "quota_snapshot_age_seconds"
+            ),
+            "codex_auto_agent_failover_ordinal": selection.get(
+                "failover_ordinal"
+            ),
+            "codex_auto_agent_prior_account_outcome": selection.get(
+                "prior_account_outcome"
+            ),
+            "codex_auto_agent_terminal_reset": selection.get(
+                "terminal_reset"
+            ),
             "codex_auto_agent_attempts": attempts,
             "codex_auto_agent_skipped_candidates": skipped,
             "codex_auto_agent_audit_events": audit_events,
@@ -842,6 +863,27 @@ def _add_anthropic_auto_agent_alias_metadata(
             "anthropic_auto_agent_affinity_state_source": selection.get("affinity_state_source"),
             "anthropic_auto_agent_cooldown_state_source": selection.get("cooldown_state_source"),
             "anthropic_auto_agent_lane_key": selection.get("lane_key"),
+            "anthropic_auto_agent_selected_account_label": candidate.get(
+                "codex_oauth_account_label"
+            ),
+            "anthropic_auto_agent_selected_account_hash": candidate.get(
+                "codex_oauth_account_hash"
+            ),
+            "anthropic_auto_agent_selected_account_lane": candidate.get(
+                "codex_oauth_lane_key"
+            ),
+            "anthropic_auto_agent_quota_snapshot_age_seconds": selection.get(
+                "quota_snapshot_age_seconds"
+            ),
+            "anthropic_auto_agent_failover_ordinal": selection.get(
+                "failover_ordinal"
+            ),
+            "anthropic_auto_agent_prior_account_outcome": selection.get(
+                "prior_account_outcome"
+            ),
+            "anthropic_auto_agent_terminal_reset": selection.get(
+                "terminal_reset"
+            ),
             "anthropic_auto_agent_attempts": attempts,
             "anthropic_auto_agent_skipped_candidates": skipped,
             "anthropic_auto_agent_audit_events": audit_events,

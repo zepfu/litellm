@@ -145,6 +145,9 @@ async def handle_alias_route(  # noqa: PLR0915
     _exclude_codex_auto_agent_request_local_candidate_without_cooldown = (
         _lpe._exclude_codex_auto_agent_request_local_candidate_without_cooldown
     )
+    _plan_codex_oauth_account_failover = (
+        _lpe._plan_codex_oauth_account_failover
+    )
     _apply_request_local_cooldown_from_plan = _lpe._apply_request_local_cooldown_from_plan
     _record_auto_agent_alias_attempt_failure = _lpe._record_auto_agent_alias_attempt_failure
     _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible = (
@@ -182,6 +185,8 @@ async def handle_alias_route(  # noqa: PLR0915
     # Request-scoped total for eligible native Grok continuation transient
     # attempts. Must not reset when the outer candidate-selection loop re-enters.
     native_grok_continuation_transient_provider_attempts = 0
+    provider_candidate_attempts = 0
+    account_failover_attempts = 0
 
     def _raise_terminal_alias_failure(exc: Exception) -> Any:
         last_attempt = attempts[-1] if attempts else {}
@@ -228,7 +233,7 @@ async def handle_alias_route(  # noqa: PLR0915
         )
         raise terminal_exc from None
 
-    for _attempt_number in range(max_candidate_attempts):
+    while provider_candidate_attempts < max_candidate_attempts:
         try:
             selection = await select_candidate_fn(
                 request=request,
@@ -246,11 +251,42 @@ async def handle_alias_route(  # noqa: PLR0915
                 )
             raise
         candidate = selection["candidate"]
+        failover_ordinal = int(selection.get("failover_ordinal") or 0)
+        if failover_ordinal > 0:
+            account_failover_attempts += 1
+            if account_failover_attempts > 1:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail={
+                        "error": {
+                            "message": (
+                                "Codex OAuth account failover limit was "
+                                "reached before dispatch."
+                            ),
+                            "type": "rate_limit_error",
+                            "code": (
+                                "aawm_codex_oauth_account_failover_limit"
+                            ),
+                        }
+                    },
+                )
+        else:
+            provider_candidate_attempts += 1
         attempt_record = _codex_auto_agent_candidate_public_shape(
             candidate,
             lane_key=selection.get("lane_key"),
             reason=selection.get("selection_reason"),
         )
+        for field in (
+            "quota_snapshot_age_seconds",
+            "quota_windows",
+            "failover_ordinal",
+            "prior_account_outcome",
+            "terminal_reset",
+        ):
+            value = selection.get(field)
+            if value is not None:
+                attempt_record[field] = value
         attempts.append(attempt_record)
         candidate_body = _record_auto_agent_alias_attempt_started(
             alias_family=alias_family,
@@ -480,6 +516,14 @@ async def handle_alias_route(  # noqa: PLR0915
                 candidate=candidate,
                 kimi_failure_metadata=kimi_failure_metadata,
             )
+            account_failover_planned = _plan_codex_oauth_account_failover(
+                request,
+                candidate=candidate,
+                selection=selection,
+                attempt_record=attempt_record,
+                error_class=error_class,
+                has_continuation_state=has_continuation_state,
+            )
             if cooldown_scope == "none" and not has_continuation_state:
                 _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
                     request,
@@ -529,6 +573,33 @@ async def handle_alias_route(  # noqa: PLR0915
                     attempts=failure_metadata.get(attempts_metadata_key),
                     skipped_candidates=failure_metadata.get(skipped_candidates_metadata_key),
                 )
+            if account_failover_planned:
+                provider_candidate_attempts = max(
+                    0,
+                    provider_candidate_attempts - 1,
+                )
+                _record_auto_agent_alias_attempt_failure(
+                    alias_family=alias_family,
+                    alias_model=alias_model,
+                    request=request,
+                    prepared_request_body=prepared_request_body,
+                    selection=selection,
+                    attempts=attempts,
+                    attempt_record=attempt_record,
+                    error_class=error_class,
+                    add_alias_metadata_fn=add_alias_metadata_fn,
+                )
+                verbose_proxy_logger.debug(
+                    "%s auto-agent alias %s moving once from Codex OAuth "
+                    "account %s after %s",
+                    log_label,
+                    alias_model,
+                    candidate.get("codex_oauth_account_label"),
+                    error_class,
+                )
+                break
+            if failover_ordinal > 0:
+                provider_candidate_attempts += 1
             native_grok_retry_eligible = _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
                 is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
                 has_continuation_state=has_continuation_state,

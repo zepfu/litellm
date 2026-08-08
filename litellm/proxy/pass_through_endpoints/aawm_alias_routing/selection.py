@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import random
 import time
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from fastapi import HTTPException, Request
@@ -172,6 +173,16 @@ def _codex_auto_agent_candidate_public_shape(
         "route_family": candidate["route_family"],
         "last_resort": bool(candidate.get("last_resort")),
     }
+    for source_field, public_field in (
+        ("codex_oauth_account_label", "account_label"),
+        ("codex_oauth_account_hash", "account_hash"),
+        ("codex_oauth_lane_key", "account_lane"),
+        ("codex_oauth_account_priority", "account_priority"),
+        ("codex_oauth_account_weight", "account_weight"),
+    ):
+        value = candidate.get(source_field)
+        if value is not None:
+            shaped[public_field] = value
     if lane_key is not None:
         shaped["lane_key"] = lane_key
     if cooldown_seconds is not None:
@@ -208,6 +219,10 @@ def _build_auto_agent_skipped_candidates_from_states(
             "cooldown_scope",
             "failure_phase",
             "attempted_provider_call",
+            "auth_status",
+            "quota_remaining_pct",
+            "quota_snapshot_age_seconds",
+            "quota_windows",
         ):
             if field in state:
                 shaped[field] = state[field]
@@ -289,6 +304,158 @@ def _get_codex_auto_agent_request_local_excluded_keys(
     return excluded
 
 
+def _codex_oauth_candidate_slot(
+    candidate: dict[str, Any],
+) -> Optional[str]:
+    if not candidate.get("codex_oauth_account_hash"):
+        return None
+    return "{}:{}:{}:{}".format(
+        candidate.get("provider") or "",
+        candidate.get("model") or "",
+        candidate.get("route_family") or "",
+        candidate.get("config_epoch_tag") or "",
+    )
+
+
+def _get_codex_oauth_request_local_blocked_slots(
+    request: Request,
+) -> set[str]:
+    blocked = getattr(
+        request.state,
+        "aawm_codex_oauth_request_local_blocked_slots",
+        None,
+    )
+    if isinstance(blocked, set):
+        return blocked
+    blocked = set()
+    setattr(
+        request.state,
+        "aawm_codex_oauth_request_local_blocked_slots",
+        blocked,
+    )
+    return blocked
+
+
+def _block_codex_oauth_request_local_candidate_slot(
+    request: Request,
+    *,
+    candidate: dict[str, Any],
+) -> None:
+    slot = _codex_oauth_candidate_slot(candidate)
+    if slot is not None:
+        _get_codex_oauth_request_local_blocked_slots(request).add(slot)
+
+
+def _get_codex_oauth_request_local_failover_context(
+    request: Request,
+) -> Optional[dict[str, Any]]:
+    context = getattr(
+        request.state,
+        "aawm_codex_oauth_request_local_failover_context",
+        None,
+    )
+    return dict(context) if isinstance(context, dict) else None
+
+
+def _apply_codex_oauth_failover_context_to_state(
+    request: Request,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    candidate = state["candidate"]
+    if not _is_codex_oauth_account_candidate(candidate):
+        return state
+    state["failover_ordinal"] = 0
+    context = _get_codex_oauth_request_local_failover_context(request)
+    if (
+        context is None
+        or context.get("slot") != _codex_oauth_candidate_slot(candidate)
+        or context.get("prior_account_hash")
+        == candidate.get("codex_oauth_account_hash")
+    ):
+        return state
+    state["failover_ordinal"] = 1
+    state["prior_account_outcome"] = dict(
+        context.get("prior_account_outcome") or {}
+    )
+    return state
+
+
+def _plan_codex_oauth_account_failover(
+    request: Request,
+    *,
+    candidate: dict[str, Any],
+    selection: dict[str, Any],
+    attempt_record: dict[str, Any],
+    error_class: str,
+    has_continuation_state: bool,
+) -> bool:
+    """Plan the sole request-local account move after a pre-response failure."""
+    if not _is_codex_oauth_account_candidate(candidate):
+        return False
+    if has_continuation_state:
+        return False
+
+    failover_ordinal = int(selection.get("failover_ordinal") or 0)
+    existing = _get_codex_oauth_request_local_failover_context(request)
+    if failover_ordinal > 0 or existing is not None:
+        _block_codex_oauth_request_local_candidate_slot(
+            request,
+            candidate=candidate,
+        )
+        attempt_record["account_failover_limit_reached"] = True
+        return False
+
+    if error_class not in {
+        "capacity_exhausted",
+        "rate_limited",
+        "usage_limit_reached",
+        "candidate_unavailable",
+    }:
+        return False
+
+    prior_account_outcome: dict[str, Any] = {
+        "account_label": candidate.get("codex_oauth_account_label"),
+        "account_hash": candidate.get("codex_oauth_account_hash"),
+        "account_lane": candidate.get("codex_oauth_lane_key"),
+        "outcome": error_class,
+        "failure_phase": attempt_record.get("failure_phase"),
+        "attempted_provider_call": attempt_record.get(
+            "attempted_provider_call"
+        ),
+    }
+    for field in (
+        "quota_snapshot_age_seconds",
+        "quota_windows",
+        "terminal_reset",
+    ):
+        value = selection.get(field)
+        if value is not None:
+            prior_account_outcome[field] = value
+    prior_account_outcome = {
+        key: value
+        for key, value in prior_account_outcome.items()
+        if value is not None
+    }
+    setattr(
+        request.state,
+        "aawm_codex_oauth_request_local_failover_context",
+        {
+            "slot": _codex_oauth_candidate_slot(candidate),
+            "prior_account_hash": candidate.get(
+                "codex_oauth_account_hash"
+            ),
+            "prior_account_outcome": prior_account_outcome,
+        },
+    )
+    _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
+        request,
+        candidate=candidate,
+        lane_key=selection.get("lane_key"),
+    )
+    attempt_record["account_failover_planned"] = True
+    return True
+
+
 def _exclude_codex_auto_agent_request_local_candidate(
     request: Request,
     *,
@@ -360,6 +527,14 @@ def _apply_codex_auto_agent_request_local_candidate_state(
             cooldown_seconds = max(cooldown_seconds, 0.001)
         cooldown_state_source = "request_local"
         skip_reason = "request_local_transient_failure"
+    account_slot = _codex_oauth_candidate_slot(candidate)
+    if (
+        account_slot is not None
+        and account_slot
+        in _get_codex_oauth_request_local_blocked_slots(request)
+    ):
+        cooldown_state_source = "request_local"
+        skip_reason = "account_failover_limit"
     return cooldown_seconds, cooldown_state_source, skip_reason
 
 
@@ -505,6 +680,8 @@ def _find_codex_auto_agent_affinity_candidate(
         if (
             candidate["provider"] == affinity.get("provider")
             and candidate["model"] == affinity.get("model")
+            and candidate.get("route_family")
+            == affinity.get("route_family")
         ):
             return dict(candidate)
     return None
@@ -553,9 +730,223 @@ def _find_anthropic_auto_agent_affinity_candidate(
         if (
             candidate["provider"] == affinity.get("provider")
             and candidate["model"] == affinity.get("model")
+            and candidate.get("route_family")
+            == affinity.get("route_family")
         ):
             return dict(candidate)
     return None
+
+
+def _candidate_uses_codex_oauth(
+    candidate: Optional[dict[str, Any]],
+) -> bool:
+    return bool(
+        isinstance(candidate, dict)
+        and candidate.get("provider") == _CODEX_AUTO_AGENT_NATIVE_PROVIDER
+        and candidate.get("route_family")
+        in {
+            "codex_responses",
+            "anthropic_openai_responses_adapter",
+        }
+    )
+
+
+def _is_codex_oauth_account_candidate(
+    candidate: Optional[dict[str, Any]],
+) -> bool:
+    return bool(
+        _candidate_uses_codex_oauth(candidate)
+        and isinstance(candidate, dict)
+        and candidate.get("codex_oauth_account_label")
+        and candidate.get("codex_oauth_account_hash")
+        and candidate.get("codex_oauth_lane_key")
+    )
+
+
+def _candidate_matches_affinity(
+    candidate: dict[str, Any],
+    affinity: dict[str, Any],
+) -> bool:
+    if not (
+        candidate.get("provider") == affinity.get("provider")
+        and candidate.get("model") == affinity.get("model")
+        and candidate.get("route_family") == affinity.get("route_family")
+    ):
+        return False
+    if not _candidate_uses_codex_oauth(candidate):
+        return True
+    return all(
+        candidate.get(field) == affinity.get(field)
+        for field in (
+            "codex_oauth_account_label",
+            "codex_oauth_account_hash",
+            "codex_oauth_lane_key",
+        )
+    )
+
+
+async def _resolve_codex_oauth_account_candidate_contexts(
+    request: Request,
+    *,
+    candidate_template: dict[str, Any],
+    affinity: Optional[dict[str, Any]] = None,
+) -> list[dict[str, Any]]:
+    """Resolve ordered, auth-checked account contexts without carrying secrets."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
+        _codex_oauth_account_lane_key,
+        _load_codex_oauth_headers_for_record,
+    )
+    from litellm.secret_managers.codex_oauth_inventory import (
+        CodexOAuthInventoryError,
+        load_codex_oauth_inventory,
+    )
+
+    model = str(candidate_template.get("model") or "")
+    pinned_label: Optional[str] = None
+    pinned_hash: Optional[str] = None
+    pinned_lane: Optional[str] = None
+    if affinity is not None:
+        pinned_label = str(
+            affinity.get("codex_oauth_account_label") or ""
+        ).strip() or None
+        pinned_hash = str(
+            affinity.get("codex_oauth_account_hash") or ""
+        ).strip() or None
+        pinned_lane = str(
+            affinity.get("codex_oauth_lane_key") or ""
+        ).strip() or None
+        if not all((pinned_label, pinned_hash, pinned_lane)):
+            return [
+                {
+                    "candidate": {
+                        **candidate_template,
+                        **(
+                            {"codex_oauth_account_label": pinned_label}
+                            if pinned_label
+                            else {}
+                        ),
+                        **(
+                            {"codex_oauth_account_hash": pinned_hash}
+                            if pinned_hash
+                            else {}
+                        ),
+                        **(
+                            {"codex_oauth_lane_key": pinned_lane}
+                            if pinned_lane
+                            else {}
+                        ),
+                    },
+                    "lane_key": pinned_lane or "codex-oauth:unavailable",
+                    "auth_status": "degraded",
+                    "skip_reason": "auth_degraded",
+                    "failure_phase": "affinity_account_context_missing",
+                    "attempted_provider_call": False,
+                }
+            ]
+
+    try:
+        inventory = load_codex_oauth_inventory()
+        if pinned_label is not None:
+            records = (
+                inventory.select_record(label=pinned_label, model=model),
+            )
+        else:
+            records = inventory.ordered_records(
+                enabled_only=True,
+                model=model,
+            )
+    except CodexOAuthInventoryError:
+        records = ()
+
+    if not records:
+        unavailable_candidate = dict(candidate_template)
+        for field, value in (
+            ("codex_oauth_account_label", pinned_label),
+            ("codex_oauth_account_hash", pinned_hash),
+            ("codex_oauth_lane_key", pinned_lane),
+        ):
+            if value is not None:
+                unavailable_candidate[field] = value
+        return [
+            {
+                "candidate": unavailable_candidate,
+                "lane_key": pinned_lane or "codex-oauth:unavailable",
+                "auth_status": "degraded",
+                "skip_reason": "auth_degraded",
+                "failure_phase": (
+                    "affinity_account_unavailable"
+                    if affinity is not None
+                    else "account_inventory_unavailable"
+                ),
+                "attempted_provider_call": False,
+            }
+        ]
+
+    contexts: list[dict[str, Any]] = []
+    for record in records:
+        lane_key = _codex_oauth_account_lane_key(
+            account_label=record.label,
+            account_hash=record.expected_account_hash,
+        )
+        account_candidate = {
+            **candidate_template,
+            "codex_oauth_account_label": record.label,
+            "codex_oauth_account_hash": record.expected_account_hash,
+            "codex_oauth_lane_key": lane_key,
+            "codex_oauth_account_priority": record.priority,
+            "codex_oauth_account_weight": record.weight,
+        }
+        context: dict[str, Any] = {
+            "candidate": account_candidate,
+            "lane_key": lane_key,
+            "auth_status": "healthy",
+        }
+        if (
+            pinned_hash is not None
+            and (
+                record.expected_account_hash != pinned_hash
+                or pinned_lane != lane_key
+            )
+        ):
+            context.update(
+                {
+                    "auth_status": "degraded",
+                    "skip_reason": "auth_degraded",
+                    "failure_phase": "affinity_account_identity_mismatch",
+                    "attempted_provider_call": False,
+                }
+            )
+            contexts.append(context)
+            continue
+        try:
+            loaded = await _load_codex_oauth_headers_for_record(
+                request,
+                record,
+            )
+        except HTTPException:
+            context.update(
+                {
+                    "auth_status": "degraded",
+                    "skip_reason": "auth_degraded",
+                    "failure_phase": "pre_dispatch_auth",
+                    "attempted_provider_call": False,
+                }
+            )
+        else:
+            if (
+                loaded.account_hash != record.expected_account_hash
+                or loaded.lane_key != lane_key
+            ):
+                context.update(
+                    {
+                        "auth_status": "degraded",
+                        "skip_reason": "auth_degraded",
+                        "failure_phase": "account_identity_mismatch",
+                        "attempted_provider_call": False,
+                    }
+                )
+        contexts.append(context)
+    return contexts
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +979,10 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
 ) -> dict[str, Any]:
     assert _get_codex_active_cooldown_state is not None
     candidate = dict(candidate_template)
-    if openai_lane_key is None:
+    account_lane_key = candidate.get("codex_oauth_lane_key")
+    if isinstance(account_lane_key, str) and account_lane_key:
+        openai_lane_key = account_lane_key
+    elif openai_lane_key is None:
         openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
     forced_cooldown_seconds: Optional[float] = None
     skip_reason: Optional[str] = None
@@ -698,23 +1092,167 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     return state
 
 
-def _attach_normalized_quota_state(state: dict[str, Any]) -> dict[str, Any]:
+def _format_codex_oauth_quota_reset_at(value: Any) -> Optional[str]:
+    if not isinstance(value, (int, float)):
+        return None
+    try:
+        return (
+            datetime.fromtimestamp(float(value), tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _codex_oauth_quota_window_public_shape(
+    observation: dict[str, Any],
+) -> dict[str, Any]:
+    shaped: dict[str, Any] = {
+        "remaining_pct": observation.get("remaining_pct"),
+        "scope": observation.get("limit_scope"),
+        "window": observation.get("quota_period"),
+        "window_minutes": observation.get("window_minutes"),
+        "quota_type": observation.get("quota_type"),
+        "status": observation.get("status"),
+        "exhausted": observation.get("exhausted"),
+        "reset_at": _format_codex_oauth_quota_reset_at(
+            observation.get("expected_reset_at")
+        ),
+        "snapshot_age_seconds": round(
+            float(observation.get("observation_age_seconds") or 0.0),
+            3,
+        ),
+    }
+    return {
+        key: value
+        for key, value in shaped.items()
+        if value is not None
+    }
+
+
+def _codex_oauth_quota_window_is_confirmed_exhausted(
+    observation: dict[str, Any],
+) -> bool:
+    quota_period = str(observation.get("quota_period") or "").strip().lower()
+    try:
+        window_minutes = int(observation.get("window_minutes"))
+    except (TypeError, ValueError):
+        window_minutes = 0
+    try:
+        remaining_pct = float(observation.get("remaining_pct"))
+    except (TypeError, ValueError):
+        return False
+    return (
+        (quota_period in {"five_hour", "seven_day"}
+         or window_minutes in {300, 10080})
+        and str(observation.get("status") or "").strip().lower() == "fresh"
+        and observation.get("exhausted") is True
+        and remaining_pct <= 0
+    )
+
+
+def _build_codex_oauth_terminal_reset_information(
+    states: Sequence[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    accounts: list[dict[str, Any]] = []
+    reset_values: list[str] = []
+    for state in states:
+        if state.get("skip_reason") != "quota_exhausted":
+            continue
+        candidate = state.get("candidate")
+        if not isinstance(candidate, dict):
+            continue
+        windows = state.get("quota_exhausted_windows")
+        if not isinstance(windows, list) or not windows:
+            continue
+        account = {
+            "account_label": candidate.get(
+                "codex_oauth_account_label"
+            ),
+            "account_hash": candidate.get("codex_oauth_account_hash"),
+            "account_lane": candidate.get("codex_oauth_lane_key"),
+            "exhausted_windows": windows,
+        }
+        accounts.append(
+            {
+                key: value
+                for key, value in account.items()
+                if value is not None
+            }
+        )
+        for window in windows:
+            if isinstance(window, dict) and isinstance(
+                window.get("reset_at"), str
+            ):
+                reset_values.append(window["reset_at"])
+    if not accounts:
+        return None
+    terminal: dict[str, Any] = {
+        "reason": "codex_oauth_quota_exhausted",
+        "accounts": accounts,
+    }
+    if reset_values:
+        terminal["next_reset_at"] = min(reset_values)
+    return terminal
+
+
+def _attach_normalized_quota_state(
+    state: dict[str, Any],
+    *,
+    account_hash: Optional[str] = None,
+) -> dict[str, Any]:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
         alias_routing_state as _alias_routing_state,
     )
 
     candidate = state["candidate"]
+    selected_account_hash = (
+        account_hash
+        or candidate.get("codex_oauth_account_hash")
+        or None
+    )
     observation = _alias_routing_state.resolve_normalized_quota_observation(
         provider=str(candidate.get("provider") or ""),
         model=str(candidate.get("model") or ""),
+        account_hash=(
+            str(selected_account_hash)
+            if selected_account_hash is not None
+            else None
+        ),
     )
     if observation is None:
         return state
     state["quota_observation"] = observation
     state["quota_remaining_pct"] = observation["remaining_pct"]
-    if observation["remaining_pct"] <= 0 and state.get("skip_reason") is None:
+    state["quota_snapshot_age_seconds"] = round(
+        float(observation["observation_age_seconds"]),
+        3,
+    )
+    windows = observation.get("windows")
+    if isinstance(windows, list):
+        state["quota_windows"] = [
+            _codex_oauth_quota_window_public_shape(window)
+            for window in windows
+            if isinstance(window, dict)
+        ]
+        exhausted_windows = [
+            _codex_oauth_quota_window_public_shape(window)
+            for window in windows
+            if isinstance(window, dict)
+            and _codex_oauth_quota_window_is_confirmed_exhausted(window)
+        ]
+        if exhausted_windows:
+            state["quota_exhausted_windows"] = exhausted_windows
+    if (
+        state.get("quota_exhausted_windows")
+        and state.get("skip_reason") is None
+    ):
         state["skip_reason"] = "quota_exhausted"
         state["cooldown_state_source"] = "normalized_quota_observation"
+        state["terminal_reset"] = (
+            _build_codex_oauth_terminal_reset_information([state])
+        )
     return state
 
 
@@ -727,7 +1265,10 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
 ) -> dict[str, Any]:
     assert _get_anthropic_active_cooldown_state is not None
     candidate = dict(candidate_template)
-    if openai_lane_key is None:
+    account_lane_key = candidate.get("codex_oauth_lane_key")
+    if isinstance(account_lane_key, str) and account_lane_key:
+        openai_lane_key = account_lane_key
+    elif openai_lane_key is None:
         openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
     if anthropic_lane_key is None:
         anthropic_lane_key = _resolve_anthropic_auto_agent_native_cooldown_lane_key(request)
@@ -848,6 +1389,91 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
     return state
 
 
+def _apply_codex_oauth_account_context_to_state(
+    request: Request,
+    state: dict[str, Any],
+    *,
+    context: dict[str, Any],
+) -> dict[str, Any]:
+    state["auth_status"] = context.get("auth_status") or "degraded"
+    for field in (
+        "skip_reason",
+        "failure_phase",
+        "attempted_provider_call",
+    ):
+        if field in context:
+            state[field] = context[field]
+    account_hash = state["candidate"].get("codex_oauth_account_hash")
+    if isinstance(account_hash, str) and account_hash:
+        state = _attach_normalized_quota_state(
+            state,
+            account_hash=account_hash,
+        )
+    return _apply_codex_oauth_failover_context_to_state(request, state)
+
+
+async def _build_codex_auto_agent_affinity_candidate_state(
+    request: Request,
+    *,
+    candidate_template: dict[str, Any],
+    affinity: dict[str, Any],
+) -> dict[str, Any]:
+    if not _candidate_uses_codex_oauth(candidate_template):
+        return _attach_normalized_quota_state(
+            await _build_codex_auto_agent_candidate_state(
+                request,
+                candidate_template=candidate_template,
+            )
+        )
+    contexts = await _resolve_codex_oauth_account_candidate_contexts(
+        request,
+        candidate_template=candidate_template,
+        affinity=affinity,
+    )
+    context = contexts[0]
+    state = await _build_codex_auto_agent_candidate_state(
+        request,
+        candidate_template=context["candidate"],
+        openai_lane_key=context["lane_key"],
+    )
+    return _apply_codex_oauth_account_context_to_state(
+        request,
+        state,
+        context=context,
+    )
+
+
+async def _build_anthropic_auto_agent_affinity_candidate_state(
+    request: Request,
+    *,
+    candidate_template: dict[str, Any],
+    affinity: dict[str, Any],
+) -> dict[str, Any]:
+    if not _candidate_uses_codex_oauth(candidate_template):
+        return _attach_normalized_quota_state(
+            await _build_anthropic_auto_agent_candidate_state(
+                request,
+                candidate_template=candidate_template,
+            )
+        )
+    contexts = await _resolve_codex_oauth_account_candidate_contexts(
+        request,
+        candidate_template=candidate_template,
+        affinity=affinity,
+    )
+    context = contexts[0]
+    state = await _build_anthropic_auto_agent_candidate_state(
+        request,
+        candidate_template=context["candidate"],
+        openai_lane_key=context["lane_key"],
+    )
+    return _apply_codex_oauth_account_context_to_state(
+        request,
+        state,
+        context=context,
+    )
+
+
 async def _build_codex_auto_agent_candidate_states(
     request: Request,
     *,
@@ -862,6 +1488,25 @@ async def _build_codex_auto_agent_candidate_states(
         ingress="codex",
         client_product_label=client_product_label,
     ).candidates:
+        if _candidate_uses_codex_oauth(candidate_template):
+            contexts = await _resolve_codex_oauth_account_candidate_contexts(
+                request,
+                candidate_template=candidate_template,
+            )
+            for context in contexts:
+                state = await _build_codex_auto_agent_candidate_state(
+                    request,
+                    candidate_template=context["candidate"],
+                    openai_lane_key=context["lane_key"],
+                )
+                states.append(
+                    _apply_codex_oauth_account_context_to_state(
+                        request,
+                        state,
+                        context=context,
+                    )
+                )
+            continue
         states.append(
             _attach_normalized_quota_state(
                 await _build_codex_auto_agent_candidate_state(
@@ -889,6 +1534,26 @@ async def _build_anthropic_auto_agent_candidate_states(
         ingress="anthropic",
         client_product_label=client_product_label,
     ).candidates:
+        if _candidate_uses_codex_oauth(candidate_template):
+            contexts = await _resolve_codex_oauth_account_candidate_contexts(
+                request,
+                candidate_template=candidate_template,
+            )
+            for context in contexts:
+                state = await _build_anthropic_auto_agent_candidate_state(
+                    request,
+                    candidate_template=context["candidate"],
+                    openai_lane_key=context["lane_key"],
+                    anthropic_lane_key=anthropic_lane_key,
+                )
+                states.append(
+                    _apply_codex_oauth_account_context_to_state(
+                        request,
+                        state,
+                        context=context,
+                    )
+                )
+            continue
         states.append(
             _attach_normalized_quota_state(
                 await _build_anthropic_auto_agent_candidate_state(
@@ -1179,6 +1844,7 @@ def _build_auto_agent_redispatch_http_exception_detail(
     audit_events: Optional[list[dict[str, Any]]] = None,
     attempts: Optional[list[dict[str, Any]]] = None,
     skipped_candidates: Optional[list[dict[str, Any]]] = None,
+    terminal_reset: Optional[dict[str, Any]] = None,
     code: str,
     message: str,
 ) -> dict[str, Any]:
@@ -1232,6 +1898,8 @@ def _build_auto_agent_redispatch_http_exception_detail(
         detail["attempts"] = attempts
     if isinstance(skipped_candidates, list):
         detail["skipped_candidates"] = skipped_candidates
+    if isinstance(terminal_reset, dict):
+        detail["terminal_reset"] = terminal_reset
     return detail
 
 
@@ -1254,6 +1922,7 @@ def _raise_codex_auto_agent_redispatch_required(
     attempts: Optional[list[dict[str, Any]]] = None,
     skipped_candidates: Optional[list[dict[str, Any]]] = None,
 ) -> None:
+    terminal_reset = candidate.get("_codex_oauth_terminal_reset")
     detail = _build_auto_agent_redispatch_http_exception_detail(
         alias_family="codex_auto_agent",
         alias_model=alias_model,
@@ -1272,6 +1941,7 @@ def _raise_codex_auto_agent_redispatch_required(
         audit_events=audit_events,
         attempts=attempts,
         skipped_candidates=skipped_candidates,
+        terminal_reset=terminal_reset,
         code="aawm_codex_auto_agent_redispatch_required",
         message=(
             "Codex auto-agent alias target hit retryable provider exhaustion "
@@ -1306,6 +1976,7 @@ def _raise_anthropic_auto_agent_redispatch_required(
     attempts: Optional[list[dict[str, Any]]] = None,
     skipped_candidates: Optional[list[dict[str, Any]]] = None,
 ) -> None:
+    terminal_reset = candidate.get("_codex_oauth_terminal_reset")
     detail = _build_auto_agent_redispatch_http_exception_detail(
         alias_family="anthropic_auto_agent",
         alias_model=alias_model,
@@ -1324,6 +1995,7 @@ def _raise_anthropic_auto_agent_redispatch_required(
         audit_events=audit_events,
         attempts=attempts,
         skipped_candidates=skipped_candidates,
+        terminal_reset=terminal_reset,
         code="aawm_anthropic_auto_agent_redispatch_required",
         message=(
             "Anthropic auto-agent alias target hit retryable provider "
@@ -1386,54 +2058,88 @@ async def _select_codex_auto_agent_candidate(
             client_product_label=client_product_label,
             request=request,
         )
-        # Wave 3 R3-4: continuation-safe affinity.  If the pinned candidate
-        # was removed from the active enumeration or its route_family changed
-        # (route-incompatible), fail closed with redispatch-required BEFORE
-        # any alternate upstream call.  Compatible candidates (same
-        # provider/model/route_family) remain pinned regardless of
-        # priority/weight/schedule changes.
-        if affinity_candidate is None or (
-            affinity_candidate.get("route_family") != affinity.get("route_family")
-        ):
-            _pinned_candidate_shape = {
+        if affinity_candidate is None:
+            pinned_candidate_shape = {
                 "provider": affinity.get("provider"),
                 "model": affinity.get("model"),
                 "route_family": affinity.get("route_family"),
                 "last_resort": bool(affinity.get("last_resort")),
             }
+            for field in (
+                "codex_oauth_account_label",
+                "codex_oauth_account_hash",
+                "codex_oauth_lane_key",
+            ):
+                if affinity.get(field) is not None:
+                    pinned_candidate_shape[field] = affinity.get(field)
             _raise_codex_auto_agent_redispatch_required(
-                candidate=_pinned_candidate_shape,
-                lane_key=None,
+                candidate=pinned_candidate_shape,
+                lane_key=affinity.get("codex_oauth_lane_key"),
                 cooldown_seconds=0.0,
                 error_tokens=set(),
                 alias_model=alias_model,
                 failure_phase="affinity_continuation_removed",
                 attempted_provider_call=False,
             )
-        if affinity_candidate is not None:
-            affinity_state = await _build_codex_auto_agent_candidate_state(
-                request,
-                candidate_template=affinity_candidate,
+        assert affinity_candidate is not None
+        affinity_state = await _build_codex_auto_agent_affinity_candidate_state(
+            request,
+            candidate_template=affinity_candidate,
+            affinity=affinity,
+        )
+        if (
+            _candidate_matches_affinity(
+                affinity_state["candidate"],
+                affinity,
             )
-            if _is_auto_agent_candidate_state_available(affinity_state):
-                return _attach_aawm_alias_routing_state_sources(
-                    {
-                        **affinity_state,
-                        "alias_model": alias_model,
-                        "session_key": session_key,
-                        "selection_reason": "session_affinity",
-                        "skipped": [],
-                        "in_flight_session": has_continuation_state,
-                    },
-                    affinity=affinity,
-                    selected_state=affinity_state,
-                )
-            if affinity_state["cooldown_seconds"] > 0:
-                _raise_codex_auto_agent_in_flight_cooldown(
-                    candidate=affinity_candidate,
-                    lane_key=affinity_state.get("lane_key"),
-                    cooldown_seconds=affinity_state["cooldown_seconds"],
-                )
+            and _is_auto_agent_candidate_state_available(affinity_state)
+        ):
+            return _attach_aawm_alias_routing_state_sources(
+                {
+                    **affinity_state,
+                    "alias_model": alias_model,
+                    "session_key": session_key,
+                    "selection_reason": "session_affinity",
+                    "skipped": [],
+                    "in_flight_session": True,
+                },
+                affinity=affinity,
+                selected_state=affinity_state,
+            )
+        if affinity_state["cooldown_seconds"] > 0:
+            _raise_codex_auto_agent_in_flight_cooldown(
+                candidate=affinity_state["candidate"],
+                lane_key=affinity_state.get("lane_key"),
+                cooldown_seconds=affinity_state["cooldown_seconds"],
+            )
+        affinity_skipped = _build_auto_agent_skipped_candidates_from_states(
+            [affinity_state]
+        )
+        terminal_reset = _build_codex_oauth_terminal_reset_information(
+            [affinity_state]
+        )
+        redispatch_candidate = dict(affinity_state["candidate"])
+        if terminal_reset is not None:
+            redispatch_candidate["_codex_oauth_terminal_reset"] = (
+                terminal_reset
+            )
+        _raise_codex_auto_agent_redispatch_required(
+            candidate=redispatch_candidate,
+            lane_key=affinity_state.get("lane_key"),
+            cooldown_seconds=0.0,
+            error_tokens=set(),
+            alias_model=alias_model,
+            error_class=(
+                "usage_limit_reached"
+                if affinity_state.get("skip_reason") == "quota_exhausted"
+                else "candidate_unavailable"
+            ),
+            cooldown_scope="account",
+            failure_phase=affinity_state.get("failure_phase")
+            or "affinity_account_unavailable",
+            attempted_provider_call=False,
+            skipped_candidates=affinity_skipped,
+        )
 
     states = await _build_codex_auto_agent_candidate_states(
         request,
@@ -1442,78 +2148,6 @@ async def _select_codex_auto_agent_candidate(
     )
     skipped = _build_auto_agent_skipped_candidates_from_states(states)
 
-    if affinity is not None:
-        affinity_candidate = _find_codex_auto_agent_candidate(
-            affinity.get("provider"),
-            affinity.get("model"),
-            alias_model=alias_model,
-            client_product_label=client_product_label,
-            request=request,
-        )
-        if affinity_candidate is not None:
-            matched_affinity_state: Optional[dict[str, Any]] = None
-            for state in states:
-                if (
-                    state["candidate"]["provider"] == affinity_candidate["provider"]
-                    and state["candidate"]["model"] == affinity_candidate["model"]
-                ):
-                    matched_affinity_state = state
-                    break
-            if matched_affinity_state is not None:
-                if not _is_auto_agent_candidate_state_available(matched_affinity_state):
-                    if has_continuation_state:
-                        if matched_affinity_state["cooldown_seconds"] > 0:
-                            _raise_codex_auto_agent_in_flight_cooldown(
-                                candidate=affinity_candidate,
-                                lane_key=matched_affinity_state.get("lane_key"),
-                                cooldown_seconds=matched_affinity_state["cooldown_seconds"],
-                            )
-                    skipped.append(
-                        _codex_auto_agent_candidate_public_shape(
-                            affinity_candidate,
-                            lane_key=matched_affinity_state.get("lane_key"),
-                            cooldown_seconds=(
-                                matched_affinity_state["cooldown_seconds"]
-                                if matched_affinity_state["cooldown_seconds"] > 0
-                                else None
-                            ),
-                            reason=matched_affinity_state.get("skip_reason") or "session_affinity_cooldown",
-                        )
-                    )
-                else:
-                    return _attach_aawm_alias_routing_state_sources(
-                        {
-                            **matched_affinity_state,
-                            "alias_model": alias_model,
-                            "session_key": session_key,
-                            "selection_reason": "session_affinity",
-                            "skipped": skipped,
-                            "in_flight_session": has_continuation_state,
-                        },
-                        affinity=affinity,
-                        selected_state=matched_affinity_state,
-                    )
-            preferred_available = any(
-                not state["candidate"].get("last_resort") and _is_auto_agent_candidate_state_available(state)
-                for state in states
-            )
-            if (
-                matched_affinity_state is not None
-                and _is_auto_agent_candidate_state_available(matched_affinity_state)
-                and (not affinity_candidate.get("last_resort") or not preferred_available)
-            ):
-                return _attach_aawm_alias_routing_state_sources(
-                    {
-                        **matched_affinity_state,
-                        "alias_model": alias_model,
-                        "session_key": session_key,
-                        "selection_reason": "session_affinity",
-                        "skipped": skipped,
-                    },
-                    affinity=affinity,
-                    selected_state=matched_affinity_state,
-                )
-
     state = _select_available_state(
         request,
         states,
@@ -1521,12 +2155,17 @@ async def _select_codex_auto_agent_candidate(
         last_resort=False,
     )
     if state is not None:
+        selection_reason = (
+            "codex_oauth_account_failover"
+            if int(state.get("failover_ordinal") or 0) > 0
+            else "first_available"
+        )
         return _attach_aawm_alias_routing_state_sources(
             {
                 **state,
                 "alias_model": alias_model,
                 "session_key": session_key,
-                "selection_reason": "first_available",
+                "selection_reason": selection_reason,
                 "skipped": skipped,
             },
             selected_state=state,
@@ -1539,27 +2178,39 @@ async def _select_codex_auto_agent_candidate(
         last_resort=True,
     )
     if state is not None:
+        selection_reason = (
+            "codex_oauth_account_failover"
+            if int(state.get("failover_ordinal") or 0) > 0
+            else "last_resort"
+        )
         return _attach_aawm_alias_routing_state_sources(
             {
                 **state,
                 "alias_model": alias_model,
                 "session_key": session_key,
-                "selection_reason": "last_resort",
+                "selection_reason": selection_reason,
                 "skipped": skipped,
             },
             selected_state=state,
         )
 
+    detail: dict[str, Any] = {
+        "error": {
+            "message": (
+                "All Codex auto-agent alias candidates are currently "
+                "cooled down or unavailable."
+            ),
+            "type": "rate_limit_error",
+            "code": "aawm_codex_auto_agent_all_candidates_cooling_down",
+        },
+        "candidates": skipped,
+    }
+    terminal_reset = _build_codex_oauth_terminal_reset_information(states)
+    if terminal_reset is not None:
+        detail["terminal_reset"] = terminal_reset
     raise HTTPException(
         status_code=429,
-        detail={
-            "error": {
-                "message": ("All Codex auto-agent alias candidates are currently cooled down."),
-                "type": "rate_limit_error",
-                "code": "aawm_codex_auto_agent_all_candidates_cooling_down",
-            },
-            "candidates": skipped,
-        },
+        detail=detail,
     )
 
 
@@ -1610,52 +2261,90 @@ async def _select_anthropic_auto_agent_candidate(
             client_product_label=client_product_label,
             request=request,
         )
-        # CFG-001: continuation-safe affinity.  If the pinned candidate
-        # was removed from the active enumeration or its route_family changed
-        # (route-incompatible), fail closed with redispatch-required BEFORE
-        # any alternate upstream call.  Mirrors the Codex selector guard.
-        if affinity_candidate is None or (
-            affinity_candidate.get("route_family") != affinity.get("route_family")
-        ):
-            _pinned_candidate_shape = {
+        if affinity_candidate is None:
+            pinned_candidate_shape = {
                 "provider": affinity.get("provider"),
                 "model": affinity.get("model"),
                 "route_family": affinity.get("route_family"),
                 "last_resort": bool(affinity.get("last_resort")),
             }
+            for field in (
+                "codex_oauth_account_label",
+                "codex_oauth_account_hash",
+                "codex_oauth_lane_key",
+            ):
+                if affinity.get(field) is not None:
+                    pinned_candidate_shape[field] = affinity.get(field)
             _raise_anthropic_auto_agent_redispatch_required(
-                candidate=_pinned_candidate_shape,
-                lane_key=None,
+                candidate=pinned_candidate_shape,
+                lane_key=affinity.get("codex_oauth_lane_key"),
                 cooldown_seconds=0.0,
                 error_tokens=set(),
                 alias_model=alias_model,
                 failure_phase="affinity_continuation_removed",
                 attempted_provider_call=False,
             )
-        if affinity_candidate is not None:
-            affinity_state = await _build_anthropic_auto_agent_candidate_state(
+        assert affinity_candidate is not None
+        affinity_state = (
+            await _build_anthropic_auto_agent_affinity_candidate_state(
                 request,
                 candidate_template=affinity_candidate,
+                affinity=affinity,
             )
-            if _is_auto_agent_candidate_state_available(affinity_state):
-                return _attach_aawm_alias_routing_state_sources(
-                    {
-                        **affinity_state,
-                        "alias_model": alias_model,
-                        "session_key": session_key,
-                        "selection_reason": "session_affinity",
-                        "skipped": [],
-                        "in_flight_session": has_continuation_state,
-                    },
-                    affinity=affinity,
-                    selected_state=affinity_state,
-                )
-            if affinity_state["cooldown_seconds"] > 0:
-                _raise_anthropic_auto_agent_in_flight_cooldown(
-                    candidate=affinity_candidate,
-                    lane_key=affinity_state.get("lane_key"),
-                    cooldown_seconds=affinity_state["cooldown_seconds"],
-                )
+        )
+        if (
+            _candidate_matches_affinity(
+                affinity_state["candidate"],
+                affinity,
+            )
+            and _is_auto_agent_candidate_state_available(affinity_state)
+        ):
+            return _attach_aawm_alias_routing_state_sources(
+                {
+                    **affinity_state,
+                    "alias_model": alias_model,
+                    "session_key": session_key,
+                    "selection_reason": "session_affinity",
+                    "skipped": [],
+                    "in_flight_session": True,
+                },
+                affinity=affinity,
+                selected_state=affinity_state,
+            )
+        if affinity_state["cooldown_seconds"] > 0:
+            _raise_anthropic_auto_agent_in_flight_cooldown(
+                candidate=affinity_state["candidate"],
+                lane_key=affinity_state.get("lane_key"),
+                cooldown_seconds=affinity_state["cooldown_seconds"],
+            )
+        affinity_skipped = _build_auto_agent_skipped_candidates_from_states(
+            [affinity_state]
+        )
+        terminal_reset = _build_codex_oauth_terminal_reset_information(
+            [affinity_state]
+        )
+        redispatch_candidate = dict(affinity_state["candidate"])
+        if terminal_reset is not None:
+            redispatch_candidate["_codex_oauth_terminal_reset"] = (
+                terminal_reset
+            )
+        _raise_anthropic_auto_agent_redispatch_required(
+            candidate=redispatch_candidate,
+            lane_key=affinity_state.get("lane_key"),
+            cooldown_seconds=0.0,
+            error_tokens=set(),
+            alias_model=alias_model,
+            error_class=(
+                "usage_limit_reached"
+                if affinity_state.get("skip_reason") == "quota_exhausted"
+                else "candidate_unavailable"
+            ),
+            cooldown_scope="account",
+            failure_phase=affinity_state.get("failure_phase")
+            or "affinity_account_unavailable",
+            attempted_provider_call=False,
+            skipped_candidates=affinity_skipped,
+        )
 
     states = await _build_anthropic_auto_agent_candidate_states(
         request,
@@ -1664,58 +2353,6 @@ async def _select_anthropic_auto_agent_candidate(
     )
     skipped = _build_auto_agent_skipped_candidates_from_states(states)
 
-    if affinity is not None:
-        affinity_candidate = _find_anthropic_auto_agent_candidate(
-            affinity.get("provider"),
-            affinity.get("model"),
-            alias_model=alias_model,
-            client_product_label=client_product_label,
-            request=request,
-        )
-        if affinity_candidate is not None:
-            matched_affinity_state: Optional[dict[str, Any]] = None
-            for state in states:
-                if (
-                    state["candidate"]["provider"] == affinity_candidate["provider"]
-                    and state["candidate"]["model"] == affinity_candidate["model"]
-                ):
-                    matched_affinity_state = state
-                    break
-            if matched_affinity_state is not None:
-                if not _is_auto_agent_candidate_state_available(matched_affinity_state):
-                    if has_continuation_state:
-                        if matched_affinity_state["cooldown_seconds"] > 0:
-                            _raise_anthropic_auto_agent_in_flight_cooldown(
-                                candidate=affinity_candidate,
-                                lane_key=matched_affinity_state.get("lane_key"),
-                                cooldown_seconds=matched_affinity_state["cooldown_seconds"],
-                            )
-                    skipped.append(
-                        _codex_auto_agent_candidate_public_shape(
-                            affinity_candidate,
-                            lane_key=matched_affinity_state.get("lane_key"),
-                            cooldown_seconds=(
-                                matched_affinity_state["cooldown_seconds"]
-                                if matched_affinity_state["cooldown_seconds"] > 0
-                                else None
-                            ),
-                            reason=matched_affinity_state.get("skip_reason") or "session_affinity_cooldown",
-                        )
-                    )
-                else:
-                    return _attach_aawm_alias_routing_state_sources(
-                        {
-                            **matched_affinity_state,
-                            "alias_model": alias_model,
-                            "session_key": session_key,
-                            "selection_reason": "session_affinity",
-                            "skipped": skipped,
-                            "in_flight_session": has_continuation_state,
-                        },
-                        affinity=affinity,
-                        selected_state=matched_affinity_state,
-                    )
-
     state = _select_available_state(
         request,
         states,
@@ -1723,12 +2360,17 @@ async def _select_anthropic_auto_agent_candidate(
         last_resort=False,
     )
     if state is not None:
+        selection_reason = (
+            "codex_oauth_account_failover"
+            if int(state.get("failover_ordinal") or 0) > 0
+            else "first_available"
+        )
         return _attach_aawm_alias_routing_state_sources(
             {
                 **state,
                 "alias_model": alias_model,
                 "session_key": session_key,
-                "selection_reason": "first_available",
+                "selection_reason": selection_reason,
                 "skipped": skipped,
                 "in_flight_session": has_continuation_state,
             },
@@ -1742,28 +2384,40 @@ async def _select_anthropic_auto_agent_candidate(
         last_resort=True,
     )
     if state is not None:
+        selection_reason = (
+            "codex_oauth_account_failover"
+            if int(state.get("failover_ordinal") or 0) > 0
+            else "last_resort"
+        )
         return _attach_aawm_alias_routing_state_sources(
             {
                 **state,
                 "alias_model": alias_model,
                 "session_key": session_key,
-                "selection_reason": "last_resort",
+                "selection_reason": selection_reason,
                 "skipped": skipped,
                 "in_flight_session": has_continuation_state,
             },
             selected_state=state,
         )
 
+    detail: dict[str, Any] = {
+        "error": {
+            "message": (
+                "All Anthropic auto-agent alias candidates are currently "
+                "cooled down or unavailable."
+            ),
+            "type": "rate_limit_error",
+            "code": "aawm_anthropic_auto_agent_all_candidates_cooling_down",
+        },
+        "candidates": skipped,
+    }
+    terminal_reset = _build_codex_oauth_terminal_reset_information(states)
+    if terminal_reset is not None:
+        detail["terminal_reset"] = terminal_reset
     raise HTTPException(
         status_code=429,
-        detail={
-            "error": {
-                "message": ("All Anthropic auto-agent alias candidates are currently cooled down."),
-                "type": "rate_limit_error",
-                "code": "aawm_anthropic_auto_agent_all_candidates_cooling_down",
-            },
-            "candidates": skipped,
-        },
+        detail=detail,
     )
 
 
@@ -1783,6 +2437,12 @@ _HOST_FUNCTION_NAMES = (
     "_get_codex_auto_agent_request_local_cooldown_seconds",
     "_set_codex_auto_agent_request_local_cooldown",
     "_get_codex_auto_agent_request_local_excluded_keys",
+    "_codex_oauth_candidate_slot",
+    "_get_codex_oauth_request_local_blocked_slots",
+    "_block_codex_oauth_request_local_candidate_slot",
+    "_get_codex_oauth_request_local_failover_context",
+    "_apply_codex_oauth_failover_context_to_state",
+    "_plan_codex_oauth_account_failover",
     "_exclude_codex_auto_agent_request_local_candidate",
     "_exclude_codex_auto_agent_request_local_candidate_without_cooldown",
     "_apply_request_local_cooldown_from_plan",
@@ -1796,10 +2456,21 @@ _HOST_FUNCTION_NAMES = (
     "_find_codex_auto_agent_affinity_candidate",
     "_find_anthropic_auto_agent_candidate",
     "_find_anthropic_auto_agent_affinity_candidate",
+    "_candidate_uses_codex_oauth",
+    "_is_codex_oauth_account_candidate",
+    "_candidate_matches_affinity",
+    "_resolve_codex_oauth_account_candidate_contexts",
     "_get_anthropic_auto_agent_candidate_cooldown_state",
     "_build_codex_auto_agent_candidate_state",
     "_build_anthropic_auto_agent_candidate_state",
+    "_format_codex_oauth_quota_reset_at",
+    "_codex_oauth_quota_window_public_shape",
+    "_codex_oauth_quota_window_is_confirmed_exhausted",
+    "_build_codex_oauth_terminal_reset_information",
     "_attach_normalized_quota_state",
+    "_apply_codex_oauth_account_context_to_state",
+    "_build_codex_auto_agent_affinity_candidate_state",
+    "_build_anthropic_auto_agent_affinity_candidate_state",
     "_build_codex_auto_agent_candidate_states",
     "_build_anthropic_auto_agent_candidate_states",
     "_get_request_selection_choices",
@@ -1866,8 +2537,11 @@ def install(host_globals: dict) -> None:
         "_find_anthropic_auto_agent_affinity_candidate": _find_anthropic_auto_agent_affinity_candidate,
         "_lookup_active_snapshot_canonical_alias": _lookup_active_snapshot_canonical_alias,
         "_resolve_aawm_alias_selection_enumeration": _resolve_aawm_alias_selection_enumeration,
+        "_select_snapshot_candidates": _select_snapshot_candidates,
         "_is_grok_account_quota_candidate": _is_grok_account_quota_candidate,
         "_get_grok_account_quota_lane_cooldown_key": _get_grok_account_quota_lane_cooldown_key,
         "_is_kimi_code_candidate": _is_kimi_code_candidate,
         "_get_kimi_managed_account_cooldown_key": _get_kimi_managed_account_cooldown_key,
+        "datetime": datetime,
+        "timezone": timezone,
     })

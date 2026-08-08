@@ -285,22 +285,35 @@ async def _set_codex_auto_agent_session_affinity(
     # compatibility against the active enumeration -- NOT the config hash --
     # so a priority/weight/schedule change does not break a valid pin.
     config_hash = candidate.get("config_epoch_tag")
-    async with family.lock:
-        family.session_affinity_by_key[session_key] = {
-            "provider": candidate["provider"],
-            "model": candidate["model"],
-            "route_family": candidate["route_family"],
-            "last_resort": bool(candidate.get("last_resort")),
-            "config_hash": config_hash,
-            "expires_at_monotonic": (time.monotonic() + _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS),
-            "affinity_state_source": "memory",
-        }
-        bound_memory_map(family.session_affinity_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
-    durable_payload: dict[str, Any] = {
+    affinity_payload: dict[str, Any] = {
         "provider": candidate["provider"],
         "model": candidate["model"],
         "route_family": candidate["route_family"],
         "last_resort": bool(candidate.get("last_resort")),
+        "config_hash": config_hash,
+    }
+    for field in (
+        "codex_oauth_account_label",
+        "codex_oauth_account_hash",
+        "codex_oauth_lane_key",
+    ):
+        value = candidate.get(field)
+        if isinstance(value, str) and value:
+            affinity_payload[field] = value
+    async with family.lock:
+        family.session_affinity_by_key[session_key] = {
+            **affinity_payload,
+            "expires_at_monotonic": (
+                time.monotonic()
+                + _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS
+            ),
+            "affinity_state_source": "memory",
+        }
+        bound_memory_map(family.session_affinity_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
+    durable_payload: dict[str, Any] = {
+        key: value
+        for key, value in affinity_payload.items()
+        if key != "config_hash"
     }
     if config_hash is not None:
         durable_payload["config_hash"] = config_hash
@@ -472,22 +485,35 @@ async def _set_anthropic_auto_agent_session_affinity(
     # is bypassed (config_hash is None) and affinity silently falls through
     # to the eligibility-filtered candidate list.
     config_hash = candidate.get("config_epoch_tag")
-    async with family.lock:
-        family.session_affinity_by_key[session_key] = {
-            "provider": candidate["provider"],
-            "model": candidate["model"],
-            "route_family": candidate["route_family"],
-            "last_resort": bool(candidate.get("last_resort")),
-            "config_hash": config_hash,
-            "expires_at_monotonic": (time.monotonic() + _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS),
-            "affinity_state_source": "memory",
-        }
-        bound_memory_map(family.session_affinity_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
-    durable_payload: dict[str, Any] = {
+    affinity_payload: dict[str, Any] = {
         "provider": candidate["provider"],
         "model": candidate["model"],
         "route_family": candidate["route_family"],
         "last_resort": bool(candidate.get("last_resort")),
+        "config_hash": config_hash,
+    }
+    for field in (
+        "codex_oauth_account_label",
+        "codex_oauth_account_hash",
+        "codex_oauth_lane_key",
+    ):
+        value = candidate.get(field)
+        if isinstance(value, str) and value:
+            affinity_payload[field] = value
+    async with family.lock:
+        family.session_affinity_by_key[session_key] = {
+            **affinity_payload,
+            "expires_at_monotonic": (
+                time.monotonic()
+                + _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS
+            ),
+            "affinity_state_source": "memory",
+        }
+        bound_memory_map(family.session_affinity_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE)
+    durable_payload: dict[str, Any] = {
+        key: value
+        for key, value in affinity_payload.items()
+        if key != "config_hash"
     }
     if config_hash is not None:
         durable_payload["config_hash"] = config_hash

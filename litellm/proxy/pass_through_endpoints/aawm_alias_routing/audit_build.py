@@ -287,6 +287,38 @@ def _build_auto_agent_alias_audit_event(
     elif isinstance(error_tokens, set):
         event["error_tokens"] = sorted(error_tokens)
 
+    for public_field, candidate_fields in (
+        (
+            "account_label",
+            ("account_label", "codex_oauth_account_label"),
+        ),
+        (
+            "account_hash",
+            ("account_hash", "codex_oauth_account_hash"),
+        ),
+        (
+            "account_lane",
+            ("account_lane", "codex_oauth_lane_key"),
+        ),
+    ):
+        for candidate_field in candidate_fields:
+            value = candidate.get(candidate_field)
+            if value is not None:
+                event[public_field] = value
+                break
+    for field in (
+        "quota_snapshot_age_seconds",
+        "quota_windows",
+        "failover_ordinal",
+        "prior_account_outcome",
+        "terminal_reset",
+    ):
+        value = candidate.get(field)
+        if value is None:
+            value = selection.get(field)
+        if value is not None:
+            event[field] = value
+
     cooldown_state_source = candidate.get("cooldown_state_source")
     if cooldown_state_source is None:
         cooldown_state_source = selection.get("cooldown_state_source")
