@@ -750,9 +750,9 @@ async def test_oa_xai_harness_routes_litellm_client_to_upstream_oauth(
 
 
 @pytest.mark.asyncio
-async def test_oa_xai_harness_decodes_previous_response_id_before_responses_egress():
+async def test_oa_xai_harness_sanitizes_tool_search_continuation_before_egress():
     harness = OaXaiHarness()
-    public_model = "oa_xai/grok-4.3"
+    public_model = "oa_xai/grok-4.5"
     original_response_id = "resp_xai_upstream_compaction_blob"
     encoded_response_id = ResponsesAPIRequestUtils._build_responses_api_response_id(
         custom_llm_provider="xai",
@@ -769,16 +769,96 @@ async def test_oa_xai_harness_decodes_previous_response_id_before_responses_egre
                 "summary": [],
                 "encrypted_content": "encrypted-direct-oa-xai-compaction",
             },
-            {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+            {
+                "type": "tool_search_call",
+                "id": "tsc_tool_search",
+                "call_id": "call_tool_search",
+                "status": "completed",
+                "execution": "client",
+                "arguments": {"query": "collaboration tools"},
+            },
+            {
+                "type": "tool_search_output",
+                "id": "tso_tool_search",
+                "call_id": "call_tool_search",
+                "status": "completed",
+                "execution": "client",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "collaboration",
+                        "description": "Collaboration tools.",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "spawn_agent",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {},
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "type": "tool_search_call",
+                "id": "tsc_tool_search_followup",
+                "call_id": "call_tool_search_followup",
+                "status": "completed",
+                "execution": "client",
+                "arguments": {"query": "spawn agent"},
+            },
+            {
+                "type": "tool_search_output",
+                "id": "tso_tool_search_followup",
+                "call_id": "call_tool_search_followup",
+                "status": "completed",
+                "execution": "client",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "collaboration",
+                        "description": "Collaboration tools.",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "spawn_agent",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {},
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "type": "function_call",
+                "id": "fc_spawn_agent",
+                "name": "spawn_agent",
+                "namespace": "collaboration",
+                "call_id": "call_1",
+                "arguments": '{"message":"inspect"}',
+            },
             {
                 "type": "function_call_output",
+                "id": "fco_spawn_agent",
                 "call_id": "call_1",
                 "output": "ok",
             },
         ],
         "previous_response_id": encoded_response_id,
+        "client_metadata": {"originator": "codex_exec"},
+        "prompt_cache_key": "codex-request-identity",
         "metadata": {"session_id": harness.session_id, "tags": ["existing-tag"]},
-        "litellm_metadata": {"tags": ["existing-litellm-tag"]},
+        "litellm_metadata": {
+            "agent_name": "d1-594-regression",
+            "agent_role": "openai",
+            "thread_source": "subagent",
+            "agent_id": "agent-d1-594",
+            "tags": ["existing-litellm-tag"],
+        },
     }
     llm_router = MagicMock()
     llm_router.model_names = []
@@ -801,15 +881,25 @@ async def test_oa_xai_harness_decodes_previous_response_id_before_responses_egre
     assert call_kwargs["model"] == harness.public_to_upstream[public_model]
     assert call_kwargs["input"] == [
         {"type": "message", "role": "user", "content": "continue"},
-        {"type": "function_call", "name": "exec_command", "call_id": "call_1"},
+        {
+            "type": "function_call",
+            "id": "fc_spawn_agent",
+            "name": "spawn_agent",
+            "namespace": "collaboration",
+            "call_id": "call_1",
+            "arguments": '{"message":"inspect"}',
+        },
         {
             "type": "function_call_output",
+            "id": "fco_spawn_agent",
             "call_id": "call_1",
             "output": "ok",
         },
     ]
     assert call_kwargs["previous_response_id"] == original_response_id
     assert call_kwargs["previous_response_id"] != encoded_response_id
+    assert call_kwargs["client_metadata"] == {"originator": "codex_exec"}
+    assert call_kwargs["prompt_cache_key"] == "codex-request-identity"
     assert call_kwargs["metadata"] == {
         "session_id": harness.session_id,
         "tags": ["existing-tag"],
@@ -827,10 +917,25 @@ async def test_oa_xai_harness_decodes_previous_response_id_before_responses_egre
     ]["tags"]
     assert call_kwargs["litellm_metadata"][
         "codex_unsupported_input_item_removed_count"
-    ] == 1
+    ] == 5
+    assert call_kwargs["litellm_metadata"][
+        "codex_unsupported_input_item_types_removed"
+    ] == ["reasoning", "tool_search_call", "tool_search_output"]
     assert call_kwargs["litellm_metadata"][
         "codex_unsupported_input_items_removed"
-    ] == [{"type": "reasoning", "index": 1, "encrypted_content": True}]
+    ] == [
+        {"type": "reasoning", "index": 1, "encrypted_content": True},
+        {"type": "tool_search_call", "index": 2},
+        {"type": "tool_search_output", "index": 3},
+        {"type": "tool_search_call", "index": 4},
+        {"type": "tool_search_output", "index": 5},
+    ]
+    assert call_kwargs["litellm_metadata"]["agent_name"] == "d1-594-regression"
+    assert call_kwargs["litellm_metadata"]["agent_role"] == "openai"
+    assert call_kwargs["litellm_metadata"]["thread_source"] == "subagent"
+    assert call_kwargs["litellm_metadata"]["agent_id"] == "agent-d1-594"
+    assert call_kwargs["api_key"] == "managed-oauth-token"
+    assert call_kwargs["custom_llm_provider"] == "xai"
 
 
 @pytest.mark.parametrize(

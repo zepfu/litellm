@@ -60,7 +60,10 @@ _XAI_RESPONSES_PREVIOUS_RESPONSE_ID_DECODED_METADATA = {
     "tags": ["xai-responses-previous-response-id-decoded"],
 }
 
-_XAI_UNSUPPORTED_REASONING_INPUT_REMOVED_TAG = "codex-unsupported-input-item-removed"
+_XAI_UNSUPPORTED_INPUT_ITEM_REMOVED_TAG = "codex-unsupported-input-item-removed"
+_XAI_UNSUPPORTED_INPUT_ITEM_TYPES = frozenset(
+    {"reasoning", "tool_search_call", "tool_search_output"}
+)
 
 _refresh_locks: Dict[str, asyncio.Lock] = {}
 
@@ -169,7 +172,7 @@ async def prepare_oa_xai_request(data: Dict[str, Any]) -> bool:
     data["api_key"] = await get_xai_oauth_access_token()
     data["custom_llm_provider"] = "xai"
     decoded_previous_response_id = _decode_previous_response_id_in_place(data)
-    removed_input_items = _drop_xai_unsupported_reasoning_input_items_in_place(data)
+    removed_input_items = _drop_xai_unsupported_input_items_in_place(data)
 
     existing_litellm_metadata = data.get("litellm_metadata")
     litellm_metadata = (
@@ -193,9 +196,7 @@ async def prepare_oa_xai_request(data: Dict[str, Any]) -> bool:
     if removed_input_items:
         _merge_metadata(
             litellm_metadata,
-            _build_xai_unsupported_reasoning_input_removed_metadata(
-                removed_input_items
-            ),
+            _build_xai_unsupported_input_removed_metadata(removed_input_items),
             authoritative=True,
         )
 
@@ -217,7 +218,7 @@ def _decode_previous_response_id_in_place(data: Dict[str, Any]) -> bool:
     return True
 
 
-def _drop_xai_unsupported_reasoning_input_items_in_place(
+def _drop_xai_unsupported_input_items_in_place(
     data: Dict[str, Any],
 ) -> list[Dict[str, Any]]:
     input_items = data.get("input")
@@ -231,9 +232,12 @@ def _drop_xai_unsupported_reasoning_input_items_in_place(
             updated_input_items.append(item)
             continue
 
-        if str(item.get("type") or "").lower() == "reasoning":
-            removed_item: Dict[str, Any] = {"type": "reasoning", "index": index}
-            if isinstance(item.get("encrypted_content"), str):
+        item_type = str(item.get("type") or "").lower()
+        if item_type in _XAI_UNSUPPORTED_INPUT_ITEM_TYPES:
+            removed_item: Dict[str, Any] = {"type": item_type, "index": index}
+            if item_type == "reasoning" and isinstance(
+                item.get("encrypted_content"), str
+            ):
                 removed_item["encrypted_content"] = True
             removed_items.append(removed_item)
             continue
@@ -245,16 +249,26 @@ def _drop_xai_unsupported_reasoning_input_items_in_place(
     return removed_items
 
 
-def _build_xai_unsupported_reasoning_input_removed_metadata(
+def _build_xai_unsupported_input_removed_metadata(
     removed_items: list[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    removed_item_types = sorted(
+        {
+            item_type
+            for item in removed_items
+            if isinstance((item_type := item.get("type")), str) and item_type
+        }
+    )
     return {
         "codex_unsupported_input_item_removed_count": len(removed_items),
-        "codex_unsupported_input_item_types_removed": ["reasoning"],
+        "codex_unsupported_input_item_types_removed": removed_item_types,
         "codex_unsupported_input_items_removed": removed_items,
         "tags": [
-            _XAI_UNSUPPORTED_REASONING_INPUT_REMOVED_TAG,
-            "codex-unsupported-input-item:reasoning",
+            _XAI_UNSUPPORTED_INPUT_ITEM_REMOVED_TAG,
+            *(
+                f"codex-unsupported-input-item:{item_type}"
+                for item_type in removed_item_types
+            ),
         ],
     }
 
