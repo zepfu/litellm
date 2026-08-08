@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane as cp
+from litellm.proxy.pass_through_endpoints import aawm_context_query as context_query
 
 
 def test_dispatch_reference_extraction_caps_and_filters_stopwords() -> None:
@@ -253,10 +254,10 @@ async def test_close_aawm_dynamic_injection_pool_closes_and_clears() -> None:
             closed["n"] += 1
 
     pool = _Pool()
-    cp._aawm_dynamic_injection_pool = pool
+    context_query._aawm_dynamic_injection_pool = pool
     await cp.close_aawm_dynamic_injection_pool()
     assert closed["n"] == 1
-    assert cp._aawm_dynamic_injection_pool is None
+    assert context_query._aawm_dynamic_injection_pool is None
     # Second close is a no-op
     await cp.close_aawm_dynamic_injection_pool()
     assert closed["n"] == 1

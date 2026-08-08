@@ -155,8 +155,22 @@ by provider routes. Operator-facing behaviors that are easy to miss:
 
 ## AAWM Claude control-plane (fork overlay)
 
-`aawm_claude_control_plane.py` owns Claude Code request rewrites and dynamic
-injection for this fork. Operator-facing behavior that is easy to miss:
+`aawm_claude_control_plane.py` owns Claude Code rewrite orchestration for this
+fork. Its dependencies have narrower canonical owners:
+
+- `aawm_request_policy/claude_prompt_replacement.py` owns template discovery,
+  packaged-data fallback, auto-memory replacement, prompt-patch manifest
+  application, and their metadata helpers.
+- `aawm_context_query.py` owns provider-neutral secret/DSN parsing, the single
+  process asyncpg pool, acquire/query timeouts, context queries, and both
+  15-second default TTL caches.
+- `llm_passthrough_endpoints.py` is the production composition root. It injects
+  prompt, context/query, clock, cache, and observability services into one
+  `ClaudeControlPlaneRewriter`; the control plane never imports the host.
+
+Historical control-plane names remain available only as thin compatibility
+delegates. They do not own copied prompt/query implementations or a second pool.
+Operator-facing behavior that is easy to miss:
 
 ### Trust boundary
 
@@ -184,22 +198,38 @@ blocks; the request-wide budget is what stops unbounded DB fan-out.
 
 ### Connection pool lifecycle
 
-The control-plane module owns the canonical process-wide asyncpg pool used for
-dynamic injection / context grabs **and** for sibling AAWM Postgres lookups that
-share the same DSN (for example OpenRouter free-tier durable quota reads in
-`llm_passthrough_endpoints.py`). `close_aawm_dynamic_injection_pool()` is
-invoked from `proxy_shutdown_event()` so connections are released on clean
-proxy shutdown.
+`aawm_context_query.py` owns the canonical process-wide asyncpg pool used for
+dynamic injection / context grabs and sibling AAWM Postgres lookups that share
+the same DSN. OpenRouter free-tier durable quota reads receive this neutral pool
+callback directly; they do not consume a Claude-owned database service.
+`close_aawm_dynamic_injection_pool()` is invoked from
+`proxy_shutdown_event()` so connections are released on clean proxy shutdown.
 
-`llm_passthrough_endpoints` re-exports the control-plane pool/DSN helpers
-(`_get_aawm_dynamic_injection_pool`, `_build_aawm_dynamic_injection_dsn`, …)
-for stable import compatibility, but it must not create a second asyncpg pool.
+`llm_passthrough_endpoints` and `aawm_claude_control_plane` retain stable
+pool/DSN compatibility exports, but neither stores pool state or creates a
+second asyncpg pool.
 
 ### Control-plane rewrite scope
 
 `apply_claude_control_plane_rewrites_to_anthropic_request_body()` rewrites only
 `system` and the first user message (auto-memory, prompt-patch manifest,
 CommonMark identifier list). Full history is not re-scanned every turn.
+
+### Startup and readiness
+
+Startup records a sanitized Claude control-plane initialization state:
+
+- `active/enabled`: required owners imported and the production rewriter was
+  composed.
+- `degraded/optional`: only the exact absence of the optional overlay module is
+  accepted; rewrite callbacks are explicit no-ops and readiness remains healthy.
+- `failed/unavailable`: a transitive import, required owner, or composition
+  defect installs fail-closed callbacks and makes `/health/readiness` return
+  HTTP 503 with reason `aawm_claude_control_plane_unavailable`.
+
+The readiness payload exposes only state, mode, readiness, a stable reason, and
+the exception class. Import messages, filesystem paths, configuration values,
+and secrets are not included.
 
 ## AAWM alias routing and adapter ownership (RR-054)
 
@@ -533,17 +563,22 @@ persisted-output installation (which references the logging callback), and
 alias guidance must be configured after observability (which supplies its
 merge/span callbacks).
 
-**Control-plane canonicalization.** `aawm_claude_control_plane.py` imports
-three canonical helpers from `observability_metadata`:
+**Control-plane canonicalization.** `aawm_claude_control_plane.py` composes
+canonical prompt services from `claude_prompt_replacement`, context/query
+services from `aawm_context_query`, and three canonical helpers from
+`observability_metadata`:
 
 - `_iter_anthropic_text_fragments`
 - `_extract_claude_agent_and_tenant_from_request_body`
 - `_detect_claude_post_rewrite_context_files`
 
-These are same-object references to the observability module's definitions.
-The control plane retains its own distinct local `_get_nested_str_value`
-implementation, which is intentionally separate from the
-observability-metadata facade of the same name.
+The observability helpers are same-object references to that module's
+definitions. The control plane retains its own distinct local
+`_get_nested_str_value` implementation, which is intentionally separate from
+the observability-metadata facade of the same name. Prompt/template and
+context/query compatibility names are thin delegates to their canonical
+owners; no control-plane runtime path calls `_lp()` or imports the pass-through
+host.
 
 **Import boundary.** No Wave 6D module imports `llm_passthrough_endpoints` at
 module scope. `alias_guidance.py` imports from `lane_keys` (policy constants)
@@ -689,7 +724,8 @@ authoritative reference for the pass-through subsystem.
 | `observability_metadata.py` | `aawm_request_policy/` | Shared metadata primitives, session/repository extraction, tool-definition snapshots, Claude/Gemini/Codex breakouts, Anthropic billing headers, route-family logging |
 | `persisted_output.py` | `aawm_request_policy/` | Claude persisted-output expansion and content-text estimation |
 | `anthropic_body_prep.py` | `aawm_request_policy/` | OpenAI-adapter Claude-context compaction, Anthropic tool-block validation / tool-use-id repair, final `_prepare_anthropic_request_body_for_passthrough` orchestration |
-| `claude_prompt_replacement.py` | `aawm_request_policy/` | Claude auto-memory section replacement, prompt-patch manifest application, logging-metadata helpers |
+| `claude_prompt_replacement.py` | `aawm_request_policy/` | Claude template and packaged-data lookup, auto-memory replacement, prompt-patch manifest application, logging-metadata helpers, prompt service construction |
+| `aawm_context_query.py` | `pass_through_endpoints/` | Provider-neutral context caches, secret/DSN parsing, asyncpg pool lifecycle, acquire/query timeouts, context and reference queries |
 | `codex_tool_policy.py` | `aawm_request_policy/` | Codex spawn-agent / core-tool description patches, model-capability policy, custom-tool-to-function and namespace-tool adaptation, unsupported-field drops, tool-choice cleanup, Grok-native input-item policy |
 | `anthropic_adapter_calls.py` | `aawm_adapter_runtime/` | Shared Anthropic adapter request policies, execution, streaming, response finalization, route logging support |
 | `anthropic_dispatch.py` | `aawm_adapter_runtime/` | Anthropic-shaped adapter recognition and optional dispatch through explicit `AnthropicDispatchRuntime` |

@@ -16,9 +16,10 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from litellm.proxy.pass_through_endpoints.aawm_request_policy.observability_metadata import (
     _build_langfuse_span_descriptor,
@@ -30,24 +31,65 @@ from litellm.proxy.pass_through_endpoints.aawm_request_policy.observability_meta
 # Constants
 # ---------------------------------------------------------------------------
 
-_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR = (
+_REPO_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR = (
     Path(__file__).resolve().parents[4] / "context-replacement" / "claude-code"
 )
+_PACKAGED_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR = (
+    Path(__file__).resolve().parents[1]
+    / "aawm_claude_control_plane_data"
+    / "claude-code"
+)
+_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR = _REPO_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR
 _CLAUDE_AUTO_MEMORY_TEMPLATE_PATH = (
     _CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR / "2.1.110" / "auto-memory-replacement.md"
 )
 _CLAUDE_PROMPT_PATCH_MANIFEST_PATH = (
     _CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR / "prompt-patches" / "roman01la-2026-04-02.json"
 )
-_CLAUDE_AUTO_MEMORY_MIN_COMPAT_VERSION = (2, 1, 110)
-_CLAUDE_AUTO_MEMORY_SECTION_PATTERN = re.compile(
-    r"(?ms)^# auto memory\n.*?(?=^# Environment\b|\Z)"
+_CLAUDE_AUTO_MEMORY_TEMPLATE_LOGICAL_PATH = (
+    "context-replacement/claude-code/2.1.110/auto-memory-replacement.md"
 )
+_CLAUDE_PROMPT_PATCH_MANIFEST_LOGICAL_PATH = (
+    "context-replacement/claude-code/prompt-patches/roman01la-2026-04-02.json"
+)
+_CLAUDE_REPORT_FILE_PATCH_ID = "subagent-report-file-explicit-request"
+_CLAUDE_REPORT_FILE_INSTRUCTION_PATTERN = re.compile(
+    r"Do NOT\s+(?:Write|\$\{[^}\r\n]+\})\s+"
+    r"report/summary/findings/analysis\s+\.md\s+files\.\s+"
+    r"Return findings directly as your final assistant message"
+    r"(?:\s+[—-]\s+the parent agent reads your text output,\s+not files you create)?"
+    r"\.?",
+)
+_CLAUDE_AUTO_MEMORY_MIN_COMPAT_VERSION = (2, 1, 110)
+_CLAUDE_MEMORY_SECTION_PATTERN = re.compile(
+    r"(?ms)^(?P<section_heading># (?:auto memory|Persistent Agent Memory))\n"
+    r".*?(?=^# [^\n]+\n|\Z)"
+)
+_CLAUDE_AUTO_MEMORY_SECTION_PATTERN = _CLAUDE_MEMORY_SECTION_PATTERN
 _CLAUDE_TYPES_XML_BLOCK_PATTERN = re.compile(r"<types>\n.*?\n</types>", re.DOTALL)
 _CLAUDE_CONTEXT_REPLACEMENT_PLACEHOLDER_PATTERN = re.compile(r"\{\{[A-Z_]+\}\}")
 _CLAUDE_CC_VERSION_PATTERN = re.compile(
     r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ClaudePromptReplacementServices:
+    resolve_auto_memory_template_path: Callable[[Optional[str]], Optional[Path]]
+    resolve_prompt_patch_manifest_path: Callable[[], Path]
+    load_prompt_patch_manifest: Callable[[Path], dict[str, Any]]
+    replace_auto_memory_section: Callable[
+        [str, str], tuple[str, Optional[dict[str, Any]]]
+    ]
+    apply_prompt_patch_manifest: Callable[
+        ..., tuple[str, list[dict[str, Any]]]
+    ]
+    add_override_metadata: Callable[
+        [dict[str, Any], list[dict[str, Any]]], dict[str, Any]
+    ]
+    add_patch_metadata: Callable[
+        [dict[str, Any], list[dict[str, Any]]], dict[str, Any]
+    ]
 
 # ---------------------------------------------------------------------------
 # Caches
@@ -78,6 +120,27 @@ def _parse_claude_code_version(
     )
 
 
+def _candidate_context_replacement_dirs() -> tuple[Path, ...]:
+    return tuple(
+        directory
+        for directory in (
+            _REPO_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR,
+            _PACKAGED_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR,
+        )
+        if directory.exists()
+    )
+
+
+def _resolve_context_replacement_file(
+    relative_parts: tuple[str, ...],
+) -> Optional[Path]:
+    for base_dir in _candidate_context_replacement_dirs():
+        candidate = base_dir.joinpath(*relative_parts)
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _resolve_claude_auto_memory_template_path(
     cc_version: Optional[str],
 ) -> Optional[Path]:
@@ -93,7 +156,18 @@ def _resolve_claude_auto_memory_template_path(
     if patch < min_patch:
         return None
 
-    return _CLAUDE_AUTO_MEMORY_TEMPLATE_PATH
+    return _resolve_context_replacement_file(
+        ("2.1.110", "auto-memory-replacement.md")
+    )
+
+
+def _resolve_claude_prompt_patch_manifest_path() -> Path:
+    manifest_path = _resolve_context_replacement_file(
+        ("prompt-patches", "roman01la-2026-04-02.json")
+    )
+    if manifest_path is None:
+        raise ValueError("Claude prompt patch manifest is missing")
+    return manifest_path
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +259,10 @@ def _extract_markdown_section(markdown_text: str, heading: str) -> str:
 
 
 def _render_claude_auto_memory_replacement(
-    auto_memory_section: str, cc_version: str
-) -> tuple[str, Path]:
+    memory_section: str,
+    cc_version: str,
+    section_heading: str = "# auto memory",
+) -> tuple[str, str]:
     template_path = _resolve_claude_auto_memory_template_path(cc_version)
     if template_path is None:
         raise ValueError(
@@ -196,7 +272,7 @@ def _render_claude_auto_memory_replacement(
     template_text = _load_claude_context_replacement_template(template_path)
     rendered_text = template_text
     if "{{TYPES_XML_BLOCK}}" in rendered_text:
-        types_match = _CLAUDE_TYPES_XML_BLOCK_PATTERN.search(auto_memory_section)
+        types_match = _CLAUDE_TYPES_XML_BLOCK_PATTERN.search(memory_section)
         if types_match is None:
             raise ValueError("Missing Claude auto-memory <types> block")
         rendered_text = rendered_text.replace(
@@ -211,7 +287,7 @@ def _render_claude_auto_memory_replacement(
     for placeholder, heading in section_placeholders.items():
         if placeholder in rendered_text:
             rendered_text = rendered_text.replace(
-                placeholder, _extract_markdown_section(auto_memory_section, heading)
+                placeholder, _extract_markdown_section(memory_section, heading)
             )
 
     unresolved_placeholders = (
@@ -223,30 +299,34 @@ def _render_claude_auto_memory_replacement(
             + ", ".join(sorted(unresolved_placeholders))
         )
 
-    return rendered_text.rstrip() + "\n", template_path
+    if section_heading != "# auto memory":
+        rendered_text = rendered_text.replace("# auto memory", section_heading, 1)
+
+    return rendered_text.rstrip() + "\n", _CLAUDE_AUTO_MEMORY_TEMPLATE_LOGICAL_PATH
 
 
 def _replace_claude_auto_memory_section_in_text(
     text: str, cc_version: str
 ) -> tuple[str, Optional[dict[str, Any]]]:
-    if "# auto memory" not in text:
+    if "# auto memory" not in text and "# Persistent Agent Memory" not in text:
         return text, None
 
-    section_match = _CLAUDE_AUTO_MEMORY_SECTION_PATTERN.search(text)
+    section_match = _CLAUDE_MEMORY_SECTION_PATTERN.search(text)
     if section_match is None:
         return text, None
 
-    replacement_text, template_path = _render_claude_auto_memory_replacement(
+    section_heading = section_match.group("section_heading")
+    replacement_text, logical_path = _render_claude_auto_memory_replacement(
         section_match.group(0),
         cc_version,
+        section_heading,
     )
     replacement_event: dict[str, Any] = {
         "id": "auto-memory",
         "status": "resolved",
         "cc_version": cc_version,
-        "template_path": str(
-            template_path.relative_to(Path(__file__).resolve().parents[4])
-        ),
+        "template_path": logical_path,
+        "section_heading": section_heading,
         "output_chars": len(replacement_text),
     }
     return (
@@ -260,7 +340,10 @@ def _replace_claude_system_prompt_override_in_value(
 ) -> tuple[Any, list[dict[str, Any]]]:
     if isinstance(value, dict):
         if value.get("type") == "text" and isinstance(value.get("text"), str):
-            if "# auto memory" not in value["text"]:
+            if (
+                "# auto memory" not in value["text"]
+                and "# Persistent Agent Memory" not in value["text"]
+            ):
                 return value, []
             try:
                 updated_text, event = _replace_claude_auto_memory_section_in_text(
@@ -444,36 +527,63 @@ def _replace_claude_system_prompt_in_anthropic_request_body(
 # ---------------------------------------------------------------------------
 
 
+def _apply_claude_prompt_patch_manifest_to_text(
+    text: str,
+    *,
+    cc_version: str,
+    manifest: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]]]:
+    updated_text = text
+    patch_events: list[dict[str, Any]] = []
+
+    for patch_descriptor in manifest["patches"]:
+        patch_id = patch_descriptor["id"]
+        before_text = patch_descriptor["before"]
+        after_text = patch_descriptor["after"]
+        occurrences = updated_text.count(before_text)
+        match_types: list[str] = []
+        if occurrences:
+            updated_text = updated_text.replace(before_text, after_text)
+            match_types.append("exact")
+
+        if patch_id == _CLAUDE_REPORT_FILE_PATCH_ID:
+            updated_text, pattern_occurrences = (
+                _CLAUDE_REPORT_FILE_INSTRUCTION_PATTERN.subn(
+                    after_text,
+                    updated_text,
+                )
+            )
+            if pattern_occurrences:
+                occurrences += pattern_occurrences
+                match_types.append("pattern")
+
+        if not occurrences:
+            continue
+
+        event: dict[str, Any] = {
+            "id": patch_id,
+            "status": "resolved",
+            "cc_version": cc_version,
+            "manifest_path": _CLAUDE_PROMPT_PATCH_MANIFEST_LOGICAL_PATH,
+            "occurrences": occurrences,
+        }
+        if match_types:
+            event["match_types"] = match_types
+        patch_events.append(event)
+
+    return updated_text, patch_events
+
+
 def _apply_claude_prompt_patches_in_text(
     text: str, cc_version: str
 ) -> tuple[str, list[dict[str, Any]]]:
-    manifest_path = _CLAUDE_PROMPT_PATCH_MANIFEST_PATH
+    manifest_path = _resolve_claude_prompt_patch_manifest_path()
     manifest = _load_claude_prompt_patch_manifest(manifest_path)
-    updated_text = text
-    patch_events: list[dict[str, Any]] = []
-    relative_manifest_path = str(
-        manifest_path.relative_to(Path(__file__).resolve().parents[4])
+    return _apply_claude_prompt_patch_manifest_to_text(
+        text,
+        cc_version=cc_version,
+        manifest=manifest,
     )
-
-    for patch_descriptor in manifest["patches"]:
-        before_text = patch_descriptor["before"]
-        if before_text not in updated_text:
-            continue
-
-        after_text = patch_descriptor["after"]
-        occurrences = updated_text.count(before_text)
-        updated_text = updated_text.replace(before_text, after_text)
-        patch_events.append(
-            {
-                "id": patch_descriptor["id"],
-                "status": "resolved",
-                "cc_version": cc_version,
-                "manifest_path": relative_manifest_path,
-                "occurrences": occurrences,
-            }
-        )
-
-    return updated_text, patch_events
 
 
 def _replace_claude_prompt_patches_in_value(
@@ -652,3 +762,17 @@ def _apply_claude_prompt_patches_to_anthropic_request_body(
                         datetime.now(timezone.utc)
                     )
     return updated_body, patch_events
+
+
+def build_claude_prompt_replacement_services() -> ClaudePromptReplacementServices:
+    return ClaudePromptReplacementServices(
+        resolve_auto_memory_template_path=_resolve_claude_auto_memory_template_path,
+        resolve_prompt_patch_manifest_path=(
+            _resolve_claude_prompt_patch_manifest_path
+        ),
+        load_prompt_patch_manifest=_load_claude_prompt_patch_manifest,
+        replace_auto_memory_section=_replace_claude_auto_memory_section_in_text,
+        apply_prompt_patch_manifest=_apply_claude_prompt_patch_manifest_to_text,
+        add_override_metadata=_add_claude_system_prompt_override_logging_metadata,
+        add_patch_metadata=_add_claude_prompt_patch_logging_metadata,
+    )

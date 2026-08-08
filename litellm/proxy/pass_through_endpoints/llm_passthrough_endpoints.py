@@ -10,6 +10,7 @@ import asyncio  # noqa: F401 - live compatibility binding for provider runtimes
 import codecs  # noqa: F401 - compatibility binding for extracted Wave 6A facades
 import copy
 import hashlib  # noqa: F401 - live host global for installed lane-key functions
+import importlib
 import json
 import os
 import posixpath
@@ -146,48 +147,236 @@ from litellm.proxy.aawm_route_logging import (
     record_aawm_route_rollup_turn,  # noqa: F401 - Wave 6F facade host binding
     resolve_aawm_route_host_attribution,  # noqa: F401 - rollup install host binding
 )
-
-try:
-    from litellm.proxy.pass_through_endpoints.aawm_claude_control_plane import (
-        add_claude_post_rewrite_context_file_logging_metadata as _aawm_add_claude_post_rewrite_context_file_logging_metadata,
-    )
-    from litellm.proxy.pass_through_endpoints.aawm_claude_control_plane import (
-        apply_claude_control_plane_rewrites_to_anthropic_request_body as _aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body,
-    )
-    from litellm.proxy.pass_through_endpoints.aawm_claude_control_plane import (
-        expand_aawm_dynamic_directives_in_anthropic_request_body as _aawm_expand_aawm_dynamic_directives_in_anthropic_request_body,
-    )
-except ImportError:
-
-    def _aawm_add_claude_post_rewrite_context_file_logging_metadata(
-        request_body: dict[str, Any],
-    ) -> dict[str, Any]:
-        return request_body
-
-    async def _aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body(
-        request_body: dict[str, Any],
-        billing_header_fields: dict[str, str],
-    ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
-        return request_body, [], []
-
-    async def _aawm_expand_aawm_dynamic_directives_in_anthropic_request_body(
-        request_body: dict[str, Any],
-    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        return request_body, []
-
-
-# RR-054 #7: single process-wide AAWM dynamic-injection pool ownership lives in
-# aawm_claude_control_plane. Re-export stable helpers so OpenRouter quota and
-# tests keep the historical import surface without opening a second pool.
-from litellm.proxy.pass_through_endpoints.aawm_claude_control_plane import (  # noqa: F401
-    _build_aawm_dynamic_injection_dsn,
-    _call_aawm_get_agent_memories,
-    _get_aawm_dynamic_injection_application_name,
-    _get_aawm_dynamic_injection_pool,
-    _get_aawm_dynamic_injection_server_settings,
-    _initialize_aawm_dynamic_injection_connection,
-    close_aawm_dynamic_injection_pool,
+from litellm.proxy.pass_through_endpoints import (
+    aawm_context_query as _aawm_context_query,
 )
+
+_AAWM_CLAUDE_CONTROL_PLANE_MODULE = (
+    "litellm.proxy.pass_through_endpoints.aawm_claude_control_plane"
+)
+_AAWM_CLAUDE_PROMPT_REPLACEMENT_MODULE = (
+    "litellm.proxy.pass_through_endpoints.aawm_request_policy."
+    "claude_prompt_replacement"
+)
+_AAWM_CLAUDE_CONTROL_PLANE_UNAVAILABLE = (
+    "AAWM Claude control plane is unavailable"
+)
+_aawm_claude_control_plane_initialization_status: dict[str, Any] = {
+    "state": "not_initialized",
+    "mode": "unavailable",
+    "ready": False,
+    "reason": "not_initialized",
+    "error_type": None,
+}
+
+
+def get_aawm_claude_control_plane_initialization_status() -> dict[str, Any]:
+    return dict(_aawm_claude_control_plane_initialization_status)
+
+
+def is_aawm_claude_control_plane_ready() -> bool:
+    return bool(_aawm_claude_control_plane_initialization_status.get("ready"))
+
+
+def _aawm_claude_control_plane_degraded_add_metadata(
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    return request_body
+
+
+async def _aawm_claude_control_plane_degraded_apply_rewrites(
+    request_body: dict[str, Any],
+    billing_header_fields: dict[str, str],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    return request_body, [], []
+
+
+async def _aawm_claude_control_plane_degraded_expand_context(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    return request_body, []
+
+
+def _raise_aawm_claude_control_plane_unavailable() -> None:
+    raise RuntimeError(_AAWM_CLAUDE_CONTROL_PLANE_UNAVAILABLE)
+
+
+def _aawm_claude_control_plane_failed_add_metadata(
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    _raise_aawm_claude_control_plane_unavailable()
+
+
+async def _aawm_claude_control_plane_failed_apply_rewrites(
+    request_body: dict[str, Any],
+    billing_header_fields: dict[str, str],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    _raise_aawm_claude_control_plane_unavailable()
+
+
+async def _aawm_claude_control_plane_failed_expand_context(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    _raise_aawm_claude_control_plane_unavailable()
+
+
+_aawm_add_claude_post_rewrite_context_file_logging_metadata = (
+    _aawm_claude_control_plane_failed_add_metadata
+)
+_aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body = (
+    _aawm_claude_control_plane_failed_apply_rewrites
+)
+_aawm_expand_aawm_dynamic_directives_in_anthropic_request_body = (
+    _aawm_claude_control_plane_failed_expand_context
+)
+
+# Provider-neutral ownership with historical host compatibility exports.
+_build_aawm_dynamic_injection_dsn = (
+    _aawm_context_query._build_aawm_dynamic_injection_dsn
+)
+_call_aawm_get_agent_memories = (
+    _aawm_context_query._call_aawm_get_agent_memories
+)
+_get_aawm_dynamic_injection_application_name = (
+    _aawm_context_query._get_aawm_dynamic_injection_application_name
+)
+_get_aawm_dynamic_injection_pool = (
+    _aawm_context_query._get_aawm_dynamic_injection_pool
+)
+_get_aawm_dynamic_injection_server_settings = (
+    _aawm_context_query._get_aawm_dynamic_injection_server_settings
+)
+_initialize_aawm_dynamic_injection_connection = (
+    _aawm_context_query._initialize_aawm_dynamic_injection_connection
+)
+close_aawm_dynamic_injection_pool = (
+    _aawm_context_query.close_aawm_dynamic_injection_pool
+)
+
+
+def _set_aawm_claude_control_plane_initialization_status(
+    *,
+    state: str,
+    mode: str,
+    ready: bool,
+    reason: Optional[str],
+    error_type: Optional[str] = None,
+) -> None:
+    global _aawm_claude_control_plane_initialization_status
+    _aawm_claude_control_plane_initialization_status = {
+        "state": state,
+        "mode": mode,
+        "ready": ready,
+        "reason": reason,
+        "error_type": error_type,
+    }
+
+
+def _initialize_aawm_claude_control_plane(
+    import_module: Optional[Callable[[str], Any]] = None,
+) -> None:
+    global _aawm_add_claude_post_rewrite_context_file_logging_metadata
+    global _aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body
+    global _aawm_expand_aawm_dynamic_directives_in_anthropic_request_body
+
+    importer = import_module or importlib.import_module
+    try:
+        control_plane = importer(_AAWM_CLAUDE_CONTROL_PLANE_MODULE)
+        prompt_replacement = importer(_AAWM_CLAUDE_PROMPT_REPLACEMENT_MODULE)
+        context_services = _aawm_context_query.build_context_query_services(
+            get_agent_memories=lambda **kwargs: (
+                control_plane._call_aawm_get_agent_memories(**kwargs)
+            ),
+            get_context=lambda **kwargs: control_plane._call_aawm_context_grab(
+                **kwargs
+            ),
+            get_reference_identifiers=lambda **kwargs: (
+                control_plane._call_aawm_reference_identifier_list(**kwargs)
+            ),
+        )
+        services = control_plane.build_claude_control_plane_services(
+            prompt=prompt_replacement.build_claude_prompt_replacement_services(),
+            context_query=context_services,
+            now_utc=lambda: datetime.now(timezone.utc),
+            merge_metadata=_merge_litellm_metadata,
+            build_span=_build_langfuse_span_descriptor,
+            format_span_timestamp=_format_langfuse_span_timestamp,
+            add_context_file_metadata=(
+                _aawm_observability_metadata._add_claude_post_rewrite_context_file_logging_metadata
+            ),
+        )
+        rewriter = control_plane.compose_claude_control_plane(services)
+    except ModuleNotFoundError as exc:
+        if exc.name == _AAWM_CLAUDE_CONTROL_PLANE_MODULE:
+            _aawm_add_claude_post_rewrite_context_file_logging_metadata = (
+                _aawm_claude_control_plane_degraded_add_metadata
+            )
+            _aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body = (
+                _aawm_claude_control_plane_degraded_apply_rewrites
+            )
+            _aawm_expand_aawm_dynamic_directives_in_anthropic_request_body = (
+                _aawm_claude_control_plane_degraded_expand_context
+            )
+            _set_aawm_claude_control_plane_initialization_status(
+                state="degraded",
+                mode="optional",
+                ready=True,
+                reason="optional_module_absent",
+            )
+            return
+        _aawm_add_claude_post_rewrite_context_file_logging_metadata = (
+            _aawm_claude_control_plane_failed_add_metadata
+        )
+        _aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body = (
+            _aawm_claude_control_plane_failed_apply_rewrites
+        )
+        _aawm_expand_aawm_dynamic_directives_in_anthropic_request_body = (
+            _aawm_claude_control_plane_failed_expand_context
+        )
+        _set_aawm_claude_control_plane_initialization_status(
+            state="failed",
+            mode="unavailable",
+            ready=False,
+            reason="initialization_failed",
+            error_type=exc.__class__.__name__,
+        )
+        return
+    except Exception as exc:
+        _aawm_add_claude_post_rewrite_context_file_logging_metadata = (
+            _aawm_claude_control_plane_failed_add_metadata
+        )
+        _aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body = (
+            _aawm_claude_control_plane_failed_apply_rewrites
+        )
+        _aawm_expand_aawm_dynamic_directives_in_anthropic_request_body = (
+            _aawm_claude_control_plane_failed_expand_context
+        )
+        _set_aawm_claude_control_plane_initialization_status(
+            state="failed",
+            mode="unavailable",
+            ready=False,
+            reason="initialization_failed",
+            error_type=exc.__class__.__name__,
+        )
+        return
+
+    _aawm_add_claude_post_rewrite_context_file_logging_metadata = (
+        rewriter.add_post_rewrite_context_file_metadata
+    )
+    _aawm_apply_claude_control_plane_rewrites_to_anthropic_request_body = (
+        rewriter.apply_rewrites
+    )
+    _aawm_expand_aawm_dynamic_directives_in_anthropic_request_body = (
+        rewriter.expand_dynamic_context
+    )
+    _set_aawm_claude_control_plane_initialization_status(
+        state="active",
+        mode="enabled",
+        ready=True,
+        reason=None,
+    )
+
+
 from litellm.proxy.utils import is_known_model
 from litellm.proxy.vector_store_endpoints.utils import (
     is_allowed_to_call_vector_store_endpoint,
@@ -203,6 +392,10 @@ from litellm.types.llms.openai import (
 )
 from litellm.types.utils import LlmProviders
 from litellm.utils import ProviderConfigManager
+
+_aawm_context_query.configure_context_query_runtime(
+    _aawm_context_query.ContextQueryRuntime(get_secret_str=get_secret_str)
+)
 
 from .passthrough_endpoint_router import passthrough_endpoint_router
 
@@ -5813,6 +6006,7 @@ _aawm_observability_metadata.configure_observability_metadata_runtime(
     get_env=os.getenv,
 )
 _aawm_observability_metadata.install(globals())
+_initialize_aawm_claude_control_plane()
 
 # ---------------------------------------------------------------------------
 # Wave 7: codex-tool-policy owner install (replaces 42 inline wrappers)

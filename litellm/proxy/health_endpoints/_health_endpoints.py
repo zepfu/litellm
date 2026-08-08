@@ -1355,6 +1355,24 @@ async def health_readiness():
             },
         )
 
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        get_aawm_claude_control_plane_initialization_status,
+        is_aawm_claude_control_plane_ready,
+    )
+
+    aawm_claude_control_plane_status = (
+        get_aawm_claude_control_plane_initialization_status()
+    )
+    if not is_aawm_claude_control_plane_ready():
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "not_ready",
+                "reason": "aawm_claude_control_plane_unavailable",
+                "aawm_claude_control_plane": aawm_claude_control_plane_status,
+            },
+        )
+
     try:
         # get success callback
         success_callback_names = []
@@ -1398,6 +1416,7 @@ async def health_readiness():
                 "cache": cache_type,
                 "litellm_version": version,
                 "aawm_alias_config": _get_aawm_alias_config_startup_status(),
+                "aawm_claude_control_plane": aawm_claude_control_plane_status,
                 "aawm_alias_routing_cache": _get_aawm_alias_routing_cache_status(),
                 "success_callbacks": success_callback_names,
                 "use_aiohttp_transport": AsyncHTTPHandler._should_use_aiohttp_transport(),
@@ -1411,6 +1430,7 @@ async def health_readiness():
                 "cache": cache_type,
                 "litellm_version": version,
                 "aawm_alias_config": _get_aawm_alias_config_startup_status(),
+                "aawm_claude_control_plane": aawm_claude_control_plane_status,
                 "aawm_alias_routing_cache": _get_aawm_alias_routing_cache_status(),
                 "success_callbacks": success_callback_names,
                 "use_aiohttp_transport": AsyncHTTPHandler._should_use_aiohttp_transport(),

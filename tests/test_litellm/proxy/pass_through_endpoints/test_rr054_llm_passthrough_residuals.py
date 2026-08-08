@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane as cp
+from litellm.proxy.pass_through_endpoints import aawm_context_query as context_query
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 
 
@@ -61,15 +62,25 @@ async def test_rr054_issue41_gemini_route_missing_key_raises_401_without_auth() 
 # ---------------------------------------------------------------------------
 
 
-def test_rr054_issue7_pool_helpers_are_control_plane_owned() -> None:
-    assert lpe._get_aawm_dynamic_injection_pool is cp._get_aawm_dynamic_injection_pool
-    assert lpe._build_aawm_dynamic_injection_dsn is cp._build_aawm_dynamic_injection_dsn
-    assert lpe.close_aawm_dynamic_injection_pool is cp.close_aawm_dynamic_injection_pool
-    # No second module-global pool on the god-file after consolidation.
+def test_rr054_issue7_pool_helpers_are_neutral_context_owned() -> None:
     assert (
-        not hasattr(lpe, "_aawm_dynamic_injection_pool")
-        or lpe._aawm_dynamic_injection_pool is cp._aawm_dynamic_injection_pool
+        lpe._get_aawm_dynamic_injection_pool
+        is context_query._get_aawm_dynamic_injection_pool
     )
+    assert (
+        lpe._build_aawm_dynamic_injection_dsn
+        is context_query._build_aawm_dynamic_injection_dsn
+    )
+    assert (
+        lpe.close_aawm_dynamic_injection_pool
+        is context_query.close_aawm_dynamic_injection_pool
+    )
+    assert cp.close_aawm_dynamic_injection_pool is (
+        context_query.close_aawm_dynamic_injection_pool
+    )
+    assert callable(cp._get_aawm_dynamic_injection_pool)
+    assert not hasattr(lpe, "_aawm_dynamic_injection_pool")
+    assert not hasattr(cp, "_aawm_dynamic_injection_pool")
 
 
 # ---------------------------------------------------------------------------

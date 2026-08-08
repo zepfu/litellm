@@ -245,19 +245,17 @@ def _patch_aawm_secret_values(
     monkeypatch,
     values: dict[str, str],
 ) -> None:
-    from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
-    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
+    from litellm.proxy.pass_through_endpoints import aawm_context_query
 
     def _secret(name: str):
         return values.get(name)
 
-    # Control-plane owns DSN/pool secrets after RR-054 #7 consolidation; patch both
-    # surfaces so historical llm_passthrough DSN tests keep working.
-    monkeypatch.setattr(llm_passthrough_endpoints, "get_secret_str", _secret)
+    # D1-531/D1-537: production composition supplies the secret getter to the
+    # neutral context/query owner.
     monkeypatch.setattr(
-        aawm_claude_control_plane,
-        "_get_first_secret_value",
-        lambda names: next((values[n] for n in names if n in values), None),
+        aawm_context_query,
+        "_runtime",
+        aawm_context_query.ContextQueryRuntime(get_secret_str=_secret),
     )
 
 
@@ -330,13 +328,10 @@ async def _assert_aawm_dynamic_injection_pool_disables_statement_cache(
             create_pool_calls.append(kwargs)
             return created_pool
 
-    # RR-054: pool global always lives on aawm_claude_control_plane even when
-    # llm_passthrough_endpoints re-exports the getter/DSN helpers.
-    from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane as owner
+    # D1-531: provider-neutral context/query owns the one process pool.
+    from litellm.proxy.pass_through_endpoints import aawm_context_query as owner
 
     monkeypatch.setattr(owner, "_aawm_dynamic_injection_pool", None)
-    if hasattr(module, "_aawm_dynamic_injection_pool"):
-        monkeypatch.setattr(module, "_aawm_dynamic_injection_pool", None)
     monkeypatch.setattr(
         owner,
         "_build_aawm_dynamic_injection_dsn",
@@ -360,22 +355,27 @@ async def _assert_aawm_dynamic_injection_pool_disables_statement_cache(
             owner._get_aawm_dynamic_injection_application_name,
         )
     monkeypatch.setattr(
-        owner.importlib,
-        "import_module",
-        lambda name: FakeAsyncpg() if name == "asyncpg" else None,
+        owner,
+        "_runtime",
+        owner.ContextQueryRuntime(
+            get_secret_str=lambda _name: None,
+            import_module=lambda name: (
+                FakeAsyncpg() if name == "asyncpg" else None
+            ),
+        ),
     )
 
     try:
         pool = await module._get_aawm_dynamic_injection_pool()
     finally:
         owner._aawm_dynamic_injection_pool = None
-        if hasattr(module, "_aawm_dynamic_injection_pool"):
-            module._aawm_dynamic_injection_pool = None
 
     assert pool is created_pool
     assert create_pool_calls[0]["statement_cache_size"] == 0
     assert create_pool_calls[0]["server_settings"] == {"application_name": "aawm-litellm-test-dynamic"}
-    assert create_pool_calls[0]["init"] is (owner._initialize_aawm_dynamic_injection_connection)
+    assert create_pool_calls[0]["init"] is (
+        module._initialize_aawm_dynamic_injection_connection
+    )
 
 
 def test_llm_passthrough_dynamic_injection_dsn_adds_application_name(

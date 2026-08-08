@@ -1,45 +1,28 @@
 import asyncio
 import hashlib
-import importlib
 import json
 import re
+from contextvars import ContextVar
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from time import monotonic
-from pathlib import Path
-from typing import Any, Optional
-from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
-from litellm.proxy.pass_through_endpoints.aawm_request_policy import observability_metadata as _observability_metadata
+from typing import Any, Callable, Optional
 
-_REPO_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR = (
-    Path(__file__).resolve().parents[3] / "context-replacement" / "claude-code"
+from litellm.proxy.pass_through_endpoints import (
+    aawm_context_query as _context_query,
 )
-_PACKAGED_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR = (
-    Path(__file__).resolve().parent / "aawm_claude_control_plane_data" / "claude-code"
+from litellm.proxy.pass_through_endpoints.aawm_request_policy import (
+    claude_prompt_replacement as _prompt_replacement,
 )
+from litellm.proxy.pass_through_endpoints.aawm_request_policy import (
+    observability_metadata as _observability_metadata,
+)
+
 _CLAUDE_AUTO_MEMORY_TEMPLATE_LOGICAL_PATH = (
-    "context-replacement/claude-code/2.1.110/auto-memory-replacement.md"
+    _prompt_replacement._CLAUDE_AUTO_MEMORY_TEMPLATE_LOGICAL_PATH
 )
 _CLAUDE_PROMPT_PATCH_MANIFEST_LOGICAL_PATH = (
-    "context-replacement/claude-code/prompt-patches/roman01la-2026-04-02.json"
-)
-_CLAUDE_REPORT_FILE_PATCH_ID = "subagent-report-file-explicit-request"
-_CLAUDE_REPORT_FILE_INSTRUCTION_PATTERN = re.compile(
-    r"Do NOT\s+(?:Write|\$\{[^}\r\n]+\})\s+"
-    r"report/summary/findings/analysis\s+\.md\s+files\.\s+"
-    r"Return findings directly as your final assistant message"
-    r"(?:\s+[—-]\s+the parent agent reads your text output,\s+not files you create)?"
-    r"\.?",
-)
-_CLAUDE_AUTO_MEMORY_MIN_COMPAT_VERSION = (2, 1, 110)
-_CLAUDE_MEMORY_SECTION_PATTERN = re.compile(
-    r"(?ms)^(?P<section_heading># (?:auto memory|Persistent Agent Memory))\n"
-    r".*?(?=^# [^\n]+\n|\Z)"
-)
-_CLAUDE_TYPES_XML_BLOCK_PATTERN = re.compile(r"<types>\n.*?\n</types>", re.DOTALL)
-_CLAUDE_CONTEXT_REPLACEMENT_PLACEHOLDER_PATTERN = re.compile(r"\{\{[A-Z_]+\}\}")
-_CLAUDE_CC_VERSION_PATTERN = re.compile(
-    r"^(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
+    _prompt_replacement._CLAUDE_PROMPT_PATCH_MANIFEST_LOGICAL_PATH
 )
 _CLAUDE_COMMONMARK_PROMPT_SENTENCE = (
     "You can use Github-flavored markdown for formatting, and will be rendered in a "
@@ -94,17 +77,6 @@ _CLAUDE_KNOWN_TOOL_DESCRIPTIONS = {
 }
 _AAWM_REFERENCE_IDENTIFIER_PATCH_ID = "technical-identifiers-list"
 _AAWM_REFERENCE_IDENTIFIER_CACHE_KEY = "reference-identifiers"
-_AAWM_REFERENCE_IDENTIFIER_LIST_QUERY = """
-SELECT DISTINCT rc.name
-FROM ag_catalog.raw_content rc
-WHERE rc.role = 'reference'
-  AND rc.valid_to IS NULL
-  AND ($1::text IS NULL OR rc.tenant_id IS NULL OR rc.tenant_id = $1::text)
-  AND ($2::text IS NULL OR rc.agent_id IS NULL OR rc.agent_id = $2::text)
-  AND rc.name NOT IN (SELECT name FROM public.agents)
-  AND rc.name NOT IN (SELECT name || '-instructions' FROM public.agents)
-ORDER BY rc.name
-"""
 _AAWM_DYNAMIC_DIRECTIVE_PATTERN = re.compile(
     r"<!--\s*AAWM(?=[ \t]+(?:p|proc)=)\s+(?P<html_attrs>.*?)\s*-->"
     r"|@@@\s*AAWM(?=[ \t]+(?:p|proc)=)\s+(?P<at_attrs>.*?)\s*@@@"
@@ -123,26 +95,11 @@ _AAWM_DYNAMIC_DIRECTIVE_ATTR_PATTERN = re.compile(
     r"(?P<key>[A-Za-z_][A-Za-z0-9_-]*)="
     r'(?:"(?P<double>[^"]*)"|\'(?P<single>[^\']*)\'|(?P<bare>[^\s]+))'
 )
-_AAWM_SQL_IDENTIFIER_PATTERN = re.compile(
-    r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$"
-)
-_CLAUDE_AGENT_TENANT_PATTERN = re.compile(
-    r"You are '(?P<agent>[^']+)' and you are working on the '(?P<tenant>[^']+)' project\b"
-)
-_CLAUDE_POST_REWRITE_CONTEXT_FILE_MARKERS: tuple[tuple[str, str], ...] = (
-    ("MEMORY.md", "memory-md"),
-    ("CLAUDE.md", "claude-md"),
-)
 _AAWM_AGENT_MEMORY_PROC_NAME = "get_agent_memories"
 _AAWM_DYNAMIC_PROC_ALIASES = {"get_agent_memory": _AAWM_AGENT_MEMORY_PROC_NAME}
 _AAWM_DYNAMIC_PROC_DEFAULT_CTX_FIELDS: dict[str, tuple[str, ...]] = {
     _AAWM_AGENT_MEMORY_PROC_NAME: ("agent", "tenant"),
 }
-_AAWM_CONTEXT_GRAB_PROC_NAME_ENV_VARS = (
-    "AAWM_CONTEXT_GRAB_PROC_NAME",
-    "AAWM_DYNAMIC_CONTEXT_GRAB_PROC_NAME",
-)
-_AAWM_CONTEXT_GRAB_DEFAULT_PROC_NAME = "tristore_search_exact"
 _AAWM_DYNAMIC_INJECTION_FAILURE_TEMPLATE = (
     "## AAWM Injection Status\n\n"
     'AAWM "{proc_name}" failed for this session.\n'
@@ -160,68 +117,9 @@ _AAWM_SYSTEM_REMINDER_BLOCK_PATTERN = re.compile(
 _AAWM_NO_MEMORIES_TEMPLATE = (
     "# Memory Injection\n" "You have saved no memories as of yet.\n"
 )
-_AAWM_DB_HOST_ENV_VARS = (
-    "AAWM_DB_HOST",
-    "AAWM_POSTGRES_SERVER",
-    "POSTGRES_SERVER",
-    "PGHOST",
+_AAWM_DYNAMIC_INJECTION_POOL_MAX_SIZE = (
+    _context_query._AAWM_DYNAMIC_INJECTION_POOL_MAX_SIZE
 )
-_AAWM_DB_PORT_ENV_VARS = (
-    "AAWM_DB_PORT",
-    "AAWM_POSTGRES_PORT",
-    "POSTGRES_PORT",
-    "PGPORT",
-)
-_AAWM_DB_USER_ENV_VARS = (
-    "AAWM_DB_USER",
-    "AAWM_POSTGRES_USER",
-    "POSTGRES_USER",
-    "PGUSER",
-)
-_AAWM_DB_PASSWORD_ENV_VARS = (
-    "AAWM_DB_PASSWORD",
-    "AAWM_DB_PWD",
-    "AAWM_POSTGRES_PASSWORD",
-    "AAWM_POSTGRES_PWD",
-    "POSTGRES_PASSWORD",
-    "POSTGRES_PWD",
-    "PGPASSWORD",
-)
-_AAWM_DB_NAME_ENV_VARS = (
-    "AAWM_DB_NAME",
-    "AAWM_POSTGRES_DATABASE",
-    "POSTGRES_DATABASE",
-    "PGDATABASE",
-)
-_AAWM_DB_SSLMODE_ENV_VARS = (
-    "AAWM_DB_SSLMODE",
-    "AAWM_POSTGRES_SSLMODE",
-    "POSTGRES_SSLMODE",
-    "PGSSLMODE",
-)
-_AAWM_DB_SSL_BOOL_ENV_VARS = (
-    "AAWM_DB_SSL",
-    "AAWM_POSTGRES_SSL",
-    "POSTGRES_SSL",
-)
-_AAWM_DB_URL_ENV_VARS = (
-    "AAWM_DB_URL",
-    "AAWM_DATABASE_URL",
-    "AAWM_POSTGRES_URL",
-)
-_AAWM_DB_APPLICATION_NAME_ENV_VARS = (
-    "AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME",
-    "AAWM_DB_APPLICATION_NAME",
-    "AAWM_POSTGRES_APPLICATION_NAME",
-    "PGAPPNAME",
-)
-_AAWM_DYNAMIC_INJECTION_APPLICATION_NAME = "aawm-litellm-dynamic-injection"
-_AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS = 15.0
-_AAWM_DYNAMIC_INJECTION_POOL_MIN_SIZE = 1
-_AAWM_DYNAMIC_INJECTION_POOL_MAX_SIZE = 4
-_AAWM_DYNAMIC_INJECTION_COMMAND_TIMEOUT_SECONDS = 10
-_AAWM_DYNAMIC_INJECTION_ACQUIRE_TIMEOUT_SECONDS = 10.0
-_AAWM_DYNAMIC_INJECTION_STATEMENT_CACHE_SIZE = 0
 # Cap distinct dispatch backtick/acronym lookups per text node (High/RR-053 #1).
 _AAWM_DISPATCH_CONTEXT_REFERENCE_MAX = 24
 # Cap total dispatch lookups across an entire request (all trusted text blocks).
@@ -275,492 +173,247 @@ _AAWM_DISPATCH_ACRONYM_STOPWORDS = frozenset(
         "YML",
     }
 )
-_aawm_dynamic_injection_pool: Optional[Any] = None
-_aawm_dynamic_injection_pool_lock = asyncio.Lock()
-_aawm_dynamic_injection_cache: dict[
-    tuple[str, str, str, str], tuple[float, Optional[str]]
-] = {}
-_aawm_dynamic_injection_cache_lock = asyncio.Lock()
-_aawm_context_grab_cache: dict[
-    tuple[str, str, str, str, str], tuple[float, dict[str, str]]
-] = {}
-_aawm_context_grab_cache_lock = asyncio.Lock()
-_claude_context_replacement_template_cache: dict[Path, str] = {}
-_claude_prompt_patch_manifest_cache: dict[Path, dict[str, Any]] = {}
+_aawm_dynamic_injection_cache = _context_query._aawm_dynamic_injection_cache
+_aawm_context_grab_cache = _context_query._aawm_context_grab_cache
+_claude_context_replacement_template_cache = (
+    _prompt_replacement._claude_context_replacement_template_cache
+)
+_claude_prompt_patch_manifest_cache = (
+    _prompt_replacement._claude_prompt_patch_manifest_cache
+)
 _claude_tool_advertisement_compaction_cache: dict[
     str, tuple[dict[str, Any], dict[str, Any]]
 ] = {}
 
 
-def _get_aawm_dynamic_injection_cache_ttl_seconds() -> float:
-    raw_value = _clean_secret_string(
-        _lp().get_secret_str("AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS")
+@dataclass(frozen=True, slots=True)
+class ClaudeControlPlaneServices:
+    prompt: _prompt_replacement.ClaudePromptReplacementServices
+    context_query: _context_query.ContextQueryServices
+    now_utc: Callable[[], datetime]
+    merge_metadata: Callable[..., dict[str, Any]]
+    build_span: Callable[..., dict[str, Any]]
+    format_span_timestamp: Callable[[datetime], str]
+    add_context_file_metadata: Callable[[dict[str, Any]], dict[str, Any]]
+
+
+_active_services: ContextVar[Optional[ClaudeControlPlaneServices]] = ContextVar(
+    "aawm_claude_control_plane_services",
+    default=None,
+)
+_standalone_rewriter: Optional["ClaudeControlPlaneRewriter"] = None
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _build_standalone_services() -> ClaudeControlPlaneServices:
+    prompt = _prompt_replacement.ClaudePromptReplacementServices(
+        resolve_auto_memory_template_path=(
+            lambda cc_version: _resolve_claude_auto_memory_template_path(cc_version)
+        ),
+        resolve_prompt_patch_manifest_path=(
+            lambda: _resolve_claude_prompt_patch_manifest_path()
+        ),
+        load_prompt_patch_manifest=(
+            lambda path: _load_claude_prompt_patch_manifest(path)
+        ),
+        replace_auto_memory_section=(
+            lambda text, version: _replace_claude_auto_memory_section_in_text(
+                text, version
+            )
+        ),
+        apply_prompt_patch_manifest=(
+            lambda text, **kwargs: _apply_claude_prompt_patch_manifest_to_text(
+                text, **kwargs
+            )
+        ),
+        add_override_metadata=(
+            lambda body, events: _add_claude_system_prompt_override_logging_metadata(
+                body, events
+            )
+        ),
+        add_patch_metadata=(
+            lambda body, events: _add_claude_prompt_patch_logging_metadata(
+                body, events
+            )
+        ),
     )
-    if not raw_value:
-        return _AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS
-    try:
-        return max(0.0, float(raw_value))
-    except (TypeError, ValueError):
-        return _AAWM_DYNAMIC_INJECTION_CACHE_TTL_SECONDS
+    context_query = _context_query.build_context_query_services(
+        get_agent_memories=(
+            lambda **kwargs: _call_aawm_get_agent_memories(**kwargs)
+        ),
+        get_context=lambda **kwargs: _call_aawm_context_grab(**kwargs),
+        get_reference_identifiers=(
+            lambda **kwargs: _call_aawm_reference_identifier_list(**kwargs)
+        ),
+    )
+    return ClaudeControlPlaneServices(
+        prompt=prompt,
+        context_query=context_query,
+        now_utc=_utc_now,
+        merge_metadata=_observability_metadata._merge_litellm_metadata,
+        build_span=_observability_metadata._build_langfuse_span_descriptor,
+        format_span_timestamp=(
+            _observability_metadata._format_langfuse_span_timestamp
+        ),
+        add_context_file_metadata=(
+            _observability_metadata._add_claude_post_rewrite_context_file_logging_metadata
+        ),
+    )
+
+
+def build_claude_control_plane_services(
+    *,
+    context_query: _context_query.ContextQueryServices,
+    now_utc: Callable[[], datetime],
+    merge_metadata: Callable[..., dict[str, Any]],
+    build_span: Callable[..., dict[str, Any]],
+    format_span_timestamp: Callable[[datetime], str],
+    add_context_file_metadata: Callable[[dict[str, Any]], dict[str, Any]],
+    prompt: Optional[
+        _prompt_replacement.ClaudePromptReplacementServices
+    ] = None,
+) -> ClaudeControlPlaneServices:
+    return ClaudeControlPlaneServices(
+        prompt=prompt
+        or _prompt_replacement.build_claude_prompt_replacement_services(),
+        context_query=context_query,
+        now_utc=now_utc,
+        merge_metadata=merge_metadata,
+        build_span=build_span,
+        format_span_timestamp=format_span_timestamp,
+        add_context_file_metadata=add_context_file_metadata,
+    )
+
+
+class ClaudeControlPlaneRewriter:
+    def __init__(self, services: ClaudeControlPlaneServices) -> None:
+        self.services = services
+
+    async def apply_rewrites(
+        self,
+        request_body: dict[str, Any],
+        billing_header_fields: dict[str, str],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+        token = _active_services.set(self.services)
+        try:
+            return await _apply_claude_control_plane_rewrites_impl(
+                request_body,
+                billing_header_fields,
+            )
+        finally:
+            _active_services.reset(token)
+
+    async def expand_dynamic_context(
+        self,
+        request_body: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        token = _active_services.set(self.services)
+        try:
+            return await _expand_aawm_dynamic_directives_impl(request_body)
+        finally:
+            _active_services.reset(token)
+
+    def add_post_rewrite_context_file_metadata(
+        self,
+        request_body: dict[str, Any],
+    ) -> dict[str, Any]:
+        return self.services.add_context_file_metadata(request_body)
+
+
+def compose_claude_control_plane(
+    services: ClaudeControlPlaneServices,
+) -> ClaudeControlPlaneRewriter:
+    if services.prompt is None:
+        raise ValueError("Claude control-plane prompt services are required")
+    if services.context_query is None:
+        raise ValueError("Claude control-plane context-query services are required")
+    return ClaudeControlPlaneRewriter(services)
+
+
+def _get_standalone_rewriter() -> ClaudeControlPlaneRewriter:
+    global _standalone_rewriter
+    if _standalone_rewriter is None:
+        _standalone_rewriter = ClaudeControlPlaneRewriter(
+            _build_standalone_services()
+        )
+    return _standalone_rewriter
+
+
+def _get_services() -> ClaudeControlPlaneServices:
+    active = _active_services.get()
+    if active is not None:
+        return active
+    return _get_standalone_rewriter().services
+
+
+def _get_aawm_dynamic_injection_cache_ttl_seconds() -> float:
+    return _context_query._get_aawm_dynamic_injection_cache_ttl_seconds()
 
 
 async def _get_cached_aawm_dynamic_injection_result(
     cache_key: tuple[str, str, str, str],
 ) -> tuple[bool, Optional[str]]:
-    async with _aawm_dynamic_injection_cache_lock:
-        cached_entry = _aawm_dynamic_injection_cache.get(cache_key)
-        if cached_entry is None:
-            return False, None
-
-        expires_at, cached_value = cached_entry
-        if expires_at < monotonic():
-            _aawm_dynamic_injection_cache.pop(cache_key, None)
-            return False, None
-        return True, cached_value
+    return await _get_services().context_query.get_cached_dynamic_result(cache_key)
 
 
 async def _set_cached_aawm_dynamic_injection_result(
     cache_key: tuple[str, str, str, str],
     injected_text: Optional[str],
 ) -> None:
-    ttl_seconds = _get_aawm_dynamic_injection_cache_ttl_seconds()
-    if ttl_seconds <= 0:
-        return
-
-    async with _aawm_dynamic_injection_cache_lock:
-        _aawm_dynamic_injection_cache[cache_key] = (
-            monotonic() + ttl_seconds,
-            injected_text,
-        )
+    await _get_services().context_query.set_cached_dynamic_result(
+        cache_key,
+        injected_text,
+    )
 
 
 async def _get_cached_aawm_context_grab_result(
     cache_key: tuple[str, str, str, str, str],
 ) -> tuple[bool, Optional[dict[str, str]]]:
-    async with _aawm_context_grab_cache_lock:
-        cached_entry = _aawm_context_grab_cache.get(cache_key)
-        if cached_entry is None:
-            return False, None
-
-        expires_at, cached_value = cached_entry
-        if expires_at < monotonic():
-            _aawm_context_grab_cache.pop(cache_key, None)
-            return False, None
-        return True, dict(cached_value)
+    return await _get_services().context_query.get_cached_context_result(cache_key)
 
 
 async def _set_cached_aawm_context_grab_result(
     cache_key: tuple[str, str, str, str, str],
     cached_payload: dict[str, str],
 ) -> None:
-    ttl_seconds = _get_aawm_dynamic_injection_cache_ttl_seconds()
-    if ttl_seconds <= 0:
-        return
-
-    async with _aawm_context_grab_cache_lock:
-        _aawm_context_grab_cache[cache_key] = (
-            monotonic() + ttl_seconds,
-            dict(cached_payload),
-        )
-
-
-def _lp():
-    return importlib.import_module(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints"
+    await _get_services().context_query.set_cached_context_result(
+        cache_key,
+        cached_payload,
     )
 
 
-def _clean_secret_string(value: Optional[str]) -> Optional[str]:
-    if value is None:
-        return None
-
-    cleaned = value.strip()
-    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
-        cleaned = cleaned[1:-1].strip()
-    return cleaned or None
-
-
-def _get_first_secret_value(secret_names: tuple[str, ...]) -> Optional[str]:
-    get_secret_str = _lp().get_secret_str
-    for secret_name in secret_names:
-        value = _clean_secret_string(get_secret_str(secret_name))
-        if value:
-            return value
-    return None
-
-
-def _normalize_aawm_sslmode(value: Optional[str]) -> Optional[str]:
-    cleaned = _clean_secret_string(value)
-    if not cleaned:
-        return None
-
-    lowered = cleaned.lower()
-    if lowered in {"1", "true", "yes", "on"}:
-        return "require"
-    if lowered in {"0", "false", "no", "off"}:
-        return "disable"
-    return cleaned
-
-
-def _candidate_context_replacement_dirs() -> tuple[Path, ...]:
-    return tuple(
-        directory
-        for directory in (
-            _REPO_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR,
-            _PACKAGED_CLAUDE_CODE_CONTEXT_REPLACEMENT_DIR,
-        )
-        if directory.exists()
-    )
-
-
-def _resolve_context_replacement_file(
-    relative_parts: tuple[str, ...]
-) -> Optional[Path]:
-    for base_dir in _candidate_context_replacement_dirs():
-        candidate = base_dir.joinpath(*relative_parts)
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def _parse_claude_code_version(
-    cc_version: Optional[str],
-) -> Optional[tuple[int, int, int]]:
-    if not cc_version:
-        return None
-
-    match = _CLAUDE_CC_VERSION_PATTERN.match(cc_version.strip())
-    if match is None:
-        return None
-
-    return (
-        int(match.group("major")),
-        int(match.group("minor")),
-        int(match.group("patch")),
-    )
-
-
-def _resolve_claude_auto_memory_template_path(
-    cc_version: Optional[str],
-) -> Optional[Path]:
-    parsed_version = _parse_claude_code_version(cc_version)
-    if parsed_version is None:
-        return None
-
-    major, minor, patch = parsed_version
-    min_major, min_minor, min_patch = _CLAUDE_AUTO_MEMORY_MIN_COMPAT_VERSION
-
-    if (major, minor) != (min_major, min_minor):
-        return None
-    if patch < min_patch:
-        return None
-
-    return _resolve_context_replacement_file(("2.1.110", "auto-memory-replacement.md"))
-
-
-def _load_claude_context_replacement_template(template_path: Path) -> str:
-    cached_template = _claude_context_replacement_template_cache.get(template_path)
-    if cached_template is not None:
-        return cached_template
-
-    template_text = template_path.read_text(encoding="utf-8").strip()
-    if not template_text:
-        raise ValueError(
-            f"Claude context replacement template is empty: {template_path}"
-        )
-
-    cached_template = template_text + "\n"
-    _claude_context_replacement_template_cache[template_path] = cached_template
-    return cached_template
-
-
-def _resolve_claude_prompt_patch_manifest_path() -> Path:
-    manifest_path = _resolve_context_replacement_file(
-        ("prompt-patches", "roman01la-2026-04-02.json")
-    )
-    if manifest_path is None:
-        raise ValueError("Claude prompt patch manifest is missing")
-    return manifest_path
-
-
-def _load_claude_prompt_patch_manifest(template_path: Path) -> dict[str, Any]:
-    cached_manifest = _claude_prompt_patch_manifest_cache.get(template_path)
-    if cached_manifest is not None:
-        return cached_manifest
-
-    manifest = json.loads(template_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise ValueError(f"Invalid Claude prompt patch manifest: {template_path}")
-
-    patches = manifest.get("patches")
-    if not isinstance(patches, list) or not patches:
-        raise ValueError(
-            f"Claude prompt patch manifest has no patches: {template_path}"
-        )
-
-    normalized_patches: list[dict[str, str]] = []
-    for patch_descriptor in patches:
-        if not isinstance(patch_descriptor, dict):
-            raise ValueError(
-                f"Invalid Claude prompt patch descriptor in {template_path}"
-            )
-        patch_id = patch_descriptor.get("id")
-        before_text = patch_descriptor.get("before")
-        after_text = patch_descriptor.get("after")
-        if not isinstance(patch_id, str) or not patch_id:
-            raise ValueError(
-                f"Claude prompt patch manifest is missing patch id in {template_path}"
-            )
-        if not isinstance(before_text, str) or not before_text:
-            raise ValueError(
-                f"Claude prompt patch manifest is missing before text for {patch_id}"
-            )
-        if not isinstance(after_text, str) or not after_text:
-            raise ValueError(
-                f"Claude prompt patch manifest is missing after text for {patch_id}"
-            )
-        normalized_patches.append(
-            {
-                "id": patch_id,
-                "before": before_text,
-                "after": after_text,
-            }
-        )
-
-    normalized_manifest = {
-        "source": manifest.get("source"),
-        "patches": normalized_patches,
-    }
-    _claude_prompt_patch_manifest_cache[template_path] = normalized_manifest
-    return normalized_manifest
-
-
-def _extract_markdown_section(markdown_text: str, heading: str) -> str:
-    section_pattern = re.compile(rf"(?ms)^## {re.escape(heading)}\n.*?(?=^## |\Z)")
-    match = section_pattern.search(markdown_text)
-    if match is None:
-        raise ValueError(f"Missing Claude auto-memory section: {heading}")
-    return match.group(0).rstrip()
-
-
-def _render_claude_auto_memory_replacement(
-    memory_section: str, cc_version: str, section_heading: str
-) -> tuple[str, str]:
-    template_path = _resolve_claude_auto_memory_template_path(cc_version)
-    if template_path is None:
-        raise ValueError(
-            f"Unsupported Claude Code version for auto-memory override: {cc_version}"
-        )
-
-    template_text = _load_claude_context_replacement_template(template_path)
-    rendered_text = template_text
-    if "{{TYPES_XML_BLOCK}}" in rendered_text:
-        types_match = _CLAUDE_TYPES_XML_BLOCK_PATTERN.search(memory_section)
-        if types_match is None:
-            raise ValueError("Missing Claude auto-memory <types> block")
-        rendered_text = rendered_text.replace(
-            "{{TYPES_XML_BLOCK}}", types_match.group(0).rstrip()
-        )
-
-    section_placeholders = {
-        "{{WHAT_NOT_TO_SAVE_SECTION}}": "What NOT to save in memory",
-        "{{BEFORE_RECOMMENDING_SECTION}}": "Before recommending from memory",
-        "{{MEMORY_AND_PERSISTENCE_SECTION}}": "Memory and other forms of persistence",
-    }
-    for placeholder, heading in section_placeholders.items():
-        if placeholder in rendered_text:
-            rendered_text = rendered_text.replace(
-                placeholder, _extract_markdown_section(memory_section, heading)
-            )
-
-    unresolved_placeholders = _CLAUDE_CONTEXT_REPLACEMENT_PLACEHOLDER_PATTERN.findall(
-        rendered_text
-    )
-    if unresolved_placeholders:
-        raise ValueError(
-            "Unresolved Claude context replacement placeholders: "
-            + ", ".join(sorted(unresolved_placeholders))
-        )
-
-    if section_heading != "# auto memory":
-        rendered_text = rendered_text.replace("# auto memory", section_heading, 1)
-
-    return rendered_text.rstrip() + "\n", _CLAUDE_AUTO_MEMORY_TEMPLATE_LOGICAL_PATH
-
-
-def _replace_claude_auto_memory_section_in_text(
-    text: str, cc_version: str
-) -> tuple[str, Optional[dict[str, Any]]]:
-    if "# auto memory" not in text and "# Persistent Agent Memory" not in text:
-        return text, None
-
-    section_match = _CLAUDE_MEMORY_SECTION_PATTERN.search(text)
-    if section_match is None:
-        return text, None
-
-    section_heading = section_match.group("section_heading")
-    replacement_text, logical_path = _render_claude_auto_memory_replacement(
-        section_match.group(0),
-        cc_version,
-        section_heading,
-    )
-    replacement_event: dict[str, Any] = {
-        "id": "auto-memory",
-        "status": "resolved",
-        "cc_version": cc_version,
-        "template_path": logical_path,
-        "section_heading": section_heading,
-        "output_chars": len(replacement_text),
-    }
-    return (
-        text[: section_match.start()] + replacement_text + text[section_match.end() :],
-        replacement_event,
-    )
-
-
-def _replace_claude_system_prompt_override_in_value(
-    value: Any, cc_version: str
-) -> tuple[Any, list[dict[str, Any]]]:
-    if isinstance(value, dict):
-        if value.get("type") == "text" and isinstance(value.get("text"), str):
-            if (
-                "# auto memory" not in value["text"]
-                and "# Persistent Agent Memory" not in value["text"]
-            ):
-                return value, []
-            try:
-                updated_text, event = _replace_claude_auto_memory_section_in_text(
-                    value["text"], cc_version
-                )
-            except Exception as exc:
-                return value, [
-                    {
-                        "id": "auto-memory",
-                        "status": "failed",
-                        "cc_version": cc_version,
-                        "error": exc.__class__.__name__,
-                    }
-                ]
-
-            if event is None:
-                return value, []
-            updated_value = dict(value)
-            updated_value["text"] = updated_text
-            return updated_value, [event]
-
-        updated_dict: dict[str, Any] = {}
-        combined_events: list[dict[str, Any]] = []
-        changed = False
-        for key, child in value.items():
-            (
-                updated_child,
-                child_events,
-            ) = _replace_claude_system_prompt_override_in_value(
-                child,
-                cc_version,
-            )
-            updated_dict[key] = updated_child
-            combined_events.extend(child_events)
-            if updated_child is not child:
-                changed = True
-        return (updated_dict if changed else value), combined_events
-
-    if isinstance(value, list):
-        updated_list = []
-        list_events: list[dict[str, Any]] = []
-        changed = False
-        for child in value:
-            (
-                updated_child,
-                child_events,
-            ) = _replace_claude_system_prompt_override_in_value(
-                child,
-                cc_version,
-            )
-            updated_list.append(updated_child)
-            list_events.extend(child_events)
-            if updated_child is not child:
-                changed = True
-        return (updated_list if changed else value), list_events
-
-    return value, []
-
-
-def _add_claude_system_prompt_override_logging_metadata(
-    request_body: dict[str, Any], override_events: list[dict[str, Any]]
-) -> dict[str, Any]:
-    lp = _lp()
-    override_ids = sorted(
-        {
-            event["id"]
-            for event in override_events
-            if isinstance(event.get("id"), str) and event["id"]
-        }
-    )
-    failure_ids = sorted(
-        {
-            event["id"]
-            for event in override_events
-            if event.get("status") == "failed"
-            and isinstance(event.get("id"), str)
-            and event["id"]
-        }
-    )
-    statuses = [
-        event["status"]
-        for event in override_events
-        if isinstance(event.get("status"), str) and event["status"]
-    ]
-    cc_versions = sorted(
-        {
-            event["cc_version"]
-            for event in override_events
-            if isinstance(event.get("cc_version"), str) and event["cc_version"]
-        }
-    )
-    template_paths = sorted(
-        {
-            event["template_path"]
-            for event in override_events
-            if isinstance(event.get("template_path"), str) and event["template_path"]
-        }
-    )
-
-    tags_to_add = ["claude-system-prompt-override"]
-    tags_to_add.extend(
-        f"claude-system-prompt-override:{override_id}" for override_id in override_ids
-    )
-    if failure_ids:
-        tags_to_add.append("claude-system-prompt-override-failed")
-
-    span_metadata: dict[str, Any] = {
-        "override_count": len(override_events),
-        "failure_count": len(failure_ids),
-    }
-    if override_ids:
-        span_metadata["override_ids"] = override_ids
-    if cc_versions:
-        span_metadata["cc_versions"] = cc_versions
-
-    return lp._merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields={
-            "claude_system_prompt_override_count": len(override_events),
-            "claude_system_prompt_override_ids": override_ids,
-            "claude_system_prompt_override_failure_ids": failure_ids,
-            "claude_system_prompt_override_statuses": statuses,
-            "claude_system_prompt_override_cc_versions": cc_versions,
-            "claude_system_prompt_override_template_paths": template_paths,
-            "claude_system_prompt_override_events": override_events,
-            "langfuse_spans": [
-                lp._build_langfuse_span_descriptor(
-                    name="claude.system_prompt_override",
-                    metadata=span_metadata,
-                )
-            ],
-        },
-    )
+_clean_secret_string = _context_query._clean_secret_string
+_get_first_secret_value = _context_query._get_first_secret_value
+_normalize_aawm_sslmode = _context_query._normalize_aawm_sslmode
+_parse_claude_code_version = _prompt_replacement._parse_claude_code_version
+_resolve_claude_auto_memory_template_path = (
+    _prompt_replacement._resolve_claude_auto_memory_template_path
+)
+_load_claude_context_replacement_template = (
+    _prompt_replacement._load_claude_context_replacement_template
+)
+_resolve_claude_prompt_patch_manifest_path = (
+    _prompt_replacement._resolve_claude_prompt_patch_manifest_path
+)
+_load_claude_prompt_patch_manifest = (
+    _prompt_replacement._load_claude_prompt_patch_manifest
+)
+_extract_markdown_section = _prompt_replacement._extract_markdown_section
+_render_claude_auto_memory_replacement = (
+    _prompt_replacement._render_claude_auto_memory_replacement
+)
+_replace_claude_auto_memory_section_in_text = (
+    _prompt_replacement._replace_claude_auto_memory_section_in_text
+)
+_replace_claude_system_prompt_override_in_value = (
+    _prompt_replacement._replace_claude_system_prompt_override_in_value
+)
+_add_claude_system_prompt_override_logging_metadata = (
+    _prompt_replacement._add_claude_system_prompt_override_logging_metadata
+)
 
 
 def _json_compact_char_count(value: Any) -> int:
@@ -1051,7 +704,7 @@ def _add_claude_tool_advertisement_compaction_logging_metadata(
     request_body: dict[str, Any],
     compaction_events: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    lp = _lp()
+    services = _get_services()
     tool_names = sorted(
         {
             event["tool_name"]
@@ -1118,7 +771,7 @@ def _add_claude_tool_advertisement_compaction_logging_metadata(
     if compaction_cache_misses:
         span_metadata["compaction_cache_misses"] = compaction_cache_misses
 
-    return lp._merge_litellm_metadata(
+    return services.merge_metadata(
         request_body,
         tags_to_add=["claude-tool-advertisement-compaction"],
         extra_fields={
@@ -1137,7 +790,7 @@ def _add_claude_tool_advertisement_compaction_logging_metadata(
             "claude_tool_advertisement_compaction_cache_misses": compaction_cache_misses,
             "claude_tool_advertisement_compaction_events": compaction_events,
             "langfuse_spans": [
-                lp._build_langfuse_span_descriptor(
+                services.build_span(
                     name="claude.tool_advertisement_compaction",
                     metadata=span_metadata,
                 )
@@ -1146,52 +799,12 @@ def _add_claude_tool_advertisement_compaction_logging_metadata(
     )
 
 
-def _apply_claude_prompt_patch_manifest_to_text(
-    text: str,
-    *,
-    cc_version: str,
-    manifest: dict[str, Any],
-) -> tuple[str, list[dict[str, Any]]]:
-    updated_text = text
-    patch_events: list[dict[str, Any]] = []
-
-    for patch_descriptor in manifest["patches"]:
-        patch_id = patch_descriptor["id"]
-        before_text = patch_descriptor["before"]
-        after_text = patch_descriptor["after"]
-        occurrences = updated_text.count(before_text)
-        match_types: list[str] = []
-        if occurrences:
-            updated_text = updated_text.replace(before_text, after_text)
-            match_types.append("exact")
-
-        if patch_id == _CLAUDE_REPORT_FILE_PATCH_ID:
-            (
-                updated_text,
-                pattern_occurrences,
-            ) = _CLAUDE_REPORT_FILE_INSTRUCTION_PATTERN.subn(
-                after_text,
-                updated_text,
-            )
-            if pattern_occurrences:
-                occurrences += pattern_occurrences
-                match_types.append("pattern")
-
-        if not occurrences:
-            continue
-
-        event: dict[str, Any] = {
-            "id": patch_id,
-            "status": "resolved",
-            "cc_version": cc_version,
-            "manifest_path": _CLAUDE_PROMPT_PATCH_MANIFEST_LOGICAL_PATH,
-            "occurrences": occurrences,
-        }
-        if match_types:
-            event["match_types"] = match_types
-        patch_events.append(event)
-
-    return updated_text, patch_events
+_apply_claude_prompt_patch_manifest_to_text = (
+    _prompt_replacement._apply_claude_prompt_patch_manifest_to_text
+)
+_add_claude_prompt_patch_logging_metadata = (
+    _prompt_replacement._add_claude_prompt_patch_logging_metadata
+)
 
 
 async def _rewrite_claude_control_plane_text(
@@ -1201,15 +814,16 @@ async def _rewrite_claude_control_plane_text(
     manifest: dict[str, Any],
     available_context: dict[str, str],
 ) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    services = _get_services()
     updated_text = text
     override_events: list[dict[str, Any]] = []
     patch_events: list[dict[str, Any]] = []
 
     if (
         "# auto memory" in updated_text or "# Persistent Agent Memory" in updated_text
-    ) and _resolve_claude_auto_memory_template_path(cc_version) is not None:
+    ) and services.prompt.resolve_auto_memory_template_path(cc_version) is not None:
         try:
-            updated_text, override_event = _replace_claude_auto_memory_section_in_text(
+            updated_text, override_event = services.prompt.replace_auto_memory_section(
                 updated_text,
                 cc_version,
             )
@@ -1227,7 +841,7 @@ async def _rewrite_claude_control_plane_text(
                 override_events.append(override_event)
 
     try:
-        updated_text, patch_events = _apply_claude_prompt_patch_manifest_to_text(
+        updated_text, patch_events = services.prompt.apply_prompt_patch_manifest(
             updated_text,
             cc_version=cc_version,
             manifest=manifest,
@@ -1264,12 +878,7 @@ async def _rewrite_claude_control_plane_text(
             ],
         }
         if not cache_hit:
-            resolver = getattr(
-                _lp(),
-                "_call_aawm_reference_identifier_list",
-                _call_aawm_reference_identifier_list,
-            )
-            identifier_list = await resolver(
+            identifier_list = await services.context_query.get_reference_identifiers(
                 tenant_id=available_context.get("tenant"),
                 agent_id=available_context.get("agent"),
             )
@@ -1391,18 +1000,17 @@ async def _rewrite_claude_control_plane_in_value(
     return value, [], []
 
 
-async def apply_claude_control_plane_rewrites_to_anthropic_request_body(  # noqa: PLR0915
+async def _apply_claude_control_plane_rewrites_impl(  # noqa: PLR0915
     request_body: dict[str, Any], billing_header_fields: dict[str, str]
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
-    # Defer llm_passthrough_endpoints import until span timestamps are needed so
-    # focused control-plane tests (and partial module loads) stay isolated.
+    services = _get_services()
     cc_version = billing_header_fields.get("cc_version")
     if not cc_version:
         return request_body, [], []
 
-    span_started_at = datetime.now(timezone.utc)
-    manifest_path = _resolve_claude_prompt_patch_manifest_path()
-    manifest = _load_claude_prompt_patch_manifest(manifest_path)
+    span_started_at = services.now_utc()
+    manifest_path = services.prompt.resolve_prompt_patch_manifest_path()
+    manifest = services.prompt.load_prompt_patch_manifest(manifest_path)
     available_context = _build_aawm_context_for_anthropic_request(request_body)
 
     # RR-053 #4: rewrites target stable control-plane surfaces (system + first
@@ -1470,12 +1078,12 @@ async def apply_claude_control_plane_rewrites_to_anthropic_request_body(  # noqa
         return request_body, [], []
 
     if override_events:
-        updated_body = _add_claude_system_prompt_override_logging_metadata(
+        updated_body = services.prompt.add_override_metadata(
             updated_body,
             override_events,
         )
     if patch_events:
-        updated_body = _add_claude_prompt_patch_logging_metadata(
+        updated_body = services.prompt.add_patch_metadata(
             updated_body,
             patch_events,
         )
@@ -1489,7 +1097,6 @@ async def apply_claude_control_plane_rewrites_to_anthropic_request_body(  # noqa
     if isinstance(litellm_metadata, dict):
         langfuse_spans = litellm_metadata.get("langfuse_spans")
         if isinstance(langfuse_spans, list):
-            lp = None
             for span_descriptor in langfuse_spans:
                 if not isinstance(span_descriptor, dict):
                     continue
@@ -1498,97 +1105,23 @@ async def apply_claude_control_plane_rewrites_to_anthropic_request_body(  # noqa
                     "claude.prompt_patch",
                     "claude.tool_advertisement_compaction",
                 }:
-                    if lp is None:
-                        lp = _lp()
-                    span_descriptor["start_time"] = lp._format_langfuse_span_timestamp(
+                    span_descriptor["start_time"] = services.format_span_timestamp(
                         span_started_at
                     )
-                    span_descriptor["end_time"] = lp._format_langfuse_span_timestamp(
-                        datetime.now(timezone.utc)
+                    span_descriptor["end_time"] = services.format_span_timestamp(
+                        services.now_utc()
                     )
 
     return updated_body, override_events, patch_events
 
 
-def _add_claude_prompt_patch_logging_metadata(
-    request_body: dict[str, Any], patch_events: list[dict[str, Any]]
-) -> dict[str, Any]:
-    lp = _lp()
-    patch_ids = sorted(
-        {
-            event["id"]
-            for event in patch_events
-            if isinstance(event.get("id"), str) and event["id"]
-        }
-    )
-    failure_ids = sorted(
-        {
-            event["id"]
-            for event in patch_events
-            if event.get("status") == "failed"
-            and isinstance(event.get("id"), str)
-            and event["id"]
-        }
-    )
-    statuses = [
-        event["status"]
-        for event in patch_events
-        if isinstance(event.get("status"), str) and event["status"]
-    ]
-    cc_versions = sorted(
-        {
-            event["cc_version"]
-            for event in patch_events
-            if isinstance(event.get("cc_version"), str) and event["cc_version"]
-        }
-    )
-    manifest_paths = sorted(
-        {
-            event["manifest_path"]
-            for event in patch_events
-            if isinstance(event.get("manifest_path"), str) and event["manifest_path"]
-        }
-    )
-    total_occurrences = sum(
-        event["occurrences"]
-        for event in patch_events
-        if isinstance(event.get("occurrences"), int)
-    )
-
-    tags_to_add = ["claude-prompt-patch"]
-    tags_to_add.extend(f"claude-prompt-patch:{patch_id}" for patch_id in patch_ids)
-    if failure_ids:
-        tags_to_add.append("claude-prompt-patch-failed")
-
-    span_metadata: dict[str, Any] = {
-        "patch_count": len(patch_events),
-        "replacement_count": total_occurrences,
-        "failure_count": len(failure_ids),
-    }
-    if patch_ids:
-        span_metadata["patch_ids"] = patch_ids
-    if cc_versions:
-        span_metadata["cc_versions"] = cc_versions
-
-    return lp._merge_litellm_metadata(
+async def apply_claude_control_plane_rewrites_to_anthropic_request_body(
+    request_body: dict[str, Any],
+    billing_header_fields: dict[str, str],
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    return await _get_standalone_rewriter().apply_rewrites(
         request_body,
-        tags_to_add=tags_to_add,
-        extra_fields={
-            "claude_prompt_patch_count": len(patch_events),
-            "claude_prompt_patch_replacement_count": total_occurrences,
-            "claude_prompt_patch_ids": patch_ids,
-            "claude_prompt_patch_failure_ids": failure_ids,
-            "claude_prompt_patch_statuses": statuses,
-            "claude_prompt_patch_cc_versions": cc_versions,
-            "claude_prompt_patch_manifest_paths": manifest_paths,
-            "claude_prompt_patch_events": patch_events,
-            "langfuse_spans": [
-                lp._build_langfuse_span_descriptor(
-                    name="claude.prompt_patch",
-                    metadata=span_metadata,
-                )
-            ],
-        },
+        billing_header_fields,
     )
 
 
@@ -1668,24 +1201,7 @@ def _build_aawm_context_for_anthropic_request(
 def add_claude_post_rewrite_context_file_logging_metadata(
     request_body: dict[str, Any]
 ) -> dict[str, Any]:
-    lp = _lp()
-    present_files = _detect_claude_post_rewrite_context_files(request_body)
-    if not present_files:
-        return request_body
-
-    tags_to_add = ["claude-post-rewrite-context-file-present"]
-    for marker, tag_suffix in _CLAUDE_POST_REWRITE_CONTEXT_FILE_MARKERS:
-        if marker in present_files:
-            tags_to_add.append(f"claude-post-rewrite-context-file:{tag_suffix}")
-
-    return lp._merge_litellm_metadata(
-        request_body,
-        tags_to_add=tags_to_add,
-        extra_fields={
-            "claude_post_rewrite_context_files_present": present_files,
-            "claude_post_rewrite_context_file_count": len(present_files),
-        },
-    )
+    return _get_services().add_context_file_metadata(request_body)
 
 
 def _build_aawm_dynamic_injection_failure_text(proc_name: str) -> str:
@@ -1698,194 +1214,88 @@ def _build_aawm_context_grab_failure_text(name: str) -> str:
     return _AAWM_CONTEXT_GRAB_FAILURE_TEMPLATE.format(name=name or "unknown")
 
 
-def _append_aawm_dynamic_injection_dsn_query_params(
-    dsn: str,
-    params: dict[str, Optional[str]],
-) -> str:
-    parsed = urlsplit(dsn)
-    if not parsed.scheme:
-        return dsn
-
-    query_items = parse_qsl(parsed.query, keep_blank_values=True)
-    existing_keys = {key for key, _value in query_items}
-    for key, value in params.items():
-        cleaned_value = _clean_secret_string(value)
-        if cleaned_value and key not in existing_keys:
-            query_items.append((key, cleaned_value))
-            existing_keys.add(key)
-    return urlunsplit(
-        (
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            urlencode(query_items),
-            parsed.fragment,
-        )
-    )
+_append_aawm_dynamic_injection_dsn_query_params = (
+    _context_query._append_aawm_dynamic_injection_dsn_query_params
+)
+close_aawm_dynamic_injection_pool = (
+    _context_query.close_aawm_dynamic_injection_pool
+)
 
 
 def _get_aawm_dynamic_injection_application_name() -> str:
-    return (
-        _get_first_secret_value(_AAWM_DB_APPLICATION_NAME_ENV_VARS)
-        or _AAWM_DYNAMIC_INJECTION_APPLICATION_NAME
+    return _context_query._get_aawm_dynamic_injection_application_name(
+        get_first_secret_value=lambda names: _get_first_secret_value(names)
     )
 
 
 def _get_aawm_dynamic_injection_server_settings() -> dict[str, str]:
-    return {"application_name": _get_aawm_dynamic_injection_application_name()}
+    return _context_query._get_aawm_dynamic_injection_server_settings(
+        get_application_name=_get_aawm_dynamic_injection_application_name
+    )
 
 
 async def _initialize_aawm_dynamic_injection_connection(conn: Any) -> None:
-    await conn.execute(
-        "select set_config($1, $2, false)",
-        "application_name",
-        _get_aawm_dynamic_injection_application_name(),
+    await _context_query._initialize_aawm_dynamic_injection_connection(
+        conn,
+        get_application_name=_get_aawm_dynamic_injection_application_name,
     )
 
 
 def _build_aawm_dynamic_injection_dsn() -> Optional[str]:
-    host = _get_first_secret_value(_AAWM_DB_HOST_ENV_VARS)
-    port = _get_first_secret_value(_AAWM_DB_PORT_ENV_VARS)
-    user = _get_first_secret_value(_AAWM_DB_USER_ENV_VARS)
-    password = _get_first_secret_value(_AAWM_DB_PASSWORD_ENV_VARS)
-    database = _get_first_secret_value(_AAWM_DB_NAME_ENV_VARS)
-    sslmode = _normalize_aawm_sslmode(
-        _get_first_secret_value(_AAWM_DB_SSLMODE_ENV_VARS)
-        or _get_first_secret_value(_AAWM_DB_SSL_BOOL_ENV_VARS)
-    )
-
-    has_component_config = any((host, port, user, password, database, sslmode))
-    if has_component_config:
-        if not host or not user or not database:
-            return None
-
-        credentials = quote(user, safe="")
-        if password:
-            credentials += f":{quote(password, safe='')}"
-        dsn = (
-            f"postgresql://{credentials}@{host}:{port or '5432'}/"
-            f"{quote(database, safe='')}"
-        )
-        if sslmode:
-            dsn += f"?{urlencode({'sslmode': sslmode})}"
-        return _append_aawm_dynamic_injection_dsn_query_params(
-            dsn,
-            {"application_name": _get_aawm_dynamic_injection_application_name()},
-        )
-
-    url_dsn = _get_first_secret_value(_AAWM_DB_URL_ENV_VARS)
-    if not url_dsn:
-        return None
-    return _append_aawm_dynamic_injection_dsn_query_params(
-        url_dsn,
-        {"application_name": _get_aawm_dynamic_injection_application_name()},
+    return _context_query._build_aawm_dynamic_injection_dsn(
+        get_first_secret_value=lambda names: _get_first_secret_value(names),
+        normalize_sslmode=lambda value: _normalize_aawm_sslmode(value),
+        get_application_name=_get_aawm_dynamic_injection_application_name,
     )
 
 
 async def _get_aawm_dynamic_injection_pool() -> Any:
-    global _aawm_dynamic_injection_pool
-
-    if _aawm_dynamic_injection_pool is not None:
-        return _aawm_dynamic_injection_pool
-
-    async with _aawm_dynamic_injection_pool_lock:
-        if _aawm_dynamic_injection_pool is not None:
-            return _aawm_dynamic_injection_pool
-
-        dsn = _build_aawm_dynamic_injection_dsn()
-        if not dsn:
-            raise RuntimeError(
-                "AAWM dynamic injection database configuration is missing"
-            )
-
-        try:
-            asyncpg = importlib.import_module("asyncpg")
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "AAWM dynamic injection requires asyncpg to be installed"
-            ) from exc
-
-        # Canonical AAWM dynamic-injection pool for this process (RR-053 #2).
-        # Callers in sibling modules should import this helper rather than open
-        # a second pool against the same DSN.
-        _aawm_dynamic_injection_pool = await asyncpg.create_pool(
-            dsn=dsn,
-            min_size=_AAWM_DYNAMIC_INJECTION_POOL_MIN_SIZE,
-            max_size=_AAWM_DYNAMIC_INJECTION_POOL_MAX_SIZE,
-            command_timeout=_AAWM_DYNAMIC_INJECTION_COMMAND_TIMEOUT_SECONDS,
-            statement_cache_size=_AAWM_DYNAMIC_INJECTION_STATEMENT_CACHE_SIZE,
-            server_settings=_get_aawm_dynamic_injection_server_settings(),
-            init=_initialize_aawm_dynamic_injection_connection,
-        )
-        return _aawm_dynamic_injection_pool
-
-
-async def close_aawm_dynamic_injection_pool() -> None:
-    """Release the process-wide dynamic-injection pool (proxy shutdown hook)."""
-    global _aawm_dynamic_injection_pool
-    async with _aawm_dynamic_injection_pool_lock:
-        pool = _aawm_dynamic_injection_pool
-        _aawm_dynamic_injection_pool = None
-    if pool is not None:
-        await pool.close()
+    return await _context_query._get_aawm_dynamic_injection_pool(
+        build_dsn=_build_aawm_dynamic_injection_dsn,
+        get_server_settings=_get_aawm_dynamic_injection_server_settings,
+        initialize_connection=_initialize_aawm_dynamic_injection_connection,
+    )
 
 
 def _aawm_dynamic_injection_acquire_timeout_seconds() -> float:
-    raw_value = _clean_secret_string(
-        _lp().get_secret_str("AAWM_DYNAMIC_INJECTION_ACQUIRE_TIMEOUT_SECONDS")
-    )
-    if not raw_value:
-        return _AAWM_DYNAMIC_INJECTION_ACQUIRE_TIMEOUT_SECONDS
-    try:
-        return max(0.1, float(raw_value))
-    except (TypeError, ValueError):
-        return _AAWM_DYNAMIC_INJECTION_ACQUIRE_TIMEOUT_SECONDS
+    return _context_query._aawm_dynamic_injection_acquire_timeout_seconds()
 
 
 async def _aawm_pool_fetch(pool: Any, query: str, *args: Any) -> Any:
-    timeout = _aawm_dynamic_injection_acquire_timeout_seconds()
-    async with pool.acquire(timeout=timeout) as connection:
-        return await connection.fetch(query, *args)
+    return await _context_query._aawm_pool_fetch(
+        pool,
+        query,
+        *args,
+        get_timeout=_aawm_dynamic_injection_acquire_timeout_seconds,
+    )
 
 
 async def _aawm_pool_fetchval(pool: Any, query: str, *args: Any) -> Any:
-    timeout = _aawm_dynamic_injection_acquire_timeout_seconds()
-    async with pool.acquire(timeout=timeout) as connection:
-        return await connection.fetchval(query, *args)
+    return await _context_query._aawm_pool_fetchval(
+        pool,
+        query,
+        *args,
+        get_timeout=_aawm_dynamic_injection_acquire_timeout_seconds,
+    )
 
 
 async def _call_aawm_get_agent_memories(
     *, agent_name: str, tenant_id: str
 ) -> Optional[str]:
-    pool = await _get_aawm_dynamic_injection_pool()
-    result = await _aawm_pool_fetchval(
-        pool,
-        "SELECT get_agent_memories($1, $2)",
-        agent_name,
-        tenant_id,
+    return await _context_query._call_aawm_get_agent_memories(
+        agent_name=agent_name,
+        tenant_id=tenant_id,
+        get_pool=_get_aawm_dynamic_injection_pool,
+        pool_fetchval=_aawm_pool_fetchval,
     )
-    if isinstance(result, str):
-        stripped_result = result.strip()
-        if stripped_result:
-            return stripped_result
-    return None
 
 
 def _get_aawm_context_grab_proc_name() -> str:
-    proc_name = (
-        _get_first_secret_value(_AAWM_CONTEXT_GRAB_PROC_NAME_ENV_VARS)
-        or _AAWM_CONTEXT_GRAB_DEFAULT_PROC_NAME
-    )
-    if _AAWM_SQL_IDENTIFIER_PATTERN.fullmatch(proc_name) is None:
-        raise RuntimeError("AAWM context grab proc name is invalid")
-    return proc_name
+    return _context_query._get_aawm_context_grab_proc_name()
 
 
 def _get_aawm_context_grab_proc_name_for_logging() -> str:
-    try:
-        return _get_aawm_context_grab_proc_name()
-    except Exception:
-        return "unknown"
+    return _context_query._get_aawm_context_grab_proc_name_for_logging()
 
 
 def _format_aawm_context_retrieved_at(retrieved_at: datetime) -> str:
@@ -1900,55 +1310,25 @@ def _format_aawm_context_retrieved_at(retrieved_at: datetime) -> str:
 async def _call_aawm_context_grab(
     *, name: str, tenant_id: Optional[str], agent_id: Optional[str]
 ) -> Optional[str]:
-    proc_name = _get_aawm_context_grab_proc_name()
-    pool = await _get_aawm_dynamic_injection_pool()
-    rows = await _aawm_pool_fetch(
-        pool,
-        f"SELECT content FROM {proc_name}($1, $2, $3)",
-        name,
-        tenant_id,
-        agent_id,
+    return await _context_query._call_aawm_context_grab(
+        name=name,
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        get_pool=_get_aawm_dynamic_injection_pool,
+        pool_fetch=_aawm_pool_fetch,
+        get_proc_name=_get_aawm_context_grab_proc_name,
     )
-    contents: list[str] = []
-    for row in rows:
-        content: Optional[str] = None
-        if isinstance(row, dict):
-            content = row.get("content")
-        elif hasattr(row, "get"):
-            content = row.get("content")
-        if isinstance(content, str):
-            stripped_content = content.strip()
-            if stripped_content:
-                contents.append(stripped_content)
-    if contents:
-        return "\n\n".join(contents)
-    return None
 
 
 async def _call_aawm_reference_identifier_list(
     *, tenant_id: Optional[str], agent_id: Optional[str]
 ) -> Optional[str]:
-    pool = await _get_aawm_dynamic_injection_pool()
-    rows = await _aawm_pool_fetch(
-        pool,
-        _AAWM_REFERENCE_IDENTIFIER_LIST_QUERY,
-        tenant_id,
-        agent_id,
+    return await _context_query._call_aawm_reference_identifier_list(
+        tenant_id=tenant_id,
+        agent_id=agent_id,
+        get_pool=_get_aawm_dynamic_injection_pool,
+        pool_fetch=_aawm_pool_fetch,
     )
-    identifier_names: list[str] = []
-    for row in rows:
-        identifier_name: Optional[str] = None
-        if isinstance(row, dict):
-            identifier_name = row.get("name")
-        elif hasattr(row, "get"):
-            identifier_name = row.get("name")
-        if isinstance(identifier_name, str):
-            stripped_identifier_name = identifier_name.strip()
-            if stripped_identifier_name:
-                identifier_names.append(stripped_identifier_name)
-    if identifier_names:
-        return ", ".join(identifier_names)
-    return None
 
 
 def _resolve_aawm_dynamic_context_fields(
@@ -1987,7 +1367,7 @@ async def _resolve_aawm_dynamic_directive(
     directive_attrs: dict[str, str],
     available_context: dict[str, str],
 ) -> tuple[str, dict[str, Any]]:
-    lp = _lp()
+    services = _get_services()
     raw_proc_name = directive_attrs.get("p") or directive_attrs.get("proc") or "unknown"
     proc_name = _AAWM_DYNAMIC_PROC_ALIASES.get(raw_proc_name, raw_proc_name)
     context_fields = _resolve_aawm_dynamic_context_fields(proc_name, directive_attrs)
@@ -2019,10 +1399,7 @@ async def _resolve_aawm_dynamic_directive(
         )
         event["cache_status"] = "hit" if cache_hit else "miss"
         if not cache_hit:
-            resolver = getattr(
-                lp, "_call_aawm_get_agent_memories", _call_aawm_get_agent_memories
-            )
-            injected_text = await resolver(
+            injected_text = await services.context_query.get_agent_memories(
                 agent_name=selected_context["agent"],
                 tenant_id=selected_context["tenant"],
             )
@@ -2058,8 +1435,8 @@ async def _resolve_aawm_context_reference(
     *,
     placeholder_type: str,
 ) -> tuple[Optional[str], dict[str, Any]]:
-    lp = _lp()
-    proc_name = _get_aawm_context_grab_proc_name()
+    services = _get_services()
+    proc_name = services.context_query.get_context_proc_name()
     context_keys = [
         context_key
         for context_key in ("session_id", "tenant", "agent")
@@ -2082,9 +1459,8 @@ async def _resolve_aawm_context_reference(
     cache_hit, cached_payload = await _get_cached_aawm_context_grab_result(cache_key)
     event["cache_status"] = "hit" if cache_hit else "miss"
     if not cache_hit:
-        retrieved_at = _format_aawm_context_retrieved_at(datetime.now(timezone.utc))
-        resolver = getattr(lp, "_call_aawm_context_grab", _call_aawm_context_grab)
-        content = await resolver(
+        retrieved_at = _format_aawm_context_retrieved_at(services.now_utc())
+        content = await services.context_query.get_context(
             name=name,
             tenant_id=available_context.get("tenant"),
             agent_id=available_context.get("agent"),
@@ -2186,7 +1562,7 @@ async def _expand_aawm_context_markers_in_text(
     if not ordered_names:
         return updated_text, []
 
-    semaphore = asyncio.Semaphore(_AAWM_DYNAMIC_INJECTION_POOL_MAX_SIZE)
+    semaphore = asyncio.Semaphore(_get_services().context_query.max_parallel_queries)
 
     async def _resolve_with_limit(
         name: str,
@@ -2198,7 +1574,7 @@ async def _expand_aawm_context_markers_in_text(
                 return (
                     _build_aawm_context_grab_failure_text(name),
                     {
-                        "proc": _get_aawm_context_grab_proc_name_for_logging(),
+                        "proc": _get_services().context_query.get_context_proc_name_for_logging(),
                         "status": "failed",
                         "error": exc.__class__.__name__,
                         "context_keys": [
@@ -2330,7 +1706,7 @@ async def _expand_aawm_dispatch_context_references_in_text(
         for name, _placeholder_type in ordered_references:
             request_lookup_budget.seen_names.add(name)
 
-    semaphore = asyncio.Semaphore(_AAWM_DYNAMIC_INJECTION_POOL_MAX_SIZE)
+    semaphore = asyncio.Semaphore(_get_services().context_query.max_parallel_queries)
 
     async def _resolve_with_limit(
         name: str,
@@ -2347,7 +1723,7 @@ async def _expand_aawm_dispatch_context_references_in_text(
                 return (
                     None,
                     {
-                        "proc": _get_aawm_context_grab_proc_name_for_logging(),
+                        "proc": _get_services().context_query.get_context_proc_name_for_logging(),
                         "status": "failed",
                         "error": exc.__class__.__name__,
                         "context_keys": [
@@ -2604,7 +1980,7 @@ async def _expand_aawm_dynamic_directives_in_value(
 def _add_aawm_dynamic_injection_logging_metadata(
     request_body: dict[str, Any], injection_events: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    lp = _lp()
+    services = _get_services()
     proc_names = sorted(
         {
             event["proc"]
@@ -2668,7 +2044,7 @@ def _add_aawm_dynamic_injection_logging_metadata(
     if context_names:
         span_metadata["context_names"] = context_names
 
-    return lp._merge_litellm_metadata(
+    return services.merge_metadata(
         request_body,
         tags_to_add=tags_to_add,
         extra_fields={
@@ -2683,7 +2059,7 @@ def _add_aawm_dynamic_injection_logging_metadata(
             "aawm_dynamic_injection_cache_misses": cache_miss_count,
             "aawm_dynamic_injection_events": injection_events,
             "langfuse_spans": [
-                lp._build_langfuse_span_descriptor(
+                services.build_span(
                     name="aawm.dynamic_injection",
                     metadata=span_metadata,
                 )
@@ -2711,15 +2087,15 @@ def _request_uses_aawm_dispatch_backtick_context(request_body: dict[str, Any]) -
     return False
 
 
-async def expand_aawm_dynamic_directives_in_anthropic_request_body(
+async def _expand_aawm_dynamic_directives_impl(
     request_body: dict[str, Any]
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    # Defer llm_passthrough_endpoints import until span timestamps are needed.
+    services = _get_services()
     available_context = _build_aawm_context_for_anthropic_request(request_body)
     enable_dispatch_backtick_context = _request_uses_aawm_dispatch_backtick_context(
         request_body
     )
-    span_started_at = datetime.now(timezone.utc)
+    span_started_at = services.now_utc()
     updated_body = dict(request_body)
     injection_events: list[dict[str, Any]] = []
     changed = False
@@ -2764,20 +2140,23 @@ async def expand_aawm_dynamic_directives_in_anthropic_request_body(
         if isinstance(litellm_metadata, dict):
             langfuse_spans = litellm_metadata.get("langfuse_spans")
             if isinstance(langfuse_spans, list):
-                lp = None
                 for span_descriptor in langfuse_spans:
                     if (
                         isinstance(span_descriptor, dict)
                         and span_descriptor.get("name") == "aawm.dynamic_injection"
                     ):
-                        if lp is None:
-                            lp = _lp()
                         span_descriptor[
                             "start_time"
-                        ] = lp._format_langfuse_span_timestamp(span_started_at)
+                        ] = services.format_span_timestamp(span_started_at)
                         span_descriptor[
                             "end_time"
-                        ] = lp._format_langfuse_span_timestamp(
-                            datetime.now(timezone.utc)
+                        ] = services.format_span_timestamp(
+                            services.now_utc()
                         )
     return updated_body, injection_events
+
+
+async def expand_aawm_dynamic_directives_in_anthropic_request_body(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    return await _get_standalone_rewriter().expand_dynamic_context(request_body)
