@@ -20,6 +20,9 @@ import httpx  # noqa: F401  # harness patch surface; refresh path removed (RR-04
 
 from litellm.constants import XAI_API_BASE
 from litellm.responses.utils import ResponsesAPIRequestUtils
+from litellm.secret_managers.grok_oidc_auth_path import (
+    resolve_grok_oidc_auth_path,
+)
 from litellm.secret_managers.main import get_secret_str
 
 OA_XAI_PROVIDER_PREFIX = "oa_xai/"
@@ -36,7 +39,6 @@ _DEFAULT_REFRESH_BUFFER_SECONDS = 300
 _DEFAULT_HERMES_XAI_OAUTH_PROVIDER_ID = "xai-oauth"
 _DEFAULT_HERMES_AUTH_PATH = "~/.hermes/auth.json"
 _DEFAULT_LITELLM_XAI_OAUTH_AUTH_PATH = "~/.litellm/xai/oauth-auth.json"
-_DEFAULT_GROK_XAI_OAUTH_AUTH_PATH = "~/.grok/auth.json"
 
 _GROK_NATIVE_OAUTH_MODELS = frozenset(
     {
@@ -427,19 +429,9 @@ def default_litellm_xai_oauth_auth_path() -> Path:
 
 
 def default_grok_xai_oauth_auth_path() -> Path:
-    configured = (
-        get_secret_str("LITELLM_XAI_GROK_AUTH_FILE")
-        or get_secret_str("LITELLM_XAI_OAUTH_GROK_AUTH_FILE")
-        or get_secret_str("GROK_AUTH_FILE")
-    )
-    if isinstance(configured, str) and configured.strip():
-        return Path(configured.strip()).expanduser()
-
-    grok_home = get_secret_str("GROK_HOME")
-    if isinstance(grok_home, str) and grok_home.strip():
-        return Path(grok_home.strip()).expanduser() / "auth.json"
-
-    return Path(_DEFAULT_GROK_XAI_OAUTH_AUTH_PATH).expanduser()
+    return resolve_grok_oidc_auth_path(
+        value_getter=get_secret_str,
+    ).path
 
 
 def migrate_hermes_xai_oauth_credential(

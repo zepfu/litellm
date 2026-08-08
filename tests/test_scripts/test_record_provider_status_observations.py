@@ -14,6 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from litellm.integrations import aawm_agent_identity
+from litellm.llms.xai import oauth
 from scripts import codex_oauth_refresh
 from scripts import grok_oidc_refresh
 from scripts import kimi_oauth_refresh
@@ -655,6 +656,18 @@ def test_resolve_grok_sidecar_auth_file_prefers_aawm_override(tmp_path, monkeypa
     assert source == "AAWM_GROK_OIDC_AUTH_FILE"
 
 
+def test_resolve_grok_sidecar_auth_file_prefers_explicit_non_default_path(tmp_path, monkeypatch) -> None:
+    explicit_auth = tmp_path / "explicit-auth.json"
+    native_auth = tmp_path / "native-auth.json"
+    monkeypatch.delenv("AAWM_GROK_OIDC_AUTH_FILE", raising=False)
+    monkeypatch.setenv("LITELLM_XAI_GROK_AUTH_FILE", str(native_auth))
+
+    resolved_path, source = loop._resolve_grok_sidecar_auth_file(str(explicit_auth))
+
+    assert resolved_path == str(explicit_auth)
+    assert source == "explicit"
+
+
 def test_resolve_grok_sidecar_auth_file_falls_back_to_native_precedence(tmp_path, monkeypatch) -> None:
     litellm_auth = tmp_path / "litellm-auth.json"
     oauth_auth = tmp_path / "oauth-auth.json"
@@ -679,6 +692,41 @@ def test_resolve_grok_sidecar_auth_file_falls_back_to_native_precedence(tmp_path
 
     assert resolved_path == str(litellm_auth)
     assert source == "LITELLM_XAI_GROK_AUTH_FILE"
+
+
+@pytest.mark.parametrize(
+    ("env_name", "configured_name", "expected_name"),
+    (
+        (
+            "LITELLM_XAI_OAUTH_GROK_AUTH_FILE",
+            "legacy-oauth.json",
+            "legacy-oauth.json",
+        ),
+        ("GROK_AUTH_FILE", "grok-auth.json", "grok-auth.json"),
+    ),
+)
+def test_resolve_grok_sidecar_auth_file_supports_each_native_source(
+    tmp_path,
+    monkeypatch,
+    env_name,
+    configured_name,
+    expected_name,
+) -> None:
+    for configured_env_name in (
+        "AAWM_GROK_OIDC_AUTH_FILE",
+        "LITELLM_XAI_GROK_AUTH_FILE",
+        "LITELLM_XAI_OAUTH_GROK_AUTH_FILE",
+        "GROK_AUTH_FILE",
+        "GROK_HOME",
+    ):
+        monkeypatch.delenv(configured_env_name, raising=False)
+    monkeypatch.setenv(env_name, str(tmp_path / configured_name))
+
+    resolved_path, source = loop._resolve_grok_sidecar_auth_file(loop.DEFAULT_GROK_OIDC_AUTH_FILE)
+
+    assert resolved_path == str(tmp_path / expected_name)
+    assert source == env_name
+    assert str(tmp_path) not in source
 
 
 def test_resolve_grok_sidecar_auth_file_keeps_configured_missing_path(
@@ -730,6 +778,37 @@ def test_resolve_grok_sidecar_auth_file_uses_grok_home_and_default(tmp_path, mon
     assert resolved_path == str(grok_auth)
     assert source == "GROK_HOME"
 
+    monkeypatch.delenv("GROK_HOME")
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    resolved_path, source = loop._resolve_grok_sidecar_auth_file(loop.DEFAULT_GROK_OIDC_AUTH_FILE)
+
+    assert resolved_path == str(tmp_path / ".grok" / "auth.json")
+    assert source == "default"
+
+
+def test_grok_runtime_and_sidecar_resolve_same_conflicting_override(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE", "~/aawm/auth.json")
+    monkeypatch.setenv(
+        "LITELLM_XAI_GROK_AUTH_FILE",
+        "~/litellm-native/auth.json",
+    )
+    monkeypatch.setenv(
+        "LITELLM_XAI_OAUTH_GROK_AUTH_FILE",
+        "~/legacy-oauth/auth.json",
+    )
+    monkeypatch.setenv("GROK_AUTH_FILE", "~/grok/auth.json")
+    monkeypatch.setenv("GROK_HOME", "~/grok-home")
+
+    runtime_path = oauth.default_grok_xai_oauth_auth_path()
+    sidecar_path, sidecar_source = loop._resolve_grok_sidecar_auth_file("~/explicit/auth.json")
+
+    expected_path = tmp_path / "aawm" / "auth.json"
+    assert runtime_path == expected_path
+    assert sidecar_path == str(expected_path)
+    assert sidecar_source == "AAWM_GROK_OIDC_AUTH_FILE"
+    assert str(expected_path) not in sidecar_source
 
 
 def test_resolve_grok_billing_client_version_prefers_grok_client_version(monkeypatch) -> None:

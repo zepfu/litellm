@@ -285,6 +285,33 @@ async def test_grok_native_oauth_loads_default_grok_auth_json_scoped_record(
 
 
 @pytest.mark.asyncio
+async def test_grok_native_and_managed_xai_oauth_keep_separate_auth_paths(
+    tmp_path,
+    monkeypatch,
+):
+    harness = OaXaiHarness()
+    native_path = tmp_path / "native" / "auth.json"
+    managed_path = tmp_path / "managed" / "oauth-auth.json"
+    native_path.parent.mkdir()
+    managed_path.parent.mkdir()
+    native_path.write_text(
+        json.dumps(harness.credential_payload(token="native-token", scoped=True)),
+        encoding="utf-8",
+    )
+    managed_path.write_text(
+        json.dumps(harness.credential_payload(token="managed-token", scoped=True)),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("AAWM_GROK_OIDC_AUTH_FILE", str(native_path))
+    monkeypatch.setenv("LITELLM_XAI_OAUTH_AUTH_FILE", str(managed_path))
+
+    assert oauth.default_grok_xai_oauth_auth_path() == native_path
+    assert await oauth.get_grok_native_oauth_access_token() == "native-token"
+    assert await oauth.get_xai_oauth_access_token() == "managed-token"
+
+
+@pytest.mark.asyncio
 async def test_grok_native_oauth_does_not_copy_seed_auth_file(
     tmp_path,
     monkeypatch,

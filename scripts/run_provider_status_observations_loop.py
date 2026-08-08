@@ -66,6 +66,11 @@ from litellm.secret_managers.kimi_native_contract import (
     resolve_endpoint_url as _kimi_resolve_endpoint_url,
 )
 from litellm.secret_managers import grok_native_version_contract
+from litellm.secret_managers.grok_oidc_auth_path import (
+    DEFAULT_GROK_OIDC_AUTH_FILE,
+    GROK_OIDC_AUTH_FILE_ENV_VARS,
+    resolve_grok_oidc_auth_path,
+)
 
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -73,13 +78,8 @@ FALSE_VALUES = {"0", "false", "no", "off"}
 PROVIDER_FAILURE_SUMMARY_LIMIT = 8
 PROVIDER_FAILURE_FIELD_LIMIT = 160
 PROVIDER_FAILURE_MESSAGE_LIMIT = 240
-DEFAULT_GROK_OIDC_AUTH_FILE = "/home/zepfu/.grok/auth.json"
 DEFAULT_GROK_OIDC_LOCK_FILE = "/home/zepfu/.grok/auth.json.lock"
-GROK_SIDECAR_NATIVE_AUTH_FILE_ENV_VARS = (
-    "LITELLM_XAI_GROK_AUTH_FILE",
-    "LITELLM_XAI_OAUTH_GROK_AUTH_FILE",
-    "GROK_AUTH_FILE",
-)
+GROK_SIDECAR_NATIVE_AUTH_FILE_ENV_VARS = GROK_OIDC_AUTH_FILE_ENV_VARS
 DEFAULT_GROK_OIDC_REFRESH_INTERVAL_SECONDS = 3600.0
 DEFAULT_GROK_OIDC_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_CODEX_AUTH_FILE = codex_oauth_refresh.DEFAULT_CODEX_AUTH_FILE
@@ -1374,29 +1374,11 @@ def _first_non_empty_env(*names: str) -> Optional[str]:
 def _resolve_grok_sidecar_auth_file(
     explicit_auth_file: Optional[str],
 ) -> tuple[str, str]:
-    explicit_value = (
-        explicit_auth_file.strip()
-        if isinstance(explicit_auth_file, str) and explicit_auth_file.strip()
-        else None
+    resolution = resolve_grok_oidc_auth_path(
+        explicit_auth_file,
+        value_getter=os.getenv,
     )
-
-    aawm_auth_file = os.getenv("AAWM_GROK_OIDC_AUTH_FILE", "").strip()
-    if aawm_auth_file:
-        return str(Path(aawm_auth_file).expanduser()), "AAWM_GROK_OIDC_AUTH_FILE"
-
-    if explicit_value and explicit_value != DEFAULT_GROK_OIDC_AUTH_FILE:
-        return str(Path(explicit_value).expanduser()), "explicit"
-
-    for env_name in GROK_SIDECAR_NATIVE_AUTH_FILE_ENV_VARS:
-        env_value = os.getenv(env_name, "").strip()
-        if env_value:
-            return str(Path(env_value).expanduser()), env_name
-
-    grok_home = os.getenv("GROK_HOME", "").strip()
-    if grok_home:
-        return str(Path(grok_home).expanduser() / "auth.json"), "GROK_HOME"
-
-    return DEFAULT_GROK_OIDC_AUTH_FILE, "default"
+    return str(resolution.path), resolution.source
 
 
 def _resolve_codex_sidecar_auth_file(
@@ -1684,7 +1666,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         help=(
             "Grok CLI auth JSON file maintained by this sidecar. Defaults to "
             "AAWM_GROK_OIDC_AUTH_FILE, then native Grok auth-file env vars, "
-            "GROK_HOME/auth.json, or /home/zepfu/.grok/auth.json."
+            "GROK_HOME/auth.json, or ~/.grok/auth.json."
         ),
     )
     parser.add_argument(
