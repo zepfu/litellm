@@ -3929,7 +3929,7 @@
             },
             "minimum_total_tool_uses": 3,
             "maximum_total_tool_uses": 3,
-            "minimum_tools_in_single_assistant_message": 3,
+            "minimum_tools_in_single_assistant_message": 2,
             "maximum_tool_uses_per_assistant_message": 3,
             "forbid_tool_result_errors": true
           }

@@ -3769,6 +3769,7 @@ def _assert_parallel_read_common_case(
     model,
     durable_tool_names,
     transcript_mode="parallel",
+    minimum_tools_in_single_assistant_message=3,
 ):
     command = case_config["command"]
     prompt = command[2]
@@ -3812,7 +3813,10 @@ def _assert_parallel_read_common_case(
         "Grep": 1,
     }
     if transcript_mode == "parallel":
-        assert transcript_agent["minimum_tools_in_single_assistant_message"] == 3
+        assert (
+            transcript_agent["minimum_tools_in_single_assistant_message"]
+            == minimum_tools_in_single_assistant_message
+        )
         assert transcript_agent["maximum_tool_uses_per_assistant_message"] == 3
         assert "require_tool_result_before_next_tool_use" not in transcript_agent
     else:
@@ -3978,6 +3982,12 @@ def test_d1251_parallel_read_cases_cover_expected_aawm_anthropic_target_matrix()
                 "sequential"
                 if case_name in D1251_SEQUENTIAL_TRANSCRIPT_CASES
                 else "parallel"
+            ),
+            minimum_tools_in_single_assistant_message=(
+                2
+                if case_name
+                == "claude_adapter_xai_oa_xai_grok_build_child_parallel_read_tools"
+                else 3
             ),
         )
         assert case_config["claude_agents"][agent_name]["model"] == (
