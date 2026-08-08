@@ -1,3 +1,5 @@
+import asyncio
+import json
 import os
 import sys
 
@@ -5,6 +7,9 @@ import pytest
 
 sys.path.insert(0, os.path.abspath("../../../../.."))
 
+from litellm.llms.anthropic.experimental_pass_through.adapters import (
+    streaming_iterator as streaming_iterator_module,
+)
 from litellm.llms.anthropic.experimental_pass_through.adapters.streaming_iterator import (
     AnthropicStreamWrapper,
 )
@@ -760,3 +765,153 @@ async def test_async_wrapper_synthesizes_end_turn_when_stream_ends_without_termi
 
     message_delta = next(chunk for chunk in chunks if chunk["type"] == "message_delta")
     assert message_delta["delta"]["stop_reason"] == "end_turn"
+
+
+def _partial_chat_chunk(partial_kind):
+    if partial_kind == "text":
+        return ModelResponseStream(
+            choices=[
+                StreamingChoices(
+                    delta=Delta(content="partial text"),
+                    index=0,
+                    finish_reason=None,
+                )
+            ]
+        )
+    return ModelResponseStream(
+        choices=[
+            StreamingChoices(
+                delta=Delta(
+                    tool_calls=[
+                        ChatCompletionDeltaToolCall(
+                            id="call_partial",
+                            function=Function(
+                                name="Bash",
+                                arguments='{"command":"pw',
+                            ),
+                            type="function",
+                            index=0,
+                        )
+                    ]
+                ),
+                index=0,
+                finish_reason=None,
+            )
+        ]
+    )
+
+
+class _FailingCompletionStream:
+    def __init__(self, partial_kind, failure):
+        self.partial_chunk = _partial_chat_chunk(partial_kind)
+        self.failure = failure
+        self.sent_partial_chunk = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self.sent_partial_chunk:
+            self.sent_partial_chunk = True
+            return self.partial_chunk
+        raise self.failure
+
+
+class _AsyncFailingCompletionStream:
+    def __init__(self, partial_kind, failure):
+        self.partial_chunk = _partial_chat_chunk(partial_kind)
+        self.failure = failure
+        self.sent_partial_chunk = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.sent_partial_chunk:
+            self.sent_partial_chunk = True
+            return self.partial_chunk
+        raise self.failure
+
+
+_STREAM_FAILURE_FACTORIES = [
+    pytest.param(
+        lambda: ConnectionResetError("upstream connection reset"),
+        id="transport",
+    ),
+    pytest.param(
+        lambda: json.JSONDecodeError("invalid upstream event", "{", 1),
+        id="parser",
+    ),
+    pytest.param(
+        lambda: asyncio.CancelledError("upstream stream cancelled"),
+        id="cancellation",
+    ),
+    pytest.param(
+        lambda: RuntimeError("unexpected upstream failure"),
+        id="other",
+    ),
+]
+
+
+def _assert_partial_output_has_no_success_terminal(chunks, partial_kind):
+    delta_type = "text_delta" if partial_kind == "text" else "input_json_delta"
+    assert any(
+        chunk.get("type") == "content_block_delta"
+        and chunk.get("delta", {}).get("type") == delta_type
+        for chunk in chunks
+    )
+    assert not any(
+        chunk.get("type") in {"message_delta", "message_stop"} for chunk in chunks
+    )
+
+
+@pytest.mark.parametrize("partial_kind", ["text", "tool"])
+@pytest.mark.parametrize("failure_factory", _STREAM_FAILURE_FACTORIES)
+def test_sync_wrapper_propagates_failure_after_partial_output(
+    partial_kind,
+    failure_factory,
+    monkeypatch,
+):
+    failure = failure_factory()
+    logged_errors = []
+    monkeypatch.setattr(
+        streaming_iterator_module.verbose_logger,
+        "error",
+        lambda message: logged_errors.append(str(message)),
+    )
+    wrapper = AnthropicStreamWrapper(
+        completion_stream=_FailingCompletionStream(partial_kind, failure),
+        model="claude-3",
+    )
+
+    chunks = []
+    with pytest.raises(type(failure)) as exc_info:
+        while True:
+            chunks.append(next(wrapper))
+
+    assert exc_info.value is failure
+    _assert_partial_output_has_no_success_terminal(chunks, partial_kind)
+    if isinstance(failure, Exception):
+        assert any(str(failure) in message for message in logged_errors)
+
+
+@pytest.mark.parametrize("partial_kind", ["text", "tool"])
+@pytest.mark.parametrize("failure_factory", _STREAM_FAILURE_FACTORIES)
+@pytest.mark.asyncio
+async def test_async_wrapper_propagates_failure_after_partial_output(
+    partial_kind,
+    failure_factory,
+):
+    failure = failure_factory()
+    wrapper = AnthropicStreamWrapper(
+        completion_stream=_AsyncFailingCompletionStream(partial_kind, failure),
+        model="claude-3",
+    )
+
+    chunks = []
+    with pytest.raises(type(failure)) as exc_info:
+        async for chunk in wrapper:
+            chunks.append(chunk)
+
+    assert exc_info.value is failure
+    _assert_partial_output_has_no_success_terminal(chunks, partial_kind)

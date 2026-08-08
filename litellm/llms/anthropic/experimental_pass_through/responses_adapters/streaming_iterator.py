@@ -1027,6 +1027,7 @@ class AnthropicResponsesStreamWrapper:
             verbose_logger.error(
                 f"AnthropicResponsesStreamWrapper error: {e}\n{traceback.format_exc()}"
             )
+            raise
 
         # Drain any remaining queued chunks
         if self._chunk_queue:

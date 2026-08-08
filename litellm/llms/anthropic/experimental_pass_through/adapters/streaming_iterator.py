@@ -819,7 +819,7 @@ class AnthropicStreamWrapper(AdapterCompletionStreamWrapper):
             verbose_logger.error(
                 "Anthropic Adapter - {}\n{}".format(e, traceback.format_exc())
             )
-            raise StopAsyncIteration
+            raise
 
     async def __anext__(self):  # noqa: PLR0915
         from .transformation import LiteLLMAnthropicMessagesAdapter

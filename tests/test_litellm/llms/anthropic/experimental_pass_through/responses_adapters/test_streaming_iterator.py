@@ -1,7 +1,12 @@
+import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
 
+from litellm.llms.anthropic.experimental_pass_through.responses_adapters import (
+    streaming_iterator as streaming_iterator_module,
+)
 from litellm.llms.anthropic.experimental_pass_through.responses_adapters.streaming_iterator import (
     AnthropicResponsesEmptySuccessError,
     AnthropicResponsesProviderError,
@@ -12,6 +17,62 @@ from litellm.llms.anthropic.experimental_pass_through.responses_adapters.streami
 async def _make_stream(*events):
     for event in events:
         yield event
+
+
+async def _make_failing_stream(events, failure):
+    for event in events:
+        yield event
+    raise failure
+
+
+def _partial_stream_events(partial_kind):
+    if partial_kind == "text":
+        return [
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(
+                type="response.output_text.delta",
+                item_id="msg_partial",
+                delta="partial text",
+            ),
+        ]
+    return [
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="response.output_item.added",
+            item=SimpleNamespace(
+                type="function_call",
+                id="fc_partial",
+                call_id="call_partial",
+                name="Bash",
+                arguments="",
+            ),
+        ),
+        SimpleNamespace(
+            type="response.function_call_arguments.delta",
+            item_id="fc_partial",
+            delta='{"command":"pw',
+        ),
+    ]
+
+
+_STREAM_FAILURE_FACTORIES = [
+    pytest.param(
+        lambda: ConnectionResetError("upstream connection reset"),
+        id="transport",
+    ),
+    pytest.param(
+        lambda: json.JSONDecodeError("invalid upstream event", "{", 1),
+        id="parser",
+    ),
+    pytest.param(
+        lambda: asyncio.CancelledError("upstream stream cancelled"),
+        id="cancellation",
+    ),
+    pytest.param(
+        lambda: RuntimeError("unexpected upstream failure"),
+        id="other",
+    ),
+]
 
 
 @pytest.mark.asyncio
@@ -1011,3 +1072,45 @@ async def test_stream_wrapper_rejects_empty_success_when_enabled():
 
     assert "empty successful response" in str(exc_info.value)
     assert "resp_empty" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("partial_kind", ["text", "tool"])
+@pytest.mark.parametrize("failure_factory", _STREAM_FAILURE_FACTORIES)
+@pytest.mark.asyncio
+async def test_stream_wrapper_propagates_failure_after_partial_output(
+    partial_kind,
+    failure_factory,
+    monkeypatch,
+):
+    failure = failure_factory()
+    logged_errors = []
+    monkeypatch.setattr(
+        streaming_iterator_module.verbose_logger,
+        "error",
+        lambda message: logged_errors.append(str(message)),
+    )
+    wrapper = AnthropicResponsesStreamWrapper(
+        responses_stream=_make_failing_stream(
+            _partial_stream_events(partial_kind),
+            failure,
+        ),
+        model="gpt-5.4",
+    )
+
+    chunks = []
+    with pytest.raises(type(failure)) as exc_info:
+        async for chunk in wrapper:
+            chunks.append(chunk)
+
+    assert exc_info.value is failure
+    delta_type = "text_delta" if partial_kind == "text" else "input_json_delta"
+    assert any(
+        chunk.get("type") == "content_block_delta"
+        and chunk.get("delta", {}).get("type") == delta_type
+        for chunk in chunks
+    )
+    assert not any(
+        chunk.get("type") in {"message_delta", "message_stop"} for chunk in chunks
+    )
+    if isinstance(failure, Exception):
+        assert any(str(failure) in message for message in logged_errors)
