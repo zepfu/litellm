@@ -1,3 +1,15 @@
+x-codex-oauth-inventory: &codex-oauth-inventory >-
+  LITELLM_CODEX_OAUTH_INVENTORY={"schema_version":1,"accounts":[
+  {"label":"account1","auth_path":"/home/zepfu/.codex/oauth.account1.json",
+  "lock_path":"/home/zepfu/.codex/oauth.account1.json.lock","priority":10,
+  "weight":1.0,"enabled":${AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED:-true},
+  "models":["*"],"expected_account_hash":"${AAWM_CODEX_OAUTH_ACCOUNT1_EXPECTED_HASH:?AAWM_CODEX_OAUTH_ACCOUNT1_EXPECTED_HASH is required}"},
+  {"label":"account2","auth_path":"/home/zepfu/.codex/oauth.account2.json",
+  "lock_path":"/home/zepfu/.codex/oauth.account2.json.lock","priority":20,
+  "weight":1.0,"enabled":${AAWM_CODEX_OAUTH_ACCOUNT2_ENABLED:-true},
+  "models":["*"],"expected_account_hash":"${AAWM_CODEX_OAUTH_ACCOUNT2_EXPECTED_HASH:?AAWM_CODEX_OAUTH_ACCOUNT2_EXPECTED_HASH is required}"}
+  ]}
+
 services:
   litellm-dev:
     build:
@@ -100,7 +112,8 @@ services:
       - /home/zepfu/.claude/projects:/home/zepfu/.claude/projects:ro
       # Claude agent specs for subagent model resolution
       - /home/zepfu/projects/aawm/agents:/home/zepfu/.claude/agents:ro
-      # Codex OAuth tokens for Anthropic->Codex adapter testing
+      # Explicit account1/account2 Codex OAuth inventory. The directory mount
+      # stays read-only and preserves atomic replacement visibility.
       - /home/zepfu/.codex:/home/zepfu/.codex:ro
       # OpenCode Zen auth for native OpenCode and Codex/Claude adapter testing
       - /home/zepfu/.local/share/opencode:/home/zepfu/.local/share/opencode:ro
@@ -178,7 +191,7 @@ services:
       - LITELLM_LOG=${LITELLM_LOG:-INFO}
       - LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT=${LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT:-1}
       - LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT=${LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT:-/home/zepfu/.claude/projects}
-      - LITELLM_CODEX_AUTH_FILE=${LITELLM_CODEX_AUTH_FILE:-/home/zepfu/.codex/auth.json}
+      - *codex-oauth-inventory
       - LITELLM_OPENCODE_AUTH_FILE=${LITELLM_OPENCODE_AUTH_FILE:-/home/zepfu/.local/share/opencode/auth.json}
       - AAWM_NVIDIA_API_KEY=${AAWM_NVIDIA_API_KEY:-}
       - NVIDIA_NIM_API_KEY=${NVIDIA_NIM_API_KEY:-${AAWM_NVIDIA_API_KEY:-}}
@@ -256,7 +269,8 @@ services:
       - ./.analysis:/app/.analysis
       # The provider-status sidecar is the scheduled writer for Grok OIDC.
       - /home/zepfu/.grok:/home/zepfu/.grok
-      # The provider-status sidecar is the scheduled writer for Codex OAuth.
+      # Writable parent for the explicitly enrolled account1/account2 auth and
+      # independent lock paths. OPENAI-002 owns multi-account scheduling.
       - /home/zepfu/.codex:/home/zepfu/.codex
       # The provider-status sidecar is the scheduled writer for managed xAI OAuth.
       - /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai
@@ -316,9 +330,11 @@ services:
       - AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS=${AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS:-300}
       - AAWM_GROK_OIDC_FORCE_REFRESH=${AAWM_GROK_OIDC_FORCE_REFRESH:-1}
       - AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS=${AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS:-30}
+      - *codex-oauth-inventory
       - AAWM_CODEX_OAUTH_REFRESH_ENABLED=${AAWM_CODEX_OAUTH_REFRESH_ENABLED:-1}
-      - AAWM_CODEX_AUTH_FILE=${AAWM_CODEX_AUTH_FILE:-/home/zepfu/.codex/auth.json}
-      - AAWM_CODEX_LOCK_FILE=${AAWM_CODEX_LOCK_FILE:-/home/zepfu/.codex/auth.json.lock}
+      # Compatibility one-file scheduler: account1 only until OPENAI-002.
+      - AAWM_CODEX_AUTH_FILE=${AAWM_CODEX_AUTH_FILE:-/home/zepfu/.codex/oauth.account1.json}
+      - AAWM_CODEX_LOCK_FILE=${AAWM_CODEX_LOCK_FILE:-/home/zepfu/.codex/oauth.account1.json.lock}
       - AAWM_CODEX_AUTH_FILE_UID=${AAWM_CODEX_AUTH_FILE_UID:-1000}
       - AAWM_CODEX_AUTH_FILE_GID=${AAWM_CODEX_AUTH_FILE_GID:-1000}
       - AAWM_CODEX_AUTH_FILE_MODE=${AAWM_CODEX_AUTH_FILE_MODE:-0o600}

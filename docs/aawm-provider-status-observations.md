@@ -88,6 +88,32 @@ Relevant environment variables:
 - `AAWM_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS`: minimum seconds between
   inspections; defaults to `3600`.
 
+## Codex OAuth Inventory Boundary
+
+Managed Codex proxy consumers use only the explicit
+`LITELLM_CODEX_OAUTH_INVENTORY`. Development Compose enrolls ordered
+`account1` and `account2` records with separate auth files, separate lock
+files, stable non-secret labels, explicit model eligibility, and
+operator-supplied expected account hashes. It supplies the same inventory to
+the provider-status sidecar so deployment configuration cannot silently drift.
+
+The LiteLLM proxy mounts `/home/zepfu/.codex` read-only. The sidecar mounts that
+directory read-write for lock ownership and atomic credential publication.
+Neither mount enrolls files: only paths named in the inventory are eligible,
+and there is no `~/.codex/auth.json`, glob, backup-file, or `api.openai.com`
+fallback for proxy requests.
+
+OPENAI-001 does not add multi-account scheduling, quota polling, or routing.
+The current sidecar refresh, passive health, and reset-credit tasks still use
+one `AAWM_CODEX_AUTH_FILE` / `AAWM_CODEX_LOCK_FILE` pair; development Compose
+points that pair at `account1`. `account2` is mounted and enrolled in the
+read-only proxy inventory but is not scheduled by those tasks until OPENAI-002.
+Per-account quota persistence remains OPENAI-003 and account routing remains
+OPENAI-004.
+
+Enrollment, removal, label/hash handling, permissions, rotation, and rollback
+are defined in `docs/aawm-oauth-credential-maintenance.md`.
+
 ## Grok OIDC Refresh Task
 
 The same sidecar can also own the scheduled Grok native OIDC credential refresh.
@@ -608,12 +634,14 @@ parity.
 The same sidecar can run an explicit hourly Codex banked usage-limit reset-credit
 poll. This is telemetry-only and separate from the five-minute provider front-door
 probes, Codex OAuth refresh, and Grok billing poll. The poll reads the current
-Codex OAuth credential from `AAWM_CODEX_AUTH_FILE`, calls the native ChatGPT
-reset-credit **detail** endpoint (default
+Codex OAuth credential from the compatibility `AAWM_CODEX_AUTH_FILE` record
+(`account1` in development Compose), calls the native ChatGPT reset-credit
+**detail** endpoint (default
 `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`) with
 `Authorization: Bearer <token>` and `ChatGPT-Account-Id` when the auth file
 includes an account id, and persists sanitized rows to
 `public.provider_credit_observations` (not `public.rate_limit_observations`).
+It does not iterate the ordered inventory under OPENAI-001.
 
 `AAWM_CODEX_USAGE_URL` remains the backward-compatible env name for the poll URL.
 If it is still set to the legacy aggregate URL (`/backend-api/wham/usage`), the

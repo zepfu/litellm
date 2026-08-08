@@ -4669,6 +4669,10 @@ async def test_load_local_codex_auth_headers_reads_valid_nested_auth_file(tmp_pa
     from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
         _load_local_codex_auth_headers,
     )
+    from litellm.secret_managers.codex_oauth_inventory import (
+        CODEX_OAUTH_INVENTORY_ENV,
+        codex_oauth_account_identity_hash,
+    )
 
     auth_path = tmp_path / "auth.json"
     access_token = _build_test_jwt(
@@ -4692,7 +4696,28 @@ async def test_load_local_codex_auth_headers_reads_valid_nested_auth_file(tmp_pa
     )
     auth_path.write_text(original_payload, encoding="utf-8")
     auth_path.chmod(0o600)
-    monkeypatch.setenv("LITELLM_CODEX_AUTH_FILE", str(auth_path))
+    monkeypatch.setenv(
+        CODEX_OAUTH_INVENTORY_ENV,
+        json.dumps(
+            {
+                "schema_version": 1,
+                "accounts": [
+                    {
+                        "label": "account1",
+                        "auth_path": str(auth_path),
+                        "lock_path": str(tmp_path / "auth.json.lock"),
+                        "priority": 10,
+                        "weight": 1.0,
+                        "enabled": True,
+                        "models": ["*"],
+                        "expected_account_hash": codex_oauth_account_identity_hash(
+                            "acct_valid"
+                        ),
+                    }
+                ],
+            }
+        ),
+    )
 
     mock_request = MagicMock(spec=Request)
     mock_request.headers = {"session_id": "codex-session-123"}
@@ -4711,20 +4736,54 @@ async def test_load_local_codex_auth_headers_rejects_stale_sidecar_token(tmp_pat
     from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
         _load_local_codex_auth_headers,
     )
+    from litellm.secret_managers.codex_oauth_inventory import (
+        CODEX_OAUTH_INVENTORY_ENV,
+        codex_oauth_account_identity_hash,
+    )
 
     auth_path = tmp_path / "auth.json"
     auth_path.write_text(
         json.dumps(
             {
                 "tokens": {
-                    "access_token": _build_test_jwt({"exp": int(time.time()) - 60}),
+                    "access_token": _build_test_jwt(
+                        {
+                            "exp": int(time.time()) - 60,
+                            "https://api.openai.com/auth": {
+                                "chatgpt_account_id": "acct_stale"
+                            },
+                        }
+                    ),
                     "refresh_token": "codex-refresh-token",
+                    "account_id": "acct_stale",
                 }
             }
         ),
         encoding="utf-8",
     )
-    monkeypatch.setenv("LITELLM_CODEX_AUTH_FILE", str(auth_path))
+    auth_path.chmod(0o600)
+    monkeypatch.setenv(
+        CODEX_OAUTH_INVENTORY_ENV,
+        json.dumps(
+            {
+                "schema_version": 1,
+                "accounts": [
+                    {
+                        "label": "account1",
+                        "auth_path": str(auth_path),
+                        "lock_path": str(tmp_path / "auth.json.lock"),
+                        "priority": 10,
+                        "weight": 1.0,
+                        "enabled": True,
+                        "models": ["*"],
+                        "expected_account_hash": codex_oauth_account_identity_hash(
+                            "acct_stale"
+                        ),
+                    }
+                ],
+            }
+        ),
+    )
     mock_request = MagicMock(spec=Request)
     mock_request.headers = {}
 
@@ -4737,7 +4796,8 @@ async def test_load_local_codex_auth_headers_rejects_stale_sidecar_token(tmp_pat
 
     detail = str(exc_info.value.detail)
     assert "sidecar owns Codex auth refresh" in detail
-    assert str(auth_path) in detail
+    assert "account1" in detail
+    assert str(auth_path) not in detail
     assert "codex-refresh-token" not in detail
     client_mock.assert_not_called()
     assert auth_path.read_text(encoding="utf-8") == original_payload

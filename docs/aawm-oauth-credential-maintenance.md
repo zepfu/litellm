@@ -57,7 +57,7 @@ Related deeper context:
 
 | Family | Writer | Typical consumer | Default portable auth path |
 | --- | --- | --- | --- |
-| Codex / ChatGPT OAuth | `scripts/codex_oauth_refresh.py` (sidecar) | LiteLLM Codex adapter routes | `~/.codex/auth.json` |
+| Codex / ChatGPT OAuth | `scripts/codex_oauth_refresh.py` for one selected inventory record | LiteLLM Codex adapter routes | Explicit `LITELLM_CODEX_OAUTH_INVENTORY`; managed dev enrolls `~/.codex/oauth.account1.json` and `~/.codex/oauth.account2.json` |
 | Managed xAI OAuth (`oa_xai/*`) | `scripts/xai_oauth_refresh.py` (sidecar) | LiteLLM managed xAI OAuth routes | `~/.litellm/xai/oauth-auth.json` |
 | Grok native OIDC | `scripts/grok_oidc_refresh.py` (sidecar) | LiteLLM Grok native routes | Caller-supplied configured path |
 | Kimi Code CLI OAuth (`kimi_code`) | Existing Kimi Code CLI grant; sidecar refresh only when enabled | Configured LiteLLM Kimi Code consumers | `~/.kimi-code/credentials/kimi-code.json` |
@@ -81,19 +81,102 @@ credential path. Defaults must not hardcode a specific operator home directory.
 
 | Credential | Auth file default | Lock file default |
 | --- | --- | --- |
-| Codex | `~/.codex/auth.json` | `~/.codex/auth.json.lock` |
+| Codex standalone one-file refresh primitive | `~/.codex/auth.json` | `~/.codex/auth.json.lock` |
 | Managed xAI OAuth | `~/.litellm/xai/oauth-auth.json` | `~/.litellm/xai/oauth-auth.json.lock` |
 | Grok OIDC | Caller-supplied configured path | same directory, `.lock` sibling when configured |
 | Kimi Code CLI OAuth | `~/.kimi-code/credentials/kimi-code.json` | `~/.kimi-code/oauth/kimi-code` (native `proper-lockfile` creates the transient `kimi-code.lock` directory) |
 
 Override paths with the normal env vars for the family in use (for example
-`AAWM_CODEX_AUTH_FILE` / `LITELLM_CODEX_AUTH_FILE`,
+`AAWM_CODEX_AUTH_FILE` / `AAWM_CODEX_LOCK_FILE` for the Codex one-file writer,
 `AAWM_XAI_OAUTH_AUTH_FILE` / `LITELLM_XAI_OAUTH_AUTH_FILE`,
 `AAWM_KIMI_OAUTH_AUTH_FILE` / `LITELLM_KIMI_OAUTH_AUTH_FILE`,
 `LITELLM_XAI_GROK_AUTH_FILE`,
 variants). Compose may bind the expanded host path into containers; the script
 defaults themselves remain `~`-relative so other operators and hosts work
 without patching source.
+
+`LITELLM_CODEX_AUTH_FILE` is no longer a managed proxy enrollment surface.
+Managed Codex proxy consumers require the explicit inventory below and do not
+fall back to `~/.codex/auth.json`, directory scans, backup files, path globs, or
+`api.openai.com`.
+
+## Codex ordered account inventory (OPENAI-001)
+
+`LITELLM_CODEX_OAUTH_INVENTORY` is a versioned JSON object whose `accounts`
+array explicitly enrolls each credential. Managed development Compose supplies
+the same inventory to the proxy and provider-status sidecar:
+
+| Label | Auth path | Independent lock path | Priority | Weight | Enabled | Models |
+| --- | --- | --- | --- | --- | --- | --- |
+| `account1` | `/home/zepfu/.codex/oauth.account1.json` | `/home/zepfu/.codex/oauth.account1.json.lock` | `10` | `1.0` | `AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED` (default `true`) | `["*"]` |
+| `account2` | `/home/zepfu/.codex/oauth.account2.json` | `/home/zepfu/.codex/oauth.account2.json.lock` | `20` | `1.0` | `AAWM_CODEX_OAUTH_ACCOUNT2_ENABLED` (default `true`) | `["*"]` |
+
+Selection order is priority first and declaration order second. Labels are
+stable, non-secret operator names; they are not upstream account identities.
+Configured labels differ from hashed upstream identities and must not be used
+interchangeably.
+Each record separately pins a 12-character lowercase SHA-256 prefix derived
+from the raw upstream ChatGPT account ID. The required values are supplied
+outside tracked configuration:
+
+```bash
+export AAWM_CODEX_OAUTH_ACCOUNT1_EXPECTED_HASH='<12 lowercase hex>'
+export AAWM_CODEX_OAUTH_ACCOUNT2_EXPECTED_HASH='<12 lowercase hex>'
+```
+
+Generate each value from an operator-known raw account ID without echoing the
+input:
+
+```bash
+./.venv/bin/python -c 'import getpass, hashlib; value=getpass.getpass("Raw ChatGPT account ID (hidden): ").strip(); assert value; print(hashlib.sha256(value.encode()).hexdigest()[:12])'
+```
+
+Do not put raw account IDs, token fields, credential contents, or invented hash
+values in tracked config. Duplicate labels, auth paths, lock paths, or expected
+account hashes fail closed. A file whose actual account identity no longer
+matches its record's expected hash also fails closed without redefining the
+label.
+
+### Enrollment and removal
+
+1. Publish each credential at its configured auth path as a regular file with
+   mode `0600`; do not use a symlink.
+2. Give each record its own sibling lock path. Never share a lock between
+   records.
+3. Generate the expected hash from the known upstream account ID using hidden
+   input, then supply both required hash env values.
+4. Render the Compose config and confirm both records, their order, paths,
+   hashes, enable flags, and model eligibility before recreating consumers.
+5. To stage removal, set only that record's `AAWM_CODEX_OAUTH_ACCOUNT*_ENABLED`
+   value to `false` and redeploy. Remove the record from the explicit inventory
+   before archiving its file. Unlisted files and backups are never enrolled.
+
+The managed proxy mounts `/home/zepfu/.codex` read-only. The provider-status
+sidecar mounts the same parent directory read-write so its lock and atomic
+`os.replace` publication remain visible to readers. Keep directory mounts
+rather than individual file mounts; bind-mounting one file can hide later
+inode replacements. Any production proxy/sidecar deployment must preserve the
+same read-only consumer and single-writer directory boundary.
+
+### Rotation and rollback
+
+- Normal token refresh stays under the record's own lock and publishes back to
+  the same auth path. The stable label and expected account hash do not change.
+- For an intentional upstream identity replacement, disable that label first,
+  publish the replacement to that label's path, update only its externally
+  supplied expected hash, verify the rendered inventory, and then re-enable it.
+- Roll back by restoring the prior same-label credential and its prior expected
+  hash together. Never swap `account1` and `account2` files or hashes to recover
+  from a failed rotation.
+- An identity mismatch is a deployment or rotation error, not a reason to
+  accept the new identity automatically.
+
+The current provider-status loop still schedules Codex refresh and reset-credit
+polling through one `AAWM_CODEX_AUTH_FILE` / `AAWM_CODEX_LOCK_FILE` pair.
+Development Compose points that compatibility pair at `account1`. Supplying the
+inventory to the sidecar does not yet make it iterate `account2`; OPENAI-002
+owns multi-account refresh scheduling, OPENAI-003 owns per-account quota state,
+and OPENAI-004 owns routing.
 
 ## Shared atomic 0600 publication
 
@@ -269,6 +352,7 @@ restart event.
 | Shared metadata | `litellm/secret_managers/credential_file_metadata.py` |
 | Shared atomic write | `litellm/secret_managers/credential_file_write.py` |
 | Shared error sanitizer | `litellm/secret_managers/credential_error_sanitizer.py` |
+| Codex ordered inventory | `litellm/secret_managers/codex_oauth_inventory.py` |
 | Codex refresh | `scripts/codex_oauth_refresh.py` |
 | Managed xAI refresh | `scripts/xai_oauth_refresh.py` |
 | Grok OIDC refresh | `scripts/grok_oidc_refresh.py` |

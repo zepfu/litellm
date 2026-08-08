@@ -1256,10 +1256,14 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         in compose_text
     )
     assert "AAWM_GROK_OIDC_FORCE_REFRESH=${AAWM_GROK_OIDC_FORCE_REFRESH:-1}" in compose_text
+    assert "- /home/zepfu/.codex:/home/zepfu/.codex:ro" in compose_text
     assert "- /home/zepfu/.codex:/home/zepfu/.codex" in compose_text
+    assert compose_text.count("- *codex-oauth-inventory") == 2
+    assert "LITELLM_CODEX_AUTH_FILE=" not in compose_text
     for expected_codex_setting in (
         "AAWM_CODEX_OAUTH_REFRESH_ENABLED=${AAWM_CODEX_OAUTH_REFRESH_ENABLED:-1}",
-        "AAWM_CODEX_AUTH_FILE=${AAWM_CODEX_AUTH_FILE:-/home/zepfu/.codex/auth.json}",
+        "AAWM_CODEX_AUTH_FILE=${AAWM_CODEX_AUTH_FILE:-/home/zepfu/.codex/oauth.account1.json}",
+        "AAWM_CODEX_LOCK_FILE=${AAWM_CODEX_LOCK_FILE:-/home/zepfu/.codex/oauth.account1.json.lock}",
         "AAWM_CODEX_AUTH_FILE_UID=${AAWM_CODEX_AUTH_FILE_UID:-1000}",
         "AAWM_CODEX_AUTH_FILE_GID=${AAWM_CODEX_AUTH_FILE_GID:-1000}",
         "AAWM_CODEX_AUTH_FILE_MODE=${AAWM_CODEX_AUTH_FILE_MODE:-0o600}",
@@ -1448,6 +1452,11 @@ def test_provider_status_compose_aawm_network_rendered_default_name() -> None:
         capture_output=True,
         text=True,
         timeout=120,
+        env={
+            **os.environ,
+            "AAWM_CODEX_OAUTH_ACCOUNT1_EXPECTED_HASH": "111111111111",
+            "AAWM_CODEX_OAUTH_ACCOUNT2_EXPECTED_HASH": "222222222222",
+        },
     )
     if proc.returncode != 0:
         pytest.skip(f"docker compose config unavailable: {proc.stderr.strip()}")
@@ -1458,6 +1467,66 @@ def test_provider_status_compose_aawm_network_rendered_default_name() -> None:
     net = rendered["networks"]["aawm_default"]
     assert net["external"] is True
     assert net["name"] == "aawm-infrastructure_default"
+
+    services = rendered["services"]
+    proxy_inventory = services["litellm-dev"]["environment"][
+        "LITELLM_CODEX_OAUTH_INVENTORY"
+    ]
+    sidecar_inventory = services["provider-status-observations"]["environment"][
+        "LITELLM_CODEX_OAUTH_INVENTORY"
+    ]
+    assert proxy_inventory == sidecar_inventory
+    inventory = json.loads(proxy_inventory)
+    assert inventory["schema_version"] == 1
+    assert [
+        (
+            account["label"],
+            account["auth_path"],
+            account["lock_path"],
+            account["priority"],
+            account["weight"],
+            account["enabled"],
+            account["models"],
+            account["expected_account_hash"],
+        )
+        for account in inventory["accounts"]
+    ] == [
+        (
+            "account1",
+            "/home/zepfu/.codex/oauth.account1.json",
+            "/home/zepfu/.codex/oauth.account1.json.lock",
+            10,
+            1.0,
+            True,
+            ["*"],
+            "111111111111",
+        ),
+        (
+            "account2",
+            "/home/zepfu/.codex/oauth.account2.json",
+            "/home/zepfu/.codex/oauth.account2.json.lock",
+            20,
+            1.0,
+            True,
+            ["*"],
+            "222222222222",
+        ),
+    ]
+
+    proxy_codex_mount = next(
+        volume
+        for volume in services["litellm-dev"]["volumes"]
+        if volume.get("source") == "/home/zepfu/.codex"
+    )
+    sidecar_codex_mount = next(
+        volume
+        for volume in services["provider-status-observations"]["volumes"]
+        if volume.get("source") == "/home/zepfu/.codex"
+    )
+    assert proxy_codex_mount["target"] == "/home/zepfu/.codex"
+    assert proxy_codex_mount["read_only"] is True
+    assert sidecar_codex_mount["target"] == "/home/zepfu/.codex"
+    assert sidecar_codex_mount.get("read_only", False) is False
 
 
 def test_env_example_documents_aawm_infrastructure_network_name() -> None:

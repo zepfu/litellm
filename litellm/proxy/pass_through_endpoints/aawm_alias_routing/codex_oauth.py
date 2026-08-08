@@ -1,7 +1,4 @@
-"""Codex auth-file discovery, JWT decode, token validation, and request detection.
-
-Wave 5A extraction from ``llm_passthrough_endpoints.py``.  Behavior-preserving
-relocation only; no logic changes.
+"""Codex OAuth inventory loading, token validation, and request detection.
 
 Runtime dependency ``_get_request_header_or_passthrough_alias`` is injected via
 :func:`configure_codex_oauth_runtime` (the function lives in the god module and
@@ -12,8 +9,8 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -22,10 +19,19 @@ from fastapi import HTTPException, Request
 
 from litellm.llms.chatgpt.common_utils import get_chatgpt_default_headers
 from litellm.proxy.common_utils.http_parsing_utils import _safe_get_request_headers
+from litellm.secret_managers.codex_oauth_inventory import (
+    CodexOAuthCredentialRecord,
+    CodexOAuthCredentialSnapshot,
+    CodexOAuthInventoryError,
+    load_codex_oauth_credential,
+    load_codex_oauth_inventory,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+# Legacy facade symbols retained for decomposition compatibility. The active
+# loader below does not consult these paths or enroll credentials from them.
 _ANTHROPIC_ADAPTER_CODEX_AUTH_FILE_ENV_VARS = (
     "LITELLM_CODEX_AUTH_FILE",
     "CHATGPT_AUTH_FILE",
@@ -77,39 +83,14 @@ def _clean_codex_auth_value(value: Any) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Auth-file discovery
+# Explicit inventory compatibility accessor
 # ---------------------------------------------------------------------------
 
 
 def _get_anthropic_adapter_codex_auth_file_path() -> Optional[Path]:
-    for env_name in _ANTHROPIC_ADAPTER_CODEX_AUTH_FILE_ENV_VARS:
-        raw_value = _clean_codex_auth_value(os.getenv(env_name))
-        if not raw_value:
-            continue
-        path = Path(raw_value).expanduser()
-        if path.exists():
-            return path
-
-    token_dir: Optional[Path] = None
-    for env_name in _ANTHROPIC_ADAPTER_CODEX_TOKEN_DIR_ENV_VARS:
-        raw_value = _clean_codex_auth_value(os.getenv(env_name))
-        if not raw_value:
-            continue
-        candidate = Path(raw_value).expanduser()
-        if candidate.exists():
-            token_dir = candidate
-            break
-    if token_dir is not None:
-        candidate = token_dir / "auth.json"
-        if candidate.exists():
-            return candidate
-
-    for candidate_str in _ANTHROPIC_ADAPTER_CODEX_DEFAULT_AUTH_PATHS:
-        candidate = Path(candidate_str).expanduser()
-        if candidate.exists():
-            return candidate
-
-    return None
+    """Compatibility accessor for the first explicit enabled inventory record."""
+    inventory = load_codex_oauth_inventory()
+    return inventory.select_record().auth_path
 
 
 # ---------------------------------------------------------------------------
@@ -188,33 +169,44 @@ async def _load_codex_auth_data_from_path(auth_path: Path) -> Optional[CodexAuth
     return auth_data
 
 
-async def _load_local_codex_auth_headers(request: Request) -> Optional[dict[str, str]]:
-    auth_path = _get_anthropic_adapter_codex_auth_file_path()
-    if auth_path is None:
-        return None
+@dataclass(frozen=True)
+class CodexOAuthRequestAuth:
+    """Selected account metadata plus headers, with secrets hidden from repr."""
 
-    auth_data = await _load_codex_auth_data_from_path(auth_path)
-    if auth_data is None:
-        return None
+    account_label: str
+    account_hash: str
+    headers: dict[str, str] = field(repr=False)
 
-    token_data = _get_codex_auth_token_data(auth_data)
-    access_token = _clean_codex_auth_value(token_data.get("access_token"))
-    if access_token is None:
-        return None
-    if not _codex_auth_access_token_is_valid(token_data):
+
+def _codex_oauth_credential_snapshot_is_valid(
+    credential: CodexOAuthCredentialSnapshot,
+) -> bool:
+    if credential.expires_at is None:
+        return True
+    return time.time() < credential.expires_at - 60
+
+
+async def _load_codex_oauth_headers_for_record(
+    request: Request,
+    record: CodexOAuthCredentialRecord,
+) -> CodexOAuthRequestAuth:
+    """Build headers only from one already-selected immutable record."""
+    try:
+        credential = load_codex_oauth_credential(record)
+    except CodexOAuthInventoryError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from None
+
+    if not _codex_oauth_credential_snapshot_is_valid(credential):
         raise HTTPException(
             status_code=500,
             detail=(
-                "Codex OAuth access token is expired or invalid. The "
+                f"Codex OAuth credential '{record.label}' "
+                f"(account_hash={credential.account_hash}) is expired or "
+                "invalid. The "
                 "provider-status sidecar owns Codex auth refresh; confirm the "
-                "sidecar can write the configured auth file and refresh "
-                f"{auth_path}."
+                "configured account can be refreshed."
             ),
         )
-
-    account_id = _clean_codex_auth_value(token_data.get("account_id")) or _extract_codex_account_id_from_token(
-        _clean_codex_auth_value(token_data.get("id_token")) or access_token
-    )
 
     headers = _safe_get_request_headers(request)
     assert _get_request_header_or_passthrough_alias is not None
@@ -224,11 +216,36 @@ async def _load_local_codex_auth_headers(request: Request) -> Optional[dict[str,
         or headers.get("X-Claude-Code-Session-Id")
     )
 
-    return get_chatgpt_default_headers(
-        access_token=access_token,
-        account_id=account_id,
-        session_id=session_id,
+    return CodexOAuthRequestAuth(
+        account_label=record.label,
+        account_hash=credential.account_hash,
+        headers=get_chatgpt_default_headers(
+            access_token=credential.access_token,
+            account_id=credential.account_id,
+            session_id=session_id,
+        ),
     )
+
+
+async def _load_local_codex_auth_selection(
+    request: Request,
+    *,
+    account_label: Optional[str] = None,
+    model: Optional[str] = None,
+) -> CodexOAuthRequestAuth:
+    """Select from the explicit inventory and load exactly that record."""
+    try:
+        inventory = load_codex_oauth_inventory()
+        record = inventory.select_record(label=account_label, model=model)
+    except CodexOAuthInventoryError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from None
+    return await _load_codex_oauth_headers_for_record(request, record)
+
+
+async def _load_local_codex_auth_headers(request: Request) -> dict[str, str]:
+    """Compatibility wrapper for the current first-eligible account consumer."""
+    selection = await _load_local_codex_auth_selection(request)
+    return dict(selection.headers)
 
 
 # ---------------------------------------------------------------------------

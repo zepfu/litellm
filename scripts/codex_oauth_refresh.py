@@ -19,6 +19,7 @@ from litellm.secret_managers.credential_file_lock import credential_file_lock
 from litellm.secret_managers.credential_file_metadata import (
     CredentialFileMetadata,
     apply_credential_file_metadata,
+    ensure_not_symlink_path,
     resolve_credential_file_metadata,
     snapshot_credential_file_metadata,
 )
@@ -29,6 +30,11 @@ from litellm.secret_managers.credential_file_write import (
 from litellm.secret_managers.credential_error_sanitizer import (
     DEFAULT_SECRET_FIELD_NAMES,
     sanitize_credential_error_message,
+)
+from litellm.secret_managers.codex_oauth_inventory import (
+    CodexOAuthCredentialRecord,
+    CodexOAuthIdentityMismatchError,
+    validate_codex_oauth_account_identity,
 )
 
 # Portable ~ defaults (expanded via Path.expanduser at use sites).
@@ -140,17 +146,40 @@ def refresh_codex_oauth_auth_file(
     token_endpoint: Optional[str] = None,
     client_id: Optional[str] = None,
     http_timeout_seconds: float = DEFAULT_CODEX_HTTP_TIMEOUT_SECONDS,
+    credential_record: Optional[CodexOAuthCredentialRecord] = None,
 ) -> Dict[str, Any]:
     """Refresh a Codex OAuth auth file when it is near expiry or forced."""
 
-    resolved_auth_file = Path(auth_file).expanduser()
-    if lock_file is not None:
-        resolved_lock_file = Path(lock_file).expanduser()
+    if credential_record is not None:
+        resolved_auth_file = credential_record.auth_path
+        resolved_lock_file = credential_record.lock_path
     else:
+        resolved_auth_file = Path(auth_file).expanduser()
+    if credential_record is None and lock_file is not None:
+        resolved_lock_file = Path(lock_file).expanduser()
+    elif credential_record is None:
         resolved_lock_file = resolved_auth_file.with_name(
             f"{resolved_auth_file.name}.lock"
         )
     resolved_buffer_seconds = _resolve_buffer_seconds(buffer_seconds)
+
+    try:
+        ensure_not_symlink_path(
+            resolved_lock_file,
+            role="Codex OAuth lock path",
+        )
+    except Exception as exc:
+        return CodexOAuthRefreshSummary(
+            attempted=True,
+            refreshed=False,
+            skipped=False,
+            auth_file=str(resolved_auth_file),
+            error_class=exc.__class__.__name__,
+            error_message=_refresh_error_message(
+                exc,
+                credential_record=credential_record,
+            ),
+        ).as_dict()
 
     with _credential_file_lock(resolved_lock_file):
         try:
@@ -160,6 +189,11 @@ def refresh_codex_oauth_auth_file(
                 resolved_lock_file,
             )
             token_data = _get_token_data(auth_data)
+            if credential_record is not None:
+                validate_codex_oauth_account_identity(
+                    credential_record,
+                    token_data,
+                )
             current_expires_at = _format_expires_at(_get_token_expiry(token_data))
             current_account_id = _extract_account_id(token_data)
 
@@ -183,6 +217,11 @@ def refresh_codex_oauth_auth_file(
                 http_timeout_seconds=http_timeout_seconds,
             )
             _update_token_data(token_data, refreshed)
+            if credential_record is not None:
+                validate_codex_oauth_account_identity(
+                    credential_record,
+                    token_data,
+                )
             auth_data["last_refresh"] = datetime.now(timezone.utc).isoformat()
             _write_auth_data(resolved_auth_file, auth_data)
             return CodexOAuthRefreshSummary(
@@ -200,9 +239,73 @@ def refresh_codex_oauth_auth_file(
                 skipped=False,
                 auth_file=str(resolved_auth_file),
                 error_class=exc.__class__.__name__,
-                error_message=_sanitize_error_message(str(exc)),
+                error_message=_refresh_error_message(
+                    exc,
+                    credential_record=credential_record,
+                ),
                 error_hint=_extract_oauth_error_hint(exc),
             ).as_dict()
+
+
+def refresh_codex_oauth_inventory_record(
+    record: CodexOAuthCredentialRecord,
+    *,
+    buffer_seconds: Optional[int] = None,
+    force: bool = False,
+    token_endpoint: Optional[str] = None,
+    client_id: Optional[str] = None,
+    http_timeout_seconds: float = DEFAULT_CODEX_HTTP_TIMEOUT_SECONDS,
+) -> Dict[str, Any]:
+    """Refresh one explicit inventory record and return only safe identity."""
+    if not record.enabled:
+        return {
+            "attempted": False,
+            "refreshed": False,
+            "skipped": True,
+            "account_label": record.label,
+            "account_hash": record.expected_account_hash,
+            "expires_at": None,
+            "error_class": "CredentialDisabled",
+            "error_message": (
+                f"Codex OAuth credential '{record.label}' is disabled."
+            ),
+            "error_hint": None,
+        }
+    result = refresh_codex_oauth_auth_file(
+        record.auth_path,
+        buffer_seconds=buffer_seconds,
+        force=force,
+        lock_file=record.lock_path,
+        token_endpoint=token_endpoint,
+        client_id=client_id,
+        http_timeout_seconds=http_timeout_seconds,
+        credential_record=record,
+    )
+    return {
+        "attempted": result["attempted"],
+        "refreshed": result["refreshed"],
+        "skipped": result["skipped"],
+        "account_label": record.label,
+        "account_hash": record.expected_account_hash,
+        "expires_at": result["expires_at"],
+        "error_class": result["error_class"],
+        "error_message": result["error_message"],
+        "error_hint": result["error_hint"],
+    }
+
+
+def _refresh_error_message(
+    exc: Exception,
+    *,
+    credential_record: Optional[CodexOAuthCredentialRecord],
+) -> str:
+    if credential_record is None:
+        return _sanitize_error_message(str(exc))
+    if isinstance(exc, CodexOAuthIdentityMismatchError):
+        return str(exc)
+    return (
+        f"Codex OAuth credential '{credential_record.label}' refresh failed."
+    )
 
 
 def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
