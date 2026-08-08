@@ -1110,3 +1110,7 @@ class TestDevReadOnlyMount:
             "./litellm/secret_managers/codex_oauth_inventory.py:"
             "/app/litellm/secret_managers/codex_oauth_inventory.py:ro"
         ) in content
+        assert (
+            "./litellm/llms/xai/route_descriptors.py:"
+            "/app/litellm/llms/xai/route_descriptors.py:ro"
+        ) in content

@@ -103,6 +103,7 @@ services:
       - ./litellm/proxy/route_llm_request.py:/app/litellm/proxy/route_llm_request.py
       - ./litellm/litellm_core_utils/get_llm_provider_logic.py:/app/litellm/litellm_core_utils/get_llm_provider_logic.py
       - ./litellm/llms/xai/oauth.py:/app/litellm/llms/xai/oauth.py
+      - ./litellm/llms/xai/route_descriptors.py:/app/litellm/llms/xai/route_descriptors.py:ro
       - ./litellm/responses/litellm_completion_transformation/streaming_iterator.py:/app/litellm/responses/litellm_completion_transformation/streaming_iterator.py
       - ./model_prices_and_context_window.json:/app/model_prices_and_context_window.json
       - ./context-replacement:/app/context-replacement
