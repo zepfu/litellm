@@ -179,7 +179,38 @@ record does not suppress another, and successful skipped/no-op refreshes remain
 usable. Aggregate health is degraded while at least one record remains usable
 and terminal when none do. Sidecar events and observations use only the
 configured label and expected safe hash; they do not emit raw paths, account
-IDs, or tokens. Account-aware request routing remains OPENAI-004 scope.
+IDs, or tokens.
+
+## Codex multi-account request routing (OPENAI-004)
+
+Managed Codex OAuth request routing uses only the explicit ordered
+`LITELLM_CODEX_OAUTH_INVENTORY`. New auto-agent selections expand each Codex
+OAuth candidate template into one account lane per inventory record that is
+enabled, model-eligible, and auth-healthy at load time. Selection is
+deterministic across that ordered inventory and applies fresh per-account
+five-hour and weekly/seven-day quota evidence from the normalized observation
+cache. Confirmed exhaustion requires a fresh window with `exhausted=true` and
+`remaining_pct <= 0`; stale, unknown, missing, or ambiguous quota evidence is
+not treated as confirmed exhaustion and does not by itself remove an otherwise
+admissible account.
+
+Within one request, routing may make at most one immediate pre-first-byte move
+to another admissible account after a capacity, rate-limit, usage-limit, or
+candidate-unavailable failure. After the first response byte, or after that
+single account move is consumed, no further account failover is planned for the
+request. Continuations stay account-pinned to the affinity label/hash/lane and
+fail fast with a structured safe `429` when that pinned account is unavailable;
+they do not search sibling accounts. When no account is admissible for a new
+selection, the proxy returns a structured safe `429` that may include skipped
+candidate metadata and terminal reset information built only from configured
+labels, expected account hashes, lanes, and public quota window fields.
+
+Selected-account identity in request state, attempt records, and operator-facing
+errors is limited to the stable label, expected hash, lane key, priority/weight,
+failover ordinal, and related non-secret diagnostics. Raw ChatGPT account IDs,
+tokens, credential paths, and secrets are never emitted. There is no
+`api.openai.com` API-key fallback, `~/.codex/auth.json` enrollment, directory
+scan, backup-file, or glob path for managed proxy Codex OAuth dispatch.
 
 ## Shared atomic 0600 publication
 

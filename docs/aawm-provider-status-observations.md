@@ -113,7 +113,18 @@ suppress later records, including an otherwise idle `account2`. Refresh and
 health aggregates are `healthy` when every enabled record is usable,
 `degraded` when some are usable, and `terminal` when none are usable. Events
 emit only the configured label and pinned safe hash for account identity.
-Account-aware request routing remains separate OPENAI-004 scope.
+
+OPENAI-004 request routing consumes the same explicit inventory plus the
+sidecar's fresh per-account five-hour and weekly/seven-day quota observations.
+The proxy selects only enabled, auth-healthy, model-eligible accounts;
+treats only fresh confirmed exhaustion as terminal for an account; allows at
+most one immediate pre-first-byte account move; pins continuations and fails
+fast on the pinned account; returns a structured safe `429` when no account is
+admissible; and publishes only label/hash/lane/failover metadata without raw
+IDs or secrets. Managed Codex OAuth dispatch never falls back to
+`api.openai.com` API keys or unlisted credential files. Full operator contract:
+`docs/aawm-oauth-credential-maintenance.md` section
+`Codex multi-account request routing (OPENAI-004)`.
 
 Enrollment, removal, label/hash handling, permissions, rotation, and rollback
 are defined in `docs/aawm-oauth-credential-maintenance.md`.
