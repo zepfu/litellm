@@ -1114,3 +1114,7 @@ class TestDevReadOnlyMount:
             "./litellm/llms/xai/route_descriptors.py:"
             "/app/litellm/llms/xai/route_descriptors.py:ro"
         ) in content
+        assert (
+            "./litellm/secret_managers/grok_oidc_auth_path.py:"
+            "/app/litellm/secret_managers/grok_oidc_auth_path.py:ro"
+        ) in content
