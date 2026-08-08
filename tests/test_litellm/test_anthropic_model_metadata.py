@@ -139,13 +139,26 @@ def test_claude_opus_5_metadata_offline(monkeypatch):
     monkeypatch.setattr(litellm, "model_cost", litellm.get_model_cost_map(url=""))
 
     expected_entry = {
+        "cache_creation_input_token_cost": 6.25e-06,
+        "cache_creation_input_token_cost_above_1hr": 1e-05,
+        "cache_read_input_token_cost": 5e-07,
+        "input_cost_per_token": 5e-06,
         "litellm_provider": "anthropic",
         "mode": "chat",
         "max_input_tokens": 1000000,
         "max_output_tokens": 128000,
         "max_tokens": 128000,
+        "output_cost_per_token": 2.5e-05,
+        "prompt_cache_min_tokens": 512,
+        "provider_specific_entry": {"us": 1.1, "fast": 2.0},
+        "search_context_cost_per_query": {
+            "search_context_size_high": 0.01,
+            "search_context_size_low": 0.01,
+            "search_context_size_medium": 0.01,
+        },
         "supports_reasoning": True,
         "supports_max_reasoning_effort": True,
+        "supports_prompt_caching": True,
     }
 
     with open("model_prices_and_context_window.json") as f:
@@ -161,12 +174,27 @@ def test_claude_opus_5_metadata_offline(monkeypatch):
     assert "claude-opus-5[1m]" not in canonical
     assert "claude-opus-5[1m]" not in bundled
 
-    # get_model_info resolves the exact verified facts.
+    # get_model_info resolves the facts it surfaces (some map fields, e.g.
+    # prompt_cache_min_tokens/provider_specific_entry, are not ModelInfo keys).
+    info_excluded = {
+        "prompt_cache_min_tokens",
+        "provider_specific_entry",
+        "search_context_cost_per_query",
+    }
     info = litellm.get_model_info("claude-opus-5")
     for key, expected_value in expected_entry.items():
+        if key in info_excluded:
+            continue
         assert info.get(key) == expected_value, (
             f"claude-opus-5 {key} mismatch: {info.get(key)} != {expected_value}"
         )
+
+    # Nonzero end-to-end cost proof for the real harness path.
+    prompt_cost, completion_cost = litellm.cost_per_token(
+        model="claude-opus-5", prompt_tokens=100_000, completion_tokens=10_000
+    )
+    assert abs(prompt_cost - 0.5) < 1e-9
+    assert abs(completion_cost - 0.25) < 1e-9
 
     # Capability helpers resolve reasoning and max reasoning effort.
     assert litellm.supports_reasoning("claude-opus-5") is True
