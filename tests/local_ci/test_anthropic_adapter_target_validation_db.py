@@ -797,6 +797,7 @@ class TestTemplatePlaceholderResolution:
             "cli_passthrough": "codex",
             "command": ["codex", "exec", "-m", "basic"],
             "expected_user_ids": ["{harness_user_id}"],
+            "tenant_id": "explicit-operator-tenant",
         }
         profile = {
             "litellm_base_url": "http://127.0.0.1:4001",
@@ -811,11 +812,14 @@ class TestTemplatePlaceholderResolution:
             assert "{" not in uid
 
     def test_cli_harness_context_preserves_concrete_user_ids(self, harness):
-        """Explicit concrete IDs must be preserved."""
+        """A non-harness explicit tenant ID is preserved as the expected
+        trace user identity (repository mapping applies only to
+        harness/validation tenant aliases)."""
         config = {
             "cli_passthrough": "codex",
             "command": ["codex", "exec", "-m", "basic"],
             "expected_user_ids": ["adapter-harness-tenant"],
+            "tenant_id": "operator-explicit-tenant",
         }
         profile = {
             "litellm_base_url": "http://127.0.0.1:4001",
@@ -824,7 +828,35 @@ class TestTemplatePlaceholderResolution:
         result = harness._ensure_cli_harness_context(
             config, profile=profile, target="dev", case_name="test_case"
         )
-        assert result["expected_user_ids"] == ["adapter-harness-tenant"]
+        assert result["expected_user_ids"] == ["operator-explicit-tenant"]
+
+    def test_codex_cli_expected_user_id_resolves_to_repository_tenant(
+        self, harness, monkeypatch
+    ):
+        """Codex harness/validation tenant aliases map to the repository
+        identity for trace correlation, while emitted headers/session keep
+        the transient harness user ID."""
+        monkeypatch.setattr(
+            harness, "_resolve_harness_repository", lambda: "aawm/litellm"
+        )
+        config = {
+            "cli_passthrough": "codex",
+            "command": ["codex", "exec", "-m", "basic"],
+            "tenant_id": "adapter-harness-tenant",
+        }
+        profile = {
+            "litellm_base_url": "http://127.0.0.1:4001",
+            "anthropic_base_url": "http://127.0.0.1:4001/anthropic",
+        }
+        result = harness._ensure_cli_harness_context(
+            config, profile=profile, target="dev", case_name="test_case"
+        )
+        harness_user_id = harness.RA._build_claude_harness_user_id(
+            target="dev", case_name="test_case"
+        )
+        assert result["expected_user_ids"] == ["aawm/litellm"]
+        assert harness_user_id in " ".join(str(v) for v in result["command"])
+        assert result["expected_trace_session_id"] == f"{harness_user_id}.session"
 
     def test_basic_alias_codex_case_no_unresolved_placeholders_after_resolution(
         self, harness
@@ -1190,6 +1222,29 @@ class TestSessionIdAndHeaderPlaceholderResolution:
         assert not harness._contains_unresolved_placeholder(
             codex_result["expected_trace_session_id"]
         )
+
+
+def test_codex_tool_activity_rate_limit_rows_reflect_provider_truth():
+    """The tool-activity Codex case expects one seven_day codex:primary row
+    (x-codex-primary-window-minutes=10080) and no secondary row."""
+    case = _config()["cases"][
+        "native_openai_passthrough_responses_codex_tool_activity"
+    ]
+    rows = case["rate_limit_observations_validation"]["expected_rows"]
+    assert [(r["quota_key"], r["required_equals"]["quota_period"]) for r in rows] == [
+        ("codex:primary", "seven_day")
+    ]
+
+
+def test_grok_build_cli_uses_live_model_with_grok_build_client():
+    """The Grok CLI case invokes/validates grok-4.5 while the client
+    identity remains grok-build."""
+    case = _config()["cases"]["native_grok_cli_passthrough_grok_build"]
+    cmd = case["command"]
+    shv = case["session_history_validation"]
+    assert cmd[cmd.index("--model") + 1] == "grok-4.5"
+    assert shv["expected_model"] == "grok-4.5"
+    assert shv["expected_client_name"] == "grok-build"
 
 
 # ---------------------------------------------------------------------------

@@ -1661,6 +1661,19 @@ def _ensure_cli_harness_context(
     if cli_kind == 'grok':
         updated['expected_user_ids'] = []
         updated['require_trace_user_id'] = False
+    elif cli_kind == 'codex':
+        # AAWM maps harness/validation tenant aliases to the repository
+        # identity for Codex traces/session history, so the expected trace
+        # user id must match the same repository-resolved tenant identity
+        # used for session-history validation.  The emitted headers and
+        # session ID still carry the transient harness user ID.  For
+        # non-harness explicit tenant IDs the explicit tenant is preserved.
+        updated['expected_user_ids'] = [
+            _resolve_expected_session_history_tenant_id(
+                tenant_id,
+                repository=repository,
+            )
+        ]
     else:
         updated['expected_user_ids'] = [harness_user_id]
     if cli_kind == 'codex':

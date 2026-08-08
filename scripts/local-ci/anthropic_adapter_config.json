@@ -1778,28 +1778,6 @@
             "quota_key": "codex:primary",
             "quota_type": "tokens",
             "required_equals": {
-              "quota_period": "five_hour"
-            },
-            "minimums": {
-              "remaining_pct": 0
-            },
-            "maximums": {
-              "remaining_pct": 100
-            },
-            "required_future_timestamps": [
-              "expected_reset_at"
-            ],
-            "required_timestamp_after_observed": [
-              "expected_reset_at"
-            ]
-          },
-          {
-            "provider": "openai",
-            "client": "codex",
-            "source": "codex_response_headers",
-            "quota_key": "codex:secondary",
-            "quota_type": "tokens",
-            "required_equals": {
               "quota_period": "seven_day"
             },
             "minimums": {
@@ -1828,7 +1806,7 @@
       "command": [
         "grok",
         "--model",
-        "grok-build",
+        "grok-4.5",
         "--output-format",
         "json",
         "--permission-mode",
@@ -1861,7 +1839,7 @@
         "db_user": "aawm",
         "db_password_env": "AAWM_DB_PASSWORD",
         "expected_provider": "xai",
-        "expected_model": "grok-build",
+        "expected_model": "grok-4.5",
         "expected_client_name": "grok-build",
         "client_user_agent_contains": "grok-shell/",
         "metadata_required_equals": {
