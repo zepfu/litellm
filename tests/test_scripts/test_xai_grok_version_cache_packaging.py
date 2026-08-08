@@ -54,6 +54,29 @@ def test_dockerfile_copies_grok_native_version_contract() -> None:
     ) in dockerfile
 
 
+def test_dockerfile_copies_secret_manager_sidecar_dependencies() -> None:
+    """The loop imports these pure-stdlib secret-manager modules at startup;
+    the minimal image must ship them."""
+    dockerfile = _DOCKERFILE_PATH.read_text(encoding="utf-8")
+
+    for module in (
+        "grok_oidc_auth_path",
+        "codex_oauth_inventory",
+    ):
+        assert (
+            f"COPY litellm/secret_managers/{module}.py "
+            f"/app/litellm/secret_managers/{module}.py"
+        ) in dockerfile
+
+
+def test_dockerfile_does_not_ship_full_aawm_integrations() -> None:
+    """The psycopg-only sidecar image must not package the full
+    ``litellm.integrations.aawm_agent_identity`` dependency chain."""
+    dockerfile = _DOCKERFILE_PATH.read_text(encoding="utf-8")
+
+    assert "litellm/integrations" not in dockerfile
+
+
 def test_dockerfile_creates_secret_managers_init_for_import() -> None:
     dockerfile = _DOCKERFILE_PATH.read_text(encoding="utf-8")
 

@@ -20,7 +20,7 @@ import time
 import traceback
 import uuid
 from dataclasses import dataclass, field as dataclass_field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence
 from urllib import error as urllib_error
@@ -78,7 +78,6 @@ from litellm.secret_managers.codex_oauth_inventory import (
     load_codex_oauth_credential,
     load_codex_oauth_inventory,
 )
-from litellm.integrations import aawm_agent_identity
 
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -4291,6 +4290,284 @@ def _codex_quota_number(value: Any) -> Optional[float]:
     return parsed
 
 
+def _codex_quota_int(value: Any) -> Optional[int]:
+    parsed = _codex_quota_number(value)
+    if parsed is None:
+        return None
+    integer = int(parsed)
+    if integer != parsed:
+        return None
+    return integer
+
+
+def _codex_quota_clean_string(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _codex_quota_utc_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _codex_quota_parse_timestamp(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return (
+            value
+            if value.tzinfo is not None
+            else value.replace(tzinfo=timezone.utc)
+        )
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if numeric_value <= 0:
+            return None
+        if numeric_value > 1_000_000_000_000:
+            numeric_value = numeric_value / 1000.0
+        try:
+            return datetime.fromtimestamp(numeric_value, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    parsed = _parse_sidecar_timestamp(value)
+    if parsed is not None:
+        return (
+            parsed
+            if parsed.tzinfo is not None
+            else parsed.replace(tzinfo=timezone.utc)
+        )
+    if isinstance(value, str):
+        numeric_string_value = _codex_quota_number(value.strip())
+        if numeric_string_value is not None:
+            return _codex_quota_parse_timestamp(numeric_string_value)
+    return None
+
+
+def _codex_quota_period_from_window_minutes(
+    window_minutes: Optional[int],
+) -> Optional[str]:
+    if window_minutes is None:
+        return None
+    if window_minutes == 60:
+        return "hourly"
+    if window_minutes == 300:
+        return "five_hour"
+    if window_minutes == 10080:
+        return "seven_day"
+    if window_minutes == 1440:
+        return "daily"
+    return f"{window_minutes}_minutes"
+
+
+def _coerce_codex_quota_payload(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, bytes):
+        try:
+            return _coerce_codex_quota_payload(
+                value.decode("utf-8", errors="replace")
+            )
+        except Exception:
+            return None
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    # Fail closed on unbounded provider-influenced text before JSON parsing.
+    if not stripped or len(stripped) > 8192:
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except ValueError:
+        return None
+    if isinstance(parsed, (dict, list)):
+        return parsed
+    return None
+
+
+def _iter_codex_quota_dicts(root: Any) -> List[Dict[str, Any]]:
+    pending: List[tuple[Any, int]] = [(root, 0)] if root is not None else []
+    seen: set = set()
+    dicts: List[Dict[str, Any]] = []
+    while pending and len(seen) < 512:
+        value, depth = pending.pop(0)
+        coerced = _coerce_codex_quota_payload(value)
+        if coerced is not None:
+            value = coerced
+        value_id = id(value)
+        if value_id in seen:
+            continue
+        seen.add(value_id)
+        if isinstance(value, dict):
+            dicts.append(value)
+            if depth >= 6:
+                continue
+            for nested_value in list(value.values()):
+                if isinstance(nested_value, (dict, list, str, bytes)):
+                    pending.append((nested_value, depth + 1))
+        elif isinstance(value, list):
+            if depth >= 6:
+                continue
+            for item in value[:200]:
+                if isinstance(item, (dict, list, str, bytes)):
+                    pending.append((item, depth + 1))
+    return dicts
+
+
+def _json_safe_codex_quota_value(
+    value: Any,
+    *,
+    _seen: Optional[set] = None,
+    _depth: int = 0,
+) -> Any:
+    if _seen is None:
+        _seen = set()
+    if _depth > 12:
+        return "<max_depth>"
+    if isinstance(value, datetime):
+        return _codex_quota_utc_timestamp(value)
+    if isinstance(value, dict):
+        value_id = id(value)
+        if value_id in _seen:
+            return "<recursive>"
+        _seen.add(value_id)
+        try:
+            return {
+                str(key): _json_safe_codex_quota_value(
+                    nested_value,
+                    _seen=_seen,
+                    _depth=_depth + 1,
+                )
+                for key, nested_value in list(value.items())
+            }
+        finally:
+            _seen.discard(value_id)
+    if isinstance(value, list):
+        value_id = id(value)
+        if value_id in _seen:
+            return ["<recursive>"]
+        _seen.add(value_id)
+        try:
+            return [
+                _json_safe_codex_quota_value(
+                    item,
+                    _seen=_seen,
+                    _depth=_depth + 1,
+                )
+                for item in value[:100]
+            ]
+        finally:
+            _seen.discard(value_id)
+    if isinstance(value, tuple):
+        value_id = id(value)
+        if value_id in _seen:
+            return ["<recursive>"]
+        _seen.add(value_id)
+        try:
+            return [
+                _json_safe_codex_quota_value(
+                    item,
+                    _seen=_seen,
+                    _depth=_depth + 1,
+                )
+                for item in value[:100]
+            ]
+        finally:
+            _seen.discard(value_id)
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="replace")[:500]
+        except Exception:
+            return "<bytes>"
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, str):
+            return value[:1000]
+        return value
+    return str(value)[:500]
+
+
+def _infer_codex_quota_model_family_and_tier(
+    *values: Any,
+) -> tuple[Optional[str], Optional[str]]:
+    text = " ".join(str(value) for value in values if value is not None).lower()
+
+    def _has_token(token: str) -> bool:
+        return (
+            re.search(rf"(?<![a-z0-9_]){re.escape(token)}(?![a-z0-9_])", text)
+            is not None
+        )
+
+    model_tier = None
+    if _has_token("sonnet"):
+        model_tier = "sonnet"
+    elif _has_token("opus"):
+        model_tier = "opus"
+    elif _has_token("haiku"):
+        model_tier = "haiku"
+    elif "flash-lite" in text or "flash_lite" in text or _has_token("flash-lite"):
+        model_tier = "flash_lite"
+    elif _has_token("flash"):
+        model_tier = "flash"
+    elif _has_token("pro"):
+        model_tier = "pro"
+
+    if "claude" in text or model_tier in {"sonnet", "opus", "haiku"}:
+        return "claude", model_tier
+    # Prefer explicit OpenAI/Codex markers over tier-based gemini inference so
+    # names like gpt-5-pro / o1-pro are not misclassified as gemini solely
+    # because of a "pro" token.
+    if "gpt" in text or "openai" in text or _has_token("o1") or _has_token("o3") or _has_token("o4"):
+        return "openai", model_tier
+    if "codex" in text:
+        return "codex", model_tier
+    if "gemini" in text or "gemma" in text or model_tier in {"pro", "flash", "flash_lite"}:
+        return "gemini", model_tier
+    return None, model_tier
+
+
+def _build_codex_quota_limit_key(
+    *,
+    provider: Optional[str],
+    client_family: Optional[str],
+    account_hash: Optional[str],
+    limit_id: Optional[str],
+    limit_name: Optional[str],
+    limit_scope: Optional[str],
+    quota_period: Optional[str],
+    window_minutes: Optional[int],
+    model: Optional[str],
+    model_family: Optional[str],
+) -> str:
+    identity = (
+        _codex_quota_clean_string(limit_id)
+        or _codex_quota_clean_string(limit_name)
+        or (
+            _codex_quota_clean_string(model)
+            if str(limit_scope or "").startswith("model")
+            else None
+        )
+        or _codex_quota_clean_string(model_family)
+        or "default"
+    )
+    parts = (
+        provider or "unknown_provider",
+        client_family or "unknown_client",
+        account_hash or "unknown_account",
+        identity,
+        limit_scope or quota_period or "unknown_scope",
+        str(window_minutes or "unknown_window"),
+    )
+    normalized_parts = [
+        re.sub(r"[^a-z0-9_.-]+", "_", str(part).strip().lower()).strip("_")
+        or "unknown"
+        for part in parts
+    ]
+    return ":".join(normalized_parts)
+
+
 def _codex_quota_upstream_model(
     *sources: Mapping[str, Any],
 ) -> Optional[str]:
@@ -4305,7 +4582,7 @@ def _codex_quota_upstream_model(
 def _find_codex_quota_rate_limits(
     response_body: Mapping[str, Any],
 ) -> tuple[Optional[Mapping[str, Any]], Optional[Mapping[str, Any]]]:
-    for candidate in aawm_agent_identity._iter_rate_limit_dicts(response_body):
+    for candidate in _iter_codex_quota_dicts(response_body):
         candidate_rate_limits = candidate.get("rate_limits")
         if not isinstance(candidate_rate_limits, dict):
             continue
@@ -4337,6 +4614,111 @@ def _codex_quota_freshness(
     return "fresh"
 
 
+def _extract_codex_quota_rate_limit_observations(
+    rate_limits: Mapping[str, Any],
+    *,
+    record: CodexOAuthCredentialRecord,
+    observed_at: datetime,
+    environment: str,
+    upstream_model: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Extract per-window Codex quota observations from one rate-limits dict.
+
+    Pure-stdlib extractor local to the sidecar. The emitted rows preserve the
+    finalized observation contract consumed by the rate-limit storage payload
+    builder (source, provider, client_family, window fields, evidence, model
+    family inference).
+    """
+    limit_id = _codex_quota_clean_string(rate_limits.get("limit_id"))
+    limit_name = _codex_quota_clean_string(rate_limits.get("limit_name"))
+    metadata = {
+        "client_name": DEFAULT_CODEX_QUOTA_CLIENT,
+        "litellm_environment": environment,
+        "passthrough_route_family": "codex_quota_poll",
+    }
+    model = upstream_model or "unknown"
+    observations: List[Dict[str, Any]] = []
+    for limit_scope in ("primary", "secondary"):
+        window = rate_limits.get(limit_scope)
+        if not isinstance(window, dict):
+            continue
+        window_minutes = _codex_quota_int(window.get("window_minutes"))
+        used_percentage = _codex_quota_number(window.get("used_percent"))
+        provider_resets_at = _codex_quota_parse_timestamp(window.get("resets_at"))
+        observations.append(
+            {
+                "observed_at": observed_at,
+                "source": "codex_token_count",
+                "provider": "openai",
+                "client_family": DEFAULT_CODEX_QUOTA_CLIENT,
+                "limit_id": limit_id,
+                "limit_name": limit_name,
+                "limit_scope": limit_scope,
+                "window_minutes": window_minutes,
+                "provider_resets_at": provider_resets_at,
+                "used_percentage": used_percentage,
+                "exhausted": bool(
+                    used_percentage is not None and used_percentage >= 100
+                ),
+                "exhaustion_kind": (
+                    rate_limits.get("rate_limit_reached_type")
+                    if rate_limits.get("rate_limit_reached_type")
+                    else None
+                ),
+                "raw_provider_fields": {
+                    "limit_id": limit_id,
+                    "limit_name": limit_name,
+                    "limit_scope": limit_scope,
+                    "window_minutes": window.get("window_minutes"),
+                    "used_percent": window.get("used_percent"),
+                    "resets_at": window.get("resets_at"),
+                    "plan_type": rate_limits.get("plan_type"),
+                    "rate_limit_reached_type": rate_limits.get(
+                        "rate_limit_reached_type"
+                    ),
+                },
+                "evidence": {
+                    "signals": ["provider_rate_limits"],
+                    "provider_fields": [
+                        f"rate_limits.{limit_scope}.used_percent",
+                        f"rate_limits.{limit_scope}.window_minutes",
+                        f"rate_limits.{limit_scope}.resets_at",
+                    ],
+                },
+                "metadata": metadata,
+                "model": model,
+            }
+        )
+
+    finalized: List[Dict[str, Any]] = []
+    for observation in observations:
+        window_minutes = _codex_quota_int(observation.get("window_minutes"))
+        observation["window_minutes"] = window_minutes
+        observation["quota_period"] = _codex_quota_period_from_window_minutes(
+            window_minutes
+        )
+        provider_resets_at = _codex_quota_parse_timestamp(
+            observation.get("provider_resets_at")
+        )
+        observation["provider_resets_at"] = provider_resets_at
+        observation["inferred_window_start_at"] = (
+            provider_resets_at - timedelta(minutes=window_minutes)
+            if provider_resets_at is not None
+            and window_minutes is not None
+            and window_minutes > 0
+            else None
+        )
+        model_family, model_tier = _infer_codex_quota_model_family_and_tier(
+            model,
+            observation.get("limit_name"),
+            observation.get("raw_provider_fields"),
+        )
+        observation["model_family"] = model_family
+        observation["model_tier"] = model_tier
+        finalized.append(observation)
+    return finalized
+
+
 def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
     config: ProviderStatusLoopConfig,
     *,
@@ -4363,26 +4745,12 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
 
     parent = parent or {}
     upstream_model = _codex_quota_upstream_model(rate_limits, parent)
-    extractor_kwargs: Dict[str, Any] = {
-        "custom_llm_provider": "openai",
-        "litellm_call_id": (
-            f"codex-quota-poll-{record.label}-"
-            f"{observed_at.strftime('%Y%m%d%H%M%S')}"
-        ),
-        "litellm_params": {
-            "metadata": {
-                "client_name": DEFAULT_CODEX_QUOTA_CLIENT,
-                "litellm_environment": config.environment,
-                "passthrough_route_family": "codex_quota_poll",
-            }
-        },
-    }
-    if upstream_model is not None:
-        extractor_kwargs["model"] = upstream_model
-    extracted = aawm_agent_identity._extract_codex_rate_limit_observations(
-        extractor_kwargs,
-        {"rate_limits": dict(rate_limits)},
-        observed_at,
+    extracted = _extract_codex_quota_rate_limit_observations(
+        rate_limits,
+        record=record,
+        observed_at=observed_at,
+        environment=config.environment,
+        upstream_model=upstream_model,
     )
 
     rows: list[Dict[str, Any]] = []
@@ -4415,9 +4783,7 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
             used_percentage=used_percentage,
             expected_reset_at=expected_reset_at,
         )
-        quota_period = aawm_agent_identity._quota_period_from_window_minutes(
-            window_minutes
-        )
+        quota_period = _codex_quota_period_from_window_minutes(window_minutes)
         window_states[limit_scope] = freshness
         quota_periods[limit_scope] = quota_period
         if quota_period in period_states:
@@ -4482,7 +4848,7 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
                 ),
             }
         )
-        row["limit_key"] = aawm_agent_identity._build_rate_limit_key(
+        row["limit_key"] = _build_codex_quota_limit_key(
             provider="openai",
             client_family=DEFAULT_CODEX_QUOTA_CLIENT,
             account_hash=record.expected_account_hash,
@@ -4526,23 +4892,134 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
     }
 
 
-def _enqueue_codex_quota_observations(
+def _build_codex_quota_observation_db_payload(
+    observation: Mapping[str, Any],
+) -> tuple[Any, ...]:
+    """Map one finalized Codex quota row onto the rate-limit insert contract.
+
+    Mirrors the session-history storage-field mapping so the sidecar writes
+    the same public columns (client, quota_key, quota_type, remaining_pct).
+    """
+    limit_id = _codex_quota_clean_string(observation.get("limit_id"))
+    limit_scope = _codex_quota_clean_string(observation.get("limit_scope"))
+    if limit_id and limit_scope:
+        quota_key = f"{limit_id}:{limit_scope}"
+    else:
+        quota_key = (
+            _codex_quota_clean_string(observation.get("limit_key"))
+            or _codex_quota_clean_string(observation.get("limit_name"))
+            or ":".join(
+                part
+                for part in (
+                    _codex_quota_clean_string(observation.get("source")),
+                    _codex_quota_clean_string(observation.get("model")),
+                )
+                if part
+            )
+            or "unknown_quota"
+        )
+    client = (
+        _codex_quota_clean_string(observation.get("client_family"))
+        or _codex_quota_clean_string(observation.get("client_name"))
+        or _codex_quota_clean_string(
+            (observation.get("metadata") or {}).get("client_name")
+            if isinstance(observation.get("metadata"), Mapping)
+            else None
+        )
+    )
+    remaining_pct = _codex_quota_number(observation.get("remaining_pct"))
+    if remaining_pct is not None:
+        remaining_pct = max(0.0, min(100.0, remaining_pct))
+    else:
+        used_percentage = _codex_quota_number(observation.get("used_percentage"))
+        if used_percentage is not None:
+            remaining_pct = max(0.0, min(100.0, 100.0 - used_percentage))
+        elif bool(observation.get("exhausted")):
+            remaining_pct = 0.0
+    return (
+        observation["observed_at"],
+        client,
+        observation.get("client_version"),
+        observation.get("account_hash"),
+        observation.get("provider"),
+        observation.get("model"),
+        quota_key,
+        observation.get("quota_period"),
+        _codex_quota_clean_string(observation.get("quota_type")) or "unknown",
+        observation.get("provider_resets_at"),
+        remaining_pct,
+        _codex_quota_number(observation.get("quota_limit")),
+        _codex_quota_number(observation.get("quota_used")),
+        _codex_quota_number(observation.get("quota_remaining")),
+        _codex_quota_parse_timestamp(observation.get("billing_period_start_at")),
+        _codex_quota_parse_timestamp(observation.get("billing_period_end_at")),
+        json.dumps(
+            _json_safe_codex_quota_value(
+                observation.get("raw_provider_fields") or {}
+            )
+        ),
+        json.dumps(
+            _json_safe_codex_quota_value(observation.get("evidence") or {})
+        ),
+        observation.get("source"),
+        observation.get("session_id"),
+        observation.get("trace_id"),
+        observation.get("litellm_call_id"),
+    )
+
+
+def _persist_codex_quota_observations(
+    config: ProviderStatusLoopConfig,
     observations: Sequence[Dict[str, Any]],
 ) -> int:
     if not observations:
         return 0
-    record = aawm_agent_identity._build_rate_limit_observation_only_record(
-        {
-            "metadata": {
-                "custom_llm_provider": "openai",
-                "source": DEFAULT_CODEX_QUOTA_SOURCE,
-            }
-        },
-        list(observations),
-    )
-    aawm_agent_identity._enqueue_session_history_record(record)
-    return len(observations)
+    dsn = _resolve_dsn(config)
+    inserted_count = 0
+    try:
+        with probes.psycopg.connect(dsn) as conn:
+            try:
+                with conn.cursor() as cur:
+                    _set_codex_quota_database_timeouts(
+                        cur,
+                        lock_timeout_ms=config.db_lock_timeout_ms,
+                        statement_timeout_ms=config.db_statement_timeout_ms,
+                    )
+                    for observation in observations:
+                        cur.execute(
+                            GROK_BILLING_RATE_LIMIT_INSERT_SQL,
+                            _build_codex_quota_observation_db_payload(observation),
+                        )
+                        inserted_count += max(0, cur.rowcount)
+            except (
+                probes.psycopg.errors.LockNotAvailable,
+                probes.psycopg.errors.QueryCanceled,
+            ) as exc:
+                conn.rollback()
+                raise probes.ProviderStatusDatabaseWriteSkipped(
+                    error_class=exc.__class__.__name__,
+                    message=str(exc),
+                ) from exc
+    except probes.ProviderStatusDatabaseWriteSkipped:
+        raise
+    return inserted_count
 
+
+def _set_codex_quota_database_timeouts(
+    cur: Any,
+    *,
+    lock_timeout_ms: int,
+    statement_timeout_ms: int,
+) -> None:
+    cur.execute(
+        "SELECT set_config('application_name', %s, false)",
+        (f"{probes._provider_status_db_application_name()}-codex-quota",),
+    )
+    cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",))
+    cur.execute(
+        "SELECT set_config('statement_timeout', %s, true)",
+        (f"{statement_timeout_ms}ms",),
+    )
 
 def _persist_codex_reset_credit_observation(
     config: ProviderStatusLoopConfig,
@@ -4666,7 +5143,7 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
             "credit_inserted_count": 0,
             "credit_persisted": False,
             "quota_observation_count": 0,
-            "quota_accepted_count": 0,
+            "quota_inserted_count": 0,
             "quota_storage_status": "not_attempted",
             "quota_health": "terminal",
             "quota_window_states": {
@@ -4774,10 +5251,13 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
                 else:
                     summary["quota_health"] = "terminal"
                 if config.apply and quota_observations:
-                    summary["quota_accepted_count"] = (
-                        _enqueue_codex_quota_observations(quota_observations)
+                    summary["quota_inserted_count"] = (
+                        _persist_codex_quota_observations(
+                            config,
+                            quota_observations,
+                        )
                     )
-                    summary["quota_storage_status"] = "queued"
+                    summary["quota_storage_status"] = "persisted"
                 elif not config.apply:
                     summary["quota_storage_status"] = "apply_disabled"
                 else:
@@ -4785,7 +5265,7 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
             except Exception as exc:
                 summary["quota_error_class"] = exc.__class__.__name__
                 summary["quota_error_message"] = _redacted_failure_message(str(exc))
-                summary["quota_storage_status"] = "failed"
+                summary["quota_storage_status"] = "db_write_failed"
                 summary["quota_health"] = "terminal"
 
             summary["inserted_count"] = summary["credit_inserted_count"]

@@ -6611,10 +6611,10 @@ def test_codex_quota_poll_failure_does_not_suppress_other_account(
     assert aggregate["health"] == "degraded"
 
 
-def test_enqueue_codex_quota_observations_uses_session_history_writer(
+def test_persist_codex_quota_observations_uses_synchronous_psycopg_insert(
     monkeypatch,
 ) -> None:
-    config = _codex_reset_credit_poll_config(apply=False)
+    config = _codex_reset_credit_poll_config(apply=True)
     record = config.codex_oauth_inventory.records[0]
     rows, _summary = loop._build_codex_quota_rate_limit_observations(
         config,
@@ -6622,25 +6622,117 @@ def test_enqueue_codex_quota_observations_uses_session_history_writer(
         observed_at=datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc),
         response_body=_codex_quota_payload(),
     )
-    queued = []
+    executed: list = []
+
+    class _FakeCursor:
+        rowcount = 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=None):
+            executed.append((sql, params))
+
+    class _FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return _FakeCursor()
+
+        def rollback(self):
+            raise AssertionError("rollback must not run on success")
+
     monkeypatch.setattr(
-        loop.aawm_agent_identity,
-        "_enqueue_session_history_record",
-        queued.append,
+        loop.probes.psycopg,
+        "connect",
+        lambda _dsn: _FakeConnection(),
     )
 
-    accepted = loop._enqueue_codex_quota_observations(rows)
+    inserted = loop._persist_codex_quota_observations(config, rows)
 
-    assert accepted == 2
-    assert len(queued) == 1
-    assert queued[0]["_skip_session_history"] is True
-    assert queued[0]["rate_limit_observations"] == rows
+    assert inserted == 2
+    quota_inserts = [
+        (sql, params)
+        for sql, params in executed
+        if "INSERT INTO public.rate_limit_observations" in sql
+    ]
+    assert len(quota_inserts) == 2
+    quota_keys = set()
+    for _sql, params in quota_inserts:
+        assert params[1] == "codex"
+        assert params[3] == record.expected_account_hash
+        assert params[4] == "openai"
+        assert params[18] == loop.DEFAULT_CODEX_QUOTA_SOURCE
+        quota_keys.add(params[6])
+    assert quota_keys == {
+        "codex_bengalfox:primary",
+        "codex_bengalfox:secondary",
+    }
     assert {
-        row["account_hash"] for row in queued[0]["rate_limit_observations"]
+        row["account_hash"] for row in rows
     } == {record.expected_account_hash}
 
 
-def test_codex_quota_poll_reports_queued_rows_not_synchronous_inserts(
+def test_persist_codex_quota_observations_propagates_db_write_skipped(
+    monkeypatch,
+) -> None:
+    config = _codex_reset_credit_poll_config(apply=True)
+    record = config.codex_oauth_inventory.records[0]
+    rows, _summary = loop._build_codex_quota_rate_limit_observations(
+        config,
+        record=record,
+        observed_at=datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc),
+        response_body=_codex_quota_payload(),
+    )
+
+    class _FakeCursor:
+        rowcount = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=None):
+            if "INSERT INTO public.rate_limit_observations" in sql:
+                raise loop.probes.psycopg.errors.LockNotAvailable("lock timeout")
+
+    class _FakeConnection:
+        rolled_back = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return _FakeCursor()
+
+        def rollback(self):
+            self.rolled_back = True
+
+    fake_conn = _FakeConnection()
+    monkeypatch.setattr(
+        loop.probes.psycopg,
+        "connect",
+        lambda _dsn: fake_conn,
+    )
+
+    with pytest.raises(loop.probes.ProviderStatusDatabaseWriteSkipped):
+        loop._persist_codex_quota_observations(config, rows)
+    assert fake_conn.rolled_back is True
+
+
+def test_codex_quota_poll_reports_synchronous_insert_counts(
     monkeypatch,
 ) -> None:
     config = _codex_reset_credit_poll_config()
@@ -6663,8 +6755,8 @@ def test_codex_quota_poll_reports_queued_rows_not_synchronous_inserts(
     )
     monkeypatch.setattr(
         loop,
-        "_enqueue_codex_quota_observations",
-        lambda observations: len(observations),
+        "_persist_codex_quota_observations",
+        lambda _config, observations: len(observations),
     )
 
     events = loop._run_codex_reset_credit_poll_task(
@@ -6678,11 +6770,94 @@ def test_codex_quota_poll_reports_queued_rows_not_synchronous_inserts(
     )
     assert poll["credit_inserted_count"] == 1
     assert poll["quota_observation_count"] == 2
-    assert poll["quota_accepted_count"] == 2
-    assert poll["quota_storage_status"] == "queued"
+    assert poll["quota_inserted_count"] == 2
+    assert poll["quota_storage_status"] == "persisted"
     assert poll["inserted_count"] == 1
-    assert "quota_inserted_count" not in poll
-    assert "quota_persisted" not in poll
+    assert "quota_accepted_count" not in poll
+
+
+def test_codex_quota_poll_reports_db_write_failure_disposition(
+    monkeypatch,
+) -> None:
+    config = _codex_reset_credit_poll_config()
+    monkeypatch.setattr(
+        loop,
+        "_fetch_codex_reset_credit_payload",
+        lambda *_args, **_kwargs: {
+            "status_code": 200,
+            "payload": _codex_quota_payload(),
+            "auth_context": _codex_reset_credit_auth_context(),
+            "attempt_count": 1,
+            "retry_count": 0,
+            "poll_url": probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL,
+        },
+    )
+    monkeypatch.setattr(
+        loop,
+        "_persist_codex_reset_credit_observation",
+        lambda *_args, **_kwargs: (1, 1),
+    )
+
+    def _raise_skipped(_config, _observations):
+        raise loop.probes.ProviderStatusDatabaseWriteSkipped(
+            error_class="LockNotAvailable",
+            message="lock timeout",
+        )
+
+    monkeypatch.setattr(loop, "_persist_codex_quota_observations", _raise_skipped)
+
+    events = loop._run_codex_reset_credit_poll_task(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    poll = next(
+        event for event in events if event["event"] == "codex_reset_credit_poll"
+    )
+    assert poll["quota_observation_count"] == 2
+    assert poll["quota_inserted_count"] == 0
+    assert poll["quota_storage_status"] == "db_write_failed"
+    assert poll["quota_error_class"] == "ProviderStatusDatabaseWriteSkipped"
+    assert poll["quota_health"] == "terminal"
+
+
+def test_codex_quota_poll_apply_disabled_keeps_quota_unpersisted(
+    monkeypatch,
+) -> None:
+    config = _codex_reset_credit_poll_config(apply=False)
+    monkeypatch.setattr(
+        loop,
+        "_fetch_codex_reset_credit_payload",
+        lambda *_args, **_kwargs: {
+            "status_code": 200,
+            "payload": _codex_quota_payload(),
+            "auth_context": _codex_reset_credit_auth_context(),
+            "attempt_count": 1,
+            "retry_count": 0,
+            "poll_url": probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL,
+        },
+    )
+    monkeypatch.setattr(
+        loop,
+        "_persist_codex_quota_observations",
+        lambda *_args, **_kwargs: pytest.fail(
+            "persistence must not run when apply is disabled"
+        ),
+    )
+
+    events = loop._run_codex_reset_credit_poll_task(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    poll = next(
+        event for event in events if event["event"] == "codex_reset_credit_poll"
+    )
+    assert poll["quota_observation_count"] == 2
+    assert poll["quota_inserted_count"] == 0
+    assert poll["quota_storage_status"] == "apply_disabled"
 
 
 @pytest.mark.parametrize(

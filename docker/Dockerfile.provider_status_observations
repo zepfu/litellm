@@ -38,6 +38,10 @@ COPY litellm/secret_managers/credential_error_sanitizer.py /app/litellm/secret_m
 COPY litellm/secret_managers/credential_file_lock.py /app/litellm/secret_managers/credential_file_lock.py
 COPY litellm/secret_managers/credential_file_metadata.py /app/litellm/secret_managers/credential_file_metadata.py
 COPY litellm/secret_managers/credential_file_write.py /app/litellm/secret_managers/credential_file_write.py
+# Grok native OIDC auth-path resolver (pure-stdlib).
+COPY litellm/secret_managers/grok_oidc_auth_path.py /app/litellm/secret_managers/grok_oidc_auth_path.py
+# Codex OAuth credential inventory (pure-stdlib).
+COPY litellm/secret_managers/codex_oauth_inventory.py /app/litellm/secret_managers/codex_oauth_inventory.py
 # Canonical Kimi endpoint/contract resolver (pure-stdlib, MS-030/MS-031).
 COPY litellm/secret_managers/kimi_native_contract.py /app/litellm/secret_managers/kimi_native_contract.py
 # Grok native client-version cache contract (pure-stdlib, xai-002).
