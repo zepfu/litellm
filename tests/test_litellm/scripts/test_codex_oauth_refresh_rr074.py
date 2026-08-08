@@ -82,6 +82,41 @@ def test_lock_wrapper_delegates_only_to_shared_helper(codex) -> None:
     assert "LOCK_UN" not in src
 
 
+def test_refresh_returns_sanitized_lock_failure(
+    codex,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.secret_managers.credential_file_lock import (
+        CredentialFileLockError,
+    )
+
+    class _FailingLock:
+        def __enter__(self):
+            raise CredentialFileLockError("Credential file lock is already held.")
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+    monkeypatch.setattr(
+        codex,
+        "_credential_file_lock",
+        lambda _lock_path: _FailingLock(),
+    )
+
+    result = codex.refresh_codex_oauth_auth_file(
+        tmp_path / "auth.json",
+        lock_file=tmp_path / "auth.json.lock",
+        force=True,
+    )
+
+    assert result["attempted"] is True
+    assert result["refreshed"] is False
+    assert result["skipped"] is False
+    assert result["error_class"] == "CredentialFileLockError"
+    assert result["error_message"] == "Credential file lock is already held."
+
+
 # ---------------------------------------------------------------------------
 # Finding #4: shared metadata helpers
 # ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 
 Covers consumer migration onto shared credential write/metadata APIs:
 1/4/5. Lock delegates solely to shared credential_file_lock (no dead fcntl copy);
-       flock failures surface as warnings via the shared helper.
+       lock acquisition failures fail closed via the shared helper.
 2.     Credential publish uses write_and_publish_private_text (private exclusive
        temp, non-pid-only name, symlink refusal, shared metadata apply).
 3.     Metadata helpers delegate to shared credential_file_metadata.
@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -107,32 +106,39 @@ def test_lock_wrapper_delegates_only_to_shared_helper(grok) -> None:
     assert src.count("refuse_symlink=True") >= 4
 
 
-def test_lock_failures_surface_through_shared_helper(
+def test_refresh_returns_sanitized_lock_failure(
     grok,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    import litellm.secret_managers.credential_file_lock as lock_mod
+    from litellm.secret_managers.credential_file_lock import (
+        CredentialFileLockError,
+    )
 
-    class _FakeFcntl:
-        LOCK_EX = 1
-        LOCK_UN = 2
+    class _FailingLock:
+        def __enter__(self):
+            raise CredentialFileLockError("Credential file lock is already held.")
 
-        @staticmethod
-        def flock(fd, op):  # noqa: ARG004
-            raise OSError("simulated flock failure")
+        def __exit__(self, *_args: Any) -> None:
+            return None
 
-    monkeypatch.setattr(lock_mod, "_fcntl", _FakeFcntl)
-    lock = tmp_path / "auth.json.lock"
-    with caplog.at_level(logging.WARNING, logger=lock_mod.__name__):
-        with grok._credential_file_lock(lock):
-            pass
-    messages = [rec.getMessage() for rec in caplog.records]
-    assert any("LOCK_EX failed" in msg for msg in messages)
-    joined = " ".join(messages)
-    assert "access_token" not in joined
-    assert "refresh_token" not in joined
+    monkeypatch.setattr(
+        grok,
+        "_credential_file_lock",
+        lambda _lock_path: _FailingLock(),
+    )
+
+    result = grok.refresh_grok_oidc_auth_file(
+        tmp_path / "auth.json",
+        lock_file=tmp_path / "auth.json.lock",
+        force=True,
+    )
+
+    assert result["attempted"] is True
+    assert result["refreshed"] is False
+    assert result["skipped"] is False
+    assert result["error_class"] == "CredentialFileLockError"
+    assert result["error_message"] == "Credential file lock is already held."
 
 
 # ---------------------------------------------------------------------------

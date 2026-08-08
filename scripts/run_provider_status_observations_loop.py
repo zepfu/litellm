@@ -19,7 +19,7 @@ import sys
 import time
 import traceback
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence
@@ -71,6 +71,14 @@ from litellm.secret_managers.grok_oidc_auth_path import (
     GROK_OIDC_AUTH_FILE_ENV_VARS,
     resolve_grok_oidc_auth_path,
 )
+from litellm.secret_managers.codex_oauth_inventory import (
+    CodexOAuthCredentialRecord,
+    CodexOAuthCredentialSnapshot,
+    CodexOAuthInventory,
+    load_codex_oauth_credential,
+    load_codex_oauth_inventory,
+)
+from litellm.integrations import aawm_agent_identity
 
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -292,6 +300,8 @@ DEFAULT_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS = 0.5
 DEFAULT_CODEX_RESET_CREDIT_CREDIT_FAMILY = "codex_rate_limit_reset"
 DEFAULT_CODEX_RESET_CREDIT_CREDIT_TYPE = "reset_credit"
 DEFAULT_CODEX_RESET_CREDIT_SOURCE = "codex_reset_credit_poll"
+DEFAULT_CODEX_QUOTA_SOURCE = "codex_quota_poll"
+DEFAULT_CODEX_QUOTA_CLIENT = "codex"
 DEFAULT_CODEX_RESET_CREDIT_LATEST_VISIBLE_SOURCE_URL = (
     "https://x.com/thsottiaux/status/2070653282440405046"
 )
@@ -1240,6 +1250,7 @@ class ProviderStatusLoopConfig:
     grok_oidc_force_refresh: bool = False
     grok_oidc_http_timeout_seconds: float = DEFAULT_GROK_OIDC_HTTP_TIMEOUT_SECONDS
     codex_oauth_refresh_enabled: bool = False
+    codex_oauth_inventory: Optional[CodexOAuthInventory] = None
     codex_auth_file: str = DEFAULT_CODEX_AUTH_FILE
     codex_auth_file_source: str = "default"
     codex_lock_file: str = DEFAULT_CODEX_LOCK_FILE
@@ -1335,7 +1346,15 @@ class ProviderStatusLoopConfig:
 @dataclass
 class SidecarTaskState:
     grok_oidc_last_attempt_monotonic: Optional[float] = None
-    codex_oauth_last_attempt_monotonic: Optional[float] = None
+    codex_oauth_last_attempt_monotonic_by_label: Dict[str, float] = dataclass_field(
+        default_factory=dict
+    )
+    codex_oauth_usable_by_label: Dict[str, bool] = dataclass_field(
+        default_factory=dict
+    )
+    codex_oauth_status_by_label: Dict[str, str] = dataclass_field(
+        default_factory=dict
+    )
     xai_oauth_last_attempt_monotonic: Optional[float] = None
     kimi_oauth_last_attempt_monotonic: Optional[float] = None
     provider_auth_health_poll_last_attempt_monotonic: Optional[float] = None
@@ -1346,7 +1365,24 @@ class SidecarTaskState:
     alibaba_subscription_payload: Optional[Dict[str, Any]] = None
     alibaba_auth_fingerprint: Optional[str] = None
     grok_billing_last_attempt_monotonic: Optional[float] = None
-    codex_reset_credit_last_attempt_monotonic: Optional[float] = None
+    codex_reset_credit_last_attempt_monotonic_by_label: Dict[str, float] = (
+        dataclass_field(default_factory=dict)
+    )
+    codex_quota_usable_by_label: Dict[str, bool] = dataclass_field(
+        default_factory=dict
+    )
+    codex_quota_status_by_label: Dict[str, str] = dataclass_field(
+        default_factory=dict
+    )
+    codex_auth_health_last_attempt_monotonic_by_label: Dict[str, float] = (
+        dataclass_field(default_factory=dict)
+    )
+    codex_auth_health_usable_by_label: Dict[str, bool] = dataclass_field(
+        default_factory=dict
+    )
+    codex_auth_health_status_by_label: Dict[str, str] = dataclass_field(
+        default_factory=dict
+    )
     observability_anomaly_scan_last_attempt_monotonic: Optional[float] = None
 
 
@@ -1408,6 +1444,26 @@ def _resolve_codex_sidecar_auth_file(
             return str(Path(token_dir).expanduser() / "auth.json"), env_name
 
     return DEFAULT_CODEX_AUTH_FILE, "default"
+
+
+def _load_codex_inventory_for_config(
+    *,
+    refresh_enabled: bool,
+    quota_poll_enabled: bool,
+    health_poll_enabled: bool,
+) -> Optional[CodexOAuthInventory]:
+    if not refresh_enabled and not quota_poll_enabled and not health_poll_enabled:
+        return None
+    return load_codex_oauth_inventory()
+
+
+def _require_codex_oauth_inventory(
+    config: ProviderStatusLoopConfig,
+) -> CodexOAuthInventory:
+    inventory = config.codex_oauth_inventory
+    if inventory is not None:
+        return inventory
+    return load_codex_oauth_inventory()
 
 
 def _resolve_xai_oauth_sidecar_auth_file(
@@ -2603,6 +2659,11 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
     args = _build_parser().parse_args(argv)
     _validate_config_args(args)
     grok_billing_http_method = str(args.grok_billing_http_method).strip().upper()
+    codex_oauth_inventory = _load_codex_inventory_for_config(
+        refresh_enabled=args.codex_oauth_refresh_enabled,
+        quota_poll_enabled=args.codex_reset_credit_poll_enabled,
+        health_poll_enabled=args.provider_auth_health_poll_enabled,
+    )
 
     (
         resolved_grok_auth_file,
@@ -2645,6 +2706,7 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         grok_oidc_force_refresh=args.grok_oidc_force_refresh,
         grok_oidc_http_timeout_seconds=args.grok_oidc_http_timeout_seconds,
         codex_oauth_refresh_enabled=args.codex_oauth_refresh_enabled,
+        codex_oauth_inventory=codex_oauth_inventory,
         codex_auth_file=resolved_codex_auth_file,
         codex_auth_file_source=resolved_codex_auth_file_source,
         codex_lock_file=args.codex_lock_file,
@@ -2996,6 +3058,8 @@ def _persist_grok_oidc_auth_observation(
 def _build_codex_auth_observation(
     config: ProviderStatusLoopConfig,
     event: Mapping[str, Any],
+    *,
+    record: Optional[CodexOAuthCredentialRecord] = None,
 ) -> Dict[str, Any]:
     observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(
         timezone.utc
@@ -3005,10 +3069,21 @@ def _build_codex_auth_observation(
     successful_validation = status in {"refreshed", "skipped"} and not event.get(
         "error_class"
     )
-    auth_file = event.get("auth_file") or config.codex_auth_file
+    account_label = event.get("account_label")
+    account_hash = event.get("account_hash")
+    if record is not None:
+        account_label = record.label
+        account_hash = record.expected_account_hash
+        auth_file = str(record.auth_path)
+        auth_file_source = "codex_oauth_inventory"
+    else:
+        auth_file = event.get("auth_file") or config.codex_auth_file
+        auth_file_source = config.codex_auth_file_source
     metadata = {
         "auth_file_hash_algorithm": "sha256",
-        "auth_file_source": config.codex_auth_file_source,
+        "auth_file_source": auth_file_source,
+        "account_label": _redacted_summary_field(account_label),
+        "account_hash": _redacted_summary_field(account_hash),
         "refresh_buffer_seconds": config.codex_refresh_buffer_seconds,
         "refresh_interval_seconds": config.codex_refresh_interval_seconds,
         "force_refresh": config.codex_force_refresh,
@@ -3024,7 +3099,7 @@ def _build_codex_auth_observation(
         "provider": "openai",
         "auth_family": "codex_oauth",
         "credential_scope": _redacted_summary_field(
-            event.get("account_id"),
+            account_label,
             limit=512,
         ),
         "auth_file_hash": probes.auth_file_identity_hash(auth_file),
@@ -3044,11 +3119,17 @@ def _build_codex_auth_observation(
 def _persist_codex_auth_observation(
     config: ProviderStatusLoopConfig,
     event: Mapping[str, Any],
+    *,
+    record: Optional[CodexOAuthCredentialRecord] = None,
 ) -> tuple[bool, int, Optional[str], Optional[str]]:
     if not config.apply:
         return False, 0, None, "apply_disabled"
 
-    observation = _build_codex_auth_observation(config, event)
+    observation = _build_codex_auth_observation(
+        config,
+        event,
+        record=record,
+    )
     dsn = _resolve_dsn(config)
     try:
         inserted_count = probes.insert_provider_auth_observations(
@@ -3325,18 +3406,15 @@ def _codex_reset_credit_poll_failure_message(
     return message + "."
 
 
-def _load_codex_reset_credit_auth_context(auth_file: str) -> Dict[str, Any]:
-    auth_data = codex_oauth_refresh._read_auth_data(Path(auth_file).expanduser())
-    token_data = codex_oauth_refresh._get_token_data(auth_data)
-    access_token = codex_oauth_refresh._clean_string(token_data.get("access_token"))
-    if access_token is None:
-        raise ValueError(
-            "Codex OAuth auth file does not contain a usable access token for reset-credit poll."
-        )
-    account_id = codex_oauth_refresh._extract_account_id(token_data)
+def _load_codex_reset_credit_auth_context(
+    record: CodexOAuthCredentialRecord,
+) -> Dict[str, Any]:
+    snapshot = load_codex_oauth_credential(record)
     return {
-        "access_token": access_token,
-        "account_id": account_id,
+        "access_token": snapshot.access_token,
+        "account_id": snapshot.account_id,
+        "account_label": record.label,
+        "account_hash": snapshot.account_hash,
     }
 
 
@@ -3582,10 +3660,12 @@ def _codex_reset_credit_poll_evidence(
     status_code: int,
     attempt_count: int,
     retry_count: int,
-    account_id: Any,
+    auth_context: Optional[Mapping[str, Any]],
     detail_endpoint: bool,
     visible_credit_count: int,
 ) -> Dict[str, Any]:
+    auth_context = auth_context or {}
+    account_id = auth_context.get("account_id")
     return {
         "signals": ["codex_reset_credit_poll"],
         "provider_fields": [
@@ -3604,6 +3684,8 @@ def _codex_reset_credit_poll_evidence(
         "retry_count": retry_count,
         "account_id_present": bool(account_id),
         "chatgpt_account_id_header_present": bool(account_id),
+        "account_label": auth_context.get("account_label"),
+        "account_hash": auth_context.get("account_hash"),
         "visible_credit_count": visible_credit_count,
     }
 
@@ -3632,6 +3714,15 @@ def _apply_codex_reset_credit_visible_source_url(
     return updated
 
 
+def _codex_auth_context_account_hash(
+    auth_context: Mapping[str, Any],
+) -> Optional[str]:
+    configured_hash = auth_context.get("account_hash")
+    if isinstance(configured_hash, str) and configured_hash.strip():
+        return configured_hash.strip()
+    return probes.account_identity_hash(auth_context.get("account_id"))
+
+
 def _build_codex_reset_credit_observations(
     config: ProviderStatusLoopConfig,
     *,
@@ -3643,8 +3734,7 @@ def _build_codex_reset_credit_observations(
     retry_count: int,
     poll_url: str,
 ) -> List[Dict[str, Any]]:
-    account_id = auth_context.get("account_id")
-    account_hash = probes.account_identity_hash(account_id)
+    account_hash = _codex_auth_context_account_hash(auth_context)
     if account_hash is None:
         raise ValueError(
             "Codex reset-credit poll could not derive a stable hashed account identity."
@@ -3693,7 +3783,7 @@ def _build_codex_reset_credit_observations(
                 status_code=status_code,
                 attempt_count=attempt_count,
                 retry_count=retry_count,
-                account_id=account_id,
+                auth_context=auth_context,
                 detail_endpoint=True,
                 visible_credit_count=len(parsed_credits),
             )
@@ -3754,8 +3844,7 @@ def _build_codex_reset_credit_observation_legacy(
 ) -> Dict[str, Any]:
     available_count = _parse_codex_reset_credit_available_count(response_body)
     expires_at = _parse_codex_reset_credit_expires_at(response_body)
-    account_id = auth_context.get("account_id")
-    account_hash = probes.account_identity_hash(account_id)
+    account_hash = _codex_auth_context_account_hash(auth_context)
     if account_hash is None:
         raise ValueError(
             "Codex reset-credit poll could not derive a stable hashed account identity."
@@ -3778,7 +3867,7 @@ def _build_codex_reset_credit_observation_legacy(
         status_code=status_code,
         attempt_count=attempt_count,
         retry_count=retry_count,
-        account_id=account_id,
+        auth_context=auth_context,
         detail_endpoint=detail_endpoint,
         visible_credit_count=0,
     )
@@ -3915,6 +4004,7 @@ def _build_codex_reset_credit_seed_observations(
     *,
     observed_at: datetime,
     account_hash: str,
+    auth_context: Optional[Mapping[str, Any]] = None,
     visible_identities: set[str],
     visible_credit_windows: Optional[
         set[tuple[Optional[datetime], Optional[datetime]]]
@@ -3974,7 +4064,7 @@ def _build_codex_reset_credit_seed_observations(
             status_code=status_code,
             attempt_count=attempt_count,
             retry_count=retry_count,
-            account_id=True,
+            auth_context=auth_context,
             detail_endpoint=True,
             visible_credit_count=len(visible_identities),
         )
@@ -4072,6 +4162,7 @@ def _codex_reset_credit_retryable_url_error(exc: urllib_error.URLError) -> bool:
 
 def _fetch_codex_reset_credit_payload(
     config: ProviderStatusLoopConfig,
+    record: CodexOAuthCredentialRecord,
 ) -> Dict[str, Any]:
     max_attempts = max(1, config.codex_reset_credit_poll_max_attempts)
     attempt_count = 0
@@ -4084,7 +4175,7 @@ def _fetch_codex_reset_credit_payload(
     while attempt_count < max_attempts:
         attempt_count += 1
         try:
-            auth_context = _load_codex_reset_credit_auth_context(config.codex_auth_file)
+            auth_context = _load_codex_reset_credit_auth_context(record)
             request = urllib_request.Request(
                 poll_url,
                 headers=_build_codex_reset_credit_request_headers(auth_context),
@@ -4183,6 +4274,276 @@ def _fetch_codex_reset_credit_payload(
     )
 
 
+def _codex_quota_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
+
+
+def _codex_quota_upstream_model(
+    *sources: Mapping[str, Any],
+) -> Optional[str]:
+    for source in sources:
+        for key in ("model", "model_id", "model_slug"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _find_codex_quota_rate_limits(
+    response_body: Mapping[str, Any],
+) -> tuple[Optional[Mapping[str, Any]], Optional[Mapping[str, Any]]]:
+    for candidate in aawm_agent_identity._iter_rate_limit_dicts(response_body):
+        candidate_rate_limits = candidate.get("rate_limits")
+        if not isinstance(candidate_rate_limits, dict):
+            continue
+        if not (
+            isinstance(candidate_rate_limits.get("primary"), dict)
+            or isinstance(candidate_rate_limits.get("secondary"), dict)
+        ):
+            continue
+        return candidate_rate_limits, candidate
+    return None, None
+
+
+def _codex_quota_freshness(
+    *,
+    observed_at: datetime,
+    window_minutes: Optional[int],
+    used_percentage: Optional[float],
+    expected_reset_at: Optional[datetime],
+) -> str:
+    if expected_reset_at is not None and expected_reset_at <= observed_at:
+        return "stale"
+    if (
+        window_minutes is None
+        or used_percentage is None
+        or used_percentage < 0
+        or expected_reset_at is None
+    ):
+        return "unknown"
+    return "fresh"
+
+
+def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
+    config: ProviderStatusLoopConfig,
+    *,
+    record: CodexOAuthCredentialRecord,
+    observed_at: datetime,
+    response_body: Mapping[str, Any],
+) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
+    rate_limits, parent = _find_codex_quota_rate_limits(response_body)
+
+    if rate_limits is None:
+        return [], {
+            "telemetry_status": "absent",
+            "window_states": {
+                "primary": "absent",
+                "secondary": "absent",
+            },
+            "period_states": {
+                "five_hour": "absent",
+                "seven_day": "absent",
+            },
+            "fresh_window_count": 0,
+            "window_count": 0,
+        }
+
+    parent = parent or {}
+    upstream_model = _codex_quota_upstream_model(rate_limits, parent)
+    extractor_kwargs: Dict[str, Any] = {
+        "custom_llm_provider": "openai",
+        "litellm_call_id": (
+            f"codex-quota-poll-{record.label}-"
+            f"{observed_at.strftime('%Y%m%d%H%M%S')}"
+        ),
+        "litellm_params": {
+            "metadata": {
+                "client_name": DEFAULT_CODEX_QUOTA_CLIENT,
+                "litellm_environment": config.environment,
+                "passthrough_route_family": "codex_quota_poll",
+            }
+        },
+    }
+    if upstream_model is not None:
+        extractor_kwargs["model"] = upstream_model
+    extracted = aawm_agent_identity._extract_codex_rate_limit_observations(
+        extractor_kwargs,
+        {"rate_limits": dict(rate_limits)},
+        observed_at,
+    )
+
+    rows: list[Dict[str, Any]] = []
+    window_states: Dict[str, str] = {}
+    quota_periods: Dict[str, Optional[str]] = {}
+    period_states = {
+        "five_hour": "absent",
+        "seven_day": "absent",
+    }
+    observations_by_scope = {
+        str(observation.get("limit_scope")): observation
+        for observation in extracted
+        if observation.get("limit_scope") in {"primary", "secondary"}
+    }
+    for limit_scope in ("primary", "secondary"):
+        observation = observations_by_scope.get(limit_scope)
+        window = rate_limits.get(limit_scope)
+        if observation is None or not isinstance(window, dict):
+            window_states[limit_scope] = "absent"
+            quota_periods[limit_scope] = None
+            continue
+
+        row = dict(observation)
+        window_minutes = row.get("window_minutes")
+        used_percentage = _codex_quota_number(row.get("used_percentage"))
+        expected_reset_at = row.get("provider_resets_at")
+        freshness = _codex_quota_freshness(
+            observed_at=observed_at,
+            window_minutes=window_minutes,
+            used_percentage=used_percentage,
+            expected_reset_at=expected_reset_at,
+        )
+        quota_period = aawm_agent_identity._quota_period_from_window_minutes(
+            window_minutes
+        )
+        window_states[limit_scope] = freshness
+        quota_periods[limit_scope] = quota_period
+        if quota_period in period_states:
+            period_states[quota_period] = freshness
+
+        fresh_used_percentage = used_percentage if freshness == "fresh" else None
+        remaining_pct = (
+            max(0.0, min(100.0, 100.0 - fresh_used_percentage))
+            if fresh_used_percentage is not None
+            else None
+        )
+        limit_id = _redacted_summary_field(row.get("limit_id"))
+        limit_name = _redacted_summary_field(row.get("limit_name"))
+        upstream_scope = limit_id or limit_name
+        raw_provider_fields = dict(row.get("raw_provider_fields") or {})
+        raw_provider_fields["freshness_state"] = freshness
+        if upstream_model is not None:
+            raw_provider_fields["upstream_model"] = upstream_model
+        evidence = dict(row.get("evidence") or {})
+        evidence.update(
+            {
+                "signals": ["codex_native_quota_poll"],
+                "freshness_state": freshness,
+                "account_label": record.label,
+                "account_hash": record.expected_account_hash,
+                "environment": config.environment,
+                "upstream_limit_scope": limit_scope,
+            }
+        )
+        if upstream_scope is not None:
+            evidence["upstream_scope"] = upstream_scope
+        if upstream_model is not None:
+            evidence["upstream_model"] = upstream_model
+        row.update(
+            {
+                "observed_at": observed_at,
+                "provider": "openai",
+                "client_family": DEFAULT_CODEX_QUOTA_CLIENT,
+                "account_hash": record.expected_account_hash,
+                "model": upstream_model,
+                "source": DEFAULT_CODEX_QUOTA_SOURCE,
+                "limit_id": limit_id,
+                "limit_name": limit_name,
+                "limit_scope": limit_scope,
+                "window_minutes": window_minutes,
+                "quota_period": quota_period,
+                "quota_type": "tokens",
+                "provider_resets_at": expected_reset_at,
+                "remaining_pct": remaining_pct,
+                "used_percentage": fresh_used_percentage,
+                "status": freshness,
+                "exhausted": bool(
+                    freshness == "fresh"
+                    and fresh_used_percentage is not None
+                    and fresh_used_percentage >= 100
+                ),
+                "raw_provider_fields": raw_provider_fields,
+                "evidence": evidence,
+                "litellm_call_id": (
+                    f"codex-quota-poll-{record.label}-{limit_scope}-"
+                    f"{observed_at.strftime('%Y%m%d%H%M%S')}"
+                ),
+            }
+        )
+        row["limit_key"] = aawm_agent_identity._build_rate_limit_key(
+            provider="openai",
+            client_family=DEFAULT_CODEX_QUOTA_CLIENT,
+            account_hash=record.expected_account_hash,
+            limit_id=limit_id,
+            limit_name=limit_name,
+            limit_scope=limit_scope,
+            quota_period=quota_period,
+            window_minutes=window_minutes,
+            model=upstream_model,
+            model_family=row.get("model_family"),
+        )
+        rows.append(row)
+
+    fresh_window_count = sum(state == "fresh" for state in window_states.values())
+    present_window_count = sum(state != "absent" for state in window_states.values())
+    required_periods_fresh = all(
+        period_states[period] == "fresh" for period in ("five_hour", "seven_day")
+    )
+    if present_window_count == 0:
+        telemetry_status = "absent"
+    elif required_periods_fresh:
+        telemetry_status = "fresh"
+    elif fresh_window_count > 0:
+        telemetry_status = "partial"
+    elif "stale" in period_states.values():
+        telemetry_status = "stale"
+    else:
+        telemetry_status = "unknown"
+    return rows, {
+        "telemetry_status": telemetry_status,
+        "window_states": window_states,
+        "quota_periods": quota_periods,
+        "period_states": period_states,
+        "fresh_window_count": fresh_window_count,
+        "window_count": present_window_count,
+        "required_periods_fresh": required_periods_fresh,
+        "upstream_scope_present": any(
+            row.get("limit_id") or row.get("limit_name") for row in rows
+        ),
+        "upstream_model_present": upstream_model is not None,
+    }
+
+
+def _enqueue_codex_quota_observations(
+    observations: Sequence[Dict[str, Any]],
+) -> int:
+    if not observations:
+        return 0
+    record = aawm_agent_identity._build_rate_limit_observation_only_record(
+        {
+            "metadata": {
+                "custom_llm_provider": "openai",
+                "source": DEFAULT_CODEX_QUOTA_SOURCE,
+            }
+        },
+        list(observations),
+    )
+    aawm_agent_identity._enqueue_session_history_record(record)
+    return len(observations)
+
+
 def _persist_codex_reset_credit_observation(
     config: ProviderStatusLoopConfig,
     *,
@@ -4208,7 +4569,7 @@ def _persist_codex_reset_credit_observation(
     account_hash = (
         observations[0]["account_hash"]
         if observations
-        else probes.account_identity_hash(auth_context.get("account_id"))
+        else _codex_auth_context_account_hash(auth_context)
     )
     if account_hash is None:
         raise ValueError(
@@ -4228,6 +4589,7 @@ def _persist_codex_reset_credit_observation(
         config,
         observed_at=observed_at,
         account_hash=account_hash,
+        auth_context=auth_context,
         visible_identities=visible_identities,
         visible_credit_windows=visible_credit_windows,
         status_code=status_code,
@@ -4261,95 +4623,206 @@ def _persist_codex_reset_credit_observation(
     return len(rows), inserted_count
 
 
-def _run_codex_reset_credit_poll_task(
+def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
     *,
     now_monotonic: float,
-) -> Optional[Dict[str, Any]]:
+) -> list[Dict[str, Any]]:
     if not config.codex_reset_credit_poll_enabled:
-        return None
-    last_attempt = state.codex_reset_credit_last_attempt_monotonic
-    if (
-        last_attempt is not None
-        and now_monotonic - last_attempt
-        < config.codex_reset_credit_poll_interval_seconds
-    ):
-        return None
+        return []
 
-    state.codex_reset_credit_last_attempt_monotonic = now_monotonic
-    observed_at = datetime.now(timezone.utc)
-    summary: Dict[str, Any] = {
-        "attempted": True,
-        "persisted": False,
-        "skipped": False,
-        "auth_file": config.codex_auth_file,
-        "resolved_auth_file": config.codex_auth_file,
-        "auth_file_source": config.codex_auth_file_source,
-        "usage_url": _resolve_codex_reset_credit_poll_url(config),
-        "poll_url": _resolve_codex_reset_credit_poll_url(config),
-        "available_count": None,
-        "inserted_count": 0,
-        "status_code": None,
-        "attempt_count": 0,
-        "retry_count": 0,
-        "poll_max_attempts": max(1, config.codex_reset_credit_poll_max_attempts),
-        "error_class": None,
-        "error_message": None,
-    }
-    try:
-        fetched = _fetch_codex_reset_credit_payload(config)
-        summary["status_code"] = fetched["status_code"]
-        summary["attempt_count"] = fetched.get("attempt_count", 1)
-        summary["retry_count"] = fetched.get("retry_count", 0)
-        available_count = _parse_codex_reset_credit_available_count(fetched["payload"])
-        summary["available_count"] = available_count
-        if config.apply:
-            observation_count, inserted_count = _persist_codex_reset_credit_observation(
-                config,
-                observed_at=observed_at,
-                response_body=fetched["payload"],
-                auth_context=fetched["auth_context"],
-                status_code=fetched["status_code"],
-                attempt_count=summary["attempt_count"],
-                retry_count=summary["retry_count"],
-                poll_url=fetched.get("poll_url"),
+    inventory = _require_codex_oauth_inventory(config)
+    records = inventory.ordered_records(enabled_only=True)
+    events: list[Dict[str, Any]] = []
+    attempted_any = False
+    for record in records:
+        last_attempt = state.codex_reset_credit_last_attempt_monotonic_by_label.get(
+            record.label
+        )
+        if (
+            last_attempt is not None
+            and now_monotonic - last_attempt
+            < config.codex_reset_credit_poll_interval_seconds
+        ):
+            continue
+
+        attempted_any = True
+        state.codex_reset_credit_last_attempt_monotonic_by_label[record.label] = (
+            now_monotonic
+        )
+        observed_at = datetime.now(timezone.utc)
+        summary: Dict[str, Any] = {
+            "attempted": True,
+            "persisted": False,
+            "skipped": False,
+            "account_label": record.label,
+            "account_hash": record.expected_account_hash,
+            "usage_url": _resolve_codex_reset_credit_poll_url(config),
+            "poll_url": _resolve_codex_reset_credit_poll_url(config),
+            "available_count": None,
+            "inserted_count": 0,
+            "credit_observation_count": 0,
+            "credit_inserted_count": 0,
+            "credit_persisted": False,
+            "quota_observation_count": 0,
+            "quota_accepted_count": 0,
+            "quota_storage_status": "not_attempted",
+            "quota_health": "terminal",
+            "quota_window_states": {
+                "primary": "unknown",
+                "secondary": "unknown",
+            },
+            "quota_period_states": {
+                "five_hour": "unknown",
+                "seven_day": "unknown",
+            },
+            "quota_periods": {},
+            "status_code": None,
+            "attempt_count": 0,
+            "retry_count": 0,
+            "poll_max_attempts": max(
+                1, config.codex_reset_credit_poll_max_attempts
+            ),
+            "reset_credit_error_class": None,
+            "reset_credit_error_message": None,
+            "quota_error_class": None,
+            "quota_error_message": None,
+            "error_class": None,
+            "error_message": None,
+        }
+        try:
+            fetched = _fetch_codex_reset_credit_payload(config, record)
+        except Exception as exc:
+            summary["error_class"] = exc.__class__.__name__
+            summary["error_message"] = (
+                _redacted_failure_message(str(exc))
+                if isinstance(exc, CodexResetCreditPollError)
+                else f"Codex quota poll for account '{record.label}' failed."
             )
-            summary["inserted_count"] = inserted_count
-            summary["persisted"] = observation_count > 0 and inserted_count >= 0
+            if isinstance(exc, CodexResetCreditPollError):
+                summary["status_code"] = exc.status_code
+                summary["attempt_count"] = exc.attempt_count
+                summary["retry_count"] = exc.retry_count
+            else:
+                summary["attempt_count"] = 1
         else:
-            _build_codex_reset_credit_observations(
-                config,
-                observed_at=observed_at,
-                response_body=fetched["payload"],
-                auth_context=fetched["auth_context"],
-                status_code=fetched["status_code"],
-                attempt_count=summary["attempt_count"],
-                retry_count=summary["retry_count"],
-                poll_url=fetched.get("poll_url")
-                or _resolve_codex_reset_credit_poll_url(config),
-            )
-            summary["persisted"] = False
-    except Exception as exc:
-        summary["error_class"] = exc.__class__.__name__
-        summary["error_message"] = _redacted_failure_message(str(exc))
-        if isinstance(exc, CodexResetCreditPollError):
-            summary["status_code"] = exc.status_code
-            summary["attempt_count"] = exc.attempt_count
-            summary["retry_count"] = exc.retry_count
-        elif summary["status_code"] is None:
-            status_match = re.search(r"with HTTP (\d{3})", str(exc))
-            if status_match is not None:
-                summary["status_code"] = int(status_match.group(1))
-        if summary["attempt_count"] == 0:
-            summary["attempt_count"] = 1
+            summary["status_code"] = fetched["status_code"]
+            summary["attempt_count"] = fetched.get("attempt_count", 1)
+            summary["retry_count"] = fetched.get("retry_count", 0)
 
-    return {
-        "event": "codex_reset_credit_poll",
-        "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
-        "environment": config.environment,
-        **summary,
-    }
+            try:
+                summary["available_count"] = (
+                    _parse_codex_reset_credit_available_count(fetched["payload"])
+                )
+                if config.apply:
+                    credit_count, credit_inserted = (
+                        _persist_codex_reset_credit_observation(
+                            config,
+                            observed_at=observed_at,
+                            response_body=fetched["payload"],
+                            auth_context=fetched["auth_context"],
+                            status_code=fetched["status_code"],
+                            attempt_count=summary["attempt_count"],
+                            retry_count=summary["retry_count"],
+                            poll_url=fetched.get("poll_url"),
+                        )
+                    )
+                    summary["credit_observation_count"] = credit_count
+                    summary["credit_inserted_count"] = credit_inserted
+                    summary["credit_persisted"] = credit_count > 0
+                else:
+                    credit_rows = _build_codex_reset_credit_observations(
+                        config,
+                        observed_at=observed_at,
+                        response_body=fetched["payload"],
+                        auth_context=fetched["auth_context"],
+                        status_code=fetched["status_code"],
+                        attempt_count=summary["attempt_count"],
+                        retry_count=summary["retry_count"],
+                        poll_url=fetched.get("poll_url")
+                        or _resolve_codex_reset_credit_poll_url(config),
+                    )
+                    summary["credit_observation_count"] = len(credit_rows)
+            except Exception as exc:
+                summary["reset_credit_error_class"] = exc.__class__.__name__
+                summary["reset_credit_error_message"] = _redacted_failure_message(
+                    str(exc)
+                )
+
+            try:
+                quota_observations, quota_summary = (
+                    _build_codex_quota_rate_limit_observations(
+                        config,
+                        record=record,
+                        observed_at=observed_at,
+                        response_body=fetched["payload"],
+                    )
+                )
+                summary["quota_observation_count"] = len(quota_observations)
+                summary["quota_window_states"] = quota_summary["window_states"]
+                summary["quota_periods"] = quota_summary.get("quota_periods", {})
+                summary["quota_period_states"] = quota_summary.get(
+                    "period_states",
+                    {},
+                )
+                fresh_window_count = int(quota_summary.get("fresh_window_count", 0))
+                if quota_summary.get("required_periods_fresh"):
+                    summary["quota_health"] = "healthy"
+                elif fresh_window_count > 0:
+                    summary["quota_health"] = "degraded"
+                else:
+                    summary["quota_health"] = "terminal"
+                if config.apply and quota_observations:
+                    summary["quota_accepted_count"] = (
+                        _enqueue_codex_quota_observations(quota_observations)
+                    )
+                    summary["quota_storage_status"] = "queued"
+                elif not config.apply:
+                    summary["quota_storage_status"] = "apply_disabled"
+                else:
+                    summary["quota_storage_status"] = "no_observations"
+            except Exception as exc:
+                summary["quota_error_class"] = exc.__class__.__name__
+                summary["quota_error_message"] = _redacted_failure_message(str(exc))
+                summary["quota_storage_status"] = "failed"
+                summary["quota_health"] = "terminal"
+
+            summary["inserted_count"] = summary["credit_inserted_count"]
+            summary["persisted"] = summary["credit_persisted"]
+            if (
+                summary["reset_credit_error_class"]
+                and summary["quota_error_class"]
+            ):
+                summary["error_class"] = "CodexTelemetryComponentsFailed"
+                summary["error_message"] = (
+                    f"Codex reset-credit and quota telemetry failed for "
+                    f"account '{record.label}'."
+                )
+
+        quota_usable = summary["quota_health"] in {"healthy", "degraded"}
+        state.codex_quota_usable_by_label[record.label] = quota_usable
+        state.codex_quota_status_by_label[record.label] = summary["quota_health"]
+        events.append(
+            {
+                "event": "codex_reset_credit_poll",
+                "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+                "environment": config.environment,
+                **summary,
+            }
+        )
+
+    if attempted_any or not records:
+        events.append(
+            _codex_account_aggregate_event(
+                event_name="codex_quota_poll_aggregate",
+                config=config,
+                records=records,
+                usable_by_label=state.codex_quota_usable_by_label,
+                status_by_label=state.codex_quota_status_by_label,
+            )
+        )
+    return events
 
 
 def _load_grok_billing_access_token(auth_file: str) -> str:
@@ -7502,58 +7975,177 @@ def _run_grok_oidc_metadata_repair_task(
     }
 
 
+def _refresh_event_succeeded(event: Mapping[str, Any]) -> bool:
+    return bool(
+        not event.get("error_class")
+        and (event.get("refreshed") or event.get("skipped"))
+    )
+
+
+def _codex_account_aggregate_event(
+    *,
+    event_name: str,
+    config: ProviderStatusLoopConfig,
+    records: Sequence[CodexOAuthCredentialRecord],
+    usable_by_label: Mapping[str, bool],
+    status_by_label: Mapping[str, str],
+) -> Dict[str, Any]:
+    accounts = [
+        {
+            "account_label": record.label,
+            "account_hash": record.expected_account_hash,
+            "status": status_by_label.get(record.label, "unknown"),
+            "usable": bool(usable_by_label.get(record.label, False)),
+        }
+        for record in records
+    ]
+    usable_count = sum(account["usable"] for account in accounts)
+    fully_healthy_statuses = {"fresh", "healthy", "refreshed", "skipped"}
+    if (
+        accounts
+        and usable_count == len(accounts)
+        and all(account["status"] in fully_healthy_statuses for account in accounts)
+    ):
+        health = "healthy"
+    elif usable_count > 0:
+        health = "degraded"
+    else:
+        health = "terminal"
+    return {
+        "event": event_name,
+        "observed_at": _utc_timestamp(),
+        "environment": config.environment,
+        "health": health,
+        "account_count": len(accounts),
+        "usable_count": usable_count,
+        "unusable_count": len(accounts) - usable_count,
+        "accounts": accounts,
+    }
+
+
 def _run_codex_oauth_refresh_task(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
     *,
     now_monotonic: float,
-) -> Optional[Dict[str, Any]]:
+) -> list[Dict[str, Any]]:
     if not config.codex_oauth_refresh_enabled:
-        return None
-    last_attempt = state.codex_oauth_last_attempt_monotonic
-    if (
-        last_attempt is not None
-        and now_monotonic - last_attempt < config.codex_refresh_interval_seconds
-    ):
-        return None
+        return []
 
-    state.codex_oauth_last_attempt_monotonic = now_monotonic
-    try:
-        summary = codex_oauth_refresh.refresh_codex_oauth_auth_file(
-            config.codex_auth_file,
-            buffer_seconds=config.codex_refresh_buffer_seconds,
-            force=config.codex_force_refresh,
-            lock_file=config.codex_lock_file,
-            http_timeout_seconds=config.codex_http_timeout_seconds,
+    inventory = _require_codex_oauth_inventory(config)
+    records = inventory.ordered_records(enabled_only=True)
+    events: list[Dict[str, Any]] = []
+    if not records:
+        events.append(
+            {
+                "event": "codex_oauth_refresh",
+                "observed_at": _utc_timestamp(),
+                "environment": config.environment,
+                "attempted": True,
+                "refreshed": False,
+                "skipped": False,
+                "error_class": "NoEnabledCodexOAuthAccounts",
+                "error_message": "No enabled Codex OAuth account is configured.",
+            }
         )
-    except Exception as exc:
-        summary = {
-            "attempted": True,
-            "refreshed": False,
-            "skipped": False,
-            "auth_file": config.codex_auth_file,
-            "error_class": exc.__class__.__name__,
-            "error_message": _redacted_failure_message(str(exc)),
-        }
+        events.append(
+            _codex_account_aggregate_event(
+                event_name="codex_oauth_refresh_aggregate",
+                config=config,
+                records=records,
+                usable_by_label=state.codex_oauth_usable_by_label,
+                status_by_label=state.codex_oauth_status_by_label,
+            )
+        )
+        return events
 
-    event = {
-        "event": "codex_oauth_refresh",
-        "observed_at": _utc_timestamp(),
-        "environment": config.environment,
-        **summary,
-    }
-    (
-        persisted,
-        inserted_count,
-        skip_error_class,
-        skip_reason,
-    ) = _persist_codex_auth_observation(config, event)
-    event["auth_observation_status"] = _provider_auth_status_from_event(event)
-    event["auth_observation_persisted"] = persisted
-    event["auth_observation_inserted_count"] = inserted_count
-    event["auth_observation_skip_error_class"] = skip_error_class
-    event["auth_observation_skip_reason"] = skip_reason
-    return event
+    attempted_any = False
+    for record in records:
+        last_attempt = state.codex_oauth_last_attempt_monotonic_by_label.get(
+            record.label
+        )
+        if (
+            last_attempt is not None
+            and now_monotonic - last_attempt
+            < config.codex_refresh_interval_seconds
+        ):
+            continue
+
+        attempted_any = True
+        state.codex_oauth_last_attempt_monotonic_by_label[record.label] = (
+            now_monotonic
+        )
+        try:
+            summary = codex_oauth_refresh.refresh_codex_oauth_inventory_record(
+                record,
+                buffer_seconds=config.codex_refresh_buffer_seconds,
+                force=config.codex_force_refresh,
+                http_timeout_seconds=config.codex_http_timeout_seconds,
+            )
+        except Exception as exc:
+            summary = {
+                "attempted": True,
+                "refreshed": False,
+                "skipped": False,
+                "account_label": record.label,
+                "account_hash": record.expected_account_hash,
+                "expires_at": None,
+                "error_class": exc.__class__.__name__,
+                "error_message": (
+                    f"Codex OAuth credential '{record.label}' refresh failed."
+                ),
+                "error_hint": None,
+            }
+
+        event = {
+            "event": "codex_oauth_refresh",
+            "observed_at": _utc_timestamp(),
+            "environment": config.environment,
+            "attempted": bool(summary.get("attempted")),
+            "refreshed": bool(summary.get("refreshed")),
+            "skipped": bool(summary.get("skipped")),
+            "account_label": record.label,
+            "account_hash": record.expected_account_hash,
+            "expires_at": summary.get("expires_at"),
+            "error_class": _redacted_summary_field(summary.get("error_class")),
+            "error_message": _redacted_failure_message(
+                summary.get("error_message")
+            ),
+            "error_hint": _redacted_summary_field(summary.get("error_hint")),
+        }
+        (
+            persisted,
+            inserted_count,
+            skip_error_class,
+            skip_reason,
+        ) = _persist_codex_auth_observation(
+            config,
+            event,
+            record=record,
+        )
+        event["auth_observation_status"] = _provider_auth_status_from_event(event)
+        event["auth_observation_persisted"] = persisted
+        event["auth_observation_inserted_count"] = inserted_count
+        event["auth_observation_skip_error_class"] = skip_error_class
+        event["auth_observation_skip_reason"] = skip_reason
+        refresh_succeeded = _refresh_event_succeeded(event)
+        state.codex_oauth_usable_by_label[record.label] = refresh_succeeded
+        state.codex_oauth_status_by_label[record.label] = event[
+            "auth_observation_status"
+        ]
+        events.append(event)
+
+    if attempted_any:
+        events.append(
+            _codex_account_aggregate_event(
+                event_name="codex_oauth_refresh_aggregate",
+                config=config,
+                records=records,
+                usable_by_label=state.codex_oauth_usable_by_label,
+                status_by_label=state.codex_oauth_status_by_label,
+            )
+        )
+    return events
 
 
 def _run_xai_oauth_refresh_task(
@@ -7686,7 +8278,89 @@ def _run_kimi_oauth_refresh_task(
     return event
 
 
-def _run_provider_auth_health_poll_task(
+def _inspect_codex_inventory_record_health(
+    record: CodexOAuthCredentialRecord,
+) -> Dict[str, Any]:
+    try:
+        snapshot: CodexOAuthCredentialSnapshot = load_codex_oauth_credential(record)
+        expires_at = snapshot.expires_at
+        if expires_at is None:
+            return {
+                "attempted": True,
+                "health_status": "degraded",
+                "account_label": record.label,
+                "account_hash": record.expected_account_hash,
+                "expires_at": None,
+                "error_class": "CredentialExpiryUnavailable",
+                "error_message": (
+                    f"Codex OAuth credential '{record.label}' expiry is unavailable."
+                ),
+            }
+        expires_at_text = (
+            datetime.fromtimestamp(expires_at, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        if expires_at <= time.time():
+            return {
+                "attempted": True,
+                "health_status": "expired",
+                "account_label": record.label,
+                "account_hash": record.expected_account_hash,
+                "expires_at": expires_at_text,
+                "error_class": "CredentialExpiredError",
+                "error_message": (
+                    f"Codex OAuth credential '{record.label}' is expired."
+                ),
+            }
+        return {
+            "attempted": True,
+            "health_status": "fresh",
+            "account_label": record.label,
+            "account_hash": record.expected_account_hash,
+            "expires_at": expires_at_text,
+            "error_class": None,
+            "error_message": None,
+        }
+    except Exception as exc:
+        return {
+            "attempted": True,
+            "health_status": "malformed",
+            "account_label": record.label,
+            "account_hash": record.expected_account_hash,
+            "expires_at": None,
+            "error_class": exc.__class__.__name__,
+            "error_message": (
+                f"Codex OAuth credential '{record.label}' health inspection failed."
+            ),
+        }
+
+
+def _persist_codex_passive_auth_observation(
+    config: ProviderStatusLoopConfig,
+    event: Mapping[str, Any],
+    *,
+    record: CodexOAuthCredentialRecord,
+) -> tuple[bool, int, Optional[str], Optional[str]]:
+    observation = _build_passive_provider_auth_observation(
+        config,
+        event,
+        provider="openai",
+        auth_family="codex_oauth",
+        auth_file=str(record.auth_path),
+        auth_file_source="codex_oauth_inventory",
+        credential_scope=record.label,
+    )
+    observation["metadata"].update(
+        {
+            "account_label": record.label,
+            "account_hash": record.expected_account_hash,
+        }
+    )
+    return _persist_passive_provider_auth_observation(config, observation)
+
+
+def _run_provider_auth_health_poll_task(  # noqa: PLR0915
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
     *,
@@ -7696,14 +8370,11 @@ def _run_provider_auth_health_poll_task(
     if not config.provider_auth_health_poll_enabled:
         return []
     last_attempt = state.provider_auth_health_poll_last_attempt_monotonic
-    if (
+    non_codex_due = not (
         last_attempt is not None
         and now_monotonic - last_attempt
         < config.provider_auth_health_poll_interval_seconds
-    ):
-        return []
-
-    state.provider_auth_health_poll_last_attempt_monotonic = now_monotonic
+    )
     inspections: tuple[tuple[Any, ...], ...] = (
         (
             "grok_oidc_passive_health_inspection",
@@ -7715,17 +8386,6 @@ def _run_provider_auth_health_poll_task(
             config.grok_oidc_auth_file,
             config.grok_oidc_auth_file_source,
             "scope",
-        ),
-        (
-            "codex_oauth_passive_health_inspection",
-            codex_oauth_refresh.inspect_codex_oauth_credential_health,
-            (config.codex_auth_file,),
-            {},
-            "openai",
-            "codex_oauth",
-            config.codex_auth_file,
-            config.codex_auth_file_source,
-            "account_id",
         ),
         (
             "xai_oauth_passive_health_inspection",
@@ -7751,44 +8411,91 @@ def _run_provider_auth_health_poll_task(
         ),
     )
     events: list[Dict[str, Any]] = []
-    for (
-        event_name,
-        inspector,
-        inspector_args,
-        inspector_kwargs,
-        provider,
-        auth_family,
-        auth_file,
-        auth_file_source,
-        scope_field,
-    ) in inspections:
+    if non_codex_due:
+        state.provider_auth_health_poll_last_attempt_monotonic = now_monotonic
+        for (
+            event_name,
+            inspector,
+            inspector_args,
+            inspector_kwargs,
+            provider,
+            auth_family,
+            auth_file,
+            auth_file_source,
+            scope_field,
+        ) in inspections:
+            try:
+                summary = inspector(*inspector_args, **inspector_kwargs)
+            except Exception as exc:
+                summary = {
+                    "attempted": True,
+                    "refreshed": False,
+                    "skipped": False,
+                    "auth_file": auth_file,
+                    "health_status": "malformed",
+                    "error_class": exc.__class__.__name__,
+                    "error_message": _redacted_failure_message(str(exc)),
+                }
+            event = {
+                "event": event_name,
+                "source_task": "provider_auth_health_poll",
+                "observed_at": _utc_timestamp(),
+                "environment": config.environment,
+                **{key: value for key, value in summary.items() if key != "auth_file"},
+            }
+            observation = _build_passive_provider_auth_observation(
+                config,
+                event,
+                provider=provider,
+                auth_family=auth_family,
+                auth_file=auth_file,
+                auth_file_source=auth_file_source,
+                credential_scope=summary.get(scope_field),
+            )
+            persisted, inserted_count, skip_error_class, skip_reason = (
+                _persist_passive_provider_auth_observation(config, observation)
+            )
+            event["auth_observation_status"] = observation["status"]
+            event["auth_observation_persisted"] = persisted
+            event["auth_observation_inserted_count"] = inserted_count
+            event["auth_observation_skip_error_class"] = skip_error_class
+            event["auth_observation_skip_reason"] = skip_reason
+            events.append(event)
+
+    inventory = config.codex_oauth_inventory
+    if inventory is None:
+        if not non_codex_due:
+            return events
         try:
-            summary = inspector(*inspector_args, **inspector_kwargs)
+            summary = codex_oauth_refresh.inspect_codex_oauth_credential_health(
+                config.codex_auth_file
+            )
         except Exception as exc:
             summary = {
                 "attempted": True,
-                "refreshed": False,
-                "skipped": False,
-                "auth_file": auth_file,
                 "health_status": "malformed",
                 "error_class": exc.__class__.__name__,
                 "error_message": _redacted_failure_message(str(exc)),
             }
         event = {
-            "event": event_name,
+            "event": "codex_oauth_passive_health_inspection",
             "source_task": "provider_auth_health_poll",
             "observed_at": _utc_timestamp(),
             "environment": config.environment,
-            **{key: value for key, value in summary.items() if key != "auth_file"},
+            **{
+                key: value
+                for key, value in summary.items()
+                if key not in {"auth_file", "account_id"}
+            },
         }
         observation = _build_passive_provider_auth_observation(
             config,
             event,
-            provider=provider,
-            auth_family=auth_family,
-            auth_file=auth_file,
-            auth_file_source=auth_file_source,
-            credential_scope=summary.get(scope_field),
+            provider="openai",
+            auth_family="codex_oauth",
+            auth_file=config.codex_auth_file,
+            auth_file_source=config.codex_auth_file_source,
+            credential_scope=summary.get("account_id"),
         )
         persisted, inserted_count, skip_error_class, skip_reason = (
             _persist_passive_provider_auth_observation(config, observation)
@@ -7799,6 +8506,60 @@ def _run_provider_auth_health_poll_task(
         event["auth_observation_skip_error_class"] = skip_error_class
         event["auth_observation_skip_reason"] = skip_reason
         events.append(event)
+        return events
+
+    records = inventory.ordered_records(enabled_only=True)
+    inspected_any = False
+    for record in records:
+        last_codex_attempt = (
+            state.codex_auth_health_last_attempt_monotonic_by_label.get(record.label)
+        )
+        if (
+            last_codex_attempt is not None
+            and now_monotonic - last_codex_attempt
+            < config.provider_auth_health_poll_interval_seconds
+        ):
+            continue
+        inspected_any = True
+        state.codex_auth_health_last_attempt_monotonic_by_label[record.label] = (
+            now_monotonic
+        )
+        summary = _inspect_codex_inventory_record_health(record)
+        event = {
+            "event": "codex_oauth_passive_health_inspection",
+            "source_task": "provider_auth_health_poll",
+            "observed_at": _utc_timestamp(),
+            "environment": config.environment,
+            **summary,
+        }
+        persisted, inserted_count, skip_error_class, skip_reason = (
+            _persist_codex_passive_auth_observation(
+                config,
+                event,
+                record=record,
+            )
+        )
+        event["auth_observation_status"] = summary["health_status"]
+        event["auth_observation_persisted"] = persisted
+        event["auth_observation_inserted_count"] = inserted_count
+        event["auth_observation_skip_error_class"] = skip_error_class
+        event["auth_observation_skip_reason"] = skip_reason
+        usable = summary["health_status"] == "fresh"
+        state.codex_auth_health_usable_by_label[record.label] = usable
+        state.codex_auth_health_status_by_label[record.label] = summary[
+            "health_status"
+        ]
+        events.append(event)
+    if inspected_any or not records:
+        events.append(
+            _codex_account_aggregate_event(
+                event_name="codex_oauth_health_aggregate",
+                config=config,
+                records=records,
+                usable_by_label=state.codex_auth_health_usable_by_label,
+                status_by_label=state.codex_auth_health_status_by_label,
+            )
+        )
     return events
 
 
@@ -8258,9 +9019,9 @@ def run_due_sidecar_tasks(
         (_run_observability_anomaly_scan_task, "observability_anomaly_scan"),
     ):
         try:
-            event = runner(config, state, now_monotonic=now)
+            result = runner(config, state, now_monotonic=now)
         except Exception as exc:
-            event = {
+            result = {
                 "event": event_name,
                 "observed_at": _utc_timestamp(),
                 "environment": config.environment,
@@ -8268,8 +9029,10 @@ def run_due_sidecar_tasks(
                 "error_class": exc.__class__.__name__,
                 "error_message": _redacted_failure_message(str(exc)),
             }
-        if event is not None:
-            events.append(event)
+        if isinstance(result, list):
+            events.extend(result)
+        elif result is not None:
+            events.append(result)
     events.extend(
         _run_provider_auth_health_poll_task(
             config,
@@ -8278,6 +9041,74 @@ def run_due_sidecar_tasks(
         )
     )
     return events
+
+
+def _sidecar_one_shot_policy(event: Mapping[str, Any]) -> str:
+    event_name = str(event.get("event") or "")
+    if event_name in {
+        "grok_oidc_refresh",
+        "codex_oauth_refresh",
+        "xai_oauth_refresh",
+    }:
+        return "required"
+    if event_name.endswith("_aggregate"):
+        return "summary"
+    return "optional"
+
+
+def _required_one_shot_refresh_failures(
+    events: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    failures: list[Mapping[str, Any]] = []
+    for event in events:
+        if _sidecar_one_shot_policy(event) != "required":
+            continue
+        if _refresh_event_succeeded(event):
+            continue
+        failures.append(event)
+    return failures
+
+
+def _build_one_shot_status_event(
+    config: ProviderStatusLoopConfig,
+    events: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    required_events = [
+        event
+        for event in events
+        if _sidecar_one_shot_policy(event) == "required"
+    ]
+    optional_events = [
+        event
+        for event in events
+        if _sidecar_one_shot_policy(event) == "optional"
+    ]
+    failures = _required_one_shot_refresh_failures(events)
+    optional_failures = [
+        event for event in optional_events if event.get("error_class")
+    ]
+    return {
+        "event": "provider_status_sidecar_one_shot_status",
+        "observed_at": _utc_timestamp(),
+        "environment": config.environment,
+        "status": "failed" if failures else "healthy",
+        "required_task_count": len(required_events),
+        "required_failure_count": len(failures),
+        "required_tasks": [event.get("event") for event in required_events],
+        "optional_status": "degraded" if optional_failures else "healthy",
+        "optional_task_count": len(optional_events),
+        "optional_failure_count": len(optional_failures),
+        "optional_tasks": [event.get("event") for event in optional_events],
+        "required_failures": [
+            {
+                "task": failure.get("event"),
+                "account_label": failure.get("account_label"),
+                "account_hash": failure.get("account_hash"),
+                "error_class": failure.get("error_class"),
+            }
+            for failure in failures
+        ],
+    }
 
 
 def _emit(payload: Dict[str, Any]) -> None:
@@ -8293,7 +9124,19 @@ def _utc_timestamp() -> str:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    config = parse_config(argv)
+    try:
+        config = parse_config(argv)
+    except Exception as exc:
+        _emit(
+            {
+                "event": "provider_status_observations_config_error",
+                "observed_at": _utc_timestamp(),
+                "environment": os.getenv("AAWM_LITELLM_ENVIRONMENT", "dev"),
+                "error_class": exc.__class__.__name__,
+                "error_message": _redacted_failure_message(str(exc)),
+            }
+        )
+        return 1
     try:
         validate_runtime_guardrails(config)
     except Exception as exc:
@@ -8352,7 +9195,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if config.once:
                 return 1
         try:
-            for event in run_due_sidecar_tasks(config, sidecar_state):
+            sidecar_events = run_due_sidecar_tasks(config, sidecar_state)
+            for event in sidecar_events:
                 _emit(event)
         except Exception as exc:
             _emit(
@@ -8370,7 +9214,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 return 1
 
         if config.once:
-            return 0
+            one_shot_status = _build_one_shot_status_event(
+                config,
+                sidecar_events,
+            )
+            _emit(one_shot_status)
+            return 1 if one_shot_status["required_failure_count"] else 0
 
         remaining_seconds = config.interval_seconds - (time.monotonic() - cycle_started)
         while remaining_seconds > 0 and not stopping:

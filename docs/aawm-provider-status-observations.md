@@ -74,11 +74,13 @@ single credential writer but `provider_auth_observations` and
 `provider_auth_current` still need fresh health state.
 
 The inspection performs local file reads only. It does not acquire credential
-locks, repair metadata, write files, or make network calls. Each provider emits
-one sanitized event with a health status of `fresh`, `expired`, `degraded`, or
-`malformed`; the event omits the credential path and all token values. Persisted
-rows use `source_task=provider_auth_health_poll` and metadata flags
-`passive_read_only=true`, `network_calls=false`, and
+locks, repair metadata, write files, or make network calls. Each non-Codex
+provider emits one sanitized event. Codex emits one event per enabled inventory
+record plus `codex_oauth_health_aggregate`. Health is `healthy` when every
+enabled record is fresh, `degraded` when some remain usable, and `terminal`
+when none are usable. Events omit credential paths, raw account IDs, and all
+token values. Persisted rows use `source_task=provider_auth_health_poll` and
+metadata flags `passive_read_only=true`, `network_calls=false`, and
 `credential_file_mutated=false`.
 
 Relevant environment variables:
@@ -103,13 +105,15 @@ Neither mount enrolls files: only paths named in the inventory are eligible,
 and there is no `~/.codex/auth.json`, glob, backup-file, or `api.openai.com`
 fallback for proxy requests.
 
-OPENAI-001 does not add multi-account scheduling, quota polling, or routing.
-The current sidecar refresh, passive health, and reset-credit tasks still use
-one `AAWM_CODEX_AUTH_FILE` / `AAWM_CODEX_LOCK_FILE` pair; development Compose
-points that pair at `account1`. `account2` is mounted and enrolled in the
-read-only proxy inventory but is not scheduled by those tasks until OPENAI-002.
-Per-account quota persistence remains OPENAI-003 and account routing remains
-OPENAI-004.
+The sidecar loads this inventory whenever Codex refresh, passive health, or
+quota polling is enabled. Every enabled record has independent refresh,
+passive-health, and quota timers. One timeout, malformed/revoked credential,
+identity mismatch, or lock conflict is recorded for that label and does not
+suppress later records, including an otherwise idle `account2`. Refresh and
+health aggregates are `healthy` when every enabled record is usable,
+`degraded` when some are usable, and `terminal` when none are usable. Events
+emit only the configured label and pinned safe hash for account identity.
+Account-aware request routing remains separate OPENAI-004 scope.
 
 Enrollment, removal, label/hash handling, permissions, rotation, and rollback
 are defined in `docs/aawm-oauth-credential-maintenance.md`.
@@ -151,6 +155,10 @@ Relevant environment variables:
 - `AAWM_GROK_OIDC_FORCE_REFRESH`: when true, refreshes on every scheduled
   attempt even if the current token still appears valid.
 - `AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS`: token endpoint timeout.
+
+Credential lock acquisition is nonblocking and fail closed. A held lock,
+unavailable `fcntl`, or failed lock open/acquisition aborts that refresh without
+an unlocked write or an indefinite wait.
 
 Each due attempt emits a separate `grok_oidc_refresh` JSON line with sanitized
 status fields such as `attempted`, `refreshed`, `skipped`, `auth_file`,
@@ -631,17 +639,21 @@ parity.
 
 ## Codex Reset-Credit Poll Task
 
-The same sidecar can run an explicit hourly Codex banked usage-limit reset-credit
-poll. This is telemetry-only and separate from the five-minute provider front-door
-probes, Codex OAuth refresh, and Grok billing poll. The poll reads the current
-Codex OAuth credential from the compatibility `AAWM_CODEX_AUTH_FILE` record
-(`account1` in development Compose), calls the native ChatGPT reset-credit
-**detail** endpoint (default
-`https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`) with
-`Authorization: Bearer <token>` and `ChatGPT-Account-Id` when the auth file
-includes an account id, and persists sanitized rows to
-`public.provider_credit_observations` (not `public.rate_limit_observations`).
-It does not iterate the ordered inventory under OPENAI-001.
+The same sidecar can run an explicit hourly Codex reset-credit and quota poll.
+This is telemetry-only and separate from the five-minute provider front-door
+probes, Codex OAuth refresh, and Grok billing poll. The poll independently reads
+every enabled `LITELLM_CODEX_OAUTH_INVENTORY` record, calls the native ChatGPT
+reset-credit **detail** endpoint (default
+`https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`) with that
+record's exact `Authorization: Bearer <token>` and `ChatGPT-Account-Id`
+headers, and continues to the next record after an account-specific failure.
+Reset-credit rows use `public.provider_credit_observations`; native five-hour
+and seven-day quota windows are submitted as observation-only records to the
+existing `litellm.integrations.aawm_session_history` structured writer. That
+owner performs meaningful-change filtering, previous-observation lookup,
+transition generation, queue/spool/retry handling, and durable
+`public.rate_limit_observations` persistence. The provider-status script does
+not define a second quota SQL writer or mutate the observation schema.
 
 `AAWM_CODEX_USAGE_URL` remains the backward-compatible env name for the poll URL.
 If it is still set to the legacy aggregate URL (`/backend-api/wham/usage`), the
@@ -684,12 +696,36 @@ omit `client` and `client_version`. Inserts dedupe on the latest row per
 `credit_identity` when status, counts, timestamps, and annotations are unchanged.
 
 Each due attempt emits `codex_reset_credit_poll` with sanitized fields such as
-`attempted`, `persisted`, `status_code`, `attempt_count`, `retry_count`,
-`available_count`, `inserted_count`, `poll_url`, `error_class`, and
-`error_message`. Events must not contain access tokens, refresh tokens, raw auth
-headers, account ids, or emails.
+`account_label`, `account_hash`, `attempted`, `persisted`, `status_code`,
+`attempt_count`, `retry_count`, `available_count`, `inserted_count`,
+`quota_accepted_count`, `quota_storage_status`, `quota_window_states`,
+`quota_period_states`, `quota_health`, `poll_url`, `error_class`, and
+`error_message`. `inserted_count` covers the synchronous reset-credit writer;
+quota rows report `quota_storage_status=queued` and an accepted count because
+the authoritative session-history writer applies filtering and insertion
+asynchronously. The paired quota windows are healthy only when both five-hour
+and seven-day observations are fresh. Stale or unknown windows retain their
+reset/freshness evidence but store no fabricated remaining or used percentage.
+Upstream scope and model are stored only when the response actually supplies
+them; a model-like limit name is not promoted to model specificity.
+
+`codex_quota_poll_aggregate` is `healthy` when every enabled account has both
+fresh windows, `degraded` when at least one account has usable fresh quota
+state, and `terminal` when none do. Events must not contain access tokens,
+refresh tokens, raw auth headers, account IDs, emails, or credential paths.
 
 The detail endpoint is undocumented and provider-owned; shape may change without notice.
+
+## One-Shot Exit Policy
+
+With `--once`, enabled `grok_oidc_refresh`, per-account
+`codex_oauth_refresh`, and `xai_oauth_refresh` events are required tasks.
+A successful refresh or successful no-op/skipped refresh satisfies the task.
+Any required failure returns a non-zero process status. Telemetry, metadata
+repair, passive health, Kimi work, and aggregate events are optional; their
+failures are reported as optional degradation without changing the required
+exit status. Native Grok OIDC and managed xAI OAuth remain separate credential
+families and tasks.
 
 
 ## Observability Anomaly Scan Task

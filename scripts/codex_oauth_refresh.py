@@ -181,8 +181,8 @@ def refresh_codex_oauth_auth_file(
             ),
         ).as_dict()
 
-    with _credential_file_lock(resolved_lock_file):
-        try:
+    try:
+        with _credential_file_lock(resolved_lock_file):
             auth_data = _read_auth_data(resolved_auth_file)
             _repair_credential_file_metadata(
                 resolved_auth_file,
@@ -232,19 +232,19 @@ def refresh_codex_oauth_auth_file(
                 account_id=_extract_account_id(token_data),
                 expires_at=_format_expires_at(_get_token_expiry(token_data)),
             ).as_dict()
-        except Exception as exc:
-            return CodexOAuthRefreshSummary(
-                attempted=True,
-                refreshed=False,
-                skipped=False,
-                auth_file=str(resolved_auth_file),
-                error_class=exc.__class__.__name__,
-                error_message=_refresh_error_message(
-                    exc,
-                    credential_record=credential_record,
-                ),
-                error_hint=_extract_oauth_error_hint(exc),
-            ).as_dict()
+    except Exception as exc:
+        return CodexOAuthRefreshSummary(
+            attempted=True,
+            refreshed=False,
+            skipped=False,
+            auth_file=str(resolved_auth_file),
+            error_class=exc.__class__.__name__,
+            error_message=_refresh_error_message(
+                exc,
+                credential_record=credential_record,
+            ),
+            error_hint=_extract_oauth_error_hint(exc),
+        ).as_dict()
 
 
 def refresh_codex_oauth_inventory_record(
@@ -322,7 +322,7 @@ def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
 
 @contextmanager
 def _credential_file_lock(lock_path: Path) -> Iterator[None]:
-    """Delegate to shared credential_file_lock (module-scoped fcntl + warnings)."""
+    """Delegate to shared nonblocking, fail-closed credential_file_lock."""
     with credential_file_lock(lock_path):
         yield
 

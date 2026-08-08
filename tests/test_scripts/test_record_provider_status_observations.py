@@ -15,6 +15,12 @@ import pytest
 
 from litellm.integrations import aawm_agent_identity
 from litellm.llms.xai import oauth
+from litellm.secret_managers.codex_oauth_inventory import (
+    CodexOAuthCredentialRecord,
+    CodexOAuthCredentialSnapshot,
+    CodexOAuthInventory,
+    codex_oauth_account_identity_hash,
+)
 from scripts import codex_oauth_refresh
 from scripts import grok_oidc_refresh
 from scripts import kimi_oauth_refresh
@@ -29,6 +35,66 @@ def _build_test_jwt(payload: dict) -> str:
         return encoded.rstrip(b"=").decode("ascii")
 
     return f"{encode_part({'alg': 'none'})}.{encode_part(payload)}.sig"
+
+
+def _codex_oauth_record(
+    label: str,
+    *,
+    declaration_order: int,
+    root: Path = Path("/home/zepfu/.codex"),
+    enabled: bool = True,
+) -> CodexOAuthCredentialRecord:
+    account_id = f"acct-{label}"
+    return CodexOAuthCredentialRecord(
+        label=label,
+        auth_path=root / f"oauth.{label}.json",
+        lock_path=root / f"oauth.{label}.json.lock",
+        priority=(declaration_order + 1) * 10,
+        weight=1.0,
+        enabled=enabled,
+        models=("*",),
+        expected_account_hash=codex_oauth_account_identity_hash(account_id),
+        declaration_order=declaration_order,
+    )
+
+
+def _codex_oauth_inventory(
+    *labels: str,
+    root: Path = Path("/home/zepfu/.codex"),
+) -> CodexOAuthInventory:
+    selected_labels = labels or ("account1", "account2")
+    return CodexOAuthInventory(
+        records=tuple(
+            _codex_oauth_record(
+                label,
+                declaration_order=index,
+                root=root,
+            )
+            for index, label in enumerate(selected_labels)
+        )
+    )
+
+
+def _codex_oauth_inventory_env_payload() -> str:
+    inventory = _codex_oauth_inventory()
+    return json.dumps(
+        {
+            "schema_version": 1,
+            "accounts": [
+                {
+                    "label": record.label,
+                    "auth_path": str(record.auth_path),
+                    "lock_path": str(record.lock_path),
+                    "priority": record.priority,
+                    "weight": record.weight,
+                    "enabled": record.enabled,
+                    "models": list(record.models),
+                    "expected_account_hash": record.expected_account_hash,
+                }
+                for record in inventory.records
+            ],
+        }
+    )
 
 
 def _provider_status_row() -> dict:
@@ -1260,10 +1326,10 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
     assert "- /home/zepfu/.codex:/home/zepfu/.codex" in compose_text
     assert compose_text.count("- *codex-oauth-inventory") == 2
     assert "LITELLM_CODEX_AUTH_FILE=" not in compose_text
+    assert "AAWM_CODEX_AUTH_FILE=" not in compose_text
+    assert "AAWM_CODEX_LOCK_FILE=" not in compose_text
     for expected_codex_setting in (
         "AAWM_CODEX_OAUTH_REFRESH_ENABLED=${AAWM_CODEX_OAUTH_REFRESH_ENABLED:-1}",
-        "AAWM_CODEX_AUTH_FILE=${AAWM_CODEX_AUTH_FILE:-/home/zepfu/.codex/oauth.account1.json}",
-        "AAWM_CODEX_LOCK_FILE=${AAWM_CODEX_LOCK_FILE:-/home/zepfu/.codex/oauth.account1.json.lock}",
         "AAWM_CODEX_AUTH_FILE_UID=${AAWM_CODEX_AUTH_FILE_UID:-1000}",
         "AAWM_CODEX_AUTH_FILE_GID=${AAWM_CODEX_AUTH_FILE_GID:-1000}",
         "AAWM_CODEX_AUTH_FILE_MODE=${AAWM_CODEX_AUTH_FILE_MODE:-0o600}",
@@ -5465,6 +5531,7 @@ def _codex_oauth_auth_persist_config(**overrides):
     config = _grok_oidc_auth_persist_config(
         grok_oidc_refresh_enabled=False,
         codex_oauth_refresh_enabled=True,
+        codex_oauth_inventory=_codex_oauth_inventory("account1"),
         codex_auth_file="/home/zepfu/.codex/auth.json",
         codex_auth_file_source="default",
         codex_lock_file="/home/zepfu/.codex/auth.json.lock",
@@ -5479,6 +5546,7 @@ def _codex_oauth_auth_persist_config(**overrides):
 
 
 def _codex_oauth_refresh_sidecar_event(**overrides) -> dict:
+    record = _codex_oauth_inventory("account1").records[0]
     event = {
         "event": "codex_oauth_refresh",
         "observed_at": "2026-06-19T12:00:00Z",
@@ -5486,8 +5554,8 @@ def _codex_oauth_refresh_sidecar_event(**overrides) -> dict:
         "attempted": True,
         "refreshed": True,
         "skipped": False,
-        "auth_file": "/home/zepfu/.codex/auth.json",
-        "account_id": "acct_refreshed",
+        "account_label": record.label,
+        "account_hash": record.expected_account_hash,
         "expires_at": "2026-06-19T13:00:00Z",
         "error_class": None,
         "error_message": None,
@@ -5498,17 +5566,22 @@ def _codex_oauth_refresh_sidecar_event(**overrides) -> dict:
 
 def test_build_codex_oauth_auth_observation_maps_successful_refresh() -> None:
     config = _codex_oauth_auth_persist_config()
+    record = config.codex_oauth_inventory.records[0]
     event = _codex_oauth_refresh_sidecar_event()
 
-    observation = loop._build_codex_auth_observation(config, event)
+    observation = loop._build_codex_auth_observation(
+        config,
+        event,
+        record=record,
+    )
 
     assert observation["observed_at"] == datetime(2026, 6, 19, 12, 0, tzinfo=timezone.utc)
     assert observation["environment"] == "dev"
     assert observation["provider"] == "openai"
     assert observation["auth_family"] == "codex_oauth"
-    assert observation["credential_scope"] == "acct_refreshed"
+    assert observation["credential_scope"] == "account1"
     assert observation["auth_file_hash"] == hashlib.sha256(
-        event["auth_file"].encode("utf-8")
+        str(record.auth_path).encode("utf-8")
     ).hexdigest()
     assert observation["status"] == "refreshed"
     assert observation["attempted"] is True
@@ -5517,7 +5590,9 @@ def test_build_codex_oauth_auth_observation_maps_successful_refresh() -> None:
     assert observation["expires_at"] == datetime(2026, 6, 19, 13, 0, tzinfo=timezone.utc)
     assert observation["last_success_at"] == observation["observed_at"]
     assert observation["source_task"] == "codex_oauth_refresh"
-    assert observation["metadata"]["auth_file_source"] == "default"
+    assert observation["metadata"]["auth_file_source"] == "codex_oauth_inventory"
+    assert observation["metadata"]["account_label"] == "account1"
+    assert observation["metadata"]["account_hash"] == record.expected_account_hash
     observation_json = json.dumps(observation, default=str)
     assert "refresh_token" not in observation_json
     assert "access_token" not in observation_json
@@ -5526,6 +5601,7 @@ def test_build_codex_oauth_auth_observation_maps_successful_refresh() -> None:
 
 def test_build_codex_oauth_auth_observation_sanitizes_refresh_failure() -> None:
     config = _codex_oauth_auth_persist_config()
+    record = config.codex_oauth_inventory.records[0]
     event = _codex_oauth_refresh_sidecar_event(
         refreshed=False,
         skipped=False,
@@ -5537,7 +5613,11 @@ def test_build_codex_oauth_auth_observation_sanitizes_refresh_failure() -> None:
         ),
     )
 
-    observation = loop._build_codex_auth_observation(config, event)
+    observation = loop._build_codex_auth_observation(
+        config,
+        event,
+        record=record,
+    )
 
     assert observation["status"] == "failed"
     assert observation["last_success_at"] is None
@@ -5554,26 +5634,29 @@ def test_run_due_sidecar_tasks_persists_codex_auth_observation_when_apply_enable
         codex_force_refresh=True,
         codex_refresh_interval_seconds=3600.0,
     )
+    record = config.codex_oauth_inventory.records[0]
     captured = {}
 
     monkeypatch.setattr(
         loop.codex_oauth_refresh,
-        "refresh_codex_oauth_auth_file",
-        lambda *_args, **_kwargs: {
+        "refresh_codex_oauth_inventory_record",
+        lambda selected_record, **_kwargs: {
             "attempted": True,
             "refreshed": True,
             "skipped": False,
-            "auth_file": config.codex_auth_file,
-            "account_id": "acct_refreshed",
+            "account_label": selected_record.label,
+            "account_hash": selected_record.expected_account_hash,
             "expires_at": "2026-06-19T13:00:00Z",
             "error_class": None,
             "error_message": None,
+            "error_hint": None,
         },
     )
 
-    def fake_persist(persist_config, event):
+    def fake_persist(persist_config, event, *, record=None):
         captured["config"] = persist_config
         captured["event"] = dict(event)
+        captured["record"] = record
         return True, 1, None, None
 
     monkeypatch.setattr(loop, "_persist_codex_auth_observation", fake_persist)
@@ -5590,7 +5673,145 @@ def test_run_due_sidecar_tasks_persists_codex_auth_observation_when_apply_enable
     assert refresh_events[0]["auth_observation_persisted"] is True
     assert refresh_events[0]["auth_observation_inserted_count"] == 1
     assert captured["config"] is config
-    assert captured["event"]["account_id"] == "acct_refreshed"
+    assert captured["event"]["account_label"] == "account1"
+    assert captured["event"]["account_hash"] == record.expected_account_hash
+    assert captured["record"] is record
+
+
+def test_codex_inventory_refresh_isolates_failures_and_keeps_label_timers(
+    monkeypatch,
+) -> None:
+    inventory = _codex_oauth_inventory("account1", "account2")
+    config = _codex_oauth_auth_persist_config(
+        apply=False,
+        codex_oauth_inventory=inventory,
+    )
+    calls = []
+
+    def fake_refresh(record, **_kwargs):
+        calls.append(record.label)
+        if record.label == "account1":
+            raise RuntimeError(
+                f"failed {record.auth_path} account=acct-account1 token=secret-token"
+            )
+        return {
+            "attempted": False,
+            "refreshed": False,
+            "skipped": True,
+            "account_label": record.label,
+            "account_hash": record.expected_account_hash,
+            "expires_at": "2026-08-08T18:00:00Z",
+            "error_class": None,
+            "error_message": None,
+            "error_hint": None,
+        }
+
+    monkeypatch.setattr(
+        loop.codex_oauth_refresh,
+        "refresh_codex_oauth_inventory_record",
+        fake_refresh,
+    )
+
+    state = loop.SidecarTaskState()
+    events = loop._run_codex_oauth_refresh_task(
+        config,
+        state,
+        now_monotonic=100.0,
+    )
+
+    refresh_events = [
+        event for event in events if event["event"] == "codex_oauth_refresh"
+    ]
+    aggregate = next(
+        event for event in events if event["event"] == "codex_oauth_refresh_aggregate"
+    )
+    assert calls == ["account1", "account2"]
+    assert [event["account_label"] for event in refresh_events] == [
+        "account1",
+        "account2",
+    ]
+    assert aggregate["health"] == "degraded"
+    assert aggregate["usable_count"] == 1
+    rendered = json.dumps(events)
+    assert "/home/zepfu/.codex" not in rendered
+    assert "acct-account1" not in rendered
+    assert "secret-token" not in rendered
+
+    calls.clear()
+    state.codex_oauth_last_attempt_monotonic_by_label = {"account1": 150.0}
+    state.codex_oauth_usable_by_label = {"account1": True}
+    state.codex_oauth_status_by_label = {"account1": "skipped"}
+    loop._run_codex_oauth_refresh_task(
+        config,
+        state,
+        now_monotonic=200.0,
+    )
+    assert calls == ["account2"]
+
+    terminal = loop._codex_account_aggregate_event(
+        event_name="codex_oauth_refresh_aggregate",
+        config=config,
+        records=inventory.records,
+        usable_by_label={"account1": False, "account2": False},
+        status_by_label={"account1": "failed", "account2": "failed"},
+    )
+    assert terminal["health"] == "terminal"
+
+
+def test_codex_inventory_passive_health_isolates_records(monkeypatch) -> None:
+    inventory = _codex_oauth_inventory("account1", "account2")
+    config = _grok_oidc_auth_persist_config(
+        grok_oidc_refresh_enabled=False,
+        codex_oauth_inventory=inventory,
+        provider_auth_health_poll_enabled=True,
+        provider_auth_health_poll_interval_seconds=3600.0,
+    )
+    inspected = []
+
+    def fake_inspect(record):
+        inspected.append(record.label)
+        if record.label == "account1":
+            return {
+                "attempted": True,
+                "health_status": "malformed",
+                "account_label": record.label,
+                "account_hash": record.expected_account_hash,
+                "expires_at": None,
+                "error_class": "ValueError",
+                "error_message": "account1 health inspection failed.",
+            }
+        return {
+            "attempted": True,
+            "health_status": "fresh",
+            "account_label": record.label,
+            "account_hash": record.expected_account_hash,
+            "expires_at": "2026-08-08T18:00:00Z",
+            "error_class": None,
+            "error_message": None,
+        }
+
+    monkeypatch.setattr(loop, "_inspect_codex_inventory_record_health", fake_inspect)
+    monkeypatch.setattr(
+        loop,
+        "_persist_codex_passive_auth_observation",
+        lambda *_args, **_kwargs: (False, 0, None, "apply_disabled"),
+    )
+    state = loop.SidecarTaskState(
+        provider_auth_health_poll_last_attempt_monotonic=100.0
+    )
+
+    events = loop._run_provider_auth_health_poll_task(
+        config,
+        state,
+        now_monotonic=200.0,
+    )
+
+    assert inspected == ["account1", "account2"]
+    aggregate = next(
+        event for event in events if event["event"] == "codex_oauth_health_aggregate"
+    )
+    assert aggregate["health"] == "degraded"
+    assert aggregate["usable_count"] == 1
 
 
 def _xai_oauth_auth_persist_config(**overrides):
@@ -5856,6 +6077,7 @@ def _codex_reset_credit_poll_config(**overrides):
         db_statement_timeout_ms=5000,
         grok_oidc_refresh_enabled=False,
         codex_oauth_refresh_enabled=False,
+        codex_oauth_inventory=_codex_oauth_inventory("account1"),
         codex_auth_file="/home/zepfu/.codex/auth.json",
         codex_auth_file_source="AAWM_CODEX_AUTH_FILE",
         codex_reset_credit_poll_enabled=True,
@@ -5906,10 +6128,42 @@ def _codex_reset_credit_payload_detail(**overrides) -> dict:
     payload.update(overrides)
     return payload
 
+
+def _codex_quota_payload(
+    *,
+    primary_reset: str = "2026-08-08T18:00:00Z",
+    secondary_reset: str = "2026-08-15T12:00:00Z",
+    model: str | None = None,
+) -> dict:
+    rate_limits = {
+        "limit_id": "codex_bengalfox",
+        "limit_name": "GPT-5.3-Codex-Spark",
+        "primary": {
+            "used_percent": 12.5,
+            "window_minutes": 300,
+            "resets_at": primary_reset,
+        },
+        "secondary": {
+            "used_percent": 51.0,
+            "window_minutes": 10080,
+            "resets_at": secondary_reset,
+        },
+    }
+    if model is not None:
+        rate_limits["model"] = model
+    return {
+        "rate_limit_reset_credits": {"available_count": 2},
+        "rate_limits": rate_limits,
+    }
+
+
 def _codex_reset_credit_auth_context(**overrides) -> dict:
+    record = _codex_oauth_inventory("account1").records[0]
     context = {
         "access_token": "access-token-secret",
-        "account_id": "acct-openai-primary",
+        "account_id": "acct-account1",
+        "account_label": record.label,
+        "account_hash": record.expected_account_hash,
     }
     context.update(overrides)
     return context
@@ -5945,10 +6199,10 @@ def test_build_codex_reset_credit_request_headers_includes_account_id_without_se
     )
 
     assert headers["authorization"] == "Bearer access-token-secret"
-    assert headers["ChatGPT-Account-Id"] == "acct-openai-primary"
+    assert headers["ChatGPT-Account-Id"] == "acct-account1"
     headers_json = json.dumps(headers)
     assert "refresh_token" not in headers_json
-    assert "acct-openai-primary" in headers_json
+    assert "acct-account1" in headers_json
 
 
 def test_account_identity_hash_uses_stable_short_sha256_prefix() -> None:
@@ -6058,6 +6312,10 @@ def test_insert_provider_credit_observations_returns_changed_rowcount(monkeypatc
 
 
 def test_loop_config_reads_codex_reset_credit_poll_env_defaults(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "LITELLM_CODEX_OAUTH_INVENTORY",
+        _codex_oauth_inventory_env_payload(),
+    )
     monkeypatch.setenv("AAWM_CODEX_RESET_CREDIT_POLL_ENABLED", "1")
     monkeypatch.setenv("AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS", "7200")
     monkeypatch.setenv("AAWM_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS", "45")
@@ -6076,6 +6334,26 @@ def test_loop_config_reads_codex_reset_credit_poll_env_defaults(monkeypatch) -> 
     assert config.codex_usage_url == "https://chatgpt.com/backend-api/wham/usage?lane=dev"
     assert config.codex_reset_credit_poll_max_attempts == 5
     assert config.codex_reset_credit_poll_retry_backoff_seconds == 1.25
+
+
+def test_loop_config_loads_codex_inventory_for_passive_health(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "LITELLM_CODEX_OAUTH_INVENTORY",
+        _codex_oauth_inventory_env_payload(),
+    )
+    monkeypatch.setenv("AAWM_PROVIDER_AUTH_HEALTH_POLL_ENABLED", "1")
+    monkeypatch.setenv("AAWM_CODEX_OAUTH_REFRESH_ENABLED", "0")
+    monkeypatch.setenv("AAWM_CODEX_RESET_CREDIT_POLL_ENABLED", "0")
+
+    config = loop.parse_config([])
+
+    assert config.codex_oauth_inventory is not None
+    assert [
+        record.label
+        for record in config.codex_oauth_inventory.ordered_records(
+            enabled_only=True
+        )
+    ] == ["account1", "account2"]
 
 
 def test_run_due_sidecar_tasks_skips_when_codex_reset_credit_poll_disabled(monkeypatch) -> None:
@@ -6120,11 +6398,16 @@ def test_run_due_sidecar_tasks_throttles_codex_reset_credit_poll(monkeypatch) ->
     third_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=3701.0)
 
     assert calls == {"fetch": 2}
-    assert first_events[-1]["event"] == "codex_reset_credit_poll"
-    assert first_events[-1]["available_count"] == 2
-    assert first_events[-1]["inserted_count"] == 0
+    first_poll = next(
+        event for event in first_events if event["event"] == "codex_reset_credit_poll"
+    )
+    third_poll = next(
+        event for event in third_events if event["event"] == "codex_reset_credit_poll"
+    )
+    assert first_poll["available_count"] == 2
+    assert first_poll["inserted_count"] == 0
     assert second_events == []
-    assert third_events[-1]["event"] == "codex_reset_credit_poll"
+    assert third_poll["available_count"] == 2
 
 
 def test_run_due_sidecar_tasks_emits_codex_reset_credit_poll_event(monkeypatch) -> None:
@@ -6166,6 +6449,317 @@ def test_run_due_sidecar_tasks_emits_codex_reset_credit_poll_event(monkeypatch) 
     assert "access-token-secret" not in event_json
     assert "acct-openai-primary" not in event_json
     assert '"account_id"' not in event_json
+
+
+def test_codex_quota_observations_keep_distinct_fresh_windows_without_inventing_model() -> None:
+    config = _codex_reset_credit_poll_config(apply=False)
+    record = config.codex_oauth_inventory.records[0]
+    observed_at = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+
+    rows, summary = loop._build_codex_quota_rate_limit_observations(
+        config,
+        record=record,
+        observed_at=observed_at,
+        response_body=_codex_quota_payload(),
+    )
+
+    assert summary["required_periods_fresh"] is True
+    assert summary["period_states"] == {
+        "five_hour": "fresh",
+        "seven_day": "fresh",
+    }
+    by_period = {row["quota_period"]: row for row in rows}
+    assert by_period["five_hour"]["remaining_pct"] == 87.5
+    assert by_period["seven_day"]["remaining_pct"] == 49.0
+    assert by_period["five_hour"]["provider_resets_at"] == datetime(
+        2026,
+        8,
+        8,
+        18,
+        0,
+        tzinfo=timezone.utc,
+    )
+    assert all(row["account_hash"] == record.expected_account_hash for row in rows)
+    assert all(row["evidence"]["account_label"] == "account1" for row in rows)
+    assert all(row["model"] is None for row in rows)
+    assert all(
+        row["evidence"]["upstream_scope"] == "codex_bengalfox" for row in rows
+    )
+
+
+def test_codex_quota_stale_and_unknown_windows_are_not_healthy() -> None:
+    config = _codex_reset_credit_poll_config(apply=False)
+    record = config.codex_oauth_inventory.records[0]
+    payload = _codex_quota_payload(model="gpt-5.3-codex-spark")
+    payload["rate_limits"]["primary"]["resets_at"] = "2026-08-08T11:00:00Z"
+    payload["rate_limits"]["secondary"].pop("resets_at")
+
+    rows, summary = loop._build_codex_quota_rate_limit_observations(
+        config,
+        record=record,
+        observed_at=datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc),
+        response_body=payload,
+    )
+
+    assert summary["required_periods_fresh"] is False
+    assert summary["period_states"] == {
+        "five_hour": "stale",
+        "seven_day": "unknown",
+    }
+    assert summary["fresh_window_count"] == 0
+    assert {row["status"] for row in rows} == {"stale", "unknown"}
+    assert all(row["remaining_pct"] is None for row in rows)
+    assert all(row["used_percentage"] is None for row in rows)
+    assert all(row["exhausted"] is False for row in rows)
+    assert all(row["model"] == "gpt-5.3-codex-spark" for row in rows)
+
+
+def test_codex_quota_poll_uses_each_inventory_records_exact_headers(
+    monkeypatch,
+) -> None:
+    inventory = _codex_oauth_inventory("account1", "account2")
+    config = _codex_reset_credit_poll_config(
+        apply=False,
+        codex_oauth_inventory=inventory,
+    )
+    snapshots = {
+        record.label: CodexOAuthCredentialSnapshot(
+            record=record,
+            account_hash=record.expected_account_hash,
+            expires_at=time.time() + 3600,
+            access_token=f"token-{record.label}",
+            account_id=f"acct-{record.label}",
+        )
+        for record in inventory.records
+    }
+    requests = []
+
+    monkeypatch.setattr(
+        loop,
+        "load_codex_oauth_credential",
+        lambda record: snapshots[record.label],
+    )
+
+    def fake_urlopen(request, timeout):
+        requests.append(
+            (
+                request.get_header("Authorization"),
+                request.get_header("Chatgpt-account-id"),
+                timeout,
+            )
+        )
+        return _FakeAlibabaHTTPResponse(json.dumps(_codex_quota_payload()))
+
+    monkeypatch.setattr(loop.urllib_request, "urlopen", fake_urlopen)
+
+    for record in inventory.records:
+        loop._fetch_codex_reset_credit_payload(config, record)
+
+    assert requests == [
+        ("Bearer token-account1", "acct-account1", 30.0),
+        ("Bearer token-account2", "acct-account2", 30.0),
+    ]
+
+
+def test_codex_quota_poll_failure_does_not_suppress_other_account(
+    monkeypatch,
+) -> None:
+    inventory = _codex_oauth_inventory("account1", "account2")
+    config = _codex_reset_credit_poll_config(
+        apply=False,
+        codex_oauth_inventory=inventory,
+    )
+    calls = []
+
+    def fake_fetch(_config, record):
+        calls.append(record.label)
+        if record.label == "account1":
+            raise RuntimeError("account1 unavailable")
+        return {
+            "status_code": 200,
+            "payload": _codex_quota_payload(),
+            "auth_context": {
+                "access_token": "token-account2",
+                "account_id": "acct-account2",
+                "account_label": record.label,
+                "account_hash": record.expected_account_hash,
+            },
+            "attempt_count": 1,
+            "retry_count": 0,
+            "poll_url": probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL,
+        }
+
+    monkeypatch.setattr(loop, "_fetch_codex_reset_credit_payload", fake_fetch)
+
+    events = loop._run_codex_reset_credit_poll_task(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    assert calls == ["account1", "account2"]
+    by_label = {
+        event["account_label"]: event
+        for event in events
+        if event["event"] == "codex_reset_credit_poll"
+    }
+    assert by_label["account1"]["error_class"] == "RuntimeError"
+    assert by_label["account2"]["quota_health"] == "healthy"
+    aggregate = next(
+        event for event in events if event["event"] == "codex_quota_poll_aggregate"
+    )
+    assert aggregate["health"] == "degraded"
+
+
+def test_enqueue_codex_quota_observations_uses_session_history_writer(
+    monkeypatch,
+) -> None:
+    config = _codex_reset_credit_poll_config(apply=False)
+    record = config.codex_oauth_inventory.records[0]
+    rows, _summary = loop._build_codex_quota_rate_limit_observations(
+        config,
+        record=record,
+        observed_at=datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc),
+        response_body=_codex_quota_payload(),
+    )
+    queued = []
+    monkeypatch.setattr(
+        loop.aawm_agent_identity,
+        "_enqueue_session_history_record",
+        queued.append,
+    )
+
+    accepted = loop._enqueue_codex_quota_observations(rows)
+
+    assert accepted == 2
+    assert len(queued) == 1
+    assert queued[0]["_skip_session_history"] is True
+    assert queued[0]["rate_limit_observations"] == rows
+    assert {
+        row["account_hash"] for row in queued[0]["rate_limit_observations"]
+    } == {record.expected_account_hash}
+
+
+def test_codex_quota_poll_reports_queued_rows_not_synchronous_inserts(
+    monkeypatch,
+) -> None:
+    config = _codex_reset_credit_poll_config()
+    monkeypatch.setattr(
+        loop,
+        "_fetch_codex_reset_credit_payload",
+        lambda *_args, **_kwargs: {
+            "status_code": 200,
+            "payload": _codex_quota_payload(),
+            "auth_context": _codex_reset_credit_auth_context(),
+            "attempt_count": 1,
+            "retry_count": 0,
+            "poll_url": probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL,
+        },
+    )
+    monkeypatch.setattr(
+        loop,
+        "_persist_codex_reset_credit_observation",
+        lambda *_args, **_kwargs: (1, 1),
+    )
+    monkeypatch.setattr(
+        loop,
+        "_enqueue_codex_quota_observations",
+        lambda observations: len(observations),
+    )
+
+    events = loop._run_codex_reset_credit_poll_task(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    poll = next(
+        event for event in events if event["event"] == "codex_reset_credit_poll"
+    )
+    assert poll["credit_inserted_count"] == 1
+    assert poll["quota_observation_count"] == 2
+    assert poll["quota_accepted_count"] == 2
+    assert poll["quota_storage_status"] == "queued"
+    assert poll["inserted_count"] == 1
+    assert "quota_inserted_count" not in poll
+    assert "quota_persisted" not in poll
+
+
+@pytest.mark.parametrize(
+    ("sidecar_events", "expected_exit", "expected_status", "optional_status"),
+    [
+        (
+            [
+                {
+                    "event": "codex_oauth_refresh",
+                    "account_label": "account1",
+                    "account_hash": "111111111111",
+                    "refreshed": False,
+                    "skipped": False,
+                    "error_class": "CredentialFileLockError",
+                }
+            ],
+            1,
+            "failed",
+            "healthy",
+        ),
+        (
+            [
+                {"event": "grok_oidc_refresh", "skipped": True},
+                {
+                    "event": "codex_oauth_refresh",
+                    "account_label": "account1",
+                    "account_hash": "111111111111",
+                    "skipped": True,
+                },
+                {"event": "xai_oauth_refresh", "skipped": True},
+            ],
+            0,
+            "healthy",
+            "healthy",
+        ),
+        (
+            [
+                {
+                    "event": "codex_reset_credit_poll",
+                    "error_class": "TimeoutError",
+                }
+            ],
+            0,
+            "healthy",
+            "degraded",
+        ),
+    ],
+)
+def test_main_once_enforces_required_refresh_policy(
+    monkeypatch,
+    sidecar_events,
+    expected_exit,
+    expected_status,
+    optional_status,
+) -> None:
+    config = _codex_reset_credit_poll_config(
+        apply=False,
+        codex_reset_credit_poll_enabled=False,
+    )
+    emitted = []
+    monkeypatch.setattr(loop, "parse_config", lambda _argv: config)
+    monkeypatch.setattr(loop, "validate_runtime_guardrails", lambda _config: None)
+    monkeypatch.setattr(loop, "run_cycle", lambda _config: {"event": "cycle"})
+    monkeypatch.setattr(
+        loop,
+        "run_due_sidecar_tasks",
+        lambda _config, _state: list(sidecar_events),
+    )
+    monkeypatch.setattr(loop.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(loop, "_emit", emitted.append)
+
+    assert loop.main(["--once"]) == expected_exit
+
+    one_shot = emitted[-1]
+    assert one_shot["event"] == "provider_status_sidecar_one_shot_status"
+    assert one_shot["status"] == expected_status
+    assert one_shot["optional_status"] == optional_status
 
 
 def test_compose_wires_codex_reset_credit_poll_defaults() -> None:

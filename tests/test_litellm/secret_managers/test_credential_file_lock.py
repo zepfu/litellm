@@ -1,11 +1,15 @@
-"""Shared credential_file_lock: exclusive flock with warning on failure."""
+"""Shared credential_file_lock: nonblocking exclusive fail-closed flock."""
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 
-from litellm.secret_managers.credential_file_lock import credential_file_lock
+import pytest
+
+from litellm.secret_managers.credential_file_lock import (
+    CredentialFileLockError,
+    credential_file_lock,
+)
 
 
 def test_credential_file_lock_creates_and_releases(tmp_path: Path) -> None:
@@ -41,43 +45,59 @@ def test_scripts_delegate_to_shared_lock() -> None:
     assert "Delegate to shared" in src
 
 
-def test_credential_file_lock_warns_when_fcntl_missing(
-    tmp_path: Path, monkeypatch, caplog
+def test_credential_file_lock_fails_closed_when_fcntl_missing(
+    tmp_path: Path, monkeypatch
 ) -> None:
     import litellm.secret_managers.credential_file_lock as lock_mod
 
     monkeypatch.setattr(lock_mod, "_fcntl", None)
     lock = tmp_path / "cred.lock"
-    with caplog.at_level(logging.WARNING, logger=lock_mod.__name__):
+    with pytest.raises(CredentialFileLockError, match="locking is unavailable"):
         with lock_mod.credential_file_lock(lock):
             pass
-    assert any("fcntl unavailable" in rec.getMessage() for rec in caplog.records)
-    joined = " ".join(rec.getMessage() for rec in caplog.records)
-    assert "secret" not in joined.lower()
-    assert "token" not in joined.lower()
 
 
-def test_credential_file_lock_warns_on_flock_oserror(
-    tmp_path: Path, monkeypatch, caplog
+def test_credential_file_lock_fails_closed_on_flock_oserror(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import litellm.secret_managers.credential_file_lock as lock_mod
+
+    operations = []
+
+    class _FakeFcntl:
+        LOCK_EX = 1
+        LOCK_UN = 2
+        LOCK_NB = 4
+
+        @staticmethod
+        def flock(fd, op):  # noqa: ARG004
+            operations.append(op)
+            raise OSError("simulated flock failure")
+
+    monkeypatch.setattr(lock_mod, "_fcntl", _FakeFcntl)
+    lock = tmp_path / "cred.lock"
+    with pytest.raises(CredentialFileLockError, match="acquisition failed"):
+        with lock_mod.credential_file_lock(lock):
+            pass
+    assert operations == [_FakeFcntl.LOCK_EX | _FakeFcntl.LOCK_NB]
+
+
+def test_credential_file_lock_fails_closed_on_contention(
+    tmp_path: Path, monkeypatch
 ) -> None:
     import litellm.secret_managers.credential_file_lock as lock_mod
 
     class _FakeFcntl:
         LOCK_EX = 1
         LOCK_UN = 2
+        LOCK_NB = 4
 
         @staticmethod
         def flock(fd, op):  # noqa: ARG004
-            raise OSError("simulated flock failure")
+            raise BlockingIOError("simulated contention")
 
     monkeypatch.setattr(lock_mod, "_fcntl", _FakeFcntl)
     lock = tmp_path / "cred.lock"
-    with caplog.at_level(logging.WARNING, logger=lock_mod.__name__):
+    with pytest.raises(CredentialFileLockError, match="already held"):
         with lock_mod.credential_file_lock(lock):
             pass
-    messages = [rec.getMessage() for rec in caplog.records]
-    assert any("LOCK_EX failed" in msg for msg in messages)
-    joined = " ".join(messages)
-    # path may appear; secrets must not
-    assert "GOCSPX" not in joined
-    assert "access_token" not in joined

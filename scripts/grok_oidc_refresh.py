@@ -196,8 +196,8 @@ def refresh_grok_oidc_auth_file(
         else resolved_auth_file.with_name(f"{resolved_auth_file.name}.lock")
     )
 
-    with _credential_file_lock(resolved_lock_file):
-        try:
+    try:
+        with _credential_file_lock(resolved_lock_file):
             raw_payload = _read_credential_payload(resolved_auth_file)
             credential = _select_credential_record(raw_payload, resolved_scope)
             current_expires_at = _format_expires_at(credential.get("expires_at"))
@@ -232,16 +232,16 @@ def refresh_grok_oidc_auth_file(
                 scope=resolved_scope,
                 expires_at=_format_expires_at(credential.get("expires_at")),
             ).as_dict()
-        except Exception as exc:
-            return GrokOidcRefreshSummary(
-                attempted=True,
-                refreshed=False,
-                skipped=False,
-                auth_file=str(resolved_auth_file),
-                scope=resolved_scope,
-                error_class=exc.__class__.__name__,
-                error_message=_sanitize_error_message(str(exc)),
-            ).as_dict()
+    except Exception as exc:
+        return GrokOidcRefreshSummary(
+            attempted=True,
+            refreshed=False,
+            skipped=False,
+            auth_file=str(resolved_auth_file),
+            scope=resolved_scope,
+            error_class=exc.__class__.__name__,
+            error_message=_sanitize_error_message(str(exc)),
+        ).as_dict()
 
 
 def repair_grok_oidc_auth_file_metadata(
@@ -258,8 +258,8 @@ def repair_grok_oidc_auth_file_metadata(
         else resolved_auth_file.with_name(f"{resolved_auth_file.name}.lock")
     )
 
-    with _credential_file_lock(resolved_lock_file):
-        try:
+    try:
+        with _credential_file_lock(resolved_lock_file):
             before = _snapshot_credential_file_metadata(resolved_auth_file)
             target_metadata = _resolve_credential_file_metadata(resolved_auth_file)
             repaired = before != target_metadata
@@ -270,14 +270,14 @@ def repair_grok_oidc_auth_file_metadata(
                 repaired=repaired,
                 auth_file=str(resolved_auth_file),
             ).as_dict()
-        except Exception as exc:
-            return GrokOidcMetadataRepairSummary(
-                attempted=True,
-                repaired=False,
-                auth_file=str(resolved_auth_file),
-                error_class=exc.__class__.__name__,
-                error_message=_sanitize_error_message(str(exc)),
-            ).as_dict()
+    except Exception as exc:
+        return GrokOidcMetadataRepairSummary(
+            attempted=True,
+            repaired=False,
+            auth_file=str(resolved_auth_file),
+            error_class=exc.__class__.__name__,
+            error_message=_sanitize_error_message(str(exc)),
+        ).as_dict()
 
 
 def _resolve_scope(scope: Optional[str]) -> str:
@@ -305,7 +305,7 @@ def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
 
 @contextmanager
 def _credential_file_lock(lock_path: Path) -> Iterator[None]:
-    """Delegate to shared credential_file_lock (module-scoped fcntl + warnings)."""
+    """Delegate to shared nonblocking, fail-closed credential_file_lock."""
     with credential_file_lock(lock_path):
         yield
 

@@ -57,7 +57,7 @@ Related deeper context:
 
 | Family | Writer | Typical consumer | Default portable auth path |
 | --- | --- | --- | --- |
-| Codex / ChatGPT OAuth | `scripts/codex_oauth_refresh.py` for one selected inventory record | LiteLLM Codex adapter routes | Explicit `LITELLM_CODEX_OAUTH_INVENTORY`; managed dev enrolls `~/.codex/oauth.account1.json` and `~/.codex/oauth.account2.json` |
+| Codex / ChatGPT OAuth | Provider-status sidecar, using `scripts/codex_oauth_refresh.py` once per enabled inventory record | LiteLLM Codex adapter routes | Explicit `LITELLM_CODEX_OAUTH_INVENTORY`; managed dev enrolls `~/.codex/oauth.account1.json` and `~/.codex/oauth.account2.json` |
 | Managed xAI OAuth (`oa_xai/*`) | `scripts/xai_oauth_refresh.py` (sidecar) | LiteLLM managed xAI OAuth routes | `~/.litellm/xai/oauth-auth.json` |
 | Grok native OIDC | `scripts/grok_oidc_refresh.py` (sidecar) | LiteLLM Grok native routes | Caller-supplied configured path |
 | Kimi Code CLI OAuth (`kimi_code`) | Existing Kimi Code CLI grant; sidecar refresh only when enabled | Configured LiteLLM Kimi Code consumers | `~/.kimi-code/credentials/kimi-code.json` |
@@ -87,8 +87,9 @@ credential path. Defaults must not hardcode a specific operator home directory.
 | Kimi Code CLI OAuth | `~/.kimi-code/credentials/kimi-code.json` | `~/.kimi-code/oauth/kimi-code` (native `proper-lockfile` creates the transient `kimi-code.lock` directory) |
 
 Override paths with the normal env vars for the family in use (for example
-`AAWM_CODEX_AUTH_FILE` / `AAWM_CODEX_LOCK_FILE` for the Codex one-file writer,
-`AAWM_XAI_OAUTH_AUTH_FILE` / `LITELLM_XAI_OAUTH_AUTH_FILE`,
+`AAWM_CODEX_AUTH_FILE` / `AAWM_CODEX_LOCK_FILE` only for the standalone Codex
+one-file primitive, `AAWM_XAI_OAUTH_AUTH_FILE` /
+`LITELLM_XAI_OAUTH_AUTH_FILE`,
 `AAWM_KIMI_OAUTH_AUTH_FILE` / `LITELLM_KIMI_OAUTH_AUTH_FILE`,
 `LITELLM_XAI_GROK_AUTH_FILE`,
 variants). Compose may bind the expanded host path into containers; the script
@@ -171,12 +172,14 @@ same read-only consumer and single-writer directory boundary.
 - An identity mismatch is a deployment or rotation error, not a reason to
   accept the new identity automatically.
 
-The current provider-status loop still schedules Codex refresh and reset-credit
-polling through one `AAWM_CODEX_AUTH_FILE` / `AAWM_CODEX_LOCK_FILE` pair.
-Development Compose points that compatibility pair at `account1`. Supplying the
-inventory to the sidecar does not yet make it iterate `account2`; OPENAI-002
-owns multi-account refresh scheduling, OPENAI-003 owns per-account quota state,
-and OPENAI-004 owns routing.
+The provider-status loop schedules refresh, passive health, and native
+reset-credit/quota polling independently for every enabled inventory record.
+Each label has separate timers and its configured lock path. A failure for one
+record does not suppress another, and successful skipped/no-op refreshes remain
+usable. Aggregate health is degraded while at least one record remains usable
+and terminal when none do. Sidecar events and observations use only the
+configured label and expected safe hash; they do not emit raw paths, account
+IDs, or tokens. Account-aware request routing remains OPENAI-004 scope.
 
 ## Shared atomic 0600 publication
 
@@ -185,7 +188,7 @@ All credential writers share the same private publish pipeline under
 
 | Module | Responsibility |
 | --- | --- |
-| `credential_file_lock.py` | Advisory `fcntl` flock; warns (never silent) if lock is unavailable |
+| `credential_file_lock.py` | Nonblocking advisory `fcntl` flock; lock unavailability or contention fails closed |
 | `credential_file_metadata.py` | Snapshot / resolve / apply uid, gid, mode |
 | `credential_file_write.py` | Private temp create + atomic publish |
 | `credential_error_sanitizer.py` | Secret-value redaction for error summaries |
@@ -205,9 +208,15 @@ Group/other permission bits are always clamped back to private `0600`. A prior
 file that was left group- or world-readable is corrected on the next successful
 publish or metadata repair cycle rather than perpetuated.
 
-Matching lock files sit beside the auth files. Writers hold the advisory lock
-for read/refresh/write, including metadata repair on skipped refresh cycles
-where the script supports that (Codex and Grok repair paths).
+Matching lock files sit beside the auth files. Writers acquire the advisory
+lock with `LOCK_EX | LOCK_NB` and hold it for read/refresh/write, including
+metadata repair on skipped refresh cycles where the script supports that
+(Codex and Grok repair paths). Missing locking support, lock-file open failure,
+or contention raises `CredentialFileLockError`; the writer performs no
+unlocked credential mutation and does not wait indefinitely. The Codex,
+managed xAI, and Grok refresh APIs catch that acquisition error at their
+existing result boundary and return a sanitized failed refresh summary, so
+sidecar and standalone callers retain the normal structured failure contract.
 
 ## Metadata env overrides
 
@@ -343,6 +352,9 @@ restart event.
 4. Run the family refresh (sidecar cycle or manual script) and inspect the
    summary: `refreshed` / `skipped` / redacted `error_message` only.
 5. Verify LiteLLM continues serving without restart once the file is updated.
+6. For `--once`, require exit `0` for enabled Grok OIDC, every enabled Codex
+   record, and managed xAI OAuth refresh. Optional telemetry degradation is
+   reported separately and does not mask required refresh failures.
 
 ## Implementation map
 

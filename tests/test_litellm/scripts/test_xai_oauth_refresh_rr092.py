@@ -123,6 +123,41 @@ def test_lock_wrapper_delegates_only_to_shared_helper(xai) -> None:
     assert src.count("refuse_symlink=True") >= 4
 
 
+def test_refresh_returns_sanitized_lock_failure(
+    xai,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.secret_managers.credential_file_lock import (
+        CredentialFileLockError,
+    )
+
+    class _FailingLock:
+        def __enter__(self):
+            raise CredentialFileLockError("Credential file lock is already held.")
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+    monkeypatch.setattr(
+        xai,
+        "_credential_file_lock",
+        lambda _lock_path: _FailingLock(),
+    )
+
+    result = xai.refresh_xai_oauth_auth_file(
+        tmp_path / "oauth-auth.json",
+        lock_file=tmp_path / "oauth-auth.json.lock",
+        force=True,
+    )
+
+    assert result["attempted"] is True
+    assert result["refreshed"] is False
+    assert result["skipped"] is False
+    assert result["error_class"] == "CredentialFileLockError"
+    assert result["error_message"] == "Credential file lock is already held."
+
+
 # ---------------------------------------------------------------------------
 # Finding #5: shared metadata helpers + mode self-heal + symlink safety
 # ---------------------------------------------------------------------------
