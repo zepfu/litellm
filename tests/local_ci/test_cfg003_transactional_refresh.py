@@ -137,6 +137,206 @@ class TestProofEnforcement:
         assert not result["passed"]
         assert any("empty semantic hash" in f for f in result["failures"])
 
+    def test_nonbasic_source_refresh_phase_preserves_full_directory_semantics(  # noqa: PLR0915
+        self, adapter, ra, monkeypatch, tmp_path
+    ):
+        basic_yaml = """\
+defaults: {}
+
+aliases:
+  - name: basic
+    candidates:
+      - provider: openrouter
+        model: or/model-a
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+      - provider: alibaba_token_plan
+        model: atp/qwen-mini
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 90
+"""
+        nonbasic_yaml = """\
+defaults: {}
+
+aliases:
+  - name: nonbasic
+    candidates:
+      - provider: openrouter
+        model: gpt-test-1
+        route_family: codex_openrouter_completion_adapter
+        priority: 200
+      - provider: openrouter
+        model: or/model-b
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+"""
+        (tmp_path / "basic.yaml").write_text(basic_yaml, encoding="utf-8")
+        nonbasic_path = tmp_path / "nonbasic.yaml"
+        nonbasic_path.write_text(nonbasic_yaml, encoding="utf-8")
+
+        monkeypatch.setattr(adapter.RA, "_AAWM_ALIAS_CONFIG_DIR", tmp_path)
+        auth = adapter.RA._load_authoritative_startup_config()
+        baseline_inventory = adapter.RA._snapshot_source_inventory()
+
+        swapped_yaml, _, _ = ra._build_exact_pair_priority_swap_yaml(
+            nonbasic_yaml,
+            pair=(("openrouter", "gpt-test-1"), ("openrouter", "or/model-b")),
+            alias_name="nonbasic",
+        )
+        load_calls = {"n": 0}
+        observed_mutation_auth = {}
+        authoritative_loader = adapter.RA._load_authoritative_startup_config
+
+        def fake_load_auth():
+            load_calls["n"] += 1
+            assert nonbasic_path.read_bytes() == swapped_yaml.encode("utf-8")
+            loaded = authoritative_loader()
+            observed_mutation_auth.update(loaded)
+            return loaded
+
+        monkeypatch.setattr(adapter.RA, "_load_authoritative_startup_config", fake_load_auth)
+        monkeypatch.setattr(adapter, "_cfg003_query_active_inventory", lambda url: {
+            "healthy": True,
+            "active_aliases": auth["aliases"],
+            "source_files": auth["file_names"],
+        })
+        readiness_calls = {"n": 0}
+
+        def fake_readiness(*a, **kw):
+            readiness_calls["n"] += 1
+            if readiness_calls["n"] == 1:
+                mutated_auth = observed_mutation_auth
+                assert mutated_auth
+                return 200, {
+                    "aawm_alias_config": {
+                        "state": "active",
+                        "config_hash": mutated_auth["config_hash"],
+                        "config_version": mutated_auth["config_version"],
+                        "files": mutated_auth["file_names"],
+                        "aliases": mutated_auth["aliases"],
+                    }
+                }
+            return 200, {
+                "aawm_alias_config": {
+                    "state": "active",
+                    "config_hash": auth["config_hash"],
+                    "config_version": auth["config_version"],
+                    "files": auth["file_names"],
+                    "aliases": auth["aliases"],
+                }
+            }
+
+        monkeypatch.setattr(adapter.RA, "_http_get_json_plain", fake_readiness)
+
+        post_calls = {"empty": 0}
+
+        def fake_post(url, payload, **kw):
+            assert payload == {}
+            post_calls["empty"] += 1
+            mutated_auth = observed_mutation_auth
+            assert mutated_auth
+            mutated_order = ra._derive_full_order_from_snapshot(
+                mutated_auth["snapshot"], alias_name="nonbasic"
+            )
+            if post_calls["empty"] == 1:
+                return 200, {
+                    "changed": True,
+                    "active_config_hash": mutated_auth["config_hash"],
+                    "config_version": mutated_auth["config_version"],
+                    "active_candidate_order": {"nonbasic": mutated_order},
+                }
+            if post_calls["empty"] == 2:
+                return 200, {
+                    "changed": False,
+                    "active_config_hash": mutated_auth["config_hash"],
+                    "config_version": mutated_auth["config_version"],
+                    "active_candidate_order": {"nonbasic": mutated_order},
+                }
+            if post_calls["empty"] == 3:
+                return 400, {
+                    "detail": {
+                        "active_config_hash": mutated_auth["config_hash"],
+                        "config_version": mutated_auth["config_version"],
+                    }
+                }
+            return 200, {
+                "changed": False,
+                "active_config_hash": auth["config_hash"],
+                "config_version": auth["config_version"],
+                "active_candidate_order": {
+                    "nonbasic": ra._derive_full_order_from_snapshot(
+                        auth["snapshot"], alias_name="nonbasic"
+                    )
+                },
+            }
+
+        monkeypatch.setattr(adapter.RA, "_http_post_json", fake_post)
+
+        phase = adapter._cfg003_nonbasic_source_file_refresh_phase(
+            litellm_base_url="http://localhost:4001",
+            refresh_url=f"http://localhost:4001{adapter.RA._AAWM_ALIAS_CONFIG_REFRESH_PATH}",
+            baseline_aliases=auth["aliases"],
+            baseline_source_files=auth["file_names"],
+            baseline_hash=auth["config_hash"],
+            baseline_version=auth["config_version"],
+            source_inventory_before=baseline_inventory,
+        )
+
+        assert not phase["failures"]
+        assert phase["restoration_error"] is None
+        assert phase["selected_alias"] == "nonbasic"
+        assert phase["steps"]["mutate_refresh"]["changed"] is True
+        assert observed_mutation_auth["aliases"] == ["basic", "nonbasic"]
+        assert observed_mutation_auth["file_names"] == ["basic.yaml", "nonbasic.yaml"]
+        assert phase["steps"]["mutate_refresh"]["active_hash"] == observed_mutation_auth["config_hash"]
+        assert phase["steps"]["mutate_refresh"]["alias_order_matches"] is True
+        assert phase["steps"]["unchanged_refresh"]["changed"] is False
+        assert phase["steps"]["unchanged_refresh"]["active_hash"] == observed_mutation_auth["config_hash"]
+        assert phase["steps"]["invalid_refresh"]["status_code"] == 400
+        assert phase["steps"]["invalid_refresh"]["lkg_hash"] == observed_mutation_auth["config_hash"]
+        assert phase["steps"]["restore"]["active_hash"] == auth["config_hash"]
+        assert phase["steps"]["restore"]["readiness_passed"] is True
+        assert phase["steps"]["source_inventory_after_restore"]["unchanged"] is True
+        assert nonbasic_path.read_bytes() == nonbasic_yaml.encode("utf-8")
+        assert load_calls["n"] == 1
+        assert post_calls["empty"] == 4
+
+    def test_nonbasic_source_phase_restoration_failure_becomes_parent_primary(self, adapter, ra, monkeypatch):
+        auth = ra._load_authoritative_startup_config()
+        snap = auth["snapshot"]
+        eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
+        avail_res = _avail_result(eligible[:3])
+
+        monkeypatch.setattr(
+            adapter,
+            "_cfg003_nonbasic_source_file_refresh_phase",
+            lambda *a, **kw: {
+                "name": "nonbasic_source_file_refresh",
+                "selected_file": "nonbasic.yaml",
+                "selected_alias": "nonbasic",
+                "failures": ["nonbasic source helper failed"],
+                "steps": {},
+                "restoration_error": "RESTORATION FAILED: nonbasic helper",
+            },
+        )
+        monkeypatch.setattr(adapter.RA, "_load_authoritative_startup_config", lambda: auth)
+        monkeypatch.setattr(adapter, "_cfg003_collect_availability_evidence", lambda *a, **kw: avail_res)
+        monkeypatch.setattr(adapter, "_cfg003_readiness_check", lambda *a, **kw: (False, ["halted by test"]))
+
+        result = adapter._cfg003_transactional_refresh_test(
+            litellm_base_url="http://localhost:4001",
+            cases={},
+            suite_config={},
+            query_url="q",
+            public_key="pk",
+            secret_key="sk",
+        )
+
+        assert not result["passed"]
+        assert "nonbasic source helper failed" in result["failures"]
+        assert "RESTORATION FAILED: nonbasic helper" in result["restoration_failure"]
+        assert result["failures"][0] == result["restoration_failure"]
+
 
 # ---------------------------------------------------------------------------
 # Finding 2: Authoritative fail-closed inventory via CFG-002

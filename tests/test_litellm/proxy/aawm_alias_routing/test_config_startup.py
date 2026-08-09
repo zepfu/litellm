@@ -1109,20 +1109,67 @@ class TestTOCTOUAncestorSymlink:
 
 
 class TestDevReadOnlyMount:
-    def test_compose_has_read_only_alias_config_mount(self) -> None:
-        """docker-compose.dev.yml mounts aawm_alias_config as :ro."""
+    @staticmethod
+    def _load_dev_compose_yaml() -> tuple[Path, dict[str, object]]:
         compose_path = Path(__file__).resolve().parents[4] / "docker-compose.dev.yml"
         if not compose_path.exists():
             pytest.skip("docker-compose.dev.yml not found")
-        content = compose_path.read_text(encoding="utf-8")
-        assert "./litellm/proxy/aawm_alias_config:/app/litellm/proxy/aawm_alias_config:ro" in content
+        compose_data = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+        if not isinstance(compose_data, dict):
+            raise AssertionError("docker-compose.dev.yml did not parse to a mapping")
+        return compose_path, compose_data
+
+    def test_compose_has_read_only_alias_config_mount(self) -> None:
+        """docker-compose.dev.yml mounts aawm_alias_config as :ro."""
+        compose_path, compose_data = self._load_dev_compose_yaml()
+        services = compose_data.get("services", {})
+        litellm_dev = services["litellm-dev"]
+        assert isinstance(litellm_dev, dict)
+        volumes = litellm_dev["volumes"]
+        assert isinstance(volumes, list)
+
+        mount = "./litellm/proxy/aawm_alias_config:/app/litellm/proxy/aawm_alias_config:ro"
+        assert mount in volumes
+
+        source, destination = mount.split(":", maxsplit=1)
+        destination = destination.rsplit(":", maxsplit=1)[0]
+
+        repo_root = compose_path.parent
+        canonical_source = (repo_root / source).resolve()
+        expected = (repo_root / "litellm/proxy/aawm_alias_config").resolve()
+        assert canonical_source == expected
+        assert destination == "/app/litellm/proxy/aawm_alias_config"
+
+    def test_compose_alias_config_mount_is_canonical_to_active_checkout(self) -> None:
+        """CFG-017: alias-config source must be repo-root canonical path."""
+        compose_path, compose_data = self._load_dev_compose_yaml()
+
+        services = compose_data.get("services", {})
+        litellm_dev = services["litellm-dev"]
+        assert isinstance(litellm_dev, dict)
+        volumes = litellm_dev["volumes"]
+        assert isinstance(volumes, list)
+
+        mount = next(
+            (v for v in volumes if isinstance(v, str) and v.startswith("./litellm/proxy/aawm_alias_config:")),
+            None,
+        )
+        assert mount is not None, "aawm_alias_config mount entry is missing"
+
+        source = mount.split(":", maxsplit=1)[0]
+        source_path = (compose_path.parent / source).resolve()
+        expected_source = (compose_path.parent / "litellm/proxy/aawm_alias_config").resolve()
+        assert source_path == expected_source
+        assert mount.endswith(":ro")
 
     def test_compose_has_read_only_alias_routing_mount(self) -> None:
         """docker-compose.dev.yml mounts alias routing dependencies as :ro."""
-        compose_path = Path(__file__).resolve().parents[4] / "docker-compose.dev.yml"
-        if not compose_path.exists():
-            pytest.skip("docker-compose.dev.yml not found")
-        content = compose_path.read_text(encoding="utf-8")
+        _, compose_data = self._load_dev_compose_yaml()
+
+        services = compose_data["services"]
+        litellm_dev = services["litellm-dev"]
+        assert isinstance(litellm_dev, dict)
+        content = yaml.safe_dump(litellm_dev)
         assert "aawm_alias_routing:/app/litellm/proxy/pass_through_endpoints/aawm_alias_routing:ro" in content
         assert (
             "./litellm/secret_managers/codex_oauth_inventory.py:"

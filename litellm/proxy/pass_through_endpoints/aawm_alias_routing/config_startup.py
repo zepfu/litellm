@@ -532,6 +532,19 @@ def compile_directory(config_dir: Path) -> RoutingSnapshot:
     return _compile_inventory(inventory)
 
 
+def compile_directory_with_file_names(
+    config_dir: Path,
+) -> tuple[RoutingSnapshot, tuple[str, ...]]:
+    """Compile the full config directory and return its file names.
+
+    This helper preserves startup scanner semantics (`_scan_inventory`) while
+    exposing the deterministic file-name inventory for readout paths that need
+    to report complete source metadata without recompiling the directory.
+    """
+    inventory = _scan_inventory(config_dir)
+    return _compile_inventory(inventory), inventory.file_names
+
+
 # ---------------------------------------------------------------------------
 # Startup state (process-local, per-worker)
 # ---------------------------------------------------------------------------
@@ -697,3 +710,9 @@ def reset_startup_state() -> None:
         _startup_state.snapshot = None
         _startup_state.files_loaded = ()
         _startup_state.config_dir = None
+
+
+def set_startup_files_loaded(file_names: Sequence[str]) -> None:
+    """Update readiness `files` metadata without changing activation state."""
+    with _state_lock:
+        _startup_state.files_loaded = tuple(file_names)

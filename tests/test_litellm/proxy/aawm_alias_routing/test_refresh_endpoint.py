@@ -199,6 +199,148 @@ aliases:
         priority: 0
 """
 
+_DEFAULT_DIR_YAML_A = """
+defaults: {}
+aliases:
+  - name: alpha
+    candidates:
+      - provider: openai
+        model: gpt-5.4-mini
+        route_family: codex_responses
+        priority: 110
+"""
+
+_DEFAULT_DIR_YAML_B = """
+defaults: {}
+aliases:
+  - name: zulu
+    candidates:
+      - provider: openrouter
+        model: openrouter/default-dir-model
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+"""
+
+
+@pytest.fixture()
+def _default_dir_refresh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """Create a canonical-style multi-file config directory and use it for refresh."""
+    startup_dir = tmp_path / "startup_config"
+    startup_dir.mkdir()
+    (startup_dir / "basic.yaml").write_text(_STARTUP_YAML, encoding="utf-8")
+
+    refresh_dir = tmp_path / "refresh_config"
+    refresh_dir.mkdir()
+    (refresh_dir / "alpha.yaml").write_text(_DEFAULT_DIR_YAML_A, encoding="utf-8")
+    nested_dir = refresh_dir / "nested"
+    nested_dir.mkdir()
+    (nested_dir / "zulu.yaml").write_text(_DEFAULT_DIR_YAML_B, encoding="utf-8")
+
+    monkeypatch.setattr(
+        config_refresh,
+        "_DEFAULT_AAWM_ALIAS_CONFIG_DIR",
+        refresh_dir,
+    )
+
+    config_startup.reset_startup_state()
+    config_startup.activate_alias_config_directory(startup_dir)
+    assert config_startup.is_startup_healthy()
+    yield refresh_dir
+    config_startup.reset_startup_state()
+
+
+def test_default_refresh_compiles_full_directory(_default_dir_refresh: Path) -> None:
+    """Missing yaml body compiles the full canonical directory and updates readiness files."""
+    client = _client()
+    response = client.post(REFRESH_PATH, json={})
+    assert response.status_code == 200
+
+    payload = response.json()
+    assert payload["changed"] is True
+    assert "files" in payload
+    assert payload["files"] == ["alpha.yaml", "nested/zulu.yaml"]
+    assert payload["active_candidate_order"].keys() == {"alpha", "zulu"}
+
+    status = config_startup.get_startup_status()
+    assert status["state"] == "active"
+    assert status["files"] == ["alpha.yaml", "nested/zulu.yaml"]
+    assert status["aliases"] == ["alpha", "zulu"]
+    assert status["alias_count"] == 2
+    assert status["config_hash"] == payload["active_config_hash"]
+
+
+def test_default_refresh_uses_latest_file_bytes(_default_dir_refresh: Path) -> None:
+    """Directory refresh consumes newest visible YAML bytes from each file."""
+    client = _client()
+    first = client.post(REFRESH_PATH, json={})
+    assert first.status_code == 200
+    assert first.json()["changed"] is True
+
+    zulu_path = _default_dir_refresh / "nested" / "zulu.yaml"
+    zulu_path.write_text(
+        _DEFAULT_DIR_YAML_B.replace(
+            "openrouter/default-dir-model",
+            "openrouter/default-dir-model-v2",
+        ),
+        encoding="utf-8",
+    )
+
+    second = client.post(REFRESH_PATH, json={})
+    assert second.status_code == 200
+    payload = second.json()
+    assert payload["changed"] is True
+    assert (
+        payload["active_candidate_order"]["zulu"][0]["model"]
+        == "openrouter/default-dir-model-v2"
+    )
+    assert payload["active_config_hash"] != first.json()["active_config_hash"]
+
+    status = config_startup.get_startup_status()
+    assert status["config_hash"] == payload["active_config_hash"]
+    assert status["aliases"] == ["alpha", "zulu"]
+
+
+def test_default_refresh_noop_keeps_active_snapshot(_default_dir_refresh: Path) -> None:
+    """Identical default refresh is a successful no-op and keeps snapshot identity."""
+    client = _client()
+    first = client.post(REFRESH_PATH, json={})
+    assert first.status_code == 200
+    prior_snapshot = config_snapshot.get_active_snapshot()
+    assert prior_snapshot is not None
+
+    second = client.post(REFRESH_PATH, json={})
+    assert second.status_code == 200
+    payload = second.json()
+    assert payload["changed"] is False
+    assert payload["active_config_hash"] == first.json()["active_config_hash"]
+
+    active_snapshot = config_snapshot.get_active_snapshot()
+    assert active_snapshot is prior_snapshot
+    status = config_startup.get_startup_status()
+    assert status["files"] == ["alpha.yaml", "nested/zulu.yaml"]
+
+
+def test_default_refresh_invalid_preserves_lkg_and_readiness_files(_default_dir_refresh: Path) -> None:
+    """Invalid directory refresh keeps prior snapshot and prior startup file list."""
+    client = _client()
+    first = client.post(REFRESH_PATH, json={})
+    assert first.status_code == 200
+    prior_hash = first.json()["active_config_hash"]
+
+    bad_path = _default_dir_refresh / "alpha.yaml"
+    bad_path.write_text("aliases:", encoding="utf-8")
+
+    bad = client.post(REFRESH_PATH, json={})
+    assert bad.status_code in (400, 422)
+
+    status = config_startup.get_startup_status()
+    assert status["state"] == "active"
+    assert status["config_hash"] == prior_hash
+    assert status["files"] == ["alpha.yaml", "nested/zulu.yaml"]
+    active_snapshot = config_snapshot.get_active_snapshot()
+    assert active_snapshot is not None
+    assert active_snapshot.config_hash == prior_hash
+
 
 @pytest.fixture()
 def _startup_dir(tmp_path: Path) -> Iterator[Path]:

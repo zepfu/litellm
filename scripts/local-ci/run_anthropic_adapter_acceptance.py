@@ -8372,6 +8372,309 @@ def _cfg003_phase_error_intake(
     }
 
 
+def _cfg003_nonbasic_source_file_refresh_phase(  # noqa: PLR0915
+    *,
+    litellm_base_url: str,
+    refresh_url: str,
+    baseline_aliases: list[str],
+    baseline_source_files: list[str],
+    baseline_hash: str,
+    baseline_version: str,
+    source_inventory_before: dict[str, str],
+) -> dict[str, Any]:
+    """Run one deterministic non-basic source refresh phase with full restore."""
+    phase: dict[str, Any] = {
+        "name": "nonbasic_source_file_refresh",
+        "selected_file": None,
+        "selected_alias": None,
+        "failures": [],
+        "steps": {},
+        "restoration_error": None,
+    }
+    failures: list[str] = phase["failures"]
+
+    recursive_source_inventory = RA._recursive_yaml_source_inventory()
+    candidate_source_files = sorted(
+        name for name in recursive_source_inventory if name != "basic.yaml"
+    )
+    if not candidate_source_files:
+        failures.append("no non-basic canonical YAML source found")
+        return phase
+
+    selected_path: pathlib.Path | None = None
+    selected_alias: str | None = None
+    original_bytes: bytes | None = None
+    original_text: str | None = None
+
+    for source_name in candidate_source_files:
+        filepath = RA._AAWM_ALIAS_CONFIG_DIR / source_name
+        try:
+            file_text = filepath.read_text(encoding="utf-8")
+        except OSError as exc:  # noqa: BLE001
+            failures.append(f"cannot read candidate source {source_name}: {exc}")
+            continue
+
+        doc = yaml.safe_load(file_text)
+        aliases = doc.get("aliases") if isinstance(doc, dict) else None
+        if not isinstance(aliases, list):
+            continue
+
+        for alias in aliases:
+            if not isinstance(alias, dict):
+                continue
+            alias_name = str(alias.get("name") or "")
+            if alias_name == "basic" or not alias_name:
+                continue
+            try:
+                eligible = RA._derive_eligible_candidates_from_yaml(
+                    file_text, alias_name=alias_name
+                )
+            except Exception as exc:  # noqa: BLE001
+                failures.append(
+                    f"non-basic source {source_name} alias {alias_name!r} ineligible: {exc}"
+                )
+                continue
+            if len(eligible) >= 2:
+                selected_path = filepath
+                selected_alias = alias_name
+                original_text = file_text
+                original_bytes = filepath.read_bytes()
+                break
+        if selected_alias is not None:
+            phase["selected_file"] = source_name
+            phase["selected_alias"] = selected_alias
+            break
+
+    if selected_alias is None or selected_path is None or original_text is None:
+        failures.append("no non-basic canonical YAML alias has >=2 eligible candidates")
+        return phase
+
+    try:
+        eligible = RA._derive_eligible_candidates_from_yaml(
+            original_text, alias_name=selected_alias
+        )
+        swap_pair = (
+            (eligible[0]["provider"], eligible[0]["model"]),
+            (eligible[1]["provider"], eligible[1]["model"]),
+        )
+        try:
+            swapped_yaml, _, swapped_eligible = (
+                RA._build_exact_pair_priority_swap_yaml(
+                    original_text,
+                    pair=swap_pair,
+                    alias_name=selected_alias,
+                )
+            )
+        except (ValueError, KeyError) as swap_exc:  # noqa: BLE001
+            failures.append(f"non-basic source swap build failed: {swap_exc}")
+            return phase
+        if len(swapped_eligible) < 2:
+            failures.append("non-basic source swap build did not preserve candidates")
+            return phase
+
+        selected_path.write_text(swapped_yaml, encoding="utf-8")
+        phase["steps"]["mutated_bytes_applied"] = True
+
+        # Derive expected identity from the mutated authoritative source
+        # directory, never from the single edited YAML document.
+        swapped_auth = RA._load_authoritative_startup_config()
+        expected_hash = swapped_auth["config_hash"]
+        expected_version = swapped_auth["config_version"]
+        expected_order = RA._derive_full_order_from_snapshot(
+            swapped_auth["snapshot"], alias_name=selected_alias
+        )
+
+        mutate_status, mutate_response = RA._http_post_json(refresh_url, {})
+        mutate_hash = RA._extract_refresh_response_hash(mutate_response)
+        mutate_version = RA._extract_refresh_response_version(mutate_response)
+        mutate_order = mutate_response.get("active_candidate_order")
+        mutate_alias_order: list[dict[str, Any]] | None = None
+        if isinstance(mutate_order, dict):
+            mutate_alias_order = mutate_order.get(selected_alias)  # type: ignore[assignment]
+
+        phase["steps"]["mutate_refresh"] = {
+            "status_code": mutate_status,
+            "active_hash": mutate_hash,
+            "active_version": mutate_version,
+            "changed": bool(mutate_response.get("changed")),
+            "alias_order_matches": RA._candidate_order_matches(
+                mutate_alias_order, expected_order
+            ),
+        }
+        if mutate_status != 200:
+            failures.append(
+                f"non-basic source mutation refresh failed: status={mutate_status}"
+            )
+        if not phase["steps"]["mutate_refresh"]["changed"]:
+            failures.append("non-basic source mutation refresh did not report changed=true")
+        if mutate_hash != expected_hash:
+            failures.append(
+                f"non-basic source refresh hash mismatch: expected {expected_hash!r}, "
+                f"got {mutate_hash!r}"
+            )
+        if mutate_version != expected_version:
+            failures.append(
+                f"non-basic source refresh version mismatch: expected {expected_version!r}, "
+                f"got {mutate_version!r}"
+            )
+
+        mutate_readiness_ok, mutate_readiness_failures = _cfg003_readiness_check(
+            litellm_base_url,
+            expected_hash=expected_hash,
+            expected_version=expected_version,
+            phase_label="nonbasic_mutate",
+        )
+        phase["steps"]["post_mutate_readiness"] = {
+            "passed": mutate_readiness_ok,
+            "failures": mutate_readiness_failures,
+        }
+        if not mutate_readiness_ok:
+            failures.extend(mutate_readiness_failures)
+
+        mutate_inventory = _cfg003_query_active_inventory(litellm_base_url)
+        phase["steps"]["post_mutate_inventory"] = {
+            "healthy": mutate_inventory.get("healthy"),
+            "active_aliases": mutate_inventory.get("active_aliases"),
+            "source_files": mutate_inventory.get("source_files"),
+        }
+        if not mutate_inventory.get("healthy"):
+            failures.extend(mutate_inventory.get("inventory_failures") or [])
+        else:
+            if sorted(mutate_inventory.get("active_aliases", [])) != sorted(
+                baseline_aliases
+            ):
+                failures.append(
+                    "non-basic source refresh changed active aliases: "
+                    f"expected {sorted(baseline_aliases)} "
+                    f"got {sorted(mutate_inventory.get('active_aliases') or [])}"
+                )
+            if sorted(mutate_inventory.get("source_files", [])) != sorted(
+                baseline_source_files
+            ):
+                failures.append(
+                    "non-basic source refresh changed active source files: "
+                    f"expected {sorted(baseline_source_files)} "
+                    f"got {sorted(mutate_inventory.get('source_files') or [])}"
+                )
+
+        unchanged_status, unchanged_response = RA._http_post_json(refresh_url, {})
+        unchanged_hash = RA._extract_refresh_response_hash(unchanged_response)
+        unchanged_version = RA._extract_refresh_response_version(unchanged_response)
+        phase["steps"]["unchanged_refresh"] = {
+            "status_code": unchanged_status,
+            "active_hash": unchanged_hash,
+            "active_version": unchanged_version,
+            "changed": bool(unchanged_response.get("changed")),
+        }
+        if unchanged_status != 200 or bool(unchanged_response.get("changed")):
+            failures.append(
+                f"non-basic source unchanged refresh failed: "
+                f"status={unchanged_status} changed={unchanged_response.get('changed')!r}"
+            )
+        if unchanged_hash != mutate_hash:
+            failures.append(
+                "non-basic source unchanged refresh changed hash: "
+                f"expected {mutate_hash!r} got {unchanged_hash!r}"
+            )
+        if unchanged_version != mutate_version:
+            failures.append(
+                "non-basic source unchanged refresh changed version: "
+                f"expected {mutate_version!r} got {unchanged_version!r}"
+            )
+
+        selected_path.write_text(_CFG003_INVALID_YAML, encoding="utf-8")
+        invalid_status, invalid_response = RA._http_post_json(refresh_url, {})
+        invalid_hash = RA._extract_refresh_response_hash(invalid_response)
+        invalid_version = RA._extract_refresh_response_version(invalid_response)
+        phase["steps"]["invalid_refresh"] = {
+            "status_code": invalid_status,
+            "lkg_hash": invalid_hash,
+            "lkg_version": invalid_version,
+        }
+        if invalid_status != 400:
+            failures.append(f"non-basic source invalid refresh expected 400, got {invalid_status}")
+        if invalid_hash != mutate_hash:
+            failures.append(
+                "non-basic source invalid refresh dropped mutation hash: "
+                f"expected {mutate_hash!r} got {invalid_hash!r}"
+            )
+        if invalid_version != mutate_version:
+            failures.append(
+                "non-basic source invalid refresh dropped mutation version: "
+                f"expected {mutate_version!r} got {invalid_version!r}"
+            )
+    except Exception as phase_exc:  # noqa: BLE001
+        failures.append(f"non-basic source phase exception: {phase_exc}")
+
+    try:
+        if selected_path is not None and original_bytes is not None:
+            selected_path.write_bytes(original_bytes)
+            restore_status, restore_response = RA._http_post_json(refresh_url, {})
+            restore_hash = RA._extract_refresh_response_hash(restore_response)
+            restore_version = RA._extract_refresh_response_version(restore_response)
+            restore_readiness_ok, restore_readiness_failures = _cfg003_readiness_check(
+                litellm_base_url,
+                expected_hash=baseline_hash,
+                expected_version=baseline_version,
+                phase_label="nonbasic_post_restore",
+            )
+            phase["steps"]["restore"] = {
+                "status_code": restore_status,
+                "active_hash": restore_hash,
+                "active_version": restore_version,
+                "readiness_passed": restore_readiness_ok,
+                "readiness_failures": restore_readiness_failures,
+            }
+            restore_failures: list[str] = []
+            if restore_status != 200:
+                restore_failures.append(
+                    f"non-basic source restore refresh failed: status={restore_status}"
+                )
+            if restore_hash != baseline_hash:
+                restore_failures.append(
+                    "non-basic source restore refresh hash mismatch: "
+                    f"expected {baseline_hash!r} got {restore_hash!r}"
+                )
+            if restore_version != baseline_version:
+                restore_failures.append(
+                    "non-basic source restore refresh version mismatch: "
+                    f"expected {baseline_version!r} got {restore_version!r}"
+                )
+            if not restore_readiness_ok:
+                restore_failures.extend(restore_readiness_failures)
+            if restore_failures:
+                failures.extend(restore_failures)
+                phase["restoration_error"] = (
+                    "NON-BASIC SOURCE RESTORATION FAILED: "
+                    + "; ".join(restore_failures)
+                )
+    except Exception as restore_exc:  # noqa: BLE001
+        phase["restoration_error"] = (
+            f"non-basic source restore failed in finally: {restore_exc}"
+        )
+        return phase
+
+    try:
+        source_inventory_after = RA._snapshot_source_inventory()
+        inventory_unchanged = source_inventory_after == source_inventory_before
+        phase["steps"]["source_inventory_after_restore"] = {
+            "before_count": len(source_inventory_before),
+            "after_count": len(source_inventory_after),
+            "unchanged": inventory_unchanged,
+        }
+        if not inventory_unchanged:
+            inventory_failure = "non-basic source restore changed unrelated files"
+            failures.append(inventory_failure)
+            if phase["restoration_error"] is None:
+                phase["restoration_error"] = (
+                    f"NON-BASIC SOURCE RESTORATION FAILED: {inventory_failure}"
+                )
+    except Exception as inv_exc:  # noqa: BLE001
+        failures.append(f"non-basic source inventory verification failed: {inv_exc}")
+
+    return phase
+
+
 def _cfg003_transactional_refresh_test(  # noqa: PLR0915
     *,
     litellm_base_url: str,
@@ -8433,23 +8736,30 @@ def _cfg003_transactional_refresh_test(  # noqa: PLR0915
         original_semantic_version = auth["config_version"]
         snapshot = auth["snapshot"]
 
-        # Finding 1: Derive the authoritative RECURSIVE YAML source inventory
-        # from the CFG-002 discovery path and require exactly one supported
-        # source before any transaction/proof/POST.  Nested or multi-file
-        # source sets hard-fail before egress.
+        # Finding 1: Capture recursive source inventory for full-file readiness
+        # proofs, then run one compact default-refresh mutation phase on a
+        # non-basic canonical file with immediate restore.
         recursive_source_inventory = RA._recursive_yaml_source_inventory()
-        if len(recursive_source_inventory) != 1:
-            evidence["failures"].append(
-                f"require exactly one recursive YAML source for raw-byte restore, "
-                f"got {len(recursive_source_inventory)}: {sorted(recursive_source_inventory)}"
-            )
-            raise _Cfg003InsufficientCandidates()
-        single_filename = next(iter(recursive_source_inventory))
-        single_filepath = RA._AAWM_ALIAS_CONFIG_DIR / single_filename
-        raw_source_text = single_filepath.read_bytes().decode("utf-8")
-
-        # Source inventory snapshot for post-run verification.
         source_inventory_before = RA._snapshot_source_inventory()
+        source_file_phase = _cfg003_nonbasic_source_file_refresh_phase(
+            litellm_base_url=litellm_base_url,
+            refresh_url=refresh_url,
+            baseline_aliases=auth["aliases"],
+            baseline_source_files=auth["file_names"],
+            baseline_hash=original_semantic_hash,
+            baseline_version=original_semantic_version,
+            source_inventory_before=source_inventory_before,
+        )
+        evidence["phases"]["nonbasic_source_refresh"] = source_file_phase
+        if source_file_phase.get("failures"):
+            evidence["failures"].extend(source_file_phase["failures"])
+        if source_file_phase.get("restoration_error"):
+            evidence["failures"].append(source_file_phase["restoration_error"])
+            if restoration_error is None:
+                restoration_error = source_file_phase["restoration_error"]
+
+        # Existing priority-swap flow uses inline deterministic refresh text.
+        raw_source_text = auth["merged_yaml"]
 
         # Capture the COMPLETE compiled candidate order directly from the
         # snapshot, independent of provider exclusions, availability, and
@@ -8537,7 +8847,7 @@ def _cfg003_transactional_refresh_test(  # noqa: PLR0915
             "original_semantic_hash": original_semantic_hash,
             "original_semantic_version": original_semantic_version,
             "per_file_hashes": original_per_file_hashes,
-            "single_source_file": single_filename,
+            "source_files": auth["file_names"],
             "recursive_source_inventory": recursive_source_inventory,
             "availability_evidence": avail["evidence_records"],
             "available_identities": avail["available_identities"],

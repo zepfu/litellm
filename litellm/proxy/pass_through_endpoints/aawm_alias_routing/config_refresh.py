@@ -25,6 +25,7 @@ from .config_compiler import (
     ConfigCompileError as _AawmAliasConfigCompileError,
     compile_yaml as _compile_aawm_alias_routing_yaml,
 )
+from . import config_startup as _config_startup
 from .config_snapshot import (
     AliasReference as _AliasReference,
     RoutingSnapshot as _RoutingSnapshot,
@@ -42,6 +43,7 @@ from .snapshot_select import (
 _DEFAULT_AAWM_ALIAS_CONFIG_PATH = (
     Path(__file__).resolve().parents[2] / "aawm_alias_config" / "basic.yaml"
 )
+_DEFAULT_AAWM_ALIAS_CONFIG_DIR = Path(__file__).resolve().parents[2] / "aawm_alias_config"
 
 
 def _snapshot_candidate_order(snapshot: Any) -> dict[str, list[dict[str, Any]]]:
@@ -170,6 +172,10 @@ async def aawm_alias_config_refresh_route(request: Request) -> dict[str, Any]:
             detail={"error": "AAWM alias-routing config 'yaml' field must be a string"},
         )
 
+    runtime = _get_runtime()
+    if runtime is None and inline_yaml is None:
+        return await _refresh_default_via_direct_imports()
+
     try:
         source_yaml = _load_aawm_alias_routing_source_yaml(inline_yaml=inline_yaml)
     except OSError as exc:
@@ -178,10 +184,62 @@ async def aawm_alias_config_refresh_route(request: Request) -> dict[str, Any]:
             detail={"error": "failed to read AAWM alias-routing config source"},
         ) from exc
 
-    runtime = _get_runtime()
     if runtime is not None:
         return await _refresh_via_runtime(runtime, source_yaml)
     return await _refresh_via_direct_imports(source_yaml)
+
+
+def _load_full_default_directory_snapshot() -> tuple[_RoutingSnapshot, tuple[str, ...]]:
+    """Compile the full canonical config directory and return source file names."""
+    return _config_startup.compile_directory_with_file_names(
+        _DEFAULT_AAWM_ALIAS_CONFIG_DIR
+    )
+
+
+async def _refresh_default_via_direct_imports() -> dict[str, Any]:
+    """Compile and activate using startup directory semantics."""
+    try:
+        attempted_snapshot, files_loaded = _load_full_default_directory_snapshot()
+    except (
+        _AawmAliasConfigCompileError,
+        _config_startup.ConfigDirectoryError,
+        ValidationError,
+    ) as exc:
+        last_known_good = get_active_routing_snapshot()
+        error_detail: dict[str, Any] = {
+            "error": "AAWM alias-routing config failed to compile; last-known-good snapshot remains active",
+        }
+        if last_known_good is not None:
+            error_detail["active_config_hash"] = last_known_good.config_hash
+            error_detail["config_version"] = last_known_good.config_version
+        raise HTTPException(status_code=400, detail=error_detail) from exc
+
+    previous_snapshot = get_active_routing_snapshot()
+    changed = (
+        previous_snapshot is None
+        or previous_snapshot.config_hash != attempted_snapshot.config_hash
+    )
+    if changed:
+        set_active_routing_snapshot(attempted_snapshot)
+        active_snapshot = attempted_snapshot
+    else:
+        # No-op: identical content already active. Do not replace the
+        # snapshot object -- in-flight readers holding a reference to the
+        # active snapshot must keep observing the exact same object.
+        assert previous_snapshot is not None
+        active_snapshot = previous_snapshot
+
+    _config_startup.set_startup_files_loaded(files_loaded)
+
+    return {
+        "changed": changed,
+        "attempted_config_hash": attempted_snapshot.config_hash,
+        "active_config_hash": active_snapshot.config_hash,
+        "config_version": active_snapshot.config_version,
+        "activated_at": datetime.now(timezone.utc).isoformat(),
+        "active_candidate_order": _snapshot_candidate_order(active_snapshot),
+        "files": list(files_loaded),
+    }
 
 
 async def _refresh_via_runtime(

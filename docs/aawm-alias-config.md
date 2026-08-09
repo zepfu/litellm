@@ -215,9 +215,11 @@ retries, cooldown recovery, probes, and acceptance harnesses.
 - **Routing snapshot lifetime**: once activated, the routing snapshot lasts
   until a **successful refresh** replaces it or the worker **restarts**. A
   failed refresh preserves the last-known-good snapshot.
-- **Restart**: file additions or removals in the canonical directory take
-  effect on the next worker restart (or container recreation). The startup
-  loader re-scans the full directory inventory.
+- **Restart**: the startup loader re-scans and compiles the complete canonical
+  directory. A successful empty-body/default refresh performs the same full
+  re-scan and compile, so host-side file additions, removals, and edits can
+  take effect without a restart. Recovery from a failed startup still requires
+  a worker restart.
 - **Invalid hot refresh**: if a runtime refresh attempt encounters invalid
   config, the active last-known-good snapshot is preserved. No restart is
   needed; routing continues on the prior valid definition.
@@ -231,8 +233,35 @@ retries, cooldown recovery, probes, and acceptance harnesses.
 `docker-compose.dev.yml` bind-mounts the canonical directory **read-only**
 (`./litellm/proxy/aawm_alias_config:/app/litellm/proxy/aawm_alias_config:ro`).
 This blocks **container-side** writes to the config tree. It does **not**
-prevent host-side edits to the bind-mounted source; those are bounded by the
-scan-rescan drift check at activation and otherwise load on the next restart.
+prevent host-side edits to the bind-mounted source. A successful
+empty-body/default refresh re-scans and compiles the complete canonical
+directory, including those host-side additions, removals, and edits; otherwise
+they load on the next restart.
+
+## CFG-017 source identity and parity contract
+
+For dev parity, `litellm-dev` must load alias-config only from the canonical
+`aawm_alias_config` directory in the current checked-out workspace. The
+compose mount source (`./litellm/proxy/aawm_alias_config`) must therefore be the
+same canonicalized source for every startup and refresh attempt.
+
+Contract-level parity checks for operators are:
+
+1. `docker-compose.dev.yml` contains exactly the mount
+   `./litellm/proxy/aawm_alias_config:/app/litellm/proxy/aawm_alias_config:ro`.
+2. The mount source resolves to the current repo checkout path
+   (`$compose_dir/litellm/proxy/aawm_alias_config`) and no alternate source
+   path is used.
+3. The preflight inventory path used by startup is the mounted destination
+   `/app/litellm/proxy/aawm_alias_config` (no other alias-config source is
+   consulted).
+
+The later runtime preflight should compare the host source mount identity
+(`realpath` of `compose_dir/litellm/proxy/aawm_alias_config`) against the
+expected checkout path and compare startup inventory identity metadata from the
+two-pass scan (`root_st_dev`, `root_st_ino`, `root_st_mtime_ns`,
+`root_st_ctime_ns`) to guarantee the mounted source did not change before
+activation.
 
 ## Production parity
 
