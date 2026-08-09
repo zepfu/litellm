@@ -1273,6 +1273,10 @@ class AliasRoutingStateManager:
             tuple[str, str, str, str, str], dict[str, Any]
         ] = {}
         self._normalized_quota_observations_lock = threading.Lock()
+        self.codex_quota_hydration_lock = asyncio.Lock()
+        self._codex_quota_hydrated_until_by_environment_account_hash: dict[
+            tuple[str, str], float
+        ] = {}
 
     async def key_barrier_lock(self, cooldown_key: str) -> asyncio.Lock:
         """Return the per-key barrier lock for read/clear serialization (Defect 3)."""
@@ -1343,6 +1347,61 @@ class AliasRoutingStateManager:
     def set_openrouter_free_quota_cache(self, value: Tuple[Optional[float], float]) -> None:
         """Replace the OpenRouter free-daily-quota cache tuple (immutable update)."""
         self._openrouter_free_quota_cache = value
+
+    def codex_quota_hydration_due_account_hashes(
+        self,
+        account_hashes: Sequence[str],
+        *,
+        environment: str,
+        now_monotonic: Optional[float] = None,
+    ) -> tuple[str, ...]:
+        """Return configured account hashes whose durable quota cache is due."""
+        now = time.monotonic() if now_monotonic is None else now_monotonic
+        normalized_environment = str(environment).strip()
+        if not normalized_environment:
+            return ()
+        normalized = tuple(
+            dict.fromkeys(
+                str(account_hash).strip()
+                for account_hash in account_hashes
+                if str(account_hash).strip()
+            )
+        )
+        return tuple(
+            account_hash
+            for account_hash in normalized
+            if self._codex_quota_hydrated_until_by_environment_account_hash.get(
+                (normalized_environment, account_hash),
+                0.0,
+            )
+            <= now
+        )
+
+    def defer_codex_quota_hydration(
+        self,
+        account_hashes: Sequence[str],
+        *,
+        environment: str,
+        ttl_seconds: float,
+        now_monotonic: Optional[float] = None,
+    ) -> None:
+        """Bound durable quota reads independently for each configured account."""
+        now = time.monotonic() if now_monotonic is None else now_monotonic
+        normalized_environment = str(environment).strip()
+        if not normalized_environment:
+            return
+        refresh_after = now + max(0.0, ttl_seconds)
+        for account_hash in account_hashes:
+            normalized = str(account_hash).strip()
+            if normalized:
+                key = (normalized_environment, normalized)
+                self._codex_quota_hydrated_until_by_environment_account_hash[
+                    key
+                ] = refresh_after
+        bound_memory_map(
+            self._codex_quota_hydrated_until_by_environment_account_hash,
+            max_size=self.max_size,
+        )
 
     @staticmethod
     def _quota_observation_timestamp(value: Any) -> Optional[float]:
@@ -1430,6 +1489,34 @@ class AliasRoutingStateManager:
                 self._normalized_quota_observations,
                 max_size=self.max_size,
             )
+
+    def replace_normalized_quota_observations(
+        self,
+        observations: Sequence[Mapping[str, Any]],
+        *,
+        provider: str,
+        source: str,
+        account_hashes: Sequence[str],
+    ) -> None:
+        """Replace one durable source's current rows for the named accounts."""
+        selected_account_hashes = {
+            str(account_hash).strip()
+            for account_hash in account_hashes
+            if str(account_hash).strip()
+        }
+        if not selected_account_hashes:
+            return
+        with self._normalized_quota_observations_lock:
+            for key, observation in list(
+                self._normalized_quota_observations.items()
+            ):
+                if (
+                    key[0] == provider
+                    and key[2] in selected_account_hashes
+                    and observation.get("source") == source
+                ):
+                    self._normalized_quota_observations.pop(key, None)
+        self.record_normalized_quota_observations(observations)
 
     def resolve_normalized_quota_observation(
         self,
@@ -1521,6 +1608,7 @@ class AliasRoutingStateManager:
         self.publication_intents.clear()
         self._key_barrier_locks.clear()
         self._openrouter_free_quota_cache = (None, 0.0)
+        self._codex_quota_hydrated_until_by_environment_account_hash.clear()
         with self._normalized_quota_observations_lock:
             self._normalized_quota_observations.clear()
 

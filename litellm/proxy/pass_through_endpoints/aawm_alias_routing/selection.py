@@ -10,12 +10,17 @@ Direct imports from sibling Wave 4/5A modules (``lane_keys``, ``snapshot_select`
 
 from __future__ import annotations
 
+import asyncio
+import json
 import random
+import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Optional, Sequence
+from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
 
 from fastapi import HTTPException, Request
+
+from litellm._logging import verbose_proxy_logger
 
 from . import cooldown_state as _cooldown_state
 from .cooldown_state import _attach_aawm_alias_routing_state_sources
@@ -46,6 +51,8 @@ from .snapshot_select import (
     _select_snapshot_candidates,
 )
 from .state import alias_routing_state
+
+_aawm_selection = sys.modules[__name__]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -86,6 +93,52 @@ _get_grok_account_quota_lane_cooldown_key: Optional[
 ] = None
 _is_kimi_code_candidate: Optional[Callable[[Optional[dict[str, Any]]], bool]] = None
 _get_kimi_managed_account_cooldown_key: Optional[Callable[[], str]] = None
+_get_codex_quota_observation_pool: Optional[
+    Callable[[], Awaitable[Any]]
+] = None
+_get_codex_quota_observation_environment: Optional[
+    Callable[[], Optional[str]]
+] = None
+
+_CODEX_OAUTH_QUOTA_CACHE_TTL_SECONDS = 30.0
+_CODEX_OAUTH_QUOTA_FAILURE_RETRY_SECONDS = 5.0
+_CODEX_OAUTH_QUOTA_LOOKUP_TIMEOUT_SECONDS = 0.5
+_CODEX_OAUTH_QUOTA_CLIENT = "codex"
+_CODEX_OAUTH_QUOTA_SOURCE = "codex_quota_poll"
+_CODEX_OAUTH_QUOTA_CURRENT_ROWS_SQL = """
+SELECT DISTINCT ON (
+    NULLIF(BTRIM(evidence->>'environment'), ''),
+    account_hash,
+    COALESCE(model, ''),
+    quota_key
+)
+    observed_at,
+    provider,
+    model,
+    account_hash,
+    quota_key,
+    quota_period,
+    quota_type,
+    expected_reset_at,
+    remaining_pct,
+    raw_provider_fields,
+    evidence,
+    NULLIF(BTRIM(evidence->>'environment'), '') AS environment,
+    source
+FROM public.rate_limit_observations
+WHERE provider = $1
+  AND client = $2
+  AND source = $3
+  AND NULLIF(BTRIM(evidence->>'environment'), '') = $4
+  AND account_hash = ANY($5::text[])
+ORDER BY
+    NULLIF(BTRIM(evidence->>'environment'), ''),
+    account_hash,
+    COALESCE(model, ''),
+    quota_key,
+    observed_at DESC,
+    id DESC
+"""
 
 
 def configure_selection_runtime(
@@ -106,6 +159,12 @@ def configure_selection_runtime(
     get_grok_account_quota_lane_cooldown_key: Callable[[Any, Optional[str]], Optional[str]],
     is_kimi_code_candidate: Callable[[Optional[dict[str, Any]]], bool],
     get_kimi_managed_account_cooldown_key: Callable[[], str],
+    get_codex_quota_observation_pool: Optional[
+        Callable[[], Awaitable[Any]]
+    ] = None,
+    get_codex_quota_observation_environment: Optional[
+        Callable[[], Optional[str]]
+    ] = None,
 ) -> None:
     """Bind god-module / cooldown_state.py owned dependencies."""
     global _get_codex_active_cooldown_state
@@ -140,6 +199,12 @@ def configure_selection_runtime(
     _is_kimi_code_candidate = is_kimi_code_candidate
     global _get_kimi_managed_account_cooldown_key
     _get_kimi_managed_account_cooldown_key = get_kimi_managed_account_cooldown_key
+    global _get_codex_quota_observation_pool
+    _get_codex_quota_observation_pool = get_codex_quota_observation_pool
+    global _get_codex_quota_observation_environment
+    _get_codex_quota_observation_environment = (
+        get_codex_quota_observation_environment
+    )
 
 # ---------------------------------------------------------------------------
 # Utility
@@ -783,6 +848,179 @@ def _candidate_matches_affinity(
             "codex_oauth_lane_key",
         )
     )
+
+
+def _codex_oauth_quota_json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if not isinstance(value, str):
+        return {}
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return {}
+    return dict(decoded) if isinstance(decoded, Mapping) else {}
+
+
+def _codex_oauth_quota_int(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if str(parsed) == str(value).strip() else None
+
+
+def _codex_oauth_quota_observation_from_row(
+    row: Any,
+    *,
+    expected_environment: str,
+) -> dict[str, Any]:
+    try:
+        values = dict(row)
+    except Exception:
+        return {}
+    environment = str(values.get("environment") or "").strip()
+    if environment != expected_environment:
+        return {}
+    raw_provider_fields = _codex_oauth_quota_json_mapping(
+        values.get("raw_provider_fields")
+    )
+    evidence = _codex_oauth_quota_json_mapping(values.get("evidence"))
+    freshness = str(
+        raw_provider_fields.get("freshness_state")
+        or evidence.get("freshness_state")
+        or ""
+    ).strip().lower()
+    remaining_pct = values.get("remaining_pct")
+    try:
+        exhausted = freshness == "fresh" and float(remaining_pct) <= 0
+    except (TypeError, ValueError):
+        exhausted = False
+    return {
+        "provider": values.get("provider"),
+        "model": values.get("model"),
+        "account_hash": values.get("account_hash"),
+        "environment": environment,
+        "quota_key": values.get("quota_key"),
+        "quota_period": values.get("quota_period"),
+        "quota_type": values.get("quota_type"),
+        "limit_scope": (
+            evidence.get("upstream_limit_scope")
+            or raw_provider_fields.get("limit_scope")
+        ),
+        "window_minutes": _codex_oauth_quota_int(
+            raw_provider_fields.get("window_minutes")
+        ),
+        "remaining_pct": remaining_pct,
+        "observed_at": values.get("observed_at"),
+        "expected_reset_at": values.get("expected_reset_at"),
+        "status": freshness or None,
+        "exhausted": exhausted,
+        "source": values.get("source"),
+    }
+
+
+async def _hydrate_codex_oauth_quota_observations(
+    contexts: Sequence[dict[str, Any]],
+) -> None:
+    if (
+        _get_codex_quota_observation_pool is None
+        or _get_codex_quota_observation_environment is None
+    ):
+        return
+    try:
+        environment = str(
+            _get_codex_quota_observation_environment() or ""
+        ).strip()
+    except Exception as exc:
+        verbose_proxy_logger.debug(
+            "Codex OAuth durable quota environment resolution failed open "
+            "(error_class=%s)",
+            exc.__class__.__name__,
+        )
+        return
+    if not environment:
+        return
+    account_hashes = tuple(
+        dict.fromkeys(
+            str(context.get("candidate", {}).get("codex_oauth_account_hash") or "")
+            .strip()
+            for context in contexts
+            if str(
+                context.get("candidate", {}).get("codex_oauth_account_hash")
+                or ""
+            ).strip()
+        )
+    )
+    due_account_hashes = (
+        alias_routing_state.codex_quota_hydration_due_account_hashes(
+            account_hashes,
+            environment=environment,
+        )
+    )
+    if not due_account_hashes:
+        return
+
+    async with alias_routing_state.codex_quota_hydration_lock:
+        due_account_hashes = (
+            alias_routing_state.codex_quota_hydration_due_account_hashes(
+                account_hashes,
+                environment=environment,
+            )
+        )
+        if not due_account_hashes:
+            return
+        try:
+
+            async def _fetch_rows() -> Any:
+                pool = await _get_codex_quota_observation_pool()
+                return await pool.fetch(
+                    _CODEX_OAUTH_QUOTA_CURRENT_ROWS_SQL,
+                    _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+                    _CODEX_OAUTH_QUOTA_CLIENT,
+                    _CODEX_OAUTH_QUOTA_SOURCE,
+                    environment,
+                    list(due_account_hashes),
+                )
+
+            rows = await asyncio.wait_for(
+                _fetch_rows(),
+                timeout=_CODEX_OAUTH_QUOTA_LOOKUP_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            alias_routing_state.defer_codex_quota_hydration(
+                due_account_hashes,
+                environment=environment,
+                ttl_seconds=_CODEX_OAUTH_QUOTA_FAILURE_RETRY_SECONDS,
+            )
+            verbose_proxy_logger.debug(
+                "Codex OAuth durable quota hydration failed open "
+                "(error_class=%s)",
+                exc.__class__.__name__,
+            )
+            return
+
+        observations = [
+            observation
+            for row in rows
+            if (
+                observation := _codex_oauth_quota_observation_from_row(
+                    row,
+                    expected_environment=environment,
+                )
+            )
+        ]
+        alias_routing_state.replace_normalized_quota_observations(
+            observations,
+            provider=_CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+            source=_CODEX_OAUTH_QUOTA_SOURCE,
+            account_hashes=due_account_hashes,
+        )
+        alias_routing_state.defer_codex_quota_hydration(
+            due_account_hashes,
+            environment=environment,
+            ttl_seconds=_CODEX_OAUTH_QUOTA_CACHE_TTL_SECONDS,
+        )
 
 
 async def _resolve_codex_oauth_account_candidate_contexts(
@@ -1430,6 +1668,7 @@ async def _build_codex_auto_agent_affinity_candidate_state(
         candidate_template=candidate_template,
         affinity=affinity,
     )
+    await _aawm_selection._hydrate_codex_oauth_quota_observations(contexts)
     context = contexts[0]
     state = await _build_codex_auto_agent_candidate_state(
         request,
@@ -1461,6 +1700,7 @@ async def _build_anthropic_auto_agent_affinity_candidate_state(
         candidate_template=candidate_template,
         affinity=affinity,
     )
+    await _aawm_selection._hydrate_codex_oauth_quota_observations(contexts)
     context = contexts[0]
     state = await _build_anthropic_auto_agent_candidate_state(
         request,
@@ -1492,6 +1732,9 @@ async def _build_codex_auto_agent_candidate_states(
             contexts = await _resolve_codex_oauth_account_candidate_contexts(
                 request,
                 candidate_template=candidate_template,
+            )
+            await _aawm_selection._hydrate_codex_oauth_quota_observations(
+                contexts
             )
             for context in contexts:
                 state = await _build_codex_auto_agent_candidate_state(
@@ -1538,6 +1781,9 @@ async def _build_anthropic_auto_agent_candidate_states(
             contexts = await _resolve_codex_oauth_account_candidate_contexts(
                 request,
                 candidate_template=candidate_template,
+            )
+            await _aawm_selection._hydrate_codex_oauth_quota_observations(
+                contexts
             )
             for context in contexts:
                 state = await _build_anthropic_auto_agent_candidate_state(

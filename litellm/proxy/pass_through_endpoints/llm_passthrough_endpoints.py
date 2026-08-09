@@ -60,6 +60,9 @@ from litellm.integrations.aawm_agent_quality_rules import (
     is_malformed_composer_call_literal_text,  # noqa: F401 - Wave 6A host binding
     is_malformed_grok_literal_tool_label_transcript_text,  # noqa: F401 - Wave 6A host binding
 )
+from litellm.integrations.aawm_agent_identity.constants import (
+    _AAWM_LITELLM_ENVIRONMENT_ENV_VARS,
+)
 from litellm.integrations.aawm_passthrough_shape_capture import (
     capture_passthrough_shape,  # noqa: F401 - pending shape-capture install wiring
 )
@@ -1764,6 +1767,10 @@ _aawm_selection.configure_selection_runtime(
     get_grok_account_quota_lane_cooldown_key=lambda *a, **kw: _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(*a, **kw),
     is_kimi_code_candidate=lambda *a, **kw: _is_kimi_code_auto_agent_candidate(*a, **kw),
     get_kimi_managed_account_cooldown_key=lambda *a, **kw: _get_kimi_code_managed_account_cooldown_key(*a, **kw),
+    get_codex_quota_observation_pool=lambda: _get_aawm_dynamic_injection_pool(),
+    get_codex_quota_observation_environment=lambda: _get_first_secret_value(
+        _AAWM_LITELLM_ENVIRONMENT_ENV_VARS
+    ),
 )
 _aawm_selection.install(globals())
 
