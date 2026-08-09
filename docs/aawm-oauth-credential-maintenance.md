@@ -112,6 +112,14 @@ the same inventory to the proxy and provider-status sidecar:
 | `account1` | `/home/zepfu/.codex/oauth.account1.json` | `/home/zepfu/.codex/oauth.account1.json.lock` | `10` | `1.0` | `AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED` (default `true`) | `["*"]` |
 | `account2` | `/home/zepfu/.codex/oauth.account2.json` | `/home/zepfu/.codex/oauth.account2.json.lock` | `20` | `1.0` | `AAWM_CODEX_OAUTH_ACCOUNT2_ENABLED` (default `true`) | `["*"]` |
 
+Operator mapping for those enrolled files (documentation only; not inventory
+schema fields):
+
+| Label | Source host auth | Owner |
+| --- | --- | --- |
+| `account1` | Seshat `~/.codex/auth.json` | `rdkick+openai@pm.me` |
+| `account2` | Thoth `~/.codex/auth.json` | `rdkick+openai2@pm.me` |
+
 Selection order is priority first and declaration order second. Labels are
 stable, non-secret operator names; they are not upstream account identities.
 Configured labels differ from hashed upstream identities and must not be used

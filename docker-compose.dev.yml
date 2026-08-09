@@ -1,3 +1,6 @@
+# Explicit Codex OAuth inventory labels (non-secret operator mapping only):
+# - account1: sourced from Seshat ~/.codex/auth.json; owner rdkick+openai@pm.me
+# - account2: sourced from Thoth ~/.codex/auth.json; owner rdkick+openai2@pm.me
 x-codex-oauth-inventory: &codex-oauth-inventory >-
   LITELLM_CODEX_OAUTH_INVENTORY={"schema_version":1,"accounts":[
   {"label":"account1","auth_path":"/home/zepfu/.codex/oauth.account1.json",
