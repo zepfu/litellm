@@ -1169,6 +1169,7 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
         "AAWM_PROVIDER_STATUS_ONCE",
         "AAWM_PROVIDER_STATUS_SETUP_SCHEMA_ON_START",
         "AAWM_PROVIDER_STATUS_SCHEMA_DSN",
+        "AAWM_CODEX_QUOTA_DSN",
         "AAWM_DIRECT_DATABASE_URL",
         "AAWM_PROVIDER_STATUS_REQUIRE_PGBOUNCER",
         "AAWM_PROVIDER_STATUS_DB_LOCK_TIMEOUT_MS",
@@ -1213,6 +1214,7 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
     assert config.db_lock_timeout_ms == 1000
     assert config.db_statement_timeout_ms == 5000
     assert config.schema_dsn is None
+    assert config.codex_quota_dsn is None
     assert config.require_pgbouncer is False
     assert config.grok_billing_poll_enabled is False
     assert config.grok_billing_poll_interval_seconds == 3600.0
@@ -1252,6 +1254,19 @@ def test_loop_config_uses_explicit_direct_schema_dsn(monkeypatch) -> None:
     assert (
         config.schema_dsn
         == "postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore"
+    )
+
+
+def test_loop_config_uses_dedicated_codex_quota_dsn(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "AAWM_CODEX_QUOTA_DSN",
+        "postgresql://litellm_dev:secret@pgbouncer-litellm-dev:6432/litellm_dev",
+    )
+
+    config = loop.parse_config([])
+
+    assert config.codex_quota_dsn == (
+        "postgresql://litellm_dev:secret@pgbouncer-litellm-dev:6432/litellm_dev"
     )
 
 
@@ -6614,7 +6629,13 @@ def test_codex_quota_poll_failure_does_not_suppress_other_account(
 def test_persist_codex_quota_observations_uses_synchronous_psycopg_insert(
     monkeypatch,
 ) -> None:
-    config = _codex_reset_credit_poll_config(apply=True)
+    config = _codex_reset_credit_poll_config(
+        apply=True,
+        codex_quota_dsn=(
+            "postgresql://litellm_dev:secret@pgbouncer-litellm-dev:6432/"
+            "litellm_dev?application_name=codex-quota-writer"
+        ),
+    )
     record = config.codex_oauth_inventory.records[0]
     rows, _summary = loop._build_codex_quota_rate_limit_observations(
         config,
@@ -6623,6 +6644,7 @@ def test_persist_codex_quota_observations_uses_synchronous_psycopg_insert(
         response_body=_codex_quota_payload(),
     )
     executed: list = []
+    connected_dsns: list[str] = []
 
     class _FakeCursor:
         rowcount = 1
@@ -6652,12 +6674,16 @@ def test_persist_codex_quota_observations_uses_synchronous_psycopg_insert(
     monkeypatch.setattr(
         loop.probes.psycopg,
         "connect",
-        lambda _dsn: _FakeConnection(),
+        lambda dsn: connected_dsns.append(dsn) or _FakeConnection(),
     )
 
     inserted = loop._persist_codex_quota_observations(config, rows)
 
     assert inserted == 2
+    assert connected_dsns == [
+        "postgresql://litellm_dev:secret@pgbouncer-litellm-dev:6432/"
+        "litellm_dev?application_name=codex-quota-writer"
+    ]
     quota_inserts = [
         (sql, params)
         for sql, params in executed
@@ -6678,6 +6704,61 @@ def test_persist_codex_quota_observations_uses_synchronous_psycopg_insert(
     assert {
         row["account_hash"] for row in rows
     } == {record.expected_account_hash}
+
+
+def test_persist_codex_quota_observations_falls_back_to_general_dsn(
+    monkeypatch,
+) -> None:
+    config = _codex_reset_credit_poll_config(
+        apply=True,
+        dsn=(
+            "postgresql://aawm:secret@pgbouncer-aawm-dev:6432/"
+            "aawm_tristore?application_name=general-sidecar"
+        ),
+        codex_quota_dsn=None,
+    )
+    record = config.codex_oauth_inventory.records[0]
+    rows, _summary = loop._build_codex_quota_rate_limit_observations(
+        config,
+        record=record,
+        observed_at=datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc),
+        response_body=_codex_quota_payload(),
+    )
+    connected_dsns: list[str] = []
+
+    class _FakeCursor:
+        rowcount = 1
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _sql, _params=None):
+            return None
+
+    class _FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return _FakeCursor()
+
+    monkeypatch.setattr(
+        loop.probes.psycopg,
+        "connect",
+        lambda dsn: connected_dsns.append(dsn) or _FakeConnection(),
+    )
+
+    assert loop._persist_codex_quota_observations(config, rows) == 2
+    assert connected_dsns == [
+        "postgresql://aawm:secret@pgbouncer-aawm-dev:6432/"
+        "aawm_tristore?application_name=general-sidecar"
+    ]
 
 
 def test_persist_codex_quota_observations_propagates_db_write_skipped(

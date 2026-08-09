@@ -1235,6 +1235,7 @@ class ProviderStatusLoopConfig:
     db_lock_timeout_ms: int
     db_statement_timeout_ms: int
     schema_dsn: Optional[str] = None
+    codex_quota_dsn: Optional[str] = None
     require_pgbouncer: bool = False
     grok_oidc_refresh_enabled: bool = False
     grok_oidc_auth_file: str = DEFAULT_GROK_OIDC_AUTH_FILE
@@ -1610,6 +1611,15 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         help="Collect and log a summary without inserting observations.",
     )
     parser.add_argument("--dsn", default=os.getenv("AAWM_PROVIDER_STATUS_DSN"))
+    parser.add_argument(
+        "--codex-quota-dsn",
+        default=os.getenv("AAWM_CODEX_QUOTA_DSN"),
+        help=(
+            "Postgres DSN used only for direct Codex quota persistence. "
+            "Defaults to AAWM_CODEX_QUOTA_DSN, then falls back to the general "
+            "provider-status DSN."
+        ),
+    )
     parser.add_argument(
         "--schema-dsn",
         default=(
@@ -2695,6 +2705,7 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         db_lock_timeout_ms=args.db_lock_timeout_ms,
         db_statement_timeout_ms=args.db_statement_timeout_ms,
         schema_dsn=args.schema_dsn,
+        codex_quota_dsn=args.codex_quota_dsn,
         require_pgbouncer=args.require_pgbouncer,
         grok_oidc_refresh_enabled=args.grok_oidc_refresh_enabled,
         grok_oidc_auth_file=resolved_grok_auth_file,
@@ -2794,6 +2805,15 @@ def _resolve_dsn(config: ProviderStatusLoopConfig) -> str:
             "No database DSN found. Set AAWM_DB_* or AAWM_PROVIDER_STATUS_DSN."
         )
     return dsn
+
+
+def _resolve_codex_quota_dsn(config: ProviderStatusLoopConfig) -> str:
+    if config.codex_quota_dsn:
+        return probes._append_dsn_query_params(
+            config.codex_quota_dsn,
+            {"application_name": probes._provider_status_db_application_name()},
+        )
+    return _resolve_dsn(config)
 
 
 def _resolve_schema_dsn(config: ProviderStatusLoopConfig) -> str:
@@ -4974,7 +4994,7 @@ def _persist_codex_quota_observations(
 ) -> int:
     if not observations:
         return 0
-    dsn = _resolve_dsn(config)
+    dsn = _resolve_codex_quota_dsn(config)
     inserted_count = 0
     try:
         with probes.psycopg.connect(dsn) as conn:

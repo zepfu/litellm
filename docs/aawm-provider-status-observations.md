@@ -659,12 +659,13 @@ reset-credit **detail** endpoint (default
 record's exact `Authorization: Bearer <token>` and `ChatGPT-Account-Id`
 headers, and continues to the next record after an account-specific failure.
 Reset-credit rows use `public.provider_credit_observations`; native five-hour
-and seven-day quota windows are submitted as observation-only records to the
-existing `litellm.integrations.aawm_session_history` structured writer. That
-owner performs meaningful-change filtering, previous-observation lookup,
-transition generation, queue/spool/retry handling, and durable
-`public.rate_limit_observations` persistence. The provider-status script does
-not define a second quota SQL writer or mutate the observation schema.
+and seven-day quota windows are written synchronously to
+`public.rate_limit_observations`. The quota writer uses
+`AAWM_CODEX_QUOTA_DSN` when configured and otherwise falls back to the general
+provider-status DSN. This lets deployments store Codex quota beside the
+LiteLLM callback/session-history tables that hydrate routing while leaving
+other provider-status and reset-credit writes on the sidecar's general
+database. The provider-status script reuses the existing observation schema.
 
 `AAWM_CODEX_USAGE_URL` remains the backward-compatible env name for the poll URL.
 If it is still set to the legacy aggregate URL (`/backend-api/wham/usage`), the
@@ -682,6 +683,8 @@ Relevant environment variables:
 - `AAWM_CODEX_USAGE_URL`: poll URL (defaults to rate-limit-reset-credits).
 - `AAWM_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS`: max attempts per scheduled run.
 - `AAWM_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS`: retry backoff base.
+- `AAWM_CODEX_QUOTA_DSN`: optional Postgres DSN used only for direct Codex
+  quota persistence; falls back to the general sidecar DSN when unset.
 
 The detail parser reads `credits[]` with `status`, `reset_type`, `granted_at`,
 `expires_at`, `redeem_started_at`, and `redeemed_at` when present. Each visible
@@ -712,13 +715,13 @@ Each due attempt emits `codex_reset_credit_poll` with sanitized fields such as
 `quota_accepted_count`, `quota_storage_status`, `quota_window_states`,
 `quota_period_states`, `quota_health`, `poll_url`, `error_class`, and
 `error_message`. `inserted_count` covers the synchronous reset-credit writer;
-quota rows report `quota_storage_status=queued` and an accepted count because
-the authoritative session-history writer applies filtering and insertion
-asynchronously. The paired quota windows are healthy only when both five-hour
-and seven-day observations are fresh. Stale or unknown windows retain their
-reset/freshness evidence but store no fabricated remaining or used percentage.
-Upstream scope and model are stored only when the response actually supplies
-them; a model-like limit name is not promoted to model specificity.
+quota rows report `quota_storage_status=persisted` and
+`quota_inserted_count` after the synchronous direct insert. The paired quota
+windows are healthy only when both five-hour and seven-day observations are
+fresh. Stale or unknown windows retain their reset/freshness evidence but store
+no fabricated remaining or used percentage. Upstream scope and model are
+stored only when the response actually supplies them; a model-like limit name
+is not promoted to model specificity.
 
 `codex_quota_poll_aggregate` is `healthy` when every enabled account has both
 fresh windows, `degraded` when at least one account has usable fresh quota
