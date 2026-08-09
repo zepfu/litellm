@@ -173,6 +173,9 @@ async def aawm_alias_config_refresh_route(request: Request) -> dict[str, Any]:
         )
 
     runtime = _get_runtime()
+    if runtime is not None and inline_yaml is None:
+        return await _refresh_default_via_runtime(runtime)
+
     if runtime is None and inline_yaml is None:
         return await _refresh_default_via_direct_imports()
 
@@ -278,6 +281,54 @@ async def _refresh_via_runtime(
         "config_version": active_snapshot.config_version,
         "activated_at": datetime.now(timezone.utc).isoformat(),
         "active_candidate_order": _snapshot_candidate_order(active_snapshot),
+    }
+
+
+async def _refresh_default_via_runtime(
+    runtime: ConfigRefreshRuntime,
+) -> dict[str, Any]:
+    """Runtime path: compile the canonical directory and activate it."""
+    try:
+        attempted_snapshot, files_loaded = _load_full_default_directory_snapshot()
+    except (
+        _AawmAliasConfigCompileError,
+        _config_startup.ConfigDirectoryError,
+        ValidationError,
+    ) as exc:
+        last_known_good = runtime.get_active_snapshot()
+        error_detail: dict[str, Any] = {
+            "error": "AAWM alias-routing config failed to compile; last-known-good snapshot remains active",
+        }
+        if last_known_good is not None:
+            error_detail["active_config_hash"] = last_known_good.config_hash
+            error_detail["config_version"] = last_known_good.config_version
+        raise HTTPException(status_code=400, detail=error_detail) from exc
+
+    previous_snapshot = runtime.get_active_snapshot()
+    changed = (
+        previous_snapshot is None
+        or previous_snapshot.config_hash != attempted_snapshot.config_hash
+    )
+    if changed:
+        runtime.set_active_snapshot(attempted_snapshot)
+        active_snapshot = attempted_snapshot
+    else:
+        # No-op: identical content already active. Do not replace the
+        # snapshot object -- in-flight readers holding a reference to the
+        # active snapshot must keep observing the exact same object.
+        assert previous_snapshot is not None
+        active_snapshot = previous_snapshot
+
+    _config_startup.set_startup_files_loaded(files_loaded)
+
+    return {
+        "changed": changed,
+        "attempted_config_hash": attempted_snapshot.config_hash,
+        "active_config_hash": active_snapshot.config_hash,
+        "config_version": active_snapshot.config_version,
+        "activated_at": datetime.now(timezone.utc).isoformat(),
+        "active_candidate_order": _snapshot_candidate_order(active_snapshot),
+        "files": list(files_loaded),
     }
 
 

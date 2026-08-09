@@ -216,11 +216,15 @@ def test_di_non_string_yaml_field_returns_400() -> None:
     assert "must be a string" in exc_info.value.detail["error"]
 
 
-def test_di_unparseable_json_body_uses_default_yaml() -> None:
+def test_di_unparseable_json_body_refreshes_default_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     snapshot = _FakeSnapshot(config_hash="from_default", config_version=1)
-    runtime, calls = _make_runtime(
-        compile_result=snapshot,
-        default_yaml="defaults: {from_file: true}\n",
+    runtime, calls = _make_runtime(compile_result=snapshot)
+    monkeypatch.setattr(
+        config_refresh,
+        "_load_full_default_directory_snapshot",
+        lambda: (snapshot, ("alpha.yaml", "nested/zulu.yaml")),
     )
     configure_config_refresh_runtime(runtime=runtime)
 
@@ -229,19 +233,23 @@ def test_di_unparseable_json_body_uses_default_yaml() -> None:
     result = asyncio.run(aawm_alias_config_refresh_route(request))  # type: ignore[arg-type]
 
     assert result["changed"] is True
-    assert calls["compile_calls"] == ["defaults: {from_file: true}\n"]
+    assert result["files"] == ["alpha.yaml", "nested/zulu.yaml"]
+    assert calls["compile_calls"] == []
 
 
-def test_di_default_loader_oserror_returns_400() -> None:
-    def _broken_loader() -> str:
-        raise OSError("disk gone")
+def test_di_default_directory_error_returns_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _broken_directory_loader() -> tuple[_FakeSnapshot, tuple[str, ...]]:
+        raise config_refresh._AawmAliasConfigCompileError("disk gone")
 
-    runtime = ConfigRefreshRuntime(
-        compile_yaml=lambda s: None,
-        get_active_snapshot=lambda: None,
-        set_active_snapshot=lambda s: None,
-        load_default_source_yaml=_broken_loader,
-        compile_error_types=(_CompileError,),
+    lkg = _FakeSnapshot(config_hash="good_hash", config_version=5)
+    runtime, calls = _make_runtime(
+        active_snapshot=lkg,
+        compile_result=_FakeSnapshot(config_hash="unused", config_version=0),
+    )
+    monkeypatch.setattr(
+        config_refresh,
+        "_load_full_default_directory_snapshot",
+        _broken_directory_loader,
     )
     configure_config_refresh_runtime(runtime=runtime)
 
@@ -250,7 +258,10 @@ def test_di_default_loader_oserror_returns_400() -> None:
         asyncio.run(aawm_alias_config_refresh_route(request))  # type: ignore[arg-type]
 
     assert exc_info.value.status_code == 400
-    assert "failed to read" in exc_info.value.detail["error"]
+    assert "last-known-good" in exc_info.value.detail["error"]
+    assert exc_info.value.detail["active_config_hash"] == "good_hash"
+    assert exc_info.value.detail["config_version"] == 5
+    assert calls["set_snapshot"] is None
 
 
 # ---------------------------------------------------------------------------
