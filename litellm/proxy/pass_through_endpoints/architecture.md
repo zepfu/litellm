@@ -161,9 +161,10 @@ fork. Its dependencies have narrower canonical owners:
 - `aawm_request_policy/claude_prompt_replacement.py` owns template discovery,
   packaged-data fallback, auto-memory replacement, prompt-patch manifest
   application, and their metadata helpers.
-- `aawm_context_query.py` owns provider-neutral secret/DSN parsing, the single
-  process asyncpg pool, acquire/query timeouts, context queries, and both
-  15-second default TTL caches.
+- `aawm_context_query.py` owns provider-neutral secret/DSN parsing, the
+  dynamic-injection asyncpg pool, the callback/session-history pool delegate,
+  acquire/query timeouts, context queries, and both 15-second default TTL
+  caches.
 - `llm_passthrough_endpoints.py` is the production composition root. It injects
   prompt, context/query, clock, cache, and observability services into one
   `ClaudeControlPlaneRewriter`; the control plane never imports the host.
@@ -198,12 +199,24 @@ blocks; the request-wide budget is what stops unbounded DB fan-out.
 
 ### Connection pool lifecycle
 
-`aawm_context_query.py` owns the canonical process-wide asyncpg pool used for
-dynamic injection / context grabs and sibling AAWM Postgres lookups that share
-the same DSN. OpenRouter free-tier durable quota reads receive this neutral pool
-callback directly; they do not consume a Claude-owned database service.
+`aawm_context_query.py` owns two distinct database paths:
+
+- The dynamic-injection pool, built from the `AAWM_DYNAMIC_INJECTION_DB_*`
+  selectors (falling back to the shared `AAWM_DB_*` selectors when unset). It
+  targets the tristore database (`aawm_tristore`) and serves dynamic context
+  queries: `ag_catalog.raw_content` reference identifier lists,
+  `tristore_search_exact` context grabs, and agent memories.
+- The callback/session-history pool, delegated to
+  `aawm_session_history.writer._get_aawm_session_history_pool()` and built
+  from the `AAWM_DB_*` selectors. It targets the callback database
+  (`litellm_dev` on Thoth) and serves OpenRouter durable free-tier quota reads
+  and Codex account quota hydration against
+  `public.rate_limit_observations`.
+
 `close_aawm_dynamic_injection_pool()` is invoked from
-`proxy_shutdown_event()` so connections are released on clean proxy shutdown.
+`proxy_shutdown_event()` so dynamic-injection connections are released on
+clean proxy shutdown; the session-history pool lifecycle is owned by the
+session-history writer.
 
 `llm_passthrough_endpoints` and `aawm_claude_control_plane` retain stable
 pool/DSN compatibility exports, but neither stores pool state or creates a

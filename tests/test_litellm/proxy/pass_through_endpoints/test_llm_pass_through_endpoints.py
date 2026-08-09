@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import copy
+import importlib
 import json
 import logging
 import os
@@ -34,6 +35,8 @@ from litellm.proxy.aawm_route_logging import (
     flush_aawm_route_rollups,
 )
 from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
+from litellm.proxy.pass_through_endpoints import aawm_context_query
+from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     config_compiler as aawm_alias_config_compiler,
 )
@@ -400,6 +403,72 @@ def test_claude_control_plane_dynamic_injection_dsn_adds_application_name(
     )
 
 
+def test_dynamic_injection_dsn_prefers_dedicated_selectors(
+    monkeypatch,
+) -> None:
+    """Dynamic-injection DSN must target the tristore DB via
+    AAWM_DYNAMIC_INJECTION_DB_* selectors even when the callback AAWM_DB_*
+    selectors point at a different database (litellm_dev)."""
+    _patch_aawm_secret_values(
+        monkeypatch,
+        {
+            "AAWM_DB_HOST": "pgbouncer-litellm-dev",
+            "AAWM_DB_PORT": "6432",
+            "AAWM_DB_USER": "litellm_dev",
+            "AAWM_DB_PASSWORD": "litellm_dev_pw",
+            "AAWM_DB_NAME": "litellm_dev",
+            "AAWM_DB_SSLMODE": "disable",
+            "AAWM_DYNAMIC_INJECTION_DB_HOST": "pgbouncer-aawm-dev",
+            "AAWM_DYNAMIC_INJECTION_DB_PORT": "6432",
+            "AAWM_DYNAMIC_INJECTION_DB_USER": "aawm",
+            "AAWM_DYNAMIC_INJECTION_DB_PASSWORD": "aawm dev",
+            "AAWM_DYNAMIC_INJECTION_DB_NAME": "aawm_tristore",
+        },
+    )
+
+    dsn = aawm_context_query._build_aawm_dynamic_injection_dsn()
+
+    assert dsn is not None
+    parsed = urlsplit(dsn)
+    assert parsed.hostname == "pgbouncer-aawm-dev"
+    assert parsed.port == 6432
+    assert parsed.path == "/aawm_tristore"
+    assert _dsn_query_params(dsn) == {
+        "sslmode": ["disable"],
+        "application_name": ["aawm-litellm-dynamic-injection"],
+    }
+
+
+def test_dynamic_injection_dsn_prefers_dedicated_url(
+    monkeypatch,
+) -> None:
+    """AAWM_DYNAMIC_INJECTION_DB_URL wins over the callback AAWM_DATABASE_URL
+    so dynamic context queries can target aawm_tristore independently."""
+    _patch_aawm_secret_values(
+        monkeypatch,
+        {
+            "AAWM_DATABASE_URL": (
+                "postgresql://litellm_dev:pw@pgbouncer-litellm-dev:6432/litellm_dev"
+            ),
+            "AAWM_DYNAMIC_INJECTION_DB_URL": (
+                "postgresql://aawm:pw@pgbouncer-aawm-dev:6432/aawm_tristore"
+                "?sslmode=require"
+            ),
+        },
+    )
+
+    dsn = aawm_context_query._build_aawm_dynamic_injection_dsn()
+
+    assert dsn is not None
+    parsed = urlsplit(dsn)
+    assert parsed.hostname == "pgbouncer-aawm-dev"
+    assert parsed.path == "/aawm_tristore"
+    assert _dsn_query_params(dsn) == {
+        "sslmode": ["require"],
+        "application_name": ["aawm-litellm-dynamic-injection"],
+    }
+
+
 def test_llm_passthrough_dynamic_injection_dsn_preserves_application_name(
     monkeypatch,
 ) -> None:
@@ -444,6 +513,123 @@ async def test_claude_control_plane_dynamic_injection_pool_disables_statement_ca
         monkeypatch,
         aawm_claude_control_plane,
     )
+
+
+@pytest.mark.asyncio
+async def test_callback_pool_delegates_to_session_history_writer(
+    monkeypatch,
+) -> None:
+    """Quota hydration pool must resolve to the session-history callback pool
+    (litellm_dev), not the dynamic-injection/tristore pool."""
+    sentinel_pool = object()
+
+    class FakeWriter:
+        async def _get_aawm_session_history_pool(self):
+            return sentinel_pool
+
+    monkeypatch.setattr(
+        aawm_context_query,
+        "_runtime",
+        aawm_context_query.ContextQueryRuntime(
+            get_secret_str=lambda _name: None,
+            import_module=lambda name: (
+                FakeWriter()
+                if name == "litellm.integrations.aawm_session_history.writer"
+                else importlib.import_module(name)
+            ),
+        ),
+    )
+
+    pool = await aawm_context_query._get_aawm_callback_pool()
+
+    assert pool is sentinel_pool
+
+
+@pytest.mark.asyncio
+async def test_quota_hydration_uses_callback_pool_not_dynamic_pool(
+    monkeypatch,
+) -> None:
+    """OpenRouter and Codex quota hydration read callback-owned tables
+    (public.rate_limit_observations) and must stay on the callback DB."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        openrouter_quota as _openrouter_quota,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        selection as _selection,
+    )
+
+    callback_pool = llm_passthrough_endpoints._get_aawm_callback_pool
+    dynamic_pool = llm_passthrough_endpoints._get_aawm_dynamic_injection_pool
+    assert callback_pool is not dynamic_pool
+    assert (
+        _openrouter_quota._get_dynamic_injection_pool
+        is callback_pool
+    )
+
+    codex_pool_getter = _selection._get_codex_quota_observation_pool
+    assert codex_pool_getter is not None
+    sentinel_pool = object()
+
+    async def fake_callback_pool():
+        return sentinel_pool
+
+    async def fail_dynamic_pool():
+        raise AssertionError("Codex quota hydration used the dynamic pool")
+
+    monkeypatch.setattr(
+        llm_passthrough_endpoints,
+        "_get_aawm_callback_pool",
+        fake_callback_pool,
+    )
+    monkeypatch.setattr(
+        llm_passthrough_endpoints,
+        "_get_aawm_dynamic_injection_pool",
+        fail_dynamic_pool,
+    )
+
+    assert await codex_pool_getter() is sentinel_pool
+
+
+@pytest.mark.asyncio
+async def test_dynamic_context_queries_production_pool_is_dynamic(
+    monkeypatch,
+) -> None:
+    """Production composition wires dynamic context queries to the
+    dynamic-injection pool factory on the Claude control plane facade."""
+    sentinel_pool = object()
+
+    async def fake_dynamic_pool(**kwargs):
+        return sentinel_pool
+
+    recorded: list[Any] = []
+
+    async def fake_pool_fetch(pool, query, *args, **kwargs):
+        recorded.append(pool)
+        return []
+
+    monkeypatch.setattr(
+        aawm_context_query,
+        "_runtime",
+        aawm_context_query.ContextQueryRuntime(get_secret_str=lambda _name: None),
+    )
+    monkeypatch.setattr(
+        aawm_context_query,
+        "_get_aawm_dynamic_injection_pool",
+        fake_dynamic_pool,
+    )
+    monkeypatch.setattr(
+        aawm_context_query,
+        "_aawm_pool_fetch",
+        fake_pool_fetch,
+    )
+    # aawm_claude_control_plane delegates to _context_query with the facade
+    # get_pool that closes over _context_query._get_aawm_dynamic_injection_pool.
+    await aawm_claude_control_plane._call_aawm_reference_identifier_list(
+        tenant_id=None,
+        agent_id=None,
+    )
+
+    assert recorded == [sentinel_pool]
 
 
 @pytest.mark.parametrize(

@@ -255,6 +255,7 @@ _initialize_aawm_dynamic_injection_connection = (
 close_aawm_dynamic_injection_pool = (
     _aawm_context_query.close_aawm_dynamic_injection_pool
 )
+_get_aawm_callback_pool = _aawm_context_query._get_aawm_callback_pool
 
 
 def _set_aawm_claude_control_plane_initialization_status(
@@ -288,7 +289,7 @@ def _initialize_aawm_claude_control_plane(
         prompt_replacement = importer(_AAWM_CLAUDE_PROMPT_REPLACEMENT_MODULE)
         context_services = _aawm_context_query.build_context_query_services(
             get_agent_memories=lambda **kwargs: (
-                control_plane._call_aawm_get_agent_memories(**kwargs)
+                _call_aawm_get_agent_memories(**kwargs)
             ),
             get_context=lambda **kwargs: control_plane._call_aawm_context_grab(
                 **kwargs
@@ -1731,7 +1732,7 @@ _aawm_openrouter_quota.configure_openrouter_quota_runtime(
     get_quota_cache=_get_openrouter_free_daily_quota_cache,
     set_quota_cache=_set_openrouter_free_daily_quota_cache,
     quota_lock=_openrouter_free_daily_quota_lock,
-    get_dynamic_injection_pool=_get_aawm_dynamic_injection_pool,
+    get_dynamic_injection_pool=_get_aawm_callback_pool,
     get_adapter_active_cooldown_seconds=_get_openrouter_adapter_active_cooldown_seconds,
     get_adapter_rate_limit_key=_get_openrouter_adapter_rate_limit_key,
     fetch_quota_row=_fetch_openrouter_quota_row_via_facade,
@@ -1767,7 +1768,7 @@ _aawm_selection.configure_selection_runtime(
     get_grok_account_quota_lane_cooldown_key=lambda *a, **kw: _get_codex_auto_agent_grok_account_quota_lane_cooldown_key(*a, **kw),
     is_kimi_code_candidate=lambda *a, **kw: _is_kimi_code_auto_agent_candidate(*a, **kw),
     get_kimi_managed_account_cooldown_key=lambda *a, **kw: _get_kimi_code_managed_account_cooldown_key(*a, **kw),
-    get_codex_quota_observation_pool=lambda: _get_aawm_dynamic_injection_pool(),
+    get_codex_quota_observation_pool=lambda: _get_aawm_callback_pool(),
     get_codex_quota_observation_environment=lambda: _get_first_secret_value(
         _AAWM_LITELLM_ENVIRONMENT_ENV_VARS
     ),

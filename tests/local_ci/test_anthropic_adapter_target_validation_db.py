@@ -241,10 +241,10 @@ def test_target_profile_applies_db_settings_to_all_db_validators(harness):
     }
     harness._apply_profile_validation_db_overrides(case, _dev_profile())
     for block in case.values():
-        assert block["db_port"] == 6435
-        assert block["db_name"] == "aawm_tristore"
-        assert block["db_user"] == "aawm"
-        assert block["db_password_container"] == "thoth-aawm-dev-pgbouncer"
+        assert block["db_port"] == 6433
+        assert block["db_name"] == "litellm_dev"
+        assert block["db_user"] == "litellm_dev"
+        assert block["db_password_container"] == "thoth-litellm-dev-pgbouncer"
         assert block["db_password_container_env"] == "PGBOUNCER_AUTH_PASSWORD"
 
 
@@ -576,12 +576,12 @@ def test_config_case_uses_failure_observability_and_read_only_codex():
 
 def test_config_dev_profile_declares_container_owned_credentials():
     dev = _config()["target_profiles"]["dev"]
-    # CFG-003 Initiation 2 item 4: dev evidence DB is aawm_tristore on 6435.
+    # Dev evidence DB is the litellm_dev callback database on 6433.
     assert dev["validation_db_host"] == "127.0.0.1"
-    assert dev["validation_db_port"] == "6435"
-    assert dev["validation_db_name"] == "aawm_tristore"
-    assert dev["validation_db_user"] == "aawm"
-    assert dev["validation_db_password_container"] == "thoth-aawm-dev-pgbouncer"
+    assert dev["validation_db_port"] == "6433"
+    assert dev["validation_db_name"] == "litellm_dev"
+    assert dev["validation_db_user"] == "litellm_dev"
+    assert dev["validation_db_password_container"] == "thoth-litellm-dev-pgbouncer"
     assert dev["validation_db_password_container_env"] == "PGBOUNCER_AUTH_PASSWORD"
     # CFG-003 Initiation 2 item 6: Langfuse credentials are owned by a
     # dedicated container distinct from the target litellm-dev container.

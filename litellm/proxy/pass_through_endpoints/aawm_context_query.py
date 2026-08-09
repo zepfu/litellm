@@ -38,6 +38,68 @@ _AAWM_CONTEXT_GRAB_PROC_NAME_ENV_VARS = (
     "AAWM_DYNAMIC_CONTEXT_GRAB_PROC_NAME",
 )
 _AAWM_CONTEXT_GRAB_DEFAULT_PROC_NAME = "tristore_search_exact"
+_AAWM_DYNAMIC_INJECTION_DB_HOST_ENV_VARS = (
+    "AAWM_DYNAMIC_INJECTION_DB_HOST",
+    "AAWM_DB_HOST",
+    "AAWM_POSTGRES_SERVER",
+    "POSTGRES_SERVER",
+    "PGHOST",
+)
+_AAWM_DYNAMIC_INJECTION_DB_PORT_ENV_VARS = (
+    "AAWM_DYNAMIC_INJECTION_DB_PORT",
+    "AAWM_DB_PORT",
+    "AAWM_POSTGRES_PORT",
+    "POSTGRES_PORT",
+    "PGPORT",
+)
+_AAWM_DYNAMIC_INJECTION_DB_USER_ENV_VARS = (
+    "AAWM_DYNAMIC_INJECTION_DB_USER",
+    "AAWM_DB_USER",
+    "AAWM_POSTGRES_USER",
+    "POSTGRES_USER",
+    "PGUSER",
+)
+_AAWM_DYNAMIC_INJECTION_DB_PASSWORD_ENV_VARS = (
+    "AAWM_DYNAMIC_INJECTION_DB_PASSWORD",
+    "AAWM_DYNAMIC_INJECTION_DB_PWD",
+    "AAWM_DB_PASSWORD",
+    "AAWM_DB_PWD",
+    "AAWM_POSTGRES_PASSWORD",
+    "AAWM_POSTGRES_PWD",
+    "POSTGRES_PASSWORD",
+    "POSTGRES_PWD",
+    "PGPASSWORD",
+)
+_AAWM_DYNAMIC_INJECTION_DB_NAME_ENV_VARS = (
+    "AAWM_DYNAMIC_INJECTION_DB_NAME",
+    "AAWM_DB_NAME",
+    "AAWM_POSTGRES_DATABASE",
+    "POSTGRES_DATABASE",
+    "PGDATABASE",
+)
+_AAWM_DYNAMIC_INJECTION_DB_SSLMODE_ENV_VARS = (
+    "AAWM_DYNAMIC_INJECTION_DB_SSLMODE",
+    "AAWM_DB_SSLMODE",
+    "AAWM_POSTGRES_SSLMODE",
+    "POSTGRES_SSLMODE",
+    "PGSSLMODE",
+)
+_AAWM_DYNAMIC_INJECTION_DB_SSL_BOOL_ENV_VARS = (
+    "AAWM_DYNAMIC_INJECTION_DB_SSL",
+    "AAWM_DB_SSL",
+    "AAWM_POSTGRES_SSL",
+    "POSTGRES_SSL",
+)
+_AAWM_DYNAMIC_INJECTION_DB_URL_ENV_VARS = (
+    "AAWM_DYNAMIC_INJECTION_DB_URL",
+    "AAWM_DYNAMIC_INJECTION_DATABASE_URL",
+    "AAWM_DB_URL",
+    "AAWM_DATABASE_URL",
+    "AAWM_POSTGRES_URL",
+)
+# Callback/session-history database selectors. Dynamic injection must not use
+# these directly; they target the callback database (for example litellm_dev)
+# while dynamic context queries target the tristore database (aawm_tristore).
 _AAWM_DB_HOST_ENV_VARS = (
     "AAWM_DB_HOST",
     "AAWM_POSTGRES_SERVER",
@@ -313,13 +375,14 @@ def _build_aawm_dynamic_injection_dsn(
     secret_value_getter = get_first_secret_value or _get_first_secret_value
     sslmode_normalizer = normalize_sslmode or _normalize_aawm_sslmode
     application_name_getter = get_application_name or _get_aawm_dynamic_injection_application_name
-    host = secret_value_getter(_AAWM_DB_HOST_ENV_VARS)
-    port = secret_value_getter(_AAWM_DB_PORT_ENV_VARS)
-    user = secret_value_getter(_AAWM_DB_USER_ENV_VARS)
-    password = secret_value_getter(_AAWM_DB_PASSWORD_ENV_VARS)
-    database = secret_value_getter(_AAWM_DB_NAME_ENV_VARS)
+    host = secret_value_getter(_AAWM_DYNAMIC_INJECTION_DB_HOST_ENV_VARS)
+    port = secret_value_getter(_AAWM_DYNAMIC_INJECTION_DB_PORT_ENV_VARS)
+    user = secret_value_getter(_AAWM_DYNAMIC_INJECTION_DB_USER_ENV_VARS)
+    password = secret_value_getter(_AAWM_DYNAMIC_INJECTION_DB_PASSWORD_ENV_VARS)
+    database = secret_value_getter(_AAWM_DYNAMIC_INJECTION_DB_NAME_ENV_VARS)
     sslmode = sslmode_normalizer(
-        secret_value_getter(_AAWM_DB_SSLMODE_ENV_VARS) or secret_value_getter(_AAWM_DB_SSL_BOOL_ENV_VARS)
+        secret_value_getter(_AAWM_DYNAMIC_INJECTION_DB_SSLMODE_ENV_VARS)
+        or secret_value_getter(_AAWM_DYNAMIC_INJECTION_DB_SSL_BOOL_ENV_VARS)
     )
     has_component_config = any((host, port, user, password, database, sslmode))
     if has_component_config:
@@ -335,7 +398,7 @@ def _build_aawm_dynamic_injection_dsn(
             dsn,
             {"application_name": application_name_getter()},
         )
-    url_dsn = secret_value_getter(_AAWM_DB_URL_ENV_VARS)
+    url_dsn = secret_value_getter(_AAWM_DYNAMIC_INJECTION_DB_URL_ENV_VARS)
     if not url_dsn:
         return None
     return _append_aawm_dynamic_injection_dsn_query_params(
@@ -382,6 +445,24 @@ async def close_aawm_dynamic_injection_pool() -> None:
         _aawm_dynamic_injection_pool = None
     if pool is not None:
         await pool.close()
+
+
+async def _get_aawm_callback_pool() -> Any:
+    """Callback/session-history asyncpg pool (for example litellm_dev).
+
+    Quota hydration (OpenRouter durable quota, Codex account quota state) reads
+    callback-owned tables such as public.rate_limit_observations from this
+    pool, not from the dynamic-injection/tristore pool.
+    """
+    try:
+        writer = _runtime.import_module(
+            "litellm.integrations.aawm_session_history.writer"
+        )
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "AAWM callback pool requires the aawm_session_history writer"
+        ) from exc
+    return await writer._get_aawm_session_history_pool()
 
 
 def _aawm_dynamic_injection_acquire_timeout_seconds() -> float:
