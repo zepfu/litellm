@@ -846,6 +846,17 @@ class TestAliasReferenceResolution:
         snapshot_eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
         assert _snapshot_eligible_fields(yaml_eligible) == _snapshot_eligible_fields(snapshot_eligible)
 
+    def test_dispatch_only_alias_is_resolved_to_default_target(self, ra):
+        snap = _compile_snapshot()
+        ingresses = ra._derive_ingresses_from_snapshot(snap, alias_name="sota")
+        eligible = ra._derive_eligible_candidates_from_snapshot(
+            snap, alias_name="sota", excluded_providers=frozenset()
+        )
+        assert ingresses == ["anthropic_messages", "codex_responses"]
+        assert len(eligible) == 1
+        assert eligible[0]["provider"] == "openai"
+        assert eligible[0]["model"] == "gpt-5.6-sol"
+
 
 # ---------------------------------------------------------------------------
 # Finding 1 (round 4): Error intake baseline/delta collector

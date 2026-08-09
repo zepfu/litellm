@@ -3271,11 +3271,32 @@ def _concretize_alias_candidates(
     if alias is None:
         return []
 
+    next_path = (*path, alias_name)
+
+    # Dispatch-only aliases should inherit their resolved target's concrete
+    # candidate set for inventory/derivation purposes, matching runtime
+    # snapshot selection behavior.
+    if alias.dispatch is not None:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+            _resolve_dispatch_target,
+        )
+
+        resolved_target = _resolve_dispatch_target(
+            alias_name=alias_name,
+            client_product_label=None,
+            snapshot=snapshot,
+        )
+        if resolved_target is None:
+            return []
+        return _concretize_alias_candidates(
+            snapshot,
+            alias_name=resolved_target,
+            path=next_path,
+        )
+
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
         AliasReference,
     )
-
-    next_path = (*path, alias_name)
     concrete_candidates: list[Any] = []
     for candidate in getattr(alias, "candidates", ()):  # robust against fake snapshots
         if isinstance(candidate, AliasReference):
