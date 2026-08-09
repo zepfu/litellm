@@ -822,6 +822,31 @@ def _compile_snapshot():
     return compile_directory(pathlib.Path(str(ROOT / "litellm" / "proxy" / "aawm_alias_config")))
 
 
+def _snapshot_eligible_fields(snapshot_candidates: list[dict[str, str]]):
+    return [
+        (
+            c["provider"],
+            c["model"],
+            c["route_family"],
+            c["priority"],
+        )
+        for c in snapshot_candidates
+    ]
+
+
+class TestAliasReferenceResolution:
+    def test_derive_ingresses_resolves_reference_aliases(self, ra):
+        snap = _compile_snapshot()
+        ingresses = ra._derive_ingresses_from_snapshot(snap, alias_name="work")
+        assert ingresses == ["anthropic_messages", "codex_responses"]
+
+    def test_derive_eligible_candidates_preserves_non_reference_aliases(self, ra, basic_yaml_text):
+        snap = _compile_snapshot()
+        yaml_eligible = ra._derive_eligible_candidates_from_yaml(basic_yaml_text)
+        snapshot_eligible = ra._derive_eligible_candidates_from_snapshot(snap, alias_name="basic")
+        assert _snapshot_eligible_fields(yaml_eligible) == _snapshot_eligible_fields(snapshot_eligible)
+
+
 # ---------------------------------------------------------------------------
 # Finding 1 (round 4): Error intake baseline/delta collector
 # ---------------------------------------------------------------------------

@@ -3238,11 +3238,9 @@ def _derive_ingresses_from_snapshot(
     RoutingSnapshot, using compiler-projected route families including
     anthropic_route_family.
     """
-    alias = snapshot.aliases.get(alias_name)
-    if alias is None:
-        return []
+    concrete_candidates = _concretize_alias_candidates(snapshot, alias_name=alias_name)
     ingresses: set[str] = set()
-    for cand in alias.candidates:
+    for cand in concrete_candidates:
         rf = cand.route_family or ""
         if rf.startswith("codex_") or rf == "codex_responses":
             ingresses.add("codex_responses")
@@ -3252,6 +3250,45 @@ def _derive_ingresses_from_snapshot(
         if arf:
             ingresses.add("anthropic_messages")
     return sorted(ingresses)
+
+
+def _concretize_alias_candidates(
+    snapshot: Any,
+    alias_name: str,
+    *,
+    path: tuple[str, ...] = (),
+) -> list[Any]:
+    """Resolve alias references to concrete candidates.
+
+    Mirrors snapshot compiler semantics for reference expansion by following
+    ``AliasReference`` entries in priority order and skipping already-visited
+    aliases to preserve cycle behavior.
+    """
+    if alias_name in path:
+        return []
+
+    alias = snapshot.aliases.get(alias_name)
+    if alias is None:
+        return []
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+        AliasReference,
+    )
+
+    next_path = (*path, alias_name)
+    concrete_candidates: list[Any] = []
+    for candidate in getattr(alias, "candidates", ()):  # robust against fake snapshots
+        if isinstance(candidate, AliasReference):
+            concrete_candidates.extend(
+                _concretize_alias_candidates(
+                    snapshot,
+                    alias_name=candidate.alias_name,
+                    path=next_path,
+                )
+            )
+            continue
+        concrete_candidates.append(candidate)
+    return concrete_candidates
 
 
 def _derive_eligible_candidates_from_snapshot(
@@ -3287,13 +3324,14 @@ def _derive_eligible_candidates_from_snapshot(
     if excluded_providers is None:
         excluded_providers = _TRANSACTIONAL_SWAP_EXCLUDED_PROVIDERS
 
-    alias = snapshot.aliases.get(alias_name)
-    if alias is None:
+    if snapshot.aliases.get(alias_name) is None:
         raise ValueError(f"alias {alias_name!r} not found in snapshot")
+
+    alias_candidates = _concretize_alias_candidates(snapshot, alias_name=alias_name)
 
     now_utc = now if now is not None else dt.datetime.now(dt.timezone.utc)
     eligible: list[dict[str, Any]] = []
-    for idx, cand in enumerate(alias.candidates):
+    for idx, cand in enumerate(alias_candidates):
         if cand.provider in excluded_providers:
             continue
         # Schedule window check.
