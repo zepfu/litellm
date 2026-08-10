@@ -127,6 +127,7 @@ async def _stream_text(response: StreamingResponse) -> str:
         ("dashscope/qwen3.8-max-preview", None),
         ("alibaba_token_plan/", None),
         ("alibaba_token_plan/   ", None),
+        ("alibaba_token_plan/qwen/sub", None),
         ("sota-alibaba", None),
     ),
 )

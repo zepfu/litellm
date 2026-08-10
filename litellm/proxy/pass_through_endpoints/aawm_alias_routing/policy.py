@@ -128,8 +128,10 @@ def normalize_alibaba_token_plan_adapter_model_name(model: Any) -> Optional[str]
 
     Any structurally valid explicit `alibaba_token_plan/<nonempty-model-id>`
     route is admitted without a Python model enumeration and the exact model
-    ID suffix is forwarded upstream. Unprefixed or foreign-provider names
-    return `None` so provider inference stays fail-closed.
+    ID suffix is forwarded upstream. Unprefixed names, foreign-provider names,
+    and nested suffixes (for example `alibaba_token_plan/qwen/sub`) return
+    `None`, matching `AlibabaTokenPlanChatConfig._model_id`, so provider
+    inference stays fail-closed.
     """
 
     if not isinstance(model, str):
@@ -140,7 +142,7 @@ def normalize_alibaba_token_plan_adapter_model_name(model: Any) -> Optional[str]
     provider_prefix, separator, model_id = candidate.partition("/")
     if not separator or provider_prefix != CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
         return None
-    if not model_id.strip():
+    if not model_id.strip() or "/" in model_id:
         return None
     return candidate
 
