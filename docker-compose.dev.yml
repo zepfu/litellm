@@ -135,8 +135,12 @@ services:
       # existing grant; the directory mount preserves atomic credential replacement.
       - /home/zepfu/.kimi-code/credentials:/home/zepfu/.kimi-code/credentials:ro
       # Sanitized Kimi native descriptor for canonical endpoint resolution (MS-030/MS-031).
-      # Read-only; does not contain OAuth credentials or the full Kimi home.
-      - ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.analysis/kimi-descriptor}:/app/kimi-descriptor:ro
+      # CFG-018: mount ONLY the dedicated sanitized descriptor directory
+      # read-only (canonical host file:
+      # /home/zepfu/.kimi-code/native-contract/native-contract.json ->
+      # /app/kimi-descriptor/native-contract.json). Never mount the whole
+      # Kimi home; the descriptor contains no OAuth credentials.
+      - ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.kimi-code/native-contract}:/app/kimi-descriptor:ro
       # Grok native client-version cache (xai-002). Read-only directory mount;
       # the sidecar or host CLI writes the JSON, LiteLLM only reads.
       - ${AAWM_GROK_CLIENT_VERSION_CACHE_DIR:-/home/zepfu/.cache/aawm/grok}:/run/aawm/grok:ro
@@ -223,7 +227,7 @@ services:
       - LITELLM_XAI_OAUTH_AUTH_FILE=${LITELLM_XAI_OAUTH_AUTH_FILE:-/home/zepfu/.litellm/xai/oauth-auth.json}
       - LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.grok/auth.json}
       - LITELLM_KIMI_OAUTH_AUTH_FILE=${LITELLM_KIMI_OAUTH_AUTH_FILE:-/home/zepfu/.kimi-code/credentials/kimi-code.json}
-      - LITELLM_KIMI_NATIVE_CONTRACT_PATH=${LITELLM_KIMI_NATIVE_CONTRACT_PATH:-/app/kimi-descriptor/kimi-native-contract.json}
+      - LITELLM_KIMI_NATIVE_CONTRACT_PATH=${LITELLM_KIMI_NATIVE_CONTRACT_PATH:-/app/kimi-descriptor/native-contract.json}
       - LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=${LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED:-true}
       - AAWM_GROK_CLIENT_VERSION_CACHE_PATH=${AAWM_GROK_CLIENT_VERSION_CACHE_PATH:-/run/aawm/grok/native-client-version.json}
       - AAWM_GROK_CLIENT_VERSION_CACHE_MAX_AGE_SECONDS=${AAWM_GROK_CLIENT_VERSION_CACHE_MAX_AGE_SECONDS:-172800}
@@ -298,7 +302,9 @@ services:
       - /home/zepfu/.kimi-code/credentials:/home/zepfu/.kimi-code/credentials
       - /home/zepfu/.kimi-code/oauth:/home/zepfu/.kimi-code/oauth
       # Sanitized Kimi native descriptor for canonical endpoint resolution (MS-030/MS-031).
-      - ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.analysis/kimi-descriptor}:/app/kimi-descriptor:ro
+      # CFG-018: dedicated sanitized descriptor directory only; canonical host
+      # file /home/zepfu/.kimi-code/native-contract/native-contract.json.
+      - ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.kimi-code/native-contract}:/app/kimi-descriptor:ro
       # Grok native client-version cache (xai-002). Read-only directory mount;
       # the billing poller reads the version written by the host CLI.
       - ${AAWM_GROK_CLIENT_VERSION_CACHE_DIR:-/home/zepfu/.cache/aawm/grok}:/run/aawm/grok:ro
@@ -368,7 +374,7 @@ services:
       - AAWM_XAI_OAUTH_HTTP_TIMEOUT_SECONDS=${AAWM_XAI_OAUTH_HTTP_TIMEOUT_SECONDS:-30}
       - AAWM_KIMI_OAUTH_REFRESH_ENABLED=${AAWM_KIMI_OAUTH_REFRESH_ENABLED:-1}
       - AAWM_KIMI_OAUTH_AUTH_FILE=${AAWM_KIMI_OAUTH_AUTH_FILE:-/home/zepfu/.kimi-code/credentials/kimi-code.json}
-      - LITELLM_KIMI_NATIVE_CONTRACT_PATH=${LITELLM_KIMI_NATIVE_CONTRACT_PATH:-/app/kimi-descriptor/kimi-native-contract.json}
+      - LITELLM_KIMI_NATIVE_CONTRACT_PATH=${LITELLM_KIMI_NATIVE_CONTRACT_PATH:-/app/kimi-descriptor/native-contract.json}
       - LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=${LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED:-true}
       - AAWM_KIMI_OAUTH_LOCK_FILE=${AAWM_KIMI_OAUTH_LOCK_FILE:-/home/zepfu/.kimi-code/oauth/kimi-code}
       - AAWM_KIMI_OAUTH_AUTH_FILE_UID=${AAWM_KIMI_OAUTH_AUTH_FILE_UID:-1000}

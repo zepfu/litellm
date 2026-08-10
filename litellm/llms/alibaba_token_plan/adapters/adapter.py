@@ -28,25 +28,25 @@ _CODEX_AGENT_MESSAGE_EMPTY_PAYLOAD_PATTERN = re.compile(
 def normalize_alibaba_token_plan_adapter_model_name(
     model: Any,
     *,
-    allowed_models: Iterable[str],
+    allowed_models: Iterable[str] = (),
 ) -> Optional[str]:
-    """Normalize only canonical `alibaba_token_plan/<model-id>` routes."""
+    """Normalize canonical `alibaba_token_plan/<model-id>` direct routes.
 
-    if not isinstance(model, str):
-        return None
-    candidate = model.strip()
-    if not candidate:
-        return None
-    provider_prefix, separator, model_id = candidate.partition("/")
-    if not separator or provider_prefix != "alibaba_token_plan" or not model_id.strip():
-        return None
-    return candidate if candidate in allowed_models else None
+    Any structurally valid explicit `alibaba_token_plan/<nonempty-model-id>`
+    route is admitted without a Python model enumeration and the exact suffix
+    is forwarded upstream; `allowed_models` is retained for source
+    compatibility and is not consulted.
+    """
+
+    _ = allowed_models
+    return policy.normalize_alibaba_token_plan_adapter_model_name(model)
 
 
 def _resolve_upstream_model(adapter_model: str) -> str:
-    if adapter_model not in policy.ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS:
+    normalized = policy.normalize_alibaba_token_plan_adapter_model_name(adapter_model)
+    if normalized is None:
         raise ValueError(f"Unsupported Alibaba Token Plan adapter model {adapter_model!r}.")
-    return adapter_model.removeprefix("alibaba_token_plan/")
+    return normalized.removeprefix("alibaba_token_plan/")
 
 
 def _add_adapter_metadata(

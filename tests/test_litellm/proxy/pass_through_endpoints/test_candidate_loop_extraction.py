@@ -29,6 +29,9 @@ from starlette.requests import Request
 from litellm.proxy.pass_through_endpoints import aawm_alias_routing as package
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import candidate_loop
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+)
 
 PACKAGE_DIR = Path(package.__file__).resolve().parent
 GOD_PATH = Path(lpe.__file__).resolve()
@@ -190,3 +193,55 @@ async def test_candidate_loop_resolves_generic_status_helper_from_live_host() ->
         lpe._extract_adapter_exception_status_code
         is package.error_signals._extract_adapter_exception_status_code
     )
+
+
+def test_resolve_failure_plan_classifies_alibaba_model_not_found_as_candidate_unavailable() -> None:
+    """Alibaba candidate + structured ModelNotFound -> ``candidate_unavailable``.
+
+    Regression: ``_resolve_failure_plan`` must forward ``candidate`` to the
+    retryable classifier. The Alibaba Token Plan unsupported-model guard needs
+    trusted provider attribution from the failed candidate; without the
+    forwarded candidate the structured ``ModelNotFound`` rejection is never
+    classified and the plan loses ``candidate_unavailable``.
+    """
+
+    class _StructuredModelNotFound(Exception):
+        def __init__(self) -> None:
+            super().__init__("ModelNotFound")
+            self.detail = {
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "ModelNotFound",
+                    "message": "Model not exist",
+                }
+            }
+
+    exc = _StructuredModelNotFound()
+    candidate = {"provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER}
+    captured: dict = {}
+
+    def _capture_publication(**kwargs) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    def _fail_if_recording(**kwargs) -> None:
+        raise AssertionError("codex failure evidence must not be recorded")
+
+    plan = candidate_loop._resolve_failure_plan(
+        resolve_cooldown_publication_fn=_capture_publication,
+        record_codex_failure_evidence_fn=_fail_if_recording,
+        request=SimpleNamespace(),
+        candidate=candidate,
+        selection={"cooldown_key": f"{CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER}:default", "lane_key": None},
+        attempt_record={},
+        exc=exc,
+        codex_failure_evidence_alias=None,
+        kimi_failure_metadata_fn=lambda exc, candidate=None: None,
+        classify_kimi_fn=lambda metadata: None,
+        classify_retryable_fn=package.error_signals._classify_codex_auto_agent_retryable_exhaustion,
+        grok_quota_fn=lambda exc, candidate=None: False,
+        cooldown_seconds_fn=lambda exc, candidate=None: 60,
+    )
+
+    assert captured["error_class"] == "candidate_unavailable"
+    assert plan.error_class == "candidate_unavailable"

@@ -39,13 +39,10 @@ from litellm.responses.litellm_completion_transformation.transformation import (
 from litellm.utils import _invalidate_model_cost_lowercase_map, get_model_info
 
 
-_ALLOWED_MODELS = {
-    "kimi_code/k3",
-    "kimi_code/k3-low",
-    "kimi_code/k3-high",
-    "kimi_code/k3-max",
-    "kimi_code/kimi-for-coding",
-    "kimi_code/kimi-for-coding-highspeed",
+_RETAINED_COMPATIBILITY_MAPPINGS = {
+    "kimi_code/k3-low": "low",
+    "kimi_code/k3-high": "high",
+    "kimi_code/k3-max": "max",
 }
 
 
@@ -187,13 +184,20 @@ async def _stream_text(response: StreamingResponse) -> str:
         ("kimi_code/k3-high", "kimi_code/k3-high"),
         ("kimi_code/k3-max", "kimi_code/k3-max"),
         ("kimi_code/kimi-for-coding", "kimi_code/kimi-for-coding"),
+        ("kimi_code/k3-preview", "kimi_code/k3-preview"),
+        ("kimi_code/k4-preview", "kimi_code/k4-preview"),
+        (" kimi_code/k4-preview ", "kimi_code/k4-preview"),
         ("k3", None),
         ("moonshot/k3", None),
-        ("kimi_code/k3-preview", None),
+        ("kimi_code/", None),
+        ("kimi_code/  ", None),
+        ("", None),
+        (None, None),
+        (42, None),
     ),
 )
-def test_should_normalize_only_managed_kimi_direct_models(model, expected):
-    assert normalize_kimi_code_chat_completions_adapter_model_name(model, allowed_models=_ALLOWED_MODELS) == expected
+def test_should_normalize_any_explicit_kimi_code_namespaced_model(model, expected):
+    assert normalize_kimi_code_chat_completions_adapter_model_name(model) == expected
 
 
 @pytest.mark.asyncio
@@ -921,6 +925,77 @@ def test_should_require_prefixed_direct_adapter_keys():
     )
     assert _resolve_codex_kimi_chat_completions_adapter_model({"model": "k3"}, "/v1/responses") is None
     assert _resolve_anthropic_kimi_chat_completions_adapter_model({"model": "k3"}, "/v1/messages") is None
+
+
+@pytest.mark.asyncio
+async def test_should_admit_synthetic_future_namespaced_model_without_python_enumeration():
+    """A future config-selected `kimi_code/<model-id>` routes without code changes."""
+    adapter_key = "kimi_code/k4-preview"
+
+    codex_plan = await prepare_codex_kimi_chat_completions_adapter_route(
+        request=MagicMock(),
+        adapter_model=adapter_key,
+        prepared_request_body={
+            "model": adapter_key,
+            "input": "hello",
+            "reasoning": {"effort": "high"},
+        },
+    )
+    anthropic_plan = await prepare_anthropic_kimi_chat_completions_adapter_route(
+        request=MagicMock(),
+        adapter_model=adapter_key,
+        prepared_request_body={
+            "model": adapter_key,
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 64,
+        },
+    )
+
+    completion_kwargs = codex_plan.perform_kwargs["completion_kwargs"]
+    assert completion_kwargs["model"] == "k4-preview"
+    # A future non-K3 model never gets a synthesized reasoning effort.
+    assert "reasoning_effort" not in completion_kwargs
+    assert codex_plan.prepared_request_body["litellm_metadata"]["kimi_code_upstream_model"] == "k4-preview"
+    assert anthropic_plan.perform_kwargs["model_for_upstream"] == "k4-preview"
+    assert "reasoning_effort" not in anthropic_plan.perform_kwargs["extra_handler_kwargs"]
+
+
+def test_should_resolve_synthetic_future_namespaced_model_through_model_resolution():
+    assert (
+        _resolve_codex_kimi_chat_completions_adapter_model({"model": "kimi_code/k4-preview"}, "/v1/responses")
+        == "kimi_code/k4-preview"
+    )
+    assert (
+        _resolve_anthropic_kimi_chat_completions_adapter_model({"model": "kimi_code/k4-preview"}, "/v1/messages")
+        == "kimi_code/k4-preview"
+    )
+    assert (
+        _resolve_codex_kimi_chat_completions_adapter_model({"model": "moonshot/k4-preview"}, "/v1/responses")
+        is None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("adapter_key", "forced_effort"),
+    tuple(_RETAINED_COMPATIBILITY_MAPPINGS.items()),
+)
+async def test_should_retain_k3_semantic_compatibility_mappings(adapter_key, forced_effort):
+    """k3-low/k3-high/k3-max remain semantic mappings to K3 with forced effort."""
+    plan = await prepare_codex_kimi_chat_completions_adapter_route(
+        request=MagicMock(),
+        adapter_model=adapter_key,
+        prepared_request_body={
+            "model": adapter_key,
+            "input": "hello",
+        },
+    )
+
+    completion_kwargs = plan.perform_kwargs["completion_kwargs"]
+    assert completion_kwargs["model"] == "k3"
+    assert completion_kwargs["reasoning_effort"] == forced_effort
+    assert plan.prepared_request_body["litellm_metadata"]["kimi_code_adapter_key"] == adapter_key
+    assert plan.prepared_request_body["litellm_metadata"]["kimi_code_upstream_model"] == "k3"
 
 
 @pytest.mark.asyncio
@@ -1882,12 +1957,13 @@ def _write_contract_descriptor(
 
 
 @pytest.mark.asyncio
-async def test_should_fail_closed_when_contract_required_but_missing_codex(
+async def test_should_use_builtin_identity_when_contract_required_but_missing_codex(
     monkeypatch,
     tmp_path,
 ):
-    """Codex adapter raises 503 HTTPException when the contract is required
-    but the descriptor is absent; no upstream call is made."""
+    """MS-035: Codex adapter continues with the conservative built-in
+    identity when the contract is required but the descriptor is absent; the
+    route no longer fails solely for contract unavailability."""
     from litellm.secret_managers.kimi_native_contract import (
         KIMI_NATIVE_CONTRACT_PATH_ENV,
         KIMI_NATIVE_CONTRACT_REQUIRED_ENV,
@@ -1899,28 +1975,28 @@ async def test_should_fail_closed_when_contract_required_but_missing_codex(
     monkeypatch.delenv(KIMI_NATIVE_CONTRACT_PATH_ENV, raising=False)
     monkeypatch.setenv(KIMI_NATIVE_CONTRACT_REQUIRED_ENV, "true")
 
-    with pytest.raises(HTTPException) as exc_info:
-        await prepare_codex_kimi_chat_completions_adapter_route(
-            request=_request(),
-            prepared_request_body={
-                "model": "kimi_code/k3",
-                "input": "hello",
-                "stream": False,
-            },
-            adapter_model="kimi_code/k3",
-        )
+    plan = await prepare_codex_kimi_chat_completions_adapter_route(
+        request=_request(),
+        prepared_request_body={
+            "model": "kimi_code/k3",
+            "input": "hello",
+            "stream": False,
+        },
+        adapter_model="kimi_code/k3",
+    )
 
-    assert exc_info.value.status_code == 503
-    assert exc_info.value.detail["error"]["code"] == "kimi_code_contract_unavailable"
+    assert plan.target_url == "https://api.kimi.com/coding/v1/chat/completions"
+    assert plan.api_base == "https://api.kimi.com/coding/v1"
 
 
 @pytest.mark.asyncio
-async def test_should_fail_closed_when_contract_required_but_missing_anthropic(
+async def test_should_use_builtin_identity_when_contract_required_but_missing_anthropic(
     monkeypatch,
     tmp_path,
 ):
-    """Anthropic adapter raises 503 HTTPException when the contract is required
-    but the descriptor is absent; no upstream call is made."""
+    """MS-035: Anthropic adapter continues with the conservative built-in
+    identity when the contract is required but the descriptor is absent; the
+    route no longer fails solely for contract unavailability."""
     from litellm.secret_managers.kimi_native_contract import (
         KIMI_NATIVE_CONTRACT_PATH_ENV,
         KIMI_NATIVE_CONTRACT_REQUIRED_ENV,
@@ -1932,20 +2008,19 @@ async def test_should_fail_closed_when_contract_required_but_missing_anthropic(
     monkeypatch.delenv(KIMI_NATIVE_CONTRACT_PATH_ENV, raising=False)
     monkeypatch.setenv(KIMI_NATIVE_CONTRACT_REQUIRED_ENV, "true")
 
-    with pytest.raises(HTTPException) as exc_info:
-        await prepare_anthropic_kimi_chat_completions_adapter_route(
-            request=_request(),
-            prepared_request_body={
-                "model": "kimi_code/k3",
-                "max_tokens": 64,
-                "messages": [{"role": "user", "content": "hello"}],
-                "stream": False,
-            },
-            adapter_model="kimi_code/k3",
-        )
+    plan = await prepare_anthropic_kimi_chat_completions_adapter_route(
+        request=_request(),
+        prepared_request_body={
+            "model": "kimi_code/k3",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": False,
+        },
+        adapter_model="kimi_code/k3",
+    )
 
-    assert exc_info.value.status_code == 503
-    assert exc_info.value.detail["error"]["code"] == "kimi_code_contract_unavailable"
+    assert plan.target_url == "https://api.kimi.com/coding/v1/chat/completions"
+    assert plan.api_base == "https://api.kimi.com/coding/v1"
 
 
 @pytest.mark.asyncio

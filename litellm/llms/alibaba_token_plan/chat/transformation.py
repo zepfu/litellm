@@ -18,6 +18,9 @@ ALIBABA_TOKEN_PLAN_API_KEY_ENV = "ALIBABA_KEY"
 ALIBABA_TOKEN_PLAN_SETTINGS_FILE_ENV = (
     "LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE"
 )
+ALIBABA_TOKEN_PLAN_PROVIDER_NAME = "alibaba_token_plan"
+# Catalog metadata only: credential discovery and model admission are
+# validated structurally, never against this static enumeration.
 ALIBABA_TOKEN_PLAN_MODEL_IDS = frozenset(
     {
         "qwen3.8-max-preview",
@@ -50,16 +53,30 @@ class AlibabaTokenPlanChatConfig(DashScopeChatConfig):
 
     @staticmethod
     def _model_id(model: str) -> str:
+        """Accept a bare internal model suffix or exactly
+        ``alibaba_token_plan/<single nonempty suffix>``.
+
+        Foreign provider prefixes, empty suffixes, and nested namespaces are
+        rejected. Admission is structural and never gated on a static model
+        enumeration.
+        """
         provider, separator, model_id = model.partition("/")
-        if separator and provider == "alibaba_token_plan":
+        if separator:
+            if provider != ALIBABA_TOKEN_PLAN_PROVIDER_NAME:
+                raise ValueError(
+                    f"Unsupported Alibaba Token Plan model {model!r}. "
+                    "Token Plan routes require a bare model ID or an "
+                    "alibaba_token_plan/<model-id> route."
+                )
             normalized = model_id
-        elif separator:
-            normalized = model
         else:
             normalized = provider
-        if normalized not in ALIBABA_TOKEN_PLAN_MODEL_IDS:
-            supported = ", ".join(sorted(ALIBABA_TOKEN_PLAN_MODEL_IDS))
-            raise ValueError(f"Unsupported Alibaba Token Plan model {model!r}. " f"Supported model IDs: {supported}.")
+        normalized = normalized.strip()
+        if not normalized or "/" in normalized:
+            raise ValueError(
+                f"Unsupported Alibaba Token Plan model {model!r}. "
+                "Token Plan routes require a nonempty model ID."
+            )
         return normalized
 
     @staticmethod
@@ -83,13 +100,18 @@ class AlibabaTokenPlanChatConfig(DashScopeChatConfig):
         if not isinstance(providers, list):
             return None
 
+        # Provider/credential-structure validation only: the provider entry
+        # must point at the canonical Token Plan base URL with a structurally
+        # valid id and envKey. The static model catalog is never an admission
+        # gate here.
         env_keys = {
             provider.get("envKey")
             for provider in providers
             if isinstance(provider, dict)
             and str(provider.get("baseUrl") or "").rstrip("/")
             == ALIBABA_TOKEN_PLAN_API_BASE
-            and provider.get("id") in ALIBABA_TOKEN_PLAN_MODEL_IDS
+            and isinstance(provider.get("id"), str)
+            and provider["id"].strip()
             and isinstance(provider.get("envKey"), str)
             and provider["envKey"].strip()
         }

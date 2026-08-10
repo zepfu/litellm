@@ -47,7 +47,7 @@ def _live_models_payload():
     }
 
 
-def test_should_parse_only_managed_exact_model_ids():
+def test_should_parse_namespaced_model_ids_without_python_enumeration():
     payload = _live_models_payload()
     payload["data"].append({"id": "k3-preview", "context_length": 1})
 
@@ -57,6 +57,7 @@ def test_should_parse_only_managed_exact_model_ids():
         "k3",
         "kimi-for-coding",
         "kimi-for-coding-highspeed",
+        "k3-preview",
     }
     assert is_managed_kimi_code_model_id("k3")
     assert is_managed_kimi_code_model_id("kimi-for-coding")
@@ -66,7 +67,27 @@ def test_should_parse_only_managed_exact_model_ids():
     assert not is_k3_model_id("k3-preview")
     assert is_k2_7_model_id("kimi-for-coding-highspeed")
     assert not is_k2_7_model_id("kimi-for-coding-highspeed-preview")
-    assert get_kimi_code_model_metadata(payload, "k3-preview") is None
+    assert get_kimi_code_model_metadata(payload, "k3-preview") is not None
+
+
+def test_should_reject_malformed_or_foreign_namespaced_model_ids():
+    payload = _live_models_payload()
+    payload["data"].extend(
+        [
+            {"id": "moonshot/k3", "context_length": 1},
+            {"id": "", "context_length": 1},
+            {"id": "   ", "context_length": 1},
+        ]
+    )
+
+    metadata_by_id = parse_kimi_code_models_payload(payload)
+
+    assert "moonshot/k3" not in metadata_by_id
+    assert "" not in metadata_by_id
+    assert get_kimi_code_model_metadata(payload, "moonshot/k3") is None
+    assert get_kimi_code_model_metadata(payload, "") is None
+    assert get_kimi_code_model_metadata(payload, None) is None
+    assert get_kimi_code_model_metadata(payload, 42) is None
 
 
 def test_should_preserve_exact_authenticated_live_metadata():

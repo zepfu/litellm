@@ -39,6 +39,7 @@ from .lane_keys import (
     _CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES,
 )
 from .policy import (
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
     CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS,
     CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS,
     CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
@@ -1021,8 +1022,79 @@ def _is_codex_auto_agent_grok_account_quota_exhaustion(
 # ---------------------------------------------------------------------------
 
 
+_ALIBABA_TOKEN_PLAN_UNSUPPORTED_MODEL_ERROR_CODES = frozenset(
+    {
+        "ModelNotFound",
+        "ModelNotSupported",
+        "UnsupportedModel",
+        "model_not_found",
+        "model_not_supported",
+        "InvalidParameter.Model",
+    }
+)
+
+_ALIBABA_TOKEN_PLAN_UNSUPPORTED_MODEL_MESSAGE_MARKERS = (
+    "model not exist",
+    "model does not exist",
+    "model is not supported",
+    "model not supported",
+    "unsupported model",
+    "has been withdrawn",
+)
+
+
+def _is_alibaba_token_plan_unsupported_model_response(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Detect a structured Alibaba Token Plan unsupported/withdrawn-model rejection.
+
+    Both conditions are mandatory:
+
+    1. Trusted Alibaba provider attribution: the failed *candidate* must be
+       the Alibaba Token Plan provider. A local exception or another
+       provider's ``ModelNotFound``-style error never matches.
+    2. A structured error payload: a structured error block carrying a known
+       Alibaba model-admission error code, or a structured error message
+       that names the model as unsupported/unknown/withdrawn. Free-form
+       local exception text (e.g. a local ``ValueError``) never matches.
+
+    Generic capacity, auth, or request-shape errors never match here, so
+    programming and configuration errors are not hidden behind candidate
+    classification.
+    """
+    if not isinstance(candidate, dict):
+        return False
+    if candidate.get("provider") != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
+        return False
+
+    error_blocks = _iter_codex_auto_agent_error_blocks(exc)
+    if not error_blocks:
+        return False
+
+    _error_type, error_code = _extract_codex_auto_agent_error_type_and_code(exc)
+    if isinstance(error_code, str) and error_code in _ALIBABA_TOKEN_PLAN_UNSUPPORTED_MODEL_ERROR_CODES:
+        return True
+    for error in error_blocks:
+        message = error.get("message")
+        if not isinstance(message, str):
+            continue
+        message_lower = message.lower()
+        if "model" not in message_lower:
+            continue
+        if any(
+            marker in message_lower
+            for marker in _ALIBABA_TOKEN_PLAN_UNSUPPORTED_MODEL_MESSAGE_MARKERS
+        ):
+            return True
+    return False
+
+
 def _classify_codex_auto_agent_retryable_exhaustion(
     exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]] = None,
 ) -> Optional[str]:
     assert _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS is not None
     assert _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS is not None
@@ -1030,6 +1102,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     tokens = _extract_codex_auto_agent_error_tokens(exc)
     if _is_codex_auto_agent_grok_account_quota_exhaustion(exc):
         return "capacity_exhausted"
+    if _is_alibaba_token_plan_unsupported_model_response(exc, candidate=candidate):
+        return "candidate_unavailable"
     if "usage_limit_reached" in tokens:
         return "usage_limit_reached"
     if tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS:
@@ -1109,7 +1183,9 @@ def _get_codex_auto_agent_cooldown_seconds(
 ) -> float:
     assert _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS is not None
     header_wait = _parse_codex_auto_agent_header_wait_seconds(exc)
-    error_class = _classify_codex_auto_agent_retryable_exhaustion(exc)
+    error_class = _classify_codex_auto_agent_retryable_exhaustion(
+        exc, candidate=candidate
+    )
     tokens = _extract_codex_auto_agent_error_tokens(exc)
     if header_wait is not None:
         resolved = max(_CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS, header_wait)

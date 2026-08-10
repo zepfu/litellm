@@ -192,7 +192,9 @@ async def handle_alias_route(  # noqa: PLR0915
         last_attempt = attempts[-1] if attempts else {}
         error_class = str(
             last_attempt.get("error_class")
-            or _classify_codex_auto_agent_retryable_exhaustion(exc)
+            or _classify_codex_auto_agent_retryable_exhaustion(
+                exc, candidate=candidate
+            )
             or "provider_terminal_error"
         )
         if error_class in {
@@ -483,7 +485,9 @@ async def handle_alias_route(  # noqa: PLR0915
             )
             error_class = _classify_kimi_code_auto_agent_probe_failure(kimi_failure_metadata)
             if error_class is None:
-                error_class = _classify_codex_auto_agent_retryable_exhaustion(failure_exc)
+                error_class = _classify_codex_auto_agent_retryable_exhaustion(
+                    failure_exc, candidate=candidate
+                )
             if error_class is None:
                 raise failure_exc
             last_retryable_exc = failure_exc
@@ -710,7 +714,7 @@ def _resolve_failure_plan(
     kimi_failure_metadata = kimi_failure_metadata_fn(exc, candidate=candidate)
     error_class = classify_kimi_fn(kimi_failure_metadata)
     if error_class is None:
-        error_class = classify_retryable_fn(exc)
+        error_class = classify_retryable_fn(exc, candidate=candidate)
     grok_account_quota_exhausted = grok_quota_fn(exc, candidate=candidate)
     cooldown_seconds = cooldown_seconds_fn(exc, candidate=candidate)
     if codex_failure_evidence_alias is not None:

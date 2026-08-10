@@ -1616,6 +1616,52 @@ def _write_sidecar_contract_descriptor(tmp_path, *, client_version="0.29.1"):
     return contract_path
 
 
+def _write_expired_sidecar_contract_descriptor(tmp_path, *, client_version="0.29.1"):
+    import time as _time
+    from litellm.secret_managers.kimi_native_contract import (
+        KIMI_NATIVE_BASE_URL,
+        KIMI_NATIVE_SCHEMA_VERSION,
+        compute_canonical_digest,
+    )
+
+    now = _time.time()
+    payload = {
+        "schema_version": KIMI_NATIVE_SCHEMA_VERSION,
+        "client_name": "kimi-code",
+        "client_version": client_version,
+        "base_url": KIMI_NATIVE_BASE_URL,
+        "user_agent": f"kimi-code-cli/{client_version}",
+        "issued_at": now - 7200,
+        "expires_at": now - 60,
+        "x_msh_platform": "kimi_code_cli",
+        "x_msh_version": client_version,
+        "x_msh_device_name": "aawm-service-node",
+        "x_msh_device_model": "aawm-managed",
+        "x_msh_os_version": "linux-6.x",
+        "x_msh_device_id": "0d3f8a2e-7b14-4c6a-9e5f-a1b2c3d4e5f6",
+    }
+    payload["digest"] = compute_canonical_digest(payload)
+    contract_path = tmp_path / "contract-expired.json"
+    contract_path.write_text(json.dumps(payload), encoding="utf-8")
+    return contract_path
+
+
+class _KimiUsageOkResponse:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def getcode(self):
+        return self.status
+
+    def read(self):
+        return b'{"data":{"account":{"id":"account-1"},"usages":{"5h":{"limit":1}}}}'
+
+
 def test_ms031_sidecar_source_version_identity_is_current(loop) -> None:
     """The stale 0.27.0 sidecar source-version identity must be 0.29.1."""
     assert loop.KIMI_CODE_USAGE_SOURCE_VERSION_FALLBACK == "kimi_code_0.29.1_managed_usage_v1"
@@ -1742,12 +1788,12 @@ def test_ms031_sidecar_usage_get_honest_fallback_ua_without_descriptor(
     assert not any(key.startswith("x-msh-") for key in header_keys)
 
 
-def test_ms030_sidecar_fails_closed_when_contract_required_but_missing(
+def test_ms035_sidecar_continues_with_builtin_identity_when_contract_required_but_missing(
     loop, tmp_path, monkeypatch
 ) -> None:
-    """When the descriptor is required but missing, the usage poll fails closed
-    with a sanitized contract_unavailable classification and makes no upstream
-    call."""
+    """MS-035: when the descriptor is required but missing, the usage poll
+    continues with the conservative built-in identity instead of failing
+    closed; only real transport/auth failures terminate the poll."""
     from litellm.secret_managers.kimi_native_contract import (
         KIMI_NATIVE_CONTRACT_PATH_ENV,
         KIMI_NATIVE_CONTRACT_REQUIRED_ENV,
@@ -1766,29 +1812,30 @@ def test_ms030_sidecar_fails_closed_when_contract_required_but_missing(
         kimi_usage_poll_enabled=True,
         kimi_oauth_auth_file=str(credential),
     )
+    requests = []
 
-    def urlopen(*args, **kwargs):
-        raise AssertionError("no upstream call must be made when contract is missing")
+    def urlopen(request, timeout):
+        requests.append(request)
+        return _KimiUsageOkResponse()
 
     monkeypatch.setattr(loop.urllib_request, "urlopen", urlopen)
 
-    with pytest.raises(loop.KimiUsagePollError) as exc_info:
-        loop._fetch_kimi_usage_payload(config)
+    fetched = loop._fetch_kimi_usage_payload(config)
 
-    error = exc_info.value
-    assert error.telemetry_class == "contract_unavailable"
-    assert error.status_code is None
-    assert error.attempt_count == 1
-    assert error.retry_count == 0
-    assert error.refresh_attempted is False
-    assert "credential-access-token" not in str(error)
+    assert fetched["status_code"] == 200
+    request = requests[0]
+    # Built-in identity derives from the installed client when discoverable
+    # (host CLI 0.30.0 here) with the pinned 0.29.1 floor as fallback.
+    assert request.get_header("User-agent").startswith("kimi-code-cli/")
+    assert request.get_header("X-msh-platform") == "kimi_code_cli"
+    assert request.get_header("Authorization") == "Bearer credential-access-token"
 
 
-def test_ms030_sidecar_poll_task_reports_contract_unavailable_without_crashing(
+def test_ms035_sidecar_poll_task_succeeds_with_builtin_identity_without_crashing(
     loop, tmp_path, monkeypatch
 ) -> None:
-    """The poll task surfaces a sanitized contract_unavailable event instead of
-    escaping or crashing the sidecar task loop."""
+    """MS-035: the poll task succeeds with the built-in identity instead of
+    surfacing contract_unavailable when the descriptor is missing."""
     from litellm.secret_managers.kimi_native_contract import (
         KIMI_NATIVE_CONTRACT_PATH_ENV,
         KIMI_NATIVE_CONTRACT_REQUIRED_ENV,
@@ -1810,7 +1857,7 @@ def test_ms030_sidecar_poll_task_reports_contract_unavailable_without_crashing(
     monkeypatch.setattr(
         loop.urllib_request,
         "urlopen",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no upstream call")),
+        lambda request, timeout: _KimiUsageOkResponse(),
     )
 
     event = loop._run_kimi_usage_poll_task(
@@ -1821,10 +1868,52 @@ def test_ms030_sidecar_poll_task_reports_contract_unavailable_without_crashing(
 
     assert event is not None
     assert event["event"] == "kimi_usage_poll"
-    assert event["telemetry_class"] == "contract_unavailable"
-    assert event["error_class"] == "KimiUsagePollError"
+    assert event["telemetry_class"] != "contract_unavailable"
+    assert event["error_class"] is None
     serialized = json.dumps(event, sort_keys=True)
     assert "credential-access-token" not in serialized
+
+
+def test_ms035_sidecar_usage_get_succeeds_with_expired_descriptor_stale_identity(
+    loop, tmp_path, monkeypatch
+) -> None:
+    """MS-035: an expired but structurally valid descriptor continues to serve
+    usage polls with its older claimed client identity (stale source)."""
+    from litellm.secret_managers.kimi_native_contract import (
+        KIMI_NATIVE_CONTRACT_PATH_ENV,
+        KIMI_NATIVE_CONTRACT_REQUIRED_ENV,
+    )
+
+    credential = tmp_path / "kimi-code.json"
+    credential.write_text(
+        json.dumps({"access_token": "credential-access-token"}),
+        encoding="utf-8",
+    )
+    contract_path = _write_expired_sidecar_contract_descriptor(tmp_path, client_version="0.29.1")
+    monkeypatch.setenv(KIMI_NATIVE_CONTRACT_PATH_ENV, str(contract_path))
+    monkeypatch.setenv(KIMI_NATIVE_CONTRACT_REQUIRED_ENV, "true")
+    config = _config(
+        loop,
+        tmp_path,
+        kimi_usage_poll_enabled=True,
+        kimi_oauth_auth_file=str(credential),
+    )
+    requests = []
+
+    def urlopen(request, timeout):
+        requests.append(request)
+        return _KimiUsageOkResponse()
+
+    monkeypatch.setattr(loop.urllib_request, "urlopen", urlopen)
+
+    fetched = loop._fetch_kimi_usage_payload(config)
+
+    assert fetched["status_code"] == 200
+    request = requests[0]
+    assert request.get_header("User-agent") == "kimi-code-cli/0.29.1"
+    assert request.get_header("X-msh-platform") == "kimi_code_cli"
+    assert request.get_header("X-msh-version") == "0.29.1"
+    assert request.get_header("X-msh-device-id") == "0d3f8a2e-7b14-4c6a-9e5f-a1b2c3d4e5f6"
 
 
 def test_ms031_sidecar_source_version_derives_from_descriptor(

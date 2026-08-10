@@ -317,6 +317,82 @@ class TestImportBoundaries:
 # ===========================================================================
 
 
+class TestModelResolutionBindingSafety:
+    """install() rebinds model_resolution functions into host_globals.
+
+    Rebound functions must not depend on module-imported helpers that
+    disappear from the rebound globals namespace (CFG-018 Kimi NameError).
+    """
+
+    def test_rebound_model_resolution_functions_have_no_unresolved_load_globals(self):
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+            model_resolution,
+        )
+
+        # Seed only the documented late-bound host dependencies; module-import
+        # helpers (e.g. policy normalize aliases) must not be required.
+        host_globals: dict = {
+            "__builtins__": builtins.__dict__,
+            "_alibaba_token_plan_adapters": object(),
+            "_OPENCODE_ZEN_PROVIDER": "opencode_zen",
+            "_OPENCODE_ZEN_FREE_MODELS": frozenset(),
+            "_ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS": frozenset(),
+            "_ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS": frozenset(),
+            "_ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS": frozenset(),
+            "_ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS": frozenset(),
+            "_ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS": frozenset(),
+            "_extract_claude_agent_and_tenant_from_request_body": object(),
+            "_load_claude_agent_declared_model": object(),
+            "_is_openai_responses_endpoint": object(),
+            "is_oa_xai_model": object(),
+            "normalize_grok_native_oauth_model": object(),
+        }
+        model_resolution.install(host_globals)
+        for name in model_resolution._HOST_FUNCTION_NAMES:
+            function = host_globals[name]
+            unresolved = {
+                instruction.argval
+                for instruction in dis.get_instructions(function)
+                if instruction.opname == "LOAD_GLOBAL"
+                and instruction.argval not in function.__globals__
+                and not hasattr(builtins, str(instruction.argval))
+            }
+            assert not unresolved, (
+                f"{name} has unresolved LOAD_GLOBAL names after install(): "
+                f"{sorted(unresolved)}"
+            )
+
+    def test_rebound_kimi_normalizer_resolves_kimi_code_routes(self):
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+            model_resolution,
+        )
+
+        host_globals: dict = {"__builtins__": builtins.__dict__}
+        model_resolution.install(host_globals)
+        normalizer = host_globals["_normalize_kimi_code_chat_completions_adapter_model_name"]
+        assert normalizer("kimi_code/k3") == "kimi_code/k3"
+        assert normalizer("kimi_code/future-model-2026") == "kimi_code/future-model-2026"
+        assert normalizer("k3") is None
+        assert normalizer("openai/kimi_code/k3") is None
+
+    def test_rebound_alibaba_normalizer_resolves_structurally_valid_routes(self):
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+            model_resolution,
+        )
+        from litellm.llms.alibaba_token_plan.adapters import adapter as alibaba_adapter
+
+        host_globals: dict = {
+            "__builtins__": builtins.__dict__,
+            "_alibaba_token_plan_adapters": alibaba_adapter,
+        }
+        model_resolution.install(host_globals)
+        normalizer = host_globals["_normalize_alibaba_token_plan_adapter_model_name"]
+        assert normalizer("alibaba_token_plan/qwen3.8-max-preview") == "alibaba_token_plan/qwen3.8-max-preview"
+        assert normalizer("alibaba_token_plan/future-model-2026") == "alibaba_token_plan/future-model-2026"
+        assert normalizer("alibaba_token_plan/") is None
+        assert normalizer("qwen3.8-max-preview") is None
+
+
 class TestNonOverlap:
     """Wave 5B symbols must not duplicate Wave 4 or 5A module ownership."""
 

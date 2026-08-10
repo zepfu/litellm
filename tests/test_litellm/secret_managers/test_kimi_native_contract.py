@@ -11,16 +11,29 @@ import pytest
 
 from litellm.secret_managers.kimi_native_contract import (
     KIMI_NATIVE_BASE_URL,
+    KIMI_NATIVE_BUILTIN_CLIENT_VERSION,
+    KIMI_NATIVE_BUILTIN_DEVICE_ID,
     KIMI_NATIVE_CONTRACT_MAX_BYTES,
     KIMI_NATIVE_CONTRACT_PATH_ENV,
     KIMI_NATIVE_CONTRACT_REQUIRED_ENV,
+    KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN,
+    KIMI_NATIVE_CONTRACT_SOURCE_DESCRIPTOR,
+    KIMI_NATIVE_CONTRACT_SOURCE_STALE,
     KIMI_NATIVE_SCHEMA_VERSION,
     KimiNativeContractError,
+    _reset_source_telemetry_state,
     build_outbound_headers,
     compute_canonical_digest,
     resolve_contract,
     resolve_endpoint_url,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_source_telemetry_state():
+    _reset_source_telemetry_state()
+    yield
+    _reset_source_telemetry_state()
 
 
 def _make_payload(
@@ -99,13 +112,16 @@ class TestSchemaAndDigest:
         )
         assert payload["digest"] == digest_without
 
-    def test_tampered_payload_fails_digest(self, tmp_path: Path):
+    def test_tampered_payload_falls_back_to_builtin(self, tmp_path: Path):
+        """MS-035: digest-invalid descriptors fall back to the conservative
+        builtin identity even when required=true."""
         payload = _make_payload()
         payload["x_msh_device_name"] = "tampered-node"  # tamper after digest
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="digest mismatch"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
     @pytest.mark.parametrize(
         "field",
@@ -120,7 +136,9 @@ class TestSchemaAndDigest:
             "digest",
         ],
     )
-    def test_missing_required_field_rejected(self, tmp_path: Path, field: str):
+    def test_missing_required_field_falls_back_to_builtin(
+        self, tmp_path: Path, field: str
+    ):
         payload = _make_payload()
         del payload[field]
         # Recompute digest without the field so digest itself is valid
@@ -129,26 +147,29 @@ class TestSchemaAndDigest:
             payload["digest"] = compute_canonical_digest(payload)
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="missing required"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
-    def test_unknown_field_rejected(self, tmp_path: Path):
+    def test_unknown_field_falls_back_to_builtin(self, tmp_path: Path):
         payload = _make_payload()
         payload["evil_field"] = "injected"
         payload["digest"] = compute_canonical_digest(payload)
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="unknown fields"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
-    def test_wrong_schema_version_rejected(self, tmp_path: Path):
+    def test_wrong_schema_version_falls_back_to_builtin(self, tmp_path: Path):
         payload = _make_payload()
         payload["schema_version"] = 99
         payload["digest"] = compute_canonical_digest(payload)
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="schema_version"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
 
 # ---------------------------------------------------------------------------
@@ -157,69 +178,219 @@ class TestSchemaAndDigest:
 
 
 class TestStaleMissingHostile:
-    def test_expired_contract_rejected(self, tmp_path: Path):
+    def test_expired_contract_resolves_with_stale_source(self, tmp_path: Path):
+        """MS-035: an expired but structurally valid descriptor stays usable.
+
+        The resolver returns the descriptor's older claimed identity with a
+        ``stale`` source classification instead of failing the route.
+        """
         payload = _make_payload(expires_at=time.time() - 10)
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="expired"):
+        contract = resolve_contract(str(path), required=True)
+
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_STALE
+        assert contract.client_version == "0.29.1"
+        assert contract.user_agent == "kimi-code-cli/0.29.1"
+        assert contract.x_msh_platform == "kimi_code_cli"
+
+    def test_fresh_contract_resolves_with_descriptor_source(self, tmp_path: Path):
+        payload = _make_payload()
+        path = _write_contract(tmp_path, payload)
+
+        contract = resolve_contract(str(path), required=True)
+
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_DESCRIPTOR
+
+    def test_expired_contract_not_required_keeps_stale_source(self, tmp_path: Path):
+        payload = _make_payload(expires_at=time.time() - 10)
+        path = _write_contract(tmp_path, payload)
+
+        contract = resolve_contract(str(path), required=False)
+
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_STALE
+
+    def test_stale_source_telemetry_is_sanitized_and_deduplicated(
+        self, tmp_path: Path, caplog
+    ):
+        """Stale telemetry names only the classification and path, is emitted
+        once per transition, and never leaks descriptor body contents."""
+        import logging
+
+        payload = _make_payload(expires_at=time.time() - 10)
+        path = _write_contract(tmp_path, payload)
+
+        logger = logging.getLogger("litellm.secret_managers.kimi_native_contract")
+        with caplog.at_level(logging.WARNING, logger=logger.name):
+            resolve_contract(str(path), required=True)
             resolve_contract(str(path), required=True)
 
-    def test_future_issued_at_rejected(self, tmp_path: Path):
+        warnings = [
+            record
+            for record in caplog.records
+            if record.name == logger.name and record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "source=stale" in message
+        assert str(path) in message
+        assert "0.29.1" not in message
+        assert "aawm-service-node" not in message
+        assert "0d3f8a2e" not in message
+
+    def test_builtin_source_telemetry_is_sanitized_and_deduplicated(
+        self, tmp_path: Path, caplog
+    ):
+        import logging
+
+        logger = logging.getLogger("litellm.secret_managers.kimi_native_contract")
+        with caplog.at_level(logging.WARNING, logger=logger.name):
+            resolve_contract(str(tmp_path / "absent.json"), required=True)
+            resolve_contract(str(tmp_path / "absent.json"), required=True)
+
+        warnings = [
+            record
+            for record in caplog.records
+            if record.name == logger.name and record.levelno == logging.WARNING
+        ]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert "source=builtin" in message
+        assert "aawm-service-node" not in message
+
+    def test_builtin_identity_is_coherent_and_conservative(self, tmp_path: Path):
+        """The built-in fallback identity keeps UA/X-Msh coherence and never
+        fabricates a digest."""
+        contract = resolve_contract(str(tmp_path / "absent.json"), required=True)
+
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
+        assert contract.client_name == "kimi-code"
+        assert contract.user_agent == f"kimi-code-cli/{contract.client_version}"
+        assert contract.x_msh_platform == "kimi_code_cli"
+        assert contract.x_msh_version == contract.client_version
+        assert contract.base_url == KIMI_NATIVE_BASE_URL
+        assert contract.digest == ""
+        assert contract.client_version  # non-empty conservative identity
+
+    def test_builtin_identity_uses_pinned_defaults_when_lookup_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """With no discoverable installed client, the conservative pinned
+        floor identity is used (no network, no writes)."""
+        monkeypatch.setenv("KIMI_CODE_HOME", str(tmp_path / "no-kimi-home"))
+
+        contract = resolve_contract(str(tmp_path / "absent.json"), required=True)
+
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
+        assert contract.client_version == KIMI_NATIVE_BUILTIN_CLIENT_VERSION
+        assert contract.x_msh_device_id == KIMI_NATIVE_BUILTIN_DEVICE_ID
+
+    def test_builtin_identity_prefers_installed_client_version_and_device(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """When the installed client exposes a version/device ID, the built-in
+        identity derives from it (installed-client contract, read-only)."""
+        import subprocess
+
+        kimi_home = tmp_path / "kimi-home"
+        kimi_home.mkdir()
+        (kimi_home / "device_id").write_text(
+            "11111111-2222-3333-4444-555555555555", encoding="utf-8"
+        )
+        monkeypatch.setenv("KIMI_CODE_HOME", str(kimi_home))
+
+        real_run = subprocess.run
+
+        def fake_run(*args, **kwargs):
+            class Result:
+                stdout = "0.31.0\n"
+
+            return Result()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        try:
+            contract = resolve_contract(str(tmp_path / "absent.json"), required=True)
+        finally:
+            monkeypatch.setattr(subprocess, "run", real_run)
+
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
+        assert contract.client_version == "0.31.0"
+        assert contract.user_agent == "kimi-code-cli/0.31.0"
+        assert contract.x_msh_device_id == "11111111-2222-3333-4444-555555555555"
+
+    def test_future_issued_at_falls_back_to_builtin(self, tmp_path: Path):
         payload = _make_payload(issued_at=time.time() + 600)
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="future"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
     def test_missing_file_returns_none_when_not_required(self, tmp_path: Path):
         result = resolve_contract(str(tmp_path / "nonexistent.json"))
         assert result is None
 
-    def test_missing_file_raises_when_required(self, tmp_path: Path):
-        with pytest.raises(KimiNativeContractError, match="missing"):
-            resolve_contract(str(tmp_path / "nonexistent.json"), required=True)
+    def test_missing_file_resolves_builtin_when_required(self, tmp_path: Path):
+        """MS-035: a missing descriptor never terminates Kimi solely for
+        contract unavailability; the conservative built-in identity is used."""
+        contract = resolve_contract(str(tmp_path / "nonexistent.json"), required=True)
+
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
     def test_non_regular_file_rejected_when_required(self, tmp_path: Path):
         dir_path = tmp_path / "subdir"
         dir_path.mkdir()
 
-        with pytest.raises(KimiNativeContractError, match="not a regular file"):
-            resolve_contract(str(dir_path), required=True)
+        contract = resolve_contract(str(dir_path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
     def test_oversized_file_rejected_when_required(self, tmp_path: Path):
         path = tmp_path / "big.json"
         path.write_text("x" * (KIMI_NATIVE_CONTRACT_MAX_BYTES + 1), encoding="utf-8")
 
-        with pytest.raises(KimiNativeContractError, match="exceeds"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
     def test_invalid_json_rejected_when_required(self, tmp_path: Path):
         path = tmp_path / "bad.json"
         path.write_text("{not json", encoding="utf-8")
 
-        with pytest.raises(KimiNativeContractError, match="not valid JSON"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
     def test_non_object_root_rejected_when_required(self, tmp_path: Path):
         path = tmp_path / "array.json"
         path.write_text("[1, 2, 3]", encoding="utf-8")
 
-        with pytest.raises(KimiNativeContractError, match="JSON object"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
-    def test_wrong_base_url_rejected(self, tmp_path: Path):
+    def test_wrong_base_url_falls_back_to_builtin(self, tmp_path: Path):
         payload = _make_payload(base_url="https://api.moonshot.ai/v1")
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="base_url"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
-    def test_empty_client_name_rejected(self, tmp_path: Path):
+    def test_empty_client_name_falls_back_to_builtin(self, tmp_path: Path):
         payload = _make_payload(client_name="  ")
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="non-empty"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
 
 # ---------------------------------------------------------------------------
@@ -548,12 +719,16 @@ class TestDeploymentGate:
 
         assert resolve_contract() is None
 
-    def test_no_path_required_raises(self, monkeypatch):
+    def test_no_path_required_resolves_builtin(self, monkeypatch):
+        """MS-035: required=true with no configured path still resolves the
+        conservative built-in identity; absence never fails the route."""
         monkeypatch.delenv(KIMI_NATIVE_CONTRACT_PATH_ENV, raising=False)
         monkeypatch.setenv(KIMI_NATIVE_CONTRACT_REQUIRED_ENV, "true")
 
-        with pytest.raises(KimiNativeContractError, match="required"):
-            resolve_contract()
+        contract = resolve_contract()
+
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
     def test_env_path_used_when_no_explicit_path(
         self, tmp_path: Path, monkeypatch
@@ -637,12 +812,13 @@ class TestXMshFieldValidation:
             "x_msh_device_id",
         ],
     )
-    def test_empty_x_msh_field_rejected(self, tmp_path: Path, field: str):
+    def test_empty_x_msh_field_falls_back_to_builtin(self, tmp_path: Path, field: str):
         payload = _make_payload(**{field: ""})
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="non-empty"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
     @pytest.mark.parametrize(
         "field",
@@ -655,12 +831,13 @@ class TestXMshFieldValidation:
             "x_msh_device_id",
         ],
     )
-    def test_non_ascii_x_msh_field_rejected(self, tmp_path: Path, field: str):
+    def test_non_ascii_x_msh_field_falls_back_to_builtin(self, tmp_path: Path, field: str):
         payload = _make_payload(**{field: "caf\u00e9-\u00fc"})
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="printable ASCII"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
     def test_client_coherence(self, tmp_path: Path):
         """client_name, client_version, and user_agent must be coherent."""
@@ -687,47 +864,53 @@ class TestXMshFieldValidation:
         assert contract.user_agent == "kimi-code-cli/1.99.0"
         assert contract.x_msh_version == "1.99.0"
 
-    def test_wrong_client_name_rejected(self, tmp_path: Path):
+    def test_wrong_client_name_falls_back_to_builtin(self, tmp_path: Path):
         payload = _make_payload(client_name="kimi-code-fork")
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="client_name"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
-    def test_incoherent_user_agent_rejected(self, tmp_path: Path):
+    def test_incoherent_user_agent_falls_back_to_builtin(self, tmp_path: Path):
         payload = _make_payload(user_agent="kimi-code/0.29.1")
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="user_agent"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
-    def test_user_agent_version_mismatch_rejected(self, tmp_path: Path):
+    def test_user_agent_version_mismatch_falls_back_to_builtin(self, tmp_path: Path):
         payload = _make_payload(user_agent="kimi-code-cli/0.28.0")
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="user_agent"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
-    def test_wrong_x_msh_platform_rejected(self, tmp_path: Path):
+    def test_wrong_x_msh_platform_falls_back_to_builtin(self, tmp_path: Path):
         payload = _make_payload(x_msh_platform="kimi_desktop")
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="x_msh_platform"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
-    def test_x_msh_version_mismatch_rejected(self, tmp_path: Path):
+    def test_x_msh_version_mismatch_falls_back_to_builtin(self, tmp_path: Path):
         payload = _make_payload(x_msh_version="0.28.0")
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="x_msh_version"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
-    def test_non_uuid_device_id_rejected(self, tmp_path: Path):
+    def test_non_uuid_device_id_falls_back_to_builtin(self, tmp_path: Path):
         payload = _make_payload(x_msh_device_id="aawm-litellm-gateway")
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="UUID"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
     @pytest.mark.parametrize(
         "bad_id",
@@ -738,14 +921,15 @@ class TestXMshFieldValidation:
             "urn:uuid:0d3f8a2e-7b14-4c6a-9e5f-a1b2c3d4e5f6",  # urn prefix
         ],
     )
-    def test_noncanonical_uuid_device_id_rejected(
+    def test_noncanonical_uuid_device_id_falls_back_to_builtin(
         self, tmp_path: Path, bad_id: str
     ):
         payload = _make_payload(x_msh_device_id=bad_id)
         path = _write_contract(tmp_path, payload)
 
-        with pytest.raises(KimiNativeContractError, match="canonical"):
-            resolve_contract(str(path), required=True)
+        contract = resolve_contract(str(path), required=True)
+        assert contract is not None
+        assert contract.source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN
 
     def test_canonical_lowercase_uuid_device_id_accepted(self, tmp_path: Path):
         payload = _make_payload(

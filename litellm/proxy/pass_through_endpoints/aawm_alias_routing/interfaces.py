@@ -265,7 +265,12 @@ class ClassifyKimiFailureFn(Protocol):
 class ClassifyRetryableFailureFn(Protocol):
     """Classify a provider exception into the retry vocabulary."""
 
-    def __call__(self, exc: Exception) -> Optional[str]:
+    def __call__(
+        self,
+        exc: Exception,
+        *,
+        candidate: Optional[dict[str, Any]] = None,
+    ) -> Optional[str]:
         ...
 
 

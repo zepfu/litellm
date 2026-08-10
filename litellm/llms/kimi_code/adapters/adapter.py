@@ -82,23 +82,24 @@ def _resolve_kimi_contract_or_fail():
 def normalize_kimi_code_chat_completions_adapter_model_name(
     model: Any,
     *,
-    allowed_models: Iterable[str],
+    allowed_models: Iterable[str] = (),
 ) -> Optional[str]:
-    """Normalize only canonical `kimi_code/<adapter-key>` direct routes."""
+    """Normalize canonical `kimi_code/<model-id>` direct routes.
 
-    if not isinstance(model, str):
-        return None
-    candidate = model.strip()
-    if not candidate:
-        return None
-    provider_prefix, separator, model_id = candidate.partition("/")
-    if not separator or provider_prefix != "kimi_code" or not model_id.strip():
-        return None
-    return candidate if candidate in allowed_models else None
+    Explicit `kimi_code/<nonempty-model-id>` routes are admitted without a
+    Python model enumeration; `allowed_models` is retained for source
+    compatibility and is not consulted.
+    """
+
+    _ = allowed_models
+    return policy.normalize_kimi_code_chat_completions_adapter_model_name(model)
 
 
 def _resolve_adapter_selection(adapter_key: str) -> tuple[str, Optional[str]]:
-    if adapter_key not in policy.KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS:
+    normalized_key = policy.normalize_kimi_code_chat_completions_adapter_model_name(
+        adapter_key
+    )
+    if normalized_key is None:
         raise ValueError(f"Unsupported managed Kimi Code adapter key {adapter_key!r}.")
     forced_effort = _K3_VARIANT_EFFORTS.get(adapter_key)
     upstream_model = adapter_key.removeprefix("kimi_code/")

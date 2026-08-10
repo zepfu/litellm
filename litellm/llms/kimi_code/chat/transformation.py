@@ -12,8 +12,8 @@ from typing import Any, AsyncIterator, Iterator, List, Optional, Tuple, Union, c
 import httpx
 
 from litellm.llms.kimi_code.model_metadata import (
-    MANAGED_KIMI_CODE_MODEL_IDS,
-    is_managed_kimi_code_model_id,
+    is_k3_model_id,
+    normalize_managed_kimi_code_model_id,
 )
 from litellm.secret_managers.kimi_native_contract import (
     KIMI_NATIVE_BASE_URL,
@@ -100,10 +100,11 @@ class KimiCodeChatConfig(OpenAIGPTConfig):
             model_id = model
         else:
             model_id = model_parts[-1]
-        if not is_managed_kimi_code_model_id(model_id):
-            supported_models = ", ".join(sorted(MANAGED_KIMI_CODE_MODEL_IDS))
+        if normalize_managed_kimi_code_model_id(model_id) is None:
             raise ValueError(
-                f"Unsupported managed Kimi Code model {model!r}. " f"Supported model IDs: {supported_models}."
+                f"Unsupported managed Kimi Code model {model!r}. "
+                "Managed Kimi Code routes require a nonempty local model ID "
+                "without another provider namespace."
             )
         return model_id
 
@@ -205,8 +206,8 @@ class KimiCodeChatConfig(OpenAIGPTConfig):
     @classmethod
     def _supported_reasoning_efforts(cls, model: str) -> Tuple[str, ...]:
         model_id = model.split("/", maxsplit=1)[-1]
-        if model_id in {"k3-low", "k3-high", "k3-max"}:
-            model_id = "k3"
+        if not is_k3_model_id(model_id):
+            return ()
         try:
             model_info = _get_model_info_helper(
                 model=model_id,
@@ -255,8 +256,7 @@ class KimiCodeChatConfig(OpenAIGPTConfig):
         return resolve_endpoint_url(contract, "chat_completions")
 
     def get_supported_openai_params(self, model: str) -> list:
-        if model.split("/", maxsplit=1)[-1] not in {"k3-low", "k3-high", "k3-max"}:
-            self._model_id(model)
+        self._model_id(model)
         supported_reasoning_efforts = self._supported_reasoning_efforts(model)
         supported_params = [
             "frequency_penalty",

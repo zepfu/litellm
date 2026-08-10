@@ -12,6 +12,7 @@ from litellm.llms.alibaba_token_plan.adapters.adapter import (
     ALIBABA_TOKEN_PLAN_CREDENTIAL_SENTINEL,
     normalize_alibaba_token_plan_adapter_model_name,
     prepare_anthropic_alibaba_token_plan_adapter_route,
+    _resolve_upstream_model,
 )
 from litellm.llms.alibaba_token_plan.chat.transformation import (
     ALIBABA_TOKEN_PLAN_API_BASE,
@@ -121,13 +122,15 @@ async def _stream_text(response: StreamingResponse) -> str:
         ("alibaba_token_plan/qwen3.6-flash", "alibaba_token_plan/qwen3.6-flash"),
         ("alibaba_token_plan/deepseek-v4-pro", "alibaba_token_plan/deepseek-v4-pro"),
         ("alibaba_token_plan/glm-5.2", "alibaba_token_plan/glm-5.2"),
+        ("alibaba_token_plan/future-model-2026", "alibaba_token_plan/future-model-2026"),
         ("qwen3.8-max-preview", None),
         ("dashscope/qwen3.8-max-preview", None),
-        ("alibaba_token_plan/unknown", None),
+        ("alibaba_token_plan/", None),
+        ("alibaba_token_plan/   ", None),
         ("sota-alibaba", None),
     ),
 )
-def test_should_normalize_only_exact_token_plan_adapter_models(
+def test_should_normalize_structurally_valid_token_plan_adapter_models(
     model: str,
     expected: str | None,
 ) -> None:
@@ -138,6 +141,23 @@ def test_should_normalize_only_exact_token_plan_adapter_models(
         )
         == expected
     )
+
+
+def test_should_forward_exact_upstream_suffix_without_admission_list() -> None:
+    assert (
+        _resolve_upstream_model("alibaba_token_plan/qwen3.8-max-preview")
+        == "qwen3.8-max-preview"
+    )
+    assert (
+        _resolve_upstream_model("alibaba_token_plan/future-model-2026")
+        == "future-model-2026"
+    )
+
+
+def test_should_reject_malformed_adapter_models_without_upstream_forwarding() -> None:
+    for malformed in ("alibaba_token_plan/", "qwen3.8-max-preview", "dashscope/qwen3.8-max-preview"):
+        with pytest.raises(ValueError, match="Unsupported Alibaba Token Plan adapter model"):
+            _resolve_upstream_model(malformed)
 
 
 @pytest.mark.asyncio

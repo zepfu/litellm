@@ -306,6 +306,81 @@ class TestClassification:
         exc = _FakeExc(message="all good")
         assert _classify_codex_auto_agent_retryable_exhaustion(exc) is None
 
+    def test_classify_alibaba_unsupported_model_by_structured_code(self):
+        exc = _FakeExc(
+            detail={
+                "error": {
+                    "message": "Model not exist.",
+                    "type": "invalid_request_error",
+                    "code": "ModelNotFound",
+                }
+            }
+        )
+        exc.status_code = 404
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate={"provider": "alibaba_token_plan", "model": "alibaba_token_plan/qwen3.8-max-preview"},
+            )
+            == "candidate_unavailable"
+        )
+
+    def test_classify_alibaba_withdrawn_model_by_message(self):
+        exc = _FakeExc(
+            detail={
+                "error": {
+                    "message": "Model qwen3.8-max-preview has been withdrawn.",
+                    "type": "invalid_request_error",
+                    "code": "InvalidParameter.Model",
+                }
+            }
+        )
+        exc.status_code = 400
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate={"provider": "alibaba_token_plan", "model": "alibaba_token_plan/qwen3.8-max-preview"},
+            )
+            == "candidate_unavailable"
+        )
+
+    def test_alibaba_model_not_found_from_another_provider_is_not_candidate_unavailable(self):
+        exc = _FakeExc(
+            detail={
+                "error": {
+                    "message": "Model not exist.",
+                    "type": "invalid_request_error",
+                    "code": "ModelNotFound",
+                }
+            }
+        )
+        exc.status_code = 404
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate={"provider": "openai", "model": "gpt-5"},
+            )
+            != "candidate_unavailable"
+        )
+
+    def test_local_value_error_is_never_alibaba_unsupported_model(self):
+        exc = ValueError("unsupported model does not exist")
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate={"provider": "alibaba_token_plan", "model": "alibaba_token_plan/qwen3.8-max-preview"},
+            )
+            is None
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(exc) is None
+        )
+
+    def test_generic_model_error_is_not_alibaba_unsupported_model(self):
+        exc = _FakeExc(message="too many requests for this model")
+        exc.status_code = 429
+        assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "rate_limited"
+
     def test_is_retryable_true(self):
         exc = _FakeExc(message="too many requests")
         assert _is_codex_auto_agent_retryable_exhaustion(exc) is True

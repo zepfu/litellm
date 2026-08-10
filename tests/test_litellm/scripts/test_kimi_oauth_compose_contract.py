@@ -114,19 +114,21 @@ def test_kimi_credential_docs_use_only_the_existing_cli_grant() -> None:
 
 def test_litellm_dev_mounts_sanitized_descriptor_directory_read_only() -> None:
     """MS-030/MS-031: litellm-dev mounts a dedicated sanitized descriptor
-    directory read-only, not the full Kimi home or OAuth credentials."""
+    directory read-only. MS-035 reconciles the consumer mount to the
+    repository updater's canonical host descriptor path so the publisher and
+    consumers share one contract; consumers never write it."""
     compose = _COMPOSE_PATH.read_text(encoding="utf-8")
     litellm_dev = _service_block(compose, "litellm-dev")
 
     assert (
-        "- ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.analysis/kimi-descriptor}:"
+        "- ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.kimi-code/native-contract}:"
         "/app/kimi-descriptor:ro"
     ) in litellm_dev
     assert "/home/zepfu/.kimi-code:/home/zepfu/.kimi-code" not in litellm_dev
     assert (
         "- LITELLM_KIMI_NATIVE_CONTRACT_PATH="
         "${LITELLM_KIMI_NATIVE_CONTRACT_PATH:-"
-        "/app/kimi-descriptor/kimi-native-contract.json}"
+        "/app/kimi-descriptor/native-contract.json}"
     ) in litellm_dev
     assert (
         "- LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED="
@@ -141,13 +143,13 @@ def test_provider_status_mounts_sanitized_descriptor_directory_read_only() -> No
     sidecar = _service_block(compose, "provider-status-observations")
 
     assert (
-        "- ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.analysis/kimi-descriptor}:"
+        "- ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.kimi-code/native-contract}:"
         "/app/kimi-descriptor:ro"
     ) in sidecar
     assert (
         "- LITELLM_KIMI_NATIVE_CONTRACT_PATH="
         "${LITELLM_KIMI_NATIVE_CONTRACT_PATH:-"
-        "/app/kimi-descriptor/kimi-native-contract.json}"
+        "/app/kimi-descriptor/native-contract.json}"
     ) in sidecar
     assert (
         "- LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED="
@@ -166,7 +168,7 @@ def test_provider_status_image_packages_kimi_native_contract_module() -> None:
     ) in dockerfile
     assert (
         "LITELLM_KIMI_NATIVE_CONTRACT_PATH="
-        "/app/kimi-descriptor/kimi-native-contract.json"
+        "/app/kimi-descriptor/native-contract.json"
     ) in dockerfile
     assert "LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=false" in dockerfile
     assert "RUN mkdir -p /app/kimi-descriptor" in dockerfile

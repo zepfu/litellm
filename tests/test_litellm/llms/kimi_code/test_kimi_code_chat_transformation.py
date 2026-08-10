@@ -107,7 +107,7 @@ def test_should_resolve_kimi_code_through_managed_provider(monkeypatch: pytest.M
     assert api_base == KIMI_CODE_API_BASE
 
 
-def test_should_admit_only_exact_managed_kimi_code_model_ids():
+def test_should_retain_managed_kimi_code_model_id_constants():
     assert MANAGED_KIMI_CODE_MODEL_IDS == {
         "k3",
         "kimi-for-coding",
@@ -118,14 +118,26 @@ def test_should_admit_only_exact_managed_kimi_code_model_ids():
 
 @pytest.mark.parametrize(
     "model",
-    ["k3-preview", "kimi-for-coding-v2", "moonshot/k3", "kimi_code/unknown"],
+    ["", "  ", "moonshot/k3", "kimi_code/", "openai/gpt-5"],
 )
-def test_should_reject_non_managed_model_ids(model: str):
+def test_should_reject_empty_or_foreign_namespaced_model_ids(model: str):
     config = KimiCodeChatConfig()
 
     with pytest.raises(ValueError, match="Unsupported managed Kimi Code model"):
         config.get_supported_openai_params(model)
 
+
+@pytest.mark.parametrize(
+    "model",
+    ["k3", "kimi-for-coding", "kimi_code/k3-preview", "kimi-for-coding-v2", "kimi_code/k4-preview"],
+)
+def test_should_admit_any_nonempty_namespaced_model_id(model: str):
+    config = KimiCodeChatConfig()
+
+    supported_params = config.get_supported_openai_params(model)
+
+    assert "max_tokens" in supported_params
+    assert config._model_id(model) == model.split("/", maxsplit=1)[-1]
 
 def test_should_hot_read_credentials_without_writing_them(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     credentials_path = tmp_path / "kimi-code.json"
@@ -394,6 +406,54 @@ def test_should_send_managed_k3_request_through_litellm_completion(
     }
 
 
+def test_should_send_synthetic_future_namespaced_model_through_litellm_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    respx_mock,
+):
+    """A future `kimi_code/<model-id>` config route needs no Python update."""
+    credentials_path = tmp_path / "kimi-code.json"
+    _set_credentials_path(monkeypatch, credentials_path)
+    _write_credentials(credentials_path)
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    respx_mock.post(KIMI_CODE_CHAT_COMPLETIONS_URL).respond(
+        json={
+            "id": "chatcmpl-kimi-future",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "k4-preview",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "done"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "total_tokens": 5,
+            },
+        }
+    )
+
+    response = litellm.completion(
+        model="kimi_code/k4-preview",
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=1234,
+    )
+
+    assert response.choices[0].message.content == "done"
+    assert len(respx_mock.calls) == 1
+    request = respx_mock.calls[0].request
+    request_body = json.loads(request.content)
+    assert str(request.url) == KIMI_CODE_CHAT_COMPLETIONS_URL
+    assert request.headers["Authorization"] == "Bearer current-access-token"
+    assert request_body["model"] == "k4-preview"
+    assert request_body["max_completion_tokens"] == 1234
+    assert "thinking" not in request_body
+
+
 def test_should_read_reasoning_efforts_and_context_from_model_metadata():
     k3_info = get_model_info(model="k3", custom_llm_provider="kimi_code")
     k2_info = get_model_info(model="kimi-for-coding", custom_llm_provider="kimi_code")
@@ -631,17 +691,17 @@ def test_should_use_honest_fallback_ua_without_descriptor(
     assert not any(k.lower().startswith("x-msh-") for k in headers)
 
 
-def test_should_fail_closed_when_contract_required_but_missing(
+def test_should_use_builtin_identity_when_contract_required_but_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
-    """When LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=true and no descriptor path
-    is set, the provider raises KimiCodeContractError (503) without making an
-    upstream call."""
+    """MS-035: with LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=true and no
+    descriptor path set, the provider continues with the conservative
+    installed-client/built-in identity instead of failing the route; only
+    actual OAuth/authentication or provider failures terminate the request."""
     from litellm.secret_managers.kimi_native_contract import (
         KIMI_NATIVE_CONTRACT_PATH_ENV,
         KIMI_NATIVE_CONTRACT_REQUIRED_ENV,
     )
-    from litellm.llms.kimi_code.chat.transformation import KimiCodeContractError
 
     credentials_path = tmp_path / "kimi-code.json"
     _set_credentials_path(monkeypatch, credentials_path)
@@ -650,17 +710,75 @@ def test_should_fail_closed_when_contract_required_but_missing(
     monkeypatch.setenv(KIMI_NATIVE_CONTRACT_REQUIRED_ENV, "true")
 
     config = KimiCodeChatConfig()
-    with pytest.raises(KimiCodeContractError) as exc_info:
-        config.validate_environment(
-            headers={},
-            model="k3",
-            messages=[],
-            optional_params={},
-            litellm_params={},
-        )
+    headers = config.validate_environment(
+        headers={},
+        model="k3",
+        messages=[],
+        optional_params={},
+        litellm_params={},
+    )
 
-    assert exc_info.value.status_code == 503
-    assert "native contract descriptor" in str(exc_info.value)
+    assert headers["User-Agent"].startswith("kimi-code-cli/")
+    assert headers["X-Msh-Platform"] == "kimi_code_cli"
+    assert headers["X-Msh-Version"] == headers["User-Agent"].split("/", 1)[1]
+    assert headers["Authorization"] == "Bearer current-access-token"
+
+
+def test_should_use_stale_descriptor_identity_when_expired_but_valid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """MS-035: an expired but structurally valid descriptor keeps serving
+    requests with its older claimed identity and all six X-Msh headers."""
+    import time as _time
+    from litellm.secret_managers.kimi_native_contract import (
+        KIMI_NATIVE_BASE_URL,
+        KIMI_NATIVE_CONTRACT_PATH_ENV,
+        KIMI_NATIVE_CONTRACT_REQUIRED_ENV,
+        KIMI_NATIVE_SCHEMA_VERSION,
+        compute_canonical_digest,
+    )
+
+    credentials_path = tmp_path / "kimi-code.json"
+    _set_credentials_path(monkeypatch, credentials_path)
+    _write_credentials(credentials_path)
+
+    now = _time.time()
+    payload = {
+        "schema_version": KIMI_NATIVE_SCHEMA_VERSION,
+        "client_name": "kimi-code",
+        "client_version": "0.28.0",
+        "base_url": KIMI_NATIVE_BASE_URL,
+        "user_agent": "kimi-code-cli/0.28.0",
+        "issued_at": now - 7200,
+        "expires_at": now - 60,
+        "x_msh_platform": "kimi_code_cli",
+        "x_msh_version": "0.28.0",
+        "x_msh_device_name": "aawm-service-node",
+        "x_msh_device_model": "aawm-managed",
+        "x_msh_os_version": "linux-6.x",
+        "x_msh_device_id": "0d3f8a2e-7b14-4c6a-9e5f-a1b2c3d4e5f6",
+    }
+    payload["digest"] = compute_canonical_digest(payload)
+    contract_path = tmp_path / "contract-expired.json"
+    contract_path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setenv(KIMI_NATIVE_CONTRACT_PATH_ENV, str(contract_path))
+    monkeypatch.setenv(KIMI_NATIVE_CONTRACT_REQUIRED_ENV, "true")
+
+    config = KimiCodeChatConfig()
+    headers = config.validate_environment(
+        headers={},
+        model="k3",
+        messages=[],
+        optional_params={},
+        litellm_params={},
+    )
+
+    # Stale descriptor identity is served, not the built-in fallback.
+    assert headers["User-Agent"] == "kimi-code-cli/0.28.0"
+    assert headers["X-Msh-Version"] == "0.28.0"
+    assert headers["X-Msh-Platform"] == "kimi_code_cli"
+    assert headers["X-Msh-Device-Id"] == "0d3f8a2e-7b14-4c6a-9e5f-a1b2c3d4e5f6"
+    assert headers["Authorization"] == "Bearer current-access-token"
 
 
 def test_should_send_descriptor_headers_through_litellm_completion(

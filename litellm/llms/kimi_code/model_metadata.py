@@ -1,4 +1,4 @@
-"""Conservative parsing and admission helpers for Kimi Code `/models` metadata."""
+"""Conservative parsing and identity helpers for Kimi Code `/models` metadata."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from typing import Dict, Final, FrozenSet, Optional, Tuple
 K3_MODEL_ID: Final[str] = "k3"
 K2_7_MODEL_IDS: Final[FrozenSet[str]] = frozenset({"kimi-for-coding", "kimi-for-coding-highspeed"})
 MANAGED_KIMI_CODE_MODEL_IDS: Final[FrozenSet[str]] = frozenset({K3_MODEL_ID, *K2_7_MODEL_IDS})
+KIMI_CODE_PROVIDER_PREFIX: Final[str] = "kimi_code"
 
 _EXPLICIT_CAPABILITY_FIELDS: Final[FrozenSet[str]] = frozenset(
     {"supports_reasoning", "supports_image_in", "supports_video_in"}
@@ -43,6 +44,24 @@ def is_managed_kimi_code_model_id(model_id: object) -> bool:
     """Return whether `model_id` is one of the exact managed Kimi Code IDs."""
 
     return isinstance(model_id, str) and model_id in MANAGED_KIMI_CODE_MODEL_IDS
+
+
+def normalize_managed_kimi_code_model_id(model_id: object) -> Optional[str]:
+    """
+    Return the managed Kimi Code model ID when it is a nonempty local ID.
+
+    Any nonempty bare model ID is admissible for an explicit
+    `kimi_code/<model-id>` route; upstream support is proven at egress, not by
+    a Python enumeration. IDs that already carry another provider namespace
+    remain inadmissible here so cross-provider routing stays fail-closed.
+    """
+
+    if not isinstance(model_id, str):
+        return None
+    candidate = model_id.strip()
+    if not candidate or "/" in candidate:
+        return None
+    return candidate
 
 
 def is_k3_model_id(model_id: object) -> bool:
@@ -82,11 +101,12 @@ def parse_kimi_code_models_payload(
 
 
 def get_kimi_code_model_metadata(payload: object, model_id: object) -> Optional[KimiCodeModelMetadata]:
-    """Return metadata for an exact managed ID from one `/models` payload."""
+    """Return metadata for a namespaced managed ID from one `/models` payload."""
 
-    if not isinstance(model_id, str) or not is_managed_kimi_code_model_id(model_id):
+    normalized_model_id = normalize_managed_kimi_code_model_id(model_id)
+    if normalized_model_id is None:
         return None
-    return parse_kimi_code_models_payload(payload).get(model_id)
+    return parse_kimi_code_models_payload(payload).get(normalized_model_id)
 
 
 def supports_k3_think_effort(metadata: Optional[KimiCodeModelMetadata], effort: object) -> bool:
@@ -157,8 +177,8 @@ def _parse_managed_model_metadata(
     if not isinstance(model, Mapping):
         return None
 
-    model_id = model.get("id")
-    if not isinstance(model_id, str) or not is_managed_kimi_code_model_id(model_id):
+    model_id = normalize_managed_kimi_code_model_id(model.get("id"))
+    if model_id is None:
         return None
 
     return KimiCodeModelMetadata(

@@ -21,14 +21,18 @@ identity. Reject caller attempts to spoof its endpoint, native header/version,
 freshness, digest, or identity fields. Replacement is validated and atomically
 published without a LiteLLM restart. The configured host directory is mounted
 read-only at `/app/kimi-descriptor`, and the consumer path is
-`/app/kimi-descriptor/kimi-native-contract.json`.
+`/app/kimi-descriptor/native-contract.json`.
 
 The standalone image default
 `LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=false` is compatibility mode. Managed
-dev Compose defaults the gate to `true`. In required mode, a missing, stale,
-malformed, digest-invalid, endpoint-mismatched, version-incoherent, or hostile
-descriptor fails closed and records a sanitized failure. It must not fall back
-to generic `moonshot/*`, API-key authentication, or another endpoint.
+dev Compose defaults the gate to `true`. Required mode requires a resolved
+Kimi identity, not a fresh descriptor. An expired but structurally valid
+descriptor remains usable as the last valid identity and records sanitized
+stale-source telemetry. If the descriptor is missing, malformed,
+digest-invalid, endpoint-mismatched, version-incoherent, or hostile, installed
+Kimi remains available through the conservative built-in identity with
+sanitized source telemetry. Neither fallback may use generic `moonshot/*`,
+API-key authentication, another provider, or another endpoint.
 
 The descriptor does not define usage-to-chat correlation. Any such join must
 be proved by the polling and persistence runtime evidence; prompt text,

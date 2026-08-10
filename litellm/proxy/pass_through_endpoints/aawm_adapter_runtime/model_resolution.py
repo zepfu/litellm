@@ -8,11 +8,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional
 
-from litellm.llms.kimi_code.adapters import adapter as _kimi_code_adapters
-from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
-    KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS as _KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS,
-)
-
 if TYPE_CHECKING:
     from fastapi import Request
 
@@ -27,7 +22,6 @@ if TYPE_CHECKING:
     _ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS: frozenset
     _ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS: frozenset
     _ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS: frozenset
-    _ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS: frozenset
 
     # Host-global functions
     def _extract_claude_agent_and_tenant_from_request_body(request_body: dict) -> tuple: ...
@@ -226,17 +220,21 @@ def _normalize_opencode_zen_adapter_model_name(model: Any) -> Optional[str]:
 def _normalize_kimi_code_chat_completions_adapter_model_name(
     model: Any,
 ) -> Optional[str]:
-    return _kimi_code_adapters.normalize_kimi_code_chat_completions_adapter_model_name(  # noqa: F821
-        model,
-        allowed_models=_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS,  # noqa: F821
+    # Binding-safe: install() rebinds this function into host_globals, so a
+    # module-imported helper name would disappear from the visible namespace.
+    # Resolve the policy helper at call time instead (host-owned dependencies
+    # stay late-bound through host_globals).
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        normalize_kimi_code_chat_completions_adapter_model_name as _normalize_kimi_code_adapter_model_name,
     )
+
+    return _normalize_kimi_code_adapter_model_name(model)
 
 def _normalize_alibaba_token_plan_adapter_model_name(
     model: Any,
 ) -> Optional[str]:
     return _alibaba_token_plan_adapters.normalize_alibaba_token_plan_adapter_model_name(  # noqa: F821
         model,
-        allowed_models=_ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS,  # noqa: F821
     )
 
 

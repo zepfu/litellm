@@ -7,7 +7,7 @@ quota, allowlist, and adapter-capability policy shared by runtime components.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 # Default cooldowns for auto-agent alias candidates.
 CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS = 3 * 60 * 60.0
@@ -89,26 +89,60 @@ ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS = frozenset(
         "owl-alpha",
     }
 )
-KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS = frozenset(
+# Managed Kimi Code model admission is namespace-based: any explicit
+# `kimi_code/<nonempty-model-id>` config route is admissible without a Python
+# enumeration. This set retains only the semantic compatibility mappings
+# (k3-low/k3-high/k3-max select the K3 model with a forced thinking effort);
+# it is not a model-admission gate.
+KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_COMPATIBILITY_MAPPINGS = frozenset(
     {
-        "kimi_code/k3",
         "kimi_code/k3-low",
         "kimi_code/k3-high",
         "kimi_code/k3-max",
-        "kimi_code/kimi-for-coding",
-        "kimi_code/kimi-for-coding-highspeed",
     }
 )
-ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS = frozenset(
-    {
-        "alibaba_token_plan/qwen3.8-max",
-        "alibaba_token_plan/qwen3.7-plus",
-        "alibaba_token_plan/qwen3.7-max",
-        "alibaba_token_plan/qwen3.6-flash",
-        "alibaba_token_plan/deepseek-v4-pro",
-        "alibaba_token_plan/glm-5.2",
-    }
-)
+
+
+def normalize_kimi_code_chat_completions_adapter_model_name(model: Any) -> Optional[str]:
+    """Return the canonical `kimi_code/<model-id>` adapter key when admissible.
+
+    Any explicit `kimi_code/<nonempty-model-id>` route is admitted without a
+    Python model enumeration; unprefixed or foreign-provider names return
+    `None` so provider inference stays fail-closed.
+    """
+
+    if not isinstance(model, str):
+        return None
+    candidate = model.strip()
+    if not candidate:
+        return None
+    provider_prefix, separator, model_id = candidate.partition("/")
+    if not separator or provider_prefix != CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER:
+        return None
+    if not model_id.strip():
+        return None
+    return candidate
+
+def normalize_alibaba_token_plan_adapter_model_name(model: Any) -> Optional[str]:
+    """Return the canonical `alibaba_token_plan/<model-id>` adapter key when admissible.
+
+    Any structurally valid explicit `alibaba_token_plan/<nonempty-model-id>`
+    route is admitted without a Python model enumeration and the exact model
+    ID suffix is forwarded upstream. Unprefixed or foreign-provider names
+    return `None` so provider inference stays fail-closed.
+    """
+
+    if not isinstance(model, str):
+        return None
+    candidate = model.strip()
+    if not candidate:
+        return None
+    provider_prefix, separator, model_id = candidate.partition("/")
+    if not separator or provider_prefix != CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
+        return None
+    if not model_id.strip():
+        return None
+    return candidate
 
 # Generic compatibility publication for the pass-through integration module.
 COMPAT_ALIAS_MAP: dict[str, str] = {
@@ -162,11 +196,14 @@ COMPAT_ALIAS_MAP: dict[str, str] = {
     "_ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS": (
         "ANTHROPIC_OPENROUTER_COMPLETION_ADAPTER_ALLOWED_MODELS"
     ),
-    "_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS": (
-        "KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS"
+    "_KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_COMPATIBILITY_MAPPINGS": (
+        "KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_COMPATIBILITY_MAPPINGS"
     ),
-    "_ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS": (
-        "ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS"
+    "_normalize_kimi_code_chat_completions_adapter_model_name": (
+        "normalize_kimi_code_chat_completions_adapter_model_name"
+    ),
+    "_normalize_alibaba_token_plan_adapter_model_name": (
+        "normalize_alibaba_token_plan_adapter_model_name"
     ),
 }
 COMPAT_ALIAS_COUNT = len(COMPAT_ALIAS_MAP)
@@ -184,7 +221,6 @@ def install_policy_compat_aliases(host_globals: dict[str, Any]) -> None:
 
 
 __all__ = [
-    "ALIBABA_TOKEN_PLAN_ADAPTER_ALLOWED_MODELS",
     "ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER",
     "ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS",
     "ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS",
@@ -209,8 +245,10 @@ __all__ = [
     "CODEX_AUTO_AGENT_XAI_PROVIDER",
     "COMPAT_ALIAS_COUNT",
     "COMPAT_ALIAS_MAP",
-    "KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_ALLOWED_MODELS",
+    "KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_COMPATIBILITY_MAPPINGS",
     "OPENCODE_ZEN_PROVIDER",
     "OPENROUTER_FREE_DAILY_QUOTA_MODELS",
     "install_policy_compat_aliases",
+    "normalize_alibaba_token_plan_adapter_model_name",
+    "normalize_kimi_code_chat_completions_adapter_model_name",
 ]

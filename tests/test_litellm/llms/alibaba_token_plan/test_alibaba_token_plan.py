@@ -31,7 +31,9 @@ def test_should_register_alibaba_token_plan_provider_and_config() -> None:
     )
 
 
-def test_should_admit_only_the_seven_token_plan_models() -> None:
+def test_catalog_constant_is_metadata_only() -> None:
+    """ALIBABA_TOKEN_PLAN_MODEL_IDS is retained as catalog metadata only;
+    admission and credential discovery are structural, not enumerated."""
     assert ALIBABA_TOKEN_PLAN_MODEL_IDS == {
         "qwen3.8-max",
         "qwen3.8-max-preview",
@@ -46,12 +48,14 @@ def test_should_admit_only_the_seven_token_plan_models() -> None:
 @pytest.mark.parametrize(
     "model",
     (
-        "qwen/qwen3.8-max-preview",
-        "dashscope/qwen3.8-max-preview",
-        "alibaba_token_plan/unknown",
+        "alibaba_token_plan/",
+        "alibaba_token_plan/   ",
+        "alibaba_token_plan/qwen/sub",
+        "openai/gpt-5",
+        "dashscope/qwen3.8-max",
     ),
 )
-def test_should_reject_non_token_plan_model_ids(model: str) -> None:
+def test_should_reject_empty_token_plan_model_ids(model: str) -> None:
     with pytest.raises(ValueError, match="Unsupported Alibaba Token Plan model"):
         AlibabaTokenPlanChatConfig().get_complete_url(
             api_base=None,
@@ -60,6 +64,28 @@ def test_should_reject_non_token_plan_model_ids(model: str) -> None:
             optional_params={},
             litellm_params={},
         )
+
+
+def test_should_forward_future_config_selected_model_ids() -> None:
+    url = AlibabaTokenPlanChatConfig().get_complete_url(
+        api_base=None,
+        api_key=None,
+        model="alibaba_token_plan/future-model-2026",
+        optional_params={},
+        litellm_params={},
+    )
+    assert url == ALIBABA_TOKEN_PLAN_CHAT_COMPLETIONS_URL
+
+
+def test_should_accept_bare_internal_suffix_model_id() -> None:
+    url = AlibabaTokenPlanChatConfig().get_complete_url(
+        api_base=None,
+        api_key=None,
+        model="qwen3.8-max-preview",
+        optional_params={},
+        litellm_params={},
+    )
+    assert url == ALIBABA_TOKEN_PLAN_CHAT_COMPLETIONS_URL
 
 
 def test_should_use_only_the_canonical_endpoint_and_existing_credential(

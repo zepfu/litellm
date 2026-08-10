@@ -11,9 +11,12 @@ not converted to OAuth, governed by the native Kimi descriptor, or selected as
 an AAWM route or fallback.
 
 All AAWM Moonshot traffic is OAuth-only through managed `kimi_code/*` routes.
-AAWM does not use Moonshot API keys. If the managed OAuth credential, native
-endpoint, or required contract descriptor is unavailable, the AAWM route fails
-closed; it must not fall back to `moonshot/*`, an API key, or another provider.
+AAWM does not use Moonshot API keys. If the managed OAuth credential or native
+endpoint is unavailable, the AAWM route fails closed; it must not fall back to
+`moonshot/*`, an API key, or another provider. Descriptor publication failures
+do not disable installed Kimi: consumers retain the last structurally valid
+descriptor, including after expiry, or use the conservative built-in identity
+when no usable descriptor is available.
 
 The authoritative native client for the managed contract is the WSL
 installation at `/home/zepfu/.kimi-code/bin/kimi`, version `0.29.1`. The
@@ -144,15 +147,18 @@ without a restart. Readers may retain the immutable snapshot captured for an
 in-flight request. The host directory selected by
 `AAWM_KIMI_NATIVE_DESCRIPTOR_DIR` is mounted read-only at
 `/app/kimi-descriptor`; the consumer file is
-`kimi-native-contract.json`.
+`native-contract.json`.
 
 The standalone image default
 `LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=false` is compatibility mode and does
 not establish exact-parity acceptance. Managed dev Compose defaults the gate
-to `true`, as must fail-closed managed deployments. In required mode, a
-missing, stale, malformed, digest-invalid, endpoint-mismatched,
-version-incoherent, or hostile descriptor fails closed; there is no generic
-`moonshot/*` fallback, API-key fallback, or alternate endpoint.
+to `true`. Required mode requires a resolved Kimi identity, not a fresh
+descriptor. An expired but structurally valid descriptor remains usable as the
+last valid identity; a missing, malformed, digest-invalid,
+endpoint-mismatched, version-incoherent, or hostile descriptor selects the
+conservative built-in installed-client identity. Descriptor expiry alone does
+not disable the provider, and neither fallback permits a generic `moonshot/*`
+route, API-key authentication, another provider, or an alternate endpoint.
 
 ### Non-streaming
 

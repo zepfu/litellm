@@ -9,10 +9,32 @@ atomic replacement is restart-free and naturally reaches every worker.
 Deployment gate
 ---------------
 Set ``LITELLM_KIMI_NATIVE_CONTRACT_PATH`` to the descriptor file path
-and ``LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=true`` to fail closed when
-the descriptor is absent or invalid.  Without the required flag the
-resolver returns ``None`` and callers fall back to the built-in
-constants (honest fallback that does not claim native parity).
+and ``LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=true`` to require a resolved
+identity for Kimi routes.  A missing or structurally invalid descriptor
+(unknown or missing fields, digest mismatch, malformed values, identity
+incoherence, or a future ``issued_at``) never fails closed: it falls
+back to the conservative installed-client identity with sanitized
+builtin-source telemetry.  Only actual auth/provider failures remain
+terminal for callers.
+
+MS-035 resilience: descriptor publication failures must never make an
+installed Kimi client unavailable.  An expired but otherwise valid
+descriptor stays usable with a ``stale`` source classification; when no
+usable descriptor exists (missing or malformed), the resolver derives a
+conservative built-in identity from the installed Kimi client contract
+(version, User-Agent shape, device identity) and returns that with a
+``builtin`` source classification.  ``required=true`` therefore only
+selects between the builtin identity and ``None`` when the descriptor is
+missing or malformed; it never raises for publication staleness, absence,
+or structural invalidity.  Without the required flag the resolver returns
+``None`` in those cases and callers fall back to the built-in constants
+(honest fallback that does not claim native parity).
+
+This module is strictly read-only: it never writes the descriptor, the
+OAuth credential, or any other file, and it never logs descriptor
+contents or credentials.  Stale-source telemetry is emitted as one
+sanitized warning per classification transition, naming only the
+classification and the descriptor path.
 """
 
 from __future__ import annotations
@@ -20,13 +42,14 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
 import time
 import uuid as _uuid
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # Environment configuration
@@ -34,12 +57,28 @@ from typing import Dict, Optional
 KIMI_NATIVE_CONTRACT_PATH_ENV = "LITELLM_KIMI_NATIVE_CONTRACT_PATH"
 KIMI_NATIVE_CONTRACT_REQUIRED_ENV = "LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED"
 
+_logger = logging.getLogger("litellm.secret_managers.kimi_native_contract")
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 KIMI_NATIVE_BASE_URL = "https://api.kimi.com/coding/v1"
 KIMI_NATIVE_SCHEMA_VERSION = 2
 KIMI_NATIVE_CONTRACT_MAX_BYTES = 65_536  # 64 KiB
+
+# Conservative identity used when the published descriptor is expired but
+# otherwise valid (``stale``), or when no usable descriptor exists and the
+# resolver must derive the installed-client identity (``builtin``).
+KIMI_NATIVE_CONTRACT_SOURCE_DESCRIPTOR = "descriptor"
+KIMI_NATIVE_CONTRACT_SOURCE_STALE = "stale"
+KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN = "builtin"
+
+# Conservative built-in identity floor for the installed Kimi Code client.
+# This is a lower bound on the installed client contract, not the claimed
+# current version; it claims no native parity beyond the pinned device
+# identity below.
+KIMI_NATIVE_BUILTIN_CLIENT_VERSION = "0.29.1"
+KIMI_NATIVE_BUILTIN_DEVICE_ID = "3dfef765-cf3b-471f-b6bc-d78bba1c4b59"
 
 _REQUIRED_FIELDS = frozenset(
     {
@@ -78,6 +117,55 @@ _KIMI_CLIENT_NAME = "kimi-code"
 _KIMI_USER_AGENT_PREFIX = "kimi-code-cli/"
 _KIMI_X_MSH_PLATFORM = "kimi_code_cli"
 
+# Sanitized stale/builtin-source telemetry: one warning per source
+# classification transition per process.  Messages name only the
+# classification and the descriptor path, never descriptor contents or
+# credential material.
+_SOURCE_TELEMETRY_STATE: Dict[str, object] = {
+    "descriptor": False,
+    "stale": False,
+    "builtin": False,
+    "path": None,
+}
+
+
+def _reset_source_telemetry_state() -> None:
+    """Test seam: reset the per-process source-telemetry transition state."""
+    _SOURCE_TELEMETRY_STATE["descriptor"] = False
+    _SOURCE_TELEMETRY_STATE["stale"] = False
+    _SOURCE_TELEMETRY_STATE["builtin"] = False
+    _SOURCE_TELEMETRY_STATE["path"] = None
+
+
+def _record_contract_source(source: str, path: Optional[str]) -> None:
+    """Emit sanitized transition telemetry for stale/builtin resolution.
+
+    Only the source classification and descriptor path are logged; the
+    descriptor body and credential material are never logged.
+    """
+    if source == KIMI_NATIVE_CONTRACT_SOURCE_DESCRIPTOR:
+        _SOURCE_TELEMETRY_STATE["descriptor"] = True
+        _SOURCE_TELEMETRY_STATE["path"] = path
+        return
+    if _SOURCE_TELEMETRY_STATE.get(source) and _SOURCE_TELEMETRY_STATE.get("path") == path:
+        return
+    _SOURCE_TELEMETRY_STATE[source] = True
+    _SOURCE_TELEMETRY_STATE["path"] = path
+    if source == KIMI_NATIVE_CONTRACT_SOURCE_STALE:
+        _logger.warning(
+            "Kimi native contract source=stale: descriptor at %s is expired; "
+            "continuing with its older claimed client identity until "
+            "publication catches up.",
+            path,
+        )
+    elif source == KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN:
+        _logger.warning(
+            "Kimi native contract source=builtin: no usable descriptor at %s; "
+            "using the conservative installed-client identity version=%s.",
+            path if path else "<unset>",
+            KIMI_NATIVE_BUILTIN_CLIENT_VERSION,
+        )
+
 
 class KimiNativeContractError(Exception):
     """Raised when the contract descriptor is missing, stale, or malformed."""
@@ -85,7 +173,16 @@ class KimiNativeContractError(Exception):
 
 @dataclasses.dataclass(frozen=True)
 class KimiNativeContract:
-    """Validated, immutable snapshot of the native contract descriptor."""
+    """Validated, immutable snapshot of the native contract identity.
+
+    ``source`` classifies where the identity came from:
+
+    * ``descriptor`` -- a current published descriptor;
+    * ``stale`` -- an expired but structurally valid published descriptor
+      (its claimed client identity may be stale);
+    * ``builtin`` -- the conservative installed-client identity derived
+      locally when no usable descriptor exists.
+    """
 
     schema_version: int
     client_name: str
@@ -101,6 +198,7 @@ class KimiNativeContract:
     x_msh_device_model: str
     x_msh_os_version: str
     x_msh_device_id: str
+    source: str = KIMI_NATIVE_CONTRACT_SOURCE_DESCRIPTOR
 
 
 # ---------------------------------------------------------------------------
@@ -161,8 +259,16 @@ def _parse_timestamp(value: object) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _validate_and_build(payload: Dict, *, now: float) -> KimiNativeContract:
-    """Strict schema validation and construction."""
+def _validate_and_build(
+    payload: Dict, *, now: float
+) -> Tuple[KimiNativeContract, bool]:
+    """Strict schema validation and construction.
+
+    Returns ``(contract, expired)``.  Expiry no longer rejects the
+    descriptor: it only downgrades the source classification so callers
+    keep operating on the older claimed client identity with stale-source
+    telemetry.
+    """
     unknown = set(payload.keys()) - _REQUIRED_FIELDS
     if unknown:
         raise KimiNativeContractError(
@@ -238,8 +344,7 @@ def _validate_and_build(payload: Dict, *, now: float) -> KimiNativeContract:
 
     issued_at = _parse_timestamp(payload["issued_at"])
     expires_at = _parse_timestamp(payload["expires_at"])
-    if expires_at <= now:
-        raise KimiNativeContractError("contract descriptor is expired")
+    expired = expires_at <= now
     if issued_at > now + _ISSUED_AT_FUTURE_SKEW_SECONDS:
         raise KimiNativeContractError("contract issued_at is in the future")
 
@@ -268,6 +373,87 @@ def _validate_and_build(payload: Dict, *, now: float) -> KimiNativeContract:
         x_msh_device_model=payload["x_msh_device_model"],
         x_msh_os_version=payload["x_msh_os_version"],
         x_msh_device_id=payload["x_msh_device_id"],
+        source=(
+            KIMI_NATIVE_CONTRACT_SOURCE_STALE
+            if expired
+            else KIMI_NATIVE_CONTRACT_SOURCE_DESCRIPTOR
+        ),
+    ), expired
+
+
+# ---------------------------------------------------------------------------
+# Conservative installed-client identity (MS-035)
+# ---------------------------------------------------------------------------
+
+
+def _derive_builtin_client_version() -> str:
+    """Best-effort read-only lookup of the installed Kimi CLI version.
+
+    Falls back to :data:`KIMI_NATIVE_BUILTIN_CLIENT_VERSION` on any
+    failure.  Never raises, writes, or contacts the network.
+    """
+    kimi_home = os.environ.get("KIMI_CODE_HOME", "~/.kimi-code")
+    try:
+        import subprocess
+
+        result = subprocess.run(  # noqa: S603,S607
+            [os.path.join(os.path.expanduser(kimi_home), "bin", "kimi"), "--version"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        version = result.stdout.strip().splitlines()
+        if len(version) == 1 and re.fullmatch(r"\d+\.\d+\.\d+", version[0]):
+            return version[0]
+    except Exception:
+        pass
+    return KIMI_NATIVE_BUILTIN_CLIENT_VERSION
+
+
+def _derive_builtin_device_id() -> str:
+    """Best-effort read-only lookup of the installed Kimi CLI device ID.
+
+    Falls back to :data:`KIMI_NATIVE_BUILTIN_DEVICE_ID` on any failure.
+    Never raises or writes.
+    """
+    kimi_home = os.environ.get("KIMI_CODE_HOME", "~/.kimi-code")
+    try:
+        raw = (
+            open(
+                os.path.join(os.path.expanduser(kimi_home), "device_id"),
+                "r",
+                encoding="utf-8",
+            )
+            .read()
+            .strip()
+        )
+        if str(_uuid.UUID(raw)) == raw:
+            return raw
+    except Exception:
+        pass
+    return KIMI_NATIVE_BUILTIN_DEVICE_ID
+
+
+def _build_builtin_contract() -> KimiNativeContract:
+    """Conservative installed-client identity for descriptor-less operation."""
+    version = _derive_builtin_client_version()
+    return KimiNativeContract(
+        schema_version=KIMI_NATIVE_SCHEMA_VERSION,
+        client_name=_KIMI_CLIENT_NAME,
+        client_version=version,
+        base_url=KIMI_NATIVE_BASE_URL,
+        user_agent=f"{_KIMI_USER_AGENT_PREFIX}{version}",
+        issued_at=0.0,
+        expires_at=0.0,
+        digest="",
+        x_msh_platform=_KIMI_X_MSH_PLATFORM,
+        x_msh_version=version,
+        x_msh_device_name="aawm-service-node",
+        x_msh_device_model="aawm-managed",
+        x_msh_os_version="linux-6.x",
+        x_msh_device_id=_derive_builtin_device_id(),
+        source=KIMI_NATIVE_CONTRACT_SOURCE_BUILTIN,
     )
 
 
@@ -284,9 +470,22 @@ def resolve_contract(
 ) -> Optional[KimiNativeContract]:
     """Resolve the native contract from the configured descriptor file.
 
+    MS-035 source classification:
+
+    * ``descriptor`` -- current published descriptor;
+    * ``stale`` -- expired but structurally valid descriptor (kept usable
+      with sanitized stale-source telemetry);
+    * ``builtin`` -- conservative installed-client identity used when the
+      descriptor is missing or malformed.  Publication failures never make
+      an installed Kimi client unavailable, even when *required* is true.
+
     Returns ``None`` when the descriptor is absent or invalid and not
-    required.  Raises :class:`KimiNativeContractError` when *required*
-    and the descriptor is absent or invalid (fail closed).
+    required (honest fallback: callers use their built-in constants).
+    Never raises for descriptor staleness, absence, or structural
+    invalidity: with *required* true those cases resolve the conservative
+    builtin identity with sanitized source telemetry.  Only actual
+    auth/provider failures (raised by callers, never here) remain
+    terminal.
     """
     if path is None:
         path = os.environ.get(KIMI_NATIVE_CONTRACT_PATH_ENV)
@@ -300,10 +499,9 @@ def resolve_contract(
 
     if not path:
         if required:
-            raise KimiNativeContractError(
-                "native contract is required but no descriptor path "
-                "is configured"
-            )
+            contract = _build_builtin_contract()
+            _record_contract_source(contract.source, None)
+            return contract
         return None
 
     # -- file-level checks --------------------------------------------------
@@ -311,25 +509,23 @@ def resolve_contract(
         st = os.stat(path)
     except OSError:
         if required:
-            raise KimiNativeContractError(
-                "native contract is required but descriptor is "
-                f"missing: {path}"
-            )
+            contract = _build_builtin_contract()
+            _record_contract_source(contract.source, path)
+            return contract
         return None
 
     if not stat.S_ISREG(st.st_mode):
         if required:
-            raise KimiNativeContractError(
-                f"native contract descriptor is not a regular file: {path}"
-            )
+            contract = _build_builtin_contract()
+            _record_contract_source(contract.source, path)
+            return contract
         return None
 
     if st.st_size > KIMI_NATIVE_CONTRACT_MAX_BYTES:
         if required:
-            raise KimiNativeContractError(
-                f"native contract descriptor exceeds "
-                f"{KIMI_NATIVE_CONTRACT_MAX_BYTES} bytes"
-            )
+            contract = _build_builtin_contract()
+            _record_contract_source(contract.source, path)
+            return contract
         return None
 
     try:
@@ -337,33 +533,42 @@ def resolve_contract(
             raw_text = fh.read()
     except OSError:
         if required:
-            raise KimiNativeContractError(
-                f"native contract descriptor is unreadable: {path}"
-            )
+            contract = _build_builtin_contract()
+            _record_contract_source(contract.source, path)
+            return contract
         return None
 
     try:
         payload = json.loads(raw_text)
     except (json.JSONDecodeError, ValueError):
         if required:
-            raise KimiNativeContractError(
-                "native contract descriptor is not valid JSON"
-            )
+            contract = _build_builtin_contract()
+            _record_contract_source(contract.source, path)
+            return contract
         return None
 
     if not isinstance(payload, dict):
         if required:
-            raise KimiNativeContractError(
-                "native contract descriptor root must be a JSON object"
-            )
+            contract = _build_builtin_contract()
+            _record_contract_source(contract.source, path)
+            return contract
         return None
 
     try:
-        return _validate_and_build(payload, now=now)
+        contract, _expired = _validate_and_build(payload, now=now)
     except KimiNativeContractError:
+        # MS-035: a malformed / schema-invalid / digest-invalid /
+        # identity-incoherent descriptor is treated like an absent one:
+        # required=true falls back to the conservative installed-client
+        # identity with sanitized builtin-source telemetry. Only actual
+        # auth/provider failures remain terminal for callers.
         if required:
-            raise
+            contract = _build_builtin_contract()
+            _record_contract_source(contract.source, path)
+            return contract
         return None
+    _record_contract_source(contract.source, path)
+    return contract
 
 
 def resolve_endpoint_url(

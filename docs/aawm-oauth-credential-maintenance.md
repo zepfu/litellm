@@ -31,17 +31,20 @@ Validate and publish replacements atomically so readers see a new snapshot
 without a restart. The host descriptor directory is configured by
 `AAWM_KIMI_NATIVE_DESCRIPTOR_DIR` and mounted read-only at
 `/app/kimi-descriptor`; consumers read
-`/app/kimi-descriptor/kimi-native-contract.json`. The image contains the
+`/app/kimi-descriptor/native-contract.json`. The image contains the
 resolver, not a captured descriptor or OAuth credential.
 
 The standalone image default
 `LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=false` is compatibility mode and does
 not establish exact-parity acceptance. Managed dev Compose defaults the gate
-to `true`, as must any fail-closed managed deployment. In required mode, a
-missing, stale, malformed, digest-invalid, endpoint-mismatched,
-version-incoherent, or hostile descriptor fails closed. Do not use a guessed
-contract, alternate endpoint, Moonshot API key, generic `moonshot/*` route, or
-another provider to recover.
+to `true`. Required mode requires a resolved Kimi identity, not a fresh
+descriptor: an expired but structurally valid descriptor remains usable as the
+last valid identity, while a missing, malformed, digest-invalid,
+endpoint-mismatched, version-incoherent, or hostile descriptor selects the
+conservative built-in installed-client identity. Descriptor publication or
+expiry alone does not disable installed Kimi. Neither fallback may change the
+native endpoint or recover through a Moonshot API key, generic `moonshot/*`
+route, or another provider.
 
 This document is the operator-facing maintenance guide for AAWM OAuth and OIDC
 credential files used by LiteLLM and the provider-status sidecar. It covers the
