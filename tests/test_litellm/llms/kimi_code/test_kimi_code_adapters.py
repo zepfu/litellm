@@ -191,6 +191,7 @@ async def _stream_text(response: StreamingResponse) -> str:
         ("moonshot/k3", None),
         ("kimi_code/", None),
         ("kimi_code/  ", None),
+        ("kimi_code/k3/preview", None),
         ("", None),
         (None, None),
         (42, None),

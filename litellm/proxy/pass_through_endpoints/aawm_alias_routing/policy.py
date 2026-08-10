@@ -107,8 +107,9 @@ def normalize_kimi_code_chat_completions_adapter_model_name(model: Any) -> Optio
     """Return the canonical `kimi_code/<model-id>` adapter key when admissible.
 
     Any explicit `kimi_code/<nonempty-model-id>` route is admitted without a
-    Python model enumeration; unprefixed or foreign-provider names return
-    `None` so provider inference stays fail-closed.
+    Python model enumeration. Unprefixed names, foreign-provider names, and
+    nested suffixes return `None` so provider inference stays fail-closed and
+    the policy boundary matches the downstream Kimi model contract.
     """
 
     if not isinstance(model, str):
@@ -119,7 +120,7 @@ def normalize_kimi_code_chat_completions_adapter_model_name(model: Any) -> Optio
     provider_prefix, separator, model_id = candidate.partition("/")
     if not separator or provider_prefix != CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER:
         return None
-    if not model_id.strip():
+    if not model_id.strip() or "/" in model_id:
         return None
     return candidate
 
