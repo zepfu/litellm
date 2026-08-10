@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional, Union
 import httpx
 
 from litellm.proxy.aawm_route_logging import (
+    _normalize_aawm_route_log_reasoning_effort,
     build_aawm_route_rollup_group_header_label,
     emit_aawm_route_status_event,
     record_aawm_route_rollup,
@@ -217,12 +218,19 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
     )
     if not group_header_label or not incoming_endpoint:
         return
+    # Zero-turn status rollups use same-request native effort only.
+    # Core normalization renders absent/invalid values as "none"; never consult
+    # candidate config, defaults, or model capabilities here.
+    effort = _normalize_aawm_route_log_reasoning_effort(
+        event.get("reasoning_effort_native_value")
+    )
     for label in model_labels:
         record_aawm_route_rollup(
             group_header_label=group_header_label,
             incoming_endpoint=incoming_endpoint,
             outgoing_target=outgoing_target,
             model_label=label,
+            effort=effort,
             turns=0,
             status=status,
             message=_clean_codex_auth_value(event.get("source_error")),
@@ -274,6 +282,12 @@ def install(host_globals: dict) -> None:
             _rebound.__dict__.update(_obj.__dict__)
         _mod[_name] = _rebound
         host_globals[_name] = _rebound
+    # Rebound functions resolve imported helpers through host_globals.
+    host_globals.setdefault(
+        "_normalize_aawm_route_log_reasoning_effort",
+        _normalize_aawm_route_log_reasoning_effort,
+    )
+
     # Copy seam variables into host_globals so rebound functions resolve them.
     for _sk, _sv in (
         ("_get_anthropic_adapter_access_log_target_label", _get_anthropic_adapter_access_log_target_label),

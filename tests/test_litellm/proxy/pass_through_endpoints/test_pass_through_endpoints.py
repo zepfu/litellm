@@ -104,6 +104,29 @@ def _build_aawm_route_log_request(
     return request
 
 
+
+def _build_aawm_route_log_user_api_key_dict(
+    *,
+    request_route: str = "/openai_passthrough/responses",
+) -> MagicMock:
+    return MagicMock(
+        api_key="test-api-key",
+        key_alias="test-alias",
+        user_email="test@example.com",
+        user_id="test-user-id",
+        team_id="test-team-id",
+        org_id="test-org-id",
+        project_id="test-project-id",
+        team_alias="test-team-alias",
+        end_user_id="test-end-user-id",
+        request_route=request_route,
+        spend=0,
+        max_budget=None,
+        budget_reset_at=None,
+        metadata={},
+    )
+
+
 def test_request_shape_422_modelinput_enrichment_is_sanitized_and_fingerprinted():
     secret_prompt = "SUPER_SECRET_MODELINPUT_PROMPT"
     secret_token = "sk-leaked-modelinput-token"
@@ -1302,6 +1325,90 @@ async def test_pass_through_request_emits_aawm_route_access_log(
 
 
 @pytest.mark.asyncio
+async def test_pass_through_request_emits_aawm_route_access_log_with_provider_bound_body(
+    monkeypatch,
+) -> None:
+    """Keep original request_body for labeling; pass final provider_bound_body to route log."""
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "0")
+
+    request = _build_aawm_route_log_request(
+        url="http://127.0.0.1:4001/openai_passthrough/responses?stream=false",
+        client=("172.19.0.1", 44766),
+        headers={"user-agent": "codex-cli/0.119.0-alpha.29"},
+    )
+    original_request_body = {
+        "model": "gpt-5.3-codex-spark",
+        "input": "redacted-original",
+        "reasoning": {"effort": "xhigh"},
+        "litellm_metadata": {
+            "agent_name": "W2 tester",
+            "repository": "litellm",
+            "requested_model_alias": "work",
+            "codex_auto_agent_selected_model": "gpt-5.3-codex-spark",
+            "reasoning_effort_native_value": "xhigh",
+        },
+    }
+    mock_response = MagicMock(
+        status_code=200,
+        headers={},
+        text='{"success": true}',
+        content=b'{"success": true}',
+        aread=AsyncMock(return_value=b'{"success": true}'),
+        raise_for_status=MagicMock(),
+    )
+    captured_emit_kwargs: dict = {}
+    captured_upstream_body: dict = {}
+
+    async def _capture_upstream(**kwargs):
+        body = kwargs.get("_parsed_body")
+        if isinstance(body, dict):
+            captured_upstream_body.update(body)
+        return mock_response
+
+    with patch("litellm.proxy.proxy_server.proxy_logging_obj") as mock_proxy_logging, patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+        new=AsyncMock(side_effect=_capture_upstream),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.ProxyBaseLLMRequestProcessing.get_custom_headers",
+        return_value={},
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.pass_through_endpoint_logging.pass_through_async_success_handler",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_response_body",
+        return_value={"success": True},
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.pass_through_endpoints.emit_aawm_route_access_log",
+        side_effect=lambda **kwargs: captured_emit_kwargs.update(kwargs),
+    ):
+        mock_proxy_logging.pre_call_hook = AsyncMock(return_value=original_request_body)
+        mock_proxy_logging.post_call_failure_hook = AsyncMock()
+        await pass_through_request(
+            request=request,
+            target="https://api.openai.com/v1/responses",
+            custom_headers={},
+            user_api_key_dict=_build_aawm_route_log_user_api_key_dict(),
+            custom_body=original_request_body,
+            custom_llm_provider="openai",
+        )
+
+    request_body = captured_emit_kwargs["request_body"]
+    provider_bound_body = captured_emit_kwargs["provider_bound_body"]
+    assert request_body["model"] == "gpt-5.3-codex-spark"
+    assert request_body["litellm_metadata"]["requested_model_alias"] == "work"
+    assert request_body["reasoning"]["effort"] == "xhigh"
+    assert provider_bound_body["model"] == "gpt-5.3-codex-spark"
+    assert provider_bound_body["reasoning"]["effort"] == "xhigh"
+    assert "litellm_metadata" not in provider_bound_body
+    assert "litellm_logging_obj" not in provider_bound_body
+    assert captured_upstream_body["model"] == "gpt-5.3-codex-spark"
+    assert captured_upstream_body["reasoning"]["effort"] == "xhigh"
+    assert "litellm_metadata" not in captured_upstream_body
+    clear_aawm_route_rollups()
+
+
 async def test_pass_through_async_success_handler_records_completed_route_rollup_turn(
     monkeypatch,
 ) -> None:
@@ -1355,7 +1462,8 @@ async def test_pass_through_async_success_handler_records_completed_route_rollup
     assert len(flushed) == 2
     assert ("litellm@Codex[0.119.0-alpha.29] /openai_passthrough/responses") in rendered
     assert (
-        " - gpt-5.3-codex-spark(work) - Turns: 1 -> " "api.openai.com/v1/responses"
+        " - gpt-5.3-codex-spark(work):none - Turns: 1 -> "
+        "api.openai.com/v1/responses"
     ) in rendered
     assert (
         kwargs["litellm_params"]["metadata"]["aawm_route_rollup_turn_recorded"] is True

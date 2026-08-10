@@ -307,7 +307,7 @@ def test_kimi_gateway_auth_failure_uses_structured_log_and_failed_route_rollup(
 
     rendered_rollup = "\n".join(flush_aawm_route_rollups(force=True))
     assert "/kimi/v1/usages" in rendered_rollup
-    assert "kimi_code/__managed_account__ - Turns: 0" in rendered_rollup
+    assert "kimi_code/__managed_account__:none - Turns: 0" in rendered_rollup
     assert "[Kimi Code gateway authorization is invalid.] [Failed]" in rendered_rollup
 
     access_filter = AawmRouteAccessLogReplacementFilter()
@@ -544,7 +544,7 @@ def test_kimi_gateway_success_records_route_rollup_turn(
     assert response.status_code == 200
     rendered_rollup = "\n".join(flush_aawm_route_rollups(force=True))
     assert "/kimi/v1/models" in rendered_rollup
-    assert "kimi_code/__managed_account__ - Turns: 1" in rendered_rollup
+    assert "kimi_code/__managed_account__:none - Turns: 1" in rendered_rollup
 
     access_filter = AawmRouteAccessLogReplacementFilter()
     assert (
@@ -611,7 +611,7 @@ def test_kimi_gateway_upstream_failure_logs_exact_source_error_and_failed_rollup
 
     rendered_rollup = "\n".join(flush_aawm_route_rollups(force=True))
     assert "/kimi/v1/chat/completions" in rendered_rollup
-    assert "kimi_code/k3-high - Turns: 0" in rendered_rollup
+    assert "kimi_code/k3-high:none - Turns: 0" in rendered_rollup
     assert "[Kimi quota exhausted.] [Failed]" in rendered_rollup
 
     access_filter = AawmRouteAccessLogReplacementFilter()
@@ -712,7 +712,7 @@ def test_kimi_gateway_stream_read_failure_is_logged_without_asgi_exception(
     assert not error_records[0].exc_info
 
     rendered_rollup = "\n".join(flush_aawm_route_rollups(force=True))
-    assert "kimi_code/k3-high - Turns: 0" in rendered_rollup
+    assert "kimi_code/k3-high:none - Turns: 0" in rendered_rollup
     assert "[Kimi Code gateway upstream response stream failed.] [Failed]" in (
         rendered_rollup
     )

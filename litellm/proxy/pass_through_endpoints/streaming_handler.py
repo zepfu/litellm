@@ -977,6 +977,7 @@ class PassThroughStreamingHandler:
             incoming_endpoint=str(context.get("incoming_endpoint") or ""),
             outgoing_target=str(context.get("outgoing_target") or ""),
             model_label=str(model_label),
+            effort=str(context.get("reasoning_effort") or "none"),
             turns=0,
             status="Failed",
         )

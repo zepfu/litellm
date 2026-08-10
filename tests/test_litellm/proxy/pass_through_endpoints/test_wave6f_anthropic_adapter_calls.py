@@ -60,7 +60,7 @@ class TestSignaturePinning:
     def test_emit_adapted_route_access_log(self):
         sig = inspect.signature(mod._emit_adapted_route_access_log)
         params = list(sig.parameters)
-        assert params == ["request", "target_url", "request_body", "rollup_kwargs", "adapter_label"]
+        assert params == ["request", "target_url", "request_body", "rollup_kwargs", "adapter_label", "provider_bound_body"]
 
     def test_record_adapted_completed_route_rollup_turn(self):
         sig = inspect.signature(mod._record_adapted_completed_route_rollup_turn)
@@ -845,3 +845,134 @@ class TestConstants:
 
     def test_parallel_instructions_content(self):
         assert "Parallel tool calls" in mod._OPENAI_ADAPTER_PARALLEL_FUNCTION_TOOL_INSTRUCTIONS
+
+
+# ---------------------------------------------------------------------------
+# D1-521: access logging receives final provider_bound_body
+# ---------------------------------------------------------------------------
+
+
+class TestD1521ProviderBoundBodyBoundary:
+    """Access logging must receive translated completion kwargs and alias label."""
+
+    @staticmethod
+    def _patch_live_emit(monkeypatch, captured: dict[str, Any]) -> None:
+        """Patch emit through rebound install() globals, not only module attrs."""
+        live_globals = mod._emit_adapted_route_access_log.__globals__
+
+        def _capture(**kwargs):
+            captured.clear()
+            captured.update(kwargs)
+
+        monkeypatch.setitem(live_globals, "emit_aawm_route_access_log", _capture)
+        # Keep module-local path covered when functions are not rebound.
+        monkeypatch.setattr(mod, "emit_aawm_route_access_log", _capture, raising=False)
+
+    @staticmethod
+    def _patch_live_callable(monkeypatch, func_name: str, value) -> None:
+        live_globals = getattr(mod, func_name).__globals__
+        monkeypatch.setitem(live_globals, func_name, value)
+        monkeypatch.setattr(mod, func_name, value, raising=False)
+
+    def test_emit_adapted_route_access_log_forwards_provider_bound_body(self, monkeypatch):
+        captured: dict[str, Any] = {}
+        self._patch_live_emit(monkeypatch, captured)
+
+        request_body = {"model": "alias-model", "reasoning_effort": "xhigh"}
+        provider_bound_body = {
+            "model": "upstream-model",
+            "reasoning_effort": "high",
+            "messages": [],
+        }
+        rollup_kwargs = {"litellm_params": {"metadata": {"model_alias": "alias-model"}}}
+
+        mod._emit_adapted_route_access_log(
+            request=MagicMock(),
+            target_url="https://example.test/v1/chat/completions",
+            request_body=request_body,
+            rollup_kwargs=rollup_kwargs,
+            adapter_label="test-adapter",
+            provider_bound_body=provider_bound_body,
+        )
+
+        assert captured["request_body"] is request_body
+        assert captured["provider_bound_body"] is provider_bound_body
+        assert captured["provider_bound_body"]["reasoning_effort"] == "high"
+        assert captured["kwargs"] is rollup_kwargs
+
+    @pytest.mark.asyncio
+    async def test_completion_messages_call_logs_prepared_completion_kwargs(self, monkeypatch):
+        prepared_request_body = {
+            "model": "alias-model",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "xhigh",
+            "litellm_metadata": {"model_alias": "alias-model"},
+            "stream": False,
+        }
+        translated_completion_kwargs = {
+            "model": "upstream-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16,
+            "reasoning_effort": "high",
+            "custom_llm_provider": "openrouter",
+        }
+        captured_emit: dict[str, Any] = {}
+        acompletion_kwargs: dict[str, Any] = {}
+
+        class _Handler:
+            @staticmethod
+            def _prepare_completion_kwargs(**kwargs):
+                return dict(translated_completion_kwargs), {"tool": "mapped"}
+
+            @staticmethod
+            def _transform_completion_response(completion_response, **kwargs):
+                return completion_response
+
+        async def _fake_acompletion(**kwargs):
+            acompletion_kwargs.update(kwargs)
+            return SimpleNamespace(model_dump_json=lambda **_k: '{"type":"message","content":[]}')
+
+        monkeypatch.setattr(
+            "litellm.llms.anthropic.experimental_pass_through.adapters.handler."
+            "LiteLLMMessagesToCompletionTransformationHandler",
+            _Handler,
+        )
+        # acompletion is resolved via the rebound function globals after install().
+        live_globals = mod._perform_anthropic_completion_adapter_messages_call.__globals__
+        litellm_obj = live_globals.get("litellm", mod.litellm)
+        monkeypatch.setattr(litellm_obj, "acompletion", _fake_acompletion)
+        self._patch_live_emit(monkeypatch, captured_emit)
+        self._patch_live_callable(
+            monkeypatch,
+            "_annotate_request_scope_for_adapted_access_log",
+            lambda *a, **k: None,
+        )
+        self._patch_live_callable(
+            monkeypatch,
+            "_build_adapted_route_rollup_kwargs",
+            lambda metadata: {"litellm_params": {"metadata": dict(metadata or {})}},
+        )
+        self._patch_live_callable(
+            monkeypatch,
+            "_finalize_anthropic_completion_adapter_response",
+            lambda **kwargs: Response(content=b'{"ok":true}', media_type="application/json"),
+        )
+
+        result = await mod._perform_anthropic_completion_adapter_messages_call(
+            config=SimpleNamespace(adapter_label="OpenRouter", custom_llm_provider="openrouter"),
+            request=MagicMock(headers={}),
+            prepared_request_body=prepared_request_body,
+            adapter_model="alias-model",
+            target_url="https://openrouter.ai/api/v1/chat/completions",
+            api_key="sk-test",
+            api_base="https://openrouter.ai/api/v1",
+            client_requested_stream=False,
+            model_for_upstream="upstream-model",
+        )
+
+        assert isinstance(result, Response)
+        assert captured_emit["request_body"] is prepared_request_body
+        assert captured_emit["request_body"]["model"] == "alias-model"
+        assert captured_emit["provider_bound_body"] == translated_completion_kwargs
+        assert acompletion_kwargs == translated_completion_kwargs

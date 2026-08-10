@@ -247,22 +247,14 @@ class TestDispatchBehavior:
 class TestCallbackOrdering:
     """Kimi/Alibaba handle-route must call prepare -> perform -> validate -> rollup."""
 
-    @pytest.fixture()
-    def kimi_host(self):
+    def _completion_handle_host(self, *, prepare_name: str) -> dict[str, Any]:
         host: dict[str, Any] = {"__builtins__": __builtins__}
-        call_order: list[str] = []
-
         from fastapi.responses import Response, StreamingResponse
 
         host["StreamingResponse"] = StreamingResponse
         host["Response"] = Response
 
         async def mock_driver_run(*, prepare, perform, **kwargs):
-            call_order.append("driver_run")
-            plan = MagicMock()
-            plan.perform_kwargs = {"litellm_metadata": {}}
-            plan.prepared_request_body = {"litellm_metadata": {}}
-            plan.target_url = "https://kimi.example/v1"
             await prepare(
                 request=kwargs["request"],
                 prepared_request_body=kwargs["prepared_request_body"],
@@ -281,32 +273,98 @@ class TestCallbackOrdering:
         host["_record_adapted_completed_route_rollup_after_stream"] = MagicMock()
         host["_record_adapted_completed_route_rollup_turn"] = MagicMock()
         codex_candidate_calls.install(host)
-        # Override AFTER install() so mocks replace rebound functions
         mock_plan = MagicMock()
         mock_plan.perform_kwargs = {"litellm_metadata": {}}
         mock_plan.prepared_request_body = {"litellm_metadata": {}}
-        mock_plan.target_url = "https://kimi.example/v1"
-        host["_prepare_codex_kimi_chat_completions_adapter_route"] = AsyncMock(return_value=mock_plan)
-        host["_call_order"] = call_order
+        mock_plan.target_url = "https://example.test/v1"
+        host[prepare_name] = AsyncMock(return_value=mock_plan)
         return host
 
+    @staticmethod
+    def _completion_plan(*, alias: str, upstream: str, effort: str) -> tuple[MagicMock, dict[str, Any]]:
+        completion_kwargs = {
+            "model": upstream,
+            "messages": [],
+            "reasoning_effort": effort,
+        }
+        mock_plan = MagicMock()
+        mock_plan.perform_kwargs = {
+            "litellm_metadata": {"model_alias": alias},
+            "completion_kwargs": completion_kwargs,
+        }
+        mock_plan.prepared_request_body = {
+            "model": alias,
+            "litellm_metadata": {"model_alias": alias},
+        }
+        mock_plan.target_url = "https://example.test/v1"
+        return mock_plan, completion_kwargs
+
     @pytest.mark.asyncio
-    async def test_kimi_route_calls_validate_and_rollup(self, kimi_host):
-        """handle_codex_kimi must call validate then rollup_turn for non-stream."""
-        fn = kimi_host["_handle_codex_kimi_chat_completions_adapter_route"]
-        mock_request = MagicMock()
-        mock_request.headers = {}
-        await fn(
+    async def test_kimi_route_calls_validate_and_rollup(self):
+        """handle_codex_kimi must validate/rollup and log provider-bound body."""
+        host = self._completion_handle_host(
+            prepare_name="_prepare_codex_kimi_chat_completions_adapter_route"
+        )
+        mock_plan, completion_kwargs = self._completion_plan(
+            alias="kimi-test",
+            upstream="kimi-upstream",
+            effort="high",
+        )
+        host["_prepare_codex_kimi_chat_completions_adapter_route"] = AsyncMock(
+            return_value=mock_plan
+        )
+
+        await host["_handle_codex_kimi_chat_completions_adapter_route"](
             endpoint="/v1/responses",
-            request=mock_request,
+            request=MagicMock(headers={}),
             fastapi_response=MagicMock(),
             user_api_key_dict=MagicMock(),
             prepared_request_body={"model": "kimi-test"},
             adapter_model="kimi-test",
             use_alias_candidate_probe=False,
         )
-        kimi_host["_validate_codex_auto_agent_responses_payload"].assert_awaited_once()
-        kimi_host["_record_adapted_completed_route_rollup_turn"].assert_called_once()
+
+        host["_validate_codex_auto_agent_responses_payload"].assert_awaited_once()
+        host["_record_adapted_completed_route_rollup_turn"].assert_called_once()
+        emit_kwargs = host["_emit_adapted_route_access_log"].call_args.kwargs
+        assert emit_kwargs["request_body"] is mock_plan.prepared_request_body
+        assert emit_kwargs["request_body"]["model"] == "kimi-test"
+        assert emit_kwargs["provider_bound_body"] is completion_kwargs
+        assert emit_kwargs["provider_bound_body"]["reasoning_effort"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_alibaba_route_logs_provider_bound_body(self):
+        """handle_codex_alibaba must log translated completion kwargs with alias label."""
+        host = self._completion_handle_host(
+            prepare_name="_prepare_codex_alibaba_token_plan_adapter_route"
+        )
+        mock_plan, completion_kwargs = self._completion_plan(
+            alias="alibaba-alias",
+            upstream="qwen-upstream",
+            effort="low",
+        )
+        host["_prepare_codex_alibaba_token_plan_adapter_route"] = AsyncMock(
+            return_value=mock_plan
+        )
+
+        await host["_handle_codex_alibaba_token_plan_adapter_route"](
+            endpoint="/v1/responses",
+            request=MagicMock(headers={}),
+            fastapi_response=MagicMock(),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body={"model": "alibaba-alias"},
+            adapter_model="alibaba-alias",
+            use_alias_candidate_probe=False,
+        )
+
+        host["_validate_codex_auto_agent_responses_payload"].assert_awaited_once()
+        host["_record_adapted_completed_route_rollup_turn"].assert_called_once()
+        emit_kwargs = host["_emit_adapted_route_access_log"].call_args.kwargs
+        assert emit_kwargs["request_body"] is mock_plan.prepared_request_body
+        assert emit_kwargs["request_body"]["model"] == "alibaba-alias"
+        assert emit_kwargs["provider_bound_body"] is completion_kwargs
+        assert emit_kwargs["provider_bound_body"]["reasoning_effort"] == "low"
+
 
 
 # -- Fix 1 regression: namespace tool adaptation before chat-completion --
@@ -406,10 +464,16 @@ class TestOpenRouterCompletionNamespaceToolAdaptation:
         host["_emit_adapted_route_access_log"] = MagicMock()
         host["_annotate_request_scope_for_adapted_access_log"] = MagicMock()
         host["_record_adapted_completed_route_rollup_turn"] = MagicMock()
+        completion_kwargs = {
+            "model": "openrouter-upstream",
+            "messages": [],
+            "reasoning_effort": "high",
+            "tools": flat_tools,
+        }
         host["_apply_openrouter_completion_message_sanitization"] = MagicMock(
             side_effect=lambda **kw: (
                 kw["request_body"],
-                kw["completion_kwargs"],
+                completion_kwargs,
                 kw["litellm_metadata"],
             )
         )
@@ -517,6 +581,12 @@ class TestOpenRouterCompletionNamespaceToolAdaptation:
         assert len(egress_calls) == 1
         assert egress_calls[0]["url"].endswith("/v1/chat/completions")
         assert egress_calls[0]["credential_family"] == "openrouter"
+
+        # D1-521: access log gets final provider-bound kwargs and alias/model label.
+        emit_kwargs = host["_emit_adapted_route_access_log"].call_args.kwargs
+        assert emit_kwargs["provider_bound_body"] is completion_kwargs
+        assert emit_kwargs["provider_bound_body"]["reasoning_effort"] == "high"
+        assert emit_kwargs["request_body"]["model"] == "test-model"
 
 
 # -- CFG-004 regression: encrypted reasoning in tool call arguments --
@@ -1013,3 +1083,133 @@ class TestCFG004AlibabaStreamingPath:
             all_sse_text += json.dumps(body)
         assert "gAAAA" not in all_sse_text
         assert "implement the fix" in all_sse_text
+
+
+# ---------------------------------------------------------------------------
+# D1-521: OpenCode logs final provider_bound_body (no shared handle fixture)
+# ---------------------------------------------------------------------------
+
+
+class TestD1521OpenCodeProviderBoundBody:
+    """OpenCode handle path logs translated completion kwargs with alias label."""
+
+    @pytest.mark.asyncio
+    async def test_opencode_route_logs_completion_kwargs_as_provider_bound_body(self):
+        from fastapi.responses import Response, StreamingResponse
+
+        completion_kwargs = {
+            "model": "opencode-upstream",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "medium",
+        }
+        request_body = {
+            "model": "opencode-alias",
+            "litellm_metadata": {"model_alias": "opencode-alias"},
+        }
+        normalized = MagicMock(
+            request_body=request_body,
+            request_input="hi",
+            responses_api_request={},
+            litellm_metadata=dict(request_body["litellm_metadata"]),
+            completion_kwargs=completion_kwargs,
+        )
+
+        host: dict[str, Any] = {
+            "__builtins__": __builtins__,
+            "json": json,
+            "httpx": __import__("httpx"),
+            "Response": Response,
+            "StreamingResponse": StreamingResponse,
+            "cast": lambda typ, val: val,
+            "ResponsesAPIOptionalRequestParams": dict,
+            "_annotate_request_scope_for_adapted_access_log": MagicMock(),
+            "_emit_adapted_route_access_log": MagicMock(),
+            "_build_adapted_route_rollup_kwargs": MagicMock(return_value={}),
+            "_consume_opencode_zen_tools_mode_header": MagicMock(
+                side_effect=lambda request, body, probe: body
+            ),
+            "_prepare_opencode_zen_direct_observability_metadata": MagicMock(
+                return_value=(request_body, None)
+            ),
+            "_get_anthropic_opencode_zen_normalization_runtime": MagicMock(return_value=object()),
+            "_anthropic_opencode_zen_normalization": MagicMock(
+                normalize_codex_request=AsyncMock(return_value=normalized)
+            ),
+            "_get_opencode_zen_target_base": MagicMock(return_value="https://opencode.example"),
+            "_join_opencode_zen_passthrough_url": MagicMock(
+                return_value="https://opencode.example/v1/chat/completions"
+            ),
+            "_load_opencode_zen_api_key_for_candidate": AsyncMock(return_value="sk-test"),
+            "BaseOpenAIPassThroughHandler": MagicMock(
+                _assemble_headers=MagicMock(return_value={"Authorization": "Bearer sk-test"})
+            ),
+            "HttpPassThroughEndpointHelpers": MagicMock(
+                validate_outgoing_egress=MagicMock()
+            ),
+            "_build_opencode_zen_completion_call_kwargs": MagicMock(
+                side_effect=lambda **kwargs: dict(kwargs["completion_kwargs"])
+            ),
+            "_perform_opencode_zen_completion_call": AsyncMock(return_value=MagicMock()),
+            "_build_responses_response_from_adapter_response": MagicMock(return_value=MagicMock()),
+            "_serialize_responses_adapter_response": MagicMock(return_value="{}"),
+            "_is_codex_auto_agent_malformed_tool_call_text_output": MagicMock(return_value=False),
+            "_is_codex_auto_agent_empty_success_responses_body": MagicMock(return_value=False),
+            "_validate_codex_auto_agent_responses_payload": AsyncMock(return_value=MagicMock()),
+            "_build_malformed_tool_call_intake_context": MagicMock(return_value={}),
+            "_record_adapted_completed_route_rollup_turn": MagicMock(),
+            "_record_adapted_completed_route_rollup_after_stream": MagicMock(),
+        }
+        import litellm as _litellm
+
+        host["litellm"] = _litellm
+        codex_candidate_calls.install(host)
+        # Keep branch-specific mocks after install rebind.
+        host["_emit_adapted_route_access_log"] = MagicMock()
+        host["_annotate_request_scope_for_adapted_access_log"] = MagicMock()
+        host["_build_adapted_route_rollup_kwargs"] = MagicMock(return_value={})
+        host["_build_opencode_zen_completion_call_kwargs"] = MagicMock(
+            side_effect=lambda **kwargs: dict(kwargs["completion_kwargs"])
+        )
+        host["_perform_opencode_zen_completion_call"] = AsyncMock(return_value=MagicMock())
+        host["_consume_opencode_zen_tools_mode_header"] = MagicMock(
+            side_effect=lambda request, body, probe: body
+        )
+        host["_prepare_opencode_zen_direct_observability_metadata"] = MagicMock(
+            return_value=(request_body, None)
+        )
+        host["_get_anthropic_opencode_zen_normalization_runtime"] = MagicMock(return_value=object())
+        host["_anthropic_opencode_zen_normalization"] = MagicMock(
+            normalize_codex_request=AsyncMock(return_value=normalized)
+        )
+        host["_get_opencode_zen_target_base"] = MagicMock(return_value="https://opencode.example")
+        host["_join_opencode_zen_passthrough_url"] = MagicMock(
+            return_value="https://opencode.example/v1/chat/completions"
+        )
+        host["_load_opencode_zen_api_key_for_candidate"] = AsyncMock(return_value="sk-test")
+
+        mock_config = MagicMock()
+        mock_config.transform_chat_completion_response_to_responses_api_response.return_value = (
+            MagicMock()
+        )
+        with unittest.mock.patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig",
+            mock_config,
+        ), unittest.mock.patch(
+            "litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants._OPENCODE_ZEN_FREE_MODELS",
+            set(),
+        ):
+            await host["_handle_codex_opencode_zen_adapter_route"](
+                endpoint="/v1/responses",
+                request=MagicMock(headers={}),
+                fastapi_response=MagicMock(),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body=dict(request_body),
+                adapter_model="opencode-alias",
+                use_alias_candidate_probe=False,
+            )
+
+        emit_kwargs = host["_emit_adapted_route_access_log"].call_args.kwargs
+        assert emit_kwargs["provider_bound_body"] is completion_kwargs
+        assert emit_kwargs["provider_bound_body"]["reasoning_effort"] == "medium"
+        assert emit_kwargs["request_body"] is request_body
+        assert emit_kwargs["request_body"]["model"] == "opencode-alias"

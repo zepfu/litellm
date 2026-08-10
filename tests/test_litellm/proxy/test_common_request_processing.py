@@ -1223,7 +1223,7 @@ class TestProxyBaseLLMRequestProcessing:
         assert (
             "litellm#Codex[0.141.0] /openai_passthrough/responses"
         ) in rendered
-        assert " - gpt-5.5 - Turns: 1" in rendered
+        assert " - gpt-5.5:none - Turns: 1" in rendered
         assert "chatgpt.com/backend-api/codex/responses" not in rendered
         assert " [ROUTE] " not in rendered
 
@@ -1375,7 +1375,7 @@ class TestProxyBaseLLMRequestProcessing:
         assert (
             "aegis#Claude[2.1.178] /anthropic/v1/messages?beta=true"
         ) in rendered
-        assert " - claude-opus-4-8 - Turns: 2" in rendered
+        assert " - claude-opus-4-8:none - Turns: 2" in rendered
         assert "api.anthropic.com/v1/messages" not in rendered
         assert "orchestrator.claude-opus-4-8" not in rendered
 
@@ -3088,7 +3088,127 @@ class TestAawmRouteRollup:
             flushed[0]
             == "20260623 01:06:52 litellm#Codex[0.141.0] /openai_passthrough/responses"
         )
-        assert flushed[1] == " - grok-4-fast(basic) - Turns: 3"
+        assert flushed[1] == " - grok-4-fast(basic):none - Turns: 3"
+
+    @pytest.mark.parametrize(
+        ("provider_bound_body", "metadata", "expected"),
+        [
+            (
+                {
+                    "reasoning": {"effort": "high"},
+                    "reasoning_effort": "max",
+                    "output_config": {"effort": "low"},
+                },
+                {"reasoning_effort_native_value": "low"},
+                "high",
+            ),
+            (
+                {"model": "gpt-5.5"},
+                {"reasoning_effort_native_value": "medium"},
+                "medium",
+            ),
+            (None, {}, "none"),
+            ({"reasoning_effort": "none"}, {}, "none"),
+            ({"reasoning_effort": "invalid"}, {}, "none"),
+            ({"reasoning": {"effort": "invalid"}}, {}, "none"),
+        ],
+    )
+    def test_route_rollup_reasoning_effort_precedence_and_fallback(
+        self,
+        provider_bound_body,
+        metadata,
+        expected,
+    ):
+        from litellm.proxy.aawm_route_logging import (
+            _resolve_aawm_route_rollup_reasoning_effort,
+        )
+
+        assert (
+            _resolve_aawm_route_rollup_reasoning_effort(
+                metadata=metadata,
+                provider_bound_body=provider_bound_body,
+            )
+            == expected
+        )
+
+    def test_route_rollup_mixed_effort_separates_sublines(self):
+        from datetime import datetime
+
+        from litellm.proxy.aawm_route_logging import AawmRouteRollupAccumulator
+
+        now = datetime(2026, 6, 23, 1, 7, 17)
+        accumulator = AawmRouteRollupAccumulator(interval_seconds=60)
+        for effort, turns in (("low", 1), ("high", 2)):
+            accumulator.record(
+                group_header_label="litellm#Codex[0.144.6]",
+                incoming_endpoint="/openai_passthrough/responses",
+                outgoing_target="chatgpt.com/backend-api/codex/responses",
+                model_label="gpt-5.5",
+                effort=effort,
+                turns=turns,
+                now=now,
+            )
+
+        assert accumulator.flush(force=True, now=now) == [
+            "20260623 01:07:17 litellm#Codex[0.144.6] /openai_passthrough/responses",
+            " - gpt-5.5:low - Turns: 1",
+            " - gpt-5.5:high - Turns: 2",
+        ]
+
+    def test_route_rollup_completed_and_failure_paths_preserve_effort(
+        self,
+        monkeypatch,
+    ):
+        from datetime import datetime
+
+        from litellm.proxy.aawm_route_logging import record_aawm_route_rollup_failure
+
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        target = "https://chatgpt.com/backend-api/codex/responses"
+        body = {"model": "gpt-5.5"}
+        provider = {"reasoning": {"effort": "xhigh"}}
+        now = datetime(2026, 6, 23, 1, 7, 18)
+
+        def _request():
+            return _build_aawm_route_log_request(
+                url="http://127.0.0.1:4001/openai_passthrough/responses",
+                headers={"user-agent": "codex-cli/0.141.0"},
+            )
+
+        try:
+            completed_kwargs = {"litellm_params": {"metadata": {}}}
+            emit_aawm_route_access_log(
+                request=_request(),
+                target=target,
+                request_body=body,
+                kwargs=completed_kwargs,
+                provider_bound_body=provider,
+                completed=True,
+            )
+            completed = "\n".join(flush_aawm_route_rollups(force=True, now=now))
+            assert " - gpt-5.5:xhigh - Turns: 1" in completed
+
+            clear_aawm_route_rollups()
+            failed_kwargs = {"litellm_params": {"metadata": {}}}
+            emit_aawm_route_access_log(
+                request=_request(),
+                target=target,
+                request_body=body,
+                kwargs=failed_kwargs,
+                provider_bound_body=provider,
+                completed=False,
+            )
+            record_aawm_route_rollup_failure(
+                failed_kwargs,
+                message="provider returned failure",
+                status="Failed",
+            )
+            failed = "\n".join(flush_aawm_route_rollups(force=True, now=now))
+            assert " - gpt-5.5:xhigh - Turns: 0" in failed
+            assert "provider returned failure" in failed
+        finally:
+            clear_aawm_route_rollups()
 
     def test_route_rollup_groups_destinations_under_local_endpoint(self):
         from datetime import datetime
@@ -3121,10 +3241,10 @@ class TestAawmRouteRollup:
         assert flushed == [
             "20260623 02:51:23 aawm#Codex[0.141.0] /openai_passthrough/responses",
             (
-                " - grok-4-fast(basic) - Turns: 7 -> "
+                " - grok-4-fast(basic):none - Turns: 7 -> "
                 "api.x.ai/v1/responses"
             ),
-            " - gpt-5.5 - Turns: 4",
+            " - gpt-5.5:none - Turns: 4",
         ]
 
     def test_route_rollup_suppresses_common_destination_on_all_same_bucket(self):
@@ -3158,8 +3278,8 @@ class TestAawmRouteRollup:
         flushed = accumulator.flush(force=True, now=now)
         assert flushed == [
             "20260623 22:01:09 litellm@Codex[0.142.0] /openai_passthrough/responses",
-            " - gpt-5.5 - Turns: 4",
-            " - codex-auto-review - Turns: 1",
+            " - gpt-5.5:none - Turns: 4",
+            " - codex-auto-review:none - Turns: 1",
         ]
 
     def test_route_rollup_retains_only_divergent_destination_in_mixed_bucket(self):
@@ -3202,12 +3322,12 @@ class TestAawmRouteRollup:
         flushed = accumulator.flush(force=True, now=now)
         assert flushed == [
             "20260623 22:05:55 aegis@Claude[2.1.186] /anthropic/v1/messages?beta=true",
-            " - claude-haiku-4-5-20251001 - Turns: 3",
+            " - claude-haiku-4-5-20251001:none - Turns: 3",
             (
-                " - grok-composer-2.5-fast(work) - Turns: 1 -> "
+                " - grok-composer-2.5-fast(work):none - Turns: 1 -> "
                 "cli-chat-proxy.grok.com/v1/responses"
             ),
-            " - claude-opus-4-8 - Turns: 4",
+            " - claude-opus-4-8:none - Turns: 4",
         ]
 
     def test_route_rollup_status_latest_material_state_wins(self):
@@ -3241,7 +3361,7 @@ class TestAawmRouteRollup:
             now=now,
         )
         flushed = accumulator.flush(force=True, now=now)
-        assert " - gpt-5.5(basic) - Turns: 3 [Exhausted]" in flushed
+        assert " - gpt-5.5(basic):none - Turns: 3 [Exhausted]" in flushed
 
     def test_route_rollup_retains_sanitized_source_error(self):
         from datetime import datetime
@@ -3266,7 +3386,7 @@ class TestAawmRouteRollup:
         assert flushed == [
             "20260720 14:05:17 litellm#Codex[0.144.6] /openai_passthrough/responses",
             (
-                " - oa_xai/grok-4.5(sota-xai) - Turns: 0 "
+                " - oa_xai/grok-4.5(sota-xai):none - Turns: 0 "
                 "[Grok Build usage balance exhausted] [Cooling Down] -> "
                 "codex_xai_oauth_responses_adapter"
             ),
@@ -3292,11 +3412,11 @@ class TestAawmRouteRollup:
                         "/openai_passthrough/responses"
                     ),
                     (
-                        " - oa_xai/grok-4.5(sota-xai) - Turns: 0 "
+                        " - oa_xai/grok-4.5(sota-xai):none - Turns: 0 "
                         "[Grok Build usage balance exhausted] [Cooling Down]"
                     ),
                     (
-                        " - grok-4.5(sota-xai) - Turns: 0 "
+                        " - grok-4.5(sota-xai):none - Turns: 0 "
                         "[The requested model 'grok-4.5' does not exist.] [Failed]"
                     ),
                 ]
@@ -3308,11 +3428,11 @@ class TestAawmRouteRollup:
             "/openai_passthrough/responses\n"
         )
         assert (
-            "\x1b[94m - oa_xai/grok-4.5(sota-xai) - Turns: 0 "
+            "\x1b[94m - oa_xai/grok-4.5(sota-xai):none - Turns: 0 "
             "[Grok Build usage balance exhausted] [Cooling Down]\x1b[0m"
         ) in rendered
         assert (
-            "\x1b[91m - grok-4.5(sota-xai) - Turns: 0 "
+            "\x1b[91m - grok-4.5(sota-xai):none - Turns: 0 "
             "[The requested model 'grok-4.5' does not exist.] [Failed]\x1b[0m"
         ) in rendered
 
@@ -3332,7 +3452,7 @@ class TestAawmRouteRollup:
                         "/openai_passthrough/responses"
                     ),
                     (
-                        " - grok-4.5(sota-xai) - Turns: 0 "
+                        " - grok-4.5(sota-xai):none - Turns: 0 "
                         "[The requested model 'grok-4.5' does not exist.] [Failed]"
                     ),
                 ]

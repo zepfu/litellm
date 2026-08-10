@@ -4,7 +4,8 @@ Covers: outgoing target mapping, model label, status classification,
 status message, group-header resolution, and the full
 _record_auto_agent_alias_route_status_rollup orchestration including
 emit_aawm_route_status_event / record_aawm_route_rollup delegation,
-turns=0, omission behavior, and candidate model expansion.
+turns=0, same-request native effort passthrough, omission behavior, and
+candidate model expansion.
 """
 
 from __future__ import annotations
@@ -381,6 +382,7 @@ class TestRecordRouteStatusRollup:
             incoming_endpoint="/v1/chat/completions",
             outgoing_target="opencode.ai/zen/v1/chat/completions",
             model_label="gpt-4o(basic)",
+            effort="none",
             turns=0,
             status="Exhausted",
             message=None,
@@ -530,6 +532,98 @@ class TestRecordRouteStatusRollup:
         # Only primary model label
         assert mock_emit.call_count == 1
         assert mock_record.call_count == 1
+
+
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.record_aawm_route_rollup",
+    )
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.emit_aawm_route_status_event",
+    )
+    def test_native_effort_passed_to_zero_turn_rollup(self, mock_emit, mock_record):
+        event = self._make_event(reasoning_effort_native_value="high")
+        _record_auto_agent_alias_route_status_rollup(event)
+
+        mock_emit.assert_called_once_with(
+            alias_model="basic",
+            model_label="gpt-4o",
+            status="Exhausted",
+            message="route status changed",
+        )
+        mock_record.assert_called_once_with(
+            group_header_label="myrepo@myhost",
+            incoming_endpoint="/v1/chat/completions",
+            outgoing_target="opencode.ai/zen/v1/chat/completions",
+            model_label="gpt-4o(basic)",
+            effort="high",
+            turns=0,
+            status="Exhausted",
+            message=None,
+        )
+
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.record_aawm_route_rollup",
+    )
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.emit_aawm_route_status_event",
+    )
+    def test_absent_native_effort_renders_none(self, mock_emit, mock_record):
+        event = self._make_event()
+        assert "reasoning_effort_native_value" not in event
+        _record_auto_agent_alias_route_status_rollup(event)
+
+        # Immediate non-rollup status-line shape is unchanged (no effort kw).
+        mock_emit.assert_called_once_with(
+            alias_model="basic",
+            model_label="gpt-4o",
+            status="Exhausted",
+            message="route status changed",
+        )
+        assert mock_record.call_args.kwargs["effort"] == "none"
+        assert mock_record.call_args.kwargs["turns"] == 0
+
+
+# ---------------------------------------------------------------------------
+# install() host binding
+# ---------------------------------------------------------------------------
+
+
+class TestInstallHostBinding:
+    def test_installed_host_record_status_rollup_resolves_normalize_effort(self):
+        """Host-bound rollup must resolve the normalizer without NameError."""
+        mock_emit = MagicMock()
+        mock_record = MagicMock()
+        host: dict[str, Any] = {
+            "_clean_codex_auth_value": rollup_mod._clean_codex_auth_value,
+            "emit_aawm_route_status_event": mock_emit,
+            "record_aawm_route_rollup": mock_record,
+            "build_aawm_route_rollup_group_header_label": MagicMock(
+                return_value="myrepo@myhost"
+            ),
+        }
+        assert "_normalize_aawm_route_log_reasoning_effort" not in host
+
+        rollup_mod.install(host)
+
+        assert host.get("_normalize_aawm_route_log_reasoning_effort") is (
+            rollup_mod._normalize_aawm_route_log_reasoning_effort
+        )
+
+        event = {
+            "event_type": "no_candidate_available",
+            "alias_model": "basic",
+            "model": "gpt-4o",
+            "rollup_group_header_label": "myrepo",
+            "host_name": "myhost",
+            "incoming_endpoint": "/v1/chat/completions",
+            "route_family": "codex_opencode_zen_adapter",
+        }
+        host["_record_auto_agent_alias_route_status_rollup"](event)
+
+        mock_emit.assert_called_once()
+        mock_record.assert_called_once()
+        assert mock_record.call_args.kwargs["effort"] == "none"
+        assert mock_record.call_args.kwargs["turns"] == 0
 
 
 # ---------------------------------------------------------------------------

@@ -1601,21 +1601,43 @@ such as `x`, `wt`, and `wt-ops-xyz` are suppressed instead of being printed as
 the route owner.
 
 `[EARLY]` appears only when a bounded in-memory cap forces a flush before the
-interval elapses. Each rollup subline uses ` - model(alias) - Turns: N` with an
-optional trailing status tag (`[Degraded]`, `[Cooling Down]`, `[Failed]`, or
-`[Exhausted]`). `Cooling Down` is reserved for actual candidate-scoped cooldown
-or skipped-cooldown state; `retryable_no_cooldown`, scope `none`, and
-request-local redispatch/failover failures render as `Failed` instead of
-`Cooling Down`. Exhausted and Degraded labels are unchanged. The subline appends
-` -> outgoing` only when the model's
-destination differs from the incoming endpoint's default upstream target for
-the group. For example, native Anthropic traffic under `/anthropic/v1/messages`
+interval elapses. Each rollup subline uses
+` - model(alias):effort-or-none - Turns: N` with a mandatory
+`:<effort-or-none>` segment and an optional trailing status tag (`[Degraded]`,
+`[Cooling Down]`, `[Failed]`, or `[Exhausted]`). Existing aliases remain inside
+the model label, producing shapes such as `gpt-5.3-codex-spark(work):low`.
+`Cooling Down` is reserved for actual candidate-scoped cooldown or
+skipped-cooldown state; `retryable_no_cooldown`, scope `none`, and request-local
+redispatch/failover failures render as `Failed` instead of `Cooling Down`.
+Exhausted and Degraded labels are unchanged. The subline appends ` -> outgoing`
+only when the model's destination differs from the incoming endpoint's default
+upstream target for the group. For example, native Anthropic traffic under `/anthropic/v1/messages`
 omits `api.anthropic.com/v1/messages`, and Codex passthrough traffic under
 `/openai_passthrough/responses` omits
 `chatgpt.com/backend-api/codex/responses`; mixed-provider routes such as Grok
 or OpenRouter adapters remain explicit on their own sublines. If LiteLLM cannot
 infer an endpoint default, it suppresses the destination only when every subline
-in the bucket shares the same outgoing target. `Turns` counts completed
+in the bucket shares the same outgoing target.
+
+The `:<effort-or-none>` value is the request-specific effective effort after
+dynamic overrides, route resolution, clamping, and provider translation. Read
+the final provider-bound request body first, in this precedence order:
+
+1. nested `reasoning.effort`
+2. top-level `reasoning_effort`
+3. translated `output_config.effort`
+
+Use same-request `reasoning_effort_native_value` only as a fallback when that
+final body lacks an effort field (or as a same-request cross-check). Absent
+effort and explicit `none` both render as `:none`. Never infer effort from
+static TOML/YAML alias values, configured defaults, model capabilities, product
+modes, or model-name heuristics. Accumulator keys include the normalized effort,
+so the same destination and model at different efforts (for example `low` and
+`xhigh`) create separate rollup sublines and turn counts within one interval.
+Completed turns, streaming failures, and zero-turn route-status rollups preserve
+that request-specific effort when available and otherwise use `none`.
+
+`Turns` counts completed
 requests only. Alias-route candidate events that degrade, cool down, fail, or
 exhaust before a successful completion emit an immediate compact status line:
 

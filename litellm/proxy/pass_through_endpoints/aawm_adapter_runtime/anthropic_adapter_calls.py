@@ -153,6 +153,7 @@ def _emit_adapted_route_access_log(
     request_body: dict[str, Any],
     rollup_kwargs: dict[str, Any],
     adapter_label: str,
+    provider_bound_body: Optional[dict[str, Any]] = None,
 ) -> None:
     try:
         emit_aawm_route_access_log(
@@ -160,6 +161,7 @@ def _emit_adapted_route_access_log(
             target=target_url,
             request_body=request_body,
             kwargs=rollup_kwargs,
+            provider_bound_body=provider_bound_body,
         )
     except Exception:
         verbose_proxy_logger.debug(
@@ -1152,11 +1154,14 @@ async def _perform_normalized_anthropic_completion_adapter_stream(
     handler_call_kwargs: dict[str, Any],
     handler_extra_kwargs: dict[str, Any],
     completion_stream_normalizer: Callable[[Any], Any],
+    completion_kwargs: Optional[dict[str, Any]] = None,
+    tool_name_mapping: Optional[dict[str, str]] = None,
 ) -> object:
-    completion_kwargs, tool_name_mapping = handler._prepare_completion_kwargs(
-        **handler_call_kwargs,
-        extra_kwargs=handler_extra_kwargs,
-    )
+    if completion_kwargs is None or tool_name_mapping is None:
+        completion_kwargs, tool_name_mapping = handler._prepare_completion_kwargs(
+            **handler_call_kwargs,
+            extra_kwargs=handler_extra_kwargs,
+        )
     raw_completion_stream = await litellm.acompletion(**completion_kwargs)
     normalized_completion_stream = completion_stream_normalizer(raw_completion_stream)
     return handler._transform_completion_response(
@@ -1211,6 +1216,68 @@ def _finalize_anthropic_completion_adapter_response(
     return response
 
 
+def _build_anthropic_completion_adapter_handler_call_kwargs(
+    *,
+    prepared_request_body: Payload,
+    model_name: str,
+    upstream_stream: bool,
+) -> dict[str, Any]:
+    """Build completion-handler kwargs from a prepared Anthropic messages body."""
+    raw_max_tokens = prepared_request_body.get("max_tokens")
+    raw_messages = prepared_request_body.get("messages")
+    raw_stop_sequences = prepared_request_body.get("stop_sequences")
+    raw_system = prepared_request_body.get("system")
+    raw_temperature = prepared_request_body.get("temperature")
+    raw_thinking = prepared_request_body.get("thinking")
+    raw_reasoning_effort = prepared_request_body.get("reasoning_effort")
+    raw_tool_choice = prepared_request_body.get("tool_choice")
+    raw_tools = prepared_request_body.get("tools")
+    raw_top_k = prepared_request_body.get("top_k")
+    raw_top_p = prepared_request_body.get("top_p")
+    raw_output_format = prepared_request_body.get("output_format")
+    raw_output_config = prepared_request_body.get("output_config")
+    return {
+        "max_tokens": (
+            raw_max_tokens
+            if isinstance(raw_max_tokens, int) and not isinstance(raw_max_tokens, bool)
+            else 1024
+        ),
+        "messages": raw_messages if isinstance(raw_messages, list) else [],
+        "model": model_name,
+        "metadata": _build_completion_adapter_metadata(prepared_request_body),
+        "stop_sequences": (
+            [item for item in raw_stop_sequences if isinstance(item, str)]
+            if isinstance(raw_stop_sequences, list)
+            else None
+        ),
+        "stream": upstream_stream,
+        "system": raw_system if isinstance(raw_system, str) else None,
+        "temperature": (
+            float(raw_temperature)
+            if isinstance(raw_temperature, (int, float)) and not isinstance(raw_temperature, bool)
+            else None
+        ),
+        "thinking": raw_thinking if isinstance(raw_thinking, dict) else None,
+        "reasoning_effort": (
+            raw_reasoning_effort
+            if isinstance(raw_reasoning_effort, str) and raw_reasoning_effort
+            else None
+        ),
+        "tool_choice": raw_tool_choice if isinstance(raw_tool_choice, dict) else None,
+        "tools": raw_tools if isinstance(raw_tools, list) else None,
+        "top_k": (
+            raw_top_k if isinstance(raw_top_k, int) and not isinstance(raw_top_k, bool) else None
+        ),
+        "top_p": (
+            float(raw_top_p)
+            if isinstance(raw_top_p, (int, float)) and not isinstance(raw_top_p, bool)
+            else None
+        ),
+        "output_format": raw_output_format if isinstance(raw_output_format, dict) else None,
+        "output_config": raw_output_config if isinstance(raw_output_config, dict) else None,
+    }
+
+
 async def _perform_anthropic_completion_adapter_messages_call(
     *,
     config: _aawm_adapter_config.AnthropicCompletionAdapterConfig,
@@ -1259,60 +1326,21 @@ async def _perform_anthropic_completion_adapter_messages_call(
     if extra_handler_kwargs:
         handler_extra_kwargs.update(extra_handler_kwargs)
 
-    raw_max_tokens = prepared_request_body.get("max_tokens")
-    max_tokens = raw_max_tokens if isinstance(raw_max_tokens, int) and not isinstance(raw_max_tokens, bool) else 1024
-    raw_messages = prepared_request_body.get("messages")
-    messages = raw_messages if isinstance(raw_messages, list) else []
-    raw_stop_sequences = prepared_request_body.get("stop_sequences")
-    stop_sequences = (
-        [item for item in raw_stop_sequences if isinstance(item, str)] if isinstance(raw_stop_sequences, list) else None
+    handler_call_kwargs = _build_anthropic_completion_adapter_handler_call_kwargs(
+        prepared_request_body=prepared_request_body,
+        model_name=model_name,
+        upstream_stream=upstream_stream,
     )
-    raw_system = prepared_request_body.get("system")
-    system = raw_system if isinstance(raw_system, str) else None
-    raw_temperature = prepared_request_body.get("temperature")
-    temperature = (
-        float(raw_temperature)
-        if isinstance(raw_temperature, (int, float)) and not isinstance(raw_temperature, bool)
-        else None
+
+    # D1-521: prepare the exact final translated/clamped completion kwargs once
+    # before access logging, pass them as provider_bound_body, and reuse them for
+    # the upstream call. Keep prepared_request_body for request_body/model label.
+    completion_kwargs, tool_name_mapping = (
+        LiteLLMMessagesToCompletionTransformationHandler._prepare_completion_kwargs(
+            **handler_call_kwargs,
+            extra_kwargs=handler_extra_kwargs,
+        )
     )
-    raw_thinking = prepared_request_body.get("thinking")
-    thinking = raw_thinking if isinstance(raw_thinking, dict) else None
-    raw_reasoning_effort = prepared_request_body.get("reasoning_effort")
-    reasoning_effort = (
-        raw_reasoning_effort
-        if isinstance(raw_reasoning_effort, str) and raw_reasoning_effort
-        else None
-    )
-    raw_tool_choice = prepared_request_body.get("tool_choice")
-    tool_choice = raw_tool_choice if isinstance(raw_tool_choice, dict) else None
-    raw_tools = prepared_request_body.get("tools")
-    tools = raw_tools if isinstance(raw_tools, list) else None
-    raw_top_k = prepared_request_body.get("top_k")
-    top_k = raw_top_k if isinstance(raw_top_k, int) and not isinstance(raw_top_k, bool) else None
-    raw_top_p = prepared_request_body.get("top_p")
-    top_p = float(raw_top_p) if isinstance(raw_top_p, (int, float)) and not isinstance(raw_top_p, bool) else None
-    raw_output_format = prepared_request_body.get("output_format")
-    output_format = raw_output_format if isinstance(raw_output_format, dict) else None
-    raw_output_config = prepared_request_body.get("output_config")
-    output_config = raw_output_config if isinstance(raw_output_config, dict) else None
-    handler_call_kwargs = {
-        "max_tokens": max_tokens,
-        "messages": messages,
-        "model": model_name,
-        "metadata": _build_completion_adapter_metadata(prepared_request_body),
-        "stop_sequences": stop_sequences,
-        "stream": upstream_stream,
-        "system": system,
-        "temperature": temperature,
-        "thinking": thinking,
-        "reasoning_effort": reasoning_effort,
-        "tool_choice": tool_choice,
-        "tools": tools,
-        "top_k": top_k,
-        "top_p": top_p,
-        "output_format": output_format,
-        "output_config": output_config,
-    }
 
     async def _operation() -> object:
         if upstream_stream and completion_stream_normalizer is not None:
@@ -1321,10 +1349,15 @@ async def _perform_anthropic_completion_adapter_messages_call(
                 handler_call_kwargs=handler_call_kwargs,
                 handler_extra_kwargs=handler_extra_kwargs,
                 completion_stream_normalizer=completion_stream_normalizer,
+                completion_kwargs=completion_kwargs,
+                tool_name_mapping=tool_name_mapping,
             )
-        return await LiteLLMMessagesToCompletionTransformationHandler.async_anthropic_messages_handler(
-            **handler_call_kwargs,  # type: ignore[arg-type]
-            **handler_extra_kwargs,  # type: ignore[arg-type]
+        completion_response = await litellm.acompletion(**completion_kwargs)
+        return LiteLLMMessagesToCompletionTransformationHandler._transform_completion_response(
+            completion_response,
+            model=handler_call_kwargs["model"],
+            stream=upstream_stream,
+            tool_name_mapping=tool_name_mapping,
         )
 
     litellm_metadata = prepared_request_body.get("litellm_metadata")
@@ -1336,6 +1369,7 @@ async def _perform_anthropic_completion_adapter_messages_call(
         request_body=prepared_request_body,
         rollup_kwargs=rollup_kwargs,
         adapter_label=config.adapter_label,
+        provider_bound_body=completion_kwargs,
     )
     if operation_wrapper is not None:
         completion_response = await operation_wrapper(_operation)
@@ -1416,6 +1450,7 @@ _EXTRACTED_FUNCTION_NAMES: tuple[str, ...] = (
     "_perform_normalized_anthropic_completion_adapter_stream",
     "_is_anthropic_messages_response",
     "_finalize_anthropic_completion_adapter_response",
+    "_build_anthropic_completion_adapter_handler_call_kwargs",
     "_perform_anthropic_completion_adapter_messages_call",
     "_add_route_family_logging_metadata",
 )

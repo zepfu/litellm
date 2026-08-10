@@ -38,6 +38,16 @@ _AAWM_ROUTE_ROLLUP_DEFAULT_INTERVAL_SECONDS = 60
 _AAWM_ROUTE_ROLLUP_MAX_GROUPS = 256
 _AAWM_ROUTE_ROLLUP_MAX_SUBLINES = 16
 _AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY = "aawm_route_rollup_context"
+_AAWM_ROUTE_LOG_REASONING_EFFORT_METADATA_KEY = "reasoning_effort_native_value"
+_AAWM_ROUTE_ROLLUP_REASONING_EFFORT_VALUES = (
+    "none",
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+)
 _AAWM_ROUTE_ROLLUP_RED = "\033[91m"
 _AAWM_ROUTE_ROLLUP_BLUE = "\033[94m"
 _AAWM_ROUTE_ROLLUP_RESET = "\033[0m"
@@ -1353,7 +1363,11 @@ _AAWM_ROUTE_LOG_TOP_LEVEL_METADATA_KEYS = (
     + _AAWM_ROUTE_LOG_CLIENT_VERSION_METADATA_KEYS
     + _AAWM_ROUTE_LOG_MODEL_ALIAS_METADATA_KEYS
     + _AAWM_ROUTE_LOG_SELECTED_MODEL_METADATA_KEYS
-    + ("trace_name", "trace_user_id")
+    + (
+        _AAWM_ROUTE_LOG_REASONING_EFFORT_METADATA_KEY,
+        "trace_name",
+        "trace_user_id",
+    )
 )
 _AAWM_ROUTE_LOG_TENANT_REPOSITORY_FRAGMENTS = (
     "harness",
@@ -1416,6 +1430,46 @@ def _normalize_aawm_route_rollup_status(status: Optional[str]) -> Optional[str]:
     return None
 
 
+def _normalize_aawm_route_log_reasoning_effort(
+    value: Any,
+) -> str:
+    if value is None:
+        return "none"
+    normalized = " ".join(str(value).strip().lower().split())
+    if not normalized:
+        return "none"
+    if normalized in _AAWM_ROUTE_ROLLUP_REASONING_EFFORT_VALUES:
+        return normalized
+    return "none"
+
+
+def _extract_aawm_route_log_provider_bound_reasoning_effort(
+    provider_bound_body: Optional[dict[str, Any]],
+) -> tuple[bool, Optional[str]]:
+    if not isinstance(provider_bound_body, dict):
+        return False, None
+
+    reasoning = provider_bound_body.get("reasoning")
+    if isinstance(reasoning, dict) and "effort" in reasoning:
+        return True, _normalize_aawm_route_log_reasoning_effort(reasoning.get("effort"))
+
+    if "reasoning_effort" in provider_bound_body:
+        return (
+            True,
+            _normalize_aawm_route_log_reasoning_effort(
+                provider_bound_body.get("reasoning_effort")
+            ),
+        )
+
+    output_config = provider_bound_body.get("output_config")
+    if isinstance(output_config, dict) and "effort" in output_config:
+        return True, _normalize_aawm_route_log_reasoning_effort(
+            output_config.get("effort")
+        )
+
+    return False, None
+
+
 def _format_aawm_route_rollup_client_context_label(
     *,
     group_header_label: str,
@@ -1472,7 +1526,7 @@ def _resolve_aawm_route_rollup_default_destination(
 def _resolve_aawm_route_rollup_redundant_destination(
     *,
     incoming_endpoint: str,
-    sublines: list[tuple[str, int, Optional[str], str, Optional[str]]],
+    sublines: list[tuple[str, str, int, Optional[str], str, Optional[str]]],
 ) -> Optional[str]:
     default_destination = _resolve_aawm_route_rollup_default_destination(
         incoming_endpoint
@@ -1483,7 +1537,7 @@ def _resolve_aawm_route_rollup_redundant_destination(
         return None
 
     destinations: set[str] = set()
-    for _, _, _, outgoing_target, _ in sublines:
+    for _, _, _, _, outgoing_target, _ in sublines:
         if not outgoing_target:
             continue
         destinations.add(outgoing_target)
@@ -1510,7 +1564,7 @@ def _format_aawm_route_rollup_lines(
     *,
     group_header_label: str,
     incoming_endpoint: str,
-    sublines: list[tuple[str, int, Optional[str], str, Optional[str]]],
+    sublines: list[tuple[str, str, int, Optional[str], str, Optional[str]]],
     now: Optional[datetime] = None,
     early: bool = False,
 ) -> list[str]:
@@ -1529,10 +1583,10 @@ def _format_aawm_route_rollup_lines(
         incoming_endpoint=incoming_endpoint,
         sublines=sublines,
     )
-    for model_label, turns, status, outgoing_target, message in sublines:
+    for model_label, effort, turns, status, outgoing_target, message in sublines:
         message_suffix = f" [{message}]" if message else ""
         lines.append(
-            f" - {model_label} - Turns: {turns}"
+            f" - {model_label}:{effort} - Turns: {turns}"
             f"{message_suffix}"
             f"{_format_aawm_route_rollup_status_tag(status)}"
             f"{_format_aawm_route_rollup_subline_destination_suffix(outgoing_target=outgoing_target, common_destination=common_destination)}"
@@ -1552,21 +1606,22 @@ class _AawmRouteRollupSubline:
 class _AawmRouteRollupGroup:
     group_header_label: str
     incoming_endpoint: str
-    sublines: dict[tuple[str, str], _AawmRouteRollupSubline] = field(
+    sublines: dict[tuple[str, str, str], _AawmRouteRollupSubline] = field(
         default_factory=dict
     )
-    subline_order: list[tuple[str, str]] = field(default_factory=list)
+    subline_order: list[tuple[str, str, str]] = field(default_factory=list)
     event_sequence: int = 0
 
     def ordered_sublines(
         self,
-    ) -> list[tuple[str, int, Optional[str], str, Optional[str]]]:
+    ) -> list[tuple[str, str, int, Optional[str], str, Optional[str]]]:
         return [
             (
                 subline_key[0],
+                subline_key[1],
                 self.sublines[subline_key].turns,
                 self.sublines[subline_key].status,
-                subline_key[1],
+                subline_key[2],
                 self.sublines[subline_key].message,
             )
             for subline_key in self.subline_order
@@ -1609,6 +1664,7 @@ class AawmRouteRollupAccumulator:
         incoming_endpoint: str,
         outgoing_target: str,
         model_label: str,
+        effort: str = "none",
         turns: int = 1,
         status: Optional[str] = None,
         message: Optional[str] = None,
@@ -1636,6 +1692,7 @@ class AawmRouteRollupAccumulator:
             cleaned_group_header,
             cleaned_incoming_endpoint,
         )
+        cleaned_effort = _normalize_aawm_route_log_reasoning_effort(effort)
         group = self._groups.get(group_key)
         if group is None and len(self._groups) >= self._max_groups:
             emitted_lines.extend(self.flush(force=True, now=now, early=True))
@@ -1647,7 +1704,7 @@ class AawmRouteRollupAccumulator:
             )
             self._groups[group_key] = group
 
-        subline_key = (cleaned_model_label, cleaned_outgoing_target)
+        subline_key = (cleaned_model_label, cleaned_effort, cleaned_outgoing_target)
         subline = group.sublines.get(subline_key)
         if subline is None:
             if len(group.subline_order) >= self._max_sublines:
@@ -1912,6 +1969,22 @@ def _set_aawm_route_rollup_metadata(
     return metadata
 
 
+def _resolve_aawm_route_rollup_reasoning_effort(
+    *,
+    metadata: dict[str, Any],
+    provider_bound_body: Optional[dict[str, Any]],
+) -> str:
+    has_provider_body_effort, resolved_effort = (
+        _extract_aawm_route_log_provider_bound_reasoning_effort(provider_bound_body)
+    )
+    if has_provider_body_effort:
+        return _normalize_aawm_route_log_reasoning_effort(resolved_effort)
+
+    return _normalize_aawm_route_log_reasoning_effort(
+        metadata.get(_AAWM_ROUTE_LOG_REASONING_EFFORT_METADATA_KEY)
+    )
+
+
 def _get_aawm_route_rollup_model_label(
     *,
     model_label: Optional[str],
@@ -1927,6 +2000,7 @@ def build_aawm_route_rollup_context(
     target: Union[str, httpx.URL],
     request_body: Optional[dict[str, Any]] = None,
     kwargs: Optional[dict] = None,
+    provider_bound_body: Optional[dict[str, Any]] = None,
     route_type: Optional[str] = None,
 ) -> Optional[dict[str, Optional[str]]]:
     metadata = _extract_aawm_route_log_metadata(request_body, kwargs)
@@ -1974,6 +2048,10 @@ def build_aawm_route_rollup_context(
         "incoming_endpoint": incoming_endpoint,
         "outgoing_target": outgoing_target,
         "model_label": model_label,
+        "reasoning_effort": _resolve_aawm_route_rollup_reasoning_effort(
+            metadata=metadata,
+            provider_bound_body=provider_bound_body,
+        ),
         "route_type": log_type,
         "client_ip": host_attribution.get("client_ip"),
         "client_ip_source": host_attribution.get("client_ip_source"),
@@ -1988,6 +2066,7 @@ def attach_aawm_route_rollup_context(
     target: Union[str, httpx.URL],
     request_body: Optional[dict[str, Any]] = None,
     kwargs: Optional[dict] = None,
+    provider_bound_body: Optional[dict[str, Any]] = None,
     route_type: Optional[str] = None,
 ) -> Optional[dict[str, Optional[str]]]:
     context = build_aawm_route_rollup_context(
@@ -1995,6 +2074,7 @@ def attach_aawm_route_rollup_context(
         target=target,
         request_body=request_body,
         kwargs=kwargs,
+        provider_bound_body=provider_bound_body,
         route_type=route_type,
     )
     if context is None:
@@ -2015,6 +2095,7 @@ def record_aawm_route_rollup(
     incoming_endpoint: str,
     outgoing_target: str,
     model_label: str,
+    effort: str = "none",
     turns: int = 1,
     status: Optional[str] = None,
     message: Optional[str] = None,
@@ -2029,6 +2110,7 @@ def record_aawm_route_rollup(
             incoming_endpoint=incoming_endpoint,
             outgoing_target=outgoing_target,
             model_label=model_label,
+            effort=effort,
             turns=turns,
             status=status,
             message=message,
@@ -2060,6 +2142,7 @@ def record_aawm_route_rollup_turn(
         incoming_endpoint=str(context.get("incoming_endpoint") or ""),
         outgoing_target=str(context.get("outgoing_target") or ""),
         model_label=str(context.get("model_label") or ""),
+        effort=str(context.get("reasoning_effort") or "none"),
         turns=turns,
         now=now,
     )
@@ -2085,6 +2168,7 @@ def record_aawm_route_rollup_failure(
         incoming_endpoint=str(context.get("incoming_endpoint") or ""),
         outgoing_target=str(context.get("outgoing_target") or ""),
         model_label=str(context.get("model_label") or ""),
+        effort=str(context.get("reasoning_effort") or "none"),
         turns=0,
         status=status,
         message=message,
@@ -2641,6 +2725,7 @@ def _build_aawm_route_access_log_line_and_key(
     target: Union[str, httpx.URL],
     request_body: Optional[dict[str, Any]] = None,
     kwargs: Optional[dict] = None,
+    provider_bound_body: Optional[dict[str, Any]] = None,
     route_type: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> tuple[str, tuple[str, ...]]:
@@ -2723,6 +2808,7 @@ def build_aawm_route_access_log_line(
     target: Union[str, httpx.URL],
     request_body: Optional[dict[str, Any]] = None,
     kwargs: Optional[dict] = None,
+    provider_bound_body: Optional[dict[str, Any]] = None,
     route_type: Optional[str] = None,
     now: Optional[datetime] = None,
 ) -> str:
@@ -2731,6 +2817,7 @@ def build_aawm_route_access_log_line(
         target=target,
         request_body=request_body,
         kwargs=kwargs,
+        provider_bound_body=provider_bound_body,
         route_type=route_type,
         now=now,
     )
@@ -2743,6 +2830,7 @@ def emit_aawm_route_access_log(
     target: Union[str, httpx.URL],
     request_body: Optional[dict[str, Any]] = None,
     kwargs: Optional[dict] = None,
+    provider_bound_body: Optional[dict[str, Any]] = None,
     route_type: Optional[str] = None,
     completed: bool = False,
 ) -> None:
@@ -2758,6 +2846,7 @@ def emit_aawm_route_access_log(
         target=target,
         request_body=request_body,
         kwargs=kwargs,
+        provider_bound_body=provider_bound_body,
         route_type=route_type,
     )
     if aawm_route_rollups_enabled():
@@ -2766,6 +2855,7 @@ def emit_aawm_route_access_log(
             target=target,
             request_body=request_body,
             kwargs=kwargs,
+            provider_bound_body=provider_bound_body,
             route_type=route_type,
         )
         _register_aawm_route_access_log_replacement(

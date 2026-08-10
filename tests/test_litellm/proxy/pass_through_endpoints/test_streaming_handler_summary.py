@@ -359,3 +359,47 @@ async def test_chunk_processor_keeps_raw_bytes_when_summary_finalize_and_capture
         ]
         is True
     )
+
+
+def test_record_post_first_byte_stream_terminal_rollup_preserves_reasoning_effort():
+    success_handler_kwargs = {
+        "litellm_params": {
+            "metadata": {
+                "aawm_route_rollup_context": {
+                    "group_header_label": "litellm#Codex[0.141.0]",
+                    "incoming_endpoint": "/openai_passthrough/responses",
+                    "outgoing_target": "chatgpt.com/backend-api/codex/responses",
+                    "model_label": "gpt-5.3-codex-spark(work)",
+                    "reasoning_effort": "xhigh",
+                }
+            }
+        }
+    }
+    failure_context = {
+        "failure_kind": "streaming_upstream_read_timeout",
+        "stream_failure_stage": "stream_interrupted_after_first_byte",
+        "stream_chunks_seen": 2,
+        "stream_bytes_seen": 64,
+        "model": "gpt-5.3-codex-spark",
+        "model_alias": "work",
+        "route_family": "codex_responses",
+    }
+    with patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.emit_aawm_route_status_event"
+    ) as mock_status, patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup"
+    ) as mock_rollup:
+        PassThroughStreamingHandler._record_post_first_byte_stream_terminal_rollup(
+            success_handler_kwargs=success_handler_kwargs,
+            failure_context=failure_context,
+            exc=httpx.ReadTimeout("upstream timed out", request=None),
+        )
+
+    mock_status.assert_called_once()
+    mock_rollup.assert_called_once()
+    rollup_kwargs = mock_rollup.call_args.kwargs
+    assert rollup_kwargs["effort"] == "xhigh"
+    assert rollup_kwargs["status"] == "Failed"
+    assert rollup_kwargs["turns"] == 0
+    assert rollup_kwargs["model_label"] == "work"
+    assert rollup_kwargs["group_header_label"] == "litellm#Codex[0.141.0]"

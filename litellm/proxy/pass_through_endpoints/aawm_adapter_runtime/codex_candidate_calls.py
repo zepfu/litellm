@@ -872,12 +872,16 @@ async def _handle_codex_kimi_chat_completions_adapter_route(
             metadata = plan.prepared_request_body.get("litellm_metadata")
         rollup_kwargs.update(_build_adapted_route_rollup_kwargs(metadata if isinstance(metadata, dict) else {}))
         _annotate_request_scope_for_adapted_access_log(request, plan.target_url)
+        provider_bound_body = plan.perform_kwargs.get("completion_kwargs")
+        if not isinstance(provider_bound_body, dict):
+            provider_bound_body = None
         _emit_adapted_route_access_log(
             request=request,
             target_url=str(plan.target_url),
             request_body=plan.prepared_request_body,
             rollup_kwargs=rollup_kwargs,
             adapter_label="Kimi Code",
+            provider_bound_body=provider_bound_body,
         )
         return plan
 
@@ -1116,12 +1120,16 @@ async def _handle_codex_alibaba_token_plan_adapter_route(
             metadata = plan.prepared_request_body.get("litellm_metadata")
         rollup_kwargs.update(_build_adapted_route_rollup_kwargs(metadata if isinstance(metadata, dict) else {}))
         _annotate_request_scope_for_adapted_access_log(request, plan.target_url)
+        provider_bound_body = plan.perform_kwargs.get("completion_kwargs")
+        if not isinstance(provider_bound_body, dict):
+            provider_bound_body = None
         _emit_adapted_route_access_log(
             request=request,
             target_url=str(plan.target_url),
             request_body=plan.prepared_request_body,
             rollup_kwargs=rollup_kwargs,
             adapter_label="Alibaba Token Plan",
+            provider_bound_body=provider_bound_body,
         )
         return plan
 
@@ -1507,13 +1515,6 @@ async def _handle_codex_opencode_zen_adapter_route(
     )
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
     rollup_kwargs = _build_adapted_route_rollup_kwargs(litellm_metadata)
-    _emit_adapted_route_access_log(
-        request=request,
-        target_url=target_url,
-        request_body=request_body,
-        rollup_kwargs=rollup_kwargs,
-        adapter_label="OpenCode Zen",
-    )
     completion_call_kwargs = _build_opencode_zen_completion_call_kwargs(
         completion_kwargs=completion_kwargs,
         api_key=api_key,
@@ -1522,6 +1523,16 @@ async def _handle_codex_opencode_zen_adapter_route(
         request=request,
         use_alias_candidate_probe=use_alias_candidate_probe,
         request_body=request_body,
+    )
+    # D1-521: log the exact final translated completion kwargs while retaining
+    # the original request body/model label for access-log model labeling.
+    _emit_adapted_route_access_log(
+        request=request,
+        target_url=target_url,
+        request_body=request_body,
+        rollup_kwargs=rollup_kwargs,
+        adapter_label="OpenCode Zen",
+        provider_bound_body=completion_kwargs,
     )
     try:
         completion_response = await _perform_opencode_zen_completion_call(
@@ -1721,12 +1732,15 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
     )
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
     rollup_kwargs = _build_adapted_route_rollup_kwargs(litellm_metadata)
+    # D1-521: pass the exact final translated/clamped completion kwargs as
+    # provider_bound_body while retaining request_body for model label.
     _emit_adapted_route_access_log(
         request=request,
         target_url=target_url,
         request_body=request_body,
         rollup_kwargs=rollup_kwargs,
         adapter_label="OpenRouter chat-completions",
+        provider_bound_body=completion_kwargs,
     )
 
     completion_response = await _perform_openrouter_completion_adapter_operation(

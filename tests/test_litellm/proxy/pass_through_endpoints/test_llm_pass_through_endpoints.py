@@ -5349,7 +5349,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         flushed = flush_aawm_route_rollups(force=True)
         rendered = "\n".join(flushed)
         assert "Codex[0.0.0] /openai_passthrough/responses" in rendered
-        assert " - big-pickle - Turns: 1 -> opencode.ai/zen/v1/chat/completions" in rendered
+        assert " - big-pickle:none - Turns: 1 -> opencode.ai/zen/v1/chat/completions" in rendered
         assert json.loads(response.body.decode("utf-8"))["id"] == "chatcmpl_opencode"
         clear_aawm_route_rollups()
 
@@ -5465,7 +5465,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         flushed = flush_aawm_route_rollups(force=True)
         rendered = "\n".join(flushed)
         assert "Codex[0.0.0] /openai_passthrough/responses" in rendered
-        assert " - big-pickle(basic) - Turns: 1 -> opencode.ai/zen/v1/chat/completions" in rendered
+        assert " - big-pickle(basic):none - Turns: 1 -> opencode.ai/zen/v1/chat/completions" in rendered
         clear_aawm_route_rollups()
 
     @pytest.mark.asyncio
@@ -5581,7 +5581,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         rendered = "\n".join(flushed)
         assert "Codex[0.0.0] /openai_passthrough/responses" in rendered
         assert (
-            " - openrouter/cohere/north-mini-code:free - Turns: 1 -> openrouter.ai/api/v1/chat/completions" in rendered
+            " - openrouter/cohere/north-mini-code:free:none - Turns: 1 -> openrouter.ai/api/v1/chat/completions" in rendered
         )
         assert json.loads(response.body.decode("utf-8"))["id"] == "chatcmpl_openrouter"
         clear_aawm_route_rollups()
@@ -5733,7 +5733,7 @@ class TestAnthropicAdapterClaudeCodeAgentProjectMetadata:
         rendered = "\n".join(flushed)
         assert "Codex[0.0.0] /openai_passthrough/responses" in rendered
         assert (
-            " - openrouter/cohere/north-mini-code:free(basic) - Turns: 1 -> openrouter.ai/api/v1/chat/completions"
+            " - openrouter/cohere/north-mini-code:free(basic):none - Turns: 1 -> openrouter.ai/api/v1/chat/completions"
             in rendered
         )
         clear_aawm_route_rollups()

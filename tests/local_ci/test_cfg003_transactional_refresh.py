@@ -393,13 +393,16 @@ class TestAvailabilityEvidence:
     def test_parse_route_availability_evidence(self, ra):
         log = """
 20260730 06:00:00 Codex[1.0] <mock>
- - openrouter/model-a(basic) - Turns: 0 [rate limited by upstream] [Cooling Down] -> route
- - openrouter/model-b(basic) - Turns: 0 [Selected model is at capacity] [Failed] -> route
- - openrouter/model-c(basic) - Turns: 3 [success] [Selected] -> route
+ - openrouter/model-a(basic):none - Turns: 0 [rate limited by upstream] [Cooling Down] -> route
+ - openrouter/model-b(basic):low - Turns: 0 [Selected model is at capacity] [Failed] -> route
+ - openrouter/model-c(basic):xhigh - Turns: 2 [success] [Selected] -> route
+ - openrouter/model-c(basic):low - Turns: 1 [success] [Selected] -> route
 """
         evidence = ra._parse_route_availability_evidence(log, "basic")
         assert evidence["openrouter/model-a"] == "Cooling Down"
         assert evidence["openrouter/model-b"] == "Failed"
+        # Mixed-effort buckets for the same model remain separate rollup lines;
+        # availability still keys by model and keeps the latest status.
         assert evidence["openrouter/model-c"] == "Selected"
 
     def test_unavailable_candidates_filtered(self, ra, basic_yaml_text):

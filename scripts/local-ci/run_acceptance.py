@@ -3610,7 +3610,17 @@ def _parse_route_availability_evidence(
     a map of model -> latest status.
 
     Route rollup lines have the shape:
-      `` - {model}({alias}) - Turns: N [{message}] [{status}] -> {route}``
+      `` - {model}({alias}):{effort-or-none} - Turns: N [{message}] [{status}] -> {route}``
+
+    The mandatory ``:{effort-or-none}`` segment is the request-specific
+    provider-bound effort (``reasoning.effort``, then ``reasoning_effort``,
+    then ``output_config.effort``; same-request
+    ``reasoning_effort_native_value`` only when the final body lacks a field).
+    Absent effort and explicit ``none`` both appear as ``:none``. Mixed
+    efforts for the same model remain separate rollup buckets; this parser
+    still keys availability by model only and keeps the latest status per
+    model so existing CFG-003 consumers stay compatible. Effort is never
+    inferred from TOML/YAML, alias defaults, capabilities, or model names.
 
     Only the latest status per model is retained.  Models not mentioned
     in the logs are absent from the result (treated as unknown/available

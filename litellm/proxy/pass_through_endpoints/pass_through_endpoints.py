@@ -3709,6 +3709,7 @@ async def pass_through_request(  # noqa: PLR0915
                 target=url,
                 request_body=_parsed_body,
                 kwargs=kwargs,
+                provider_bound_body=provider_bound_body,
             )
         except Exception:
             verbose_proxy_logger.debug(
