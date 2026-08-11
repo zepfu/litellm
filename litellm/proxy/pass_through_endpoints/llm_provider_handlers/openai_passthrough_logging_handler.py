@@ -756,6 +756,127 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         return "".join(text_parts)
 
     @staticmethod
+    def _extract_responses_api_incomplete_reason_from_payload(
+        payload: Any,
+    ) -> Optional[str]:
+        if not isinstance(payload, dict):
+            return None
+
+        metadata = payload.get("metadata")
+        if isinstance(metadata, dict):
+            reason = metadata.get("aawm_stream_incomplete_reason")
+            if isinstance(reason, str):
+                reason_value = reason.strip()
+                if reason_value:
+                    return reason_value
+
+        reason = payload.get("aawm_stream_incomplete_reason")
+        if isinstance(reason, str):
+            reason_value = reason.strip()
+            if reason_value:
+                return reason_value
+
+        incomplete_details = payload.get("incomplete_details")
+        if not isinstance(incomplete_details, dict):
+            return None
+
+        reason = incomplete_details.get("reason")
+        if isinstance(reason, str):
+            reason_value = reason.strip()
+            if reason_value:
+                return reason_value
+
+        return None
+
+    @staticmethod
+    def _extract_responses_api_incomplete_reason_from_stream(
+        all_chunks: List[str],
+    ) -> Optional[str]:
+        from litellm.llms.base_llm.base_model_iterator import (
+            BaseModelResponseIterator,
+        )
+
+        for chunk_str in all_chunks:
+            parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
+                str_line=chunk_str
+            )
+            if not isinstance(parsed_chunk, dict):
+                continue
+
+            reason = OpenAIPassthroughLoggingHandler._extract_responses_api_incomplete_reason_from_payload(
+                parsed_chunk
+            )
+            if reason is not None:
+                return reason
+
+            response_payload = parsed_chunk.get("response")
+            if not isinstance(response_payload, dict):
+                continue
+
+            reason = OpenAIPassthroughLoggingHandler._extract_responses_api_incomplete_reason_from_payload(
+                response_payload
+            )
+            if reason is not None:
+                return reason
+
+        return None
+
+    @staticmethod
+    def _extract_responses_api_usage_from_stream(all_chunks: List[str]) -> Optional[dict]:
+        from litellm.llms.base_llm.base_model_iterator import (
+            BaseModelResponseIterator,
+        )
+
+        observed_usage: Optional[dict] = None
+        for chunk_str in all_chunks:
+            parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
+                str_line=chunk_str
+            )
+            if not isinstance(parsed_chunk, dict):
+                continue
+
+            direct_usage = parsed_chunk.get("usage")
+            if isinstance(direct_usage, dict):
+                observed_usage = direct_usage
+
+            response_payload = parsed_chunk.get("response")
+            if not isinstance(response_payload, dict):
+                continue
+
+            response_usage = response_payload.get("usage")
+            if isinstance(response_usage, dict):
+                observed_usage = response_usage
+
+        return observed_usage
+
+    @staticmethod
+    def _extract_responses_api_response_id_from_stream(all_chunks: List[str]) -> Optional[str]:
+        from litellm.llms.base_llm.base_model_iterator import (
+            BaseModelResponseIterator,
+        )
+
+        for chunk_str in all_chunks:
+            parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(
+                str_line=chunk_str
+            )
+            if not isinstance(parsed_chunk, dict):
+                continue
+
+            response_id = parsed_chunk.get("id")
+            if isinstance(response_id, str) and response_id.strip():
+                return response_id
+
+            response_payload = parsed_chunk.get("response")
+            if not isinstance(response_payload, dict):
+                continue
+
+            response_id = response_payload.get("id")
+            if isinstance(response_id, str) and response_id.strip():
+                return response_id
+
+        return None
+
+    @staticmethod
     def _sanitize_responses_terminal_error_for_logging(error: Any, *, limit: int = 500) -> Optional[str]:
         if error is None:
             return None
@@ -912,6 +1033,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
         fallback_model: str,
         all_chunks: List[str],
         terminal_event_type: str,
+        assistant_content: str = "",
     ) -> ModelResponse:
         reconstructed_output = (
             OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream(
@@ -927,7 +1049,7 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             OpenAIPassthroughLoggingHandler._build_responses_api_fallback_model_response(
                 response_body=response_body,
                 fallback_model=fallback_model,
-                assistant_content="",
+                assistant_content=assistant_content,
                 reasoning_content=OpenAIPassthroughLoggingHandler._extract_responses_api_reasoning_summary_text(
                     merged_output
                 ),
@@ -940,6 +1062,61 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
             response_payload=response_body,
         )
         return model_response
+
+    @staticmethod
+    def _build_responses_api_no_terminal_incomplete_model_response(
+        *,
+        all_chunks: List[str],
+        model: str,
+    ) -> Optional[ModelResponse]:
+        incomplete_reason = (
+            OpenAIPassthroughLoggingHandler._extract_responses_api_incomplete_reason_from_stream(
+                all_chunks
+            )
+        )
+        if incomplete_reason != "upstream_stream_ended_without_terminal_event":
+            return None
+
+        reconstructed_output = (
+            OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream(
+                all_chunks
+            )
+        )
+        stream_output_text = (
+            OpenAIPassthroughLoggingHandler._extract_responses_api_stream_text(
+                all_chunks
+            )
+        )
+        synthetic_terminal_payload = {
+            "object": "response",
+            "status": "incomplete",
+            "model": model,
+            "output": reconstructed_output,
+            "incomplete_details": {"reason": incomplete_reason},
+        }
+        terminal_response_id = (
+            OpenAIPassthroughLoggingHandler._extract_responses_api_response_id_from_stream(
+                all_chunks
+            )
+        )
+        if terminal_response_id is not None:
+            synthetic_terminal_payload["id"] = terminal_response_id
+
+        observed_usage = (
+            OpenAIPassthroughLoggingHandler._extract_responses_api_usage_from_stream(
+                all_chunks
+            )
+        )
+        if observed_usage is not None:
+            synthetic_terminal_payload["usage"] = observed_usage
+
+        return OpenAIPassthroughLoggingHandler._build_responses_api_terminal_model_response(
+            response_body=synthetic_terminal_payload,
+            fallback_model=model,
+            all_chunks=all_chunks,
+            terminal_event_type="response.incomplete",
+            assistant_content=stream_output_text,
+        )
 
     @staticmethod
     def _build_responses_api_fallback_model_response_from_stream(
@@ -1926,6 +2103,14 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
                         request_body=request_body,
                         fallback_model=model,
                     )
+                no_terminal_incomplete_response = (
+                    OpenAIPassthroughLoggingHandler._build_responses_api_no_terminal_incomplete_model_response(
+                        all_chunks=all_chunks,
+                        model=model,
+                    )
+                )
+                if no_terminal_incomplete_response is not None:
+                    return no_terminal_incomplete_response
                 verbose_proxy_logger.warning(
                     "No recognized Responses terminal event found in OpenAI responses stream"
                 )

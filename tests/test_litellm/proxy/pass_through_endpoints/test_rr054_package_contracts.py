@@ -15,6 +15,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
+import httpx
 import pytest
 from fastapi import HTTPException, Response
 from fastapi.responses import StreamingResponse
@@ -674,6 +676,101 @@ async def test_rr054_streaming_peek_exhausted_and_overflow() -> None:
         cont.append(chunk)
     assert cont[0] == b"12345"
     assert b"more" in cont or cont[-1] == b"more"
+
+
+@pytest.mark.parametrize(
+    "timeout_error",
+    [
+        httpx.ReadTimeout("read timed out", request=None),
+        aiohttp.client_exceptions.SocketTimeoutError(),
+    ],
+)
+@pytest.mark.parametrize("flow", ["pending", "lossless"])
+@pytest.mark.asyncio
+async def test_rr054_streaming_peek_tail_timeouts_are_terminalized(
+    flow: str,
+    timeout_error: Exception,
+) -> None:
+    async def lossless_body() -> Any:
+        yield b"first"
+        raise timeout_error
+
+    async def pending_body() -> Any:
+        yield b"first"
+        await asyncio.sleep(0.02)
+        raise timeout_error
+
+    body = lossless_body if flow == "lossless" else pending_body
+    max_chunks = 0 if flow == "lossless" else 10
+    max_bytes = 1 if flow == "lossless" else 1000
+
+    terminal_calls: list[Any] = []
+
+    async def terminalizer(
+        exc: Exception,
+        progress: streaming.StreamingTimeoutProgress,
+    ) -> list[bytes]:
+        terminal_calls.append((type(exc), progress))
+        return [b"data: [DONE]\n\n"]
+
+    response = streaming._bind_stream_timeout_terminalizer(
+        StreamingResponse(
+            body(),
+            media_type="text/event-stream",
+            status_code=200,
+        ),
+        terminalizer,
+    )
+    peek = await streaming.peek_streaming_response(
+        response,
+        max_chunks=max_chunks,
+        max_bytes=max_bytes,
+        terminalizer=streaming._get_stream_timeout_terminalizer(response),
+    )
+    assert peek.stop_reason in {"chunk_limit", "pending_stream"}
+    assert streaming._get_stream_timeout_terminalizer(peek.response) is terminalizer
+
+    emitted: list[Any] = []
+    try:
+        async for chunk in peek.response.body_iterator:
+            emitted.append(chunk)
+    except Exception as exc:
+        pytest.fail(f"unexpected terminalization leak: {exc}")
+
+    assert emitted == [b"first", b"data: [DONE]\n\n"]
+    assert len(terminal_calls) == 1
+    assert terminal_calls[0][0] == type(timeout_error)
+    assert terminal_calls[0][1].chunk_count == 1
+    assert terminal_calls[0][1].total_emitted_bytes >= len(b"first")
+    assert isinstance(terminal_calls[0][1].emitted_bytes, bool)
+    assert terminal_calls[0][1].last_emission_timestamp is not None
+    assert emitted[1:] == [b"data: [DONE]\n\n"]
+
+
+@pytest.mark.asyncio
+async def test_rr054_streaming_peek_pre_first_or_unrelated_exceptions_still_raise() -> None:
+    async def pre_first_byte_timeout_body() -> Any:
+        if False:
+            yield b""
+        raise httpx.ReadTimeout("pre-first byte", request=None)
+
+    with pytest.raises(httpx.ReadTimeout):
+        await streaming.peek_streaming_response(
+            StreamingResponse(pre_first_byte_timeout_body(), media_type="text/event-stream", status_code=200),
+            max_chunks=10,
+            max_bytes=100,
+        )
+
+    async def post_first_byte_generic_body() -> Any:
+        yield b"first"
+        raise RuntimeError("generic")
+
+    with pytest.raises(RuntimeError):
+        await streaming.peek_streaming_response(
+            StreamingResponse(post_first_byte_generic_body(), media_type="text/event-stream", status_code=200),
+            max_chunks=10,
+            max_bytes=100,
+        )
 
 
 def _minimal_responses_api_payload(*, response_id: str = "resp_1") -> dict[str, Any]:

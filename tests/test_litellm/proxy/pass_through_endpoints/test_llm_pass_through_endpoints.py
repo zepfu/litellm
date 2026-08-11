@@ -2961,13 +2961,17 @@ class TestPassThroughRequestRetryableFailures:
             _noop_streaming_logger,
         )
 
+        logging_obj = MagicMock()
+        logging_obj.async_failure_handler = AsyncMock()
+        logging_obj.async_success_handler = AsyncMock()
+
         chunks: list[bytes] = []
         success_handler_kwargs = {"litellm_params": {"metadata": {}}}
         try:
             async for chunk in PassThroughStreamingHandler.chunk_processor(
                 response=PartiallyFailingStreamingResponse(),  # type: ignore[arg-type]
                 request_body={"model": "claude-opus-4-8"},
-                litellm_logging_obj=MagicMock(),
+                litellm_logging_obj=logging_obj,
                 endpoint_type=EndpointType.ANTHROPIC,
                 start_time=datetime.now(),
                 passthrough_success_handler_obj=MagicMock(),
@@ -3011,10 +3015,31 @@ class TestPassThroughRequestRetryableFailures:
         assert metadata["status_code"] == 504
         assert b"event: error" in b"".join(chunks)
         assert b"proxy_stream_terminal_error" in b"".join(chunks)
+        assert len([chunk for chunk in chunks if b"event: error" in chunk]) == 1
+        logging_obj.async_failure_handler.assert_awaited_once()
+        logging_obj.async_success_handler.assert_not_awaited()
+        assert await PassThroughStreamingHandler._terminalize_post_first_byte_stream_timeout(
+            exc=httpx.ReadTimeout(
+                "Timeout on reading data from socket",
+                request=httpx.Request("POST", target_url),
+            ),
+            litellm_logging_obj=logging_obj,
+            endpoint_type=EndpointType.ANTHROPIC,
+            url_route=target_url,
+            custom_llm_provider="anthropic",
+            start_time=datetime.now(),
+            error_log_context=error_context,
+            success_handler_kwargs=success_handler_kwargs,
+            chunk_count=1,
+            total_stream_bytes=len(chunks[0]),
+            first_chunk_at=datetime.now(),
+            first_emitted_at=datetime.now(),
+        ) == []
+        logging_obj.async_failure_handler.assert_awaited_once()
         assert streaming_logger_calls == []
 
     @pytest.mark.asyncio
-    async def test_streaming_timeout_after_first_chunk_emits_codex_terminal_failed_event(
+    async def test_streaming_timeout_after_first_chunk_emits_codex_terminal_failed_event(  # noqa: PLR0915
         self,
         monkeypatch,
         tmp_path,
@@ -3075,6 +3100,10 @@ class TestPassThroughRequestRetryableFailures:
             _capture_rollup,
         )
 
+        logging_obj = MagicMock()
+        logging_obj.async_failure_handler = AsyncMock()
+        logging_obj.async_success_handler = AsyncMock()
+
         chunks: list[bytes] = []
         success_handler_kwargs = {
             "litellm_params": {
@@ -3092,7 +3121,7 @@ class TestPassThroughRequestRetryableFailures:
             async for chunk in PassThroughStreamingHandler.chunk_processor(
                 response=PartiallyFailingCodexStreamingResponse(),  # type: ignore[arg-type]
                 request_body={"model": "gpt-5.4-mini"},
-                litellm_logging_obj=MagicMock(),
+                litellm_logging_obj=logging_obj,
                 endpoint_type=EndpointType.OPENAI,
                 start_time=datetime.now(),
                 passthrough_success_handler_obj=MagicMock(),
@@ -3111,15 +3140,75 @@ class TestPassThroughRequestRetryableFailures:
 
         combined = b"".join(chunks)
         assert combined.startswith(b"event: response.created")
+        assert combined.count(b"event: response.failed") == 1
         assert b"event: response.failed" in combined
         assert b"streaming_upstream_read_timeout" in combined
-        assert b"data: [DONE]" in combined
+        assert combined.count(b"data: [DONE]") == 1
+        expected_terminal_metadata = {
+            "stream_failure_stage": "stream_interrupted_after_first_byte",
+            "stream_chunks_seen": 1,
+            "stream_bytes_seen": len(chunks[0]),
+            "stream_hidden_retry_safe": False,
+            "provider": "openai",
+            "model": "gpt-5.4-mini",
+            "model_alias": "basic",
+            "route_family": "codex_responses",
+        }
+        expected_failed_payload = {
+            "type": "response.failed",
+            "response": {
+                "object": "response",
+                "status": "failed",
+                "error": {
+                    "type": "proxy_stream_terminal_error",
+                    "code": "streaming_upstream_read_timeout",
+                    "message": (
+                        "Streaming response interrupted after first byte due to "
+                        "upstream read timeout: Timeout on reading data from socket"
+                    ),
+                    "param": None,
+                },
+                "metadata": expected_terminal_metadata,
+            },
+        }
+        assert chunks[1] == (
+            "event: response.failed\ndata: "
+            + json.dumps(expected_failed_payload, separators=(",", ":"))
+            + "\n\n"
+        ).encode("utf-8")
+        failed_payload = json.loads(chunks[1].split(b"\ndata: ", 1)[1])
+        assert list(failed_payload["response"]["metadata"]) == list(
+            expected_terminal_metadata
+        )
         assert status_events
+        assert len(status_events) == 1
         assert status_events[0]["status"] == "Failed"
         assert status_events[0]["alias_model"] == "basic"
-        assert rollup_events
+        assert len(rollup_events) == 1
         assert rollup_events[0]["status"] == "Failed"
         assert rollup_events[0]["model_label"] == "basic"
+        logging_obj.async_failure_handler.assert_awaited_once()
+        logging_obj.async_success_handler.assert_not_awaited()
+        assert await PassThroughStreamingHandler._terminalize_post_first_byte_stream_timeout(
+            exc=httpx.ReadTimeout(
+                "Timeout on reading data from socket",
+                request=httpx.Request("POST", target_url),
+            ),
+            litellm_logging_obj=logging_obj,
+            endpoint_type=EndpointType.OPENAI,
+            url_route=target_url,
+            custom_llm_provider="openai",
+            start_time=datetime.now(),
+            error_log_context=error_context,
+            success_handler_kwargs=success_handler_kwargs,
+            chunk_count=1,
+            total_stream_bytes=len(chunks[0]),
+            first_chunk_at=datetime.now(),
+            first_emitted_at=datetime.now(),
+        ) == []
+        assert len(status_events) == 1
+        assert len(rollup_events) == 1
+        logging_obj.async_failure_handler.assert_awaited_once()
         assert streaming_logger_calls == []
 
     @pytest.mark.asyncio

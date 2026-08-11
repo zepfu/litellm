@@ -476,6 +476,9 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             response,
             max_chunks=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS,  # noqa: F821
             max_bytes=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES,  # noqa: F821
+            terminalizer=_aawm_alias_streaming._get_stream_timeout_terminalizer(  # noqa: F821
+                response
+            ),
         )
         if not peek.exhausted:
             correlation = intake_context or {}

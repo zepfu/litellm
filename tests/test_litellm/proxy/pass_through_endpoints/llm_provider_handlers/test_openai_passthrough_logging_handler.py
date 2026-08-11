@@ -869,7 +869,7 @@ class TestOpenAIPassthroughLoggingHandler:
         assert result["kwargs"]["standard_logging_object"]["status"] == "failure"
 
     @patch("litellm.completion_cost")
-    def test_openai_streaming_handler_returns_none_for_no_terminal_stream(
+    def test_openai_streaming_handler_returns_synthesized_incomplete_for_no_terminal_stream(
         self, mock_completion_cost, caplog
     ):
         mock_completion_cost.return_value = 0.0
@@ -885,6 +885,8 @@ class TestOpenAIPassthroughLoggingHandler:
             'data: {"type":"response.created","response":{"id":"resp-truncated","status":"in_progress","model":"gpt-5.4","output":[]}}',
             'event: response.output_text.done',
             'data: {"type":"response.output_text.done","item_id":"msg_123","output_index":0,"content_index":0,"text":"partial only"}',
+            'event: response.chunk',
+            'data: {"response":{"id":"resp-truncated","usage":{"input_tokens":13,"output_tokens":7,"total_tokens":20}},"metadata":{"aawm_stream_incomplete_reason":"upstream_stream_ended_without_terminal_event"}}',
         ]
 
         with caplog.at_level("WARNING"):
@@ -899,8 +901,23 @@ class TestOpenAIPassthroughLoggingHandler:
                 end_time=self.end_time,
             )
 
-        assert result["result"] is None
-        assert "No recognized Responses terminal event found" in caplog.text
+        assert result["result"] is not None
+        assert result["result"].choices[0].message.content == "partial only"
+        assert (
+            result["result"]._hidden_params["responses_terminal_event_type"]
+            == "response.incomplete"
+        )
+        assert result["result"]._hidden_params["responses_terminal_status"] == "incomplete"
+        assert (
+            result["result"]._hidden_params["responses_terminal_incomplete_details"]
+            == "upstream_stream_ended_without_terminal_event"
+        )
+        assert result["kwargs"]["standard_logging_object"]["status"] == "failure"
+        assert result["result"].usage is not None
+        assert result["result"].usage.prompt_tokens == 13
+        assert result["result"].usage.completion_tokens == 7
+        assert result["result"].usage.total_tokens == 20
+        assert "No recognized Responses terminal event found" not in caplog.text
 
     @patch("litellm.completion_cost")
     def test_openai_streaming_handler_marks_output_text_done_fallback_as_synthesized(

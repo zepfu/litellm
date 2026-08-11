@@ -129,6 +129,7 @@ _HOST_FUNCTION_NAMES = (
     "_perform_codex_auto_agent_native_openai_request",
     "_perform_codex_auto_agent_grok_native_responses_request",
     "_perform_codex_auto_agent_oa_xai_responses_request",
+    "_bind_responses_stream_timeout_terminalizer",
     "_validate_codex_auto_agent_openrouter_responses_stream",
     "_perform_codex_auto_agent_openrouter_responses_request",
     "_perform_codex_auto_agent_openrouter_completion_request",
@@ -575,6 +576,129 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
     )
 
 
+def _bind_responses_stream_timeout_terminalizer(
+    response: StreamingResponse,
+    *,
+    adapter_model: str,
+    adapter_label: str,
+    provider: str,
+    intake_context: Optional[dict[str, Any]],
+    rollup_kwargs: dict[str, Any],
+    stream_error_callback: Optional[Any] = None,
+) -> StreamingResponse:
+    finalized = False
+
+    async def _terminalize(
+        exc: BaseException,
+        progress: Any,
+    ) -> list[Any]:
+        nonlocal finalized
+        if finalized:
+            return []
+        finalized = True
+        if not isinstance(exc, Exception):
+            raise exc
+
+        import time
+        from datetime import datetime, timedelta, timezone
+
+        from litellm.proxy.pass_through_endpoints.streaming_handler import (
+            PassThroughStreamingHandler,
+        )
+        from litellm.types.passthrough_endpoints.pass_through_endpoints import (
+            EndpointType,
+        )
+
+        identity = intake_context if isinstance(intake_context, dict) else {}
+        failure_context = {
+            key: identity.get(key)
+            for key in (
+                "request_id",
+                "litellm_call_id",
+                "trace_id",
+                "session_id",
+                "endpoint",
+                "upstream_url",
+                "model_alias",
+                "route_family",
+            )
+            if identity.get(key) is not None
+        }
+        failure_context.update(
+            {
+                "provider": provider,
+                "model": adapter_model,
+                "adapter_label": adapter_label,
+                "failure_kind": "streaming_upstream_read_timeout",
+                "stream_failure_stage": "stream_interrupted_after_first_byte",
+                "stream_chunks_seen": progress.chunk_count,
+                "stream_bytes_seen": progress.total_emitted_bytes,
+                "stream_hidden_retry_safe": False,
+                "status_code": 504,
+            }
+        )
+        if progress.last_emission_timestamp is not None:
+            idle_seconds = max(
+                0.0,
+                time.monotonic() - progress.last_emission_timestamp,
+            )
+            failure_context["stream_last_emission_at"] = (
+                datetime.now(timezone.utc) - timedelta(seconds=idle_seconds)
+            ).isoformat()
+            failure_context["stream_idle_ms"] = round(idle_seconds * 1000.0, 3)
+
+        litellm_params = rollup_kwargs.get("litellm_params")
+        metadata = (
+            litellm_params.get("metadata")
+            if isinstance(litellm_params, dict)
+            and isinstance(litellm_params.get("metadata"), dict)
+            else None
+        )
+        if isinstance(metadata, dict):
+            if metadata.get("aawm_stream_terminal_emitted"):
+                return []
+            metadata.update(failure_context)
+            metadata["aawm_stream_interrupted"] = True
+            metadata["aawm_stream_terminal_emitted"] = True
+            metadata["aawm_route_rollup_turn_suppressed"] = True
+            metadata["aawm_route_rollup_turn_recorded"] = True
+
+        PassThroughStreamingHandler._record_post_first_byte_stream_terminal_rollup(
+            success_handler_kwargs=rollup_kwargs,
+            failure_context=failure_context,
+            exc=exc,
+        )
+
+        terminal_event = (
+            stream_error_callback(exc)
+            if stream_error_callback is not None
+            else None
+        )
+        if terminal_event is not None:
+            rendered = (
+                terminal_event.decode("utf-8", errors="replace")
+                if isinstance(terminal_event, bytes)
+                else str(terminal_event)
+            )
+            chunks = [terminal_event]
+            if "data: [DONE]" not in rendered:
+                chunks.append("data: [DONE]\n\n")
+            return chunks
+
+        return PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
+            endpoint_type=EndpointType.OPENAI,
+            url_route="https://api.openai.com/v1/responses",
+            custom_llm_provider=provider,
+            failure_context=failure_context,
+            exc=exc,
+        )
+
+    return _aawm_alias_streaming._bind_stream_timeout_terminalizer(
+        response,
+        _terminalize,
+    )
+
+
 async def _validate_codex_auto_agent_openrouter_responses_stream(
     response: StreamingResponse,
     *,
@@ -586,6 +710,9 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(
         response,
         max_chunks=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS,
         max_bytes=_AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES,
+        terminalizer=_aawm_alias_streaming._get_stream_timeout_terminalizer(
+            response
+        ),
     )
     if not peek.exhausted:
         return peek.response
@@ -893,17 +1020,27 @@ async def _handle_codex_kimi_chat_completions_adapter_route(
         adapter_model=adapter_model,
         use_alias_candidate_probe=use_alias_candidate_probe,
     )
+    intake_context = _build_malformed_tool_call_intake_context(
+        request,
+        prepared_request_body,
+        adapter="codex_kimi_chat_completions_adapter",
+        provider="kimi_code",
+    )
+    if isinstance(response, StreamingResponse):
+        response = _bind_responses_stream_timeout_terminalizer(
+            response,
+            adapter_model=adapter_model,
+            adapter_label="Kimi Code",
+            provider="kimi_code",
+            intake_context=intake_context,
+            rollup_kwargs=rollup_kwargs,
+        )
     validated_response = await _validate_codex_auto_agent_responses_payload(
         response,
         adapter_model=adapter_model,
         adapter="codex_kimi_chat_completions_adapter",
         adapter_label="Kimi Code",
-        intake_context=_build_malformed_tool_call_intake_context(
-            request,
-            prepared_request_body,
-            adapter="codex_kimi_chat_completions_adapter",
-            provider="kimi_code",
-        ),
+        intake_context=intake_context,
         request_body=prepared_request_body,
     )
     if isinstance(validated_response, StreamingResponse):
@@ -1591,12 +1728,30 @@ async def _handle_codex_opencode_zen_adapter_route(
         )
         if use_alias_candidate_probe:
             return stream_response
+        stream_response = _bind_responses_stream_timeout_terminalizer(
+            stream_response,
+            adapter_model=adapter_model,
+            adapter_label="OpenCode Zen",
+            provider="opencode",
+            intake_context=_build_malformed_tool_call_intake_context(
+                request,
+                request_body,
+                adapter="codex_opencode_zen_completion_adapter",
+                upstream_url=target_url,
+                provider="opencode",
+            ),
+            rollup_kwargs=rollup_kwargs,
+            stream_error_callback=_opencode_zen_direct_stream_terminal_error,
+        )
         # D1-574: peek for pre-first-byte streaming failures
         try:
             peek = await _aawm_alias_streaming.peek_streaming_response(
                 stream_response,
                 max_chunks=1,
                 max_bytes=_OPENCODE_ZEN_DIRECT_PEEK_MAX_BYTES,
+                terminalizer=_aawm_alias_streaming._get_stream_timeout_terminalizer(
+                    stream_response
+                ),
             )
         except Exception as peek_exc:
             _maybe_raise_opencode_zen_direct_rate_limit(peek_exc)
@@ -1790,6 +1945,14 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
                 ),
             ),
             media_type="text/event-stream",
+        )
+        stream_response = _bind_responses_stream_timeout_terminalizer(
+            stream_response,
+            adapter_model=adapter_model,
+            adapter_label="OpenRouter chat-completions",
+            provider="openrouter",
+            intake_context=intake_context,
+            rollup_kwargs=rollup_kwargs,
         )
         validated_response = await _validate_codex_auto_agent_responses_payload(
             stream_response,

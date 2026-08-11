@@ -83,6 +83,10 @@ class _PassThroughStreamLineAccumulator:
         return self.lines
 
 
+def _strip_chunk_line(raw_line: str) -> str:
+    return raw_line.strip()
+
+
 class PassThroughStreamingHandler:
     _AAWM_STREAM_SUMMARY_FIRST_FINALIZE_ENV = "AAWM_STREAM_SUMMARY_FIRST_FINALIZE"
 
@@ -105,6 +109,131 @@ class PassThroughStreamingHandler:
     _XAI_OAUTH_RATE_LIMIT_HEADER_NAMES = {
         "retry-after",
     }
+    _CLEAN_EOF_INCOMPLETE_REASON = "upstream_stream_ended_without_terminal_event"
+    _RESPONSES_TERMINAL_EVENTS = {
+        "response.completed",
+        "response.failed",
+        "response.incomplete",
+    }
+
+    @staticmethod
+    def _is_openai_responses_stream(
+        *,
+        endpoint_type: EndpointType,
+        url_route: str,
+        custom_llm_provider: Optional[str],
+    ) -> bool:
+        parsed_url = urlparse(url_route)
+        return (
+            endpoint_type == EndpointType.OPENAI
+            and custom_llm_provider == "openai"
+            and parsed_url.hostname in {"api.openai.com", "chatgpt.com"}
+            and OpenAIPassthroughLoggingHandler.is_openai_responses_route(url_route)
+        )
+
+    @staticmethod
+    def _is_done_chunk(chunk: bytes) -> bool:
+        try:
+            decoded = chunk.decode("utf-8", errors="ignore")
+        except (AttributeError, UnicodeDecodeError):
+            return False
+        for raw_line in decoded.splitlines():
+            if _strip_chunk_line(raw_line) == "data: [DONE]":
+                return True
+        return False
+
+    @staticmethod
+    def _split_trailing_done_chunk(chunk: bytes) -> tuple[bytes, bytes]:
+        def _split_complete_done_suffix(value: bytes) -> tuple[bytes, bytes]:
+            lines = value.splitlines(keepends=True)
+            first_done_line: Optional[int] = None
+            for index in range(len(lines) - 1, -1, -1):
+                stripped = lines[index].strip()
+                if not stripped:
+                    continue
+                if stripped == b"data: [DONE]":
+                    first_done_line = index
+                    continue
+                break
+            if first_done_line is None:
+                return value, b""
+            return (
+                b"".join(lines[:first_done_line]),
+                b"".join(lines[first_done_line:]),
+            )
+
+        prefix, done_suffix = _split_complete_done_suffix(chunk)
+        if done_suffix:
+            return prefix, done_suffix
+
+        done_marker = b"data: [DONE]"
+        for marker_length in range(
+            min(len(chunk), len(done_marker) - 1),
+            0,
+            -1,
+        ):
+            if not chunk.endswith(done_marker[:marker_length]):
+                continue
+            marker_start = len(chunk) - marker_length
+            if marker_start > 0 and chunk[marker_start - 1 : marker_start] not in {
+                b"\n",
+                b"\r",
+            }:
+                continue
+            prefix, prior_done_suffix = _split_complete_done_suffix(
+                chunk[:marker_start]
+            )
+            return prefix, prior_done_suffix + chunk[marker_start:]
+
+        return chunk, b""
+
+    @staticmethod
+    def _chunk_lines(chunks: List[bytes]) -> List[str]:
+        accumulator = _PassThroughStreamLineAccumulator()
+        for chunk in chunks:
+            accumulator.feed(chunk)
+        return accumulator.finish()
+
+    @staticmethod
+    def _responses_lines_have_terminal_event(lines: List[str]) -> bool:
+        for raw_line in lines:
+            line = _strip_chunk_line(raw_line)
+            event_type: Optional[str] = None
+            if line.startswith("event:"):
+                event_type = line.removeprefix("event:").strip()
+            elif line.startswith("data:"):
+                payload_text = line.removeprefix("data:").strip()
+                if payload_text == "[DONE]":
+                    continue
+                try:
+                    payload = json.loads(payload_text)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, dict):
+                    payload_type = payload.get("type")
+                    if isinstance(payload_type, str):
+                        event_type = payload_type
+            if event_type in PassThroughStreamingHandler._RESPONSES_TERMINAL_EVENTS:
+                return True
+        return False
+
+    @staticmethod
+    def _dedupe_done_chunks(
+        *,
+        chunks: List[bytes],
+        lines: List[str],
+    ) -> tuple[List[bytes], List[str]]:
+        filtered_chunks = [
+            chunk
+            for chunk in chunks
+            if not PassThroughStreamingHandler._is_done_chunk(chunk)
+        ]
+        filtered_lines = [
+            line
+            for line in lines
+            if _strip_chunk_line(line) != "data: [DONE]"
+        ]
+        return filtered_chunks, filtered_lines
 
     @staticmethod
     def _ensure_streaming_metadata(success_handler_kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -536,6 +665,20 @@ class PassThroughStreamingHandler:
         try:
             raw_bytes: List[bytes] = []
             line_accumulator: Optional[_PassThroughStreamLineAccumulator] = None
+            is_fork_owned_responses_stream = (
+                PassThroughStreamingHandler._is_openai_responses_stream(
+                    endpoint_type=endpoint_type,
+                    url_route=url_route,
+                    custom_llm_provider=custom_llm_provider,
+                )
+            )
+            responses_terminal_accumulator = (
+                _PassThroughStreamLineAccumulator()
+                if is_fork_owned_responses_stream
+                else None
+            )
+            responses_terminal_seen = False
+            held_responses_done_suffix = b""
             buffer_raw_bytes = True
             if PassThroughStreamingHandler._stream_summary_first_finalize_eligible(
                 endpoint_type=endpoint_type,
@@ -559,6 +702,33 @@ class PassThroughStreamingHandler:
                 custom_llm_provider=custom_llm_provider,
             )
             metadata["aawm_stream_raw_bytes_buffered"] = buffer_raw_bytes
+
+            def _mark_first_emitted_chunk() -> None:
+                nonlocal first_emitted_at
+                if first_emitted_at is not None:
+                    return
+                first_emitted_at = datetime.now()
+                metadata["aawm_first_emitted_chunk_ms"] = round(
+                    max(0.0, (first_emitted_at - start_time).total_seconds() * 1000.0),
+                    3,
+                )
+                if first_chunk_at is not None:
+                    metadata["aawm_stream_emit_gap_ms"] = round(
+                        max(
+                            0.0,
+                            (first_emitted_at - first_chunk_at).total_seconds()
+                            * 1000.0,
+                        ),
+                        3,
+                    )
+
+            def _record_responses_wire_chunk(chunk: bytes) -> None:
+                if buffer_raw_bytes:
+                    raw_bytes.append(chunk)
+                if line_accumulator is not None:
+                    line_accumulator.feed(chunk)
+                _mark_first_emitted_chunk()
+
             # Extract model name for cost injection
             model_name = PassThroughStreamingHandler._extract_model_for_cost_injection(
                 request_body=request_body,
@@ -608,6 +778,38 @@ class PassThroughStreamingHandler:
                         },
                     )
 
+                if responses_terminal_accumulator is not None:
+                    responses_terminal_accumulator.feed(chunk)
+                    if not responses_terminal_seen:
+                        responses_terminal_seen = (
+                            PassThroughStreamingHandler._responses_lines_have_terminal_event(
+                                responses_terminal_accumulator.lines
+                            )
+                        )
+                    responses_terminal_accumulator.lines.clear()
+
+                    if responses_terminal_seen:
+                        if held_responses_done_suffix:
+                            _record_responses_wire_chunk(
+                                held_responses_done_suffix
+                            )
+                            yield held_responses_done_suffix
+                            held_responses_done_suffix = b""
+                        _record_responses_wire_chunk(chunk)
+                        yield chunk
+                        continue
+
+                    (
+                        chunk_without_done,
+                        held_responses_done_suffix,
+                    ) = PassThroughStreamingHandler._split_trailing_done_chunk(
+                        held_responses_done_suffix + chunk
+                    )
+                    if chunk_without_done:
+                        _record_responses_wire_chunk(chunk_without_done)
+                        yield chunk_without_done
+                    continue
+
                 if buffer_raw_bytes:
                     raw_bytes.append(chunk)
                 if line_accumulator is not None:
@@ -631,23 +833,41 @@ class PassThroughStreamingHandler:
                         if modified_chunk is not None:
                             chunk = modified_chunk
 
-                if first_emitted_at is None:
-                    first_emitted_at = datetime.now()
-                    metadata["aawm_first_emitted_chunk_ms"] = round(
-                        max(0.0, (first_emitted_at - start_time).total_seconds() * 1000.0),
-                        3,
-                    )
-                    if first_chunk_at is not None:
-                        metadata["aawm_stream_emit_gap_ms"] = round(
-                            max(
-                                0.0,
-                                (first_emitted_at - first_chunk_at).total_seconds()
-                                * 1000.0,
-                            ),
-                            3,
-                        )
-
+                _mark_first_emitted_chunk()
                 yield chunk
+
+            if responses_terminal_accumulator is not None:
+                if not responses_terminal_seen:
+                    responses_terminal_seen = (
+                        PassThroughStreamingHandler._responses_lines_have_terminal_event(
+                            responses_terminal_accumulator.finish()
+                        )
+                    )
+
+                terminal_chunks: List[bytes] = []
+                if first_emitted_at is not None and not responses_terminal_seen:
+                    terminal_chunks = await PassThroughStreamingHandler._terminalize_post_first_byte_responses_clean_eof(
+                        litellm_logging_obj=litellm_logging_obj,
+                        endpoint_type=endpoint_type,
+                        url_route=url_route,
+                        custom_llm_provider=custom_llm_provider,
+                        start_time=start_time,
+                        error_log_context=error_log_context,
+                        success_handler_kwargs=success_handler_kwargs,
+                        chunk_count=chunk_count,
+                        total_stream_bytes=total_stream_bytes,
+                    )
+
+                if terminal_chunks:
+                    held_responses_done_suffix = b""
+                    for terminal_chunk in terminal_chunks:
+                        _record_responses_wire_chunk(terminal_chunk)
+                        yield terminal_chunk
+                    return
+                elif held_responses_done_suffix:
+                    _record_responses_wire_chunk(held_responses_done_suffix)
+                    yield held_responses_done_suffix
+                    held_responses_done_suffix = b""
 
             # After all chunks are processed, handle post-processing
             end_time = datetime.now()
@@ -724,78 +944,241 @@ class PassThroughStreamingHandler:
                 isinstance(e, httpx.ReadTimeout)
                 and local_first_emitted_at is not None
             ):
-                verbose_proxy_logger.error(
-                    "Streaming response interrupted after first byte in chunk_processor: %s",
-                    str(e),
-                    extra=exception_context,
-                )
-                failure_context = (
-                    PassThroughStreamingHandler._build_streaming_failure_context(
+                terminal_chunks = (
+                    await PassThroughStreamingHandler._terminalize_post_first_byte_stream_timeout(
                         exc=e,
+                        litellm_logging_obj=litellm_logging_obj,
+                        endpoint_type=endpoint_type,
+                        url_route=url_route,
+                        custom_llm_provider=custom_llm_provider,
+                        start_time=start_time,
+                        error_log_context=error_log_context,
+                        success_handler_kwargs=success_handler_kwargs,
                         chunk_count=local_chunk_count,
                         total_stream_bytes=local_total_stream_bytes,
                         first_chunk_at=local_first_chunk_at,
                         first_emitted_at=local_first_emitted_at,
                     )
                 )
-                if isinstance(error_log_context, dict):
-                    failure_context = {
-                        **error_log_context,
-                        **failure_context,
-                    }
-                if isinstance(success_handler_kwargs, dict):
-                    metadata = PassThroughStreamingHandler._ensure_streaming_metadata(
-                        success_handler_kwargs
-                    )
-                    metadata["aawm_stream_chunk_count"] = local_chunk_count
-                    metadata["aawm_stream_total_bytes"] = local_total_stream_bytes
-                    metadata["aawm_stream_interrupted"] = True
-                    metadata["aawm_stream_terminal_emitted"] = True
-                    metadata["aawm_route_rollup_turn_suppressed"] = True
-                    metadata.update(failure_context)
-                PassThroughStreamingHandler._record_post_first_byte_stream_terminal_rollup(
-                    success_handler_kwargs=success_handler_kwargs,
-                    failure_context=failure_context,
-                    exc=e,
-                )
-                # The stream has already emitted bytes to the client, so this
-                # cannot be retried or completed truthfully. Error intake and
-                # route rollup above carry the terminal failure; do not send
-                # partial chunks through the normal success callback pipeline.
-                #
-                # Still run the standard failure logging pipeline so Langfuse /
-                # session_history / spend callbacks observe the mid-stream
-                # timeout (success handlers must not run on partial streams).
-                try:
-                    await litellm_logging_obj.async_failure_handler(
-                        exception=e,
-                        traceback_exception=traceback.format_exc(),
-                        start_time=start_time,
-                        end_time=datetime.now(),
-                    )
-                except Exception as logging_exc:
-                    verbose_proxy_logger.exception(
-                        "async_failure_handler failed after mid-stream ReadTimeout: %s",
-                        str(logging_exc),
-                        extra=exception_context,
-                    )
-                for terminal_chunk in (
-                    PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
-                        endpoint_type=endpoint_type,
-                        url_route=url_route,
-                        custom_llm_provider=custom_llm_provider,
-                        failure_context=failure_context,
-                        exc=e,
-                    )
-                ):
+                for terminal_chunk in terminal_chunks:
                     yield terminal_chunk
                 return
+            if (
+                "held_responses_done_suffix" in locals()
+                and held_responses_done_suffix
+                and "_record_responses_wire_chunk" in locals()
+            ):
+                _record_responses_wire_chunk(held_responses_done_suffix)
+                yield held_responses_done_suffix
             verbose_proxy_logger.exception(
                 "Error in chunk_processor: %s",
                 str(e),
                 extra=exception_context,
             )
             raise
+
+    @staticmethod
+    async def _terminalize_post_first_byte_stream_timeout(
+        *,
+        exc: Exception,
+        litellm_logging_obj: LiteLLMLoggingObj,
+        endpoint_type: EndpointType,
+        url_route: str,
+        custom_llm_provider: Optional[str],
+        start_time: datetime,
+        error_log_context: Optional[Dict[str, Any]],
+        success_handler_kwargs: Optional[Dict[str, Any]],
+        chunk_count: int,
+        total_stream_bytes: int,
+        first_chunk_at: Optional[datetime],
+        first_emitted_at: Optional[datetime],
+    ) -> List[bytes]:
+        failure_context = PassThroughStreamingHandler._build_streaming_failure_context(
+            exc=exc,
+            chunk_count=chunk_count,
+            total_stream_bytes=total_stream_bytes,
+            first_chunk_at=first_chunk_at,
+            first_emitted_at=first_emitted_at,
+        )
+
+        if isinstance(error_log_context, dict):
+            failure_context = {
+                **error_log_context,
+                **failure_context,
+            }
+            error_log_context.update(failure_context)
+
+            exception_context = error_log_context
+        else:
+            exception_context = PassThroughStreamingHandler._build_streaming_exception_log_context(
+                error_log_context=error_log_context,
+                exc=exc,
+                chunk_count=chunk_count,
+                total_stream_bytes=total_stream_bytes,
+                first_chunk_at=first_chunk_at,
+                first_emitted_at=first_emitted_at,
+            )
+
+        metadata = PassThroughStreamingHandler._ensure_streaming_metadata(
+            success_handler_kwargs
+        )
+        if metadata.get("aawm_stream_terminal_emitted"):
+            return []
+
+        if not isinstance(success_handler_kwargs, dict) and isinstance(
+            error_log_context, dict
+        ):
+            if error_log_context.get("aawm_stream_terminal_emitted"):
+                return []
+
+        metadata["aawm_stream_chunk_count"] = chunk_count
+        metadata["aawm_stream_total_bytes"] = total_stream_bytes
+        metadata["aawm_stream_interrupted"] = True
+        metadata["aawm_stream_terminal_emitted"] = True
+        metadata["aawm_route_rollup_turn_suppressed"] = True
+        metadata.update(failure_context)
+        if not isinstance(success_handler_kwargs, dict) and isinstance(
+            error_log_context, dict
+        ):
+            error_log_context["aawm_stream_terminal_emitted"] = True
+
+        verbose_proxy_logger.error(
+            "Streaming response interrupted after first byte in chunk_processor: %s",
+            str(exc),
+            extra=exception_context,
+        )
+
+        # The stream has already emitted bytes to the client, so this
+        # cannot be retried or completed truthfully. Error intake and
+        # route rollup above carry the terminal failure; do not send
+        # partial chunks through the normal success callback pipeline.
+        #
+        # Still run the standard failure logging pipeline so Langfuse /
+        # session_history / spend callbacks observe the mid-stream
+        # timeout (success handlers must not run on partial streams).
+        try:
+            await litellm_logging_obj.async_failure_handler(
+                exception=exc,
+                traceback_exception=traceback.format_exc(),
+                start_time=start_time,
+                end_time=datetime.now(),
+            )
+        except Exception as logging_exc:
+            verbose_proxy_logger.exception(
+                "async_failure_handler failed after mid-stream ReadTimeout: %s",
+                str(logging_exc),
+                extra=exception_context,
+            )
+
+        PassThroughStreamingHandler._record_post_first_byte_stream_terminal_rollup(
+            success_handler_kwargs=success_handler_kwargs,
+            failure_context=failure_context,
+            exc=exc,
+        )
+
+        return PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
+            endpoint_type=endpoint_type,
+            url_route=url_route,
+            custom_llm_provider=custom_llm_provider,
+            failure_context=failure_context,
+            exc=exc,
+        )
+
+    @staticmethod
+    async def _terminalize_post_first_byte_responses_clean_eof(
+        *,
+        litellm_logging_obj: LiteLLMLoggingObj,
+        endpoint_type: EndpointType,
+        url_route: str,
+        custom_llm_provider: Optional[str],
+        start_time: datetime,
+        error_log_context: Optional[Dict[str, Any]],
+        success_handler_kwargs: Optional[Dict[str, Any]],
+        chunk_count: int,
+        total_stream_bytes: int,
+    ) -> List[bytes]:
+        metadata = PassThroughStreamingHandler._ensure_streaming_metadata(
+            success_handler_kwargs
+        )
+        if metadata.get("aawm_stream_terminal_emitted"):
+            return []
+        if not isinstance(success_handler_kwargs, dict) and isinstance(
+            error_log_context, dict
+        ):
+            if error_log_context.get("aawm_stream_terminal_emitted"):
+                return []
+
+        failure_context = dict(error_log_context or {})
+        failure_context.update(
+            {
+                "failure_kind": "streaming_upstream_clean_eof",
+                "stream_failure_stage": "stream_interrupted_after_first_byte",
+                "stream_chunks_seen": chunk_count,
+                "stream_bytes_seen": total_stream_bytes,
+                "stream_hidden_retry_safe": False,
+            }
+        )
+        if isinstance(error_log_context, dict):
+            error_log_context.update(failure_context)
+
+        metadata.update(failure_context)
+        metadata["aawm_stream_chunk_count"] = chunk_count
+        metadata["aawm_stream_total_bytes"] = total_stream_bytes
+        metadata["aawm_stream_interrupted"] = True
+        metadata["aawm_stream_incomplete"] = True
+        metadata["aawm_stream_incomplete_reason"] = (
+            PassThroughStreamingHandler._CLEAN_EOF_INCOMPLETE_REASON
+        )
+        metadata["aawm_stream_terminal_emitted"] = True
+        metadata["aawm_stream_replayable"] = False
+        metadata["aawm_route_rollup_turn_suppressed"] = True
+        if not isinstance(success_handler_kwargs, dict) and isinstance(
+            error_log_context, dict
+        ):
+            error_log_context.update(
+                {
+                    "aawm_stream_interrupted": True,
+                    "aawm_stream_incomplete": True,
+                    "aawm_stream_terminal_emitted": True,
+                    "aawm_stream_replayable": False,
+                    "aawm_route_rollup_turn_suppressed": True,
+                }
+            )
+
+        clean_eof_exc = RuntimeError(
+            PassThroughStreamingHandler._CLEAN_EOF_INCOMPLETE_REASON
+        )
+        verbose_proxy_logger.error(
+            "Streaming response ended after partial bytes without a terminal event",
+            extra=error_log_context or failure_context,
+        )
+        try:
+            await litellm_logging_obj.async_failure_handler(
+                exception=clean_eof_exc,
+                traceback_exception=None,
+                start_time=start_time,
+                end_time=datetime.now(),
+            )
+        except Exception as logging_exc:
+            verbose_proxy_logger.exception(
+                "async_failure_handler failed after clean Responses EOF: %s",
+                str(logging_exc),
+                extra=error_log_context or failure_context,
+            )
+
+        PassThroughStreamingHandler._record_post_first_byte_stream_terminal_rollup(
+            success_handler_kwargs=success_handler_kwargs,
+            failure_context=failure_context,
+            exc=clean_eof_exc,
+        )
+
+        return PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
+            endpoint_type=endpoint_type,
+            url_route=url_route,
+            custom_llm_provider=custom_llm_provider,
+            failure_context=failure_context,
+            incomplete_reason=PassThroughStreamingHandler._CLEAN_EOF_INCOMPLETE_REASON,
+        )
 
     @staticmethod
     def _build_streaming_exception_log_context(
@@ -859,8 +1242,53 @@ class PassThroughStreamingHandler:
         url_route: str,
         custom_llm_provider: Optional[str],
         failure_context: Dict[str, Any],
-        exc: Exception,
+        exc: Optional[Exception] = None,
+        incomplete_reason: Optional[str] = None,
     ) -> List[bytes]:
+        legacy_terminal_metadata = {
+            "stream_failure_stage": failure_context.get("stream_failure_stage"),
+            "stream_chunks_seen": failure_context.get("stream_chunks_seen"),
+            "stream_bytes_seen": failure_context.get("stream_bytes_seen"),
+            "stream_hidden_retry_safe": failure_context.get("stream_hidden_retry_safe"),
+            "provider": custom_llm_provider or endpoint_type.value,
+            "model": failure_context.get("model"),
+            "model_alias": failure_context.get("model_alias"),
+            "route_family": failure_context.get("route_family"),
+        }
+        if incomplete_reason is not None:
+            terminal_metadata = {
+                **legacy_terminal_metadata,
+                "request_id": failure_context.get("request_id"),
+                "litellm_call_id": failure_context.get("litellm_call_id"),
+                "trace_id": failure_context.get("trace_id"),
+                "session_id": failure_context.get("session_id"),
+                "stream_last_emission_at": failure_context.get(
+                    "stream_last_emission_at"
+                ),
+                "stream_idle_ms": failure_context.get("stream_idle_ms"),
+            }
+            payload = {
+                "type": "response.incomplete",
+                "response": {
+                    "object": "response",
+                    "status": "incomplete",
+                    "error": None,
+                    "incomplete_details": {"reason": incomplete_reason},
+                    "output": [],
+                    "metadata": terminal_metadata,
+                },
+            }
+            return [
+                (
+                    "event: response.incomplete\ndata: "
+                    + json.dumps(payload, separators=(",", ":"))
+                    + "\n\n"
+                ).encode("utf-8"),
+                b"data: [DONE]\n\n",
+            ]
+
+        if exc is None:
+            raise ValueError("exc is required for failed stream terminal chunks")
         message = (
             "Streaming response interrupted after first byte due to upstream read "
             f"timeout: {exc}"
@@ -871,16 +1299,6 @@ class PassThroughStreamingHandler:
             or "streaming_upstream_read_failure",
             "message": message,
             "param": None,
-        }
-        terminal_metadata = {
-            "stream_failure_stage": failure_context.get("stream_failure_stage"),
-            "stream_chunks_seen": failure_context.get("stream_chunks_seen"),
-            "stream_bytes_seen": failure_context.get("stream_bytes_seen"),
-            "stream_hidden_retry_safe": failure_context.get("stream_hidden_retry_safe"),
-            "provider": custom_llm_provider or endpoint_type.value,
-            "model": failure_context.get("model"),
-            "model_alias": failure_context.get("model_alias"),
-            "route_family": failure_context.get("route_family"),
         }
 
         if endpoint_type == EndpointType.ANTHROPIC:
@@ -908,7 +1326,7 @@ class PassThroughStreamingHandler:
                     "object": "response",
                     "status": "failed",
                     "error": error_payload,
-                    "metadata": terminal_metadata,
+                    "metadata": legacy_terminal_metadata,
                 },
             }
             chunks = [
@@ -923,7 +1341,7 @@ class PassThroughStreamingHandler:
 
         payload = {
             "error": error_payload,
-            "aawm_stream_terminal": terminal_metadata,
+            "aawm_stream_terminal": legacy_terminal_metadata,
         }
         return [
             (
