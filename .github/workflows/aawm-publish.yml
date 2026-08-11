@@ -34,28 +34,95 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Smoke test — verify runtime imports
+      - name: Build runtime base image
+        id: base_image
         run: |
-          docker build -t litellm-runtime-test .
-          docker run --rm --entrypoint python3 litellm-runtime-test -c "
-          from importlib.metadata import version
-          print('litellm', version('litellm'))
-          import litellm
-          from litellm.proxy.proxy_server import app
-          print('proxy server module loaded')
-          print('smoke test passed')
-          "
+          IMAGE_TAG="litellm-runtime-test:${GITHUB_SHA}"
+          echo "tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          docker build -t "$IMAGE_TAG" .
 
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: ${{ format('{0}/{1}:{2},{0}/{1}:latest', env.REGISTRY, env.IMAGE_NAME, steps.version.outputs.version) }}
-          platforms: linux/amd64
+      - name: Build AAWM addon wheels
+        id: addon_wheels
+        run: |
+          python -m pip install --quiet build
+          rm -rf .wheel-build/dist .control-plane-wheel-build/dist
+          python -m build --wheel --outdir .wheel-build/dist .wheel-build
+          python -m build --wheel --outdir .control-plane-wheel-build/dist .control-plane-wheel-build
+          shopt -s nullglob
+          CALLBACK_WHEELS=(.wheel-build/dist/*.whl)
+          CONTROL_PLANE_WHEELS=(.control-plane-wheel-build/dist/*.whl)
+          if [ "${#CALLBACK_WHEELS[@]}" -ne 1 ] || [ "${#CONTROL_PLANE_WHEELS[@]}" -ne 1 ]; then
+            echo "Expected exactly one callback and one control-plane wheel" >&2
+            printf "callback wheels: %s\n" "${CALLBACK_WHEELS[@]}"
+            printf "control-plane wheels: %s\n" "${CONTROL_PLANE_WHEELS[@]}"
+            exit 1
+          fi
+          CALLBACK_WHEEL="${CALLBACK_WHEELS[0]}"
+          CONTROL_PLANE_WHEEL="${CONTROL_PLANE_WHEELS[0]}"
+          echo "callback_wheel=$CALLBACK_WHEEL" >> "$GITHUB_OUTPUT"
+          echo "control_plane_wheel=$CONTROL_PLANE_WHEEL" >> "$GITHUB_OUTPUT"
+
+      - name: Validate runtime image installs local wheels
+        run: |
+          BASE_IMAGE="${{ steps.base_image.outputs.tag }}"
+          VALIDATION_IMAGE="litellm-runtime-validate:${GITHUB_SHA}"
+          SMOKE_DIR="/tmp/d1-575-smoke-${GITHUB_SHA}"
+          mkdir -p "$SMOKE_DIR"
+          mkdir -p "$SMOKE_DIR/wheels"
+          cp "${{ steps.addon_wheels.outputs.callback_wheel }}" "$SMOKE_DIR/wheels/"
+          cp "${{ steps.addon_wheels.outputs.control_plane_wheel }}" "$SMOKE_DIR/wheels/"
+          cat >"$SMOKE_DIR/Dockerfile" <<EOF
+          FROM ${BASE_IMAGE}
+          WORKDIR /tmp
+          RUN mkdir -p /tmp/wheels
+          COPY wheels/*.whl /tmp/wheels/
+          RUN python3 -m pip install --no-cache-dir --no-deps /tmp/wheels/*.whl \
+            && rm -rf /tmp/wheels
+          EOF
+          docker build -t "$VALIDATION_IMAGE" -f "$SMOKE_DIR/Dockerfile" "$SMOKE_DIR"
+          docker run --rm --workdir /tmp -i --entrypoint python3 "$VALIDATION_IMAGE" - <<'PY'
+          from importlib import import_module
+          from importlib.metadata import version
+          import os
+          import shutil
+
+          def assert_not_under_app(module_name: str) -> None:
+              module = import_module(module_name)
+              module_file = os.path.realpath(getattr(module, "__file__", ""))
+              if not module_file:
+                  raise SystemExit(f"{module_name} has no source path")
+              print(f"{module_name}: {module_file}")
+              if module_file.startswith('/app/'):
+                  raise SystemExit(f"{module_name} resolved to /app source path: {module_file}")
+
+          print(f"litellm version: {version('litellm')}")
+          print(f"aawm-litellm-callbacks version: {version('aawm-litellm-callbacks')}")
+          print(f"aawm-litellm-control-plane version: {version('aawm-litellm-control-plane')}")
+
+          assert_not_under_app('litellm')
+          assert_not_under_app('aawm_litellm_callbacks')
+          assert_not_under_app('aawm_litellm_callbacks.agent_identity')
+          assert_not_under_app('litellm.proxy.pass_through_endpoints.aawm_claude_control_plane')
+
+          import asyncpg  # noqa: F401
+          from litellm.proxy.proxy_server import app  # noqa: F401
+
+          if shutil.which('litellm') is None:
+              raise SystemExit('litellm CLI is not discoverable')
+
+          if not (os.path.isfile('/app/docker/prod_entrypoint.sh') and os.access('/app/docker/prod_entrypoint.sh', os.X_OK)):
+              raise SystemExit('prod_entrypoint.sh missing or not executable')
+
+          print('smoke test passed')
+          PY
+
+      - name: Push prebuilt image
+        run: |
+          docker tag "${{ steps.base_image.outputs.tag }}" \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}"
+          docker tag "${{ steps.base_image.outputs.tag }}" "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          docker push "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}"
+          docker push "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
 
       - name: Create GitHub release
         env:
