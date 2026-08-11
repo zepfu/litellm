@@ -397,6 +397,7 @@ async def _perform_codex_auto_agent_alias_candidate_request(
     )
 
 
+
 async def _perform_codex_auto_agent_native_openai_request(
     *,
     request: Request,
@@ -408,6 +409,14 @@ async def _perform_codex_auto_agent_native_openai_request(
     request_body: dict[str, Any],
     custom_headers: Optional[dict[str, str]] = None,
 ) -> Response:
+    # OPENAI-007: legacy history may collapse provider tool ids into item id.
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.direct_openai_function_call_history import (
+        normalize_direct_openai_legacy_function_call_history_ids,
+    )
+
+    request_body = normalize_direct_openai_legacy_function_call_history_ids(
+        request_body
+    )
     is_streaming_request = "stream" in str(target_url)
     resolved_headers = (
         dict(custom_headers)
