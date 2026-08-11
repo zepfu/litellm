@@ -29,6 +29,8 @@ from litellm.llms.anthropic.experimental_pass_through.providers.grok import (
 )
 
 from .codex_oauth import _clean_codex_auth_value
+from . import classification as _classification
+from . import failure_actions as _failure_actions
 from .lane_keys import (
     _codex_auto_agent_candidate_key,
     _CODEX_AUTO_AGENT_MALFORMED_TOOL_CALL_COOLDOWN_SECONDS,
@@ -1303,6 +1305,76 @@ def _get_codex_auto_agent_source_error_summary(
 
 
 # ---------------------------------------------------------------------------
+# D1-586 shadow failure-action decisions (observational only)
+# ---------------------------------------------------------------------------
+
+
+def build_shadow_failure_action_decision(
+    *,
+    status_code: Optional[int] = None,
+    message: str = "",
+    retry_after_seconds: Optional[float] = None,
+    provider: Optional[str] = None,
+    current_error_class: Optional[str] = None,
+    current_cooldown_scope: Optional[str] = None,
+    current_status: Optional[str] = None,
+    policy: Optional[_failure_actions.FailureActionPolicy] = None,
+) -> _failure_actions.ShadowFailureActionDecision:
+    """Classify then map to a shadow action without enforcing policy.
+
+    Classification remains in :mod:`classification`; this helper only attaches
+    the configurable action vocabulary decision for observability. Enforcement
+    stays disabled (:data:`FAILURE_ACTION_ENFORCEMENT_ENABLED` is False).
+    """
+    event = _classification.classify_failure(
+        status_code=status_code,
+        provider=provider,
+        message=message or "",
+        retry_after_seconds=retry_after_seconds,
+    )
+    return _failure_actions.decide_shadow_failure_action(
+        event,
+        policy=policy,
+        current_error_class=current_error_class,
+        current_cooldown_scope=current_cooldown_scope,
+        current_status=current_status,
+    )
+
+
+def build_shadow_failure_action_decision_from_exc(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]] = None,
+    current_error_class: Optional[str] = None,
+    current_cooldown_scope: Optional[str] = None,
+    current_status: Optional[str] = None,
+    policy: Optional[_failure_actions.FailureActionPolicy] = None,
+) -> _failure_actions.ShadowFailureActionDecision:
+    """Shadow decision for a raised exception using existing signal extractors.
+
+    Uses status/summary/retry-after extractors already owned by this module so
+    the candidate loop can stamp the same sanitized comparison fields without
+    re-implementing classification inputs.
+    """
+    del candidate  # reserved for future provider-neutral context; unused (no hardcoding)
+    status_code = _extract_adapter_exception_status_code(exc)
+    source_error = _get_codex_auto_agent_source_error_summary(
+        exc,
+        status_code=status_code,
+    )
+    retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(exc)
+    return build_shadow_failure_action_decision(
+        status_code=status_code,
+        message=str(source_error or ""),
+        retry_after_seconds=retry_after_seconds,
+        provider=None,
+        current_error_class=current_error_class,
+        current_cooldown_scope=current_cooldown_scope,
+        current_status=current_status,
+        policy=policy,
+    )
+
+# ---------------------------------------------------------------------------
 # God-module facade installation (Wave 5C)
 # ---------------------------------------------------------------------------
 
@@ -1340,6 +1412,8 @@ _HOST_FUNCTION_NAMES = (
     "_iter_codex_auto_agent_error_blocks",
     "_extract_codex_auto_agent_error_type_and_code",
     "_get_codex_auto_agent_source_error_summary",
+    "build_shadow_failure_action_decision",
+    "build_shadow_failure_action_decision_from_exc",
     "_extract_adapter_exception_detail",
     "_extract_adapter_error_payloads",
     "_extract_adapter_exception_status_code",

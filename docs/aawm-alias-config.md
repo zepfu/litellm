@@ -394,6 +394,17 @@ An exact target uses the actual snapshot identity:
    TTL, environment, and namespace, and correlate the sanitized audit event.
    Do not treat a 409/503 as a successful clear.
 
+## Failure-action shadow mode (D1-586)
+
+Alias routing classifies failures into the open `FailureEvent` vocabulary and,
+separately, maps each class to a configurable action (`observe`, `retry_same`,
+`failover`, `cooldown`, `terminal`, `redispatch`). The first delivery emits only
+a deterministic **shadow** decision on retryable attempt records as
+`shadow_failure_action` so operators can compare current cooldown/retry behavior
+with the mapped action. Enforcement of class-keyed retry/failover remains
+**disabled**; client and unknown-origin events stay non-cooling and
+non-retryable regardless of the mapped action.
+
 ## Multi-worker refresh consensus
 
 Explicitly **out of scope**. Each worker performs its own deterministic

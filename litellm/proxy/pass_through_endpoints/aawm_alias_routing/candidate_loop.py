@@ -16,6 +16,9 @@ intent-based probing:
 - AFTER the mutation, the loop applies ``plan.request_local_action``, updates
   the attempt record with ``plan.applied_scope``, signals redispatch, and runs
   the native-grok backoff ``asyncio.sleep`` (never inside any lock).
+- D1-586 stamps a shadow-only ``shadow_failure_action`` observability field on
+  retryable attempt records; enforcement of class-keyed retry/failover remains
+  disabled.
 
 Memory and durable targets are derived once from the same plan so telemetry,
 waiter visibility, and Redis state cannot disagree, and no target-key logic is
@@ -36,6 +39,7 @@ from litellm.proxy.aawm_route_logging import (
     register_aawm_route_rollup_access_log_replacement,
 )
 
+from . import error_signals as _error_signals
 from .interfaces import (
     AliasRouteServices,
     ClassifyKimiFailureFn,
@@ -519,6 +523,17 @@ async def handle_alias_route(  # noqa: PLR0915
                 alias_model=alias_model,
                 candidate=candidate,
                 kimi_failure_metadata=kimi_failure_metadata,
+            )
+            # D1-586: observational shadow action only. Does not change retry,
+            # failover, sleep, admission, or cooldown enforcement paths.
+            attempt_record["shadow_failure_action"] = (
+                _error_signals.build_shadow_failure_action_decision_from_exc(
+                    failure_exc,
+                    candidate=candidate,
+                    current_error_class=error_class,
+                    current_cooldown_scope=cooldown_scope,
+                    current_status=attempt_record.get("status"),
+                ).to_observability_dict()
             )
             account_failover_planned = _plan_codex_oauth_account_failover(
                 request,
