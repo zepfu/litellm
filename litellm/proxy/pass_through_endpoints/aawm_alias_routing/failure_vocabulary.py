@@ -25,7 +25,7 @@ _VALID_ORIGINS: frozenset[str] = frozenset({"upstream", "client", "unknown"})
 _VALID_CONFIDENCES: frozenset[str] = frozenset({"structured", "marker", "unknown"})
 _VALID_SCOPES: frozenset[str] = frozenset({"provider", "account", "model", "lane", "alias"})
 
-# The ~12 structured seed classes. Growth beyond this seed set happens via
+# Structured seed classes (open registry). Growth beyond this seed set happens via
 # FailureClassRegistry.register() at runtime -- this tuple is a starting
 # point, not an exhaustive closed set.
 SEED_FAILURE_CLASSES: tuple[str, ...] = (
@@ -40,6 +40,10 @@ SEED_FAILURE_CLASSES: tuple[str, ...] = (
     "provider_4xx_other",
     "serialization",
     "client_cancelled",
+    # D1-587 fixture-backed open-registry growth (image/stream themes).
+    "invalid_media",
+    "content_policy",
+    "stream_failure",
     "unknown",
 )
 
@@ -65,7 +69,7 @@ class FailureClassRegistry:
 
     @classmethod
     def with_seed_classes(cls) -> "FailureClassRegistry":
-        """Return a registry pre-seeded with the ~12 structured seed classes."""
+        """Return a registry pre-seeded with the structured seed classes."""
         registry = cls()
         for class_name in SEED_FAILURE_CLASSES:
             registry.register(class_name)

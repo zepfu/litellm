@@ -27,6 +27,9 @@ SEED_CLASSES = {
     "provider_4xx_other",
     "serialization",
     "client_cancelled",
+    "invalid_media",
+    "content_policy",
+    "stream_failure",
     "unknown",
 }
 

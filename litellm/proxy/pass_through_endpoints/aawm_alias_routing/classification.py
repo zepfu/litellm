@@ -37,6 +37,7 @@ framework-wide under-cooling policy.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -57,6 +58,159 @@ _RATE_LIMIT_MARKERS = ("rate limit", "rate-limit", "too many requests")
 _AUTH_MARKERS = ("api key", "unauthorized", "invalid auth", "auth")
 _CLIENT_CANCELLED_MARKERS = ("cancelled", "canceled", "cancel")
 
+# D1-587: fixture-backed image-content sub-errors (open-registry growth).
+# Only markers with direct catalog CSV evidence. No zero-hit phrase variants
+# such as "invalid media", hyphenated "content-filter", or compact
+# "finish_reason=error".
+_INVALID_MEDIA_MARKERS = (
+    "invalid_image",
+    "invalid_image_format",
+    "invalid_base64_image",
+    "invalid_image_url",
+    "invalid_image_mode",
+    "image_too_large",
+    "image_too_small",
+    "image_parse_error",
+    "image_file_too_large",
+    "unsupported_image_media_type",
+    "unsupported_image_format",
+    "empty_image_file",
+    "image_not_found",
+    "image_file_not_found",
+)
+_IMAGE_DOWNLOAD_MARKERS = (
+    "failed_to_download_image",
+    "image_download_failed",
+)
+_CONTENT_POLICY_MARKERS = (
+    "image_content_policy_violation",
+    "content_policy_violation",
+    "content_policy",
+    "content_filter",
+    "data_inspection_failed",
+    "datainspectionfailed",
+    "ipinfringementsuspect",
+)
+
+# D1-587: HTTP-200-body / SSE stream failure markers from catalog fixtures.
+_STREAM_FAILURE_MARKERS = (
+    "finish_reason = error",
+    "response.failed",
+    "response.error",
+    "top-level error",
+    "http remains 200",
+)
+
+# JSON-RPC wire codes observed in Wire mode catalog fixtures.
+# Exact token form only: reject glued/prefixed junk such as x-32600y / --32600.
+_JSON_RPC_CODE_RE = re.compile(
+    r"(?<![a-z0-9_-])(-32(?:700|600|601|602|603|000|001|002|003))(?![a-z0-9_])"
+)
+_JSON_RPC_STRUCTURED: dict[int, tuple[str, str, bool]] = {
+    # class_name, scope, retryable
+    -32700: ("serialization", "provider", False),
+    -32600: ("provider_4xx_other", "provider", False),
+    -32601: ("model_unavailable", "model", False),
+    -32602: ("provider_4xx_other", "provider", False),
+    -32603: ("transient", "provider", True),
+    -32000: ("provider_4xx_other", "provider", False),
+    -32001: ("provider_4xx_other", "provider", False),
+    -32002: ("model_unavailable", "model", False),
+    -32003: ("transient", "provider", True),
+}
+
+# Documentation-only / fixture prose must not cool from marker hits alone.
+_DOC_ONLY_RE = re.compile(
+    r"\b(?:documentation only|docs only|for documentation|example only)\b"
+)
+# Negation immediately before a marker token (e.g. "not an invalid_image").
+_NEGATION_BEFORE_MARKER_RE = re.compile(
+    r"(?:\bnot\s+(?:an?\s+)?|\bno\s+|\bwithout\s+|\bnon-?)\s*$"
+)
+# Token boundary for machine-code / short phrase markers.
+_MARKER_BOUNDARY_LEFT = r"(?<![a-z0-9_])"
+_MARKER_BOUNDARY_RIGHT = r"(?![a-z0-9_])"
+
+# Open-registry class names introduced for fixture-backed D1-587 themes.
+D1_587_FAILURE_CLASSES: tuple[str, ...] = (
+    "invalid_media",
+    "content_policy",
+    "stream_failure",
+)
+
+
+def register_d1_587_failure_classes(
+    registry: Optional[fv.FailureClassRegistry] = None,
+) -> fv.FailureClassRegistry:
+    """Register fixture-backed D1-587 class names on an open registry."""
+    target = registry if registry is not None else fv.FailureClassRegistry.with_seed_classes()
+    for class_name in D1_587_FAILURE_CLASSES:
+        target.register(class_name)
+    # Ensure previously unused seed classes remain explicitly available.
+    for class_name in ("serialization", "transient", "usage_limit"):
+        target.register(class_name)
+    return target
+
+
+def _event(
+    *,
+    class_name: str,
+    origin: fv.Origin,
+    confidence: fv.Confidence,
+    provider: Optional[str],
+    scope: fv.Scope,
+    retryable: Optional[bool],
+    evidence: dict[str, str],
+) -> fv.FailureEvent:
+    return fv.FailureEvent(
+        class_name=class_name,
+        origin=origin,
+        confidence=confidence,
+        provider=provider,
+        scope=scope,
+        retryable=retryable,
+        evidence=evidence,
+    )
+
+
+def _json_rpc_code_from_message(message_lower: str) -> Optional[int]:
+    match = _JSON_RPC_CODE_RE.search(message_lower)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_documentation_only_text(text: str) -> bool:
+    """True when the text is explicitly documentation/example-only prose."""
+    return _DOC_ONLY_RE.search(text) is not None
+
+
+def _marker_match(text: str, marker: str) -> bool:
+    """Return True when ``marker`` appears as a non-negated token in ``text``.
+
+    Uses left/right token boundaries so longer machine codes do not collapse
+    into shorter prefixes (``invalid_image`` inside ``invalid_image_format``)
+    and rejects negated prose such as ``not an invalid_image fixture``.
+    """
+    if not marker:
+        return False
+    pattern = re.compile(
+        _MARKER_BOUNDARY_LEFT + re.escape(marker) + _MARKER_BOUNDARY_RIGHT
+    )
+    for match in pattern.finditer(text):
+        prefix = text[: match.start()]
+        if _NEGATION_BEFORE_MARKER_RE.search(prefix):
+            continue
+        return True
+    return False
+
+
+def _any_marker(text: str, markers: tuple[str, ...]) -> bool:
+    return any(_marker_match(text, marker) for marker in markers)
+
 
 def classify_failure(
     *,
@@ -72,6 +226,10 @@ def classify_failure(
     falls back to free-text marker matching with ``confidence="marker"``.
     Unrecognized signals default to ``class_name="unknown"``,
     ``origin="unknown"`` (never coolable).
+
+    D1-587 grows mappings for fixture-backed image-content sub-errors,
+    JSON-RPC negative wire codes, and HTTP-200-body stream failures without
+    changing the open ``FailureEvent`` schema.
     """
     text = (message or "").lower()
     evidence: dict[str, str] = {}
@@ -80,9 +238,23 @@ def classify_failure(
     if retry_after_seconds is not None:
         evidence["retry_after_seconds"] = str(float(retry_after_seconds))
 
+    # JSON-RPC wire codes are structured provider signals (negative ints).
+    if status_code is not None and status_code in _JSON_RPC_STRUCTURED:
+        class_name, scope, retryable = _JSON_RPC_STRUCTURED[status_code]
+        evidence["json_rpc_code"] = str(status_code)
+        return _event(
+            class_name=class_name,
+            origin="upstream",
+            confidence="structured",
+            provider=provider,
+            scope=scope,  # type: ignore[arg-type]
+            retryable=retryable,
+            evidence=evidence,
+        )
+
     if status_code == 429:
         if any(marker in text for marker in _QUOTA_MARKERS):
-            return fv.FailureEvent(
+            return _event(
                 class_name="quota_exhausted",
                 origin="upstream",
                 confidence="structured",
@@ -91,7 +263,7 @@ def classify_failure(
                 retryable=True,
                 evidence=evidence,
             )
-        return fv.FailureEvent(
+        return _event(
             class_name="rate_limit",
             origin="upstream",
             confidence="structured",
@@ -101,7 +273,7 @@ def classify_failure(
             evidence=evidence,
         )
     if status_code in (401, 403):
-        return fv.FailureEvent(
+        return _event(
             class_name="auth",
             origin="upstream",
             confidence="structured",
@@ -111,7 +283,7 @@ def classify_failure(
             evidence=evidence,
         )
     if status_code == 404:
-        return fv.FailureEvent(
+        return _event(
             class_name="model_unavailable",
             origin="upstream",
             confidence="structured",
@@ -121,7 +293,7 @@ def classify_failure(
             evidence=evidence,
         )
     if status_code is not None and 500 <= status_code <= 599:
-        return fv.FailureEvent(
+        return _event(
             class_name="provider_5xx",
             origin="upstream",
             confidence="structured",
@@ -131,7 +303,18 @@ def classify_failure(
             evidence=evidence,
         )
     if status_code is not None and 400 <= status_code <= 499:
-        return fv.FailureEvent(
+        # Prefer fixture-backed content/media subclasses inside 4xx bodies.
+        # Skip documentation-only prose so it does not subclass as coolable.
+        if not _is_documentation_only_text(text):
+            media_event = _classify_media_or_policy_markers(
+                text=text,
+                provider=provider,
+                confidence="structured",
+                evidence=evidence,
+            )
+            if media_event is not None:
+                return media_event
+        return _event(
             class_name="provider_4xx_other",
             origin="upstream",
             confidence="structured",
@@ -141,9 +324,57 @@ def classify_failure(
             evidence=evidence,
         )
 
-    # No structured status code: free-text marker matching (low confidence).
+    # Structured HTTP 2xx streaming connections still carry body/event failures.
+    if status_code == 200 and not _is_documentation_only_text(text):
+        stream_event = _classify_stream_failure_markers(
+            text=text,
+            provider=provider,
+            confidence="structured",
+            evidence=evidence,
+        )
+        if stream_event is not None:
+            return stream_event
+
+    # Message-embedded JSON-RPC codes (catalog rows without a parsed status).
+    # Exact token only; documentation-only prose stays unknown.
+    if not _is_documentation_only_text(text):
+        rpc_code = _json_rpc_code_from_message(text)
+        if rpc_code is not None and rpc_code in _JSON_RPC_STRUCTURED:
+            class_name, scope, retryable = _JSON_RPC_STRUCTURED[rpc_code]
+            evidence["json_rpc_code"] = str(rpc_code)
+            return _event(
+                class_name=class_name,
+                origin="upstream",
+                confidence="marker",
+                provider=provider,
+                scope=scope,  # type: ignore[arg-type]
+                retryable=retryable,
+                evidence=evidence,
+            )
+
+    # No structured HTTP status (or unresolved 2xx): free-text markers.
+    # Documentation-only prose must stay unknown / never coolable.
+    if not _is_documentation_only_text(text):
+        media_event = _classify_media_or_policy_markers(
+            text=text,
+            provider=provider,
+            confidence="marker",
+            evidence=evidence,
+        )
+        if media_event is not None:
+            return media_event
+
+        stream_event = _classify_stream_failure_markers(
+            text=text,
+            provider=provider,
+            confidence="marker",
+            evidence=evidence,
+        )
+        if stream_event is not None:
+            return stream_event
+
     if any(marker in text for marker in _CAPACITY_MARKERS):
-        return fv.FailureEvent(
+        return _event(
             class_name="capacity",
             origin="upstream",
             confidence="marker",
@@ -153,7 +384,7 @@ def classify_failure(
             evidence=evidence,
         )
     if any(marker in text for marker in _QUOTA_MARKERS):
-        return fv.FailureEvent(
+        return _event(
             class_name="quota_exhausted",
             origin="upstream",
             confidence="marker",
@@ -163,7 +394,7 @@ def classify_failure(
             evidence=evidence,
         )
     if any(marker in text for marker in _RATE_LIMIT_MARKERS):
-        return fv.FailureEvent(
+        return _event(
             class_name="rate_limit",
             origin="upstream",
             confidence="marker",
@@ -173,7 +404,7 @@ def classify_failure(
             evidence=evidence,
         )
     if any(marker in text for marker in _AUTH_MARKERS):
-        return fv.FailureEvent(
+        return _event(
             class_name="auth",
             origin="upstream",
             confidence="marker",
@@ -183,7 +414,7 @@ def classify_failure(
             evidence=evidence,
         )
     if any(marker in text for marker in _CLIENT_CANCELLED_MARKERS):
-        return fv.FailureEvent(
+        return _event(
             class_name="client_cancelled",
             origin="client",
             confidence="marker",
@@ -193,7 +424,7 @@ def classify_failure(
             evidence=evidence,
         )
 
-    return fv.FailureEvent(
+    return _event(
         class_name="unknown",
         origin="unknown",
         confidence="unknown",
@@ -202,6 +433,79 @@ def classify_failure(
         retryable=None,
         evidence=evidence,
     )
+
+
+def _classify_media_or_policy_markers(
+    *,
+    text: str,
+    provider: Optional[str],
+    confidence: fv.Confidence,
+    evidence: dict[str, str],
+) -> Optional[fv.FailureEvent]:
+    if _any_marker(text, _CONTENT_POLICY_MARKERS):
+        return _event(
+            class_name="content_policy",
+            origin="upstream",
+            confidence=confidence,
+            provider=provider,
+            scope="provider",
+            retryable=False,
+            evidence=evidence,
+        )
+    if _any_marker(text, _IMAGE_DOWNLOAD_MARKERS):
+        return _event(
+            class_name="transient",
+            origin="upstream",
+            confidence=confidence,
+            provider=provider,
+            scope="provider",
+            retryable=True,
+            evidence=evidence,
+        )
+    if _any_marker(text, _INVALID_MEDIA_MARKERS):
+        return _event(
+            class_name="invalid_media",
+            origin="upstream",
+            confidence=confidence,
+            provider=provider,
+            scope="provider",
+            retryable=False,
+            evidence=evidence,
+        )
+    return None
+
+
+def _classify_stream_failure_markers(
+    *,
+    text: str,
+    provider: Optional[str],
+    confidence: fv.Confidence,
+    evidence: dict[str, str],
+) -> Optional[fv.FailureEvent]:
+    if _any_marker(text, _STREAM_FAILURE_MARKERS):
+        return _event(
+            class_name="stream_failure",
+            origin="upstream",
+            confidence=confidence,
+            provider=provider,
+            scope="provider",
+            retryable=True,
+            evidence=evidence,
+        )
+    # Responses-compatible bare stream error event type (catalog fixture):
+    # machine code "error" plus stream-context wording in Meaning/Protocol.
+    # Require a non-negated standalone "error" token near stream context.
+    if _marker_match(text, "stream") and _marker_match(text, "error"):
+        return _event(
+            class_name="stream_failure",
+            origin="upstream",
+            confidence=confidence,
+            provider=provider,
+            scope="provider",
+            retryable=True,
+            evidence=evidence,
+        )
+    return None
 
 
 def classify_exception(exc: BaseException) -> fv.FailureEvent:
