@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from litellm.integrations import aawm_agent_identity
+from litellm.integrations.aawm_session_history import writer
 
 
 def test_rr006_normalize_provider_cache_family_keeps_native() -> None:
@@ -597,7 +598,7 @@ def test_rr006_shutdown_drains_queue_to_spool_within_budget(
     assert [r["litellm_call_id"] for r in spooled[0][0]] == ["queued-1", "queued-2"]
     assert spooled[0][1]["reason"] == "shutdown post-join drain"
     assert q.items == []
-    assert aawm_agent_identity._session_history_shutdown_disposition() == {
+    assert writer._session_history_shutdown_disposition() == {
         "drained": 0,
         "spooled": 2,
         "abandoned": 0,
@@ -709,7 +710,7 @@ def test_rr006_shutdown_waits_for_db_timeout_before_worker_spools(  # noqa: PLR0
     assert time.monotonic() - started_at < 0.5
     assert not worker.is_alive()
     assert spooled == [records]
-    assert aawm_agent_identity._session_history_shutdown_disposition() == {
+    assert writer._session_history_shutdown_disposition() == {
         "drained": 0,
         "spooled": 1,
         "abandoned": 0,
@@ -760,7 +761,7 @@ def test_rr006_shutdown_remainder_spools_records_and_tracks_success(
     assert len(spooled) == 1
     assert [r["litellm_call_id"] for r in spooled[0][0]] == ["queued-1", "queued-2"]
     assert spooled[0][1]["reason"] == "shutdown with no worker"
-    assert aawm_agent_identity._session_history_shutdown_disposition() == {
+    assert writer._session_history_shutdown_disposition() == {
         "drained": 0,
         "spooled": 2,
         "abandoned": 0,
@@ -811,7 +812,7 @@ def test_rr006_shutdown_remainder_spool_failure_tracks_abandoned(
 
     aawm_agent_identity._shutdown_session_history_worker()
 
-    assert aawm_agent_identity._session_history_shutdown_disposition() == {
+    assert writer._session_history_shutdown_disposition() == {
         "drained": 0,
         "spooled": 0,
         "abandoned": 2,
@@ -859,7 +860,9 @@ def test_rr006_shutdown_session_history_worker_lock_not_reentered(
     aawm_agent_identity._aawm_session_history_shutdown_in_progress = False
     aawm_agent_identity._aawm_session_history_shutdown_deadline_monotonic = 0.0
 
-    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_shutdown_lock", lock)
+    from litellm.integrations.aawm_session_history import runtime
+
+    monkeypatch.setattr(runtime, "_aawm_session_history_shutdown_lock", lock)
     monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_worker", None)
     monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", FakeQueue())
     monkeypatch.setattr(
