@@ -451,14 +451,42 @@ this exact shape:
 ```
 
 The auth file must be a regular file at the mounted path, not a symlink, and
-mode `0600`. The file payload is treated as cookie-only session bootstrap
-material for subscription and usage calls.
+mode `0600`. The file payload seeds the console session; the auth mount is
+read-only and the sidecar never writes it.
 
-The sidecar attempts cookie-only subscription/usage calls first. If `sec_token`
-is required, discovery is bounded and in-memory only: first through the
-dashboard endpoint, then through `/tool/user/info.json`, with exactly one retry.
-The discovered `sec_token` is never persisted and is discarded after the poll
-cycle.
+The canonical `login_ticket` seeds a process-lifetime in-memory console
+session. The session is a stdlib `CookieJar` behind an
+`HTTPCookieProcessor` opener with an origin-restricted cookie policy that
+accepts and returns cookies only for the ModelStudio console and gateway
+HTTPS hosts; no other origin's cookies are stored or forwarded. The ticket
+is seeded as a `login_aliyunid_ticket` cookie on those hosts. If a poll
+reloads the auth file and the ticket fingerprint has changed, the session
+(jar and cached token) is discarded and rebuilt from the new ticket; this
+reset is reported as value-free `ticket_reset=true`. The session lives in
+sidecar memory only and is never persisted to disk; it is discarded on
+process exit.
+
+The sidecar attempts cookie-only subscription/usage calls through the session
+opener first, so response `Set-Cookie` updates are retained in memory across
+the subscription and usage calls and across poll cycles for the process
+lifetime. When a quota response is a known application-level authentication
+envelope (the narrow fail-closed auth classification), or an HTTP 401/403,
+the sidecar runs one bounded session bootstrap even when the envelope carries
+no `sec_token` hint: a dashboard request, then `/tool/user/info.json`, both
+through the session opener so their response cookies renew the in-memory
+session. At most one bootstrap runs per endpoint fetch, followed by a single
+replay of the original call; a still-failing replay fails closed as `auth`
+with no second bootstrap. If the bootstrap response exposes a `sec_token`,
+it is cached on the session in memory, attached to the replayed call, and
+never persisted.
+
+Each `alibaba_quota_poll` event reports the legacy `token_fallback_*` fields
+(retained for compatibility; a bootstrap that yields a `sec_token` also sets
+them) plus value-free session telemetry: `bootstrap_attempted`,
+`bootstrap_succeeded`, `bootstrap_source` (`dashboard` or `user_info`),
+`cookie_names` (sorted cookie names only, never values), `cookie_count`, and
+`ticket_reset`. No cookie value, ticket, account identifier, or response body
+is ever logged or persisted.
 
 The sidecar does not copy the Token Plan inference API key, run browser
 flows, launch secondary CLIs, ask for passwords, or automate MFA. Session
@@ -500,7 +528,7 @@ Relevant environment variables:
 Each due attempt emits one sanitized `alibaba_quota_poll` JSON event. Runtime
 success requires HTTP 200 responses, an active subscription, two parsed
 observations, successful persistence, and no credential, raw response, account
-identity, or traceback in container logs.
+identity, cookie value, or traceback in container logs.
 
 Anthropic unified response headers persist separate weekly buckets:
 
