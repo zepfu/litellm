@@ -4309,7 +4309,7 @@ async def pass_through_request(  # noqa: PLR0915
                     error_log_context
                 )
                 if agent_session_killed:
-                    persist_agent_terminal_error(
+                    _ = persist_agent_terminal_error(
                         error_context=error_log_context,
                         terminal_outcome="request_rejected",
                         fallback_result="none",

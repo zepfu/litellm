@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import threading
 from datetime import UTC, datetime
+from dataclasses import dataclass
+from time import monotonic
 from typing import Any, Dict, List, Mapping, Optional
 
 from litellm._logging import (
@@ -28,6 +31,7 @@ MALFORMED_TOOL_CALL_SCHEMA_VERSION = 1
 MALFORMED_TOOL_CALL_ERROR_CODE = "aawm_auto_agent_malformed_tool_call_text"
 MALFORMED_TOOL_CALL_FAILURE_KIND = "malformed_tool_call"
 AGENT_TERMINAL_ERROR_SCHEMA_VERSION = 1
+_RUNTIME_ERROR_INTAKE_HEALTH_SCHEMA_VERSION = 1
 
 _DEFAULT_MAX_TEXT_CHARS = 8_192
 _DEFAULT_MAX_PAYLOAD_CHARS = 16_384
@@ -41,6 +45,231 @@ _HARD_MAX_MALFORMED_EVIDENCE_ITEMS = 64
 _DEFAULT_MAX_ERROR_LOG_FILE_BYTES = 10 * 1024 * 1024
 _MALFORMED_ERROR_LOG_LOCK = threading.Lock()
 _AGENT_TERMINAL_ERROR_LOG_LOCK = threading.Lock()
+
+_RUNTIME_ERROR_INTAKE_STATUS_WRITTEN = "written"
+_RUNTIME_ERROR_INTAKE_STATUS_DISABLED = "disabled"
+_RUNTIME_ERROR_INTAKE_STATUS_EMPTY = "empty"
+_RUNTIME_ERROR_INTAKE_STATUS_SATURATED = "saturated"
+_RUNTIME_ERROR_INTAKE_STATUS_SERIALIZATION_FAILED = "serialization_failed"
+_RUNTIME_ERROR_INTAKE_STATUS_WRITE_FAILED = "write_failed"
+_RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL = "malformed_tool_call"
+_RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR = "agent_terminal_error"
+_RUNTIME_ERROR_INTAKE_STATUS_LIST = (
+    _RUNTIME_ERROR_INTAKE_STATUS_WRITTEN,
+    _RUNTIME_ERROR_INTAKE_STATUS_DISABLED,
+    _RUNTIME_ERROR_INTAKE_STATUS_EMPTY,
+    _RUNTIME_ERROR_INTAKE_STATUS_SATURATED,
+    _RUNTIME_ERROR_INTAKE_STATUS_SERIALIZATION_FAILED,
+    _RUNTIME_ERROR_INTAKE_STATUS_WRITE_FAILED,
+)
+_RUNTIME_ERROR_INTAKE_WARNABLE_STATUSES = {
+    _RUNTIME_ERROR_INTAKE_STATUS_SATURATED,
+    _RUNTIME_ERROR_INTAKE_STATUS_SERIALIZATION_FAILED,
+    _RUNTIME_ERROR_INTAKE_STATUS_WRITE_FAILED,
+}
+_RUNTIME_ERROR_INTAKE_WARNING_INTERVAL_SECONDS = 60
+_RUNTIME_ERROR_INTAKE_WARNING_DEFAULT = None
+_RUNTIME_ERROR_INTAKE_RETRYABLE = {
+    _RUNTIME_ERROR_INTAKE_STATUS_WRITTEN: False,
+    _RUNTIME_ERROR_INTAKE_STATUS_DISABLED: False,
+    _RUNTIME_ERROR_INTAKE_STATUS_EMPTY: False,
+    _RUNTIME_ERROR_INTAKE_STATUS_SATURATED: True,
+    _RUNTIME_ERROR_INTAKE_STATUS_SERIALIZATION_FAILED: False,
+    _RUNTIME_ERROR_INTAKE_STATUS_WRITE_FAILED: True,
+}
+_RUNTIME_ERROR_INTAKE_REASON = {
+    _RUNTIME_ERROR_INTAKE_STATUS_WRITTEN: "written",
+    _RUNTIME_ERROR_INTAKE_STATUS_DISABLED: "disabled_or_no_path",
+    _RUNTIME_ERROR_INTAKE_STATUS_EMPTY: "empty_input",
+    _RUNTIME_ERROR_INTAKE_STATUS_SATURATED: "max_file_size_saturated",
+    _RUNTIME_ERROR_INTAKE_STATUS_SERIALIZATION_FAILED: "serialization_failed",
+    _RUNTIME_ERROR_INTAKE_STATUS_WRITE_FAILED: "write_or_metadata_failure",
+}
+_RUNTIME_ERROR_INTAKE_LOGGER = logging.getLogger("litellm.proxy.runtime_error_logging")
+
+
+@dataclass(frozen=True)
+class RuntimeErrorIntakeDisposition:
+    sink: str
+    status: str
+    reason_code: str
+    records_attempted: int
+    records_written: int
+    retryable: bool
+
+    @property
+    def success(self) -> bool:
+        return self.status == _RUNTIME_ERROR_INTAKE_STATUS_WRITTEN
+
+    def __bool__(self) -> bool:
+        return self.success
+
+
+def _runtime_error_intake_status_counts() -> Dict[str, int]:
+    return {status: 0 for status in _RUNTIME_ERROR_INTAKE_STATUS_LIST}
+
+
+def _runtime_error_intake_initial_state() -> Dict[str, Any]:
+    return {
+        "totals": {
+            "attempted_records": 0,
+            "written_records": 0,
+        },
+        "sinks": {
+            _RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL: {
+                "attempted_records": 0,
+                "written_records": 0,
+                "status_counts": _runtime_error_intake_status_counts(),
+                "last_disposition": None,
+            },
+            _RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR: {
+                "attempted_records": 0,
+                "written_records": 0,
+                "status_counts": _runtime_error_intake_status_counts(),
+                "last_disposition": None,
+            },
+        },
+        "warning_last": {
+            f"{_RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL}:{status}": _RUNTIME_ERROR_INTAKE_WARNING_DEFAULT
+            for status in _RUNTIME_ERROR_INTAKE_WARNABLE_STATUSES
+        }
+        | {
+            f"{_RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR}:{status}": _RUNTIME_ERROR_INTAKE_WARNING_DEFAULT
+            for status in _RUNTIME_ERROR_INTAKE_WARNABLE_STATUSES
+        },
+    }
+
+
+_RUNTIME_ERROR_INTAKE_STATE = _runtime_error_intake_initial_state()
+_RUNTIME_ERROR_INTAKE_STATE_LOCK = threading.Lock()
+
+
+def _runtime_error_intake_disposition(
+    *,
+    sink: str,
+    status: str,
+    records_attempted: int,
+    records_written: int,
+) -> RuntimeErrorIntakeDisposition:
+    safe_records_attempted = max(int(records_attempted), 0)
+    safe_records_written = max(int(records_written), 0)
+    reason_code = _RUNTIME_ERROR_INTAKE_REASON.get(
+        status,
+        "failure",
+    )
+    return RuntimeErrorIntakeDisposition(
+        sink=sink,
+        status=status,
+        reason_code=reason_code,
+        records_attempted=safe_records_attempted,
+        records_written=min(safe_records_written, safe_records_attempted),
+        retryable=_RUNTIME_ERROR_INTAKE_RETRYABLE.get(status, False),
+    )
+
+
+def _record_runtime_error_intake_disposition(
+    disposition: RuntimeErrorIntakeDisposition,
+) -> None:
+    with _RUNTIME_ERROR_INTAKE_STATE_LOCK:
+        sink = disposition.sink
+        if sink not in _RUNTIME_ERROR_INTAKE_STATE["sinks"]:
+            _RUNTIME_ERROR_INTAKE_STATE["sinks"][sink] = {
+                "attempted_records": 0,
+                "written_records": 0,
+                "status_counts": _runtime_error_intake_status_counts(),
+                "last_disposition": None,
+            }
+
+        _RUNTIME_ERROR_INTAKE_STATE["totals"]["attempted_records"] += (
+            disposition.records_attempted
+        )
+        _RUNTIME_ERROR_INTAKE_STATE["totals"]["written_records"] += (
+            disposition.records_written
+        )
+        sink_state = _RUNTIME_ERROR_INTAKE_STATE["sinks"][sink]
+        sink_state["attempted_records"] += disposition.records_attempted
+        sink_state["written_records"] += disposition.records_written
+        sink_state["status_counts"][disposition.status] = (
+            sink_state["status_counts"].get(disposition.status, 0) + 1
+        )
+        sink_state["last_disposition"] = disposition
+
+
+def _warn_runtime_error_intake_status(disposition: RuntimeErrorIntakeDisposition) -> None:
+    if disposition.status not in _RUNTIME_ERROR_INTAKE_WARNABLE_STATUSES:
+        return
+
+    key = f"{disposition.sink}:{disposition.status}"
+    now = monotonic()
+    with _RUNTIME_ERROR_INTAKE_STATE_LOCK:
+        last_warning = _RUNTIME_ERROR_INTAKE_STATE["warning_last"].get(
+            key,
+            _RUNTIME_ERROR_INTAKE_WARNING_DEFAULT,
+        )
+        if last_warning is not None and now - last_warning < _RUNTIME_ERROR_INTAKE_WARNING_INTERVAL_SECONDS:
+            return
+        _RUNTIME_ERROR_INTAKE_STATE["warning_last"][key] = now
+
+    _RUNTIME_ERROR_INTAKE_LOGGER.warning(
+        "runtime_error_intake status=%s sink=%s reason_code=%s "
+        "records_attempted=%s records_written=%s interval_seconds=%s",
+        disposition.status,
+        disposition.sink,
+        disposition.reason_code,
+        disposition.records_attempted,
+        disposition.records_written,
+        _RUNTIME_ERROR_INTAKE_WARNING_INTERVAL_SECONDS,
+    )
+
+
+def _safe_record_runtime_error_intake_disposition(
+    disposition: RuntimeErrorIntakeDisposition,
+) -> None:
+    _record_runtime_error_intake_disposition(disposition)
+    _warn_runtime_error_intake_status(disposition)
+
+
+def get_runtime_error_intake_health() -> Dict[str, Any]:
+    """Return sanitized intake health counters for malformed and terminal sinks."""
+    with _RUNTIME_ERROR_INTAKE_STATE_LOCK:
+        return {
+            "schema_version": _RUNTIME_ERROR_INTAKE_HEALTH_SCHEMA_VERSION,
+            "totals": {
+                "records_attempted": _RUNTIME_ERROR_INTAKE_STATE["totals"][
+                    "attempted_records"
+                ],
+                "records_written": _RUNTIME_ERROR_INTAKE_STATE["totals"][
+                    "written_records"
+                ],
+            },
+            "sinks": {
+                sink: {
+                    "attempted_records": sink_state["attempted_records"],
+                    "written_records": sink_state["written_records"],
+                    "status_counts": dict(sink_state["status_counts"]),
+                    "last_disposition": {
+                        "sink": sink_state["last_disposition"].sink,
+                        "status": sink_state["last_disposition"].status,
+                        "reason_code": sink_state["last_disposition"].reason_code,
+                        "records_attempted": sink_state[
+                            "last_disposition"
+                        ].records_attempted,
+                        "records_written": sink_state["last_disposition"].records_written,
+                        "retryable": sink_state["last_disposition"].retryable,
+                    }
+                    if sink_state["last_disposition"] is not None
+                    else None,
+                }
+                for sink, sink_state in _RUNTIME_ERROR_INTAKE_STATE["sinks"].items()
+            },
+        }
+
+
+def _reset_runtime_error_intake_health_for_tests() -> None:
+    """Reset runtime intake health counters for deterministic tests."""
+    with _RUNTIME_ERROR_INTAKE_STATE_LOCK:
+        global _RUNTIME_ERROR_INTAKE_STATE
+        _RUNTIME_ERROR_INTAKE_STATE = _runtime_error_intake_initial_state()
 
 _AGENT_TERMINAL_CONTEXT_FIELDS = (
     "source",
@@ -436,7 +665,7 @@ def build_malformed_tool_call_intake_record(
     return record
 
 
-def append_malformed_tool_call_detection(record: Dict[str, Any]) -> bool:
+def append_malformed_tool_call_detection(record: Dict[str, Any]) -> RuntimeErrorIntakeDisposition:
     """Best-effort append of one malformed-tool-call JSON object. Never raises."""
     return append_malformed_tool_call_detections([record])
 
@@ -453,7 +682,9 @@ def _projected_jsonl_batch_bytes(records: List[Dict[str, Any]]) -> int:
     return sum(_jsonl_record_line_bytes(record) for record in records)
 
 
-def append_malformed_tool_call_detections(records: List[Dict[str, Any]]) -> bool:
+def append_malformed_tool_call_detections(
+    records: List[Dict[str, Any]],
+) -> RuntimeErrorIntakeDisposition:
     """Best-effort append of one or more malformed-tool-call JSON objects.
 
     Writes all records under a single lock acquisition and file open so a
@@ -462,15 +693,42 @@ def append_malformed_tool_call_detections(records: List[Dict[str, Any]]) -> bool
     projected encoded size of the entire pending batch.
     Never raises.
     """
+    attempted = len(records)
     if not records:
-        return False
+        disposition = _runtime_error_intake_disposition(
+            sink=_RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL,
+            status=_RUNTIME_ERROR_INTAKE_STATUS_EMPTY,
+            records_attempted=0,
+            records_written=0,
+        )
+        _safe_record_runtime_error_intake_disposition(disposition)
+        return disposition
     log_path = _get_malformed_error_log_path()
     if not log_path:
-        return False
+        disposition = _runtime_error_intake_disposition(
+            sink=_RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL,
+            status=_RUNTIME_ERROR_INTAKE_STATUS_DISABLED,
+            records_attempted=attempted,
+            records_written=0,
+        )
+        _safe_record_runtime_error_intake_disposition(disposition)
+        return disposition
 
     try:
         encoded_lines = [_encode_jsonl_record_line(record) for record in records]
         pending_bytes = sum(len(line.encode("utf-8")) for line in encoded_lines)
+    except Exception:
+        disposition = _runtime_error_intake_disposition(
+            sink=_RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL,
+            status=_RUNTIME_ERROR_INTAKE_STATUS_SERIALIZATION_FAILED,
+            records_attempted=attempted,
+            records_written=0,
+        )
+        _safe_record_runtime_error_intake_disposition(disposition)
+        return disposition
+
+    records_written = 0
+    try:
         with _MALFORMED_ERROR_LOG_LOCK:
             with _AAWM_ERROR_LOG_LOCK:
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -480,14 +738,39 @@ def append_malformed_tool_call_detections(records: List[Dict[str, Any]]) -> bool
                 )
                 # Strict ceiling: refuse the whole batch if it would cross max.
                 if current_size + pending_bytes > max_file_bytes:
-                    return False
+                    disposition = _runtime_error_intake_disposition(
+                        sink=_RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL,
+                        status=_RUNTIME_ERROR_INTAKE_STATUS_SATURATED,
+                        records_attempted=attempted,
+                        records_written=0,
+                    )
+                    _safe_record_runtime_error_intake_disposition(disposition)
+                    return disposition
                 with open(log_path, "a", encoding="utf-8") as intake_file:
                     for line in encoded_lines:
-                        intake_file.write(line)
+                        written_chars = intake_file.write(line)
+                        if written_chars != len(line):
+                            raise OSError("incomplete JSONL record write")
+                        records_written += 1
                 _normalize_aawm_error_log_file_metadata(log_path)
-        return True
     except Exception:
-        return False
+        disposition = _runtime_error_intake_disposition(
+            sink=_RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL,
+            status=_RUNTIME_ERROR_INTAKE_STATUS_WRITE_FAILED,
+            records_attempted=attempted,
+            records_written=records_written,
+        )
+        _safe_record_runtime_error_intake_disposition(disposition)
+        return disposition
+
+    disposition = _runtime_error_intake_disposition(
+        sink=_RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL,
+        status=_RUNTIME_ERROR_INTAKE_STATUS_WRITTEN,
+        records_attempted=attempted,
+        records_written=records_written,
+    )
+    _safe_record_runtime_error_intake_disposition(disposition)
+    return disposition
 
 
 def persist_malformed_tool_call_detection(
@@ -498,12 +781,23 @@ def persist_malformed_tool_call_detection(
     adapter_label: str,
     intake_context: Optional[Dict[str, Any]] = None,
     stream_event_summaries: Optional[list[dict[str, Any]]] = None,
-) -> bool:
+) -> RuntimeErrorIntakeDisposition:
     max_items = _max_malformed_evidence_items()
-    evidence = extract_malformed_tool_call_evidence(
-        response_body,
-        max_items=max_items,
-    )
+    try:
+        evidence = extract_malformed_tool_call_evidence(
+            response_body,
+            max_items=max_items,
+        )
+    except Exception:
+        disposition = _runtime_error_intake_disposition(
+            sink=_RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL,
+            status=_RUNTIME_ERROR_INTAKE_STATUS_SERIALIZATION_FAILED,
+            records_attempted=1,
+            records_written=0,
+        )
+        _safe_record_runtime_error_intake_disposition(disposition)
+        return disposition
+
     if not evidence:
         record = build_malformed_tool_call_intake_record(
             response_body=response_body,
@@ -552,7 +846,7 @@ def schedule_persist_malformed_tool_call_detection(
 
     def _run() -> None:
         try:
-            persist_malformed_tool_call_detection(
+            _ = persist_malformed_tool_call_detection(
                 response_body=response_body,
                 adapter_model=adapter_model,
                 adapter=adapter,
@@ -572,7 +866,7 @@ def schedule_persist_malformed_tool_call_detection(
 
     async def _offload() -> None:
         try:
-            await asyncio.to_thread(
+            _ = await asyncio.to_thread(
                 persist_malformed_tool_call_detection,
                 response_body=response_body,
                 adapter_model=adapter_model,
@@ -771,30 +1065,84 @@ def _sanitize_agent_terminal_scalar_list(
     return sanitized or None
 
 
-def append_agent_terminal_error(record: Dict[str, Any]) -> bool:
+def append_agent_terminal_error(record: Dict[str, Any]) -> RuntimeErrorIntakeDisposition:
     """Best-effort append of one terminal agent error JSON object."""
+    attempted = 1 if record else 0
+    if not record:
+        disposition = _runtime_error_intake_disposition(
+            sink=_RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR,
+            status=_RUNTIME_ERROR_INTAKE_STATUS_EMPTY,
+            records_attempted=0,
+            records_written=0,
+        )
+        _safe_record_runtime_error_intake_disposition(disposition)
+        return disposition
+
     log_path = _get_agent_terminal_error_log_path()
     if not log_path:
-        return False
+        disposition = _runtime_error_intake_disposition(
+            sink=_RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR,
+            status=_RUNTIME_ERROR_INTAKE_STATUS_DISABLED,
+            records_attempted=attempted,
+            records_written=0,
+        )
+        _safe_record_runtime_error_intake_disposition(disposition)
+        return disposition
 
     try:
+        encoded_line = _encode_jsonl_record_line(record)
+    except Exception:
+        disposition = _runtime_error_intake_disposition(
+            sink=_RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR,
+            status=_RUNTIME_ERROR_INTAKE_STATUS_SERIALIZATION_FAILED,
+            records_attempted=attempted,
+            records_written=0,
+        )
+        _safe_record_runtime_error_intake_disposition(disposition)
+        return disposition
+
+    records_written = 0
+    try:
+        pending_bytes = len(encoded_line.encode("utf-8"))
         with _AGENT_TERMINAL_ERROR_LOG_LOCK:
             with _AAWM_ERROR_LOG_LOCK:
                 os.makedirs(os.path.dirname(log_path), exist_ok=True)
                 max_file_bytes = _max_agent_terminal_error_log_file_bytes()
-                encoded_line = _encode_jsonl_record_line(record)
-                pending_bytes = len(encoded_line.encode("utf-8"))
                 current_size = (
                     os.path.getsize(log_path) if os.path.exists(log_path) else 0
                 )
                 if current_size + pending_bytes > max_file_bytes:
-                    return False
+                    disposition = _runtime_error_intake_disposition(
+                        sink=_RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR,
+                        status=_RUNTIME_ERROR_INTAKE_STATUS_SATURATED,
+                        records_attempted=attempted,
+                        records_written=0,
+                    )
+                    _safe_record_runtime_error_intake_disposition(disposition)
+                    return disposition
                 with open(log_path, "a", encoding="utf-8") as intake_file:
-                    intake_file.write(encoded_line)
+                    written_chars = intake_file.write(encoded_line)
+                    if written_chars != len(encoded_line):
+                        raise OSError("incomplete JSONL record write")
+                    records_written = 1
                 _normalize_aawm_error_log_file_metadata(log_path)
-        return True
+        disposition = _runtime_error_intake_disposition(
+            sink=_RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR,
+            status=_RUNTIME_ERROR_INTAKE_STATUS_WRITTEN,
+            records_attempted=attempted,
+            records_written=records_written,
+        )
+        _safe_record_runtime_error_intake_disposition(disposition)
+        return disposition
     except Exception:
-        return False
+        disposition = _runtime_error_intake_disposition(
+            sink=_RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR,
+            status=_RUNTIME_ERROR_INTAKE_STATUS_WRITE_FAILED,
+            records_attempted=attempted,
+            records_written=records_written,
+        )
+        _safe_record_runtime_error_intake_disposition(disposition)
+        return disposition
 
 
 def build_agent_terminal_error_record(
@@ -863,7 +1211,7 @@ def persist_agent_terminal_error(
     fallback_result: Optional[str] = None,
     redispatch_required: Optional[bool] = None,
     agent_session_killed: bool,
-) -> bool:
+) -> RuntimeErrorIntakeDisposition:
     record = build_agent_terminal_error_record(
         error_context=error_context,
         terminal_outcome=terminal_outcome,

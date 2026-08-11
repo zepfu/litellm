@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -26,6 +27,74 @@ def _many_malformed_response(*, count: int) -> dict:
         "model": "test-model",
         "output": [_composer_call_message() for _ in range(count)],
     }
+
+
+@pytest.fixture(autouse=True)
+def _reset_runtime_error_intake_health_state() -> None:
+    rel._reset_runtime_error_intake_health_for_tests()
+    yield
+    rel._reset_runtime_error_intake_health_for_tests()
+
+
+def _configure_disabled_intake_sinks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disable both intake sinks without touching logging paths."""
+    monkeypatch.delenv("LITELLM_AAWM_MALFORMED_ERROR_LOG_ENABLED", raising=False)
+    monkeypatch.delenv("LITELLM_AAWM_AGENT_TERMINAL_ERROR_LOG_ENABLED", raising=False)
+    monkeypatch.delenv("LITELLM_AAWM_ERROR_LOG_ENABLED", raising=False)
+    monkeypatch.delenv("LITELLM_AAWM_ERROR_LOG_DIR", raising=False)
+
+
+def _configure_enabled_sink(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    sink: str,
+) -> None:
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_ENV", "test")
+    monkeypatch.setenv("LITELLM_AAWM_ERROR_LOG_DIR", str(tmp_path))
+    if sink == rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL:
+        monkeypatch.setenv("LITELLM_AAWM_MALFORMED_ERROR_LOG_ENABLED", "1")
+        monkeypatch.delenv("LITELLM_AAWM_AGENT_TERMINAL_ERROR_LOG_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("LITELLM_AAWM_AGENT_TERMINAL_ERROR_LOG_ENABLED", "1")
+        monkeypatch.delenv("LITELLM_AAWM_MALFORMED_ERROR_LOG_ENABLED", raising=False)
+
+
+def _malformed_records() -> list[dict[str, object]]:
+    return [
+        {
+            "schema_version": 1,
+            "failure_kind": rel.MALFORMED_TOOL_CALL_FAILURE_KIND,
+            "error_code": rel.MALFORMED_TOOL_CALL_ERROR_CODE,
+            "malformed_tool_call_index": 0,
+        }
+    ]
+
+
+def _terminal_record() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "failure_kind": "agent_terminal_error",
+        "error_code": "agent_terminal_error",
+        "message": "terminal test",
+    }
+
+
+def _append_to_sink(
+    sink: str,
+    payload: dict[str, object] | list[dict[str, object]],
+) -> rel.RuntimeErrorIntakeDisposition:
+    if sink == rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL:
+        records = payload if isinstance(payload, list) else [payload]
+        return rel.append_malformed_tool_call_detections(records)
+    return rel.append_agent_terminal_error(
+        payload if isinstance(payload, dict) else payload[0]
+    )
+
+
+def _sink_log_path(tmp_path: Path, sink: str) -> Path:
+    if sink == rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL:
+        return tmp_path / "malformed-error.jsonl"
+    return tmp_path / "test-error.jsonl"
 
 
 def test_persist_malformed_tool_call_detection_caps_evidence_items(
@@ -116,16 +185,18 @@ def test_append_malformed_tool_call_detection_enforces_default_size_cap(
     log_path = tmp_path / "malformed-error.jsonl"
     log_path.write_text("x" * 40, encoding="utf-8")
 
-    assert (
-        rel.append_malformed_tool_call_detection(
-            {
-                "schema_version": 1,
-                "failure_kind": "malformed_tool_call",
-                "error_code": "aawm_auto_agent_malformed_tool_call_text",
-            }
-        )
-        is False
+    disposition = rel.append_malformed_tool_call_detection(
+        {
+            "schema_version": 1,
+            "failure_kind": "malformed_tool_call",
+            "error_code": "aawm_auto_agent_malformed_tool_call_text",
+        }
     )
+    assert disposition.status == rel._RUNTIME_ERROR_INTAKE_STATUS_SATURATED
+    assert disposition.success is False
+    assert not disposition
+    assert disposition.records_attempted == 1
+    assert disposition.records_written == 0
     assert log_path.read_text(encoding="utf-8") == "x" * 40
 
 
@@ -142,17 +213,337 @@ def test_append_agent_terminal_error_enforces_default_size_cap(
     log_path = tmp_path / "test-error.jsonl"
     log_path.write_text("y" * 40, encoding="utf-8")
 
-    assert (
-        rel.append_agent_terminal_error(
-            {
-                "schema_version": 1,
-                "failure_kind": "agent_terminal_error",
-                "error_code": "agent_terminal_error",
-            }
-        )
-        is False
+    disposition = rel.append_agent_terminal_error(
+        {
+            "schema_version": 1,
+            "failure_kind": "agent_terminal_error",
+            "error_code": "agent_terminal_error",
+        }
     )
+    assert disposition.status == rel._RUNTIME_ERROR_INTAKE_STATUS_SATURATED
+    assert disposition.success is False
+    assert not disposition
+    assert disposition.records_attempted == 1
+    assert disposition.records_written == 0
     assert log_path.read_text(encoding="utf-8") == "y" * 40
+
+
+@pytest.mark.parametrize(
+    "sink",
+    [
+        rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL,
+        rel._RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR,
+    ],
+)
+def test_append_disposition_disabled_for_both_sinks(
+    sink: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_disabled_intake_sinks(monkeypatch)
+
+    if sink == rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL:
+        disposition = _append_to_sink(sink, _malformed_records())
+        expected_attempted = 1
+    else:
+        disposition = _append_to_sink(sink, _terminal_record())
+        expected_attempted = 1
+
+    assert disposition.status == rel._RUNTIME_ERROR_INTAKE_STATUS_DISABLED
+    assert disposition.success is False
+    assert not disposition
+    assert disposition.records_attempted == expected_attempted
+    assert disposition.records_written == 0
+
+    health = rel.get_runtime_error_intake_health()
+    assert not _sink_log_path(tmp_path, sink).exists()
+    assert health["sinks"][sink]["status_counts"][disposition.status] == 1
+    assert health["sinks"][sink]["attempted_records"] == expected_attempted
+    assert health["sinks"][sink]["written_records"] == 0
+    assert health["sinks"][sink]["last_disposition"] == {
+        "sink": sink,
+        "status": rel._RUNTIME_ERROR_INTAKE_STATUS_DISABLED,
+        "reason_code": rel._RUNTIME_ERROR_INTAKE_REASON[
+            rel._RUNTIME_ERROR_INTAKE_STATUS_DISABLED
+        ],
+        "records_attempted": expected_attempted,
+        "records_written": 0,
+        "retryable": rel._RUNTIME_ERROR_INTAKE_RETRYABLE[
+            rel._RUNTIME_ERROR_INTAKE_STATUS_DISABLED
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "sink",
+    [
+        rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL,
+        rel._RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR,
+    ],
+)
+def test_append_disposition_empty_input_for_both_sinks(
+    sink: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if sink == rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL:
+        disposition = _append_to_sink(sink, [])
+    else:
+        disposition = _append_to_sink(sink, {})
+
+    assert disposition.status == rel._RUNTIME_ERROR_INTAKE_STATUS_EMPTY
+    assert disposition.success is False
+    assert not disposition
+    assert disposition.records_attempted == 0
+    assert disposition.records_written == 0
+
+    health = rel.get_runtime_error_intake_health()
+    assert health["sinks"][sink]["status_counts"][disposition.status] == 1
+    assert not _sink_log_path(tmp_path, sink).exists()
+
+
+@pytest.mark.parametrize(
+    "sink",
+    [
+        rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL,
+        rel._RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR,
+    ],
+)
+def test_append_disposition_saturated_ceiling_for_both_sinks(
+    sink: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_enabled_sink(monkeypatch, tmp_path, sink)
+    monkeypatch.delenv("LITELLM_AAWM_MALFORMED_ERROR_LOG_MAX_BYTES", raising=False)
+    monkeypatch.delenv("LITELLM_AAWM_ERROR_LOG_MAX_BYTES", raising=False)
+    monkeypatch.setattr(rel, "_DEFAULT_MAX_ERROR_LOG_FILE_BYTES", 32)
+
+    log_path = _sink_log_path(tmp_path, sink)
+    log_path.write_text("x" * 40, encoding="utf-8")
+
+    if sink == rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL:
+        disposition = _append_to_sink(sink, _malformed_records())
+    else:
+        disposition = _append_to_sink(sink, _terminal_record())
+
+    assert disposition.status == rel._RUNTIME_ERROR_INTAKE_STATUS_SATURATED
+    assert disposition.success is False
+    assert not disposition
+    assert disposition.records_attempted == 1
+    assert disposition.records_written == 0
+    assert log_path.read_text(encoding="utf-8") == "x" * 40
+
+
+@pytest.mark.parametrize(
+    "sink",
+    [
+        rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL,
+        rel._RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR,
+    ],
+)
+def test_append_disposition_serialization_failure_for_both_sinks(
+    sink: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_enabled_sink(monkeypatch, tmp_path, sink)
+
+    def _raise_json_dumps(*_args, **_kwargs):
+        raise RuntimeError("encode failed")
+
+    monkeypatch.setattr(rel, "safe_dumps", _raise_json_dumps)
+
+    if sink == rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL:
+        disposition = _append_to_sink(sink, _malformed_records())
+    else:
+        disposition = _append_to_sink(sink, _terminal_record())
+
+    assert disposition.status == rel._RUNTIME_ERROR_INTAKE_STATUS_SERIALIZATION_FAILED
+    assert disposition.success is False
+    assert not disposition
+    assert disposition.records_attempted == 1
+    assert disposition.records_written == 0
+
+
+@pytest.mark.parametrize(
+    "sink",
+    [
+        rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL,
+        rel._RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR,
+    ],
+)
+def test_append_disposition_write_failure_for_both_sinks(
+    sink: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_enabled_sink(monkeypatch, tmp_path, sink)
+
+    def _fail_metadata_normalization(_path: str) -> None:
+        raise RuntimeError("metadata blocked")
+
+    monkeypatch.setattr(
+        rel,
+        "_normalize_aawm_error_log_file_metadata",
+        _fail_metadata_normalization,
+    )
+
+    if sink == rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL:
+        expected_record = _malformed_records()[0]
+        disposition = _append_to_sink(sink, [expected_record])
+    else:
+        expected_record = _terminal_record()
+        disposition = _append_to_sink(sink, expected_record)
+
+    assert disposition.status == rel._RUNTIME_ERROR_INTAKE_STATUS_WRITE_FAILED
+    assert disposition.success is False
+    assert not disposition
+    assert disposition.records_attempted == 1
+    assert disposition.records_written == 1
+    written_records = [
+        json.loads(line)
+        for line in _sink_log_path(tmp_path, sink)
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert written_records == [expected_record]
+
+
+@pytest.mark.parametrize(
+    "sink,should_write",
+    [
+        (rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL, True),
+        (rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL, False),
+        (rel._RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR, True),
+        (rel._RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR, False),
+    ],
+)
+def test_append_disposition_truthiness_for_both_sinks(
+    sink: str,
+    should_write: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if should_write:
+        _configure_enabled_sink(monkeypatch, tmp_path, sink)
+        if sink == rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL:
+            disposition = _append_to_sink(sink, _malformed_records())
+        else:
+            disposition = _append_to_sink(sink, _terminal_record())
+    else:
+        _configure_disabled_intake_sinks(monkeypatch)
+        if sink == rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL:
+            disposition = _append_to_sink(sink, _malformed_records())
+        else:
+            disposition = _append_to_sink(sink, _terminal_record())
+
+    assert bool(disposition) == should_write
+    assert disposition.success is should_write
+
+
+def test_runtime_error_intake_health_reports_sanitized_totals_and_last_disposition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    malformed = rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL
+    terminal = rel._RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR
+
+    _configure_enabled_sink(monkeypatch, tmp_path, malformed)
+    malformed_disposition = _append_to_sink(malformed, _malformed_records())
+
+    _configure_enabled_sink(monkeypatch, tmp_path, terminal)
+    _configure_disabled_intake_sinks(monkeypatch)
+    terminal_disposition = _append_to_sink(terminal, {})
+
+    health = rel.get_runtime_error_intake_health()
+    assert health["totals"]["records_attempted"] == (
+        malformed_disposition.records_attempted + terminal_disposition.records_attempted
+    )
+    assert health["totals"]["records_written"] == (
+        malformed_disposition.records_written + terminal_disposition.records_written
+    )
+
+    malformed_health = health["sinks"][malformed]
+    assert malformed_health["attempted_records"] == malformed_disposition.records_attempted
+    assert malformed_health["written_records"] == malformed_disposition.records_written
+    assert malformed_health["status_counts"][malformed_disposition.status] == 1
+    assert set(malformed_health["status_counts"]) == set(
+        rel._RUNTIME_ERROR_INTAKE_STATUS_LIST
+    )
+    assert malformed_health["last_disposition"] == {
+        "sink": malformed,
+        "status": malformed_disposition.status,
+        "reason_code": malformed_disposition.reason_code,
+        "records_attempted": malformed_disposition.records_attempted,
+        "records_written": malformed_disposition.records_written,
+        "retryable": malformed_disposition.retryable,
+    }
+
+    terminal_health = health["sinks"][terminal]
+    assert terminal_health["attempted_records"] == terminal_disposition.records_attempted
+    assert terminal_health["written_records"] == terminal_disposition.records_written
+    assert terminal_health["status_counts"][terminal_disposition.status] == 1
+    assert set(terminal_health["status_counts"]) == set(
+        rel._RUNTIME_ERROR_INTAKE_STATUS_LIST
+    )
+    assert terminal_health["last_disposition"] == {
+        "sink": terminal,
+        "status": terminal_disposition.status,
+        "reason_code": terminal_disposition.reason_code,
+        "records_attempted": terminal_disposition.records_attempted,
+        "records_written": terminal_disposition.records_written,
+        "retryable": terminal_disposition.retryable,
+    }
+
+    snapshot = rel.get_runtime_error_intake_health()
+    snapshot["totals"]["records_attempted"] = -1
+    assert rel.get_runtime_error_intake_health()["totals"]["records_attempted"] != -1
+
+
+@pytest.mark.parametrize(
+    "sink",
+    [
+        rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL,
+        rel._RUNTIME_ERROR_INTAKE_SINK_AGENT_TERMINAL_ERROR,
+    ],
+)
+def test_runtime_error_intake_warning_is_first_and_rate_limited_by_sink_status(
+    sink: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _configure_enabled_sink(monkeypatch, tmp_path, sink)
+
+    def _raise_json_dumps(*_args, **_kwargs):
+        raise RuntimeError("encode failed")
+
+    monkeypatch.setattr(rel, "safe_dumps", _raise_json_dumps)
+    monotonic_values = iter([10.0, 20.0, 80.0])
+    monkeypatch.setattr(rel, "monotonic", lambda: next(monotonic_values))
+
+    if sink == rel._RUNTIME_ERROR_INTAKE_SINK_MALFORMED_TOOL_CALL:
+        append_payload = _malformed_records()
+    else:
+        append_payload = _terminal_record()
+
+    with caplog.at_level(logging.WARNING, logger=rel._RUNTIME_ERROR_INTAKE_LOGGER.name):
+        first = _append_to_sink(sink, append_payload)
+        second = _append_to_sink(sink, append_payload)
+        third = _append_to_sink(sink, append_payload)
+
+    assert first.status == rel._RUNTIME_ERROR_INTAKE_STATUS_SERIALIZATION_FAILED
+    assert second.status == rel._RUNTIME_ERROR_INTAKE_STATUS_SERIALIZATION_FAILED
+    assert third.status == rel._RUNTIME_ERROR_INTAKE_STATUS_SERIALIZATION_FAILED
+    warnings = [record.getMessage() for record in caplog.records]
+    assert len(warnings) == 2
+    for warning in warnings:
+        lowered = warning.lower()
+        assert "path" not in lowered
+        assert "payload" not in lowered
+        assert "exception" not in lowered
 
 
 def test_append_malformed_tool_call_detections_batches_under_single_open(
@@ -181,7 +572,12 @@ def test_append_malformed_tool_call_detections_batches_under_single_open(
         }
         for index in range(5)
     ]
-    assert rel.append_malformed_tool_call_detections(records) is True
+    disposition = rel.append_malformed_tool_call_detections(records)
+    assert disposition.status == rel._RUNTIME_ERROR_INTAKE_STATUS_WRITTEN
+    assert disposition.success is True
+    assert disposition
+    assert disposition.records_attempted == 5
+    assert disposition.records_written == 5
 
     log_path = str(tmp_path / "malformed-error.jsonl")
     assert open_calls.count(log_path) == 1
@@ -250,7 +646,12 @@ def test_append_malformed_tool_call_detections_rejects_batch_that_would_exceed_c
         "error_code": "aawm_auto_agent_malformed_tool_call_text",
         "payload": "x" * 32,
     }
-    assert rel.append_malformed_tool_call_detections([pending]) is False
+    disposition = rel.append_malformed_tool_call_detections([pending])
+    assert disposition.status == rel._RUNTIME_ERROR_INTAKE_STATUS_SATURATED
+    assert disposition.success is False
+    assert not disposition
+    assert disposition.records_attempted == 1
+    assert disposition.records_written == 0
     assert log_path.read_text(encoding="utf-8") == seed_line
 
 
@@ -275,7 +676,12 @@ def test_append_malformed_tool_call_detections_allows_batch_within_projected_cap
     pending_bytes = rel._projected_jsonl_batch_bytes(records)
     monkeypatch.setattr(rel, "_DEFAULT_MAX_ERROR_LOG_FILE_BYTES", pending_bytes)
 
-    assert rel.append_malformed_tool_call_detections(records) is True
+    disposition = rel.append_malformed_tool_call_detections(records)
+    assert disposition.status == rel._RUNTIME_ERROR_INTAKE_STATUS_WRITTEN
+    assert disposition.success is True
+    assert disposition
+    assert disposition.records_attempted == 2
+    assert disposition.records_written == 2
     lines = [
         line
         for line in (tmp_path / "malformed-error.jsonl")

@@ -89,6 +89,26 @@ would cross that size. Malformed-tool rows use a separate ceiling via
 `LITELLM_AAWM_MALFORMED_ERROR_LOG_MAX_BYTES` with the same 10 MiB default.
 Neither writer truncates or rewrites existing intake to make room.
 
+### Malformed and terminal intake disposition and health
+
+Malformed and terminal append/persist operations return a
+`RuntimeErrorIntakeDisposition` with one of these statuses: `written`,
+`disabled`, `empty`, `saturated`, `serialization_failed`, or `write_failed`.
+Existing truthiness checks remain compatible: only `written` is truthy.
+
+- `records_attempted` counts submitted records even when intake is disabled or
+  refused. `records_written` counts records fully appended and can be nonzero
+  with `write_failed`, including after a partial batch or a
+  metadata-normalization failure. `retryable` is classification metadata only;
+  it does not mean the writer automatically retries.
+- `get_runtime_error_intake_health()` returns a sanitized, in-process,
+  process-lifetime snapshot with aggregate and per-sink attempted/written
+  counts, per-sink status counts, and each sink's last disposition.
+- `saturated`, `serialization_failed`, and `write_failed` emit sanitized
+  warnings at most once per sink/status per 60 seconds. Warning text contains
+  no paths, payloads, or exception text, and no intake failure escapes the
+  request path.
+
 When the proxy or provider-status sidecar runs as root inside a container, a
 plain bind-mount append would create root-owned active intake files on the host.
 After each successful append, the JSONL writers therefore make a best-effort
@@ -101,8 +121,10 @@ metadata repair:
 - file mode is left as created by the process umask unless
   `LITELLM_AAWM_ERROR_LOG_FILE_MODE` is set to an octal value such as `0640`.
 
-Ownership or mode repair failures are swallowed after the JSONL line is written.
-Error-intake logging must never fail a client request or the sidecar scan loop.
+Ownership or mode repair failures do not escape a client request or the sidecar
+scan loop. For malformed and terminal writers, an already appended row remains
+counted in `records_written`; the disposition is `write_failed`, and sanitized
+process health and warning telemetry expose the failure.
 
 ### Repo-local `.analysis` mounts for non-root sidecars
 

@@ -288,12 +288,12 @@ def _emit_auto_agent_alias_no_candidate_event(
         except RuntimeError:
             loop = None
         if loop is not None:
-            loop.run_in_executor(
+            _ = loop.run_in_executor(
                 None,
                 persist_terminal_error,
             )
         else:
-            persist_terminal_error()
+            _ = persist_terminal_error()
     except Exception:
         verbose_proxy_logger.debug(
             "Failed to append terminal alias error intake",
