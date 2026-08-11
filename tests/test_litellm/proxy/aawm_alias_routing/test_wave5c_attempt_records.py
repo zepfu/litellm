@@ -772,6 +772,38 @@ class TestCodexAliasMetadata:
         assert second_body["reasoning"] == {"effort": "high"}
         assert original_body["reasoning"] == {"effort": "high"}
 
+    def test_copies_fresh_redispatch_trace_onto_last_attempt(self) -> None:
+        request = _make_request()
+        body = {"model": "codex-auto-agent"}
+        attempts: list[dict[str, Any]] = [{"status": "started"}]
+        selection = self._selection(
+            request_mode="fresh_redispatch",
+            redispatch_ordinal=2,
+            affinity_bypassed=True,
+        )
+
+        result = attempt_records._add_codex_auto_agent_alias_metadata(
+            body,
+            request=request,
+            selection=selection,
+            attempts=attempts,
+        )
+
+        assert attempts[-1]["request_mode"] == "fresh_redispatch"
+        assert attempts[-1]["redispatch_ordinal"] == 2
+        assert attempts[-1]["affinity_bypassed"] is True
+
+        meta = result["litellm_metadata"]
+        assert meta["codex_auto_agent_request_mode"] == "fresh_redispatch"
+        assert meta["codex_auto_agent_redispatch_ordinal"] == 2
+        assert meta["codex_auto_agent_affinity_bypassed"] is True
+
+        audit_events = meta["codex_auto_agent_audit_events"]
+        assert audit_events
+        assert audit_events[0]["attempts"][-1]["request_mode"] == "fresh_redispatch"
+        assert audit_events[0]["attempts"][-1]["redispatch_ordinal"] == 2
+        assert audit_events[0]["attempts"][-1]["affinity_bypassed"] is True
+
 
 # ---------------------------------------------------------------------------
 # _add_anthropic_auto_agent_alias_metadata
@@ -894,3 +926,35 @@ class TestAnthropicAliasMetadata:
         assert result["thinking"] == {"type": "enabled", "budget_tokens": 8000}
         assert result["output_config"] == {"effort": "high"}
         assert "reasoning_effort" not in result
+
+    def test_copies_fresh_redispatch_trace_onto_last_attempt(self) -> None:
+        request = _make_request()
+        body = {"model": "claude-auto-agent"}
+        attempts: list[dict[str, Any]] = [{"status": "started"}]
+        selection = self._selection(
+            request_mode="fresh_redispatch",
+            redispatch_ordinal=2,
+            affinity_bypassed=True,
+        )
+
+        result = attempt_records._add_anthropic_auto_agent_alias_metadata(
+            body,
+            request=request,
+            selection=selection,
+            attempts=attempts,
+        )
+
+        assert attempts[-1]["request_mode"] == "fresh_redispatch"
+        assert attempts[-1]["redispatch_ordinal"] == 2
+        assert attempts[-1]["affinity_bypassed"] is True
+
+        meta = result["litellm_metadata"]
+        assert meta["anthropic_auto_agent_request_mode"] == "fresh_redispatch"
+        assert meta["anthropic_auto_agent_redispatch_ordinal"] == 2
+        assert meta["anthropic_auto_agent_affinity_bypassed"] is True
+
+        audit_events = meta["anthropic_auto_agent_audit_events"]
+        assert audit_events
+        assert audit_events[0]["attempts"][-1]["request_mode"] == "fresh_redispatch"
+        assert audit_events[0]["attempts"][-1]["redispatch_ordinal"] == 2
+        assert audit_events[0]["attempts"][-1]["affinity_bypassed"] is True

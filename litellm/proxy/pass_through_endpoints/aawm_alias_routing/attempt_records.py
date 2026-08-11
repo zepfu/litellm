@@ -687,6 +687,13 @@ def _add_codex_auto_agent_alias_metadata(
                     **reasoning_effort_metadata,
                 },
             }
+    selection_trace_values = {
+        key: selection[key]
+        for key in ("request_mode", "redispatch_ordinal", "affinity_bypassed")
+        if key in selection
+    }
+    if attempts and selection_trace_values:
+        attempts[-1].update(selection_trace_values)
     skipped = selection.get("skipped") or []
     audit_events = _build_auto_agent_alias_audit_events(
         alias_family="codex_auto_agent",
@@ -735,6 +742,9 @@ def _add_codex_auto_agent_alias_metadata(
             "codex_auto_agent_affinity_state_source": selection.get("affinity_state_source"),
             "codex_auto_agent_cooldown_state_source": selection.get("cooldown_state_source"),
             "codex_auto_agent_lane_key": selection.get("lane_key"),
+            "codex_auto_agent_request_mode": selection.get("request_mode"),
+            "codex_auto_agent_redispatch_ordinal": selection.get("redispatch_ordinal"),
+            "codex_auto_agent_affinity_bypassed": selection.get("affinity_bypassed"),
             "codex_auto_agent_selected_account_label": candidate.get(
                 "codex_oauth_account_label"
             ),
@@ -822,6 +832,13 @@ def _add_anthropic_auto_agent_alias_metadata(
                     **reasoning_effort_metadata,
                 },
             }
+    selection_trace_values = {
+        key: selection[key]
+        for key in ("request_mode", "redispatch_ordinal", "affinity_bypassed")
+        if key in selection
+    }
+    if attempts and selection_trace_values:
+        attempts[-1].update(selection_trace_values)
     skipped = selection.get("skipped") or []
     audit_events = _build_auto_agent_alias_audit_events(
         alias_family="anthropic_auto_agent",
@@ -863,6 +880,9 @@ def _add_anthropic_auto_agent_alias_metadata(
             "anthropic_auto_agent_affinity_state_source": selection.get("affinity_state_source"),
             "anthropic_auto_agent_cooldown_state_source": selection.get("cooldown_state_source"),
             "anthropic_auto_agent_lane_key": selection.get("lane_key"),
+            "anthropic_auto_agent_request_mode": selection.get("request_mode"),
+            "anthropic_auto_agent_redispatch_ordinal": selection.get("redispatch_ordinal"),
+            "anthropic_auto_agent_affinity_bypassed": selection.get("affinity_bypassed"),
             "anthropic_auto_agent_selected_account_label": candidate.get(
                 "codex_oauth_account_label"
             ),

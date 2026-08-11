@@ -435,6 +435,27 @@ class TestRedispatchErrors:
         assert detail["alias_family"] == "anthropic_auto_agent"
 
 
+class TestCodexRequestRedispatchOrdinal:
+    @pytest.mark.parametrize(
+        "request_body,expected",
+        [
+            ({"litellm_metadata": {"redispatch_ordinal": 2}}, 2),
+            ({"litellm_metadata": {"agent_redispatch_ordinal": "2"}}, 2),
+            ({"litellm_metadata": {"redispatch_ordinal": True}}, None),
+            ({"litellm_metadata": {"redispatch_ordinal": 0}}, None),
+            ({"litellm_metadata": {"redispatch_ordinal": -1}}, None),
+            ({"litellm_metadata": {"redispatch_ordinal": "2.5"}}, None),
+            ({"litellm_metadata": {"redispatch_ordinal": "bad"}}, None),
+            ({"litellm_metadata": {"redispatch_ordinal": float("nan")}}, None),
+            ({"litellm_metadata": {"dispatch_ordinal": float("inf")}}, None),
+        ],
+    )
+    def test_extract_codex_request_redispatch_ordinal(self, request_body, expected):
+        assert (
+            selection._extract_codex_request_redispatch_ordinal(request_body) == expected
+        )
+
+
 # ---------------------------------------------------------------------------
 # Codex selector: first-choice
 # ---------------------------------------------------------------------------
@@ -452,6 +473,7 @@ class TestCodexSelectorFirstChoice:
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import SelectionEnumeration
 
         mock_enum = SelectionEnumeration(candidates=candidates, commit_token=None)
+        _set_selection_runtime("_has_continuation_state", lambda v: True)
         with patch.dict(
             selection._select_codex_auto_agent_candidate.__globals__,
             {
@@ -467,6 +489,59 @@ class TestCodexSelectorFirstChoice:
         assert result["selection_reason"] == "first_available"
         assert result["candidate"]["provider"] == "openai"
         assert result["candidate"]["model"] == "gpt-4o"
+        assert result["request_mode"] == "ordinary_continuation"
+        assert result["redispatch_ordinal"] is None
+        assert result["affinity_bypassed"] is False
+
+    @pytest.mark.asyncio
+    async def test_fresh_redispatch_ordinal_falls_back_to_next_candidate(self):
+        request = _make_request()
+        candidates = (
+            _candidate("openai", "gpt-4o"),
+            _candidate("xai", "grok-4"),
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+            SelectionEnumeration,
+        )
+
+        mock_enum = SelectionEnumeration(candidates=candidates, commit_token=None)
+
+        async def _codex_cooldown(key: str) -> tuple[float, str]:
+            if "gpt-4o" in key:
+                return (60.0, "memory")
+            return (0.0, "local_fallback")
+
+        _set_selection_runtime("_has_continuation_state", lambda v: True)
+        _set_selection_runtime(
+            "_get_codex_session_affinity",
+            AsyncMock(
+                return_value={
+                    "provider": "openai",
+                    "model": "gpt-4o",
+                    "route_family": "openai_responses_adapter",
+                    "last_resort": False,
+                }
+            ),
+        )
+        _set_selection_runtime("_get_codex_active_cooldown_state", _codex_cooldown)
+
+        with patch.dict(
+            selection._select_codex_auto_agent_candidate.__globals__,
+            {
+                "_resolve_aawm_alias_selection_enumeration": (
+                    lambda request, canonical_alias, *, ingress, client_product_label=None: mock_enum
+                )
+            },
+        ):
+            result = await selection._select_codex_auto_agent_candidate(
+                request=request,
+                request_body={"model": "basic", "litellm_metadata": {"redispatch_ordinal": "2"}},
+            )
+        assert result["selection_reason"] == "first_available"
+        assert result["candidate"]["provider"] == "xai"
+        assert result["request_mode"] == "fresh_redispatch"
+        assert result["redispatch_ordinal"] == 2
+        assert result["affinity_bypassed"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +846,7 @@ class TestAnthropicSelectorFirstChoice:
             _candidate("openai", "gpt-4o", last_resort=True),
         )
         _set_selection_candidates(candidates)
+        _set_selection_runtime("_has_continuation_state", lambda v: True)
 
         result = await selection._select_anthropic_auto_agent_candidate(
             request=request,
@@ -778,6 +854,54 @@ class TestAnthropicSelectorFirstChoice:
         )
         assert result["selection_reason"] == "first_available"
         assert result["candidate"]["provider"] == "anthropic"
+        assert result["request_mode"] == "ordinary_continuation"
+        assert result["redispatch_ordinal"] is None
+        assert result["affinity_bypassed"] is False
+
+    @pytest.mark.asyncio
+    async def test_fresh_redispatch_ordinal_falls_back_to_next_candidate(self):
+        request = _make_request()
+        candidates = (
+            _candidate("anthropic", "claude-sonnet-4-20250514"),
+            _candidate("openai", "gpt-4o"),
+        )
+        _set_selection_candidates(candidates)
+
+        async def _anthropic_cooldown(key: str) -> tuple[float, str]:
+            if "claude" in key:
+                return (120.0, "memory")
+            return (0.0, "local_fallback")
+
+        async def _openai_merged_cooldown(key: str) -> tuple[float, str]:
+            return (0.0, "local_fallback")
+
+        _set_selection_runtime("_has_continuation_state", lambda v: True)
+        _set_selection_runtime(
+            "_get_anthropic_session_affinity",
+            AsyncMock(
+                return_value={
+                    "provider": "anthropic",
+                    "model": "claude-sonnet-4-20250514",
+                    "route_family": "anthropic_responses_adapter",
+                    "last_resort": False,
+                }
+            ),
+        )
+        _set_selection_runtime("_get_anthropic_active_cooldown_state", _anthropic_cooldown)
+        _set_selection_runtime(
+            "_get_anthropic_merged_codex_openai_cooldown_state",
+            _openai_merged_cooldown,
+        )
+
+        result = await selection._select_anthropic_auto_agent_candidate(
+            request=request,
+            request_body={"model": "basic", "litellm_metadata": {"redispatch_ordinal": "2"}},
+        )
+        assert result["selection_reason"] == "first_available"
+        assert result["candidate"]["provider"] == "openai"
+        assert result["request_mode"] == "fresh_redispatch"
+        assert result["redispatch_ordinal"] == 2
+        assert result["affinity_bypassed"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -884,11 +1008,21 @@ class TestAnthropicInFlight:
             _cooled,
         )
 
-        with pytest.raises(HTTPException) as exc_info:
-            await selection._select_anthropic_auto_agent_candidate(
-                request=request,
-                request_body={"model": "basic"},
-            )
+        with patch.dict(
+            selection._select_anthropic_auto_agent_candidate.__globals__,
+            {
+                "_find_anthropic_auto_agent_affinity_candidate": (
+                    lambda affinity, *, alias_model, client_product_label=None, request: _candidate(
+                        "anthropic", "claude-sonnet-4-20250514"
+                    )
+                )
+            },
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await selection._select_anthropic_auto_agent_candidate(
+                    request=request,
+                    request_body={"model": "basic"},
+                )
         exc = exc_info.value
         assert exc.status_code == 429
         assert exc.detail["error"]["code"] == "aawm_anthropic_auto_agent_in_flight_provider_cooling_down"

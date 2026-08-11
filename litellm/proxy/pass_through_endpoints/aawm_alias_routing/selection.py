@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import random
 import sys
 import time
@@ -218,6 +219,52 @@ def _auto_agent_alias_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _extract_codex_request_redispatch_ordinal(
+    request_body: dict[str, Any],
+) -> Optional[int]:
+    metadata = request_body.get("litellm_metadata")
+    for candidate in (
+        metadata if isinstance(metadata, dict) else None,
+        request_body,
+    ):
+        if not isinstance(candidate, dict):
+            continue
+        for field in (
+            "redispatch_ordinal",
+            "agent_redispatch_ordinal",
+            "dispatch_ordinal",
+            "aawm_redispatch_ordinal",
+        ):
+            value = candidate.get(field)
+            if isinstance(value, bool):
+                continue
+            float_value = _auto_agent_alias_float(value)
+            if float_value is None or float_value <= 0:
+                continue
+            if not math.isfinite(float_value):
+                continue
+            int_value = int(float_value)
+            if int_value <= 0:
+                continue
+            if float(int_value) != float_value:
+                continue
+            return int_value
+    return None
+
+
+def _resolve_codex_request_mode_and_ordinal(
+    *,
+    has_continuation_state: bool,
+    request_body: dict[str, Any],
+) -> tuple[str, Optional[int]]:
+    redispatch_ordinal = _extract_codex_request_redispatch_ordinal(request_body)
+    if redispatch_ordinal is not None:
+        return "fresh_redispatch", redispatch_ordinal
+    if has_continuation_state:
+        return "ordinary_continuation", None
+    return "fresh", None
 
 
 # ---------------------------------------------------------------------------
@@ -2299,11 +2346,22 @@ async def _select_codex_auto_agent_candidate(
         alias_model=alias_model,
     )
     has_continuation_state = _has_continuation_state(request_body)
+    request_mode, redispatch_ordinal = _resolve_codex_request_mode_and_ordinal(
+        has_continuation_state=has_continuation_state,
+        request_body=request_body,
+    )
 
-    affinity = await _get_codex_session_affinity(session_key)
-    if affinity is not None and not has_continuation_state:
-        affinity = None
-    if affinity is not None and has_continuation_state:
+    affinity = None
+    affinity_bypassed = False
+
+    if request_mode == "ordinary_continuation":
+        affinity = await _get_codex_session_affinity(session_key)
+    elif request_mode == "fresh_redispatch":
+        existing_affinity = await _get_codex_session_affinity(session_key)
+        if existing_affinity is not None:
+            affinity_bypassed = True
+
+    if affinity is not None:
         affinity_candidate = _find_codex_auto_agent_affinity_candidate(
             affinity,
             alias_model=alias_model,
@@ -2354,6 +2412,9 @@ async def _select_codex_auto_agent_candidate(
                     "selection_reason": "session_affinity",
                     "skipped": [],
                     "in_flight_session": True,
+                    "request_mode": request_mode,
+                    "redispatch_ordinal": redispatch_ordinal,
+                    "affinity_bypassed": affinity_bypassed,
                 },
                 affinity=affinity,
                 selected_state=affinity_state,
@@ -2419,6 +2480,9 @@ async def _select_codex_auto_agent_candidate(
                 "session_key": session_key,
                 "selection_reason": selection_reason,
                 "skipped": skipped,
+                "request_mode": request_mode,
+                "redispatch_ordinal": redispatch_ordinal,
+                "affinity_bypassed": affinity_bypassed,
             },
             selected_state=state,
         )
@@ -2442,6 +2506,9 @@ async def _select_codex_auto_agent_candidate(
                 "session_key": session_key,
                 "selection_reason": selection_reason,
                 "skipped": skipped,
+                "request_mode": request_mode,
+                "redispatch_ordinal": redispatch_ordinal,
+                "affinity_bypassed": affinity_bypassed,
             },
             selected_state=state,
         )
@@ -2502,11 +2569,22 @@ async def _select_anthropic_auto_agent_candidate(
         alias_model=alias_model,
     )
     has_continuation_state = _has_continuation_state(request_body)
+    request_mode, redispatch_ordinal = _resolve_codex_request_mode_and_ordinal(
+        has_continuation_state=has_continuation_state,
+        request_body=request_body,
+    )
 
-    affinity = await _get_anthropic_session_affinity(session_key)
-    if affinity is not None and not has_continuation_state:
-        affinity = None
-    if affinity is not None and has_continuation_state:
+    affinity = None
+    affinity_bypassed = False
+
+    if request_mode == "ordinary_continuation":
+        affinity = await _get_anthropic_session_affinity(session_key)
+    elif request_mode == "fresh_redispatch":
+        existing_affinity = await _get_anthropic_session_affinity(session_key)
+        if existing_affinity is not None:
+            affinity_bypassed = True
+
+    if affinity is not None:
         affinity_candidate = _find_anthropic_auto_agent_affinity_candidate(
             affinity,
             alias_model=alias_model,
@@ -2559,6 +2637,9 @@ async def _select_anthropic_auto_agent_candidate(
                     "selection_reason": "session_affinity",
                     "skipped": [],
                     "in_flight_session": True,
+                    "request_mode": request_mode,
+                    "redispatch_ordinal": redispatch_ordinal,
+                    "affinity_bypassed": affinity_bypassed,
                 },
                 affinity=affinity,
                 selected_state=affinity_state,
@@ -2625,6 +2706,9 @@ async def _select_anthropic_auto_agent_candidate(
                 "selection_reason": selection_reason,
                 "skipped": skipped,
                 "in_flight_session": has_continuation_state,
+                "request_mode": request_mode,
+                "redispatch_ordinal": redispatch_ordinal,
+                "affinity_bypassed": affinity_bypassed,
             },
             selected_state=state,
         )
@@ -2649,6 +2733,9 @@ async def _select_anthropic_auto_agent_candidate(
                 "selection_reason": selection_reason,
                 "skipped": skipped,
                 "in_flight_session": has_continuation_state,
+                "request_mode": request_mode,
+                "redispatch_ordinal": redispatch_ordinal,
+                "affinity_bypassed": affinity_bypassed,
             },
             selected_state=state,
         )
@@ -2681,6 +2768,8 @@ from types import FunctionType as _FunctionType
 
 _HOST_FUNCTION_NAMES = (
     "_auto_agent_alias_float",
+    "_extract_codex_request_redispatch_ordinal",
+    "_resolve_codex_request_mode_and_ordinal",
     "_codex_auto_agent_candidate_public_shape",
     "_is_auto_agent_candidate_state_available",
     "_build_auto_agent_skipped_candidates_from_states",
