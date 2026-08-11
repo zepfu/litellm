@@ -20,6 +20,42 @@ async def test_proxy_shutdown_event_closes_cached_async_clients():
 
 
 @pytest.mark.asyncio
+async def test_proxy_shutdown_event_runs_session_history_shutdown_before_client_cleanup() -> None:
+    from litellm.proxy import proxy_server as proxy_server_module
+
+    ordered: list[str] = []
+
+    def shutdown_session_history() -> None:
+        ordered.append("session_history")
+
+    async def close_litellm_clients() -> None:
+        ordered.append("close_litellm")
+
+    with patch(
+        "litellm.integrations.aawm_agent_identity._shutdown_session_history_worker",
+        new=shutdown_session_history,
+    ), patch.object(
+        proxy_server_module,
+        "shutdown_aawm_alias_routing_redis",
+        new=AsyncMock(name="shutdown_aawm_alias_routing_redis"),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.aawm_claude_control_plane.close_aawm_dynamic_injection_pool",
+        new=AsyncMock(name="close_aawm_dynamic_injection_pool"),
+    ), patch.object(
+        proxy_server_module.litellm,
+        "close_litellm_async_clients",
+        new=AsyncMock(name="close_litellm_async_clients", side_effect=close_litellm_clients),
+    ), patch.object(
+        proxy_server_module,
+        "_close_guardrail_shutdown_hooks",
+        new=AsyncMock(name="_close_guardrail_shutdown_hooks"),
+    ):
+        await proxy_server_module.proxy_shutdown_event()
+
+    assert ordered == ["session_history", "close_litellm"]
+
+
+@pytest.mark.asyncio
 async def test_proxy_shutdown_event_runs_guardrail_shutdown_hooks():
     from litellm.proxy import proxy_server as proxy_server_module
 

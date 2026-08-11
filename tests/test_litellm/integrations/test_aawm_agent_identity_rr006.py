@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import asyncio
 import queue
+import threading
+import time
 from typing import Any
 
 import pytest
@@ -534,6 +537,9 @@ def test_rr006_shutdown_drains_queue_to_spool_within_budget(
         def join(self, timeout):
             self.join_timeout = timeout
 
+        def is_alive(self) -> bool:
+            return False
+
     class FakeQueue:
         def __init__(self) -> None:
             self.put_calls = []
@@ -555,6 +561,9 @@ def test_rr006_shutdown_drains_queue_to_spool_within_budget(
     worker = FakeWorker()
     q = FakeQueue()
     spooled = []
+
+    aawm_agent_identity._aawm_session_history_shutdown_in_progress = False
+    aawm_agent_identity._aawm_session_history_shutdown_deadline_monotonic = 0.0
 
     monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_worker", worker)
     monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", q)
@@ -578,11 +587,289 @@ def test_rr006_shutdown_drains_queue_to_spool_within_budget(
 
     aawm_agent_identity._shutdown_session_history_worker()
 
-    assert q.put_calls == [(None, 0.5)]
-    assert worker.join_timeout == 1.0
+    assert len(q.put_calls) == 1
+    sentinel_item, sentinel_timeout = q.put_calls[0]
+    assert sentinel_item is None
+    assert 0.0 < sentinel_timeout <= 2.0
+    assert worker.join_timeout is not None
+    assert 0.0 < worker.join_timeout <= 2.0
     assert len(spooled) == 1
     assert [r["litellm_call_id"] for r in spooled[0][0]] == ["queued-1", "queued-2"]
     assert spooled[0][1]["reason"] == "shutdown post-join drain"
+    assert q.items == []
+    assert aawm_agent_identity._session_history_shutdown_disposition() == {
+        "drained": 0,
+        "spooled": 2,
+        "abandoned": 0,
+    }
+
+
+def test_rr006_shutdown_waits_for_db_timeout_before_worker_spools(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.integrations.aawm_session_history import writer
+
+    tracked = threading.Event()
+    release_worker = threading.Event()
+    cancellation_completed = threading.Event()
+    spooled: list[list[dict[str, Any]]] = []
+    records = [{"litellm_call_id": "inflight-1"}]
+
+    original_track = writer._session_history_track_worker_batch
+
+    def track_worker_batch(batch: list[dict[str, Any]]) -> None:
+        original_track(batch)
+        tracked.set()
+        assert release_worker.wait(timeout=1.0)
+
+    async def persist_records(_records: list[dict[str, Any]]) -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)
+            cancellation_completed.set()
+            raise
+
+    def spool_records(batch: list[dict[str, Any]], **_kwargs: Any) -> str:
+        assert cancellation_completed.is_set()
+        spooled.append(list(batch))
+        return "/tmp/session-history-inflight.jsonl"
+
+    class FakeQueue:
+        maxsize = 1024
+
+        def put(self, item: Any, timeout: float) -> None:
+            del item
+            del timeout
+            release_worker.set()
+
+        def get_nowait(self) -> None:
+            raise queue.Empty
+
+        def qsize(self) -> int:
+            return 0
+
+    aawm_agent_identity._aawm_session_history_shutdown_in_progress = False
+    aawm_agent_identity._aawm_session_history_shutdown_deadline_monotonic = 0.0
+    aawm_agent_identity._aawm_session_history_shutdown_records_drained = 0
+    aawm_agent_identity._aawm_session_history_shutdown_records_spooled = 0
+    aawm_agent_identity._aawm_session_history_shutdown_records_abandoned = 0
+    aawm_agent_identity._aawm_session_history_worker_inflight_records = []
+
+    monkeypatch.setattr(writer, "_session_history_track_worker_batch", track_worker_batch)
+    monkeypatch.setattr(
+        writer,
+        "_get_session_history_shutdown_budget_seconds",
+        lambda: 0.05,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_persist_session_history_records",
+        persist_records,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_spool_session_history_records",
+        spool_records,
+    )
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", FakeQueue())
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_drain_session_history_queue_to_spool_on_shutdown",
+        lambda **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_session_history_queue_depth_summary",
+        lambda: "queue_depth=0",
+    )
+
+    def run_worker() -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            writer._flush_session_history_worker_batch(records, loop)
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
+
+    worker = threading.Thread(
+        target=run_worker,
+        name="aawm-session-history-writer",
+        daemon=True,
+    )
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_worker", worker)
+    worker.start()
+    assert tracked.wait(timeout=1.0)
+
+    started_at = time.monotonic()
+    aawm_agent_identity._shutdown_session_history_worker()
+    worker.join(timeout=1.0)
+
+    assert time.monotonic() - started_at < 0.5
+    assert not worker.is_alive()
+    assert spooled == [records]
+    assert aawm_agent_identity._session_history_shutdown_disposition() == {
+        "drained": 0,
+        "spooled": 1,
+        "abandoned": 0,
+    }
+
+
+def test_rr006_shutdown_remainder_spools_records_and_tracks_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeQueue:
+        def __init__(self) -> None:
+            self.maxsize = 1024
+            self.items = [
+                {"litellm_call_id": "queued-1"},
+                {"litellm_call_id": "queued-2"},
+            ]
+
+        def get_nowait(self):
+            if not self.items:
+                raise queue.Empty
+            return self.items.pop(0)
+
+        def put(self, item, timeout):
+            del item
+            del timeout
+
+        def qsize(self):
+            return len(self.items)
+
+
+    spooled = []
+
+    aawm_agent_identity._aawm_session_history_shutdown_in_progress = False
+    aawm_agent_identity._aawm_session_history_shutdown_deadline_monotonic = 0.0
+
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_worker", None)
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", FakeQueue())
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_spool_session_history_records",
+        lambda records, **kwargs: spooled.append((list(records), kwargs))
+        or "/tmp/session-history-remainder.jsonl",
+    )
+    monkeypatch.setattr(aawm_agent_identity, "_session_history_queue_depth_summary", lambda: "queue_depth=2")
+
+    aawm_agent_identity._shutdown_session_history_worker()
+
+    assert len(spooled) == 1
+    assert [r["litellm_call_id"] for r in spooled[0][0]] == ["queued-1", "queued-2"]
+    assert spooled[0][1]["reason"] == "shutdown with no worker"
+    assert aawm_agent_identity._session_history_shutdown_disposition() == {
+        "drained": 0,
+        "spooled": 2,
+        "abandoned": 0,
+    }
+
+
+def test_rr006_shutdown_remainder_spool_failure_tracks_abandoned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeQueue:
+        def __init__(self) -> None:
+            self.maxsize = 1024
+            self.items = [
+                {"litellm_call_id": "queued-1"},
+                {"litellm_call_id": "queued-2"},
+            ]
+
+        def get_nowait(self):
+            if not self.items:
+                raise queue.Empty
+            return self.items.pop(0)
+
+        def qsize(self):
+            return len(self.items)
+
+    aawm_agent_identity._aawm_session_history_shutdown_in_progress = False
+    aawm_agent_identity._aawm_session_history_shutdown_deadline_monotonic = 0.0
+
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_worker", None)
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", FakeQueue())
+
+    def _failing_spool(records, **kwargs):
+        del records
+        del kwargs
+        raise RuntimeError("spool failed")
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_spool_session_history_records",
+        _failing_spool,
+    )
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_session_history_queue_depth_summary",
+        lambda: "queue_depth=2",
+    )
+
+    aawm_agent_identity._shutdown_session_history_worker()
+
+    assert aawm_agent_identity._session_history_shutdown_disposition() == {
+        "drained": 0,
+        "spooled": 0,
+        "abandoned": 2,
+    }
+
+
+def test_rr006_shutdown_session_history_worker_lock_not_reentered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NonReentrantShutdownLock:
+        def __init__(self) -> None:
+            self.acquires = 0
+            self._held = False
+
+        def acquire(self, *args, **kwargs):  # noqa: ANN001
+            if self._held:
+                raise AssertionError("reentered shutdown lock")
+            self._held = True
+            self.acquires += 1
+            return True
+
+        def release(self) -> None:
+            self._held = False
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            self.release()
+
+
+    class FakeQueue:
+        def __init__(self) -> None:
+            self.maxsize = 1024
+
+        def get_nowait(self):
+            raise queue.Empty
+
+        def put(self, item, timeout):
+            del item
+            del timeout
+
+    lock = NonReentrantShutdownLock()
+    aawm_agent_identity._aawm_session_history_shutdown_in_progress = False
+    aawm_agent_identity._aawm_session_history_shutdown_deadline_monotonic = 0.0
+
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_shutdown_lock", lock)
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_worker", None)
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", FakeQueue())
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_drain_session_history_queue_to_spool_on_shutdown",
+        lambda **_kwargs: 0,
+    )
+
+    aawm_agent_identity._shutdown_session_history_worker()
+    assert lock.acquires >= 1
 
 
 def test_rr006_embedded_json_parse_attempt_budget() -> None:
@@ -1329,7 +1616,6 @@ def test_rr006_ensure_session_history_schema_is_noop_without_ddl(monkeypatch) ->
 def test_rr006_session_history_service_uses_threading_locks_only() -> None:
     """RR-006 #22: durable writer state is threading-locked, not asyncio-locked."""
     from litellm.integrations.aawm_session_history import runtime
-    import threading
 
     assert isinstance(runtime._aawm_session_history_worker_lock, type(threading.Lock()))
     assert isinstance(runtime._aawm_session_history_pool_lock, type(threading.Lock()))

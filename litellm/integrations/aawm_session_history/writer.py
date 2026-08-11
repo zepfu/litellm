@@ -38,6 +38,7 @@ from litellm.integrations.aawm_session_history.runtime import (  # noqa: F401
     _AAWM_SESSION_HISTORY_POOL_MAX_SIZE,
     _AAWM_SESSION_HISTORY_QUEUE_DRAIN_TO_SPOOL_MAX_RECORDS,
     _AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS,
+    _AAWM_SESSION_HISTORY_SHUTDOWN_BUDGET_SECONDS,
     _AAWM_SESSION_HISTORY_RETRYABLE_EXCEPTION_NAMES,
     _AAWM_SESSION_HISTORY_RETRYABLE_MESSAGE_MARKERS,
     _AAWM_SESSION_HISTORY_SPOOL_DATETIME_MARKER,
@@ -57,11 +58,18 @@ from litellm.integrations.aawm_session_history.runtime import (  # noqa: F401
     _aawm_session_history_queue,
     _aawm_session_history_schema_lock,
     _aawm_session_history_schema_ready,
+    _aawm_session_history_shutdown_records_abandoned,
+    _aawm_session_history_worker_inflight_records,
     _aawm_session_history_spool_drain_lock,
     _aawm_session_history_spool_drainer,
     _aawm_session_history_spool_drainer_lock,
     _aawm_session_history_spool_startup_bootstrapped,
     _aawm_session_history_spool_startup_lock,
+    _aawm_session_history_shutdown_deadline_monotonic,
+    _aawm_session_history_shutdown_in_progress,
+    _aawm_session_history_shutdown_lock,
+    _aawm_session_history_shutdown_records_drained,
+    _aawm_session_history_shutdown_records_spooled,
     _aawm_session_history_suppressed_flush_failures,
     _aawm_session_history_worker,
     _aawm_session_history_worker_lock,
@@ -134,6 +142,152 @@ def _get_session_history_statement_cache_size() -> int:
     return max(0, parsed_value)
 
 
+def _get_session_history_shutdown_budget_seconds() -> float:
+    raw_value = _writer_get_secret_str("AAWM_SESSION_HISTORY_SHUTDOWN_BUDGET_SECONDS") or ""
+    try:
+        parsed_value = float(str(raw_value).strip())
+    except (TypeError, ValueError):
+        parsed_value = _AAWM_SESSION_HISTORY_SHUTDOWN_BUDGET_SECONDS
+    return max(0.0, parsed_value)
+
+
+def _session_history_shutdown_deadline() -> float:
+    with _state("_aawm_session_history_shutdown_lock"):
+        if not _state("_aawm_session_history_shutdown_in_progress"):
+            return 0.0
+        return float(_state("_aawm_session_history_shutdown_deadline_monotonic"))
+
+
+def _session_history_shutdown_disposition() -> Dict[str, int]:
+    with _state("_aawm_session_history_shutdown_lock"):
+        return {
+            "drained": int(_state("_aawm_session_history_shutdown_records_drained")),
+            "spooled": int(_state("_aawm_session_history_shutdown_records_spooled")),
+            "abandoned": int(_state("_aawm_session_history_shutdown_records_abandoned")),
+        }
+
+
+def _session_history_mark_shutdown_disposition(
+    *,
+    drained: int = 0,
+    spooled: int = 0,
+    abandoned: int = 0,
+) -> None:
+    if drained == 0 and spooled == 0 and abandoned == 0:
+        return
+    with _state("_aawm_session_history_shutdown_lock"):
+        if drained:
+            _set_state(
+                "_aawm_session_history_shutdown_records_drained",
+                int(_state("_aawm_session_history_shutdown_records_drained")) + drained,
+            )
+        if spooled:
+            _set_state(
+                "_aawm_session_history_shutdown_records_spooled",
+                int(_state("_aawm_session_history_shutdown_records_spooled")) + spooled,
+            )
+        if abandoned:
+            _set_state(
+                "_aawm_session_history_shutdown_records_abandoned",
+                int(_state("_aawm_session_history_shutdown_records_abandoned")) + abandoned,
+            )
+
+
+def _session_history_track_worker_batch(records: List[Dict[str, Any]]) -> None:
+    with _state("_aawm_session_history_shutdown_lock"):
+        _set_state("_aawm_session_history_worker_inflight_records", records)
+
+
+def _session_history_finish_worker_batch(
+    records: List[Dict[str, Any]], *, persisted: bool = False
+) -> bool:
+    with _state("_aawm_session_history_shutdown_lock"):
+        if _state("_aawm_session_history_worker_inflight_records") is not records:
+            return False
+        _set_state("_aawm_session_history_worker_inflight_records", [])
+        if persisted and _state("_aawm_session_history_shutdown_in_progress"):
+            _set_state(
+                "_aawm_session_history_shutdown_records_drained",
+                int(_state("_aawm_session_history_shutdown_records_drained"))
+                + len(records),
+            )
+        return True
+
+
+def _session_history_claim_worker_batch(
+    records: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    with _state("_aawm_session_history_shutdown_lock"):
+        active_records = _state("_aawm_session_history_worker_inflight_records")
+        if not active_records or (records is not None and active_records is not records):
+            return []
+        _set_state("_aawm_session_history_worker_inflight_records", [])
+        return list(active_records)
+
+
+def _session_history_worker_batch_was_claimed(records: List[Dict[str, Any]]) -> bool:
+    with _state("_aawm_session_history_shutdown_lock"):
+        return bool(
+            _state("_aawm_session_history_shutdown_in_progress")
+            and _state("_aawm_session_history_worker_inflight_records") is not records
+        )
+
+
+def _spool_session_history_records_after_shutdown(
+    records: List[Dict[str, Any]], reason: str
+) -> None:
+    if not records:
+        return
+    record_count = len(records)
+    try:
+        _call(
+            "_spool_session_history_records",
+            records,
+            reason=reason,
+            start_drainer=False,
+        )
+        _session_history_mark_shutdown_disposition(spooled=record_count)
+        verbose_logger.warning(
+            "AawmAgentIdentity: spooled %d session_history records during "
+            "shutdown (reason=%s, %s)",
+            record_count,
+            reason,
+            _call("_session_history_queue_depth_summary"),
+        )
+    except Exception as exc:
+        _session_history_mark_shutdown_disposition(abandoned=record_count)
+        verbose_logger.exception(
+            "AawmAgentIdentity: failed durable session_history disposition during "
+            "shutdown (record_count=%d, reason=%s): %s",
+            record_count,
+            reason,
+            _call("_format_exception_for_warning", exc),
+        )
+
+
+def _admit_session_history_record_before_shutdown(
+    record: Dict[str, Any], *, timeout: float
+) -> bool:
+    with _state("_aawm_session_history_shutdown_lock"):
+        if not _state("_aawm_session_history_shutdown_in_progress"):
+            _state("_aawm_session_history_queue").put(record, timeout=timeout)
+            _ensure_session_history_worker_started_locked()
+            return True
+    _spool_session_history_records_after_shutdown([record], "shutdown cutoff")
+    return False
+
+
+def _spool_session_history_record_if_shutdown_started(
+    record: Dict[str, Any], reason: str
+) -> bool:
+    with _state("_aawm_session_history_shutdown_lock"):
+        shutdown_started = bool(_state("_aawm_session_history_shutdown_in_progress"))
+    if not shutdown_started:
+        return False
+    _spool_session_history_records_after_shutdown([record], reason)
+    return True
+
+
 def _session_history_queue_depth_summary() -> str:
     queue_size: Union[int, str]
     try:
@@ -201,6 +355,7 @@ def _flush_session_history_batch(
     records: List[Dict[str, Any]],
     loop: Optional[asyncio.AbstractEventLoop] = None,
     *,
+    timeout_seconds: Optional[float] = None,
     log_exception: bool = True,
     failure_callback: Optional[Callable[[Exception], None]] = None,
     ensure_spool_drainer: bool = True,
@@ -208,6 +363,11 @@ def _flush_session_history_batch(
     retry_write_ahead_spool_path: Optional[str] = None,
 ) -> bool:
     if not records:
+        return True
+    if (
+        threading.current_thread().name == "aawm-session-history-writer"
+        and _session_history_worker_batch_was_claimed(records)
+    ):
         return True
 
     if loop is not None and loop.is_running():
@@ -241,12 +401,23 @@ def _flush_session_history_batch(
             return False
 
     started_at = _writer_time().perf_counter()
+
+    async def _persist_records() -> None:
+        persist_coro = _get_persist_session_history_records()(records)
+        if timeout_seconds is None:
+            await persist_coro
+            return
+        await asyncio.wait_for(
+            persist_coro,
+            timeout=max(0.0, timeout_seconds),
+        )
+
     try:
         if loop is None:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             try:
-                loop.run_until_complete(_get_persist_session_history_records()(records))
+                loop.run_until_complete(_persist_records())
             finally:
                 loop.run_until_complete(
                     _call("_close_aawm_session_history_pools_for_current_loop", )
@@ -254,7 +425,7 @@ def _flush_session_history_batch(
                 loop.close()
                 asyncio.set_event_loop(None)
         else:
-            loop.run_until_complete(_get_persist_session_history_records()(records))
+            loop.run_until_complete(_persist_records())
     except Exception as exc:
         if failure_callback is not None:
             failure_callback(exc)
@@ -302,6 +473,7 @@ def _flush_session_history_batch(
             )
         return False
 
+    _session_history_finish_worker_batch(records, persisted=True)
     suppressed_failures = _call("_reset_session_history_flush_failure_window", )
     if suppressed_failures is not None:
         verbose_logger.warning(
@@ -334,6 +506,41 @@ def _flush_session_history_overflow_record(record: Dict[str, Any]) -> None:
         _state("_aawm_session_history_overflow_flush_semaphore").release()
 
 
+def _flush_session_history_worker_batch(
+    records: List[Dict[str, Any]], loop: asyncio.AbstractEventLoop
+) -> None:
+    _session_history_track_worker_batch(records)
+    try:
+        shutdown_deadline = _session_history_shutdown_deadline()
+        if shutdown_deadline > 0.0:
+            remaining_shutdown_budget = (
+                shutdown_deadline - _writer_time().monotonic()
+            )
+            if remaining_shutdown_budget <= 0.0:
+                claimed_records = _session_history_claim_worker_batch(records)
+                _spool_session_history_records_after_shutdown(
+                    claimed_records,
+                    "shutdown DB deadline expired",
+                )
+                return
+            if not _call(
+                "_flush_session_history_batch",
+                records,
+                loop=loop,
+                timeout_seconds=remaining_shutdown_budget,
+            ):
+                claimed_records = _session_history_claim_worker_batch(records)
+                _spool_session_history_records_after_shutdown(
+                    claimed_records,
+                    "shutdown DB flush failed",
+                )
+                return
+            return
+        _call("_flush_session_history_batch_with_retry", records, loop=loop)
+    finally:
+        _session_history_finish_worker_batch(records)
+
+
 def _session_history_worker_main() -> None:
     flush_interval = _call("_get_session_history_flush_interval_seconds", )
     batch_size = _call("_get_session_history_batch_size", )
@@ -342,25 +549,29 @@ def _session_history_worker_main() -> None:
 
     try:
         while True:
+            shutdown_deadline = _session_history_shutdown_deadline()
+            if shutdown_deadline > 0.0 and _writer_time().monotonic() >= shutdown_deadline:
+                break
+
+            effective_timeout = flush_interval
+            if shutdown_deadline > 0.0:
+                remaining = shutdown_deadline - _writer_time().monotonic()
+                if remaining <= 0:
+                    break
+                effective_timeout = min(effective_timeout, remaining)
             try:
-                first_item = _state("_aawm_session_history_queue").get(timeout=flush_interval)
+                first_item = _state("_aawm_session_history_queue").get(timeout=effective_timeout)
             except queue.Empty:
                 continue
 
             if first_item is None:
-                # Sentinel: flush any backlog left behind the sentinel (B5).
-                while True:
-                    try:
-                        leftover = _state("_aawm_session_history_queue").get_nowait()
-                    except queue.Empty:
-                        break
-                    if leftover is None:
-                        continue
-                    _call("_flush_session_history_batch_with_retry", [leftover], loop=loop)
                 break
 
             batch: List[Dict[str, Any]] = [first_item]
             deadline = _writer_time().monotonic() + flush_interval
+            if shutdown_deadline > 0.0:
+                deadline = min(deadline, shutdown_deadline)
+            stop_after_batch = False
             while len(batch) < batch_size:
                 remaining = deadline - _writer_time().monotonic()
                 if remaining <= 0:
@@ -370,22 +581,13 @@ def _session_history_worker_main() -> None:
                 except queue.Empty:
                     break
                 if next_item is None:
-                    _call("_flush_session_history_batch_with_retry", batch, loop=loop)
-                    # Drain remaining non-sentinel items before exit (B5).
-                    while True:
-                        try:
-                            leftover = _state("_aawm_session_history_queue").get_nowait()
-                        except queue.Empty:
-                            break
-                        if leftover is None:
-                            continue
-                        _call("_flush_session_history_batch_with_retry",
-                            [leftover], loop=loop
-                        )
-                    return
+                    stop_after_batch = True
+                    break
                 batch.append(next_item)
 
-            _call("_flush_session_history_batch_with_retry", batch, loop=loop)
+            _flush_session_history_worker_batch(batch, loop)
+            if stop_after_batch:
+                break
     finally:
         loop.run_until_complete(_call("_close_aawm_session_history_pools_for_current_loop", ))
         loop.close()
@@ -393,12 +595,25 @@ def _session_history_worker_main() -> None:
 
 
 def _ensure_session_history_worker_started() -> None:
+    with _state("_aawm_session_history_shutdown_lock"):
+        if _state("_aawm_session_history_shutdown_in_progress"):
+            return
 
-    if _state("_aawm_session_history_worker") is not None and _state("_aawm_session_history_worker").is_alive():
+        _ensure_session_history_worker_started_locked()
+
+
+def _ensure_session_history_worker_started_locked() -> None:
+    if (
+        _state("_aawm_session_history_worker") is not None
+        and _state("_aawm_session_history_worker").is_alive()
+    ):
         return
 
     with _state("_aawm_session_history_worker_lock"):
-        if _state("_aawm_session_history_worker") is not None and _state("_aawm_session_history_worker").is_alive():
+        if (
+            _state("_aawm_session_history_worker") is not None
+            and _state("_aawm_session_history_worker").is_alive()
+        ):
             return
 
         _set_state(
@@ -414,33 +629,72 @@ def _ensure_session_history_worker_started() -> None:
 
 
 def _shutdown_session_history_worker() -> None:
-    worker = _state("_aawm_session_history_worker")
+    shutdown_budget_seconds = _call("_get_session_history_shutdown_budget_seconds", )
+    shutdown_deadline = _writer_time().monotonic() + max(0.0, shutdown_budget_seconds)
+
+    with _state("_aawm_session_history_shutdown_lock"):
+        if _state("_aawm_session_history_shutdown_in_progress"):
+            return
+        _set_state("_aawm_session_history_shutdown_records_drained", 0)
+        _set_state("_aawm_session_history_shutdown_records_spooled", 0)
+        _set_state("_aawm_session_history_shutdown_records_abandoned", 0)
+        _set_state("_aawm_session_history_shutdown_in_progress", True)
+        _set_state("_aawm_session_history_shutdown_deadline_monotonic", shutdown_deadline)
+        worker = _state("_aawm_session_history_worker")
     if worker is None:
-        _call("_drain_session_history_queue_to_spool_on_shutdown",
+        _call(
+            "_drain_session_history_queue_to_spool_on_shutdown",
             reason="shutdown with no worker",
         )
+        _close_session_history_worker_resources()
         return
 
-    try:
-        _state("_aawm_session_history_queue").put(
-            None,
-            timeout=max(
-                _AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS,
-                _call("_get_session_history_flush_interval_seconds", ),
-            ),
-        )
-    except queue.Full:
-        verbose_logger.warning(
-            "AawmAgentIdentity: session_history queue full during shutdown; "
-            "draining remaining records to spool before worker join"
-        )
-        _call("_drain_session_history_queue_to_spool_on_shutdown",
-            reason="shutdown queue full before sentinel",
-        )
+    sentinel_budget = max(0.0, shutdown_deadline - _writer_time().monotonic())
+    if sentinel_budget > 0.0:
+        try:
+            _state("_aawm_session_history_queue").put(
+                None,
+                timeout=sentinel_budget,
+            )
+        except queue.Full:
+            verbose_logger.warning(
+                "AawmAgentIdentity: session_history queue full during shutdown; "
+                "remaining queued records will be spooled after worker join"
+            )
 
-    worker.join(timeout=1.0)
-    _call("_drain_session_history_queue_to_spool_on_shutdown",
+    join_budget = max(0.0, shutdown_deadline - _writer_time().monotonic())
+    if join_budget > 0.0:
+        worker.join(timeout=join_budget)
+
+    if not worker.is_alive():
+        active_records = _session_history_claim_worker_batch()
+        if active_records:
+            _spool_session_history_records_after_shutdown(
+                active_records,
+                "shutdown unresolved stopped worker batch",
+            )
+    _call(
+        "_drain_session_history_queue_to_spool_on_shutdown",
         reason="shutdown post-join drain",
+    )
+    _close_session_history_worker_resources()
+
+
+def _close_session_history_worker_resources() -> None:
+    with _state("_aawm_session_history_shutdown_lock"):
+        worker = _state("_aawm_session_history_worker")
+        if worker is not None and not worker.is_alive():
+            with _state("_aawm_session_history_worker_lock"):
+                if _state("_aawm_session_history_worker") is worker:
+                    _set_state("_aawm_session_history_worker", None)
+    disposition = _session_history_shutdown_disposition()
+    verbose_logger.warning(
+        "AawmAgentIdentity: session_history shutdown disposition complete "
+        "(shutdown_records_drained=%d, shutdown_records_spooled=%d, "
+        "shutdown_records_abandoned=%d)",
+        disposition["drained"],
+        disposition["spooled"],
+        disposition["abandoned"],
     )
 
 
@@ -499,20 +753,22 @@ def _enqueue_session_history_record(record: Dict[str, Any]) -> None:
             return
 
     try:
-        _state("_aawm_session_history_queue").put(
+        if not _admit_session_history_record_before_shutdown(
             record,
             timeout=_AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS,
-        )
+        ):
+            return
     except queue.Full:
         if not _state("_aawm_session_history_overflow_flush_semaphore").acquire(blocking=False):
             try:
-                _state("_aawm_session_history_queue").put(
+                if not _admit_session_history_record_before_shutdown(
                     record,
                     timeout=max(
                         _AAWM_SESSION_HISTORY_QUEUE_TIMEOUT_SECONDS,
                         _call("_get_session_history_flush_interval_seconds", ),
                     ),
-                )
+                ):
+                    return
                 verbose_logger.warning(
                     "AawmAgentIdentity: session_history queue full; queued "
                     "record after waiting (queue_disposition=queued_after_wait, %s)",
@@ -558,6 +814,13 @@ def _enqueue_session_history_record(record: Dict[str, Any]) -> None:
                     spool_batch,
                     retry_message="inline session_history overflow after spool failure",
                 )
+            return
+
+        if _spool_session_history_record_if_shutdown_started(
+            record,
+            "shutdown cutoff before overflow flush",
+        ):
+            _state("_aawm_session_history_overflow_flush_semaphore").release()
             return
 
         verbose_logger.warning(

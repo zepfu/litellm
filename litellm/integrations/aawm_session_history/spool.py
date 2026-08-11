@@ -730,24 +730,33 @@ def _drain_session_history_queue_to_spool_on_shutdown(
     drained_records = _call("_drain_session_history_queue_for_spool", max(0, drain_limit))
     if not drained_records:
         return 0
+    drained_count = len(drained_records)
     try:
         _call("_spool_session_history_records",
             drained_records,
             reason=reason,
             start_drainer=False,
         )
+        _call(
+            "_session_history_mark_shutdown_disposition",
+            spooled=drained_count,
+        )
         verbose_logger.warning(
             "AawmAgentIdentity: spooled %d session_history records during "
             "shutdown drain (reason=%s, %s)",
-            len(drained_records),
+            drained_count,
             reason,
             _call("_session_history_queue_depth_summary", ),
         )
     except Exception as exc:
+        _call(
+            "_session_history_mark_shutdown_disposition",
+            abandoned=drained_count,
+        )
         verbose_logger.exception(
             "AawmAgentIdentity: failed to spool session_history records during "
             "shutdown drain (record_count=%d, reason=%s): %s",
-            len(drained_records),
+            drained_count,
             reason,
             _call("_format_exception_for_warning", exc),
         )

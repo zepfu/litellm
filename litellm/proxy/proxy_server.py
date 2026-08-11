@@ -739,6 +739,15 @@ async def proxy_shutdown_event():
             e,
         )
     try:
+        from litellm.integrations import aawm_agent_identity as _aawm_agent_identity
+
+        _aawm_agent_identity._shutdown_session_history_worker()
+    except Exception as e:
+        verbose_proxy_logger.error(
+            "Error closing AAWM session history worker during proxy shutdown: %s",
+            e,
+        )
+    try:
         await litellm.close_litellm_async_clients()
     except Exception as e:
         verbose_proxy_logger.error(
