@@ -1,4 +1,6 @@
 import socket
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -1076,6 +1078,223 @@ def test_resolve_host_name_fast_path_schedules_background_enrichment(monkeypatch
     gethostbyaddr.assert_not_called()
     # Provisional IP must not be cached so enrichment can still resolve later.
     assert "100.99.166.16" not in route_logging._aawm_route_host_reverse_dns_cache
+
+
+def test_resolve_host_attribution_default_path_non_blocking_under_delayed_dns_lookup(monkeypatch):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    route_logging._aawm_route_host_enrichment_inflight.clear()
+    setdefault_calls: list = []
+    dns_started = threading.Event()
+    dns_block = threading.Event()
+
+    def tracking_setdefault(value):
+        setdefault_calls.append(value)
+
+    def delayed_gethostbyaddr(_client_ip):
+        dns_started.set()
+        dns_block.wait()
+        raise TimeoutError("blocked dns")
+
+    monkeypatch.setattr(route_logging.socket, "setdefaulttimeout", tracking_setdefault)
+    monkeypatch.setattr(socket, "setdefaulttimeout", tracking_setdefault)
+    monkeypatch.setattr(route_logging.socket, "gethostbyaddr", delayed_gethostbyaddr)
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value=None),
+    )
+
+    slow_lookup_done = threading.Event()
+
+    def run_blocking_lookup():
+        route_logging._resolve_aawm_route_host_name_from_ip(
+            "100.99.1.5",
+            allow_blocking_lookup=True,
+        )
+        slow_lookup_done.set()
+
+    thread = threading.Thread(target=run_blocking_lookup)
+    thread.start()
+
+    try:
+        assert dns_started.wait(timeout=1.0)
+
+        fast_start = time.monotonic()
+        host_name, source = route_logging._resolve_aawm_route_host_name_from_ip(
+            "100.99.1.6",
+            allow_blocking_lookup=False,
+        )
+        fast_elapsed = time.monotonic() - fast_start
+
+        assert host_name == "100.99.1.6"
+        assert source == "ip_literal"
+        assert fast_elapsed < 0.2
+        assert setdefault_calls == []
+    finally:
+        dns_block.set()
+
+    assert slow_lookup_done.wait(timeout=2.0)
+    thread.join(timeout=2.0)
+
+
+def test_resolve_host_attribution_default_path_has_bounded_latency_with_blocked_background_enrichment(monkeypatch):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    route_logging._aawm_route_host_enrichment_inflight.clear()
+    setdefault_calls: list = []
+
+    enrichment_ready = threading.Event()
+    enrichment_go = threading.Event()
+    enrichment_stored = threading.Event()
+    original_store = route_logging._store_aawm_route_host_reverse_dns_cache
+
+    def tracking_setdefault(value):
+        setdefault_calls.append(value)
+
+    def blocking_magicdns(_client_ip):
+        enrichment_ready.set()
+        enrichment_go.wait()
+        return "seshat"
+
+    def track_store(cache_key, host_name, source, *, now, ttl_for_source=None):
+        original_store(
+            cache_key,
+            host_name,
+            source,
+            now=now,
+            ttl_for_source=ttl_for_source,
+        )
+        if cache_key == "100.99.166.16":
+            enrichment_stored.set()
+
+    request = Mock(spec=Request)
+    request.headers = {}
+    request.client = SimpleNamespace(host="100.99.166.16", port=12345)
+    request.scope = {"client": ("100.99.166.16", 12345)}
+
+    monkeypatch.setattr(
+        "litellm.proxy.auth.ip_address_utils.IPAddressUtils.get_mcp_client_ip",
+        lambda request, general_settings=None: "100.99.166.16",
+    )
+    monkeypatch.setattr(route_logging.socket, "setdefaulttimeout", tracking_setdefault)
+    monkeypatch.setattr(socket, "setdefaulttimeout", tracking_setdefault)
+    monkeypatch.setattr(route_logging, "_store_aawm_route_host_reverse_dns_cache", track_store)
+    monkeypatch.setattr(route_logging.socket, "gethostbyaddr", Mock(return_value=None))
+    monkeypatch.setattr(route_logging, "_resolve_hostname_via_magicdns", blocking_magicdns)
+
+    try:
+        start = time.monotonic()
+        attribution = resolve_aawm_route_host_attribution(request)
+        elapsed = time.monotonic() - start
+
+        assert attribution["host_name"] == "100.99.166.16"
+        assert attribution["host_name_source"] == "ip_literal"
+        assert elapsed < 0.2
+        assert setdefault_calls == []
+        assert enrichment_ready.wait(timeout=1.0)
+    finally:
+        enrichment_go.set()
+        assert enrichment_stored.wait(timeout=2.0)
+        assert "100.99.166.16" not in route_logging._aawm_route_host_enrichment_inflight
+
+
+def test_resolve_host_attribution_background_enrichment_populates_host_cache(monkeypatch):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    cache_refreshed = threading.Event()
+    original_store = route_logging._store_aawm_route_host_reverse_dns_cache
+
+    def wrapped_store(cache_key, host_name, source, *, now, ttl_for_source=None):
+        original_store(
+            cache_key,
+            host_name,
+            source,
+            now=now,
+            ttl_for_source=ttl_for_source,
+        )
+        if cache_key == "100.99.166.16":
+            cache_refreshed.set()
+
+    request = Mock(spec=Request)
+    request.headers = {}
+    request.client = SimpleNamespace(host="100.99.166.16", port=12345)
+    request.scope = {"client": ("100.99.166.16", 12345)}
+
+    monkeypatch.setattr(
+        "litellm.proxy.auth.ip_address_utils.IPAddressUtils.get_mcp_client_ip",
+        lambda request, general_settings=None: "100.99.166.16",
+    )
+    monkeypatch.setattr(route_logging, "_store_aawm_route_host_reverse_dns_cache", wrapped_store)
+    monkeypatch.setattr(route_logging.socket, "gethostbyaddr", Mock(return_value=None))
+    monkeypatch.setattr(route_logging, "_resolve_hostname_via_magicdns", Mock(return_value="seshat"))
+
+    fast_attribution = resolve_aawm_route_host_attribution(request)
+    assert fast_attribution["host_name"] == "100.99.166.16"
+    assert fast_attribution["host_name_source"] == "ip_literal"
+    assert cache_refreshed.wait(timeout=2.0)
+
+    host_name, host_name_source = route_logging._resolve_aawm_route_host_name_from_ip(
+        "100.99.166.16",
+        allow_blocking_lookup=True,
+    )
+    assert host_name == "seshat"
+    assert host_name_source == "magicdns_reverse_cache"
+
+
+def test_resolve_host_name_timeout_returns_ip_literal_fallback_without_mutating_global_defaults(
+    monkeypatch,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    original_default = socket.getdefaulttimeout()
+    setdefault_calls: list = []
+
+    monkeypatch.setattr(
+        route_logging,
+        "_run_socket_call_with_timeout",
+        Mock(side_effect=TimeoutError("resolver timeout")),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value=None),
+    )
+
+    def tracking_setdefault(value):
+        setdefault_calls.append(value)
+
+    monkeypatch.setattr(route_logging.socket, "setdefaulttimeout", tracking_setdefault)
+    monkeypatch.setattr(socket, "setdefaulttimeout", tracking_setdefault)
+
+    host_name, source = route_logging._resolve_aawm_route_host_name_from_ip(
+        "100.99.1.5",
+        allow_blocking_lookup=True,
+    )
+    assert host_name == "100.99.1.5"
+    assert source == "ip_literal"
+    assert setdefault_calls == []
+    assert socket.getdefaulttimeout() == original_default
+
+    cache_entry = route_logging._aawm_route_host_reverse_dns_cache["100.99.1.5"]
+    assert cache_entry[0] == "100.99.1.5"
+    assert cache_entry[1] == "ip_literal"
+
+    monkeypatch.setattr(
+        route_logging,
+        "_run_socket_call_with_timeout",
+        Mock(side_effect=AssertionError("cached value should short-circuit retries")),
+    )
+    host_name_cached, source_cached = route_logging._resolve_aawm_route_host_name_from_ip(
+        "100.99.1.5",
+        allow_blocking_lookup=True,
+    )
+    assert host_name_cached == "100.99.1.5"
+    assert source_cached == "ip_literal_cache"
 
 
 def test_aresolve_host_attribution_offloads_blocking_lookup(monkeypatch):
