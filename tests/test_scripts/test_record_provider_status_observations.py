@@ -634,7 +634,7 @@ def _set_alibaba_test_opener(session, open_fn) -> None:
     session.opener = opener
 
 
-def _alibaba_console_envelope(data: dict) -> dict:
+def _alibaba_console_envelope(data) -> dict:
     return {
         "data": {
             "DataV2": {
@@ -666,6 +666,23 @@ def _alibaba_subscription_payload() -> dict:
         "endTime": 1787184000000,
         "status": "VALID",
     }
+
+
+def _alibaba_reset_card_payload() -> list[dict]:
+    return [
+        {
+            "cardNo": "reset-card-secret-available",
+            "cardType": "WEEKLY",
+            "effectiveAt": 1785542400000,
+            "expiresAt": 1788220800000,
+        },
+        {
+            "cardNo": "reset-card-secret-expired",
+            "cardType": "PROMOTIONAL",
+            "effectiveAt": 1782864000000,
+            "expiresAt": 1785888000000,
+        },
+    ]
 
 
 def _grok_billing_payload() -> dict:
@@ -2717,6 +2734,153 @@ def test_extract_alibaba_console_data_success_returns_provider_data() -> None:
     assert provider_data["per5HourPercentage"] == 0.25
 
 
+def test_alibaba_reset_card_parser_builds_sanitized_credit_rows() -> None:
+    reset_cards = _alibaba_reset_card_payload()
+    assert loop._extract_alibaba_console_reset_card_list(
+        _alibaba_console_envelope(reset_cards),
+        endpoint="reset_cards",
+    ) == reset_cards
+    with pytest.raises(loop.AlibabaQuotaPollError) as exc_info:
+        loop._extract_alibaba_console_reset_card_list(
+            _alibaba_console_envelope({"cards": reset_cards}),
+            endpoint="reset_cards",
+        )
+    assert exc_info.value.telemetry_class == "contract_drift"
+
+    subscription = loop._parse_alibaba_subscription_payload(_alibaba_subscription_payload())
+    rows, available_count = loop._build_alibaba_reset_card_observations(
+        _alibaba_quota_poll_config(),
+        observed_at=datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc),
+        reset_cards=reset_cards,
+        subscription=subscription,
+        status_code=200,
+        attempt_count=1,
+        retry_count=0,
+        auth_source="auth_file",
+    )
+
+    available, expired = rows
+    assert available_count == 1
+    assert (
+        available["provider"],
+        available["credit_family"],
+        available["credit_type"],
+        available["status"],
+        available["available_count"],
+        expired["status"],
+        expired["available_count"],
+    ) == (
+        loop.ALIBABA_TOKEN_PLAN_PROVIDER,
+        loop.ALIBABA_TOKEN_PLAN_RESET_CARD_CREDIT_FAMILY,
+        "manual_reset_card",
+        "available",
+        1,
+        "expired",
+        0,
+    )
+    assert available["raw_provider_fields"] == {
+        "parser_version": loop.ALIBABA_TOKEN_PLAN_RESET_CARD_PARSER_VERSION,
+        "cardType": "WEEKLY",
+        "effectiveAt": 1785542400000,
+        "expiresAt": 1788220800000,
+    }
+    assert available["credit_identity"] == hashlib.sha256(
+        (
+            f"{subscription['account_hash']}|"
+            f"{loop.ALIBABA_TOKEN_PLAN_RESET_CARD_CREDIT_FAMILY}|"
+            "reset-card-secret-available"
+        ).encode()
+    ).hexdigest()
+    serialized = json.dumps(rows, default=str)
+    for forbidden in (
+        "cardNo",
+        "reset-card-secret-available",
+        "reset-card-secret-expired",
+        "instance-secret-identifier",
+    ):
+        assert forbidden not in serialized
+
+
+def test_alibaba_reset_card_persistence_dedupes_and_transitions_empty_inventory(
+    monkeypatch,
+) -> None:
+    config = _alibaba_quota_poll_config()
+    observed_at = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+    subscription = loop._parse_alibaba_subscription_payload(_alibaba_subscription_payload())
+    observations, available_count = loop._build_alibaba_reset_card_observations(
+        config,
+        observed_at=observed_at,
+        reset_cards=_alibaba_reset_card_payload(),
+        subscription=subscription,
+        status_code=200,
+        attempt_count=1,
+        retry_count=0,
+    )
+    inserted_rows = []
+    current_rows = observations
+    load_calls = []
+
+    def fake_load(_dsn, **kwargs):
+        load_calls.append(kwargs)
+        return current_rows
+
+    def fake_insert(_dsn, rows, **_kwargs):
+        inserted_rows.extend(rows)
+        return 0
+
+    monkeypatch.setattr(probes, "load_provider_credit_current_rows", fake_load)
+    monkeypatch.setattr(probes, "insert_provider_credit_observations", fake_insert)
+    assert loop._persist_alibaba_reset_card_observations(
+        config,
+        observed_at=observed_at,
+        observations=observations,
+        account_hash=subscription["account_hash"],
+        available_count=available_count,
+        status_code=200,
+        attempt_count=1,
+        retry_count=0,
+    ) == (2, 0)
+    assert inserted_rows == observations
+
+    empty_rows, empty_count = loop._build_alibaba_reset_card_observations(
+        config,
+        observed_at=observed_at,
+        reset_cards=[],
+        subscription=subscription,
+        status_code=200,
+        attempt_count=1,
+        retry_count=0,
+    )
+    current_rows = [
+        dict(observations[0], status="available"),
+        dict(observations[1], status="available"),
+        dict(observations[0], credit_identity="already-used", status="used"),
+    ]
+    lifecycle_rows = loop._synthesize_alibaba_reset_card_lifecycle_observations(
+        config,
+        observed_at=observed_at,
+        account_hash=subscription["account_hash"],
+        visible_identities=set(),
+        visible_card_count=0,
+        available_count=empty_count,
+        status_code=200,
+        attempt_count=1,
+        retry_count=0,
+    )
+    assert empty_rows == []
+    assert empty_count == 0
+    assert {
+        row["status"]: row["evidence"]["lifecycle_reason"]
+        for row in lifecycle_rows
+    } == {
+        "used": "card_missing_before_expiry",
+        "expired": "card_past_expiry",
+    }
+    assert load_calls[-1]["provider"] == loop.ALIBABA_TOKEN_PLAN_PROVIDER
+    assert load_calls[-1]["credit_family"] == loop.ALIBABA_TOKEN_PLAN_RESET_CARD_CREDIT_FAMILY
+    assert load_calls[-1]["source"] == loop.ALIBABA_TOKEN_PLAN_RESET_CARD_SOURCE
+
+
 def test_alibaba_quota_payloads_emit_exact_active_model_identities() -> None:
     import yaml
 
@@ -3386,22 +3550,30 @@ def test_alibaba_quota_error_preserves_token_fallback_compatibility() -> None:
     assert summary["token_fallback_source"] == "dashboard"
 
 
-def test_run_due_sidecar_tasks_schedules_alibaba_usage_and_subscription(
+def test_run_due_sidecar_tasks_schedules_alibaba_quota_inventory(
     monkeypatch,
 ) -> None:
     config = _alibaba_quota_poll_config()
     monkeypatch.setenv("ALIBABA_WEB_KEY", _alibaba_web_key())
     calls: list[str] = []
+    reset_fetch_count = 0
+    reset_persisted = []
 
     def fake_fetch(_config, *, api_name, endpoint, auth, session):
+        nonlocal reset_fetch_count
         assert auth["login_ticket"] == "login-ticket-secret"
         assert isinstance(session, loop.AlibabaWebSession)
         calls.append(endpoint)
-        data = (
-            _alibaba_subscription_payload()
-            if api_name == loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API
-            else _alibaba_usage_payload()
-        )
+        if api_name == loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API:
+            data = _alibaba_subscription_payload()
+        elif api_name == loop.ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API:
+            reset_fetch_count += 1
+            data = _alibaba_reset_card_payload()
+            if reset_fetch_count == 2:
+                data[0]["cardNo"] = "reset-card-secret-invalid"
+                data[0]["expiresAt"] = "invalid-expiry"
+        else:
+            data = _alibaba_usage_payload()
         return {
             "status_code": 200,
             "payload": data,
@@ -3416,6 +3588,12 @@ def test_run_due_sidecar_tasks_schedules_alibaba_usage_and_subscription(
         "_persist_alibaba_quota_observations",
         lambda _config, payloads: len(payloads),
     )
+    monkeypatch.setattr(
+        loop,
+        "_persist_alibaba_reset_card_observations",
+        lambda _config, **kwargs: reset_persisted.append(kwargs["observations"])
+        or (len(kwargs["observations"]),) * 2,
+    )
 
     state = loop.SidecarTaskState()
     first = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
@@ -3423,26 +3601,74 @@ def test_run_due_sidecar_tasks_schedules_alibaba_usage_and_subscription(
     usage_only = loop.run_due_sidecar_tasks(config, state, now_monotonic=401.0)
     refreshed = loop.run_due_sidecar_tasks(config, state, now_monotonic=21701.0)
 
-    assert calls == ["subscription", "usage", "usage", "subscription", "usage"]
+    assert calls == [
+        "subscription",
+        "usage",
+        "reset_cards",
+        "usage",
+        "reset_cards",
+        "subscription",
+        "usage",
+        "reset_cards",
+    ]
     assert throttled == []
-    assert first[0]["event"] == "alibaba_quota_poll"
-    assert first[0]["subscription_refreshed"] is True
-    assert first[0]["observation_count"] == 4
-    assert first[0]["inserted_count"] == 4
-    assert first[0]["persisted"] is True
-    assert first[0]["telemetry_status"] == "valid"
-    assert first[0]["auth_source"] == "ALIBABA_WEB_KEY"
-    assert first[0]["cookie_only_first"] is True
-    assert first[0]["sec_token_persisted"] is False
-    assert first[0]["token_fallback_attempted"] is False
-    assert first[0]["token_fallback_succeeded"] is False
-    assert first[0]["token_fallback_source"] is None
-    assert usage_only[0]["subscription_refreshed"] is False
+    assert (
+        first[0]["event"],
+        first[0]["subscription_refreshed"],
+        first[0]["observation_count"],
+        first[0]["inserted_count"],
+        first[0]["persisted"],
+        first[0]["reset_card_visible_count"],
+        first[0]["reset_card_available_count"],
+        first[0]["reset_card_observation_count"],
+        first[0]["reset_card_inserted_count"],
+        first[0]["reset_card_persisted"],
+        first[0]["telemetry_status"],
+        first[0]["auth_source"],
+        first[0]["cookie_only_first"],
+        first[0]["sec_token_persisted"],
+        first[0]["token_fallback_attempted"],
+        first[0]["token_fallback_succeeded"],
+        first[0]["token_fallback_source"],
+    ) == (
+        "alibaba_quota_poll",
+        True,
+        8,
+        8,
+        True,
+        2,
+        1,
+        2,
+        2,
+        True,
+        "valid",
+        "ALIBABA_WEB_KEY",
+        True,
+        False,
+        False,
+        False,
+        None,
+    )
+    assert (
+        usage_only[0]["subscription_refreshed"],
+        usage_only[0]["persisted"],
+        usage_only[0]["reset_card_persisted"],
+        usage_only[0]["telemetry_class"],
+        usage_only[0]["error_endpoint"],
+    ) == (False, True, False, "malformed_telemetry", "reset_cards")
     assert refreshed[0]["subscription_refreshed"] is True
+    assert len(reset_persisted) == 2
     serialized = json.dumps(first + usage_only + refreshed)
-    assert "instance-secret-identifier" not in serialized
-    assert "login-ticket-secret" not in serialized
-    assert "security-token-secret" not in serialized
+    assert all(
+        secret not in serialized
+        for secret in (
+            "instance-secret-identifier",
+            "login-ticket-secret",
+            "security-token-secret",
+            "reset-card-secret-invalid",
+            "invalid-expiry",
+        )
+    )
 
 
 def test_run_due_sidecar_tasks_reuses_alibaba_cookies_across_polls(
@@ -3472,6 +3698,12 @@ def test_run_due_sidecar_tasks_reuses_alibaba_cookies_across_polls(
                     "Path=/; Secure; HttpOnly"
                 ],
             )
+        if api_name == loop.ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API:
+            return (
+                json.dumps(_alibaba_console_envelope(_alibaba_reset_card_payload())),
+                200,
+                [],
+            )
         return (
             json.dumps(_alibaba_console_envelope(_alibaba_usage_payload())),
             200,
@@ -3488,14 +3720,20 @@ def test_run_due_sidecar_tasks_reuses_alibaba_cookies_across_polls(
     assert [api_name for api_name, _cookie, _body in calls] == [
         loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API,
         loop.ALIBABA_TOKEN_PLAN_USAGE_API,
+        loop.ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API,
         loop.ALIBABA_TOKEN_PLAN_USAGE_API,
+        loop.ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API,
     ]
     assert "quota_session=" not in calls[0][1]
     assert "quota_session=quota-cookie-secret" in calls[1][1]
     assert "quota_session=quota-cookie-secret" in calls[2][1]
+    assert "quota_session=quota-cookie-secret" in calls[3][1]
+    assert "quota_session=quota-cookie-secret" in calls[4][1]
     assert "sec_token" not in calls[0][2]
     assert "sec_token" not in calls[1][2]
-    assert calls[2][2]["sec_token"] == ["cached-security-token-secret"]
+    assert "sec_token" not in calls[2][2]
+    assert calls[3][2]["sec_token"] == ["cached-security-token-secret"]
+    assert calls[4][2]["sec_token"] == ["cached-security-token-secret"]
     assert state.alibaba_web_session is session
     assert first[0]["cookie_only_first"] is True
     assert second[0]["cookie_only_first"] is False
@@ -3517,16 +3755,20 @@ def test_run_due_sidecar_tasks_hot_reloads_replaced_auth_file(
 ) -> None:
     auth_path = tmp_path / "token-plan-session.json"
     _write_alibaba_web_auth_file(auth_path, login_ticket="first-ticket-secret")
-    config = _alibaba_quota_poll_config(alibaba_web_auth_file=str(auth_path))
+    config = _alibaba_quota_poll_config(
+        apply=False,
+        alibaba_web_auth_file=str(auth_path),
+    )
     calls: list[tuple[str, str, loop.AlibabaWebSession]] = []
 
     def fake_fetch(_config, *, api_name, endpoint, auth, session):
         calls.append((endpoint, auth["login_ticket"], session))
-        payload = (
-            _alibaba_subscription_payload()
-            if api_name == loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API
-            else _alibaba_usage_payload()
-        )
+        if api_name == loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API:
+            payload = _alibaba_subscription_payload()
+        elif api_name == loop.ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API:
+            payload = _alibaba_reset_card_payload()
+        else:
+            payload = _alibaba_usage_payload()
         return {
             "status_code": 200,
             "payload": payload,
@@ -3535,11 +3777,6 @@ def test_run_due_sidecar_tasks_hot_reloads_replaced_auth_file(
         }
 
     monkeypatch.setattr(loop, "_fetch_alibaba_quota_payload", fake_fetch)
-    monkeypatch.setattr(
-        loop,
-        "_persist_alibaba_quota_observations",
-        lambda _config, payloads: len(payloads),
-    )
     state = loop.SidecarTaskState()
 
     first = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
@@ -3554,12 +3791,16 @@ def test_run_due_sidecar_tasks_hot_reloads_replaced_auth_file(
     assert [(endpoint, ticket) for endpoint, ticket, _session in calls] == [
         ("subscription", "first-ticket-secret"),
         ("usage", "first-ticket-secret"),
+        ("reset_cards", "first-ticket-secret"),
         ("subscription", "second-ticket-secret"),
         ("usage", "second-ticket-secret"),
+        ("reset_cards", "second-ticket-secret"),
     ]
     assert calls[0][2] is calls[1][2]
-    assert calls[2][2] is calls[3][2]
-    assert calls[0][2] is not calls[2][2]
+    assert calls[0][2] is calls[2][2]
+    assert calls[3][2] is calls[4][2]
+    assert calls[3][2] is calls[5][2]
+    assert calls[0][2] is not calls[3][2]
     assert first[0]["credential_reloaded"] is True
     assert first[0]["ticket_reset"] is False
     assert second[0]["credential_reloaded"] is True
@@ -3675,7 +3916,7 @@ def test_persist_alibaba_quota_observations_uses_sidecar_db_path(
 
     inserted_count = loop._persist_alibaba_quota_observations(config, payloads)
 
-    assert inserted_count == 4
+    assert inserted_count == 8
     assert fake_conn.cursor_instance.execute_calls[:3] == [
         (
             "SELECT set_config('application_name', %s, false)",
@@ -3687,6 +3928,10 @@ def test_persist_alibaba_quota_observations_uses_sidecar_db_path(
     assert [params[6] for _statement, params in fake_conn.cursor_instance.execute_calls[3:]] == [
         loop.ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY,
         loop.ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY,
+        loop.ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY,
+        loop.ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY,
+        loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
+        loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
         loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
         loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
     ]

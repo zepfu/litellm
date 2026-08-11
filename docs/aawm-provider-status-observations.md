@@ -441,6 +441,29 @@ consumed fraction is exactly zero. That unused window is persisted with
 `reset_at_state=absent_unused_window` evidence. A missing reset for a consumed
 window remains malformed telemetry and is not persisted.
 
+The same scheduled poll separately reads the manual reset-card inventory from
+`zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/reset-card/list`. These cards
+are operator-consumable weekly quota resets, not the automatic rolling 5-hour
+or 7-day quota-window reset timestamps above. Observation is read-only: it
+lists cards but never consumes or applies a reset.
+
+Manual reset-card rows reuse `public.provider_credit_observations` and
+`public.provider_credit_current` with
+`provider=alibaba_token_plan`,
+`credit_family=alibaba_token_plan_manual_quota_reset`, and
+`source=alibaba_token_plan_reset_card_list`. Each card has a stable SHA-256
+`credit_identity` derived from the hashed account scope and `cardNo`; raw
+`cardNo` is never stored. Sanitized fields retain `cardType`, `effectiveAt`,
+and `expiresAt`, while normalized columns use `granted_at=effectiveAt`,
+`expires_at`, per-row `available_count` (`1` or `0`), and lifecycle `status`.
+Visible unexpired cards are `available`; visible expired cards are `expired`.
+A previously visible `available` card that disappears before expiry becomes
+`used`, while one that disappears at or after expiry becomes `expired`.
+Unchanged inventories dedupe through the shared credit writer. An empty list is
+valid and transitions any previously available cards without fabricating a
+card row. The poll event exposes the aggregate as
+`reset_card_available_count`.
+
 Authentication is file-driven and reloaded on each due poll. The sidecar reads
 `AAWM_ALIBABA_WEB_AUTH_FILE` (default:
 `/home/zepfu/.alibaba/token-plan-session.json`) and requires a JSON payload in
@@ -467,9 +490,9 @@ sidecar memory only and is never persisted to disk; it is discarded on
 process exit.
 
 The first quota fetch in a new process-lifetime session starts cookie-only.
-Response `Set-Cookie` updates are retained in memory across subscription and
-usage calls and across poll cycles. If a bootstrap discovers a `sec_token`, it
-is cached only in that in-memory session, so later subscription or usage
+Response `Set-Cookie` updates are retained in memory across subscription,
+usage, and reset-card list calls and across poll cycles. If a bootstrap
+discovers a `sec_token`, it is cached only in that in-memory session, so later
 fetches may include it on their initial request. The `cookie_only_first`
 telemetry field reports whether the initial request of the reported fetch
 actually omitted `sec_token`.
@@ -502,12 +525,12 @@ The replacement procedure is atomic write-to-temp plus rename to the configured
 path. A replaced file is picked up automatically on the next due poll without
 container restart.
 
-The usage request runs at startup and then on the configured usage cadence.
-Subscription metadata is refreshed at startup and independently on the
-configured subscription cadence. The subscription response supplies the
-active-plan status, plan specification, period boundaries, and a plan-instance
-identifier used only to derive `account_hash`; the raw identifier is not
-persisted.
+The usage and manual reset-card list requests run at startup and then on the
+configured usage cadence. Subscription metadata is refreshed at startup and
+independently on the configured subscription cadence. The subscription
+response supplies the active-plan status, plan specification, period
+boundaries, and a plan-instance identifier used only to derive `account_hash`;
+the raw identifier is not persisted.
 
 Relevant environment variables:
 
@@ -530,10 +553,15 @@ Relevant environment variables:
 - `AAWM_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS`: base exponential backoff for
   transient failures; the managed sidecar default is `0.5`.
 
-Each due attempt emits one sanitized `alibaba_quota_poll` JSON event. Runtime
-success requires HTTP 200 responses, an active subscription, two parsed
-observations, successful persistence, and no credential, raw response, account
-identity, cookie value, or traceback in container logs.
+Each due attempt emits one sanitized `alibaba_quota_poll` JSON event. Reset-card
+telemetry includes status/attempt counts, visible and available card counts,
+credit observation/insert counts, and whether the reset-card state was
+persisted. Runtime success requires HTTP 200 responses, an active subscription,
+valid recognized usage windows, a valid reset-card array (including an empty
+array), successful configured persistence, and no credential, raw response,
+raw card number, account identity, cookie value, or traceback in container
+logs. Authentication, transport, HTTP, envelope, or field-validation failures
+are degraded and leave the last-known reset-card current state unchanged.
 
 Anthropic unified response headers persist separate weekly buckets:
 

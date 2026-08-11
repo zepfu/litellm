@@ -1147,9 +1147,20 @@ def derive_provider_credit_identity(
     expires_at: Optional[datetime],
     reset_type: Optional[str],
     provider_credit_id: Optional[str] = None,
+    hash_provider_credit_id: bool = False,
 ) -> str:
     if isinstance(provider_credit_id, str) and provider_credit_id.strip():
-        return provider_credit_id.strip()
+        normalized_provider_credit_id = provider_credit_id.strip()
+        if not hash_provider_credit_id:
+            return normalized_provider_credit_id
+        provider_identity_material = "|".join(
+            [
+                account_hash,
+                credit_family,
+                normalized_provider_credit_id,
+            ]
+        )
+        return hashlib.sha256(provider_identity_material.encode("utf-8")).hexdigest()
     identity_material = "|".join(
         [
             account_hash,
