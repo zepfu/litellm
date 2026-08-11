@@ -260,11 +260,11 @@ async def test_should_translate_responses_tools_continuation_and_k3_effort():
 
 
 @pytest.mark.asyncio
-async def test_should_normalize_forced_tool_choice_to_auto_for_k3_reasoning():
+async def test_should_normalize_forced_tool_choice_to_auto_for_k3_default_thinking():
     plan = await _prepare_codex_kimi_chat_completions_adapter_route(
         request=_request(),
         prepared_request_body={
-            "model": "kimi_code/k3-max",
+            "model": "kimi_code/k3",
             "input": [{"role": "user", "content": "inspect"}],
             "tools": [
                 {
@@ -278,19 +278,17 @@ async def test_should_normalize_forced_tool_choice_to_auto_for_k3_reasoning():
                 "type": "custom",
                 "name": "apply_patch",
             },
-            "reasoning": {"effort": "max"},
             "stream": False,
         },
-        adapter_model="kimi_code/k3-max",
+        adapter_model="kimi_code/k3",
     )
 
     completion_kwargs = plan.perform_kwargs["completion_kwargs"]
     assert completion_kwargs["tool_choice"] == "auto"
-    assert completion_kwargs["reasoning_effort"] == "max"
-    assert [tool["function"]["name"] for tool in completion_kwargs["tools"]] == [
-        "apply_patch",
-        "read_file",
-    ]
+    assert "reasoning_effort" not in completion_kwargs
+    assert completion_kwargs["tools"][0]["type"] == "custom"
+    assert completion_kwargs["tools"][0]["name"] == "apply_patch"
+    assert completion_kwargs["tools"][1]["function"]["name"] == "read_file"
 
 
 @pytest.mark.asyncio

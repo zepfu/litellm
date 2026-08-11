@@ -206,15 +206,12 @@ def _normalize_kimi_forced_tool_choice_for_k3_reasoning(
 ) -> None:
     """Kimi returns 400 when a forced tool choice is paired with thinking.
 
-    When a specific tool is requested on a K3 model with thinking enabled,
-    normalize the choice to `auto` so function tools continue to flow while
-    avoiding the incompatible `tool_choice='specified'` request shape.
+    K3 uses thinking by default even when no reasoning effort is provided.
+    Normalize specific tool choices to `auto` so function tools continue to
+    flow while avoiding the incompatible `tool_choice='specified'` shape.
     """
 
     if not is_k3_model_id(upstream_model):
-        return
-
-    if completion_kwargs.get("reasoning_effort") is None:
         return
 
     tool_choice = original_tool_choice
