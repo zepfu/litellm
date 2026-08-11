@@ -3488,6 +3488,114 @@ def _session_affinity_mod():
     return mod
 
 
+def _aawm_apply_openai_encrypted_reasoning_pre_send(
+    *,
+    request: Request,
+    parsed_body: dict,
+    custom_llm_provider: Optional[str],
+    egress_credential_family: Optional[str],
+    expected_target_family: Optional[str],
+    url: Optional[httpx.URL],
+    provider_bound_body: Optional[dict] = None,
+) -> None:
+    """OPENAI-006: item provenance guard before OpenAI/Codex Responses egress.
+
+    Preparation is applied to the final upstream JSON body
+    (``provider_bound_body`` when detached; otherwise ``parsed_body``) so both
+    streaming and non-streaming HTTP sends serialize original ciphertext
+    byte-for-byte with no ``aawm_erp`` wrapper or item sidecar. Safe disposition
+    metadata is merged only into the observability ``parsed_body`` (and
+    request.state), never re-injected into the provider-bound send body.
+    Account lane is never a sole rejection reason.
+    """
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+        build_encrypted_reasoning_disposition_metadata,
+        guard_openai_encrypted_reasoning_egress,
+        is_openai_responses_egress,
+        merge_encrypted_reasoning_disposition_into_request_body,
+    )
+
+    path = str(getattr(url, "path", "") or "")
+    if not is_openai_responses_egress(
+        custom_llm_provider=custom_llm_provider,
+        egress_credential_family=egress_credential_family,
+        expected_target_family=expected_target_family,
+        url_path=path,
+    ):
+        return
+
+    # Final serialized JSON for both stream and non-stream send paths.
+    send_body = (
+        provider_bound_body
+        if isinstance(provider_bound_body, dict)
+        else parsed_body
+    )
+    identity_source = (
+        parsed_body if isinstance(parsed_body, dict) else send_body
+    )
+
+    sa = _session_affinity_mod()
+    session_identity = sa.resolve_canonical_session_identity(
+        request, identity_source
+    )
+    prepared, disposition = guard_openai_encrypted_reasoning_egress(
+        send_body,
+        session_identity=session_identity,
+        target_provider="openai",
+        target_route_family=egress_credential_family or expected_target_family,
+        failure_phase="encrypted_reasoning_openai_pre_send",
+    )
+
+    # Synchronize normalized input into the live send body used by httpx.
+    # ``prepare`` returns a new dict when input items change; a top-level
+    # shallow provider_bound_body copy would otherwise keep the wrapped list.
+    if isinstance(prepared, dict):
+        prepared_input = prepared.get("input")
+        if isinstance(prepared_input, list):
+            send_body["input"] = prepared_input
+            if (
+                isinstance(parsed_body, dict)
+                and parsed_body is not send_body
+                and isinstance(parsed_body.get("input"), list)
+            ):
+                # Keep the observability body aligned with egress ciphertext.
+                parsed_body["input"] = prepared_input
+
+    # Disposition/observability only — do not reintroduce litellm_metadata onto
+    # the stripped provider-bound send body.
+    if isinstance(parsed_body, dict):
+        merged = merge_encrypted_reasoning_disposition_into_request_body(
+            parsed_body, disposition
+        )
+        if merged is not parsed_body:
+            parsed_body.clear()
+            parsed_body.update(merged)
+
+    # Mirror safe disposition onto request.state for attempt/audit consumers.
+    state = getattr(request, "state", None)
+    if state is not None:
+        try:
+            setattr(
+                state,
+                "_aawm_encrypted_reasoning_disposition",
+                build_encrypted_reasoning_disposition_metadata(
+                    disposition=str(
+                        disposition.get("encrypted_reasoning_disposition")
+                        or "unknown"
+                    ),
+                    items=disposition.get("encrypted_reasoning_items") or [],
+                    compatibility_ok=disposition.get(
+                        "encrypted_reasoning_compatible"
+                    ),
+                    mismatch_reason=disposition.get(
+                        "encrypted_reasoning_mismatch_reason"
+                    ),
+                ),
+            )
+        except Exception:
+            pass
+
+
 async def _aawm_session_owner_pre_send_guard(
     *,
     request: Request,
@@ -3496,11 +3604,33 @@ async def _aawm_session_owner_pre_send_guard(
     egress_credential_family: Optional[str],
     expected_target_family: Optional[str],
     url: Optional[httpx.URL],
+    provider_bound_body: Optional[dict] = None,
 ) -> None:
     """Ensure tokenized session-owner reservation before upstream send.
 
     No-ops when the request was already guarded (alias candidate loop / handler).
+    OPENAI-006 encrypted-reasoning compatibility always runs for OpenAI
+    Responses egress, including when session-owner was already guarded, and is
+    applied to the final provider-bound JSON body used by stream/non-stream send.
     """
+    if isinstance(parsed_body, dict) or isinstance(provider_bound_body, dict):
+        body_for_apply = (
+            parsed_body if isinstance(parsed_body, dict) else provider_bound_body
+        )
+        assert isinstance(body_for_apply, dict)
+        _aawm_apply_openai_encrypted_reasoning_pre_send(
+            request=request,
+            parsed_body=body_for_apply,
+            custom_llm_provider=custom_llm_provider,
+            egress_credential_family=egress_credential_family,
+            expected_target_family=expected_target_family,
+            url=url,
+            provider_bound_body=(
+                provider_bound_body
+                if isinstance(provider_bound_body, dict)
+                else None
+            ),
+        )
     sa = _session_affinity_mod()
     if sa.request_session_owner_already_guarded(request):
         # Renew held reservation before potentially long upstream I/O.
@@ -4038,6 +4168,11 @@ async def pass_through_request(  # noqa: PLR0915
                 egress_credential_family=egress_credential_family,
                 expected_target_family=expected_target_family,
                 url=url,
+                provider_bound_body=(
+                    provider_bound_body
+                    if isinstance(provider_bound_body, dict)
+                    else None
+                ),
             )
             upstream_wait_started_at = datetime.now()
 
@@ -4169,6 +4304,11 @@ async def pass_through_request(  # noqa: PLR0915
             egress_credential_family=egress_credential_family,
             expected_target_family=expected_target_family,
             url=url,
+            provider_bound_body=(
+                provider_bound_body
+                if isinstance(provider_bound_body, dict)
+                else None
+            ),
         )
         upstream_wait_started_at = datetime.now()
 
@@ -4355,6 +4495,38 @@ async def pass_through_request(  # noqa: PLR0915
                 response_body = restored_response_body
                 content = json.dumps(
                     restored_response_body,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+        # OPENAI-006: stamp producer provenance on outbound encrypted reasoning.
+        if isinstance(response_body, dict):
+            from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+                build_producer_provenance_from_egress_context,
+                stamp_encrypted_reasoning_provenance_in_response,
+            )
+
+            producer_prov = build_producer_provenance_from_egress_context(
+                custom_llm_provider=custom_llm_provider,
+                egress_credential_family=egress_credential_family,
+                expected_target_family=expected_target_family,
+                request_body=_parsed_body if isinstance(_parsed_body, dict) else None,
+            )
+            stamped_body = stamp_encrypted_reasoning_provenance_in_response(
+                response_body, producer_prov
+            )
+            if stamped_body is not response_body:
+                response_body = stamped_body
+            # Re-serialize when any encrypted reasoning item was stamped.
+            if any(
+                isinstance(item, dict)
+                and item.get("type") == "reasoning"
+                and isinstance(item.get("encrypted_content"), str)
+                and item.get("aawm_encrypted_reasoning_provenance")
+                for item in (response_body.get("output") or [])
+                if isinstance(item, dict)
+            ):
+                content = json.dumps(
+                    response_body,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ).encode("utf-8")

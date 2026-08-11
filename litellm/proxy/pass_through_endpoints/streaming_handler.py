@@ -132,6 +132,24 @@ class PassThroughStreamingHandler:
         )
 
     @staticmethod
+    def _stamp_encrypted_reasoning_in_responses_sse_chunk(
+        chunk: bytes,
+        *,
+        request_body: Optional[Dict[str, Any]],
+        custom_llm_provider: Optional[str],
+    ) -> bytes:
+        """OPENAI-006: delegate SSE provenance stamping to the helper module."""
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+            stamp_encrypted_reasoning_in_responses_sse_chunk,
+        )
+
+        return stamp_encrypted_reasoning_in_responses_sse_chunk(
+            chunk,
+            request_body=request_body,
+            custom_llm_provider=custom_llm_provider,
+        )
+
+    @staticmethod
     def _is_done_chunk(chunk: bytes) -> bool:
         try:
             decoded = chunk.decode("utf-8", errors="ignore")
@@ -779,6 +797,11 @@ class PassThroughStreamingHandler:
                     )
 
                 if responses_terminal_accumulator is not None:
+                    chunk = PassThroughStreamingHandler._stamp_encrypted_reasoning_in_responses_sse_chunk(
+                        chunk,
+                        request_body=request_body if isinstance(request_body, dict) else None,
+                        custom_llm_provider=custom_llm_provider,
+                    )
                     responses_terminal_accumulator.feed(chunk)
                     if not responses_terminal_seen:
                         responses_terminal_seen = (
@@ -833,6 +856,19 @@ class PassThroughStreamingHandler:
                         if modified_chunk is not None:
                             chunk = modified_chunk
 
+                # OPENAI-006: stamp encrypted reasoning on non-OpenAI Responses
+                # streams too (e.g. xAI) so foreign provenance survives into
+                # later OpenAI continuations.
+                if (
+                    isinstance(chunk, (bytes, bytearray))
+                    and b"encrypted_content" in chunk
+                    and b"reasoning" in chunk
+                ):
+                    chunk = PassThroughStreamingHandler._stamp_encrypted_reasoning_in_responses_sse_chunk(
+                        bytes(chunk),
+                        request_body=request_body if isinstance(request_body, dict) else None,
+                        custom_llm_provider=custom_llm_provider,
+                    )
                 _mark_first_emitted_chunk()
                 yield chunk
 
