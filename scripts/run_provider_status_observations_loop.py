@@ -599,6 +599,7 @@ class AlibabaQuotaFetchState:
 
     session: AlibabaWebSession
     request_auth: Dict[str, str]
+    cookie_only_attempted: bool
     attempt_count: int = 0
     retry_count: int = 0
     bootstrap_attempted: bool = False
@@ -612,6 +613,7 @@ class AlibabaQuotaFetchState:
         return {
             "attempt_count": self.attempt_count,
             "retry_count": self.retry_count,
+            "cookie_only_attempted": self.cookie_only_attempted,
             "bootstrap_attempted": self.bootstrap_attempted,
             "bootstrap_succeeded": self.bootstrap_succeeded,
             "bootstrap_source": self.bootstrap_source,
@@ -622,10 +624,7 @@ class AlibabaQuotaFetchState:
         }
 
     def result_metadata(self) -> Dict[str, Any]:
-        return {
-            **self.error_metadata(),
-            "cookie_only_attempted": True,
-        }
+        return self.error_metadata()
 
 
 GROK_BILLING_RATE_LIMIT_INSERT_SQL = """
@@ -7059,6 +7058,7 @@ def _fetch_alibaba_quota_payload(
     state = AlibabaQuotaFetchState(
         session=session,
         request_auth=request_auth,
+        cookie_only_attempted="sec_token" not in request_auth,
     )
     while True:
         state.attempt_count += 1
@@ -7366,7 +7366,7 @@ def _alibaba_quota_request_contract_summary(
         "configured_auth_file": bool(config.alibaba_web_auth_file),
         "auth_source": None,
         "header_names": ["content-type", "cookie", "referer", "user-agent"],
-        "cookie_only_first": True,
+        "cookie_only_first": None,
         "sec_token_persisted": False,
         "usage_interval_seconds": config.alibaba_quota_poll_interval_seconds,
         "subscription_interval_seconds": (config.alibaba_subscription_poll_interval_seconds),
@@ -9458,6 +9458,8 @@ def _merge_alibaba_fetch_summary(
     summary[f"{endpoint}_status_code"] = fetched["status_code"]
     summary[f"{endpoint}_attempt_count"] = fetched.get("attempt_count", 1)
     summary[f"{endpoint}_retry_count"] = fetched.get("retry_count", 0)
+    if "cookie_only_attempted" in fetched:
+        summary["cookie_only_first"] = bool(fetched["cookie_only_attempted"])
     summary["bootstrap_attempted"] = bool(
         summary["bootstrap_attempted"] or fetched.get("bootstrap_attempted")
     )
@@ -9495,6 +9497,7 @@ def _record_alibaba_poll_failure(
         summary[f"{exc.endpoint}_status_code"] = exc.status_code
         summary[f"{exc.endpoint}_attempt_count"] = exc.attempt_count
         summary[f"{exc.endpoint}_retry_count"] = exc.retry_count
+        summary["cookie_only_first"] = exc.cookie_only_attempted
         summary["bootstrap_attempted"] = exc.bootstrap_attempted
         summary["bootstrap_succeeded"] = exc.bootstrap_succeeded
         summary["bootstrap_source"] = exc.bootstrap_source

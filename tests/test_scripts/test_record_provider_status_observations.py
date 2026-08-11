@@ -3381,6 +3381,7 @@ def test_run_due_sidecar_tasks_schedules_alibaba_usage_and_subscription(
             "payload": data,
             "attempt_count": 1,
             "retry_count": 0,
+            "cookie_only_attempted": True,
         }
 
     monkeypatch.setattr(loop, "_fetch_alibaba_quota_payload", fake_fetch)
@@ -3428,11 +3429,12 @@ def test_run_due_sidecar_tasks_reuses_alibaba_cookies_across_polls(
         login_ticket="login-ticket-secret",
     )
     gateway_host = urlsplit(config.alibaba_quota_gateway_url).hostname
-    calls: list[tuple[str, str]] = []
+    calls: list[tuple[str, str, dict[str, list[str]]]] = []
 
     def fake_open(request):
         api_name = parse_qs(urlsplit(request.full_url).query)["api"][0]
-        calls.append((api_name, request.get_header("Cookie") or ""))
+        body = parse_qs((request.data or b"").decode("utf-8"))
+        calls.append((api_name, request.get_header("Cookie") or "", body))
         if api_name == loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API:
             return (
                 json.dumps(
@@ -3454,9 +3456,10 @@ def test_run_due_sidecar_tasks_reuses_alibaba_cookies_across_polls(
     state = loop.SidecarTaskState(alibaba_web_session=session)
 
     first = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
+    session.sec_token = "cached-security-token-secret"
     second = loop.run_due_sidecar_tasks(config, state, now_monotonic=401.0)
 
-    assert [api_name for api_name, _cookie in calls] == [
+    assert [api_name for api_name, _cookie, _body in calls] == [
         loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API,
         loop.ALIBABA_TOKEN_PLAN_USAGE_API,
         loop.ALIBABA_TOKEN_PLAN_USAGE_API,
@@ -3464,7 +3467,12 @@ def test_run_due_sidecar_tasks_reuses_alibaba_cookies_across_polls(
     assert "quota_session=" not in calls[0][1]
     assert "quota_session=quota-cookie-secret" in calls[1][1]
     assert "quota_session=quota-cookie-secret" in calls[2][1]
+    assert "sec_token" not in calls[0][2]
+    assert "sec_token" not in calls[1][2]
+    assert calls[2][2]["sec_token"] == ["cached-security-token-secret"]
     assert state.alibaba_web_session is session
+    assert first[0]["cookie_only_first"] is True
+    assert second[0]["cookie_only_first"] is False
     assert first[0]["cookie_names"] == [
         "login_aliyunid_ticket",
         "login_aliyunid_ticket",
@@ -3472,7 +3480,9 @@ def test_run_due_sidecar_tasks_reuses_alibaba_cookies_across_polls(
     ]
     assert first[0]["cookie_count"] == 3
     assert second[0]["cookie_names"] == first[0]["cookie_names"]
-    assert "quota-cookie-secret" not in json.dumps(first + second)
+    serialized = json.dumps(first + second)
+    assert "quota-cookie-secret" not in serialized
+    assert "cached-security-token-secret" not in serialized
 
 
 def test_run_due_sidecar_tasks_hot_reloads_replaced_auth_file(

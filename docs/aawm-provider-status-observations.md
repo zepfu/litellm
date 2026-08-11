@@ -466,19 +466,24 @@ reset is reported as value-free `ticket_reset=true`. The session lives in
 sidecar memory only and is never persisted to disk; it is discarded on
 process exit.
 
-The sidecar attempts cookie-only subscription/usage calls through the session
-opener first, so response `Set-Cookie` updates are retained in memory across
-the subscription and usage calls and across poll cycles for the process
-lifetime. When a quota response is a known application-level authentication
-envelope (the narrow fail-closed auth classification), or an HTTP 401/403,
-the sidecar runs one bounded session bootstrap even when the envelope carries
-no `sec_token` hint: a dashboard request, then `/tool/user/info.json`, both
+The first quota fetch in a new process-lifetime session starts cookie-only.
+Response `Set-Cookie` updates are retained in memory across subscription and
+usage calls and across poll cycles. If a bootstrap discovers a `sec_token`, it
+is cached only in that in-memory session, so later subscription or usage
+fetches may include it on their initial request. The `cookie_only_first`
+telemetry field reports whether the initial request of the reported fetch
+actually omitted `sec_token`.
+
+When a quota response is a known application-level authentication envelope
+(the narrow fail-closed auth classification), or an HTTP 401/403, the sidecar
+runs one bounded session bootstrap even when the envelope carries no
+`sec_token` hint: a dashboard request, then `/tool/user/info.json`, both
 through the session opener so their response cookies renew the in-memory
 session. At most one bootstrap runs per endpoint fetch, followed by a single
 replay of the original call; a still-failing replay fails closed as `auth`
-with no second bootstrap. If the bootstrap response exposes a `sec_token`,
-it is cached on the session in memory, attached to the replayed call, and
-never persisted.
+with no second bootstrap. If the bootstrap response exposes a `sec_token`, it
+is attached to the replayed call and remains available to later fetches, but
+is never persisted.
 
 Each `alibaba_quota_poll` event reports the legacy `token_fallback_*` fields
 (retained for compatibility; a bootstrap that yields a `sec_token` also sets
