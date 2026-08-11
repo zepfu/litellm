@@ -124,6 +124,12 @@ def _lookup_active_snapshot_canonical_alias(
     for alias_name in snapshot.aliases:
         if alias_name.casefold() == normalized:
             return alias_name
+
+    if normalized.startswith("aawm-"):
+        stripped_alias = normalized.removeprefix("aawm-")
+        for alias_name in snapshot.aliases:
+            if alias_name.casefold() == stripped_alias:
+                return alias_name
     return None
 
 

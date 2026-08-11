@@ -151,6 +151,13 @@ def test_should_register_the_canonical_moonshot_alias_for_both_ingresses() -> No
     )
 
 
+def test_should_lookup_dispatcher_prefixed_moonshot_alias() -> None:
+    assert (
+        snapshot_select._lookup_active_snapshot_canonical_alias("aawm-sota-moonshot")
+        == "sota-moonshot"
+    )
+
+
 @pytest.mark.asyncio
 async def test_should_follow_work_snapshot_candidates_after_spark_cooldown() -> None:
     codex_candidates = snapshot_select._select_snapshot_candidates(
