@@ -260,6 +260,66 @@ async def test_should_translate_responses_tools_continuation_and_k3_effort():
 
 
 @pytest.mark.asyncio
+async def test_should_normalize_forced_tool_choice_to_auto_for_k3_reasoning():
+    plan = await _prepare_codex_kimi_chat_completions_adapter_route(
+        request=_request(),
+        prepared_request_body={
+            "model": "kimi_code/k3-max",
+            "input": [{"role": "user", "content": "inspect"}],
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a patch to files in the workspace.",
+                },
+                {"type": "function", "name": "read_file", "parameters": {"type": "object", "properties": {}}},
+            ],
+            "tool_choice": {
+                "type": "custom",
+                "name": "apply_patch",
+            },
+            "reasoning": {"effort": "max"},
+            "stream": False,
+        },
+        adapter_model="kimi_code/k3-max",
+    )
+
+    completion_kwargs = plan.perform_kwargs["completion_kwargs"]
+    assert completion_kwargs["tool_choice"] == "auto"
+    assert completion_kwargs["reasoning_effort"] == "max"
+    assert [tool["function"]["name"] for tool in completion_kwargs["tools"]] == [
+        "apply_patch",
+        "read_file",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_should_preserve_scalar_required_tool_choice_for_k3_reasoning():
+    plan = await _prepare_codex_kimi_chat_completions_adapter_route(
+        request=_request(),
+        prepared_request_body={
+            "model": "kimi_code/k3-max",
+            "input": [{"role": "user", "content": "inspect"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "read_file",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+            "tool_choice": "required",
+            "reasoning": {"effort": "max"},
+            "stream": False,
+        },
+        adapter_model="kimi_code/k3-max",
+    )
+
+    completion_kwargs = plan.perform_kwargs["completion_kwargs"]
+    assert completion_kwargs["tool_choice"] == "required"
+    assert completion_kwargs["reasoning_effort"] == "max"
+
+
+@pytest.mark.asyncio
 async def test_should_restore_codex_agent_task_payload_for_kimi():
     task_payload = (
         "You are Child A. Run two parallel command batches and return the "

@@ -198,6 +198,46 @@ def _apply_kimi_reasoning_effort(
         completion_kwargs["reasoning_effort"] = mapped_effort
 
 
+def _normalize_kimi_forced_tool_choice_for_k3_reasoning(
+    *,
+    completion_kwargs: dict[str, Any],
+    upstream_model: str,
+    original_tool_choice: Any = None,
+) -> None:
+    """Kimi returns 400 when a forced tool choice is paired with thinking.
+
+    When a specific tool is requested on a K3 model with thinking enabled,
+    normalize the choice to `auto` so function tools continue to flow while
+    avoiding the incompatible `tool_choice='specified'` request shape.
+    """
+
+    if not is_k3_model_id(upstream_model):
+        return
+
+    if completion_kwargs.get("reasoning_effort") is None:
+        return
+
+    tool_choice = original_tool_choice
+    if tool_choice is None:
+        tool_choice = completion_kwargs.get("tool_choice")
+
+    if isinstance(tool_choice, dict):
+        tool_name = None
+        if isinstance(tool_choice.get("function"), dict):
+            tool_name = tool_choice["function"].get("name")
+        elif tool_choice.get("type") in {"custom", "function", "tool"} and "name" in tool_choice:
+            tool_name = tool_choice.get("name")
+        if not isinstance(tool_name, str) or not tool_name:
+            return
+        completion_kwargs["tool_choice"] = "auto"
+        return
+    elif tool_choice == "specified":
+        completion_kwargs["tool_choice"] = "auto"
+        return
+    else:
+        return
+
+
 def _get_kimi_message_field(message: Any, field: str) -> Any:
     if isinstance(message, dict):
         return message.get(field)
@@ -743,6 +783,11 @@ async def prepare_codex_kimi_chat_completions_adapter_route(
         upstream_model=upstream_model,
         forced_effort=forced_effort,
         completion_kwargs=completion_kwargs,
+    )
+    _normalize_kimi_forced_tool_choice_for_k3_reasoning(
+        completion_kwargs=completion_kwargs,
+        upstream_model=upstream_model,
+        original_tool_choice=request_body.get("tool_choice"),
     )
 
     def handle_exception(exc: Exception) -> None:
