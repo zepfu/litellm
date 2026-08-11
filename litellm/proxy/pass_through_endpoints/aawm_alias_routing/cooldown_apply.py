@@ -170,6 +170,7 @@ def _resolve_auto_agent_cooldown_publication_plan(
         candidate=candidate,
         kimi_failure_metadata=kimi_failure_metadata,
     )
+    is_last_resort = bool(candidate.get("last_resort"))
     duration = max(0.0, float(cooldown_seconds))
     if (
         codex_failure_evidence_alias is not None
@@ -206,6 +207,36 @@ def _resolve_auto_agent_cooldown_publication_plan(
             kimi_failure_metadata=kimi_failure_metadata,
         )
     if cooldown_scope == "candidate":
+        if is_last_resort:
+            if grok_account_quota_exhausted:
+                lane_cooldown_key = _get_grok_account_quota_lane_cooldown_key(
+                    candidate,
+                    lane_key,
+                )
+                lane_keys = tuple(
+                    [lane_cooldown_key]
+                    if lane_cooldown_key is not None
+                    else []
+                )
+                return CooldownPublicationPlan(
+                    memory_keys=lane_keys,
+                    durable_keys=lane_keys,
+                    duration_seconds=duration,
+                    applied_scope="request_local",
+                    request_local_action="request_local_cooldown",
+                    grok_account_quota_exhausted=grok_account_quota_exhausted,
+                    kimi_failure_metadata=kimi_failure_metadata,
+                )
+
+            # Last-resort, non-account-gated failures stay request-local only.
+            return CooldownPublicationPlan(
+                duration_seconds=duration,
+                applied_scope="request_local",
+                request_local_action="request_local_cooldown",
+                grok_account_quota_exhausted=grok_account_quota_exhausted,
+                kimi_failure_metadata=kimi_failure_metadata,
+            )
+
         memory_keys = [selected_cooldown_key]
         if grok_account_quota_exhausted:
             lane_cooldown_key = _get_grok_account_quota_lane_cooldown_key(
@@ -416,17 +447,24 @@ async def _apply_codex_failure_evidence_cooldown(
         codex_failure_evidence_alias=canonical_alias,
     )
     if plan.request_local_action is not None:
-        return await _apply_auto_agent_alias_cooldown(
-            request=request,
+        assert _get_request_local_cooldown_key is not None
+        assert _set_request_local_cooldown is not None
+        assert _exclude_request_local_candidate is not None
+        request_local_key = _get_request_local_cooldown_key(
             candidate=candidate,
             lane_key=lane_key,
-            selected_cooldown_key=selected_cooldown_key,
-            cooldown_seconds=plan.duration_seconds,
-            error_class=error_class,
-            set_candidate_cooldown=set_candidate_cooldown,
-            grok_account_quota_exhausted=grok_account_quota_exhausted,
-            kimi_failure_metadata=kimi_failure_metadata,
         )
+        _set_request_local_cooldown(
+            request,
+            cooldown_key=request_local_key,
+            cooldown_seconds=plan.duration_seconds,
+        )
+        _exclude_request_local_candidate(request, cooldown_key=request_local_key)
+        for key in plan.memory_keys:
+            _state_manager.codex.set_cooldown_memory(key, plan.duration_seconds)
+        for key in plan.durable_keys:
+            await set_candidate_cooldown(key, plan.duration_seconds)
+        return plan.applied_scope
     if plan.applied_scope == "none" or not plan.memory_keys:
         return plan.applied_scope
     # Apply to the authoritative in-memory cooldown state synchronously so the

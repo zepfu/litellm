@@ -1900,7 +1900,13 @@ def _select_available_state(
         state
         for state in states
         if bool(state["candidate"].get("last_resort")) is last_resort
-        and _is_auto_agent_candidate_state_available(state)
+        and (
+            (
+                state["candidate"].get("last_resort")
+                and state.get("skip_reason") is None
+            )
+            or _is_auto_agent_candidate_state_available(state)
+        )
     ]
     if not available:
         return None

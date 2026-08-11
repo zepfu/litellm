@@ -508,6 +508,42 @@ class TestCodexSelectorLastResort:
             result = await selection._select_codex_auto_agent_candidate(
                 request=request,
                 request_body={"model": "basic"},
+        )
+        assert result["selection_reason"] == "last_resort"
+        assert result["candidate"]["provider"] == "xai"
+
+    @pytest.mark.asyncio
+    async def test_last_resort_bypasses_its_own_cooldown(self):
+        request = _make_request()
+        candidates = (
+            _candidate("openai", "gpt-4o"),
+            _candidate("xai", "grok-4", last_resort=True),
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+            SelectionEnumeration,
+        )
+
+        mock_enum = SelectionEnumeration(candidates=candidates, commit_token=None)
+
+        async def _all_cooled(key: str) -> tuple[float, str]:
+            return (120.0, "memory")
+
+        _set_selection_runtime(
+            "_get_codex_active_cooldown_state",
+            _all_cooled,
+        )
+
+        with patch.dict(
+            selection._select_codex_auto_agent_candidate.__globals__,
+            {
+                "_resolve_aawm_alias_selection_enumeration": (
+                    lambda request, canonical_alias, *, ingress, client_product_label=None: mock_enum
+                )
+            },
+        ):
+            result = await selection._select_codex_auto_agent_candidate(
+                request=request,
+                request_body={"model": "basic"},
             )
         assert result["selection_reason"] == "last_resort"
         assert result["candidate"]["provider"] == "xai"
@@ -593,6 +629,134 @@ class TestCodexSelectorRequestLocalExclusion:
         assert result["candidate"]["provider"] == "xai"
 
 
+class TestCodexSelectorRequestLocalLastResortSkip:
+    @pytest.mark.asyncio
+    async def test_last_resort_request_local_skipped(self):
+        request = _make_request()
+        candidates = (
+            _candidate("openai", "gpt-4o"),
+            _candidate("xai", "grok-4", last_resort=True),
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+            SelectionEnumeration,
+        )
+
+        mock_enum = SelectionEnumeration(candidates=candidates, commit_token=None)
+        last_resort = _candidate("xai", "grok-4", last_resort=True)
+        rl_key = selection._get_codex_auto_agent_request_local_cooldown_key(
+            candidate=last_resort,
+            lane_key="xai:default",
+        )
+        selection._exclude_codex_auto_agent_request_local_candidate(
+            request,
+            cooldown_key=rl_key,
+        )
+
+        async def _cooldown(key: str) -> tuple[float, str]:
+            return (60.0, "memory")
+
+        _set_selection_runtime(
+            "_get_codex_active_cooldown_state",
+            _cooldown,
+        )
+
+        with patch.dict(
+            selection._select_codex_auto_agent_candidate.__globals__,
+            {
+                "_resolve_aawm_alias_selection_enumeration": (
+                    lambda request, canonical_alias, *, ingress, client_product_label=None: mock_enum
+                )
+            },
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await selection._select_codex_auto_agent_candidate(
+                    request=request,
+                    request_body={"model": "basic"},
+                )
+        assert exc_info.value.status_code == 429
+        skipped = exc_info.value.detail["candidates"]
+        assert any(
+            candidate.get("reason") == "request_local_transient_failure"
+            for candidate in skipped
+        )
+
+
+class TestCodexSelectorLastResortSkipBlocking:
+    def test_select_available_state_rejects_quota_skipped_last_resort(self):
+        request = _make_request()
+        states = [
+            {
+                "candidate": _candidate("xai", "grok-4", last_resort=True),
+                "cooldown_seconds": 0.0,
+                "skip_reason": "quota_exhausted",
+            },
+        ]
+        assert (
+            selection._select_available_state(
+                request,
+                states,
+                ingress="codex",
+                last_resort=True,
+            )
+            is None
+        )
+
+    def test_select_available_state_rejects_auth_skipped_last_resort(self):
+        request = _make_request()
+        states = [
+            {
+                "candidate": _candidate("xai", "grok-4", last_resort=True),
+                "cooldown_seconds": 300.0,
+                "skip_reason": "auth_degraded",
+            },
+        ]
+        assert (
+            selection._select_available_state(
+                request,
+                states,
+                ingress="codex",
+                last_resort=True,
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_codex_last_resort_quota_skip_stays_unavailable(self):
+        request = _make_request()
+        states = [
+            {
+                "candidate": _candidate("xai", "grok-4", last_resort=True),
+                "lane_key": "xai:default",
+                "cooldown_seconds": 0.0,
+                "cooldown_state_source": "normalized_quota_observation",
+                "skip_reason": "quota_exhausted",
+            },
+        ]
+
+        async def _states(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            return states
+
+        with patch.dict(
+            selection._select_codex_auto_agent_candidate.__globals__,
+            {"_build_codex_auto_agent_candidate_states": _states},
+        ):
+            with pytest.raises(HTTPException) as exc_info:
+                await selection._select_codex_auto_agent_candidate(
+                    request=request,
+                    request_body={"model": "basic"},
+                )
+        exc = exc_info.value
+        assert exc.status_code == 429
+        assert (
+            exc.detail["error"]["code"]
+            == "aawm_codex_auto_agent_all_candidates_cooling_down"
+        )
+        assert any(
+            candidate.get("reason") == "quota_exhausted"
+            for candidate in exc.detail["candidates"]
+        )
+
+
 # ---------------------------------------------------------------------------
 # Anthropic selector: first-choice
 # ---------------------------------------------------------------------------
@@ -648,6 +812,36 @@ class TestAnthropicSelectorAllCooled:
         exc = exc_info.value
         assert exc.status_code == 429
         assert exc.detail["error"]["code"] == "aawm_anthropic_auto_agent_all_candidates_cooling_down"
+
+
+class TestAnthropicSelectorLastResort:
+    @pytest.mark.asyncio
+    async def test_last_resort_bypasses_its_own_cooldown(self):
+        request = _make_request()
+        candidates = (
+            _candidate("anthropic", "claude-sonnet-4-20250514"),
+            _candidate("openai", "gpt-4o", last_resort=True),
+        )
+        _set_selection_candidates(candidates)
+
+        async def _all_cooled(key: str) -> tuple[float, str]:
+            return (120.0, "memory")
+
+        _set_selection_runtime(
+            "_get_anthropic_active_cooldown_state",
+            _all_cooled,
+        )
+        _set_selection_runtime(
+            "_get_anthropic_merged_codex_openai_cooldown_state",
+            _all_cooled,
+        )
+
+        result = await selection._select_anthropic_auto_agent_candidate(
+            request=request,
+            request_body={"model": "basic"},
+        )
+        assert result["selection_reason"] == "last_resort"
+        assert result["candidate"]["provider"] == "openai"
 
 
 # ---------------------------------------------------------------------------

@@ -255,6 +255,81 @@ class TestResolvePublicationPlan:
         assert plan.durable_keys == ("ck",)
         assert plan.duration_seconds == 120.0
 
+    def test_last_resort_candidate_scope_becomes_request_local(
+        self, configured_runtime: dict
+    ) -> None:
+        configured_runtime["scope_fn"].return_value = "candidate"
+        plan = _resolve_auto_agent_cooldown_publication_plan(
+            request=None,
+            candidate={"provider": "p", "model": "m", "last_resort": True},
+            lane_key="lane",
+            selected_cooldown_key="ck",
+            cooldown_seconds=120.0,
+            error_class="rate_limited",
+        )
+        assert plan.applied_scope == "request_local"
+        assert plan.request_local_action == "request_local_cooldown"
+        assert plan.memory_keys == ()
+        assert plan.durable_keys == ()
+        assert plan.duration_seconds == 120.0
+
+    def test_last_resort_candidate_scope_keeps_grok_lane_only(
+        self, configured_runtime: dict
+    ) -> None:
+        configured_runtime["scope_fn"].return_value = "candidate"
+        configured_runtime["grok_lane_fn"].return_value = "grok:__account_quota__:lane"
+        plan = _resolve_auto_agent_cooldown_publication_plan(
+            request=None,
+            candidate={
+                "provider": "xai",
+                "model": "grok",
+                "last_resort": True,
+            },
+            lane_key="lane",
+            selected_cooldown_key="ck",
+            cooldown_seconds=90.0,
+            error_class="rate_limited",
+            grok_account_quota_exhausted=True,
+        )
+        assert plan.applied_scope == "request_local"
+        assert plan.request_local_action == "request_local_cooldown"
+        assert plan.memory_keys == ("grok:__account_quota__:lane",)
+        assert plan.durable_keys == ("grok:__account_quota__:lane",)
+
+    def test_managed_account_last_resort_preserves_managed_key(
+        self, configured_runtime: dict
+    ) -> None:
+        configured_runtime["scope_fn"].return_value = "managed_account"
+        plan = _resolve_auto_agent_cooldown_publication_plan(
+            request=None,
+            candidate={"provider": "kimi", "model": "kimi-code", "last_resort": True},
+            lane_key="lane",
+            selected_cooldown_key="ck",
+            cooldown_seconds=300.0,
+            error_class="kimi_code_managed_account",
+            kimi_failure_metadata={"scope": "managed_account"},
+        )
+        assert plan.applied_scope == "managed_account"
+        assert plan.request_local_action is None
+        assert plan.memory_keys == ("kimi:__managed__:default",)
+        assert plan.durable_keys == ("kimi:__managed__:default",)
+        assert plan.kimi_failure_metadata == {"scope": "managed_account"}
+
+    def test_preferred_candidate_scope_remains_process_global(self, configured_runtime: dict) -> None:
+        configured_runtime["scope_fn"].return_value = "candidate"
+        plan = _resolve_auto_agent_cooldown_publication_plan(
+            request=None,
+            candidate={"provider": "p", "model": "m", "last_resort": False},
+            lane_key="lane",
+            selected_cooldown_key="ck",
+            cooldown_seconds=120.0,
+            error_class="rate_limited",
+        )
+        assert plan.applied_scope == "candidate"
+        assert plan.memory_keys == ("ck",)
+        assert plan.durable_keys == ("ck",)
+        assert plan.request_local_action is None
+
     def test_candidate_scope_with_grok_account_lane(
         self, configured_runtime: dict
     ) -> None:
