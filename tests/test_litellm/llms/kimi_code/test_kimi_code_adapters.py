@@ -52,15 +52,37 @@ def _use_current_kimi_code_model_metadata(monkeypatch):
     model_cost.update(
         {
             "kimi_code/k3": {
+                "custom_tool_function_adapters": ["apply_patch"],
                 "default_reasoning_effort": "high",
                 "litellm_provider": "kimi_code",
                 "max_input_tokens": 1048576,
                 "mode": "chat",
+                "namespace_tool_function_adapters": {
+                    "collaboration": [
+                        "followup_task",
+                        "interrupt_agent",
+                        "list_agents",
+                        "send_message",
+                        "spawn_agent",
+                        "wait_agent",
+                    ]
+                },
                 "supports_high_reasoning_effort": True,
                 "supports_low_reasoning_effort": True,
                 "supports_max_reasoning_effort": True,
                 "supports_reasoning": True,
                 "supports_vision": True,
+                "unsupported_hosted_tools": [
+                    "custom",
+                    "image_generation",
+                    "namespace",
+                    "tool_search",
+                    "web_search",
+                ],
+                "unsupported_input_item_types": [
+                    "custom_tool_call",
+                    "custom_tool_call_output",
+                ],
             },
             "kimi_code/kimi-for-coding": {
                 "litellm_provider": "kimi_code",
@@ -1164,13 +1186,60 @@ async def test_should_run_codex_nonstream_through_hot_read_kimi_provider(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_should_adapt_apply_patch_and_restore_custom_tool_calls_for_kimi(monkeypatch, tmp_path, respx_mock):
+async def test_should_filter_base_k3_mixed_tools_on_final_wire(
+    monkeypatch,
+    tmp_path,
+    respx_mock,
+):
     credentials_path = tmp_path / "kimi-code.json"
     _write_credentials(credentials_path)
     monkeypatch.setenv(KIMI_CODE_CREDENTIAL_PATH_ENV, str(credentials_path))
     monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
-    patch_text = "*** Begin Patch\n*** End Patch"
+    ordinary_function_names = [
+        "exec_command",
+        "write_stdin",
+        "list_mcp_resources",
+        "list_mcp_resource_templates",
+        "read_mcp_resource",
+        "update_plan",
+        "request_user_input",
+        "request_plugin_install",
+        "view_image",
+        "get_goal",
+        "create_goal",
+        "update_goal",
+        "read_file",
+    ]
+    ordinary_function_tools = [
+        {
+            "type": "function",
+            "name": name,
+            "parameters": {"type": "object", "properties": {}},
+        }
+        for name in ordinary_function_names
+    ]
 
+    plan = await _prepare_codex_kimi_chat_completions_adapter_route(
+        request=_request(),
+        prepared_request_body={
+            "model": "kimi_code/k3",
+            "input": [{"role": "user", "content": "apply the patch"}],
+            "tools": [
+                *ordinary_function_tools,
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a patch to files in the workspace.",
+                },
+                {"type": "tool_search", "name": "tool_search"},
+                {"type": "web_search", "name": "web_search"},
+            ],
+            "tool_choice": "auto",
+            "reasoning": {"effort": "xhigh"},
+            "stream": False,
+        },
+        adapter_model="kimi_code/k3",
+    )
     respx_mock.post(KIMI_CODE_CHAT_COMPLETIONS_URL).respond(
         json={
             "id": "chatcmpl-kimi",
@@ -1180,100 +1249,35 @@ async def test_should_adapt_apply_patch_and_restore_custom_tool_calls_for_kimi(m
             "choices": [
                 {
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": "call_apply_patch",
-                                "type": "function",
-                                "function": {
-                                    "name": "apply_patch",
-                                    "arguments": json.dumps({"input": patch_text}),
-                                },
-                            }
-                        ],
-                    },
-                    "finish_reason": "tool_calls",
+                    "message": {"role": "assistant", "content": "done"},
+                    "finish_reason": "stop",
                 }
             ],
             "usage": {
                 "prompt_tokens": 12,
-                "completion_tokens": 7,
-                "total_tokens": 19,
+                "completion_tokens": 1,
+                "total_tokens": 13,
             },
         }
     )
 
-    response = await _handle_codex_kimi_chat_completions_adapter_route(
-        endpoint="/v1/responses",
-        request=_request(),
-        fastapi_response=MagicMock(spec=Response),
-        user_api_key_dict=MagicMock(),
-        prepared_request_body={
-            "model": "kimi_code/k3-high",
-            "input": [
-                {"role": "user", "content": "apply the patch"},
-                {
-                    "type": "custom_tool_call",
-                    "call_id": "call_prior_apply_patch",
-                    "name": "apply_patch",
-                    "input": patch_text,
-                },
-                {
-                    "type": "custom_tool_call_output",
-                    "call_id": "call_prior_apply_patch",
-                    "output": "Exit code: 0",
-                },
-            ],
-            "tools": [
-                {
-                    "type": "custom",
-                    "name": "apply_patch",
-                    "description": "Apply a patch to files in the workspace.",
-                },
-                {"type": "custom", "name": "exec_command"},
-                {
-                    "type": "function",
-                    "name": "read_file",
-                    "parameters": {"type": "object", "properties": {}},
-                },
-                {"type": "tool_search", "name": "tool_search"},
-                {"type": "namespace", "name": "functions"},
-                {"type": "web_search", "name": "web_search"},
-                {"type": "image_generation"},
-            ],
-            "tool_choice": {"type": "custom", "name": "apply_patch"},
-            "stream": False,
-        },
-        adapter_model="kimi_code/k3-high",
+    litellm.completion(
+        **plan.perform_kwargs["completion_kwargs"],
+        api_key=plan.api_key,
+        api_base=plan.api_base,
     )
 
     upstream_body = json.loads(respx_mock.calls[0].request.content)
     assert all(tool["type"] == "function" for tool in upstream_body["tools"])
-    assert [tool["function"]["name"] for tool in upstream_body["tools"]] == ["apply_patch", "read_file"]
+    assert [tool["function"]["name"] for tool in upstream_body["tools"]] == [
+        *ordinary_function_names,
+        "apply_patch",
+    ]
+    assert upstream_body["tool_choice"] == "auto"
+    assert upstream_body["thinking"]["effort"] == "max"
     upstream_body_json = json.dumps(upstream_body)
-    for unsupported_tool_name in (
-        "exec_command",
-        "tool_search",
-        "namespace",
-        "web_search",
-        "image_generation",
-    ):
-        assert unsupported_tool_name not in upstream_body_json
-    assert upstream_body["messages"][-1]["role"] == "tool"
-    assert upstream_body["messages"][-1]["tool_call_id"] == "call_prior_apply_patch"
-
-    response_body = json.loads(response.body)
-    custom_tool_call = next(item for item in response_body["output"] if item["type"] == "custom_tool_call")
-    assert custom_tool_call == {
-        "type": "custom_tool_call",
-        "id": "call_apply_patch",
-        "call_id": "call_apply_patch",
-        "name": "apply_patch",
-        "input": patch_text,
-        "status": "completed",
-    }
+    assert "tool_search" not in upstream_body_json
+    assert "web_search" not in upstream_body_json
 
 
 @pytest.mark.asyncio

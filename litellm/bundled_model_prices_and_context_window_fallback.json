@@ -280,6 +280,19 @@
     "kimi_code/k3": {
         "cache_read_input_token_cost": 3e-07,
         "comment": "Public reference costs for the kimi_code subscription route, not known invoice billing.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
         "default_reasoning_effort": "high",
         "input_cost_per_token": 3e-06,
         "litellm_provider": "kimi_code",
@@ -295,7 +308,18 @@
         "supports_reasoning": true,
         "supports_response_schema": true,
         "supports_tool_choice": true,
-        "supports_vision": true
+        "supports_vision": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search"
+        ],
+        "unsupported_input_item_types": [
+            "custom_tool_call",
+            "custom_tool_call_output"
+        ]
     },
     "kimi_code/k3-high": {
         "cache_read_input_token_cost": 3e-07,
