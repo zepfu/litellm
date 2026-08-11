@@ -2408,16 +2408,29 @@ def test_alibaba_quota_payloads_map_consumed_fractions_and_hash_identity() -> No
         subscription=subscription,
     )
 
-    # 2 windows x 2 active models = 4 rows.  The account-wide quota is shared,
-    # so both models carry identical remaining_pct per window.
-    assert len(payloads) == 4
+    # 2 windows x 4 active models = 8 rows.  The account-wide quota is shared,
+    # so all models carry identical remaining_pct per window.
+    assert len(payloads) == 8
     assert [payload[6] for payload in payloads] == [
         loop.ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY,
         loop.ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY,
+        loop.ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY,
+        loop.ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY,
+        loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
+        loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
         loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
         loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
     ]
-    assert [payload[10] for payload in payloads] == [75.0, 75.0, 50.0, 50.0]
+    assert [payload[10] for payload in payloads] == [
+        75.0,
+        75.0,
+        75.0,
+        75.0,
+        50.0,
+        50.0,
+        50.0,
+        50.0,
+    ]
     assert all(payload[11:14] == (None, None, None) for payload in payloads)
     assert all(payload[4] == loop.ALIBABA_TOKEN_PLAN_PROVIDER for payload in payloads)
     assert all(payload[18] == loop.ALIBABA_TOKEN_PLAN_SOURCE for payload in payloads)
@@ -2705,6 +2718,20 @@ def test_extract_alibaba_console_data_success_returns_provider_data() -> None:
 
 
 def test_alibaba_quota_payloads_emit_exact_active_model_identities() -> None:
+    import yaml
+
+    repo_root = Path(__file__).resolve().parents[2]
+    configured_models = {
+        candidate["model"]
+        for path in (repo_root / "litellm/proxy/aawm_alias_config").glob("*.yaml")
+        for alias in yaml.safe_load(path.read_text(encoding="utf-8")).get(
+            "aliases", []
+        )
+        for candidate in alias.get("candidates", [])
+        if candidate.get("provider") == loop.ALIBABA_TOKEN_PLAN_PROVIDER
+    }
+    assert set(loop.ALIBABA_TOKEN_PLAN_ACTIVE_MODELS) == configured_models
+
     subscription = loop._parse_alibaba_subscription_payload(_alibaba_subscription_payload())
     payloads = loop._build_alibaba_quota_rate_limit_payloads(
         _alibaba_quota_poll_config(),
@@ -2712,26 +2739,23 @@ def test_alibaba_quota_payloads_emit_exact_active_model_identities() -> None:
         usage_payload=_alibaba_usage_payload(),
         subscription=subscription,
     )
-    # Exact truthful model identities for both active read-alias candidates.
+    # Exact truthful model identities for all active alias candidates.
     models = [payload[5] for payload in payloads]
-    assert models == [
-        "alibaba_token_plan/qwen3.8-max-preview",
-        "alibaba_token_plan/qwen3.6-flash",
-        "alibaba_token_plan/qwen3.8-max-preview",
-        "alibaba_token_plan/qwen3.6-flash",
-    ]
+    assert models == list(loop.ALIBABA_TOKEN_PLAN_ACTIVE_MODELS) * 2
     # Shared account-wide quota: identical remaining_pct per window across models.
     by_window = {}
     for payload in payloads:
         by_window.setdefault(payload[6], []).append(payload[10])
-    assert by_window[loop.ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY] == [75.0, 75.0]
-    assert by_window[loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY] == [50.0, 50.0]
+    assert by_window[loop.ALIBABA_TOKEN_PLAN_5H_QUOTA_KEY] == [75.0] * 4
+    assert by_window[loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY] == [50.0] * 4
     # Shared-quota scope recorded in evidence.
     for payload in payloads:
         evidence = json.loads(payload[17])
         assert "account-wide" in evidence["quota_scope"]
-        assert "qwen3.8-max-preview" in evidence["quota_scope"]
-        assert "qwen3.6-flash" in evidence["quota_scope"]
+        assert all(
+            model in evidence["quota_scope"]
+            for model in loop.ALIBABA_TOKEN_PLAN_ACTIVE_MODELS
+        )
 
 
 def test_alibaba_quota_payloads_allow_absent_reset_for_unused_window() -> None:
@@ -2827,12 +2851,14 @@ def test_alibaba_quota_payloads_emit_weekly_only_for_live_weekly_payload() -> No
     assert [payload[6] for payload in payloads] == [
         loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
         loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
+        loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
+        loop.ALIBABA_TOKEN_PLAN_7D_QUOTA_KEY,
     ]
-    assert [payload[7] for payload in payloads] == ["7d", "7d"]
+    assert [payload[7] for payload in payloads] == ["7d"] * 4
     assert [payload[5] for payload in payloads] == list(
         loop.ALIBABA_TOKEN_PLAN_ACTIVE_MODELS
     )
-    assert [payload[10] for payload in payloads] == [0.0, 0.0]
+    assert [payload[10] for payload in payloads] == [0.0] * 4
     assert all(
         payload[9] == datetime(2026, 8, 9, 18, 12, tzinfo=timezone.utc)
         for payload in payloads

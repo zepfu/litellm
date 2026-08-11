@@ -256,13 +256,15 @@ ALIBABA_TOKEN_PLAN_USER_INFO_URL = (
 ALIBABA_TOKEN_PLAN_CLIENT = "qwen-cloud-console"
 ALIBABA_TOKEN_PLAN_PROVIDER = "alibaba_token_plan"
 ALIBABA_TOKEN_PLAN_MODEL = "qwen-token-plan"
-# Active read-alias Alibaba Token Plan candidates.  The plan quota is
-# account-wide (single consumed-percentage, no per-model dimension); both
-# models share the same 5h/7d Credit windows.  Rows are emitted for each
-# exact model identity so the availability query can match alias candidates.
+# Active alias Alibaba Token Plan candidates.  The plan quota is account-wide
+# (single consumed-percentage, no per-model dimension); all models share the
+# same 5h/7d Credit windows.  Rows are emitted for each exact model identity so
+# the availability query can match alias candidates.
 ALIBABA_TOKEN_PLAN_ACTIVE_MODELS = (
-    "alibaba_token_plan/qwen3.8-max-preview",
+    "alibaba_token_plan/qwen3.8-max",
+    "alibaba_token_plan/qwen3.7-max",
     "alibaba_token_plan/qwen3.6-flash",
+    "alibaba_token_plan/deepseek-v4-pro",
 )
 ALIBABA_TOKEN_PLAN_SOURCE = "alibaba_token_plan_usage"
 ALIBABA_TOKEN_PLAN_PARSER_VERSION = "alibaba_token_plan_usage_v3"
@@ -7262,8 +7264,8 @@ def _build_alibaba_quota_rate_limit_payloads(
                 "limits are not present in this console response."
             ),
             "quota_scope": (
-                "account-wide; shared across all Token Plan models including "
-                "qwen3.8-max-preview and qwen3.6-flash"
+                "account-wide; shared across all configured Token Plan model "
+                f"identities: {', '.join(ALIBABA_TOKEN_PLAN_ACTIVE_MODELS)}"
             ),
         }
         for model_identity in ALIBABA_TOKEN_PLAN_ACTIVE_MODELS:
