@@ -326,6 +326,36 @@ Recent AAWM runtime work also changed the default performance posture:
   - override with `AAWM_DYNAMIC_INJECTION_ACQUIRE_TIMEOUT_SECONDS`
   - release with `close_aawm_dynamic_injection_pool()` on proxy shutdown
 
+## Full-payload capture runtime controls
+
+AAWM full-payload controls and defaults:
+
+- `AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS` (required flag: `1`)
+- `AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR` (default: `/tmp/captures/pass_through_full_payloads`)
+- `AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_CONTROL_FILE` (default: `/tmp/captures/pass_through_full_payloads.enabled`)
+- `AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_MAX_BYTES` (default: unset)
+- `AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_AGGREGATE_MAX_BYTES` (default: `2097152`; minimum effective value: `256`; invalid/non-positive values use the default)
+- `AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_FIELD_MAX_BYTES` (default: `min(1048576, effective aggregate)`; explicit values are also bounded by the effective aggregate)
+
+Recursive request, response, and stream construction shares the effective
+aggregate budget after reserving `1536` bytes for artifact and truncation
+metadata. Final JSON serialization remains the exact ceiling guard.
+
+Aggregate and field truncation markers emitted in artifacts:
+
+- `field_bytes`
+- `header_value_bytes`
+- `header_count`
+- `dict_key_limit`
+- `list_item_limit`
+- `depth_limit`
+- `aggregate_limit`
+- `aggregate_truncated`
+- `aggregate_limit_bytes`
+
+Entries in `truncations` contain only `path`, `reason`, and optional numeric
+`original_bytes`, `stored_bytes`, or `dropped_count` fields.
+
 Useful operator-visible instrumentation from those changes:
 
 - DEBUG log: `AawmAgentIdentity: flushed N session_history records in Xms`

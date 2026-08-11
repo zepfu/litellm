@@ -19,6 +19,7 @@ artifact files are written atomically mode ``0600``.
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -62,6 +63,40 @@ _MAX_EVENT_SAMPLES = 40
 _MAX_SHAPE_DEPTH = 5
 _MAX_DICT_KEYS = 60
 _MAX_LIST_ITEMS = 3
+_FULL_PAYLOAD_AGGREGATE_MAX_BYTES_ENV = (
+    "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_AGGREGATE_MAX_BYTES"
+)
+_FULL_PAYLOAD_FIELD_MAX_BYTES_ENV = (
+    "AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_FIELD_MAX_BYTES"
+)
+_DEFAULT_FULL_PAYLOAD_FIELD_BYTES = 1024 * 1024
+_DEFAULT_FULL_PAYLOAD_AGGREGATE_BYTES = 2 * 1024 * 1024
+_MIN_FULL_PAYLOAD_AGGREGATE_BYTES = 256
+_FULL_PAYLOAD_CONSTRUCTION_RESERVE_BYTES = 1536
+_FULL_PAYLOAD_MAX_DEPTH = 12
+_FULL_PAYLOAD_MAX_DICT_KEYS = 500
+_FULL_PAYLOAD_MAX_LIST_ITEMS = 500
+_FULL_PAYLOAD_MAX_HEADERS = 120
+_FULL_PAYLOAD_HEADER_VALUE_MAX_BYTES = 8192
+_FULL_PAYLOAD_OMITTED = object()
+_FULL_PAYLOAD_CONTAINER_OVERHEAD_BYTES = 2
+_FULL_PAYLOAD_KEY_OVERHEAD_BYTES = 2
+_FULL_PAYLOAD_LIST_ITEM_OVERHEAD_BYTES = 1
+
+
+class _FullPayloadBudget:
+    def __init__(self, aggregate_limit: int):
+        self.limit = aggregate_limit
+        self.remaining = max(
+            0,
+            aggregate_limit - _FULL_PAYLOAD_CONSTRUCTION_RESERVE_BYTES,
+        )
+        self.truncations: List[Dict[str, Any]] = []
+
+    def consume(self, byte_count: int) -> int:
+        consumed = min(max(byte_count, 0), self.remaining)
+        self.remaining -= consumed
+        return consumed
 
 _counter_lock = threading.Lock()
 _counter = 0
@@ -280,6 +315,43 @@ def _full_payload_max_bytes() -> Optional[int]:
     if value <= 0:
         return None
     return value
+
+
+def _full_payload_aggregate_max_bytes() -> int:
+    configured = os.environ.get(_FULL_PAYLOAD_AGGREGATE_MAX_BYTES_ENV)
+    if not configured:
+        return _DEFAULT_FULL_PAYLOAD_AGGREGATE_BYTES
+    try:
+        value = int(configured)
+    except ValueError:
+        return _DEFAULT_FULL_PAYLOAD_AGGREGATE_BYTES
+    if value <= 0:
+        return _DEFAULT_FULL_PAYLOAD_AGGREGATE_BYTES
+    return max(_MIN_FULL_PAYLOAD_AGGREGATE_BYTES, value)
+
+
+def _field_byte_limit() -> int:
+    aggregate_limit = _full_payload_aggregate_max_bytes()
+    configured = os.environ.get(_FULL_PAYLOAD_FIELD_MAX_BYTES_ENV)
+    if configured:
+        try:
+            value = int(configured)
+            if value > 0:
+                return min(value, aggregate_limit)
+        except ValueError:
+            pass
+    return min(_DEFAULT_FULL_PAYLOAD_FIELD_BYTES, aggregate_limit)
+
+
+def _new_full_payload_budget(
+    aggregate_limit: Optional[int] = None,
+) -> _FullPayloadBudget:
+    effective_limit = (
+        _full_payload_aggregate_max_bytes()
+        if aggregate_limit is None
+        else max(_MIN_FULL_PAYLOAD_AGGREGATE_BYTES, aggregate_limit)
+    )
+    return _FullPayloadBudget(effective_limit)
 
 
 def _next_counter() -> int:
@@ -676,32 +748,156 @@ def _header_name_is_sensitive(header_name: str) -> bool:
     return any(term in normalized_name for term in _HEADER_DROP_TERMS)
 
 
-def _full_payload_headers(headers: Optional[Mapping[str, Any]]) -> Dict[str, str]:
+def _full_payload_headers(
+    headers: Optional[Mapping[str, Any]],
+    *,
+    budget: Optional[_FullPayloadBudget] = None,
+    path: str = "$.headers",
+) -> Dict[str, Any]:
     """Copy headers for full-payload capture, dropping sensitive names."""
     if not headers:
         return {}
     values: Dict[str, str] = {}
-    for header_name, header_value in headers.items():
-        if _header_name_is_sensitive(str(header_name)):
+    truncated_headers: List[Dict[str, Any]] = []
+    dropped_count = 0
+    aggregate_dropped_count = 0
+    retained_count = 0
+    for header_name in headers:
+        name_text = str(header_name)
+        if _header_name_is_sensitive(name_text):
             continue
-        values[str(header_name)] = str(header_value)
-    return dict(sorted(values.items(), key=lambda item: item[0].lower()))
+        if retained_count >= _FULL_PAYLOAD_MAX_HEADERS:
+            dropped_count += 1
+            continue
+        if budget is not None and budget.remaining <= 0:
+            aggregate_dropped_count += 1
+            continue
+        header_value = headers[header_name]
+        value_text = str(header_value)
+        field_limited_value, field_bytes, original_bytes = (
+            _truncate_to_byte_limit_with_counts(
+                value_text,
+                _header_value_byte_limit(),
+            )
+        )
+        value_path = f"{path}.{name_text.lower()}"
+        truncated_value = _budgeted_full_payload_text(
+            field_limited_value,
+            budget=budget,
+            path=value_path,
+            byte_limit=_header_value_byte_limit(),
+            limit_reason="header_value_bytes",
+        )
+        if field_limited_value != value_text:
+            truncated_headers.append(
+                {
+                    "path": value_path,
+                    "original_bytes": original_bytes,
+                    "stored_bytes": field_bytes,
+                    "reason": "header_value_bytes",
+                }
+            )
+        values[name_text] = truncated_value
+        retained_count += 1
+    result: Dict[str, Any] = dict(
+        sorted(values.items(), key=lambda item: item[0].lower())
+    )
+    if truncated_headers:
+        result["_truncated_headers"] = truncated_headers
+    if dropped_count:
+        result["_truncated_header_count"] = dropped_count
+        _record_truncation(
+            budget,
+            path=path,
+            reason="header_count",
+            dropped_count=dropped_count,
+        )
+    if aggregate_dropped_count:
+        result["_aggregate_truncated_header_count"] = aggregate_dropped_count
+        _record_truncation(
+            budget,
+            path=path,
+            reason="aggregate_limit",
+            dropped_count=aggregate_dropped_count,
+        )
+    return result
 
 
 def _full_payload_header_items(
     headers: Optional[Mapping[str, Any]],
-) -> List[Dict[str, str]]:
+    *,
+    budget: Optional[_FullPayloadBudget] = None,
+    path: str = "$.header_items",
+) -> List[Dict[str, Any]]:
     if not headers:
         return []
+    multi_items = getattr(headers, "multi_items", None)
     try:
-        raw_items = list(headers.multi_items())  # type: ignore[attr-defined]
+        raw_items = multi_items() if callable(multi_items) else headers.items()
     except Exception:
-        raw_items = list(headers.items())
-    return [
-        {"name": str(header_name), "value": str(header_value)}
-        for header_name, header_value in raw_items
-        if not _header_name_is_sensitive(str(header_name))
-    ]
+        raw_items = headers.items()
+    items: List[Dict[str, Any]] = []
+    dropped_count = 0
+    aggregate_dropped_count = 0
+    for header_name, header_value in raw_items:
+        name_text = str(header_name)
+        if _header_name_is_sensitive(name_text):
+            continue
+        if len(items) >= _FULL_PAYLOAD_MAX_HEADERS:
+            dropped_count += 1
+            continue
+        if budget is not None and budget.remaining <= 0:
+            aggregate_dropped_count += 1
+            continue
+        value_text = str(header_value)
+        field_limited_value, field_bytes, original_bytes = (
+            _truncate_to_byte_limit_with_counts(
+                value_text,
+                _header_value_byte_limit(),
+            )
+        )
+        truncated_value = _budgeted_full_payload_text(
+            field_limited_value,
+            budget=budget,
+            path=f"{path}[{len(items)}].value",
+            byte_limit=_header_value_byte_limit(),
+            limit_reason="header_value_bytes",
+        )
+        item: Dict[str, Any] = {"name": name_text, "value": truncated_value}
+        if field_limited_value != value_text:
+            item["truncated"] = True
+            item["original_bytes"] = original_bytes
+            item["stored_bytes"] = field_bytes
+        items.append(item)
+    if dropped_count:
+        items.append(
+            {
+                "path": path,
+                "reason": "header_count",
+                "dropped_count": dropped_count,
+            }
+        )
+        _record_truncation(
+            budget,
+            path=path,
+            reason="header_count",
+            dropped_count=dropped_count,
+        )
+    if aggregate_dropped_count:
+        items.append(
+            {
+                "path": path,
+                "reason": "aggregate_limit",
+                "dropped_count": aggregate_dropped_count,
+            }
+        )
+        _record_truncation(
+            budget,
+            path=path,
+            reason="aggregate_limit",
+            dropped_count=aggregate_dropped_count,
+        )
+    return items
 
 
 def _response_headers(response: Optional[httpx.Response]) -> Optional[Mapping[str, Any]]:
@@ -716,10 +912,7 @@ def _maybe_truncate_text(value: Optional[str]) -> Optional[str]:
     max_bytes = _full_payload_max_bytes()
     if max_bytes is None:
         return value
-    encoded = value.encode("utf-8", errors="replace")
-    if len(encoded) <= max_bytes:
-        return value
-    return encoded[:max_bytes].decode("utf-8", errors="replace")
+    return _truncate_to_byte_limit(value, max_bytes)
 
 
 def _maybe_truncate_bytes(value: bytes) -> bytes:
@@ -743,42 +936,461 @@ def _decode_body_bytes(content: Optional[bytes]) -> Optional[str]:
         return None
 
 
-def _jsonable_full_payload(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
+def _truncate_to_byte_limit_with_counts(
+    value: str, byte_limit: int
+) -> tuple[str, int, int]:
+    """Return UTF-8 truncated value plus original and stored byte counts."""
+
+    byte_limit = max(0, byte_limit)
+    if not value:
+        return value, 0, 0
+
+    original_bytes = 0
+    stored_bytes = 0
+    prefix_index = 0
+    truncated = False
+
+    for index, char in enumerate(value):
+        char_bytes = char.encode("utf-8", errors="replace")
+        char_len = len(char_bytes)
+        original_bytes += char_len
+        if not truncated and stored_bytes + char_len <= byte_limit:
+            stored_bytes += char_len
+            prefix_index = index + 1
+        else:
+            truncated = True
+
+    if not truncated:
+        return value, stored_bytes, original_bytes
+    return value[:prefix_index], stored_bytes, original_bytes
+
+
+def _truncate_to_byte_limit(value: str, byte_limit: int) -> str:
+    truncated, _, _ = _truncate_to_byte_limit_with_counts(value, byte_limit)
+    return truncated
+
+
+def _truncate_to_field_bytes(value: str) -> str:
+    return _truncate_to_byte_limit(value, _field_byte_limit())
+
+
+def _header_value_byte_limit() -> int:
+    return min(_field_byte_limit(), _FULL_PAYLOAD_HEADER_VALUE_MAX_BYTES)
+
+
+def _truncate_header_value(value: str) -> str:
+    return _truncate_to_byte_limit(value, _header_value_byte_limit())
+
+
+def _record_truncation(
+    budget: Optional[_FullPayloadBudget],
+    *,
+    path: str,
+    reason: str,
+    original_bytes: Optional[int] = None,
+    stored_bytes: Optional[int] = None,
+    dropped_count: Optional[int] = None,
+) -> None:
+    if budget is None:
+        return
+    record: Dict[str, Any] = {"path": path, "reason": reason}
+    if original_bytes is not None:
+        record["original_bytes"] = original_bytes
+    if stored_bytes is not None:
+        record["stored_bytes"] = stored_bytes
+    if dropped_count is not None:
+        record["dropped_count"] = dropped_count
+    budget.truncations.append(record)
+
+
+def _budgeted_full_payload_text(
+    value: str,
+    *,
+    budget: Optional[_FullPayloadBudget],
+    path: str,
+    byte_limit: int,
+    limit_reason: str,
+) -> str:
+    field_limited, field_bytes, original_bytes = _truncate_to_byte_limit_with_counts(
+        value,
+        byte_limit,
+    )
+    if field_limited != value:
+        _record_truncation(
+            budget,
+            path=path,
+            reason=limit_reason,
+            original_bytes=original_bytes,
+            stored_bytes=field_bytes,
+        )
+    if budget is None:
+        return field_limited
+
+    allowed_bytes = min(field_bytes, budget.remaining)
+    if field_bytes <= allowed_bytes:
+        stored = field_limited
+        stored_bytes = field_bytes
+        budget.consume(field_bytes)
+    else:
+        stored, stored_bytes, _ = _truncate_to_byte_limit_with_counts(
+            field_limited,
+            allowed_bytes,
+        )
+        budget.consume(stored_bytes)
+
+    if stored != field_limited:
+        _record_truncation(
+            budget,
+            path=path,
+            reason="aggregate_limit",
+            original_bytes=original_bytes,
+            stored_bytes=stored_bytes,
+        )
+    return stored
+
+
+def _budgeted_full_payload_base64(
+    value: bytes,
+    *,
+    budget: Optional[_FullPayloadBudget],
+    path: str,
+) -> tuple[str, int]:
+    max_bytes = _full_payload_max_bytes()
+    field_limit = len(value) if max_bytes is None else min(len(value), max_bytes)
+    if budget is not None:
+        aggregate_raw_limit = (budget.remaining // 4) * 3
+        stored_limit = min(field_limit, aggregate_raw_limit)
+    else:
+        stored_limit = field_limit
+    stored_value = value[:stored_limit]
+    encoded = base64.b64encode(stored_value).decode("ascii")
+    if budget is not None:
+        budget.consume(len(encoded))
+    if field_limit < len(value):
+        _record_truncation(
+            budget,
+            path=path,
+            reason="field_bytes",
+            original_bytes=len(value),
+            stored_bytes=field_limit,
+        )
+    if stored_limit < field_limit:
+        _record_truncation(
+            budget,
+            path=path,
+            reason="aggregate_limit",
+            original_bytes=len(value),
+            stored_bytes=stored_limit,
+        )
+    return encoded, stored_limit
+
+
+def _consume_full_payload_scalar(
+    value: Any,
+    *,
+    budget: Optional[_FullPayloadBudget],
+    path: str,
+) -> bool:
+    if budget is None:
+        return True
+    serialized_bytes = len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+    if serialized_bytes > budget.remaining:
+        original_remaining = budget.remaining
+        budget.consume(original_remaining)
+        _record_truncation(
+            budget,
+            path=path,
+            reason="aggregate_limit",
+            original_bytes=serialized_bytes,
+            stored_bytes=0,
+        )
+        return False
+    budget.consume(serialized_bytes)
+    return True
+
+
+def _consume_full_payload_overhead(
+    *,
+    budget: Optional[_FullPayloadBudget],
+    path: str,
+    overhead_bytes: int,
+) -> bool:
+    if budget is None or overhead_bytes <= 0:
+        return True
+    if budget.remaining <= 0:
+        budget.consume(0)
+        _record_truncation(
+            budget,
+            path=path,
+            reason="aggregate_limit",
+            original_bytes=overhead_bytes,
+            stored_bytes=0,
+        )
+        return False
+    consumed = min(overhead_bytes, budget.remaining)
+    budget.consume(consumed)
+    if consumed < overhead_bytes:
+        _record_truncation(
+            budget,
+            path=path,
+            reason="aggregate_limit",
+            original_bytes=overhead_bytes,
+            stored_bytes=consumed,
+        )
+        return False
+    return True
+
+
+def _jsonable_full_payload_mapping(
+    value: Mapping[Any, Any],
+    *,
+    budget: Optional[_FullPayloadBudget],
+    path: str,
+    depth: int,
+) -> Dict[str, Any]:
+    if not _consume_full_payload_overhead(
+        budget=budget,
+        path=path,
+        overhead_bytes=_FULL_PAYLOAD_CONTAINER_OVERHEAD_BYTES,
+    ):
+        return _FULL_PAYLOAD_OMITTED
+    result: Dict[str, Any] = {}
+    cardinality_dropped_count = 0
+    aggregate_dropped_count = 0
+    for index, key in enumerate(value):
+        if index >= _FULL_PAYLOAD_MAX_DICT_KEYS:
+            cardinality_dropped_count += 1
+            continue
+        if budget is not None and budget.remaining <= 0:
+            aggregate_dropped_count += 1
+            continue
+        key_text = _truncate_to_field_bytes(str(key))
+        key_bytes = len(key_text.encode("utf-8", errors="replace"))
+        if budget is not None and key_bytes > budget.remaining:
+            budget.consume(budget.remaining)
+            aggregate_dropped_count += 1
+            continue
+        if not _consume_full_payload_overhead(
+            budget=budget,
+            path=f"{path}.{key_text}",
+            overhead_bytes=_FULL_PAYLOAD_KEY_OVERHEAD_BYTES,
+        ):
+            aggregate_dropped_count += 1
+            continue
+        if budget is not None:
+            budget.consume(key_bytes)
+        child_value = _jsonable_full_payload(
+            value[key],
+            budget=budget,
+            path=f"{path}.{key_text}",
+            depth=depth + 1,
+        )
+        if child_value is _FULL_PAYLOAD_OMITTED:
+            aggregate_dropped_count += 1
+            continue
+        result[key_text] = child_value
+    if cardinality_dropped_count:
+        _record_truncation(
+            budget,
+            path=path,
+            reason="dict_key_limit",
+            dropped_count=cardinality_dropped_count,
+        )
+    if aggregate_dropped_count:
+        _record_truncation(
+            budget,
+            path=path,
+            reason="aggregate_limit",
+            dropped_count=aggregate_dropped_count,
+        )
+    return result
+
+
+def _jsonable_full_payload_sequence(
+    value: Sequence[Any],
+    *,
+    budget: Optional[_FullPayloadBudget],
+    path: str,
+    depth: int,
+) -> List[Any]:
+    if not _consume_full_payload_overhead(
+        budget=budget,
+        path=path,
+        overhead_bytes=_FULL_PAYLOAD_CONTAINER_OVERHEAD_BYTES,
+    ):
+        return _FULL_PAYLOAD_OMITTED
+    total_items = len(value)
+    retained_limit = min(total_items, _FULL_PAYLOAD_MAX_LIST_ITEMS)
+    result: List[Any] = []
+    aggregate_dropped_count = 0
+    for index in range(retained_limit):
+        if not _consume_full_payload_overhead(
+            budget=budget,
+            path=f"{path}[{index}]",
+            overhead_bytes=_FULL_PAYLOAD_LIST_ITEM_OVERHEAD_BYTES,
+        ):
+            aggregate_dropped_count += retained_limit - index
+            break
+        if budget is not None and budget.remaining <= 0:
+            aggregate_dropped_count += retained_limit - index
+            break
+        child_value = _jsonable_full_payload(
+            value[index],
+            budget=budget,
+            path=f"{path}[{index}]",
+            depth=depth + 1,
+        )
+        if child_value is _FULL_PAYLOAD_OMITTED:
+            aggregate_dropped_count += retained_limit - index
+            break
+        result.append(child_value)
+    if total_items > _FULL_PAYLOAD_MAX_LIST_ITEMS:
+        _record_truncation(
+            budget,
+            path=path,
+            reason="list_item_limit",
+            dropped_count=total_items - _FULL_PAYLOAD_MAX_LIST_ITEMS,
+        )
+    if aggregate_dropped_count:
+        _record_truncation(
+            budget,
+            path=path,
+            reason="aggregate_limit",
+            dropped_count=aggregate_dropped_count,
+        )
+    return result
+
+
+def _jsonable_full_payload(
+    value: Any,
+    *,
+    budget: Optional[_FullPayloadBudget] = None,
+    path: str = "$",
+    depth: int = 0,
+) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        value = str(value)
+    if value is None or isinstance(value, bool) or isinstance(value, (int, float)):
+        if not _consume_full_payload_scalar(value, budget=budget, path=path):
+            return _FULL_PAYLOAD_OMITTED
         return value
+    if isinstance(value, str):
+        return _budgeted_full_payload_text(
+            value,
+            budget=budget,
+            path=path,
+            byte_limit=_field_byte_limit(),
+            limit_reason="field_bytes",
+        )
     if isinstance(value, bytes):
-        payload = _maybe_truncate_bytes(value)
+        data, stored_bytes = _budgeted_full_payload_base64(
+            value,
+            budget=budget,
+            path=path,
+        )
+        wrapper_overhead_bytes = len(
+            json.dumps(
+                {
+                    "encoding": "base64",
+                    "data": "",
+                    "truncated": stored_bytes < len(value),
+                    "original_bytes": len(value),
+                    "stored_bytes": stored_bytes,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        if not _consume_full_payload_overhead(
+            budget=budget,
+            path=path,
+            overhead_bytes=wrapper_overhead_bytes,
+        ):
+            return _FULL_PAYLOAD_OMITTED
         return {
             "encoding": "base64",
-            "data": base64.b64encode(payload).decode("ascii"),
-            "truncated": _was_truncated_bytes(value),
+            "data": data,
+            "truncated": stored_bytes < len(value),
             "original_bytes": len(value),
-            "stored_bytes": len(payload),
+            "stored_bytes": stored_bytes,
         }
+    if depth >= _FULL_PAYLOAD_MAX_DEPTH:
+        _record_truncation(budget, path=path, reason="depth_limit")
+        return {"_truncated": True, "reason": "depth_limit"}
     if isinstance(value, Mapping):
-        return {str(key): _jsonable_full_payload(item) for key, item in value.items()}
+        return _jsonable_full_payload_mapping(
+            value,
+            budget=budget,
+            path=path,
+            depth=depth,
+        )
     if isinstance(value, (list, tuple)):
-        return [_jsonable_full_payload(item) for item in value]
-    return str(value)
+        return _jsonable_full_payload_sequence(
+            value,
+            budget=budget,
+            path=path,
+            depth=depth,
+        )
+    return _budgeted_full_payload_text(
+        str(value),
+        budget=budget,
+        path=path,
+        byte_limit=_field_byte_limit(),
+        limit_reason="field_bytes",
+    )
 
 
 def _full_response_body(
     response_body: Any,
     response_content: Optional[bytes],
+    *,
+    budget: Optional[_FullPayloadBudget] = None,
+    path: str = "$.response.body",
 ) -> Dict[str, Any]:
     body: Dict[str, Any] = {}
     parsed_body = response_body
     if parsed_body is None:
-        parsed_body = _parse_json_text(_decode_body_bytes(response_content))
+        parse_content = (
+            response_content[: _field_byte_limit()]
+            if response_content is not None
+            else None
+        )
+        parsed_body = _parse_json_text(_decode_body_bytes(parse_content))
     if parsed_body is not None:
-        body["json"] = _jsonable_full_payload(parsed_body)
+        json_body = _jsonable_full_payload(
+            parsed_body,
+            budget=budget,
+            path=f"{path}.json",
+        )
+        if json_body is not _FULL_PAYLOAD_OMITTED:
+            body["json"] = json_body
     if response_content is not None:
-        stored_content = _maybe_truncate_bytes(response_content)
-        body["content_base64"] = base64.b64encode(stored_content).decode("ascii")
-        body["content_text"] = _maybe_truncate_text(_decode_body_bytes(stored_content))
-        body["truncated"] = _was_truncated_bytes(response_content)
+        content_base64, stored_bytes = _budgeted_full_payload_base64(
+            response_content,
+            budget=budget,
+            path=f"{path}.content_base64",
+        )
+        stored_content = response_content[:stored_bytes]
+        body["content_base64"] = content_base64
+        decoded_content = _decode_body_bytes(stored_content)
+        if decoded_content is not None:
+            body["content_text"] = _budgeted_full_payload_text(
+                decoded_content,
+                budget=budget,
+                path=f"{path}.content_text",
+                byte_limit=_field_byte_limit(),
+                limit_reason="field_bytes",
+            )
+        body["truncated"] = stored_bytes < len(response_content)
         body["original_bytes"] = len(response_content)
-        body["stored_bytes"] = len(stored_content)
+        body["stored_bytes"] = stored_bytes
     return body
 
 
@@ -805,26 +1417,65 @@ def _httpx_request_payload(
     *,
     fallback_url_route: Optional[str],
     fallback_request_body: Any,
+    budget: Optional[_FullPayloadBudget] = None,
 ) -> Dict[str, Any]:
     if upstream_request is None:
-        return {
-            "body": _jsonable_full_payload(fallback_request_body),
-        }
+        body = _jsonable_full_payload(
+            fallback_request_body,
+            budget=budget,
+            path="$.request.body",
+        )
+        return {} if body is _FULL_PAYLOAD_OMITTED else {"body": body}
 
     request_content = _httpx_request_content(upstream_request)
     payload: Dict[str, Any] = {
-        "method": upstream_request.method,
-        "url": str(upstream_request.url),
-        "headers": _full_payload_headers(upstream_request.headers),
-        "header_items": _full_payload_header_items(upstream_request.headers),
+        "method": _budgeted_full_payload_text(
+            upstream_request.method,
+            budget=budget,
+            path="$.request.method",
+            byte_limit=_field_byte_limit(),
+            limit_reason="field_bytes",
+        ),
+        "url": _budgeted_full_payload_text(
+            str(upstream_request.url),
+            budget=budget,
+            path="$.request.url",
+            byte_limit=_field_byte_limit(),
+            limit_reason="field_bytes",
+        ),
+        "headers": _full_payload_headers(
+            upstream_request.headers,
+            budget=budget,
+            path="$.request.headers",
+        ),
+        "header_items": _full_payload_header_items(
+            upstream_request.headers,
+            budget=budget,
+            path="$.request.header_items",
+        ),
     }
     if request_content is not None:
-        payload["body"] = _full_response_body(None, request_content)
+        payload["body"] = _full_response_body(
+            None,
+            request_content,
+            budget=budget,
+            path="$.request.body",
+        )
     else:
-        payload["body"] = _jsonable_full_payload(fallback_request_body)
-        payload["body_source"] = "fallback_request_body"
+        body = _jsonable_full_payload(
+            fallback_request_body, budget=budget, path="$.request.body"
+        )
+        if body is not _FULL_PAYLOAD_OMITTED:
+            payload["body"] = body
+            payload["body_source"] = "fallback_request_body"
     if fallback_url_route and str(upstream_request.url) != fallback_url_route:
-        payload["logging_url"] = fallback_url_route
+        payload["logging_url"] = _budgeted_full_payload_text(
+            fallback_url_route,
+            budget=budget,
+            path="$.request.logging_url",
+            byte_limit=_field_byte_limit(),
+            limit_reason="field_bytes",
+        )
     return payload
 
 
@@ -983,6 +1634,7 @@ def _base_full_payload_artifact(
     upstream_request: Optional[httpx.Request],
     litellm_call_id: Optional[str],
     extra_metadata: Optional[Mapping[str, Any]],
+    budget: Optional[_FullPayloadBudget] = None,
 ) -> Dict[str, Any]:
     artifact: Dict[str, Any] = {
         "captured_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -1001,19 +1653,30 @@ def _base_full_payload_artifact(
             upstream_request,
             fallback_url_route=url_route,
             fallback_request_body=request_body,
+            budget=budget,
         ),
         "response": {
             "status_code": response.status_code if response is not None else None,
-            "headers": _full_payload_headers(_response_headers(response)),
-            "header_items": _full_payload_header_items(_response_headers(response)),
+            "headers": _full_payload_headers(
+                _response_headers(response),
+                budget=budget,
+                path="$.response.headers",
+            ),
+            "header_items": _full_payload_header_items(
+                _response_headers(response),
+                budget=budget,
+                path="$.response.header_items",
+            ),
         },
     }
     if extra_metadata:
-        artifact["metadata"] = {
-            str(key): value
-            for key, value in extra_metadata.items()
-            if isinstance(value, (str, int, float, bool)) or value is None
-        }
+        metadata = _jsonable_full_payload(
+            extra_metadata,
+            budget=budget,
+            path="$.metadata",
+        )
+        if metadata is not _FULL_PAYLOAD_OMITTED:
+            artifact["metadata"] = metadata
     return artifact
 
 
@@ -1242,7 +1905,7 @@ def _ensure_private_dir(path: Path) -> None:
 
 def _atomic_write_private_json(path: Path, payload: Mapping[str, Any]) -> None:
     """Atomically write JSON with mode 0600 at creation (no write-then-chmod)."""
-    serialized = json.dumps(payload, indent=2, sort_keys=True, default=str)
+    serialized = _serialize_full_payload_json(payload)
     tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{_next_counter()}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     fd = os.open(str(tmp_path), flags, 0o600)
@@ -1268,6 +1931,147 @@ def _atomic_write_private_json(path: Path, payload: Mapping[str, Any]) -> None:
         pass
 
 
+def _serialize_full_payload_json(payload: Mapping[str, Any]) -> str:
+    return json.dumps(
+        payload,
+        indent=2,
+        sort_keys=True,
+        default=str,
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def _full_payload_serialized_bytes(payload: Mapping[str, Any]) -> int:
+    return len(_serialize_full_payload_json(payload).encode("utf-8"))
+
+
+def _full_payload_fits(
+    payload: Mapping[str, Any],
+    aggregate_limit: int,
+) -> bool:
+    try:
+        return _full_payload_serialized_bytes(payload) <= aggregate_limit
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+_FULL_PAYLOAD_TRUNCATION_NUMERIC_KEYS = (
+    "original_bytes",
+    "stored_bytes",
+    "dropped_count",
+)
+
+
+def _sanitize_full_payload_truncation_record(
+    record: Mapping[str, Any],
+) -> Dict[str, Any]:
+    sanitized: Dict[str, Any] = {
+        "path": _truncate_to_byte_limit(str(record.get("path") or "$"), 256),
+        "reason": _truncate_to_byte_limit(
+            str(record.get("reason") or "aggregate_limit"),
+            64,
+        ),
+    }
+    for key in _FULL_PAYLOAD_TRUNCATION_NUMERIC_KEYS:
+        value = record.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            sanitized[key] = max(0, value)
+        elif isinstance(value, float) and math.isfinite(value):
+            sanitized[key] = max(0, int(value))
+    return sanitized
+
+
+_FULL_PAYLOAD_AGGREGATE_CORE_KEYS = (
+    "captured_at",
+    "capture_kind",
+    "capture_scope",
+    "mode",
+    "provider",
+    "endpoint_type",
+    "litellm_call_id",
+    "url",
+)
+
+
+def _enforce_full_payload_aggregate_limit(
+    artifact: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Enforce the exact aggregate artifact ceiling before serialization."""
+    aggregate_limit = _full_payload_aggregate_max_bytes()
+    normalized = dict(artifact)
+    truncations: List[Dict[str, Any]] = [
+        _sanitize_full_payload_truncation_record(record)
+        for record in (normalized.get("truncations") or [])
+        if isinstance(record, Mapping)
+    ]
+    if truncations:
+        normalized["truncations"] = truncations
+    else:
+        normalized.pop("truncations", None)
+    normalized["aggregate_limit_bytes"] = aggregate_limit
+    if any(
+        record.get("reason") == "aggregate_limit" for record in truncations
+    ):
+        normalized["aggregate_truncated"] = True
+    if _full_payload_fits(normalized, aggregate_limit):
+        return normalized
+
+    for key in normalized:
+        if key in _FULL_PAYLOAD_AGGREGATE_CORE_KEYS or key == "truncations":
+            continue
+        if key in {"aggregate_limit_bytes", "aggregate_truncated"}:
+            continue
+        truncations.append(
+            {
+                "path": f"$.{key}",
+                "reason": "aggregate_limit",
+            }
+        )
+    reduced: Dict[str, Any] = {
+        key: value
+        for key, value in normalized.items()
+        if key in _FULL_PAYLOAD_AGGREGATE_CORE_KEYS
+    }
+    reduced["aggregate_limit_bytes"] = aggregate_limit
+    reduced["aggregate_truncated"] = True
+    reduced["truncations"] = truncations
+    for key in (
+        "url",
+        "endpoint_type",
+        "capture_scope",
+        "captured_at",
+        "provider",
+        "mode",
+        "litellm_call_id",
+        "capture_kind",
+    ):
+        if _full_payload_fits(reduced, aggregate_limit):
+            return reduced
+        reduced.pop(key, None)
+    if _full_payload_fits(reduced, aggregate_limit):
+        return reduced
+
+    fallback = {
+        "aggregate_limit_bytes": aggregate_limit,
+        "aggregate_truncated": True,
+        "truncations": [
+            {
+                "path": "$",
+                "reason": "aggregate_limit",
+                "dropped_count": max(1, len(truncations)),
+            }
+        ],
+    }
+    if not _full_payload_fits(fallback, aggregate_limit):
+        raise ValueError(
+            "full-payload aggregate minimum is too small for truncation metadata"
+        )
+    return fallback
+
+
 def _write_full_payload_artifact(artifact: Dict[str, Any]) -> Optional[str]:
     if not passthrough_full_payload_capture_enabled():
         return None
@@ -1280,7 +2084,8 @@ def _write_full_payload_artifact(artifact: Dict[str, Any]) -> Optional[str]:
         mode = _sanitize_filename_part(artifact.get("mode"))
         call_id = _sanitize_filename_part(artifact.get("litellm_call_id"))[:18]
         path = capture_dir / f"{ts}_{counter:04d}_{provider}_{mode}_{call_id}.json"
-        _atomic_write_private_json(path, artifact)
+        limited_artifact = _enforce_full_payload_aggregate_limit(artifact)
+        _atomic_write_private_json(path, limited_artifact)
         return str(path)
     except Exception as exc:
         verbose_proxy_logger.warning(
@@ -1327,6 +2132,7 @@ def capture_passthrough_shape(
 
     full_payload_path: Optional[str] = None
     if full_payload_enabled:
+        budget = _new_full_payload_budget()
         full_payload_artifact = _base_full_payload_artifact(
             mode=mode,
             provider=provider,
@@ -1337,11 +2143,16 @@ def capture_passthrough_shape(
             upstream_request=upstream_request,
             litellm_call_id=litellm_call_id,
             extra_metadata=extra_metadata,
+            budget=budget,
         )
         full_payload_artifact["response"]["body"] = _full_response_body(
             response_body,
             response_content,
+            budget=budget,
+            path="$.response.body",
         )
+        full_payload_artifact["truncations"] = budget.truncations
+        full_payload_artifact["aggregate_limit_bytes"] = budget.limit
         full_payload_path = _write_full_payload_artifact(full_payload_artifact)
 
     if not shape_enabled:
@@ -1420,6 +2231,92 @@ def capture_rerank_shape(
     )
 
 
+def _full_payload_stream_payload(
+    all_chunks: Sequence[str],
+    raw_bytes: Optional[Sequence[bytes]],
+    *,
+    budget: _FullPayloadBudget,
+) -> Dict[str, Any]:
+    total_lines = len(all_chunks)
+    retained_line_limit = min(total_lines, _FULL_PAYLOAD_MAX_LIST_ITEMS)
+    lines: List[str] = []
+    aggregate_line_dropped_count = 0
+    for index in range(retained_line_limit):
+        if budget.remaining <= 0:
+            aggregate_line_dropped_count += retained_line_limit - index
+            break
+        lines.append(
+            _budgeted_full_payload_text(
+                str(all_chunks[index]),
+                budget=budget,
+                path=f"$.response.stream.lines[{index}]",
+                byte_limit=_field_byte_limit(),
+                limit_reason="field_bytes",
+            )
+        )
+    stream_payload: Dict[str, Any] = {
+        "line_count": total_lines,
+        "lines": lines,
+    }
+    if total_lines > _FULL_PAYLOAD_MAX_LIST_ITEMS:
+        _record_truncation(
+            budget,
+            path="$.response.stream.lines",
+            reason="list_item_limit",
+            dropped_count=total_lines - _FULL_PAYLOAD_MAX_LIST_ITEMS,
+        )
+    if aggregate_line_dropped_count:
+        _record_truncation(
+            budget,
+            path="$.response.stream.lines",
+            reason="aggregate_limit",
+            dropped_count=aggregate_line_dropped_count,
+        )
+
+    if raw_bytes is None:
+        return stream_payload
+
+    total_raw_chunks = len(raw_bytes)
+    retained_raw_limit = min(total_raw_chunks, _FULL_PAYLOAD_MAX_LIST_ITEMS)
+    raw_chunks_base64: List[str] = []
+    raw_chunks_truncated: List[bool] = []
+    aggregate_raw_dropped_count = 0
+    raw_total_bytes = 0
+    for index in range(total_raw_chunks):
+        raw_total_bytes += len(raw_bytes[index])
+    for index in range(retained_raw_limit):
+        if budget.remaining <= 0:
+            aggregate_raw_dropped_count += retained_raw_limit - index
+            break
+        chunk = raw_bytes[index]
+        encoded, stored_bytes = _budgeted_full_payload_base64(
+            chunk,
+            budget=budget,
+            path=f"$.response.stream.raw_chunks[{index}]",
+        )
+        raw_chunks_base64.append(encoded)
+        raw_chunks_truncated.append(stored_bytes < len(chunk))
+    stream_payload["raw_chunk_count"] = total_raw_chunks
+    stream_payload["raw_total_bytes"] = raw_total_bytes
+    stream_payload["raw_chunks_base64"] = raw_chunks_base64
+    stream_payload["raw_chunks_truncated"] = raw_chunks_truncated
+    if total_raw_chunks > _FULL_PAYLOAD_MAX_LIST_ITEMS:
+        _record_truncation(
+            budget,
+            path="$.response.stream.raw_chunks",
+            reason="list_item_limit",
+            dropped_count=total_raw_chunks - _FULL_PAYLOAD_MAX_LIST_ITEMS,
+        )
+    if aggregate_raw_dropped_count:
+        _record_truncation(
+            budget,
+            path="$.response.stream.raw_chunks",
+            reason="aggregate_limit",
+            dropped_count=aggregate_raw_dropped_count,
+        )
+    return stream_payload
+
+
 def capture_passthrough_stream_shape(
     *,
     provider: Optional[str],
@@ -1457,6 +2354,7 @@ def capture_passthrough_stream_shape(
 
     full_payload_path: Optional[str] = None
     if full_payload_enabled:
+        budget = _new_full_payload_budget()
         full_payload_artifact = _base_full_payload_artifact(
             mode="stream",
             provider=provider,
@@ -1467,22 +2365,15 @@ def capture_passthrough_stream_shape(
             upstream_request=upstream_request,
             litellm_call_id=litellm_call_id,
             extra_metadata=extra_metadata,
+            budget=budget,
         )
-        stream_payload: Dict[str, Any] = {
-            "line_count": len(all_chunks),
-            "lines": [_maybe_truncate_text(str(line)) for line in all_chunks],
-        }
-        if raw_bytes is not None:
-            stored_raw_chunks = [_maybe_truncate_bytes(chunk) for chunk in raw_bytes]
-            stream_payload["raw_chunk_count"] = len(raw_bytes)
-            stream_payload["raw_total_bytes"] = sum(len(chunk) for chunk in raw_bytes)
-            stream_payload["raw_chunks_base64"] = [
-                base64.b64encode(chunk).decode("ascii") for chunk in stored_raw_chunks
-            ]
-            stream_payload["raw_chunks_truncated"] = [
-                _was_truncated_bytes(chunk) for chunk in raw_bytes
-            ]
-        full_payload_artifact["response"]["stream"] = stream_payload
+        full_payload_artifact["response"]["stream"] = _full_payload_stream_payload(
+            all_chunks,
+            raw_bytes,
+            budget=budget,
+        )
+        full_payload_artifact["truncations"] = budget.truncations
+        full_payload_artifact["aggregate_limit_bytes"] = budget.limit
         full_payload_path = _write_full_payload_artifact(full_payload_artifact)
 
     if not shape_enabled:
