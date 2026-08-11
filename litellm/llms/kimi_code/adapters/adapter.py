@@ -621,6 +621,24 @@ def _handle_kimi_adapter_exception(
         exc,
         adapter_model=adapter_model,
     )
+    if use_alias_candidate_probe:
+        if (
+            metadata.get("kind") == "malformed"
+            and metadata.get("status_code") in {400, 422}
+        ):
+            setattr(
+                exc,
+                "detail",
+                {
+                    "error": {
+                        "message": "Managed Kimi Code rejected the request shape.",
+                        "type": "invalid_request_error",
+                        "code": "kimi_code_invalid_request",
+                    }
+                },
+            )
+        setattr(exc, "kimi_code_probe_failure_metadata", metadata)
+        return
     if (
         metadata.get("kind") == "malformed"
         and metadata.get("status_code") in {400, 422}
@@ -635,9 +653,6 @@ def _handle_kimi_adapter_exception(
                 }
             },
         ) from exc
-    if use_alias_candidate_probe:
-        setattr(exc, "kimi_code_probe_failure_metadata", metadata)
-        return
     if (
         metadata.get("kind") == "refresh_required_auth"
         and metadata.get("scope") == "managed_account"

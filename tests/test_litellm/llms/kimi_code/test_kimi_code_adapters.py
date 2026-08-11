@@ -1640,10 +1640,7 @@ class _KimiAdapterFailure(RuntimeError):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("use_alias_candidate_probe", (False, True))
-async def test_should_return_one_bounded_400_for_invalid_kimi_request_shape(
-    use_alias_candidate_probe,
-):
+async def test_should_return_one_bounded_400_for_direct_invalid_kimi_request_shape():
     raw_provider_detail = "text content is empty: raw-provider-detail"
     upstream_failure = _KimiAdapterFailure(
         status_code=400,
@@ -1666,7 +1663,7 @@ async def test_should_return_one_bounded_400_for_invalid_kimi_request_shape(
                 "stream": False,
             },
             adapter_model="kimi_code/k3-high",
-            use_alias_candidate_probe=use_alias_candidate_probe,
+            use_alias_candidate_probe=False,
         )
 
     assert caught.value.status_code == 400
@@ -1680,6 +1677,60 @@ async def test_should_return_one_bounded_400_for_invalid_kimi_request_shape(
     assert raw_provider_detail not in json.dumps(caught.value.detail)
     assert completion_mock.await_count == 1
     assert not hasattr(caught.value, "kimi_code_probe_failure_metadata")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", (400, 422))
+async def test_should_preserve_safe_probe_metadata_for_invalid_kimi_request_shape(
+    status_code,
+):
+    raw_provider_detail = "text content is empty: raw-provider-detail"
+    upstream_failure = _KimiAdapterFailure(
+        status_code=status_code,
+        message=raw_provider_detail,
+    )
+    completion_mock = AsyncMock(side_effect=upstream_failure)
+
+    with (
+        patch("litellm.acompletion", new=completion_mock),
+        pytest.raises(_KimiAdapterFailure) as caught,
+    ):
+        await _handle_codex_kimi_chat_completions_adapter_route(
+            endpoint="/v1/responses",
+            request=_request(),
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body={
+                "model": "kimi_code/k3-high",
+                "input": "hello",
+                "stream": False,
+            },
+            adapter_model="kimi_code/k3-high",
+            use_alias_candidate_probe=True,
+        )
+
+    assert caught.value is upstream_failure
+    assert completion_mock.await_count == 1
+    assert caught.value.kimi_code_probe_failure_metadata == {
+        "kind": "malformed",
+        "scope": "none",
+        "upstream_id": "k3",
+        "metadata_gate": "none",
+        "status_code": status_code,
+        "trace_id": "trace-safe",
+        "reset_reason": "malformed_provider_response",
+    }
+    assert caught.value.detail == {
+        "error": {
+            "message": "Managed Kimi Code rejected the request shape.",
+            "type": "invalid_request_error",
+            "code": "kimi_code_invalid_request",
+        }
+    }
+    assert raw_provider_detail not in json.dumps(caught.value.detail)
+    assert raw_provider_detail not in json.dumps(
+        caught.value.kimi_code_probe_failure_metadata
+    )
 
 
 @pytest.mark.asyncio

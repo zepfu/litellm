@@ -1263,11 +1263,10 @@ def _consume_opencode_zen_tools_mode_header(
     """D1-574/MS-033: resolve direct-route unsupported-tools mode.
 
     Direct mode defaults to ``drop`` immediately before normalization. Body
-    litellm_metadata wins if already present. Alias probes remain strict.
+    litellm_metadata wins if already present. Alias probes also default to
+    ``drop`` so unsupported Codex-native tools do not terminate the whole
+    alias before the provider can consume retained function tools.
     """
-    if use_alias_candidate_probe:
-        return prepared_request_body
-
     _existing_metadata = prepared_request_body.get("litellm_metadata")
     _existing_mode = (
         _existing_metadata.get("opencode_zen_unsupported_tools_mode")
@@ -1275,6 +1274,13 @@ def _consume_opencode_zen_tools_mode_header(
         else None
     )
     if _existing_mode is not None:
+        return prepared_request_body
+
+    if use_alias_candidate_probe:
+        prepared_request_body = dict(prepared_request_body)
+        _meta = dict(prepared_request_body.get("litellm_metadata") or {})
+        _meta["opencode_zen_unsupported_tools_mode"] = "drop"
+        prepared_request_body["litellm_metadata"] = _meta
         return prepared_request_body
 
     _header_mode_raw = request.headers.get(

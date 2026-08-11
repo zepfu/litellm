@@ -205,12 +205,10 @@ class TestHeaderConsumption:
         )
 
     @pytest.mark.asyncio
-    async def test_alias_probe_ignores_header(self):
+    async def test_alias_probe_defaults_to_drop(self):
         mock_norm = _install_stubs()
         body: dict[str, Any] = {"model": "opencode_zen/big-pickle"}
-        request = _make_request(
-            {"x-aawm-opencode-zen-unsupported-tools-mode": "drop"}
-        )
+        request = _make_request({})
         try:
             await codex_candidate_calls._handle_codex_opencode_zen_adapter_route(
                 endpoint="/v1/responses",
@@ -224,9 +222,11 @@ class TestHeaderConsumption:
         except RuntimeError:
             pass
         call_body = mock_norm.normalize_codex_request.call_args[0][1]
-        assert "litellm_metadata" not in call_body or (
-            "opencode_zen_unsupported_tools_mode"
-            not in call_body.get("litellm_metadata", {})
+        assert (
+            call_body["litellm_metadata"][
+                "opencode_zen_unsupported_tools_mode"
+            ]
+            == "drop"
         )
 
     @pytest.mark.asyncio
@@ -677,10 +677,15 @@ class TestPreAliasHeaderTranslation:
         assert result is not body
         assert "litellm_metadata" not in body
 
-    def test_probe_behavior_unchanged(self):
-        """Alias candidate handler still ignores headers (probe mode)."""
+    def test_probe_body_metadata_wins_over_default(self):
+        """Alias probes preserve an explicit unsupported-tools mode."""
         mock_norm = _install_stubs()
-        body = {"model": "opencode_zen/big-pickle"}
+        body = {
+            "model": "opencode_zen/big-pickle",
+            "litellm_metadata": {
+                "opencode_zen_unsupported_tools_mode": "strict"
+            },
+        }
         request = _make_request(
             {"x-aawm-opencode-zen-unsupported-tools-mode": "drop"}
         )
@@ -702,9 +707,9 @@ class TestPreAliasHeaderTranslation:
             if "stop-after-normalization" not in str(exc):
                 raise
         call_body = mock_norm.normalize_codex_request.call_args[0][1]
-        assert "litellm_metadata" not in call_body or (
-            "opencode_zen_unsupported_tools_mode"
-            not in call_body.get("litellm_metadata", {})
+        assert (
+            call_body["litellm_metadata"]["opencode_zen_unsupported_tools_mode"]
+            == "strict"
         )
 
 
