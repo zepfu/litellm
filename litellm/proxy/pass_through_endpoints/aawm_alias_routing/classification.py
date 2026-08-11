@@ -118,6 +118,18 @@ _PAYLOAD_LIMIT_MARKERS = (
     "payload_too_large",
 )
 
+# D1-587: fixture-backed invalid-request machine codes (open-registry growth).
+# Exact catalog tokens only. Matched via hyphen-aware boundaries (see
+# _invalid_request_marker_match). Deliberately excludes hyphen/spaced variants
+# and successful non-error prose.
+_INVALID_REQUEST_MARKERS = (
+    "invalid_request_error",
+    "invalid_request",
+    "invalid_prompt",
+    "string_too_long",
+    "unprocessable",
+)
+
 # JSON-RPC wire codes observed in Wire mode catalog fixtures.
 # Exact token form only: reject glued/prefixed junk such as x-32600y / --32600.
 _JSON_RPC_CODE_RE = re.compile(
@@ -245,9 +257,9 @@ def classify_failure(
     ``origin="unknown"`` (never coolable).
 
     D1-587 grows mappings for fixture-backed image-content sub-errors,
-    JSON-RPC negative wire codes, HTTP-200-body stream failures, and
-    usage/limit/quota machine codes without changing the open
-    ``FailureEvent`` schema.
+    JSON-RPC negative wire codes, HTTP-200-body stream failures,
+    usage/limit/quota machine codes, and invalid-request machine codes
+    without changing the open ``FailureEvent`` schema.
     """
     text = (message or "").lower()
     evidence: dict[str, str] = {}
@@ -340,6 +352,14 @@ def classify_failure(
             )
             if limit_event is not None:
                 return limit_event
+            invalid_event = _classify_invalid_request_markers(
+                text=text,
+                provider=provider,
+                confidence="structured",
+                evidence=evidence,
+            )
+            if invalid_event is not None:
+                return invalid_event
         return _event(
             class_name="provider_4xx_other",
             origin="upstream",
@@ -407,6 +427,15 @@ def classify_failure(
         )
         if limit_event is not None:
             return limit_event
+
+        invalid_event = _classify_invalid_request_markers(
+            text=text,
+            provider=provider,
+            confidence="marker",
+            evidence=evidence,
+        )
+        if invalid_event is not None:
+            return invalid_event
 
     if any(marker in text for marker in _CAPACITY_MARKERS):
         return _event(
@@ -540,6 +569,52 @@ def _classify_limit_or_quota_markers(
             evidence=evidence,
         )
     if _any_marker(text, _PAYLOAD_LIMIT_MARKERS):
+        return _event(
+            class_name="provider_4xx_other",
+            origin="upstream",
+            confidence=confidence,
+            provider=provider,
+            scope="provider",
+            retryable=False,
+            evidence=evidence,
+        )
+    return None
+
+
+def _invalid_request_marker_match(text: str, marker: str) -> bool:
+    """Exact invalid-request token match with hyphen treated as identifier-adjacent.
+
+    Narrower than :func:`_marker_match`: left/right boundaries reject both
+    alphanumerics/underscore *and* hyphen so catalog tokens do not match
+    hyphen-glued variants such as ``invalid_request-error`` or
+    ``string_too_long-extra``. Global marker matching is unchanged.
+    """
+    if not marker:
+        return False
+    pattern = re.compile(
+        r"(?<![a-z0-9_-])" + re.escape(marker) + r"(?![a-z0-9_-])"
+    )
+    for match in pattern.finditer(text):
+        prefix = text[: match.start()]
+        if _NEGATION_BEFORE_MARKER_RE.search(prefix):
+            continue
+        return True
+    return False
+
+
+def _any_invalid_request_marker(text: str, markers: tuple[str, ...]) -> bool:
+    return any(_invalid_request_marker_match(text, marker) for marker in markers)
+
+
+def _classify_invalid_request_markers(
+    *,
+    text: str,
+    provider: Optional[str],
+    confidence: fv.Confidence,
+    evidence: dict[str, str],
+) -> Optional[fv.FailureEvent]:
+    """Map fixture-backed invalid-request machine codes to provider_4xx_other."""
+    if _any_invalid_request_marker(text, _INVALID_REQUEST_MARKERS):
         return _event(
             class_name="provider_4xx_other",
             origin="upstream",

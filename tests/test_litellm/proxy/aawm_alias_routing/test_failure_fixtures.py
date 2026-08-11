@@ -55,14 +55,13 @@ _TUI_LAYERS = frozenset({"TUI hook", "TUI/headless"})
 
 # Residual known-gap set after D1-587 fixture-backed mappings for
 # image-content sub-errors, JSON-RPC wire codes, HTTP-200-body stream
-# failures, and usage/limit/quota machine codes. A class remains listed while
-# any provider-reachable catalog row in that class still classifies as unknown
-# (local/client network, non-error 2xx/3xx, passthrough shells, request/body
-# codes, overload/timeout/server shells, or successful length truncation).
+# failures, usage/limit/quota machine codes, and invalid-request machine
+# codes. A class remains listed while any provider-reachable catalog row in
+# that class still classifies as unknown (local/client network, non-error
+# 2xx/3xx, passthrough shells, overload/timeout/server shells, permission/
+# plan restrictions, or successful length truncation).
 _KNOWN_COVERAGE_GAPS = frozenset(
     {
-        "Fix request/content",
-        "Invalid request",
         "Layered/platform passthrough",
         "Local network",
         "Local network/config",
@@ -74,7 +73,6 @@ _KNOWN_COVERAGE_GAPS = frozenset(
         "Permission/policy block",
         "Plan/tool restriction",
         "Precondition/conflict",
-        "Protocol-mapped error",
         "Provider overload",
         "Provider unavailable",
         "Reconnect",
@@ -362,6 +360,56 @@ _D1_587_THEME_FIXTURE_CASES: tuple[tuple[object, str, str, str, str], ...] = (
         "upstream",
         "marker",
     ),
+    # Invalid-request machine codes
+    (
+        None,
+        "invalid_request The request is malformed or missing a required parameter.",
+        "provider_4xx_other",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "invalid_request_error Anthropic-compatible invalid request, prompt, or related validation failure.",
+        "provider_4xx_other",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "invalid_prompt The message, role, content, or prompt structure is invalid.",
+        "provider_4xx_other",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "invalid_prompt The prompt was invalid or rejected for an endpoint-specific reason.",
+        "provider_4xx_other",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "invalid_prompt Responses-compatible error code used for invalid prompt/request and context-length conditions.",
+        "provider_4xx_other",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "string_too_long A string field exceeds the accepted length.",
+        "provider_4xx_other",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "unprocessable The request is syntactically valid but semantically cannot be processed.",
+        "provider_4xx_other",
+        "upstream",
+        "marker",
+    ),
 )
 
 
@@ -394,7 +442,7 @@ def test_d1_587_theme_fixtures_classify(
     expected_origin: str,
     expected_confidence: str,
 ) -> None:
-    """Image-content, JSON-RPC, stream, and usage/limit fixtures map to registered classes."""
+    """Image-content, JSON-RPC, stream, usage/limit, and invalid-request fixtures map to registered classes."""
     registry = clsf.register_d1_587_failure_classes()
     event = clsf.classify_failure(status_code=status_code, message=message)
     assert event.class_name == expected_class
@@ -431,6 +479,35 @@ def test_d1_587_structured_4xx_limit_branch_classifies_usage_limit() -> None:
     assert event.scope == "model"
     assert event.retryable is False
     assert event.evidence.get("status_code") == "400"
+    assert fv.is_coolable(event)
+
+
+def test_d1_587_structured_4xx_invalid_request_branch_classifies_provider_4xx_other() -> None:
+    """Structured 4xx path exercises the invalid-request subclass branch."""
+    event = clsf.classify_failure(
+        status_code=400,
+        message="invalid_request The request is malformed or missing a required parameter.",
+    )
+    assert event.class_name == "provider_4xx_other"
+    assert event.origin == "upstream"
+    assert event.confidence == "structured"
+    assert event.scope == "provider"
+    assert event.retryable is False
+    assert event.evidence.get("status_code") == "400"
+    assert fv.is_coolable(event)
+
+
+def test_d1_587_marker_invalid_request_is_provider_4xx_other_non_retryable() -> None:
+    """Marker-path invalid_request maps provider_4xx_other/provider/non-retryable."""
+    event = clsf.classify_failure(
+        status_code=None,
+        message="invalid_request The request is malformed or missing a required parameter.",
+    )
+    assert event.class_name == "provider_4xx_other"
+    assert event.origin == "upstream"
+    assert event.confidence == "marker"
+    assert event.scope == "provider"
+    assert event.retryable is False
     assert fv.is_coolable(event)
 
 
@@ -509,6 +586,28 @@ def test_csv_coverage_checklist() -> None:
     )
 
 
+def test_d1_587_provider_reachable_residual_totals_are_exact() -> None:
+    """Acceptance claim: exactly 25 unknown residual rows across 22 gap classes."""
+    rows = _load_catalog_rows()
+    residual_classes: set[str] = set()
+    residual_count = 0
+    for row in rows:
+        if row["Layer"] not in _PROVIDER_REACHABLE_LAYERS:
+            continue
+        raw_code = row["HTTP / Exit / RPC"].strip()
+        status_code = _parse_catalog_status_code(raw_code)
+        message = f"{raw_code} {row['Machine Code / Type / Event']} {row['Meaning']}"
+        event = clsf.classify_failure(status_code=status_code, message=message)
+        if event.class_name != "unknown":
+            continue
+        residual_count += 1
+        residual_classes.add(row["Normalized Class"])
+
+    assert residual_count == 25
+    assert len(residual_classes) == 22
+    assert residual_classes == set(_KNOWN_COVERAGE_GAPS)
+
+
 # TUI-layer rows whose bare code/type text happens to share a marker string
 # with a real upstream signal (e.g. "authentication_failed" also matches the
 # upstream auth marker). This is a known ambiguity of pure free-text marker
@@ -524,6 +623,8 @@ _TUI_MARKER_AMBIGUOUS_CODES = frozenset(
         "Device authorization flow failed: fetch failed",
         # Shared machine-code token with provider usage-limit residuals.
         "max_output_tokens",
+        # Shared machine-code token with provider invalid-request residuals.
+        "invalid_request",
     }
 )
 
@@ -572,6 +673,16 @@ def test_tui_layer_rows_unaffected_by_marker_ambiguity_are_never_coolable() -> N
         (None, "token-limit-exceeded hyphen variant is unsupported"),
         (None, "finish_reason = length successful truncation is non-error"),
         (None, "max tokens exceeded spaced form is unsupported"),
+        (None, "not an invalid_request case"),
+        (None, "invalid_prompt documentation only"),
+        (None, "invalid-request hyphen variant is unsupported"),
+        (None, "string too long spaced form is unsupported"),
+        (None, "not an unprocessable case"),
+        (None, "invalid_request-error"),
+        (None, "invalid_request_error-extra"),
+        (None, "invalid_prompt-extra"),
+        (None, "string_too_long-extra"),
+        (None, "unprocessable-entity"),
     ],
 )
 def test_d1_587_negated_docs_and_junk_remain_unknown_and_not_coolable(
