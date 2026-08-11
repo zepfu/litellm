@@ -6,6 +6,7 @@
 # docker-compose.wsl-grok-oidc.yml and refuse to touch aawm-litellm or
 # litellm-dev. Proxy identity (container ID, start timestamp, restart count)
 # is snapshotted before and after every mutation.
+# --apply is WSL-only; --status and --stop remain available elsewhere.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,6 +17,7 @@ image_name="${WSL_GROK_OIDC_IMAGE:-aawm-provider-status-observations:prod}"
 native_auth_file="${WSL_GROK_OIDC_AUTH_FILE:-/home/zepfu/.grok/auth.json}"
 managed_auth_file="${WSL_XAI_OAUTH_AUTH_FILE:-/home/zepfu/.litellm/xai/oauth-auth.json}"
 docker_bin="${WSL_GROK_OIDC_DOCKER_BIN:-docker}"
+osrelease_file="${WSL_GROK_OIDC_OSRELEASE_FILE:-/proc/sys/kernel/osrelease}"
 
 declare -a proxy_containers=(aawm-litellm litellm-dev)
 
@@ -34,7 +36,7 @@ Usage:
             proxy snapshots (default). Status works before activation.
   --apply   Start/recreate only the dedicated dual-credential service with
             --no-deps --no-build after proving both LiteLLM proxies stay
-            unchanged.
+            unchanged. WSL-only: refused fail-closed on a non-WSL host.
   --stop    Stop only the dedicated service with --no-deps, then prove both
             LiteLLM proxies stayed unchanged.
 USAGE
@@ -55,6 +57,21 @@ die() {
 
 info() {
   echo "$*"
+}
+
+detect_host_kind() {
+  if grep -qiE 'microsoft|wsl' "$osrelease_file" 2>/dev/null; then
+    printf 'wsl\n'
+  else
+    printf 'non-wsl\n'
+  fi
+}
+
+require_wsl_host_for_apply() {
+  local host_kind
+  host_kind="$(detect_host_kind)"
+  [[ "$host_kind" == "wsl" ]] \
+    || die "apply_refused_non_wsl_host: --apply may only start this WSL-only sidecar on a WSL host (host_kind=${host_kind}); use --status or --stop to inspect/stop an accidentally present container"
 }
 
 require_cmd() {
@@ -370,7 +387,7 @@ run_status() {
   assert_compose_contract
   preflight_image
   preflight_credentials
-  info "mode=status compose=${compose_file} service=${service_name} image=${image_name}"
+  info "mode=status host_kind=$(detect_host_kind) compose=${compose_file} service=${service_name} image=${image_name}"
   info "native_auth_file=${native_auth_file}"
   info "managed_auth_file=${managed_auth_file}"
   print_sidecar_status
@@ -379,6 +396,7 @@ run_status() {
 }
 
 run_apply() {
+  require_wsl_host_for_apply
   local before_file after_file
   assert_compose_contract
   preflight_image

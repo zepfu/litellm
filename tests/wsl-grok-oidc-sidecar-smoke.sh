@@ -354,6 +354,134 @@ require_contains "$docs_file" 'xai_oauth_refresh' \
   "docs name managed xai_oauth_refresh events/task"
 
 echo
+guard_probe_dir="$(mktemp -d)"
+trap 'rm -rf "$guard_probe_dir"' EXIT
+fake_bin_dir="${guard_probe_dir}/bin"
+fake_creds_dir="${guard_probe_dir}/creds"
+mkdir -p "$fake_bin_dir" "$fake_creds_dir"
+real_stat="$(command -v stat)"
+
+cat >"${fake_bin_dir}/docker" <<'FAKE_DOCKER'
+#!/usr/bin/env bash
+echo "docker $*" >>"$FAKE_DOCKER_CALLS"
+case "${1:-}" in
+  image) exit 0 ;;
+  compose)
+    [[ " $* " == *" stop "* ]] && printf 'exited\n' >"$FAKE_DOCKER_STATE"
+    [[ " $* " == *" up "* ]] && printf 'running\n' >"$FAKE_DOCKER_STATE"
+    exit 0
+    ;;
+  inspect)
+    template="${3:-}"
+    target="${@: -1}"
+    case "$template" in
+      '{{.Id}}') printf 'id-%s\n' "$target" ;;
+      '{{.State.StartedAt}}') printf '2026-08-11T00:00:00Z\n' ;;
+      '{{.RestartCount}}') printf '0\n' ;;
+      '{{.State.Status}}')
+        if [[ "$target" == "aawm-wsl-grok-oidc-refresh" ]]; then
+          cat "$FAKE_DOCKER_STATE"
+        else
+          printf 'running\n'
+        fi
+        ;;
+      *'.State.Health'*) printf 'healthy\n' ;;
+      '{{.Config.Image}}') printf 'aawm-provider-status-observations:prod\n' ;;
+    esac
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+FAKE_DOCKER
+chmod +x "${fake_bin_dir}/docker"
+
+cat >"${fake_bin_dir}/stat" <<'FAKE_STAT'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-c" && "$#" -eq 3 ]]; then
+  case "${3}:${2}" in
+    "${FAKE_NATIVE_AUTH_FILE}:%a"|"${FAKE_MANAGED_AUTH_FILE}:%a") printf '600\n'; exit 0 ;;
+    "${FAKE_NATIVE_AUTH_FILE}:%u"|"${FAKE_NATIVE_AUTH_FILE}:%g") printf '1000\n'; exit 0 ;;
+    "${FAKE_MANAGED_AUTH_FILE}:%u"|"${FAKE_MANAGED_AUTH_FILE}:%g") printf '0\n'; exit 0 ;;
+  esac
+fi
+exec "$REAL_STAT" "$@"
+FAKE_STAT
+chmod +x "${fake_bin_dir}/stat"
+
+printf '%s' '{"https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828": {"oidc_issuer": "https://auth.x.ai", "oidc_client_id": "b1a00492-073a-47ea-816f-4c329264a828", "expires_at": 9999999999, "refresh_token": "test-only", "key": "test-only"}}' \
+  >"${fake_creds_dir}/auth.json"
+printf '%s' '{"client_id": "b1a00492-073a-47ea-816f-4c329264a828", "expires_at": 9999999999, "refresh_token": "test-only", "key": "test-only"}' \
+  >"${fake_creds_dir}/oauth-auth.json"
+chmod 600 "${fake_creds_dir}/auth.json" "${fake_creds_dir}/oauth-auth.json"
+
+run_fixture() {
+  local osrelease_fixture="$1" mode="$2" label="$3"
+  probe_calls="${guard_probe_dir}/calls-${label}.log"
+  probe_state="${guard_probe_dir}/state-${label}"
+  : >"$probe_calls"
+  printf 'running\n' >"$probe_state"
+  probe_rc=0
+  probe_output="$(
+    PATH="${fake_bin_dir}:${PATH}" \
+    REAL_STAT="$real_stat" \
+    FAKE_DOCKER_CALLS="$probe_calls" \
+    FAKE_DOCKER_STATE="$probe_state" \
+    FAKE_NATIVE_AUTH_FILE="${fake_creds_dir}/auth.json" \
+    FAKE_MANAGED_AUTH_FILE="${fake_creds_dir}/oauth-auth.json" \
+    WSL_GROK_OIDC_OSRELEASE_FILE="$osrelease_fixture" \
+    WSL_GROK_OIDC_DOCKER_BIN="${fake_bin_dir}/docker" \
+    WSL_GROK_OIDC_COMPOSE_FILE="$compose_file" \
+    WSL_GROK_OIDC_AUTH_FILE="${fake_creds_dir}/auth.json" \
+    WSL_XAI_OAUTH_AUTH_FILE="${fake_creds_dir}/oauth-auth.json" \
+    WSL_GROK_OIDC_HEALTH_TIMEOUT_SECONDS=5 \
+    "$launcher" "$mode" 2>&1
+  )" || probe_rc=$?
+}
+
+assert_refused_apply() {
+  local osrelease_fixture="$1" label="$2"
+  run_fixture "$osrelease_fixture" --apply "$label"
+  if [[ "$probe_rc" -eq 1 ]] && grep -q 'apply_refused_non_wsl_host' <<<"$probe_output"; then
+    pass "${label}: apply refused"
+  else
+    fail "${label}: expected refusal, rc=${probe_rc}; output: ${probe_output}"
+  fi
+  if [[ ! -s "$probe_calls" ]]; then
+    pass "${label}: no Docker calls"
+  else
+    fail "${label}: Docker was called: $(cat "$probe_calls")"
+  fi
+}
+
+printf '5.15.0-105-generic\n' >"${guard_probe_dir}/osrelease-nonwsl"
+printf '5.15.153.1-microsoft-standard-WSL2\n' >"${guard_probe_dir}/osrelease-wsl"
+
+assert_refused_apply "${guard_probe_dir}/missing-osrelease" "unreadable-osrelease"
+assert_refused_apply "${guard_probe_dir}/osrelease-nonwsl" "marker-free-osrelease"
+
+for mode in status stop; do
+  run_fixture "${guard_probe_dir}/osrelease-nonwsl" "--${mode}" "nonwsl-${mode}"
+  if [[ "$probe_rc" -eq 0 ]] && grep -q "${mode}_ok" <<<"$probe_output"; then
+    pass "non-WSL --${mode} remains available"
+  else
+    fail "non-WSL --${mode} failed, rc=${probe_rc}; output: ${probe_output}"
+  fi
+done
+
+run_fixture "${guard_probe_dir}/osrelease-wsl" --apply "wsl-apply"
+expected_compose_call="docker compose -f ${compose_file} up -d --no-deps --no-build wsl-grok-oidc-refresh"
+compose_calls="$(grep '^docker compose ' "$probe_calls" || true)"
+if [[ "$probe_rc" -eq 0 ]] && grep -q 'apply_ok service=wsl-grok-oidc-refresh proxies_unchanged=true' <<<"$probe_output"; then
+  pass "WSL apply preserves proxy snapshots"
+else
+  fail "WSL apply failed, rc=${probe_rc}; output: ${probe_output}"
+fi
+if [[ "$compose_calls" == "$expected_compose_call" ]]; then
+  pass "WSL apply uses exactly the service-scoped compose up"
+else
+  fail "unexpected WSL apply compose calls: ${compose_calls:-none}"
+fi
+
 echo "summary: pass=${pass_count} fail=${fail_count}"
 if [[ "$fail_count" -ne 0 ]]; then
   exit 1
