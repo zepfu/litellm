@@ -399,6 +399,12 @@ cat >"${fake_bin_dir}/stat" <<'FAKE_STAT'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "-c" && "$#" -eq 3 ]]; then
   case "${3}:${2}" in
+    "${FAKE_NATIVE_AUTH_FILE}:"*|"${FAKE_MANAGED_AUTH_FILE}:"*)
+      echo "stat $*" >>"$FAKE_STAT_CALLS"
+      [[ "${FAKE_STAT_REJECT_AUTH:-0}" == "1" ]] && exit 1
+      ;;
+  esac
+  case "${3}:${2}" in
     "${FAKE_NATIVE_AUTH_FILE}:%a"|"${FAKE_MANAGED_AUTH_FILE}:%a") printf '600\n'; exit 0 ;;
     "${FAKE_NATIVE_AUTH_FILE}:%u"|"${FAKE_NATIVE_AUTH_FILE}:%g") printf '1000\n'; exit 0 ;;
     "${FAKE_MANAGED_AUTH_FILE}:%u"|"${FAKE_MANAGED_AUTH_FILE}:%g") printf '0\n'; exit 0 ;;
@@ -415,10 +421,12 @@ printf '%s' '{"client_id": "b1a00492-073a-47ea-816f-4c329264a828", "expires_at":
 chmod 600 "${fake_creds_dir}/auth.json" "${fake_creds_dir}/oauth-auth.json"
 
 run_fixture() {
-  local osrelease_fixture="$1" mode="$2" label="$3"
+  local osrelease_fixture="$1" mode="$2" label="$3" reject_auth_stat="${4:-0}"
   probe_calls="${guard_probe_dir}/calls-${label}.log"
+  probe_stat_calls="${guard_probe_dir}/stat-calls-${label}.log"
   probe_state="${guard_probe_dir}/state-${label}"
   : >"$probe_calls"
+  : >"$probe_stat_calls"
   printf 'running\n' >"$probe_state"
   probe_rc=0
   probe_output="$(
@@ -426,6 +434,8 @@ run_fixture() {
     REAL_STAT="$real_stat" \
     FAKE_DOCKER_CALLS="$probe_calls" \
     FAKE_DOCKER_STATE="$probe_state" \
+    FAKE_STAT_CALLS="$probe_stat_calls" \
+    FAKE_STAT_REJECT_AUTH="$reject_auth_stat" \
     FAKE_NATIVE_AUTH_FILE="${fake_creds_dir}/auth.json" \
     FAKE_MANAGED_AUTH_FILE="${fake_creds_dir}/oauth-auth.json" \
     WSL_GROK_OIDC_OSRELEASE_FILE="$osrelease_fixture" \
@@ -459,14 +469,22 @@ printf '5.15.153.1-microsoft-standard-WSL2\n' >"${guard_probe_dir}/osrelease-wsl
 assert_refused_apply "${guard_probe_dir}/missing-osrelease" "unreadable-osrelease"
 assert_refused_apply "${guard_probe_dir}/osrelease-nonwsl" "marker-free-osrelease"
 
-for mode in status stop; do
-  run_fixture "${guard_probe_dir}/osrelease-nonwsl" "--${mode}" "nonwsl-${mode}"
-  if [[ "$probe_rc" -eq 0 ]] && grep -q "${mode}_ok" <<<"$probe_output"; then
-    pass "non-WSL --${mode} remains available"
-  else
-    fail "non-WSL --${mode} failed, rc=${probe_rc}; output: ${probe_output}"
-  fi
-done
+run_fixture "${guard_probe_dir}/osrelease-nonwsl" --status "nonwsl-status" 1
+if [[ "$probe_rc" -eq 0 ]] \
+  && grep -q 'credential_preflight=skipped_non_wsl' <<<"$probe_output" \
+  && grep -q 'status_ok' <<<"$probe_output" \
+  && [[ ! -s "$probe_stat_calls" ]]; then
+  pass "non-WSL --status skips credential preflight"
+else
+  fail "non-WSL --status used credential preflight, rc=${probe_rc}; output: ${probe_output}"
+fi
+
+run_fixture "${guard_probe_dir}/osrelease-nonwsl" --stop "nonwsl-stop"
+if [[ "$probe_rc" -eq 0 ]] && grep -q 'stop_ok' <<<"$probe_output"; then
+  pass "non-WSL --stop remains available"
+else
+  fail "non-WSL --stop failed, rc=${probe_rc}; output: ${probe_output}"
+fi
 
 run_fixture "${guard_probe_dir}/osrelease-wsl" --apply "wsl-apply"
 expected_compose_call="docker compose -f ${compose_file} up -d --no-deps --no-build wsl-grok-oidc-refresh"

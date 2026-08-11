@@ -32,8 +32,7 @@ for arg in "$@"; do
 Usage:
   scripts/ensure-wsl-grok-oidc-sidecar.sh [--status|--apply|--stop]
 
-  --status  Preflight image + native/managed credentials, report sidecar +
-            proxy snapshots (default). Status works before activation.
+  --status  Inspect image, sidecar, and proxies (default); WSL also preflights credentials, while non-WSL skips WSL credential ownership checks.
   --apply   Start/recreate only the dedicated dual-credential service with
             --no-deps --no-build after proving both LiteLLM proxies stay
             unchanged. WSL-only: refused fail-closed on a non-WSL host.
@@ -384,10 +383,16 @@ print_sidecar_status() {
 }
 
 run_status() {
+  local host_kind
+  host_kind="$(detect_host_kind)"
   assert_compose_contract
   preflight_image
-  preflight_credentials
-  info "mode=status host_kind=$(detect_host_kind) compose=${compose_file} service=${service_name} image=${image_name}"
+  if [[ "$host_kind" == "wsl" ]]; then
+    preflight_credentials
+  else
+    info "credential_preflight=skipped_non_wsl"
+  fi
+  info "mode=status host_kind=${host_kind} compose=${compose_file} service=${service_name} image=${image_name}"
   info "native_auth_file=${native_auth_file}"
   info "managed_auth_file=${managed_auth_file}"
   print_sidecar_status
