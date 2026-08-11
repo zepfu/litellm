@@ -27249,8 +27249,16 @@ class TestOpenAIPassthroughRoute:
         Codex-native OAuth traffic should preserve client auth and target the ChatGPT
         Codex backend instead of the public OpenAI Responses API.
         """
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import durable as durable_mod
         from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
             openai_proxy_route,
+        )
+        # D1-612 fail-closed ownership consult requires durable Redis authority.
+        # Reuse the focused session-affinity fake store so this supported-behavior
+        # gate test does not spuriously redispatch when no durable cache is wired.
+        from tests.test_litellm.proxy.pass_through_endpoints.test_d1_612_session_affinity import (
+            _FakeRedisCache,
+            _patch_dual,
         )
 
         mock_request = MagicMock(spec=Request)
@@ -27264,10 +27272,24 @@ class TestOpenAIPassthroughRoute:
             "user-agent": "codex_exec/0.118.0",
         }
         mock_request.query_params = {}
+        # Plain state object: MagicMock attributes must not look like ownership leases.
+        mock_request.state = type("State", (), {})()
+        # Deterministic Codex responses body so D1-612 owner attrs include model.
+        request_body = {
+            "model": "gpt-5.4-codex",
+            "input": [{"role": "user", "content": "ping"}],
+        }
+        mock_request.body = AsyncMock(
+            return_value=json.dumps(request_body).encode("utf-8")
+        )
+        mock_request.json = AsyncMock(return_value=request_body)
         mock_response = MagicMock(spec=Response)
         mock_user_api_key_dict = MagicMock()
+        redis = _FakeRedisCache()
 
-        with patch(
+        with _patch_dual(redis), patch.object(
+            durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+        ), patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials"
         ) as mock_get_credentials, patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"

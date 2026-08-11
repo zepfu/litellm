@@ -514,12 +514,159 @@ class BaseOpenAIPassThroughHandler:
             egress_credential_family=egress_credential_family,
             expected_target_family=expected_target_family,
         )
-        return await endpoint_func(
-            request,
-            fastapi_response,
-            user_api_key_dict,
-            custom_body=endpoint_custom_body,
+
+        # D1-612: request-scoped session-owner guard for direct OpenAI fallthrough.
+        # Does not mutate the egress body (preserves caller body identity). Nested
+        # alias routes return earlier; pass_through_request also renews pre-send.
+        import sys
+
+        _sa = sys.modules.get(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity"
         )
+        if _sa is None:
+            from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+                session_affinity as _sa,
+            )
+
+        session_owner_lease = None
+        if not _sa.request_session_owner_already_guarded(request):
+            direct_body = endpoint_custom_body if isinstance(endpoint_custom_body, dict) else {}
+            canonical_session_identity = _sa.resolve_canonical_session_identity(
+                request,
+                direct_body,
+            )
+            if canonical_session_identity is not None:
+                # Concrete resolved provider/model/route — not generic defaults.
+                provider_name = (
+                    custom_llm_provider.value
+                    if isinstance(custom_llm_provider, litellm.LlmProviders)
+                    else str(custom_llm_provider or "openai")
+                )
+                requested_model = (
+                    direct_body.get("model")
+                    if isinstance(direct_body, dict)
+                    else None
+                )
+                is_responses_endpoint = bool(
+                    rt.is_openai_responses_endpoint_fn(endpoint)
+                )
+                is_codex_native = bool(
+                    rt.request_uses_codex_native_auth_fn(request)
+                )
+                # Prefer explicit resolved credential/target families when the
+                # prepare path set them (xAI/Grok/etc). For direct Codex/OpenAI
+                # fallthrough, pin an account-scoped codex_oauth family so the
+                # selected ChatGPT account lane is part of owner identity.
+                if egress_credential_family:
+                    route_family = str(egress_credential_family)
+                elif expected_target_family:
+                    route_family = str(expected_target_family)
+                elif is_codex_native and is_responses_endpoint:
+                    route_family = "codex_oauth"
+                elif is_responses_endpoint:
+                    route_family = "openai_responses"
+                else:
+                    route_family = str(provider_name)
+                endpoint_contract = (
+                    "openai_responses"
+                    if is_responses_endpoint
+                    else "openai_passthrough"
+                )
+                state_format = (
+                    "openai_responses" if is_responses_endpoint else "openai"
+                )
+                account_identity = _sa.extract_account_identity_from_context(
+                    request=request,
+                    request_body=direct_body,
+                )
+                requested_attributes = _sa.build_session_owner_attributes(
+                    provider=provider_name,
+                    model=requested_model,
+                    route_family=route_family,
+                    endpoint_contract=endpoint_contract,
+                    state_format=state_format,
+                    ingress="openai_passthrough",
+                    requested_model=requested_model,
+                    extra=account_identity,
+                )
+                # Account-scoped direct Codex/OpenAI routes must fail closed
+                # before send when safe selected account identity is missing.
+                # Non-account-scoped direct routes remain valid without it.
+                if _sa.route_requires_account_identity(requested_attributes):
+                    incomplete = _sa.incomplete_owner_attribute_reason(
+                        requested_attributes, for_promotion=True
+                    )
+                    if incomplete is not None:
+                        _sa.raise_session_owner_redispatch_required(
+                            session_identity=canonical_session_identity,
+                            failure_phase=(
+                                "session_owner_direct_openai_missing_account_identity"
+                            ),
+                            candidate=requested_attributes,
+                            guard=_sa.SessionOwnerGuardResult(
+                                decision=(
+                                    _sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
+                                ),
+                                session_identity=canonical_session_identity,
+                                mismatch_reason=incomplete,
+                                provenance=_sa.build_session_owner_provenance(
+                                    session_identity=canonical_session_identity,
+                                    decision="redispatch_required",
+                                    mismatch_reason=incomplete,
+                                ),
+                            ),
+                        )
+                await _sa.ensure_session_owner_guard_for_request(
+                    request=request,
+                    request_body=direct_body,
+                    session_identity=canonical_session_identity,
+                    requested_attributes=requested_attributes,
+                    alias_model=str(requested_model)
+                    if requested_model is not None
+                    else None,
+                    require_exact_attributes=True,
+                    failure_phase="session_owner_direct_openai_pre_egress",
+                )
+        session_owner_lease = _sa.get_request_session_owner_lease(request)
+
+        try:
+            response = await endpoint_func(
+                request,
+                fastapi_response,
+                user_api_key_dict,
+                custom_body=endpoint_custom_body,
+            )
+        except Exception:
+            await _sa.finalize_session_owner_lease_on_failure(session_owner_lease)
+            raise
+
+        status_code = getattr(response, "status_code", None)
+        if isinstance(status_code, int) and 200 <= status_code < 300:
+            promote_result = await _sa.finalize_session_owner_lease_on_success(
+                session_owner_lease,
+                attributes=(
+                    session_owner_lease.attributes
+                    if session_owner_lease is not None
+                    else None
+                ),
+            )
+            if promote_result is not None and promote_result.outcome in {
+                _sa.SessionOwnerMutationOutcome.CONFLICT,
+                _sa.SessionOwnerMutationOutcome.ERROR,
+                _sa.SessionOwnerMutationOutcome.NOT_HELD,
+            }:
+                _sa.raise_session_owner_redispatch_required(
+                    session_identity=(
+                        session_owner_lease.session_identity
+                        if session_owner_lease is not None
+                        else None
+                    ),
+                    mutation=promote_result,
+                    failure_phase="session_owner_direct_openai_promote",
+                )
+        else:
+            await _sa.finalize_session_owner_lease_on_failure(session_owner_lease)
+        return response
 
 
 # ---------------------------------------------------------------------------

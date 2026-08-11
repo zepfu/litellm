@@ -107,6 +107,36 @@ ANTHROPIC_DISPATCH_SEAM_DISPOSITION: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 
+async def _dispatch_anthropic_adapter_with_lease(request, handler_coro):
+    """Await one nested adapter handler and finalize the shared lease."""
+    try:
+        response = await handler_coro
+    except Exception as exc:
+        await _finalize_nested_session_owner_lease(request, exc=exc)
+        raise
+    await _finalize_nested_session_owner_lease(request, response)
+    return response
+
+
+async def _finalize_nested_session_owner_lease(request, response=None, *, exc=None):
+    """Promote/release via the shared session_affinity lifecycle API."""
+    import sys as _sys
+
+    _sa = _sys.modules.get(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity"
+    )
+    if _sa is None:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            session_affinity as _sa,
+        )
+    return await _sa.finalize_request_session_owner_lease(
+        request,
+        response,
+        exc=exc,
+        failure_phase="session_owner_anthropic_nested_promote",
+    )
+
+
 async def try_dispatch_anthropic_adapter(
     runtime: AnthropicDispatchRuntime,
     *,
@@ -126,7 +156,48 @@ async def try_dispatch_anthropic_adapter(
     ``anthropic_proxy_route``: each resolver is tried in sequence; the
     first non-None result dispatches to its handler.  Exceptions from
     resolvers or handlers propagate unmodified.
+
+    D1-612: early nested ownership is consult-only. Concrete
+    provider/model/route reservation happens at the last common pre-egress
+    points inside the adapter perform helpers once the selected adapter
+    identity is known, so promotion cannot pin the generic
+    ``anthropic/<inbound>/anthropic_nested`` placeholder.
     """
+    import sys as _sys
+
+    _sa = _sys.modules.get(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity"
+    )
+    if _sa is None:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            session_affinity as _sa,
+        )
+    # Consult-only: fail closed on Redis/store errors before adapter selection.
+    # Do not reserve or promote with generic inbound/nested placeholder attrs.
+    if not _sa.request_session_owner_already_guarded(request):
+        _sid = _sa.resolve_canonical_session_identity(request, prepared_request_body)
+        if _sid is not None:
+            _, _ck, _err = await _sa.get_session_owner_record(
+                session_identity=_sid
+            )
+            if _err is not None:
+                _sa.raise_session_owner_redispatch_required(
+                    session_identity=_sid,
+                    failure_phase="session_owner_anthropic_nested_redis",
+                    guard=_sa.SessionOwnerGuardResult(
+                        decision=_sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                        session_identity=_sid,
+                        cache_key=_ck,
+                        mismatch_reason=_err,
+                        provenance=_sa.build_session_owner_provenance(
+                            session_identity=_sid,
+                            decision="redispatch_required",
+                            mismatch_reason=_err,
+                            cache_key=_ck,
+                        ),
+                    ),
+                )
+
     # Common handler kwargs shared across all adapter routes.
     common: dict[str, Any] = {
         "endpoint": endpoint,
@@ -142,11 +213,17 @@ async def try_dispatch_anthropic_adapter(
     )
     if xai_oauth_adapter_model is not None:
         if runtime.is_oa_xai_responses_model(xai_oauth_adapter_model):
-            return await runtime.handle_xai_oauth_responses(
-                **common, adapter_model=xai_oauth_adapter_model,
+            return await _dispatch_anthropic_adapter_with_lease(
+                request,
+                runtime.handle_xai_oauth_responses(
+                    **common, adapter_model=xai_oauth_adapter_model,
+                ),
             )
-        return await runtime.handle_xai_oauth_completion(
-            **common, adapter_model=xai_oauth_adapter_model,
+        return await _dispatch_anthropic_adapter_with_lease(
+            request,
+            runtime.handle_xai_oauth_completion(
+                **common, adapter_model=xai_oauth_adapter_model,
+            ),
         )
 
     # 2. Grok native OAuth
@@ -154,8 +231,11 @@ async def try_dispatch_anthropic_adapter(
         prepared_request_body, endpoint,
     )
     if grok_native_oauth_adapter_model is not None:
-        return await runtime.handle_grok_native_oauth_responses(
-            **common, adapter_model=grok_native_oauth_adapter_model,
+        return await _dispatch_anthropic_adapter_with_lease(
+            request,
+            runtime.handle_grok_native_oauth_responses(
+                **common, adapter_model=grok_native_oauth_adapter_model,
+            ),
         )
 
     # 3. OpenAI responses adapter
@@ -163,8 +243,11 @@ async def try_dispatch_anthropic_adapter(
         prepared_request_body, endpoint,
     )
     if adapter_model is not None:
-        return await runtime.handle_openai_responses(
-            **common, adapter_model=adapter_model,
+        return await _dispatch_anthropic_adapter_with_lease(
+            request,
+            runtime.handle_openai_responses(
+                **common, adapter_model=adapter_model,
+            ),
         )
 
     # 4. OpenCode Zen
@@ -172,8 +255,11 @@ async def try_dispatch_anthropic_adapter(
         prepared_request_body, endpoint,
     )
     if opencode_zen_adapter_model is not None:
-        return await runtime.handle_opencode_zen(
-            **common, adapter_model=opencode_zen_adapter_model,
+        return await _dispatch_anthropic_adapter_with_lease(
+            request,
+            runtime.handle_opencode_zen(
+                **common, adapter_model=opencode_zen_adapter_model,
+            ),
         )
 
     # 5. Kimi code chat completions
@@ -181,8 +267,11 @@ async def try_dispatch_anthropic_adapter(
         prepared_request_body, endpoint,
     )
     if kimi_code_adapter_model is not None:
-        return await runtime.handle_kimi(
-            **common, adapter_model=kimi_code_adapter_model,
+        return await _dispatch_anthropic_adapter_with_lease(
+            request,
+            runtime.handle_kimi(
+                **common, adapter_model=kimi_code_adapter_model,
+            ),
         )
 
     # 6. Alibaba token plan
@@ -190,8 +279,11 @@ async def try_dispatch_anthropic_adapter(
         prepared_request_body, endpoint,
     )
     if alibaba_token_plan_adapter_model is not None:
-        return await runtime.handle_alibaba(
-            **common, adapter_model=alibaba_token_plan_adapter_model,
+        return await _dispatch_anthropic_adapter_with_lease(
+            request,
+            runtime.handle_alibaba(
+                **common, adapter_model=alibaba_token_plan_adapter_model,
+            ),
         )
 
     # 7. NVIDIA completion adapter
@@ -199,8 +291,11 @@ async def try_dispatch_anthropic_adapter(
         prepared_request_body, endpoint,
     )
     if nvidia_adapter_model is not None:
-        return await runtime.handle_nvidia(
-            **common, adapter_model=nvidia_adapter_model,
+        return await _dispatch_anthropic_adapter_with_lease(
+            request,
+            runtime.handle_nvidia(
+                **common, adapter_model=nvidia_adapter_model,
+            ),
         )
 
     # 8. OpenRouter completion adapter
@@ -208,8 +303,11 @@ async def try_dispatch_anthropic_adapter(
         prepared_request_body, endpoint,
     )
     if openrouter_completion_adapter_model is not None:
-        return await runtime.handle_openrouter_completion(
-            **common, adapter_model=openrouter_completion_adapter_model,
+        return await _dispatch_anthropic_adapter_with_lease(
+            request,
+            runtime.handle_openrouter_completion(
+                **common, adapter_model=openrouter_completion_adapter_model,
+            ),
         )
 
     # 9. OpenRouter responses adapter
@@ -217,8 +315,11 @@ async def try_dispatch_anthropic_adapter(
         prepared_request_body, endpoint,
     )
     if openrouter_adapter_model is not None:
-        return await runtime.handle_openrouter_responses(
-            **common, adapter_model=openrouter_adapter_model,
+        return await _dispatch_anthropic_adapter_with_lease(
+            request,
+            runtime.handle_openrouter_responses(
+                **common, adapter_model=openrouter_adapter_model,
+            ),
         )
 
     return None

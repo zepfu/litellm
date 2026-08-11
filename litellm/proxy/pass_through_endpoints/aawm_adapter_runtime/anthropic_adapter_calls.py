@@ -1081,6 +1081,109 @@ async def _finalize_anthropic_responses_adapter_from_config(
     )
 
 
+
+def _session_affinity_mod():
+    """Lazy session_affinity import (safe under module rebinding / tests)."""
+    import sys as _sys
+
+    _sa = _sys.modules.get(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity"
+    )
+    if _sa is None:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            session_affinity as _sa,
+        )
+    return _sa
+
+
+async def _ensure_anthropic_nested_session_owner_pre_egress(
+    *,
+    request: Request,
+    request_body: Optional[Payload],
+    provider: Any,
+    model: Any,
+    route_family: Any,
+    endpoint_contract: str,
+    state_format: str,
+    failure_phase: str,
+) -> None:
+    """Reserve/renew nested session ownership with concrete resolved attrs.
+
+    Called at the last common pre-egress points after adapter/provider/model/
+    route resolution and before actual provider send. Uses exact provider,
+    concrete model, route_family, endpoint_contract, state_format, and any
+    safe account-lane labels already present on the request.
+
+    Idempotent:
+    - alias ``candidate_loop`` / pass-through that already reserved a concrete
+      owner identity is renewed in place (attributes preserved)
+    - generic nested placeholders (e.g. ``anthropic_nested``) are upgraded to
+      the concrete resolved identity before send/finalize
+    """
+
+    _sa = _session_affinity_mod()
+    body = request_body if isinstance(request_body, dict) else {}
+    existing = _sa.get_request_session_owner_lease(request)
+    prior = (
+        existing.attributes
+        if existing is not None and isinstance(existing.attributes, dict)
+        else None
+    )
+    prior_route = str((prior or {}).get("route_family") or "").strip().lower()
+    prior_is_generic_placeholder = (not prior) or prior_route in {
+        "",
+        "anthropic_nested",
+        "codex_nested",
+    }
+    if (
+        existing is not None
+        and existing.held_reservation
+        and prior
+        and not prior_is_generic_placeholder
+    ):
+        # Already reserved with concrete candidate/handler attrs — renew only.
+        await _sa.ensure_session_owner_guard_for_request(
+            request=request,
+            request_body=body,
+            session_identity=existing.session_identity
+            or _sa.resolve_canonical_session_identity(request, body),
+            requested_attributes=prior,
+            alias_model=str(model) if model is not None else None,
+            failure_phase=failure_phase,
+        )
+        return
+
+    account_identity = _sa.extract_account_identity_from_context(
+        request=request,
+        request_body=body,
+    )
+    attrs = _sa.build_session_owner_attributes(
+        provider=provider,
+        model=model,
+        route_family=route_family,
+        endpoint_contract=endpoint_contract,
+        state_format=state_format,
+        ingress="anthropic_nested_pre_egress",
+        requested_model=body.get("model") if isinstance(body, dict) else None,
+        extra=account_identity,
+    )
+    if existing is not None and existing.held_reservation:
+        # Upgrade generic nested placeholder reservation before send.
+        _sa.refresh_request_session_owner_lease_attributes(request, attrs)
+    await _sa.ensure_session_owner_guard_for_request(
+        request=request,
+        request_body=body,
+        session_identity=(
+            existing.session_identity
+            if existing is not None and existing.session_identity
+            else _sa.resolve_canonical_session_identity(request, body)
+        ),
+        requested_attributes=attrs,
+        alias_model=str(model) if model is not None else None,
+        failure_phase=failure_phase,
+    )
+
+
 async def _perform_anthropic_responses_adapter_pass_through(
     *,
     config: _aawm_adapter_config.AnthropicResponsesAdapterConfig,
@@ -1133,6 +1236,26 @@ async def _perform_anthropic_responses_adapter_pass_through(
         pt_kwargs["allowed_pass_through_prefixed_headers"] = allowed_pass_through_prefixed_headers
     if extra_pass_through_kwargs:
         pt_kwargs.update(extra_pass_through_kwargs)
+    # D1-612: last common pre-egress point for nested Responses adapters.
+    # Concrete provider/model/route are known here; reserve before send so
+    # promotion cannot pin generic anthropic_nested inbound placeholders.
+    await _ensure_anthropic_nested_session_owner_pre_egress(
+        request=request,
+        request_body=translated_request_body
+        if isinstance(translated_request_body, dict)
+        else None,
+        provider=pt_kwargs.get("custom_llm_provider") or config.provider,
+        model=adapter_model,
+        route_family=(
+            pt_kwargs.get("egress_credential_family")
+            or pt_kwargs.get("expected_target_family")
+            or config.adapter
+            or config.provider
+        ),
+        endpoint_contract="openai_responses",
+        state_format="openai_responses",
+        failure_phase="session_owner_anthropic_nested_pre_egress",
+    )
     upstream_response = await transport(**pt_kwargs)
     return await _finalize_anthropic_responses_adapter_from_config(
         config=config,
@@ -1371,18 +1494,55 @@ async def _perform_anthropic_completion_adapter_messages_call(
         adapter_label=config.adapter_label,
         provider_bound_body=completion_kwargs,
     )
-    if operation_wrapper is not None:
-        completion_response = await operation_wrapper(_operation)
-    else:
-        completion_response = await _operation()
-
-    return _finalize_anthropic_completion_adapter_response(
-        completion_response=completion_response,
-        stream_flag=stream_flag,
-        fake_stream=fake_stream,
-        rollup_kwargs=rollup_kwargs,
-        adapter_label=config.adapter_label,
+    _sa = _session_affinity_mod()
+    # D1-612: last common pre-egress point for nested completion adapters
+    # (acompletion path has no pass_through_request pre-send hook).
+    await _ensure_anthropic_nested_session_owner_pre_egress(
+        request=request,
+        request_body=prepared_request_body
+        if isinstance(prepared_request_body, dict)
+        else None,
+        provider=custom_llm_provider
+        or getattr(config, "custom_llm_provider", None),
+        model=model_name,
+        route_family=(
+            getattr(config, "route_family", None)
+            or getattr(config, "adapter", None)
+        ),
+        endpoint_contract="anthropic_messages",
+        state_format="anthropic",
+        failure_phase="session_owner_anthropic_nested_pre_egress",
     )
+
+    try:
+        if operation_wrapper is not None:
+            completion_response = await operation_wrapper(_operation)
+        else:
+            completion_response = await _operation()
+        response = _finalize_anthropic_completion_adapter_response(
+            completion_response=completion_response,
+            stream_flag=stream_flag,
+            fake_stream=fake_stream,
+            rollup_kwargs=rollup_kwargs,
+            adapter_label=config.adapter_label,
+        )
+    except Exception as _exc:
+        # Release tokenized reservation on acompletion/stream failure.
+        # Nested dispatch may also finalize; SessionOwnerLease is one-shot.
+        await _sa.finalize_request_session_owner_lease(
+            request,
+            exc=_exc,
+            failure_phase="session_owner_anthropic_completion_release",
+        )
+        raise
+    # Authoritative success / first-byte stream object: promote held reservation.
+    # Nested dispatch finalizer is a no-op once promoted/released.
+    await _sa.finalize_request_session_owner_lease(
+        request,
+        response,
+        failure_phase="session_owner_anthropic_completion_promote",
+    )
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -1451,6 +1611,8 @@ _EXTRACTED_FUNCTION_NAMES: tuple[str, ...] = (
     "_is_anthropic_messages_response",
     "_finalize_anthropic_completion_adapter_response",
     "_build_anthropic_completion_adapter_handler_call_kwargs",
+    "_session_affinity_mod",
+    "_ensure_anthropic_nested_session_owner_pre_egress",
     "_perform_anthropic_completion_adapter_messages_call",
     "_add_route_family_logging_metadata",
 )

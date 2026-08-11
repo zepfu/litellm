@@ -4270,6 +4270,57 @@ async def anthropic_proxy_route(  # noqa: PLR0915
             blocked_pass_through_prefixed_headers = [_ANTHROPIC_BETA_HEADER_NAME]
             _safe_set_request_parsed_body(request, prepared_request_body)
 
+    # D1-612: native Anthropic path shares the global session-owner guard.
+    # Reservation is finalized in pass_through_request immediately before
+    # upstream send; pre-check owned mismatches here so adapter fallthrough
+    # cannot select a different owner first.
+    import sys as _sys
+
+    _sa = _sys.modules.get(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity"
+    )
+    if _sa is None:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            session_affinity as _sa,
+        )
+    if request.method == "POST":
+        try:
+            _body = prepared_request_body if isinstance(prepared_request_body, dict) else {}
+        except Exception:  # noqa: BLE001
+            _body = {}
+        _requested_model = _body.get("model") if isinstance(_body, dict) else None
+        _attrs = _sa.build_session_owner_attributes(
+            provider="anthropic",
+            model=_requested_model,
+            route_family="anthropic_native",
+            endpoint_contract="anthropic_messages",
+            state_format="anthropic",
+            ingress="anthropic_passthrough",
+            requested_model=_requested_model,
+        )
+        await _sa.ensure_session_owner_guard_for_request(
+            request=request,
+            request_body=_body if isinstance(_body, dict) else {},
+            requested_attributes=_attrs,
+            alias_model=str(_requested_model) if _requested_model is not None else None,
+            failure_phase="session_owner_anthropic_native_pre_egress",
+        )
+        _lease = _sa.get_request_session_owner_lease(request)
+        if _lease is not None and isinstance(_body, dict):
+            _meta = _body.get("litellm_metadata")
+            if not isinstance(_meta, dict):
+                _meta = {}
+                _body["litellm_metadata"] = _meta
+            _sa.attach_session_owner_metadata(
+                _meta,
+                provenance=_sa.build_session_owner_provenance(
+                    session_identity=_lease.session_identity,
+                    decision=_lease.decision or "unknown",
+                    owner_id=_lease.owner_id,
+                ),
+            )
+            _safe_set_request_parsed_body(request, _body)
+
     return await _perform_anthropic_native_passthrough_request(
         endpoint=endpoint,
         request=request,

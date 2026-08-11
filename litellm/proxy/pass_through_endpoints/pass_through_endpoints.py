@@ -3473,6 +3473,132 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         return stream
 
 
+def _session_affinity_mod():
+    """Lazy session_affinity import (safe under module rebinding)."""
+    import sys
+
+    mod = sys.modules.get(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity"
+    )
+    if mod is not None:
+        return mod
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as mod,
+    )
+    return mod
+
+
+async def _aawm_session_owner_pre_send_guard(
+    *,
+    request: Request,
+    parsed_body: Optional[dict],
+    custom_llm_provider: Optional[str],
+    egress_credential_family: Optional[str],
+    expected_target_family: Optional[str],
+    url: Optional[httpx.URL],
+) -> None:
+    """Ensure tokenized session-owner reservation before upstream send.
+
+    No-ops when the request was already guarded (alias candidate loop / handler).
+    """
+    sa = _session_affinity_mod()
+    if sa.request_session_owner_already_guarded(request):
+        # Renew held reservation before potentially long upstream I/O.
+        lease = sa.get_request_session_owner_lease(request)
+        if lease is not None and lease.held_reservation and not lease.promoted:
+            await sa.ensure_session_owner_guard_for_request(
+                request=request,
+                request_body=parsed_body if isinstance(parsed_body, dict) else {},
+                session_identity=lease.session_identity,
+                requested_attributes=lease.attributes,
+                failure_phase="session_owner_pre_send_renew",
+            )
+        return
+
+    body = parsed_body if isinstance(parsed_body, dict) else {}
+    requested_model = body.get("model")
+    provider_name = str(custom_llm_provider or expected_target_family or "unknown")
+    route_family = str(
+        egress_credential_family or expected_target_family or provider_name
+    )
+    path = str(getattr(url, "path", "") or "")
+    if "responses" in path:
+        endpoint_contract = "openai_responses"
+        state_format = "openai_responses"
+    elif "messages" in path:
+        endpoint_contract = "anthropic_messages"
+        state_format = "anthropic"
+    else:
+        endpoint_contract = "passthrough"
+        state_format = route_family
+    account_identity = sa.extract_account_identity_from_context(
+        request=request,
+        request_body=body,
+    )
+    attrs = sa.build_session_owner_attributes(
+        provider=provider_name,
+        model=requested_model,
+        route_family=route_family,
+        endpoint_contract=endpoint_contract,
+        state_format=state_format,
+        ingress="pass_through_request",
+        requested_model=requested_model,
+        extra=account_identity,
+    )
+    # Account-scoped routes cannot reserve/send without credential identity.
+    if sa.route_requires_account_identity(attrs):
+        incomplete = sa.incomplete_owner_attribute_reason(attrs, for_promotion=True)
+        if incomplete is not None:
+            sa.raise_session_owner_redispatch_required(
+                session_identity=sa.resolve_canonical_session_identity(
+                    request, body
+                ),
+                failure_phase="session_owner_pass_through_missing_account_identity",
+                candidate=attrs,
+                guard=sa.SessionOwnerGuardResult(
+                    decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                    session_identity=sa.resolve_canonical_session_identity(
+                        request, body
+                    ),
+                    mismatch_reason=incomplete,
+                    provenance=sa.build_session_owner_provenance(
+                        session_identity=sa.resolve_canonical_session_identity(
+                            request, body
+                        ),
+                        decision="redispatch_required",
+                        mismatch_reason=incomplete,
+                    ),
+                ),
+            )
+    await sa.ensure_session_owner_guard_for_request(
+        request=request,
+        request_body=body,
+        requested_attributes=attrs,
+        alias_model=str(requested_model) if requested_model is not None else None,
+        failure_phase="session_owner_pass_through_pre_send",
+    )
+
+
+async def _aawm_session_owner_on_upstream_result(
+    *,
+    request: Request,
+    success: bool,
+) -> None:
+    sa = _session_affinity_mod()
+    if success:
+        await sa.finalize_request_session_owner_lease(
+            request,
+            response=type("R", (), {"status_code": 200})(),
+            failure_phase="session_owner_pass_through_promote",
+        )
+    else:
+        await sa.finalize_request_session_owner_lease(
+            request,
+            exc=RuntimeError("upstream_failed"),
+            failure_phase="session_owner_pass_through_release",
+        )
+
+
 async def pass_through_request(  # noqa: PLR0915
     request: Request,
     target: str,
@@ -3905,6 +4031,14 @@ async def pass_through_request(  # noqa: PLR0915
         )
 
         if stream:
+            await _aawm_session_owner_pre_send_guard(
+                request=request,
+                parsed_body=_parsed_body if isinstance(_parsed_body, dict) else None,
+                custom_llm_provider=custom_llm_provider,
+                egress_credential_family=egress_credential_family,
+                expected_target_family=expected_target_family,
+                url=url,
+            )
             upstream_wait_started_at = datetime.now()
 
             async def _send_stream_pre_first_byte() -> Tuple[
@@ -3960,15 +4094,31 @@ async def pass_through_request(  # noqa: PLR0915
                     ) from e
                 return response, req
 
-            (
-                response,
-                req,
-            ) = await _execute_passthrough_pre_first_byte_with_hidden_retries(
-                kwargs=kwargs,
-                operation_name="stream_pre_first_byte",
-                operation=_send_stream_pre_first_byte,
-                caller_managed_hidden_retry=caller_managed_hidden_retry,
+            try:
+                (
+                    response,
+                    req,
+                ) = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                    kwargs=kwargs,
+                    operation_name="stream_pre_first_byte",
+                    operation=_send_stream_pre_first_byte,
+                    caller_managed_hidden_retry=caller_managed_hidden_retry,
+                )
+            except Exception:
+                await _aawm_session_owner_on_upstream_result(
+                    request=request, success=False
+                )
+                raise
+            # First upstream byte path succeeded enough to return a response object.
+            status_ok = bool(
+                getattr(response, "status_code", 500) < 300
             )
+            await _aawm_session_owner_on_upstream_result(
+                request=request, success=status_ok
+            )
+            if not status_ok:
+                # Keep existing error handling below.
+                pass
             upstream_wait_completed_at = datetime.now()
             _record_passthrough_duration(
                 kwargs,
@@ -4012,6 +4162,14 @@ async def pass_through_request(  # noqa: PLR0915
                 status_code=response.status_code,
             )
 
+        await _aawm_session_owner_pre_send_guard(
+            request=request,
+            parsed_body=_parsed_body if isinstance(_parsed_body, dict) else None,
+            custom_llm_provider=custom_llm_provider,
+            egress_credential_family=egress_credential_family,
+            expected_target_family=expected_target_family,
+            url=url,
+        )
         upstream_wait_started_at = datetime.now()
 
         async def _send_non_stream_pre_first_byte() -> httpx.Response:
@@ -4101,11 +4259,21 @@ async def pass_through_request(  # noqa: PLR0915
                 ) from e
             return response
 
-        response = await _execute_passthrough_pre_first_byte_with_hidden_retries(
-            kwargs=kwargs,
-            operation_name="non_stream_pre_first_byte",
-            operation=_send_non_stream_pre_first_byte,
-            caller_managed_hidden_retry=caller_managed_hidden_retry,
+        try:
+            response = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                kwargs=kwargs,
+                operation_name="non_stream_pre_first_byte",
+                operation=_send_non_stream_pre_first_byte,
+                caller_managed_hidden_retry=caller_managed_hidden_retry,
+            )
+        except Exception:
+            await _aawm_session_owner_on_upstream_result(
+                request=request, success=False
+            )
+            raise
+        status_ok = bool(getattr(response, "status_code", 500) < 300)
+        await _aawm_session_owner_on_upstream_result(
+            request=request, success=status_ok
         )
         upstream_wait_completed_at = datetime.now()
         _record_passthrough_duration(

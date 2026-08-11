@@ -54,6 +54,22 @@ from .interfaces import (
 )
 from .state import alias_routing_state, validate_alias_family
 
+
+def _session_affinity_mod():
+    """Lazy session_affinity import (safe under module rebinding)."""
+    import sys
+
+    mod = sys.modules.get(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity"
+    )
+    if mod is not None:
+        return mod
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as mod,
+    )
+    return mod
+
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from fastapi import Request
     from starlette.responses import Response
@@ -412,13 +428,79 @@ async def handle_alias_route(  # noqa: PLR0915
             # probe lock is ALWAYS released, regardless of exception type
             # (Exception, CancelledError, KeyboardInterrupt, etc.).
             try:
+                session_owner_lease = None
                 try:
+                    sa = _session_affinity_mod()
+                    canonical_session_identity = selection.get(
+                        "canonical_session_identity"
+                    ) or sa.resolve_canonical_session_identity(
+                        request,
+                        prepared_request_body,
+                    )
+                    owner_attributes = sa.build_session_owner_attributes(
+                        candidate=candidate,
+                        ingress=alias_family,
+                        requested_model=selection.get("alias_model") or alias_model,
+                        alias_family=alias_family,
+                        endpoint_contract=candidate.get("route_family"),
+                        state_format=candidate.get("route_family"),
+                    )
+                    # Tokenized pre-egress reservation (before upstream send).
+                    guard = await sa.ensure_session_owner_guard_for_request(
+                        request=request,
+                        request_body=prepared_request_body,
+                        session_identity=canonical_session_identity,
+                        requested_attributes=owner_attributes,
+                        candidate=candidate,
+                        alias_model=selection.get("alias_model") or alias_model,
+                        failure_phase="session_owner_pre_egress_reserve",
+                    )
+                    session_owner_lease = sa.get_request_session_owner_lease(request)
+                    # Expose reservation metadata on attempt selection.
+                    selection["canonical_session_identity"] = canonical_session_identity
+                    selection["session_owner_decision"] = guard.decision.value
+                    selection["session_owner_reservation_token"] = (
+                        guard.reservation_token
+                    )
+                    selection["session_owner_held_reservation"] = guard.held_reservation
+                    if guard.provenance:
+                        selection["session_owner_provenance"] = guard.provenance
+
                     response = await perform_candidate_request_fn(
                         candidate=candidate,
                         candidate_body=candidate_body,
                     )
+                    # Authoritative success: promote reserved -> owned.
+                    promote_result = await sa.finalize_session_owner_lease_on_success(
+                        session_owner_lease,
+                        attributes=owner_attributes,
+                        candidate=candidate,
+                    )
+                    if promote_result is not None and promote_result.outcome in {
+                        sa.SessionOwnerMutationOutcome.CONFLICT,
+                        sa.SessionOwnerMutationOutcome.ERROR,
+                        sa.SessionOwnerMutationOutcome.NOT_HELD,
+                    }:
+                        # Success bytes may already be in flight to the client;
+                        # fail closed for subsequent requests by not treating
+                        # ownership as established. Still surface structured error
+                        # for non-streaming callers by raising.
+                        sa.raise_session_owner_redispatch_required(
+                            session_identity=canonical_session_identity,
+                            mutation=promote_result,
+                            alias_model=selection.get("alias_model") or alias_model,
+                            candidate=candidate,
+                            failure_phase="session_owner_promote_after_success",
+                        )
                 except Exception as probe_exc:  # noqa: PERF203
                     probe_failure_exc = probe_exc
+                    if session_owner_lease is not None:
+                        try:
+                            await _session_affinity_mod().finalize_session_owner_lease_on_failure(
+                                session_owner_lease
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
                 finally:
                     # Release probe lock FIRST (unconditional, before any
                     # resolver call that might raise).

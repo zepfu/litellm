@@ -2310,12 +2310,64 @@ def _raise_anthropic_auto_agent_redispatch_required(
     )
 
 
+
+def _session_affinity_mod():
+    """Lazy load session_affinity (safe under module rebinding)."""
+    import sys
+
+    mod = sys.modules.get(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity"
+    )
+    if mod is not None:
+        return mod
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as mod,
+    )
+    return mod
+
+
+def _attach_session_owner_selection_fields(
+    selection: dict[str, Any],
+    *,
+    canonical_session_identity: Optional[str],
+    session_owner_guard: Any,
+) -> dict[str, Any]:
+    sa = _session_affinity_mod()
+    provenance = getattr(session_owner_guard, "provenance", None) or sa.build_session_owner_provenance(
+        session_identity=canonical_session_identity,
+        decision=getattr(
+            getattr(session_owner_guard, "decision", None),
+            "value",
+            str(getattr(session_owner_guard, "decision", "")),
+        ),
+        owner_record=getattr(session_owner_guard, "owner_record", None),
+        owner_id=getattr(session_owner_guard, "owner_id", None),
+        mismatch_reason=getattr(session_owner_guard, "mismatch_reason", None),
+        cache_key=getattr(session_owner_guard, "cache_key", None),
+        reservation_token=getattr(session_owner_guard, "reservation_token", None),
+    )
+    selection["canonical_session_identity"] = canonical_session_identity
+    selection["session_owner_decision"] = provenance.get("session_owner_decision")
+    selection["session_owner_id"] = provenance.get("session_owner_id")
+    selection["session_owner_mismatch_reason"] = provenance.get(
+        "session_owner_mismatch_reason"
+    )
+    selection["session_owner_provenance"] = provenance
+    selection["session_owner_reservation_token"] = getattr(
+        session_owner_guard, "reservation_token", None
+    )
+    selection["session_owner_held_reservation"] = bool(
+        getattr(session_owner_guard, "held_reservation", False)
+    )
+    return selection
+
+
 # ---------------------------------------------------------------------------
 # Codex selector
 # ---------------------------------------------------------------------------
 
 
-async def _select_codex_auto_agent_candidate(
+async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     *,
     request: Request,
     request_body: dict[str, Any],
@@ -2351,10 +2403,149 @@ async def _select_codex_auto_agent_candidate(
         request_body=request_body,
     )
 
+    sa = _session_affinity_mod()
+    canonical_session_identity = sa.resolve_canonical_session_identity(
+        request,
+        request_body,
+    )
+    # Read-path ownership check before free selection. Reservation happens at
+    # pre-egress once a concrete candidate is chosen (candidate_loop).
+    session_owner_record, _cache_key, session_owner_error = await sa.get_session_owner_record(
+        session_identity=canonical_session_identity,
+    )
+    if session_owner_error is not None:
+        sa.raise_session_owner_redispatch_required(
+            session_identity=canonical_session_identity,
+            alias_model=alias_model,
+            failure_phase="session_owner_redis_unavailable",
+            message=(
+                "Session ownership could not be verified against durable storage. "
+                "Fail closed before provider selection; redispatch with a new "
+                "session identity after Redis recovers."
+            ),
+            guard=sa.SessionOwnerGuardResult(
+                decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                session_identity=canonical_session_identity,
+                cache_key=_cache_key,
+                mismatch_reason=session_owner_error,
+                provenance=sa.build_session_owner_provenance(
+                    session_identity=canonical_session_identity,
+                    decision="redispatch_required",
+                    mismatch_reason=session_owner_error,
+                    cache_key=_cache_key,
+                ),
+            ),
+        )
+
     affinity = None
     affinity_bypassed = False
+    session_owner_guard_meta = {
+        "decision": "unowned",
+        "owner_record": session_owner_record,
+        "owner_id": (
+            session_owner_record.get("owner")
+            if isinstance(session_owner_record, dict)
+            else None
+        ),
+        "mismatch_reason": None,
+        "provenance": sa.build_session_owner_provenance(
+            session_identity=canonical_session_identity,
+            decision="unowned",
+            owner_record=session_owner_record,
+            cache_key=_cache_key,
+        ),
+        "reservation_token": None,
+        "held_reservation": False,
+        "cache_key": _cache_key,
+    }
 
-    if request_mode == "ordinary_continuation":
+    if isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "owned":
+        if request_mode == "fresh_redispatch" and has_continuation_state:
+            sa.raise_session_owner_redispatch_required(
+                session_identity=canonical_session_identity,
+                alias_model=alias_model,
+                failure_phase="session_owner_redispatch_metadata_cannot_bypass",
+                message=(
+                    "Redispatch metadata cannot erase or bypass ownership for an "
+                    "existing session with continuation state. Start a fresh "
+                    "dispatch with a new session identity."
+                ),
+                guard=sa.SessionOwnerGuardResult(
+                    decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                    session_identity=canonical_session_identity,
+                    cache_key=_cache_key,
+                    owner_record=session_owner_record,
+                    owner_id=session_owner_record.get("owner"),
+                    mismatch_reason="session_owner: redispatch metadata cannot bypass owner",
+                    provenance=sa.build_session_owner_provenance(
+                        session_identity=canonical_session_identity,
+                        decision="redispatch_required",
+                        owner_record=session_owner_record,
+                        owner_id=session_owner_record.get("owner"),
+                        mismatch_reason="session_owner: redispatch metadata cannot bypass owner",
+                        cache_key=_cache_key,
+                    ),
+                ),
+            )
+        affinity = sa.owner_record_as_affinity_hint(session_owner_record)
+        session_owner_guard_meta.update(
+            {
+                "decision": "compatible_owner",
+                "provenance": sa.build_session_owner_provenance(
+                    session_identity=canonical_session_identity,
+                    decision="compatible_owner",
+                    owner_record=session_owner_record,
+                    owner_id=session_owner_record.get("owner"),
+                    cache_key=_cache_key,
+                ),
+            }
+        )
+        if affinity is None:
+            # Owned but unusable attributes => fail before free selection.
+            sa.raise_session_owner_redispatch_required(
+                session_identity=canonical_session_identity,
+                alias_model=alias_model,
+                failure_phase="session_owner_owned_record_unusable",
+                guard=sa.SessionOwnerGuardResult(
+                    decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                    session_identity=canonical_session_identity,
+                    cache_key=_cache_key,
+                    owner_record=session_owner_record,
+                    owner_id=session_owner_record.get("owner"),
+                    mismatch_reason="session_owner: owned record missing usable attributes",
+                    provenance=sa.build_session_owner_provenance(
+                        session_identity=canonical_session_identity,
+                        decision="redispatch_required",
+                        owner_record=session_owner_record,
+                        owner_id=session_owner_record.get("owner"),
+                        mismatch_reason="session_owner: owned record missing usable attributes",
+                        cache_key=_cache_key,
+                    ),
+                ),
+            )
+    elif isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "reserved":
+        sa.raise_session_owner_redispatch_required(
+            session_identity=canonical_session_identity,
+            alias_model=alias_model,
+            failure_phase="session_owner_competing_reservation",
+            guard=sa.SessionOwnerGuardResult(
+                decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                session_identity=canonical_session_identity,
+                cache_key=_cache_key,
+                owner_record=session_owner_record,
+                owner_id=session_owner_record.get("owner"),
+                mismatch_reason="session_owner: concurrent reservation held by another request",
+                provenance=sa.build_session_owner_provenance(
+                    session_identity=canonical_session_identity,
+                    decision="redispatch_required",
+                    owner_record=session_owner_record,
+                    owner_id=session_owner_record.get("owner"),
+                    mismatch_reason="session_owner: concurrent reservation held by another request",
+                    cache_key=_cache_key,
+                ),
+            ),
+        )
+    elif request_mode == "ordinary_continuation":
         affinity = await _get_codex_session_affinity(session_key)
     elif request_mode == "fresh_redispatch":
         existing_affinity = await _get_codex_session_affinity(session_key)
@@ -2404,22 +2595,50 @@ async def _select_codex_auto_agent_candidate(
             )
             and _is_auto_agent_candidate_state_available(affinity_state)
         ):
-            return _attach_aawm_alias_routing_state_sources(
-                {
-                    **affinity_state,
-                    "alias_model": alias_model,
-                    "session_key": session_key,
-                    "selection_reason": "session_affinity",
-                    "skipped": [],
-                    "in_flight_session": True,
-                    "request_mode": request_mode,
-                    "redispatch_ordinal": redispatch_ordinal,
-                    "affinity_bypassed": affinity_bypassed,
-                },
-                affinity=affinity,
-                selected_state=affinity_state,
+            return _attach_session_owner_selection_fields(
+                _attach_aawm_alias_routing_state_sources(
+                    {
+                        **affinity_state,
+                        "alias_model": alias_model,
+                        "session_key": session_key,
+                        "selection_reason": "session_affinity",
+                        "skipped": [],
+                        "in_flight_session": True,
+                        "request_mode": request_mode,
+                        "redispatch_ordinal": redispatch_ordinal,
+                        "affinity_bypassed": affinity_bypassed,
+                    },
+                    affinity=affinity,
+                    selected_state=affinity_state,
+                ),
+                canonical_session_identity=canonical_session_identity,
+                session_owner_guard=type("G", (), session_owner_guard_meta)(),
             )
         if affinity_state["cooldown_seconds"] > 0:
+            # Owned/cooldown owner is unavailable: fail before free selection.
+            if session_owner_record is not None and sa._record_state(session_owner_record) == "owned":
+                sa.raise_session_owner_redispatch_required(
+                    session_identity=canonical_session_identity,
+                    alias_model=alias_model,
+                    candidate=affinity_state.get("candidate"),
+                    failure_phase="session_owner_owner_cooldown",
+                    guard=sa.SessionOwnerGuardResult(
+                        decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                        session_identity=canonical_session_identity,
+                        cache_key=_cache_key,
+                        owner_record=session_owner_record,
+                        owner_id=session_owner_record.get("owner"),
+                        mismatch_reason="session_owner: owner unavailable (cooldown)",
+                        provenance=sa.build_session_owner_provenance(
+                            session_identity=canonical_session_identity,
+                            decision="redispatch_required",
+                            owner_record=session_owner_record,
+                            owner_id=session_owner_record.get("owner"),
+                            mismatch_reason="session_owner: owner unavailable (cooldown)",
+                            cache_key=_cache_key,
+                        ),
+                    ),
+                )
             _raise_codex_auto_agent_in_flight_cooldown(
                 candidate=affinity_state["candidate"],
                 lane_key=affinity_state.get("lane_key"),
@@ -2473,18 +2692,22 @@ async def _select_codex_auto_agent_candidate(
             if int(state.get("failover_ordinal") or 0) > 0
             else "first_available"
         )
-        return _attach_aawm_alias_routing_state_sources(
-            {
-                **state,
-                "alias_model": alias_model,
-                "session_key": session_key,
-                "selection_reason": selection_reason,
-                "skipped": skipped,
-                "request_mode": request_mode,
-                "redispatch_ordinal": redispatch_ordinal,
-                "affinity_bypassed": affinity_bypassed,
-            },
-            selected_state=state,
+        return _attach_session_owner_selection_fields(
+            _attach_aawm_alias_routing_state_sources(
+                {
+                    **state,
+                    "alias_model": alias_model,
+                    "session_key": session_key,
+                    "selection_reason": selection_reason,
+                    "skipped": skipped,
+                    "request_mode": request_mode,
+                    "redispatch_ordinal": redispatch_ordinal,
+                    "affinity_bypassed": affinity_bypassed,
+                },
+                selected_state=state,
+            ),
+            canonical_session_identity=canonical_session_identity,
+            session_owner_guard=type("G", (), session_owner_guard_meta)(),
         )
 
     state = _select_available_state(
@@ -2499,18 +2722,22 @@ async def _select_codex_auto_agent_candidate(
             if int(state.get("failover_ordinal") or 0) > 0
             else "last_resort"
         )
-        return _attach_aawm_alias_routing_state_sources(
-            {
-                **state,
-                "alias_model": alias_model,
-                "session_key": session_key,
-                "selection_reason": selection_reason,
-                "skipped": skipped,
-                "request_mode": request_mode,
-                "redispatch_ordinal": redispatch_ordinal,
-                "affinity_bypassed": affinity_bypassed,
-            },
-            selected_state=state,
+        return _attach_session_owner_selection_fields(
+            _attach_aawm_alias_routing_state_sources(
+                {
+                    **state,
+                    "alias_model": alias_model,
+                    "session_key": session_key,
+                    "selection_reason": selection_reason,
+                    "skipped": skipped,
+                    "request_mode": request_mode,
+                    "redispatch_ordinal": redispatch_ordinal,
+                    "affinity_bypassed": affinity_bypassed,
+                },
+                selected_state=state,
+            ),
+            canonical_session_identity=canonical_session_identity,
+            session_owner_guard=type("G", (), session_owner_guard_meta)(),
         )
 
     detail: dict[str, Any] = {
@@ -2538,7 +2765,7 @@ async def _select_codex_auto_agent_candidate(
 # ---------------------------------------------------------------------------
 
 
-async def _select_anthropic_auto_agent_candidate(
+async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
     *,
     request: Request,
     request_body: dict[str, Any],
@@ -2574,10 +2801,146 @@ async def _select_anthropic_auto_agent_candidate(
         request_body=request_body,
     )
 
+    sa = _session_affinity_mod()
+    canonical_session_identity = sa.resolve_canonical_session_identity(
+        request,
+        request_body,
+    )
+    session_owner_record, _cache_key, session_owner_error = await sa.get_session_owner_record(
+        session_identity=canonical_session_identity,
+    )
+    if session_owner_error is not None:
+        sa.raise_session_owner_redispatch_required(
+            session_identity=canonical_session_identity,
+            alias_model=alias_model,
+            failure_phase="session_owner_redis_unavailable",
+            message=(
+                "Session ownership could not be verified against durable storage. "
+                "Fail closed before provider selection; redispatch with a new "
+                "session identity after Redis recovers."
+            ),
+            guard=sa.SessionOwnerGuardResult(
+                decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                session_identity=canonical_session_identity,
+                cache_key=_cache_key,
+                mismatch_reason=session_owner_error,
+                provenance=sa.build_session_owner_provenance(
+                    session_identity=canonical_session_identity,
+                    decision="redispatch_required",
+                    mismatch_reason=session_owner_error,
+                    cache_key=_cache_key,
+                ),
+            ),
+        )
+
     affinity = None
     affinity_bypassed = False
+    session_owner_guard_meta = {
+        "decision": "unowned",
+        "owner_record": session_owner_record,
+        "owner_id": (
+            session_owner_record.get("owner")
+            if isinstance(session_owner_record, dict)
+            else None
+        ),
+        "mismatch_reason": None,
+        "provenance": sa.build_session_owner_provenance(
+            session_identity=canonical_session_identity,
+            decision="unowned",
+            owner_record=session_owner_record,
+            cache_key=_cache_key,
+        ),
+        "reservation_token": None,
+        "held_reservation": False,
+        "cache_key": _cache_key,
+    }
 
-    if request_mode == "ordinary_continuation":
+    if isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "owned":
+        if request_mode == "fresh_redispatch" and has_continuation_state:
+            sa.raise_session_owner_redispatch_required(
+                session_identity=canonical_session_identity,
+                alias_model=alias_model,
+                failure_phase="session_owner_redispatch_metadata_cannot_bypass",
+                message=(
+                    "Redispatch metadata cannot erase or bypass ownership for an "
+                    "existing session with continuation state. Start a fresh "
+                    "dispatch with a new session identity."
+                ),
+                guard=sa.SessionOwnerGuardResult(
+                    decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                    session_identity=canonical_session_identity,
+                    cache_key=_cache_key,
+                    owner_record=session_owner_record,
+                    owner_id=session_owner_record.get("owner"),
+                    mismatch_reason="session_owner: redispatch metadata cannot bypass owner",
+                    provenance=sa.build_session_owner_provenance(
+                        session_identity=canonical_session_identity,
+                        decision="redispatch_required",
+                        owner_record=session_owner_record,
+                        owner_id=session_owner_record.get("owner"),
+                        mismatch_reason="session_owner: redispatch metadata cannot bypass owner",
+                        cache_key=_cache_key,
+                    ),
+                ),
+            )
+        affinity = sa.owner_record_as_affinity_hint(session_owner_record)
+        session_owner_guard_meta.update(
+            {
+                "decision": "compatible_owner",
+                "provenance": sa.build_session_owner_provenance(
+                    session_identity=canonical_session_identity,
+                    decision="compatible_owner",
+                    owner_record=session_owner_record,
+                    owner_id=session_owner_record.get("owner"),
+                    cache_key=_cache_key,
+                ),
+            }
+        )
+        if affinity is None:
+            sa.raise_session_owner_redispatch_required(
+                session_identity=canonical_session_identity,
+                alias_model=alias_model,
+                failure_phase="session_owner_owned_record_unusable",
+                guard=sa.SessionOwnerGuardResult(
+                    decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                    session_identity=canonical_session_identity,
+                    cache_key=_cache_key,
+                    owner_record=session_owner_record,
+                    owner_id=session_owner_record.get("owner"),
+                    mismatch_reason="session_owner: owned record missing usable attributes",
+                    provenance=sa.build_session_owner_provenance(
+                        session_identity=canonical_session_identity,
+                        decision="redispatch_required",
+                        owner_record=session_owner_record,
+                        owner_id=session_owner_record.get("owner"),
+                        mismatch_reason="session_owner: owned record missing usable attributes",
+                        cache_key=_cache_key,
+                    ),
+                ),
+            )
+    elif isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "reserved":
+        sa.raise_session_owner_redispatch_required(
+            session_identity=canonical_session_identity,
+            alias_model=alias_model,
+            failure_phase="session_owner_competing_reservation",
+            guard=sa.SessionOwnerGuardResult(
+                decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                session_identity=canonical_session_identity,
+                cache_key=_cache_key,
+                owner_record=session_owner_record,
+                owner_id=session_owner_record.get("owner"),
+                mismatch_reason="session_owner: concurrent reservation held by another request",
+                provenance=sa.build_session_owner_provenance(
+                    session_identity=canonical_session_identity,
+                    decision="redispatch_required",
+                    owner_record=session_owner_record,
+                    owner_id=session_owner_record.get("owner"),
+                    mismatch_reason="session_owner: concurrent reservation held by another request",
+                    cache_key=_cache_key,
+                ),
+            ),
+        )
+    elif request_mode == "ordinary_continuation":
         affinity = await _get_anthropic_session_affinity(session_key)
     elif request_mode == "fresh_redispatch":
         existing_affinity = await _get_anthropic_session_affinity(session_key)
@@ -2629,22 +2992,49 @@ async def _select_anthropic_auto_agent_candidate(
             )
             and _is_auto_agent_candidate_state_available(affinity_state)
         ):
-            return _attach_aawm_alias_routing_state_sources(
-                {
-                    **affinity_state,
-                    "alias_model": alias_model,
-                    "session_key": session_key,
-                    "selection_reason": "session_affinity",
-                    "skipped": [],
-                    "in_flight_session": True,
-                    "request_mode": request_mode,
-                    "redispatch_ordinal": redispatch_ordinal,
-                    "affinity_bypassed": affinity_bypassed,
-                },
-                affinity=affinity,
-                selected_state=affinity_state,
+            return _attach_session_owner_selection_fields(
+                _attach_aawm_alias_routing_state_sources(
+                    {
+                        **affinity_state,
+                        "alias_model": alias_model,
+                        "session_key": session_key,
+                        "selection_reason": "session_affinity",
+                        "skipped": [],
+                        "in_flight_session": True,
+                        "request_mode": request_mode,
+                        "redispatch_ordinal": redispatch_ordinal,
+                        "affinity_bypassed": affinity_bypassed,
+                    },
+                    affinity=affinity,
+                    selected_state=affinity_state,
+                ),
+                canonical_session_identity=canonical_session_identity,
+                session_owner_guard=type("G", (), session_owner_guard_meta)(),
             )
         if affinity_state["cooldown_seconds"] > 0:
+            if session_owner_record is not None and sa._record_state(session_owner_record) == "owned":
+                sa.raise_session_owner_redispatch_required(
+                    session_identity=canonical_session_identity,
+                    alias_model=alias_model,
+                    candidate=affinity_state.get("candidate"),
+                    failure_phase="session_owner_owner_cooldown",
+                    guard=sa.SessionOwnerGuardResult(
+                        decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                        session_identity=canonical_session_identity,
+                        cache_key=_cache_key,
+                        owner_record=session_owner_record,
+                        owner_id=session_owner_record.get("owner"),
+                        mismatch_reason="session_owner: owner unavailable (cooldown)",
+                        provenance=sa.build_session_owner_provenance(
+                            session_identity=canonical_session_identity,
+                            decision="redispatch_required",
+                            owner_record=session_owner_record,
+                            owner_id=session_owner_record.get("owner"),
+                            mismatch_reason="session_owner: owner unavailable (cooldown)",
+                            cache_key=_cache_key,
+                        ),
+                    ),
+                )
             _raise_anthropic_auto_agent_in_flight_cooldown(
                 candidate=affinity_state["candidate"],
                 lane_key=affinity_state.get("lane_key"),
@@ -2826,6 +3216,8 @@ _HOST_FUNCTION_NAMES = (
     "_raise_anthropic_auto_agent_redispatch_required",
     "_select_codex_auto_agent_candidate",
     "_select_anthropic_auto_agent_candidate",
+    "_session_affinity_mod",
+    "_attach_session_owner_selection_fields",
 )
 
 
