@@ -70,6 +70,21 @@ def _session_affinity_mod():
     return mod
 
 
+def _admission_mod():
+    """Lazy admission import (safe under module rebinding)."""
+    import sys
+
+    mod = sys.modules.get(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.admission"
+    )
+    if mod is not None:
+        return mod
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        admission as mod,
+    )
+    return mod
+
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from fastapi import Request
     from starlette.responses import Response
@@ -310,370 +325,27 @@ async def handle_alias_route(  # noqa: PLR0915
             if value is not None:
                 attempt_record[field] = value
         attempts.append(attempt_record)
-        candidate_body = _record_auto_agent_alias_attempt_started(
-            alias_family=alias_family,
-            alias_model=alias_model,
-            request=request,
-            prepared_request_body=prepared_request_body,
+        # D1-564: provider/account lane admission after selection and before
+        # attempt-start / probe lock / provider I/O. Separate from cooldown and
+        # session ownership. Fail-fast only: never queue/sleep/background-retry.
+        admission = _admission_mod()
+        admission_decision = await admission.admit_selected_candidate(
+            candidate=candidate,
             selection=selection,
-            attempts=attempts,
             attempt_record=attempt_record,
-            add_alias_metadata_fn=add_alias_metadata_fn,
         )
-        while True:
-            # CFG-004: ProbeLease / publication-intent single-flight design.
-            #
-            # 1. Check active cooldown BEFORE acquiring the probe lock.
-            #    The cooldown reader acquires the family lock internally;
-            #    calling it outside the probe lock prevents lock inversion
-            #    with execute_cooldown_publication_transaction (which
-            #    acquires family lock -> sorted probe locks).
-            # 2. Acquire the selected probe lock.
-            # 3. Check for an active PublicationIntent on this cooldown_key.
-            #    If found (follower path): release probe lock, await intent
-            #    completion, then break to re-select (no second provider call).
-            # 4. Leader path: create intent, perform provider I/O under the
-            #    probe lock.
-            # 5. On failure: resolve plan, attach to intent, RELEASE probe
-            #    lock, then enter cooldown mutation with NO pre-held lock
-            #    (execute_cooldown_publication_transaction acquires the
-            #    family lock + sorted probe locks internally).
-            # 6. Signal intent complete, remove from registry.
-            probe_failure_exc: Optional[Exception] = None
-            probe_failure_plan: Optional[CooldownPublicationPlan] = None
-            skip_after_probe_wait = False
-            response: Optional[Response] = None
-            intent = None
-
-            # Pre-check active cooldown OUTSIDE the probe lock.  The
-            # cooldown reader acquires the family lock; holding the probe
-            # lock here would invert the canonical lock order (family ->
-            # probe) used by execute_cooldown_publication_transaction.
-            try:
-                active_seconds, _active_source = await get_active_cooldown_state_fn(selection["cooldown_key"])
-            except Exception as pre_exc:  # noqa: PERF203
-                probe_failure_exc = pre_exc
-                active_seconds = 0.0
-            if probe_failure_exc is None and active_seconds > 0:
-                skip_after_probe_wait = True
-                attempt_record["status"] = "skipped_single_flight_cooldown"
-                attempt_record["cooldown_seconds"] = active_seconds
-
-            probe_lock = await alias_routing_state.candidate_probe_lock(
-                alias_family=alias_family,
-                cooldown_key=selection["cooldown_key"],
-            )
-            await probe_lock.acquire()
-
-            # Follower path: an active intent means a leader is probing or
-            # publishing for this key.  Await completion, then re-select.
-            # CFG-004 Defect 1 fix: atomic claim_publication_or_wait checks
-            # clear reservations AND active intents AND claims a leader intent
-            # in ONE registry-lock critical section.  This closes the race
-            # where a clear reservation could be created between the intent
-            # claim and a separate get_clear_reservation check.
-            from .state import ClaimOutcome
-
-            _claim = alias_routing_state.publication_intents.claim_publication_or_wait(
-                alias_family=alias_family,
-                cooldown_keys=frozenset({selection["cooldown_key"]}),
-                identity_hash=_active_lane_identity_hash(candidate=candidate),
-            )
-            if _claim.outcome is ClaimOutcome.BLOCKED_BY_CLEAR:
-                # Clear reservation covers this key: wait, then reselect
-                # without provider I/O.
-                probe_lock.release()
-                assert _claim.clear_reservation is not None
-                await _claim.clear_reservation.done.wait()
-                skip_after_probe_wait = True
-                break
-            if _claim.outcome is ClaimOutcome.FOLLOWER:
-                probe_lock.release()
-                assert _claim.intent is not None
-                await _claim.intent.done.wait()
-                skip_after_probe_wait = True
-                break
-            assert _claim.intent is not None
-            intent = _claim.intent
-
-            # TOCTOU guard: the pre-check ran BEFORE probe lock acquisition.
-            # A concurrent leader may have completed publication (cooldown
-            # committed, intent removed) between our pre-check and probe lock
-            # acquisition.  The publication transaction holds this same probe
-            # lock while mutating cooldown memory, so a lock-free peek here
-            # (no family lock, no mutation) sees a consistent snapshot.
-            # This closes the final singleflight TOCTOU window without
-            # introducing a family-locking read under the probe lock.
-            if not skip_after_probe_wait and probe_failure_exc is None:
-                _toctou_remaining = (
-                    alias_routing_state.family(alias_family)
-                    .peek_cooldown_remaining(selection["cooldown_key"])
-                )
-                if _toctou_remaining > 0:
-                    skip_after_probe_wait = True
-                    attempt_record["status"] = "skipped_single_flight_cooldown"
-                    attempt_record["cooldown_seconds"] = _toctou_remaining
-
-            # If the pre-check found an active cooldown or raised, we still
-            # need to create + complete the intent so followers are notified.
-            if skip_after_probe_wait or probe_failure_exc is not None:
-                probe_lock.release()
-                intent.complete(error=probe_failure_exc)
-                alias_routing_state.publication_intents.remove(intent)
-                if probe_failure_exc is not None:
-                    raise probe_failure_exc
-                break
-
-            # BaseException-safe: intent is ALWAYS completed and removed,
-            # probe lock is ALWAYS released, regardless of exception type
-            # (Exception, CancelledError, KeyboardInterrupt, etc.).
-            try:
-                session_owner_lease = None
-                try:
-                    sa = _session_affinity_mod()
-                    canonical_session_identity = selection.get(
-                        "canonical_session_identity"
-                    ) or sa.resolve_canonical_session_identity(
-                        request,
-                        prepared_request_body,
-                    )
-                    owner_attributes = sa.build_session_owner_attributes(
-                        candidate=candidate,
-                        ingress=alias_family,
-                        requested_model=selection.get("alias_model") or alias_model,
-                        alias_family=alias_family,
-                        endpoint_contract=candidate.get("route_family"),
-                        state_format=candidate.get("route_family"),
-                    )
-                    # Tokenized pre-egress reservation (before upstream send).
-                    guard = await sa.ensure_session_owner_guard_for_request(
-                        request=request,
-                        request_body=prepared_request_body,
-                        session_identity=canonical_session_identity,
-                        requested_attributes=owner_attributes,
-                        candidate=candidate,
-                        alias_model=selection.get("alias_model") or alias_model,
-                        failure_phase="session_owner_pre_egress_reserve",
-                    )
-                    session_owner_lease = sa.get_request_session_owner_lease(request)
-                    # Expose reservation metadata on attempt selection.
-                    selection["canonical_session_identity"] = canonical_session_identity
-                    selection["session_owner_decision"] = guard.decision.value
-                    selection["session_owner_reservation_token"] = (
-                        guard.reservation_token
-                    )
-                    selection["session_owner_held_reservation"] = guard.held_reservation
-                    if guard.provenance:
-                        selection["session_owner_provenance"] = guard.provenance
-
-                    response = await perform_candidate_request_fn(
-                        candidate=candidate,
-                        candidate_body=candidate_body,
-                    )
-                    # Authoritative success: promote reserved -> owned.
-                    promote_result = await sa.finalize_session_owner_lease_on_success(
-                        session_owner_lease,
-                        attributes=owner_attributes,
-                        candidate=candidate,
-                    )
-                    if promote_result is not None and promote_result.outcome in {
-                        sa.SessionOwnerMutationOutcome.CONFLICT,
-                        sa.SessionOwnerMutationOutcome.ERROR,
-                        sa.SessionOwnerMutationOutcome.NOT_HELD,
-                    }:
-                        # Success bytes may already be in flight to the client;
-                        # fail closed for subsequent requests by not treating
-                        # ownership as established. Still surface structured error
-                        # for non-streaming callers by raising.
-                        sa.raise_session_owner_redispatch_required(
-                            session_identity=canonical_session_identity,
-                            mutation=promote_result,
-                            alias_model=selection.get("alias_model") or alias_model,
-                            candidate=candidate,
-                            failure_phase="session_owner_promote_after_success",
-                        )
-                except Exception as probe_exc:  # noqa: PERF203
-                    probe_failure_exc = probe_exc
-                    if session_owner_lease is not None:
-                        try:
-                            await _session_affinity_mod().finalize_session_owner_lease_on_failure(
-                                session_owner_lease
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
-                finally:
-                    # Release probe lock FIRST (unconditional, before any
-                    # resolver call that might raise).
-                    probe_lock.release()
-
-                # Resolve the plan AFTER lock release.  If the resolver
-                # raises, the outer BaseException handler cleans up the
-                # intent.  No lock is held here (canonical order: no family
-                # lock entry while retaining a pre-acquired probe lock).
-                if probe_failure_exc is not None:
-                    probe_failure_plan = _resolve_failure_plan(
-                        resolve_cooldown_publication_fn=resolve_cooldown_publication_fn,
-                        record_codex_failure_evidence_fn=_record_codex_failure_evidence,
-                        request=request,
-                        candidate=candidate,
-                        selection=selection,
-                        attempt_record=attempt_record,
-                        exc=probe_failure_exc,
-                        codex_failure_evidence_alias=codex_failure_evidence_alias,
-                        kimi_failure_metadata_fn=_get_safe_kimi_code_probe_failure_metadata,
-                        classify_kimi_fn=_classify_kimi_code_auto_agent_probe_failure,
-                        classify_retryable_fn=_classify_codex_auto_agent_retryable_exhaustion,
-                        grok_quota_fn=_is_codex_auto_agent_grok_account_quota_exhaustion,
-                        cooldown_seconds_fn=_get_codex_auto_agent_cooldown_seconds,
-                    )
-                    intent.plan = probe_failure_plan
-
-                if skip_after_probe_wait:
-                    intent.complete()
-                    alias_routing_state.publication_intents.remove(intent)
-                    break
-                if probe_failure_exc is None:
-                    intent.complete()
-                    alias_routing_state.publication_intents.remove(intent)
-                    await set_session_affinity_fn(
-                        selection.get("session_key"),
-                        candidate,
-                    )
-                    assert response is not None
-                    return response
-
-                # --- Cooldown mutation: NO pre-held probe lock ------------
-                if probe_failure_plan is not None:
-                    await _lpe.execute_cooldown_publication_transaction(
-                        alias_family=alias_family,
-                        candidate=candidate,
-                        plan=probe_failure_plan,
-                        publish_cooldown_memory_fn=publish_cooldown_memory_fn,
-                        persist_cooldown_fn=persist_cooldown_fn,
-                    )
-                # Mutation complete (or no plan): signal intent.
-                intent.complete(error=probe_failure_exc)
-                alias_routing_state.publication_intents.remove(intent)
-            except BaseException as cleanup_exc:
-                # BaseException-safe: covers CancelledError, KeyboardInterrupt,
-                # SystemExit, and any exception from cooldown mutation.
-                if not intent.done.is_set():
-                    intent.complete(error=cleanup_exc)
-                    alias_routing_state.publication_intents.remove(intent)
-                raise
-
-            # --- failure handling (post-release) ---------------------------
-            failure_exc = probe_failure_exc
-            assert failure_exc is not None
-            kimi_failure_metadata = _get_safe_kimi_code_probe_failure_metadata(
-                failure_exc,
-                candidate=candidate,
-            )
-            error_class = _classify_kimi_code_auto_agent_probe_failure(kimi_failure_metadata)
-            if error_class is None:
-                error_class = _classify_codex_auto_agent_retryable_exhaustion(
-                    failure_exc, candidate=candidate
-                )
-            if error_class is None:
-                raise failure_exc
-            last_retryable_exc = failure_exc
-            cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(
-                failure_exc,
-                candidate=candidate,
-            )
-            # The plan was resolved inside the probe lock above.  After probe
-            # lock release, execute_cooldown_publication_transaction performed
-            # the atomic memory publish + durable commit + local index update
-            # under the family lock + sorted probe locks (canonical order).
-            # Post-release only the request-local action remains.
-            plan = probe_failure_plan
-            assert plan is not None
-            if plan.request_local_action == "request_local_cooldown":
-                _apply_request_local_cooldown_from_plan(
-                    request,
-                    candidate=candidate,
-                    lane_key=selection.get("lane_key"),
-                    cooldown_seconds=plan.duration_seconds,
-                )
-            cooldown_scope = plan.applied_scope
-            error_tokens = _update_codex_auto_agent_retryable_attempt_record(
-                attempt_record=attempt_record,
-                exc=failure_exc,
-                error_class=error_class,
-                cooldown_seconds=cooldown_seconds,
-                cooldown_scope=cooldown_scope,
-                alias_model=alias_model,
-                candidate=candidate,
-                kimi_failure_metadata=kimi_failure_metadata,
-            )
-            # D1-586: observational shadow action only. Does not change retry,
-            # failover, sleep, admission, or cooldown enforcement paths.
-            attempt_record["shadow_failure_action"] = (
-                _error_signals.build_shadow_failure_action_decision_from_exc(
-                    failure_exc,
-                    candidate=candidate,
-                    current_error_class=error_class,
-                    current_cooldown_scope=cooldown_scope,
-                    current_status=attempt_record.get("status"),
-                ).to_observability_dict()
+        if not admission_decision.allowed:
+            admission_error_class = admission.admission_deny_error_class(
+                admission_decision
             )
             account_failover_planned = _plan_codex_oauth_account_failover(
                 request,
                 candidate=candidate,
                 selection=selection,
                 attempt_record=attempt_record,
-                error_class=error_class,
+                error_class=admission_error_class,
                 has_continuation_state=has_continuation_state,
             )
-            if cooldown_scope == "none" and not has_continuation_state:
-                _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
-                    request,
-                    candidate=candidate,
-                    lane_key=selection.get("lane_key"),
-                )
-            if has_continuation_state and cooldown_scope != "none":
-                attempt_record["status"] = "terminal_in_flight_cooldown_set"
-                failure_body = _record_auto_agent_alias_attempt_failure(
-                    alias_family=alias_family,
-                    alias_model=alias_model,
-                    request=request,
-                    prepared_request_body=prepared_request_body,
-                    selection=selection,
-                    attempts=attempts,
-                    attempt_record=attempt_record,
-                    error_class=error_class,
-                    add_alias_metadata_fn=add_alias_metadata_fn,
-                    redispatch_required=True,
-                )
-                failure_metadata = failure_body.get("litellm_metadata") or {}
-                verbose_proxy_logger.debug(
-                    "%s auto-agent alias %s target %s/%s hit %s "
-                    "for an in-flight session on attempt %s; signaling redispatch",
-                    log_label,
-                    alias_model,
-                    candidate["provider"],
-                    candidate["model"],
-                    error_class,
-                    len(attempts),
-                )
-                raise_redispatch_required_fn(
-                    candidate=candidate,
-                    lane_key=selection.get("lane_key"),
-                    cooldown_seconds=cooldown_seconds,
-                    error_tokens=error_tokens,
-                    alias_model=alias_model,
-                    error_class=error_class,
-                    cooldown_scope=cooldown_scope,
-                    error_status_code=attempt_record.get("error_status_code"),
-                    error_type=attempt_record.get("error_type"),
-                    error_code=attempt_record.get("error_code"),
-                    retry_after_seconds=attempt_record.get("retry_after_seconds"),
-                    failure_phase=attempt_record.get("failure_phase"),
-                    attempted_provider_call=attempt_record.get("attempted_provider_call"),
-                    audit_events=failure_metadata.get("aawm_alias_routing_audit_events"),
-                    attempts=failure_metadata.get(attempts_metadata_key),
-                    skipped_candidates=failure_metadata.get(skipped_candidates_metadata_key),
-                )
             if account_failover_planned:
                 provider_candidate_attempts = max(
                     0,
@@ -687,49 +359,28 @@ async def handle_alias_route(  # noqa: PLR0915
                     selection=selection,
                     attempts=attempts,
                     attempt_record=attempt_record,
-                    error_class=error_class,
+                    error_class=admission_error_class,
                     add_alias_metadata_fn=add_alias_metadata_fn,
                 )
                 verbose_proxy_logger.debug(
-                    "%s auto-agent alias %s moving once from Codex OAuth "
-                    "account %s after %s",
+                    "%s auto-agent alias %s admission denied on lane %s (%s); "
+                    "moving once to an independent eligible lane",
                     log_label,
                     alias_model,
-                    candidate.get("codex_oauth_account_label"),
-                    error_class,
+                    admission_decision.lane_fingerprint,
+                    admission_decision.reason,
                 )
-                break
-            if failover_ordinal > 0:
-                provider_candidate_attempts += 1
-            native_grok_retry_eligible = _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
-                is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
-                has_continuation_state=has_continuation_state,
-                error_class=error_class,
-                cooldown_scope=cooldown_scope,
+                continue
+            admission.raise_provider_lane_admission_rejected(
+                admission_decision,
+                candidate=candidate,
+                alias_model=alias_model,
+                alias_family=alias_family,
+                lane_key=selection.get("lane_key"),
             )
-            if native_grok_retry_eligible:
-                native_grok_continuation_transient_provider_attempts += 1
-                native_grok_provider_attempt = native_grok_continuation_transient_provider_attempts
-            else:
-                native_grok_provider_attempt = 0
-            (
-                should_retry_same_candidate,
-                same_candidate_backoff_seconds,
-                native_grok_retry_metadata,
-            ) = _plan_codex_auto_agent_native_grok_continuation_transient_retry(
-                is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
-                has_continuation_state=has_continuation_state,
-                error_class=error_class,
-                cooldown_scope=cooldown_scope,
-                provider_attempt=native_grok_provider_attempt,
-                provider=str(candidate.get("provider") or "") or None,
-                model=str(candidate.get("model") or "") or None,
-                route_family=str(candidate.get("route_family") or "") or None,
-                max_attempts=native_grok_continuation_transient_max_attempts,
-            )
-            if native_grok_retry_metadata is not None:
-                attempt_record["native_grok_continuation_retry"] = native_grok_retry_metadata
-            _record_auto_agent_alias_attempt_failure(
+        admission_lease = admission_decision.lease
+        try:
+            candidate_body = _record_auto_agent_alias_attempt_started(
                 alias_family=alias_family,
                 alias_model=alias_model,
                 request=request,
@@ -737,32 +388,418 @@ async def handle_alias_route(  # noqa: PLR0915
                 selection=selection,
                 attempts=attempts,
                 attempt_record=attempt_record,
-                error_class=error_class,
                 add_alias_metadata_fn=add_alias_metadata_fn,
             )
-            verbose_proxy_logger.debug(
-                "%s auto-agent alias %s target %s/%s hit %s on attempt %s; " "cooldown %.1fs scope=%s tokens=%s",
-                log_label,
-                alias_model,
-                candidate["provider"],
-                candidate["model"],
-                error_class,
-                len(attempts),
-                cooldown_seconds,
-                cooldown_scope,
-                sorted(error_tokens),
-            )
-            if should_retry_same_candidate:
-                # Native-grok backoff sleep is NEVER inside the probe lock.
-                if same_candidate_backoff_seconds and same_candidate_backoff_seconds > 0:
-                    await asyncio.sleep(same_candidate_backoff_seconds)
-                attempt_record = _codex_auto_agent_candidate_public_shape(
-                    candidate,
-                    lane_key=selection.get("lane_key"),
-                    reason="native_grok_continuation_same_candidate_retry",
+            while True:
+                # CFG-004: ProbeLease / publication-intent single-flight design.
+                #
+                # 1. Check active cooldown BEFORE acquiring the probe lock.
+                #    The cooldown reader acquires the family lock internally;
+                #    calling it outside the probe lock prevents lock inversion
+                #    with execute_cooldown_publication_transaction (which
+                #    acquires family lock -> sorted probe locks).
+                # 2. Acquire the selected probe lock.
+                # 3. Check for an active PublicationIntent on this cooldown_key.
+                #    If found (follower path): release probe lock, await intent
+                #    completion, then break to re-select (no second provider call).
+                # 4. Leader path: create intent, perform provider I/O under the
+                #    probe lock.
+                # 5. On failure: resolve plan, attach to intent, RELEASE probe
+                #    lock, then enter cooldown mutation with NO pre-held lock
+                #    (execute_cooldown_publication_transaction acquires the
+                #    family lock + sorted probe locks internally).
+                # 6. Signal intent complete, remove from registry.
+                probe_failure_exc: Optional[Exception] = None
+                probe_failure_plan: Optional[CooldownPublicationPlan] = None
+                skip_after_probe_wait = False
+                response: Optional[Response] = None
+                intent = None
+
+                # Pre-check active cooldown OUTSIDE the probe lock.  The
+                # cooldown reader acquires the family lock; holding the probe
+                # lock here would invert the canonical lock order (family ->
+                # probe) used by execute_cooldown_publication_transaction.
+                try:
+                    active_seconds, _active_source = await get_active_cooldown_state_fn(selection["cooldown_key"])
+                except Exception as pre_exc:  # noqa: PERF203
+                    probe_failure_exc = pre_exc
+                    active_seconds = 0.0
+                if probe_failure_exc is None and active_seconds > 0:
+                    skip_after_probe_wait = True
+                    attempt_record["status"] = "skipped_single_flight_cooldown"
+                    attempt_record["cooldown_seconds"] = active_seconds
+
+                probe_lock = await alias_routing_state.candidate_probe_lock(
+                    alias_family=alias_family,
+                    cooldown_key=selection["cooldown_key"],
                 )
-                attempts.append(attempt_record)
-                candidate_body = _record_auto_agent_alias_attempt_started(
+                await probe_lock.acquire()
+
+                # Follower path: an active intent means a leader is probing or
+                # publishing for this key.  Await completion, then re-select.
+                # CFG-004 Defect 1 fix: atomic claim_publication_or_wait checks
+                # clear reservations AND active intents AND claims a leader intent
+                # in ONE registry-lock critical section.  This closes the race
+                # where a clear reservation could be created between the intent
+                # claim and a separate get_clear_reservation check.
+                from .state import ClaimOutcome
+
+                _claim = alias_routing_state.publication_intents.claim_publication_or_wait(
+                    alias_family=alias_family,
+                    cooldown_keys=frozenset({selection["cooldown_key"]}),
+                    identity_hash=_active_lane_identity_hash(candidate=candidate),
+                )
+                if _claim.outcome is ClaimOutcome.BLOCKED_BY_CLEAR:
+                    # Clear reservation covers this key: wait, then reselect
+                    # without provider I/O.
+                    probe_lock.release()
+                    assert _claim.clear_reservation is not None
+                    await _claim.clear_reservation.done.wait()
+                    skip_after_probe_wait = True
+                    break
+                if _claim.outcome is ClaimOutcome.FOLLOWER:
+                    probe_lock.release()
+                    assert _claim.intent is not None
+                    await _claim.intent.done.wait()
+                    skip_after_probe_wait = True
+                    break
+                assert _claim.intent is not None
+                intent = _claim.intent
+
+                # TOCTOU guard: the pre-check ran BEFORE probe lock acquisition.
+                # A concurrent leader may have completed publication (cooldown
+                # committed, intent removed) between our pre-check and probe lock
+                # acquisition.  The publication transaction holds this same probe
+                # lock while mutating cooldown memory, so a lock-free peek here
+                # (no family lock, no mutation) sees a consistent snapshot.
+                # This closes the final singleflight TOCTOU window without
+                # introducing a family-locking read under the probe lock.
+                if not skip_after_probe_wait and probe_failure_exc is None:
+                    _toctou_remaining = (
+                        alias_routing_state.family(alias_family)
+                        .peek_cooldown_remaining(selection["cooldown_key"])
+                    )
+                    if _toctou_remaining > 0:
+                        skip_after_probe_wait = True
+                        attempt_record["status"] = "skipped_single_flight_cooldown"
+                        attempt_record["cooldown_seconds"] = _toctou_remaining
+
+                # If the pre-check found an active cooldown or raised, we still
+                # need to create + complete the intent so followers are notified.
+                if skip_after_probe_wait or probe_failure_exc is not None:
+                    probe_lock.release()
+                    intent.complete(error=probe_failure_exc)
+                    alias_routing_state.publication_intents.remove(intent)
+                    if probe_failure_exc is not None:
+                        raise probe_failure_exc
+                    break
+
+                # BaseException-safe: intent is ALWAYS completed and removed,
+                # probe lock is ALWAYS released, regardless of exception type
+                # (Exception, CancelledError, KeyboardInterrupt, etc.).
+                try:
+                    session_owner_lease = None
+                    try:
+                        sa = _session_affinity_mod()
+                        canonical_session_identity = selection.get(
+                            "canonical_session_identity"
+                        ) or sa.resolve_canonical_session_identity(
+                            request,
+                            prepared_request_body,
+                        )
+                        owner_attributes = sa.build_session_owner_attributes(
+                            candidate=candidate,
+                            ingress=alias_family,
+                            requested_model=selection.get("alias_model") or alias_model,
+                            alias_family=alias_family,
+                            endpoint_contract=candidate.get("route_family"),
+                            state_format=candidate.get("route_family"),
+                        )
+                        # Tokenized pre-egress reservation (before upstream send).
+                        guard = await sa.ensure_session_owner_guard_for_request(
+                            request=request,
+                            request_body=prepared_request_body,
+                            session_identity=canonical_session_identity,
+                            requested_attributes=owner_attributes,
+                            candidate=candidate,
+                            alias_model=selection.get("alias_model") or alias_model,
+                            failure_phase="session_owner_pre_egress_reserve",
+                        )
+                        session_owner_lease = sa.get_request_session_owner_lease(request)
+                        # Expose reservation metadata on attempt selection.
+                        selection["canonical_session_identity"] = canonical_session_identity
+                        selection["session_owner_decision"] = guard.decision.value
+                        selection["session_owner_reservation_token"] = (
+                            guard.reservation_token
+                        )
+                        selection["session_owner_held_reservation"] = guard.held_reservation
+                        if guard.provenance:
+                            selection["session_owner_provenance"] = guard.provenance
+
+                        response = await perform_candidate_request_fn(
+                            candidate=candidate,
+                            candidate_body=candidate_body,
+                        )
+                        # Authoritative success: promote reserved -> owned.
+                        promote_result = await sa.finalize_session_owner_lease_on_success(
+                            session_owner_lease,
+                            attributes=owner_attributes,
+                            candidate=candidate,
+                        )
+                        if promote_result is not None and promote_result.outcome in {
+                            sa.SessionOwnerMutationOutcome.CONFLICT,
+                            sa.SessionOwnerMutationOutcome.ERROR,
+                            sa.SessionOwnerMutationOutcome.NOT_HELD,
+                        }:
+                            # Success bytes may already be in flight to the client;
+                            # fail closed for subsequent requests by not treating
+                            # ownership as established. Still surface structured error
+                            # for non-streaming callers by raising.
+                            sa.raise_session_owner_redispatch_required(
+                                session_identity=canonical_session_identity,
+                                mutation=promote_result,
+                                alias_model=selection.get("alias_model") or alias_model,
+                                candidate=candidate,
+                                failure_phase="session_owner_promote_after_success",
+                            )
+                    except Exception as probe_exc:  # noqa: PERF203
+                        probe_failure_exc = probe_exc
+                        if session_owner_lease is not None:
+                            try:
+                                await _session_affinity_mod().finalize_session_owner_lease_on_failure(
+                                    session_owner_lease
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
+                    finally:
+                        # Release probe lock FIRST (unconditional, before any
+                        # resolver call that might raise).
+                        probe_lock.release()
+
+                    # Resolve the plan AFTER lock release.  If the resolver
+                    # raises, the outer BaseException handler cleans up the
+                    # intent.  No lock is held here (canonical order: no family
+                    # lock entry while retaining a pre-acquired probe lock).
+                    if probe_failure_exc is not None:
+                        probe_failure_plan = _resolve_failure_plan(
+                            resolve_cooldown_publication_fn=resolve_cooldown_publication_fn,
+                            record_codex_failure_evidence_fn=_record_codex_failure_evidence,
+                            request=request,
+                            candidate=candidate,
+                            selection=selection,
+                            attempt_record=attempt_record,
+                            exc=probe_failure_exc,
+                            codex_failure_evidence_alias=codex_failure_evidence_alias,
+                            kimi_failure_metadata_fn=_get_safe_kimi_code_probe_failure_metadata,
+                            classify_kimi_fn=_classify_kimi_code_auto_agent_probe_failure,
+                            classify_retryable_fn=_classify_codex_auto_agent_retryable_exhaustion,
+                            grok_quota_fn=_is_codex_auto_agent_grok_account_quota_exhaustion,
+                            cooldown_seconds_fn=_get_codex_auto_agent_cooldown_seconds,
+                        )
+                        intent.plan = probe_failure_plan
+
+                    if skip_after_probe_wait:
+                        intent.complete()
+                        alias_routing_state.publication_intents.remove(intent)
+                        break
+                    if probe_failure_exc is None:
+                        intent.complete()
+                        alias_routing_state.publication_intents.remove(intent)
+                        await set_session_affinity_fn(
+                            selection.get("session_key"),
+                            candidate,
+                        )
+                        assert response is not None
+                        return response
+
+                    # --- Cooldown mutation: NO pre-held probe lock ------------
+                    if probe_failure_plan is not None:
+                        await _lpe.execute_cooldown_publication_transaction(
+                            alias_family=alias_family,
+                            candidate=candidate,
+                            plan=probe_failure_plan,
+                            publish_cooldown_memory_fn=publish_cooldown_memory_fn,
+                            persist_cooldown_fn=persist_cooldown_fn,
+                        )
+                    # Mutation complete (or no plan): signal intent.
+                    intent.complete(error=probe_failure_exc)
+                    alias_routing_state.publication_intents.remove(intent)
+                except BaseException as cleanup_exc:
+                    # BaseException-safe: covers CancelledError, KeyboardInterrupt,
+                    # SystemExit, and any exception from cooldown mutation.
+                    if not intent.done.is_set():
+                        intent.complete(error=cleanup_exc)
+                        alias_routing_state.publication_intents.remove(intent)
+                    raise
+
+                # --- failure handling (post-release) ---------------------------
+                failure_exc = probe_failure_exc
+                assert failure_exc is not None
+                kimi_failure_metadata = _get_safe_kimi_code_probe_failure_metadata(
+                    failure_exc,
+                    candidate=candidate,
+                )
+                error_class = _classify_kimi_code_auto_agent_probe_failure(kimi_failure_metadata)
+                if error_class is None:
+                    error_class = _classify_codex_auto_agent_retryable_exhaustion(
+                        failure_exc, candidate=candidate
+                    )
+                if error_class is None:
+                    raise failure_exc
+                last_retryable_exc = failure_exc
+                cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(
+                    failure_exc,
+                    candidate=candidate,
+                )
+                # The plan was resolved inside the probe lock above.  After probe
+                # lock release, execute_cooldown_publication_transaction performed
+                # the atomic memory publish + durable commit + local index update
+                # under the family lock + sorted probe locks (canonical order).
+                # Post-release only the request-local action remains.
+                plan = probe_failure_plan
+                assert plan is not None
+                if plan.request_local_action == "request_local_cooldown":
+                    _apply_request_local_cooldown_from_plan(
+                        request,
+                        candidate=candidate,
+                        lane_key=selection.get("lane_key"),
+                        cooldown_seconds=plan.duration_seconds,
+                    )
+                cooldown_scope = plan.applied_scope
+                error_tokens = _update_codex_auto_agent_retryable_attempt_record(
+                    attempt_record=attempt_record,
+                    exc=failure_exc,
+                    error_class=error_class,
+                    cooldown_seconds=cooldown_seconds,
+                    cooldown_scope=cooldown_scope,
+                    alias_model=alias_model,
+                    candidate=candidate,
+                    kimi_failure_metadata=kimi_failure_metadata,
+                )
+                # D1-586: observational shadow action only. Does not change retry,
+                # failover, sleep, admission, or cooldown enforcement paths.
+                attempt_record["shadow_failure_action"] = (
+                    _error_signals.build_shadow_failure_action_decision_from_exc(
+                        failure_exc,
+                        candidate=candidate,
+                        current_error_class=error_class,
+                        current_cooldown_scope=cooldown_scope,
+                        current_status=attempt_record.get("status"),
+                    ).to_observability_dict()
+                )
+                account_failover_planned = _plan_codex_oauth_account_failover(
+                    request,
+                    candidate=candidate,
+                    selection=selection,
+                    attempt_record=attempt_record,
+                    error_class=error_class,
+                    has_continuation_state=has_continuation_state,
+                )
+                if cooldown_scope == "none" and not has_continuation_state:
+                    _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
+                        request,
+                        candidate=candidate,
+                        lane_key=selection.get("lane_key"),
+                    )
+                if has_continuation_state and cooldown_scope != "none":
+                    attempt_record["status"] = "terminal_in_flight_cooldown_set"
+                    failure_body = _record_auto_agent_alias_attempt_failure(
+                        alias_family=alias_family,
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        error_class=error_class,
+                        add_alias_metadata_fn=add_alias_metadata_fn,
+                        redispatch_required=True,
+                    )
+                    failure_metadata = failure_body.get("litellm_metadata") or {}
+                    verbose_proxy_logger.debug(
+                        "%s auto-agent alias %s target %s/%s hit %s "
+                        "for an in-flight session on attempt %s; signaling redispatch",
+                        log_label,
+                        alias_model,
+                        candidate["provider"],
+                        candidate["model"],
+                        error_class,
+                        len(attempts),
+                    )
+                    raise_redispatch_required_fn(
+                        candidate=candidate,
+                        lane_key=selection.get("lane_key"),
+                        cooldown_seconds=cooldown_seconds,
+                        error_tokens=error_tokens,
+                        alias_model=alias_model,
+                        error_class=error_class,
+                        cooldown_scope=cooldown_scope,
+                        error_status_code=attempt_record.get("error_status_code"),
+                        error_type=attempt_record.get("error_type"),
+                        error_code=attempt_record.get("error_code"),
+                        retry_after_seconds=attempt_record.get("retry_after_seconds"),
+                        failure_phase=attempt_record.get("failure_phase"),
+                        attempted_provider_call=attempt_record.get("attempted_provider_call"),
+                        audit_events=failure_metadata.get("aawm_alias_routing_audit_events"),
+                        attempts=failure_metadata.get(attempts_metadata_key),
+                        skipped_candidates=failure_metadata.get(skipped_candidates_metadata_key),
+                    )
+                if account_failover_planned:
+                    provider_candidate_attempts = max(
+                        0,
+                        provider_candidate_attempts - 1,
+                    )
+                    _record_auto_agent_alias_attempt_failure(
+                        alias_family=alias_family,
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        error_class=error_class,
+                        add_alias_metadata_fn=add_alias_metadata_fn,
+                    )
+                    verbose_proxy_logger.debug(
+                        "%s auto-agent alias %s moving once from Codex OAuth "
+                        "account %s after %s",
+                        log_label,
+                        alias_model,
+                        candidate.get("codex_oauth_account_label"),
+                        error_class,
+                    )
+                    break
+                if failover_ordinal > 0:
+                    provider_candidate_attempts += 1
+                native_grok_retry_eligible = _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible(
+                    is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
+                    has_continuation_state=has_continuation_state,
+                    error_class=error_class,
+                    cooldown_scope=cooldown_scope,
+                )
+                if native_grok_retry_eligible:
+                    native_grok_continuation_transient_provider_attempts += 1
+                    native_grok_provider_attempt = native_grok_continuation_transient_provider_attempts
+                else:
+                    native_grok_provider_attempt = 0
+                (
+                    should_retry_same_candidate,
+                    same_candidate_backoff_seconds,
+                    native_grok_retry_metadata,
+                ) = _plan_codex_auto_agent_native_grok_continuation_transient_retry(
+                    is_native_grok_4_5_candidate=(_is_codex_auto_agent_native_grok_4_5_candidate(candidate)),
+                    has_continuation_state=has_continuation_state,
+                    error_class=error_class,
+                    cooldown_scope=cooldown_scope,
+                    provider_attempt=native_grok_provider_attempt,
+                    provider=str(candidate.get("provider") or "") or None,
+                    model=str(candidate.get("model") or "") or None,
+                    route_family=str(candidate.get("route_family") or "") or None,
+                    max_attempts=native_grok_continuation_transient_max_attempts,
+                )
+                if native_grok_retry_metadata is not None:
+                    attempt_record["native_grok_continuation_retry"] = native_grok_retry_metadata
+                _record_auto_agent_alias_attempt_failure(
                     alias_family=alias_family,
                     alias_model=alias_model,
                     request=request,
@@ -770,14 +807,59 @@ async def handle_alias_route(  # noqa: PLR0915
                     selection=selection,
                     attempts=attempts,
                     attempt_record=attempt_record,
+                    error_class=error_class,
                     add_alias_metadata_fn=add_alias_metadata_fn,
                 )
-                continue
-            if native_grok_retry_eligible:
-                # Same-candidate budget exhausted; do not switch providers.
-                _raise_terminal_alias_failure(last_retryable_exc)
-            break
+                verbose_proxy_logger.debug(
+                    "%s auto-agent alias %s target %s/%s hit %s on attempt %s; " "cooldown %.1fs scope=%s tokens=%s",
+                    log_label,
+                    alias_model,
+                    candidate["provider"],
+                    candidate["model"],
+                    error_class,
+                    len(attempts),
+                    cooldown_seconds,
+                    cooldown_scope,
+                    sorted(error_tokens),
+                )
+                if should_retry_same_candidate:
+                    # Native-grok backoff sleep is NEVER inside the probe lock.
+                    if same_candidate_backoff_seconds and same_candidate_backoff_seconds > 0:
+                        await asyncio.sleep(same_candidate_backoff_seconds)
+                    attempt_record = _codex_auto_agent_candidate_public_shape(
+                        candidate,
+                        lane_key=selection.get("lane_key"),
+                        reason="native_grok_continuation_same_candidate_retry",
+                    )
+                    attempts.append(attempt_record)
+                    candidate_body = _record_auto_agent_alias_attempt_started(
+                        alias_family=alias_family,
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        add_alias_metadata_fn=add_alias_metadata_fn,
+                    )
+                    continue
+                if native_grok_retry_eligible:
+                    # Same-candidate budget exhausted; do not switch providers.
+                    _raise_terminal_alias_failure(last_retryable_exc)
+                break
 
+        finally:
+            # D1-564: encompass every post-admission path. Lease must not
+            # leak on attempt-record, cooldown precheck, probe-lock,
+            # follower-wait, provider I/O, cancellation, or exception.
+            if admission_lease is not None:
+                try:
+                    await _admission_mod().release_provider_lane_admission(
+                        admission_lease
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                admission_lease = None
     if last_retryable_exc is not None:
         _raise_terminal_alias_failure(last_retryable_exc)
     raise HTTPException(

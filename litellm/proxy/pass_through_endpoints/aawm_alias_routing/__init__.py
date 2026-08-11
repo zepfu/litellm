@@ -4,6 +4,7 @@ Layers:
 - ``policy``: provider/lane constants, allowlists, and cooldown defaults
 - ``config_snapshot`` / ``snapshot_select``: configured alias identity and selection
 - ``state``: process-local cooldown/affinity/probe maps + locks
+- ``admission``: provider/account lane reservation (D1-564 first body)
 - ``oauth_token_cache``: provider-neutral OAuth token memoization primitive
 - ``memory`` / ``retry``: shared map bounding and cooldown wait primitives
 - ``error_signals``: failure extraction, classification, cooldown scope, retry planning
