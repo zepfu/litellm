@@ -723,7 +723,7 @@ aliases:
         assert "basic" in snapshot.aliases
         # OpenCode candidates with explicit overrides compile fine
         by_model = {c.model: c for c in snapshot.aliases["basic"].candidates}
-        assert by_model["deepseek-v4-flash"].anthropic_route_family == "anthropic_opencode_zen_responses_adapter"
+        assert by_model["deepseek-v4-flash-free"].anthropic_route_family == "anthropic_opencode_zen_responses_adapter"
         assert by_model["big-pickle"].anthropic_route_family == "anthropic_opencode_zen_completion_adapter"
 
 

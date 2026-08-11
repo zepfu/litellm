@@ -39611,7 +39611,7 @@
         "supports_pdf_input": false,
         "source": "https://opencode.ai/zen/v1"
     },
-    "opencode/deepseek-v4-flash": {
+    "opencode/deepseek-v4-flash-free": {
         "max_tokens": 200000,
         "max_input_tokens": 200000,
         "max_output_tokens": 128000,

@@ -28,7 +28,7 @@ aliases:
         priority: 70
 
       - provider: opencode_zen
-        model: deepseek-v4-flash
+        model: deepseek-v4-flash-free
         route_family: codex_opencode_zen_adapter
         anthropic_route_family: anthropic_opencode_zen_responses_adapter
         priority: 60

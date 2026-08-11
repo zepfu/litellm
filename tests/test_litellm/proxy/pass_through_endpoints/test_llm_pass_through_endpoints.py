@@ -4425,7 +4425,7 @@ class TestOpenRouterAdapterRetry:
             "opencode/mini-v2.5",
             "opencode/north-mini-code",
             "opencode/nemotron-3-ultra",
-            "opencode/deepseek-v4-flash",
+            "opencode/deepseek-v4-flash-free",
         }
 
         for pricing_map_path in pricing_map_paths:
@@ -4440,7 +4440,7 @@ class TestOpenRouterAdapterRetry:
             "mini-v2.5",
             "north-mini-code",
             "nemotron-3-ultra",
-            "deepseek-v4-flash",
+            "deepseek-v4-flash-free",
         }
 
     @pytest.mark.asyncio
@@ -6524,7 +6524,7 @@ aliases:
         }
         mock_request.query_params = {}
         prepared_body = {
-            "model": "opencode/deepseek-v4-flash",
+            "model": "opencode/deepseek-v4-flash-free",
             "input": [
                 {"role": "user", "content": "start"},
                 {
@@ -6551,7 +6551,7 @@ aliases:
                     "id": "chatcmpl_opencode",
                     "object": "chat.completion",
                     "created": 1770000000,
-                    "model": "deepseek-v4-flash",
+                    "model": "deepseek-v4-flash-free",
                     "choices": [
                         {
                             "index": 0,
@@ -6576,7 +6576,7 @@ aliases:
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=prepared_body,
-                adapter_model="deepseek-v4-flash",
+                adapter_model="deepseek-v4-flash-free",
             )
 
         call_kwargs = mock_acompletion.await_args.kwargs
@@ -6669,7 +6669,7 @@ aliases:
                 return _responses_events()
 
         prepared_body = {
-            "model": "opencode/deepseek-v4-flash",
+            "model": "opencode/deepseek-v4-flash-free",
             "input": "just a stream test msg",
             "stream": True,
         }
@@ -6692,19 +6692,19 @@ aliases:
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=prepared_body,
-                adapter_model="deepseek-v4-flash",
+                adapter_model="deepseek-v4-flash-free",
             )
 
         mock_validate_egress.assert_called_once()
         assert mock_validate_egress.call_args.kwargs["url"] == ("https://opencode.ai/zen/v1/chat/completions")
         call_kwargs = mock_acompletion.await_args.kwargs
-        assert call_kwargs["model"] == "deepseek-v4-flash"
+        assert call_kwargs["model"] == "deepseek-v4-flash-free"
         assert call_kwargs["api_key"] == "opencode-test-key"
         assert call_kwargs["api_base"] == "https://opencode.ai/zen/v1"
         assert call_kwargs["stream"] is True
         assert call_kwargs["custom_llm_provider"] == "openai"
         assert iterator_inits[0]["litellm_custom_stream_wrapper"] is fake_stream_wrapper
-        assert iterator_inits[0]["model"] == "deepseek-v4-flash"
+        assert iterator_inits[0]["model"] == "deepseek-v4-flash-free"
         assert iterator_inits[0]["custom_llm_provider"] == "openai"
         assert isinstance(response, StreamingResponse)
         chunks = [chunk async for chunk in response.body_iterator]
@@ -15163,7 +15163,7 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
         attempt for attempt in metadata["anthropic_auto_agent_attempts"] if attempt["provider"] == "opencode_zen"
     ]
     assert [attempt["model"] for attempt in opencode_attempts] == [
-        "deepseek-v4-flash",
+        "deepseek-v4-flash-free",
         "big-pickle",
     ]
     assert all(attempt["status"] == "cooldown_set" for attempt in opencode_attempts)
@@ -15179,7 +15179,7 @@ async def test_anthropic_auto_agent_alias_low_missing_opencode_auth_reaches_haik
     skipped_models = {candidate["model"] for candidate in metadata["anthropic_auto_agent_skipped_candidates"]}
     assert "openrouter/cohere/north-mini-code:free" in skipped_models
     assert "openrouter/owl-alpha" in skipped_models
-    assert "deepseek-v4-flash" in skipped_models
+    assert "deepseek-v4-flash-free" in skipped_models
     assert "big-pickle" in skipped_models
     assert "alibaba_token_plan/qwen3.6-flash" in skipped_models
 
@@ -15255,7 +15255,7 @@ async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_
         attempt for attempt in metadata["anthropic_auto_agent_attempts"] if attempt["provider"] == "opencode_zen"
     ]
     assert [attempt["model"] for attempt in opencode_attempts] == [
-        "deepseek-v4-flash",
+        "deepseek-v4-flash-free",
         "big-pickle",
     ]
     assert all(attempt["status"] == "cooldown_set" for attempt in opencode_attempts)
@@ -15271,7 +15271,7 @@ async def test_anthropic_auto_agent_alias_low_fails_over_after_free_usage_limit_
     skipped_models = {candidate["model"] for candidate in metadata["anthropic_auto_agent_skipped_candidates"]}
     assert "openrouter/cohere/north-mini-code:free" in skipped_models
     assert "openrouter/owl-alpha" in skipped_models
-    assert "deepseek-v4-flash" in skipped_models
+    assert "deepseek-v4-flash-free" in skipped_models
     assert "big-pickle" in skipped_models
     assert "alibaba_token_plan/qwen3.6-flash" in skipped_models
 
@@ -15292,7 +15292,7 @@ async def test_anthropic_auto_agent_alias_low_routes_big_pickle_through_completi
         60.0,
     )
     await _set_anthropic_auto_agent_cooldown(
-        "opencode_zen:deepseek-v4-flash:opencode_zen",
+        "opencode_zen:deepseek-v4-flash-free:opencode_zen",
         60.0,
     )
     success = Response(content='{"ok": true}', media_type="application/json")
@@ -19119,7 +19119,7 @@ def test_codex_auto_agent_alias_metadata_uses_requested_alias():
         selection={
             "candidate": {
                 "provider": "opencode_zen",
-                "model": "deepseek-v4-flash",
+                "model": "deepseek-v4-flash-free",
                 "route_family": "codex_opencode_zen_adapter",
                 "last_resort": False,
             },
@@ -19140,7 +19140,7 @@ def test_codex_auto_agent_alias_metadata_uses_requested_alias():
         attempts=[
             {
                 "provider": "opencode_zen",
-                "model": "deepseek-v4-flash",
+                "model": "deepseek-v4-flash-free",
                 "route_family": "codex_opencode_zen_adapter",
                 "last_resort": False,
                 "lane_key": "opencode_zen",
@@ -19154,7 +19154,7 @@ def test_codex_auto_agent_alias_metadata_uses_requested_alias():
     assert metadata["requested_model_alias"] == "basic"
     assert metadata["codex_auto_agent_alias"] == "basic"
     assert metadata["codex_auto_agent_selected_provider"] == "opencode_zen"
-    assert metadata["codex_auto_agent_selected_model"] == "deepseek-v4-flash"
+    assert metadata["codex_auto_agent_selected_model"] == "deepseek-v4-flash-free"
     assert metadata["codex_auto_agent_selected_route_family"] == ("codex_opencode_zen_adapter")
     assert metadata["codex_auto_agent_selection_reason"] == "first_available"
     assert metadata["codex_auto_agent_lane_key"] == "opencode_zen"
@@ -21741,7 +21741,7 @@ def test_auto_agent_alias_route_event_prefers_real_opencode_zen_target(monkeypat
             "candidate_status": "cooldown_set",
             "failure_class": "capacity_exhausted",
             "alias_model": "basic",
-            "model": "deepseek-v4-flash",
+            "model": "deepseek-v4-flash-free",
             "rollup_group_header_label": "litellm@Codex[0.141.0]",
             "incoming_endpoint": "/openai_passthrough/responses",
             "route_family": "codex_opencode_zen_adapter",
@@ -21755,7 +21755,7 @@ def test_auto_agent_alias_route_event_prefers_real_opencode_zen_target(monkeypat
             "group_header_label": "litellm@Codex[0.141.0]",
             "incoming_endpoint": "/openai_passthrough/responses",
             "outgoing_target": "opencode.ai/zen/v1/chat/completions",
-            "model_label": "deepseek-v4-flash(basic)",
+            "model_label": "deepseek-v4-flash-free(basic)",
             "turns": 0,
             "status": "Cooling Down",
             "message": None,
@@ -21959,7 +21959,7 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
         attempt for attempt in metadata["codex_auto_agent_attempts"] if attempt["provider"] == "opencode_zen"
     ]
     assert [attempt["model"] for attempt in opencode_attempts] == [
-        "deepseek-v4-flash",
+        "deepseek-v4-flash-free",
         "big-pickle",
     ]
     assert all(attempt["status"] == "cooldown_set" for attempt in opencode_attempts)
@@ -21975,7 +21975,7 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
     skipped_models = {candidate["model"] for candidate in metadata["codex_auto_agent_skipped_candidates"]}
     assert "openrouter/cohere/north-mini-code:free" in skipped_models
     assert "openrouter/owl-alpha" in skipped_models
-    assert "deepseek-v4-flash" in skipped_models
+    assert "deepseek-v4-flash-free" in skipped_models
     assert "big-pickle" in skipped_models
     assert "alibaba_token_plan/qwen3.6-flash" in skipped_models
 
@@ -22264,13 +22264,13 @@ async def _run_codex_auto_agent_alias_low_opencode_error_case(
         attempt for attempt in metadata["codex_auto_agent_attempts"] if attempt["provider"] == "opencode_zen"
     ]
     assert [attempt["model"] for attempt in opencode_attempts] == [
-        "deepseek-v4-flash",
+        "deepseek-v4-flash-free",
         "big-pickle",
     ]
     skipped_models = {candidate["model"] for candidate in metadata["codex_auto_agent_skipped_candidates"]}
     assert "openrouter/cohere/north-mini-code:free" in skipped_models
     assert "openrouter/owl-alpha" in skipped_models
-    assert "deepseek-v4-flash" in skipped_models
+    assert "deepseek-v4-flash-free" in skipped_models
     assert "big-pickle" in skipped_models
     assert "alibaba_token_plan/qwen3.6-flash" in skipped_models
     return opencode_attempts
@@ -22309,7 +22309,7 @@ async def test_codex_auto_agent_alias_low_opencode_error_reaches_mini(
 async def test_codex_opencode_zen_direct_route_keeps_billing_error(monkeypatch):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "opencode/deepseek-v4-flash",
+        "model": "opencode/deepseek-v4-flash-free",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -22341,7 +22341,7 @@ async def test_codex_opencode_zen_direct_route_keeps_billing_error(monkeypatch):
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
-                adapter_model="deepseek-v4-flash",
+                adapter_model="deepseek-v4-flash-free",
                 use_alias_candidate_probe=False,
             )
 
@@ -22353,7 +22353,7 @@ async def test_codex_opencode_zen_direct_route_keeps_billing_error(monkeypatch):
 async def test_codex_opencode_zen_alias_probe_uses_proxy_shared_session(monkeypatch):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "opencode/deepseek-v4-flash",
+        "model": "opencode/deepseek-v4-flash-free",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -22378,7 +22378,7 @@ async def test_codex_opencode_zen_alias_probe_uses_proxy_shared_session(monkeypa
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
-                adapter_model="deepseek-v4-flash",
+                adapter_model="deepseek-v4-flash-free",
                 use_alias_candidate_probe=True,
             )
 
@@ -22400,7 +22400,7 @@ async def test_anthropic_opencode_zen_alias_probe_error_is_candidate_unavailable
 ):
     request = _build_anthropic_auto_agent_request()
     body = {
-        "model": "opencode_zen/deepseek-v4-flash",
+        "model": "opencode_zen/deepseek-v4-flash-free",
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 64,
         "stream": False,
@@ -22422,7 +22422,7 @@ async def test_anthropic_opencode_zen_alias_probe_error_is_candidate_unavailable
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
-                adapter_model="deepseek-v4-flash",
+                adapter_model="deepseek-v4-flash-free",
                 use_alias_candidate_probe=True,
             )
 
@@ -22434,7 +22434,7 @@ async def test_anthropic_opencode_zen_alias_probe_error_is_candidate_unavailable
 async def test_anthropic_opencode_zen_alias_probe_marks_transient_statuses_alias_managed():
     request = _build_anthropic_auto_agent_request()
     body = {
-        "model": "opencode_zen/deepseek-v4-flash",
+        "model": "opencode_zen/deepseek-v4-flash-free",
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 64,
         "stream": False,
@@ -22462,7 +22462,7 @@ async def test_anthropic_opencode_zen_alias_probe_marks_transient_statuses_alias
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=body,
-            adapter_model="deepseek-v4-flash",
+            adapter_model="deepseek-v4-flash-free",
             use_alias_candidate_probe=True,
         )
 
@@ -22476,7 +22476,7 @@ async def test_anthropic_opencode_zen_alias_probe_marks_transient_statuses_alias
 async def test_anthropic_opencode_zen_direct_route_keeps_billing_error():
     request = _build_anthropic_auto_agent_request()
     body = {
-        "model": "opencode_zen/deepseek-v4-flash",
+        "model": "opencode_zen/deepseek-v4-flash-free",
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 64,
         "stream": False,
@@ -22498,7 +22498,7 @@ async def test_anthropic_opencode_zen_direct_route_keeps_billing_error():
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
-                adapter_model="deepseek-v4-flash",
+                adapter_model="deepseek-v4-flash-free",
                 use_alias_candidate_probe=False,
             )
 
@@ -22510,7 +22510,7 @@ async def test_anthropic_opencode_zen_direct_route_keeps_billing_error():
 async def test_anthropic_opencode_zen_direct_route_keeps_free_usage_limit_error():
     request = _build_anthropic_auto_agent_request()
     body = {
-        "model": "opencode_zen/deepseek-v4-flash",
+        "model": "opencode_zen/deepseek-v4-flash-free",
         "messages": [{"role": "user", "content": "hello"}],
         "max_tokens": 64,
         "stream": False,
@@ -22532,7 +22532,7 @@ async def test_anthropic_opencode_zen_direct_route_keeps_free_usage_limit_error(
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
-                adapter_model="deepseek-v4-flash",
+                adapter_model="deepseek-v4-flash-free",
                 use_alias_candidate_probe=False,
             )
 
@@ -22595,7 +22595,7 @@ async def test_anthropic_opencode_zen_big_pickle_uses_completion_adapter():
 async def test_codex_opencode_zen_direct_route_keeps_high_demand_error(monkeypatch):
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "opencode/deepseek-v4-flash",
+        "model": "opencode/deepseek-v4-flash-free",
         "input": "hello",
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
@@ -22616,7 +22616,7 @@ async def test_codex_opencode_zen_direct_route_keeps_high_demand_error(monkeypat
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
-                adapter_model="deepseek-v4-flash",
+                adapter_model="deepseek-v4-flash-free",
                 use_alias_candidate_probe=False,
             )
 
@@ -24405,9 +24405,9 @@ def test_opencode_zen_responses_stream_is_parsed_as_openai_compatible():
     url_route = "https://opencode.ai/zen/v1/responses"
     assert HttpPassThroughEndpointHelpers.get_endpoint_type(url_route) == EndpointType.OPENAI
     assert OpenAIPassthroughLoggingHandler.is_openai_responses_route(url_route) is True
-    assert "opencode/deepseek-v4-flash" in (
+    assert "opencode/deepseek-v4-flash-free" in (
         OpenAIPassthroughLoggingHandler._candidate_model_price_keys(
-            "deepseek-v4-flash",
+            "deepseek-v4-flash-free",
             "opencode_zen",
         )
     )
@@ -24424,19 +24424,19 @@ def test_opencode_zen_responses_stream_is_parsed_as_openai_compatible():
             (
                 'data: {"type":"response.completed","response":{"id":"resp_opencode",'
                 '"object":"response","created_at":1770000000,'
-                '"model":"deepseek-v4-flash","status":"completed",'
+                '"model":"deepseek-v4-flash-free","status":"completed",'
                 '"usage":{"input_tokens":12,"output_tokens":3,"total_tokens":15}}}'
             ),
         ],
         litellm_logging_obj=MagicMock(),
-        model="deepseek-v4-flash",
+        model="deepseek-v4-flash-free",
         url_route=url_route,
-        request_body={"model": "deepseek-v4-flash"},
+        request_body={"model": "deepseek-v4-flash-free"},
         litellm_params={},
     )
 
     assert model_response is not None
-    assert model_response.model == "deepseek-v4-flash"
+    assert model_response.model == "deepseek-v4-flash-free"
     assert model_response.usage.prompt_tokens == 12
     assert model_response.usage.completion_tokens == 3
     assert model_response.usage.total_tokens == 15
@@ -28774,7 +28774,7 @@ async def test_aawm_low_alias_skips_openrouter_candidates_with_durable_quota_exh
         )
 
     assert selection["candidate"]["provider"] == "opencode_zen"
-    assert selection["candidate"]["model"] == "deepseek-v4-flash"
+    assert selection["candidate"]["model"] == "deepseek-v4-flash-free"
     skipped = selection["skipped"]
     skipped_models = {candidate["model"] for candidate in skipped}
     assert {
@@ -28808,7 +28808,7 @@ async def test_aawm_low_anthropic_alias_skips_openrouter_candidates_with_durable
         )
 
     assert selection["candidate"]["provider"] == "opencode_zen"
-    assert selection["candidate"]["model"] == "deepseek-v4-flash"
+    assert selection["candidate"]["model"] == "deepseek-v4-flash-free"
     skipped = selection["skipped"]
     skipped_models = {candidate["model"] for candidate in skipped}
     assert {
@@ -29511,7 +29511,7 @@ async def test_codex_auto_agent_alias_low_falls_back_after_gpt_5_6_luna_unsuppor
         60.0,
     )
     await _set_codex_auto_agent_cooldown(
-        "opencode_zen:deepseek-v4-flash:opencode_zen",
+        "opencode_zen:deepseek-v4-flash-free:opencode_zen",
         60.0,
     )
     await _set_codex_auto_agent_cooldown(
@@ -30900,7 +30900,7 @@ class TestD1574OpenCodeDirectRateLimit:
         }
 
         request_body = {
-            "model": "opencode/deepseek-v4-flash",
+            "model": "opencode/deepseek-v4-flash-free",
             "input": "hello",
             "stream": False,
         }
@@ -31106,7 +31106,7 @@ class TestD1574OpenCodeDirectRateLimit:
     async def test_direct_stream_peeks_and_replays_first_event_once(self):
         request = _build_codex_auto_agent_request()
         body = {
-            "model": "opencode/deepseek-v4-flash",
+            "model": "opencode/deepseek-v4-flash-free",
             "input": "hello",
             "stream": True,
         }
@@ -31149,7 +31149,7 @@ class TestD1574OpenCodeDirectRateLimit:
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
-                adapter_model="deepseek-v4-flash",
+                adapter_model="deepseek-v4-flash-free",
                 use_alias_candidate_probe=False,
             )
 
@@ -31166,7 +31166,7 @@ class TestD1574OpenCodeDirectRateLimit:
     async def test_direct_pre_event_capacity_peek_consumes_and_closes_once(self):
         request = _build_codex_auto_agent_request()
         body = {
-            "model": "opencode/deepseek-v4-flash",
+            "model": "opencode/deepseek-v4-flash-free",
             "input": "hello",
             "stream": True,
         }
@@ -31210,7 +31210,7 @@ class TestD1574OpenCodeDirectRateLimit:
                     fastapi_response=MagicMock(spec=Response),
                     user_api_key_dict=MagicMock(),
                     prepared_request_body=body,
-                    adapter_model="deepseek-v4-flash",
+                    adapter_model="deepseek-v4-flash-free",
                     use_alias_candidate_probe=False,
                 )
 
@@ -31223,7 +31223,7 @@ class TestD1574OpenCodeDirectRateLimit:
     async def test_direct_post_event_capacity_emits_one_terminal_without_retry(self):
         request = _build_codex_auto_agent_request()
         body = {
-            "model": "opencode/deepseek-v4-flash",
+            "model": "opencode/deepseek-v4-flash-free",
             "input": "hello",
             "stream": True,
         }
@@ -31274,7 +31274,7 @@ class TestD1574OpenCodeDirectRateLimit:
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
-                adapter_model="deepseek-v4-flash",
+                adapter_model="deepseek-v4-flash-free",
                 use_alias_candidate_probe=False,
             )
 
@@ -31297,7 +31297,7 @@ class TestD1574OpenCodeDirectRateLimit:
     async def test_alias_stream_bypasses_direct_peek_and_capacity_callback(self):
         request = _build_codex_auto_agent_request()
         body = {
-            "model": "opencode/deepseek-v4-flash",
+            "model": "opencode/deepseek-v4-flash-free",
             "input": "hello",
             "stream": True,
         }
@@ -31342,7 +31342,7 @@ class TestD1574OpenCodeDirectRateLimit:
                 fastapi_response=MagicMock(spec=Response),
                 user_api_key_dict=MagicMock(),
                 prepared_request_body=body,
-                adapter_model="deepseek-v4-flash",
+                adapter_model="deepseek-v4-flash-free",
                 use_alias_candidate_probe=True,
             )
             with pytest.raises(ProxyException) as exc_info:
@@ -31388,7 +31388,7 @@ class TestD1574OpenCodeDirectRateLimit:
             }
         )
         body = {
-            "model": "opencode/deepseek-v4-flash",
+            "model": "opencode/deepseek-v4-flash-free",
             "input": "hello",
             "stream": False,
         }
@@ -31411,7 +31411,7 @@ class TestD1574OpenCodeDirectRateLimit:
                     fastapi_response=MagicMock(spec=Response),
                     user_api_key_dict=MagicMock(),
                     prepared_request_body=body,
-                    adapter_model="deepseek-v4-flash",
+                    adapter_model="deepseek-v4-flash-free",
                     use_alias_candidate_probe=False,
                 )
 

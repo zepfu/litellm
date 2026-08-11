@@ -30,7 +30,7 @@ _OPENCODE_ZEN_FREE_MODELS = frozenset(
         "mini-v2.5",
         "north-mini-code",
         "nemotron-3-ultra",
-        "deepseek-v4-flash",
+        "deepseek-v4-flash-free",
     }
 )
 
