@@ -106,6 +106,9 @@ _CODEX_OAUTH_QUOTA_FAILURE_RETRY_SECONDS = 5.0
 _CODEX_OAUTH_QUOTA_LOOKUP_TIMEOUT_SECONDS = 0.5
 _CODEX_OAUTH_QUOTA_CLIENT = "codex"
 _CODEX_OAUTH_QUOTA_SOURCE = "codex_quota_poll"
+_CODEX_OAUTH_WEEKLY_BALANCE_BAND_PP = 10.0
+_CODEX_OAUTH_QUOTA_FAMILY_OVERALL = "overall"
+_CODEX_OAUTH_QUOTA_FAMILY_SPARK = "spark"
 _CODEX_OAUTH_QUOTA_CURRENT_ROWS_SQL = """
 SELECT DISTINCT ON (
     NULLIF(BTRIM(evidence->>'environment'), ''),
@@ -1377,6 +1380,188 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     return state
 
 
+
+def _is_codex_oauth_spark_model(model: Any) -> bool:
+    """Return True when the request/upstream model is Spark-scoped."""
+    text = str(model or "").strip().lower()
+    return "spark" in text
+
+
+def _codex_oauth_quota_family_for_model(model: Any) -> str:
+    """Map a request model onto the independent overall/Spark quota family."""
+    if _is_codex_oauth_spark_model(model):
+        return "spark"
+    return "overall"
+
+
+def _codex_oauth_quota_observation_family(observation: Mapping[str, Any]) -> str:
+    """Classify one quota row/window using the durable model/quota_key schema.
+
+    The observation schema discriminates families primarily via ``model`` (for
+    example ``gpt-5.3-codex-spark`` vs overall Codex models or blank poll model
+    rows) and secondarily via ``quota_key`` text. Families are never collapsed.
+    """
+    model = str(observation.get("model") or "").strip().lower()
+    quota_key = str(observation.get("quota_key") or "").strip().lower()
+    if "spark" in model or "spark" in quota_key:
+        return "spark"
+    return "overall"
+
+
+def _filter_codex_oauth_quota_windows_for_family(
+    windows: Sequence[Any],
+    *,
+    family: str,
+) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for window in windows:
+        if not isinstance(window, dict):
+            continue
+        if _codex_oauth_quota_observation_family(window) == family:
+            filtered.append(window)
+    return filtered
+
+
+def _codex_oauth_window_remaining_pct(window: Mapping[str, Any]) -> Optional[float]:
+    try:
+        remaining = float(window.get("remaining_pct"))
+    except (TypeError, ValueError):
+        return None
+    if remaining != remaining or remaining in {float("inf"), float("-inf")}:
+        return None
+    return remaining
+
+
+def _codex_oauth_window_is_weekly(window: Mapping[str, Any]) -> bool:
+    period = str(
+        window.get("quota_period") or window.get("window") or ""
+    ).strip().lower()
+    try:
+        window_minutes = int(window.get("window_minutes"))
+    except (TypeError, ValueError):
+        window_minutes = 0
+    return period == "seven_day" or window_minutes == 10080
+
+
+def _codex_oauth_weekly_remaining_pct_from_windows(
+    windows: Sequence[Any],
+) -> Optional[float]:
+    """Return the conservative fresh weekly remaining percentage, if known."""
+    weekly_values: list[float] = []
+    for window in windows:
+        if not isinstance(window, dict) or not _codex_oauth_window_is_weekly(window):
+            continue
+        status = str(window.get("status") or "").strip().lower()
+        if status and status != "fresh":
+            continue
+        remaining = _codex_oauth_window_remaining_pct(window)
+        if remaining is not None:
+            weekly_values.append(remaining)
+    if not weekly_values:
+        return None
+    return min(weekly_values)
+
+
+def _codex_oauth_state_weekly_remaining_pct(state: Mapping[str, Any]) -> Optional[float]:
+    windows = state.get("quota_windows")
+    if isinstance(windows, list):
+        remaining = _codex_oauth_weekly_remaining_pct_from_windows(windows)
+        if remaining is not None:
+            return remaining
+    observation = state.get("quota_observation")
+    if isinstance(observation, Mapping):
+        obs_windows = observation.get("windows")
+        if isinstance(obs_windows, list):
+            family = _codex_oauth_quota_family_for_model(
+                (state.get("candidate") or {}).get("model")
+                if isinstance(state.get("candidate"), Mapping)
+                else None
+            )
+            filtered = _filter_codex_oauth_quota_windows_for_family(
+                obs_windows,
+                family=family,
+            )
+            return _codex_oauth_weekly_remaining_pct_from_windows(filtered)
+    return None
+
+
+def _prefer_codex_oauth_weekly_balanced_state(
+    states: Sequence[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """Soft weekly account balancing across otherwise eligible OAuth accounts.
+
+    Prefer the less-depleted account when the applicable weekly remaining spread
+    is at least 10 percentage points. Within the band, either eligible account
+    is permitted and inventory/candidate order is preserved. Confirmed five-hour
+    exhaustion is handled before this function by excluding those accounts from
+    ``states``.
+    """
+    oauth_states = [
+        state
+        for state in states
+        if isinstance(state.get("candidate"), dict)
+        and _is_codex_oauth_account_candidate(state["candidate"])
+    ]
+    if len(oauth_states) < 2:
+        return None
+
+    scored: list[tuple[float, dict[str, Any]]] = []
+    unscored: list[dict[str, Any]] = []
+    for state in oauth_states:
+        remaining = _codex_oauth_state_weekly_remaining_pct(state)
+        if remaining is None:
+            unscored.append(state)
+        else:
+            scored.append((remaining, state))
+
+    if len(scored) < 2:
+        # Balancing requires comparable weekly evidence for at least two accounts.
+        return None
+
+    max_remaining = max(remaining for remaining, _state in scored)
+    min_remaining = min(remaining for remaining, _state in scored)
+    spread = max_remaining - min_remaining
+    if spread + 1e-9 < 10.0:
+        # Within the soft band: either eligible account is permitted.
+        return None
+
+    preferred = [
+        state
+        for remaining, state in scored
+        if abs(remaining - max_remaining) <= 0.001
+    ]
+    if not preferred:
+        return None
+    selected = preferred[0]
+    selected = dict(selected)
+    selected["selection_diagnostics"] = {
+        **dict(selected.get("selection_diagnostics") or {}),
+        "strategy": "weekly_quota_balance",
+        "quota_family": _codex_oauth_quota_family_for_model(
+            selected.get("candidate", {}).get("model")
+        ),
+        "weekly_balance_band_pp": 10.0,
+        "weekly_remaining_spread_pp": round(spread, 3),
+        "preferred_weekly_remaining_pct": max_remaining,
+    }
+    return selected
+
+
+def _select_first_available_codex_oauth_account_state(
+    states: Sequence[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """Pick the first eligible account, applying soft weekly balancing when useful."""
+    available = [
+        state
+        for state in states
+        if _is_auto_agent_candidate_state_available(state)
+    ]
+    if not available:
+        return None
+    balanced = _prefer_codex_oauth_weekly_balanced_state(available)
+    return balanced if balanced is not None else available[0]
+
+
 def _format_codex_oauth_quota_reset_at(value: Any) -> Optional[str]:
     if not isinstance(value, (int, float)):
         return None
@@ -1482,6 +1667,79 @@ def _build_codex_oauth_terminal_reset_information(
     return terminal
 
 
+def _codex_oauth_public_quota_windows(
+    windows: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Shape quota windows while retaining inspectable family identity fields."""
+    shaped_windows: list[dict[str, Any]] = []
+    for window in windows:
+        shaped = _codex_oauth_quota_window_public_shape(window)
+        model_value = window.get("model")
+        if model_value is not None and "model" not in shaped:
+            shaped["model"] = model_value
+        quota_key = window.get("quota_key")
+        if quota_key is not None and "quota_key" not in shaped:
+            shaped["quota_key"] = quota_key
+        shaped_windows.append(shaped)
+    return shaped_windows
+
+
+def _build_family_quota_observation(
+    observation: Mapping[str, Any],
+    *,
+    family_windows: Sequence[dict[str, Any]],
+    quota_family: str,
+) -> Optional[dict[str, Any]]:
+    remaining_values = [
+        remaining
+        for window in family_windows
+        if (remaining := _codex_oauth_window_remaining_pct(window)) is not None
+    ]
+    if not remaining_values:
+        return None
+
+    family_observation = dict(observation)
+    family_observation["windows"] = list(family_windows)
+    family_observation["window_count"] = len(family_windows)
+    family_observation["remaining_pct"] = min(remaining_values)
+    family_observation["quota_family"] = quota_family
+    selected_window = min(
+        family_windows,
+        key=lambda window: (
+            _codex_oauth_window_remaining_pct(window)
+            if _codex_oauth_window_remaining_pct(window) is not None
+            else float("inf")
+        ),
+    )
+    for field in (
+        "quota_key",
+        "quota_type",
+        "limit_scope",
+        "quota_period",
+        "window_minutes",
+        "status",
+        "exhausted",
+        "expected_reset_at",
+        "observed_at",
+        "model",
+        "source",
+    ):
+        if field in selected_window:
+            family_observation[field] = selected_window.get(field)
+    try:
+        age_source = (
+            selected_window.get("observation_age_seconds")
+            if selected_window.get("observation_age_seconds") is not None
+            else observation.get("observation_age_seconds") or 0.0
+        )
+        family_observation["observation_age_seconds"] = max(0.0, float(age_source))
+    except (TypeError, ValueError):
+        family_observation["observation_age_seconds"] = observation.get(
+            "observation_age_seconds"
+        )
+    return family_observation
+
+
 def _attach_normalized_quota_state(
     state: dict[str, Any],
     *,
@@ -1497,9 +1755,11 @@ def _attach_normalized_quota_state(
         or candidate.get("codex_oauth_account_hash")
         or None
     )
+    request_model = str(candidate.get("model") or "")
+    quota_family = _codex_oauth_quota_family_for_model(request_model)
     observation = _alias_routing_state.resolve_normalized_quota_observation(
         provider=str(candidate.get("provider") or ""),
-        model=str(candidate.get("model") or ""),
+        model=request_model,
         account_hash=(
             str(selected_account_hash)
             if selected_account_hash is not None
@@ -1508,27 +1768,45 @@ def _attach_normalized_quota_state(
     )
     if observation is None:
         return state
-    state["quota_observation"] = observation
-    state["quota_remaining_pct"] = observation["remaining_pct"]
+
+    raw_windows = observation.get("windows")
+    family_windows = (
+        _filter_codex_oauth_quota_windows_for_family(
+            raw_windows,
+            family=quota_family,
+        )
+        if isinstance(raw_windows, list)
+        else []
+    )
+    if not family_windows:
+        # Do not let the other quota family hide or invent exhaustion/remaining.
+        return state
+
+    family_observation = _build_family_quota_observation(
+        observation,
+        family_windows=family_windows,
+        quota_family=quota_family,
+    )
+    if family_observation is None:
+        return state
+
+    state["quota_observation"] = family_observation
+    state["quota_family"] = quota_family
+    state["quota_remaining_pct"] = family_observation["remaining_pct"]
     state["quota_snapshot_age_seconds"] = round(
-        float(observation["observation_age_seconds"]),
+        float(family_observation.get("observation_age_seconds") or 0.0),
         3,
     )
-    windows = observation.get("windows")
-    if isinstance(windows, list):
-        state["quota_windows"] = [
-            _codex_oauth_quota_window_public_shape(window)
-            for window in windows
-            if isinstance(window, dict)
-        ]
-        exhausted_windows = [
-            _codex_oauth_quota_window_public_shape(window)
-            for window in windows
-            if isinstance(window, dict)
-            and _codex_oauth_quota_window_is_confirmed_exhausted(window)
-        ]
-        if exhausted_windows:
-            state["quota_exhausted_windows"] = exhausted_windows
+    state["quota_windows"] = _codex_oauth_public_quota_windows(family_windows)
+    exhausted_source = [
+        window
+        for window in family_windows
+        if _codex_oauth_quota_window_is_confirmed_exhausted(window)
+    ]
+    if exhausted_source:
+        state["quota_exhausted_windows"] = _codex_oauth_public_quota_windows(
+            exhausted_source
+        )
     if (
         state.get("quota_exhausted_windows")
         and state.get("skip_reason") is None
@@ -1970,7 +2248,8 @@ def _select_available_state(
     group = tier[0]["candidate"].get("selection_group")
     strategy = tier[0]["candidate"].get("selection_strategy")
     if not group or not strategy:
-        return tier[0]
+        balanced = _prefer_codex_oauth_weekly_balanced_state(tier)
+        return balanced if balanced is not None else tier[0]
 
     states_by_choice: dict[str, list[dict[str, Any]]] = {}
     weights: dict[str, float] = {}
@@ -3199,6 +3478,18 @@ _HOST_FUNCTION_NAMES = (
     "_codex_oauth_quota_window_is_confirmed_exhausted",
     "_build_codex_oauth_terminal_reset_information",
     "_attach_normalized_quota_state",
+    "_codex_oauth_public_quota_windows",
+    "_build_family_quota_observation",
+    "_is_codex_oauth_spark_model",
+    "_codex_oauth_quota_family_for_model",
+    "_codex_oauth_quota_observation_family",
+    "_filter_codex_oauth_quota_windows_for_family",
+    "_codex_oauth_window_remaining_pct",
+    "_codex_oauth_window_is_weekly",
+    "_codex_oauth_weekly_remaining_pct_from_windows",
+    "_codex_oauth_state_weekly_remaining_pct",
+    "_prefer_codex_oauth_weekly_balanced_state",
+    "_select_first_available_codex_oauth_account_state",
     "_apply_codex_oauth_account_context_to_state",
     "_build_codex_auto_agent_affinity_candidate_state",
     "_build_anthropic_auto_agent_affinity_candidate_state",
@@ -3256,6 +3547,10 @@ def install(host_globals: dict) -> None:
     # Copy seam variables into host_globals so rebound functions resolve them.
     host_globals.update({
         "alias_routing_state": alias_routing_state,
+        "math": math,
+        "_CODEX_OAUTH_WEEKLY_BALANCE_BAND_PP": _CODEX_OAUTH_WEEKLY_BALANCE_BAND_PP,
+        "_CODEX_OAUTH_QUOTA_FAMILY_OVERALL": _CODEX_OAUTH_QUOTA_FAMILY_OVERALL,
+        "_CODEX_OAUTH_QUOTA_FAMILY_SPARK": _CODEX_OAUTH_QUOTA_FAMILY_SPARK,
         "_get_codex_active_cooldown_state": _get_codex_active_cooldown_state,
         "_get_anthropic_active_cooldown_state": _get_anthropic_active_cooldown_state,
         "_get_anthropic_merged_codex_openai_cooldown_state": _get_anthropic_merged_codex_openai_cooldown_state,

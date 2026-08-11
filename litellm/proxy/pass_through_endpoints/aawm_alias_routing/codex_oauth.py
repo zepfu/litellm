@@ -861,11 +861,9 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         )
 
     skipped = _selection._build_auto_agent_skipped_candidates_from_states(states)
-    selected_state: Optional[dict[str, Any]] = None
-    for state in states:
-        if _selection._is_auto_agent_candidate_state_available(state):
-            selected_state = state
-            break
+    selected_state = _selection._select_first_available_codex_oauth_account_state(
+        states
+    )
 
     if selected_state is None:
         detail: dict[str, Any] = {
