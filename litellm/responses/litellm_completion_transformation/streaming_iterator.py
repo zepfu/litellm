@@ -5,6 +5,9 @@ from typing import Any, Dict, List, Optional, Union, cast
 
 import litellm
 from litellm.main import stream_chunk_builder
+from litellm.responses.litellm_completion_transformation.function_call_identity import (
+    resolve_responses_function_call_identity,
+)
 from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig,
 )
@@ -93,6 +96,8 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
         self._tool_output_index_by_call_id: dict[str, int] = {}
         self._tool_args_by_call_id: dict[str, str] = {}
         self._tool_call_id_by_index: dict[int, str] = {}
+        # Provider tool/call_id -> Responses function_call item id (fc_*).
+        self._tool_item_id_by_call_id: dict[str, str] = {}
         self._ambiguous_tool_call_indexes: set[int] = set()
         self._next_tool_output_index: int = (
             1  # output_index=0 reserved for the message item
@@ -302,7 +307,24 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             or chunk.choices[0].finish_reason is not None
         )
 
+    def _resolve_tool_stream_identity(self, provider_tool_id: str) -> tuple[str, str]:
+        """
+        Resolve Responses item id + call_id for a streamed Chat Completions tool id.
+
+        ``call_id`` remains the upstream provider id. ``item_id`` is a stable
+        native-looking ``fc_*`` value for non-native provider ids, and is reused
+        for output_item.added/done and function_call_arguments.* item_id fields.
+        """
+        existing = self._tool_item_id_by_call_id.get(provider_tool_id)
+        if existing is not None:
+            return existing, provider_tool_id
+        item_id, call_id = resolve_responses_function_call_identity(provider_tool_id)
+        if call_id:
+            self._tool_item_id_by_call_id[call_id] = item_id
+        return item_id, call_id
+
     def _queue_tool_call_delta_events(self, tool_calls: object) -> None:
+
         """
         Convert chat-completions streaming `tool_calls` deltas into Responses API streaming events.
 
@@ -356,6 +378,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                 fn_name = str(getattr(fn, "name", "") or "")
                 fn_args_delta = str(getattr(fn, "arguments", "") or "")
 
+            item_id, call_id = self._resolve_tool_stream_identity(call_id)
             output_index = self._get_or_assign_tool_output_index(call_id)
 
             if call_id not in self._tool_args_by_call_id:
@@ -367,7 +390,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                     item=BaseLiteLLMOpenAIResponseObject(
                         **{
                             "type": "function_call",
-                            "id": call_id,
+                            "id": item_id,
                             "call_id": call_id,
                             "name": fn_name,
                             "arguments": "",
@@ -390,7 +413,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                     delta_event: BaseLiteLLMOpenAIResponseObject = (
                         FunctionCallArgumentsDeltaEvent(
                             type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DELTA,
-                            item_id=call_id,
+                            item_id=item_id,
                             output_index=output_index,
                             delta=delta_chunk,
                         )
@@ -425,6 +448,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             if not call_id_raw:
                 continue
             call_id = str(call_id_raw)
+            item_id, call_id = self._resolve_tool_stream_identity(call_id)
             output_index = self._get_or_assign_tool_output_index(call_id)
 
             fn = (
@@ -454,7 +478,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                     item=BaseLiteLLMOpenAIResponseObject(
                         **{
                             "type": "function_call",
-                            "id": call_id,
+                            "id": item_id,
                             "call_id": call_id,
                             "name": fn_name,
                             "arguments": "",
@@ -480,7 +504,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                     self._sequence_number += 1
                     delta_event = FunctionCallArgumentsDeltaEvent(
                         type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DELTA,
-                        item_id=call_id,
+                        item_id=item_id,
                         output_index=output_index,
                         delta=delta_chunk,
                     )
@@ -490,7 +514,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             self._sequence_number += 1
             done_event = FunctionCallArgumentsDoneEvent(
                 type=ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE,
-                item_id=call_id,
+                item_id=item_id,
                 output_index=output_index,
                 arguments=final_args,
             )
@@ -505,7 +529,7 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                 item=BaseLiteLLMOpenAIResponseObject(
                     **{
                         "type": "function_call",
-                        "id": call_id,
+                        "id": item_id,
                         "call_id": call_id,
                         "name": fn_name,
                         "arguments": final_args,

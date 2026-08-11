@@ -53,6 +53,7 @@ EXPECTED_SYMBOLS_ORDER: tuple[str, ...] = (
     "_raise_codex_auto_agent_malformed_tool_call_text_payload",
     "_raise_codex_auto_agent_failed_responses_payload",
     "_raise_responses_adapter_failed_response",
+    "_preserve_distinct_function_call_identity_fields",
     "_validate_codex_auto_agent_responses_payload",
 )
 EXPECTED_SYMBOLS: frozenset[str] = frozenset(EXPECTED_SYMBOLS_ORDER)
@@ -250,6 +251,67 @@ class TestPureDetectors:
 
         out = pv._model_response_usage_dict(Usage())
         assert out == {"prompt_tokens": 1, "total_tokens": 4, "output_tokens": 2}
+
+
+class TestPreserveDistinctFunctionCallIdentity:
+    def test_leaves_distinct_id_and_call_id_untouched(self):
+        body = {
+            "output": [
+                {
+                    "type": "function_call",
+                    "id": "fc_abc",
+                    "call_id": "provider_1",
+                    "name": "tool",
+                }
+            ]
+        }
+        out = pv._preserve_distinct_function_call_identity_fields(body)
+        assert out["output"][0]["id"] == "fc_abc"
+        assert out["output"][0]["call_id"] == "provider_1"
+        assert out["output"][0]["id"] != out["output"][0]["call_id"]
+
+    def test_does_not_synthesize_missing_call_id_from_id(self):
+        body = {
+            "output": [
+                {
+                    "type": "function_call",
+                    "id": "fc_only",
+                    "name": "tool",
+                }
+            ]
+        }
+        out = pv._preserve_distinct_function_call_identity_fields(body)
+        assert out["output"][0]["id"] == "fc_only"
+        assert "call_id" not in out["output"][0]
+
+    def test_does_not_synthesize_missing_id_from_call_id(self):
+        body = {
+            "output": [
+                {
+                    "type": "function_call",
+                    "call_id": "provider_only",
+                    "name": "tool",
+                }
+            ]
+        }
+        out = pv._preserve_distinct_function_call_identity_fields(body)
+        assert out["output"][0]["call_id"] == "provider_only"
+        assert "id" not in out["output"][0]
+
+    def test_drops_blank_identity_placeholders_without_backfill(self):
+        body = {
+            "output": [
+                {
+                    "type": "function_call",
+                    "id": "",
+                    "call_id": "provider_1",
+                    "name": "tool",
+                }
+            ]
+        }
+        out = pv._preserve_distinct_function_call_identity_fields(body)
+        assert "id" not in out["output"][0]
+        assert out["output"][0]["call_id"] == "provider_1"
 
 
 class TestMalformedToolCallTextDetector:

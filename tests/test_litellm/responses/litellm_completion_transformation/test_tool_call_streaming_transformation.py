@@ -10,6 +10,9 @@ before response.completed.
 
 from unittest.mock import AsyncMock, MagicMock
 
+from litellm.responses.litellm_completion_transformation.function_call_identity import (
+    resolve_responses_function_call_identity,
+)
 from litellm.responses.litellm_completion_transformation.streaming_iterator import (
     LiteLLMCompletionStreamingIterator,
 )
@@ -64,7 +67,11 @@ def test_tool_call_delta_is_emitted_as_responses_events():
     evt2 = iterator._transform_chat_completion_chunk_to_response_api_chunk(chunk)
     assert evt2 is not None
     assert evt2.type == ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DELTA
-    assert evt2.item_id == "call_1"
+    expected_item_id_1, expected_call_id_1 = resolve_responses_function_call_identity("call_1")
+    assert evt1.item.id == expected_item_id_1
+    assert evt1.item.call_id == expected_call_id_1
+    assert evt1.item.id != evt1.item.call_id
+    assert evt2.item_id == expected_item_id_1
     assert evt2.output_index == 1
     # The delta will be a chunk of the arguments, not the full arguments
     assert len(evt2.delta) <= 10  # Chunks are max 10 characters
@@ -129,7 +136,8 @@ def test_tool_calls_present_only_in_final_response_are_emitted_before_completed(
 
     # The last event should be FUNCTION_CALL_ARGUMENTS_DONE
     assert evt.type == ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DONE
-    assert evt.item_id == "call_2"
+    expected_item_id_2, _ = resolve_responses_function_call_identity("call_2")
+    assert evt.item_id == expected_item_id_2
     assert evt.output_index == 1
     assert evt.arguments == '{"y":2}'
 
@@ -282,7 +290,8 @@ def test_tool_call_arguments_are_chunked_to_match_openai_behavior():
     # Verify each delta is at most 10 characters
     for evt in delta_events:
         assert len(evt.delta) <= 10
-        assert evt.item_id == "call_test"
+        expected_item_id_test, _ = resolve_responses_function_call_identity("call_test")
+        assert evt.item_id == expected_item_id_test
         assert evt.output_index == 1
         assert hasattr(evt, '__dict__') and 'sequence_number' in evt.__dict__
     
@@ -340,7 +349,10 @@ def test_tool_call_delta_without_id_uses_index_mapping():
         if evt.type == ResponsesAPIStreamEvents.OUTPUT_ITEM_ADDED
     ]
     assert len(output_item_added_events) == 1
-    assert output_item_added_events[0].item.id == "call_abc123"
+    expected_item_id_abc, expected_call_id_abc = resolve_responses_function_call_identity("call_abc123")
+    assert output_item_added_events[0].item.id == expected_item_id_abc
+    assert output_item_added_events[0].item.call_id == expected_call_id_abc
+    assert output_item_added_events[0].item.id != output_item_added_events[0].item.call_id
 
 
 def test_parallel_tool_calls_without_ids_use_index_mapping():
@@ -390,13 +402,15 @@ def test_parallel_tool_calls_without_ids_use_index_mapping():
         for evt in all_events
         if evt.type == ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DELTA
     ]
-    arguments_by_call_id = {}
+    item_id_a, _ = resolve_responses_function_call_identity("call_a")
+    item_id_b, _ = resolve_responses_function_call_identity("call_b")
+    arguments_by_item_id = {}
     for evt in delta_events:
-        arguments_by_call_id.setdefault(evt.item_id, "")
-        arguments_by_call_id[evt.item_id] += evt.delta
+        arguments_by_item_id.setdefault(evt.item_id, "")
+        arguments_by_item_id[evt.item_id] += evt.delta
 
-    assert arguments_by_call_id["call_a"] == '{"x":1}'
-    assert arguments_by_call_id["call_b"] == '{"y":2}'
+    assert arguments_by_item_id[item_id_a] == '{"x":1}'
+    assert arguments_by_item_id[item_id_b] == '{"y":2}'
 
 
 def test_reused_index_with_new_call_id_marks_fallback_ambiguous():
@@ -447,12 +461,14 @@ def test_reused_index_with_new_call_id_marks_fallback_ambiguous():
         for evt in all_events
         if evt.type == ResponsesAPIStreamEvents.FUNCTION_CALL_ARGUMENTS_DELTA
     ]
-    arguments_by_call_id = {}
+    item_id_a, _ = resolve_responses_function_call_identity("call_a")
+    item_id_b, _ = resolve_responses_function_call_identity("call_b")
+    arguments_by_item_id = {}
     for evt in delta_events:
-        arguments_by_call_id.setdefault(evt.item_id, "")
-        arguments_by_call_id[evt.item_id] += evt.delta
+        arguments_by_item_id.setdefault(evt.item_id, "")
+        arguments_by_item_id[evt.item_id] += evt.delta
 
-    assert arguments_by_call_id["call_a"] == '{"a":'
-    assert arguments_by_call_id["call_b"] == '{"b":'
-    assert arguments_by_call_id["call_a"] != '{"a":1}'
-    assert arguments_by_call_id["call_b"] != '{"b":1}'
+    assert arguments_by_item_id[item_id_a] == '{"a":'
+    assert arguments_by_item_id[item_id_b] == '{"b":'
+    assert arguments_by_item_id[item_id_a] != '{"a":1}'
+    assert arguments_by_item_id[item_id_b] != '{"b":1}'

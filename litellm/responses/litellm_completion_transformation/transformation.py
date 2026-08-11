@@ -15,6 +15,9 @@ from typing_extensions import TypedDict
 
 from litellm.caching import InMemoryCache
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+from litellm.responses.litellm_completion_transformation.function_call_identity import (
+    resolve_responses_function_call_identity,
+)
 from litellm.responses.litellm_completion_transformation.session_handler import (
     ResponsesSessionHandler,
 )
@@ -1488,11 +1491,14 @@ class LiteLLMCompletionResponsesConfig:
                             else {}
                         )
 
+                item_id, call_id = resolve_responses_function_call_identity(
+                    tool.id or ""
+                )
                 output_tool_call: ResponseFunctionToolCall = ResponseFunctionToolCall(
                     name=function_definition.name or "",
                     arguments=function_definition.get("arguments") or "",
-                    call_id=tool.id or "",
-                    id=tool.id or "",
+                    call_id=call_id,
+                    id=item_id,
                     type="function_call",  # critical this is "function_call" to work with tools like openai codex
                     status=function_definition.get("status") or "completed",
                 )

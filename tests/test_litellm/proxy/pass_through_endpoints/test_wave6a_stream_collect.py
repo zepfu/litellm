@@ -455,7 +455,37 @@ class TestRecordCollectedResponsesArgumentsEvent:
         key = state["ordered_keys"][0]
         assert state["output_items"][key]["arguments"] == '{"a":1}'
         assert state["output_items"][key]["type"] == "function_call"
-        assert state["output_items"][key]["call_id"] == "fc_1"
+        # OPENAI-007: arguments events carry item_id only; do not synthesize call_id.
+        assert state["output_items"][key]["id"] == "fc_1"
+        assert "call_id" not in state["output_items"][key]
+
+    def test_arguments_event_does_not_synthesize_call_id_from_item_id(self) -> None:
+        state = _make_recording_state()
+        # Distinct identity already present on output_item.added.
+        sc._record_collected_responses_output_item_event(
+            event={
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_item_1",
+                    "call_id": "provider_call_1",
+                    "name": "do_thing",
+                    "arguments": "",
+                },
+                "output_index": 0,
+            },
+            **state,
+        )
+        sc._record_collected_responses_arguments_event(
+            event={"item_id": "fc_item_1", "output_index": 0, "delta": '{"a":1}'},
+            event_type="response.function_call_arguments.delta",
+            **state,
+        )
+        key = state["ordered_keys"][0]
+        item = state["output_items"][key]
+        assert item["id"] == "fc_item_1"
+        assert item["call_id"] == "provider_call_1"
+        assert item["id"] != item["call_id"]
+        assert item["arguments"] == '{"a":1}'
 
     def test_done_replaces(self) -> None:
         state = _make_recording_state()

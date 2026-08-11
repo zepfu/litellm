@@ -281,9 +281,12 @@ def _record_collected_responses_arguments_event(
     existing = output_items.get(key, {})
     if not existing:
         item_type = "mcp_call" if "mcp_call" in event_type else "function_call"
-        existing = {"type": item_type, "id": item_id}
-        if item_type == "function_call" and isinstance(item_id, str) and item_id:
-            existing["call_id"] = item_id
+        # Preserve Responses item id on `id` only. Do not synthesize call_id from
+        # item_id: function_call.call_id is the exclusive upstream provider id and
+        # may intentionally differ from the fc_* item id (OPENAI-007).
+        existing = {"type": item_type}
+        if isinstance(item_id, str) and item_id.strip():
+            existing["id"] = item_id.strip()
 
     value = _mapping_or_attr_get(event, "arguments")
     if not isinstance(value, str):

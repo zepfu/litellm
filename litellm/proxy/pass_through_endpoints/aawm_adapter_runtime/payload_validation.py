@@ -70,6 +70,7 @@ _HOST_FUNCTION_NAMES = (
     "_raise_codex_auto_agent_malformed_tool_call_text_payload",
     "_raise_codex_auto_agent_failed_responses_payload",
     "_raise_responses_adapter_failed_response",
+    "_preserve_distinct_function_call_identity_fields",
     "_validate_codex_auto_agent_responses_payload",
 )
 
@@ -461,6 +462,54 @@ def _raise_responses_adapter_failed_response(
     )
 
 
+
+def _preserve_distinct_function_call_identity_fields(
+    response_body: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Preserve distinct Responses function_call ``id`` / ``call_id`` fields.
+
+    OPENAI-007: ``call_id`` is exclusively the upstream provider tool id and
+    ``id`` is the Responses item id (``fc_*``). Adapter validation must not
+    invent one field from the other when only one is present.
+    """
+    if not isinstance(response_body, dict):
+        return response_body
+    output = response_body.get("output")
+    if not isinstance(output, list):
+        return response_body
+
+    preserved_output: list[Any] = []
+    changed = False
+    for item in output:
+        if not isinstance(item, dict) or item.get("type") != "function_call":
+            preserved_output.append(item)
+            continue
+
+        clean_item = dict(item)
+        item_id = clean_item.get("id")
+        call_id = clean_item.get("call_id")
+
+        # Drop blank placeholders only. Never synthesize id from call_id or
+        # call_id from id when the counterpart is missing.
+        if "id" in clean_item and not (isinstance(item_id, str) and item_id.strip()):
+            clean_item.pop("id", None)
+            changed = True
+        if "call_id" in clean_item and not (
+            isinstance(call_id, str) and call_id.strip()
+        ):
+            clean_item.pop("call_id", None)
+            changed = True
+
+        preserved_output.append(clean_item)
+
+    if not changed:
+        return response_body
+    updated = dict(response_body)
+    updated["output"] = preserved_output
+    return updated
+
+
 async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
     response: Response,
     *,
@@ -538,6 +587,10 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             peek.response,
             event_summaries=event_summaries,
         )
+        if isinstance(response_body, dict):
+            response_body = _preserve_distinct_function_call_identity_fields(
+                response_body
+            )
         if _is_failed_responses_body(response_body):  # noqa: F821
             _raise_codex_auto_agent_failed_responses_payload(
                 response_body=response_body,
@@ -623,6 +676,10 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             response_body = json.loads(_decode_http_response_body(response.body))  # noqa: F821
         except Exception:
             return response
+        if isinstance(response_body, dict):
+            response_body = _preserve_distinct_function_call_identity_fields(
+                response_body
+            )
         if isinstance(response_body, dict) and _is_failed_responses_body(response_body):  # noqa: F821
             _raise_codex_auto_agent_failed_responses_payload(
                 response_body=response_body,
