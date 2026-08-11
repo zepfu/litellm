@@ -301,6 +301,84 @@ class TestIterateResponsesSSEEvents:
         assert len(events) == 1
         assert events[0]["type"] == "final"
 
+    def test_handles_crlf_with_separator_split_across_chunks(self):
+        async def body():
+            raw = (
+                'data: {"type":"response.created"}\r\n'
+                "\r\n"
+            )
+            bytes_body = raw.encode()
+            split = len(bytes_body) - 1
+            yield bytes_body[:split]
+            yield bytes_body[split:]
+
+        events = _run(_collect_agen(sse_mod._iterate_responses_sse_events(body())))
+        assert len(events) == 1
+        assert events[0]["type"] == "response.created"
+
+    def test_handles_lone_cr_line_endings(self):
+        async def body():
+            raw = (
+                'data: {"type":"response.created"}\r'
+                'data: {"type":"response.completed"}\r\r'
+            ).encode()
+            yield raw[:-1]
+            yield raw[-1:]
+
+        blocks = _run(
+            _collect_agen(sse_mod._iter_sse_event_blocks_with_separator(body()))
+        )
+        assert blocks == [
+            (
+                'data: {"type":"response.created"}\n'
+                'data: {"type":"response.completed"}',
+                True,
+            )
+        ]
+
+        events = _run(_collect_agen(sse_mod._iterate_responses_sse_events(body())))
+        assert len(events) == 2
+        assert events[0]["type"] == "response.created"
+        assert events[1]["type"] == "response.completed"
+
+    def test_handles_split_utf8_codepoint(self):
+        payload = json.dumps(
+            {
+                "type": "response.completed",
+                "result": "wave\U0001f680",
+            },
+            ensure_ascii=False,
+        )
+        raw = f"data: {payload}\r\n\r\n"
+        marker = "\U0001f680".encode("utf-8")
+        raw_bytes = raw.encode("utf-8")
+        split_at = raw_bytes.index(marker[0:1]) + 1
+
+        async def body():
+            # Force a codepoint split across the chunk boundary.
+            yield raw_bytes[:split_at]
+            yield raw_bytes[split_at:]
+
+        events = _run(_collect_agen(sse_mod._iterate_responses_sse_events(body())))
+        assert len(events) == 1
+        assert events[0]["result"] == "wave🚀"
+
+    def test_keeps_comments_and_repeated_data_lines(self):
+        async def body():
+            yield (
+                ": keep-alive\r\n"
+                "event: response.output_text.delta\r\n"
+                'data: {"type":"response.output_text.delta","item_id":"m","output_index":0,"delta":"a"}\r\n'
+                'data: {"ignored":"line"}\r\n'
+                "\r\n"
+            )
+
+        events = _run(_collect_agen(sse_mod._iterate_responses_sse_events(body())))
+        assert len(events) == 2
+        assert events[0]["type"] == "response.output_text.delta"
+        assert events[0]["delta"] == "a"
+        assert events[1] == {"ignored": "line"}
+
 
 # ===========================================================================
 # SECTION 7: Behavior tests - _responses_sse_from_iterator

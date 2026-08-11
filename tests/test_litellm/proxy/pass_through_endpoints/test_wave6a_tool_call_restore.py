@@ -593,6 +593,33 @@ class TestCustomSSEEventBlock:
         assert result is None
         assert count == 1
 
+    def test_repeated_data_lines_and_comment_passthrough(self, host_deps: None) -> None:
+        payload_line_one = (
+            '{"type":"response.output_item.added","item":{"type":"function_call",'
+            '"name":"my_tool",'
+        )
+        payload_line_two = '"call_id":"my_tool_call","output_index":0}}'
+        block = (
+            ": keep-alive\r\n"
+            "event: response.output_item.added\r\n"
+            f"data: {payload_line_one}\r\n"
+            f"data: {payload_line_two}\r\n"
+            "\r\n"
+        )
+
+        result, count = mod._restore_adapted_custom_tool_calls_in_sse_event_block(
+            block,
+            request_body={"tools": []},
+            adapter_model="m",
+            adapted_names={"my_tool"},
+            state_by_key={},
+        )
+        assert count == 1
+        assert result is not None
+        assert ": keep-alive" in result
+        assert "custom_tool_call" in result
+        assert result.count("data: ") == 1
+
 
 # ===========================================================================
 # SECTION 8 - Namespace stream event payload
@@ -665,6 +692,30 @@ class TestNamespaceSSEEventBlock:
         )
         assert result == block
         assert count == 0
+
+    def test_repeated_data_lines_and_comment_passthrough(self) -> None:
+        payload_line_one = (
+            '{"type":"response.output_item.added","item":{"type":"function_call",'
+            '"name":"tool_a",'
+        )
+        payload_line_two = '"output_index":0}}'
+        block = (
+            ": keep-alive\r\n"
+            "event: response.output_item.added\r\n"
+            f"data: {payload_line_one}\r\n"
+            f"data: {payload_line_two}\r\n"
+            "\r\n"
+        )
+
+        result, count = mod._restore_adapted_namespace_tool_calls_in_sse_event_block(
+            block,
+            namespace_by_name={"tool_a": "ns_adapter"},
+        )
+        assert count == 1
+        assert result is not None
+        assert ": keep-alive" in result
+        assert "ns_adapter" in result
+        assert result.count("data: ") == 1
 
 
 # ===========================================================================
@@ -814,6 +865,53 @@ class TestCustomStreamingResponse:
         # Delta should be suppressed (None return)
         assert "function_call_arguments.delta" not in combined
 
+    def test_stream_restore_with_crlf_split_and_utf8_boundary_and_final_unterminated_block(self, host_deps: None) -> None:
+        from fastapi.responses import StreamingResponse
+
+        payload = {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "name": "my_tool",
+                "call_id": "tool🚀",
+            },
+            "output_index": 0,
+        }
+        event_block = (
+            ": keep-alive\r\n"
+            "event: response.output_item.added\r\n"
+            f"data: {json.dumps(payload, ensure_ascii=False)}\r"
+        )
+        event_bytes = event_block.encode("utf-8")
+        rocket_bytes = "🚀".encode("utf-8")
+        split_boundary = event_bytes.index(b"\r") + 1
+        emoji_at = event_bytes.index(rocket_bytes) if rocket_bytes in event_bytes else split_boundary
+        split_emoji = min(len(event_bytes), emoji_at + 2)
+
+        async def gen():
+            yield event_bytes[:split_boundary]
+            yield event_bytes[split_boundary:split_emoji]
+            yield event_bytes[split_emoji:]
+
+        resp = StreamingResponse(gen(), media_type="text/event-stream")
+        result = mod._restore_adapted_custom_tool_calls_in_streaming_response(
+            resp, request_body={"tools": []}, adapter_model="m",
+        )
+
+        async def collect():
+            chunks = []
+            async for chunk in result.body_iterator:
+                chunks.append(chunk)
+            return chunks
+
+        chunks = asyncio.run(collect())
+        combined = "".join(chunks)
+        assert "custom_tool_call" in combined
+        assert "tool🚀" in combined
+        # final unterminated block should not be double-terminated
+        assert not combined.endswith("\n\n")
+        assert ": keep-alive" in combined
+
 
 # ===========================================================================
 # SECTION 13 - Namespace streaming response wrapper
@@ -846,3 +944,43 @@ class TestNamespaceStreamingResponse:
             resp, request_body={"tools": []}, adapter_model="test-model",
         )
         assert result is not resp
+
+    def test_stream_restore_preserves_crlf_comment_and_final_unterminated_block(self, host_deps: None) -> None:
+        from fastapi.responses import StreamingResponse
+
+        payload = {
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "name": "tool_a",
+            },
+            "output_index": 0,
+        }
+        event_block = (
+            ": keep-alive\r\n"
+            "event: response.output_item.added\r\n"
+            f"data: {json.dumps(payload)}\r"
+        )
+        event_bytes = event_block.encode("utf-8")
+        split_boundary = event_bytes.index(b"\r") + 1
+
+        async def gen():
+            yield event_bytes[:split_boundary]
+            yield event_bytes[split_boundary:]
+
+        resp = StreamingResponse(gen(), media_type="text/event-stream")
+        result = mod._restore_adapted_namespace_tool_calls_in_streaming_response(
+            resp, request_body={"tools": []}, adapter_model="test-model",
+        )
+
+        async def collect():
+            chunks = []
+            async for chunk in result.body_iterator:
+                chunks.append(chunk)
+            return chunks
+
+        chunks = asyncio.run(collect())
+        combined = "".join(chunks)
+        assert ": keep-alive" in combined
+        assert "ns_adapter" in combined
+        assert not combined.endswith("\n\n")

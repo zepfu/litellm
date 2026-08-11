@@ -6,7 +6,6 @@ Do not import llm_passthrough_endpoints at module scope.
 
 from __future__ import annotations
 
-import codecs
 import json
 from typing import Any, Optional
 
@@ -430,38 +429,24 @@ def _restore_adapted_custom_tool_calls_in_streaming_response(
     original_iterator = response.body_iterator
 
     async def _restoring_iterator() -> Any:
-        buffer = ""
-        decoder = codecs.getincrementaldecoder("utf-8")()
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+            sse as sse_runtime,
+        )
+
         state_by_key: dict[str, dict[str, Any]] = {}
-        async for raw_chunk in original_iterator:
-            if isinstance(raw_chunk, bytes):
-                buffer += decoder.decode(raw_chunk)
-            else:
-                buffer += str(raw_chunk)
-
-            while "\n\n" in buffer:
-                event_block, buffer = buffer.split("\n\n", 1)
-                restored_block, _ = _restore_adapted_custom_tool_calls_in_sse_event_block(
-                    event_block,
-                    request_body=request_body,
-                    adapter_model=adapter_model,
-                    adapted_names=adapted_names,
-                    state_by_key=state_by_key,
-                )
-                if restored_block is not None:
-                    yield f"{restored_block}\n\n"
-
-        buffer += decoder.decode(b"", final=True)
-        if buffer:
+        async for event_block, has_trailing_separator in sse_runtime._iter_sse_event_blocks_with_separator(original_iterator):
             restored_block, _ = _restore_adapted_custom_tool_calls_in_sse_event_block(
-                buffer,
+                event_block,
                 request_body=request_body,
                 adapter_model=adapter_model,
                 adapted_names=adapted_names,
                 state_by_key=state_by_key,
             )
             if restored_block is not None:
-                yield restored_block
+                if has_trailing_separator:
+                    yield f"{restored_block}\n\n"
+                else:
+                    yield restored_block
 
     return StreamingResponse(
         _restoring_iterator(),
@@ -569,29 +554,19 @@ def _restore_adapted_namespace_tool_calls_in_streaming_response(
     original_iterator = response.body_iterator
 
     async def _restoring_iterator() -> Any:
-        buffer = ""
-        decoder = codecs.getincrementaldecoder("utf-8")()
-        async for raw_chunk in original_iterator:
-            if isinstance(raw_chunk, bytes):
-                buffer += decoder.decode(raw_chunk)
-            else:
-                buffer += str(raw_chunk)
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+            sse as sse_runtime,
+        )
 
-            while "\n\n" in buffer:
-                event_block, buffer = buffer.split("\n\n", 1)
-                restored_block, _ = _restore_adapted_namespace_tool_calls_in_sse_event_block(
-                    event_block,
-                    namespace_by_name=namespace_by_name,
-                )
-                yield f"{restored_block}\n\n"
-
-        buffer += decoder.decode(b"", final=True)
-        if buffer:
+        async for event_block, has_trailing_separator in sse_runtime._iter_sse_event_blocks_with_separator(original_iterator):
             restored_block, _ = _restore_adapted_namespace_tool_calls_in_sse_event_block(
-                buffer,
+                event_block,
                 namespace_by_name=namespace_by_name,
             )
-            yield restored_block
+            if has_trailing_separator:
+                yield f"{restored_block}\n\n"
+            else:
+                yield restored_block
 
     return StreamingResponse(
         _restoring_iterator(),

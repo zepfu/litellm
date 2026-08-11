@@ -140,33 +140,70 @@ def _serialize_responses_adapter_response(response_obj: Any) -> str:
     return json.dumps(response_obj)
 
 
+async def _iter_sse_event_blocks_with_separator(body_iterator: Any):
+    """Yield raw SSE event blocks from an async body iterator.
+
+    Supports LF (`\n`), CRLF (`\r\n`), and CR (`\r`) line endings even when
+    boundaries split across chunks. Uses an incremental UTF-8 decoder so split
+    code points are preserved and flushes a final unterminated block at EOF.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    buffer = ""
+    trailing_cr = False
+
+    async for raw_chunk in body_iterator:
+        text_chunk = decoder.decode(raw_chunk) if isinstance(raw_chunk, bytes) else str(raw_chunk)
+        if not text_chunk:
+            continue
+
+        if trailing_cr:
+            text_chunk = f"\r{text_chunk}"
+            trailing_cr = False
+
+        if text_chunk.endswith("\r"):
+            text_chunk = text_chunk[:-1]
+            trailing_cr = True
+
+        if text_chunk:
+            buffer += text_chunk.replace("\r\n", "\n").replace("\r", "\n")
+
+        while "\n\n" in buffer:
+            event_block, buffer = buffer.split("\n\n", 1)
+            yield event_block, True
+
+    tail = decoder.decode(b"", final=True)
+    if trailing_cr:
+        tail = f"\r{tail}"
+
+    if tail:
+        buffer += tail.replace("\r\n", "\n").replace("\r", "\n")
+
+    while "\n\n" in buffer:
+        event_block, buffer = buffer.split("\n\n", 1)
+        yield event_block, True
+
+    if buffer:
+        yield buffer, False
+
+
+async def _iter_sse_event_blocks(body_iterator: Any):
+    """Yield raw SSE event blocks from an async body iterator."""
+    async for event_block, _ in _iter_sse_event_blocks_with_separator(body_iterator):
+        yield event_block
+
+
 async def _iterate_responses_sse_events(
     body_iterator: Any,
+    _iter_sse_blocks=_iter_sse_event_blocks,
 ) -> Any:
     """Yield parsed SSE event dicts (RR-054 #27: no dict<->namespace round-trip)."""
     from litellm.llms.base_llm.base_model_iterator import BaseModelResponseIterator
 
-    buffer = ""
-    decoder = codecs.getincrementaldecoder("utf-8")()
-    async for raw_chunk in body_iterator:
-        if isinstance(raw_chunk, bytes):
-            buffer += decoder.decode(raw_chunk)
-        else:
-            buffer += str(raw_chunk)
-
-        while "\n\n" in buffer:
-            event_block, buffer = buffer.split("\n\n", 1)
-            for line in event_block.splitlines():
-                parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(line)
-                if parsed_chunk is not None:
-                    # Prefer plain dicts; consumers already accept dict or attr form.
-                    yield parsed_chunk
-
-    buffer += decoder.decode(b"", final=True)
-    if buffer.strip():
-        for line in buffer.splitlines():
+    async for event_block in _iter_sse_blocks(body_iterator):
+        for line in event_block.splitlines():
             parsed_chunk = BaseModelResponseIterator._string_to_dict_parser(line)
             if parsed_chunk is not None:
+                # Prefer plain dicts; consumers already accept dict or attr form.
                 yield parsed_chunk
 
 
