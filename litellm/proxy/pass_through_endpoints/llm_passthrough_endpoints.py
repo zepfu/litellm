@@ -3028,21 +3028,46 @@ _rewrite_grok_native_unsupported_input_items_in_place = _wave6b_xai_request_prep
 
 def _should_preserve_openai_client_auth(request: Request, endpoint: str) -> bool:
     """
-    Preserve inbound client auth only for OpenAI Responses and model-list
-    passthrough traffic.
+    Preserve inbound client auth only for OpenAI model-list passthrough when
+    Codex-native markers are present.
 
-    This keeps Codex-style already-authenticated requests as close to native
-    behavior as possible while leaving the existing server-authenticated
-    passthrough behavior intact for other OpenAI endpoints.
+    Direct OpenAI Responses traffic (including Codex-native clients) must bind
+    to the server Codex OAuth inventory before egress and must not forward
+    inbound Authorization / ChatGPT-Account-Id as upstream credentials.
     """
     if _is_openai_responses_endpoint(endpoint):
-        return _request_has_openai_client_auth(request)
+        return False
     if _is_openai_models_endpoint(endpoint):
         return _request_has_openai_client_auth(request) and _request_uses_codex_native_auth(request)
     return False
 
 
-def _get_openai_passthrough_target_base(request: Request, endpoint: str) -> str:
+def _should_use_direct_codex_oauth_inventory(
+    request: Request,
+    *,
+    endpoint: str,
+    request_body: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Whether direct Responses must bind enabled account1/account2 inventory."""
+    return _aawm_codex_oauth._should_bind_direct_codex_oauth_inventory(
+        request,
+        endpoint=endpoint,
+        request_body=request_body,
+    )
+
+
+def _get_openai_passthrough_target_base(
+    request: Request,
+    endpoint: str,
+    *,
+    request_body: Optional[dict[str, Any]] = None,
+) -> str:
+    if _should_use_direct_codex_oauth_inventory(
+        request,
+        endpoint=endpoint,
+        request_body=request_body,
+    ):
+        return os.getenv("CHATGPT_API_BASE") or CHATGPT_API_BASE
     if _should_preserve_openai_client_auth(request=request, endpoint=endpoint):
         if _request_uses_codex_native_auth(request):
             return os.getenv("CHATGPT_API_BASE") or CHATGPT_API_BASE
@@ -5617,19 +5642,41 @@ async def openai_proxy_route(
     base_target_url = _get_openai_passthrough_target_base(
         request=request,
         endpoint=endpoint,
+        request_body=request_body,
     )
     preserve_client_auth = _should_preserve_openai_client_auth(
         request=request,
         endpoint=endpoint,
     )
+    use_direct_codex_oauth_inventory = _should_use_direct_codex_oauth_inventory(
+        request,
+        endpoint=endpoint,
+        request_body=request_body,
+    )
     openai_api_key: Optional[str] = None
     forward_headers = False
+    extra_headers: Optional[dict[str, str]] = None
     if is_oa_xai_request:
         base_target_url = os.getenv("LITELLM_XAI_OAUTH_API_BASE") or XAI_API_BASE
     elif is_grok_native_oauth_request:
         base_target_url = _get_grok_passthrough_target_base()
     elif is_codex_auto_agent_alias_request:
         base_target_url = os.getenv("CHATGPT_API_BASE") or CHATGPT_API_BASE
+    elif use_direct_codex_oauth_inventory:
+        # OPENAI-006: bind inventory before handler fallthrough so D1-612 and
+        # upstream auth never depend on inbound client bearer / account ids.
+        (
+            selected_auth,
+            _selection_state,
+            _metadata_body,
+        ) = await _aawm_codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+            request,
+            request_body=request_body,
+        )
+        base_target_url = os.getenv("CHATGPT_API_BASE") or CHATGPT_API_BASE
+        extra_headers = dict(selected_auth.headers)
+        forward_headers = False
+        openai_api_key = None
     elif preserve_client_auth:
         forward_headers = True
     else:
@@ -5648,6 +5695,7 @@ async def openai_proxy_route(
         base_target_url=base_target_url,
         api_key=openai_api_key,
         custom_llm_provider=litellm.LlmProviders.OPENAI,
+        extra_headers=extra_headers,
         forward_headers=forward_headers,
     )
 

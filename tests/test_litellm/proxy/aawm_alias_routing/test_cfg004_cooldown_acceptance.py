@@ -1606,9 +1606,15 @@ class TestCfg004AuthBypass:
 
     @patch(f"{_PASSTHROUGH_MOD}.user_api_key_auth", new_callable=AsyncMock)
     @patch.dict("os.environ", {}, clear=False)
-    async def test_existing_codex_client_auth_forwarding_unchanged(self, mock_auth):
-        """Without any CFG-004 env vars, auth delegates normally and
-        preserve_client_auth logic is untouched."""
+    async def test_responses_client_auth_is_not_forwarded_server_inventory_supplies_credentials(
+        self, mock_auth
+    ):
+        """OPENAI-006: Responses does not preserve/forward inbound client auth.
+
+        CFG-004 still delegates auth dependency normally when unset, but
+        Responses credential egress is supplied by server Codex OAuth inventory
+        rather than inbound client Authorization forwarding.
+        """
         from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
             _cfg004_openai_passthrough_auth_dependency,
             _should_preserve_openai_client_auth,
@@ -1621,8 +1627,7 @@ class TestCfg004AuthBypass:
             request=request, endpoint="v1/responses", api_key="Bearer oauth-token"
         )
         mock_auth.assert_called_once()
-        # preserve_client_auth still works for Responses + auth header.
-        assert _should_preserve_openai_client_auth(request, "v1/responses") is True
+        assert _should_preserve_openai_client_auth(request, "v1/responses") is False
 
 
 # ---------------------------------------------------------------------------

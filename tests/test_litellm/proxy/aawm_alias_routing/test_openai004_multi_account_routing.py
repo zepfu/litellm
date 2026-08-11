@@ -450,7 +450,7 @@ def _patch_candidate_loop_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         lpe,
         "_classify_codex_auto_agent_retryable_exhaustion",
-        lambda exc: "capacity_exhausted",
+        lambda exc, *args, candidate=None, **kwargs: "capacity_exhausted",
     )
     monkeypatch.setattr(
         lpe,
@@ -843,3 +843,422 @@ async def test_selected_account_drives_both_ingress_auth_and_redaction(
     ):
         assert secret not in public_error
         assert secret not in public_candidate
+
+
+# ---------------------------------------------------------------------------
+# OPENAI-006: direct concrete Responses inventory binding
+# ---------------------------------------------------------------------------
+
+
+def _direct_request(
+    *,
+    authorization: str = "Bearer inbound-client-secret",
+    chatgpt_account_id: str = "inbound-chatgpt-account",
+    session_id: str = "sess-direct-1",
+    originator: str = "codex_cli_rs",
+) -> Request:
+    headers: list[tuple[bytes, bytes]] = [
+        (b"authorization", authorization.encode()),
+        (b"chatgpt-account-id", chatgpt_account_id.encode()),
+        (b"session_id", session_id.encode()),
+        (b"originator", originator.encode()),
+        (b"user-agent", b"codex_cli_rs/0.1"),
+    ]
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/openai/v1/responses",
+            "raw_path": b"/openai/v1/responses",
+            "query_string": b"",
+            "headers": headers,
+            "client": ("127.0.0.1", 1234),
+            "server": ("testserver", 80),
+        }
+    )
+
+
+def _patch_direct_inventory_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[str]:
+    loaded: list[str] = []
+
+    def _fake_inventory() -> CodexOAuthInventory:
+        return _inventory()
+
+    async def _fake_load_headers(
+        request: Request,
+        record: CodexOAuthCredentialRecord,
+    ) -> codex_oauth.CodexOAuthRequestAuth:
+        loaded.append(record.label)
+        return codex_oauth.CodexOAuthRequestAuth(
+            account_label=record.label,
+            account_hash=record.expected_account_hash,
+            lane_key=codex_oauth._codex_oauth_account_lane_key(
+                account_label=record.label,
+                account_hash=record.expected_account_hash,
+            ),
+            headers={
+                "Authorization": f"Bearer server-token-{record.label}",
+                "ChatGPT-Account-Id": f"server-acct-{record.label}",
+                "session_id": "sess-direct-1",
+                "originator": "litellm-server",
+            },
+        )
+
+    monkeypatch.setattr(
+        "litellm.secret_managers.codex_oauth_inventory.load_codex_oauth_inventory",
+        _fake_inventory,
+    )
+    monkeypatch.setattr(codex_oauth, "load_codex_oauth_inventory", _fake_inventory)
+    monkeypatch.setattr(
+        codex_oauth,
+        "_load_codex_oauth_headers_for_record",
+        _fake_load_headers,
+    )
+    return loaded
+
+
+@pytest.mark.asyncio
+async def test_direct_responses_binds_enabled_inventory_and_strips_inbound_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = _patch_direct_inventory_auth(monkeypatch)
+    request = _direct_request()
+    body = {"model": "gpt-5.6-sol", "input": "hello"}
+
+    selected_auth, selection, metadata_body = (
+        await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+            request,
+            request_body=body,
+        )
+    )
+    assert selected_auth.account_label == "account1"
+    assert selected_auth.account_hash == "hash-account-1"
+    assert selected_auth.headers["Authorization"] == (
+        "Bearer server-token-account1"
+    )
+    assert selected_auth.headers["ChatGPT-Account-Id"] == (
+        "server-acct-account1"
+    )
+    assert "inbound-client-secret" not in str(selected_auth.headers)
+    assert "inbound-chatgpt-account" not in str(selected_auth.headers)
+    # Auth-check all enabled accounts, then reload the selected credential.
+    assert "account1" in loaded
+    assert loaded[-1] == "account1"
+
+    bound = codex_oauth._get_bound_codex_oauth_candidate_identity(request)
+    assert bound is not None
+    assert bound["account_label"] == "account1"
+    assert bound["account_hash"] == "hash-account-1"
+    assert bound["lane_key"] == "codex-oauth:account1:hash-account-1"
+
+    meta = metadata_body.get("litellm_metadata") or {}
+    assert meta.get("codex_oauth_account_label") == "account1"
+    assert meta.get("codex_auto_agent_selected_account_hash") == "hash-account-1"
+    assert meta.get("codex_auto_agent_selected_account_lane") == (
+        "codex-oauth:account1:hash-account-1"
+    )
+    assert selection.get("selection_reason") == (
+        "direct_inventory_first_available"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_responses_respects_session_owner_account_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = _patch_direct_inventory_auth(monkeypatch)
+    request = _direct_request()
+    body = {"model": "gpt-5.6-terra", "input": "continue"}
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+
+    async def _owned(**kwargs):
+        return (
+            {
+                "state": "owned",
+                "owner": "owner-1",
+                "attributes": {
+                    "provider": "openai",
+                    "model": "gpt-5.6-terra",
+                    "route_family": "codex_oauth",
+                    "account_label": "account2",
+                    "account_hash": "hash-account-2",
+                    "account_lane": "codex-oauth:account2:hash-account-2",
+                },
+            },
+            "cache-key",
+            None,
+        )
+
+    monkeypatch.setattr(
+        sa,
+        "resolve_canonical_session_identity",
+        lambda *a, **k: "sess-pin",
+    )
+    monkeypatch.setattr(sa, "get_session_owner_record", _owned)
+
+    selected_auth, selection, _metadata_body = (
+        await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+            request,
+            request_body=body,
+        )
+    )
+    assert selected_auth.account_label == "account2"
+    assert selected_auth.account_hash == "hash-account-2"
+    assert set(loaded) == {"account2"}
+    assert selection.get("selection_reason") == "session_owner_pin"
+
+
+@pytest.mark.asyncio
+async def test_direct_responses_respects_request_metadata_account_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = _patch_direct_inventory_auth(monkeypatch)
+    request = _direct_request()
+    body = {
+        "model": "gpt-5.6-sol",
+        "input": "continue",
+        "litellm_metadata": {
+            "codex_oauth_account_label": "account2",
+            "codex_oauth_account_hash": "hash-account-2",
+            "codex_oauth_lane_key": "codex-oauth:account2:hash-account-2",
+        },
+    }
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+
+    # No durable owner pin; request metadata must drive continuation account.
+    monkeypatch.setattr(
+        sa,
+        "resolve_canonical_session_identity",
+        lambda *a, **k: None,
+    )
+
+    selected_auth, selection, metadata_body = (
+        await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+            request,
+            request_body=body,
+        )
+    )
+    assert selected_auth.account_label == "account2"
+    assert selected_auth.account_hash == "hash-account-2"
+    assert set(loaded) == {"account2"}
+    # Request-metadata continuation pin must drive selection (not first-available).
+    assert selection.get("selection_reason") == "request_metadata_pin"
+    assert selection.get("request_mode") == "ordinary_continuation"
+    meta = metadata_body.get("litellm_metadata") or {}
+    assert meta.get("codex_auto_agent_selected_account_label") == "account2"
+    assert meta.get("codex_auto_agent_selected_account_hash") == "hash-account-2"
+    assert meta.get("codex_auto_agent_selected_account_lane") == (
+        "codex-oauth:account2:hash-account-2"
+    )
+    assert meta.get("codex_auto_agent_selection_reason") == "request_metadata_pin"
+
+
+@pytest.mark.asyncio
+async def test_direct_responses_skips_exhausted_account_and_fails_over(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = _patch_direct_inventory_auth(monkeypatch)
+    request = _direct_request()
+    body = {"model": "gpt-5.6-luna", "input": "hello"}
+    now = datetime.now(timezone.utc)
+    alias_routing_state.reset_for_tests()
+    alias_routing_state.record_normalized_quota_observations(
+        [
+            _quota_observation(
+                account_hash="hash-account-1",
+                observed_at=now,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=True,
+            )
+        ]
+    )
+    # Quota helper defaults model to gpt-5.3-codex; store matching model row too.
+    alias_routing_state.record_normalized_quota_observations(
+        [
+            {
+                **_quota_observation(
+                    account_hash="hash-account-1",
+                    observed_at=now,
+                    reset_at=now + timedelta(hours=2),
+                    quota_period="five_hour",
+                    window_minutes=300,
+                    exhausted=True,
+                ),
+                "model": "gpt-5.6-luna",
+            }
+        ]
+    )
+
+    selected_auth, selection, metadata_body = (
+        await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+            request,
+            request_body=body,
+        )
+    )
+    assert selected_auth.account_label == "account2"
+    assert "account2" in loaded
+    assert loaded[-1] == "account2"
+    meta = metadata_body.get("litellm_metadata") or {}
+    assert meta.get("codex_auto_agent_selected_account_label") == "account2"
+    skipped = selection.get("skipped") or []
+    account1_skipped = [
+        item
+        for item in skipped
+        if item.get("account_label") == "account1"
+    ]
+    assert account1_skipped, f"expected account1 skipped, got {skipped!r}"
+    # Selection-time failover must skip account1 specifically for quota
+    # exhaustion evidence with cooldown sourced from the normalized quota
+    # observation (assert both fields independently; no soft or).
+    assert all(
+        item.get("reason") == "quota_exhausted"
+        for item in account1_skipped
+    ), f"account1 skip reasons not quota_exhausted: {account1_skipped!r}"
+    assert all(
+        item.get("cooldown_state_source") == "normalized_quota_observation"
+        for item in account1_skipped
+    ), f"account1 cooldown source missing: {account1_skipped!r}"
+    alias_routing_state.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_route_direct_uses_inventory_not_client_or_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = _patch_direct_inventory_auth(monkeypatch)
+    request = _direct_request()
+    body = {"model": "gpt-5.6-sol", "input": "hello"}
+
+    async def _fake_get_body(req):
+        return dict(body)
+
+    captured: dict[str, Any] = {}
+
+    async def _fake_base_handler(**kwargs):
+        captured.update(kwargs)
+        return Response(content=b"ok", status_code=200)
+
+    monkeypatch.setattr(lpe, "get_request_body", _fake_get_body)
+    monkeypatch.setattr(
+        lpe.BaseOpenAIPassThroughHandler,
+        "_base_openai_pass_through_handler",
+        _fake_base_handler,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_resolve_codex_auto_agent_alias_model",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(lpe, "_is_oa_xai_request_body", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        lpe, "_is_grok_native_oauth_request_body", lambda *_a, **_k: False
+    )
+    monkeypatch.setattr(
+        lpe.passthrough_endpoint_router,
+        "get_credentials",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("OPENAI_API_KEY fallback must not be used")
+        ),
+    )
+
+    response = await lpe.openai_proxy_route(
+        endpoint="v1/responses",
+        request=request,
+        fastapi_response=Response(),
+        user_api_key_dict=object(),  # type: ignore[arg-type]
+    )
+    assert response.status_code == 200
+    assert captured.get("api_key") is None
+    assert captured.get("forward_headers") is False
+    extra = captured.get("extra_headers") or {}
+    assert extra.get("Authorization") == "Bearer server-token-account1"
+    assert extra.get("ChatGPT-Account-Id") == "server-acct-account1"
+    assert "inbound-client-secret" not in str(extra)
+    assert "inbound-chatgpt-account" not in str(extra)
+    target = str(captured.get("base_target_url") or "")
+    assert "api.openai.com" not in target
+    assert "account1" in loaded
+    assert lpe._should_preserve_openai_client_auth(request, "v1/responses") is False
+
+
+def test_should_bind_direct_inventory_for_concrete_codex_targets() -> None:
+    request = _direct_request()
+    assert (
+        codex_oauth._should_bind_direct_codex_oauth_inventory(
+            request,
+            endpoint="v1/responses",
+            request_body={"model": "gpt-5.6-sol"},
+        )
+        is True
+    )
+    assert (
+        codex_oauth._should_bind_direct_codex_oauth_inventory(
+            request,
+            endpoint="v1/responses",
+            request_body={"model": "gpt-5.3-codex-spark"},
+        )
+        is True
+    )
+    # Config-derived classification (no name heuristics): exclusive responses
+    # openai catalog rows and chatgpt-provider twins bind; dual chat models do not.
+    assert codex_oauth._is_direct_codex_oauth_inventory_model("gpt-5.6-terra") is True
+    assert codex_oauth._is_direct_codex_oauth_inventory_model("gpt-5.6-luna") is True
+    assert codex_oauth._is_direct_codex_oauth_inventory_model("gpt-4o") is False
+    bare = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/responses",
+            "raw_path": b"/v1/responses",
+            "query_string": b"",
+            "headers": [(b"authorization", b"Bearer sk-test")],
+            "client": ("127.0.0.1", 1234),
+            "server": ("testserver", 80),
+        }
+    )
+    assert (
+        codex_oauth._should_bind_direct_codex_oauth_inventory(
+            bare,
+            endpoint="v1/responses",
+            request_body={"model": "gpt-4o"},
+        )
+        is False
+    )
+    # Model-less non-native fails closed (no inventory bind / no blind default).
+    assert (
+        codex_oauth._should_bind_direct_codex_oauth_inventory(
+            bare,
+            endpoint="v1/responses",
+            request_body={},
+        )
+        is False
+    )
+    # Model-less Codex-native auth remains the non-model-scoped contract.
+    assert (
+        codex_oauth._should_bind_direct_codex_oauth_inventory(
+            request,
+            endpoint="v1/responses",
+            request_body={},
+        )
+        is True
+    )
+    assert (
+        codex_oauth._should_bind_direct_codex_oauth_inventory(
+            bare,
+            endpoint="v1/chat/completions",
+            request_body={"model": "gpt-5.6-sol"},
+        )
+        is False
+    )

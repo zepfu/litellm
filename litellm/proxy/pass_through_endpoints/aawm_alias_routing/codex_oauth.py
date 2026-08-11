@@ -13,7 +13,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 import httpx
 from fastapi import HTTPException, Request
@@ -411,6 +411,564 @@ async def _load_local_codex_auth_headers(request: Request) -> dict[str, str]:
     """Compatibility wrapper for the current first-eligible account consumer."""
     selection = await _load_local_codex_auth_selection(request)
     return dict(selection.headers)
+
+
+
+# ---------------------------------------------------------------------------
+# Direct concrete Responses inventory binding (OPENAI-006)
+# ---------------------------------------------------------------------------
+
+
+def _endpoint_is_openai_responses_path(endpoint: str) -> bool:
+    endpoint_path = httpx.URL(endpoint).path.rstrip("/")
+    if not endpoint_path.startswith("/"):
+        endpoint_path = "/" + endpoint_path
+    return (
+        endpoint_path == "/responses"
+        or endpoint_path == "/v1/responses"
+        or endpoint_path.startswith("/responses/")
+        or endpoint_path.startswith("/v1/responses/")
+    )
+
+
+def _normalize_supported_endpoint_set(endpoints: Any) -> set[str]:
+    if not isinstance(endpoints, (list, tuple, set)):
+        return set()
+    normalized: set[str] = set()
+    for endpoint in endpoints:
+        cleaned = _clean_codex_auth_value(endpoint)
+        if cleaned is None:
+            continue
+        path = cleaned if cleaned.startswith("/") else f"/{cleaned}"
+        normalized.add(path.rstrip("/") or "/")
+    return normalized
+
+
+def _load_direct_codex_oauth_model_cost_maps() -> tuple[dict[str, Any], ...]:
+    """Return configured model catalogs without hardcoding target names."""
+    maps: list[dict[str, Any]] = []
+    try:
+        from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
+            load_bundled_model_cost_map_for_codex_policy,
+        )
+
+        bundled = load_bundled_model_cost_map_for_codex_policy()
+        if isinstance(bundled, dict) and bundled:
+            maps.append(bundled)
+    except Exception:
+        pass
+    try:
+        import litellm as _litellm
+
+        live = getattr(_litellm, "model_cost", None)
+        if isinstance(live, dict) and live:
+            maps.append(live)
+    except Exception:
+        pass
+    return tuple(maps)
+
+
+def _iter_direct_codex_oauth_model_info_entries(
+    model: str,
+) -> list[dict[str, Any]]:
+    cleaned = _clean_codex_auth_value(model)
+    if cleaned is None:
+        return []
+    bare = cleaned.split("/", 1)[-1]
+    lookup_keys = (cleaned, bare, f"chatgpt/{bare}")
+    entries: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for cost_map in _load_direct_codex_oauth_model_cost_maps():
+        for key in lookup_keys:
+            info = cost_map.get(key)
+            if not isinstance(info, dict):
+                continue
+            marker = id(info)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            entries.append(info)
+    return entries
+
+
+def _model_info_is_chatgpt_codex_inventory_target(info: Mapping[str, Any]) -> bool:
+    """Classify ChatGPT/Codex inventory targets from structured model metadata."""
+    provider = str(info.get("litellm_provider") or "").strip().lower()
+    if provider == "chatgpt":
+        return True
+    if provider != "openai":
+        return False
+    endpoints = _normalize_supported_endpoint_set(info.get("supported_endpoints"))
+    if "/v1/responses" not in endpoints and "/responses" not in endpoints:
+        return False
+    # Dual public chat+responses OpenAI API models stay on API-key routes.
+    # Codex/ChatGPT inventory targets are responses-catalogued without chat
+    # completions (gpt-5.6-*, exclusive codex rows, chatgpt-provider twins).
+    has_chat_completions = any(
+        endpoint == "/v1/chat/completions" or endpoint.endswith("/chat/completions")
+        for endpoint in endpoints
+    )
+    return not has_chat_completions
+
+
+def _snapshot_lists_openai_codex_responses_model(model: str) -> bool:
+    """True when the active alias snapshot lists model on openai/codex_responses."""
+    cleaned = _clean_codex_auth_value(model)
+    if cleaned is None:
+        return False
+    bare = cleaned.split("/", 1)[-1]
+    try:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
+            get_active_routing_snapshot,
+        )
+    except Exception:
+        return False
+    try:
+        snapshot = get_active_routing_snapshot()
+    except Exception:
+        return False
+    if snapshot is None:
+        return False
+    aliases = getattr(snapshot, "aliases", None)
+    if not isinstance(aliases, Mapping):
+        return False
+    for alias in aliases.values():
+        candidates = getattr(alias, "candidates", ()) or ()
+        for candidate in candidates:
+            provider = str(getattr(candidate, "provider", "") or "").strip().lower()
+            route_family = str(
+                getattr(candidate, "route_family", "") or ""
+            ).strip().lower()
+            candidate_model = _clean_codex_auth_value(getattr(candidate, "model", None))
+            if provider != "openai" or route_family != "codex_responses":
+                continue
+            if candidate_model is None:
+                continue
+            if candidate_model == cleaned or candidate_model.split("/", 1)[-1] == bare:
+                return True
+    return False
+
+
+def _is_direct_codex_oauth_inventory_model(model: Any) -> bool:
+    """True when model is a configured ChatGPT/Codex inventory target."""
+    cleaned = _clean_codex_auth_value(model)
+    if cleaned is None:
+        return False
+    if _snapshot_lists_openai_codex_responses_model(cleaned):
+        return True
+    bare = cleaned.split("/", 1)[-1]
+    # A chatgpt/* catalog twin is authoritative ChatGPT/Codex inventory metadata
+    # even when the bare OpenAI row also advertises dual public chat endpoints.
+    for cost_map in _load_direct_codex_oauth_model_cost_maps():
+        twin = cost_map.get(f"chatgpt/{bare}")
+        if isinstance(twin, dict) and _model_info_is_chatgpt_codex_inventory_target(
+            twin
+        ):
+            return True
+    for info in _iter_direct_codex_oauth_model_info_entries(cleaned):
+        if _model_info_is_chatgpt_codex_inventory_target(info):
+            return True
+    return False
+
+
+def _direct_codex_oauth_concrete_model_name(model: Any) -> Optional[str]:
+    """Return cleaned model when it is a ChatGPT/Codex inventory target."""
+    cleaned = _clean_codex_auth_value(model)
+    if cleaned is None:
+        return None
+    if _is_direct_codex_oauth_inventory_model(cleaned):
+        return cleaned
+    return None
+
+
+def _should_bind_direct_codex_oauth_inventory(
+    request: Request,
+    *,
+    endpoint: str,
+    request_body: Optional[dict[str, Any]] = None,
+) -> bool:
+    """True when a direct Responses request must use server Codex OAuth inventory.
+
+    - Explicit inventory-classified models always bind (never API-key fallback).
+    - Model-less requests bind only under the existing Codex-native auth contract.
+    - Unclassified non-native models do not bind here (may use other routes).
+    """
+    if not _endpoint_is_openai_responses_path(endpoint):
+        return False
+    body = request_body if isinstance(request_body, dict) else {}
+    cleaned_model = _clean_codex_auth_value(body.get("model"))
+    if cleaned_model is not None:
+        return _is_direct_codex_oauth_inventory_model(cleaned_model)
+    # Model-less: only the established Codex-native auth contract is non-model-scoped.
+    return _request_uses_codex_native_auth(request)
+
+
+def _direct_codex_oauth_affinity_from_session_owner(
+    owner_affinity: Optional[dict[str, Any]],
+    *,
+    model: str,
+) -> Optional[dict[str, Any]]:
+    """Keep only openai/codex account pins from durable session ownership."""
+    if not isinstance(owner_affinity, dict):
+        return None
+    provider = str(owner_affinity.get("provider") or "").strip().lower()
+    route_family = str(owner_affinity.get("route_family") or "").strip().lower()
+    if provider and provider not in {"openai"}:
+        return None
+    if route_family and route_family not in {
+        "codex_oauth",
+        "codex_responses",
+        "openai_responses",
+    }:
+        return None
+    label = _clean_codex_auth_value(owner_affinity.get("codex_oauth_account_label"))
+    account_hash = _clean_codex_auth_value(
+        owner_affinity.get("codex_oauth_account_hash")
+    )
+    lane_key = _clean_codex_auth_value(owner_affinity.get("codex_oauth_lane_key"))
+    if not all((label, account_hash, lane_key)):
+        return None
+    return {
+        "provider": "openai",
+        "model": str(owner_affinity.get("model") or model),
+        "route_family": str(owner_affinity.get("route_family") or "codex_responses"),
+        "last_resort": False,
+        "codex_oauth_account_label": label,
+        "codex_oauth_account_hash": account_hash,
+        "codex_oauth_lane_key": lane_key,
+        "affinity_state_source": owner_affinity.get("affinity_state_source")
+        or "session_owner",
+    }
+
+
+
+async def _resolve_model_less_direct_codex_oauth_contexts(
+    request: Request,
+    *,
+    candidate_template: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Auth-check enabled inventory accounts without a model scope filter."""
+    # Local helpers (this module).
+    from litellm.secret_managers.codex_oauth_inventory import (
+        CodexOAuthInventoryError,
+        load_codex_oauth_inventory,
+    )
+
+    try:
+        inventory = load_codex_oauth_inventory()
+        records = inventory.ordered_records(enabled_only=True, model=None)
+    except CodexOAuthInventoryError:
+        records = ()
+
+    if not records:
+        return [
+            {
+                "candidate": dict(candidate_template),
+                "lane_key": "codex-oauth:unavailable",
+                "auth_status": "degraded",
+                "skip_reason": "auth_degraded",
+                "failure_phase": "account_inventory_unavailable",
+                "attempted_provider_call": False,
+            }
+        ]
+
+    contexts: list[dict[str, Any]] = []
+    for record in records:
+        lane_key = _codex_oauth_account_lane_key(
+            account_label=record.label,
+            account_hash=record.expected_account_hash,
+        )
+        account_candidate = {
+            **candidate_template,
+            "codex_oauth_account_label": record.label,
+            "codex_oauth_account_hash": record.expected_account_hash,
+            "codex_oauth_lane_key": lane_key,
+            "codex_oauth_account_priority": record.priority,
+            "codex_oauth_account_weight": record.weight,
+        }
+        context: dict[str, Any] = {
+            "candidate": account_candidate,
+            "lane_key": lane_key,
+            "auth_status": "healthy",
+        }
+        try:
+            loaded = await _load_codex_oauth_headers_for_record(request, record)
+        except HTTPException:
+            context.update(
+                {
+                    "auth_status": "degraded",
+                    "skip_reason": "auth_degraded",
+                    "failure_phase": "pre_dispatch_auth",
+                    "attempted_provider_call": False,
+                }
+            )
+        else:
+            if (
+                loaded.account_hash != record.expected_account_hash
+                or loaded.lane_key != lane_key
+            ):
+                context.update(
+                    {
+                        "auth_status": "degraded",
+                        "skip_reason": "auth_degraded",
+                        "failure_phase": "account_identity_mismatch",
+                        "attempted_provider_call": False,
+                    }
+                )
+        contexts.append(context)
+    return contexts
+
+
+async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
+    request: Request,
+    *,
+    request_body: Optional[dict[str, Any]] = None,
+) -> tuple["CodexOAuthRequestAuth", dict[str, Any], dict[str, Any]]:
+    """Bind direct concrete Responses traffic to enabled account inventory.
+
+    Reuses the alias-path account context, quota, cooldown, and failover
+    machinery. Returns ``(selected_auth, selection_state, metadata_body)``.
+    """
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        selection as _selection,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as _sa,
+    )
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _merge_litellm_metadata,
+        _safe_set_request_parsed_body,
+    )
+
+    body = dict(request_body) if isinstance(request_body, dict) else {}
+    explicit_model = _clean_codex_auth_value(body.get("model"))
+    native_auth = _request_uses_codex_native_auth(request)
+    if explicit_model is not None:
+        if not (
+            _is_direct_codex_oauth_inventory_model(explicit_model) or native_auth
+        ):
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Direct Codex OAuth inventory binding refused for "
+                    "unclassified model."
+                ),
+            )
+        model = explicit_model
+        inventory_model: Optional[str] = explicit_model
+    else:
+        if not native_auth:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Direct Codex OAuth inventory binding requires an explicit "
+                    "model unless Codex-native auth markers are present."
+                ),
+            )
+        # Model-less native contract: account selection is not model-scoped.
+        model = ""
+        inventory_model = None
+
+    candidate_template: dict[str, Any] = {
+        "provider": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+        "model": model or "codex_native",
+        "route_family": "codex_responses",
+        "last_resort": False,
+        "selection_priority": 100,
+    }
+
+    affinity: Optional[dict[str, Any]] = None
+    session_identity = _sa.resolve_canonical_session_identity(request, body)
+    if session_identity is not None:
+        owner_record, _cache_key, owner_error = await _sa.get_session_owner_record(
+            session_identity=session_identity,
+        )
+        if owner_error is None and isinstance(owner_record, dict):
+            affinity = _direct_codex_oauth_affinity_from_session_owner(
+                _sa.owner_record_as_affinity_hint(owner_record),
+                model=model,
+            )
+
+    # Body/request metadata pin (continuation metadata) when no owner pin.
+    if affinity is None:
+        metadata = body.get("litellm_metadata")
+        meta = metadata if isinstance(metadata, dict) else {}
+        pin_label = _clean_codex_auth_value(
+            meta.get("codex_oauth_account_label")
+            or meta.get("codex_auto_agent_selected_account_label")
+            or body.get("codex_oauth_account_label")
+        )
+        pin_hash = _clean_codex_auth_value(
+            meta.get("codex_oauth_account_hash")
+            or meta.get("codex_auto_agent_selected_account_hash")
+            or body.get("codex_oauth_account_hash")
+        )
+        pin_lane = _clean_codex_auth_value(
+            meta.get("codex_oauth_lane_key")
+            or meta.get("codex_auto_agent_selected_account_lane")
+            or body.get("codex_oauth_lane_key")
+        )
+        if all((pin_label, pin_hash, pin_lane)):
+            affinity = {
+                "provider": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+                "model": model,
+                "route_family": "codex_responses",
+                "last_resort": False,
+                "codex_oauth_account_label": pin_label,
+                "codex_oauth_account_hash": pin_hash,
+                "codex_oauth_lane_key": pin_lane,
+                "affinity_state_source": "request_metadata",
+            }
+
+    if inventory_model is None and affinity is None:
+        # Model-less native path: reuse inventory model=None eligibility
+        # (selection resolve stringifies model and would filter every record).
+        contexts = await _resolve_model_less_direct_codex_oauth_contexts(
+            request,
+            candidate_template=candidate_template,
+        )
+    else:
+        resolve_template = dict(candidate_template)
+        if inventory_model is not None:
+            resolve_template["model"] = inventory_model
+        elif affinity is not None:
+            pinned_model = _clean_codex_auth_value(affinity.get("model"))
+            if pinned_model is not None:
+                resolve_template["model"] = pinned_model
+        contexts = await _selection._resolve_codex_oauth_account_candidate_contexts(
+            request,
+            candidate_template=resolve_template,
+            affinity=affinity,
+        )
+    await _selection._hydrate_codex_oauth_quota_observations(contexts)
+
+    states: list[dict[str, Any]] = []
+    for context in contexts:
+        state = await _selection._build_codex_auto_agent_candidate_state(
+            request,
+            candidate_template=context["candidate"],
+            openai_lane_key=context.get("lane_key"),
+        )
+        states.append(
+            _selection._apply_codex_oauth_account_context_to_state(
+                request,
+                state,
+                context=context,
+            )
+        )
+
+    skipped = _selection._build_auto_agent_skipped_candidates_from_states(states)
+    selected_state: Optional[dict[str, Any]] = None
+    for state in states:
+        if _selection._is_auto_agent_candidate_state_available(state):
+            selected_state = state
+            break
+
+    if selected_state is None:
+        detail: dict[str, Any] = {
+            "error": {
+                "message": (
+                    "All enabled Codex OAuth inventory accounts are currently "
+                    "cooled down or unavailable for direct Responses traffic."
+                ),
+                "type": "rate_limit_error",
+                "code": "aawm_codex_oauth_direct_inventory_unavailable",
+            },
+            "skipped_candidates": skipped,
+            "attempted_provider_call": False,
+            "failure_phase": "direct_inventory_selection",
+        }
+        if affinity is not None:
+            detail["account"] = {
+                "account_label": affinity.get("codex_oauth_account_label"),
+                "account_hash": affinity.get("codex_oauth_account_hash"),
+                "account_lane": affinity.get("codex_oauth_lane_key"),
+            }
+        raise HTTPException(status_code=429, detail=detail)
+
+    candidate = dict(selected_state["candidate"])
+    bound = _bind_codex_oauth_candidate_to_request(request, candidate)
+    if bound is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Selected Codex OAuth account context is incomplete.",
+        )
+    selected_auth = await _load_bound_codex_oauth_auth(request)
+
+    if int(selected_state.get("failover_ordinal") or 0) > 0:
+        selection_reason = "codex_oauth_account_failover"
+    elif affinity is not None and affinity.get("affinity_state_source") == "session_owner":
+        selection_reason = "session_owner_pin"
+    elif (
+        affinity is not None
+        and affinity.get("affinity_state_source") == "request_metadata"
+    ):
+        selection_reason = "request_metadata_pin"
+    else:
+        selection_reason = "direct_inventory_first_available"
+    selection_state = {
+        **selected_state,
+        "selection_reason": selection_reason,
+        "skipped": skipped,
+        "alias_model": model,
+        "request_mode": (
+            "ordinary_continuation" if affinity is not None else "fresh"
+        ),
+    }
+
+    metadata_body = _merge_litellm_metadata(
+        body,
+        tags_to_add=[
+            "codex-oauth-direct-inventory",
+            "route:codex_responses",
+            f"codex-oauth-account:{selected_auth.account_label}",
+        ],
+        extra_fields={
+            "openai_passthrough_route_family": "codex_responses",
+            "codex_oauth_direct_inventory": True,
+            "codex_oauth_account_label": selected_auth.account_label,
+            "codex_oauth_account_hash": selected_auth.account_hash,
+            "codex_oauth_lane_key": selected_auth.lane_key,
+            "codex_auto_agent_selected_provider": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+            "codex_auto_agent_selected_model": model,
+            "codex_auto_agent_selected_route_family": "codex_responses",
+            "codex_auto_agent_selected_account_label": selected_auth.account_label,
+            "codex_auto_agent_selected_account_hash": selected_auth.account_hash,
+            "codex_auto_agent_selected_account_lane": selected_auth.lane_key,
+            "codex_auto_agent_lane_key": selected_state.get("lane_key")
+            or selected_auth.lane_key,
+            "codex_auto_agent_selection_reason": selection_reason,
+            "codex_auto_agent_cooldown_state_source": selected_state.get(
+                "cooldown_state_source"
+            ),
+            "codex_auto_agent_quota_snapshot_age_seconds": selected_state.get(
+                "quota_snapshot_age_seconds"
+            ),
+            "codex_auto_agent_failover_ordinal": selected_state.get(
+                "failover_ordinal"
+            ),
+            "codex_auto_agent_prior_account_outcome": selected_state.get(
+                "prior_account_outcome"
+            ),
+            "codex_auto_agent_terminal_reset": selected_state.get(
+                "terminal_reset"
+            ),
+            "codex_auto_agent_skipped_candidates": skipped,
+            "codex_auto_agent_attempts": [
+                _selection._codex_auto_agent_candidate_public_shape(
+                    candidate,
+                    lane_key=selected_state.get("lane_key"),
+                    reason=selection_reason,
+                )
+            ],
+        },
+    )
+    _safe_set_request_parsed_body(request, metadata_body)
+    setattr(request.state, "aawm_direct_codex_oauth_inventory", True)
+    return selected_auth, selection_state, metadata_body
 
 
 # ---------------------------------------------------------------------------

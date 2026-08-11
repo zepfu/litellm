@@ -360,6 +360,15 @@ class BaseOpenAIPassThroughHandler:
         egress_credential_family: Optional[str] = None
         expected_target_family: Optional[str] = None
         endpoint_custom_body: Optional[dict[str, Any]] = None
+        bound_codex_oauth_identity: Optional[dict[str, str]] = None
+        try:
+            from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
+                _get_bound_codex_oauth_candidate_identity as _get_bound_identity,
+            )
+
+            bound_codex_oauth_identity = _get_bound_identity(request)
+        except Exception:  # noqa: BLE001
+            bound_codex_oauth_identity = None
 
         if request.method == "POST":
             request_body = await rt.get_request_body_fn(request)
@@ -368,7 +377,7 @@ class BaseOpenAIPassThroughHandler:
             is_codex_responses_request = (
                 rt.request_uses_codex_native_auth_fn(request)
                 and rt.is_openai_responses_endpoint_fn(endpoint)
-            )
+            ) or bound_codex_oauth_identity is not None
             if (
                 rt.resolve_codex_auto_agent_alias_model_fn(
                     prepared_request_body,
@@ -561,7 +570,10 @@ class BaseOpenAIPassThroughHandler:
                     route_family = str(egress_credential_family)
                 elif expected_target_family:
                     route_family = str(expected_target_family)
-                elif is_codex_native and is_responses_endpoint:
+                elif (
+                    bound_codex_oauth_identity is not None
+                    or (is_codex_native and is_responses_endpoint)
+                ):
                     route_family = "codex_oauth"
                 elif is_responses_endpoint:
                     route_family = "openai_responses"
@@ -579,6 +591,27 @@ class BaseOpenAIPassThroughHandler:
                     request=request,
                     request_body=direct_body,
                 )
+                # Prefer the server-selected inventory identity over any inbound
+                # chatgpt-account-id digest so D1-612 pins the actual account lane.
+                if isinstance(bound_codex_oauth_identity, dict):
+                    account_identity = {
+                        **account_identity,
+                        **{
+                            key: value
+                            for key, value in {
+                                "account_label": bound_codex_oauth_identity.get(
+                                    "account_label"
+                                ),
+                                "account_hash": bound_codex_oauth_identity.get(
+                                    "account_hash"
+                                ),
+                                "account_lane": bound_codex_oauth_identity.get(
+                                    "lane_key"
+                                ),
+                            }.items()
+                            if value
+                        },
+                    }
                 requested_attributes = _sa.build_session_owner_attributes(
                     provider=provider_name,
                     model=requested_model,
