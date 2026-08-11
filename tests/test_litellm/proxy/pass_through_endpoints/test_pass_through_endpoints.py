@@ -17,6 +17,8 @@ from fastapi import HTTPException, Request, UploadFile
 from starlette.datastructures import Headers, QueryParams
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+import litellm
+
 sys.path.insert(
     0, os.path.abspath("../../..")
 )  # Adds the parent directory to the system path
@@ -45,6 +47,7 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     _build_passthrough_input_item_shape_samples,
     build_aawm_route_access_log_line,
     _build_passthrough_request_shape_failure_request_payload,
+    _build_passthrough_error_log_context,
     _classify_passthrough_request_shape_deserialization_422,
     _direct_capture_xai_passthrough_failure,
     _enrich_passthrough_error_log_context_for_request_shape_422,
@@ -60,6 +63,8 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     _is_known_grok_build_usage_balance_exhausted_response,
     _get_passthrough_grok_build_usage_balance_exhausted_failure_kind,
     _is_known_chatgpt_codex_model_not_supported_for_account_response,
+    _set_passthrough_stream_timeout_metadata,
+    _resolve_aawm_passthrough_stream_read_timeout_policy,
     _restore_responses_function_names_in_sse_chunks,
     _get_passthrough_chatgpt_codex_model_not_supported_failure_kind,
     _record_grok_billing_passthrough_request_contract,
@@ -68,6 +73,8 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     emit_aawm_route_access_log,
     pass_through_request,
 )
+from litellm.caching.llm_caching_handler import LLMClientCache
+from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
 from litellm.responses.function_name_sanitization import (
     sanitize_responses_function_names,
 )
@@ -77,6 +84,7 @@ from litellm.proxy.pass_through_endpoints.streaming_handler import (
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
 )
+from litellm.types.llms.custom_http import httpxSpecialProvider
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
 
 
@@ -611,6 +619,136 @@ def test_headers_for_json_passthrough_egress_replaces_stale_non_json_content_typ
     assert "Content-Type" not in headers
     assert headers["content-type"] == "application/json"
     assert headers["authorization"] == "Bearer token"
+
+
+def test_resolve_aawm_passthrough_stream_read_timeout_policy_defaults_and_ignores_generic_request_timeout(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("REQUEST_TIMEOUT", "99")
+    monkeypatch.setenv("LITELLM_REQUEST_TIMEOUT", "88")
+    monkeypatch.delenv("AAWM_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS", raising=False)
+
+    policy = _resolve_aawm_passthrough_stream_read_timeout_policy()
+
+    assert policy.source == "compatibility_default"
+    assert policy.stream_read_timeout_seconds == 600.0
+    assert policy.connect_timeout_seconds == 600.0
+    assert policy.write_timeout_seconds == 600.0
+    assert policy.pool_timeout_seconds == 600.0
+    assert policy.timeout.read == 600.0
+    assert policy.timeout.connect == 600.0
+    assert policy.timeout.write == 600.0
+    assert policy.timeout.pool == 600.0
+
+
+@pytest.mark.parametrize(
+    "raw_timeout, expected_seconds, expected_source",
+    [
+        ("321", 321.0, "AAWM_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS"),
+        ("0", 600.0, "compatibility_default"),
+        ("-5", 600.0, "compatibility_default"),
+        ("nan", 600.0, "compatibility_default"),
+    ],
+)
+def test_resolve_aawm_passthrough_stream_read_timeout_policy_override_and_fallback(
+    monkeypatch,
+    raw_timeout: str,
+    expected_seconds: float,
+    expected_source: str,
+) -> None:
+    monkeypatch.setenv("AAWM_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS", raw_timeout)
+
+    policy = _resolve_aawm_passthrough_stream_read_timeout_policy()
+
+    assert policy.stream_read_timeout_seconds == expected_seconds
+    assert policy.connect_timeout_seconds == 600.0
+    assert policy.write_timeout_seconds == 600.0
+    assert policy.pool_timeout_seconds == 600.0
+    assert policy.timeout.read == expected_seconds
+    assert policy.timeout.connect == 600.0
+    assert policy.timeout.write == 600.0
+    assert policy.timeout.pool == 600.0
+    assert policy.source == expected_source
+
+
+@pytest.mark.asyncio
+async def test_get_async_httpx_client_reuses_default_stream_timeout_and_separates_read_overrides(
+    monkeypatch,
+) -> None:
+    clients = LLMClientCache()
+    monkeypatch.setattr(litellm, "in_memory_llm_clients_cache", clients)
+
+    monkeypatch.delenv("AAWM_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS", raising=False)
+    default_policy = _resolve_aawm_passthrough_stream_read_timeout_policy()
+    default_cached = get_async_httpx_client(
+        llm_provider=httpxSpecialProvider.PassThroughEndpoint,
+        params={"timeout": default_policy.timeout},
+    )
+    same_default_cached = get_async_httpx_client(
+        llm_provider=httpxSpecialProvider.PassThroughEndpoint,
+        params={"timeout": default_policy.timeout},
+    )
+
+    monkeypatch.setenv("AAWM_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS", "900")
+    override_policy = _resolve_aawm_passthrough_stream_read_timeout_policy()
+    override_cached = get_async_httpx_client(
+        llm_provider=httpxSpecialProvider.PassThroughEndpoint,
+        params={"timeout": override_policy.timeout},
+    )
+    same_override_cached = get_async_httpx_client(
+        llm_provider=httpxSpecialProvider.PassThroughEndpoint,
+        params={"timeout": override_policy.timeout},
+    )
+
+    assert default_cached is same_default_cached
+    assert override_cached is same_override_cached
+    assert default_cached is not override_cached
+
+    await default_cached.close()
+    if default_cached is not override_cached:
+        await override_cached.close()
+
+
+def test_build_passthrough_error_log_context_copies_stream_read_timeout_metadata(
+    monkeypatch,
+) -> None:
+    request = _build_aawm_route_log_request()
+    monkeypatch.setenv("AAWM_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS", "721")
+    policy = _resolve_aawm_passthrough_stream_read_timeout_policy()
+
+    kwargs = {"litellm_params": {"metadata": {}}}
+    _set_passthrough_stream_timeout_metadata(
+        kwargs=kwargs,
+        policy=policy,
+    )
+
+    context = _build_passthrough_error_log_context(
+        request=request,
+        url=httpx.URL("https://cli-chat-proxy.grok.com/v1/responses"),
+        parsed_body={
+            "model": "grok-composer-2.5-fast",
+            "litellm_metadata": {
+                "requested_model_alias": "work",
+            },
+        },
+        kwargs=kwargs,
+        passthrough_logging_metadata=None,
+        custom_llm_provider="xai",
+        status_code=504,
+        litellm_call_id="call-stream-timeout",
+        final_headers={"x-test": "header"},
+        custom_headers={"authorization": "Bearer token"},
+    )
+
+    assert context["aawm_passthrough_stream_read_timeout_seconds"] == 721.0
+    assert (
+        context["aawm_passthrough_stream_read_timeout_source"]
+        == "AAWM_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS"
+    )
+    assert context["aawm_passthrough_connect_timeout_seconds"] == 600.0
+    assert context["aawm_passthrough_write_timeout_seconds"] == 600.0
+    assert context["aawm_passthrough_pool_timeout_seconds"] == 600.0
+    assert isinstance(context["aawm_passthrough_stream_read_timeout_seconds"], float)
 
 
 def _build_uvicorn_access_record(

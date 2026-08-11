@@ -224,6 +224,11 @@ Practical `context` fields to inspect are:
 - `coroutine_name`
 - `worker_delivery_state`
 - `aawm_passthrough_inbound_content_type`
+- `aawm_passthrough_stream_read_timeout_seconds`
+- `aawm_passthrough_stream_read_timeout_source` (either `compatibility_default` or `AAWM_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS`)
+- `aawm_passthrough_connect_timeout_seconds`
+- `aawm_passthrough_write_timeout_seconds`
+- `aawm_passthrough_pool_timeout_seconds`
 - `aawm_passthrough_json_egress_content_type_removed`
 - `aawm_passthrough_json_egress_content_type_removed_value`
 - `aawm_passthrough_body_container_type`

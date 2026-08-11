@@ -437,6 +437,7 @@ router_settings:
 | AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS | Hidden retry budget in seconds for AAWM OpenRouter adapter transient recovery.
 | AAWM_OPENROUTER_ADAPTER_MAX_RETRIES | Maximum retry attempts for AAWM OpenRouter adapter requests.
 | AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS | Cooldown in seconds after AAWM OpenRouter adapter failures.
+| AAWM_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS | Read timeout (seconds) for AAWM passthrough HTTPX streams. Compatibility default is 600; only finite positive values are accepted, while invalid/non-positive/non-finite values fall back to default. The dedicated resolver ignores generic `REQUEST_TIMEOUT` / `litellm.request_timeout`; connect/write/pool timeouts remain explicit 600s defaults; complete-timeout-policy determines cached-client identity; effective value/source are logged.
 | AAWM_STREAM_SUMMARY_FIRST_FINALIZE | Opt-in streaming-finalize optimization for eligible Anthropic Messages and OpenAI Responses passthrough streams. Builds logging lines incrementally while yielding raw streamed bytes unchanged. When enabled and full/diagnostic raw stream capture is off, skips retaining a second full raw-byte buffer for finalize (CPU + peak memory). If `AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS` or scoped `AAWM_DIAGNOSTIC_PAYLOAD_CAPTURE` is on, raw bytes are still retained for capture fidelity. Default is **false**.
 | ANTHROPIC_API_KEY | API key for Anthropic service
 | ANTHROPIC_API_BASE | Base URL for Anthropic API. Default is https://api.anthropic.com

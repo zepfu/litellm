@@ -8,6 +8,7 @@ import traceback
 from base64 import b64encode
 from collections import deque
 from datetime import datetime, timezone
+from math import isfinite
 import time
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union, cast
@@ -151,6 +152,65 @@ _AAWM_AGENT_IDENTITY_CALLBACK_MARKERS = (
     "aawm_agent_identity",
     "aawm_litellm_callbacks.agent_identity",
 )
+_AAWM_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS = (
+    "AAWM_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS"
+)
+_DEFAULT_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS = 600.0
+_AAWM_PASSTHROUGH_STREAM_TIMEOUT_DEFAULT_SOURCE = "compatibility_default"
+
+
+@dataclass(frozen=True)
+class _PassThroughStreamReadTimeoutPolicy:
+    timeout: httpx.Timeout
+    source: str
+    stream_read_timeout_seconds: float
+    connect_timeout_seconds: float
+    write_timeout_seconds: float
+    pool_timeout_seconds: float
+
+
+def _resolve_aawm_passthrough_stream_read_timeout_policy() -> (
+    _PassThroughStreamReadTimeoutPolicy
+):
+    """Resolve passthrough stream timeout policy.
+
+    Do not read from generic `REQUEST_TIMEOUT` / `litellm.request_timeout`. This
+    resolver is intentionally local and checks only
+    `AAWM_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS` via `get_secret_str`.
+    """
+    configured_read_timeout_seconds = _DEFAULT_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS
+    source = _AAWM_PASSTHROUGH_STREAM_TIMEOUT_DEFAULT_SOURCE
+
+    raw_timeout = get_secret_str(
+        _AAWM_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS
+    )
+    if raw_timeout is not None:
+        try:
+            parsed_timeout = float(str(raw_timeout).strip())
+        except Exception:
+            parsed_timeout = None
+
+        if (
+            parsed_timeout is not None
+            and parsed_timeout > 0
+            and isfinite(parsed_timeout)
+        ):
+            configured_read_timeout_seconds = parsed_timeout
+            source = _AAWM_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS
+
+    return _PassThroughStreamReadTimeoutPolicy(
+        timeout=httpx.Timeout(
+            read=configured_read_timeout_seconds,
+            connect=_DEFAULT_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS,
+            write=_DEFAULT_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS,
+            pool=_DEFAULT_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS,
+        ),
+        source=source,
+        stream_read_timeout_seconds=configured_read_timeout_seconds,
+        connect_timeout_seconds=_DEFAULT_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS,
+        write_timeout_seconds=_DEFAULT_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS,
+        pool_timeout_seconds=_DEFAULT_PASSTHROUGH_STREAM_READ_TIMEOUT_SECONDS,
+    )
 
 
 def _is_openai_responses_function_name_target(
@@ -996,6 +1056,21 @@ def _ensure_passthrough_metadata(kwargs: Optional[dict]) -> Dict[str, Any]:
     return metadata
 
 
+def _set_passthrough_stream_timeout_metadata(
+    *, kwargs: Optional[dict], policy: _PassThroughStreamReadTimeoutPolicy
+) -> None:
+    metadata = _ensure_passthrough_metadata(kwargs)
+    metadata["aawm_passthrough_stream_read_timeout_seconds"] = (
+        policy.stream_read_timeout_seconds
+    )
+    metadata["aawm_passthrough_stream_read_timeout_source"] = policy.source
+    metadata["aawm_passthrough_connect_timeout_seconds"] = (
+        policy.connect_timeout_seconds
+    )
+    metadata["aawm_passthrough_write_timeout_seconds"] = policy.write_timeout_seconds
+    metadata["aawm_passthrough_pool_timeout_seconds"] = policy.pool_timeout_seconds
+
+
 def _passthrough_header_value(headers: dict, header_name: str) -> Optional[str]:
     normalized_name = header_name.lower()
     for key, value in headers.items():
@@ -1553,6 +1628,24 @@ def _passthrough_error_context_metadata_value(value: Any) -> Any:
                 cleaned_dict[cleaned_key] = cleaned_value
         return cleaned_dict
     return _clean_passthrough_error_context_value(value)
+
+
+def _passthrough_error_context_timeout_metadata_value(
+    value: Any,
+) -> Optional[float]:
+    timeout_value = _passthrough_error_context_metadata_value(value)
+
+    if isinstance(timeout_value, bool):
+        return None
+    if isinstance(timeout_value, str):
+        try:
+            timeout_value = float(timeout_value.strip())
+        except ValueError:
+            return None
+    if not isinstance(timeout_value, (int, float)):
+        return None
+
+    return float(timeout_value) if isfinite(timeout_value) else None
 
 
 def _is_openai_passthrough_responses_error_context(
@@ -2383,6 +2476,22 @@ def _build_passthrough_error_log_context(
     }
     context.update(_build_passthrough_error_log_request_shape_context(metadata))
     context.update(grok_side_channel_context)
+    context["aawm_passthrough_stream_read_timeout_seconds"] = _passthrough_error_context_timeout_metadata_value(
+        metadata.get("aawm_passthrough_stream_read_timeout_seconds")
+    )
+    context["aawm_passthrough_stream_read_timeout_source"] = _first_passthrough_error_context_value(
+        metadata,
+        ("aawm_passthrough_stream_read_timeout_source",),
+    )
+    context["aawm_passthrough_connect_timeout_seconds"] = _passthrough_error_context_timeout_metadata_value(
+        metadata.get("aawm_passthrough_connect_timeout_seconds")
+    )
+    context["aawm_passthrough_write_timeout_seconds"] = _passthrough_error_context_timeout_metadata_value(
+        metadata.get("aawm_passthrough_write_timeout_seconds")
+    )
+    context["aawm_passthrough_pool_timeout_seconds"] = _passthrough_error_context_timeout_metadata_value(
+        metadata.get("aawm_passthrough_pool_timeout_seconds")
+    )
     context.update(
         _build_passthrough_error_log_auth_context(
             request=request,
@@ -3632,9 +3741,10 @@ async def pass_through_request(  # noqa: PLR0915
                     invalid_openai_tool_schemas[:10],
                 )
 
+        stream_read_timeout_policy = _resolve_aawm_passthrough_stream_read_timeout_policy()
         async_client_obj = get_async_httpx_client(
             llm_provider=httpxSpecialProvider.PassThroughEndpoint,
-            params={"timeout": 600},
+            params={"timeout": stream_read_timeout_policy.timeout},
         )
         async_client = async_client_obj.client
         _cleaned_headers = clean_headers(request.headers)
@@ -3652,6 +3762,10 @@ async def pass_through_request(  # noqa: PLR0915
             litellm_call_id=litellm_call_id,
             request=request,
             logging_obj=logging_obj,
+        )
+        _set_passthrough_stream_timeout_metadata(
+            kwargs=kwargs,
+            policy=stream_read_timeout_policy,
         )
         provider_bound_body = _provider_bound_body_from_kwargs(kwargs)
         if provider_bound_body is None:
