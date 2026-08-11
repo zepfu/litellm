@@ -101,6 +101,23 @@ _STREAM_FAILURE_MARKERS = (
     "http remains 200",
 )
 
+# D1-587: fixture-backed usage/limit/quota machine codes (open-registry growth).
+# Exact catalog tokens only. Deliberately excludes successful non-error
+# truncation prose such as "finish_reason = length".
+_USAGE_LIMIT_MARKERS = (
+    "context_length_exceeded",
+    "max_tokens_exceeded",
+    "max_output_tokens",
+    "max_steps_reached",
+    "token_limit_exceeded",
+)
+_QUOTA_MACHINE_MARKERS = (
+    "payment_required",
+)
+_PAYLOAD_LIMIT_MARKERS = (
+    "payload_too_large",
+)
+
 # JSON-RPC wire codes observed in Wire mode catalog fixtures.
 # Exact token form only: reject glued/prefixed junk such as x-32600y / --32600.
 _JSON_RPC_CODE_RE = re.compile(
@@ -228,8 +245,9 @@ def classify_failure(
     ``origin="unknown"`` (never coolable).
 
     D1-587 grows mappings for fixture-backed image-content sub-errors,
-    JSON-RPC negative wire codes, and HTTP-200-body stream failures without
-    changing the open ``FailureEvent`` schema.
+    JSON-RPC negative wire codes, HTTP-200-body stream failures, and
+    usage/limit/quota machine codes without changing the open
+    ``FailureEvent`` schema.
     """
     text = (message or "").lower()
     evidence: dict[str, str] = {}
@@ -303,7 +321,7 @@ def classify_failure(
             evidence=evidence,
         )
     if status_code is not None and 400 <= status_code <= 499:
-        # Prefer fixture-backed content/media subclasses inside 4xx bodies.
+        # Prefer fixture-backed content/media/limit subclasses inside 4xx bodies.
         # Skip documentation-only prose so it does not subclass as coolable.
         if not _is_documentation_only_text(text):
             media_event = _classify_media_or_policy_markers(
@@ -314,6 +332,14 @@ def classify_failure(
             )
             if media_event is not None:
                 return media_event
+            limit_event = _classify_limit_or_quota_markers(
+                text=text,
+                provider=provider,
+                confidence="structured",
+                evidence=evidence,
+            )
+            if limit_event is not None:
+                return limit_event
         return _event(
             class_name="provider_4xx_other",
             origin="upstream",
@@ -372,6 +398,15 @@ def classify_failure(
         )
         if stream_event is not None:
             return stream_event
+
+        limit_event = _classify_limit_or_quota_markers(
+            text=text,
+            provider=provider,
+            confidence="marker",
+            evidence=evidence,
+        )
+        if limit_event is not None:
+            return limit_event
 
     if any(marker in text for marker in _CAPACITY_MARKERS):
         return _event(
@@ -465,6 +500,48 @@ def _classify_media_or_policy_markers(
     if _any_marker(text, _INVALID_MEDIA_MARKERS):
         return _event(
             class_name="invalid_media",
+            origin="upstream",
+            confidence=confidence,
+            provider=provider,
+            scope="provider",
+            retryable=False,
+            evidence=evidence,
+        )
+    return None
+
+
+def _classify_limit_or_quota_markers(
+    *,
+    text: str,
+    provider: Optional[str],
+    confidence: fv.Confidence,
+    evidence: dict[str, str],
+) -> Optional[fv.FailureEvent]:
+    """Map fixture-backed usage/limit/quota machine codes to seed classes."""
+    if _any_marker(text, _QUOTA_MACHINE_MARKERS):
+        return _event(
+            class_name="quota_exhausted",
+            origin="upstream",
+            confidence=confidence,
+            provider=provider,
+            scope="account",
+            # Catalog Billing/quota payment_required is non-retryable.
+            retryable=False,
+            evidence=evidence,
+        )
+    if _any_marker(text, _USAGE_LIMIT_MARKERS):
+        return _event(
+            class_name="usage_limit",
+            origin="upstream",
+            confidence=confidence,
+            provider=provider,
+            scope="model",
+            retryable=False,
+            evidence=evidence,
+        )
+    if _any_marker(text, _PAYLOAD_LIMIT_MARKERS):
+        return _event(
+            class_name="provider_4xx_other",
             origin="upstream",
             confidence=confidence,
             provider=provider,

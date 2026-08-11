@@ -54,16 +54,13 @@ _PROVIDER_REACHABLE_LAYERS = frozenset(
 _TUI_LAYERS = frozenset({"TUI hook", "TUI/headless"})
 
 # Residual known-gap set after D1-587 fixture-backed mappings for
-# image-content sub-errors, JSON-RPC wire codes, and HTTP-200-body stream
-# failures. A class remains listed while any provider-reachable catalog row
-# in that class still classifies as unknown (limits, local/client network,
-# non-error 2xx/3xx, passthrough shells, or non-theme request/body codes).
+# image-content sub-errors, JSON-RPC wire codes, HTTP-200-body stream
+# failures, and usage/limit/quota machine codes. A class remains listed while
+# any provider-reachable catalog row in that class still classifies as unknown
+# (local/client network, non-error 2xx/3xx, passthrough shells, request/body
+# codes, overload/timeout/server shells, or successful length truncation).
 _KNOWN_COVERAGE_GAPS = frozenset(
     {
-        "Agent limit",
-        "Agent/model limit",
-        "Billing/quota",
-        "Context limit",
         "Fix request/content",
         "Invalid request",
         "Layered/platform passthrough",
@@ -72,7 +69,6 @@ _KNOWN_COVERAGE_GAPS = frozenset(
         "Model refusal",
         "Model/output limit",
         "Not found",
-        "Payload limit",
         "Pending/non-error",
         "Pending/not terminal",
         "Permission/policy block",
@@ -81,7 +77,6 @@ _KNOWN_COVERAGE_GAPS = frozenset(
         "Protocol-mapped error",
         "Provider overload",
         "Provider unavailable",
-        "Quota/limit",
         "Reconnect",
         "Result indirection",
         "Retry transient",
@@ -317,6 +312,56 @@ _D1_587_THEME_FIXTURE_CASES: tuple[tuple[object, str, str, str, str], ...] = (
         "upstream",
         "marker",
     ),
+    # Usage / limit / quota machine codes
+    (
+        None,
+        "context_length_exceeded The prompt/context exceeds the selected model's context window.",
+        "usage_limit",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "max_tokens_exceeded Generation reached or exceeded the requested/allowed maximum output tokens.",
+        "usage_limit",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "max_output_tokens The response is incomplete because the output-token limit was reached.",
+        "usage_limit",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "max_steps_reached The agent reached the maximum number of steps before finishing.",
+        "usage_limit",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "token_limit_exceeded An OpenRouter token or account/request token limit was exceeded.",
+        "usage_limit",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "payment_required Credits or payment entitlement are insufficient.",
+        "quota_exhausted",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "payload_too_large The request body exceeds the allowed payload size.",
+        "provider_4xx_other",
+        "upstream",
+        "marker",
+    ),
 )
 
 
@@ -349,7 +394,7 @@ def test_d1_587_theme_fixtures_classify(
     expected_origin: str,
     expected_confidence: str,
 ) -> None:
-    """Image-content, JSON-RPC, and HTTP-200 stream fixtures map to registered classes."""
+    """Image-content, JSON-RPC, stream, and usage/limit fixtures map to registered classes."""
     registry = clsf.register_d1_587_failure_classes()
     event = clsf.classify_failure(status_code=status_code, message=message)
     assert event.class_name == expected_class
@@ -358,6 +403,35 @@ def test_d1_587_theme_fixtures_classify(
     assert registry.contains(expected_class)
     if expected_origin == "upstream":
         assert fv.is_coolable(event)
+
+
+def test_d1_587_payment_required_is_quota_exhausted_non_retryable() -> None:
+    """Catalog payment_required maps to quota_exhausted with retryable=False."""
+    event = clsf.classify_failure(
+        status_code=None,
+        message="payment_required Credits or payment entitlement are insufficient.",
+    )
+    assert event.class_name == "quota_exhausted"
+    assert event.origin == "upstream"
+    assert event.confidence == "marker"
+    assert event.scope == "account"
+    assert event.retryable is False
+    assert fv.is_coolable(event)
+
+
+def test_d1_587_structured_4xx_limit_branch_classifies_usage_limit() -> None:
+    """Structured 4xx path exercises the limit/quota subclass branch."""
+    event = clsf.classify_failure(
+        status_code=400,
+        message="context_length_exceeded The prompt/context exceeds the selected model's context window.",
+    )
+    assert event.class_name == "usage_limit"
+    assert event.origin == "upstream"
+    assert event.confidence == "structured"
+    assert event.scope == "model"
+    assert event.retryable is False
+    assert event.evidence.get("status_code") == "400"
+    assert fv.is_coolable(event)
 
 
 def test_client_cancelled_asyncio_cancelled_error_is_never_coolable() -> None:
@@ -448,6 +522,8 @@ _TUI_MARKER_AMBIGUOUS_CODES = frozenset(
         "oauth_org_not_allowed",
         "FatalAuthenticationError",
         "Device authorization flow failed: fetch failed",
+        # Shared machine-code token with provider usage-limit residuals.
+        "max_output_tokens",
     }
 )
 
@@ -491,6 +567,11 @@ def test_tui_layer_rows_unaffected_by_marker_ambiguity_are_never_coolable() -> N
         (None, "--32600"),
         (None, "prefix-32600suffix"),
         (None, "code x-32001y is not a JSON-RPC token"),
+        (None, "not a context_length_exceeded case"),
+        (None, "payment_required documentation only"),
+        (None, "token-limit-exceeded hyphen variant is unsupported"),
+        (None, "finish_reason = length successful truncation is non-error"),
+        (None, "max tokens exceeded spaced form is unsupported"),
     ],
 )
 def test_d1_587_negated_docs_and_junk_remain_unknown_and_not_coolable(
