@@ -683,6 +683,33 @@ def test_parent_actor_only_correlation_distinct_keys_for_prefix_shared_actors() 
     assert stored_id_a != stored_id_b
     assert stored_name_a != stored_name_b
 
+
+def test_parent_identity_fields_hash_full_value_before_bounding() -> None:
+    shared_prefix = "p" * 150
+    field_indexes = {
+        "parent_litellm_call_id": 13,
+        "parent_session_id": 14,
+        "parent_thread_id": 15,
+    }
+    for field, payload_index in field_indexes.items():
+        payloads = identity._build_codex_review_decision_db_payloads(
+            {
+                **_base_record(),
+                "codex_review_decisions": [
+                    _event(**{field: f"{shared_prefix}-A"}),
+                    _event(**{field: f"{shared_prefix}-B"}),
+                ],
+            }
+        )
+        assert len(payloads) == 2
+        assert payloads[0][0] != payloads[1][0]
+        stored_a = payloads[0][payload_index]
+        stored_b = payloads[1][payload_index]
+        assert stored_a is not None and stored_b is not None
+        assert len(stored_a) <= 128 and len(stored_b) <= 128
+        assert stored_a != stored_b
+
+
 # ---------------------------------------------------------------------------
 # Attribution: D1-615 parity (canonical session + parent actor/thread)
 # ---------------------------------------------------------------------------

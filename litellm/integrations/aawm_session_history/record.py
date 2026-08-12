@@ -1892,14 +1892,23 @@ def _build_codex_review_decision_db_payload(
     # narrowing field and can never attribute on its own. Parent actor or
     # thread without the canonical session stays unattributed and must not
     # create a falsely linked relationship.
-    parent_litellm_call_id = _sanitize_codex_review_decision_label(
-        event.get("parent_litellm_call_id")
+    parent_litellm_call_id_full, _ = _sanitize_codex_review_decision_text(
+        event.get("parent_litellm_call_id"), None
     )
-    parent_session_id = _sanitize_codex_review_decision_label(
-        event.get("parent_session_id")
+    parent_session_id_full, _ = _sanitize_codex_review_decision_text(
+        event.get("parent_session_id"), None
     )
-    parent_thread_id = _sanitize_codex_review_decision_label(
-        event.get("parent_thread_id")
+    parent_thread_id_full, _ = _sanitize_codex_review_decision_text(
+        event.get("parent_thread_id"), None
+    )
+    parent_litellm_call_id = _bounded_stable_id(
+        parent_litellm_call_id_full, _CODEX_REVIEW_DECISION_LABEL_MAX_CHARS
+    )
+    parent_session_id = _bounded_stable_id(
+        parent_session_id_full, _CODEX_REVIEW_DECISION_LABEL_MAX_CHARS
+    )
+    parent_thread_id = _bounded_stable_id(
+        parent_thread_id_full, _CODEX_REVIEW_DECISION_LABEL_MAX_CHARS
     )
     # Parent actor identity: the FULL sanitized strings feed the decision-key
     # hash (never truncated first); only the stored columns use the bounded
@@ -1959,9 +1968,9 @@ def _build_codex_review_decision_db_payload(
             decision_id=decision_id,
             review_attempt_key=review_attempt_key,
             review_attempt_number=review_attempt_number,
-            parent_litellm_call_id=parent_litellm_call_id,
-            parent_session_id=parent_session_id,
-            parent_thread_id=parent_thread_id,
+            parent_litellm_call_id=parent_litellm_call_id_full,
+            parent_session_id=parent_session_id_full,
+            parent_thread_id=parent_thread_id_full,
             parent_agent_id=parent_agent_id_full,
             parent_agent_name=parent_agent_name_full,
         ),
