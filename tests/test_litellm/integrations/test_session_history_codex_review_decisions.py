@@ -125,6 +125,26 @@ def test_d1_616_migration_uses_required_parameterized_database_guard() -> None:
     )
     assert migration.index("SELECT CASE") < begin_idx
     assert migration.index(":guard_statement;") < begin_idx
+    assert r"\if :{?app_role}" in migration
+    assert "NULLIF(btrim(:'app_role'), '') IS NOT NULL" in migration
+    assert "FROM pg_catalog.pg_roles" in migration
+    assert "WHERE rolname = :'app_role'" in migration
+    assert r"\if :d1_616_app_role_valid" in migration
+    assert (
+        "D1-616 abort: app_role is empty or does not resolve to an existing "
+        "PostgreSQL role" in migration
+    )
+    assert (
+        "D1-616 abort: required psql variable app_role is missing" in migration
+    )
+    assert r"\set app_role_guard_statement 'SELECT 1'" in migration
+    assert migration.splitlines().count(
+        r"\set app_role_guard_statement "
+        "'SELECT 1 / 0 AS d1_616_app_role_guard_failure'"
+    ) == 2
+    assert ":app_role_guard_statement;" in migration
+    assert migration.index(r"\if :{?app_role}") < begin_idx
+    assert migration.index(":app_role_guard_statement;") < begin_idx
 
 
 def test_d1_616_migration_keeps_idempotent_ddl_after_guard() -> None:
@@ -133,6 +153,38 @@ def test_d1_616_migration_keeps_idempotent_ddl_after_guard() -> None:
     assert migration.index("CREATE TABLE IF NOT EXISTS", begin_idx) > begin_idx
     assert migration.count("CREATE INDEX IF NOT EXISTS") == 7
     assert migration.endswith("COMMIT;\n")
+
+
+def test_d1_616_migration_assigns_minimal_writer_privileges_before_commit() -> None:
+    migration = D1_616_MIGRATION.read_text(encoding="utf-8")
+    table_owner = (
+        'ALTER TABLE public.session_history_codex_review_decisions '
+        'OWNER TO :"app_role";'
+    )
+    sequence_owner = (
+        "ALTER SEQUENCE "
+        "public.session_history_codex_review_decisions_id_seq\n"
+        '    OWNER TO :"app_role";'
+    )
+    table_grant = (
+        "GRANT SELECT, INSERT, UPDATE\n"
+        "    ON TABLE public.session_history_codex_review_decisions\n"
+        '    TO :"app_role";'
+    )
+    sequence_grant = (
+        "GRANT USAGE\n"
+        "    ON SEQUENCE public.session_history_codex_review_decisions_id_seq\n"
+        '    TO :"app_role";'
+    )
+    commit_idx = migration.index("COMMIT;")
+    for statement in (table_owner, sequence_owner, table_grant, sequence_grant):
+        assert statement in migration
+        assert migration.index(statement) < commit_idx
+    assert migration.index(table_owner) < migration.index(sequence_owner)
+    assert migration.index(sequence_owner) < migration.index(table_grant)
+    assert migration.index(table_grant) < migration.index(sequence_grant)
+    assert "GRANT DELETE" not in migration
+    assert "GRANT ALL" not in migration
 
 
 def test_d1_616_docs_keep_dev_prod_migration_commands_in_parity() -> None:
@@ -149,10 +201,17 @@ def test_d1_616_docs_keep_dev_prod_migration_commands_in_parity() -> None:
         command = (
             "psql --set=ON_ERROR_STOP=1 \\\n"
             f"  --set=expected_database={database} \\\n"
+            f"  --set=app_role={database} \\\n"
             f"  --dbname={database} \\\n"
             "  --file=scripts/apply_session_history_codex_review_decisions_2026_08_12.sql"
         )
         assert command in section
+    assert (
+        "The runtime role owns the table and generated BIGSERIAL sequence and "
+        "has explicit table `SELECT`, `INSERT`, `UPDATE` and sequence `USAGE` "
+        "privileges." in normalized_section
+    )
+    assert "No `DELETE` or broad privileges are granted." in normalized_section
 
 
 def test_decisions_table_defines_stable_identities_and_bounds() -> None:

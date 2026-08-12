@@ -617,11 +617,14 @@ is `litellm_prod`; `aawm_tristore` is dynamically injected by some runtime
 configurations and is not the callback/session-history database target. The
 migration requires the matching `expected_database` psql variable and aborts
 before DDL when it is missing, empty, or does not match `current_database()`.
+It also requires a nonempty `app_role` psql variable that resolves to an
+existing PostgreSQL role.
 
 ```bash
 # Development apply (`litellm_dev`).
 psql --set=ON_ERROR_STOP=1 \
   --set=expected_database=litellm_dev \
+  --set=app_role=litellm_dev \
   --dbname=litellm_dev \
   --file=scripts/apply_session_history_codex_review_decisions_2026_08_12.sql
 
@@ -630,13 +633,18 @@ psql --set=ON_ERROR_STOP=1 \
 # authorized or performed by this D1-616 correction.
 psql --set=ON_ERROR_STOP=1 \
   --set=expected_database=litellm_prod \
+  --set=app_role=litellm_prod \
   --dbname=litellm_prod \
   --file=scripts/apply_session_history_codex_review_decisions_2026_08_12.sql
 ```
 
 The migration is safe to rerun and aborts unless `current_database()` is
-exactly the supplied `expected_database`. Before sending traffic that can emit
-review decisions, run these read-only checks against the same database:
+exactly the supplied `expected_database` and `app_role` names an existing
+PostgreSQL role. The runtime role owns the table and generated BIGSERIAL
+sequence and has explicit table `SELECT`, `INSERT`, `UPDATE` and sequence
+`USAGE` privileges. No `DELETE` or broad privileges are granted. Before sending
+traffic that can emit review decisions, run these read-only checks against the
+same database:
 
 ```sql
 SELECT current_database();

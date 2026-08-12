@@ -23,6 +23,31 @@ END AS d1_616_database_matches \gset
 
 :guard_statement;
 
+\if :{?app_role}
+SELECT CASE
+    WHEN NULLIF(btrim(:'app_role'), '') IS NOT NULL
+         AND EXISTS (
+             SELECT 1
+             FROM pg_catalog.pg_roles
+             WHERE rolname = :'app_role'
+         )
+        THEN 'true'
+    ELSE 'false'
+END AS d1_616_app_role_valid \gset
+
+\if :d1_616_app_role_valid
+\set app_role_guard_statement 'SELECT 1'
+\else
+\echo 'D1-616 abort: app_role is empty or does not resolve to an existing PostgreSQL role'
+\set app_role_guard_statement 'SELECT 1 / 0 AS d1_616_app_role_guard_failure'
+\endif
+\else
+\echo 'D1-616 abort: required psql variable app_role is missing'
+\set app_role_guard_statement 'SELECT 1 / 0 AS d1_616_app_role_guard_failure'
+\endif
+
+:app_role_guard_statement;
+
 BEGIN;
 
 CREATE TABLE IF NOT EXISTS public.session_history_codex_review_decisions (
@@ -81,5 +106,16 @@ CREATE INDEX IF NOT EXISTS session_history_codex_review_decisions_governed_tool_
 CREATE INDEX IF NOT EXISTS session_history_codex_review_decisions_governed_activity_key_idx
     ON public.session_history_codex_review_decisions (governed_tool_activity_key)
     WHERE governed_tool_activity_key IS NOT NULL;
+
+ALTER TABLE public.session_history_codex_review_decisions OWNER TO :"app_role";
+ALTER SEQUENCE public.session_history_codex_review_decisions_id_seq
+    OWNER TO :"app_role";
+
+GRANT SELECT, INSERT, UPDATE
+    ON TABLE public.session_history_codex_review_decisions
+    TO :"app_role";
+GRANT USAGE
+    ON SEQUENCE public.session_history_codex_review_decisions_id_seq
+    TO :"app_role";
 
 COMMIT;
