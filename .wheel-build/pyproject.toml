@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aawm-litellm-callbacks"
-version = "0.0.68"
+version = "0.0.69"
 description = "AAWM LiteLLM callback for Langfuse enrichment and session history"
 requires-python = ">=3.10"
 dependencies = ["litellm"]
@@ -20,6 +20,12 @@ dev = ["build"]
 # The thin checkout loader under aawm_litellm_callbacks/agent_identity.py ships
 # as-is and re-exports the canonical litellm.integrations.aawm_agent_identity
 # namespace (including private helpers) at wheel build time.
+#
+# 0.0.69: immutable re-cut so the force-included aawm_session_history package
+# carries the Codex review-decisions SQL surface that
+# aawm_agent_identity/__init__.py imports (0.0.68 was cut before
+# litellm/integrations/aawm_session_history/sql.py shipped those constants,
+# leaving pip-overlay installs with an ImportError on proxy boot).
 [tool.hatch.build.targets.wheel]
 packages = ["aawm_litellm_callbacks"]
 
