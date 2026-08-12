@@ -25,10 +25,12 @@ this file path.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import re
 import sys
 from types import FunctionType
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from litellm._logging import verbose_logger
 
@@ -41,6 +43,7 @@ from litellm.integrations.aawm_session_history.sql import (  # noqa: F401
     _AAWM_RATE_LIMIT_TRANSITION_INSERT_SQL,
     _AAWM_PROVIDER_ERROR_OBSERVATION_INSERT_SQL,
     _AAWM_ALIAS_ROUTING_AUDIT_INSERT_SQL,
+    _AAWM_SESSION_HISTORY_CODEX_REVIEW_DECISION_INSERT_SQL,
     _AAWM_SESSION_HISTORY_PREVIOUS_GAP_UPDATE_SQL,
     _AAWM_CLAUDE_AUTO_REVIEW_PARENT_IDENTITY_SQL,
     _AAWM_TOOL_DEFINITION_SNAPSHOT_METADATA_KEY,
@@ -78,6 +81,15 @@ _RECORD_API_NAMES: Tuple[str, ...] = (
     "_build_tool_definition_snapshot_db_payloads",
     "_persist_tool_definition_snapshots_best_effort",
     "_persist_alias_routing_audit_best_effort",
+    "_extract_codex_review_decision_events",
+    "_sanitize_codex_review_decision_text",
+    "_bounded_stable_id",
+    "_sanitize_codex_review_decision_label",
+    "_sanitize_codex_review_decision_rationale",
+    "_codex_review_decision_key",
+    "_build_codex_review_decision_db_payload",
+    "_build_codex_review_decision_db_payloads",
+    "_persist_codex_review_decisions",
     "_build_rate_limit_observation_only_record",
     "_persist_rate_limit_observations_best_effort",
     "_persist_provider_error_observations_best_effort",
@@ -1588,6 +1600,430 @@ async def _persist_alias_routing_audit_best_effort(
             _format_exception_for_warning(exc),
         )
 
+# --- Codex review decisions (D1-616) ---
+# First-class persistence of completed, successfully parsed codex-auto-review
+# decisions. Parsing, sanitization, and parent correlation remain owned by the
+# D1-615 route-rollup contract; this record path only accepts explicitly
+# validated decision/correlation inputs and never infers links from time, row
+# order, model order, rationale similarity, or tool names.
+_CODEX_REVIEW_DECISION_RECORD_KEYS: Tuple[str, ...] = (
+    "codex_review_decisions",
+    "codex_auto_review_decisions",
+)
+_CODEX_REVIEW_DECISION_OUTCOMES: Tuple[str, ...] = ("allow", "deny")
+_CODEX_REVIEW_DECISION_RATIONALE_MAX_CHARS = 512
+_CODEX_REVIEW_DECISION_BOUNDED_MAX_CHARS = 128
+_CODEX_REVIEW_DECISION_LABEL_MAX_CHARS = (
+    _CODEX_REVIEW_DECISION_BOUNDED_MAX_CHARS
+)
+_CODEX_REVIEW_DECISION_IDENTITY_HASH_CHARS = 16
+_CODEX_REVIEW_DECISION_PARSER_VERSION = "codex-review-parser/1"
+_CODEX_REVIEW_DECISION_CONTRACT_VERSION = "d1-616-contract/1"
+_CODEX_REVIEW_DECISION_ANSI_ESCAPE_RE = re.compile(
+    r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])"
+)
+_CODEX_REVIEW_DECISION_BEARER_RE = re.compile(
+    r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{6,}"
+)
+_CODEX_REVIEW_DECISION_TOKEN_PREFIX_RE = re.compile(
+    r"(?i)\b(?:sk|pk|xai)-[A-Za-z0-9._~+/=-]{6,}|\bya29\.[A-Za-z0-9._~+/=-]{6,}"
+)
+_CODEX_REVIEW_DECISION_NAMED_SECRET_RE = re.compile(
+    r"(?i)\b(authorization|api[ _-]?key|access[ _-]?token|password|secret|token)"
+    r"\s*[:=]\s*([^\s,;]+)"
+)
+
+
+def _extract_codex_review_decision_events(
+    record: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Collect validated review-decision events attached to *record*.
+
+    Events may ride directly on the record or in metadata under the known
+    contract keys. Duplicates (identical validated payloads) are dropped by
+    canonical JSON fingerprint, matching the alias-routing audit pattern.
+    """
+    metadata = record.get("metadata")
+    event_sources: List[Any] = [
+        record.get(key) for key in _CODEX_REVIEW_DECISION_RECORD_KEYS
+    ]
+    if isinstance(metadata, dict):
+        event_sources.extend(
+            metadata.get(key) for key in _CODEX_REVIEW_DECISION_RECORD_KEYS
+        )
+    events: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for source in event_sources:
+        if not isinstance(source, list):
+            continue
+        for event in source:
+            if not isinstance(event, dict):
+                continue
+            try:
+                fingerprint = json.dumps(
+                    event,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                )
+            except Exception:
+                fingerprint = str(id(event))
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            events.append(event)
+    return events
+
+
+def _sanitize_codex_review_decision_text(
+    value: Any,
+    max_chars: Optional[int],
+) -> Tuple[Optional[str], bool]:
+    """Return (bounded sanitized text or None, truncated flag).
+
+    Matches the D1-615 data-minimization contract: NUL bytes, ANSI escape
+    sequences, and control characters are removed/collapsed, whitespace is
+    collapsed, bearer/token/key/secret/password patterns are redacted, and the
+    result is bounded to ``max_chars``. Empty/absent input stays None so
+    rationale-less approvals are preserved without inventing text. Pass
+    ``max_chars=None`` for the unbounded variant used as hash input, so full
+    values are normalized before hashing.
+    """
+    if not isinstance(value, str):
+        return None, False
+    sanitized = _strip_postgres_nul_bytes(value)
+    sanitized = _CODEX_REVIEW_DECISION_ANSI_ESCAPE_RE.sub("", sanitized)
+    sanitized = "".join(
+        char if (char.isprintable() and char not in "\r\n\t") else " "
+        for char in sanitized
+    )
+    sanitized = " ".join(sanitized.split())
+    if not sanitized:
+        return None, False
+    sanitized = _CODEX_REVIEW_DECISION_BEARER_RE.sub("Bearer [REDACTED]", sanitized)
+    sanitized = _CODEX_REVIEW_DECISION_TOKEN_PREFIX_RE.sub("[REDACTED]", sanitized)
+    sanitized = _CODEX_REVIEW_DECISION_NAMED_SECRET_RE.sub(
+        lambda match: f"{match.group(1)}=[REDACTED]",
+        sanitized,
+    )
+    sanitized = " ".join(sanitized.split())
+    if not sanitized:
+        return None, False
+    if max_chars is not None and len(sanitized) > max_chars:
+        return sanitized[:max_chars], True
+    return sanitized, False
+
+
+def _sanitize_codex_review_decision_rationale(
+    value: Any,
+) -> Tuple[Optional[str], bool]:
+    """Bounded sanitized rationale (D1-615 parity: max 512 chars)."""
+    return _sanitize_codex_review_decision_text(
+        value,
+        _CODEX_REVIEW_DECISION_RATIONALE_MAX_CHARS,
+    )
+
+
+def _bounded_stable_id(
+    value: Any,
+    max_chars: int = _CODEX_REVIEW_DECISION_BOUNDED_MAX_CHARS,
+) -> Optional[str]:
+    """Deterministic bounded representation of an ENTIRE stable ID.
+
+    Values within ``max_chars`` pass through unchanged. Longer values are
+    never stored as a bare prefix: two inputs sharing a prefix longer than
+    ``max_chars`` would collide. Instead the bounded representation is the
+    sanitized prefix plus a SHA-256 suffix derived from the entire sanitized
+    value (total length <= ``max_chars``), so equal prefixes cannot collide
+    and distinct full values map to distinct stored identities. Hashing
+    always consumes the full normalized value, never a truncated copy.
+    """
+    sanitized, _ = _sanitize_codex_review_decision_text(value, None)
+    if sanitized is None or len(sanitized) <= max_chars:
+        return sanitized
+    digest = hashlib.sha256(sanitized.encode("utf-8")).hexdigest()
+    prefix_len = max_chars - _CODEX_REVIEW_DECISION_IDENTITY_HASH_CHARS - 1
+    return (
+        f"{sanitized[:prefix_len]}"
+        f":{digest[:_CODEX_REVIEW_DECISION_IDENTITY_HASH_CHARS]}"
+    )
+
+
+def _sanitize_codex_review_decision_label(value: Any) -> Optional[str]:
+    """Bounded sanitized identity/label field; never persists raw/unbounded text.
+
+    Over-long stable IDs are stored as the deterministic prefix+SHA-256
+    representation of the entire value (see ``_bounded_stable_id``) rather
+    than a collision-prone 128-char prefix.
+    """
+    return _bounded_stable_id(value, _CODEX_REVIEW_DECISION_LABEL_MAX_CHARS)
+
+
+def _codex_review_decision_key(
+    *,
+    reviewer_litellm_call_id: str,
+    decision_id: Optional[str],
+    review_attempt_key: Optional[str],
+    review_attempt_number: Optional[int],
+    parent_litellm_call_id: Optional[str],
+    parent_session_id: Optional[str],
+    parent_thread_id: Optional[str],
+    parent_agent_id: Optional[str],
+    parent_agent_name: Optional[str],
+) -> str:
+    """Stable idempotency key for one review decision.
+
+    Keyed on reviewer call + explicit stable decision/attempt identity +
+    explicit parent identity (including the parent actor) so retries (new
+    attempts) and decisions for different parents persist as separate rows
+    and never overwrite earlier decisions, while exact replays of the same
+    attempt/parent merge via the insert's ON CONFLICT clause. The key never
+    depends on the mutable
+    outcome, rationale, or any later enrichment: an outcome change for the
+    same decision identity maps to the same key and the first persisted
+    immutable identity wins. Parent identity is the explicit correlation
+    fields supplied by the producer (never inferred); absent parents collapse
+    to the unattributed tuple. No timestamp/order/model/rationale/outcome
+    material participates.
+
+    Hashing consumes the FULL validated identity strings: stable IDs are
+    never passed through the bounded 128-char representation before entering
+    key material, so two over-long IDs sharing a prefix cannot collide on
+    the decision key. The parent actor fields enter as the FULL sanitized
+    ``parent_agent_id``/``parent_agent_name`` strings (never their bounded
+    stored representations), so actor-only correlation distinguishes actors
+    whose IDs/names share a prefix longer than the 128-char storage bound.
+    """
+    # Full validated strings (never prefix-truncated) enter the hash.
+    key_material = [
+        reviewer_litellm_call_id,
+        decision_id,
+        review_attempt_key,
+        review_attempt_number,
+        parent_litellm_call_id,
+        parent_session_id,
+        parent_thread_id,
+        parent_agent_id,
+        parent_agent_name,
+    ]
+    digest = hashlib.sha256(
+        json.dumps(key_material, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"{reviewer_litellm_call_id}:codex-review:{digest}"
+
+
+def _build_codex_review_decision_db_payload(
+    record: Dict[str, Any],
+    event: Dict[str, Any],
+    event_index: int,
+) -> Optional[Tuple[Any, ...]]:
+    """Build one insert payload, or None when the event lacks the validated
+    identities required for persistence.
+
+    Persistence requires an explicit stable decision/review-attempt identity
+    (``decision_id`` and/or ``review_attempt_key``). A decision that cannot
+    be uniquely identified across retries is rejected rather than keyed on
+    mutable outcome/rationale content. Malformed or identity-poor events
+    return None so no falsely linked decision row is created; their
+    standalone reviewer rendering/diagnostics remain owned by the D1-615
+    route-rollup path.
+    """
+    outcome = _clean_non_empty_string(event.get("outcome"))
+    if outcome is None:
+        return None
+    outcome = outcome.lower()
+    if outcome not in _CODEX_REVIEW_DECISION_OUTCOMES:
+        return None
+
+    reviewer_litellm_call_id = _clean_non_empty_string(
+        event.get("reviewer_litellm_call_id")
+    ) or _clean_non_empty_string(record.get("litellm_call_id"))
+    reviewer_session_id = _clean_non_empty_string(
+        event.get("reviewer_session_id")
+    ) or _clean_non_empty_string(record.get("session_id"))
+    if reviewer_litellm_call_id is None or reviewer_session_id is None:
+        # No stable reviewer identity: refuse to persist rather than
+        # fabricate one.
+        return None
+
+    # Stable decision/attempt identity must be explicit and immutable. It is
+    # sanitized like every persisted label so identity fields can never carry
+    # raw auth/control text into the key material or stored rows. The FULL
+    # sanitized strings feed the decision-key hash (never truncated first);
+    # only the bounded stored columns use the deterministic prefix+SHA-256
+    # representation for over-long values.
+    decision_id, _ = _sanitize_codex_review_decision_text(
+        event.get("decision_id"), None
+    )
+    review_attempt_key, _ = _sanitize_codex_review_decision_text(
+        event.get("review_attempt_key"), None
+    )
+    review_attempt_number = _safe_int(event.get("review_attempt_number"))
+    if decision_id is None and review_attempt_key is None:
+        # No explicit stable decision identity: cannot uniquely identify the
+        # decision across retries. Refuse to persist rather than key on
+        # mutable outcome/rationale.
+        return None
+
+    rationale, rationale_truncated = _sanitize_codex_review_decision_rationale(
+        event.get("rationale")
+    )
+
+    # Canonical session identity for the decision record itself.
+    session_id = _sanitize_codex_review_decision_label(
+        event.get("session_id")
+    ) or _sanitize_codex_review_decision_label(record.get("session_id"))
+
+    # Correlation is explicit-only: parent identity fields supplied by the
+    # producer. Absence means unattributed, never guessed. Attribution
+    # follows D1-615 parity: the canonical session identity PLUS an
+    # immediate parent actor (parent_agent_id/parent_agent_name) and/or a
+    # parent thread (parent_thread_id). parent_litellm_call_id is only a
+    # narrowing field and can never attribute on its own. Parent actor or
+    # thread without the canonical session stays unattributed and must not
+    # create a falsely linked relationship.
+    parent_litellm_call_id = _sanitize_codex_review_decision_label(
+        event.get("parent_litellm_call_id")
+    )
+    parent_session_id = _sanitize_codex_review_decision_label(
+        event.get("parent_session_id")
+    )
+    parent_thread_id = _sanitize_codex_review_decision_label(
+        event.get("parent_thread_id")
+    )
+    # Parent actor identity: the FULL sanitized strings feed the decision-key
+    # hash (never truncated first); only the stored columns use the bounded
+    # prefix+SHA-256 representation for over-long values.
+    parent_agent_name_full, _ = _sanitize_codex_review_decision_text(
+        event.get("parent_agent_name"), None
+    )
+    parent_agent_id_full, _ = _sanitize_codex_review_decision_text(
+        event.get("parent_agent_id"), None
+    )
+    parent_agent_name = _bounded_stable_id(
+        parent_agent_name_full, _CODEX_REVIEW_DECISION_LABEL_MAX_CHARS
+    )
+    parent_agent_id = _bounded_stable_id(
+        parent_agent_id_full, _CODEX_REVIEW_DECISION_LABEL_MAX_CHARS
+    )
+    has_parent_actor = (
+        parent_agent_id is not None or parent_agent_name is not None
+    )
+    has_parent_thread = parent_thread_id is not None
+    correlation_status = (
+        "attributed"
+        if session_id is not None and (has_parent_actor or has_parent_thread)
+        else "unattributed"
+    )
+
+    # Reserved exact stable IDs for governed tool activity. Populated only
+    # when the producer supplies them; never inferred here.
+    governed_tool_call_id = _sanitize_codex_review_decision_label(
+        event.get("governed_tool_call_id")
+    )
+    governed_tool_activity_key = _sanitize_codex_review_decision_label(
+        event.get("governed_tool_activity_key")
+    )
+
+    metadata = {
+        "event_index": event_index,
+        "session_history_provider": _sanitize_codex_review_decision_label(
+            record.get("provider")
+        ),
+        "session_history_model": _sanitize_codex_review_decision_label(
+            record.get("model")
+        ),
+    }
+    event_metadata = event.get("metadata")
+    if isinstance(event_metadata, dict):
+        for key in ("source", "capture_source", "producer_version"):
+            value = _sanitize_codex_review_decision_label(
+                event_metadata.get(key)
+            )
+            if value is not None:
+                metadata[key] = value
+
+    return (
+        _codex_review_decision_key(
+            reviewer_litellm_call_id=reviewer_litellm_call_id,
+            decision_id=decision_id,
+            review_attempt_key=review_attempt_key,
+            review_attempt_number=review_attempt_number,
+            parent_litellm_call_id=parent_litellm_call_id,
+            parent_session_id=parent_session_id,
+            parent_thread_id=parent_thread_id,
+            parent_agent_id=parent_agent_id_full,
+            parent_agent_name=parent_agent_name_full,
+        ),
+        reviewer_litellm_call_id,
+        reviewer_session_id,
+        _sanitize_codex_review_decision_label(event.get("reviewer_trace_id"))
+        or _sanitize_codex_review_decision_label(record.get("trace_id")),
+        _sanitize_codex_review_decision_label(event.get("reviewer_model"))
+        or _sanitize_codex_review_decision_label(record.get("model")),
+        _sanitize_codex_review_decision_label(event.get("reviewer_agent_name"))
+        or _sanitize_codex_review_decision_label(record.get("agent_name")),
+        _sanitize_codex_review_decision_label(event.get("reviewer_agent_id"))
+        or _sanitize_codex_review_decision_label(record.get("agent_id")),
+        outcome,
+        rationale,
+        rationale_truncated,
+        _sanitize_codex_review_decision_label(event.get("risk_level")),
+        _sanitize_codex_review_decision_label(event.get("user_authorization")),
+        session_id,
+        parent_litellm_call_id,
+        parent_session_id,
+        parent_thread_id,
+        parent_agent_name,
+        parent_agent_id,
+        correlation_status,
+        _sanitize_codex_review_decision_label(event.get("parser_version"))
+        or _CODEX_REVIEW_DECISION_PARSER_VERSION,
+        _sanitize_codex_review_decision_label(event.get("contract_version"))
+        or _CODEX_REVIEW_DECISION_CONTRACT_VERSION,
+        review_attempt_number,
+        _bounded_stable_id(review_attempt_key),
+        governed_tool_call_id,
+        governed_tool_activity_key,
+        json.dumps(metadata),
+    )
+
+
+def _build_codex_review_decision_db_payloads(
+    record: Dict[str, Any],
+) -> List[Tuple[Any, ...]]:
+    payloads: List[Tuple[Any, ...]] = []
+    for index, event in enumerate(_extract_codex_review_decision_events(record)):
+        payload = _build_codex_review_decision_db_payload(record, event, index)
+        if payload is not None:
+            payloads.append(payload)
+    return payloads
+
+
+async def _persist_codex_review_decisions(
+    conn: Any,
+    records: List[Dict[str, Any]],
+) -> None:
+    """Persist review-decision rows within the session-history write path.
+
+    Failures are intentionally NOT swallowed here: they propagate to the
+    existing durable session-history writer retry/spool semantics (retry
+    budget, then write-ahead spool replay) exactly like any other persistence
+    failure, instead of being dropped after the primary write. Retries remain
+    safe because the primary session_history insert and this decision insert
+    are both idempotent on their stable identity keys. Primary routing is
+    unaffected: this runs after the primary transaction, outside of it.
+    """
+    payloads: List[Tuple[Any, ...]] = []
+    for record in records:
+        payloads.extend(_build_codex_review_decision_db_payloads(record))
+    if not payloads:
+        return
+    await conn.executemany(
+        _AAWM_SESSION_HISTORY_CODEX_REVIEW_DECISION_INSERT_SQL,
+        payloads,
+    )
+
 # --- _build_rate_limit_observation_only_record ---
 def _build_rate_limit_observation_only_record(
     kwargs: Dict[str, Any],
@@ -1768,6 +2204,7 @@ async def _persist_session_history_record(record: Dict[str, Any]) -> None:
         )
         await _persist_provider_error_observations_best_effort(conn, [record])
         await _persist_alias_routing_audit_best_effort(conn, [record])
+        await _persist_codex_review_decisions(conn, [record])
 
 # --- _persist_session_history_records ---
 async def _persist_session_history_records(records: List[Dict[str, Any]]) -> None:
@@ -1820,6 +2257,7 @@ async def _persist_session_history_records(records: List[Dict[str, Any]]) -> Non
             identity_by_session=identity_by_session,
         )
         await _persist_alias_routing_audit_best_effort(conn, records)
+        await _persist_codex_review_decisions(conn, records)
 
 # --- _handle_session_history_success_event ---
 def _handle_session_history_success_event(
@@ -1934,6 +2372,55 @@ def _install_record_functions() -> None:
     host_globals = host.__dict__
     # Modules used by record APIs that may not already be identity globals.
     host_globals.setdefault("inspect", inspect)
+    host_globals.setdefault("hashlib", hashlib)
+    # Codex review-decision constants referenced by the rebound D1-616
+    # builders must resolve through the identity namespace after rebind.
+    host_globals.setdefault(
+        "_CODEX_REVIEW_DECISION_RECORD_KEYS", _CODEX_REVIEW_DECISION_RECORD_KEYS
+    )
+    host_globals.setdefault(
+        "_CODEX_REVIEW_DECISION_OUTCOMES", _CODEX_REVIEW_DECISION_OUTCOMES
+    )
+    host_globals.setdefault(
+        "_CODEX_REVIEW_DECISION_RATIONALE_MAX_CHARS",
+        _CODEX_REVIEW_DECISION_RATIONALE_MAX_CHARS,
+    )
+    host_globals.setdefault(
+        "_CODEX_REVIEW_DECISION_LABEL_MAX_CHARS",
+        _CODEX_REVIEW_DECISION_LABEL_MAX_CHARS,
+    )
+    host_globals.setdefault(
+        "_CODEX_REVIEW_DECISION_BOUNDED_MAX_CHARS",
+        _CODEX_REVIEW_DECISION_BOUNDED_MAX_CHARS,
+    )
+    host_globals.setdefault(
+        "_CODEX_REVIEW_DECISION_IDENTITY_HASH_CHARS",
+        _CODEX_REVIEW_DECISION_IDENTITY_HASH_CHARS,
+    )
+    host_globals.setdefault(
+        "_CODEX_REVIEW_DECISION_ANSI_ESCAPE_RE",
+        _CODEX_REVIEW_DECISION_ANSI_ESCAPE_RE,
+    )
+    host_globals.setdefault(
+        "_CODEX_REVIEW_DECISION_BEARER_RE",
+        _CODEX_REVIEW_DECISION_BEARER_RE,
+    )
+    host_globals.setdefault(
+        "_CODEX_REVIEW_DECISION_TOKEN_PREFIX_RE",
+        _CODEX_REVIEW_DECISION_TOKEN_PREFIX_RE,
+    )
+    host_globals.setdefault(
+        "_CODEX_REVIEW_DECISION_NAMED_SECRET_RE",
+        _CODEX_REVIEW_DECISION_NAMED_SECRET_RE,
+    )
+    host_globals.setdefault(
+        "_CODEX_REVIEW_DECISION_PARSER_VERSION",
+        _CODEX_REVIEW_DECISION_PARSER_VERSION,
+    )
+    host_globals.setdefault(
+        "_CODEX_REVIEW_DECISION_CONTRACT_VERSION",
+        _CODEX_REVIEW_DECISION_CONTRACT_VERSION,
+    )
     # verbose_logger is imported on this module; ensure host can see the same
     # object if not already present (tests often patch host.verbose_logger).
     host_globals.setdefault("verbose_logger", verbose_logger)

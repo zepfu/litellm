@@ -2092,3 +2092,124 @@ ON CONFLICT (event_key) WHERE event_key IS NOT NULL DO UPDATE SET
     redispatch_threshold_crossed = aawm_alias_routing_audit.redispatch_threshold_crossed OR EXCLUDED.redispatch_threshold_crossed,
     metadata = COALESCE(aawm_alias_routing_audit.metadata, '{}'::jsonb) || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
 """
+
+# --- Codex review decisions (D1-616) ---
+# First-class persistence of completed, successfully parsed codex-auto-review
+# decisions. Parsing/attribution stays owned by the D1-615 route-rollup
+# contract; this table only stores explicitly validated decision inputs.
+#
+# Linkage safety contract:
+# - Correlation to the originating call happens ONLY through explicit
+#   parent identity fields supplied by the producer (parent_litellm_call_id /
+#   parent_thread_id / parent_session_id). Time, row order, model order, and
+#   rationale/tool-name similarity are never used.
+# - governed_tool_call_id / governed_tool_activity_key are RESERVED nullable
+#   stable IDs. They are populated only when the producer supplies an exact
+#   stable ID; no association is inferred while those producer IDs do not
+#   exist. A normalized association table may replace or complement these
+#   columns once stable producer IDs land; rationale text is never duplicated
+#   into tool-activity rows.
+_AAWM_SESSION_HISTORY_CODEX_REVIEW_DECISIONS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS public.session_history_codex_review_decisions (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    decision_key TEXT NOT NULL,
+    reviewer_litellm_call_id TEXT NOT NULL,
+    reviewer_session_id TEXT NOT NULL,
+    reviewer_trace_id TEXT,
+    reviewer_model TEXT,
+    reviewer_agent_name TEXT,
+    reviewer_agent_id TEXT,
+    outcome TEXT NOT NULL CHECK (outcome IN ('allow', 'deny')),
+    rationale TEXT,
+    rationale_truncated BOOLEAN NOT NULL DEFAULT FALSE,
+    risk_level TEXT,
+    user_authorization TEXT,
+    session_id TEXT,
+    parent_litellm_call_id TEXT,
+    parent_session_id TEXT,
+    parent_thread_id TEXT,
+    parent_agent_name TEXT,
+    parent_agent_id TEXT,
+    correlation_status TEXT NOT NULL DEFAULT 'unattributed'
+        CHECK (correlation_status IN ('attributed', 'unattributed')),
+    parser_version TEXT,
+    contract_version TEXT,
+    review_attempt_number INTEGER,
+    review_attempt_key TEXT,
+    governed_tool_call_id TEXT,
+    governed_tool_activity_key TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    UNIQUE (decision_key)
+)
+"""
+_AAWM_SESSION_HISTORY_CODEX_REVIEW_DECISIONS_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS session_history_codex_review_decisions_session_created_idx "
+    "ON public.session_history_codex_review_decisions (session_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS session_history_codex_review_decisions_reviewer_call_idx "
+    "ON public.session_history_codex_review_decisions (reviewer_litellm_call_id)",
+    "CREATE INDEX IF NOT EXISTS session_history_codex_review_decisions_reviewer_session_created_idx "
+    "ON public.session_history_codex_review_decisions (reviewer_session_id, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS session_history_codex_review_decisions_parent_call_idx "
+    "ON public.session_history_codex_review_decisions (parent_litellm_call_id) "
+    "WHERE parent_litellm_call_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS session_history_codex_review_decisions_outcome_created_idx "
+    "ON public.session_history_codex_review_decisions (outcome, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS session_history_codex_review_decisions_governed_tool_call_idx "
+    "ON public.session_history_codex_review_decisions (governed_tool_call_id) "
+    "WHERE governed_tool_call_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS session_history_codex_review_decisions_governed_activity_key_idx "
+    "ON public.session_history_codex_review_decisions (governed_tool_activity_key) "
+    "WHERE governed_tool_activity_key IS NOT NULL",
+)
+_AAWM_SESSION_HISTORY_CODEX_REVIEW_DECISION_INSERT_SQL = """
+INSERT INTO public.session_history_codex_review_decisions (
+    decision_key,
+    reviewer_litellm_call_id,
+    reviewer_session_id,
+    reviewer_trace_id,
+    reviewer_model,
+    reviewer_agent_name,
+    reviewer_agent_id,
+    outcome,
+    rationale,
+    rationale_truncated,
+    risk_level,
+    user_authorization,
+    session_id,
+    parent_litellm_call_id,
+    parent_session_id,
+    parent_thread_id,
+    parent_agent_name,
+    parent_agent_id,
+    correlation_status,
+    parser_version,
+    contract_version,
+    review_attempt_number,
+    review_attempt_key,
+    governed_tool_call_id,
+    governed_tool_activity_key,
+    metadata
+) VALUES (
+    $1::text, $2::text, $3::text, $4::text, $5::text,
+    $6::text, $7::text, $8::text, $9::text, $10::boolean,
+    $11::text, $12::text, $13::text, $14::text, $15::text,
+    $16::text, $17::text, $18::text, $19::text, $20::text,
+    $21::text, $22::integer, $23::text, $24::text, $25::text,
+    $26::jsonb
+)
+ON CONFLICT (decision_key) DO UPDATE SET
+    -- Immutable decision/identity columns (outcome, reviewer/parent/session
+    -- identity, attempt identity, correlation_status, governed IDs, parser
+    -- and contract versions) are NEVER updated on conflict. Conflict replay
+    -- keeps the stored row winning: each enrichment column uses stored-first
+    -- COALESCE ordering and may only fill NULL/empty stored values, never
+    -- overwrite a set one. Existing metadata keys win by merging incoming
+    -- first and stored second.
+    reviewer_trace_id = COALESCE(NULLIF(session_history_codex_review_decisions.reviewer_trace_id, ''), NULLIF(EXCLUDED.reviewer_trace_id, '')),
+    rationale = COALESCE(NULLIF(session_history_codex_review_decisions.rationale, ''), NULLIF(EXCLUDED.rationale, '')),
+    rationale_truncated = session_history_codex_review_decisions.rationale_truncated OR EXCLUDED.rationale_truncated,
+    risk_level = COALESCE(NULLIF(session_history_codex_review_decisions.risk_level, ''), NULLIF(EXCLUDED.risk_level, '')),
+    user_authorization = COALESCE(NULLIF(session_history_codex_review_decisions.user_authorization, ''), NULLIF(EXCLUDED.user_authorization, '')),
+    metadata = COALESCE(EXCLUDED.metadata, '{}'::jsonb) || COALESCE(session_history_codex_review_decisions.metadata, '{}'::jsonb)
+"""

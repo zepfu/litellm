@@ -552,6 +552,155 @@ Console summary includes `database`, `target_db_name`, `projects_dir`,
 `memories_dir`, `session_evidence_limit_per_session`, `candidate_rows`,
 `repairable_rows`, `classified_unresolved_rows`, and `applied`.
 
+## Codex Review Decision Persistence
+
+`public.session_history_codex_review_decisions` stores completed, successfully
+parsed Codex review outcomes as normalized records alongside
+`public.session_history`. It is a decision record, not a transcript or a
+replacement for route-rollup diagnostics.
+
+Stable identities and correlation are explicit:
+
+- `decision_key` is the unique decision identity. It is derived from the
+  reviewer call, an explicit decision/attempt identity
+  (`review_attempt_key` and/or `review_attempt_number`), and explicit parent
+  identity. It must never be derived from `outcome`, `rationale`, timestamps,
+  row order, model order, or text similarity.
+- `session_id` is the canonical session identity used for grouping.
+  `correlation_status` is `attributed` only when that canonical session is
+  present together with a parent actor (`parent_agent_name` and/or
+  `parent_agent_id`) and/or `parent_thread_id`. `parent_litellm_call_id`
+  narrows an already explicit parent relationship; a call ID alone never
+  establishes attribution. Without those required identities, the row remains
+  `unattributed`.
+- Replays of the same reviewer call, explicit decision/attempt, and explicit
+  parent reuse `decision_key` and are idempotent. A new retry/attempt has a
+  distinct key and must not overwrite the earlier decision or outcome.
+
+`outcome` is constrained to `allow` or `deny`. `rationale` is nullable:
+`NULL` means the valid decision had no rationale, including a rationale-less
+approval; it is not permission to invent text or treat the event as malformed.
+A denial remains a durable decision even when no tool-activity row exists.
+
+Rationales are sanitized, data-minimized, and bounded to at most 512
+characters; retain the truncation indicator when applicable. Do not persist
+prompts, transcript deltas, credentials, authorization payloads, raw request
+or response bodies, or duplicated tool arguments/results. Decision rows and
+any future association rows must follow the owning session-history retention
+and deletion policy; they are not an indefinite transcript archive.
+
+On an exact replay, stored identity and decision fields remain immutable.
+Existing stored replay-enrichment values win; a replay may fill a previously
+empty safe enrichment field but must not replace a value already stored.
+Existing metadata keys also win during replay enrichment; new metadata keys
+may be added without replacing an existing stored key.
+
+`governed_tool_call_id` and `governed_tool_activity_key` are reserved nullable
+slots for exact producer-supplied governed tool/action identities. They remain
+nullable and no relationship may be inferred when they are absent. Any bounded
+stable-ID representation must be derived from the full producer value, never
+from a truncated prefix, so values that share a prefix cannot collide. No
+relationship may be inferred from timestamps, row order, model order, session
+proximity, rationale, tool name, or command text. Current cardinality is
+intentionally unresolved: one canonical session may have zero-to-many
+decisions, a decision may have no governed activity (for example, a denial or
+abandoned action), and retries may produce multiple decisions for one logical
+action. Do not assume one-to-one; use a normalized association table if exact
+producer IDs establish a zero-to-many or many-to-many relationship.
+
+### Schema Apply And Pre-Traffic Verification
+
+Apply the canonical migration only to `aawm_tristore`:
+
+```bash
+psql --set=ON_ERROR_STOP=1 --dbname=aawm_tristore \
+  --file=scripts/apply_session_history_codex_review_decisions_2026_08_12.sql
+```
+
+The migration is safe to rerun and aborts unless `current_database()` is
+exactly `aawm_tristore`. Before sending traffic that can emit review decisions,
+run these read-only checks against the same database:
+
+```sql
+SELECT current_database();
+
+SELECT to_regclass('public.session_history_codex_review_decisions')
+    AS table_name;
+
+SELECT conname,
+       contype,
+       pg_get_constraintdef(oid) AS constraint_definition
+FROM pg_constraint
+WHERE conrelid = 'public.session_history_codex_review_decisions'::regclass
+ORDER BY conname;
+
+SELECT indexname,
+       indexdef
+FROM pg_indexes
+WHERE schemaname = 'public'
+  AND tablename = 'session_history_codex_review_decisions'
+ORDER BY indexname;
+```
+
+The first query must return `aawm_tristore`; the table query must return
+`public.session_history_codex_review_decisions`; the constraint query must show
+the primary key, unique `decision_key`, and the `allow`/`deny` plus
+`attributed`/`unattributed` checks; and the index query must show every
+canonical index created by the migration.
+
+The following bounded query lists decisions for a canonical session without
+reading rationale, metadata, arguments, or response bodies:
+
+```sql
+SELECT h.litellm_call_id,
+       h.session_id,
+       d.decision_key,
+       d.outcome,
+       d.correlation_status,
+       d.review_attempt_number,
+       d.review_attempt_key,
+       d.governed_tool_call_id,
+       d.governed_tool_activity_key
+FROM public.session_history AS h
+JOIN public.session_history_codex_review_decisions AS d
+  ON d.reviewer_litellm_call_id = h.litellm_call_id
+ AND d.reviewer_session_id = h.session_id
+ AND d.session_id = h.session_id
+WHERE h.session_id = $1
+ORDER BY h.created_at DESC, d.created_at DESC
+LIMIT LEAST($2, 100);
+```
+
+Only after the producer supplies an exact stable tool-call ID may a consumer
+continue to governed activity. Never substitute time, index, name, or
+session-only matching:
+
+```sql
+SELECT d.decision_key,
+       d.outcome,
+       a.litellm_call_id,
+       a.session_id,
+       a.tool_call_id,
+       a.tool_index,
+       a.tool_name
+FROM public.session_history_codex_review_decisions AS d
+JOIN public.session_history_tool_activity AS a
+  ON a.tool_call_id = d.governed_tool_call_id
+ AND a.session_id = d.session_id
+WHERE d.session_id = $1
+  AND d.governed_tool_call_id IS NOT NULL
+ORDER BY d.created_at DESC, a.created_at DESC
+LIMIT LEAST($2, 100);
+```
+
+Remaining dependencies are D1-615 event production of the validated completed
+decision and canonical/immediate-parent identities, producer-owned stable
+action/tool IDs (including proposed actions that never execute), and live
+development proof: confirm the exact `current_database()` name, apply and
+verify the canonical migration, and run the bounded queries against that
+database. There is no historical backfill and no inferred relationship under
+this contract.
+
 ## Claude Auto-Review Permission-Check Backfill
 
 Historical Claude Code Bash/tool permission-classifier rows may have been
