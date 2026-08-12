@@ -209,7 +209,8 @@ def resolve_canonical_session_identity(
 ) -> Optional[str]:
     """Resolve the provider-neutral canonical session identity.
 
-    Only the raw session id participates. Alias/provider/model/lane prefixes on
+    The current execution thread is authoritative when present, with the
+    session id used only as a fallback. Alias/provider/model/lane prefixes on
     legacy affinity keys are stripped.
     """
 
@@ -223,11 +224,10 @@ def resolve_canonical_session_identity(
     metadata = body.get("litellm_metadata") if isinstance(body, Mapping) else None
     if isinstance(metadata, dict):
         for key in (
-            "session_id",
-            "aawm_session_id",
-            "codex_session_id",
-            "claude_session_id",
-            "anthropic_session_id",
+            "thread_id",
+            "aawm_thread_id",
+            "codex_thread_id",
+            "claude_thread_id",
         ):
             value = _clean_optional_str(metadata.get(key))
             if value is not None:
@@ -244,6 +244,51 @@ def resolve_canonical_session_identity(
         header_map = {
             str(name).lower(): _clean_optional_str(value) for name, value in items
         }
+        for key in (
+            "thread-id",
+            "x-thread-id",
+            "x-aawm-thread-id",
+            "x-codex-thread-id",
+            "x-claude-thread-id",
+        ):
+            value = header_map.get(key)
+            if value is not None:
+                return _strip_legacy_affinity_prefixes(value)
+        # Common dash/underscore variants
+        for name, value in header_map.items():
+            if value and name.replace("-", "_") in {
+                "thread_id",
+                "x_thread_id",
+                "x_aawm_thread_id",
+                "x_codex_thread_id",
+                "x_claude_thread_id",
+            }:
+                return _strip_legacy_affinity_prefixes(value)
+
+    if isinstance(body, Mapping):
+        for key in (
+            "thread_id",
+            "aawm_thread_id",
+            "codex_thread_id",
+            "claude_thread_id",
+        ):
+            value = _clean_optional_str(body.get(key))
+            if value is not None:
+                return _strip_legacy_affinity_prefixes(value)
+
+    if isinstance(metadata, dict):
+        for key in (
+            "session_id",
+            "aawm_session_id",
+            "codex_session_id",
+            "claude_session_id",
+            "anthropic_session_id",
+        ):
+            value = _clean_optional_str(metadata.get(key))
+            if value is not None:
+                return _strip_legacy_affinity_prefixes(value)
+
+    if headers is not None:
         for key in (
             "session_id",
             "x-session-id",

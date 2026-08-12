@@ -199,6 +199,145 @@ def _full_attrs(**over: Any) -> dict[str, Any]:
     return base
 
 
+def test_explicit_session_identity_is_authoritative() -> None:
+    request = type("Request", (), {"headers": {"thread-id": "header-thread"}})()
+    body = {
+        "thread_id": "body-thread",
+        "session_id": "body-session",
+        "litellm_metadata": {
+            "thread_id": "metadata-thread",
+            "session_id": "metadata-session",
+        },
+    }
+
+    assert (
+        sa.resolve_canonical_session_identity(
+            request=request,
+            request_body=body,
+            session_identity="alias:explicit-thread:lane",
+        )
+        == "explicit-thread"
+    )
+
+
+def test_session_identity_fallback_is_preserved() -> None:
+    assert (
+        sa.resolve_canonical_session_identity(
+            request_body={
+                "session_id": "body-session",
+                "litellm_metadata": {"aawm_session_id": "metadata-session"},
+            }
+        )
+        == "metadata-session"
+    )
+
+
+def test_child_threads_sharing_session_resolve_distinct_identities() -> None:
+    first = sa.resolve_canonical_session_identity(
+        request_body={"thread_id": "child-one", "session_id": "shared-session"}
+    )
+    second = sa.resolve_canonical_session_identity(
+        request_body={"thread_id": "child-two", "session_id": "shared-session"}
+    )
+
+    assert first == "child-one"
+    assert second == "child-two"
+    assert first != second
+
+
+def test_same_child_thread_identity_is_stable_across_sources() -> None:
+    metadata_identity = sa.resolve_canonical_session_identity(
+        request_body={
+            "litellm_metadata": {"aawm_thread_id": "stable-child"},
+            "session_id": "shared-session",
+        }
+    )
+    request = type(
+        "Request",
+        (),
+        {"headers": {"x-aawm-thread-id": "stable-child"}},
+    )()
+    header_identity = sa.resolve_canonical_session_identity(
+        request=request,
+        request_body={"session_id": "shared-session"},
+    )
+
+    assert metadata_identity == header_identity == "stable-child"
+
+
+def test_review_thread_is_preferred_over_session_identity() -> None:
+    assert (
+        sa.resolve_canonical_session_identity(
+            request_body={
+                "claude_thread_id": "review-thread",
+                "session_id": "shared-session",
+            }
+        )
+        == "review-thread"
+    )
+
+
+def test_parent_thread_identity_is_ignored() -> None:
+    request = type(
+        "Request",
+        (),
+        {"headers": {"x-codex-parent-thread-id": "header-parent"}},
+    )()
+    assert (
+        sa.resolve_canonical_session_identity(
+            request=request,
+            request_body={
+                "parent_thread_id": "body-parent",
+                "session_id": "session-fallback",
+                "litellm_metadata": {"parent_thread_id": "metadata-parent"},
+            },
+        )
+        == "session-fallback"
+    )
+
+
+def test_optional_dispatch_labels_are_ignored() -> None:
+    request = type(
+        "Request",
+        (),
+        {"headers": {"x-openai-subagent": "review-agent"}},
+    )()
+    assert (
+        sa.resolve_canonical_session_identity(
+            request=request,
+            request_body={
+                "agent_id": "agent-1",
+                "dispatch_id": "dispatch-1",
+                "thread_source": "subagent",
+                "litellm_metadata": {
+                    "agent_id": "agent-2",
+                    "dispatch_id": "dispatch-2",
+                    "thread_source": "subagent",
+                },
+            },
+        )
+        is None
+    )
+
+
+def test_exact_thread_id_header_spelling_is_supported() -> None:
+    request = type(
+        "Request",
+        (),
+        {
+            "headers": {
+                "thread-id": "exact-header-thread",
+                "x-session-id": "session-fallback",
+            }
+        },
+    )()
+
+    assert (
+        sa.resolve_canonical_session_identity(request=request)
+        == "exact-header-thread"
+    )
+
+
 @pytest.mark.asyncio
 async def test_reservation_race_only_one_competitor_reserves() -> None:
     redis = _FakeRedisCache()
