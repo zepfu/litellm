@@ -648,6 +648,7 @@ class BaseOpenAIPassThroughHandler:
                                     mismatch_reason=incomplete,
                                 ),
                             ),
+                            request=request,
                         )
                 await _sa.ensure_session_owner_guard_for_request(
                     request=request,
@@ -696,6 +697,7 @@ class BaseOpenAIPassThroughHandler:
                     ),
                     mutation=promote_result,
                     failure_phase="session_owner_direct_openai_promote",
+                    request=request,
                 )
         else:
             await _sa.finalize_session_owner_lease_on_failure(session_owner_lease)

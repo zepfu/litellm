@@ -2714,6 +2714,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     cache_key=_cache_key,
                 ),
             ),
+            request=request,
         )
 
     affinity = None
@@ -2765,6 +2766,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                         cache_key=_cache_key,
                     ),
                 ),
+                request=request,
             )
         affinity = sa.owner_record_as_affinity_hint(session_owner_record)
         session_owner_guard_meta.update(
@@ -2801,6 +2803,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                         cache_key=_cache_key,
                     ),
                 ),
+                request=request,
             )
     elif isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "reserved":
         sa.raise_session_owner_redispatch_required(
@@ -2823,6 +2826,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     cache_key=_cache_key,
                 ),
             ),
+            request=request,
         )
     elif request_mode == "ordinary_continuation":
         affinity = await _get_codex_session_affinity(session_key)
@@ -2917,6 +2921,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                             cache_key=_cache_key,
                         ),
                     ),
+                    request=request,
                 )
             _raise_codex_auto_agent_in_flight_cooldown(
                 candidate=affinity_state["candidate"],
@@ -3110,6 +3115,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                     cache_key=_cache_key,
                 ),
             ),
+            request=request,
         )
 
     affinity = None
@@ -3161,6 +3167,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                         cache_key=_cache_key,
                     ),
                 ),
+                request=request,
             )
         affinity = sa.owner_record_as_affinity_hint(session_owner_record)
         session_owner_guard_meta.update(
@@ -3196,6 +3203,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                         cache_key=_cache_key,
                     ),
                 ),
+                request=request,
             )
     elif isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "reserved":
         sa.raise_session_owner_redispatch_required(
@@ -3218,6 +3226,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                     cache_key=_cache_key,
                 ),
             ),
+            request=request,
         )
     elif request_mode == "ordinary_continuation":
         affinity = await _get_anthropic_session_affinity(session_key)
@@ -3313,6 +3322,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                             cache_key=_cache_key,
                         ),
                     ),
+                    request=request,
                 )
             _raise_anthropic_auto_agent_in_flight_cooldown(
                 candidate=affinity_state["candidate"],

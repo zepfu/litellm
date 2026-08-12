@@ -196,6 +196,7 @@ async def try_dispatch_anthropic_adapter(
                             cache_key=_ck,
                         ),
                     ),
+                    request=request,
                 )
 
     # Common handler kwargs shared across all adapter routes.

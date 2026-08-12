@@ -561,6 +561,7 @@ async def handle_alias_route(  # noqa: PLR0915
                                 alias_model=selection.get("alias_model") or alias_model,
                                 candidate=candidate,
                                 failure_phase="session_owner_promote_after_success",
+                                request=request,
                             )
                     except Exception as probe_exc:  # noqa: PERF203
                         probe_failure_exc = probe_exc

@@ -990,3 +990,369 @@ async def test_no_fixed_six_hour_owned_expiry() -> None:
     assert p.owner_record is not None
     assert p.owner_record.get("persistent") is True
     assert "expires_at_epoch" not in (p.owner_record or {})
+
+
+# ---------------------------------------------------------------------------
+# D1-614: best-effort sanitized redispatch WARNING from the central helper.
+# ---------------------------------------------------------------------------
+
+_D614_SESSION_ID = "sess-d614-raw-1234567890"
+_D614_OWNER_ID = "owner-raw-uuid-abcdef"
+_D614_CACHE_KEY = "session_owner:d614-raw-cache-key"
+_D614_RESERVATION_TOKEN = "raw-reservation-token-9999"
+_D614_CALL_ID = "call-raw-id-777"
+_D614_TRACE_ID = "trace-raw-id-888"
+_D614_AGENT_ID = "agent-raw-id-666"
+_D614_RAW_SECRETS = (
+    _D614_SESSION_ID,
+    _D614_OWNER_ID,
+    _D614_CACHE_KEY,
+    _D614_RESERVATION_TOKEN,
+    _D614_CALL_ID,
+    _D614_TRACE_ID,
+    _D614_AGENT_ID,
+)
+_D614_LOGGER_NAME = "litellm.proxy.session_owner"
+
+
+def _d614_guard_result() -> "sa.SessionOwnerGuardResult":
+    record = {
+        "state": "owned",
+        "owner": _D614_OWNER_ID,
+        "attributes": {
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "route_family": "codex_oauth",
+            "endpoint_contract": "openai_responses",
+            "state_format": "openai_responses",
+            "account_hash": "chatgpt-account-hash:0123456789ab",
+            "account_lane": "chatgpt-account:0123456789ab",
+            "account_label": "primary",
+        },
+        "reservation_token": _D614_RESERVATION_TOKEN,
+    }
+    return sa.SessionOwnerGuardResult(
+        decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+        session_identity=_D614_SESSION_ID,
+        cache_key=_D614_CACHE_KEY,
+        reservation_token=_D614_RESERVATION_TOKEN,
+        owner_id=_D614_OWNER_ID,
+        owner_record=record,
+        mismatch_reason="session_owner: provider mismatch owner=openai requested=anthropic",
+        held_reservation=False,
+    )
+
+
+def _d614_raise(caplog) -> HTTPException:
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger=_D614_LOGGER_NAME):
+        with pytest.raises(HTTPException) as exc_info:
+            sa.raise_session_owner_redispatch_required(
+                session_identity=_D614_SESSION_ID,
+                guard=_d614_guard_result(),
+                alias_model="Codex-auto-agent",
+                candidate={
+                    "provider": "anthropic",
+                    "model": "claude-opus-4-6",
+                    "route_family": "anthropic_native",
+                },
+                failure_phase="session_owner_mismatch",
+                attribution={
+                    "litellm_call_id": _D614_CALL_ID,
+                    "trace_id": _D614_TRACE_ID,
+                    "agent_id": _D614_AGENT_ID,
+                    "agent_name": "alibaba",
+                    "agent_role": "implementer",
+                },
+            )
+    return exc_info.value
+
+
+def test_d614_single_warning_with_required_fields(caplog) -> None:
+    _d614_raise(caplog)
+    records = [r for r in caplog.records if r.name == _D614_LOGGER_NAME]
+    assert len(records) == 1
+    assert records[0].levelname == "WARNING"
+
+    payload = json.loads(records[0].getMessage())
+    assert payload["event_type"] == "session_owner_redispatch_required"
+    assert payload["status_code"] == 409
+    assert payload["code"] == "aawm_session_owner_redispatch_required"
+    assert payload["failure_phase"] == "session_owner_mismatch"
+    assert payload["mismatch_reason"].startswith("session_owner: provider mismatch")
+    assert payload["redispatch_required"] is True
+    assert payload["attempted_provider_call"] is False
+    assert payload["endpoint"] == "openai_responses"
+    assert payload["requested"]["alias_model"] == "Codex-auto-agent"
+    assert payload["requested"]["provider"] == "anthropic"
+    assert payload["owner"]["provider"] == "openai"
+    assert payload["owner"]["model"] == "gpt-5.6-sol"
+    assert payload["owner"]["route_family"] == "codex_oauth"
+    assert payload["owner"]["account_hash"] == "chatgpt-account-hash:0123456789ab"
+    assert payload["owner"]["account_lane"] == "chatgpt-account:0123456789ab"
+    assert payload["owner"]["account_label"] == "primary"
+    assert payload["attribution"]["agent_name"] == "alibaba"
+    assert payload["attribution"]["agent_role"] == "implementer"
+
+
+def test_d614_identity_bounded_and_secrets_absent(caplog) -> None:
+    _d614_raise(caplog)
+    message = caplog.records[-1].getMessage()
+    payload = json.loads(message)
+
+    # Bounded one-way canonical-session hash, never the raw identity.
+    session_hash = payload["canonical_session_hash"]
+    assert session_hash != _D614_SESSION_ID
+    assert len(session_hash) == 16
+    assert all(c in "0123456789abcdef" for c in session_hash)
+
+    # Attribution identifiers are hashed only.
+    assert payload["attribution"]["litellm_call_id_hash"] != _D614_CALL_ID
+    assert payload["attribution"]["trace_id_hash"] != _D614_TRACE_ID
+    assert payload["attribution"]["agent_id_hash"] != _D614_AGENT_ID
+
+    # No raw sensitive values anywhere in the emitted record.
+    for secret in _D614_RAW_SECRETS:
+        assert secret not in message
+        assert secret not in str(caplog.records[-1].__dict__)
+
+
+def test_d614_409_detail_unchanged_and_no_provider_attempt(caplog) -> None:
+    provider_attempt = MagicMock()
+    exc = _d614_raise(caplog)
+
+    assert exc.status_code == 409
+    detail = exc.detail
+    assert detail["redispatch_required"] is True
+    assert detail["attempted_provider_call"] is False
+    assert detail["failure_phase"] == "session_owner_mismatch"
+    assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert detail["error"]["type"] == "invalid_request_error"
+    assert detail["canonical_session_identity"] == _D614_SESSION_ID
+    assert detail["alias_model"] == "Codex-auto-agent"
+    assert detail["redispatch_model"] == "Codex-auto-agent"
+    assert detail["selected_provider"] == "openai"
+    assert detail["selected_model"] == "gpt-5.6-sol"
+    assert detail["selected_route_family"] == "codex_oauth"
+    assert detail["session_owner"]["session_owner_state"] == "owned"
+    # Raw reservation tokens never leak into the detail.
+    dumped = json.dumps(detail)
+    assert _D614_RESERVATION_TOKEN not in dumped
+    provider_attempt.assert_not_called()
+
+
+def test_d614_logging_failure_still_raises_identical_409(caplog) -> None:
+    with patch.object(
+        sa._session_owner_logger,
+        "warning",
+        side_effect=RuntimeError("logging backend down"),
+    ), pytest.raises(HTTPException) as exc_info:
+        sa.raise_session_owner_redispatch_required(
+            session_identity=_D614_SESSION_ID,
+            guard=_d614_guard_result(),
+            alias_model="Codex-auto-agent",
+            failure_phase="session_owner_mismatch",
+        )
+    exc = exc_info.value
+    assert exc.status_code == 409
+    detail = exc.detail
+    assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert detail["redispatch_required"] is True
+    assert detail["attempted_provider_call"] is False
+    assert detail["canonical_session_identity"] == _D614_SESSION_ID
+
+
+def test_d614_central_request_context_supplies_attribution(caplog) -> None:
+    """Live path: attribution sourced from request.state, no manual kwarg."""
+    import logging
+    from types import SimpleNamespace
+
+    raw_call_id = "live-call-id-4242"
+    raw_trace_id = "live-trace-id-4343"
+    raw_agent_id = "live-agent-id-4444"
+    state = SimpleNamespace()
+    state.aawm_alias_request_context = {
+        "litellm_call_id": raw_call_id,
+        "trace_id": raw_trace_id,
+        "client_product_label": "codex-cli",
+        "agent_dispatch": {
+            "agent_name": "openai",
+            "agent_role": "validator",
+            "agent_id": raw_agent_id,
+        },
+    }
+    state.aawm_alias_request_litellm_call_id = raw_call_id
+    request = SimpleNamespace(state=state)
+
+    with caplog.at_level(logging.WARNING, logger=_D614_LOGGER_NAME):
+        with pytest.raises(HTTPException) as exc_info:
+            sa.raise_session_owner_redispatch_required(
+                session_identity=_D614_SESSION_ID,
+                guard=_d614_guard_result(),
+                alias_model="Codex-auto-agent",
+                failure_phase="session_owner_mismatch",
+                request=request,
+            )
+    assert exc_info.value.status_code == 409
+    records = [r for r in caplog.records if r.name == _D614_LOGGER_NAME]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    payload = json.loads(message)
+
+    attribution = payload["attribution"]
+    assert attribution["agent_name"] == "openai"
+    assert attribution["agent_role"] == "validator"
+    assert attribution["client_product"] == "codex-cli"
+    for key in ("litellm_call_id_hash", "trace_id_hash", "agent_id_hash"):
+        assert key in attribution and len(attribution[key]) == 16
+    for raw in (raw_call_id, raw_trace_id, raw_agent_id):
+        assert raw not in message
+        assert raw not in json.dumps(exc_info.value.detail)
+
+
+def test_d614_candidate_only_denial_keeps_endpoint(caplog) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger=_D614_LOGGER_NAME):
+        with pytest.raises(HTTPException):
+            sa.raise_session_owner_redispatch_required(
+                session_identity=_D614_SESSION_ID,
+                candidate={
+                    "provider": "anthropic",
+                    "model": "claude-opus-4-6",
+                    "route_family": "anthropic_native",
+                    "endpoint_contract": "anthropic_messages",
+                },
+                alias_model="Claude-auto-agent",
+                failure_phase="session_owner_pre_egress",
+            )
+    payload = json.loads(caplog.records[-1].getMessage())
+    assert payload["endpoint"] == "anthropic_messages"
+    assert payload["requested"]["provider"] == "anthropic"
+    assert payload["requested"]["model"] == "claude-opus-4-6"
+    assert payload["requested"]["route_family"] == "anthropic_native"
+
+
+def test_d614_no_candidate_denial_does_not_clone_owner(caplog) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger=_D614_LOGGER_NAME):
+        with pytest.raises(HTTPException) as exc_info:
+            sa.raise_session_owner_redispatch_required(
+                session_identity=_D614_SESSION_ID,
+                guard=_d614_guard_result(),
+                alias_model="Codex-auto-agent",
+                failure_phase="session_owner_mismatch",
+            )
+    payload = json.loads(caplog.records[-1].getMessage())
+    requested = payload["requested"]
+    assert requested == {"alias_model": "Codex-auto-agent"}
+    # Owner fields remain visible only under the owner section.
+    assert payload["owner"]["provider"] == "openai"
+    # 409 detail keeps its pre-existing owner-synthesized candidate.
+    detail = exc_info.value.detail
+    assert detail["candidate"]["provider"] == "openai"
+
+
+def test_d614_credential_shaped_mismatch_reason_is_redacted(caplog) -> None:
+    import logging
+
+    secret_reason = (
+        "session_owner: provider mismatch owner=openai requested=anthropic "
+        "api_key=sk-live-abcdef123456 detail"
+    )
+    guard = sa.SessionOwnerGuardResult(
+        decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+        session_identity=_D614_SESSION_ID,
+        cache_key=_D614_CACHE_KEY,
+        reservation_token=_D614_RESERVATION_TOKEN,
+        owner_id=_D614_OWNER_ID,
+        owner_record=_d614_guard_result().owner_record,
+        mismatch_reason=secret_reason,
+        held_reservation=False,
+    )
+    with caplog.at_level(logging.WARNING, logger=_D614_LOGGER_NAME):
+        with pytest.raises(HTTPException):
+            sa.raise_session_owner_redispatch_required(
+                session_identity=_D614_SESSION_ID,
+                guard=guard,
+                alias_model="Codex-auto-agent",
+                failure_phase="session_owner_mismatch",
+            )
+    records = [r for r in caplog.records if r.name == _D614_LOGGER_NAME]
+    assert len(records) == 1
+    message = records[0].getMessage()
+    assert "sk-live-abcdef123456" not in message
+    assert "api_key=sk-live-abcdef123456" not in message
+    payload = json.loads(message)
+    assert "[REDACTED]" in payload["mismatch_reason"]
+
+
+def test_d614_credential_shaped_owner_fields_are_redacted(caplog) -> None:
+    import logging
+
+    record = {
+        "state": "owned",
+        "owner": _D614_OWNER_ID,
+        "attributes": {
+            "provider": "openai",
+            "model": "gpt-5.6-sol",
+            "route_family": "codex_oauth",
+            "endpoint_contract": "openai_responses",
+            "state_format": "openai_responses",
+            "account_hash": "chatgpt-account-hash:0123456789ab",
+            "account_lane": "chatgpt-account:0123456789ab",
+            "account_label": "sk-live-owner-label-secret",
+        },
+        "reservation_token": _D614_RESERVATION_TOKEN,
+    }
+    guard = sa.SessionOwnerGuardResult(
+        decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+        session_identity=_D614_SESSION_ID,
+        cache_key=_D614_CACHE_KEY,
+        reservation_token=_D614_RESERVATION_TOKEN,
+        owner_id=_D614_OWNER_ID,
+        owner_record=record,
+        mismatch_reason=(
+            "session_owner: provider mismatch owner=openai requested=anthropic"
+        ),
+        held_reservation=False,
+    )
+    with caplog.at_level(logging.WARNING, logger=_D614_LOGGER_NAME):
+        with pytest.raises(HTTPException):
+            sa.raise_session_owner_redispatch_required(
+                session_identity=_D614_SESSION_ID,
+                guard=guard,
+                alias_model="Codex-auto-agent",
+                failure_phase="session_owner_mismatch",
+            )
+    records = [r for r in caplog.records if r.name == _D614_LOGGER_NAME]
+    message = records[-1].getMessage()
+    assert "sk-live-owner-label-secret" not in message
+    payload = json.loads(message)
+    assert payload["owner"]["account_label"] == "sk-[REDACTED]"
+
+
+def test_d614_credential_shaped_attribution_labels_are_redacted(caplog) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger=_D614_LOGGER_NAME):
+        with pytest.raises(HTTPException):
+            sa.raise_session_owner_redispatch_required(
+                session_identity=_D614_SESSION_ID,
+                guard=_d614_guard_result(),
+                alias_model="Codex-auto-agent",
+                failure_phase="session_owner_mismatch",
+                attribution={
+                    "agent_name": "api_key=sh-secret-agent-key",
+                    "agent_role": "Bearer sh-bearer-token-secret-99",
+                },
+            )
+    records = [r for r in caplog.records if r.name == _D614_LOGGER_NAME]
+    message = records[-1].getMessage()
+    assert "sh-secret-agent-key" not in message
+    assert "sh-bearer-token-secret-99" not in message
+    payload = json.loads(message)
+    assert payload["attribution"]["agent_name"] == "api_key=[REDACTED]"
+    assert payload["attribution"]["agent_role"] == "Bearer [REDACTED]"

@@ -3699,6 +3699,7 @@ async def _aawm_session_owner_pre_send_guard(
                         mismatch_reason=incomplete,
                     ),
                 ),
+                request=request,
             )
     await sa.ensure_session_owner_guard_for_request(
         request=request,

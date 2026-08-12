@@ -284,6 +284,7 @@ async def _consult_codex_nested_session_owner(
                     cache_key=cache_key,
                 ),
             ),
+            request=request,
         )
     _stash_codex_nested_owner_consult(
         request,
