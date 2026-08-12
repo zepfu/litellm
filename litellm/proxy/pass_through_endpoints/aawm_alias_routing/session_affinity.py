@@ -24,6 +24,7 @@ structured ``redispatch_required`` (never ignored).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -154,6 +155,10 @@ _REQUIRED_OWNER_ATTRIBUTE_KEYS = (
 _DEFAULT_RESERVATION_TTL_SECONDS = 120.0
 _MIN_RESERVATION_TTL_SECONDS = 30.0
 _MAX_RESERVATION_TTL_SECONDS = 900.0
+_DEFAULT_RESERVATION_WAIT_TIMEOUT_SECONDS = 0.25
+_DEFAULT_RESERVATION_WAIT_POLL_SECONDS = 0.025
+_MAX_RESERVATION_WAIT_TIMEOUT_SECONDS = 1.0
+_MAX_RESERVATION_WAIT_POLL_SECONDS = 0.1
 
 # Account-scoped route families require credential/account identity on promote.
 _ACCOUNT_SCOPED_ROUTE_MARKERS = (
@@ -791,9 +796,128 @@ async def _read_session_owner_record(
         raise RuntimeError(f"session_owner: redis decode failed: {exc}") from exc
 
 
+_REQUEST_STATE_RESERVATION_WAIT_DEADLINE_ATTR = (
+    "_aawm_session_owner_reservation_wait_deadline"
+)
+
+
+def _get_reservation_wait_deadline(request: Any) -> Optional[float]:
+    if request is None:
+        return None
+    state = getattr(request, "state", None)
+    if state is None:
+        return None
+    try:
+        value = object.__getattribute__(
+            state, _REQUEST_STATE_RESERVATION_WAIT_DEADLINE_ATTR
+        )
+    except AttributeError:
+        value = getattr(state, _REQUEST_STATE_RESERVATION_WAIT_DEADLINE_ATTR, None)
+    try:
+        deadline = float(value)
+    except (TypeError, ValueError):
+        return None
+    return deadline if math.isfinite(deadline) else None
+
+
+def _set_reservation_wait_deadline(
+    request: Any,
+    deadline: float,
+) -> None:
+    if request is None:
+        return
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    setattr(state, _REQUEST_STATE_RESERVATION_WAIT_DEADLINE_ATTR, deadline)
+
+
+def _normalize_reservation_wait_timeout(timeout_seconds: Optional[float]) -> float:
+    if timeout_seconds is None:
+        timeout = _DEFAULT_RESERVATION_WAIT_TIMEOUT_SECONDS
+    else:
+        try:
+            timeout = float(timeout_seconds)
+        except (TypeError, ValueError):
+            timeout = _DEFAULT_RESERVATION_WAIT_TIMEOUT_SECONDS
+    if not math.isfinite(timeout):
+        timeout = _DEFAULT_RESERVATION_WAIT_TIMEOUT_SECONDS
+    return max(0.0, min(_MAX_RESERVATION_WAIT_TIMEOUT_SECONDS, timeout))
+
+
+def _normalize_reservation_wait_poll(poll_seconds: Optional[float]) -> float:
+    if poll_seconds is None:
+        poll = _DEFAULT_RESERVATION_WAIT_POLL_SECONDS
+    else:
+        try:
+            poll = float(poll_seconds)
+        except (TypeError, ValueError):
+            poll = _DEFAULT_RESERVATION_WAIT_POLL_SECONDS
+    if not math.isfinite(poll):
+        poll = _DEFAULT_RESERVATION_WAIT_POLL_SECONDS
+    return max(0.001, min(_MAX_RESERVATION_WAIT_POLL_SECONDS, poll))
+
+
+async def _wait_for_foreign_reserved_session_owner(
+    *,
+    redis_cache: Any,
+    cache_key: str,
+    record: Payload,
+    request: Any = None,
+    reservation_token: Optional[str] = None,
+    timeout_seconds: Optional[float] = None,
+    poll_seconds: Optional[float] = None,
+) -> tuple[Optional[Payload], Optional[str]]:
+    """Re-read a foreign reservation within one request-scoped wait budget."""
+
+    if _record_state(record) != SessionOwnerRecordState.RESERVED.value:
+        return record, None
+    record_token = _clean_optional_str(record.get(_RECORD_TOKEN_FIELD))
+    if reservation_token is not None and record_token == reservation_token:
+        return record, None
+
+    deadline = _get_reservation_wait_deadline(request)
+    if deadline is None:
+        deadline = time.monotonic() + _normalize_reservation_wait_timeout(
+            timeout_seconds
+        )
+        _set_reservation_wait_deadline(request, deadline)
+    poll = _normalize_reservation_wait_poll(poll_seconds)
+    current = record
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return current, None
+        await asyncio.sleep(min(poll, remaining))
+        try:
+            current = await _read_session_owner_record(
+                redis_cache=redis_cache,
+                cache_key=cache_key,
+            )
+        except RuntimeError as exc:
+            return current, str(exc)
+        if current is None:
+            return None, None
+        current_token = _clean_optional_str(current.get(_RECORD_TOKEN_FIELD))
+        if (
+            _record_state(current) != SessionOwnerRecordState.RESERVED.value
+            or (
+                reservation_token is not None
+                and current_token == reservation_token
+            )
+        ):
+            return current, None
+
+
 async def get_session_owner_record(
     *,
     session_identity: Optional[str],
+    request: Any = None,
+    wait_for_foreign_reservation: bool = False,
+    reservation_token: Optional[str] = None,
+    reservation_wait_timeout_seconds: Optional[float] = None,
+    reservation_wait_poll_seconds: Optional[float] = None,
 ) -> tuple[Optional[Payload], Optional[str], Optional[str]]:
     """Return (record, cache_key, error). error set => fail closed."""
 
@@ -812,6 +936,22 @@ async def get_session_owner_record(
             redis_cache=redis_cache,
             cache_key=cache_key,
         )
+        if (
+            wait_for_foreign_reservation
+            and record is not None
+            and _record_state(record) == SessionOwnerRecordState.RESERVED.value
+        ):
+            record, wait_error = await _wait_for_foreign_reserved_session_owner(
+                redis_cache=redis_cache,
+                cache_key=cache_key,
+                record=record,
+                request=request,
+                reservation_token=reservation_token,
+                timeout_seconds=reservation_wait_timeout_seconds,
+                poll_seconds=reservation_wait_poll_seconds,
+            )
+            if wait_error is not None:
+                return record, cache_key, wait_error
     except RuntimeError as exc:
         return None, cache_key, str(exc)
     return record, cache_key, None
@@ -829,6 +969,8 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
     reservation_ttl_seconds: float = _DEFAULT_RESERVATION_TTL_SECONDS,
     require_exact_attributes: bool = False,
     reserve_if_unowned: bool = True,
+    reservation_wait_timeout_seconds: Optional[float] = None,
+    reservation_wait_poll_seconds: Optional[float] = None,
 ) -> SessionOwnerGuardResult:
     """Single pre-egress lifecycle guard for every route family.
 
@@ -955,46 +1097,6 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
         existing_token = _clean_optional_str(existing.get(_RECORD_TOKEN_FIELD))
         existing_owner = _clean_optional_str(existing.get(_RECORD_OWNER_FIELD))
 
-        if state == SessionOwnerRecordState.OWNED.value:
-            mismatch = _compatibility_mismatch_reason(
-                owner_record=existing,
-                requested_attributes=attrs or None,
-                require_exact_attributes=require_exact_attributes,
-            )
-            if mismatch is not None:
-                provenance = build_session_owner_provenance(
-                    session_identity=cleaned,
-                    decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
-                    owner_record=existing,
-                    owner_id=existing_owner,
-                    mismatch_reason=mismatch,
-                    cache_key=cache_key,
-                )
-                return SessionOwnerGuardResult(
-                    decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
-                    session_identity=cleaned,
-                    cache_key=cache_key,
-                    owner_id=existing_owner,
-                    owner_record=existing,
-                    mismatch_reason=mismatch,
-                    provenance=provenance,
-                )
-            provenance = build_session_owner_provenance(
-                session_identity=cleaned,
-                decision=SessionOwnerGuardDecision.COMPATIBLE_OWNER.value,
-                owner_record=existing,
-                owner_id=existing_owner,
-                cache_key=cache_key,
-            )
-            return SessionOwnerGuardResult(
-                decision=SessionOwnerGuardDecision.COMPATIBLE_OWNER,
-                session_identity=cleaned,
-                cache_key=cache_key,
-                owner_id=existing_owner,
-                owner_record=existing,
-                provenance=provenance,
-            )
-
         if state == SessionOwnerRecordState.RESERVED.value:
             if existing_token and existing_token == token:
                 renewed = await _renew_reservation(
@@ -1036,12 +1138,112 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
                     provenance=provenance,
                     held_reservation=True,
                 )
-            reason = "session_owner: concurrent reservation held by another request"
+            existing, wait_error = await _wait_for_foreign_reserved_session_owner(
+                redis_cache=redis_cache,
+                cache_key=cache_key,
+                record=existing,
+                request=request,
+                reservation_token=token,
+                timeout_seconds=reservation_wait_timeout_seconds,
+                poll_seconds=reservation_wait_poll_seconds,
+            )
+            if wait_error is not None:
+                provenance = build_session_owner_provenance(
+                    session_identity=cleaned,
+                    decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
+                    owner_record=existing,
+                    owner_id=(
+                        _clean_optional_str(existing.get(_RECORD_OWNER_FIELD))
+                        if isinstance(existing, Mapping)
+                        else None
+                    ),
+                    mismatch_reason=wait_error,
+                    cache_key=cache_key,
+                )
+                return SessionOwnerGuardResult(
+                    decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                    session_identity=cleaned,
+                    cache_key=cache_key,
+                    owner_id=(
+                        _clean_optional_str(existing.get(_RECORD_OWNER_FIELD))
+                        if isinstance(existing, Mapping)
+                        else None
+                    ),
+                    owner_record=existing,
+                    mismatch_reason=wait_error,
+                    provenance=provenance,
+                )
+            if existing is not None:
+                state = _record_state(existing)
+                existing_owner = _clean_optional_str(
+                    existing.get(_RECORD_OWNER_FIELD)
+                )
+
+        if existing is not None:
+            if state == SessionOwnerRecordState.OWNED.value:
+                mismatch = _compatibility_mismatch_reason(
+                    owner_record=existing,
+                    requested_attributes=attrs or None,
+                    require_exact_attributes=require_exact_attributes,
+                )
+                if mismatch is not None:
+                    provenance = build_session_owner_provenance(
+                        session_identity=cleaned,
+                        decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
+                        owner_record=existing,
+                        owner_id=existing_owner,
+                        mismatch_reason=mismatch,
+                        cache_key=cache_key,
+                    )
+                    return SessionOwnerGuardResult(
+                        decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                        session_identity=cleaned,
+                        cache_key=cache_key,
+                        owner_id=existing_owner,
+                        owner_record=existing,
+                        mismatch_reason=mismatch,
+                        provenance=provenance,
+                    )
+                provenance = build_session_owner_provenance(
+                    session_identity=cleaned,
+                    decision=SessionOwnerGuardDecision.COMPATIBLE_OWNER.value,
+                    owner_record=existing,
+                    owner_id=existing_owner,
+                    cache_key=cache_key,
+                )
+                return SessionOwnerGuardResult(
+                    decision=SessionOwnerGuardDecision.COMPATIBLE_OWNER,
+                    session_identity=cleaned,
+                    cache_key=cache_key,
+                    owner_id=existing_owner,
+                    owner_record=existing,
+                    provenance=provenance,
+                )
+            if state == SessionOwnerRecordState.RESERVED.value:
+                reason = "session_owner: concurrent reservation held by another request"
+                provenance = build_session_owner_provenance(
+                    session_identity=cleaned,
+                    decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
+                    owner_record=existing,
+                    owner_id=existing_owner,
+                    mismatch_reason=reason,
+                    cache_key=cache_key,
+                )
+                return SessionOwnerGuardResult(
+                    decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                    session_identity=cleaned,
+                    cache_key=cache_key,
+                    owner_id=existing_owner,
+                    owner_record=existing,
+                    mismatch_reason=reason,
+                    provenance=provenance,
+                )
+
+            reason = "session_owner: malformed ownership record"
             provenance = build_session_owner_provenance(
                 session_identity=cleaned,
                 decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
                 owner_record=existing,
-                owner_id=existing_owner,
                 mismatch_reason=reason,
                 cache_key=cache_key,
             )
@@ -1049,28 +1251,10 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
                 decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
                 session_identity=cleaned,
                 cache_key=cache_key,
-                owner_id=existing_owner,
                 owner_record=existing,
                 mismatch_reason=reason,
                 provenance=provenance,
             )
-
-        reason = "session_owner: malformed ownership record"
-        provenance = build_session_owner_provenance(
-            session_identity=cleaned,
-            decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
-            owner_record=existing,
-            mismatch_reason=reason,
-            cache_key=cache_key,
-        )
-        return SessionOwnerGuardResult(
-            decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
-            session_identity=cleaned,
-            cache_key=cache_key,
-            owner_record=existing,
-            mismatch_reason=reason,
-            provenance=provenance,
-        )
 
     if not reserve_if_unowned:
         # Consult-only egress is forbidden. Unowned sessions must reserve.
@@ -1231,6 +1415,112 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
             mismatch_reason=reason,
             provenance=provenance,
         )
+    if _record_state(winner) == SessionOwnerRecordState.RESERVED.value:
+        winner, wait_error = await _wait_for_foreign_reserved_session_owner(
+            redis_cache=redis_cache,
+            cache_key=cache_key,
+            record=winner,
+            request=request,
+            reservation_token=token,
+            timeout_seconds=reservation_wait_timeout_seconds,
+            poll_seconds=reservation_wait_poll_seconds,
+        )
+        if wait_error is not None:
+            reason = wait_error
+            winner_owner = (
+                _clean_optional_str(winner.get(_RECORD_OWNER_FIELD))
+                if isinstance(winner, Mapping)
+                else None
+            )
+            provenance = build_session_owner_provenance(
+                session_identity=cleaned,
+                decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
+                owner_record=winner,
+                owner_id=winner_owner,
+                mismatch_reason=reason,
+                cache_key=cache_key,
+            )
+            return SessionOwnerGuardResult(
+                decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                session_identity=cleaned,
+                cache_key=cache_key,
+                owner_id=winner_owner,
+                owner_record=winner,
+                mismatch_reason=reason,
+                provenance=provenance,
+            )
+        elif winner is None:
+            # The foreign hold was released or expired after the NX race.
+            # Retry the ordinary atomic reservation once with this request's
+            # token; no token is shared with the other HTTP request.
+            try:
+                claimed = await redis_cache.async_set_cache(
+                    key=cache_key,
+                    value=_build_reserved_record(
+                        owner_id=resolved_owner_id,
+                        attributes=attrs,
+                        reservation_token=token,
+                    ),
+                    ttl=ttl,
+                    nx=True,
+                    raise_on_error=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                reason = f"session_owner: redis reserve failed: {exc}"
+            else:
+                if claimed:
+                    try:
+                        retry_record = await _read_session_owner_record(
+                            redis_cache=redis_cache,
+                            cache_key=cache_key,
+                        )
+                    except RuntimeError as exc:
+                        reason = str(exc)
+                    else:
+                        if (
+                            retry_record is not None
+                            and _record_state(retry_record)
+                            == SessionOwnerRecordState.RESERVED.value
+                            and _clean_optional_str(
+                                retry_record.get(_RECORD_TOKEN_FIELD)
+                            )
+                            == token
+                        ):
+                            provenance = build_session_owner_provenance(
+                                session_identity=cleaned,
+                                decision=SessionOwnerGuardDecision.UNOWNED_RESERVED.value,
+                                owner_record=retry_record,
+                                owner_id=resolved_owner_id,
+                                cache_key=cache_key,
+                                reservation_token=token,
+                            )
+                            return SessionOwnerGuardResult(
+                                decision=SessionOwnerGuardDecision.UNOWNED_RESERVED,
+                                session_identity=cleaned,
+                                cache_key=cache_key,
+                                reservation_token=token,
+                                owner_id=resolved_owner_id,
+                                owner_record=retry_record,
+                                provenance=provenance,
+                                held_reservation=True,
+                            )
+                        reason = "session_owner: reserve lost race on read-back"
+                else:
+                    reason = "session_owner: concurrent reservation won the race"
+            provenance = build_session_owner_provenance(
+                session_identity=cleaned,
+                decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,
+                mismatch_reason=reason,
+                cache_key=cache_key,
+            )
+            return SessionOwnerGuardResult(
+                decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+                session_identity=cleaned,
+                cache_key=cache_key,
+                mismatch_reason=reason,
+                provenance=provenance,
+            )
+
     winner_state = _record_state(winner)
     winner_owner = _clean_optional_str(winner.get(_RECORD_OWNER_FIELD))
     if winner_state == SessionOwnerRecordState.OWNED.value:
@@ -1256,8 +1546,10 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
                 provenance=provenance,
             )
         reason = mismatch
-    else:
+    elif winner_state == SessionOwnerRecordState.RESERVED.value:
         reason = "session_owner: concurrent reservation won the race"
+    else:
+        reason = "session_owner: malformed ownership record"
     provenance = build_session_owner_provenance(
         session_identity=cleaned,
         decision=SessionOwnerGuardDecision.REDISPATCH_REQUIRED.value,

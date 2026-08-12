@@ -348,6 +348,257 @@ async def test_reservation_race_only_one_competitor_reserves() -> None:
 
 
 @pytest.mark.asyncio
+async def test_foreign_reservation_release_then_selector_and_guard_reserve() -> None:
+    redis = _FakeRedisCache()
+    attrs = _full_attrs()
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        leader = await sa.guard_session_owner_before_egress(
+            session_identity="sess-wait-release",
+            requested_attributes=attrs,
+        )
+        release_once = True
+
+        async def release_during_wait(_: float) -> None:
+            nonlocal release_once
+            if release_once:
+                release_once = False
+                released = await sa.release_session_owner_reservation(
+                    session_identity="sess-wait-release",
+                    reservation_token=leader.reservation_token,
+                )
+                assert released.outcome is sa.SessionOwnerMutationOutcome.RELEASED
+
+        with patch.object(sa.asyncio, "sleep", side_effect=release_during_wait):
+            record, _, error = await sa.get_session_owner_record(
+                session_identity="sess-wait-release",
+                request=request,
+                wait_for_foreign_reservation=True,
+                reservation_wait_timeout_seconds=0.25,
+                reservation_wait_poll_seconds=0.001,
+            )
+        assert record is None
+        assert error is None
+
+        follower = await sa.guard_session_owner_before_egress(
+            session_identity="sess-wait-release",
+            request=request,
+            requested_attributes=attrs,
+        )
+
+    assert follower.decision is sa.SessionOwnerGuardDecision.UNOWNED_RESERVED
+    assert follower.held_reservation is True
+    assert follower.reservation_token != leader.reservation_token
+
+
+@pytest.mark.asyncio
+async def test_foreign_reservation_release_during_guard_wait_reserves() -> None:
+    redis = _FakeRedisCache()
+    attrs = _full_attrs()
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        leader = await sa.guard_session_owner_before_egress(
+            session_identity="sess-guard-wait-release",
+            requested_attributes=attrs,
+        )
+        release_once = True
+
+        async def release_during_wait(_: float) -> None:
+            nonlocal release_once
+            if release_once:
+                release_once = False
+                released = await sa.release_session_owner_reservation(
+                    session_identity="sess-guard-wait-release",
+                    reservation_token=leader.reservation_token,
+                )
+                assert released.outcome is sa.SessionOwnerMutationOutcome.RELEASED
+
+        with patch.object(sa.asyncio, "sleep", side_effect=release_during_wait):
+            follower = await sa.guard_session_owner_before_egress(
+                session_identity="sess-guard-wait-release",
+                request=request,
+                requested_attributes=attrs,
+                reservation_wait_timeout_seconds=0.25,
+                reservation_wait_poll_seconds=0.001,
+            )
+
+    assert follower.decision is sa.SessionOwnerGuardDecision.UNOWNED_RESERVED
+    assert follower.held_reservation is True
+    assert follower.reservation_token != leader.reservation_token
+
+
+@pytest.mark.asyncio
+async def test_get_then_guard_shares_expired_request_wait_deadline() -> None:
+    redis = _FakeRedisCache()
+    attrs = _full_attrs()
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        leader = await sa.guard_session_owner_before_egress(
+            session_identity="sess-shared-wait-deadline",
+            requested_attributes=attrs,
+        )
+        sleep = AsyncMock()
+        with patch.object(sa.asyncio, "sleep", new=sleep):
+            record, _, error = await sa.get_session_owner_record(
+                session_identity="sess-shared-wait-deadline",
+                request=request,
+                wait_for_foreign_reservation=True,
+                reservation_wait_timeout_seconds=0.0,
+                reservation_wait_poll_seconds=0.001,
+            )
+            follower = await sa.guard_session_owner_before_egress(
+                session_identity="sess-shared-wait-deadline",
+                request=request,
+                requested_attributes=attrs,
+                reservation_wait_timeout_seconds=0.25,
+                reservation_wait_poll_seconds=0.001,
+            )
+
+    assert record is not None
+    assert record.get("reservation_token") == leader.reservation_token
+    assert error is None
+    assert follower.decision is sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
+    assert "concurrent reservation" in (follower.mismatch_reason or "")
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_foreign_reservation_promotion_compatible_owner_proceeds() -> None:
+    redis = _FakeRedisCache()
+    attrs = _full_attrs()
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        leader = await sa.guard_session_owner_before_egress(
+            session_identity="sess-wait-compatible",
+            requested_attributes=attrs,
+        )
+        promote_once = True
+
+        async def promote_during_wait(_: float) -> None:
+            nonlocal promote_once
+            if promote_once:
+                promote_once = False
+                promoted = await sa.promote_session_owner_reservation(
+                    session_identity="sess-wait-compatible",
+                    reservation_token=leader.reservation_token,
+                    attributes=attrs,
+                )
+                assert promoted.outcome is sa.SessionOwnerMutationOutcome.PROMOTED
+
+        with patch.object(sa.asyncio, "sleep", side_effect=promote_during_wait):
+            record, _, error = await sa.get_session_owner_record(
+                session_identity="sess-wait-compatible",
+                request=request,
+                wait_for_foreign_reservation=True,
+                reservation_wait_timeout_seconds=0.25,
+                reservation_wait_poll_seconds=0.001,
+            )
+        assert sa._record_state(record) == "owned"
+        assert error is None
+
+        follower = await sa.guard_session_owner_before_egress(
+            session_identity="sess-wait-compatible",
+            request=request,
+            requested_attributes=attrs,
+        )
+
+    assert follower.decision is sa.SessionOwnerGuardDecision.COMPATIBLE_OWNER
+    assert follower.held_reservation is False
+    assert follower.owner_id == leader.owner_id
+
+
+@pytest.mark.asyncio
+async def test_foreign_reservation_incompatible_promotion_stays_409_before_egress() -> None:
+    redis = _FakeRedisCache()
+    attrs = _full_attrs(model="model-a")
+    incompatible = _full_attrs(model="model-b")
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        leader = await sa.guard_session_owner_before_egress(
+            session_identity="sess-wait-incompatible",
+            requested_attributes=incompatible,
+        )
+        promote_once = True
+
+        async def promote_during_wait(_: float) -> None:
+            nonlocal promote_once
+            if promote_once:
+                promote_once = False
+                promoted = await sa.promote_session_owner_reservation(
+                    session_identity="sess-wait-incompatible",
+                    reservation_token=leader.reservation_token,
+                    attributes=incompatible,
+                )
+                assert promoted.outcome is sa.SessionOwnerMutationOutcome.PROMOTED
+
+        with patch.object(sa.asyncio, "sleep", side_effect=promote_during_wait):
+            record, _, error = await sa.get_session_owner_record(
+                session_identity="sess-wait-incompatible",
+                request=request,
+                wait_for_foreign_reservation=True,
+                reservation_wait_timeout_seconds=0.25,
+                reservation_wait_poll_seconds=0.001,
+            )
+        assert sa._record_state(record) == "owned"
+        assert error is None
+
+        guard = await sa.guard_session_owner_before_egress(
+            session_identity="sess-wait-incompatible",
+            request=request,
+            requested_attributes=attrs,
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            sa.raise_session_owner_redispatch_required(
+                session_identity="sess-wait-incompatible",
+                guard=guard,
+            )
+
+    assert guard.decision is sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
+    assert "exactly match" in (guard.mismatch_reason or "")
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["attempted_provider_call"] is False
+
+
+@pytest.mark.asyncio
+async def test_foreign_reservation_timeout_preserves_existing_409() -> None:
+    redis = _FakeRedisCache()
+    attrs = _full_attrs()
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        leader = await sa.guard_session_owner_before_egress(
+            session_identity="sess-wait-timeout",
+            requested_attributes=attrs,
+        )
+        follower = await sa.guard_session_owner_before_egress(
+            session_identity="sess-wait-timeout",
+            requested_attributes=attrs,
+            reservation_wait_timeout_seconds=0.0,
+            reservation_wait_poll_seconds=0.001,
+        )
+
+    assert follower.decision is sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
+    assert follower.owner_record is not None
+    assert follower.owner_record.get("reservation_token") == leader.reservation_token
+    assert "concurrent reservation" in (follower.mismatch_reason or "")
+
+
+@pytest.mark.asyncio
 async def test_streaming_pre_send_requires_reservation_before_upstream() -> None:
     """pass_through_request pre-send guard reserves before send."""
     redis = _FakeRedisCache()

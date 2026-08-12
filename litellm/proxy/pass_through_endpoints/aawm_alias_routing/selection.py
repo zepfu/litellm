@@ -2691,6 +2691,8 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     # pre-egress once a concrete candidate is chosen (candidate_loop).
     session_owner_record, _cache_key, session_owner_error = await sa.get_session_owner_record(
         session_identity=canonical_session_identity,
+        request=request,
+        wait_for_foreign_reservation=True,
     )
     if session_owner_error is not None:
         sa.raise_session_owner_redispatch_required(
@@ -3092,6 +3094,8 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
     )
     session_owner_record, _cache_key, session_owner_error = await sa.get_session_owner_record(
         session_identity=canonical_session_identity,
+        request=request,
+        wait_for_foreign_reservation=True,
     )
     if session_owner_error is not None:
         sa.raise_session_owner_redispatch_required(
