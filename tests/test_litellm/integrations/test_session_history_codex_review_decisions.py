@@ -684,30 +684,57 @@ def test_parent_actor_only_correlation_distinct_keys_for_prefix_shared_actors() 
     assert stored_name_a != stored_name_b
 
 
-def test_parent_identity_fields_hash_full_value_before_bounding() -> None:
+def test_parent_identity_fields_reach_decision_hash_as_full_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Distinct decision keys and distinct stored values alone cannot prove the
+    # D1-616 fix: `_bounded_stable_id` appends a full-value SHA-256 digest to
+    # the stored representation, so even the predecessor behavior (bounding
+    # before the decision-key hash) produced distinct keys and stored values.
+    # Capture the arguments fed to `_codex_review_decision_key` and assert the
+    # parent identity fields arrive as the COMPLETE sanitized over-long
+    # strings, while payload indexes 13/14/15 hold only the bounded
+    # prefix+SHA-256 stable representations.
     shared_prefix = "p" * 150
-    field_indexes = {
-        "parent_litellm_call_id": 13,
-        "parent_session_id": 14,
-        "parent_thread_id": 15,
-    }
-    for field, payload_index in field_indexes.items():
-        payloads = identity._build_codex_review_decision_db_payloads(
-            {
-                **_base_record(),
-                "codex_review_decisions": [
-                    _event(**{field: f"{shared_prefix}-A"}),
-                    _event(**{field: f"{shared_prefix}-B"}),
-                ],
-            }
-        )
-        assert len(payloads) == 2
-        assert payloads[0][0] != payloads[1][0]
-        stored_a = payloads[0][payload_index]
-        stored_b = payloads[1][payload_index]
-        assert stored_a is not None and stored_b is not None
-        assert len(stored_a) <= 128 and len(stored_b) <= 128
-        assert stored_a != stored_b
+    key_kwargs: list[Dict[str, Any]] = []
+    real_key = identity._codex_review_decision_key
+
+    def capturing_key(**kwargs: Any) -> str:
+        key_kwargs.append(kwargs)
+        return real_key(**kwargs)
+
+    monkeypatch.setattr(
+        identity, "_codex_review_decision_key", capturing_key
+    )
+
+    field_names = (
+        "parent_litellm_call_id",
+        "parent_session_id",
+        "parent_thread_id",
+    )
+    payloads = identity._build_codex_review_decision_db_payloads(
+        {
+            **_base_record(),
+            "codex_review_decisions": [
+                _event(**{name: f"{shared_prefix}-A" for name in field_names}),
+                _event(**{name: f"{shared_prefix}-B" for name in field_names}),
+            ],
+        }
+    )
+
+    assert len(payloads) == 2
+    assert len(key_kwargs) == 2
+    assert payloads[0][0] != payloads[1][0]
+
+    for event_index, variant in enumerate(("A", "B")):
+        for name in field_names:
+            hash_input = key_kwargs[event_index][name]
+            assert hash_input == f"{shared_prefix}-{variant}"
+            assert len(hash_input) > 128
+            stored = payloads[event_index][13 + field_names.index(name)]
+            assert stored == identity._bounded_stable_id(hash_input)
+            assert stored is not None and len(stored) <= 128
+            assert stored != hash_input
 
 
 # ---------------------------------------------------------------------------
