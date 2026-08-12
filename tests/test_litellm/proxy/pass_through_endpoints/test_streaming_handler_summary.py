@@ -177,6 +177,103 @@ async def test_route_streaming_logging_uses_precomputed_lines(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_route_streaming_logging_syncs_codex_review_decision_event_to_callbacks(
+    monkeypatch,
+):
+    """D1-616: a parsed codex-auto-review decision attached by the route rollup
+    must be visible on litellm_logging_obj.model_call_details before success
+    callbacks run."""
+    monkeypatch.setenv(
+        PassThroughStreamingHandler._AAWM_STREAM_SUMMARY_FIRST_FINALIZE_ENV,
+        "1",
+    )
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "0")
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {}
+    logging_obj.async_success_handler = AsyncMock()
+    logging_obj._should_run_sync_callbacks_for_async_calls.return_value = False
+    success_handler_kwargs = {
+        "litellm_params": {
+            "metadata": {
+                "aawm_route_rollup_context": {
+                    "is_codex_auto_review": True,
+                    "litellm_call_id": "reviewer-call-1",
+                    "canonical_session_identity": "session-1",
+                    "review_originating_litellm_call_id": "origin-call-1",
+                    "review_parent_actor_id": "parent-actor-1",
+                    "review_parent_thread_id": "parent-thread-1",
+                }
+            }
+        },
+        "standard_logging_object": {"metadata": {}, "request_tags": []},
+    }
+
+    def _capture(**kwargs):
+        return {"result": {"response": "ok"}, "kwargs": {}}
+
+    decision_text = (
+        '{"outcome":"allow","rationale":"safe read-only review",'
+        '"risk_level":"low","user_authorization":"high"}'
+    )
+    message_item = {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": decision_text}],
+        },
+    }
+    completed_event = {
+        "type": "response.completed",
+        "response": {"status": "completed", "output": []},
+    }
+    precomputed_lines = [
+        f"data: {json.dumps(message_item)}",
+        f"data: {json.dumps(completed_event)}",
+    ]
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks",
+        side_effect=_capture,
+    ):
+        await PassThroughStreamingHandler._route_streaming_logging_to_handler(
+            litellm_logging_obj=logging_obj,
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            response=httpx.Response(
+                200,
+                request=httpx.Request(
+                    "POST",
+                    "https://chatgpt.com/backend-api/codex/responses",
+                ),
+            ),
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            request_body={"model": "codex-auto-review"},
+            endpoint_type=EndpointType.OPENAI,
+            start_time=datetime.now() - timedelta(milliseconds=10),
+            raw_bytes=[],
+            precomputed_lines=precomputed_lines,
+            end_time=datetime.now(),
+            custom_llm_provider="openai",
+            success_handler_kwargs=success_handler_kwargs,
+        )
+
+    events = logging_obj.model_call_details.get(
+        "_aawm_parsed_codex_review_decisions"
+    )
+    assert isinstance(events, list)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "allow"
+    assert events[0]["reviewer_litellm_call_id"] == "reviewer-call-1"
+    assert events[0]["session_id"] == "session-1"
+    assert events[0]["parent_litellm_call_id"] == "origin-call-1"
+    assert events[0]["parent_agent_id"] == "parent-actor-1"
+    assert events[0]["parent_thread_id"] == "parent-thread-1"
+
+
+@pytest.mark.asyncio
 async def test_chunk_processor_increments_summary_lines_for_codex_responses(monkeypatch):
     monkeypatch.setenv(
         PassThroughStreamingHandler._AAWM_STREAM_SUMMARY_FIRST_FINALIZE_ENV,

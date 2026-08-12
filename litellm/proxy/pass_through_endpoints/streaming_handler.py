@@ -20,6 +20,7 @@ from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLogging
 from litellm.litellm_core_utils.thread_pool_executor import executor
 from litellm.proxy._types import PassThroughEndpointLoggingResultValues
 from litellm.proxy.aawm_route_logging import (
+    _AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY,
     emit_aawm_route_status_event,
     record_aawm_route_rollup,
     record_aawm_route_rollup_turn,
@@ -457,6 +458,10 @@ class PassThroughStreamingHandler:
             "call_type",
             "litellm_call_id",
             "completion_start_time",
+            # D1-616: route rollup attachment happens after this sync runs in the
+            # streaming finalize path; keep the private review-decision event on the
+            # allowlist so callback-visible model_call_details carries it.
+            _AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY,
         ):
             if key in kwargs:
                 model_call_details[key] = kwargs[key]
@@ -1796,10 +1801,6 @@ class PassThroughStreamingHandler:
                 finalize_started_at=finalize_started_at,
                 local_prepare_ms=local_prepare_ms,
             )
-            PassThroughStreamingHandler._sync_logging_obj_model_call_details_from_kwargs(
-                litellm_logging_obj,
-                kwargs,
-            )
             metadata = PassThroughStreamingHandler._ensure_streaming_metadata(kwargs)
             if not (
                 metadata.get("aawm_stream_interrupted")
@@ -1816,6 +1817,13 @@ class PassThroughStreamingHandler:
                         )
                     ),
                 )
+            # Sync after rollup attachment so the private codex review-decision
+            # event attached by record_aawm_route_rollup_turn reaches
+            # callback-visible model_call_details before success callbacks run.
+            PassThroughStreamingHandler._sync_logging_obj_model_call_details_from_kwargs(
+                litellm_logging_obj,
+                kwargs,
+            )
             handler_branch = (
                 await PassThroughStreamingHandler._dispatch_streaming_success_callbacks(
                     litellm_logging_obj=litellm_logging_obj,
