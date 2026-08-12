@@ -39,6 +39,7 @@ from litellm.proxy.common_request_processing import (
 )
 from litellm.proxy.dd_span_tagger import DDSpanTagger
 from litellm.proxy.aawm_route_logging import (
+    _AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY,
     clear_aawm_route_rollups,
     clear_aawm_route_log_dedup_state,
     emit_aawm_route_access_log,
@@ -3699,6 +3700,188 @@ class TestAawmRouteRollup:
         assert " - gpt-5.5:none - Turns: 1" in rendered
         assert " - codex-auto-review:none - Turns: 1" in rendered
         assert "   - Approved:" not in rendered
+
+    def test_route_rollup_attaches_codex_review_decision_event_to_private_kwargs(
+        self,
+        monkeypatch,
+    ):
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        target = "https://chatgpt.com/backend-api/codex/responses"
+
+        kwargs = {
+            "litellm_call_id": "call-review-1",
+            "litellm_params": {"metadata": {}},
+        }
+        request = _build_aawm_route_log_request(
+            url="http://127.0.0.1:4001/openai_passthrough/responses",
+            headers={
+                "user-agent": "codex-cli/0.141.0",
+                "x-codex-parent-thread-id": "thread-parent",
+            },
+        )
+        request.state.aawm_alias_request_context = {
+            "session_id": "session-parent",
+            "litellm_call_id": "call-review-1",
+            "agent_dispatch": {"agent_id": "agent-parent"},
+        }
+        emit_aawm_route_access_log(
+            request=request,
+            target=target,
+            request_body={
+                "model": "codex-auto-review",
+                "litellm_metadata": {"repository": "litellm"},
+                "client_metadata": {"parent_agent_id": "agent-parent"},
+            },
+            kwargs=kwargs,
+        )
+        record_aawm_route_rollup_turn(
+            kwargs,
+            response_body=self._review_response("allow", "Looks safe"),
+        )
+        try:
+            metadata = kwargs["litellm_params"]["metadata"]
+            events = kwargs.get(_AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY)
+            assert isinstance(events, list) and len(events) == 1
+            assert "codex_review_decisions" not in metadata
+            event = events[0]
+            assert event["outcome"] == "allow"
+            assert event["rationale"] == "Looks safe"
+            assert event["reviewer_litellm_call_id"] == "call-review-1"
+            # Explicit stable attempt identity; never keyed on rationale.
+            assert event["review_attempt_key"] == "call-review-1:codex-review:1"
+            assert event["review_attempt_number"] == 1
+            assert event["session_id"] == "session-parent"
+            assert event["parent_thread_id"] == "thread-parent"
+            assert event["parent_agent_id"] == "agent-parent"
+            # Governed tool/action IDs are never invented by the producer.
+            assert "governed_tool_call_id" not in event
+            assert "governed_tool_activity_key" not in event
+        finally:
+            clear_aawm_route_rollups()
+
+    def test_route_rollup_attaches_codex_review_decision_when_disabled(
+        self,
+        monkeypatch,
+    ):
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "0")
+        target = "https://chatgpt.com/backend-api/codex/responses"
+
+        kwargs = {
+            "litellm_call_id": "call-review-disabled",
+            "litellm_params": {"metadata": {}},
+        }
+        request = _build_aawm_route_log_request(
+            url="http://127.0.0.1:4001/openai_passthrough/responses",
+            headers={
+                "user-agent": "codex-cli/0.141.0",
+                "x-codex-parent-thread-id": "thread-parent-disabled",
+            },
+        )
+        request.state.aawm_alias_request_context = {
+            "session_id": "session-parent-disabled",
+            "litellm_call_id": "call-review-disabled",
+            "agent_dispatch": {"agent_id": "agent-parent-disabled"},
+        }
+        emit_aawm_route_access_log(
+            request=request,
+            target=target,
+            request_body={
+                "model": "codex-auto-review",
+                "litellm_metadata": {"repository": "litellm"},
+                "client_metadata": {"parent_agent_id": "agent-parent-disabled"},
+            },
+            kwargs=kwargs,
+        )
+        try:
+            record_aawm_route_rollup_turn(
+                kwargs,
+                response_body=self._review_response("allow", "Rollup disabled"),
+            )
+            metadata = kwargs["litellm_params"]["metadata"]
+            events = kwargs.get(_AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY)
+            assert isinstance(events, list) and len(events) == 1
+            assert "codex_review_decisions" not in metadata
+            assert events[0]["outcome"] == "allow"
+            assert events[0]["session_id"] == "session-parent-disabled"
+            assert events[0]["parent_thread_id"] == "thread-parent-disabled"
+            assert metadata["aawm_route_rollup_turn_recorded"] is True
+            assert flush_aawm_route_rollups(force=True) == []
+        finally:
+            clear_aawm_route_rollups()
+
+    def test_route_rollup_review_decision_attachment_is_idempotent(
+        self,
+        monkeypatch,
+    ):
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        target = "https://chatgpt.com/backend-api/codex/responses"
+
+        kwargs = {
+            "litellm_call_id": "call-review-dup",
+            "litellm_params": {"metadata": {}},
+        }
+        request = _build_aawm_route_log_request(
+            url="http://127.0.0.1:4001/openai_passthrough/responses",
+            headers={"user-agent": "codex-cli/0.141.0"},
+        )
+        request.state.aawm_alias_request_context = {
+            "session_id": "session-parent",
+            "litellm_call_id": "call-review-dup",
+        }
+        emit_aawm_route_access_log(
+            request=request,
+            target=target,
+            request_body={
+                "model": "codex-auto-review",
+                "litellm_metadata": {"repository": "litellm"},
+            },
+            kwargs=kwargs,
+        )
+        response_body = self._review_response("deny", "Unsafe")
+        record_aawm_route_rollup_turn(kwargs, response_body=response_body)
+        record_aawm_route_rollup_turn(kwargs, response_body=response_body)
+        try:
+            events = kwargs[_AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY]
+            assert len(events) == 1
+        finally:
+            clear_aawm_route_rollups()
+
+    def test_route_rollup_skips_decision_attachment_for_invalid_review(
+        self,
+        monkeypatch,
+    ):
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        target = "https://chatgpt.com/backend-api/codex/responses"
+
+        kwargs = {
+            "litellm_call_id": "call-review-invalid",
+            "litellm_params": {"metadata": {}},
+        }
+        emit_aawm_route_access_log(
+            request=_build_aawm_route_log_request(
+                url="http://127.0.0.1:4001/openai_passthrough/responses",
+                headers={"user-agent": "codex-cli/0.141.0"},
+            ),
+            target=target,
+            request_body={
+                "model": "codex-auto-review",
+                "litellm_metadata": {"repository": "litellm"},
+            },
+            kwargs=kwargs,
+        )
+        # Non-completed / unparseable response: never attach an event.
+        record_aawm_route_rollup_turn(
+            kwargs,
+            response_body={"status": "in_progress", "output": []},
+        )
+        try:
+            assert _AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY not in kwargs
+        finally:
+            clear_aawm_route_rollups()
 
     def test_route_rollup_keeps_unattributed_reviews_standalone(
         self,

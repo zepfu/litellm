@@ -33,6 +33,9 @@ from types import FunctionType
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from litellm._logging import verbose_logger
+from litellm.proxy.aawm_route_logging import (
+    _AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY,
+)
 
 # SQL constants (package-owned)
 from litellm.integrations.aawm_session_history.sql import (  # noqa: F401
@@ -1363,6 +1366,13 @@ def _build_session_history_record(  # noqa: PLR0915
     }
     if tool_definition_snapshot is not None:
         record[_AAWM_TOOL_DEFINITION_SNAPSHOT_METADATA_KEY] = tool_definition_snapshot
+    parsed_codex_review_decisions = kwargs.get(
+        _AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY
+    )
+    if isinstance(parsed_codex_review_decisions, list):
+        record["codex_review_decisions"] = _json_safe_rate_limit_value(
+            parsed_codex_review_decisions
+        )
     _apply_runtime_agent_quality_scores(
         record=record,
         request_body=request_body,
@@ -2373,6 +2383,10 @@ def _install_record_functions() -> None:
     # Modules used by record APIs that may not already be identity globals.
     host_globals.setdefault("inspect", inspect)
     host_globals.setdefault("hashlib", hashlib)
+    host_globals.setdefault(
+        "_AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY",
+        _AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY,
+    )
     # Codex review-decision constants referenced by the rebound D1-616
     # builders must resolve through the identity namespace after rebind.
     host_globals.setdefault(

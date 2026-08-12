@@ -45,6 +45,9 @@ _AAWM_ROUTE_ROLLUP_MAX_SUBLINES = 16
 _AAWM_ROUTE_ROLLUP_MAX_ORIGIN_IDENTITIES = 256
 _AAWM_ROUTE_ROLLUP_MAX_REVIEW_RATIONALES = 8
 _AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY = "aawm_route_rollup_context"
+_AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY = (
+    "_aawm_parsed_codex_review_decisions"
+)
 _AAWM_ROUTE_LOG_REASONING_EFFORT_METADATA_KEY = "reasoning_effort_native_value"
 _AAWM_ROUTE_ROLLUP_REASONING_EFFORT_VALUES = (
     "none",
@@ -2574,6 +2577,59 @@ def record_aawm_route_rollup(
     _emit_aawm_route_rollup_lines(lines)
 
 
+def _attach_codex_review_decision_event(
+    kwargs: dict[str, Any],
+    context: dict[str, Any],
+    *,
+    decision: AawmReviewDecision,
+    correlation: _AawmRouteRollupReviewCorrelation,
+) -> None:
+    """Attach one validated D1-616 ``codex_review_decisions`` event.
+
+    Runs on the private callback kwargs that AawmAgentIdentity turns into a
+    session-history record, before sync/async success callbacks observe them.
+    Only completed, valid decisions are attached (the caller passes a
+    successfully parsed D1-615 decision). Stable attempt identity is explicit
+    (reviewer ``litellm_call_id``-scoped), never keyed on mutable
+    outcome/rationale. Correlation fields come from the D1-615 rollup context;
+    governed tool/action IDs are never populated here and stay NULL. The
+    parser-owned list replaces any prior private value.
+    """
+    reviewer_litellm_call_id = _normalize_aawm_route_rollup_identity(
+        context.get("litellm_call_id")
+    )
+    if reviewer_litellm_call_id is None:
+        # No stable reviewer identity: the D1-616 builder would refuse the
+        # event anyway; do not attach an identity-poor placeholder.
+        return
+
+    event: dict[str, Any] = {
+        "outcome": decision.outcome,
+        "reviewer_litellm_call_id": reviewer_litellm_call_id,
+        # Explicit stable attempt identity scoped to this review call. Never
+        # derived from outcome/rationale; the reviewer call ID is the only
+        # immutable identity available at the success callback.
+        "review_attempt_key": f"{reviewer_litellm_call_id}:codex-review:1",
+        "review_attempt_number": 1,
+        "metadata": {
+            "source": "aawm_route_logging.record_aawm_route_rollup_turn",
+            "capture_source": "codex_auto_review_success_callback",
+        },
+    }
+    if decision.rationale is not None:
+        event["rationale"] = decision.rationale
+    if correlation.canonical_session_identity is not None:
+        event["session_id"] = correlation.canonical_session_identity
+    if correlation.originating_litellm_call_id is not None:
+        event["parent_litellm_call_id"] = correlation.originating_litellm_call_id
+    if correlation.parent_thread_id is not None:
+        event["parent_thread_id"] = correlation.parent_thread_id
+    if correlation.parent_actor_id is not None:
+        event["parent_agent_id"] = correlation.parent_actor_id
+
+    kwargs[_AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY] = [event]
+
+
 def record_aawm_route_rollup_turn(
     kwargs: Optional[dict],
     *,
@@ -2581,8 +2637,6 @@ def record_aawm_route_rollup_turn(
     turns: int = 1,
     now: Optional[datetime] = None,
 ) -> None:
-    if not aawm_route_rollups_enabled():
-        return
     metadata = _get_aawm_route_rollup_metadata(kwargs)
     if not isinstance(metadata, dict):
         return
@@ -2592,6 +2646,8 @@ def record_aawm_route_rollup_turn(
     if metadata.get("aawm_route_rollup_turn_recorded"):
         return
     metadata["aawm_route_rollup_turn_recorded"] = True
+    if isinstance(kwargs, dict):
+        kwargs.pop(_AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY, None)
     review_decision: Optional[AawmReviewDecision] = None
     review_correlation: Optional[_AawmRouteRollupReviewCorrelation] = None
     is_codex_auto_review = context.get("is_codex_auto_review") is True
@@ -2617,6 +2673,15 @@ def record_aawm_route_rollup_turn(
                     context.get("review_parent_thread_id")
                 ),
             )
+            _attach_codex_review_decision_event(
+                kwargs,
+                context,
+                decision=review_decision,
+                correlation=review_correlation,
+            )
+
+    if not aawm_route_rollups_enabled():
+        return
 
     origin_identity: Optional[_AawmRouteRollupOriginIdentity] = None
     if not is_codex_auto_review:
@@ -3400,15 +3465,15 @@ def emit_aawm_route_access_log(
         provider_bound_body=provider_bound_body,
         route_type=route_type,
     )
+    rollup_context = attach_aawm_route_rollup_context(
+        request=request,
+        target=target,
+        request_body=request_body,
+        kwargs=kwargs,
+        provider_bound_body=provider_bound_body,
+        route_type=route_type,
+    )
     if aawm_route_rollups_enabled():
-        rollup_context = attach_aawm_route_rollup_context(
-            request=request,
-            target=target,
-            request_body=request_body,
-            kwargs=kwargs,
-            provider_bound_body=provider_bound_body,
-            route_type=route_type,
-        )
         _register_aawm_route_access_log_replacement(
             request,
             suppress_all_statuses=rollup_context is not None,

@@ -671,6 +671,14 @@ class PassThroughEndpointLogging:
             kwargs=kwargs,
         )
 
+        # Attach any validated Codex auto-review decision to private callback
+        # kwargs (and record the rollup turn) BEFORE sync/async success
+        # callbacks run, so the AawmAgentIdentity session-history success
+        # handler sees the parser-produced event.
+        record_aawm_route_rollup_turn(
+            kwargs,
+            response_body=response_body,
+        )
         await self._handle_logging(
             logging_obj=logging_obj,
             standard_logging_response_object=standard_logging_response_object,
@@ -680,10 +688,6 @@ class PassThroughEndpointLogging:
             cache_hit=cache_hit,
             standard_pass_through_logging_payload=passthrough_logging_payload,
             **kwargs,
-        )
-        record_aawm_route_rollup_turn(
-            kwargs,
-            response_body=response_body,
         )
 
     def is_vertex_route(self, url_route: str):

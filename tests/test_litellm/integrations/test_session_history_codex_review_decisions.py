@@ -26,6 +26,7 @@ import pytest
 
 import litellm.integrations.aawm_agent_identity as identity
 from litellm.integrations.aawm_session_history import sql as sh_sql
+from litellm.proxy.aawm_route_logging import record_aawm_route_rollup_turn
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -387,6 +388,120 @@ def test_duplicate_events_are_deduplicated_and_metadata_events_read() -> None:
     }
     payloads = identity._build_codex_review_decision_db_payloads(record)
     assert len(payloads) == 1
+
+
+def test_injected_metadata_invalid_review_persists_no_decision() -> None:
+    kwargs = {
+        "litellm_call_id": "call-review-record",
+        "model": "codex-auto-review",
+        "custom_llm_provider": "openai",
+        "call_type": "pass_through_endpoint",
+        "litellm_params": {
+            "metadata": {
+                "session_id": "session-review-record",
+                "codex_review_decisions": [
+                    {
+                        "outcome": "allow",
+                        "governed_tool_call_id": "injected",
+                    }
+                ],
+                "aawm_route_rollup_context": {
+                    "is_codex_auto_review": True,
+                    "litellm_call_id": "call-review-record",
+                    "canonical_session_identity": "session-review-record",
+                },
+            }
+        },
+        "standard_logging_object": {"metadata": {}, "request_tags": []},
+        "passthrough_logging_payload": {
+            "request_body": {"model": "codex-auto-review"},
+            "request_headers": {},
+        },
+    }
+    record_aawm_route_rollup_turn(
+        kwargs,
+        response_body={"status": "in_progress", "output": []},
+    )
+    record = identity._build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-review-record",
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            "output": [],
+        },
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    assert identity._extract_codex_review_decision_events(record) == []
+
+
+def test_valid_review_persists_only_private_producer_event() -> None:
+    kwargs = {
+        "litellm_call_id": "call-review-record",
+        "model": "codex-auto-review",
+        "custom_llm_provider": "openai",
+        "call_type": "pass_through_endpoint",
+        "litellm_params": {
+            "metadata": {
+                "session_id": "session-review-record",
+                "codex_review_decisions": [
+                    {
+                        "outcome": "deny",
+                        "governed_tool_call_id": "injected",
+                        "governed_tool_activity_key": "injected:tool:1",
+                    }
+                ],
+                "aawm_route_rollup_context": {
+                    "is_codex_auto_review": True,
+                    "litellm_call_id": "call-review-record",
+                    "canonical_session_identity": "session-review-record",
+                },
+            }
+        },
+        "standard_logging_object": {"metadata": {}, "request_tags": []},
+        "passthrough_logging_payload": {
+            "request_body": {"model": "codex-auto-review"},
+            "request_headers": {},
+        },
+    }
+    record_aawm_route_rollup_turn(
+        kwargs,
+        response_body={
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": '{"outcome":"allow","rationale":"Producer"}',
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    record = identity._build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-review-record",
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            "output": [],
+        },
+        start_time=None,
+        end_time=None,
+    )
+
+    assert record is not None
+    extracted = identity._extract_codex_review_decision_events(record)
+    assert len(extracted) == 1
+    assert extracted[0]["outcome"] == "allow"
+    assert extracted[0]["rationale"] == "Producer"
+    assert "governed_tool_call_id" not in extracted[0]
+    assert "governed_tool_activity_key" not in extracted[0]
 
 
 def test_governed_tool_ids_are_caller_supplied_only() -> None:
