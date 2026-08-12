@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aawm-litellm-callbacks"
-version = "0.0.69"
+version = "0.0.70"
 description = "AAWM LiteLLM callback for Langfuse enrichment and session history"
 requires-python = ">=3.10"
 dependencies = ["litellm"]
@@ -21,6 +21,14 @@ dev = ["build"]
 # as-is and re-exports the canonical litellm.integrations.aawm_agent_identity
 # namespace (including private helpers) at wheel build time.
 #
+# 0.0.70: immutable re-cut so the force-included
+# litellm/integrations/aawm_session_history/record.py carries the D1-616
+# parent-identity collision fix: the FULL sanitized
+# parent_litellm_call_id/parent_session_id/parent_thread_id values now feed
+# the stable decision-key hash, while only the stored columns use the bounded
+# prefix+SHA-256 representation. 0.0.69 force-included a record.py that
+# bounded these parent IDs before the decision-key hash, so over-long IDs
+# sharing a prefix could collide on the decision key in pip-overlay installs.
 # 0.0.69: immutable re-cut so the force-included aawm_session_history package
 # carries the Codex review-decisions SQL surface that
 # aawm_agent_identity/__init__.py imports (0.0.68 was cut before
