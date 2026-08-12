@@ -4,30 +4,26 @@
 \set ON_ERROR_STOP on
 
 \if :{?expected_database}
+SELECT CASE
+    WHEN NULLIF(btrim(:'expected_database'), '') = current_database()
+        THEN 'true'
+    ELSE 'false'
+END AS d1_616_database_matches \gset
+
+\if :d1_616_database_matches
+\set guard_statement 'SELECT 1'
+\else
+\echo 'D1-616 abort: expected_database is empty or does not match current_database()'
+\set guard_statement 'SELECT 1 / 0 AS d1_616_database_guard_failure'
+\endif
 \else
 \echo 'D1-616 abort: required psql variable expected_database is missing'
-\quit 3
+\set guard_statement 'SELECT 1 / 0 AS d1_616_database_guard_failure'
 \endif
 
+:guard_statement;
+
 BEGIN;
-
-DO $$
-DECLARE
-    expected_database_name text := NULLIF(btrim(:'expected_database'), '');
-BEGIN
-    IF expected_database_name IS NULL THEN
-        RAISE EXCEPTION
-            'D1-616 abort: required psql variable expected_database is empty';
-    END IF;
-
-    IF current_database() <> expected_database_name THEN
-        RAISE EXCEPTION
-            'D1-616 abort: expected database %, got %',
-            expected_database_name,
-            current_database();
-    END IF;
-END;
-$$;
 
 CREATE TABLE IF NOT EXISTS public.session_history_codex_review_decisions (
     id BIGSERIAL PRIMARY KEY,

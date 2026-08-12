@@ -80,13 +80,59 @@ def test_d1_616_migration_uses_required_parameterized_database_guard() -> None:
     assert "aawm_tristore" not in migration
     assert r"\set ON_ERROR_STOP on" in migration
     assert r"\if :{?expected_database}" in migration
-    assert r"\quit 3" in migration
     assert (
-        "expected_database_name text := NULLIF(btrim(:'expected_database'), '');"
+        "SELECT CASE\n"
+        "    WHEN NULLIF(btrim(:'expected_database'), '') = current_database()\n"
+        "        THEN 'true'\n"
+        "    ELSE 'false'\n"
+        "END AS d1_616_database_matches \\gset"
         in migration
     )
-    assert "IF expected_database_name IS NULL THEN" in migration
-    assert "IF current_database() <> expected_database_name THEN" in migration
+    assert "THEN 'true'" in migration
+    assert "ELSE 'false'" in migration
+    assert r"\if :d1_616_database_matches" in migration
+    assert (
+        "D1-616 abort: expected_database is empty or does not match "
+        "current_database()" in migration
+    )
+    assert (
+        "D1-616 abort: required psql variable expected_database is missing"
+        in migration
+    )
+    assert r"\set guard_statement 'SELECT 1'" in migration
+    assert (
+        r"\set guard_statement 'SELECT 1 / 0 AS d1_616_database_guard_failure'"
+        in migration
+    )
+    assert migration.splitlines().count(
+        r"\set guard_statement 'SELECT 1 / 0 AS d1_616_database_guard_failure'"
+    ) == 2
+    assert migration.splitlines().count(
+        r"\set guard_statement 'SELECT 1'"
+    ) == 1
+    assert ":guard_statement;" in migration
+    assert r"\quit" not in migration
+    assert "DO $$" not in migration
+    assert "expected_database_name" not in migration
+    assert "RAISE EXCEPTION" not in migration
+    begin_idx = migration.index("BEGIN;")
+    assert migration.index(r"\set guard_statement 'SELECT 1'") < begin_idx
+    assert migration.index(
+        r"\set guard_statement 'SELECT 1 / 0 AS d1_616_database_guard_failure'"
+    ) < begin_idx
+    assert migration.index(r"\if :{?expected_database}") < migration.index(
+        "SELECT CASE"
+    )
+    assert migration.index("SELECT CASE") < begin_idx
+    assert migration.index(":guard_statement;") < begin_idx
+
+
+def test_d1_616_migration_keeps_idempotent_ddl_after_guard() -> None:
+    migration = D1_616_MIGRATION.read_text(encoding="utf-8")
+    begin_idx = migration.index("BEGIN;")
+    assert migration.index("CREATE TABLE IF NOT EXISTS", begin_idx) > begin_idx
+    assert migration.count("CREATE INDEX IF NOT EXISTS") == 7
+    assert migration.endswith("COMMIT;\n")
 
 
 def test_d1_616_docs_keep_dev_prod_migration_commands_in_parity() -> None:
