@@ -1558,6 +1558,95 @@ class PassThroughStreamingHandler:
         return standard_logging_response_object, kwargs, handler_branch, False
 
     @staticmethod
+    def _build_completed_responses_body_for_route_rollup(
+        *,
+        all_chunks: List[str],
+        endpoint_type: EndpointType,
+        url_route: str,
+        custom_llm_provider: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        if not PassThroughStreamingHandler._is_openai_responses_stream(
+            endpoint_type=endpoint_type,
+            url_route=url_route,
+            custom_llm_provider=custom_llm_provider,
+        ):
+            return None
+
+        terminal_event_type, terminal_payload = (
+            OpenAIPassthroughLoggingHandler._extract_terminal_response_payload_from_stream(
+                all_chunks
+            )
+        )
+        if (
+            terminal_event_type != "response.completed"
+            or not isinstance(terminal_payload, dict)
+            or terminal_payload.get("status") != "completed"
+        ):
+            return None
+
+        completed_output = terminal_payload.get("output")
+        reconstructed_output = (
+            OpenAIPassthroughLoggingHandler._reconstruct_responses_output_items_from_stream(
+                all_chunks
+            )
+        )
+        merged_output = OpenAIPassthroughLoggingHandler._merge_responses_output_lists(
+            completed_output if isinstance(completed_output, list) else [],
+            reconstructed_output,
+        )
+        streamed_output_text = (
+            OpenAIPassthroughLoggingHandler._extract_responses_api_stream_text(
+                all_chunks
+            )
+        )
+        if streamed_output_text:
+            assistant_messages = [
+                item
+                for item in merged_output
+                if isinstance(item, dict)
+                and item.get("type") == "message"
+                and item.get("role") == "assistant"
+            ]
+            output_texts = [
+                content_item
+                for item in assistant_messages
+                for content_item in (
+                    item.get("content")
+                    if isinstance(item.get("content"), list)
+                    else []
+                )
+                if isinstance(content_item, dict)
+                and content_item.get("type") == "output_text"
+            ]
+            if not output_texts:
+                if len(assistant_messages) == 1:
+                    assistant_messages[0]["content"] = [
+                        {
+                            "type": "output_text",
+                            "text": streamed_output_text,
+                        }
+                    ]
+                else:
+                    merged_output.append(
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": streamed_output_text,
+                                }
+                            ],
+                        }
+                    )
+
+        return {
+            **terminal_payload,
+            "output": merged_output,
+        }
+
+    @staticmethod
     def _record_streaming_finalize_metrics(
         *,
         kwargs: Dict[str, Any],
@@ -1716,7 +1805,17 @@ class PassThroughStreamingHandler:
                 metadata.get("aawm_stream_interrupted")
                 or metadata.get("aawm_route_rollup_turn_suppressed")
             ):
-                record_aawm_route_rollup_turn(kwargs)
+                record_aawm_route_rollup_turn(
+                    kwargs,
+                    response_body=(
+                        PassThroughStreamingHandler._build_completed_responses_body_for_route_rollup(
+                            all_chunks=all_chunks,
+                            endpoint_type=endpoint_type,
+                            url_route=url_route,
+                            custom_llm_provider=custom_llm_provider,
+                        )
+                    ),
+                )
             handler_branch = (
                 await PassThroughStreamingHandler._dispatch_streaming_success_callbacks(
                     litellm_logging_obj=litellm_logging_obj,

@@ -681,7 +681,10 @@ class PassThroughEndpointLogging:
             standard_pass_through_logging_payload=passthrough_logging_payload,
             **kwargs,
         )
-        record_aawm_route_rollup_turn(kwargs)
+        record_aawm_route_rollup_turn(
+            kwargs,
+            response_body=response_body,
+        )
 
     def is_vertex_route(self, url_route: str):
         for route in self.TRACKED_VERTEX_ROUTES:

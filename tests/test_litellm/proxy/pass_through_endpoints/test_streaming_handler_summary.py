@@ -112,10 +112,25 @@ async def test_route_streaming_logging_uses_precomputed_lines(monkeypatch):
         captured["all_chunks"] = kwargs.get("all_chunks")
         return {"result": {"response": "ok"}, "kwargs": {}}
 
+    completed_event = {
+        "type": "response.completed",
+        "response": {
+            "status": "completed",
+            "output": [],
+        },
+    }
+    precomputed_lines = [
+        'data: {"type":"response.output_text.delta","output_index":0,'
+        '"delta":"{\\"outcome\\":\\"allow\\"}"}',
+        f"data: {json.dumps(completed_event)}",
+    ]
+
     with patch(
         "litellm.proxy.pass_through_endpoints.streaming_handler.OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks",
         side_effect=_capture,
-    ):
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup_turn"
+    ) as record_turn:
         await PassThroughStreamingHandler._route_streaming_logging_to_handler(
             litellm_logging_obj=logging_obj,
             passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
@@ -130,20 +145,35 @@ async def test_route_streaming_logging_uses_precomputed_lines(monkeypatch):
             request_body={"model": "gpt-5.4"},
             endpoint_type=EndpointType.OPENAI,
             start_time=datetime.now() - timedelta(milliseconds=10),
-            raw_bytes=[b"data: {\"type\":\"response.completed\"}\n\n"],
-            precomputed_lines=['data: {"type":"response.completed"}'],
+            raw_bytes=[],
+            precomputed_lines=precomputed_lines,
             end_time=datetime.now(),
             custom_llm_provider="openai",
             success_handler_kwargs=success_handler_kwargs,
         )
 
-    assert captured["all_chunks"] == ['data: {"type":"response.completed"}']
+    assert captured["all_chunks"] == precomputed_lines
     assert (
         success_handler_kwargs["litellm_params"]["metadata"][
             "aawm_stream_finalize_line_source"
         ]
         == "incremental_summary"
     )
+    reconstructed_response = record_turn.call_args.kwargs["response_body"]
+    assert reconstructed_response["status"] == "completed"
+    assert reconstructed_response["output"] == [
+        {
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": '{"outcome":"allow"}',
+                }
+            ],
+        }
+    ]
 
 
 @pytest.mark.asyncio

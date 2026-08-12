@@ -3059,6 +3059,76 @@ class TestHasAttributeErrorInChain:
 
 
 class TestAawmRouteRollup:
+    @staticmethod
+    def _review_response(
+        outcome: str,
+        rationale: Optional[str] = None,
+    ) -> dict:
+        decision = {"outcome": outcome}
+        if rationale is not None:
+            decision["rationale"] = rationale
+        return {
+            "status": "completed",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": json.dumps(decision),
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def test_route_rollup_context_extracts_real_codex_review_metadata(self):
+        from litellm.proxy.aawm_route_logging import (
+            build_aawm_route_rollup_context,
+        )
+
+        request = _build_aawm_route_log_request(
+            url="http://127.0.0.1:4001/openai_passthrough/responses",
+            headers={
+                "user-agent": "codex-cli/0.147.0",
+                "x-codex-parent-thread-id": "thread-parent-header",
+            },
+        )
+        request.state.aawm_alias_request_context = {
+            "session_id": "session-audit",
+            "litellm_call_id": "call-review-audit",
+            "agent_dispatch": {"agent_id": "agent-review-audit"},
+        }
+
+        context = build_aawm_route_rollup_context(
+            request=request,
+            target="https://chatgpt.com/backend-api/codex/responses",
+            request_body={
+                "model": "codex-auto-review",
+                "litellm_metadata": {"repository": "litellm"},
+                "x-codex-turn-metadata": json.dumps(
+                    {
+                        "project_path": "/home/zepfu/projects/litellm",
+                        "session_id": "session-body",
+                        "thread_id": "thread-review",
+                        "parent_agent_id": "agent-parent",
+                        "ignored_prompt": "must not be retained",
+                    }
+                ),
+            },
+        )
+
+        assert context is not None
+        assert context["canonical_session_identity"] == "session-body"
+        assert context["litellm_call_id"] == "call-review-audit"
+        assert context["origin_thread_id"] == "thread-review"
+        assert context["origin_actor_id"] == "agent-review-audit"
+        assert context["review_parent_thread_id"] == "thread-parent-header"
+        assert context["review_parent_actor_id"] == "agent-parent"
+        assert context["review_originating_litellm_call_id"] is None
+        assert "ignored_prompt" not in context
+
     def test_route_rollup_header_and_subline_formatting(self):
         from datetime import datetime
 
@@ -3363,6 +3433,464 @@ class TestAawmRouteRollup:
         flushed = accumulator.flush(force=True, now=now)
         assert " - gpt-5.5(basic):none - Turns: 3 [Exhausted]" in flushed
 
+    def test_route_rollup_call_id_narrows_session_parent_match_and_deduplicates_rationales(
+        self,
+        monkeypatch,
+    ):
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        target = "https://chatgpt.com/backend-api/codex/responses"
+
+        def record_turn(
+            *,
+            model: str,
+            call_id: str,
+            metadata: Optional[dict] = None,
+            client_metadata: Optional[dict] = None,
+            audit_context: Optional[dict] = None,
+            response_body: Optional[dict] = None,
+        ) -> None:
+            kwargs = {
+                "litellm_call_id": call_id,
+                "litellm_params": {"metadata": {}},
+            }
+            request_body = {
+                "model": model,
+                "litellm_metadata": {
+                    "repository": "litellm",
+                    **(metadata or {}),
+                },
+            }
+            if client_metadata is not None:
+                request_body["client_metadata"] = client_metadata
+            request = _build_aawm_route_log_request(
+                url="http://127.0.0.1:4001/openai_passthrough/responses",
+                headers={"user-agent": "codex-cli/0.141.0"},
+            )
+            if audit_context is not None:
+                request.state.aawm_alias_request_context = audit_context
+            emit_aawm_route_access_log(
+                request=request,
+                target=target,
+                request_body=request_body,
+                kwargs=kwargs,
+            )
+            record_aawm_route_rollup_turn(
+                kwargs,
+                response_body=response_body,
+            )
+
+        try:
+            parent_metadata = {
+                "canonical_session_identity": "session-parent",
+            }
+            parent_client_metadata = {
+                "thread_id": "thread-parent",
+            }
+            record_turn(
+                model="gpt-5.5",
+                call_id="call-origin",
+                metadata=parent_metadata,
+                client_metadata=parent_client_metadata,
+                audit_context={
+                    "agent_dispatch": {"agent_id": "agent-parent"},
+                    "session_id": "session-parent",
+                    "litellm_call_id": "call-origin",
+                },
+            )
+            record_turn(
+                model="grok-4.5",
+                call_id="call-other",
+                metadata=parent_metadata,
+                client_metadata=parent_client_metadata,
+                audit_context={
+                    "agent_dispatch": {"agent_id": "agent-parent"},
+                    "session_id": "session-parent",
+                    "litellm_call_id": "call-other",
+                },
+            )
+            for index, response_body in enumerate(
+                (
+                    self._review_response("allow", "Checks passed"),
+                    self._review_response("allow", " checks   PASSED "),
+                    self._review_response("deny"),
+                    self._review_response("deny", "Unsafe mutation"),
+                )
+            ):
+                record_turn(
+                    model="codex-auto-review",
+                    call_id=f"call-review-{index}",
+                    metadata={
+                        "canonical_session_identity": "session-parent",
+                    },
+                    client_metadata={
+                        "thread_id": f"thread-review-{index}",
+                        "agent_id": f"agent-review-{index}",
+                        "parent_thread_id": "thread-parent",
+                        "parent_agent_id": "agent-parent",
+                        "originating_litellm_call_id": "call-origin",
+                    },
+                    response_body=response_body,
+                )
+
+            rendered = "\n".join(flush_aawm_route_rollups(force=True))
+        finally:
+            clear_aawm_route_rollups()
+
+        assert " - gpt-5.5:none - Turns: 1" in rendered
+        assert "   - Approved: 2" in rendered
+        assert rendered.count("     - Checks passed") == 1
+        assert "   - Denied: 2" in rendered
+        assert "     - Unsafe mutation" in rendered
+        assert " - grok-4.5:none - Turns: 1" in rendered
+        assert "codex-auto-review:none" not in rendered
+
+    def test_route_rollup_correlates_unique_session_parent_thread(
+        self,
+        monkeypatch,
+    ):
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        target = "https://chatgpt.com/backend-api/codex/responses"
+
+        def record_turn(
+            model: str,
+            call_id: str,
+            turn_metadata: dict,
+            headers: Optional[dict] = None,
+            response_body: Optional[dict] = None,
+        ) -> None:
+            kwargs = {
+                "litellm_call_id": call_id,
+                "litellm_params": {"metadata": {}},
+            }
+            request_body = {
+                "model": model,
+                "litellm_metadata": {"repository": "litellm"},
+            }
+            emit_aawm_route_access_log(
+                request=_build_aawm_route_log_request(
+                    url="http://127.0.0.1:4001/openai_passthrough/responses",
+                    headers={
+                        "user-agent": "codex-cli/0.141.0",
+                        "x-codex-turn-metadata": json.dumps(turn_metadata),
+                        **(headers or {}),
+                    },
+                ),
+                target=target,
+                request_body=request_body,
+                kwargs=kwargs,
+            )
+            record_aawm_route_rollup_turn(
+                kwargs,
+                response_body=response_body,
+            )
+
+        try:
+            record_turn(
+                "gpt-5.5",
+                "call-parent-a",
+                {
+                    "project_path": "/home/zepfu/projects/litellm",
+                    "session_id": "session-parent",
+                    "thread_id": "thread-a",
+                },
+            )
+            record_turn(
+                "grok-4.5",
+                "call-parent-b",
+                {
+                    "project_path": "/home/zepfu/projects/litellm",
+                    "session_id": "session-parent",
+                    "thread_id": "thread-b",
+                },
+            )
+            record_turn(
+                "codex-auto-review",
+                "call-review-parent",
+                {
+                    "project_path": "/home/zepfu/projects/litellm",
+                    "session_id": "session-parent",
+                    "thread_id": "thread-review",
+                },
+                headers={"x-codex-parent-thread-id": "thread-a"},
+                response_body=self._review_response("allow", "Matched parent"),
+            )
+            rendered = "\n".join(flush_aawm_route_rollups(force=True))
+        finally:
+            clear_aawm_route_rollups()
+
+        assert (
+            " - gpt-5.5:none - Turns: 1\n"
+            "   - Approved: 1\n"
+            "     - Matched parent"
+        ) in rendered
+        assert " - grok-4.5:none - Turns: 1" in rendered
+        assert "codex-auto-review:none" not in rendered
+
+    @pytest.mark.parametrize(
+        "review_turn_metadata",
+        (
+            '{"session_id":"session-parent"',
+            "x" * 4097,
+        ),
+    )
+    def test_route_rollup_keeps_invalid_codex_turn_metadata_review_standalone(
+        self,
+        monkeypatch,
+        review_turn_metadata,
+    ):
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        target = "https://chatgpt.com/backend-api/codex/responses"
+
+        def record_turn(
+            *,
+            model: str,
+            call_id: str,
+            turn_metadata: str,
+            headers: Optional[dict] = None,
+            response_body: Optional[dict] = None,
+        ) -> None:
+            kwargs = {
+                "litellm_call_id": call_id,
+                "litellm_params": {"metadata": {}},
+            }
+            emit_aawm_route_access_log(
+                request=_build_aawm_route_log_request(
+                    url="http://127.0.0.1:4001/openai_passthrough/responses",
+                    headers={
+                        "user-agent": "codex-cli/0.141.0",
+                        "x-codex-turn-metadata": turn_metadata,
+                        **(headers or {}),
+                    },
+                ),
+                target=target,
+                request_body={
+                    "model": model,
+                    "litellm_metadata": {"repository": "litellm"},
+                },
+                kwargs=kwargs,
+            )
+            record_aawm_route_rollup_turn(kwargs, response_body=response_body)
+
+        try:
+            record_turn(
+                model="gpt-5.5",
+                call_id="call-parent",
+                turn_metadata=json.dumps(
+                    {
+                        "session_id": "session-parent",
+                        "thread_id": "thread-parent",
+                    }
+                ),
+            )
+            record_turn(
+                model="codex-auto-review",
+                call_id="call-review",
+                turn_metadata=review_turn_metadata,
+                headers={"x-codex-parent-thread-id": "thread-parent"},
+                response_body=self._review_response("allow"),
+            )
+            rendered = "\n".join(flush_aawm_route_rollups(force=True))
+        finally:
+            clear_aawm_route_rollups()
+
+        assert " - gpt-5.5:none - Turns: 1" in rendered
+        assert " - codex-auto-review:none - Turns: 1" in rendered
+        assert "   - Approved:" not in rendered
+
+    def test_route_rollup_keeps_unattributed_reviews_standalone(
+        self,
+        monkeypatch,
+    ):
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        target = "https://chatgpt.com/backend-api/codex/responses"
+
+        def record_turn(
+            model: str,
+            call_id: str,
+            metadata: Optional[dict] = None,
+            headers: Optional[dict] = None,
+            client_metadata: Optional[dict] = None,
+            response_body: Optional[dict] = None,
+        ) -> None:
+            kwargs = {
+                "litellm_call_id": call_id,
+                "litellm_params": {"metadata": {}},
+            }
+            request_body = {
+                "model": model,
+                "litellm_metadata": {
+                    "repository": "litellm",
+                    **(metadata or {}),
+                },
+            }
+            if client_metadata is not None:
+                request_body["client_metadata"] = client_metadata
+            emit_aawm_route_access_log(
+                request=_build_aawm_route_log_request(
+                    url="http://127.0.0.1:4001/openai_passthrough/responses",
+                    headers={
+                        "user-agent": "codex-cli/0.141.0",
+                        **(headers or {}),
+                    },
+                ),
+                target=target,
+                request_body=request_body,
+                kwargs=kwargs,
+            )
+            record_aawm_route_rollup_turn(
+                kwargs,
+                response_body=response_body,
+            )
+
+        try:
+            for model, call_id in (
+                ("gpt-5.5", "call-parent-a"),
+                ("grok-4.5", "call-parent-b"),
+            ):
+                record_turn(
+                    model,
+                    call_id,
+                    {
+                        "canonical_session_identity": "session-ambiguous",
+                    },
+                    client_metadata={"thread_id": "thread-shared"},
+                )
+            record_turn(
+                "codex-auto-review",
+                "call-review-missing",
+                response_body=self._review_response("allow"),
+            )
+            record_turn(
+                "codex-auto-review",
+                "call-review-call-id-only",
+                client_metadata={
+                    "originating_litellm_call_id": "call-parent-a",
+                },
+                response_body=self._review_response("allow"),
+            )
+            record_turn(
+                "codex-auto-review",
+                "call-review-malformed",
+                {"canonical_session_identity": "session-ambiguous"},
+                headers={"x-codex-parent-thread-id": "thread-shared"},
+                response_body={
+                    "status": "completed",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": '{"outcome":"allow"',
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+            record_turn(
+                "codex-auto-review",
+                "call-review-ambiguous",
+                {
+                    "canonical_session_identity": "session-ambiguous",
+                },
+                client_metadata={
+                    "parent_thread_id": "thread-shared",
+                    "thread_id": "thread-review-ambiguous",
+                },
+                response_body=self._review_response("deny", "Ambiguous parent"),
+            )
+            rendered = "\n".join(flush_aawm_route_rollups(force=True))
+        finally:
+            clear_aawm_route_rollups()
+
+        assert " - gpt-5.5:none - Turns: 1" in rendered
+        assert " - grok-4.5:none - Turns: 1" in rendered
+        assert " - codex-auto-review:none - Turns: 4" in rendered
+        assert "   - Approved:" not in rendered
+        assert "   - Denied:" not in rendered
+
+    def test_route_rollup_keeps_review_standalone_after_parent_early_flush(
+        self,
+        monkeypatch,
+    ):
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        target = "https://chatgpt.com/backend-api/codex/responses"
+
+        def record_turn(
+            *,
+            model: str,
+            call_id: str,
+            headers: Optional[dict] = None,
+            client_metadata: Optional[dict] = None,
+            response_body: Optional[dict] = None,
+        ) -> None:
+            kwargs = {
+                "litellm_call_id": call_id,
+                "litellm_params": {"metadata": {}},
+            }
+            request_body = {
+                "model": model,
+                "litellm_metadata": {
+                    "repository": "litellm",
+                    "canonical_session_identity": "session-flushed",
+                },
+            }
+            if client_metadata is not None:
+                request_body["client_metadata"] = client_metadata
+            emit_aawm_route_access_log(
+                request=_build_aawm_route_log_request(
+                    url="http://127.0.0.1:4001/openai_passthrough/responses",
+                    headers={
+                        "user-agent": "codex-cli/0.141.0",
+                        **(headers or {}),
+                    },
+                ),
+                target=target,
+                request_body=request_body,
+                kwargs=kwargs,
+            )
+            record_aawm_route_rollup_turn(
+                kwargs,
+                response_body=response_body,
+            )
+
+        try:
+            record_turn(
+                model="gpt-5.5",
+                call_id="call-parent-flushed",
+                client_metadata={"thread_id": "thread-parent-flushed"},
+            )
+            early = "\n".join(
+                flush_aawm_route_rollups(force=True, early=True)
+            )
+            record_turn(
+                model="codex-auto-review",
+                call_id="call-review-after-flush",
+                headers={
+                    "x-codex-parent-thread-id": "thread-parent-flushed",
+                },
+                client_metadata={"thread_id": "thread-review-after-flush"},
+                response_body=self._review_response(
+                    "deny",
+                    "Parent bucket gone",
+                ),
+            )
+            rendered = "\n".join(flush_aawm_route_rollups(force=True))
+        finally:
+            clear_aawm_route_rollups()
+
+        assert "[EARLY]" in early
+        assert " - gpt-5.5:none - Turns: 1" in early
+        assert " - codex-auto-review:none - Turns: 1" in rendered
+        assert "   - Denied:" not in rendered
+
     def test_route_rollup_retains_sanitized_source_error(self):
         from datetime import datetime
 
@@ -3419,6 +3947,8 @@ class TestAawmRouteRollup:
                         " - grok-4.5(sota-xai):none - Turns: 0 "
                         "[The requested model 'grok-4.5' does not exist.] [Failed]"
                     ),
+                    "   - Denied: 2",
+                    "     - Unsafe mutation",
                 ]
             )
 
@@ -3435,6 +3965,8 @@ class TestAawmRouteRollup:
             "\x1b[91m - grok-4.5(sota-xai):none - Turns: 0 "
             "[The requested model 'grok-4.5' does not exist.] [Failed]\x1b[0m"
         ) in rendered
+        assert "\x1b[93m   - Denied: 2\x1b[0m" in rendered
+        assert "\x1b[93m     - Unsafe mutation\x1b[0m" in rendered
 
     def test_route_rollup_json_emission_remains_ansi_free(self, monkeypatch):
         mock_logger = MagicMock()
@@ -3455,11 +3987,14 @@ class TestAawmRouteRollup:
                         " - grok-4.5(sota-xai):none - Turns: 0 "
                         "[The requested model 'grok-4.5' does not exist.] [Failed]"
                     ),
+                    "   - Denied: 1",
+                    "     - Unsafe mutation",
                 ]
             )
 
         rendered = mock_logger.info.call_args.args[1]
         assert "[Failed]" in rendered
+        assert "   - Denied: 1" in rendered
         assert "\x1b" not in rendered
 
     def test_route_rollup_status_event_keeps_immediate_error_shape(self, caplog):

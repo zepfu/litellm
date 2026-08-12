@@ -1657,6 +1657,63 @@ use the real outbound endpoint (`opencode.ai/zen/v1/chat/completions` or
 family, so operators can distinguish provider traffic without also seeing raw
 `adapted_to=...` Uvicorn access records for successful requests.
 
+### Codex auto-review decision rollups
+
+`codex-auto-review` responses are recognized only when the completed response
+contains exactly one assistant `output_text` item whose entire text is one JSON
+object with `outcome` (`allow` or `deny`) and optional `rationale`,
+`risk_level`, and `user_authorization` fields. Duplicate fields, unsupported
+fields, trailing text, malformed JSON, non-completed responses, and
+non-assistant or multiple output-text items are not review decisions. The
+rollup displays only the outcome count and sanitized rationale.
+
+An accepted review is nested under the originating route subline. The
+`codex-auto-review` request itself is not emitted as a separate subline when
+correlation succeeds, and it does not increment the originating `Turns` count:
+
+```text
+ - gpt-5.5:none - Turns: 1
+   - Approved: 2
+     - Checks passed
+   - Denied: 1
+     - Unsafe mutation
+```
+
+Only non-zero sections are printed. Review counts include every accepted
+decision; rationale text is optional, case-insensitively deduplicated, and
+limited to eight distinct values per section. Producer metadata uses the
+unprefixed keys `originating_litellm_call_id`, `parent_actor_id` (or
+compatibility alias `parent_agent_id`), and `parent_thread_id`; Codex producers
+may also send the immediate parent thread in `x-codex-parent-thread-id`.
+Canonical session identity continues to use the existing
+`canonical_session_identity` source.
+
+Exact nesting always requires the same canonical session identity plus an
+immediate parent actor and/or thread identity. `originating_litellm_call_id`
+only narrows the candidate set; it does not replace immediate-parent identity.
+A review carrying a call id alone remains a standalone `codex-auto-review`
+subline.
+
+The match must resolve to exactly one in-memory originating route subline.
+Missing or malformed review output, missing correlation, ambiguous parent
+identity, a parent already flushed, or a parent recorded by another proxy
+worker cannot be attached retroactively. Those results remain standalone
+`codex-auto-review` sublines so the review request and its `Turns` count are
+still visible; no best-effort or cross-worker attachment is attempted.
+Producer adoption of the required canonical-session and immediate-parent
+metadata, plus an authorized live proof of nested output, remain outstanding.
+Until both are complete, operators must expect reviewer results to use the
+standalone fallback.
+
+Review output is data-minimized before it reaches the rollup. Output structure
+is bounded (32 output items, 32 content items, and 4,096 output-text
+characters); rationale is limited to 512 characters, has ANSI/control
+characters removed, whitespace collapsed, and bearer tokens, common token
+prefixes, and named secret values redacted. Route identities are accepted only
+after bounded normalization. Console output colors the complete
+`   - Denied: N` section, including its rationale lines, yellow. JSON logging
+emits the same rollup text without ANSI escape sequences.
+
 AAWM alias routing audit events are still attached to request metadata for
 session-history and diagnostic consumers. Container log emission is narrower:
 failures, cooldowns, redispatches, no-candidate outcomes, and explicit warning

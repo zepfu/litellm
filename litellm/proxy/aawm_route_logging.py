@@ -23,6 +23,10 @@ from litellm._logging import (
     register_aawm_route_access_log_replacement,
     verbose_aawm_route_logger,
 )
+from litellm.integrations.aawm_review_decisions import (
+    AawmReviewDecision,
+    parse_aawm_review_decision,
+)
 
 _AAWM_ROUTE_ACCESS_LOG_SCOPE_KEY = "aawm_route_access_log_emitted"
 _AAWM_ROUTE_ACCESS_LOG_REPLACEMENT_SCOPE_KEY = (
@@ -32,11 +36,14 @@ _AAWM_ROUTE_ACCESS_LOGGER_NAME = verbose_aawm_route_logger.name
 _AAWM_ROUTE_ACCESS_LOG_TYPE = "ROUTE"
 _AAWM_ROUTE_LOG_MAX_FIELD_CHARS = 180
 _AAWM_ROUTE_LOG_MAX_IDENTITY_CHARS = 96
+_AAWM_ROUTE_LOG_MAX_CODEX_TURN_METADATA_CHARS = 4096
 _AAWM_ROUTE_LOG_DEDUP_LIMIT = 4096
 _AAWM_ROUTE_ROLLUP_INTERVAL_ENV = "AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS"
 _AAWM_ROUTE_ROLLUP_DEFAULT_INTERVAL_SECONDS = 60
 _AAWM_ROUTE_ROLLUP_MAX_GROUPS = 256
 _AAWM_ROUTE_ROLLUP_MAX_SUBLINES = 16
+_AAWM_ROUTE_ROLLUP_MAX_ORIGIN_IDENTITIES = 256
+_AAWM_ROUTE_ROLLUP_MAX_REVIEW_RATIONALES = 8
 _AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY = "aawm_route_rollup_context"
 _AAWM_ROUTE_LOG_REASONING_EFFORT_METADATA_KEY = "reasoning_effort_native_value"
 _AAWM_ROUTE_ROLLUP_REASONING_EFFORT_VALUES = (
@@ -50,6 +57,7 @@ _AAWM_ROUTE_ROLLUP_REASONING_EFFORT_VALUES = (
 )
 _AAWM_ROUTE_ROLLUP_RED = "\033[91m"
 _AAWM_ROUTE_ROLLUP_BLUE = "\033[94m"
+_AAWM_ROUTE_ROLLUP_YELLOW = "\033[93m"
 _AAWM_ROUTE_ROLLUP_RESET = "\033[0m"
 
 _AAWM_ROUTE_HOST_REVERSE_DNS_TIMEOUT_SECONDS = 0.35
@@ -1251,6 +1259,8 @@ _AAWM_ROUTE_LOG_AGENT_ID_METADATA_KEYS = (
     "aawm_claude_agent_id",
     "claude_agent_id",
     "codex_agent_id",
+    "actor_id",
+    "aawm_actor_id",
 )
 _AAWM_ROUTE_LOG_AGENT_HEADER_KEYS = (
     "x-aawm-agent-name",
@@ -1263,6 +1273,49 @@ _AAWM_ROUTE_LOG_AGENT_ID_HEADER_KEYS = (
     "x-agent-id",
     "x-claude-agent-id",
     "x-codex-agent-id",
+    "x-aawm-actor-id",
+    "x-actor-id",
+)
+_AAWM_ROUTE_ROLLUP_SESSION_METADATA_KEYS = (
+    "session_id",
+    "aawm_session_id",
+    "codex_session_id",
+    "claude_session_id",
+    "anthropic_session_id",
+)
+_AAWM_ROUTE_ROLLUP_SESSION_HEADER_KEYS = (
+    "session_id",
+    "x-session-id",
+    "x-aawm-session-id",
+    "x-codex-session-id",
+    "x-claude-session-id",
+    "anthropic-beta-session-id",
+)
+_AAWM_ROUTE_ROLLUP_THREAD_ID_METADATA_KEYS = (
+    "thread_id",
+    "aawm_thread_id",
+    "codex_thread_id",
+    "claude_thread_id",
+)
+_AAWM_ROUTE_ROLLUP_THREAD_ID_HEADER_KEYS = (
+    "x-thread-id",
+    "x-aawm-thread-id",
+    "x-codex-thread-id",
+    "x-claude-thread-id",
+)
+_AAWM_ROUTE_ROLLUP_PARENT_THREAD_ID_METADATA_KEYS = (
+    "parent_thread_id",
+)
+_AAWM_ROUTE_ROLLUP_PARENT_THREAD_ID_HEADER_KEYS = (
+    "x-codex-parent-thread-id",
+)
+_AAWM_ROUTE_ROLLUP_PARENT_ACTOR_ID_METADATA_KEYS = (
+    "parent_actor_id",
+    "parent_agent_id",
+)
+_AAWM_ROUTE_ROLLUP_ORIGINATING_CALL_ID_METADATA_KEYS = (
+    "originating_litellm_call_id",
+    "parent_litellm_call_id",
 )
 _AAWM_ROUTE_LOG_REPOSITORY_METADATA_KEYS = (
     "repository",
@@ -1363,8 +1416,13 @@ _AAWM_ROUTE_LOG_TOP_LEVEL_METADATA_KEYS = (
     + _AAWM_ROUTE_LOG_CLIENT_VERSION_METADATA_KEYS
     + _AAWM_ROUTE_LOG_MODEL_ALIAS_METADATA_KEYS
     + _AAWM_ROUTE_LOG_SELECTED_MODEL_METADATA_KEYS
+    + _AAWM_ROUTE_ROLLUP_SESSION_METADATA_KEYS
+    + _AAWM_ROUTE_ROLLUP_THREAD_ID_METADATA_KEYS
     + (
         _AAWM_ROUTE_LOG_REASONING_EFFORT_METADATA_KEY,
+        "canonical_session_identity",
+        "litellm_call_id",
+        "logical_model",
         "trace_name",
         "trace_user_id",
     )
@@ -1526,7 +1584,20 @@ def _resolve_aawm_route_rollup_default_destination(
 def _resolve_aawm_route_rollup_redundant_destination(
     *,
     incoming_endpoint: str,
-    sublines: list[tuple[str, str, int, Optional[str], str, Optional[str]]],
+    sublines: list[
+        tuple[
+            str,
+            str,
+            int,
+            Optional[str],
+            str,
+            Optional[str],
+            int,
+            tuple[str, ...],
+            int,
+            tuple[str, ...],
+        ]
+    ],
 ) -> Optional[str]:
     default_destination = _resolve_aawm_route_rollup_default_destination(
         incoming_endpoint
@@ -1537,7 +1608,8 @@ def _resolve_aawm_route_rollup_redundant_destination(
         return None
 
     destinations: set[str] = set()
-    for _, _, _, _, outgoing_target, _ in sublines:
+    for subline in sublines:
+        outgoing_target = subline[4]
         if not outgoing_target:
             continue
         destinations.add(outgoing_target)
@@ -1564,7 +1636,20 @@ def _format_aawm_route_rollup_lines(
     *,
     group_header_label: str,
     incoming_endpoint: str,
-    sublines: list[tuple[str, str, int, Optional[str], str, Optional[str]]],
+    sublines: list[
+        tuple[
+            str,
+            str,
+            int,
+            Optional[str],
+            str,
+            Optional[str],
+            int,
+            tuple[str, ...],
+            int,
+            tuple[str, ...],
+        ]
+    ],
     now: Optional[datetime] = None,
     early: bool = False,
 ) -> list[str]:
@@ -1583,7 +1668,18 @@ def _format_aawm_route_rollup_lines(
         incoming_endpoint=incoming_endpoint,
         sublines=sublines,
     )
-    for model_label, effort, turns, status, outgoing_target, message in sublines:
+    for (
+        model_label,
+        effort,
+        turns,
+        status,
+        outgoing_target,
+        message,
+        approved_reviews,
+        approved_rationales,
+        denied_reviews,
+        denied_rationales,
+    ) in sublines:
         message_suffix = f" [{message}]" if message else ""
         lines.append(
             f" - {model_label}:{effort} - Turns: {turns}"
@@ -1591,7 +1687,29 @@ def _format_aawm_route_rollup_lines(
             f"{_format_aawm_route_rollup_status_tag(status)}"
             f"{_format_aawm_route_rollup_subline_destination_suffix(outgoing_target=outgoing_target, common_destination=common_destination)}"
         )
+        if approved_reviews:
+            lines.append(f"   - Approved: {approved_reviews}")
+            lines.extend(f"     - {rationale}" for rationale in approved_rationales)
+        if denied_reviews:
+            lines.append(f"   - Denied: {denied_reviews}")
+            lines.extend(f"     - {rationale}" for rationale in denied_rationales)
     return lines
+
+
+@dataclass(frozen=True)
+class _AawmRouteRollupOriginIdentity:
+    litellm_call_id: Optional[str] = None
+    canonical_session_identity: Optional[str] = None
+    actor_id: Optional[str] = None
+    thread_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class _AawmRouteRollupReviewCorrelation:
+    originating_litellm_call_id: Optional[str] = None
+    canonical_session_identity: Optional[str] = None
+    parent_actor_id: Optional[str] = None
+    parent_thread_id: Optional[str] = None
 
 
 @dataclass
@@ -1600,6 +1718,47 @@ class _AawmRouteRollupSubline:
     status: Optional[str] = None
     status_sequence: int = 0
     message: Optional[str] = None
+    origin_identities: set[_AawmRouteRollupOriginIdentity] = field(
+        default_factory=set
+    )
+    approved_reviews: int = 0
+    approved_rationales: list[str] = field(default_factory=list)
+    denied_reviews: int = 0
+    denied_rationales: list[str] = field(default_factory=list)
+
+    def register_origin_identity(
+        self,
+        identity: _AawmRouteRollupOriginIdentity,
+    ) -> None:
+        if len(self.origin_identities) >= _AAWM_ROUTE_ROLLUP_MAX_ORIGIN_IDENTITIES:
+            return
+        self.origin_identities.add(identity)
+
+    @staticmethod
+    def _append_review_rationale(
+        rationales: list[str],
+        rationale: Optional[str],
+    ) -> None:
+        if rationale is None or len(rationales) >= _AAWM_ROUTE_ROLLUP_MAX_REVIEW_RATIONALES:
+            return
+        normalized = rationale.casefold()
+        if any(existing.casefold() == normalized for existing in rationales):
+            return
+        rationales.append(rationale)
+
+    def record_review(self, decision: AawmReviewDecision) -> None:
+        if decision.outcome == "allow":
+            self.approved_reviews += 1
+            self._append_review_rationale(
+                self.approved_rationales,
+                decision.rationale,
+            )
+            return
+        self.denied_reviews += 1
+        self._append_review_rationale(
+            self.denied_rationales,
+            decision.rationale,
+        )
 
 
 @dataclass
@@ -1614,7 +1773,20 @@ class _AawmRouteRollupGroup:
 
     def ordered_sublines(
         self,
-    ) -> list[tuple[str, str, int, Optional[str], str, Optional[str]]]:
+    ) -> list[
+        tuple[
+            str,
+            str,
+            int,
+            Optional[str],
+            str,
+            Optional[str],
+            int,
+            tuple[str, ...],
+            int,
+            tuple[str, ...],
+        ]
+    ]:
         return [
             (
                 subline_key[0],
@@ -1623,6 +1795,10 @@ class _AawmRouteRollupGroup:
                 self.sublines[subline_key].status,
                 subline_key[2],
                 self.sublines[subline_key].message,
+                self.sublines[subline_key].approved_reviews,
+                tuple(self.sublines[subline_key].approved_rationales),
+                self.sublines[subline_key].denied_reviews,
+                tuple(self.sublines[subline_key].denied_rationales),
             )
             for subline_key in self.subline_order
             if subline_key in self.sublines
@@ -1668,6 +1844,9 @@ class AawmRouteRollupAccumulator:
         turns: int = 1,
         status: Optional[str] = None,
         message: Optional[str] = None,
+        origin_identity: Optional[_AawmRouteRollupOriginIdentity] = None,
+        review_decision: Optional[AawmReviewDecision] = None,
+        review_correlation: Optional[_AawmRouteRollupReviewCorrelation] = None,
         now: Optional[datetime] = None,
     ) -> list[str]:
         if not self.enabled():
@@ -1688,6 +1867,17 @@ class AawmRouteRollupAccumulator:
 
         normalized_status = _normalize_aawm_route_rollup_status(status)
         emitted_lines: list[str] = []
+        if (
+            review_decision is not None
+            and review_correlation is not None
+            and self._record_correlated_review(
+                decision=review_decision,
+                correlation=review_correlation,
+            )
+        ):
+            emitted_lines.extend(self.flush_due(now=now))
+            return emitted_lines
+
         group_key = (
             cleaned_group_header,
             cleaned_incoming_endpoint,
@@ -1725,6 +1915,8 @@ class AawmRouteRollupAccumulator:
 
         if turns > 0:
             subline.turns += turns
+            if origin_identity is not None:
+                subline.register_origin_identity(origin_identity)
         if normalized_status is not None:
             group.event_sequence += 1
             subline.status = normalized_status
@@ -1734,6 +1926,62 @@ class AawmRouteRollupAccumulator:
 
         emitted_lines.extend(self.flush_due(now=now))
         return emitted_lines
+
+    def _matching_origin_sublines(
+        self,
+        predicate: Callable[[_AawmRouteRollupOriginIdentity], bool],
+    ) -> list[_AawmRouteRollupSubline]:
+        matches: dict[int, _AawmRouteRollupSubline] = {}
+        for group in self._groups.values():
+            for subline in group.sublines.values():
+                if any(predicate(identity) for identity in subline.origin_identities):
+                    matches[id(subline)] = subline
+        return list(matches.values())
+
+    def _record_correlated_review(
+        self,
+        *,
+        decision: AawmReviewDecision,
+        correlation: _AawmRouteRollupReviewCorrelation,
+    ) -> bool:
+        if correlation.canonical_session_identity is None or (
+            correlation.parent_actor_id is None
+            and correlation.parent_thread_id is None
+        ):
+            return False
+
+        def matches_parent(
+            identity: _AawmRouteRollupOriginIdentity,
+        ) -> bool:
+            if (
+                identity.canonical_session_identity
+                != correlation.canonical_session_identity
+            ):
+                return False
+            if (
+                correlation.parent_actor_id is not None
+                and identity.actor_id != correlation.parent_actor_id
+            ):
+                return False
+            if (
+                correlation.parent_thread_id is not None
+                and identity.thread_id != correlation.parent_thread_id
+            ):
+                return False
+            if (
+                correlation.originating_litellm_call_id is not None
+                and identity.litellm_call_id
+                != correlation.originating_litellm_call_id
+            ):
+                return False
+            return True
+
+        matches = self._matching_origin_sublines(matches_parent)
+
+        if len(matches) != 1:
+            return False
+        matches[0].record_review(decision)
+        return True
 
     def flush_due(
         self,
@@ -1919,10 +2167,31 @@ def _colorize_aawm_route_rollup_line(line: str) -> str:
     return line
 
 
+def _colorize_aawm_route_rollup_lines(lines: list[str]) -> list[str]:
+    if json_logs:
+        return lines
+
+    rendered: list[str] = []
+    denied_section = False
+    for line in lines:
+        if line.startswith("   - Denied:"):
+            denied_section = True
+        elif line.startswith((" - ", "   - Approved:")):
+            denied_section = False
+
+        if denied_section and line.startswith(("   - Denied:", "     - ")):
+            rendered.append(
+                f"{_AAWM_ROUTE_ROLLUP_YELLOW}{line}{_AAWM_ROUTE_ROLLUP_RESET}"
+            )
+        else:
+            rendered.append(_colorize_aawm_route_rollup_line(line))
+    return rendered
+
+
 def _emit_aawm_route_rollup_lines(lines: list[str]) -> None:
     if not lines:
         return
-    rendered_lines = [_colorize_aawm_route_rollup_line(line) for line in lines]
+    rendered_lines = _colorize_aawm_route_rollup_lines(lines)
     logging.getLogger(_AAWM_ROUTE_ACCESS_LOGGER_NAME).info(
         "%s", "\n".join(rendered_lines)
     )
@@ -1994,6 +2263,119 @@ def _get_aawm_route_rollup_model_label(
     return model_label
 
 
+def _normalize_aawm_route_rollup_identity(value: Any) -> Optional[str]:
+    cleaned = _clean_aawm_route_log_field(value)
+    if not cleaned or len(cleaned) > _AAWM_ROUTE_LOG_MAX_IDENTITY_CHARS:
+        return None
+    if not any(char.isalnum() for char in cleaned):
+        return None
+    if not all(char.isalnum() or char in "._:-" for char in cleaned):
+        return None
+    return cleaned
+
+
+def _iter_aawm_route_rollup_identity_sources(
+    *,
+    request: Request,
+    request_body: Optional[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+
+    def append_source(candidate: Any) -> None:
+        if not isinstance(candidate, dict):
+            return
+        sources.append(candidate)
+        for nested_key in ("client_metadata", "source"):
+            nested = candidate.get(nested_key)
+            if isinstance(nested, dict):
+                sources.append(nested)
+
+    append_source(metadata)
+    append_source(request_body)
+    if isinstance(request_body, dict):
+        append_source(request_body.get("litellm_metadata"))
+        append_source(request_body.get("metadata"))
+        append_source(request_body.get("client_metadata"))
+
+    request_state = getattr(request, "state", None)
+    audit_context = (
+        getattr(request_state, "aawm_alias_request_context", None)
+        if request_state is not None
+        else None
+    )
+    append_source(audit_context)
+    if isinstance(audit_context, dict):
+        append_source(audit_context.get("agent_dispatch"))
+    request_call_id = (
+        getattr(request_state, "aawm_alias_request_litellm_call_id", None)
+        if request_state is not None
+        else None
+    )
+    if isinstance(request_call_id, str):
+        sources.append({"litellm_call_id": request_call_id})
+    return sources
+
+
+def _get_aawm_route_rollup_litellm_call_id(
+    *,
+    identity_sources: list[dict[str, Any]],
+    kwargs: Optional[dict],
+) -> Optional[str]:
+    direct_value = kwargs.get("litellm_call_id") if isinstance(kwargs, dict) else None
+    return _normalize_aawm_route_rollup_identity(
+        direct_value
+    ) or _first_aawm_route_log_value(
+        *identity_sources,
+        keys=("litellm_call_id",),
+        normalizer=_normalize_aawm_route_rollup_identity,
+    )
+
+
+def _get_aawm_route_rollup_canonical_session_identity(
+    *,
+    identity_sources: list[dict[str, Any]],
+    headers: dict[str, Any],
+) -> Optional[str]:
+    return _first_aawm_route_log_value(
+        *identity_sources,
+        keys=("canonical_session_identity",),
+        normalizer=_normalize_aawm_route_rollup_identity,
+    ) or _first_aawm_route_log_value(
+        *identity_sources,
+        keys=_AAWM_ROUTE_ROLLUP_SESSION_METADATA_KEYS,
+        normalizer=_normalize_aawm_route_rollup_identity,
+    ) or _get_case_insensitive_header_value(
+        headers,
+        _AAWM_ROUTE_ROLLUP_SESSION_HEADER_KEYS,
+        normalizer=_normalize_aawm_route_rollup_identity,
+    )
+
+
+def _is_aawm_codex_auto_review_request(
+    *,
+    request_body: Optional[dict[str, Any]],
+    metadata: dict[str, Any],
+) -> bool:
+    candidates: list[Any] = []
+    if isinstance(request_body, dict):
+        candidates.append(request_body.get("model"))
+    for key in (
+        "logical_model",
+        "inbound_model_alias",
+        "requested_model_alias",
+        "model_alias_label",
+        "codex_auto_agent_alias",
+    ):
+        candidates.append(metadata.get(key))
+    return any(
+        isinstance(candidate, str)
+        and candidate.strip().casefold()
+        in {"codex-auto-review", "chatgpt/codex-auto-review"}
+        for candidate in candidates
+    )
+
+
 def build_aawm_route_rollup_context(
     *,
     request: Request,
@@ -2002,12 +2384,24 @@ def build_aawm_route_rollup_context(
     kwargs: Optional[dict] = None,
     provider_bound_body: Optional[dict[str, Any]] = None,
     route_type: Optional[str] = None,
-) -> Optional[dict[str, Optional[str]]]:
+) -> Optional[dict[str, Any]]:
     metadata = _extract_aawm_route_log_metadata(request_body, kwargs)
     headers = dict(getattr(request, "headers", {}) or {})
+    codex_turn_metadata = _get_aawm_route_log_codex_turn_metadata(
+        headers=headers,
+        request_body=request_body,
+    )
+    identity_sources = [
+        codex_turn_metadata,
+        *_iter_aawm_route_rollup_identity_sources(
+            request=request,
+            request_body=request_body,
+            metadata=metadata,
+        ),
+    ]
     client_product_label = _get_aawm_route_log_client_product_label(metadata, headers)
     repository = _get_aawm_route_log_codex_turn_repository(
-        headers
+        codex_turn_metadata
     ) or _first_aawm_route_log_value(
         metadata,
         keys=_AAWM_ROUTE_LOG_REPOSITORY_METADATA_KEYS,
@@ -2043,6 +2437,24 @@ def build_aawm_route_rollup_context(
     log_type = _normalize_aawm_route_log_type(route_type, incoming_endpoint)
     if not group_header_label or not model_label:
         return None
+    origin_actor_id = _first_aawm_route_log_value(
+        *identity_sources,
+        keys=_AAWM_ROUTE_LOG_AGENT_ID_METADATA_KEYS,
+        normalizer=_normalize_aawm_route_rollup_identity,
+    ) or _get_case_insensitive_header_value(
+        headers,
+        _AAWM_ROUTE_LOG_AGENT_ID_HEADER_KEYS,
+        normalizer=_normalize_aawm_route_rollup_identity,
+    )
+    origin_thread_id = _first_aawm_route_log_value(
+        *identity_sources,
+        keys=_AAWM_ROUTE_ROLLUP_THREAD_ID_METADATA_KEYS,
+        normalizer=_normalize_aawm_route_rollup_identity,
+    ) or _get_case_insensitive_header_value(
+        headers,
+        _AAWM_ROUTE_ROLLUP_THREAD_ID_HEADER_KEYS,
+        normalizer=_normalize_aawm_route_rollup_identity,
+    )
     return {
         "group_header_label": group_header_label,
         "incoming_endpoint": incoming_endpoint,
@@ -2057,6 +2469,42 @@ def build_aawm_route_rollup_context(
         "client_ip_source": host_attribution.get("client_ip_source"),
         "host_name": host_attribution.get("host_name"),
         "host_name_source": host_attribution.get("host_name_source"),
+        "litellm_call_id": _get_aawm_route_rollup_litellm_call_id(
+            identity_sources=identity_sources,
+            kwargs=kwargs,
+        ),
+        "canonical_session_identity": (
+            _get_aawm_route_rollup_canonical_session_identity(
+                identity_sources=identity_sources,
+                headers=headers,
+            )
+        ),
+        "origin_actor_id": origin_actor_id,
+        "origin_thread_id": origin_thread_id,
+        "is_codex_auto_review": _is_aawm_codex_auto_review_request(
+            request_body=request_body,
+            metadata=metadata,
+        ),
+        "review_originating_litellm_call_id": _first_aawm_route_log_value(
+            *identity_sources,
+            keys=_AAWM_ROUTE_ROLLUP_ORIGINATING_CALL_ID_METADATA_KEYS,
+            normalizer=_normalize_aawm_route_rollup_identity,
+        ),
+        "review_parent_actor_id": _first_aawm_route_log_value(
+            *identity_sources,
+            keys=_AAWM_ROUTE_ROLLUP_PARENT_ACTOR_ID_METADATA_KEYS,
+            normalizer=_normalize_aawm_route_rollup_identity,
+        ),
+        "review_parent_thread_id": _get_case_insensitive_header_value(
+            headers,
+            _AAWM_ROUTE_ROLLUP_PARENT_THREAD_ID_HEADER_KEYS,
+            normalizer=_normalize_aawm_route_rollup_identity,
+        )
+        or _first_aawm_route_log_value(
+            *identity_sources,
+            keys=_AAWM_ROUTE_ROLLUP_PARENT_THREAD_ID_METADATA_KEYS,
+            normalizer=_normalize_aawm_route_rollup_identity,
+        ),
     }
 
 
@@ -2068,7 +2516,7 @@ def attach_aawm_route_rollup_context(
     kwargs: Optional[dict] = None,
     provider_bound_body: Optional[dict[str, Any]] = None,
     route_type: Optional[str] = None,
-) -> Optional[dict[str, Optional[str]]]:
+) -> Optional[dict[str, Any]]:
     context = build_aawm_route_rollup_context(
         request=request,
         target=target,
@@ -2099,6 +2547,9 @@ def record_aawm_route_rollup(
     turns: int = 1,
     status: Optional[str] = None,
     message: Optional[str] = None,
+    origin_identity: Optional[_AawmRouteRollupOriginIdentity] = None,
+    review_decision: Optional[AawmReviewDecision] = None,
+    review_correlation: Optional[_AawmRouteRollupReviewCorrelation] = None,
     now: Optional[datetime] = None,
 ) -> None:
     with _aawm_route_rollup_lock:
@@ -2114,6 +2565,9 @@ def record_aawm_route_rollup(
             turns=turns,
             status=status,
             message=message,
+            origin_identity=origin_identity,
+            review_decision=review_decision,
+            review_correlation=review_correlation,
             now=now,
         )
     _ensure_aawm_route_rollup_flush_worker()
@@ -2123,6 +2577,7 @@ def record_aawm_route_rollup(
 def record_aawm_route_rollup_turn(
     kwargs: Optional[dict],
     *,
+    response_body: Any = None,
     turns: int = 1,
     now: Optional[datetime] = None,
 ) -> None:
@@ -2137,6 +2592,58 @@ def record_aawm_route_rollup_turn(
     if metadata.get("aawm_route_rollup_turn_recorded"):
         return
     metadata["aawm_route_rollup_turn_recorded"] = True
+    review_decision: Optional[AawmReviewDecision] = None
+    review_correlation: Optional[_AawmRouteRollupReviewCorrelation] = None
+    is_codex_auto_review = context.get("is_codex_auto_review") is True
+    if is_codex_auto_review:
+        parsed_review = parse_aawm_review_decision(response_body)
+        if parsed_review.ok:
+            review_decision = parsed_review.decision
+            review_correlation = _AawmRouteRollupReviewCorrelation(
+                originating_litellm_call_id=(
+                    _normalize_aawm_route_rollup_identity(
+                        context.get("review_originating_litellm_call_id")
+                    )
+                ),
+                canonical_session_identity=(
+                    _normalize_aawm_route_rollup_identity(
+                        context.get("canonical_session_identity")
+                    )
+                ),
+                parent_actor_id=_normalize_aawm_route_rollup_identity(
+                    context.get("review_parent_actor_id")
+                ),
+                parent_thread_id=_normalize_aawm_route_rollup_identity(
+                    context.get("review_parent_thread_id")
+                ),
+            )
+
+    origin_identity: Optional[_AawmRouteRollupOriginIdentity] = None
+    if not is_codex_auto_review:
+        candidate_identity = _AawmRouteRollupOriginIdentity(
+            litellm_call_id=_normalize_aawm_route_rollup_identity(
+                context.get("litellm_call_id")
+            ),
+            canonical_session_identity=_normalize_aawm_route_rollup_identity(
+                context.get("canonical_session_identity")
+            ),
+            actor_id=_normalize_aawm_route_rollup_identity(
+                context.get("origin_actor_id")
+            ),
+            thread_id=_normalize_aawm_route_rollup_identity(
+                context.get("origin_thread_id")
+            ),
+        )
+        if any(
+            (
+                candidate_identity.litellm_call_id,
+                candidate_identity.canonical_session_identity,
+                candidate_identity.actor_id,
+                candidate_identity.thread_id,
+            )
+        ):
+            origin_identity = candidate_identity
+
     record_aawm_route_rollup(
         group_header_label=str(context.get("group_header_label") or ""),
         incoming_endpoint=str(context.get("incoming_endpoint") or ""),
@@ -2144,6 +2651,9 @@ def record_aawm_route_rollup_turn(
         model_label=str(context.get("model_label") or ""),
         effort=str(context.get("reasoning_effort") or "none"),
         turns=turns,
+        origin_identity=origin_identity,
+        review_decision=review_decision,
+        review_correlation=review_correlation,
         now=now,
     )
 
@@ -2459,24 +2969,65 @@ def _get_case_insensitive_header_value(
     return None
 
 
-def _get_aawm_route_log_codex_turn_repository(
-    headers: Optional[dict[str, Any]],
-) -> Optional[str]:
-    raw_value = _get_case_insensitive_header_value(
-        headers,
-        ("x-codex-turn-metadata",),
-        normalizer=_clean_aawm_route_log_field,
-    )
-    if not raw_value:
-        return None
+def _decode_aawm_route_log_codex_turn_metadata(value: Any) -> dict[str, str]:
+    if not isinstance(value, str):
+        return {}
+    raw_value = value.strip()
+    if (
+        not raw_value
+        or len(raw_value) > _AAWM_ROUTE_LOG_MAX_CODEX_TURN_METADATA_CHARS
+    ):
+        return {}
     try:
         parsed_value = json.loads(raw_value)
     except Exception:
-        return None
+        return {}
     if not isinstance(parsed_value, dict):
+        return {}
+
+    sanitized: dict[str, str] = {}
+    project_path = _clean_aawm_route_log_field(parsed_value.get("project_path"))
+    if project_path:
+        sanitized["project_path"] = project_path
+    for key in (
+        *_AAWM_ROUTE_ROLLUP_SESSION_METADATA_KEYS,
+        *_AAWM_ROUTE_ROLLUP_THREAD_ID_METADATA_KEYS,
+        *_AAWM_ROUTE_ROLLUP_PARENT_THREAD_ID_METADATA_KEYS,
+        *_AAWM_ROUTE_ROLLUP_PARENT_ACTOR_ID_METADATA_KEYS,
+    ):
+        normalized = _normalize_aawm_route_rollup_identity(parsed_value.get(key))
+        if normalized:
+            sanitized[key] = normalized
+    return sanitized
+
+
+def _get_aawm_route_log_codex_turn_metadata(
+    *,
+    headers: Optional[dict[str, Any]],
+    request_body: Optional[dict[str, Any]],
+) -> dict[str, str]:
+    normalized_headers = (
+        {str(key).lower(): value for key, value in headers.items()}
+        if isinstance(headers, dict)
+        else {}
+    )
+    candidates = [normalized_headers.get("x-codex-turn-metadata")]
+    if isinstance(request_body, dict):
+        candidates.append(request_body.get("x-codex-turn-metadata"))
+    for candidate in candidates:
+        decoded = _decode_aawm_route_log_codex_turn_metadata(candidate)
+        if decoded:
+            return decoded
+    return {}
+
+
+def _get_aawm_route_log_codex_turn_repository(
+    codex_turn_metadata: Optional[dict[str, Any]],
+) -> Optional[str]:
+    if not isinstance(codex_turn_metadata, dict):
         return None
     return _normalize_aawm_route_log_repository_label(
-        parsed_value.get("project_path")
+        codex_turn_metadata.get("project_path")
     )
 
 

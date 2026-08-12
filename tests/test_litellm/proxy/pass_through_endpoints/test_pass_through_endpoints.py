@@ -1609,6 +1609,69 @@ async def test_pass_through_async_success_handler_records_completed_route_rollup
     clear_aawm_route_rollups()
 
 
+@pytest.mark.asyncio
+async def test_pass_through_async_success_handler_passes_buffered_response_to_rollup(
+) -> None:
+    handler = PassThroughEndpointLogging()
+    response_body = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": '{"outcome":"allow"}',
+                    }
+                ],
+            }
+        ],
+    }
+    kwargs = {"litellm_params": {"metadata": {}}}
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.text = json.dumps(response_body)
+    mock_response.headers = {}
+    mock_response.request = MagicMock(
+        method="POST",
+        url="https://chatgpt.com/backend-api/codex/responses",
+    )
+
+    with patch.object(
+        handler,
+        "normalize_llm_passthrough_logging_payload",
+        return_value={
+            "standard_logging_response_object": MagicMock(),
+            "kwargs": kwargs,
+        },
+    ), patch.object(
+        handler,
+        "_handle_logging",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.success_handler.record_aawm_route_rollup_turn"
+    ) as record_turn:
+        await handler.pass_through_async_success_handler(
+            httpx_response=mock_response,
+            response_body=response_body,
+            logging_obj=MagicMock(),
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            result="",
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+            cache_hit=False,
+            request_body={"model": "codex-auto-review"},
+            passthrough_logging_payload=MagicMock(),
+            custom_llm_provider="openai",
+            **kwargs,
+        )
+
+    assert record_turn.call_count == 1
+    assert record_turn.call_args.args[0] is kwargs
+    assert record_turn.call_args.kwargs["response_body"] is response_body
+
+
 # Test is_multipart
 def test_is_multipart():
     # Test with multipart content type
