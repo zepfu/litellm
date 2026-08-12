@@ -1270,6 +1270,22 @@ def _build_session_history_record(  # noqa: PLR0915
     )
     if alibaba_token_plan_cost_metadata:
         metadata.update(alibaba_token_plan_cost_metadata)
+    from litellm.llms.xai.reference_cost import (
+        build_xai_grok_46_reference_cost_metadata,
+    )
+
+    xai_grok_46_reference_cost_metadata = (
+        build_xai_grok_46_reference_cost_metadata(
+            provider=resolved_provider,
+            model=resolved_model,
+            prompt_tokens=prompt_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+            completion_tokens=completion_tokens,
+        )
+    )
+    if xai_grok_46_reference_cost_metadata:
+        metadata.update(xai_grok_46_reference_cost_metadata)
+        response_cost_usd = None
 
     runtime_identity = _build_session_runtime_identity(
         metadata=metadata,

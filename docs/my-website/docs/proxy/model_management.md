@@ -41,9 +41,9 @@ combines maximum reasoning with proactive subagent delegation, not an API
 Config-driven alias routing uses:
 
 - `sota-openai`: `gpt-5.6-sol`
-- `sota-xai`: `oa_xai/grok-4.5`
+- `sota-xai`: `oa_xai/grok-4.6`
 - `sota`: selects the producer-family `sota-*` alias from TUI origin, defaulting to `sota-openai`.
-- Grok 4.5 (`xai/grok-4.5`, `oa_xai/grok-4.5`): 500k context; input $2/M, output $6/M, cached input $0.50/M (`input_cost_per_token` 0.000002, `output_cost_per_token` 0.000006, `cache_read_input_token_cost` 5e-07); tiered pricing above 200k context is not modeled in the map
+- Grok 4.6 (`xai/grok-4.6`, `oa_xai/grok-4.6`): 500k context; created 1785974400 (2026-08-06T00:00:00Z), owned by xAI, no aliases, source `https://docs.x.ai/developers/models/grok-4.6`, verified 2026-08-12; input $2/M, output $6/M, cached input $0.50/M, image input $2/M image tokens; above 200k whole-request input tokens, input/cache/output are $4/$1/$12 per million; managed-route session history records this as a reference rate with invoice cost unknown
 - `sota-alibaba`: `alibaba_token_plan/qwen3.8-max` → `alibaba_token_plan/qwen3.7-max`
 - `basic`: the config-driven low-cost alias
 - `work`: `gpt-5.3-codex-spark` → nested `work-other` alias reference → Claude-only native Sonnet tail → `gpt-5.6-luna`

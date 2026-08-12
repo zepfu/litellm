@@ -4,7 +4,7 @@ aliases:
   - name: sota-xai
     candidates:
       - provider: xai
-        model: oa_xai/grok-4.5
+        model: oa_xai/grok-4.6
         route_family: codex_xai_oauth_responses_adapter
         priority: 100
         reasoning_effort: max

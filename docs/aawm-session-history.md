@@ -1429,18 +1429,17 @@ The config-driven `sota-openai` route uses this order:
 
 The config-driven `sota-xai` route uses this order:
 
-1. `oa_xai/grok-4.5` via the managed xAI OAuth Responses adapter
+1. `oa_xai/grok-4.6` via the managed xAI OAuth Responses adapter
 
 
-Grok 4.5 is treated as a live candidate. Generic
-`aawm_codex_auto_agent_candidate_unavailable` probe failures do not apply a
-durable Grok 4.5 cooldown: native Grok 4.5 uses cooldown scope `none`, and
-other xAI alias candidates (Composer, Grok Build, managed OAuth Grok 4.5)
-use request-local exclusion only. Explicit usage, quota, rate-limit, or
-capacity signals still use the normal durable candidate cooldown/fallback
-path. Native Grok 4.5 `malformed_tool_call_text` remains rejected and can
-redispatch in-flight, but is request-local rather than a durable candidate
-cooldown.
+Grok 4.6 is the active managed `sota-xai` candidate. Historical native Grok 4.5
+behavior remains distinct: generic `aawm_codex_auto_agent_candidate_unavailable`
+probe failures do not apply a durable Grok 4.5 cooldown, native Grok 4.5 uses
+cooldown scope `none`, and other xAI alias candidates use request-local
+exclusion only. Explicit usage, quota, rate-limit, or capacity signals still
+use the normal durable candidate cooldown/fallback path. Native Grok 4.5
+`malformed_tool_call_text` remains rejected and can redispatch in-flight, but
+is request-local rather than a durable candidate cooldown.
 
 The logical `sota` alias selects the producer-family `sota-*` alias from TUI
 origin and defaults to `sota-openai`. `sota-alibaba` uses
@@ -2188,6 +2187,21 @@ models, including xAI/Grok routes, receive the same operational cautions about
 structured edits, stale `old_string` retries, bounded reads, and reading before
 overwriting existing files even when the provider adapter removes unsupported
 top-level fields.
+
+## Managed xAI Grok 4.6 reference-cost metadata
+
+The active `sota-xai` alias uses managed `oa_xai/grok-4.6`. Its session-history
+record keeps the managed rate as reference metadata rather than an invoice
+cost: `actual_invoice_cost_known` is `false` and `response_cost_usd` remains
+`NULL`. The reference provenance is the xAI Grok 4.6 source, created timestamp
+`1785974400` (`2026-08-06T00:00:00Z`), owner `xai`, empty aliases, and verified
+date `2026-08-12`.
+
+The reference rates are input/cache/output `$2/$0.50/$6` per million tokens,
+image input `$2` per million image tokens, and `$4/$1/$12` above `200000`
+whole-request input tokens.
+The above-threshold tier applies to the complete request input token count,
+including cached input, before cached and uncached amounts are split.
 
 ## xAI Responses Sanitization
 
