@@ -798,6 +798,26 @@ def _extract_exception_status_code(exc: Exception) -> Optional[int]:
     return None
 
 
+def _is_handled_session_owner_redispatch_required(
+    exc: Exception,
+    *,
+    status_code: Optional[int],
+) -> bool:
+    """Match only the central session-owner 409 already recorded by D1-614."""
+    if not isinstance(exc, HTTPException) or status_code != status.HTTP_409_CONFLICT:
+        return False
+    detail = getattr(exc, "detail", None)
+    if not isinstance(detail, dict):
+        return False
+    error = detail.get("error")
+    return bool(
+        detail.get("redispatch_required") is True
+        and detail.get("attempted_provider_call") is False
+        and isinstance(error, dict)
+        and error.get("code") == "aawm_session_owner_redispatch_required"
+    )
+
+
 @dataclass(frozen=True)
 class PassthroughRequestObservabilityEnvelope:
     """Reusable passthrough request-body observability envelope."""
@@ -4699,10 +4719,14 @@ async def pass_through_request(  # noqa: PLR0915
             e,
             status_code=status_code,
         )
-        record_aawm_route_rollup_failure(
-            kwargs,
-            message=route_failure_summary,
-        )
+        if not _is_handled_session_owner_redispatch_required(
+            e,
+            status_code=status_code,
+        ):
+            record_aawm_route_rollup_failure(
+                kwargs,
+                message=route_failure_summary,
+            )
         if suppress_retryable_failure_logging:
             verbose_proxy_logger.debug(
                 "Pass through endpoint received retryable upstream status=%s; deferring failure logging to adapter handling",

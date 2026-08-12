@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import math
 import re
 import time
@@ -37,6 +36,7 @@ from typing import Any, Mapping, Optional, cast
 
 from fastapi import HTTPException
 
+from litellm._logging import verbose_proxy_logger
 from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
@@ -1823,19 +1823,18 @@ def extract_account_identity_from_context(
 
 
 # ---------------------------------------------------------------------------
-# D1-614: best-effort sanitized WARNING for every session-owner redispatch.
-# Observability only -- logging failures must never alter the 409 detail or
-# permit egress. Never logs raw session/owner/account IDs, cache keys,
-# reservation tokens, request content, headers, auth, or credentials.
+# Reopened D1-614: one best-effort sanitized proxy WARNING and route-rollup failure for
+# every handled session-owner redispatch. Observability failures must never
+# alter the 409 detail or permit egress.
 # ---------------------------------------------------------------------------
 
-_SESSION_OWNER_LOGGER_NAME = "litellm.proxy.session_owner"
-_SESSION_OWNER_REDISPATCH_EVENT_TYPE = "session_owner_redispatch_required"
 _SESSION_OWNER_REDISPATCH_ERROR_CODE = "aawm_session_owner_redispatch_required"
 _SESSION_OWNER_LOG_STATUS_CODE = 409
 _SESSION_OWNER_LOG_HASH_CHARS = 16
 _SESSION_OWNER_LOG_MAX_LABEL_CHARS = 96
 _SESSION_OWNER_LOG_MAX_REASON_CHARS = 240
+_SESSION_OWNER_LOG_MAX_SUMMARY_CHARS = 480
+_SESSION_OWNER_ROLLUP_CONTEXT_METADATA_KEY = "aawm_route_rollup_context"
 
 # D1-614 acceptance 3: credential-shaped substrings must not survive the log
 # label sanitizer. Reuse the shared RR-065/074/075/092 field-value redactor
@@ -1857,8 +1856,6 @@ _SESSION_OWNER_LOG_BEARER_TOKEN_RE = re.compile(
     r"(?i)\bbearer\s+['\"]?[A-Za-z0-9._~+/=-]{8,}"
 )
 _SESSION_OWNER_LOG_SK_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{6,}")
-
-_session_owner_logger = logging.getLogger(_SESSION_OWNER_LOGGER_NAME)
 
 
 def _sanitize_session_owner_log_label(
@@ -1895,224 +1892,180 @@ def _hash_session_owner_log_identifier(value: Any) -> Optional[str]:
     ]
 
 
-def _safe_session_owner_attribution_payload(
-    attribution: Optional[Mapping[str, Any]],
-) -> dict[str, Any]:
-    """Hash/sanitize call/trace/agent attribution; never raw identifiers."""
-    if not isinstance(attribution, Mapping):
-        return {}
-    safe: dict[str, Any] = {}
-    call_id = _hash_session_owner_log_identifier(
-        attribution.get("litellm_call_id") or attribution.get("call_id")
-    )
-    if call_id is not None:
-        safe["litellm_call_id_hash"] = call_id
-    trace_id = _hash_session_owner_log_identifier(attribution.get("trace_id"))
-    if trace_id is not None:
-        safe["trace_id_hash"] = trace_id
-    agent_id = _hash_session_owner_log_identifier(attribution.get("agent_id"))
-    if agent_id is not None:
-        safe["agent_id_hash"] = agent_id
-    for source_key, dest_key in (
-        ("agent_name", "agent_name"),
-        ("agent_role", "agent_role"),
-        ("client_product", "client_product"),
-        ("thread_source", "thread_source"),
-    ):
-        label = _sanitize_session_owner_log_label(
-            attribution.get(source_key), max_length=64
-        )
-        if label is not None:
-            safe[dest_key] = label
-    return safe
-
-
 # request.state keys written by aawm_alias_routing.audit_context during normal
-# request correlation. Read-only here -- the central helper never creates or
-# mutates correlation state; values feed only the sanitized log payload
-# (identifiers hashed, labels bounded), never raw output.
+# request correlation. Read-only here; identifiers are hashed before reuse.
 _SESSION_OWNER_REQUEST_CONTEXT_STATE_KEY = "aawm_alias_request_context"
 _SESSION_OWNER_REQUEST_CALL_ID_STATE_KEY = "aawm_alias_request_litellm_call_id"
 
 
-def _session_owner_attribution_from_request(request: Any) -> dict[str, Any]:
-    """Best-effort call/trace/agent attribution from existing request state.
-
-    Reads only the correlation context already built for audit during this
-    request (cached ``aawm_alias_request_context`` and call-id). Never
-    creates, persists, or trusts anything: raw identifiers are hashed and
-    labels bounded by the logging payload sanitizer before emission.
-    """
-    if request is None:
-        return {}
+def _build_session_owner_rollup_kwargs(
+    *,
+    request: Any,
+    session_identity: Optional[str],
+    alias_model: Optional[str],
+    failure_phase: str,
+    shaped_candidate: Mapping[str, Any],
+    candidate_endpoint: Optional[str],
+    owner_attrs: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the minimal standard kwargs metadata consumed by the rollup."""
+    cached_context: Mapping[str, Any] = {}
+    request_call_id: Optional[str] = None
+    incoming_endpoint: Optional[str] = None
     try:
         state = getattr(request, "state", None)
-        if state is None:
-            return {}
-        attribution: dict[str, Any] = {}
-        context = getattr(
-            state, _SESSION_OWNER_REQUEST_CONTEXT_STATE_KEY, None
+        context = (
+            getattr(state, _SESSION_OWNER_REQUEST_CONTEXT_STATE_KEY, None)
+            if state is not None
+            else None
         )
         if isinstance(context, Mapping):
-            for src_key, dest_key in (
-                ("litellm_call_id", "litellm_call_id"),
-                ("trace_id", "trace_id"),
-                ("client_product_label", "client_product"),
-            ):
-                value = context.get(src_key)
-                if isinstance(value, str) and value.strip():
-                    attribution[dest_key] = value
-            agent_dispatch = context.get("agent_dispatch")
-            if isinstance(agent_dispatch, Mapping):
-                for key in ("agent_name", "agent_role", "agent_id"):
-                    value = agent_dispatch.get(key)
-                    if isinstance(value, str) and value.strip():
-                        attribution[key] = value
-        call_id = getattr(
-            state, _SESSION_OWNER_REQUEST_CALL_ID_STATE_KEY, None
-        )
-        if (
-            "litellm_call_id" not in attribution
-            and isinstance(call_id, str)
-            and call_id.strip()
-        ):
-            attribution["litellm_call_id"] = call_id
-        return attribution
+            cached_context = context
+            raw_context_call_id = context.get("litellm_call_id")
+            if isinstance(raw_context_call_id, str):
+                request_call_id = raw_context_call_id
+        if state is not None and request_call_id is None:
+            raw_state_call_id = getattr(
+                state, _SESSION_OWNER_REQUEST_CALL_ID_STATE_KEY, None
+            )
+            if isinstance(raw_state_call_id, str):
+                request_call_id = raw_state_call_id
+        request_url = getattr(request, "url", None)
+        raw_path = getattr(request_url, "path", None)
+        if isinstance(raw_path, str):
+            incoming_endpoint = raw_path
     except Exception:  # noqa: BLE001
-        return {}
+        pass
+
+    existing_rollup_context = cached_context.get(
+        _SESSION_OWNER_ROLLUP_CONTEXT_METADATA_KEY
+    )
+    existing = (
+        existing_rollup_context
+        if isinstance(existing_rollup_context, Mapping)
+        else {}
+    )
+    max_label = _SESSION_OWNER_LOG_MAX_LABEL_CHARS
+
+    def _rollup_label(*values: Any, default: str) -> str:
+        for value in values:
+            sanitized = _sanitize_session_owner_log_label(
+                value, max_length=max_label
+            )
+            if sanitized is not None:
+                return sanitized
+        return default
+
+    rollup_context = {
+        "group_header_label": _rollup_label(
+            existing.get("group_header_label"),
+            cached_context.get("rollup_group_header_label"),
+            cached_context.get("client_product_label"),
+            default="LiteLLM Proxy",
+        ),
+        "incoming_endpoint": _rollup_label(
+            existing.get("incoming_endpoint"),
+            incoming_endpoint,
+            failure_phase,
+            default="session-owner",
+        ),
+        "outgoing_target": _rollup_label(
+            existing.get("outgoing_target"),
+            candidate_endpoint,
+            owner_attrs.get("endpoint_contract"),
+            default="no-provider-egress",
+        ),
+        "model_label": _rollup_label(
+            existing.get("model_label"),
+            alias_model,
+            shaped_candidate.get("model"),
+            owner_attrs.get("model"),
+            default="session-owner",
+        ),
+        "reasoning_effort": _rollup_label(
+            existing.get("reasoning_effort"),
+            default="none",
+        ),
+    }
+    metadata: dict[str, Any] = {
+        _SESSION_OWNER_ROLLUP_CONTEXT_METADATA_KEY: rollup_context,
+    }
+    call_id_hash = _hash_session_owner_log_identifier(request_call_id)
+    if call_id_hash is not None:
+        metadata["litellm_call_id"] = call_id_hash
+    session_hash = _hash_session_owner_log_identifier(session_identity)
+    if session_hash is not None:
+        metadata["canonical_session_identity"] = session_hash
+    return {"litellm_params": {"metadata": metadata}}
 
 
-def _prune_session_owner_log_mapping(
-    value: Mapping[str, Any],
-) -> dict[str, Any]:
-    pruned: dict[str, Any] = {}
-    for key, item in value.items():
-        if isinstance(item, Mapping):
-            nested = _prune_session_owner_log_mapping(item)
-            if nested:
-                pruned[key] = nested
-        elif item is not None:
-            pruned[key] = item
-    return pruned
+def _build_session_owner_redispatch_summary(
+    *,
+    mismatch_reason: Optional[str],
+    failure_phase: str,
+) -> str:
+    reason = _sanitize_session_owner_log_label(
+        mismatch_reason or failure_phase,
+        max_length=_SESSION_OWNER_LOG_MAX_REASON_CHARS,
+    ) or "session-owner mismatch"
+    return (
+        "LiteLLM Proxy: HTTP 409 session-owner mismatch requires redispatch; "
+        "redispatch_required=true; attempted_provider_call=false; "
+        f"reason={reason}; action=redispatch with a fresh session"
+    )[:_SESSION_OWNER_LOG_MAX_SUMMARY_CHARS]
 
 
-def _log_session_owner_redispatch_required(
+def _emit_session_owner_redispatch_observability(
     *,
     session_identity: Optional[str],
-    decision: str,
     failure_phase: str,
     mismatch_reason: Optional[str],
     alias_model: Optional[str],
     shaped_candidate: Mapping[str, Any],
-    has_real_candidate: bool,
     candidate_endpoint: Optional[str],
     owner_attrs: Mapping[str, Any],
-    provenance: Mapping[str, Any],
-    claim_outcome: Optional[str],
-    attribution: Optional[Mapping[str, Any]],
+    request: Any,
 ) -> None:
-    """Emit exactly one sanitized WARNING. Best-effort: must never raise."""
+    """Emit one proxy WARNING and one rollup failure. Never raises."""
+    summary = _build_session_owner_redispatch_summary(
+        mismatch_reason=mismatch_reason,
+        failure_phase=failure_phase,
+    )
     try:
-        owner = dict(owner_attrs) if owner_attrs else {}
-        label_max = _SESSION_OWNER_LOG_MAX_LABEL_CHARS
-        # Endpoint for the log only: original candidate first, then owner /
-        # provenance. The 409 detail candidate shaping is untouched.
-        endpoint = (
-            candidate_endpoint
-            or _clean_optional_str(owner.get("endpoint_contract"))
-            or _clean_optional_str(
-                provenance.get("session_owner_endpoint_contract")
-            )
-        )
-        requested_log: dict[str, Any] = {
-            "alias_model": _sanitize_session_owner_log_label(
-                alias_model, max_length=label_max
-            ),
-        }
-        # Log a real caller-supplied candidate only; never clone the
-        # owner-synthesized detail fallback into the log requested section.
-        if has_real_candidate:
-            requested_log["provider"] = _sanitize_session_owner_log_label(
-                shaped_candidate.get("provider"), max_length=label_max
-            )
-            requested_log["model"] = _sanitize_session_owner_log_label(
-                shaped_candidate.get("model"), max_length=label_max
-            )
-            requested_log["route_family"] = _sanitize_session_owner_log_label(
-                shaped_candidate.get("route_family"), max_length=label_max
-            )
-        payload: dict[str, Any] = {
-            "event_type": _SESSION_OWNER_REDISPATCH_EVENT_TYPE,
-            "status_code": _SESSION_OWNER_LOG_STATUS_CODE,
-            "code": _SESSION_OWNER_REDISPATCH_ERROR_CODE,
-            "failure_phase": _sanitize_session_owner_log_label(
-                failure_phase, max_length=64
-            )
-            or "unknown",
-            "mismatch_reason": _sanitize_session_owner_log_label(
-                mismatch_reason,
-                max_length=_SESSION_OWNER_LOG_MAX_REASON_CHARS,
-            ),
-            "redispatch_required": True,
-            "attempted_provider_call": False,
-            "endpoint": _sanitize_session_owner_log_label(
-                endpoint, max_length=label_max
-            ),
-            "canonical_session_hash": _hash_session_owner_log_identifier(
-                session_identity
-            ),
-            "session_owner_decision": _sanitize_session_owner_log_label(
-                decision, max_length=64
-            ),
-            "session_owner_state": _sanitize_session_owner_log_label(
-                provenance.get("session_owner_state"), max_length=32
-            ),
-            "cache_key_fingerprint": provenance.get(
-                "session_owner_cache_key_fingerprint"
-            ),
-            "claim_outcome": _sanitize_session_owner_log_label(
-                claim_outcome, max_length=64
-            ),
-            "requested": requested_log,
-            "owner": {
-                "provider": _sanitize_session_owner_log_label(
-                    owner.get("provider"), max_length=label_max
-                ),
-                "model": _sanitize_session_owner_log_label(
-                    owner.get("model"), max_length=label_max
-                ),
-                "route_family": _sanitize_session_owner_log_label(
-                    owner.get("route_family"), max_length=label_max
-                ),
-                "endpoint_contract": _sanitize_session_owner_log_label(
-                    owner.get("endpoint_contract"), max_length=label_max
-                ),
-                "state_format": _sanitize_session_owner_log_label(
-                    owner.get("state_format"), max_length=label_max
-                ),
-                "account_hash": _sanitize_session_owner_log_label(
-                    owner.get("account_hash"), max_length=label_max
-                ),
-                "account_lane": _sanitize_session_owner_log_label(
-                    owner.get("account_lane"), max_length=label_max
-                ),
-                "account_label": _sanitize_session_owner_log_label(
-                    owner.get("account_label"), max_length=label_max
-                ),
+        verbose_proxy_logger.warning(
+            "%s",
+            summary,
+            extra={
+                "source": "session_owner_affinity",
+                "status_code": _SESSION_OWNER_LOG_STATUS_CODE,
+                "failure_kind": "session_owner_mismatch",
+                "redispatch_required": True,
+                "attempted_provider_call": False,
             },
-        }
-        attribution_payload = _safe_session_owner_attribution_payload(
-            attribution
-        )
-        if attribution_payload:
-            payload["attribution"] = attribution_payload
-        payload = _prune_session_owner_log_mapping(payload)
-        _session_owner_logger.warning(
-            json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            exc_info=False,
         )
     except Exception:  # noqa: BLE001
-        # Observability only: a logging failure must never alter the 409
-        # detail below or permit egress.
+        pass
+    try:
+        from litellm.proxy.aawm_route_logging import (
+            record_aawm_route_rollup_failure,
+        )
+
+        rollup_kwargs = _build_session_owner_rollup_kwargs(
+            request=request,
+            session_identity=session_identity,
+            alias_model=alias_model,
+            failure_phase=failure_phase,
+            shaped_candidate=shaped_candidate,
+            candidate_endpoint=candidate_endpoint,
+            owner_attrs=owner_attrs,
+        )
+        record_aawm_route_rollup_failure(
+            rollup_kwargs,
+            message=summary,
+            status="Failed",
+        )
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -2130,10 +2083,7 @@ def raise_session_owner_redispatch_required(
 ) -> None:
     """Fail before egress with structured redispatch_required. Never returns.
 
-    D1-614: call/trace/agent attribution for the sanitized WARNING is sourced
-    best-effort from the request-scoped correlation context already cached on
-    ``request.state`` by the audit path; an explicit ``attribution`` mapping
-    only overrides/extends it. Raw identifiers are never emitted.
+    Reopened D1-614 observability is best-effort and cannot alter this response.
     """
 
     owner_record: Optional[Mapping[str, Any]] = None
@@ -2177,9 +2127,6 @@ def raise_session_owner_redispatch_required(
         candidate_endpoint = _clean_optional_str(
             candidate.get("endpoint_contract")
         )
-    # D1-614: capture whether the caller supplied a real candidate before the
-    # detail-only owner fallback below fills ``shaped_candidate``.
-    has_real_candidate = bool(shaped_candidate)
     if not shaped_candidate and owner_attrs:
         shaped_candidate = {
             "provider": owner_attrs.get("provider"),
@@ -2226,28 +2173,18 @@ def raise_session_owner_redispatch_required(
         detail["selected_model"] = owner_attrs.get("model")
         detail["selected_route_family"] = owner_attrs.get("route_family")
 
-    effective_attribution = _session_owner_attribution_from_request(request)
-    if isinstance(attribution, Mapping) and attribution:
-        merged = dict(effective_attribution)
-        merged.update(
-            {k: v for k, v in attribution.items() if v is not None}
-        )
-        effective_attribution = merged
-
-    # D1-614: exactly one best-effort sanitized WARNING before the 409.
-    _log_session_owner_redispatch_required(
+    # Keep the legacy attribution argument for callers; reopened D1-614 intentionally
+    # does not emit its values.
+    _ = attribution
+    _emit_session_owner_redispatch_observability(
         session_identity=session_identity,
-        decision=decision,
         failure_phase=failure_phase,
         mismatch_reason=mismatch_reason,
         alias_model=alias_model,
         shaped_candidate=shaped_candidate,
-        has_real_candidate=has_real_candidate,
         candidate_endpoint=candidate_endpoint,
         owner_attrs=owner_attrs,
-        provenance=provenance,
-        claim_outcome=claim_outcome,
-        attribution=effective_attribution,
+        request=request,
     )
 
     raise HTTPException(status_code=409, detail=detail)

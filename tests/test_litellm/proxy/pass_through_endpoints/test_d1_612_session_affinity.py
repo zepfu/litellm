@@ -3,43 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import io
 import json
 import logging
 from typing import Any, Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi import HTTPException
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import durable as durable_mod
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import session_affinity as sa
-
-
-@contextlib.contextmanager
-def _capture_session_owner_logs(caplog, level: int = logging.WARNING):
-    """Temporarily route the session-owner logger through caplog's handler only.
-
-    The D1-614 runtime wiring sets ``propagate=False`` on this named logger,
-    so pytest's root-handler capture cannot see its records. This helper
-    replaces the logger's handlers with caplog's handler so production
-    handlers (which mutate the LogRecord via SecretRedactionFilter) do not
-    run before assertions. Original handlers/level/propagate are restored.
-    """
-    logger = logging.getLogger(_D614_LOGGER_NAME)
-    saved_handlers = logger.handlers[:]
-    saved_level = logger.level
-    saved_propagate = logger.propagate
-    logger.handlers = [caplog.handler]
-    logger.setLevel(level)
-    try:
-        with caplog.at_level(level, logger=_D614_LOGGER_NAME):
-            yield
-    finally:
-        logger.handlers = saved_handlers
-        logger.setLevel(saved_level)
-        logger.propagate = saved_propagate
 
 
 class _FakeRedisClient:
@@ -1160,7 +1134,7 @@ async def test_no_fixed_six_hour_owned_expiry() -> None:
 
 
 # ---------------------------------------------------------------------------
-# D1-614: best-effort sanitized redispatch WARNING from the central helper.
+# Reopened D1-614: one proxy WARNING and one failure rollup for handled owner 409s.
 # ---------------------------------------------------------------------------
 
 _D614_SESSION_ID = "sess-d614-raw-1234567890"
@@ -1170,8 +1144,10 @@ _D614_RESERVATION_TOKEN = "raw-reservation-token-9999"
 _D614_CALL_ID = "call-raw-id-777"
 _D614_TRACE_ID = "trace-raw-id-888"
 _D614_AGENT_ID = "agent-raw-id-666"
-_D614_RAW_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
-_D614_RAW_SECRETS = (
+_D614_ACCOUNT_HASH = "chatgpt-account-hash:0123456789ab"
+_D614_ACCOUNT_LANE = "chatgpt-account:0123456789ab"
+_D614_RAW_CREDENTIAL = "sk-live-abcdef123456"
+_D614_RAW_VALUES = (
     _D614_SESSION_ID,
     _D614_OWNER_ID,
     _D614_CACHE_KEY,
@@ -1179,136 +1155,10 @@ _D614_RAW_SECRETS = (
     _D614_CALL_ID,
     _D614_TRACE_ID,
     _D614_AGENT_ID,
+    _D614_ACCOUNT_HASH,
+    _D614_ACCOUNT_LANE,
+    _D614_RAW_CREDENTIAL,
 )
-_D614_LOGGER_NAME = "litellm.proxy.session_owner"
-
-
-def test_d614_session_owner_warning_plain_stream_single_sanitized_line() -> None:
-    """Dedicated-handler plain-mode acceptance: exactly one stream line, the
-    central ``SecretRedactionFilter`` preserves the pre-sanitized
-    ``api_key=[REDACTED]`` marker, no raw secrets appear, and the 409/no-egress
-    contract is preserved."""
-    from litellm._logging import (
-        _egress_guard_alert_filter,
-        _langfuse_support_string_diagnostic_filter,
-        _secret_filter,
-    )
-
-    logger = logging.getLogger(_D614_LOGGER_NAME)
-    stream_handlers = [
-        h for h in logger.handlers if isinstance(h, logging.StreamHandler)
-    ]
-    assert len(stream_handlers) == 1, (
-        "session-owner logger must have exactly one dedicated StreamHandler"
-    )
-    owner_handler = stream_handlers[0]
-    assert owner_handler.formatter is not None, (
-        "session-owner handler must carry the mode formatter"
-    )
-    assert _secret_filter in owner_handler.filters, (
-        "dedicated session-owner handler must run SecretRedactionFilter"
-    )
-    assert _egress_guard_alert_filter in owner_handler.filters
-    assert _langfuse_support_string_diagnostic_filter in owner_handler.filters
-    assert logger.propagate is False
-
-    capture = io.StringIO()
-    original_stream = owner_handler.stream
-    owner_handler.setStream(capture)
-    try:
-        with pytest.raises(HTTPException) as exc_info:
-            sa.raise_session_owner_redispatch_required(
-                session_identity=_D614_SESSION_ID,
-                guard=_d614_guard_result(),
-                alias_model="Codex-auto-agent",
-                failure_phase="session_owner_mismatch",
-                attribution={"agent_name": f"api_key={_D614_RAW_AWS_KEY}"},
-            )
-    finally:
-        owner_handler.setStream(original_stream)
-
-    assert exc_info.value.status_code == 409
-    lines = [ln for ln in capture.getvalue().splitlines() if ln.strip()]
-    assert len(lines) == 1
-    line = lines[0]
-    for raw in (*_D614_RAW_SECRETS, _D614_RAW_AWS_KEY):
-        assert raw not in line
-    assert "api_key=[REDACTED]" in line
-    payload = json.loads(line[line.index("{"):])
-    assert payload["event_type"] == "session_owner_redispatch_required"
-    assert payload["status_code"] == 409
-    assert payload["attempted_provider_call"] is False
-    assert payload["attribution"]["agent_name"] == "api_key=[REDACTED]"
-
-
-def test_d614_session_owner_warning_json_stream_single_sanitized_line() -> None:
-    """JSON reconfiguration acceptance: ``_initialize_loggers_with_handler``
-    gives the session-owner logger a dedicated clone (JSON formatter, central
-    secret filter) reusing the incoming handler's stream, and exactly one
-    intact sanitized JSON record is emitted. Every logger returned by
-    ``_get_loggers_to_initialize()`` is snapshotted and restored so pytest
-    exits without a closed-stream ``Logging error``."""
-    from litellm._logging import (
-        JsonFormatter,
-        _get_loggers_to_initialize,
-        _initialize_loggers_with_handler,
-        _secret_filter,
-    )
-
-    loggers = _get_loggers_to_initialize()
-    snapshot = [
-        (lg, lg.handlers[:], lg.level, lg.propagate, lg.disabled, lg.filters[:])
-        for lg in loggers
-    ]
-
-    capture = io.StringIO()
-    template = logging.StreamHandler(capture)
-    template.setFormatter(JsonFormatter())
-    try:
-        _initialize_loggers_with_handler(template)
-
-        logger = logging.getLogger(_D614_LOGGER_NAME)
-        stream_handlers = [
-            h for h in logger.handlers if isinstance(h, logging.StreamHandler)
-        ]
-        assert len(stream_handlers) == 1
-        owner_handler = stream_handlers[0]
-        assert owner_handler is not template, (
-            "session-owner logger must not share the template handler"
-        )
-        assert isinstance(owner_handler.formatter, JsonFormatter)
-        assert _secret_filter in owner_handler.filters
-
-        with pytest.raises(HTTPException) as exc_info:
-            sa.raise_session_owner_redispatch_required(
-                session_identity=_D614_SESSION_ID,
-                guard=_d614_guard_result(),
-                alias_model="Codex-auto-agent",
-                failure_phase="session_owner_mismatch",
-                attribution={"agent_name": f"api_key={_D614_RAW_AWS_KEY}"},
-            )
-        assert exc_info.value.status_code == 409
-
-        lines = [ln for ln in capture.getvalue().splitlines() if ln.strip()]
-        assert len(lines) == 1
-        envelope = json.loads(lines[0])
-        assert envelope["logger"] == _D614_LOGGER_NAME
-        assert envelope["level"] == "WARNING"
-        payload = json.loads(envelope["message"])
-        assert payload["event_type"] == "session_owner_redispatch_required"
-        assert payload["status_code"] == 409
-        assert payload["attempted_provider_call"] is False
-        assert payload["attribution"]["agent_name"] == "api_key=[REDACTED]"
-        for raw in (*_D614_RAW_SECRETS, _D614_RAW_AWS_KEY):
-            assert raw not in lines[0]
-        assert "api_key=[REDACTED]" in lines[0]
-    finally:
-        for lg, handlers, level, propagate, disabled, filters in snapshot:
-            lg.handlers = handlers
-            lg.setLevel(level)
-            lg.propagate = propagate
-            lg.disabled = disabled
-            lg.filters = filters
 
 
 def _d614_guard_result() -> "sa.SessionOwnerGuardResult":
@@ -1321,8 +1171,8 @@ def _d614_guard_result() -> "sa.SessionOwnerGuardResult":
             "route_family": "codex_oauth",
             "endpoint_contract": "openai_responses",
             "state_format": "openai_responses",
-            "account_hash": "chatgpt-account-hash:0123456789ab",
-            "account_lane": "chatgpt-account:0123456789ab",
+            "account_hash": _D614_ACCOUNT_HASH,
+            "account_lane": _D614_ACCOUNT_LANE,
             "account_label": "primary",
         },
         "reservation_token": _D614_RESERVATION_TOKEN,
@@ -1334,89 +1184,102 @@ def _d614_guard_result() -> "sa.SessionOwnerGuardResult":
         reservation_token=_D614_RESERVATION_TOKEN,
         owner_id=_D614_OWNER_ID,
         owner_record=record,
-        mismatch_reason="session_owner: provider mismatch owner=openai requested=anthropic",
+        mismatch_reason=(
+            "session_owner mismatch owner=openai requested=anthropic "
+            f"api_key={_D614_RAW_CREDENTIAL}"
+        ),
         held_reservation=False,
     )
 
 
-def _d614_raise(caplog) -> HTTPException:
+def test_d614_owner_409_emits_one_proxy_warning_and_one_failure_rollup() -> None:
+    from types import SimpleNamespace
 
-    with _capture_session_owner_logs(caplog):
-        with pytest.raises(HTTPException) as exc_info:
-            sa.raise_session_owner_redispatch_required(
-                session_identity=_D614_SESSION_ID,
-                guard=_d614_guard_result(),
-                alias_model="Codex-auto-agent",
-                candidate={
-                    "provider": "anthropic",
-                    "model": "claude-opus-4-6",
-                    "route_family": "anthropic_native",
-                },
-                failure_phase="session_owner_mismatch",
-                attribution={
-                    "litellm_call_id": _D614_CALL_ID,
-                    "trace_id": _D614_TRACE_ID,
-                    "agent_id": _D614_AGENT_ID,
-                    "agent_name": "alibaba",
-                    "agent_role": "implementer",
-                },
-            )
-    return exc_info.value
+    state = SimpleNamespace(
+        aawm_alias_request_context={
+            "litellm_call_id": _D614_CALL_ID,
+            "trace_id": _D614_TRACE_ID,
+            "client_product_label": "codex-cli",
+            "rollup_group_header_label": "repo codex-cli",
+            "agent_dispatch": {"agent_id": _D614_AGENT_ID},
+        },
+        aawm_alias_request_litellm_call_id=_D614_CALL_ID,
+    )
+    request = SimpleNamespace(
+        state=state,
+        url=SimpleNamespace(path="/v1/responses"),
+    )
+    dedicated_warning = MagicMock()
+    rollup = MagicMock(return_value=True)
 
+    with patch.object(
+        sa.verbose_proxy_logger, "warning"
+    ) as proxy_warning, patch(
+        "litellm.proxy.aawm_route_logging.record_aawm_route_rollup_failure",
+        rollup,
+    ), patch.object(
+        logging.getLogger("litellm.proxy.session_owner"),
+        "warning",
+        dedicated_warning,
+    ), pytest.raises(HTTPException) as exc_info:
+        sa.raise_session_owner_redispatch_required(
+            session_identity=_D614_SESSION_ID,
+            guard=_d614_guard_result(),
+            alias_model="Codex-auto-agent",
+            candidate={
+                "provider": "anthropic",
+                "model": "claude-opus-4-6",
+                "route_family": "anthropic_native",
+                "endpoint_contract": "anthropic_messages",
+            },
+            failure_phase="session_owner_mismatch",
+            request=request,
+        )
 
-def test_d614_single_warning_with_required_fields(caplog) -> None:
-    _d614_raise(caplog)
-    records = [r for r in caplog.records if r.name == _D614_LOGGER_NAME]
-    assert len(records) == 1
-    assert records[0].levelname == "WARNING"
+    proxy_warning.assert_called_once()
+    rollup.assert_called_once()
+    dedicated_warning.assert_not_called()
 
-    payload = json.loads(records[0].getMessage())
-    assert payload["event_type"] == "session_owner_redispatch_required"
-    assert payload["status_code"] == 409
-    assert payload["code"] == "aawm_session_owner_redispatch_required"
-    assert payload["failure_phase"] == "session_owner_mismatch"
-    assert payload["mismatch_reason"].startswith("session_owner: provider mismatch")
-    assert payload["redispatch_required"] is True
-    assert payload["attempted_provider_call"] is False
-    assert payload["endpoint"] == "openai_responses"
-    assert payload["requested"]["alias_model"] == "Codex-auto-agent"
-    assert payload["requested"]["provider"] == "anthropic"
-    assert payload["owner"]["provider"] == "openai"
-    assert payload["owner"]["model"] == "gpt-5.6-sol"
-    assert payload["owner"]["route_family"] == "codex_oauth"
-    assert payload["owner"]["account_hash"] == "chatgpt-account-hash:0123456789ab"
-    assert payload["owner"]["account_lane"] == "chatgpt-account:0123456789ab"
-    assert payload["owner"]["account_label"] == "primary"
-    assert payload["attribution"]["agent_name"] == "alibaba"
-    assert payload["attribution"]["agent_role"] == "implementer"
+    warning_call = proxy_warning.call_args
+    assert warning_call.args[0] == "%s"
+    summary = warning_call.args[1]
+    assert rollup.call_args.kwargs == {
+        "message": summary,
+        "status": "Failed",
+    }
+    assert "LiteLLM Proxy" in summary
+    assert "HTTP 409" in summary
+    assert "session-owner mismatch" in summary
+    assert "redispatch" in summary
+    assert "redispatch_required=true" in summary
+    assert "attempted_provider_call=false" in summary
+    assert "[REDACTED]" in summary
+    assert len(summary) <= 480
+    assert warning_call.kwargs["exc_info"] is False
 
+    rollup_kwargs = rollup.call_args.args[0]
+    rollup_context = rollup_kwargs["litellm_params"]["metadata"][
+        "aawm_route_rollup_context"
+    ]
+    assert rollup_context == {
+        "group_header_label": "repo codex-cli",
+        "incoming_endpoint": "/v1/responses",
+        "outgoing_target": "anthropic_messages",
+        "model_label": "Codex-auto-agent",
+        "reasoning_effort": "none",
+    }
+    emitted = json.dumps(
+        {
+            "warning": warning_call.args,
+            "warning_kwargs": warning_call.kwargs,
+            "rollup": rollup.call_args,
+        },
+        default=str,
+    )
+    for raw in _D614_RAW_VALUES:
+        assert raw not in emitted
 
-def test_d614_identity_bounded_and_secrets_absent(caplog) -> None:
-    _d614_raise(caplog)
-    message = caplog.records[-1].getMessage()
-    payload = json.loads(message)
-
-    # Bounded one-way canonical-session hash, never the raw identity.
-    session_hash = payload["canonical_session_hash"]
-    assert session_hash != _D614_SESSION_ID
-    assert len(session_hash) == 16
-    assert all(c in "0123456789abcdef" for c in session_hash)
-
-    # Attribution identifiers are hashed only.
-    assert payload["attribution"]["litellm_call_id_hash"] != _D614_CALL_ID
-    assert payload["attribution"]["trace_id_hash"] != _D614_TRACE_ID
-    assert payload["attribution"]["agent_id_hash"] != _D614_AGENT_ID
-
-    # No raw sensitive values anywhere in the emitted record.
-    for secret in _D614_RAW_SECRETS:
-        assert secret not in message
-        assert secret not in str(caplog.records[-1].__dict__)
-
-
-def test_d614_409_detail_unchanged_and_no_provider_attempt(caplog) -> None:
-    provider_attempt = MagicMock()
-    exc = _d614_raise(caplog)
-
+    exc = exc_info.value
     assert exc.status_code == 409
     detail = exc.detail
     assert detail["redispatch_required"] is True
@@ -1431,17 +1294,22 @@ def test_d614_409_detail_unchanged_and_no_provider_attempt(caplog) -> None:
     assert detail["selected_model"] == "gpt-5.6-sol"
     assert detail["selected_route_family"] == "codex_oauth"
     assert detail["session_owner"]["session_owner_state"] == "owned"
-    # Raw reservation tokens never leak into the detail.
-    dumped = json.dumps(detail)
-    assert _D614_RESERVATION_TOKEN not in dumped
-    provider_attempt.assert_not_called()
+    assert _D614_RESERVATION_TOKEN not in json.dumps(detail)
 
 
-def test_d614_logging_failure_still_raises_identical_409(caplog) -> None:
+def _d614_raise_with_observability(
+    *,
+    warning_side_effect: Optional[BaseException] = None,
+    rollup_side_effect: Optional[BaseException] = None,
+) -> tuple[HTTPException, MagicMock, MagicMock]:
+    rollup = MagicMock(side_effect=rollup_side_effect, return_value=True)
     with patch.object(
-        sa._session_owner_logger,
+        sa.verbose_proxy_logger,
         "warning",
-        side_effect=RuntimeError("logging backend down"),
+        side_effect=warning_side_effect,
+    ) as proxy_warning, patch(
+        "litellm.proxy.aawm_route_logging.record_aawm_route_rollup_failure",
+        rollup,
     ), pytest.raises(HTTPException) as exc_info:
         sa.raise_session_owner_redispatch_required(
             session_identity=_D614_SESSION_ID,
@@ -1449,199 +1317,174 @@ def test_d614_logging_failure_still_raises_identical_409(caplog) -> None:
             alias_model="Codex-auto-agent",
             failure_phase="session_owner_mismatch",
         )
-    exc = exc_info.value
-    assert exc.status_code == 409
-    detail = exc.detail
-    assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
-    assert detail["redispatch_required"] is True
-    assert detail["attempted_provider_call"] is False
-    assert detail["canonical_session_identity"] == _D614_SESSION_ID
+    return exc_info.value, proxy_warning, rollup
 
 
-def test_d614_central_request_context_supplies_attribution(caplog) -> None:
-    """Live path: attribution sourced from request.state, no manual kwarg."""
+def test_d614_proxy_warning_failure_still_raises_identical_409() -> None:
+    baseline, _, _ = _d614_raise_with_observability()
+    failed, proxy_warning, rollup = _d614_raise_with_observability(
+        warning_side_effect=RuntimeError("logging backend down"),
+    )
+    proxy_warning.assert_called_once()
+    rollup.assert_called_once()
+    assert failed.status_code == baseline.status_code == 409
+    assert failed.detail == baseline.detail
+
+
+def test_d614_rollup_failure_still_raises_identical_409() -> None:
+    baseline, _, _ = _d614_raise_with_observability()
+    failed, proxy_warning, rollup = _d614_raise_with_observability(
+        rollup_side_effect=RuntimeError("rollup backend down"),
+    )
+    proxy_warning.assert_called_once()
+    rollup.assert_called_once()
+    assert failed.status_code == baseline.status_code == 409
+    assert failed.detail == baseline.detail
+
+
+@pytest.mark.asyncio
+async def test_d614_full_wrapper_records_owner_409_once_before_egress() -> None:
     from types import SimpleNamespace
 
-    raw_call_id = "live-call-id-4242"
-    raw_trace_id = "live-trace-id-4343"
-    raw_agent_id = "live-agent-id-4444"
-    state = SimpleNamespace()
-    state.aawm_alias_request_context = {
-        "litellm_call_id": raw_call_id,
-        "trace_id": raw_trace_id,
-        "client_product_label": "codex-cli",
-        "agent_dispatch": {
-            "agent_name": "openai",
-            "agent_role": "validator",
-            "agent_id": raw_agent_id,
-        },
-    }
-    state.aawm_alias_request_litellm_call_id = raw_call_id
-    request = SimpleNamespace(state=state)
+    from starlette.datastructures import Headers, QueryParams
 
-    with _capture_session_owner_logs(caplog):
-        with pytest.raises(HTTPException) as exc_info:
-            sa.raise_session_owner_redispatch_required(
-                session_identity=_D614_SESSION_ID,
-                guard=_d614_guard_result(),
-                alias_model="Codex-auto-agent",
-                failure_phase="session_owner_mismatch",
-                request=request,
-            )
-    assert exc_info.value.status_code == 409
-    records = [r for r in caplog.records if r.name == _D614_LOGGER_NAME]
-    assert len(records) == 1
-    message = records[0].getMessage()
-    payload = json.loads(message)
+    from litellm.proxy._types import ProxyException, UserAPIKeyAuth
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
 
-    attribution = payload["attribution"]
-    assert attribution["agent_name"] == "openai"
-    assert attribution["agent_role"] == "validator"
-    assert attribution["client_product"] == "codex-cli"
-    for key in ("litellm_call_id_hash", "trace_id_hash", "agent_id_hash"):
-        assert key in attribution and len(attribution[key]) == 16
-    for raw in (raw_call_id, raw_trace_id, raw_agent_id):
-        assert raw not in message
-        assert raw not in json.dumps(exc_info.value.detail)
-
-
-def test_d614_candidate_only_denial_keeps_endpoint(caplog) -> None:
-
-    with _capture_session_owner_logs(caplog):
-        with pytest.raises(HTTPException):
-            sa.raise_session_owner_redispatch_required(
-                session_identity=_D614_SESSION_ID,
-                candidate={
-                    "provider": "anthropic",
-                    "model": "claude-opus-4-6",
-                    "route_family": "anthropic_native",
-                    "endpoint_contract": "anthropic_messages",
-                },
-                alias_model="Claude-auto-agent",
-                failure_phase="session_owner_pre_egress",
-            )
-    payload = json.loads(caplog.records[-1].getMessage())
-    assert payload["endpoint"] == "anthropic_messages"
-    assert payload["requested"]["provider"] == "anthropic"
-    assert payload["requested"]["model"] == "claude-opus-4-6"
-    assert payload["requested"]["route_family"] == "anthropic_native"
-
-
-def test_d614_no_candidate_denial_does_not_clone_owner(caplog) -> None:
-
-    with _capture_session_owner_logs(caplog):
-        with pytest.raises(HTTPException) as exc_info:
-            sa.raise_session_owner_redispatch_required(
-                session_identity=_D614_SESSION_ID,
-                guard=_d614_guard_result(),
-                alias_model="Codex-auto-agent",
-                failure_phase="session_owner_mismatch",
-            )
-    payload = json.loads(caplog.records[-1].getMessage())
-    requested = payload["requested"]
-    assert requested == {"alias_model": "Codex-auto-agent"}
-    # Owner fields remain visible only under the owner section.
-    assert payload["owner"]["provider"] == "openai"
-    # 409 detail keeps its pre-existing owner-synthesized candidate.
-    detail = exc_info.value.detail
-    assert detail["candidate"]["provider"] == "openai"
-
-
-def test_d614_credential_shaped_mismatch_reason_is_redacted(caplog) -> None:
-
-    secret_reason = (
-        "session_owner: provider mismatch owner=openai requested=anthropic "
-        "api_key=sk-live-abcdef123456 detail"
+    redis = _FakeRedisCache()
+    owner_attrs = _full_attrs(
+        route_family="openai",
+        account_hash=None,
+        account_label=None,
+        account_lane=None,
     )
-    guard = sa.SessionOwnerGuardResult(
-        decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
-        session_identity=_D614_SESSION_ID,
-        cache_key=_D614_CACHE_KEY,
-        reservation_token=_D614_RESERVATION_TOKEN,
-        owner_id=_D614_OWNER_ID,
-        owner_record=_d614_guard_result().owner_record,
-        mismatch_reason=secret_reason,
-        held_reservation=False,
-    )
-    with _capture_session_owner_logs(caplog):
-        with pytest.raises(HTTPException):
-            sa.raise_session_owner_redispatch_required(
-                session_identity=_D614_SESSION_ID,
-                guard=guard,
-                alias_model="Codex-auto-agent",
-                failure_phase="session_owner_mismatch",
-            )
-    records = [r for r in caplog.records if r.name == _D614_LOGGER_NAME]
-    assert len(records) == 1
-    message = records[0].getMessage()
-    assert "sk-live-abcdef123456" not in message
-    assert "api_key=sk-live-abcdef123456" not in message
-    payload = json.loads(message)
-    assert "[REDACTED]" in payload["mismatch_reason"]
-
-
-def test_d614_credential_shaped_owner_fields_are_redacted(caplog) -> None:
-
-    record = {
-        "state": "owned",
-        "owner": _D614_OWNER_ID,
-        "attributes": {
-            "provider": "openai",
-            "model": "gpt-5.6-sol",
-            "route_family": "codex_oauth",
-            "endpoint_contract": "openai_responses",
-            "state_format": "openai_responses",
-            "account_hash": "chatgpt-account-hash:0123456789ab",
-            "account_lane": "chatgpt-account:0123456789ab",
-            "account_label": "sk-live-owner-label-secret",
+    state = SimpleNamespace(
+        aawm_alias_request_context={
+            "litellm_call_id": _D614_CALL_ID,
+            "trace_id": _D614_TRACE_ID,
+            "rollup_group_header_label": "repo codex-cli",
+            "agent_dispatch": {"agent_id": _D614_AGENT_ID},
         },
-        "reservation_token": _D614_RESERVATION_TOKEN,
-    }
-    guard = sa.SessionOwnerGuardResult(
-        decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
-        session_identity=_D614_SESSION_ID,
-        cache_key=_D614_CACHE_KEY,
-        reservation_token=_D614_RESERVATION_TOKEN,
-        owner_id=_D614_OWNER_ID,
-        owner_record=record,
-        mismatch_reason=(
-            "session_owner: provider mismatch owner=openai requested=anthropic"
+        aawm_alias_request_litellm_call_id=_D614_CALL_ID,
+    )
+    request = SimpleNamespace(
+        state=state,
+        method="POST",
+        headers=Headers(
+            {
+                "authorization": f"Bearer {_D614_RAW_CREDENTIAL}",
+                "content-type": "application/json",
+            }
         ),
-        held_reservation=False,
+        query_params=QueryParams({}),
+        url=httpx.URL("http://localhost/v1/messages"),
     )
-    with _capture_session_owner_logs(caplog):
-        with pytest.raises(HTTPException):
-            sa.raise_session_owner_redispatch_required(
-                session_identity=_D614_SESSION_ID,
-                guard=guard,
-                alias_model="Codex-auto-agent",
-                failure_phase="session_owner_mismatch",
-            )
-    records = [r for r in caplog.records if r.name == _D614_LOGGER_NAME]
-    message = records[-1].getMessage()
-    assert "sk-live-owner-label-secret" not in message
-    payload = json.loads(message)
-    assert payload["owner"]["account_label"] == "sk-[REDACTED]"
+    provider_send = AsyncMock()
+    proxy_logging = MagicMock()
+    proxy_logging.pre_call_hook = AsyncMock(side_effect=lambda **kw: kw["data"])
+    proxy_logging.post_call_failure_hook = AsyncMock(return_value=None)
+    rollup = MagicMock(return_value=True)
+    dedicated_warning = MagicMock()
+    session_id = "sess-d614-no-egress"
 
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        initial = await sa.guard_session_owner_before_egress(
+            session_identity=session_id,
+            requested_attributes=owner_attrs,
+        )
+        await sa.promote_session_owner_reservation(
+            session_identity=session_id,
+            reservation_token=initial.reservation_token,
+            attributes=owner_attrs,
+        )
 
-def test_d614_credential_shaped_attribution_labels_are_redacted(caplog) -> None:
-
-    with _capture_session_owner_logs(caplog):
-        with pytest.raises(HTTPException):
-            sa.raise_session_owner_redispatch_required(
-                session_identity=_D614_SESSION_ID,
-                guard=_d614_guard_result(),
-                alias_model="Codex-auto-agent",
-                failure_phase="session_owner_mismatch",
-                attribution={
-                    "agent_name": "api_key=sh-secret-agent-key",
-                    "agent_role": "Bearer sh-bearer-token-secret-99",
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client",
+            return_value=MagicMock(client=MagicMock()),
+        ), patch.object(
+            pte.HttpPassThroughEndpointHelpers,
+            "non_streaming_http_request_handler",
+            new=provider_send,
+        ), patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj",
+            proxy_logging,
+        ), patch.object(
+            pte,
+            "emit_aawm_route_access_log",
+        ), patch.object(
+            pte.ProxyBaseLLMRequestProcessing,
+            "get_custom_headers",
+            return_value={},
+        ), patch.object(
+            pte,
+            "_direct_capture_xai_passthrough_failure",
+            new=AsyncMock(),
+        ), patch.object(
+            sa.verbose_proxy_logger, "warning"
+        ) as proxy_warning, patch(
+            "litellm.proxy.aawm_route_logging.record_aawm_route_rollup_failure",
+            rollup,
+        ), patch.object(
+            pte,
+            "record_aawm_route_rollup_failure",
+            rollup,
+        ), patch.object(
+            logging.getLogger("litellm.proxy.session_owner"),
+            "warning",
+            dedicated_warning,
+        ), pytest.raises(ProxyException) as exc_info:
+            await pte.pass_through_request(
+                request=request,
+                target="https://api.anthropic.com/v1/messages",
+                custom_headers={"authorization": f"Bearer {_D614_RAW_CREDENTIAL}"},
+                user_api_key_dict=UserAPIKeyAuth(),
+                custom_body={
+                    "model": "claude-opus-4-6",
+                    "litellm_metadata": {
+                        "session_id": session_id,
+                    },
                 },
+                custom_llm_provider="anthropic",
+                egress_credential_family="anthropic",
+                expected_target_family="anthropic",
+                stream=False,
             )
-    records = [r for r in caplog.records if r.name == _D614_LOGGER_NAME]
-    message = records[-1].getMessage()
-    assert "sh-secret-agent-key" not in message
-    assert "sh-bearer-token-secret-99" not in message
-    payload = json.loads(message)
-    assert payload["attribution"]["agent_name"] == "api_key=[REDACTED]"
-    assert payload["attribution"]["agent_role"] == "Bearer [REDACTED]"
+
+    proxy_warning.assert_called_once()
+    rollup.assert_called_once()
+    dedicated_warning.assert_not_called()
+    provider_send.assert_not_awaited()
+    warning_call = proxy_warning.call_args
+    summary = warning_call.args[1]
+    assert warning_call.args[0] == "%s"
+    assert warning_call.kwargs["exc_info"] is False
+    assert rollup.call_args.kwargs == {
+        "message": summary,
+        "status": "Failed",
+    }
+    rollup_context = rollup.call_args.args[0]["litellm_params"]["metadata"][
+        "aawm_route_rollup_context"
+    ]
+    assert rollup_context["group_header_label"] == "repo codex-cli"
+
+    emitted = json.dumps(
+        {
+            "warning": warning_call.args,
+            "warning_kwargs": warning_call.kwargs,
+            "rollup": rollup.call_args,
+        },
+        default=str,
+    )
+    for raw in _D614_RAW_VALUES:
+        assert raw not in emitted
+    assert session_id not in emitted
+
+    exc = exc_info.value
+    assert exc.code == "409"
+    assert exc.detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert exc.detail["redispatch_required"] is True
+    assert exc.detail["attempted_provider_call"] is False
+    assert exc.detail["canonical_session_identity"] == session_id
+    assert proxy_logging.post_call_failure_hook.await_args.kwargs["traceback_str"] is None
