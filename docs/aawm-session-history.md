@@ -555,9 +555,10 @@ Console summary includes `database`, `target_db_name`, `projects_dir`,
 ## Codex Review Decision Persistence
 
 `public.session_history_codex_review_decisions` stores completed, successfully
-parsed Codex review outcomes as normalized records alongside
-`public.session_history`. It is a decision record, not a transcript or a
-replacement for route-rollup diagnostics.
+parsed Codex review outcomes as normalized records beside
+`public.session_history` in the same database and `public` schema. It is a
+decision record, not a transcript or a replacement for route-rollup
+diagnostics.
 
 Stable identities and correlation are explicit:
 
@@ -610,16 +611,32 @@ producer IDs establish a zero-to-many or many-to-many relationship.
 
 ### Schema Apply And Pre-Traffic Verification
 
-Apply the canonical migration only to `aawm_tristore`:
+Apply the canonical migration only to the active session-history database. On
+Thoth, the development database is `litellm_dev` and the production database
+is `litellm_prod`; `aawm_tristore` is dynamically injected by some runtime
+configurations and is not the callback/session-history database target. The
+migration requires the matching `expected_database` psql variable and aborts
+before DDL when it is missing, empty, or does not match `current_database()`.
 
 ```bash
-psql --set=ON_ERROR_STOP=1 --dbname=aawm_tristore \
+# Development apply (`litellm_dev`).
+psql --set=ON_ERROR_STOP=1 \
+  --set=expected_database=litellm_dev \
+  --dbname=litellm_dev \
+  --file=scripts/apply_session_history_codex_review_decisions_2026_08_12.sql
+
+# Production command shape only (`litellm_prod`).
+# Production apply requires separate operator authorization and is not
+# authorized or performed by this D1-616 correction.
+psql --set=ON_ERROR_STOP=1 \
+  --set=expected_database=litellm_prod \
+  --dbname=litellm_prod \
   --file=scripts/apply_session_history_codex_review_decisions_2026_08_12.sql
 ```
 
 The migration is safe to rerun and aborts unless `current_database()` is
-exactly `aawm_tristore`. Before sending traffic that can emit review decisions,
-run these read-only checks against the same database:
+exactly the supplied `expected_database`. Before sending traffic that can emit
+review decisions, run these read-only checks against the same database:
 
 ```sql
 SELECT current_database();
@@ -642,7 +659,8 @@ WHERE schemaname = 'public'
 ORDER BY indexname;
 ```
 
-The first query must return `aawm_tristore`; the table query must return
+The first query must return the selected target (`litellm_dev` for
+development or `litellm_prod` for production); the table query must return
 `public.session_history_codex_review_decisions`; the constraint query must show
 the primary key, unique `decision_key`, and the `allow`/`deny` plus
 `attributed`/`unattributed` checks; and the index query must show every
@@ -696,10 +714,10 @@ LIMIT LEAST($2, 100);
 Remaining dependencies are D1-615 event production of the validated completed
 decision and canonical/immediate-parent identities, producer-owned stable
 action/tool IDs (including proposed actions that never execute), and live
-development proof: confirm the exact `current_database()` name, apply and
-verify the canonical migration, and run the bounded queries against that
-database. There is no historical backfill and no inferred relationship under
-this contract.
+development proof: confirm `current_database()` is `litellm_dev`, apply and
+verify the canonical migration there, and run the bounded queries against that
+database. Production remains a separately authorized operation. There is no
+historical backfill and no inferred relationship under this contract.
 
 ## Claude Auto-Review Permission-Check Backfill
 

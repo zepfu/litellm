@@ -1,13 +1,29 @@
 -- D1-616: create the canonical Codex review-decision persistence table.
--- Intended target: aawm_tristore.public.session_history_codex_review_decisions.
+-- Intended target: <expected_database>.public.session_history_codex_review_decisions.
+
+\set ON_ERROR_STOP on
+
+\if :{?expected_database}
+\else
+\echo 'D1-616 abort: required psql variable expected_database is missing'
+\quit 3
+\endif
 
 BEGIN;
 
 DO $$
+DECLARE
+    expected_database_name text := NULLIF(btrim(:'expected_database'), '');
 BEGIN
-    IF current_database() <> 'aawm_tristore' THEN
+    IF expected_database_name IS NULL THEN
         RAISE EXCEPTION
-            'D1-616 abort: expected database aawm_tristore, got %',
+            'D1-616 abort: required psql variable expected_database is empty';
+    END IF;
+
+    IF current_database() <> expected_database_name THEN
+        RAISE EXCEPTION
+            'D1-616 abort: expected database %, got %',
+            expected_database_name,
             current_database();
     END IF;
 END;

@@ -18,6 +18,7 @@ No live database, harness expansion, or migration execution is involved.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict
 from unittest.mock import AsyncMock
 
@@ -25,6 +26,21 @@ import pytest
 
 import litellm.integrations.aawm_agent_identity as identity
 from litellm.integrations.aawm_session_history import sql as sh_sql
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+D1_616_MIGRATION = (
+    REPO_ROOT
+    / "scripts/apply_session_history_codex_review_decisions_2026_08_12.sql"
+)
+D1_616_DOCS = REPO_ROOT / "docs/aawm-session-history.md"
+
+
+def _d1_616_docs_section() -> str:
+    document = D1_616_DOCS.read_text(encoding="utf-8")
+    return document.split("## Codex Review Decision Persistence", 1)[1].split(
+        "\n## ", 1
+    )[0]
 
 
 def _base_record() -> Dict[str, Any]:
@@ -56,6 +72,40 @@ def _event(**overrides: Any) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Schema shape
 # ---------------------------------------------------------------------------
+
+
+def test_d1_616_migration_uses_required_parameterized_database_guard() -> None:
+    migration = D1_616_MIGRATION.read_text(encoding="utf-8")
+    assert "aawm_tristore" not in migration
+    assert r"\set ON_ERROR_STOP on" in migration
+    assert r"\if :{?expected_database}" in migration
+    assert r"\quit 3" in migration
+    assert (
+        "expected_database_name text := NULLIF(btrim(:'expected_database'), '');"
+        in migration
+    )
+    assert "IF expected_database_name IS NULL THEN" in migration
+    assert "IF current_database() <> expected_database_name THEN" in migration
+
+
+def test_d1_616_docs_keep_dev_prod_migration_commands_in_parity() -> None:
+    section = _d1_616_docs_section()
+    normalized_section = " ".join(section.split())
+    assert "beside `public.session_history`" in normalized_section
+    assert "--set=expected_database=aawm_tristore" not in section
+    assert "--dbname=aawm_tristore" not in section
+    assert (
+        "Production apply requires separate operator authorization and is not"
+        in section
+    )
+    for database in ("litellm_dev", "litellm_prod"):
+        command = (
+            "psql --set=ON_ERROR_STOP=1 \\\n"
+            f"  --set=expected_database={database} \\\n"
+            f"  --dbname={database} \\\n"
+            "  --file=scripts/apply_session_history_codex_review_decisions_2026_08_12.sql"
+        )
+        assert command in section
 
 
 def test_decisions_table_defines_stable_identities_and_bounds() -> None:
