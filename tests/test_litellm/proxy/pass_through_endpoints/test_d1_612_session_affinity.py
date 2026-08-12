@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import json
+import logging
 from typing import Any, Optional
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +15,31 @@ from fastapi import HTTPException
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import durable as durable_mod
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import session_affinity as sa
+
+
+@contextlib.contextmanager
+def _capture_session_owner_logs(caplog, level: int = logging.WARNING):
+    """Temporarily route the session-owner logger through caplog's handler only.
+
+    The D1-614 runtime wiring sets ``propagate=False`` on this named logger,
+    so pytest's root-handler capture cannot see its records. This helper
+    replaces the logger's handlers with caplog's handler so production
+    handlers (which mutate the LogRecord via SecretRedactionFilter) do not
+    run before assertions. Original handlers/level/propagate are restored.
+    """
+    logger = logging.getLogger(_D614_LOGGER_NAME)
+    saved_handlers = logger.handlers[:]
+    saved_level = logger.level
+    saved_propagate = logger.propagate
+    logger.handlers = [caplog.handler]
+    logger.setLevel(level)
+    try:
+        with caplog.at_level(level, logger=_D614_LOGGER_NAME):
+            yield
+    finally:
+        logger.handlers = saved_handlers
+        logger.setLevel(saved_level)
+        logger.propagate = saved_propagate
 
 
 class _FakeRedisClient:
@@ -1003,6 +1031,7 @@ _D614_RESERVATION_TOKEN = "raw-reservation-token-9999"
 _D614_CALL_ID = "call-raw-id-777"
 _D614_TRACE_ID = "trace-raw-id-888"
 _D614_AGENT_ID = "agent-raw-id-666"
+_D614_RAW_AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
 _D614_RAW_SECRETS = (
     _D614_SESSION_ID,
     _D614_OWNER_ID,
@@ -1013,6 +1042,134 @@ _D614_RAW_SECRETS = (
     _D614_AGENT_ID,
 )
 _D614_LOGGER_NAME = "litellm.proxy.session_owner"
+
+
+def test_d614_session_owner_warning_plain_stream_single_sanitized_line() -> None:
+    """Dedicated-handler plain-mode acceptance: exactly one stream line, the
+    central ``SecretRedactionFilter`` preserves the pre-sanitized
+    ``api_key=[REDACTED]`` marker, no raw secrets appear, and the 409/no-egress
+    contract is preserved."""
+    from litellm._logging import (
+        _egress_guard_alert_filter,
+        _langfuse_support_string_diagnostic_filter,
+        _secret_filter,
+    )
+
+    logger = logging.getLogger(_D614_LOGGER_NAME)
+    stream_handlers = [
+        h for h in logger.handlers if isinstance(h, logging.StreamHandler)
+    ]
+    assert len(stream_handlers) == 1, (
+        "session-owner logger must have exactly one dedicated StreamHandler"
+    )
+    owner_handler = stream_handlers[0]
+    assert owner_handler.formatter is not None, (
+        "session-owner handler must carry the mode formatter"
+    )
+    assert _secret_filter in owner_handler.filters, (
+        "dedicated session-owner handler must run SecretRedactionFilter"
+    )
+    assert _egress_guard_alert_filter in owner_handler.filters
+    assert _langfuse_support_string_diagnostic_filter in owner_handler.filters
+    assert logger.propagate is False
+
+    capture = io.StringIO()
+    original_stream = owner_handler.stream
+    owner_handler.setStream(capture)
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            sa.raise_session_owner_redispatch_required(
+                session_identity=_D614_SESSION_ID,
+                guard=_d614_guard_result(),
+                alias_model="Codex-auto-agent",
+                failure_phase="session_owner_mismatch",
+                attribution={"agent_name": f"api_key={_D614_RAW_AWS_KEY}"},
+            )
+    finally:
+        owner_handler.setStream(original_stream)
+
+    assert exc_info.value.status_code == 409
+    lines = [ln for ln in capture.getvalue().splitlines() if ln.strip()]
+    assert len(lines) == 1
+    line = lines[0]
+    for raw in (*_D614_RAW_SECRETS, _D614_RAW_AWS_KEY):
+        assert raw not in line
+    assert "api_key=[REDACTED]" in line
+    payload = json.loads(line[line.index("{"):])
+    assert payload["event_type"] == "session_owner_redispatch_required"
+    assert payload["status_code"] == 409
+    assert payload["attempted_provider_call"] is False
+    assert payload["attribution"]["agent_name"] == "api_key=[REDACTED]"
+
+
+def test_d614_session_owner_warning_json_stream_single_sanitized_line() -> None:
+    """JSON reconfiguration acceptance: ``_initialize_loggers_with_handler``
+    gives the session-owner logger a dedicated clone (JSON formatter, central
+    secret filter) reusing the incoming handler's stream, and exactly one
+    intact sanitized JSON record is emitted. Every logger returned by
+    ``_get_loggers_to_initialize()`` is snapshotted and restored so pytest
+    exits without a closed-stream ``Logging error``."""
+    from litellm._logging import (
+        JsonFormatter,
+        _get_loggers_to_initialize,
+        _initialize_loggers_with_handler,
+        _secret_filter,
+    )
+
+    loggers = _get_loggers_to_initialize()
+    snapshot = [
+        (lg, lg.handlers[:], lg.level, lg.propagate, lg.disabled, lg.filters[:])
+        for lg in loggers
+    ]
+
+    capture = io.StringIO()
+    template = logging.StreamHandler(capture)
+    template.setFormatter(JsonFormatter())
+    try:
+        _initialize_loggers_with_handler(template)
+
+        logger = logging.getLogger(_D614_LOGGER_NAME)
+        stream_handlers = [
+            h for h in logger.handlers if isinstance(h, logging.StreamHandler)
+        ]
+        assert len(stream_handlers) == 1
+        owner_handler = stream_handlers[0]
+        assert owner_handler is not template, (
+            "session-owner logger must not share the template handler"
+        )
+        assert isinstance(owner_handler.formatter, JsonFormatter)
+        assert _secret_filter in owner_handler.filters
+
+        with pytest.raises(HTTPException) as exc_info:
+            sa.raise_session_owner_redispatch_required(
+                session_identity=_D614_SESSION_ID,
+                guard=_d614_guard_result(),
+                alias_model="Codex-auto-agent",
+                failure_phase="session_owner_mismatch",
+                attribution={"agent_name": f"api_key={_D614_RAW_AWS_KEY}"},
+            )
+        assert exc_info.value.status_code == 409
+
+        lines = [ln for ln in capture.getvalue().splitlines() if ln.strip()]
+        assert len(lines) == 1
+        envelope = json.loads(lines[0])
+        assert envelope["logger"] == _D614_LOGGER_NAME
+        assert envelope["level"] == "WARNING"
+        payload = json.loads(envelope["message"])
+        assert payload["event_type"] == "session_owner_redispatch_required"
+        assert payload["status_code"] == 409
+        assert payload["attempted_provider_call"] is False
+        assert payload["attribution"]["agent_name"] == "api_key=[REDACTED]"
+        for raw in (*_D614_RAW_SECRETS, _D614_RAW_AWS_KEY):
+            assert raw not in lines[0]
+        assert "api_key=[REDACTED]" in lines[0]
+    finally:
+        for lg, handlers, level, propagate, disabled, filters in snapshot:
+            lg.handlers = handlers
+            lg.setLevel(level)
+            lg.propagate = propagate
+            lg.disabled = disabled
+            lg.filters = filters
 
 
 def _d614_guard_result() -> "sa.SessionOwnerGuardResult":
@@ -1044,9 +1201,8 @@ def _d614_guard_result() -> "sa.SessionOwnerGuardResult":
 
 
 def _d614_raise(caplog) -> HTTPException:
-    import logging
 
-    with caplog.at_level(logging.WARNING, logger=_D614_LOGGER_NAME):
+    with _capture_session_owner_logs(caplog):
         with pytest.raises(HTTPException) as exc_info:
             sa.raise_session_owner_redispatch_required(
                 session_identity=_D614_SESSION_ID,
@@ -1165,7 +1321,6 @@ def test_d614_logging_failure_still_raises_identical_409(caplog) -> None:
 
 def test_d614_central_request_context_supplies_attribution(caplog) -> None:
     """Live path: attribution sourced from request.state, no manual kwarg."""
-    import logging
     from types import SimpleNamespace
 
     raw_call_id = "live-call-id-4242"
@@ -1185,7 +1340,7 @@ def test_d614_central_request_context_supplies_attribution(caplog) -> None:
     state.aawm_alias_request_litellm_call_id = raw_call_id
     request = SimpleNamespace(state=state)
 
-    with caplog.at_level(logging.WARNING, logger=_D614_LOGGER_NAME):
+    with _capture_session_owner_logs(caplog):
         with pytest.raises(HTTPException) as exc_info:
             sa.raise_session_owner_redispatch_required(
                 session_identity=_D614_SESSION_ID,
@@ -1212,9 +1367,8 @@ def test_d614_central_request_context_supplies_attribution(caplog) -> None:
 
 
 def test_d614_candidate_only_denial_keeps_endpoint(caplog) -> None:
-    import logging
 
-    with caplog.at_level(logging.WARNING, logger=_D614_LOGGER_NAME):
+    with _capture_session_owner_logs(caplog):
         with pytest.raises(HTTPException):
             sa.raise_session_owner_redispatch_required(
                 session_identity=_D614_SESSION_ID,
@@ -1235,9 +1389,8 @@ def test_d614_candidate_only_denial_keeps_endpoint(caplog) -> None:
 
 
 def test_d614_no_candidate_denial_does_not_clone_owner(caplog) -> None:
-    import logging
 
-    with caplog.at_level(logging.WARNING, logger=_D614_LOGGER_NAME):
+    with _capture_session_owner_logs(caplog):
         with pytest.raises(HTTPException) as exc_info:
             sa.raise_session_owner_redispatch_required(
                 session_identity=_D614_SESSION_ID,
@@ -1256,7 +1409,6 @@ def test_d614_no_candidate_denial_does_not_clone_owner(caplog) -> None:
 
 
 def test_d614_credential_shaped_mismatch_reason_is_redacted(caplog) -> None:
-    import logging
 
     secret_reason = (
         "session_owner: provider mismatch owner=openai requested=anthropic "
@@ -1272,7 +1424,7 @@ def test_d614_credential_shaped_mismatch_reason_is_redacted(caplog) -> None:
         mismatch_reason=secret_reason,
         held_reservation=False,
     )
-    with caplog.at_level(logging.WARNING, logger=_D614_LOGGER_NAME):
+    with _capture_session_owner_logs(caplog):
         with pytest.raises(HTTPException):
             sa.raise_session_owner_redispatch_required(
                 session_identity=_D614_SESSION_ID,
@@ -1290,7 +1442,6 @@ def test_d614_credential_shaped_mismatch_reason_is_redacted(caplog) -> None:
 
 
 def test_d614_credential_shaped_owner_fields_are_redacted(caplog) -> None:
-    import logging
 
     record = {
         "state": "owned",
@@ -1319,7 +1470,7 @@ def test_d614_credential_shaped_owner_fields_are_redacted(caplog) -> None:
         ),
         held_reservation=False,
     )
-    with caplog.at_level(logging.WARNING, logger=_D614_LOGGER_NAME):
+    with _capture_session_owner_logs(caplog):
         with pytest.raises(HTTPException):
             sa.raise_session_owner_redispatch_required(
                 session_identity=_D614_SESSION_ID,
@@ -1335,9 +1486,8 @@ def test_d614_credential_shaped_owner_fields_are_redacted(caplog) -> None:
 
 
 def test_d614_credential_shaped_attribution_labels_are_redacted(caplog) -> None:
-    import logging
 
-    with caplog.at_level(logging.WARNING, logger=_D614_LOGGER_NAME):
+    with _capture_session_owner_logs(caplog):
         with pytest.raises(HTTPException):
             sa.raise_session_owner_redispatch_required(
                 session_identity=_D614_SESSION_ID,

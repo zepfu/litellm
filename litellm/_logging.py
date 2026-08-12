@@ -67,7 +67,10 @@ _SECRET_RE = _build_secret_patterns()
 
 
 def _redact_string(value: str) -> str:
-    return _SECRET_RE.sub(_REDACTED, value)
+    marker = "[REDACTED]"
+    return marker.join(
+        _SECRET_RE.sub(_REDACTED, part) for part in value.split(marker)
+    )
 
 
 class SecretRedactionFilter(logging.Filter):
@@ -1658,6 +1661,7 @@ verbose_router_logger = logging.getLogger("LiteLLM Router")
 verbose_logger = logging.getLogger("LiteLLM")
 verbose_aawm_route_logger = logging.getLogger("LiteLLM AAWM Route")
 verbose_aawm_route_logger.setLevel(logging.INFO)
+verbose_session_owner_logger = logging.getLogger("litellm.proxy.session_owner")
 
 _aawm_route_handler = logging.StreamHandler()
 _aawm_route_handler.setLevel(logging.INFO)
@@ -1668,12 +1672,24 @@ if json_logs:
 else:
     _aawm_route_handler.setFormatter(logging.Formatter("%(message)s"))
 
+# D1-614: dedicated session-owner StreamHandler. It mirrors the default
+# handler's level and formatter (plain or JSON mode) while retaining central
+# secret filtering for all session-owner warning payloads.
+_session_owner_handler = logging.StreamHandler()
+_session_owner_handler.setLevel(numeric_level)
+_session_owner_handler.setFormatter(handler.formatter)
+_session_owner_handler.addFilter(_secret_filter)
+_session_owner_handler.addFilter(_egress_guard_alert_filter)
+_session_owner_handler.addFilter(_langfuse_support_string_diagnostic_filter)
+
 # Add the handler to the logger
 verbose_router_logger.addHandler(handler)
 verbose_proxy_logger.addHandler(handler)
 verbose_logger.addHandler(handler)
 verbose_aawm_route_logger.addHandler(_aawm_route_handler)
 verbose_aawm_route_logger.propagate = False
+verbose_session_owner_logger.addHandler(_session_owner_handler)
+verbose_session_owner_logger.propagate = False
 
 
 def _suppress_loggers():
@@ -1698,6 +1714,7 @@ ALL_LOGGERS = [
     verbose_router_logger,
     verbose_proxy_logger,
     verbose_aawm_route_logger,
+    verbose_session_owner_logger,
     logging.getLogger("uvicorn"),
     logging.getLogger("uvicorn.error"),
     logging.getLogger("uvicorn.access"),
@@ -1883,6 +1900,23 @@ def shutdown_aawm_error_log_handlers() -> None:
 
 
 _configure_aawm_error_log_handlers()
+def _clone_session_owner_handler(template: logging.Handler) -> logging.StreamHandler:
+    """Build the dedicated session-owner handler from a template handler.
+
+    D1-614: reuses the incoming handler's stream, level, and formatter but
+    attaches the central secret and non-secret filters.
+    """
+    clone = logging.StreamHandler(getattr(template, "stream", None))
+    clone.setLevel(template.level)
+    formatter = getattr(template, "formatter", None)
+    if formatter is not None:
+        clone.setFormatter(formatter)
+    clone.addFilter(_secret_filter)
+    clone.addFilter(_egress_guard_alert_filter)
+    clone.addFilter(_langfuse_support_string_diagnostic_filter)
+    return clone
+
+
 def _initialize_loggers_with_handler(handler: logging.Handler):
     """
     Initialize all loggers with a handler
@@ -1897,7 +1931,12 @@ def _initialize_loggers_with_handler(handler: logging.Handler):
         lg.handlers.clear()  # remove any existing handlers
         _ensure_filter_on_logger(lg, _egress_guard_alert_filter)
         _ensure_filter_on_logger(lg, _langfuse_support_string_diagnostic_filter)
-        lg.addHandler(handler)  # add JSON formatter handler
+        if lg is verbose_session_owner_logger:
+            # D1-614: keep a dedicated handler while preserving the incoming
+            # formatter, stream, and central secret filtering.
+            lg.addHandler(_clone_session_owner_handler(handler))
+        else:
+            lg.addHandler(handler)  # add JSON formatter handler
         lg.propagate = False  # prevent bubbling to parent/root
     # Re-attach diagnostics after handler rebuilds so JSON_LOGS/config ordering
     # cannot drop the Langfuse support-string enrichment path.
