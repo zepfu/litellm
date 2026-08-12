@@ -93,7 +93,16 @@ Token Plan generations record:
 
 - `billing_mode=alibaba_token_plan_subscription`
 - `actual_invoice_cost_known=false`
-- `reference_cost_kind=provider_token_plan_no_public_per_token_rate`
+- `reference_cost_model` as the actual `alibaba_token_plan/...` route key
+- `reference_cost_kind` and the source/version/equivalence provenance from the
+  catalog reference contract
+
+The catalog carries non-invoice reference tariffs for Qwen 3.6
+(`$0.25/$1.50` per million input/output tokens through 256000 total tokens,
+then `$1/$4`), Qwen 3.7 (`$2.50/$7.50`), and DeepSeek V4 Pro
+(`$2.40/$4.80`). Qwen 3.8 remains explicitly unpriced. These totals are
+metadata only and do not populate `response_cost` or
+`session_history.response_cost_usd`.
 
 ## Quota observability
 

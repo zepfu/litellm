@@ -3381,6 +3381,7 @@ _lookup_bundled_model_cost_info = _aawm_cost_map._lookup_bundled_model_cost_info
 _calculate_response_cost_from_bundled_model_cost_map = (
     _aawm_cost_map._calculate_response_cost_from_bundled_model_cost_map
 )
+resolve_aawm_reference_pricing = _aawm_cost_map.resolve_aawm_reference_pricing
 _extract_claude_trace_agent_name = _aawm_identity_tenant_agent._extract_claude_trace_agent_name
 _extract_claude_trace_user_identity_from_metadata_sources = (
     _aawm_identity_tenant_agent._extract_claude_trace_user_identity_from_metadata_sources

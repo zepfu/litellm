@@ -1081,7 +1081,7 @@ def test_response_cost_calculator_with_response_cost_in_hidden_params(logging_ob
     assert response_cost > 100
 
 
-def test_response_cost_calculator_kimi_code_reference_cost_fallback_and_metadata_patch(
+def test_response_cost_calculator_keeps_kimi_reference_cost_metadata_out_of_response_cost(
     monkeypatch,
 ):
     import litellm
@@ -1128,7 +1128,7 @@ def test_response_cost_calculator_kimi_code_reference_cost_fallback_and_metadata
             result=result,
         )
 
-    assert response_cost == pytest.approx(0.0067032)
+    assert response_cost is None
     metadata = logging_obj.litellm_params["metadata"]
     assert metadata["billing_mode"] == "kimi_code_subscription"
     assert metadata["actual_invoice_cost_known"] is False
@@ -1139,7 +1139,7 @@ def test_response_cost_calculator_kimi_code_reference_cost_fallback_and_metadata
     assert metadata["reference_cost_uncached_input_usd"] == pytest.approx(0.001101)
     assert metadata["reference_cost_output_usd"] == pytest.approx(0.001455)
     assert metadata["reference_cost_total_usd"] == pytest.approx(0.0067032)
-    assert "response_cost_failure_debug_information" not in (
+    assert "response_cost_failure_debug_information" in (
         logging_obj.model_call_details
     )
 

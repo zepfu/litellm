@@ -827,27 +827,41 @@ Operator contract:
   --apply
 ```
 
-## Managed Kimi Code Subscription Cost Semantics
+## Reference Pricing Cost Semantics
 
-Managed Kimi Code session-history rows treat token-derived prices as reference
-cost fields, not an invoice. They set
-`metadata.billing_mode=kimi_code_subscription` and
-`metadata.actual_invoice_cost_known=false`; `response_cost_usd` is left unset.
-The persisted provenance includes `reference_cost_kind`,
-`reference_cost_currency`, `reference_cost_model`, `reference_cost_source`,
-`reference_cost_cached_input_usd`, `reference_cost_uncached_input_usd`,
-`reference_cost_output_usd`, and `reference_cost_total_usd`.
-Consumers must not turn a reference amount into actual subscription spend
-or native quota consumption without independent evidence.
+AAWM reference pricing is a metadata-only estimate, never an invoice. The
+generic resolver performs an exact provider-route catalog lookup under
+`provider_specific_entry.<provider>.aawm_reference_pricing`; it does not
+search another provider's key or infer an alias relationship. A
+`rates_from_model` pointer is accepted only when
+`equivalence_status=exact`.
 
-Callback observers use the same resolver. If ordinary Kimi cost calculation is
-unavailable, Langfuse receives the positive deterministic reference total as
-the generation cost while retaining
-`actual_invoice_cost_known=false` and the full reference provenance above.
-Overlapping sync and async streaming success handlers must preserve an
-already-calculated positive cost so a continuation callback cannot erase it.
-This callback behavior does not change the session-history contract:
-`response_cost_usd` remains unset because the amount is not an invoice.
+The contract records `schema_version=1`, `status`, `kind`, `billing_mode`,
+`actual_invoice_cost_known=false`, `currency=USD`, the actual route key in
+`reference_cost_model`, basis provider/model, cache mode, rate schedule,
+equivalence evidence, source kind/label/URLs/version/verification date, and an
+explicit unpriced reason when applicable. Priced entries also persist
+uncached-input, cached-input, output, and total reference components.
+
+Reference totals never populate LiteLLM `response_cost` or session-history
+`response_cost_usd`. A provider-reported cost wins; otherwise the actual route
+tariff remains the only standard cost input, including an explicit zero tariff.
+Unknown cache token counts and unsupported or non-exact equivalence fail closed
+to `status=unpriced`.
+
+The 2026-08-12 catalog includes Alibaba Qwen 3.6 whole-request tiers
+(`<=256000` tokens: `$0.25/$1.50` per million input/output; above that:
+`$1/$4`), Qwen 3.7 at `$2.50/$7.50`, and Alibaba DeepSeek V4 Pro at
+`$2.40/$4.80`. Direct DeepSeek Flash and Pro reference rates include provider
+cache reads. OpenRouter North uses a third-party hosted baseline and is not
+direct Cohere pricing. Owl Alpha, Big Pickle, and OpenCode's free DeepSeek
+route remain explicitly unpriced because their required equivalence evidence is
+absent. Alibaba subscription routes retain unknown invoice cost even when a
+reference tariff is available.
+
+Managed Kimi Code uses the same non-invoice semantics. Callback observers may
+persist its provenance metadata, but they do not turn its reference total into
+a standard response cost or callback generation cost.
 
 ## Rate Limit And Billing Observations
 

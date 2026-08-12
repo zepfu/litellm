@@ -1255,21 +1255,32 @@ def _build_session_history_record(  # noqa: PLR0915
         ),
     )
     provider_cache_state = cache_fields["provider_cache_state"]
-    kimi_code_reference_cost_metadata = _build_kimi_code_reference_cost_metadata(
-        provider=resolved_provider,
+    aawm_reference_cost_metadata = resolve_aawm_reference_pricing(
+        provider=resolved_provider or "",
         model=resolved_model,
         prompt_tokens=prompt_tokens,
-        cache_read_input_tokens=cache_read_input_tokens,
         completion_tokens=completion_tokens,
+        usage_obj=usage_obj,
     )
-    if kimi_code_reference_cost_metadata:
-        metadata.update(kimi_code_reference_cost_metadata)
-    alibaba_token_plan_cost_metadata = _build_alibaba_token_plan_cost_metadata(
-        provider=resolved_provider,
-        model=resolved_model,
-    )
-    if alibaba_token_plan_cost_metadata:
-        metadata.update(alibaba_token_plan_cost_metadata)
+    if aawm_reference_cost_metadata:
+        metadata.update(aawm_reference_cost_metadata)
+    else:
+        kimi_code_reference_cost_metadata = _build_kimi_code_reference_cost_metadata(
+            provider=resolved_provider,
+            model=resolved_model,
+            prompt_tokens=prompt_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+            completion_tokens=completion_tokens,
+        )
+        if kimi_code_reference_cost_metadata:
+            metadata.update(kimi_code_reference_cost_metadata)
+        else:
+            alibaba_token_plan_cost_metadata = _build_alibaba_token_plan_cost_metadata(
+                provider=resolved_provider,
+                model=resolved_model,
+            )
+            if alibaba_token_plan_cost_metadata:
+                metadata.update(alibaba_token_plan_cost_metadata)
     from litellm.llms.xai.reference_cost import (
         build_xai_grok_46_reference_cost_metadata,
     )

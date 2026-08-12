@@ -1,4 +1,16 @@
 # OpenRouter
+
+## AAWM reference pricing
+
+AAWM keeps OpenRouter pricing route-specific. The maintained
+`openrouter/cohere/north-mini-code:free` entry has a third-party hosted
+baseline of `$0.20/$0.80` per million input/output tokens sourced from the
+NanoGPT and Routeway hosted catalogs; it is not direct Cohere pricing.
+`openrouter/owl-alpha` and the OpenRouter DeepSeek V4 Flash `:free` routes
+remain explicitly unpriced when no exact paid-model relationship is verified.
+
+Reference totals are provenance metadata only. They do not populate
+`response_cost` or `response_cost_usd`, and a provider-reported cost wins.
 LiteLLM can route requests to OpenRouter models through the `openrouter/` prefix.
 The [OpenRouter model metadata snapshot](./openrouter-model-metadata) is the
 canonical reference for model-specific capability declarations in LiteLLM's

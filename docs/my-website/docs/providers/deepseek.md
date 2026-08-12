@@ -107,6 +107,21 @@ print(resp.choices[0].message.content)  # Final answer
 DeepSeek only supports `{"type": "enabled"}` - unlike Anthropic, it doesn't support `budget_tokens`. Any `reasoning_effort` value other than `"none"` enables thinking mode.
 :::
 
+### Direct V4 reference pricing
+
+The direct `deepseek/deepseek-v4-flash` and
+`deepseek/deepseek-v4-pro` catalog entries carry the official
+2026-08-12 reference rates, including provider cache-read pricing:
+
+| Model | Input | Cached input | Output |
+| --- | ---: | ---: | ---: |
+| DeepSeek V4 Flash | $0.14/M | $0.0028/M | $0.28/M |
+| DeepSeek V4 Pro | $0.435/M | $0.003625/M | $0.87/M |
+
+These are persisted as AAWM reference metadata with
+`actual_invoice_cost_known=false`; provider-reported cost and the actual direct
+route remain authoritative.
+
 ### Basic Usage
 
 <Tabs>

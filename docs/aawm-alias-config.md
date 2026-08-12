@@ -156,6 +156,14 @@ Anthropic-native; Luna uses the intended OpenAI/Codex OAuth route. The removed
 candidates are the `qwen3.8-max-preview` promo, `kimi-for-coding`, and
 `gpt-5.4-mini`.
 
+Cost metadata for these shared candidates is route-specific. OpenRouter North
+may carry a third-party hosted reference baseline, while Owl Alpha is
+unpriced. OpenCode Big Pickle and its free DeepSeek route remain unpriced, and
+Alibaba Qwen 3.6 is reference-priced only under the subscription
+`actual_invoice_cost_known=false` contract. Reference totals are provenance
+metadata and never standard spend or `response_cost_usd`; Luna remains the
+last-resort actual routed fallback.
+
 ## Maintained `work` and `work-other` alias behavior
 
 The `work` alias is compiled from `work.yaml`. Candidate order is:
