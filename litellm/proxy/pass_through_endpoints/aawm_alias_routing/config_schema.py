@@ -32,12 +32,13 @@ REGISTERED_PROVIDERS: frozenset[str] = frozenset(
         policy.CODEX_AUTO_AGENT_XAI_PROVIDER,
         policy.CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
         policy.CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        policy.CODEX_AUTO_AGENT_COHERE_PROVIDER,
         policy.OPENCODE_ZEN_PROVIDER,
         policy.ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
     }
 )
 
-# Registered route-family (dispatch adapter) identities for both ingress lanes.
+# Registered route-family (dispatch adapter) identities.
 REGISTERED_ROUTE_FAMILIES: frozenset[str] = frozenset(
     {
         "codex_responses",
@@ -46,6 +47,7 @@ REGISTERED_ROUTE_FAMILIES: frozenset[str] = frozenset(
         "codex_xai_oauth_responses_adapter",
         "codex_kimi_chat_completions_adapter",
         "codex_alibaba_token_plan_chat_completions_adapter",
+        "codex_cohere_chat_completions_adapter",
         "codex_opencode_zen_adapter",
         "anthropic_messages",
         "anthropic_openai_responses_adapter",
@@ -62,8 +64,7 @@ REGISTERED_ROUTE_FAMILIES: frozenset[str] = frozenset(
 
 # Closed ingress-specific route-family projection: maps each Codex/OpenAI
 # Responses ingress route_family to its Anthropic Messages ingress equivalent.
-# Candidates whose codex route_family is NOT in this mapping MUST carry an
-# explicit ``anthropic_route_family`` override or compilation fails closed.
+# Codex-only candidates are intentionally absent from this mapping.
 CODEX_TO_ANTHROPIC_ROUTE_FAMILY: dict[str, str] = {
     "codex_responses": "anthropic_openai_responses_adapter",
     "codex_openrouter_completion_adapter": "anthropic_openrouter_completion_adapter",
@@ -72,6 +73,12 @@ CODEX_TO_ANTHROPIC_ROUTE_FAMILY: dict[str, str] = {
     "codex_kimi_chat_completions_adapter": "anthropic_kimi_chat_completions_adapter",
     "codex_alibaba_token_plan_chat_completions_adapter": "anthropic_alibaba_token_plan_chat_completions_adapter",
 }
+
+CODEX_ONLY_ROUTE_FAMILIES: frozenset[str] = frozenset(
+    {
+        "codex_cohere_chat_completions_adapter",
+    }
+)
 
 # Route families that are ambiguous across ingress (one codex family maps to
 # multiple possible anthropic families depending on the specific model/candidate).

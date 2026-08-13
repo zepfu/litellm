@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     _AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES: int
     _AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS: int
     _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER: str
+    _CODEX_AUTO_AGENT_COHERE_PROVIDER: str
     _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER: str
     _CODEX_AUTO_AGENT_OPENCODE_PROVIDER: str
     _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER: str
@@ -164,6 +165,13 @@ _HOST_FUNCTION_NAMES = (
     "_ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES",
 )
 
+_COHERE_FUNCTION_NAMES = (
+    "_build_codex_cohere_adapter_request_body",
+    "_prepare_codex_cohere_chat_completions_adapter_route",
+    "_perform_codex_cohere_chat_completions_adapter_call",
+    "_handle_codex_cohere_chat_completions_adapter_route",
+)
+
 
 def install(
     host_globals: dict[str, Any],
@@ -184,6 +192,26 @@ def install(
         if not isinstance(_obj, FunctionType):
             host_globals[_name] = _obj
             continue
+        _rebound = FunctionType(
+            _obj.__code__,
+            host_globals,
+            _obj.__name__,
+            _obj.__defaults__,
+            _obj.__closure__,
+        )
+        _rebound.__kwdefaults__ = _obj.__kwdefaults__
+        _rebound.__annotations__ = _obj.__annotations__
+        _rebound.__doc__ = _obj.__doc__
+        _rebound.__module__ = _obj.__module__
+        _rebound.__qualname__ = _obj.__qualname__
+        if _obj.__dict__:
+            _rebound.__dict__.update(_obj.__dict__)
+        if publish_to_module:
+            _mod[_name] = _rebound
+        host_globals[_name] = _rebound
+
+    for _name in _COHERE_FUNCTION_NAMES:
+        _obj = _mod[_name]
         _rebound = FunctionType(
             _obj.__code__,
             host_globals,
@@ -290,7 +318,7 @@ async def _perform_codex_auto_agent_alias_candidate_request(
 
     _bind_codex_oauth_candidate_to_request(request, candidate)
     adapter_model = candidate["model"]
-
+    cohere_provider = globals().get("_CODEX_AUTO_AGENT_COHERE_PROVIDER", "cohere")
     async def _openrouter_completion() -> Response:
         return await _perform_codex_auto_agent_openrouter_completion_request(
             request=request,
@@ -358,6 +386,25 @@ async def _perform_codex_auto_agent_alias_candidate_request(
             use_alias_candidate_probe=True,
         )
 
+    async def _cohere() -> Response:
+        if (
+            candidate.get("route_family")
+            != "codex_cohere_chat_completions_adapter"
+        ):
+            raise ValueError(
+                "Cohere alias candidates require "
+                "codex_cohere_chat_completions_adapter."
+            )
+        return await _handle_codex_cohere_chat_completions_adapter_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            prepared_request_body=candidate_body,
+            adapter_model=adapter_model,
+            use_alias_candidate_probe=True,
+        )
+
     async def _native() -> Response:
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
             _codex_oauth_responses_target_url,
@@ -382,6 +429,7 @@ async def _perform_codex_auto_agent_alias_candidate_request(
             _CODEX_AUTO_AGENT_OPENCODE_PROVIDER: _opencode,
             _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER: _kimi_code,
             _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER: _alibaba_token_plan,
+            cohere_provider: _cohere,
         },
         route_family_handlers={
             _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER: {
@@ -395,6 +443,309 @@ async def _perform_codex_auto_agent_alias_candidate_request(
         },
         default_handler=_native,
     )
+
+
+def _build_codex_cohere_adapter_request_body(
+    *,
+    prepared_request_body: Payload,
+    adapter_model: str,
+    upstream_model: str,
+    config: "_aawm_adapter_config.AnthropicCompletionAdapterConfig",
+) -> Payload:
+    request_body = dict(prepared_request_body)
+    metadata = dict(request_body.get("litellm_metadata") or {})
+    tags = list(metadata.get("tags") or [])
+    for tag in (
+        f"route:{config.route_family}",
+        config.tag_prefix,
+        f"{config.tag_prefix}-model:{adapter_model}",
+        f"{config.tag_prefix}-target:{config.target_endpoint_label}",
+    ):
+        if tag not in tags:
+            tags.append(tag)
+
+    spans = list(metadata.get("langfuse_spans") or [])
+    spans.append(
+        {
+            "name": config.span_name,
+            "metadata": {
+                "requested_model": prepared_request_body.get("model"),
+                "adapter_model": adapter_model,
+                "upstream_model": upstream_model,
+                "stream": bool(prepared_request_body.get("stream")),
+            },
+        }
+    )
+    metadata.update(
+        {
+            "tags": tags,
+            "langfuse_spans": spans,
+            "passthrough_route_family": config.route_family,
+            "route_family": config.route_family,
+            "codex_cohere_adapter_model": adapter_model,
+            "codex_cohere_upstream_model": upstream_model,
+            "codex_adapter_model": adapter_model,
+            "codex_adapter_original_model": prepared_request_body.get("model"),
+            "codex_adapter_target_endpoint": config.target_endpoint_label,
+        }
+    )
+    request_body["litellm_metadata"] = metadata
+    return request_body
+
+
+async def _prepare_codex_cohere_chat_completions_adapter_route(
+    *,
+    request: Request,
+    prepared_request_body: Payload,
+    adapter_model: str,
+    use_alias_candidate_probe: bool = False,
+) -> "_aawm_adapter_driver.CompletionAdapterRoutePlan":
+    _ = request, use_alias_candidate_probe
+    normalized_model = adapter_model.strip() if isinstance(adapter_model, str) else ""
+    provider, separator, upstream_model = normalized_model.partition("/")
+    if (
+        provider != _CODEX_AUTO_AGENT_COHERE_PROVIDER
+        or not separator
+        or not upstream_model
+        or "/" in upstream_model
+    ):
+        raise ValueError(
+            "Codex Cohere adapter requires a cohere/<model> candidate."
+        )
+
+    from litellm.proxy.pass_through_endpoints.providers.cohere import (
+        runtime as _cohere_runtime,
+    )
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    adapted_request_body, _adapted_custom_tools = (
+        _adapt_codex_custom_tools_to_functions_from_request_body(
+            prepared_request_body
+        )
+    )
+    adapted_request_body, _adapted_namespace_tools = (
+        _adapt_codex_namespace_tools_to_functions_from_request_body(
+            adapted_request_body
+        )
+    )
+    adapted_request_body, _tool_description_patch_events = (
+        _apply_codex_tool_description_patches_to_request_body(adapted_request_body)
+    )
+    adapted_request_body, _unsupported_hosted_tools = (
+        _drop_unsupported_codex_hosted_tools_from_request_body(adapted_request_body)
+    )
+    adapted_request_body, _unsupported_input_items = (
+        _drop_unsupported_codex_input_items_from_request_body(adapted_request_body)
+    )
+    adapted_request_body, _removed_tool_choice = (
+        _drop_tool_choice_without_tools_from_request_body(adapted_request_body)
+    )
+    config = _aawm_adapter_config.CODEX_COHERE_CHAT_COMPLETIONS
+    request_body = _build_codex_cohere_adapter_request_body(
+        prepared_request_body=adapted_request_body,
+        adapter_model=normalized_model,
+        upstream_model=upstream_model,
+        config=config,
+    )
+    request_input = request_body.get("input", "")
+    responses_api_request = cast(
+        ResponsesAPIOptionalRequestParams,
+        {
+            key: value
+            for key, value in request_body.items()
+            if key not in {"input", "model", "litellm_metadata"}
+        },
+    )
+    litellm_metadata = dict(request_body.get("litellm_metadata") or {})
+    completion_kwargs = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+        model=upstream_model,
+        input=request_input,
+        responses_api_request=responses_api_request,
+        custom_llm_provider=_CODEX_AUTO_AGENT_COHERE_PROVIDER,
+        stream=bool(request_body.get("stream")),
+        metadata=litellm_metadata,
+    )
+    completion_kwargs.update(
+        {
+            "metadata": litellm_metadata,
+            "custom_llm_provider": _CODEX_AUTO_AGENT_COHERE_PROVIDER,
+            "num_retries": 0,
+        }
+    )
+    previous_response_id = responses_api_request.get("previous_response_id")
+    if isinstance(previous_response_id, str) and previous_response_id:
+        completion_kwargs = await LiteLLMCompletionResponsesConfig.async_responses_api_session_handler(
+            previous_response_id=previous_response_id,
+            litellm_completion_request=completion_kwargs,
+        )
+
+    target_url = _cohere_runtime._get_cohere_target_base()
+    api_key = _cohere_runtime._require_cohere_api_key()
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url=target_url,
+        headers={"Authorization": f"Bearer {api_key}"},
+        credential_family=config.credential_family,
+        expected_target_family=config.expected_target_family,
+    )
+    return _aawm_adapter_driver.CompletionAdapterRoutePlan(
+        config=config,
+        prepared_request_body=request_body,
+        target_url=target_url,
+        api_key=api_key,
+        api_base=target_url,
+        client_requested_stream=bool(request_body.get("stream")),
+        perform_kwargs={
+            "completion_kwargs": completion_kwargs,
+            "request_input": request_input,
+            "responses_api_request": responses_api_request,
+            "litellm_metadata": litellm_metadata,
+            "upstream_model": upstream_model,
+        },
+    )
+
+
+async def _perform_codex_cohere_chat_completions_adapter_call(
+    *,
+    config: "_aawm_adapter_config.AnthropicCompletionAdapterConfig",
+    request: Request,
+    prepared_request_body: Payload,
+    adapter_model: str,
+    target_url: Union[str, httpx.URL],
+    api_key: str,
+    api_base: str,
+    client_requested_stream: bool,
+    completion_kwargs: Payload,
+    request_input: Any,
+    responses_api_request: ResponsesAPIOptionalRequestParams,
+    litellm_metadata: Payload,
+    upstream_model: str,
+) -> Response:
+    from litellm.responses.litellm_completion_transformation.streaming_iterator import (
+        LiteLLMCompletionStreamingIterator,
+    )
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    _ = config, adapter_model
+    _annotate_request_scope_for_adapted_access_log(request, httpx.URL(str(target_url)))
+    completion_response = await litellm.acompletion(
+        **completion_kwargs,
+        api_key=api_key,
+        api_base=api_base,
+        litellm_metadata=litellm_metadata,
+        proxy_server_request={
+            "headers": {},
+            "body": prepared_request_body,
+        },
+        shared_session=_get_proxy_shared_aiohttp_session(),
+    )
+    if client_requested_stream:
+        return StreamingResponse(
+            _responses_sse_from_iterator(
+                LiteLLMCompletionStreamingIterator(
+                    model=upstream_model,
+                    litellm_custom_stream_wrapper=completion_response,
+                    request_input=request_input,
+                    responses_api_request=responses_api_request,
+                    custom_llm_provider=_CODEX_AUTO_AGENT_COHERE_PROVIDER,
+                    litellm_metadata=litellm_metadata,
+                )
+            ),
+            media_type="text/event-stream",
+        )
+
+    responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+        chat_completion_response=completion_response,
+        request_input=request_input,
+        responses_api_request=responses_api_request,
+    )
+    return _build_responses_response_from_adapter_response(responses_api_response)
+
+
+async def _handle_codex_cohere_chat_completions_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: Any,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+    use_alias_candidate_probe: bool = False,
+) -> Response:
+    _ = endpoint, fastapi_response, user_api_key_dict
+    rollup_kwargs: dict[str, Any] = {}
+
+    async def _prepare_and_emit_route_log(
+        **kwargs: Any,
+    ) -> "_aawm_adapter_driver.CompletionAdapterRoutePlan":
+        plan = await _prepare_codex_cohere_chat_completions_adapter_route(**kwargs)
+        metadata = plan.perform_kwargs.get("litellm_metadata")
+        if not isinstance(metadata, dict):
+            metadata = plan.prepared_request_body.get("litellm_metadata")
+        rollup_kwargs.update(
+            _build_adapted_route_rollup_kwargs(
+                metadata if isinstance(metadata, dict) else {}
+            )
+        )
+        _annotate_request_scope_for_adapted_access_log(request, plan.target_url)
+        provider_bound_body = plan.perform_kwargs.get("completion_kwargs")
+        if not isinstance(provider_bound_body, dict):
+            provider_bound_body = None
+        _emit_adapted_route_access_log(
+            request=request,
+            target_url=str(plan.target_url),
+            request_body=plan.prepared_request_body,
+            rollup_kwargs=rollup_kwargs,
+            adapter_label="Cohere",
+            provider_bound_body=provider_bound_body,
+        )
+        return plan
+
+    response = await _aawm_adapter_driver.run_completion_adapter_route(
+        prepare=_prepare_and_emit_route_log,
+        perform=_perform_codex_cohere_chat_completions_adapter_call,
+        request=request,
+        prepared_request_body=prepared_request_body,
+        adapter_model=adapter_model,
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
+    intake_context = _build_malformed_tool_call_intake_context(
+        request,
+        prepared_request_body,
+        adapter="codex_cohere_chat_completions_adapter",
+        provider=_CODEX_AUTO_AGENT_COHERE_PROVIDER,
+    )
+    if isinstance(response, StreamingResponse):
+        response = _bind_responses_stream_timeout_terminalizer(
+            response,
+            adapter_model=adapter_model,
+            adapter_label="Cohere",
+            provider=_CODEX_AUTO_AGENT_COHERE_PROVIDER,
+            intake_context=intake_context,
+            rollup_kwargs=rollup_kwargs,
+        )
+    validated_response = await _validate_codex_auto_agent_responses_payload(
+        response,
+        adapter_model=adapter_model,
+        adapter="codex_cohere_chat_completions_adapter",
+        adapter_label="Cohere",
+        intake_context=intake_context,
+        request_body=prepared_request_body,
+    )
+    if isinstance(validated_response, StreamingResponse):
+        return _record_adapted_completed_route_rollup_after_stream(
+            validated_response,
+            rollup_kwargs,
+            adapter_label="Cohere",
+        )
+    _record_adapted_completed_route_rollup_turn(
+        rollup_kwargs,
+        adapter_label="Cohere",
+    )
+    return validated_response
 
 
 

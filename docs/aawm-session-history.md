@@ -849,6 +849,24 @@ tariff remains the only standard cost input, including an explicit zero tariff.
 Unknown cache token counts and unsupported or non-exact equivalence fail closed
 to `status=unpriced`.
 
+### Direct Cohere provenance
+
+The AAWM direct Codex Cohere alias route is separate from OpenRouter traffic,
+even when an OpenRouter model label contains `cohere`. Proven selection/attempt
+metadata retains the exact selected model and alias together with
+`provider=cohere`, `lane=cohere_native`, and the
+`codex_cohere_chat_completions_adapter` route. The route-rollup endpoint label
+may identify the default endpoint `https://api.cohere.com/v2/chat`; the effective
+endpoint may be validated as native Chat V2 on `api.cohere.com` or
+`api.cohere.ai`. The OpenRouter fallback is
+`openrouter/cohere/north-mini-code:free` and remains distinct from the direct
+route.
+
+The direct route uses the canonical runtime credential `COHERE_API_KEY`; the
+Compose-only development compatibility source is `COHERE_KEY`. Credential
+values, tokens, and key material must never be persisted in session history,
+metadata, traces, logs, or documentation.
+
 The 2026-08-12 catalog includes the current undiscounted international Alibaba
 Cloud Model Studio direct list rates as references: Qwen 3.6 uses the base
 `$0.25/$1.50` per million input/output tier through 256000 whole-request input
@@ -857,7 +875,8 @@ uses `$2.50/$7.50`, and Alibaba DeepSeek V4 Pro uses `$2.40/$4.80`. These
 direct list rates are distinct from Token Plan subscription economics and do
 not claim subscription invoice cost. Direct DeepSeek Flash and Pro reference
 rates include provider cache reads. OpenRouter North uses the NanoGPT and
-Routeway hosted-model catalog consensus for `cohere/north-mini-code-1-0`, not
+Routeway hosted-model catalog consensus for
+`openrouter/cohere/north-mini-code:free`, not
 direct Cohere pricing. Owl Alpha, Big Pickle, and OpenCode's free DeepSeek
 route remain explicitly unpriced because their required equivalence evidence is
 absent. Alibaba subscription routes retain unknown invoice cost even when a

@@ -213,6 +213,17 @@ ANTHROPIC_ALIBABA_TOKEN_PLAN = AnthropicCompletionAdapterConfig(
     custom_llm_provider="alibaba_token_plan",
 )
 
+CODEX_COHERE_CHAT_COMPLETIONS = AnthropicCompletionAdapterConfig(
+    adapter="codex_cohere_chat_completions_adapter",
+    adapter_label="Cohere",
+    route_family="codex_cohere_chat_completions_adapter",
+    tag_prefix="codex-cohere-chat-completions-adapter",
+    span_name="codex.cohere_chat_completions_adapter",
+    target_endpoint_label="cohere:/v2/chat",
+    credential_family="cohere",
+    expected_target_family="cohere",
+    custom_llm_provider="cohere",
+)
 
 def responses_finalize_kwargs(
     config: AnthropicResponsesAdapterConfig,

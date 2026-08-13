@@ -431,3 +431,36 @@ A name that is absent from the snapshot is an ordinary unknown model identity
 and follows the same generic snapshot lookup failure as every other absent
 name. No identity-specific recognition, rejection, redirect, or compatibility
 path applies.
+
+## Cohere source identity (COHERE-001)
+
+The AAWM direct Codex Cohere alias route is a **direct, native provider lane**,
+not routed through OpenRouter or any other proxy egress. It uses the Cohere API
+with `https://api.cohere.com/v2/chat` as the default endpoint. The effective
+endpoint may be validated as native Chat V2 on `api.cohere.com` or
+`api.cohere.ai`. The provider/lane identity is `cohere` / `cohere_native`.
+Codex-shaped ingress selects the `codex_cohere_chat_completions_adapter` route
+family. This is a Codex adapter route to Cohere's native API, not an OpenRouter
+route.
+
+### Provider identity
+
+- The direct Codex Cohere alias route must originate from the Cohere-native
+  provider route. Cross-provider routes (e.g. through OpenRouter, Codex OAuth
+  adapters, or ChatGPT backend-api) are not direct Cohere alias traffic.
+- Proven selection/attempt metadata is limited to the alias, provider, model,
+  route, and lane. The route-rollup endpoint label may also identify the
+  endpoint. Aliases that include Cohere candidates set the exact `model` string
+  and `provider: cohere` in YAML; the selected route family is
+  `codex_cohere_chat_completions_adapter` and the lane is `cohere_native`.
+- Direct Cohere is separate from OpenRouter. An OpenRouter candidate such as
+  `openrouter/cohere/north-mini-code:free` remains an OpenRouter request and must not be
+  recorded or interpreted as direct Cohere-native traffic.
+
+### Dev compatibility key
+
+- Canonical runtime credential environment variable: **`COHERE_API_KEY`**.
+- The legacy **`COHERE_KEY`** is retained only as a dev-time compatibility
+  fallback. It does not appear in production deployments. Do not introduce new
+  references to `COHERE_KEY`; prefer `COHERE_API_KEY` consistently across new
+  code, configs, and documentation.

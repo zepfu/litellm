@@ -36,6 +36,8 @@ from .policy import (
     ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER as _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+    CODEX_AUTO_AGENT_COHERE_LANE_KEY as _CODEX_AUTO_AGENT_COHERE_LANE_KEY,
+    CODEX_AUTO_AGENT_COHERE_PROVIDER as _CODEX_AUTO_AGENT_COHERE_PROVIDER,
     CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY as _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
     CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER as _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
     CODEX_AUTO_AGENT_NATIVE_PROVIDER as _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
@@ -1247,7 +1249,7 @@ async def _get_anthropic_auto_agent_candidate_cooldown_state(
     provider: str,
     cooldown_key: str,
 ) -> tuple[float, str]:
-    """OpenAI/Codex candidates merge Anthropic + Codex cooldown; others use Anthropic-only."""
+    """Dual-ingress candidates merge Anthropic + Codex cooldown; others use Anthropic-only."""
     assert _get_anthropic_merged_codex_openai_cooldown_state is not None
     assert _get_anthropic_active_cooldown_state is not None
     if provider in {
@@ -1285,6 +1287,8 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         lane_key = _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY
     elif candidate["provider"] == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
         lane_key = _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY
+    elif candidate["provider"] == _CODEX_AUTO_AGENT_COHERE_PROVIDER:
+        lane_key = _CODEX_AUTO_AGENT_COHERE_LANE_KEY
     elif candidate["provider"] == _CODEX_AUTO_AGENT_OPENCODE_PROVIDER:
         lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
     else:

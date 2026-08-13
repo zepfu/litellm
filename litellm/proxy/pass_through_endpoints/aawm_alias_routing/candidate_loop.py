@@ -35,8 +35,13 @@ import asyncio
 import hashlib
 from typing import TYPE_CHECKING, Any, Optional
 
+import httpx
+
 from litellm.proxy.aawm_route_logging import (
     register_aawm_route_rollup_access_log_replacement,
+)
+from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.cohere import (
+    classify_cohere_failure,
 )
 
 from . import error_signals as _error_signals
@@ -142,6 +147,52 @@ def configure_candidate_loop_runtime(
 
 def _active_lane_identity_hash(*, candidate: dict[str, Any]) -> str:
     return _resolve_lane_identity_hash_fn(candidate=candidate)
+
+
+_CODEX_COHERE_PROVIDER = "cohere"
+_CODEX_COHERE_ROUTE_FAMILY = "codex_cohere_chat_completions_adapter"
+_CODEX_COHERE_CHAT_V2_URL = httpx.URL("https://api.cohere.com/v2/chat")
+
+
+def _classify_codex_cohere_candidate_failure(
+    exc: Exception,
+    *,
+    candidate: Optional[dict[str, Any]],
+    is_codex_alias: bool,
+) -> Optional[str]:
+    """Translate direct Cohere failures into the enforced Codex vocabulary."""
+
+    if (
+        not is_codex_alias
+        or not isinstance(candidate, dict)
+        or candidate.get("provider") != _CODEX_COHERE_PROVIDER
+        or candidate.get("route_family") != _CODEX_COHERE_ROUTE_FAMILY
+    ):
+        return None
+
+    classification = classify_cohere_failure(
+        url=_CODEX_COHERE_CHAT_V2_URL,
+        custom_llm_provider=_CODEX_COHERE_PROVIDER,
+        status_code=_error_signals._extract_adapter_exception_status_code(exc),
+        exc=exc,
+    )
+    if (
+        classification is None
+        or classification.cooldown_scope != "candidate"
+        or not classification.advance_fresh_candidate
+    ):
+        return None
+    if classification.name == "cohere_timeout_connectivity":
+        return "upstream_timeout"
+    return {
+        "auth": "provider_terminal_error",
+        "quota_exhausted": "usage_limit_reached",
+        "rate_limit": "rate_limited",
+        "model_unavailable": "candidate_unavailable",
+        "provider_4xx_other": "provider_terminal_error",
+        "provider_5xx": "provider_terminal_error",
+        "transient": "provider_terminal_error",
+    }.get(classification.failure_class)
 
 
 async def handle_alias_route(  # noqa: PLR0915
@@ -642,6 +693,12 @@ async def handle_alias_route(  # noqa: PLR0915
                 )
                 error_class = _classify_kimi_code_auto_agent_probe_failure(kimi_failure_metadata)
                 if error_class is None:
+                    error_class = _classify_codex_cohere_candidate_failure(
+                        failure_exc,
+                        candidate=candidate,
+                        is_codex_alias=codex_failure_evidence_alias is not None,
+                    )
+                if error_class is None:
                     error_class = _classify_codex_auto_agent_retryable_exhaustion(
                         failure_exc, candidate=candidate
                     )
@@ -893,6 +950,12 @@ def _resolve_failure_plan(
     """
     kimi_failure_metadata = kimi_failure_metadata_fn(exc, candidate=candidate)
     error_class = classify_kimi_fn(kimi_failure_metadata)
+    if error_class is None:
+        error_class = _classify_codex_cohere_candidate_failure(
+            exc,
+            candidate=candidate,
+            is_codex_alias=codex_failure_evidence_alias is not None,
+        )
     if error_class is None:
         error_class = classify_retryable_fn(exc, candidate=candidate)
     grok_account_quota_exhausted = grok_quota_fn(exc, candidate=candidate)

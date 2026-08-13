@@ -77,6 +77,47 @@ _OPENAI_NATIVE_PROVIDERS: frozenset[str] = frozenset(
         "openai",
     }
 )
+_COHERE_CREDENTIAL_ROUTE_FAMILIES: frozenset[str] = frozenset(
+    {
+        "codex_cohere_chat_completions_adapter",
+    }
+)
+_COHERE_NATIVE_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "cohere",
+    }
+)
+
+
+def _validate_cohere_credential_domain(
+    *,
+    provider: str,
+    model: str,
+    route_family: Optional[str],
+    anthropic_route_family: Optional[str],
+) -> None:
+    route_families = tuple(
+        value
+        for value in (route_family, anthropic_route_family)
+        if value is not None
+    )
+    uses_cohere_credentials = any(
+        value in _COHERE_CREDENTIAL_ROUTE_FAMILIES for value in route_families
+    )
+    is_cohere_provider = provider in _COHERE_NATIVE_PROVIDERS
+
+    if uses_cohere_credentials and not is_cohere_provider:
+        raise ConfigCompileError(
+            f"candidate model {model!r}: provider {provider!r} is incompatible "
+            "with Cohere-credential route family"
+        )
+    if is_cohere_provider and any(
+        value not in _COHERE_CREDENTIAL_ROUTE_FAMILIES for value in route_families
+    ):
+        raise ConfigCompileError(
+            f"candidate model {model!r}: provider {provider!r} requires "
+            "Cohere-native route families"
+        )
 
 
 def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> RoutingCandidate:
@@ -90,13 +131,25 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
         candidate.route_family,
         candidate.anthropic_route_family,
     )
+    if (
+        candidate.route_family in schema.CODEX_ONLY_ROUTE_FAMILIES
+        and candidate.anthropic_route_family is not None
+    ):
+        raise ConfigCompileError(
+            f"candidate model {candidate.model!r}: Codex-only route family "
+            f"{candidate.route_family!r} cannot set anthropic_route_family"
+        )
     # Ambiguous route families (e.g. codex_opencode_zen_adapter) may compile
     # with anthropic_route_family=None; the Anthropic ingress dispatch path
     # fails closed when shaping such candidates.  Non-ambiguous, unmapped
-    # families with no explicit override are a compile-time error.
+    # families with no explicit override are a compile-time error, except for
+    # route families explicitly marked Codex-only.
     if anthropic_rf is None and (
         candidate.route_family is None
-        or candidate.route_family not in schema.AMBIGUOUS_CODEX_ROUTE_FAMILIES
+        or (
+            candidate.route_family not in schema.AMBIGUOUS_CODEX_ROUTE_FAMILIES
+            and candidate.route_family not in schema.CODEX_ONLY_ROUTE_FAMILIES
+        )
     ):
         raise ConfigCompileError(
             f"candidate model {candidate.model!r} has no resolvable Anthropic-ingress "
@@ -119,6 +172,12 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
             f"candidate model {candidate.model!r}: provider {candidate.provider!r} "
             f"is incompatible with anthropic-credential route_family {anthropic_rf!r}"
         )
+    _validate_cohere_credential_domain(
+        provider=candidate.provider,
+        model=candidate.model,
+        route_family=candidate.route_family,
+        anthropic_route_family=anthropic_rf,
+    )
     return RoutingCandidate(
         provider=candidate.provider,
         model=candidate.model,

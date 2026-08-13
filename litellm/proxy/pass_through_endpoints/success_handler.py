@@ -42,6 +42,7 @@ from .llm_provider_handlers.gemini_passthrough_logging_handler import (
 from .llm_provider_handlers.vertex_passthrough_logging_handler import (
     VertexPassthroughLoggingHandler,
 )
+from .provider_failure_classifiers.cohere import is_cohere_api_url
 
 _ANTHROPIC_RATE_LIMIT_HEADER_PREFIXES = (
     "anthropic-ratelimit-",
@@ -545,7 +546,10 @@ class PassThroughEndpointLogging:
             kwargs = anthropic_passthrough_logging_handler_result["kwargs"]
         elif custom_llm_provider == "xai" and self.is_openai_route(url_route):
             return return_dict
-        elif self.is_cohere_route(url_route):
+        elif self.is_cohere_route(
+            url_route,
+            custom_llm_provider=custom_llm_provider,
+        ):
             cohere_passthrough_logging_handler_result = (
                 CoherePassthroughLoggingHandler.cohere_passthrough_handler(
                     httpx_response=httpx_response,
@@ -706,10 +710,22 @@ class PassThroughEndpointLogging:
                 return True
         return False
 
-    def is_cohere_route(self, url_route: str):
-        for route in self.TRACKED_COHERE_ROUTES:
-            if route in url_route:
-                return True
+    def is_cohere_route(
+        self,
+        url_route: str,
+        custom_llm_provider: Optional[str] = None,
+    ) -> bool:
+        parsed_url = urlparse(url_route)
+        path = parsed_url.path if parsed_url.scheme else url_route
+        is_supported_path = any(
+            path == route or path.startswith(f"{route}/")
+            for route in self.TRACKED_COHERE_ROUTES
+        )
+        if not is_supported_path:
+            return False
+        if parsed_url.scheme:
+            return is_cohere_api_url(url_route)
+        return str(custom_llm_provider or "").strip().lower() == "cohere"
 
     def is_assemblyai_route(self, url_route: str):
         parsed_url = urlparse(url_route)

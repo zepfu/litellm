@@ -17,6 +17,9 @@ from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.chatgpt_c
     _is_known_chatgpt_codex_invalid_encrypted_content_response,
     _is_known_chatgpt_codex_model_not_supported_for_account_response,
 )
+from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.cohere import (
+    classify_cohere_failure,
+)
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.openai import (
     _get_openai_model_not_found_error_summary,
     _get_openai_model_not_found_failure_kind,
@@ -48,6 +51,9 @@ class PassthroughProviderFailureClassification:
     failure_kind: Optional[str] = None
     log_message: Optional[str] = None
     log_error_summary: Optional[str] = None
+    failure_class: Optional[str] = None
+    cooldown_scope: Optional[str] = None
+    advance_fresh_candidate: Optional[bool] = None
     # Historical contract: known Grok account/auth failures skip the generic
     # post_call_failure_hook path (already classified / noisy).
     skip_post_call_failure_hook: bool = False
@@ -311,6 +317,35 @@ def _classify_anthropic_known_failure(
     )
 
 
+def _classify_cohere_known_failure(
+    *,
+    request: Request,
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+    status_code: Optional[int],
+    exc: Exception,
+) -> Optional[PassthroughProviderFailureClassification]:
+    del request
+    classification = classify_cohere_failure(
+        url=url,
+        custom_llm_provider=custom_llm_provider,
+        status_code=status_code,
+        exc=exc,
+    )
+    if classification is None:
+        return None
+    return PassthroughProviderFailureClassification(
+        name=classification.name,
+        suppress_traceback=classification.suppress_traceback,
+        failure_kind=classification.failure_kind,
+        log_message="Pass through endpoint surfaced classified Cohere failure status=%s",
+        log_error_summary=classification.log_error_summary,
+        failure_class=classification.failure_class,
+        cooldown_scope=classification.cooldown_scope,
+        advance_fresh_candidate=classification.advance_fresh_candidate,
+    )
+
+
 # Ordered data-driven registry. First matching classifier wins (short-circuit).
 PASSTHROUGH_PROVIDER_FAILURE_CLASSIFIERS: Sequence[ProviderFailureClassifier] = (
     _classify_grok_billing_timeout_cancel,
@@ -322,6 +357,7 @@ PASSTHROUGH_PROVIDER_FAILURE_CLASSIFIERS: Sequence[ProviderFailureClassifier] = 
     _classify_chatgpt_codex_invalid_encrypted_content,
     _classify_chatgpt_codex_model_not_supported,
     _classify_openai_model_not_found,
+    _classify_cohere_known_failure,
     _classify_anthropic_known_failure,
 )
 
