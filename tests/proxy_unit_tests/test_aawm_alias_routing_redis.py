@@ -829,6 +829,209 @@ async def test_aawm_alias_routing_redis_failed_initialization_then_retry_succeed
 
 
 @pytest.mark.asyncio
+async def test_aawm_alias_routing_redis_concurrent_initializations_keep_latest_client(
+    monkeypatch,
+):
+    _reset_aawm_alias_env(monkeypatch)
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_HOST", "aawm-host")
+
+    first_cache = _build_fake_aawm_alias_cache()
+    second_cache = _build_fake_aawm_alias_cache()
+    first_ping_started = asyncio.Event()
+    release_first_ping = asyncio.Event()
+
+    async def _first_ping():
+        first_ping_started.set()
+        await release_first_ping.wait()
+        return True
+
+    first_cache.ping = AsyncMock(side_effect=_first_ping)
+
+    with patch(
+        "litellm.proxy.aawm_alias_routing_redis.RedisCache",
+        side_effect=[first_cache, second_cache],
+    ):
+        manager = AAWMAliasRoutingRedisManager()
+        manager.STARTUP_RETRY_DELAY_SECONDS = 0
+        first_task = asyncio.create_task(manager.initialize())
+        await first_ping_started.wait()
+        second_task = asyncio.create_task(manager.initialize())
+
+        try:
+            await second_task
+            assert manager._cache is second_cache
+            release_first_ping.set()
+            await first_task
+            assert manager._cache is second_cache
+            assert first_cache.disconnect.await_count == 1
+            assert second_cache.disconnect.await_count == 0
+        finally:
+            release_first_ping.set()
+            if not first_task.done():
+                await first_task
+            await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_redis_failed_generation_cannot_overwrite_success(
+    monkeypatch,
+):
+    _reset_aawm_alias_env(monkeypatch)
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_HOST", "aawm-host")
+
+    failed_cache = _build_fake_aawm_alias_cache()
+    healthy_cache = _build_fake_aawm_alias_cache()
+    failed_ping_started = asyncio.Event()
+    release_failed_ping = asyncio.Event()
+
+    async def _failed_ping():
+        failed_ping_started.set()
+        await release_failed_ping.wait()
+        raise RuntimeError("redis unavailable")
+
+    failed_cache.ping = AsyncMock(side_effect=_failed_ping)
+
+    with patch(
+        "litellm.proxy.aawm_alias_routing_redis.RedisCache",
+        side_effect=[failed_cache, healthy_cache],
+    ):
+        manager = AAWMAliasRoutingRedisManager()
+        manager.STARTUP_CONNECT_ATTEMPTS = 1
+        manager.STARTUP_RETRY_DELAY_SECONDS = 0
+        failed_task = asyncio.create_task(manager.initialize())
+        await failed_ping_started.wait()
+        healthy_task = asyncio.create_task(manager.initialize())
+
+        try:
+            await healthy_task
+            assert manager._cache is healthy_cache
+            release_failed_ping.set()
+            await failed_task
+            assert manager._cache is healthy_cache
+            assert manager.get_status()["reachable"] is True
+            assert failed_cache.disconnect.await_count == 1
+        finally:
+            release_failed_ping.set()
+            if not failed_task.done():
+                await failed_task
+            await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_redis_shutdown_rejects_inflight_initialization(
+    monkeypatch,
+):
+    _reset_aawm_alias_env(monkeypatch)
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_HOST", "aawm-host")
+
+    in_flight_cache = _build_fake_aawm_alias_cache()
+    ping_started = asyncio.Event()
+    release_ping = asyncio.Event()
+
+    async def _blocked_ping():
+        ping_started.set()
+        await release_ping.wait()
+        return True
+
+    in_flight_cache.ping = AsyncMock(side_effect=_blocked_ping)
+
+    with patch(
+        "litellm.proxy.aawm_alias_routing_redis.RedisCache",
+        side_effect=lambda *args, **kwargs: in_flight_cache,
+    ):
+        manager = AAWMAliasRoutingRedisManager()
+        manager.STARTUP_CONNECT_ATTEMPTS = 1
+        initialize_task = asyncio.create_task(manager.initialize())
+        await ping_started.wait()
+
+        try:
+            await manager.shutdown()
+            assert manager.get_dual_cache() is None
+            assert manager.get_status()["configured"] is False
+            release_ping.set()
+            await initialize_task
+            assert manager.get_dual_cache() is None
+            assert manager.get_status()["mode"] == "memory"
+            assert in_flight_cache.disconnect.await_count == 1
+        finally:
+            release_ping.set()
+            if not initialize_task.done():
+                await initialize_task
+            await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_redis_reconfigure_closes_only_previous_client(
+    monkeypatch,
+):
+    _reset_aawm_alias_env(monkeypatch)
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_HOST", "aawm-host")
+
+    first_cache = _build_fake_aawm_alias_cache()
+    second_cache = _build_fake_aawm_alias_cache()
+    second_ping_started = asyncio.Event()
+    release_second_ping = asyncio.Event()
+
+    async def _second_ping():
+        second_ping_started.set()
+        await release_second_ping.wait()
+        return True
+
+    second_cache.ping = AsyncMock(side_effect=_second_ping)
+
+    with patch(
+        "litellm.proxy.aawm_alias_routing_redis.RedisCache",
+        side_effect=[first_cache, second_cache],
+    ):
+        manager = AAWMAliasRoutingRedisManager()
+        await manager.initialize()
+        monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_PORT", "6380")
+        reconfigure_task = asyncio.create_task(manager.initialize())
+        await second_ping_started.wait()
+
+        try:
+            assert manager.get_dual_cache() is None
+            release_second_ping.set()
+            await reconfigure_task
+            assert manager._cache is second_cache
+            assert first_cache.disconnect.await_count == 1
+            assert second_cache.disconnect.await_count == 0
+        finally:
+            release_second_ping.set()
+            if not reconfigure_task.done():
+                await reconfigure_task
+            await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_aawm_alias_routing_redis_repeated_shutdown_allows_startup_again(
+    monkeypatch,
+):
+    _reset_aawm_alias_env(monkeypatch)
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_HOST", "aawm-host")
+
+    first_cache = _build_fake_aawm_alias_cache()
+    second_cache = _build_fake_aawm_alias_cache()
+
+    with patch(
+        "litellm.proxy.aawm_alias_routing_redis.RedisCache",
+        side_effect=[first_cache, second_cache],
+    ):
+        manager = AAWMAliasRoutingRedisManager()
+        await manager.initialize()
+        await manager.shutdown()
+        await manager.shutdown()
+        await manager.initialize()
+        assert manager._cache is second_cache
+        await manager.shutdown()
+        await manager.shutdown()
+
+    assert first_cache.disconnect.await_count == 1
+    assert second_cache.disconnect.await_count == 1
+    assert manager.get_dual_cache() is None
+
+
+@pytest.mark.asyncio
 async def test_aawm_alias_routing_redis_shutdown_twice_after_success_and_after_failure(
     monkeypatch,
 ):

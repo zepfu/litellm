@@ -18,6 +18,15 @@ from litellm.caching.redis_cache import RedisCache
 
 logger = logging.getLogger(__name__)
 
+RedisClientOwnership = tuple[RedisCache, int]
+InitializeTransition = tuple[
+    Dict[str, Any],
+    int,
+    Optional[RedisClientOwnership],
+    Optional[asyncio.Task[Any]],
+    str,
+]
+
 # Durable-write retry policy lives here so connection/timeout and write resilience
 # share one subsystem owner. redis.exceptions is imported at module top with a
 # guarded fallback so hot write paths never pay an inline import.
@@ -100,7 +109,11 @@ class AAWMAliasRoutingRedisManager:
     SELF_HEAL_INTERVAL_ENV_VAR = "AAWM_ALIAS_ROUTING_REDIS_SELF_HEAL_INTERVAL_SECONDS"
 
     def __init__(self) -> None:
+        self._lifecycle_lock = asyncio.Lock()
+        self._lifecycle_generation = 0
         self._cache: Optional[RedisCache] = None
+        self._cache_generation: Optional[int] = None
+        self._closing_clients: list[RedisClientOwnership] = []
         self._managed_dual_cache: Optional[DualCache] = None
         self._configured: bool = False
         self._config_mode: str = "unconfigured"
@@ -108,6 +121,8 @@ class AAWMAliasRoutingRedisManager:
         self._reachable: Union[bool, str] = "unknown"
         self._error_type: Optional[str] = None
         self._namespace: str = self.DEFAULT_NAMESPACE
+        self._config_signature: Optional[tuple[tuple[str, Any], ...]] = None
+        self._active_attempts: list[RedisClientOwnership] = []
         self._self_heal_task: Optional[asyncio.Task[Any]] = None
         self._self_heal_stop: Optional[asyncio.Event] = None
         # Set when initialize() has observed a configured Redis that fell back to
@@ -215,6 +230,10 @@ class AAWMAliasRoutingRedisManager:
         }
 
     @staticmethod
+    def _build_config_signature(config: Dict[str, Any]) -> tuple[tuple[str, Any], ...]:
+        return tuple(sorted(config.items()))
+
+    @staticmethod
     def _build_key_prefix(namespace: str) -> str:
         return f"aawm:alias-routing:{namespace}"
 
@@ -307,28 +326,99 @@ class AAWMAliasRoutingRedisManager:
 
         self._managed_dual_cache = None
 
-    async def _disconnect_cached_client(self) -> None:
+    def _begin_lifecycle_transition_locked(self) -> int:
+        self._lifecycle_generation += 1
+        return self._lifecycle_generation
+
+    def _take_cached_client_locked(self) -> Optional[RedisClientOwnership]:
         if self._cache is None:
+            self._detach_cached_client()
+            self._cache = None
+            self._cache_generation = None
+            return None
+
+        ownership = (
+            self._cache,
+            self._cache_generation or self._lifecycle_generation,
+        )
+        self._detach_cached_client()
+        self._cache = None
+        self._cache_generation = None
+        return ownership
+
+    def _claim_self_heal_task_locked(self) -> Optional[asyncio.Task[Any]]:
+        task = self._self_heal_task
+        if self._self_heal_stop is not None:
+            self._self_heal_stop.set()
+        self._self_heal_task = None
+        self._self_heal_stop = None
+        return task
+
+    def _remove_active_attempt_locked(
+        self, cache: RedisCache, generation: int
+    ) -> None:
+        self._active_attempts = [
+            (owned_cache, attempt_generation)
+            for owned_cache, attempt_generation in self._active_attempts
+            if not (owned_cache is cache and attempt_generation == generation)
+        ]
+
+    def _is_client_closing_locked(self, cache: RedisCache) -> bool:
+        return any(owned_cache is cache for owned_cache, _ in self._closing_clients)
+
+    async def _disconnect_previous_cache(
+        self, previous_cache: Optional[RedisCache], *, message: str
+    ) -> None:
+        if previous_cache is None:
+            return
+        try:
+            await previous_cache.disconnect()
+        except Exception:
+            logger.debug(message, exc_info=True)
+
+    async def _disconnect_owned_client(
+        self, ownership: Optional[RedisClientOwnership], *, message: str
+    ) -> None:
+        """Close a client only after claiming its ownership under the lock."""
+        if ownership is None:
             return
 
-        try:
-            await self._cache.disconnect()
-        except Exception:
-            logger.debug("AAWM alias routing Redis disconnect failed", exc_info=True)
+        cache, generation = ownership
+        async with self._lifecycle_lock:
+            self._remove_active_attempt_locked(cache, generation)
+            if (
+                self._cache is cache
+                or self._is_client_closing_locked(cache)
+                or any(
+                    owned_cache is cache and attempt_generation > generation
+                    for owned_cache, attempt_generation in self._active_attempts
+                )
+            ):
+                return
 
-    async def _disconnect_attempt_cache(self, cache: Optional[RedisCache]) -> None:
+            self._closing_clients.append(ownership)
+        try:
+            await self._disconnect_previous_cache(cache, message=message)
+        finally:
+            async with self._lifecycle_lock:
+                self._closing_clients = [
+                    (owned_cache, owned_generation)
+                    for owned_cache, owned_generation in self._closing_clients
+                    if owned_cache is not cache
+                ]
+
+    async def _disconnect_attempt_cache(
+        self, cache: Optional[RedisCache], generation: int
+    ) -> None:
         if cache is None:
             return
-        try:
-            await cache.disconnect()
-        except Exception:
-            logger.debug(
-                "AAWM alias routing Redis close during initialize failed",
-                exc_info=True,
-            )
+        await self._disconnect_owned_client(
+            (cache, generation),
+            message="AAWM alias routing Redis close during initialize failed",
+        )
 
     async def _connect_with_startup_retries(
-        self, config: Dict[str, Any]
+        self, config: Dict[str, Any], generation: int
     ) -> tuple[Optional[RedisCache], Optional[BaseException]]:
         attempts = max(1, int(self.STARTUP_CONNECT_ATTEMPTS))
         delay_seconds = max(0.0, float(self.STARTUP_RETRY_DELAY_SECONDS))
@@ -338,12 +428,17 @@ class AAWMAliasRoutingRedisManager:
             cache: Optional[RedisCache] = None
             try:
                 cache = await self._build_redis_cache_off_loop(config)
+                async with self._lifecycle_lock:
+                    self._active_attempts.append((cache, generation))
                 if not await cache.ping():
                     raise RuntimeError("redis_ping_unreachable")
                 return cache, None
+            except asyncio.CancelledError:
+                await self._disconnect_attempt_cache(cache, generation)
+                raise
             except Exception as exc:
                 last_error = exc
-                await self._disconnect_attempt_cache(cache)
+                await self._disconnect_attempt_cache(cache, generation)
                 if attempt + 1 >= attempts:
                     break
                 logger.warning(
@@ -357,75 +452,68 @@ class AAWMAliasRoutingRedisManager:
 
         return None, last_error
 
-    async def _disconnect_previous_cache(
-        self, previous_cache: Optional[RedisCache], *, message: str
-    ) -> None:
-        if previous_cache is None:
-            return
-        try:
-            await previous_cache.disconnect()
-        except Exception:
-            logger.debug(message, exc_info=True)
-
-    async def initialize(self) -> None:
-        """Initialize the alias-routing cache and wire it when reachable."""
+    def _prepare_initialize_transition_locked(self) -> InitializeTransition:
         config = self._load_env_config()
+        generation = self._begin_lifecycle_transition_locked()
+        config_signature = self._build_config_signature(config)
         self._namespace = config["namespace"]
         self._configured = bool(config["configured"])
         self._config_mode = config["config_mode"]
+        configuration_changed = self._config_signature != config_signature
+        self._config_signature = config_signature
 
         if not self._configured:
-            previous_cache = self._cache
+            previous_cache = self._take_cached_client_locked()
             self._initialized = True
             self._reachable = "unknown"
             self._error_type = None
             self._self_heal_armed = False
-            self._detach_cached_client()
-            await self._disconnect_previous_cache(
-                previous_cache,
-                message="AAWM alias routing Redis close during disable failed",
-            )
-            self._cache = None
-            await self._stop_self_heal_task()
-            return
+            task_to_stop = self._claim_self_heal_task_locked()
+            return config, generation, previous_cache, task_to_stop, "disabled"
 
-        if self._initialized and self._is_cache_attached() and self._reachable is True:
+        if (
+            self._initialized
+            and self._is_cache_attached()
+            and self._reachable is True
+            and not configuration_changed
+        ):
             self._self_heal_armed = False
-            await self._stop_self_heal_task()
-            return
+            task_to_stop = self._claim_self_heal_task_locked()
+            return config, generation, None, task_to_stop, "already_initialized"
 
-        # Remove a prior attachment if this manager installed it before attempting
-        # to reconfigure/reattach.
-        self._detach_cached_client()
-        previous_cache = self._cache
+        return config, generation, self._take_cached_client_locked(), None, "connect"
 
-        cache, last_error = await self._connect_with_startup_retries(config)
-        if cache is not None:
-            dual_cache = self._ensure_dual_cache(cache)
-            if previous_cache is not cache:
-                await self._disconnect_previous_cache(
-                    previous_cache,
-                    message=(
-                        "AAWM alias routing Redis close during reconfigure failed"
-                    ),
-                )
+    def _commit_initialize_result_locked(
+        self,
+        generation: int,
+        cache: Optional[RedisCache],
+        last_error: Optional[BaseException],
+    ) -> tuple[
+        bool,
+        Optional[asyncio.Task[Any]],
+        Optional[RedisClientOwnership],
+    ]:
+        if generation != self._lifecycle_generation:
+            return True, None, None
+
+        if cache is not None and not self._is_client_closing_locked(cache):
+            replaced_cache = None
+            if self._cache is not None and self._cache is not cache:
+                replaced_cache = self._take_cached_client_locked()
+            self._remove_active_attempt_locked(cache, generation)
             self._cache = cache
-            self._managed_dual_cache = dual_cache
+            self._cache_generation = generation
+            self._managed_dual_cache = self._ensure_dual_cache(cache)
             self._reachable = True
             self._error_type = None
             self._initialized = True
             self._self_heal_armed = False
-            await self._stop_self_heal_task()
-            return
+            return False, self._claim_self_heal_task_locked(), replaced_cache
 
-        # Failed reconfiguration must not leave a detached previous client
-        # retained as a silent open connection; drop it and fall back visibly.
-        await self._disconnect_previous_cache(
-            previous_cache,
-            message=("AAWM alias routing Redis close during failed reconfigure failed"),
-        )
-        self._cache = None
-        self._managed_dual_cache = None
+        if cache is not None:
+            return True, None, None
+
+        replaced_cache = self._take_cached_client_locked()
         self._reachable = False
         self._error_type = type(last_error).__name__ if last_error is not None else None
         self._initialized = False
@@ -434,6 +522,52 @@ class AAWMAliasRoutingRedisManager:
             "AAWM alias routing Redis unavailable; using memory cache fallback."
         )
         self._ensure_self_heal_task()
+        return False, None, replaced_cache
+
+    async def initialize(self) -> None:
+        """Initialize the alias-routing cache and wire it when reachable."""
+        async with self._lifecycle_lock:
+            config, generation, previous_cache, task_to_stop, transition = (
+                self._prepare_initialize_transition_locked()
+            )
+
+        if transition == "disabled":
+            await self._finish_self_heal_task(task_to_stop)
+            await self._disconnect_owned_client(
+                previous_cache,
+                message="AAWM alias routing Redis close during disable failed",
+            )
+            return
+
+        if transition == "already_initialized":
+            await self._finish_self_heal_task(task_to_stop)
+            return
+
+        cache, last_error = await self._connect_with_startup_retries(
+            config, generation
+        )
+        async with self._lifecycle_lock:
+            stale_transition, task_to_stop, replaced_cache = (
+                self._commit_initialize_result_locked(generation, cache, last_error)
+            )
+
+        if stale_transition:
+            await self._disconnect_owned_client(
+                (cache, generation) if cache is not None else None,
+                message=(
+                    "AAWM alias routing Redis close for stale lifecycle attempt failed"
+                ),
+            )
+
+        await self._finish_self_heal_task(task_to_stop)
+        await self._disconnect_owned_client(
+            replaced_cache,
+            message="AAWM alias routing Redis close during reconfigure failed",
+        )
+        await self._disconnect_owned_client(
+            previous_cache,
+            message="AAWM alias routing Redis close during reconfigure failed",
+        )
 
     def _ensure_self_heal_task(self) -> None:
         """Schedule at most one background reconnect task after startup fallback."""
@@ -450,19 +584,14 @@ class AAWMAliasRoutingRedisManager:
             self._self_heal_stop.clear()
         self._self_heal_task = loop.create_task(self._self_heal_loop())
 
-    async def _stop_self_heal_task(self) -> None:
-        if self._self_heal_stop is not None:
-            self._self_heal_stop.set()
-        task = self._self_heal_task
+    async def _finish_self_heal_task(
+        self, task: Optional[asyncio.Task[Any]]
+    ) -> None:
         if task is None:
             return
         current = asyncio.current_task()
-        # When reconnect succeeds, initialize() is awaited by the self-heal task
-        # itself. Do not cancel/await that same task from inside initialize().
         if task is current:
-            self._self_heal_task = None
             return
-        self._self_heal_task = None
         if task.done():
             return
         task.cancel()
@@ -476,15 +605,19 @@ class AAWMAliasRoutingRedisManager:
                 exc_info=True,
             )
 
+    async def _stop_self_heal_task(self) -> None:
+        async with self._lifecycle_lock:
+            task = self._claim_self_heal_task_locked()
+        await self._finish_self_heal_task(task)
+
     async def _self_heal_loop(self) -> None:
         """Periodically reattempt Redis connectivity after a configured fallback.
 
         Does not run during the initial startup critical path. Uses the same
         initialize() entrypoint so reconnect shares wiring/status semantics.
 
-        Concurrent manual re-init is best-effort: there is intentionally no
-        initialize lock, so callers may overlap. Self-heal still falls back
-        safely and stops once durable cache is attached.
+        Manual re-init and shutdown share the lifecycle lock and generation
+        checks, so stale self-heal attempts cannot replace newer state.
         """
         stop_event = self._self_heal_stop
         try:
@@ -541,17 +674,24 @@ class AAWMAliasRoutingRedisManager:
 
     async def shutdown(self) -> None:
         """Detach and disconnect the manager-owned Redis client."""
-        await self._stop_self_heal_task()
-        self._detach_cached_client()
-        await self._disconnect_cached_client()
-        self._cache = None
-        self._initialized = False
-        self._reachable = "unknown"
-        self._error_type = None
-        self._configured = False
-        self._config_mode = "unconfigured"
-        self._namespace = self.DEFAULT_NAMESPACE
-        self._self_heal_armed = False
+        async with self._lifecycle_lock:
+            self._begin_lifecycle_transition_locked()
+            task_to_stop = self._claim_self_heal_task_locked()
+            previous_cache = self._take_cached_client_locked()
+            self._initialized = False
+            self._reachable = "unknown"
+            self._error_type = None
+            self._configured = False
+            self._config_mode = "unconfigured"
+            self._namespace = self.DEFAULT_NAMESPACE
+            self._config_signature = None
+            self._self_heal_armed = False
+
+        await self._finish_self_heal_task(task_to_stop)
+        await self._disconnect_owned_client(
+            previous_cache,
+            message="AAWM alias routing Redis disconnect failed",
+        )
 
     def get_status(self) -> Dict[str, Any]:
         """Return sanitized runtime status for alias-routing state cache."""
@@ -576,6 +716,7 @@ class AAWMAliasRoutingRedisManager:
 
     def reset(self) -> None:
         """Reset local manager state for tests without disconnecting live clients."""
+        self._lifecycle_generation += 1
         task = self._self_heal_task
         if task is not None and not task.done():
             task.cancel()
@@ -584,12 +725,14 @@ class AAWMAliasRoutingRedisManager:
             self._self_heal_stop.set()
         self._self_heal_stop = None
         self._detach_cached_client()
+        self._active_attempts.clear()
         self._initialized = False
         self._reachable = "unknown"
         self._error_type = None
         self._configured = False
         self._config_mode = "unconfigured"
         self._namespace = self.DEFAULT_NAMESPACE
+        self._config_signature = None
         self._self_heal_armed = False
 
 
