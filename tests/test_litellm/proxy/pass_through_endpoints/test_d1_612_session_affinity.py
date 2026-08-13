@@ -920,6 +920,61 @@ async def test_finalize_request_lease_promotes_stream_object_and_releases_on_fai
 
 
 @pytest.mark.asyncio
+async def test_sequential_candidates_replace_released_request_lease() -> None:
+    redis = _FakeRedisCache()
+    attrs = _full_attrs()
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    session_identity = "sess-sequential-candidates"
+
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        first_guard = await sa.ensure_session_owner_guard_for_request(
+            request=request,
+            session_identity=session_identity,
+            requested_attributes=attrs,
+        )
+        first_lease = sa.get_request_session_owner_lease(request)
+        assert first_guard.held_reservation is True
+        assert first_lease is not None
+        first_token = first_lease.reservation_token
+
+        first_result = await sa.finalize_request_session_owner_lease(
+            request, exc=RuntimeError("first candidate failed")
+        )
+        assert first_result is not None
+        assert first_result.outcome is sa.SessionOwnerMutationOutcome.RELEASED
+        assert first_lease.released is True
+
+        second_guard = await sa.ensure_session_owner_guard_for_request(
+            request=request,
+            session_identity=session_identity,
+            requested_attributes=attrs,
+        )
+        second_lease = sa.get_request_session_owner_lease(request)
+        assert second_guard.held_reservation is True
+        assert second_lease is not None
+        assert second_lease is not first_lease
+        assert second_lease.reservation_token != first_token
+        assert second_lease.promoted is False
+        assert second_lease.released is False
+
+        second_result = await sa.finalize_request_session_owner_lease(
+            request, exc=RuntimeError("second candidate failed")
+        )
+        assert second_result is not None
+        assert second_result.outcome is sa.SessionOwnerMutationOutcome.RELEASED
+        assert second_lease.released is True
+
+        third_guard = await sa.guard_session_owner_before_egress(
+            session_identity=session_identity,
+            requested_attributes=attrs,
+        )
+        assert third_guard.decision is sa.SessionOwnerGuardDecision.UNOWNED_RESERVED
+
+
+@pytest.mark.asyncio
 async def test_anthropic_nested_pre_egress_promotes_concrete_not_generic_attrs() -> None:
     """Nested Anthropic reserve/promote must use concrete resolved owner attrs.
 

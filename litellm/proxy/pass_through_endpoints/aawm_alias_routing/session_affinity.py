@@ -2547,15 +2547,21 @@ async def ensure_session_owner_guard_for_request(
     """
 
     existing = get_request_session_owner_lease(request)
-    token = existing.reservation_token if existing is not None else None
+    active_lease = (
+        existing
+        if existing is not None and not existing.released and not existing.promoted
+        else None
+    )
+    token = active_lease.reservation_token if active_lease is not None else None
     guard = await guard_session_owner_before_egress(
         session_identity=session_identity,
         request=request,
         request_body=request_body,
         requested_attributes=requested_attributes
-        or (existing.attributes if existing is not None else None),
+        or (active_lease.attributes if active_lease is not None else None),
         candidate=candidate,
-        owner_id=owner_id or (existing.owner_id if existing is not None else None),
+        owner_id=owner_id
+        or (active_lease.owner_id if active_lease is not None else None),
         reservation_token=token,
         require_exact_attributes=require_exact_attributes,
     )
@@ -2571,17 +2577,19 @@ async def ensure_session_owner_guard_for_request(
             failure_phase=failure_phase,
             request=request,
         )
-    if existing is not None and guard.held_reservation:
-        existing.reservation_token = guard.reservation_token
-        existing.held_reservation = True
-        existing.decision = guard.decision.value
-        existing.owner_id = guard.owner_id or existing.owner_id
-        set_request_session_owner_lease(request, existing)
+    if active_lease is not None and guard.held_reservation:
+        active_lease.reservation_token = guard.reservation_token
+        active_lease.held_reservation = True
+        active_lease.decision = guard.decision.value
+        active_lease.owner_id = guard.owner_id or active_lease.owner_id
+        active_lease.promoted = False
+        active_lease.released = False
+        set_request_session_owner_lease(request, active_lease)
     else:
         lease = lease_from_guard_result(
             guard,
             attributes=requested_attributes
-            or (existing.attributes if existing is not None else None),
+            or (active_lease.attributes if active_lease is not None else None),
         )
         set_request_session_owner_lease(request, lease)
     return guard
