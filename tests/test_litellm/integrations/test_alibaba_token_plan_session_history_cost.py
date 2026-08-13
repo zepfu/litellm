@@ -49,10 +49,15 @@ def test_should_persist_honest_token_plan_cost_provenance() -> None:
     metadata = record["metadata"]
     assert metadata["billing_mode"] == "alibaba_token_plan_subscription"
     assert metadata["actual_invoice_cost_known"] is False
-    assert metadata["reference_cost_kind"] == "provider_token_plan_no_public_per_token_rate"
+    assert metadata["reference_cost_status"] == "unpriced"
+    assert metadata["reference_cost_kind"] == "provider_subscription_reference"
     assert metadata["reference_cost_currency"] == "USD"
     assert metadata["reference_cost_model"] == ("alibaba_token_plan/qwen3.8-max-preview")
-    assert metadata["reference_cost_source"] == ("https://www.alibabacloud.com/help/en/model-studio/coding-plan")
+    assert metadata["reference_cost_source_kind"] == "official_provider_catalog"
+    assert metadata["reference_cost_source"] == "Alibaba Model Studio Coding Plan"
+    assert metadata["reference_cost_source_urls"] == [
+        "https://www.alibabacloud.com/help/en/model-studio/coding-plan"
+    ]
     assert "reference_cost_total_usd" not in metadata
 
     persisted_metadata = json.loads(_build_session_history_db_payload(record)[52])
@@ -63,6 +68,8 @@ def test_should_persist_honest_token_plan_cost_provenance() -> None:
         "reference_cost_currency",
         "reference_cost_model",
         "reference_cost_source",
+        "reference_cost_source_kind",
+        "reference_cost_source_urls",
     ):
         assert persisted_metadata[key] == metadata[key]
 

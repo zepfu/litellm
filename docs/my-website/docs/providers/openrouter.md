@@ -5,7 +5,8 @@
 AAWM keeps OpenRouter pricing route-specific. The maintained
 `openrouter/cohere/north-mini-code:free` entry has a third-party hosted
 baseline of `$0.20/$0.80` per million input/output tokens sourced from the
-NanoGPT and Routeway hosted catalogs; it is not direct Cohere pricing.
+NanoGPT and Routeway hosted-model catalog consensus for
+`cohere/north-mini-code-1-0`; it is not direct Cohere pricing.
 `openrouter/owl-alpha` and the OpenRouter DeepSeek V4 Flash `:free` routes
 remain explicitly unpriced when no exact paid-model relationship is verified.
 

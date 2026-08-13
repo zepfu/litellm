@@ -191,12 +191,12 @@
                     },
                     "cache_mode": "none",
                     "equivalence_status": "direct_reference",
-                    "equivalence_evidence": "Alibaba Qwen 3.7 public reference tariff.",
+                    "equivalence_evidence": "Alibaba Qwen 3.7 undiscounted international Model Studio direct list-rate reference; not Token Plan subscription invoice pricing.",
                     "source": {
-                        "kind": "official_provider_catalog",
-                        "label": "Alibaba Model Studio Coding Plan",
+                        "kind": "official_provider_direct_list_rate_catalog",
+                        "label": "Alibaba Cloud Model Studio international direct list rates",
                         "urls": [
-                            "https://www.alibabacloud.com/help/en/model-studio/coding-plan"
+                            "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
                         ],
                         "version": "2026-08-12",
                         "verified_on": "2026-08-12"
@@ -214,7 +214,7 @@
                 "wait_agent"
             ]
         },
-        "source": "https://www.alibabacloud.com/help/en/model-studio/coding-plan",
+        "source": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_reasoning": true,
@@ -257,12 +257,12 @@
                     },
                     "cache_mode": "none",
                     "equivalence_status": "direct_reference",
-                    "equivalence_evidence": "Alibaba Qwen 3.7 public reference tariff.",
+                    "equivalence_evidence": "Alibaba Qwen 3.7 undiscounted international Model Studio direct list-rate reference; not Token Plan subscription invoice pricing.",
                     "source": {
-                        "kind": "official_provider_catalog",
-                        "label": "Alibaba Model Studio Coding Plan",
+                        "kind": "official_provider_direct_list_rate_catalog",
+                        "label": "Alibaba Cloud Model Studio international direct list rates",
                         "urls": [
-                            "https://www.alibabacloud.com/help/en/model-studio/coding-plan"
+                            "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
                         ],
                         "version": "2026-08-12",
                         "verified_on": "2026-08-12"
@@ -280,7 +280,7 @@
                 "wait_agent"
             ]
         },
-        "source": "https://www.alibabacloud.com/help/en/model-studio/coding-plan",
+        "source": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_reasoning": true,
@@ -318,30 +318,33 @@
                         "model": "alibaba_token_plan/qwen3.6-flash"
                     },
                     "cache_mode": "none",
-                    "rate_schedule": [
-                        {
-                            "min_total_tokens": 0,
-                            "max_total_tokens": 256000,
-                            "rates": {
-                                "input_usd_per_million_tokens": 0.25,
-                                "output_usd_per_million_tokens": 1.5
+                    "rate_schedule": {
+                        "meter": "input_tokens",
+                        "tiers": [
+                            {
+                                "min_tokens": 0,
+                                "max_tokens": 256000,
+                                "rates": {
+                                    "input_usd_per_million_tokens": 0.25,
+                                    "output_usd_per_million_tokens": 1.5
+                                }
+                            },
+                            {
+                                "min_tokens": 256001,
+                                "rates": {
+                                    "input_usd_per_million_tokens": 1.0,
+                                    "output_usd_per_million_tokens": 4.0
+                                }
                             }
-                        },
-                        {
-                            "min_total_tokens": 256001,
-                            "rates": {
-                                "input_usd_per_million_tokens": 1.0,
-                                "output_usd_per_million_tokens": 4.0
-                            }
-                        }
-                    ],
+                        ]
+                    },
                     "equivalence_status": "direct_reference",
-                    "equivalence_evidence": "Alibaba Qwen 3.6 public reference tariff.",
+                    "equivalence_evidence": "Alibaba Qwen 3.6 undiscounted international Model Studio direct list-rate reference; not Token Plan subscription invoice pricing.",
                     "source": {
-                        "kind": "official_provider_catalog",
-                        "label": "Alibaba Model Studio Coding Plan",
+                        "kind": "official_provider_direct_list_rate_catalog",
+                        "label": "Alibaba Cloud Model Studio international direct list rates",
                         "urls": [
-                            "https://www.alibabacloud.com/help/en/model-studio/coding-plan"
+                            "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
                         ],
                         "version": "2026-08-12",
                         "verified_on": "2026-08-12"
@@ -359,7 +362,7 @@
                 "wait_agent"
             ]
         },
-        "source": "https://www.alibabacloud.com/help/en/model-studio/coding-plan",
+        "source": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_reasoning": true,
@@ -402,12 +405,12 @@
                     },
                     "cache_mode": "none",
                     "equivalence_status": "direct_reference",
-                    "equivalence_evidence": "Alibaba DeepSeek V4 Pro public reference tariff.",
+                    "equivalence_evidence": "Alibaba DeepSeek V4 Pro undiscounted international Model Studio direct list-rate reference; not Token Plan subscription invoice pricing.",
                     "source": {
-                        "kind": "official_provider_catalog",
-                        "label": "Alibaba Model Studio Coding Plan",
+                        "kind": "official_provider_direct_list_rate_catalog",
+                        "label": "Alibaba Cloud Model Studio international direct list rates",
                         "urls": [
-                            "https://www.alibabacloud.com/help/en/model-studio/coding-plan"
+                            "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
                         ],
                         "version": "2026-08-12",
                         "verified_on": "2026-08-12"
@@ -425,7 +428,7 @@
                 "wait_agent"
             ]
         },
-        "source": "https://www.alibabacloud.com/help/en/model-studio/coding-plan",
+        "source": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
         "supports_function_calling": true,
         "supports_parallel_function_calling": true,
         "supports_reasoning": true,
@@ -25434,7 +25437,7 @@
                     "currency": "USD",
                     "basis": {
                         "provider": "openrouter",
-                        "model": "openrouter/cohere/north-mini-code:free"
+                        "model": "cohere/north-mini-code-1-0"
                     },
                     "rates": {
                         "input_usd_per_million_tokens": 0.2,
@@ -25444,8 +25447,8 @@
                     "equivalence_status": "hosted_baseline",
                     "equivalence_evidence": "Hosted catalog baseline from NanoGPT and Routeway; not direct Cohere pricing.",
                     "source": {
-                        "kind": "third_party_hosted_catalog",
-                        "label": "NanoGPT + Routeway hosted catalogs",
+                        "kind": "third_party_hosted_catalog_consensus",
+                        "label": "NanoGPT and Routeway hosted-model catalogs",
                         "urls": [
                             "https://nano-gpt.com/",
                             "https://routeway.ai/"

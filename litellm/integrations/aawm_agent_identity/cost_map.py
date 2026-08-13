@@ -310,7 +310,10 @@ def resolve_aawm_reference_pricing(  # noqa: PLR0915
         rates = model_cost.get(basis_key)
 
     rate_schedule = contract.get("rate_schedule")
-    if not isinstance(rates, dict) and not isinstance(rate_schedule, list):
+    schedule_tiers = (
+        rate_schedule.get("tiers") if isinstance(rate_schedule, dict) else None
+    )
+    if not isinstance(rates, dict) and not isinstance(schedule_tiers, list):
         metadata["reference_cost_status"] = "unpriced"
         metadata["reference_cost_unpriced_reason"] = (
             metadata.get("reference_cost_unpriced_reason")
@@ -341,18 +344,27 @@ def resolve_aawm_reference_pricing(  # noqa: PLR0915
         metadata["reference_cost_unpriced_reason"] = "unsupported_cache_mode"
         return metadata
 
-    total_tokens = prompt_tokens + completion_tokens
     selected_rates = rates
-    if isinstance(rate_schedule, list):
+    if isinstance(rate_schedule, dict):
+        schedule_meter = rate_schedule.get("meter")
+        schedule_meter_values = {
+            "input_tokens": prompt_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+        schedule_value = schedule_meter_values.get(schedule_meter)
+        if schedule_value is None or not isinstance(schedule_tiers, list):
+            metadata["reference_cost_status"] = "unpriced"
+            metadata["reference_cost_unpriced_reason"] = "invalid_rate_schedule"
+            return metadata
         selected_rates = None
-        for schedule_entry in rate_schedule:
+        for schedule_entry in schedule_tiers:
             if not isinstance(schedule_entry, dict):
                 continue
-            minimum = _safe_int(schedule_entry.get("min_total_tokens")) or 0
-            maximum = schedule_entry.get("max_total_tokens")
+            minimum = _safe_int(schedule_entry.get("min_tokens")) or 0
+            maximum = schedule_entry.get("max_tokens")
             maximum_int = _safe_int(maximum) if maximum is not None else None
-            if total_tokens >= minimum and (
-                maximum_int is None or total_tokens <= maximum_int
+            if schedule_value >= minimum and (
+                maximum_int is None or schedule_value <= maximum_int
             ):
                 selected_rates = schedule_entry
                 break

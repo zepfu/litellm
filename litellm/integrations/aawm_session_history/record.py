@@ -1148,9 +1148,11 @@ def _build_session_history_record(  # noqa: PLR0915
                 request_tags.append(tag)
 
     response_cost_usd = None
+    provider_reported_cost = False
     if resolved_provider not in {"kimi_code", "alibaba_token_plan"}:
         if resolved_provider == "openrouter":
             response_cost_usd = _first_reported_openrouter_cost(metadata, usage_dict)
+            provider_reported_cost = response_cost_usd is not None
         if response_cost_usd is None:
             response_cost_usd = _safe_float(
                 _first_non_none(
@@ -1169,7 +1171,10 @@ def _build_session_history_record(  # noqa: PLR0915
                 )
             )
         if (
-            (response_cost_usd is None or response_cost_usd == 0)
+            (
+                response_cost_usd is None
+                or (response_cost_usd == 0 and not provider_reported_cost)
+            )
             and prompt_tokens > 0
             and resolved_model != "unknown"
             and not usage_dict.get("token_count_response")

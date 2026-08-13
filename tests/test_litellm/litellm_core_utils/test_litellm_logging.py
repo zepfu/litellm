@@ -1144,8 +1144,9 @@ def test_response_cost_calculator_keeps_kimi_reference_cost_metadata_out_of_resp
     )
 
 
+@pytest.mark.parametrize("reported_cost", [0.0, 0.007])
 def test_response_cost_calculator_kimi_hidden_cost_keeps_reference_provenance(
-    monkeypatch,
+    monkeypatch, reported_cost
 ):
     import litellm
 
@@ -1173,13 +1174,13 @@ def test_response_cost_calculator_kimi_hidden_cost_keeps_reference_provenance(
             cache_read_input_tokens=13_824,
         ),
     )
-    result._hidden_params["response_cost"] = 0.007
+    result._hidden_params["response_cost"] = reported_cost
 
     with open("model_prices_and_context_window.json") as model_cost_file:
         monkeypatch.setattr(litellm, "model_cost", json.load(model_cost_file))
     response_cost = logging_obj._response_cost_calculator(result=result)
 
-    assert response_cost == pytest.approx(0.007)
+    assert response_cost == pytest.approx(reported_cost)
     metadata = logging_obj.litellm_params["metadata"]
     assert metadata["actual_invoice_cost_known"] is False
     assert metadata["reference_cost_model"] == "kimi_code/k3-max"

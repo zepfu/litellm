@@ -849,15 +849,19 @@ tariff remains the only standard cost input, including an explicit zero tariff.
 Unknown cache token counts and unsupported or non-exact equivalence fail closed
 to `status=unpriced`.
 
-The 2026-08-12 catalog includes Alibaba Qwen 3.6 whole-request tiers
-(`<=256000` tokens: `$0.25/$1.50` per million input/output; above that:
-`$1/$4`), Qwen 3.7 at `$2.50/$7.50`, and Alibaba DeepSeek V4 Pro at
-`$2.40/$4.80`. Direct DeepSeek Flash and Pro reference rates include provider
-cache reads. OpenRouter North uses a third-party hosted baseline and is not
+The 2026-08-12 catalog includes the current undiscounted international Alibaba
+Cloud Model Studio direct list rates as references: Qwen 3.6 uses the base
+`$0.25/$1.50` per million input/output tier through 256000 whole-request input
+tokens and `$1/$4` above that; output tokens do not select the tier. Qwen 3.7
+uses `$2.50/$7.50`, and Alibaba DeepSeek V4 Pro uses `$2.40/$4.80`. These
+direct list rates are distinct from Token Plan subscription economics and do
+not claim subscription invoice cost. Direct DeepSeek Flash and Pro reference
+rates include provider cache reads. OpenRouter North uses the NanoGPT and
+Routeway hosted-model catalog consensus for `cohere/north-mini-code-1-0`, not
 direct Cohere pricing. Owl Alpha, Big Pickle, and OpenCode's free DeepSeek
 route remain explicitly unpriced because their required equivalence evidence is
 absent. Alibaba subscription routes retain unknown invoice cost even when a
-reference tariff is available.
+direct list-rate reference is available.
 
 Managed Kimi Code uses the same non-invoice semantics. Callback observers may
 persist its provenance metadata, but they do not turn its reference total into

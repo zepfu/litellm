@@ -160,9 +160,10 @@ Cost metadata for these shared candidates is route-specific. OpenRouter North
 may carry a third-party hosted reference baseline, while Owl Alpha is
 unpriced. OpenCode Big Pickle and its free DeepSeek route remain unpriced, and
 Alibaba Qwen 3.6 is reference-priced only under the subscription
-`actual_invoice_cost_known=false` contract. Reference totals are provenance
-metadata and never standard spend or `response_cost_usd`; Luna remains the
-last-resort actual routed fallback.
+`actual_invoice_cost_known=false` contract, using the international Model
+Studio direct list rate rather than claiming Token Plan subscription invoice
+economics. Reference totals are provenance metadata and never standard spend
+or `response_cost_usd`; Luna remains the last-resort actual routed fallback.
 
 ## Maintained `work` and `work-other` alias behavior
 

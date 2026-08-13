@@ -74,29 +74,44 @@ def test_should_fail_closed_on_exact_provider_key_mismatch(catalog):
 
 
 def test_should_price_alibaba_qwen36_at_the_256k_boundary(catalog):
-    low = aawm_agent_identity.resolve_aawm_reference_pricing(
-        provider="alibaba_token_plan",
-        model="qwen3.6-flash",
-        prompt_tokens=255_999,
-        completion_tokens=1,
-        usage_obj={},
-    )
-    high = aawm_agent_identity.resolve_aawm_reference_pricing(
+    contract = catalog["alibaba_token_plan/qwen3.6-flash"][
+        "provider_specific_entry"
+    ]["alibaba_token_plan"]["aawm_reference_pricing"]
+    base_tier = aawm_agent_identity.resolve_aawm_reference_pricing(
         provider="alibaba_token_plan",
         model="qwen3.6-flash",
         prompt_tokens=256_000,
+        completion_tokens=100_000,
+        usage_obj={},
+    )
+    high_tier = aawm_agent_identity.resolve_aawm_reference_pricing(
+        provider="alibaba_token_plan",
+        model="qwen3.6-flash",
+        prompt_tokens=256_001,
         completion_tokens=1,
         usage_obj={},
     )
 
-    assert low is not None
-    assert high is not None
-    assert low["reference_cost_model"] == "alibaba_token_plan/qwen3.6-flash"
-    assert low["reference_cost_total_usd"] == pytest.approx(
-        (255_999 * 0.25 + 1 * 1.50) / 1_000_000
+    assert base_tier is not None
+    assert high_tier is not None
+    assert contract["billing_mode"] == "alibaba_token_plan_subscription"
+    assert contract["actual_invoice_cost_known"] is False
+    assert contract["source"] == {
+        "kind": "official_provider_direct_list_rate_catalog",
+        "label": "Alibaba Cloud Model Studio international direct list rates",
+        "urls": [
+            "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
+        ],
+        "version": "2026-08-12",
+        "verified_on": "2026-08-12",
+    }
+    assert base_tier["reference_cost_model"] == "alibaba_token_plan/qwen3.6-flash"
+    assert base_tier["reference_cost_rate_schedule"]["meter"] == "input_tokens"
+    assert base_tier["reference_cost_total_usd"] == pytest.approx(
+        (256_000 * 0.25 + 100_000 * 1.50) / 1_000_000
     )
-    assert high["reference_cost_total_usd"] == pytest.approx(
-        (256_000 * 1.0 + 1 * 4.0) / 1_000_000
+    assert high_tier["reference_cost_total_usd"] == pytest.approx(
+        (256_001 * 1.0 + 1 * 4.0) / 1_000_000
     )
 
 
@@ -180,6 +195,9 @@ def test_should_require_exact_equivalence_for_rates_from_model(monkeypatch):
 
 
 def test_should_preserve_reference_total_as_metadata_only(catalog):
+    contract = catalog["openrouter/cohere/north-mini-code:free"][
+        "provider_specific_entry"
+    ]["openrouter"]["aawm_reference_pricing"]
     result = aawm_agent_identity.resolve_aawm_reference_pricing(
         provider="openrouter",
         model="cohere/north-mini-code:free",
@@ -189,20 +207,32 @@ def test_should_preserve_reference_total_as_metadata_only(catalog):
     )
 
     assert result is not None
+    assert contract["cache_mode"] == "none"
+    assert "cache_read_usd_per_million_tokens" not in contract["rates"]
     assert result["reference_cost_total_usd"] == pytest.approx(
         (1_000 * 0.2 + 200 * 0.8) / 1_000_000
     )
     assert result["actual_invoice_cost_known"] is False
     assert result["reference_cost_model"] == "openrouter/cohere/north-mini-code:free"
+    assert result["reference_cost_basis_model"] == "cohere/north-mini-code-1-0"
+    assert (
+        result["reference_cost_source_kind"]
+        == "third_party_hosted_catalog_consensus"
+    )
+    assert (
+        result["reference_cost_source_label"]
+        == "NanoGPT and Routeway hosted-model catalogs"
+    )
 
 
-def test_should_keep_provider_reported_cost_authoritative(catalog):
+@pytest.mark.parametrize("reported_cost", [0.0, 0.123])
+def test_should_keep_provider_reported_cost_authoritative(catalog, reported_cost):
     kwargs = {
         "litellm_call_id": "call-reference-cost-provider-wins",
         "model": "cohere/north-mini-code:free",
         "custom_llm_provider": "openrouter",
         "call_type": "completion",
-        "response_cost": 0.123,
+        "response_cost": 0.456,
         "litellm_params": {
             "metadata": {
                 "session_id": "session-reference-cost-provider-wins",
@@ -224,6 +254,7 @@ def test_should_keep_provider_reported_cost_authoritative(catalog):
                 "prompt_tokens": 1_000,
                 "completion_tokens": 200,
                 "total_tokens": 1_200,
+                "cost": reported_cost,
             },
             "choices": [{"message": {"role": "assistant", "content": "ok"}}],
         },
@@ -233,7 +264,7 @@ def test_should_keep_provider_reported_cost_authoritative(catalog):
     )
 
     assert record is not None
-    assert record["response_cost_usd"] == pytest.approx(0.123)
+    assert record["response_cost_usd"] == pytest.approx(reported_cost)
     assert record["metadata"]["reference_cost_total_usd"] == pytest.approx(
         (1_000 * 0.2 + 200 * 0.8) / 1_000_000
     )
