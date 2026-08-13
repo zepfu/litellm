@@ -2,6 +2,7 @@ import socket
 import threading
 import time
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 from fastapi import Request
@@ -10,6 +11,7 @@ from litellm.proxy.aawm_route_logging import (
     _normalize_aawm_route_client_ip,
     attach_aawm_route_rollup_context,
     build_aawm_route_repo_client_host_label,
+    build_aawm_route_rollup_context,
     build_aawm_route_rollup_group_header_label,
     resolve_aawm_route_host_attribution,
 )
@@ -313,6 +315,124 @@ def test_attach_aawm_route_rollup_context_copies_host_metadata(monkeypatch):
     assert metadata["host_name"] == "thoth"
     assert metadata["host_name_source"] in {"reverse_dns", "reverse_dns_cache"}
     assert metadata["aawm_route_rollup_context"]["host_name"] == "thoth"
+
+
+def test_build_aawm_route_rollup_context_uses_current_request_xff_over_stale_metadata(
+    monkeypatch,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    route_logging._aawm_route_host_reverse_dns_cache.clear()
+    request = Mock(spec=Request)
+    request.method = "POST"
+    request.url = "http://127.0.0.1:4001/openai_passthrough/responses"
+    request.headers = {
+        "user-agent": "codex-cli/0.142.5",
+        "x-forwarded-for": "100.100.7.5",
+    }
+    request.client = SimpleNamespace(host="172.18.0.1", port=12345)
+    request.scope = {
+        "path": "/openai_passthrough/responses",
+        "query_string": b"",
+        "client": ("172.18.0.1", 12345),
+    }
+    kwargs = {
+        "litellm_params": {
+            "metadata": {
+                "repository": "aawm-infrastructure",
+                "client_ip": "172.18.0.1",
+                "client_ip_source": "request_client",
+                "requester_ip_address": "172.18.0.1",
+            }
+        }
+    }
+
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.general_settings",
+        {
+            "aawm_route_use_x_forwarded_for": True,
+            "aawm_route_trusted_proxy_ranges": ["172.18.0.1/32"],
+        },
+    )
+    monkeypatch.setattr(
+        route_logging.socket,
+        "gethostbyaddr",
+        Mock(side_effect=OSError("reverse dns not used for cgnat test")),
+    )
+    monkeypatch.setattr(
+        route_logging,
+        "_resolve_hostname_via_magicdns",
+        Mock(return_value="desktop-qjhrj1m-wsl"),
+    )
+    route_logging._resolve_aawm_route_host_name_from_ip(
+        "100.100.7.5",
+        allow_blocking_lookup=True,
+    )
+
+    context = build_aawm_route_rollup_context(
+        request=request,
+        target="https://chatgpt.com/backend-api/codex/responses",
+        request_body={"model": "gpt-5.5"},
+        kwargs=kwargs,
+    )
+
+    assert context is not None
+    assert context["client_ip"] == "100.100.7.5"
+    assert context["client_ip_source"] == "x_forwarded_for"
+    assert context["host_name"] == "desktop-qjhrj1m-wsl"
+    assert context["group_header_label"] == (
+        "aawm-infrastructure#Codex[0.142.5]@desktop-qjhrj1m-wsl"
+    )
+
+
+def test_build_aawm_route_rollup_context_uses_metadata_without_request(
+    monkeypatch,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    captured: dict[str, Any] = {}
+
+    def capture_attribution(request, **kwargs):
+        captured["request"] = request
+        captured.update(kwargs)
+        return {
+            "client_ip": kwargs["client_ip"],
+            "client_ip_source": kwargs["client_ip_source"],
+            "host_name": "metadata-host",
+            "host_name_source": "metadata",
+        }
+
+    monkeypatch.setattr(
+        route_logging,
+        "resolve_aawm_route_host_attribution",
+        capture_attribution,
+    )
+
+    context = build_aawm_route_rollup_context(
+        request=None,
+        target="https://chatgpt.com/backend-api/codex/responses",
+        request_body={
+            "model": "gpt-5.5",
+            "litellm_metadata": {"repository": "aawm-infrastructure"},
+        },
+        kwargs={
+            "litellm_params": {
+                "metadata": {
+                    "requester_ip_address": "100.99.1.5",
+                    "client_ip_source": "request_client",
+                }
+            }
+        },
+    )
+
+    assert context is not None
+    assert captured == {
+        "request": None,
+        "client_ip": "100.99.1.5",
+        "client_ip_source": "request_client",
+    }
+    assert context["client_ip"] == "100.99.1.5"
+    assert context["host_name"] == "metadata-host"
 
 
 def test_is_tailscale_cgnat_client_ip_detects_100_64_range():

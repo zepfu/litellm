@@ -2421,12 +2421,17 @@ def build_aawm_route_rollup_context(
         _AAWM_ROUTE_LOG_REPOSITORY_TENANT_HEADER_KEYS,
         normalizer=_normalize_aawm_route_log_tenant_repository_label,
     )
-    host_attribution = resolve_aawm_route_host_attribution(
-        request,
-        client_ip=_clean_aawm_route_client_ip(metadata.get("client_ip"))
-        or _clean_aawm_route_client_ip(metadata.get("requester_ip_address")),
-        client_ip_source=_clean_aawm_route_log_field(metadata.get("client_ip_source")),
-    )
+    if request is not None:
+        host_attribution = resolve_aawm_route_host_attribution(request)
+    else:
+        host_attribution = resolve_aawm_route_host_attribution(
+            request,
+            client_ip=_clean_aawm_route_client_ip(metadata.get("client_ip"))
+            or _clean_aawm_route_client_ip(metadata.get("requester_ip_address")),
+            client_ip_source=_clean_aawm_route_log_field(
+                metadata.get("client_ip_source")
+            ),
+        )
     group_header_label = build_aawm_route_rollup_group_header_label(
         repository=repository,
         client_product_label=client_product_label,
