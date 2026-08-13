@@ -457,6 +457,14 @@ route.
   `openrouter/cohere/north-mini-code:free` remains an OpenRouter request and must not be
   recorded or interpreted as direct Cohere-native traffic.
 
+For COHERE-002 usage observations, the source identity is limited to accepted
+direct Codex Cohere terminal HTTP 200 `/v2/chat` calls with
+`provider=cohere` and `lane=cohere_native`. Calls are counted once by stable
+`litellm_call_id` and recorded as `source=locally_counted`; OpenRouter remains
+separate. Anthropic adapter integration and Anthropic testing or acceptance are
+not part of this Cohere contract. Migration, deployment, and authenticated
+acceptance remain separately authorized.
+
 ### Dev compatibility key
 
 - Canonical runtime credential environment variable: **`COHERE_API_KEY`**.

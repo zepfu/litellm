@@ -867,6 +867,20 @@ Compose-only development compatibility source is `COHERE_KEY`. Credential
 values, tokens, and key material must never be persisted in session history,
 metadata, traces, logs, or documentation.
 
+Accepted direct Cohere terminal HTTP 200 `/v2/chat` calls are counted exactly
+once by stable `litellm_call_id`. The resulting observations use
+`source=locally_counted`, not provider-reported values. Monthly usage is shared
+per credential with limit `1000`, and numeric `quota_used` comes from the
+accepted-call ledger. RPM usage is exact-model and compared with model
+metadata; unknown or missing RPM metadata or numeric usage remains unknown and
+does not block. Stale or reset observations are ignored.
+
+This applies only to `provider=cohere`, `lane=cohere_native`, and the direct
+Codex Cohere route; OpenRouter remains separate. Anthropic adapter integration
+and Anthropic testing or acceptance are outside Cohere work. Migration,
+deployment, and authenticated acceptance have not been performed and remain
+separately authorized.
+
 The 2026-08-12 catalog includes the current undiscounted international Alibaba
 Cloud Model Studio direct list rates as references: Qwen 3.6 uses the base
 `$0.25/$1.50` per million input/output tier through 256000 whole-request input
