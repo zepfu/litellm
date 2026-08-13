@@ -143,6 +143,77 @@ def test_should_price_direct_deepseek_with_cache_and_mark_unknown_cache_unpriced
     assert unknown_cache["reference_cost_unpriced_reason"] == "cache_token_count_unknown"
 
 
+@pytest.mark.parametrize(
+    (
+        "prompt_tokens",
+        "cached_input_tokens",
+        "completion_tokens",
+        "expected_uncached_input_usd",
+        "expected_cached_input_usd",
+        "expected_output_usd",
+    ),
+    (
+        (1_000, 1_000, 0, 0.0, 1_000 * 0.003625 / 1_000_000, 0.0),
+        (1_000, 0, 0, 1_000 * 0.435 / 1_000_000, 0.0, 0.0),
+        (
+            1_000,
+            400,
+            0,
+            600 * 0.435 / 1_000_000,
+            400 * 0.003625 / 1_000_000,
+            0.0,
+        ),
+        (0, 0, 200, 0.0, 0.0, 200 * 0.87 / 1_000_000),
+    ),
+)
+def test_should_price_direct_deepseek_v4_pro_components(
+    catalog,
+    prompt_tokens,
+    cached_input_tokens,
+    completion_tokens,
+    expected_uncached_input_usd,
+    expected_cached_input_usd,
+    expected_output_usd,
+):
+    contract = catalog["deepseek/deepseek-v4-pro"]["provider_specific_entry"][
+        "deepseek"
+    ]["aawm_reference_pricing"]
+    result = aawm_agent_identity.resolve_aawm_reference_pricing(
+        provider="deepseek",
+        model="deepseek-v4-pro",
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        usage_obj={"cache_read_input_tokens": cached_input_tokens},
+    )
+
+    assert contract["rates"] == {
+        "input_usd_per_million_tokens": 0.435,
+        "cache_read_usd_per_million_tokens": 0.003625,
+        "output_usd_per_million_tokens": 0.87,
+    }
+    assert result is not None
+    assert result["reference_cost_status"] == "priced"
+    assert result["actual_invoice_cost_known"] is False
+    assert result["billing_mode"] == "deepseek_direct_provider"
+    assert result["reference_cost_model"] == "deepseek/deepseek-v4-pro"
+    assert result["reference_cost_basis_provider"] == "deepseek"
+    assert result["reference_cost_basis_model"] == "deepseek/deepseek-v4-pro"
+    assert result["reference_cost_source_kind"] == "official_provider_catalog"
+    assert result["reference_cost_source_label"] == "DeepSeek API pricing"
+    assert result["reference_cost_uncached_input_usd"] == pytest.approx(
+        expected_uncached_input_usd
+    )
+    assert result["reference_cost_cached_input_usd"] == pytest.approx(
+        expected_cached_input_usd
+    )
+    assert result["reference_cost_output_usd"] == pytest.approx(expected_output_usd)
+    assert result["reference_cost_total_usd"] == pytest.approx(
+        expected_uncached_input_usd
+        + expected_cached_input_usd
+        + expected_output_usd
+    )
+
+
 def test_should_require_exact_equivalence_for_rates_from_model(monkeypatch):
     direct_rates = {
         "input_cost_per_token": 0.000001,

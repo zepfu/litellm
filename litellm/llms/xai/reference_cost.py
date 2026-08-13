@@ -6,8 +6,12 @@ import re
 from typing import Any, Dict, Optional, Tuple
 
 from litellm._logging import verbose_logger
+from litellm.llms.xai.route_descriptors import (
+    XAI_OAUTH_CREDENTIAL_FAMILY,
+    XAI_OAUTH_ROUTE_FAMILY,
+    get_oa_xai_route_descriptor,
+)
 
-_MANAGED_XAI_REFERENCE_MODELS = frozenset({"oa_xai/grok-4.6"})
 _ABOVE_TOKEN_RATE_RE = re.compile(
     r"^input_cost_per_token_(above_(?P<threshold_k>\d+)k_tokens)$"
 )
@@ -30,6 +34,17 @@ def _nonnegative_float(value: Any) -> Optional[float]:
     if normalized != normalized or normalized < 0:
         return None
     return normalized
+
+
+def _is_managed_xai_reference_model(model: str) -> bool:
+    descriptor = get_oa_xai_route_descriptor(model)
+    return bool(
+        descriptor is not None
+        and descriptor.public_model == model
+        and descriptor.route_family == XAI_OAUTH_ROUTE_FAMILY
+        and descriptor.credential_family == XAI_OAUTH_CREDENTIAL_FAMILY
+        and descriptor.auth_mode == "oauth"
+    )
 
 
 def _load_xai_reference_pricing(
@@ -152,12 +167,12 @@ def build_xai_grok_46_reference_cost_metadata(
     cache_read_input_tokens: Any,
     completion_tokens: Any,
 ) -> Dict[str, Any]:
-    """Build non-invoice provenance for the managed Grok 4.6 route."""
+    """Build non-invoice provenance for an exactly configured managed xAI route."""
 
     normalized_model = str(model or "").strip()
     if (
         str(provider or "").strip().lower() != "xai"
-        or normalized_model not in _MANAGED_XAI_REFERENCE_MODELS
+        or not _is_managed_xai_reference_model(normalized_model)
     ):
         return {}
 

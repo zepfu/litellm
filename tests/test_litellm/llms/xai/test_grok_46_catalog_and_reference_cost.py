@@ -168,6 +168,61 @@ def test_should_record_grok_46_reference_provenance_without_invoice_cost() -> No
     assert "response_cost_usd" not in metadata
 
 
+def test_should_recognize_catalog_configured_future_managed_xai_model() -> None:
+    configured_model = "oa_xai/future-managed-reference-model"
+    configured_entry = dict(litellm.model_cost["oa_xai/grok-4.6"])
+    configured_entry.update(
+        {
+            "source": "https://docs.x.ai/developers/models/future-managed-reference-model",
+            "created": 1785888000,
+            "verified": "2026-08-11",
+        }
+    )
+    litellm.model_cost[configured_model] = configured_entry
+    litellm.get_model_info.cache_clear()
+
+    metadata = build_xai_grok_46_reference_cost_metadata(
+        provider="xai",
+        model=configured_model,
+        prompt_tokens=100_000,
+        cache_read_input_tokens=20_000,
+        completion_tokens=10_000,
+    )
+
+    assert metadata["reference_cost_model"] == configured_model
+    assert metadata["reference_cost_source"].endswith(
+        "/future-managed-reference-model"
+    )
+    assert metadata["reference_cost_total_usd"] == pytest.approx(0.23)
+    assert metadata["actual_invoice_cost_known"] is False
+
+
+def test_should_fail_closed_for_ineligible_or_unconfigured_xai_model() -> None:
+    ineligible_model = "xai/catalog-only-reference-model"
+    litellm.model_cost[ineligible_model] = dict(
+        litellm.model_cost["oa_xai/grok-4.6"]
+    )
+    litellm.get_model_info.cache_clear()
+
+    ineligible_metadata = build_xai_grok_46_reference_cost_metadata(
+        provider="xai",
+        model=ineligible_model,
+        prompt_tokens=100_000,
+        cache_read_input_tokens=20_000,
+        completion_tokens=10_000,
+    )
+    unconfigured_metadata = build_xai_grok_46_reference_cost_metadata(
+        provider="xai",
+        model="oa_xai/missing-catalog-reference-model",
+        prompt_tokens=100_000,
+        cache_read_input_tokens=20_000,
+        completion_tokens=10_000,
+    )
+
+    assert ineligible_metadata == {}
+    assert unconfigured_metadata == {}
+
+
 def test_should_leave_managed_grok_46_session_history_invoice_cost_unknown() -> None:
     record = _build_session_history_record(
         kwargs={
