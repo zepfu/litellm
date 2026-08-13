@@ -94,6 +94,84 @@ Relevant environment variables:
 - `AAWM_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS`: minimum seconds between
   inspections; defaults to `3600`.
 
+## Deadline-Aware OAuth Refresh Scheduling
+
+The scheduled Grok OIDC, managed xAI OAuth, Kimi OAuth, and Codex OAuth tasks
+have two separate timing controls:
+
+- The outer eligibility cadence is the provider-status loop cadence
+  (`AAWM_PROVIDER_STATUS_INTERVAL_SECONDS`). On each eligible outer cycle, the
+  sidecar performs a read-only credential inspection and derives
+  `refresh_due_at` from the credential expiry and the provider refresh buffer.
+  Kimi uses `max(300, expires_in * 0.5)` and reports that effective value as
+  `refresh_threshold_seconds`. A `refresh_not_due` inspection does not consume
+  the endpoint-attempt throttle. A local or pre-network helper failure also
+  leaves that throttle untouched and may retry on the next outer cycle. Every
+  outer cycle reinspects the current credential pathname, including an inode
+  replaced by an external credential writer.
+- The actual token-endpoint attempt throttle is per task, and for Codex is
+  isolated per inventory label. The scheduler passes an explicit
+  `on_token_endpoint_attempt` callback to the refresh helper. The helper invokes
+  that callback immediately before the outbound token endpoint request, after
+  local validation, lock acquisition, and request construction. Only that
+  callback updates the monotonic last-attempt timestamp. Legacy `attempted`
+  summary flags are descriptive evidence and are not throttle authority.
+
+Refresh events include sanitized scheduler evidence such as
+`eligibility_checked_at`, `expires_at`, `refresh_due_at`,
+`next_refresh_check_at`, `last_actual_attempt_at`, `actual_attempted`,
+`actual_attempt_count`, `eligibility_cadence_seconds`,
+`refresh_attempt_interval_seconds`, `refresh_buffer_seconds` or
+`refresh_threshold_seconds`, `credential_health`, `usable`, and redacted
+error fields. The result classes are:
+
+- `refresh_not_due`: the credential remains outside its refresh deadline. A
+  forced operation failure can still retain this class when the credential
+  remains not-due; the scheduler records the failure metadata while leaving the
+  credential usable and healthy.
+- `refresh_due`: the credential is due and no endpoint failure was recorded.
+- `refresh_failed`: an eligible helper operation failed before or during the
+  actual token-endpoint attempt while the credential was not already expired.
+  An outer cycle skipped by the actual-attempt throttle retains this failure
+  and degraded health until a later inspection or operation changes the result.
+- `expired`: expiry overrides a refresh failure and the credential is not
+  usable.
+
+Missing or malformed expiry data never makes a credential permanently fresh.
+An otherwise usable credential with missing or unparseable `expires_at` is
+eligible for the safe refresh path and is reported as degraded. A malformed or
+unreadable credential is reported as malformed and unusable until recovery.
+Inspection and operation errors are bounded and redacted before they enter
+events or persisted auth observations.
+
+The pre-refresh inspection and post-refresh inspection are both retained in
+the scheduler evidence. The post-refresh file is authoritative when a helper
+replaces the credential with an earlier or later expiry. If the post-refresh
+read is transiently unavailable, the scheduler retains the pre-refresh expiry
+and deadline rather than discarding known state. The attempt throttle is
+process-local monotonic state. After a restart, the current credential is
+re-inspected from wall-clock expiry and no stale pre-restart timestamp is
+reused.
+
+Credential replacement is lock-protected and atomic: the refresh helper writes
+the complete sanitized credential payload to a private same-directory
+temporary file, applies the resolved private metadata, and atomically replaces
+the target. Read-only LiteLLM consumers re-read the replaced inode and do not
+need a restart. Runtime and persisted evidence may retain provider, scope,
+result class, expiry, safe Codex label/hash, and bounded error metadata, but
+must not contain access, refresh, or ID tokens, authorization headers, the full
+credential payload, or a reversible account identity. Persisted auth records
+use a hashed file identity rather than the raw credential path.
+
+The managed xAI dev Compose contract is exact:
+
+- `AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS=300`
+- `AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=900`
+- `AAWM_XAI_OAUTH_FORCE_REFRESH=0`
+
+These are checked-in development configuration defaults. They are not
+deployment or runtime acceptance evidence.
+
 ## Codex OAuth Inventory Boundary
 
 Managed Codex proxy consumers use only the explicit
@@ -117,6 +195,9 @@ suppress later records, including an otherwise idle `account2`. Refresh and
 health aggregates are `healthy` when every enabled record is usable,
 `degraded` when some are usable, and `terminal` when none are usable. Events
 emit only the configured label and pinned safe hash for account identity.
+Refresh scheduler evidence and actual-attempt throttles remain independent for
+each label; one account's due check, failure, or endpoint attempt does not
+consume the other account's timer.
 
 OPENAI-004 request routing consumes the same explicit inventory plus the
 sidecar's fresh per-account five-hour and weekly/seven-day quota observations.

@@ -577,13 +577,26 @@ def test_rr089_kimi_oauth_refresh_invocation_and_event_shape(loop, tmp_path, mon
 
     def refresh(auth_file, **kwargs):
         calls.append((auth_file, kwargs))
+        kwargs["on_token_endpoint_attempt"]()
+        Path(auth_file).write_text(
+            json.dumps(
+                {
+                    "access_token": "fresh-access-token",
+                    "refresh_token": "rotated-refresh-token",
+                    "expires_at": 4102444800,
+                    "expires_in": 900,
+                    "scope": "kimi-code",
+                }
+            ),
+            encoding="utf-8",
+        )
         return {
             "attempted": True,
             "refreshed": True,
             "skipped": False,
             "auth_file": auth_file,
             "scope": "kimi-code",
-            "expires_at": "2026-07-19T16:00:00Z",
+            "expires_at": "2100-01-01T00:00:00Z",
             "auth_degraded": False,
             "error_class": None,
             "error_message": None,
@@ -598,16 +611,12 @@ def test_rr089_kimi_oauth_refresh_invocation_and_event_shape(loop, tmp_path, mon
     )
 
     assert event is not None
-    assert calls == [
-        (
-            config.kimi_oauth_auth_file,
-            {
-                "force": True,
-                "lock_file": config.kimi_oauth_lock_file,
-                "http_timeout_seconds": 17.0,
-            },
-        )
-    ]
+    assert len(calls) == 1
+    assert calls[0][0] == config.kimi_oauth_auth_file
+    assert calls[0][1]["force"] is True
+    assert calls[0][1]["lock_file"] == config.kimi_oauth_lock_file
+    assert calls[0][1]["http_timeout_seconds"] == 17.0
+    assert callable(calls[0][1]["on_token_endpoint_attempt"])
     assert event["event"] == "kimi_oauth_refresh"
     assert event["environment"] == "dev"
     assert event["attempted"] is True
@@ -622,16 +631,32 @@ def test_rr089_kimi_oauth_refresh_invocation_and_event_shape(loop, tmp_path, mon
 
 
 def test_rr089_kimi_oauth_refresh_obeys_interval(loop, tmp_path, monkeypatch) -> None:
+    auth_file = tmp_path / "kimi.json"
+    auth_file.write_text(
+        json.dumps(
+            {
+                "access_token": "expired-access-token",
+                "refresh_token": "refresh-token",
+                "expires_at": 1,
+                "expires_in": 900,
+                "scope": "kimi-code",
+            }
+        ),
+        encoding="utf-8",
+    )
     config = _config(
         loop,
         tmp_path,
         kimi_oauth_refresh_enabled=True,
+        kimi_oauth_auth_file=str(auth_file),
+        kimi_oauth_lock_file=str(tmp_path / "kimi.lock"),
         kimi_oauth_refresh_interval_seconds=60.0,
     )
     calls: list[float] = []
 
     def refresh(*args, **kwargs):
         calls.append(1.0)
+        assert callable(kwargs["on_token_endpoint_attempt"])
         return {
             "attempted": False,
             "refreshed": False,
@@ -648,16 +673,36 @@ def test_rr089_kimi_oauth_refresh_obeys_interval(loop, tmp_path, monkeypatch) ->
     state = loop.SidecarTaskState()
 
     assert loop._run_kimi_oauth_refresh_task(config, state, now_monotonic=100.0)
-    assert loop._run_kimi_oauth_refresh_task(config, state, now_monotonic=159.0) is None
+    assert loop._run_kimi_oauth_refresh_task(config, state, now_monotonic=159.0)
     assert loop._run_kimi_oauth_refresh_task(config, state, now_monotonic=160.0)
-    assert len(calls) == 2
+    assert len(calls) == 3
 
 
 def test_rr089_kimi_oauth_refresh_event_redacts_tokens(loop, tmp_path, monkeypatch) -> None:
-    config = _config(loop, tmp_path, kimi_oauth_refresh_enabled=True)
+    auth_file = tmp_path / "kimi.json"
+    auth_file.write_text(
+        json.dumps(
+            {
+                "access_token": "expired-access-token",
+                "refresh_token": "refresh-token",
+                "expires_at": 1,
+                "expires_in": 900,
+                "scope": "kimi-code",
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _config(
+        loop,
+        tmp_path,
+        kimi_oauth_refresh_enabled=True,
+        kimi_oauth_auth_file=str(auth_file),
+        kimi_oauth_lock_file=str(tmp_path / "kimi.lock"),
+    )
     secret = "refresh-token-should-never-leak-123456"
 
     def refresh(*args, **kwargs):
+        kwargs["on_token_endpoint_attempt"]()
         return {
             "attempted": True,
             "refreshed": False,
@@ -1447,29 +1492,61 @@ def test_rr089_kimi_usage_refresh_triggered_poll_does_not_recurse(
 def test_rr089_kimi_usage_poll_scheduling_and_refresh_trigger(
     loop, tmp_path, monkeypatch, current_kimi_usage_payload
 ) -> None:
+    auth_file = tmp_path / "kimi.json"
+    auth_file.write_text(
+        json.dumps(
+            {
+                "access_token": "expired-access-token",
+                "refresh_token": "refresh-token",
+                "expires_at": 1,
+                "expires_in": 900,
+                "scope": "kimi-code",
+            }
+        ),
+        encoding="utf-8",
+    )
     config = _config(
         loop,
         tmp_path,
         kimi_oauth_refresh_enabled=True,
+        kimi_oauth_auth_file=str(auth_file),
+        kimi_oauth_lock_file=str(tmp_path / "kimi.lock"),
         kimi_usage_poll_enabled=True,
         kimi_oauth_refresh_interval_seconds=3600.0,
         kimi_usage_poll_interval_seconds=3600.0,
         observability_anomaly_scan_enabled=False,
     )
-    monkeypatch.setattr(
-        loop.kimi_oauth_refresh,
-        "refresh_kimi_oauth_auth_file",
-        lambda *args, **kwargs: {
+
+    def refresh(auth_path, **kwargs):
+        kwargs["on_token_endpoint_attempt"]()
+        Path(auth_path).write_text(
+            json.dumps(
+                {
+                    "access_token": "fresh-access-token",
+                    "refresh_token": "rotated-refresh-token",
+                    "expires_at": 4102444800,
+                    "expires_in": 900,
+                    "scope": "kimi-code",
+                }
+            ),
+            encoding="utf-8",
+        )
+        return {
             "attempted": True,
             "refreshed": True,
             "skipped": False,
             "auth_file": config.kimi_oauth_auth_file,
             "scope": "kimi-code",
-            "expires_at": None,
+            "expires_at": "2100-01-01T00:00:00Z",
             "auth_degraded": False,
             "error_class": None,
             "error_message": None,
-        },
+        }
+
+    monkeypatch.setattr(
+        loop.kimi_oauth_refresh,
+        "refresh_kimi_oauth_auth_file",
+        refresh,
     )
     monkeypatch.setattr(
         loop,

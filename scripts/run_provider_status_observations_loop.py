@@ -1438,6 +1438,18 @@ class ProviderStatusLoopConfig:
 
 @dataclass
 class SidecarTaskState:
+    grok_oidc_refresh_schedule: "OAuthRefreshScheduleState" = dataclass_field(
+        default_factory=lambda: OAuthRefreshScheduleState()
+    )
+    codex_oauth_refresh_schedule_by_label: Dict[
+        str, "OAuthRefreshScheduleState"
+    ] = dataclass_field(default_factory=dict)
+    xai_oauth_refresh_schedule: "OAuthRefreshScheduleState" = dataclass_field(
+        default_factory=lambda: OAuthRefreshScheduleState()
+    )
+    kimi_oauth_refresh_schedule: "OAuthRefreshScheduleState" = dataclass_field(
+        default_factory=lambda: OAuthRefreshScheduleState()
+    )
     grok_oidc_last_attempt_monotonic: Optional[float] = None
     codex_oauth_last_attempt_monotonic_by_label: Dict[str, float] = dataclass_field(
         default_factory=dict
@@ -1478,6 +1490,23 @@ class SidecarTaskState:
         default_factory=dict
     )
     observability_anomaly_scan_last_attempt_monotonic: Optional[float] = None
+
+
+@dataclass
+class OAuthRefreshScheduleState:
+    """Sanitized scheduler evidence for one refreshable credential."""
+
+    eligibility_checked_at: Optional[str] = None
+    refresh_due_at: Optional[str] = None
+    next_refresh_check_at: Optional[str] = None
+    expires_at: Optional[str] = None
+    last_actual_attempt_at: Optional[str] = None
+    last_result_class: Optional[str] = None
+    last_error_class: Optional[str] = None
+    last_error_message: Optional[str] = None
+    credential_health: Optional[str] = None
+    usable: Optional[bool] = None
+    actual_attempt_count: int = 0
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -2614,14 +2643,11 @@ def _validate_config_args(args: argparse.Namespace) -> None:
 
 
 def _validate_core_config_args(args: argparse.Namespace) -> None:
-    if args.interval_seconds <= 0:
-        raise SystemExit("--interval-seconds must be greater than 0")
-    if args.timeout <= 0:
-        raise SystemExit("--timeout must be greater than 0")
+    _require_positive_finite(args.interval_seconds, "--interval-seconds")
+    _require_positive_finite(args.timeout, "--timeout")
     if args.ping_count <= 0:
         raise SystemExit("--ping-count must be greater than 0")
-    if args.ping_timeout <= 0:
-        raise SystemExit("--ping-timeout must be greater than 0")
+    _require_positive_finite(args.ping_timeout, "--ping-timeout")
     if args.db_lock_timeout_ms <= 0:
         raise SystemExit("--db-lock-timeout-ms must be greater than 0")
     if args.db_statement_timeout_ms <= 0:
@@ -2629,41 +2655,126 @@ def _validate_core_config_args(args: argparse.Namespace) -> None:
 
 
 def _validate_grok_oidc_config_args(args: argparse.Namespace) -> None:
-    if args.grok_oidc_refresh_interval_seconds <= 0:
-        raise SystemExit("--grok-oidc-refresh-interval-seconds must be greater than 0")
-    if args.grok_oidc_refresh_buffer_seconds < 0:
-        raise SystemExit("--grok-oidc-refresh-buffer-seconds must be non-negative")
-    if args.grok_oidc_http_timeout_seconds <= 0:
-        raise SystemExit("--grok-oidc-http-timeout-seconds must be greater than 0")
+    _require_positive_finite(
+        args.grok_oidc_refresh_interval_seconds,
+        "--grok-oidc-refresh-interval-seconds",
+    )
+    _require_nonnegative_finite(
+        args.grok_oidc_refresh_buffer_seconds,
+        "--grok-oidc-refresh-buffer-seconds",
+    )
+    _require_positive_finite(
+        args.grok_oidc_http_timeout_seconds,
+        "--grok-oidc-http-timeout-seconds",
+    )
+    _validate_fixed_buffer_eligibility_cadence(
+        enabled=args.grok_oidc_refresh_enabled,
+        force=args.grok_oidc_force_refresh,
+        buffer_seconds=args.grok_oidc_refresh_buffer_seconds,
+        buffer_option="--grok-oidc-refresh-buffer-seconds",
+        provider_name="Grok OIDC",
+        outer_cadence=args.interval_seconds,
+    )
 
 
 def _validate_codex_config_args(args: argparse.Namespace) -> None:
-    if args.codex_refresh_interval_seconds <= 0:
-        raise SystemExit("--codex-refresh-interval-seconds must be greater than 0")
-    if args.codex_refresh_buffer_seconds < 0:
-        raise SystemExit("--codex-refresh-buffer-seconds must be non-negative")
-    if args.codex_http_timeout_seconds <= 0:
-        raise SystemExit("--codex-http-timeout-seconds must be greater than 0")
+    _require_positive_finite(
+        args.codex_refresh_interval_seconds,
+        "--codex-refresh-interval-seconds",
+    )
+    _require_nonnegative_finite(
+        args.codex_refresh_buffer_seconds,
+        "--codex-refresh-buffer-seconds",
+    )
+    _require_positive_finite(
+        args.codex_http_timeout_seconds,
+        "--codex-http-timeout-seconds",
+    )
+    _validate_fixed_buffer_eligibility_cadence(
+        enabled=args.codex_oauth_refresh_enabled,
+        force=args.codex_force_refresh,
+        buffer_seconds=args.codex_refresh_buffer_seconds,
+        buffer_option="--codex-refresh-buffer-seconds",
+        provider_name="Codex OAuth",
+        outer_cadence=args.interval_seconds,
+    )
 
 
 def _validate_xai_oauth_config_args(args: argparse.Namespace) -> None:
     if not str(args.xai_oauth_scope).strip():
         raise SystemExit("--xai-oauth-scope must not be empty")
-    if args.xai_oauth_refresh_interval_seconds <= 0:
-        raise SystemExit("--xai-oauth-refresh-interval-seconds must be greater than 0")
-    if args.xai_oauth_refresh_buffer_seconds < 0:
-        raise SystemExit("--xai-oauth-refresh-buffer-seconds must be non-negative")
-    if args.xai_oauth_http_timeout_seconds <= 0:
-        raise SystemExit("--xai-oauth-http-timeout-seconds must be greater than 0")
+    _require_positive_finite(
+        args.xai_oauth_refresh_interval_seconds,
+        "--xai-oauth-refresh-interval-seconds",
+    )
+    _require_nonnegative_finite(
+        args.xai_oauth_refresh_buffer_seconds,
+        "--xai-oauth-refresh-buffer-seconds",
+    )
+    _require_positive_finite(
+        args.xai_oauth_http_timeout_seconds,
+        "--xai-oauth-http-timeout-seconds",
+    )
+    _validate_fixed_buffer_eligibility_cadence(
+        enabled=args.xai_oauth_refresh_enabled,
+        force=args.xai_oauth_force_refresh,
+        buffer_seconds=args.xai_oauth_refresh_buffer_seconds,
+        buffer_option="--xai-oauth-refresh-buffer-seconds",
+        provider_name="xAI OAuth",
+        outer_cadence=args.interval_seconds,
+    )
 
 
 def _validate_kimi_oauth_config_args(args: argparse.Namespace) -> None:
-    if args.kimi_oauth_refresh_interval_seconds <= 0:
-        raise SystemExit(
-            "--kimi-oauth-refresh-interval-seconds must be greater than 0"
-        )
-    if args.kimi_oauth_http_timeout_seconds <= 0:
-        raise SystemExit("--kimi-oauth-http-timeout-seconds must be greater than 0")
+    _require_positive_finite(
+        args.kimi_oauth_refresh_interval_seconds,
+        "--kimi-oauth-refresh-interval-seconds",
+    )
+    _require_positive_finite(
+        args.kimi_oauth_http_timeout_seconds,
+        "--kimi-oauth-http-timeout-seconds",
+    )
+    _validate_fixed_buffer_eligibility_cadence(
+        enabled=args.kimi_oauth_refresh_enabled,
+        force=args.kimi_oauth_force_refresh,
+        buffer_seconds=float(kimi_oauth_refresh.DEFAULT_KIMI_OAUTH_REFRESH_MIN_SECONDS),
+        buffer_option="Kimi OAuth minimum refresh threshold",
+        provider_name="Kimi OAuth",
+        outer_cadence=args.interval_seconds,
+    )
+
+
+def _require_positive_finite(value: float, option: str) -> None:
+    if not math.isfinite(float(value)):
+        raise SystemExit(f"{option} must be finite")
+    if value <= 0:
+        raise SystemExit(f"{option} must be greater than 0")
+
+
+def _require_nonnegative_finite(value: float, option: str) -> None:
+    if not math.isfinite(float(value)):
+        raise SystemExit(f"{option} must be finite")
+    if value < 0:
+        raise SystemExit(f"{option} must be non-negative")
+
+
+def _validate_fixed_buffer_eligibility_cadence(
+    *,
+    enabled: bool,
+    force: bool,
+    buffer_seconds: float,
+    buffer_option: str,
+    provider_name: str,
+    outer_cadence: float,
+) -> None:
+    if not enabled or force or outer_cadence <= buffer_seconds:
+        return
+    raise SystemExit(
+        f"{provider_name} OAuth eligibility cadence is unsafe: "
+        f"--interval-seconds={outer_cadence:g} exceeds "
+        f"{buffer_option}={buffer_seconds:g}; "
+        "outer eligibility cadence must not exceed the refresh buffer"
+    )
 
 
 def _validate_provider_auth_health_poll_config_args(args: argparse.Namespace) -> None:
@@ -3024,6 +3135,20 @@ def _provider_auth_status_from_event(event: Mapping[str, Any]) -> str:
     health_status = event.get("health_status")
     if health_status in {"fresh", "expired", "degraded", "malformed"}:
         return str(health_status)
+    refresh_result_class = event.get("refresh_result_class")
+    credential_health = event.get("credential_health")
+    if refresh_result_class is not None:
+        if refresh_result_class == "expired" or credential_health == "expired":
+            return "expired"
+        if event.get("error_class"):
+            return "failed"
+        if (
+            refresh_result_class in {"refresh_due", "refresh_failed"}
+            or credential_health == "degraded"
+        ):
+            return "degraded"
+        if credential_health == "malformed":
+            return "malformed"
     if event.get("error_class"):
         return "failed"
     if event.get("refreshed"):
@@ -3033,6 +3158,56 @@ def _provider_auth_status_from_event(event: Mapping[str, Any]) -> str:
     if event.get("attempted"):
         return "attempted"
     return "not_applicable"
+
+
+def _oauth_refresh_observation_metadata(event: Mapping[str, Any]) -> Dict[str, Any]:
+    """Copy only sanitized scheduler evidence into auth observations."""
+    keys = (
+        "pre_refresh_result_class",
+        "refresh_result_class",
+        "eligibility_checked_at",
+        "pre_eligibility_checked_at",
+        "pre_expires_at",
+        "expires_at",
+        "refresh_due_at",
+        "pre_refresh_due_at",
+        "next_refresh_check_at",
+        "last_actual_attempt_at",
+        "actual_attempted",
+        "actual_attempt_count",
+        "actual_attempt_count_total",
+        "eligibility_cadence_seconds",
+        "refresh_attempt_interval_seconds",
+        "refresh_buffer_seconds",
+        "refresh_threshold_seconds",
+        "credential_health",
+        "usable",
+        "scheduler_error_class",
+        "scheduler_error_message",
+        "last_result_class",
+    )
+    metadata: Dict[str, Any] = {}
+    for key in keys:
+        value = event.get(key)
+        if key == "scheduler_error_class":
+            value = _redacted_summary_field(value)
+        elif key == "scheduler_error_message":
+            value = _redacted_failure_message(value)
+        metadata[key] = value
+    return metadata
+
+
+def _oauth_refresh_successful_validation(
+    event: Mapping[str, Any],
+    status: str,
+) -> bool:
+    """Use scheduler health when present, retaining legacy event behavior."""
+    if event.get("refresh_result_class") is not None:
+        return (
+            event.get("credential_health") == "fresh"
+            and not event.get("error_class")
+        )
+    return status in {"refreshed", "skipped"} and not event.get("error_class")
 
 
 def _build_passive_provider_auth_observation(
@@ -3107,9 +3282,7 @@ def _build_grok_oidc_auth_observation(
     )
     expires_at = _parse_sidecar_timestamp(event.get("expires_at"))
     status = _provider_auth_status_from_event(event)
-    successful_validation = status in {"refreshed", "skipped"} and not event.get(
-        "error_class"
-    )
+    successful_validation = _oauth_refresh_successful_validation(event, status)
     auth_file = event.get("auth_file") or config.grok_oidc_auth_file
     metadata = {
         "auth_file_hash_algorithm": "sha256",
@@ -3123,6 +3296,7 @@ def _build_grok_oidc_auth_observation(
             "skipped": bool(event.get("skipped")),
         },
     }
+    metadata.update(_oauth_refresh_observation_metadata(event))
     return {
         "observed_at": observed_at,
         "environment": event.get("environment") or config.environment,
@@ -3180,9 +3354,7 @@ def _build_codex_auth_observation(
     )
     expires_at = _parse_sidecar_timestamp(event.get("expires_at"))
     status = _provider_auth_status_from_event(event)
-    successful_validation = status in {"refreshed", "skipped"} and not event.get(
-        "error_class"
-    )
+    successful_validation = _oauth_refresh_successful_validation(event, status)
     account_label = event.get("account_label")
     account_hash = event.get("account_hash")
     if record is not None:
@@ -3207,6 +3379,7 @@ def _build_codex_auth_observation(
             "skipped": bool(event.get("skipped")),
         },
     }
+    metadata.update(_oauth_refresh_observation_metadata(event))
     return {
         "observed_at": observed_at,
         "environment": event.get("environment") or config.environment,
@@ -3268,9 +3441,7 @@ def _build_xai_oauth_auth_observation(
     )
     expires_at = _parse_sidecar_timestamp(event.get("expires_at"))
     status = _provider_auth_status_from_event(event)
-    successful_validation = status in {"refreshed", "skipped"} and not event.get(
-        "error_class"
-    )
+    successful_validation = _oauth_refresh_successful_validation(event, status)
     auth_file = event.get("auth_file") or config.xai_oauth_auth_file
     metadata = {
         "auth_file_hash_algorithm": "sha256",
@@ -3284,6 +3455,7 @@ def _build_xai_oauth_auth_observation(
             "skipped": bool(event.get("skipped")),
         },
     }
+    metadata.update(_oauth_refresh_observation_metadata(event))
     return {
         "observed_at": observed_at,
         "environment": event.get("environment") or config.environment,
@@ -3339,9 +3511,7 @@ def _build_kimi_oauth_auth_observation(
     )
     expires_at = _parse_sidecar_timestamp(event.get("expires_at"))
     status = _provider_auth_status_from_event(event)
-    successful_validation = status in {"refreshed", "skipped"} and not event.get(
-        "error_class"
-    )
+    successful_validation = _oauth_refresh_successful_validation(event, status)
     auth_file = event.get("auth_file") or config.kimi_oauth_auth_file
     metadata = {
         "auth_file_hash_algorithm": "sha256",
@@ -3355,6 +3525,7 @@ def _build_kimi_oauth_auth_observation(
             "auth_degraded": bool(event.get("auth_degraded")),
         },
     }
+    metadata.update(_oauth_refresh_observation_metadata(event))
     return {
         "observed_at": observed_at,
         "environment": event.get("environment") or config.environment,
@@ -8957,46 +9128,387 @@ def _build_grok_billing_observations_for_dry_run(
     return 1
 
 
+def _normalize_scheduler_wall_now(now_wall: Optional[datetime]) -> datetime:
+    value = now_wall or datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _scheduler_timestamp(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _inspect_oauth_refresh_eligibility(
+    inspector: Callable[..., Mapping[str, Any]],
+    *,
+    wall_now: datetime,
+    inspector_kwargs: Optional[Mapping[str, Any]] = None,
+    fallback_poll_interval_seconds: float = 300.0,
+) -> Dict[str, Any]:
+    try:
+        return dict(
+            inspector(
+                now=lambda: wall_now,
+                **dict(inspector_kwargs or {}),
+            )
+        )
+    except Exception as exc:
+        return {
+            "eligibility_checked_at": _scheduler_timestamp(wall_now),
+            "expires_at": None,
+            "refresh_due_at": None,
+            "next_refresh_check_at": _scheduler_timestamp(
+                wall_now
+                + timedelta(seconds=max(1.0, fallback_poll_interval_seconds))
+            ),
+            "eligible": True,
+            "credential_health": "malformed",
+            "usable": False,
+            "error_class": exc.__class__.__name__,
+            "error_message": _redacted_failure_message(str(exc)),
+        }
+
+
+def _merge_oauth_refresh_eligibility(
+    pre: Mapping[str, Any],
+    post: Mapping[str, Any],
+    *,
+    wall_now: datetime,
+    operation_summary: Optional[Mapping[str, Any]] = None,
+    cadence_seconds: float = 300.0,
+    buffer_seconds: Optional[float] = None,
+    threshold_seconds: Optional[float] = None,
+) -> Dict[str, Any]:
+    merged = dict(post)
+    effective_threshold_seconds = post.get("refresh_threshold_seconds")
+    if effective_threshold_seconds is None:
+        effective_threshold_seconds = pre.get("refresh_threshold_seconds")
+    if effective_threshold_seconds is None:
+        effective_threshold_seconds = threshold_seconds
+    if effective_threshold_seconds is not None:
+        merged["refresh_threshold_seconds"] = effective_threshold_seconds
+    summary_expires_at = _parse_sidecar_timestamp(
+        (operation_summary or {}).get("expires_at")
+    )
+    if post.get("error_class") and summary_expires_at is not None:
+        merged["expires_at"] = _scheduler_timestamp(summary_expires_at)
+        window_seconds = (
+            effective_threshold_seconds
+            if effective_threshold_seconds is not None
+            else buffer_seconds
+        )
+        if window_seconds is not None:
+            due_at = summary_expires_at - timedelta(seconds=max(0, window_seconds))
+            merged["refresh_due_at"] = _scheduler_timestamp(due_at)
+            merged["eligible"] = wall_now >= due_at
+        merged["next_refresh_check_at"] = _scheduler_timestamp(
+            wall_now + timedelta(seconds=max(1.0, cadence_seconds))
+        )
+        merged["credential_health"] = (
+            "expired" if summary_expires_at <= wall_now else "fresh"
+        )
+        merged["usable"] = summary_expires_at > wall_now
+    # A transient post-call read failure must not erase the last known expiry
+    # or deadline. The next outer cycle rereads the pathname again.
+    if post.get("error_class") and not post.get("expires_at"):
+        for key in (
+            "expires_at",
+            "refresh_due_at",
+            "next_refresh_check_at",
+            "usable",
+            "credential_health",
+            "refresh_threshold_seconds",
+        ):
+            if pre.get(key) is not None:
+                merged[key] = pre[key]
+        if merged.get("refresh_due_at"):
+            due_at = _parse_sidecar_timestamp(merged["refresh_due_at"])
+            merged["eligible"] = due_at is None or wall_now >= due_at
+    return merged
+
+
+def _oauth_refresh_result_class(
+    eligibility: Mapping[str, Any],
+    *,
+    wall_now: datetime,
+    actual_attempt_count: int,
+    operation_error_class: Optional[str],
+    prior_result_class: Optional[str],
+) -> str:
+    expires_at = _parse_sidecar_timestamp(eligibility.get("expires_at"))
+    if expires_at is not None and expires_at <= wall_now:
+        return "expired"
+    eligible = bool(eligibility.get("eligible")) or not eligibility.get("expires_at")
+    if not eligible:
+        return "refresh_not_due"
+    if operation_error_class:
+        return "refresh_failed"
+    if actual_attempt_count == 0 and prior_result_class == "refresh_failed":
+        return "refresh_failed"
+    return "refresh_due"
+
+
+def _effective_oauth_credential_health(
+    eligibility: Mapping[str, Any],
+    *,
+    result_class: str,
+) -> Optional[str]:
+    """Project scheduling state into the existing health vocabulary."""
+    if result_class == "expired":
+        return "expired"
+    inspected_health = _redacted_summary_field(
+        eligibility.get("credential_health")
+    )
+    if inspected_health in {"malformed", "degraded"}:
+        return inspected_health
+    if result_class in {"refresh_due", "refresh_failed"}:
+        return "degraded"
+    if result_class == "refresh_not_due":
+        return "fresh"
+    return inspected_health
+
+
+def _oauth_refresh_schedule_evidence(
+    *,
+    schedule: OAuthRefreshScheduleState,
+    pre: Mapping[str, Any],
+    final: Mapping[str, Any],
+    pre_result_class: str,
+    result_class: str,
+    actual_attempt_count: int,
+    eligibility_cadence_seconds: float,
+    attempt_interval_seconds: float,
+    buffer_seconds: Optional[float] = None,
+    threshold_seconds: Optional[float] = None,
+    credential_health: Optional[str] = None,
+) -> Dict[str, Any]:
+    effective_threshold_seconds = final.get("refresh_threshold_seconds")
+    if effective_threshold_seconds is None:
+        effective_threshold_seconds = pre.get("refresh_threshold_seconds")
+    if effective_threshold_seconds is None:
+        effective_threshold_seconds = threshold_seconds
+    return {
+        "pre_refresh_result_class": pre_result_class,
+        "refresh_result_class": result_class,
+        "eligibility_checked_at": final.get("eligibility_checked_at"),
+        "pre_eligibility_checked_at": pre.get("eligibility_checked_at"),
+        "pre_expires_at": pre.get("expires_at"),
+        "expires_at": final.get("expires_at"),
+        "refresh_due_at": final.get("refresh_due_at"),
+        "pre_refresh_due_at": pre.get("refresh_due_at"),
+        "next_refresh_check_at": final.get("next_refresh_check_at"),
+        "last_actual_attempt_at": schedule.last_actual_attempt_at,
+        "actual_attempted": actual_attempt_count > 0,
+        "actual_attempt_count": actual_attempt_count,
+        "actual_attempt_count_total": schedule.actual_attempt_count,
+        "eligibility_cadence_seconds": eligibility_cadence_seconds,
+        "refresh_attempt_interval_seconds": attempt_interval_seconds,
+        "refresh_buffer_seconds": buffer_seconds,
+        "refresh_threshold_seconds": effective_threshold_seconds,
+        "credential_health": credential_health
+        if credential_health is not None
+        else final.get("credential_health"),
+        "usable": final.get("usable"),
+        "scheduler_error_class": schedule.last_error_class,
+        "scheduler_error_message": schedule.last_error_message,
+        "last_result_class": schedule.last_result_class,
+    }
+
+
+def _oauth_refresh_retry_throttled(
+    last_attempt_monotonic: Optional[float],
+    *,
+    now_monotonic: float,
+    attempt_interval_seconds: float,
+) -> bool:
+    return (
+        last_attempt_monotonic is not None
+        and now_monotonic >= last_attempt_monotonic
+        and now_monotonic - last_attempt_monotonic < attempt_interval_seconds
+    )
+
+
+def _run_oauth_refresh_schedule(
+    *,
+    schedule: OAuthRefreshScheduleState,
+    last_attempt_monotonic: Optional[float],
+    set_last_attempt_monotonic: Callable[[float], None],
+    now_monotonic: float,
+    wall_now: datetime,
+    eligibility_inspector: Callable[..., Mapping[str, Any]],
+    refresh_call: Callable[[Callable[[], None]], Mapping[str, Any]],
+    force: bool,
+    attempt_interval_seconds: float,
+    eligibility_cadence_seconds: float,
+    buffer_seconds: Optional[float] = None,
+    threshold_seconds: Optional[float] = None,
+    eligibility_inspector_kwargs: Optional[Mapping[str, Any]] = None,
+) -> tuple[
+    Dict[str, Any],
+    Dict[str, Any],
+    Optional[Mapping[str, Any]],
+    Dict[str, Any],
+    bool,
+]:
+    pre = _inspect_oauth_refresh_eligibility(
+        eligibility_inspector,
+        wall_now=wall_now,
+        inspector_kwargs=eligibility_inspector_kwargs,
+        fallback_poll_interval_seconds=eligibility_cadence_seconds,
+    )
+    pre_result_class = _oauth_refresh_result_class(
+        pre,
+        wall_now=wall_now,
+        actual_attempt_count=0,
+        operation_error_class=None,
+        prior_result_class=schedule.last_result_class,
+    )
+    actual_attempt_count = 0
+    operation_summary: Mapping[str, Any] = {}
+    actual_throttled = _oauth_refresh_retry_throttled(
+        last_attempt_monotonic,
+        now_monotonic=now_monotonic,
+        attempt_interval_seconds=attempt_interval_seconds,
+    )
+
+    def on_token_endpoint_attempt() -> None:
+        nonlocal actual_attempt_count
+        actual_attempt_count += 1
+        set_last_attempt_monotonic(now_monotonic)
+        schedule.last_actual_attempt_at = _scheduler_timestamp(wall_now)
+        schedule.actual_attempt_count += 1
+
+    should_call = (force or bool(pre.get("eligible"))) and not actual_throttled
+    if should_call:
+        try:
+            operation_summary = refresh_call(on_token_endpoint_attempt)
+        except Exception as exc:
+            operation_summary = {
+                "attempted": True,
+                "refreshed": False,
+                "skipped": False,
+                "error_class": exc.__class__.__name__,
+                "error_message": _redacted_failure_message(str(exc)),
+            }
+        post = _inspect_oauth_refresh_eligibility(
+            eligibility_inspector,
+            wall_now=wall_now,
+            inspector_kwargs=eligibility_inspector_kwargs,
+            fallback_poll_interval_seconds=eligibility_cadence_seconds,
+        )
+        final = _merge_oauth_refresh_eligibility(
+            pre,
+            post,
+            wall_now=wall_now,
+            operation_summary=operation_summary,
+            cadence_seconds=eligibility_cadence_seconds,
+            buffer_seconds=buffer_seconds,
+            threshold_seconds=threshold_seconds,
+        )
+    else:
+        post = None
+        final = dict(pre)
+
+    operation_error_class = _redacted_summary_field(
+        operation_summary.get("error_class")
+    )
+    result_class = _oauth_refresh_result_class(
+        final,
+        wall_now=wall_now,
+        actual_attempt_count=actual_attempt_count,
+        operation_error_class=operation_error_class,
+        prior_result_class=schedule.last_result_class if not should_call else None,
+    )
+    effective_health = _effective_oauth_credential_health(
+        final,
+        result_class=result_class,
+    )
+    schedule.eligibility_checked_at = final.get("eligibility_checked_at")
+    schedule.refresh_due_at = final.get("refresh_due_at")
+    schedule.next_refresh_check_at = final.get("next_refresh_check_at")
+    schedule.expires_at = final.get("expires_at")
+    schedule.last_result_class = result_class
+    if operation_error_class:
+        schedule.last_error_class = operation_error_class
+        schedule.last_error_message = _redacted_failure_message(
+            operation_summary.get("error_message")
+        )
+    elif result_class != "refresh_failed":
+        schedule.last_error_class = None
+        schedule.last_error_message = None
+    schedule.credential_health = effective_health
+    schedule.usable = final.get("usable")
+    evidence = _oauth_refresh_schedule_evidence(
+        schedule=schedule,
+        pre=pre,
+        final=final,
+        pre_result_class=pre_result_class,
+        result_class=result_class,
+        actual_attempt_count=actual_attempt_count,
+        eligibility_cadence_seconds=eligibility_cadence_seconds,
+        attempt_interval_seconds=attempt_interval_seconds,
+        buffer_seconds=buffer_seconds,
+        threshold_seconds=threshold_seconds,
+        credential_health=effective_health,
+    )
+    evidence["helper_called"] = should_call
+    return dict(final), dict(operation_summary), post, evidence, should_call
+
+
 def _run_grok_oidc_refresh_task(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
     *,
     now_monotonic: float,
+    now_wall: Optional[datetime] = None,
 ) -> Optional[Dict[str, Any]]:
     if not config.grok_oidc_refresh_enabled:
         return None
-    last_attempt = state.grok_oidc_last_attempt_monotonic
-    if (
-        last_attempt is not None
-        and now_monotonic - last_attempt < config.grok_oidc_refresh_interval_seconds
-    ):
-        return None
-
-    state.grok_oidc_last_attempt_monotonic = now_monotonic
-    try:
-        summary = grok_oidc_refresh.refresh_grok_oidc_auth_file(
+    wall_now = _normalize_scheduler_wall_now(now_wall)
+    final, summary, _post, evidence, helper_called = _run_oauth_refresh_schedule(
+        schedule=state.grok_oidc_refresh_schedule,
+        last_attempt_monotonic=state.grok_oidc_last_attempt_monotonic,
+        set_last_attempt_monotonic=lambda value: setattr(
+            state, "grok_oidc_last_attempt_monotonic", value
+        ),
+        now_monotonic=now_monotonic,
+        wall_now=wall_now,
+        eligibility_inspector=lambda *, now: grok_oidc_refresh.inspect_grok_oidc_refresh_eligibility(
+            config.grok_oidc_auth_file,
+            buffer_seconds=config.grok_oidc_refresh_buffer_seconds,
+            now=now,
+            poll_interval_seconds=config.interval_seconds,
+        ),
+        refresh_call=lambda callback: grok_oidc_refresh.refresh_grok_oidc_auth_file(
             config.grok_oidc_auth_file,
             buffer_seconds=config.grok_oidc_refresh_buffer_seconds,
             force=config.grok_oidc_force_refresh,
             lock_file=config.grok_oidc_lock_file,
             http_timeout_seconds=config.grok_oidc_http_timeout_seconds,
-        )
-    except Exception as exc:
-        summary = {
-            "attempted": True,
-            "refreshed": False,
-            "skipped": False,
-            "auth_file": config.grok_oidc_auth_file,
-            "scope": None,
-            "error_class": exc.__class__.__name__,
-            "error_message": _redacted_failure_message(str(exc)),
-        }
+            on_token_endpoint_attempt=callback,
+        ),
+        force=config.grok_oidc_force_refresh,
+        attempt_interval_seconds=config.grok_oidc_refresh_interval_seconds,
+        eligibility_cadence_seconds=config.interval_seconds,
+        buffer_seconds=config.grok_oidc_refresh_buffer_seconds,
+    )
 
     event = {
         "event": "grok_oidc_refresh",
-        "observed_at": _utc_timestamp(),
+        "observed_at": _scheduler_timestamp(wall_now),
         "environment": config.environment,
-        **summary,
+        "attempted": bool(summary.get("attempted")),
+        "refreshed": bool(summary.get("refreshed")),
+        "skipped": bool(summary.get("skipped")) or (
+            not helper_called and not summary.get("error_class")
+        ),
+        "auth_file": config.grok_oidc_auth_file,
+        "scope": summary.get("scope"),
+        "expires_at": final.get("expires_at") or summary.get("expires_at"),
+        "error_class": _redacted_summary_field(summary.get("error_class")),
+        "error_message": _redacted_failure_message(summary.get("error_message")),
+        **evidence,
     }
     (
         persisted,
@@ -9100,6 +9612,7 @@ def _run_codex_oauth_refresh_task(
     state: SidecarTaskState,
     *,
     now_monotonic: float,
+    now_wall: Optional[datetime] = None,
 ) -> list[Dict[str, Any]]:
     if not config.codex_oauth_refresh_enabled:
         return []
@@ -9131,59 +9644,66 @@ def _run_codex_oauth_refresh_task(
         )
         return events
 
+    wall_now = _normalize_scheduler_wall_now(now_wall)
     attempted_any = False
     for record in records:
-        last_attempt = state.codex_oauth_last_attempt_monotonic_by_label.get(
-            record.label
+        schedule = state.codex_oauth_refresh_schedule_by_label.setdefault(
+            record.label,
+            OAuthRefreshScheduleState(),
         )
-        if (
-            last_attempt is not None
-            and now_monotonic - last_attempt
-            < config.codex_refresh_interval_seconds
-        ):
-            continue
-
+        final, summary, _post, evidence, helper_called = _run_oauth_refresh_schedule(
+            schedule=schedule,
+            last_attempt_monotonic=(
+                state.codex_oauth_last_attempt_monotonic_by_label.get(record.label)
+            ),
+            set_last_attempt_monotonic=lambda value, label=record.label: (
+                state.codex_oauth_last_attempt_monotonic_by_label.__setitem__(
+                    label, value
+                )
+            ),
+            now_monotonic=now_monotonic,
+            wall_now=wall_now,
+            eligibility_inspector=lambda *, now, selected_record=record: (
+                codex_oauth_refresh.inspect_codex_oauth_refresh_eligibility(
+                    selected_record.auth_path,
+                    buffer_seconds=config.codex_refresh_buffer_seconds,
+                    now=now,
+                    poll_interval_seconds=config.interval_seconds,
+                    credential_record=selected_record,
+                )
+            ),
+            refresh_call=lambda callback, selected_record=record: (
+                codex_oauth_refresh.refresh_codex_oauth_inventory_record(
+                    selected_record,
+                    buffer_seconds=config.codex_refresh_buffer_seconds,
+                    force=config.codex_force_refresh,
+                    http_timeout_seconds=config.codex_http_timeout_seconds,
+                    on_token_endpoint_attempt=callback,
+                )
+            ),
+            force=config.codex_force_refresh,
+            attempt_interval_seconds=config.codex_refresh_interval_seconds,
+            eligibility_cadence_seconds=config.interval_seconds,
+            buffer_seconds=config.codex_refresh_buffer_seconds,
+        )
         attempted_any = True
-        state.codex_oauth_last_attempt_monotonic_by_label[record.label] = (
-            now_monotonic
-        )
-        try:
-            summary = codex_oauth_refresh.refresh_codex_oauth_inventory_record(
-                record,
-                buffer_seconds=config.codex_refresh_buffer_seconds,
-                force=config.codex_force_refresh,
-                http_timeout_seconds=config.codex_http_timeout_seconds,
-            )
-        except Exception as exc:
-            summary = {
-                "attempted": True,
-                "refreshed": False,
-                "skipped": False,
-                "account_label": record.label,
-                "account_hash": record.expected_account_hash,
-                "expires_at": None,
-                "error_class": exc.__class__.__name__,
-                "error_message": (
-                    f"Codex OAuth credential '{record.label}' refresh failed."
-                ),
-                "error_hint": None,
-            }
 
         event = {
             "event": "codex_oauth_refresh",
-            "observed_at": _utc_timestamp(),
+            "observed_at": _scheduler_timestamp(wall_now),
             "environment": config.environment,
             "attempted": bool(summary.get("attempted")),
             "refreshed": bool(summary.get("refreshed")),
-            "skipped": bool(summary.get("skipped")),
+            "skipped": bool(summary.get("skipped")) or (
+                not helper_called and not summary.get("error_class")
+            ),
             "account_label": record.label,
             "account_hash": record.expected_account_hash,
-            "expires_at": summary.get("expires_at"),
+            "expires_at": final.get("expires_at") or summary.get("expires_at"),
             "error_class": _redacted_summary_field(summary.get("error_class")),
-            "error_message": _redacted_failure_message(
-                summary.get("error_message")
-            ),
+            "error_message": _redacted_failure_message(summary.get("error_message")),
             "error_hint": _redacted_summary_field(summary.get("error_hint")),
+            **evidence,
         }
         (
             persisted,
@@ -9200,8 +9720,15 @@ def _run_codex_oauth_refresh_task(
         event["auth_observation_inserted_count"] = inserted_count
         event["auth_observation_skip_error_class"] = skip_error_class
         event["auth_observation_skip_reason"] = skip_reason
-        refresh_succeeded = _refresh_event_succeeded(event)
-        state.codex_oauth_usable_by_label[record.label] = refresh_succeeded
+        # Post-inspection is authoritative when available. A missing/invalid
+        # post-read retains the pre-read state rather than trusting flags.
+        inspected_usable = final.get("usable")
+        if inspected_usable is not None:
+            state.codex_oauth_usable_by_label[record.label] = bool(
+                inspected_usable
+            )
+        elif record.label not in state.codex_oauth_usable_by_label:
+            state.codex_oauth_usable_by_label[record.label] = False
         state.codex_oauth_status_by_label[record.label] = event[
             "auth_observation_status"
         ]
@@ -9225,42 +9752,58 @@ def _run_xai_oauth_refresh_task(
     state: SidecarTaskState,
     *,
     now_monotonic: float,
+    now_wall: Optional[datetime] = None,
 ) -> Optional[Dict[str, Any]]:
     if not config.xai_oauth_refresh_enabled:
         return None
-    last_attempt = state.xai_oauth_last_attempt_monotonic
-    if (
-        last_attempt is not None
-        and now_monotonic - last_attempt < config.xai_oauth_refresh_interval_seconds
-    ):
-        return None
-
-    state.xai_oauth_last_attempt_monotonic = now_monotonic
-    try:
-        summary = xai_oauth_refresh.refresh_xai_oauth_auth_file(
+    wall_now = _normalize_scheduler_wall_now(now_wall)
+    final, summary, _post, evidence, helper_called = _run_oauth_refresh_schedule(
+        schedule=state.xai_oauth_refresh_schedule,
+        last_attempt_monotonic=state.xai_oauth_last_attempt_monotonic,
+        set_last_attempt_monotonic=lambda value: setattr(
+            state, "xai_oauth_last_attempt_monotonic", value
+        ),
+        now_monotonic=now_monotonic,
+        wall_now=wall_now,
+        eligibility_inspector=lambda *, now: (
+            xai_oauth_refresh.inspect_xai_oauth_refresh_eligibility(
+                config.xai_oauth_auth_file,
+                scope=config.xai_oauth_scope,
+                buffer_seconds=config.xai_oauth_refresh_buffer_seconds,
+                now=now,
+                poll_interval_seconds=config.interval_seconds,
+            )
+        ),
+        refresh_call=lambda callback: xai_oauth_refresh.refresh_xai_oauth_auth_file(
             config.xai_oauth_auth_file,
             scope=config.xai_oauth_scope,
             buffer_seconds=config.xai_oauth_refresh_buffer_seconds,
             force=config.xai_oauth_force_refresh,
             lock_file=config.xai_oauth_lock_file,
             http_timeout_seconds=config.xai_oauth_http_timeout_seconds,
-        )
-    except Exception as exc:
-        summary = {
-            "attempted": True,
-            "refreshed": False,
-            "skipped": False,
-            "auth_file": config.xai_oauth_auth_file,
-            "scope": config.xai_oauth_scope,
-            "error_class": exc.__class__.__name__,
-            "error_message": _redacted_failure_message(str(exc)),
-        }
+            on_token_endpoint_attempt=callback,
+        ),
+        force=config.xai_oauth_force_refresh,
+        attempt_interval_seconds=config.xai_oauth_refresh_interval_seconds,
+        eligibility_cadence_seconds=config.interval_seconds,
+        buffer_seconds=config.xai_oauth_refresh_buffer_seconds,
+    )
 
     event = {
         "event": "xai_oauth_refresh",
-        "observed_at": _utc_timestamp(),
+        "observed_at": _scheduler_timestamp(wall_now),
         "environment": config.environment,
-        **summary,
+        "attempted": bool(summary.get("attempted")),
+        "refreshed": bool(summary.get("refreshed")),
+        "skipped": bool(summary.get("skipped")) or (
+            not helper_called and not summary.get("error_class")
+        ),
+        "auth_file": config.xai_oauth_auth_file,
+        "scope": summary.get("scope") or config.xai_oauth_scope,
+        "expires_at": final.get("expires_at") or summary.get("expires_at"),
+        "error_class": _redacted_summary_field(summary.get("error_class")),
+        "error_message": _redacted_failure_message(summary.get("error_message")),
+        **evidence,
     }
     (
         persisted,
@@ -9281,58 +9824,55 @@ def _run_kimi_oauth_refresh_task(
     state: SidecarTaskState,
     *,
     now_monotonic: float,
+    now_wall: Optional[datetime] = None,
 ) -> Optional[Dict[str, Any]]:
     if not config.kimi_oauth_refresh_enabled:
         return None
-    last_attempt = state.kimi_oauth_last_attempt_monotonic
-    if (
-        last_attempt is not None
-        and now_monotonic - last_attempt < config.kimi_oauth_refresh_interval_seconds
-    ):
-        return None
-
-    state.kimi_oauth_last_attempt_monotonic = now_monotonic
-    try:
-        summary = kimi_oauth_refresh.refresh_kimi_oauth_auth_file(
+    wall_now = _normalize_scheduler_wall_now(now_wall)
+    final, summary, _post, evidence, helper_called = _run_oauth_refresh_schedule(
+        schedule=state.kimi_oauth_refresh_schedule,
+        last_attempt_monotonic=state.kimi_oauth_last_attempt_monotonic,
+        set_last_attempt_monotonic=lambda value: setattr(
+            state, "kimi_oauth_last_attempt_monotonic", value
+        ),
+        now_monotonic=now_monotonic,
+        wall_now=wall_now,
+        eligibility_inspector=lambda *, now: (
+            kimi_oauth_refresh.inspect_kimi_oauth_refresh_eligibility(
+                config.kimi_oauth_auth_file,
+                now=now,
+                poll_interval_seconds=config.interval_seconds,
+            )
+        ),
+        refresh_call=lambda callback: kimi_oauth_refresh.refresh_kimi_oauth_auth_file(
             config.kimi_oauth_auth_file,
             force=config.kimi_oauth_force_refresh,
             lock_file=config.kimi_oauth_lock_file,
             http_timeout_seconds=config.kimi_oauth_http_timeout_seconds,
-        )
-    except Exception as exc:
-        summary = {
-            "attempted": True,
-            "refreshed": False,
-            "skipped": False,
-            "auth_file": config.kimi_oauth_auth_file,
-            "scope": kimi_oauth_refresh.DEFAULT_KIMI_OAUTH_SCOPE,
-            "error_class": exc.__class__.__name__,
-            "error_message": _redacted_failure_message(str(exc)),
-        }
-    else:
-        error_message = summary.get("error_message")
-        if error_message:
-            summary["error_message"] = _redacted_failure_message(error_message)
+            on_token_endpoint_attempt=callback,
+        ),
+        force=config.kimi_oauth_force_refresh,
+        attempt_interval_seconds=config.kimi_oauth_refresh_interval_seconds,
+        eligibility_cadence_seconds=config.interval_seconds,
+        threshold_seconds=float(kimi_oauth_refresh.DEFAULT_KIMI_OAUTH_REFRESH_MIN_SECONDS),
+    )
 
-    safe_summary = {
-        key: summary.get(key)
-        for key in (
-            "attempted",
-            "refreshed",
-            "skipped",
-            "auth_file",
-            "scope",
-            "expires_at",
-            "auth_degraded",
-            "error_class",
-            "error_message",
-        )
-    }
     event = {
         "event": "kimi_oauth_refresh",
-        "observed_at": _utc_timestamp(),
+        "observed_at": _scheduler_timestamp(wall_now),
         "environment": config.environment,
-        **safe_summary,
+        "attempted": bool(summary.get("attempted")),
+        "refreshed": bool(summary.get("refreshed")),
+        "skipped": bool(summary.get("skipped")) or (
+            not helper_called and not summary.get("error_class")
+        ),
+        "auth_file": config.kimi_oauth_auth_file,
+        "scope": summary.get("scope") or kimi_oauth_refresh.DEFAULT_KIMI_OAUTH_SCOPE,
+        "expires_at": final.get("expires_at") or summary.get("expires_at"),
+        "auth_degraded": bool(summary.get("auth_degraded")),
+        "error_class": _redacted_summary_field(summary.get("error_class")),
+        "error_message": _redacted_failure_message(summary.get("error_message")),
+        **evidence,
     }
     (
         persisted,
@@ -10173,8 +10713,10 @@ def run_due_sidecar_tasks(
     state: SidecarTaskState,
     *,
     now_monotonic: Optional[float] = None,
+    now_wall: Optional[datetime] = None,
 ) -> list[Dict[str, Any]]:
     now = time.monotonic() if now_monotonic is None else now_monotonic
+    wall_now = _normalize_scheduler_wall_now(now_wall)
     events: list[Dict[str, Any]] = []
     for runner, event_name in (
         (_run_grok_oidc_metadata_repair_task, "grok_oidc_metadata_repair"),
@@ -10189,7 +10731,15 @@ def run_due_sidecar_tasks(
         (_run_observability_anomaly_scan_task, "observability_anomaly_scan"),
     ):
         try:
-            result = runner(config, state, now_monotonic=now)
+            runner_kwargs = {"now_monotonic": now}
+            if runner in {
+                _run_grok_oidc_refresh_task,
+                _run_codex_oauth_refresh_task,
+                _run_xai_oauth_refresh_task,
+                _run_kimi_oauth_refresh_task,
+            }:
+                runner_kwargs["now_wall"] = wall_now
+            result = runner(config, state, **runner_kwargs)
         except Exception as exc:
             result = {
                 "event": event_name,

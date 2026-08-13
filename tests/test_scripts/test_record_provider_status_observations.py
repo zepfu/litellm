@@ -1510,13 +1510,718 @@ def test_provider_status_compose_wires_managed_xai_oauth_sidecar_refresh() -> No
         in compose_text
     )
     assert (
-        "AAWM_XAI_OAUTH_FORCE_REFRESH=${AAWM_XAI_OAUTH_FORCE_REFRESH:-1}"
+        "AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS=${AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS:-300}"
+        in compose_text
+    )
+    assert (
+        "AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=${AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS:-900}"
+        in compose_text
+    )
+    assert (
+        "AAWM_XAI_OAUTH_FORCE_REFRESH=${AAWM_XAI_OAUTH_FORCE_REFRESH:-0}"
         in compose_text
     )
     assert (
         "COPY scripts/xai_oauth_refresh.py "
         "/app/scripts/xai_oauth_refresh.py"
     ) in dockerfile_text
+
+
+def test_validate_xai_oauth_guardrail_rejects_outer_cadence_above_buffer() -> None:
+    config = loop.ProviderStatusLoopConfig(
+        apply=False,
+        dsn=None,
+        environment="dev",
+        interval_seconds=901.0,
+        timeout=2.0,
+        ping_count=1,
+        ping_timeout=2,
+        skip_icmp=True,
+        once=True,
+        setup_schema=False,
+        db_lock_timeout_ms=1000,
+        db_statement_timeout_ms=5000,
+        xai_oauth_refresh_enabled=True,
+        xai_oauth_refresh_interval_seconds=60.0,
+        xai_oauth_refresh_buffer_seconds=900,
+        xai_oauth_force_refresh=False,
+    )
+
+    with pytest.raises(
+        SystemExit,
+        match=(
+            r"--interval-seconds=901 exceeds "
+            r"--xai-oauth-refresh-buffer-seconds=900; "
+            r"outer eligibility cadence must not exceed the refresh buffer"
+        ),
+    ):
+        loop._validate_xai_oauth_config_args(
+            Namespace(
+                xai_oauth_scope=config.xai_oauth_scope,
+                xai_oauth_refresh_interval_seconds=60.0,
+                xai_oauth_refresh_buffer_seconds=900,
+                xai_oauth_http_timeout_seconds=30.0,
+                xai_oauth_refresh_enabled=True,
+                xai_oauth_force_refresh=False,
+                interval_seconds=901.0,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("summary", "invoke_callback", "expected_throttled"),
+    [
+        (
+            {
+                "attempted": False,
+                "refreshed": False,
+                "skipped": True,
+                "error_class": None,
+                "error_message": None,
+            },
+            False,
+            False,
+        ),
+        (
+            {
+                "attempted": True,
+                "refreshed": False,
+                "skipped": False,
+                "error_class": "TimeoutError",
+                "error_message": "pre-network failure",
+            },
+            False,
+            False,
+        ),
+        (
+            {
+                "attempted": True,
+                "refreshed": False,
+                "skipped": False,
+                "error_class": "HTTPError",
+                "error_message": "endpoint rejected",
+            },
+            True,
+            True,
+        ),
+        (
+            {
+                "attempted": True,
+                "refreshed": True,
+                "skipped": False,
+                "error_class": None,
+                "error_message": None,
+            },
+            True,
+            True,
+        ),
+    ],
+)
+def test_oauth_schedule_throttles_only_actual_token_endpoint_attempts(
+    summary,
+    invoke_callback,
+    expected_throttled,
+) -> None:
+    schedule = loop.OAuthRefreshScheduleState()
+    state = {"last_attempt": None}
+
+    def inspect(*, now):
+        return {
+            "eligibility_checked_at": now().isoformat().replace("+00:00", "Z"),
+            "expires_at": "2026-08-13T23:00:00Z",
+            "refresh_due_at": "2026-08-13T22:00:00Z",
+            "next_refresh_check_at": "2026-08-13T23:05:00Z",
+            "eligible": True,
+            "credential_health": "fresh",
+            "usable": True,
+            "error_class": None,
+            "error_message": None,
+        }
+
+    calls = []
+
+    def refresh(callback):
+        calls.append(callback)
+        if invoke_callback:
+            callback()
+        return dict(summary)
+
+    final, _operation, _post, evidence, helper_called = (
+        loop._run_oauth_refresh_schedule(
+            schedule=schedule,
+            last_attempt_monotonic=state["last_attempt"],
+            set_last_attempt_monotonic=lambda value: state.__setitem__(
+                "last_attempt", value
+            ),
+            now_monotonic=100.0,
+            wall_now=datetime(2026, 8, 13, 22, 30, tzinfo=timezone.utc),
+            eligibility_inspector=inspect,
+            refresh_call=refresh,
+            force=False,
+            attempt_interval_seconds=300.0,
+            eligibility_cadence_seconds=300.0,
+            buffer_seconds=3600.0,
+        )
+    )
+
+    assert final["usable"] is True
+    assert helper_called is True
+    assert evidence["actual_attempted"] is invoke_callback
+    assert evidence["actual_attempt_count"] == (1 if invoke_callback else 0)
+    assert state["last_attempt"] == (100.0 if invoke_callback else None)
+
+    if expected_throttled:
+        second = loop._run_oauth_refresh_schedule(
+            schedule=schedule,
+            last_attempt_monotonic=state["last_attempt"],
+            set_last_attempt_monotonic=lambda value: state.__setitem__(
+                "last_attempt", value
+            ),
+            now_monotonic=200.0,
+            wall_now=datetime(2026, 8, 13, 22, 31, tzinfo=timezone.utc),
+            eligibility_inspector=inspect,
+            refresh_call=lambda _callback: pytest.fail(
+                "actual endpoint attempt throttle should skip helper call"
+            ),
+            force=False,
+            attempt_interval_seconds=300.0,
+            eligibility_cadence_seconds=300.0,
+            buffer_seconds=3600.0,
+        )
+        assert second[4] is False
+        assert second[3]["actual_attempted"] is False
+
+
+def test_oauth_schedule_retries_pre_network_failure_next_outer_cycle() -> None:
+    schedule = loop.OAuthRefreshScheduleState()
+    actual_attempt = {"value": None}
+    helper_calls = []
+    eligibility_calls = []
+
+    def inspect(*, now):
+        eligibility_calls.append(now())
+        return {
+            "eligibility_checked_at": now().isoformat().replace("+00:00", "Z"),
+            "expires_at": "2026-08-13T23:00:00Z",
+            "refresh_due_at": "2026-08-13T22:00:00Z",
+            "next_refresh_check_at": "2026-08-13T22:35:00Z",
+            "eligible": True,
+            "credential_health": "fresh",
+            "usable": True,
+            "error_class": None,
+            "error_message": None,
+        }
+
+    def refresh(_callback):
+        helper_calls.append(True)
+        return {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "error_class": "TimeoutError",
+            "error_message": "pre-network failure",
+        }
+
+    def run_schedule(now_monotonic, wall_now):
+        return loop._run_oauth_refresh_schedule(
+            schedule=schedule,
+            last_attempt_monotonic=actual_attempt["value"],
+            set_last_attempt_monotonic=lambda value: actual_attempt.__setitem__(
+                "value", value
+            ),
+            now_monotonic=now_monotonic,
+            wall_now=wall_now,
+            eligibility_inspector=inspect,
+            refresh_call=refresh,
+            force=False,
+            attempt_interval_seconds=300.0,
+            eligibility_cadence_seconds=300.0,
+            buffer_seconds=3600.0,
+        )
+
+    first = run_schedule(
+        100.0,
+        datetime(2026, 8, 13, 22, 30, tzinfo=timezone.utc),
+    )
+    next_outer_cycle = run_schedule(
+        101.0,
+        datetime(2026, 8, 13, 22, 30, 1, tzinfo=timezone.utc),
+    )
+
+    assert first[4] is True
+    assert next_outer_cycle[4] is True
+    assert first[3]["actual_attempted"] is False
+    assert next_outer_cycle[3]["actual_attempted"] is False
+    assert first[3]["refresh_result_class"] == "refresh_failed"
+    assert next_outer_cycle[3]["refresh_result_class"] == "refresh_failed"
+    assert helper_calls == [True, True]
+    assert len(eligibility_calls) == 4
+    assert actual_attempt["value"] is None
+    assert schedule.last_actual_attempt_at is None
+    assert schedule.actual_attempt_count == 0
+
+
+def test_oauth_schedule_reinspects_external_replacement_after_local_failure(
+    tmp_path,
+) -> None:
+    credential_path = tmp_path / "oauth.json"
+    due_expiry = datetime(2026, 8, 13, 23, 0, tzinfo=timezone.utc)
+    fresh_expiry = datetime(2026, 8, 14, 1, 0, tzinfo=timezone.utc)
+    credential_path.write_text(
+        json.dumps({"expires_at": due_expiry.isoformat()}),
+        encoding="utf-8",
+    )
+    schedule = loop.OAuthRefreshScheduleState()
+    actual_attempt = {"value": None}
+    helper_calls = []
+
+    def inspect(*, now):
+        observed_at = now()
+        expires_at = datetime.fromisoformat(
+            json.loads(credential_path.read_text(encoding="utf-8"))["expires_at"]
+        )
+        refresh_due_at = expires_at - timedelta(hours=1)
+        return {
+            "eligibility_checked_at": observed_at.isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
+            "refresh_due_at": refresh_due_at.isoformat().replace("+00:00", "Z"),
+            "next_refresh_check_at": refresh_due_at.isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "eligible": observed_at >= refresh_due_at,
+            "credential_health": "fresh",
+            "usable": observed_at < expires_at,
+            "error_class": None,
+            "error_message": None,
+        }
+
+    def refresh(_callback):
+        helper_calls.append(True)
+        return {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "error_class": "ValueError",
+            "error_message": "local request construction failed",
+        }
+
+    first = loop._run_oauth_refresh_schedule(
+        schedule=schedule,
+        last_attempt_monotonic=actual_attempt["value"],
+        set_last_attempt_monotonic=lambda value: actual_attempt.__setitem__(
+            "value", value
+        ),
+        now_monotonic=100.0,
+        wall_now=datetime(2026, 8, 13, 22, 30, tzinfo=timezone.utc),
+        eligibility_inspector=inspect,
+        refresh_call=refresh,
+        force=False,
+        attempt_interval_seconds=300.0,
+        eligibility_cadence_seconds=300.0,
+        buffer_seconds=3600.0,
+    )
+    assert first[4] is True
+    assert first[3]["actual_attempted"] is False
+    assert actual_attempt["value"] is None
+
+    replacement_path = tmp_path / "oauth.replacement.json"
+    replacement_path.write_text(
+        json.dumps({"expires_at": fresh_expiry.isoformat()}),
+        encoding="utf-8",
+    )
+    os.replace(replacement_path, credential_path)
+
+    second = loop._run_oauth_refresh_schedule(
+        schedule=schedule,
+        last_attempt_monotonic=actual_attempt["value"],
+        set_last_attempt_monotonic=lambda value: actual_attempt.__setitem__(
+            "value", value
+        ),
+        now_monotonic=101.0,
+        wall_now=datetime(2026, 8, 13, 22, 30, 1, tzinfo=timezone.utc),
+        eligibility_inspector=inspect,
+        refresh_call=lambda _callback: pytest.fail(
+            "fresh external replacement must be observed before helper invocation"
+        ),
+        force=False,
+        attempt_interval_seconds=300.0,
+        eligibility_cadence_seconds=300.0,
+        buffer_seconds=3600.0,
+    )
+    assert second[4] is False
+    assert second[3]["refresh_result_class"] == "refresh_not_due"
+    assert second[3]["expires_at"] == "2026-08-14T01:00:00Z"
+    assert second[3]["actual_attempted"] is False
+    assert second[3]["credential_health"] == "fresh"
+    assert helper_calls == [True]
+    assert actual_attempt["value"] is None
+
+
+def test_xai_incident_deadline_boundary_does_not_consume_attempt_throttle() -> None:
+    issuance = datetime(2026, 8, 12, 17, 18, 43, 881054, tzinfo=timezone.utc)
+    expiry = datetime(2026, 8, 12, 23, 18, 43, 881054, tzinfo=timezone.utc)
+    assert expiry - issuance == timedelta(hours=6)
+    due_boundary = expiry - timedelta(minutes=15)
+    assert due_boundary == datetime(
+        2026, 8, 12, 23, 3, 43, 881054, tzinfo=timezone.utc
+    )
+
+    schedule = loop.OAuthRefreshScheduleState()
+    last_attempt = {"value": None}
+    calls = []
+    eligibility_times = iter(
+        (
+            datetime(2026, 8, 12, 22, 38, 44, tzinfo=timezone.utc),
+            datetime(2026, 8, 12, 23, 3, 44, tzinfo=timezone.utc),
+        )
+    )
+
+    def inspect(*, now):
+        observed = next(eligibility_times)
+        return {
+            "eligibility_checked_at": observed.isoformat().replace("+00:00", "Z"),
+            "expires_at": expiry.isoformat().replace("+00:00", "Z"),
+            "refresh_due_at": due_boundary.isoformat().replace("+00:00", "Z"),
+            "next_refresh_check_at": due_boundary.isoformat().replace("+00:00", "Z"),
+            "eligible": observed >= due_boundary,
+            "credential_health": "fresh",
+            "usable": True,
+            "error_class": None,
+            "error_message": None,
+        }
+
+    def refresh(callback):
+        calls.append(True)
+        callback()
+        return {
+            "attempted": True,
+            "refreshed": True,
+            "skipped": False,
+            "error_class": None,
+            "error_message": None,
+        }
+
+    first = loop._run_oauth_refresh_schedule(
+        schedule=schedule,
+        last_attempt_monotonic=None,
+        set_last_attempt_monotonic=lambda value: last_attempt.__setitem__(
+            "value", value
+        ),
+        now_monotonic=100.0,
+        wall_now=datetime(2026, 8, 12, 22, 38, 44, tzinfo=timezone.utc),
+        eligibility_inspector=inspect,
+        refresh_call=refresh,
+        force=False,
+        attempt_interval_seconds=300.0,
+        eligibility_cadence_seconds=300.0,
+        buffer_seconds=900.0,
+    )
+    assert first[3]["refresh_result_class"] == "refresh_not_due"
+    assert first[3]["actual_attempted"] is False
+    assert calls == []
+
+    second = loop._run_oauth_refresh_schedule(
+        schedule=schedule,
+        last_attempt_monotonic=last_attempt["value"],
+        set_last_attempt_monotonic=lambda value: last_attempt.__setitem__(
+            "value", value
+        ),
+        now_monotonic=101.0,
+        wall_now=datetime(2026, 8, 12, 23, 3, 44, tzinfo=timezone.utc),
+        eligibility_inspector=inspect,
+        refresh_call=refresh,
+        force=False,
+        attempt_interval_seconds=300.0,
+        eligibility_cadence_seconds=300.0,
+        buffer_seconds=900.0,
+    )
+    assert second[3]["refresh_result_class"] == "refresh_due"
+    assert second[3]["actual_attempted"] is True
+    assert second[3]["last_actual_attempt_at"] == "2026-08-12T23:03:44Z"
+    assert calls == [True]
+
+
+def test_xai_restart_state_discards_pre_restart_attempt_throttle(
+    monkeypatch,
+) -> None:
+    config = _xai_oauth_auth_persist_config(
+        apply=False,
+        interval_seconds=300.0,
+        xai_oauth_refresh_interval_seconds=3600.0,
+        xai_oauth_refresh_buffer_seconds=900,
+    )
+    wall_now = datetime(2026, 8, 13, 22, 30, tzinfo=timezone.utc)
+    inspections = []
+    refresh_calls = []
+
+    def inspect(*_args, now, **_kwargs):
+        observed = now()
+        inspections.append(observed)
+        return {
+            "eligibility_checked_at": observed.isoformat().replace("+00:00", "Z"),
+            "expires_at": "2026-08-13T22:40:00Z",
+            "refresh_due_at": "2026-08-13T22:25:00Z",
+            "next_refresh_check_at": "2026-08-13T22:35:00Z",
+            "eligible": True,
+            "credential_health": "fresh",
+            "usable": True,
+            "scope": config.xai_oauth_scope,
+            "error_class": None,
+            "error_message": None,
+        }
+
+    def refresh(*_args, on_token_endpoint_attempt, **_kwargs):
+        refresh_calls.append(True)
+        on_token_endpoint_attempt()
+        return {
+            "attempted": True,
+            "refreshed": True,
+            "skipped": False,
+            "scope": config.xai_oauth_scope,
+            "expires_at": "2026-08-13T23:30:00Z",
+            "error_class": None,
+            "error_message": None,
+        }
+
+    monkeypatch.setattr(
+        loop.xai_oauth_refresh,
+        "inspect_xai_oauth_refresh_eligibility",
+        inspect,
+    )
+    monkeypatch.setattr(
+        loop.xai_oauth_refresh,
+        "refresh_xai_oauth_auth_file",
+        refresh,
+    )
+
+    pre_restart_state = loop.SidecarTaskState(
+        xai_oauth_last_attempt_monotonic=100.0
+    )
+    throttled = loop._run_xai_oauth_refresh_task(
+        config,
+        pre_restart_state,
+        now_monotonic=200.0,
+        now_wall=wall_now,
+    )
+    restarted_state = loop.SidecarTaskState()
+    after_restart = loop._run_xai_oauth_refresh_task(
+        config,
+        restarted_state,
+        now_monotonic=200.0,
+        now_wall=wall_now,
+    )
+
+    assert throttled is not None
+    assert throttled["actual_attempted"] is False
+    assert after_restart is not None
+    assert after_restart["actual_attempted"] is True
+    assert after_restart["last_actual_attempt_at"] == "2026-08-13T22:30:00Z"
+    assert restarted_state.xai_oauth_last_attempt_monotonic == 200.0
+    assert len(inspections) == 3
+    assert refresh_calls == [True]
+
+
+def test_kimi_event_and_observation_use_dynamic_refresh_threshold(
+    tmp_path,
+) -> None:
+    wall_now = datetime(2026, 8, 13, 22, 30, tzinfo=timezone.utc)
+    auth_file = tmp_path / "kimi.json"
+    auth_file.write_text(
+        json.dumps(
+            {
+                "access_token": "access-token-secret",
+                "refresh_token": "refresh-token-secret",
+                "expires_at": (wall_now + timedelta(minutes=10)).timestamp(),
+                "expires_in": 900,
+                "scope": "kimi-code",
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _grok_oidc_auth_persist_config(
+        apply=False,
+        grok_oidc_refresh_enabled=False,
+        kimi_oauth_refresh_enabled=True,
+        kimi_oauth_auth_file=str(auth_file),
+        kimi_oauth_lock_file=str(tmp_path / "kimi.lock"),
+        kimi_oauth_refresh_interval_seconds=3600.0,
+        kimi_oauth_force_refresh=False,
+    )
+
+    event = loop._run_kimi_oauth_refresh_task(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+        now_wall=wall_now,
+    )
+
+    assert event is not None
+    assert event["refresh_result_class"] == "refresh_not_due"
+    assert event["refresh_threshold_seconds"] == 450.0
+    assert event["actual_attempted"] is False
+    observation = loop._build_kimi_oauth_auth_observation(config, event)
+    assert observation["metadata"]["refresh_threshold_seconds"] == 450.0
+    rendered = json.dumps(observation, default=str)
+    assert "access-token-secret" not in rendered
+    assert "refresh-token-secret" not in rendered
+
+
+@pytest.mark.parametrize(
+    (
+        "operation_error_class",
+        "expires_at",
+        "refresh_due_at",
+        "eligible",
+        "expected_result",
+        "expected_health",
+        "usable",
+    ),
+    [
+        (
+            None,
+            "2026-08-13T23:00:00Z",
+            "2026-08-13T23:30:00Z",
+            False,
+            "refresh_not_due",
+            "fresh",
+            True,
+        ),
+        (
+            None,
+            "2026-08-13T23:00:00Z",
+            "2026-08-13T22:00:00Z",
+            True,
+            "refresh_due",
+            "degraded",
+            True,
+        ),
+        (
+            "HTTPError",
+            "2026-08-13T23:00:00Z",
+            "2026-08-13T22:00:00Z",
+            True,
+            "refresh_failed",
+            "degraded",
+            True,
+        ),
+        (
+            "HTTPError",
+            "2026-08-13T21:00:00Z",
+            "2026-08-13T20:00:00Z",
+            True,
+            "expired",
+            "expired",
+            False,
+        ),
+    ],
+)
+def test_oauth_schedule_result_and_health_classes(
+    operation_error_class,
+    expires_at,
+    refresh_due_at,
+    eligible,
+    expected_result,
+    expected_health,
+    usable,
+) -> None:
+    schedule = loop.OAuthRefreshScheduleState()
+
+    def inspect(*, now):
+        return {
+            "eligibility_checked_at": now().isoformat().replace("+00:00", "Z"),
+            "expires_at": expires_at,
+            "refresh_due_at": refresh_due_at,
+            "next_refresh_check_at": "2026-08-13T23:05:00Z",
+            "eligible": eligible,
+            "credential_health": "fresh",
+            "usable": usable,
+            "error_class": None,
+            "error_message": None,
+        }
+
+    def refresh(callback):
+        callback()
+        return {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "error_class": operation_error_class,
+            "error_message": "refresh_token=secret-value",
+        }
+
+    _final, _summary, _post, evidence, _called = loop._run_oauth_refresh_schedule(
+        schedule=schedule,
+        last_attempt_monotonic=None,
+        set_last_attempt_monotonic=lambda _value: None,
+        now_monotonic=100.0,
+        wall_now=datetime(2026, 8, 13, 22, 30, tzinfo=timezone.utc),
+        eligibility_inspector=inspect,
+        refresh_call=refresh,
+        force=False,
+        attempt_interval_seconds=300.0,
+        eligibility_cadence_seconds=300.0,
+        buffer_seconds=3600.0,
+    )
+    assert evidence["refresh_result_class"] == expected_result
+    assert evidence["credential_health"] == expected_health
+    assert evidence["usable"] is usable
+    if operation_error_class:
+        assert evidence["scheduler_error_message"] is not None
+        assert "secret-value" not in evidence["scheduler_error_message"]
+        assert "REDACTED" in evidence["scheduler_error_message"]
+    else:
+        assert evidence["scheduler_error_message"] is None
+
+
+def test_oauth_schedule_preserves_not_due_credential_after_forced_failure() -> None:
+    schedule = loop.OAuthRefreshScheduleState()
+
+    def inspect(*, now):
+        return {
+            "eligibility_checked_at": now().isoformat().replace("+00:00", "Z"),
+            "expires_at": "2026-08-13T23:00:00Z",
+            "refresh_due_at": "2026-08-13T22:45:00Z",
+            "next_refresh_check_at": "2026-08-13T22:45:00Z",
+            "eligible": False,
+            "credential_health": "fresh",
+            "usable": True,
+            "error_class": None,
+            "error_message": None,
+        }
+
+    def refresh(callback):
+        callback()
+        return {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "error_class": "HTTPError",
+            "error_message": "Authorization=Bearer secret-value-123456",
+        }
+
+    _final, _summary, _post, evidence, called = loop._run_oauth_refresh_schedule(
+        schedule=schedule,
+        last_attempt_monotonic=None,
+        set_last_attempt_monotonic=lambda _value: None,
+        now_monotonic=100.0,
+        wall_now=datetime(2026, 8, 13, 22, 30, tzinfo=timezone.utc),
+        eligibility_inspector=inspect,
+        refresh_call=refresh,
+        force=True,
+        attempt_interval_seconds=300.0,
+        eligibility_cadence_seconds=300.0,
+        buffer_seconds=900.0,
+    )
+    assert called is True
+    assert evidence["refresh_result_class"] == "refresh_not_due"
+    assert evidence["credential_health"] == "fresh"
+    assert evidence["usable"] is True
+    assert evidence["scheduler_error_class"] == "HTTPError"
+    assert evidence["scheduler_error_message"] is not None
+    assert "secret-value-123456" not in evidence["scheduler_error_message"]
+    assert "REDACTED" in evidence["scheduler_error_message"]
 
 
 def test_provider_status_compose_aawm_network_external_name_contract() -> None:
@@ -1609,6 +2314,10 @@ def test_provider_status_compose_aawm_network_rendered_default_name() -> None:
         "LITELLM_CODEX_OAUTH_INVENTORY"
     ]
     assert proxy_inventory == sidecar_inventory
+    sidecar_environment = services["provider-status-observations"]["environment"]
+    assert sidecar_environment["AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS"] == "300"
+    assert sidecar_environment["AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS"] == "900"
+    assert sidecar_environment["AAWM_XAI_OAUTH_FORCE_REFRESH"] == "0"
     inventory = json.loads(proxy_inventory)
     assert inventory["schema_version"] == 1
     assert [
@@ -1825,6 +2534,7 @@ def test_run_due_sidecar_tasks_runs_grok_oidc_refresh_when_due(monkeypatch) -> N
 
     def fake_refresh(*args, **kwargs):
         calls.append((args, kwargs))
+        kwargs["on_token_endpoint_attempt"]()
         return {
             "attempted": True,
             "refreshed": True,
@@ -1859,20 +2569,19 @@ def test_run_due_sidecar_tasks_runs_grok_oidc_refresh_when_due(monkeypatch) -> N
     third_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=3701.0)
 
     assert len(calls) == 2
-    assert calls[0] == (
-        ("/home/zepfu/.grok/auth.json",),
-        {
-            "buffer_seconds": 300,
-            "force": True,
-            "lock_file": "/home/zepfu/.grok/auth.json.lock",
-            "http_timeout_seconds": 30.0,
-        },
-    )
+    assert calls[0][0] == ("/home/zepfu/.grok/auth.json",)
+    assert calls[0][1]["buffer_seconds"] == 300
+    assert calls[0][1]["force"] is True
+    assert calls[0][1]["lock_file"] == "/home/zepfu/.grok/auth.json.lock"
+    assert calls[0][1]["http_timeout_seconds"] == 30.0
+    assert callable(calls[0][1]["on_token_endpoint_attempt"])
     assert events[0]["event"] == "grok_oidc_refresh"
     assert events[0]["environment"] == "dev"
     assert events[0]["refreshed"] is True
     assert "access-token" not in str(events)
-    assert second_events == []
+    assert second_events[0]["event"] == "grok_oidc_refresh"
+    assert second_events[0]["skipped"] is True
+    assert second_events[0]["actual_attempted"] is False
     assert third_events[0]["event"] == "grok_oidc_refresh"
 
 
@@ -1941,18 +2650,19 @@ def test_run_due_sidecar_tasks_repairs_grok_oidc_metadata_each_cycle(
             {"lock_file": "/home/zepfu/.grok/auth.json.lock"},
         )
     ]
-    assert events == [
-        {
-            "event": "grok_oidc_metadata_repair",
-            "observed_at": events[0]["observed_at"],
-            "environment": "dev",
-            "attempted": True,
-            "repaired": True,
-            "auth_file": "/home/zepfu/.grok/auth.json",
-            "error_class": None,
-            "error_message": None,
-        }
-    ]
+    assert events[0] == {
+        "event": "grok_oidc_metadata_repair",
+        "observed_at": events[0]["observed_at"],
+        "environment": "dev",
+        "attempted": True,
+        "repaired": True,
+        "auth_file": "/home/zepfu/.grok/auth.json",
+        "error_class": None,
+        "error_message": None,
+    }
+    assert events[1]["event"] == "grok_oidc_refresh"
+    assert events[1]["skipped"] is True
+    assert events[1]["actual_attempted"] is False
 
 
 def test_run_cycle_requires_dsn_when_apply_enabled(monkeypatch) -> None:
@@ -3938,7 +4648,8 @@ def test_persist_alibaba_quota_observations_uses_sidecar_db_path(
 
 
 def test_compose_wires_alibaba_quota_poll_defaults() -> None:
-    compose_text = Path("/home/zepfu/projects/litellm/docker-compose.dev.yml").read_text()
+    repo_root = Path(__file__).resolve().parents[2]
+    compose_text = (repo_root / "docker-compose.dev.yml").read_text()
 
     assert (
         "/home/zepfu/.alibaba:/home/zepfu/.alibaba:ro"
@@ -6312,10 +7023,9 @@ def test_run_due_sidecar_tasks_persists_codex_auth_observation_when_apply_enable
     record = config.codex_oauth_inventory.records[0]
     captured = {}
 
-    monkeypatch.setattr(
-        loop.codex_oauth_refresh,
-        "refresh_codex_oauth_inventory_record",
-        lambda selected_record, **_kwargs: {
+    def fake_refresh(selected_record, **kwargs):
+        kwargs["on_token_endpoint_attempt"]()
+        return {
             "attempted": True,
             "refreshed": True,
             "skipped": False,
@@ -6325,7 +7035,12 @@ def test_run_due_sidecar_tasks_persists_codex_auth_observation_when_apply_enable
             "error_class": None,
             "error_message": None,
             "error_hint": None,
-        },
+        }
+
+    monkeypatch.setattr(
+        loop.codex_oauth_refresh,
+        "refresh_codex_oauth_inventory_record",
+        fake_refresh,
     )
 
     def fake_persist(persist_config, event, *, record=None):
@@ -6340,6 +7055,7 @@ def test_run_due_sidecar_tasks_persists_codex_auth_observation_when_apply_enable
         config,
         loop.SidecarTaskState(),
         now_monotonic=100.0,
+        now_wall=datetime(2026, 6, 19, 12, 0, tzinfo=timezone.utc),
     )
 
     refresh_events = [event for event in events if event.get("event") == "codex_oauth_refresh"]
@@ -6355,27 +7071,63 @@ def test_run_due_sidecar_tasks_persists_codex_auth_observation_when_apply_enable
 
 def test_codex_inventory_refresh_isolates_failures_and_keeps_label_timers(
     monkeypatch,
+    tmp_path,
 ) -> None:
-    inventory = _codex_oauth_inventory("account1", "account2")
+    inventory = _codex_oauth_inventory("account1", "account2", root=tmp_path)
+    wall_now = datetime(2026, 8, 13, 22, 30, tzinfo=timezone.utc)
+    initial_expiry = int((wall_now + timedelta(hours=1)).timestamp())
+    refreshed_expiry = int((wall_now + timedelta(hours=2)).timestamp())
+    for record in inventory.records:
+        record.auth_path.write_text(
+            json.dumps(
+                {
+                    "tokens": {
+                        "access_token": _build_test_jwt(
+                            {"exp": initial_expiry}
+                        ),
+                        "refresh_token": f"refresh-{record.label}",
+                        "account_id": f"acct-{record.label}",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        record.auth_path.chmod(0o600)
     config = _codex_oauth_auth_persist_config(
         apply=False,
         codex_oauth_inventory=inventory,
+        codex_refresh_buffer_seconds=3600,
     )
     calls = []
 
-    def fake_refresh(record, **_kwargs):
+    def fake_refresh(record, **kwargs):
         calls.append(record.label)
         if record.label == "account1":
             raise RuntimeError(
-                f"failed {record.auth_path} account=acct-account1 token=secret-token"
+                f"failed {record.auth_path} token=secret-token"
             )
+        kwargs["on_token_endpoint_attempt"]()
+        record.auth_path.write_text(
+            json.dumps(
+                {
+                    "tokens": {
+                        "access_token": _build_test_jwt(
+                            {"exp": refreshed_expiry}
+                        ),
+                        "refresh_token": f"rotated-{record.label}",
+                        "account_id": f"acct-{record.label}",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
         return {
-            "attempted": False,
-            "refreshed": False,
-            "skipped": True,
+            "attempted": True,
+            "refreshed": True,
+            "skipped": False,
             "account_label": record.label,
             "account_hash": record.expected_account_hash,
-            "expires_at": "2026-08-08T18:00:00Z",
+            "expires_at": "2026-08-14T00:30:00Z",
             "error_class": None,
             "error_message": None,
             "error_hint": None,
@@ -6392,6 +7144,7 @@ def test_codex_inventory_refresh_isolates_failures_and_keeps_label_timers(
         config,
         state,
         now_monotonic=100.0,
+        now_wall=wall_now,
     )
 
     refresh_events = [
@@ -6406,22 +7159,39 @@ def test_codex_inventory_refresh_isolates_failures_and_keeps_label_timers(
         "account2",
     ]
     assert aggregate["health"] == "degraded"
-    assert aggregate["usable_count"] == 1
+    assert aggregate["usable_count"] == 2
     rendered = json.dumps(events)
     assert "/home/zepfu/.codex" not in rendered
-    assert "acct-account1" not in rendered
     assert "secret-token" not in rendered
 
     calls.clear()
-    state.codex_oauth_last_attempt_monotonic_by_label = {"account1": 150.0}
-    state.codex_oauth_usable_by_label = {"account1": True}
-    state.codex_oauth_status_by_label = {"account1": "skipped"}
-    loop._run_codex_oauth_refresh_task(
+    second_events = loop._run_codex_oauth_refresh_task(
         config,
         state,
-        now_monotonic=200.0,
+        now_monotonic=400.0,
+        now_wall=wall_now + timedelta(minutes=5),
     )
-    assert calls == ["account2"]
+    assert calls == ["account1"]
+    second_refresh_events = [
+        event for event in second_events if event["event"] == "codex_oauth_refresh"
+    ]
+    second_by_label = {
+        event["account_label"]: event for event in second_refresh_events
+    }
+    assert second_by_label["account1"]["actual_attempted"] is False
+    assert second_by_label["account1"]["refresh_result_class"] == "refresh_failed"
+    assert second_by_label["account1"]["credential_health"] == "degraded"
+    assert second_by_label["account1"]["auth_observation_status"] == "failed"
+    assert second_by_label["account2"]["actual_attempted"] is False
+    assert second_by_label["account2"]["refresh_result_class"] == "refresh_not_due"
+    assert state.codex_oauth_last_attempt_monotonic_by_label.get("account1") is None
+    assert state.codex_oauth_last_attempt_monotonic_by_label["account2"] == 100.0
+    second_aggregate = next(
+        event
+        for event in second_events
+        if event["event"] == "codex_oauth_refresh_aggregate"
+    )
+    assert second_aggregate["health"] == "degraded"
 
     terminal = loop._codex_account_aggregate_event(
         event_name="codex_oauth_refresh_aggregate",
@@ -6431,6 +7201,215 @@ def test_codex_inventory_refresh_isolates_failures_and_keeps_label_timers(
         status_by_label={"account1": "failed", "account2": "failed"},
     )
     assert terminal["health"] == "terminal"
+
+
+def test_codex_oauth_refresh_reinspects_replaced_account_identity(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    inventory = _codex_oauth_inventory("account1", root=tmp_path)
+    record = inventory.records[0]
+    wall_now = datetime(2026, 8, 13, 22, 30, tzinfo=timezone.utc)
+    future_expiry = int((wall_now + timedelta(hours=2)).timestamp())
+    record.auth_path.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": _build_test_jwt({"exp": future_expiry}),
+                    "refresh_token": "refresh-account1",
+                    "account_id": "acct-account1",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _codex_oauth_auth_persist_config(
+        apply=False,
+        codex_oauth_inventory=inventory,
+        codex_refresh_buffer_seconds=300,
+    )
+    helper_calls = []
+
+    def fake_refresh(selected_record, **_kwargs):
+        helper_calls.append(selected_record.label)
+        return {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "account_label": selected_record.label,
+            "account_hash": selected_record.expected_account_hash,
+            "expires_at": None,
+            "error_class": "CodexOAuthIdentityMismatchError",
+            "error_message": (
+                f"Codex OAuth credential identity mismatch for account "
+                f"'{selected_record.label}'."
+            ),
+            "error_hint": None,
+        }
+
+    monkeypatch.setattr(
+        loop.codex_oauth_refresh,
+        "refresh_codex_oauth_inventory_record",
+        fake_refresh,
+    )
+    state = loop.SidecarTaskState()
+
+    first_events = loop._run_codex_oauth_refresh_task(
+        config,
+        state,
+        now_monotonic=100.0,
+        now_wall=wall_now,
+    )
+    first_refresh = next(
+        event for event in first_events if event["event"] == "codex_oauth_refresh"
+    )
+    assert first_refresh["refresh_result_class"] == "refresh_not_due"
+    assert first_refresh["usable"] is True
+    assert helper_calls == []
+
+    replacement_path = tmp_path / "oauth.account1.replacement.json"
+    replacement_path.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": _build_test_jwt({"exp": future_expiry}),
+                    "refresh_token": "refresh-other-account",
+                    "account_id": "acct-other-account",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.replace(replacement_path, record.auth_path)
+
+    second_events = loop._run_codex_oauth_refresh_task(
+        config,
+        state,
+        now_monotonic=101.0,
+        now_wall=wall_now + timedelta(seconds=1),
+    )
+    second_refresh = next(
+        event for event in second_events if event["event"] == "codex_oauth_refresh"
+    )
+    assert helper_calls == ["account1"]
+    assert second_refresh["refresh_result_class"] != "refresh_not_due"
+    assert second_refresh["usable"] is False
+    assert second_refresh["actual_attempted"] is False
+    assert second_refresh["account_label"] == "account1"
+    assert "acct-other-account" not in json.dumps(second_events)
+
+
+def test_codex_actual_attempt_throttle_retains_failed_degraded_aggregate(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    inventory = _codex_oauth_inventory("account1", root=tmp_path)
+    record = inventory.records[0]
+    record.auth_path.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": _build_test_jwt(
+                        {
+                            "exp": int(
+                                datetime(
+                                    2026,
+                                    8,
+                                    13,
+                                    23,
+                                    0,
+                                    tzinfo=timezone.utc,
+                                ).timestamp()
+                            )
+                        }
+                    ),
+                    "refresh_token": "refresh-account1",
+                    "account_id": "acct-account1",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _codex_oauth_auth_persist_config(
+        apply=False,
+        codex_oauth_inventory=inventory,
+        codex_refresh_interval_seconds=300.0,
+        codex_refresh_buffer_seconds=3600,
+    )
+    helper_calls = []
+
+    def fake_refresh(selected_record, **kwargs):
+        helper_calls.append(selected_record.label)
+        kwargs["on_token_endpoint_attempt"]()
+        return {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "account_label": selected_record.label,
+            "account_hash": selected_record.expected_account_hash,
+            "expires_at": "2026-08-13T23:00:00Z",
+            "error_class": "HTTPError",
+            "error_message": "token endpoint rejected request",
+            "error_hint": None,
+        }
+
+    monkeypatch.setattr(
+        loop.codex_oauth_refresh,
+        "refresh_codex_oauth_inventory_record",
+        fake_refresh,
+    )
+    state = loop.SidecarTaskState()
+    wall_now = datetime(2026, 8, 13, 22, 30, tzinfo=timezone.utc)
+
+    first_events = loop._run_codex_oauth_refresh_task(
+        config,
+        state,
+        now_monotonic=100.0,
+        now_wall=wall_now,
+    )
+    first_refresh = next(
+        event for event in first_events if event["event"] == "codex_oauth_refresh"
+    )
+    first_aggregate = next(
+        event
+        for event in first_events
+        if event["event"] == "codex_oauth_refresh_aggregate"
+    )
+    assert first_refresh["refresh_result_class"] == "refresh_failed"
+    assert first_refresh["credential_health"] == "degraded"
+    assert first_refresh["auth_observation_status"] == "failed"
+    assert first_aggregate["health"] == "degraded"
+    assert state.codex_oauth_last_attempt_monotonic_by_label["account1"] == 100.0
+
+    second_events = loop._run_codex_oauth_refresh_task(
+        config,
+        state,
+        now_monotonic=101.0,
+        now_wall=wall_now + timedelta(seconds=1),
+    )
+    second_refresh = next(
+        event for event in second_events if event["event"] == "codex_oauth_refresh"
+    )
+    second_aggregate = next(
+        event
+        for event in second_events
+        if event["event"] == "codex_oauth_refresh_aggregate"
+    )
+    assert helper_calls == ["account1"]
+    assert second_refresh["actual_attempted"] is False
+    assert second_refresh["refresh_result_class"] == "refresh_failed"
+    assert second_refresh["credential_health"] == "degraded"
+    assert second_refresh["auth_observation_status"] == "degraded"
+    assert second_aggregate["health"] == "degraded"
+    assert second_aggregate["accounts"] == [
+        {
+            "account_label": "account1",
+            "account_hash": record.expected_account_hash,
+            "status": "degraded",
+            "usable": True,
+        }
+    ]
+    assert state.codex_oauth_last_attempt_monotonic_by_label["account1"] == 100.0
 
 
 def test_codex_inventory_passive_health_isolates_records(monkeypatch) -> None:
@@ -6587,10 +7566,9 @@ def test_run_due_sidecar_tasks_persists_xai_oauth_auth_observation_when_apply_en
     )
     captured = {}
 
-    monkeypatch.setattr(
-        loop.xai_oauth_refresh,
-        "refresh_xai_oauth_auth_file",
-        lambda *_args, **_kwargs: {
+    def fake_xai_refresh(*_args, **kwargs):
+        kwargs["on_token_endpoint_attempt"]()
+        return {
             "attempted": True,
             "refreshed": True,
             "skipped": False,
@@ -6599,7 +7577,12 @@ def test_run_due_sidecar_tasks_persists_xai_oauth_auth_observation_when_apply_en
             "expires_at": "2026-06-19T13:00:00Z",
             "error_class": None,
             "error_message": None,
-        },
+        }
+
+    monkeypatch.setattr(
+        loop.xai_oauth_refresh,
+        "refresh_xai_oauth_auth_file",
+        fake_xai_refresh,
     )
 
     def fake_persist(persist_config, event):
@@ -6613,6 +7596,7 @@ def test_run_due_sidecar_tasks_persists_xai_oauth_auth_observation_when_apply_en
         config,
         loop.SidecarTaskState(),
         now_monotonic=100.0,
+        now_wall=datetime(2026, 6, 19, 12, 0, tzinfo=timezone.utc),
     )
 
     refresh_events = [event for event in events if event.get("event") == "xai_oauth_refresh"]
@@ -6647,8 +7631,23 @@ def test_run_due_sidecar_tasks_persists_grok_oidc_auth_observation_when_apply_en
     )
     monkeypatch.setattr(
         loop.grok_oidc_refresh,
-        "refresh_grok_oidc_auth_file",
-        lambda *_args, **_kwargs: {
+        "inspect_grok_oidc_refresh_eligibility",
+        lambda *_args, now, **_kwargs: {
+            "eligibility_checked_at": now().isoformat().replace("+00:00", "Z"),
+            "expires_at": "2026-06-19T13:00:00Z",
+            "refresh_due_at": "2026-06-19T12:55:00Z",
+            "next_refresh_check_at": "2026-06-19T12:55:00Z",
+            "eligible": False,
+            "credential_health": "fresh",
+            "usable": True,
+            "error_class": None,
+            "error_message": None,
+        },
+    )
+
+    def fake_grok_refresh(*_args, **kwargs):
+        kwargs["on_token_endpoint_attempt"]()
+        return {
             "attempted": True,
             "refreshed": True,
             "skipped": False,
@@ -6657,7 +7656,12 @@ def test_run_due_sidecar_tasks_persists_grok_oidc_auth_observation_when_apply_en
             "expires_at": "2026-06-19T13:00:00Z",
             "error_class": None,
             "error_message": None,
-        },
+        }
+
+    monkeypatch.setattr(
+        loop.grok_oidc_refresh,
+        "refresh_grok_oidc_auth_file",
+        fake_grok_refresh,
     )
 
     def fake_persist(cfg, event):
@@ -6671,6 +7675,7 @@ def test_run_due_sidecar_tasks_persists_grok_oidc_auth_observation_when_apply_en
         config,
         loop.SidecarTaskState(),
         now_monotonic=100.0,
+        now_wall=datetime(2026, 6, 19, 12, 0, tzinfo=timezone.utc),
     )
 
     refresh_events = [event for event in events if event.get("event") == "grok_oidc_refresh"]
@@ -6700,8 +7705,23 @@ def test_run_due_sidecar_tasks_marks_grok_oidc_auth_persistence_failure(
     )
     monkeypatch.setattr(
         loop.grok_oidc_refresh,
-        "refresh_grok_oidc_auth_file",
-        lambda *_args, **_kwargs: {
+        "inspect_grok_oidc_refresh_eligibility",
+        lambda *_args, now, **_kwargs: {
+            "eligibility_checked_at": now().isoformat().replace("+00:00", "Z"),
+            "expires_at": "2026-06-19T13:00:00Z",
+            "refresh_due_at": "2026-06-19T12:55:00Z",
+            "next_refresh_check_at": "2026-06-19T12:55:00Z",
+            "eligible": False,
+            "credential_health": "fresh",
+            "usable": True,
+            "error_class": None,
+            "error_message": None,
+        },
+    )
+
+    def fake_grok_failure_refresh(*_args, **kwargs):
+        kwargs["on_token_endpoint_attempt"]()
+        return {
             "attempted": True,
             "refreshed": True,
             "skipped": False,
@@ -6710,7 +7730,12 @@ def test_run_due_sidecar_tasks_marks_grok_oidc_auth_persistence_failure(
             "expires_at": "2026-06-19T13:00:00Z",
             "error_class": None,
             "error_message": None,
-        },
+        }
+
+    monkeypatch.setattr(
+        loop.grok_oidc_refresh,
+        "refresh_grok_oidc_auth_file",
+        fake_grok_failure_refresh,
     )
     monkeypatch.setattr(
         loop,
@@ -6722,6 +7747,7 @@ def test_run_due_sidecar_tasks_marks_grok_oidc_auth_persistence_failure(
         config,
         loop.SidecarTaskState(),
         now_monotonic=100.0,
+        now_wall=datetime(2026, 6, 19, 12, 0, tzinfo=timezone.utc),
     )
 
     refresh_event = next(
@@ -7679,7 +8705,8 @@ def test_main_once_enforces_required_refresh_policy(
 
 
 def test_compose_wires_codex_reset_credit_poll_defaults() -> None:
-    compose_text = Path("/home/zepfu/projects/litellm/docker-compose.dev.yml").read_text()
+    repo_root = Path(__file__).resolve().parents[2]
+    compose_text = (repo_root / "docker-compose.dev.yml").read_text()
 
     assert (
         "AAWM_CODEX_RESET_CREDIT_POLL_ENABLED=${AAWM_CODEX_RESET_CREDIT_POLL_ENABLED:-1}"

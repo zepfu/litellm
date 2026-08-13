@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 from urllib import error as urllib_error
@@ -366,6 +366,7 @@ def refresh_kimi_oauth_auth_file(
     lock_now: Callable[[], float] = time.time,
     lock_retries: int = DEFAULT_KIMI_OAUTH_LOCK_RETRIES,
     lock_heartbeat_interval_seconds: float = (DEFAULT_KIMI_OAUTH_LOCK_HEARTBEAT_SECONDS),
+    on_token_endpoint_attempt: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Refresh the shared Kimi Code OAuth credential when its lease is near expiry."""
 
@@ -404,6 +405,7 @@ def refresh_kimi_oauth_auth_file(
                     http_timeout_seconds=http_timeout_seconds,
                     now=now,
                     sleep=sleep,
+                    on_token_endpoint_attempt=on_token_endpoint_attempt,
                 )
             except KimiOAuthAuthorizationError as exc:
                 # A Kimi Code peer may have rotated the refresh token just
@@ -445,6 +447,114 @@ def refresh_kimi_oauth_auth_file(
             ).as_dict()
     except Exception as exc:
         return _failed_summary(auth_path, fallback_scope, exc)
+
+
+def inspect_kimi_oauth_refresh_eligibility(
+    auth_file: str | Path,
+    *,
+    now: Optional[Callable[[], float | datetime]] = None,
+    poll_interval_seconds: float = 300.0,
+) -> Dict[str, Any]:
+    """Inspect Kimi OAuth refresh eligibility without its native lock."""
+    resolved_auth_file = Path(auth_file).expanduser()
+    observed_at = _resolve_wall_timestamp(now)
+    try:
+        credential = _read_credential_payload(resolved_auth_file)
+        scope = _credential_scope(credential, DEFAULT_KIMI_OAUTH_SCOPE)
+        access_token = credential.get("access_token")
+        if not isinstance(access_token, str) or not access_token.strip():
+            raise KimiOAuthError("Kimi OAuth credential is missing access_token.")
+        expires_at = _as_finite_number(credential.get("expires_at"))
+        if expires_at is None:
+            return _kimi_eligibility_summary(
+                observed_at=observed_at,
+                expires_at=None,
+                refresh_due_at=None,
+                next_refresh_check_at=observed_at
+                + timedelta(seconds=max(1.0, poll_interval_seconds)),
+                eligible=True,
+                credential_health="degraded",
+                usable=True,
+                scope=scope,
+                error_class="CredentialExpiryUnavailable",
+                error_message="Kimi OAuth credential expires_at is missing or invalid.",
+            )
+        expiry = datetime.fromtimestamp(expires_at, timezone.utc)
+        threshold_seconds = _refresh_threshold_seconds(credential.get("expires_in"))
+        refresh_due_at = expiry - timedelta(seconds=threshold_seconds)
+        return _kimi_eligibility_summary(
+            observed_at=observed_at,
+            expires_at=expiry,
+            refresh_due_at=refresh_due_at,
+            next_refresh_check_at=(
+                refresh_due_at
+                if observed_at < refresh_due_at
+                else observed_at + timedelta(seconds=max(1.0, poll_interval_seconds))
+            ),
+            eligible=observed_at >= refresh_due_at,
+            credential_health="expired" if expiry <= observed_at else "fresh",
+            usable=expiry > observed_at,
+            scope=scope,
+            refresh_threshold_seconds=threshold_seconds,
+        )
+    except Exception as exc:
+        return _kimi_eligibility_summary(
+            observed_at=observed_at,
+            expires_at=None,
+            refresh_due_at=None,
+            next_refresh_check_at=observed_at
+            + timedelta(seconds=max(1.0, poll_interval_seconds)),
+            eligible=True,
+            credential_health="malformed",
+            usable=False,
+            scope=DEFAULT_KIMI_OAUTH_SCOPE,
+            error_class=exc.__class__.__name__,
+            error_message=_redacted_error_message(exc),
+        )
+
+
+def _kimi_eligibility_summary(
+    *,
+    observed_at: datetime,
+    expires_at: Optional[datetime],
+    refresh_due_at: Optional[datetime],
+    next_refresh_check_at: datetime,
+    eligible: bool,
+    credential_health: str,
+    usable: bool,
+    scope: str,
+    refresh_threshold_seconds: Optional[float] = None,
+    error_class: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "eligibility_checked_at": _format_expires_at(observed_at.timestamp()),
+        "expires_at": _format_expires_at(
+            expires_at.timestamp() if expires_at is not None else None
+        ),
+        "refresh_due_at": _format_expires_at(
+            refresh_due_at.timestamp() if refresh_due_at is not None else None
+        ),
+        "next_refresh_check_at": _format_expires_at(next_refresh_check_at.timestamp()),
+        "eligible": eligible,
+        "credential_health": credential_health,
+        "usable": usable,
+        "scope": scope,
+        "refresh_threshold_seconds": refresh_threshold_seconds,
+        "error_class": error_class,
+        "error_message": error_message,
+    }
+
+
+def _resolve_wall_timestamp(
+    now: Optional[Callable[[], float | datetime]],
+) -> datetime:
+    value = now() if now is not None else time.time()
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    return datetime.fromtimestamp(float(value), timezone.utc)
 
 
 def _kimi_code_lock(
@@ -539,6 +649,7 @@ def _refresh_credential(
     http_timeout_seconds: float,
     now: Callable[[], float],
     sleep: Callable[[float], None],
+    on_token_endpoint_attempt: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     refresh_token = credential.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token.strip():
@@ -551,6 +662,7 @@ def _refresh_credential(
                 client_id=client_id,
                 refresh_token=refresh_token,
                 http_timeout_seconds=http_timeout_seconds,
+                on_token_endpoint_attempt=on_token_endpoint_attempt,
             )
             return _normalize_refreshed_credential(
                 response,
@@ -571,6 +683,7 @@ def _request_refresh_token(
     client_id: str,
     refresh_token: str,
     http_timeout_seconds: float,
+    on_token_endpoint_attempt: Optional[Callable[[], None]] = None,
 ) -> Mapping[str, Any]:
     form = urllib_parse.urlencode(
         {
@@ -589,6 +702,8 @@ def _request_refresh_token(
         method="POST",
     )
     try:
+        if on_token_endpoint_attempt is not None:
+            on_token_endpoint_attempt()
         with urllib_request.urlopen(request, timeout=http_timeout_seconds) as response:
             status = int(getattr(response, "status", 200))
             payload = _read_response_payload(response.read())

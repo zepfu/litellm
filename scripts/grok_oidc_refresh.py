@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, Mapping, MutableMapping, Optional
+from typing import Any, Callable, Dict, Iterator, Mapping, MutableMapping, Optional
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -51,6 +51,7 @@ __all__ = (
     "GrokOidcMetadataRepairSummary",
     "GrokOidcRefreshSummary",
     "inspect_grok_oidc_credential_health",
+    "inspect_grok_oidc_refresh_eligibility",
     "refresh_grok_oidc_auth_file",
     "repair_grok_oidc_auth_file_metadata",
 )
@@ -184,6 +185,7 @@ def refresh_grok_oidc_auth_file(
     client_id: Optional[str] = None,
     client_secret: Optional[str] = None,
     http_timeout_seconds: float = DEFAULT_GROK_OIDC_HTTP_TIMEOUT_SECONDS,
+    on_token_endpoint_attempt: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Refresh a Grok-style OIDC auth file when it is near expiry or forced."""
 
@@ -221,6 +223,7 @@ def refresh_grok_oidc_auth_file(
                 client_id=client_id,
                 client_secret=client_secret,
                 http_timeout_seconds=http_timeout_seconds,
+                on_token_endpoint_attempt=on_token_endpoint_attempt,
             )
             _update_credential_record(credential, refreshed_payload)
             _write_credential_payload(resolved_auth_file, raw_payload)
@@ -242,6 +245,100 @@ def refresh_grok_oidc_auth_file(
             error_class=exc.__class__.__name__,
             error_message=_sanitize_error_message(str(exc)),
         ).as_dict()
+
+
+def inspect_grok_oidc_refresh_eligibility(
+    auth_file: str | Path,
+    *,
+    buffer_seconds: int = DEFAULT_GROK_OIDC_REFRESH_BUFFER_SECONDS,
+    now: Optional[Callable[[], datetime]] = None,
+    poll_interval_seconds: float = 300.0,
+    scope: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Inspect refresh eligibility without locks, writes, or HTTP."""
+    resolved_auth_file = Path(auth_file).expanduser()
+    observed_at = _resolve_wall_now(now)
+    resolved_scope = _resolve_scope(scope)
+    try:
+        payload = _read_credential_payload(resolved_auth_file)
+        credential = _select_credential_record(payload, resolved_scope)
+        if not _looks_like_credential_record(credential):
+            raise ValueError("Grok OIDC credential has no usable access credential.")
+        expires_at = _parse_expires_at(credential.get("expires_at"))
+        if expires_at is None:
+            return _eligibility_summary(
+                observed_at=observed_at,
+                expires_at=None,
+                refresh_due_at=None,
+                next_refresh_check_at=observed_at
+                + timedelta(seconds=max(1.0, poll_interval_seconds)),
+                eligible=True,
+                credential_health="degraded",
+                usable=True,
+                error_class="CredentialExpiryUnavailable",
+                error_message="Grok OIDC credential expires_at is missing or invalid.",
+            )
+        refresh_due_at = expires_at - timedelta(seconds=max(0, buffer_seconds))
+        return _eligibility_summary(
+            observed_at=observed_at,
+            expires_at=expires_at,
+            refresh_due_at=refresh_due_at,
+            next_refresh_check_at=(
+                refresh_due_at
+                if observed_at < refresh_due_at
+                else observed_at + timedelta(seconds=max(1.0, poll_interval_seconds))
+            ),
+            eligible=observed_at >= refresh_due_at,
+            credential_health="expired" if expires_at <= observed_at else "fresh",
+            usable=expires_at > observed_at,
+        )
+    except Exception as exc:
+        return _eligibility_summary(
+            observed_at=observed_at,
+            expires_at=None,
+            refresh_due_at=None,
+            next_refresh_check_at=observed_at
+            + timedelta(seconds=max(1.0, poll_interval_seconds)),
+            eligible=True,
+            credential_health="malformed",
+            usable=False,
+            error_class=exc.__class__.__name__,
+            error_message=_sanitize_error_message(str(exc)),
+        )
+
+
+def _eligibility_summary(
+    *,
+    observed_at: datetime,
+    expires_at: Optional[datetime],
+    refresh_due_at: Optional[datetime],
+    next_refresh_check_at: datetime,
+    eligible: bool,
+    credential_health: str,
+    usable: bool,
+    error_class: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "eligibility_checked_at": _format_expires_at(observed_at),
+        "expires_at": _format_expires_at(expires_at),
+        "refresh_due_at": _format_expires_at(refresh_due_at),
+        "next_refresh_check_at": _format_expires_at(next_refresh_check_at),
+        "eligible": eligible,
+        "credential_health": credential_health,
+        "usable": usable,
+        "error_class": error_class,
+        "error_message": error_message,
+    }
+
+
+def _resolve_wall_now(now: Optional[Callable[[], datetime]]) -> datetime:
+    value = now() if now is not None else datetime.now(timezone.utc)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    return datetime.fromtimestamp(float(value), timezone.utc)
 
 
 def repair_grok_oidc_auth_file_metadata(
@@ -440,6 +537,7 @@ def _refresh_credential_record(
     client_id: Optional[str],
     client_secret: Optional[str],
     http_timeout_seconds: float,
+    on_token_endpoint_attempt: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     refresh_token = credential.get("refresh_token")
     if not isinstance(refresh_token, str) or not refresh_token.strip():
@@ -492,6 +590,8 @@ def _refresh_credential_record(
     )
 
     try:
+        if on_token_endpoint_attempt is not None:
+            on_token_endpoint_attempt()
         with urllib_request.urlopen(request, timeout=http_timeout_seconds) as response:
             response_body = response.read().decode("utf-8")
     except urllib_error.HTTPError as exc:

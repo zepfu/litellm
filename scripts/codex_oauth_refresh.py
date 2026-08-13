@@ -9,9 +9,9 @@ import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, Mapping, MutableMapping, Optional
+from typing import Any, Callable, Dict, Iterator, Mapping, MutableMapping, Optional
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -147,6 +147,7 @@ def refresh_codex_oauth_auth_file(
     client_id: Optional[str] = None,
     http_timeout_seconds: float = DEFAULT_CODEX_HTTP_TIMEOUT_SECONDS,
     credential_record: Optional[CodexOAuthCredentialRecord] = None,
+    on_token_endpoint_attempt: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Refresh a Codex OAuth auth file when it is near expiry or forced."""
 
@@ -215,6 +216,7 @@ def refresh_codex_oauth_auth_file(
                 token_endpoint=token_endpoint,
                 client_id=client_id,
                 http_timeout_seconds=http_timeout_seconds,
+                on_token_endpoint_attempt=on_token_endpoint_attempt,
             )
             _update_token_data(token_data, refreshed)
             if credential_record is not None:
@@ -247,6 +249,115 @@ def refresh_codex_oauth_auth_file(
         ).as_dict()
 
 
+def inspect_codex_oauth_refresh_eligibility(
+    auth_file: str | Path,
+    *,
+    buffer_seconds: int = DEFAULT_CODEX_REFRESH_BUFFER_SECONDS,
+    now: Optional[Callable[[], float | datetime]] = None,
+    poll_interval_seconds: float = 300.0,
+    credential_record: Optional[CodexOAuthCredentialRecord] = None,
+) -> Dict[str, Any]:
+    """Inspect one Codex OAuth file without locks, writes, or HTTP."""
+    resolved_auth_file = Path(auth_file).expanduser()
+    observed_at = _resolve_wall_timestamp(now)
+    try:
+        token_data = _get_token_data(_read_auth_data(resolved_auth_file))
+        access_token = _clean_string(token_data.get("access_token"))
+        if access_token is None:
+            raise ValueError("Codex OAuth credential is missing access_token.")
+        if credential_record is not None:
+            validate_codex_oauth_account_identity(
+                credential_record,
+                token_data,
+            )
+        expires_at = _get_token_expiry(token_data)
+        if expires_at is None:
+            return _eligibility_summary(
+                observed_at=observed_at,
+                expires_at=None,
+                refresh_due_at=None,
+                next_refresh_check_at=observed_at
+                + timedelta(seconds=max(1.0, poll_interval_seconds)),
+                eligible=True,
+                credential_health="degraded",
+                usable=True,
+                error_class="CredentialExpiryUnavailable",
+                error_message="Codex OAuth credential expiry is unavailable.",
+            )
+        expires_at_datetime = datetime.fromtimestamp(expires_at, timezone.utc)
+        refresh_due_at = expires_at_datetime - timedelta(
+            seconds=max(0, buffer_seconds)
+        )
+        return _eligibility_summary(
+            observed_at=observed_at,
+            expires_at=expires_at_datetime,
+            refresh_due_at=refresh_due_at,
+            next_refresh_check_at=(
+                refresh_due_at
+                if observed_at < refresh_due_at
+                else observed_at + timedelta(seconds=max(1.0, poll_interval_seconds))
+            ),
+            eligible=observed_at >= refresh_due_at,
+            credential_health=(
+                "expired" if expires_at_datetime <= observed_at else "fresh"
+            ),
+            usable=expires_at_datetime > observed_at,
+        )
+    except Exception as exc:
+        return _eligibility_summary(
+            observed_at=observed_at,
+            expires_at=None,
+            refresh_due_at=None,
+            next_refresh_check_at=observed_at
+            + timedelta(seconds=max(1.0, poll_interval_seconds)),
+            eligible=True,
+            credential_health="malformed",
+            usable=False,
+            error_class=exc.__class__.__name__,
+            error_message="Codex OAuth eligibility inspection failed.",
+        )
+
+
+def _eligibility_summary(
+    *,
+    observed_at: datetime,
+    expires_at: Optional[datetime],
+    refresh_due_at: Optional[datetime],
+    next_refresh_check_at: datetime,
+    eligible: bool,
+    credential_health: str,
+    usable: bool,
+    error_class: Optional[str] = None,
+    error_message: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "eligibility_checked_at": _format_expires_at(observed_at.timestamp()),
+        "expires_at": _format_expires_at(
+            expires_at.timestamp() if expires_at is not None else None
+        ),
+        "refresh_due_at": _format_expires_at(
+            refresh_due_at.timestamp() if refresh_due_at is not None else None
+        ),
+        "next_refresh_check_at": _format_expires_at(next_refresh_check_at.timestamp()),
+        "eligible": eligible,
+        "credential_health": credential_health,
+        "usable": usable,
+        "error_class": error_class,
+        "error_message": error_message,
+    }
+
+
+def _resolve_wall_timestamp(
+    now: Optional[Callable[[], float | datetime]],
+) -> datetime:
+    value = now() if now is not None else time.time()
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+    return datetime.fromtimestamp(float(value), timezone.utc)
+
+
 def refresh_codex_oauth_inventory_record(
     record: CodexOAuthCredentialRecord,
     *,
@@ -255,6 +366,7 @@ def refresh_codex_oauth_inventory_record(
     token_endpoint: Optional[str] = None,
     client_id: Optional[str] = None,
     http_timeout_seconds: float = DEFAULT_CODEX_HTTP_TIMEOUT_SECONDS,
+    on_token_endpoint_attempt: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Refresh one explicit inventory record and return only safe identity."""
     if not record.enabled:
@@ -280,6 +392,7 @@ def refresh_codex_oauth_inventory_record(
         client_id=client_id,
         http_timeout_seconds=http_timeout_seconds,
         credential_record=record,
+        on_token_endpoint_attempt=on_token_endpoint_attempt,
     )
     return {
         "attempted": result["attempted"],
@@ -464,7 +577,7 @@ def _token_needs_refresh(
         return True
     expires_at = _get_token_expiry(token_data)
     if expires_at is None:
-        return False
+        return True
     return time.time() >= expires_at - max(0, buffer_seconds)
 
 
@@ -474,6 +587,7 @@ def _refresh_token_data(
     token_endpoint: Optional[str],
     client_id: Optional[str],
     http_timeout_seconds: float,
+    on_token_endpoint_attempt: Optional[Callable[[], None]] = None,
 ) -> Mapping[str, Any]:
     refresh_token = _clean_string(token_data.get("refresh_token"))
     if refresh_token is None:
@@ -498,6 +612,8 @@ def _refresh_token_data(
         method="POST",
     )
     try:
+        if on_token_endpoint_attempt is not None:
+            on_token_endpoint_attempt()
         with urllib_request.urlopen(
             request,
             timeout=http_timeout_seconds,
