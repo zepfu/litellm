@@ -589,16 +589,18 @@ def _should_bind_direct_codex_oauth_inventory(
 ) -> bool:
     """True when a direct Responses request must use server Codex OAuth inventory.
 
-    - Explicit inventory-classified models always bind (never API-key fallback).
-    - Model-less requests bind only under the existing Codex-native auth contract.
-    - Unclassified non-native models do not bind here (may use other routes).
+    - Explicit inventory-classified models always bind.
+    - When inventory is configured, every explicit Responses model binds.
+    - Model-less requests bind only under the Codex-native auth contract.
     """
     if not _endpoint_is_openai_responses_path(endpoint):
         return False
     body = request_body if isinstance(request_body, dict) else {}
     cleaned_model = _clean_codex_auth_value(body.get("model"))
     if cleaned_model is not None:
-        return _is_direct_codex_oauth_inventory_model(cleaned_model)
+        return _is_direct_codex_oauth_inventory_model(cleaned_model) or bool(
+            os.getenv("LITELLM_CODEX_OAUTH_INVENTORY", "").strip()
+        )
     # Model-less: only the established Codex-native auth contract is non-model-scoped.
     return _request_uses_codex_native_auth(request)
 
@@ -747,16 +749,6 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     explicit_model = _clean_codex_auth_value(body.get("model"))
     native_auth = _request_uses_codex_native_auth(request)
     if explicit_model is not None:
-        if not (
-            _is_direct_codex_oauth_inventory_model(explicit_model) or native_auth
-        ):
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "Direct Codex OAuth inventory binding refused for "
-                    "unclassified model."
-                ),
-            )
         model = explicit_model
         inventory_model: Optional[str] = explicit_model
     else:

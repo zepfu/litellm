@@ -27519,6 +27519,166 @@ class TestOpenAIPassthroughRoute:
             assert result == {"id": "asst_123", "object": "assistant"}
 
 
+    # OPENAI-006: direct Responses inventory bind gate (compact regressions)
+    def _openai006_request(self) -> Request:
+        return Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/openai_passthrough/v1/responses",
+                "raw_path": b"/openai_passthrough/v1/responses",
+                "query_string": b"",
+                "headers": [(b"content-type", b"application/json")],
+                "client": ("127.0.0.1", 1234),
+                "server": ("testserver", 80),
+            }
+        )
+
+    @pytest.mark.parametrize(
+        ("inventory_env", "endpoint", "model", "expected"),
+        [
+            (None, "v1/responses", "gpt-brand-new-unknown-xyz", False),
+            ("{bad-json", "v1/responses", "gpt-brand-new-unknown-xyz", True),
+            (None, "v1/responses", "gpt-5.6-sol", True),
+            ("{bad-json", "v1/chat/completions", "gpt-5.6-sol", False),
+            ("{bad-json", "v1/chat/completions", "gpt-brand-new-unknown-xyz", False),
+        ],
+    )
+    def test_openai006_should_bind_direct_inventory_gate(
+        self, monkeypatch, inventory_env, endpoint, model, expected
+    ):
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            codex_oauth,
+        )
+
+        monkeypatch.delenv("LITELLM_CODEX_OAUTH_INVENTORY", raising=False)
+        if inventory_env is not None:
+            monkeypatch.setenv("LITELLM_CODEX_OAUTH_INVENTORY", inventory_env)
+        assert (
+            codex_oauth._should_bind_direct_codex_oauth_inventory(
+                self._openai006_request(),
+                endpoint=endpoint,
+                request_body={"model": model},
+            )
+            is expected
+        )
+
+    @pytest.mark.asyncio
+    async def test_openai006_unknown_configured_inventory_binds_via_route(
+        self, monkeypatch
+    ):
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            codex_oauth,
+        )
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            openai_proxy_route,
+        )
+
+        monkeypatch.setenv("LITELLM_CODEX_OAUTH_INVENTORY", '{"schema_version":1,"accounts":[]}')
+        body = {"model": "gpt-brand-new-unknown-xyz", "input": "hello"}
+        request = self._openai006_request()
+        selected = codex_oauth.CodexOAuthRequestAuth(
+            account_label="account1",
+            account_hash="hash-account-1",
+            lane_key="codex-oauth:account1:hash-account-1",
+            headers={
+                "Authorization": "Bearer server-token-account1",
+                "ChatGPT-Account-Id": "server-acct-account1",
+            },
+        )
+        captured: dict[str, Any] = {}
+
+        async def _fake_base(**kwargs):
+            captured.update(kwargs)
+            return Response(content=b"ok", status_code=200)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_alias_model",
+            return_value=None,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_oa_xai_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_grok_native_oauth_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth.select_and_bind_direct_codex_oauth_inventory",
+            new=AsyncMock(return_value=(selected, {"selection_reason": "direct_inventory_first_available"}, body)),
+        ) as mock_bind, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials",
+        ) as mock_get_credentials, patch.object(
+            llm_passthrough_endpoints.BaseOpenAIPassThroughHandler,
+            "_base_openai_pass_through_handler",
+            new=_fake_base,
+        ):
+            mock_get_credentials.side_effect = AssertionError(
+                "OPENAI_API_KEY fallback must not be used"
+            )
+            response = await openai_proxy_route(
+                endpoint="v1/responses",
+                request=request,
+                fastapi_response=Response(),
+                user_api_key_dict=object(),  # type: ignore[arg-type]
+            )
+
+        assert response.status_code == 200
+        mock_bind.assert_awaited_once()
+        mock_get_credentials.assert_not_called()
+        assert captured.get("api_key") is None
+        assert captured.get("forward_headers") is False
+        extra = captured.get("extra_headers") or {}
+        assert extra.get("Authorization") == "Bearer server-token-account1"
+        assert "api.openai.com" not in str(captured.get("base_target_url") or "")
+
+    @pytest.mark.asyncio
+    async def test_openai006_malformed_inventory_fails_before_get_credentials(
+        self, monkeypatch
+    ):
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            openai_proxy_route,
+        )
+
+        monkeypatch.setenv("LITELLM_CODEX_OAUTH_INVENTORY", "{bad-json")
+        body = {"model": "gpt-brand-new-unknown-xyz", "input": "hello"}
+        request = self._openai006_request()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_alias_model",
+            return_value=None,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_oa_xai_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_grok_native_oauth_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials",
+        ) as mock_get_credentials:
+            mock_get_credentials.side_effect = AssertionError(
+                "OPENAI_API_KEY fallback must not be used"
+            )
+            with pytest.raises(HTTPException) as exc_info:
+                await openai_proxy_route(
+                    endpoint="v1/responses",
+                    request=request,
+                    fastapi_response=Response(),
+                    user_api_key_dict=object(),  # type: ignore[arg-type]
+                )
+
+        mock_get_credentials.assert_not_called()
+        assert exc_info.value.status_code == 429
+        detail = exc_info.value.detail
+        assert isinstance(detail, dict)
+        assert detail["error"]["code"] == "aawm_codex_oauth_direct_inventory_unavailable"
+
+
 class TestGrokProxyRoute:
     """Tests for the native Grok Build pass-through route."""
 
