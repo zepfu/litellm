@@ -101,6 +101,9 @@ services:
       # CFG-010: keep the complete aawm_adapter_runtime package coherent with
       # the bind-mounted llm_passthrough_endpoints.py during development.
       - ./litellm/proxy/pass_through_endpoints/aawm_adapter_runtime:/app/litellm/proxy/pass_through_endpoints/aawm_adapter_runtime:ro
+      # COHERE-001: keep the direct Cohere provider package coherent with the
+      # bind-mounted passthrough host during development.
+      - ./litellm/proxy/pass_through_endpoints/providers/cohere:/app/litellm/proxy/pass_through_endpoints/providers/cohere:ro
       # CFG-002: complete alias-config directory, read-only, for deterministic
       # startup directory loading.
       - ./litellm/proxy/aawm_alias_config:/app/litellm/proxy/aawm_alias_config:ro
@@ -224,6 +227,10 @@ services:
       - AAWM_OPENROUTER_API_KEY=${AAWM_OPENROUTER_API_KEY:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - OPENROUTER_API_BASE=${OPENROUTER_API_BASE:-https://openrouter.ai/api/v1}
+      # COHERE-001: export only the canonical direct Cohere credential.
+      # COHERE_KEY is a Compose-level compatibility source (repository-local
+      # .env) and is mapped into COHERE_API_KEY without exposing the value.
+      - COHERE_API_KEY=${COHERE_API_KEY:-${COHERE_KEY:-}}
       - LITELLM_XAI_OAUTH_AUTH_FILE=${LITELLM_XAI_OAUTH_AUTH_FILE:-/home/zepfu/.litellm/xai/oauth-auth.json}
       - LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.grok/auth.json}
       - LITELLM_KIMI_OAUTH_AUTH_FILE=${LITELLM_KIMI_OAUTH_AUTH_FILE:-/home/zepfu/.kimi-code/credentials/kimi-code.json}
