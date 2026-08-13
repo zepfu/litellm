@@ -59,8 +59,8 @@ _TUI_LAYERS = frozenset({"TUI hook", "TUI/headless"})
 # codes. A class remains listed while any provider-reachable catalog row in
 # that class still classifies as unknown (local/client network, non-error
 # 2xx/3xx, passthrough shells, overload/timeout/server shells, permission/
-# plan restrictions, provider-overload marker codes, or successful length
-# truncation).
+# plan restrictions, ambiguous residual markers, provider-overload marker
+# codes, or successful length truncation).
 _KNOWN_COVERAGE_GAPS = frozenset(
     {
         "Layered/platform passthrough",
@@ -73,14 +73,10 @@ _KNOWN_COVERAGE_GAPS = frozenset(
         "Pending/not terminal",
         "Permission/policy block",
         "Plan/tool restriction",
-        "Precondition/conflict",
         "Provider unavailable",
-        "Reconnect",
         "Result indirection",
-        "Retry transient",
         "Server error",
         "Server/API error",
-        "State/session recovery",
         "Timeout",
         "Unknown/fallback",
         "Workload-specific passthrough",
@@ -425,6 +421,42 @@ _D1_587_THEME_FIXTURE_CASES: tuple[tuple[object, str, str, str, str], ...] = (
         "upstream",
         "marker",
     ),
+    # Exact residual provider machine codes
+    (
+        None,
+        "previous_response_not_found The previous response could not be resolved.",
+        "provider_4xx_other",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "websocket_connection_limit_reached The WebSocket lifetime ended.",
+        "transient",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "server_error The provider failed internally.",
+        "provider_5xx",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "vector_store_timeout The vector-store operation timed out.",
+        "transient",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "precondition_failed The required precondition was not satisfied.",
+        "provider_4xx_other",
+        "upstream",
+        "marker",
+    ),
 )
 
 
@@ -526,6 +558,129 @@ def test_d1_587_marker_invalid_request_is_provider_4xx_other_non_retryable() -> 
     assert fv.is_coolable(event)
 
 
+@pytest.mark.parametrize(
+    "message,expected_class,expected_retryable",
+    [
+        (
+            "previous_response_not_found The previous response could not be resolved.",
+            "provider_4xx_other",
+            False,
+        ),
+        (
+            "websocket_connection_limit_reached The WebSocket lifetime ended.",
+            "transient",
+            True,
+        ),
+        ("server_error The provider failed internally.", "provider_5xx", True),
+        (
+            "vector_store_timeout The vector-store operation timed out.",
+            "transient",
+            True,
+        ),
+        (
+            "precondition_failed The required precondition was not satisfied.",
+            "provider_4xx_other",
+            False,
+        ),
+    ],
+)
+def test_d1_587_exact_residual_machine_codes_preserve_retry_semantics(
+    message: str,
+    expected_class: str,
+    expected_retryable: bool,
+) -> None:
+    """Exact residual machine codes map to stable provider classifications."""
+    event = clsf.classify_failure(status_code=None, message=message)
+    assert event.class_name == expected_class
+    assert event.origin == "upstream"
+    assert event.confidence == "marker"
+    assert event.scope == "provider"
+    assert event.retryable is expected_retryable
+    assert fv.is_coolable(event)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "previous_response_not_found documentation only",
+        "not previous_response_not_found",
+        "previous_response_not_found-extra",
+        "websocket_connection_limit_reached docs only",
+        "not websocket_connection_limit_reached",
+        "websocket_connection_limit_reached-extra",
+        "server_error documentation only",
+        "not server_error",
+        "server_error-extra",
+        "vector_store_timeout docs only",
+        "not vector_store_timeout",
+        "vector_store_timeout-extra",
+        "precondition_failed documentation only",
+        "not precondition_failed",
+        "precondition_failed-extra",
+    ],
+)
+def test_d1_587_exact_residual_machine_codes_require_clean_tokens(message: str) -> None:
+    """Residual machine codes reject docs, negation, and hyphen-glued forms."""
+    event = clsf.classify_failure(status_code=None, message=message)
+    assert event.class_name == "unknown"
+    assert event.origin == "unknown"
+    assert event.confidence == "unknown"
+    assert not fv.is_coolable(event)
+
+
+@pytest.mark.parametrize(
+    "status_code,message",
+    [
+        (202, "Accepted Deferred completion is queued; the response is not yet available."),
+        (302, "Large result redirect The result is available through Location."),
+        (202, "previous_response_not_found is not an accepted response error."),
+        (302, "precondition_failed is not a redirect error."),
+        (None, "finish_reason = length successful truncation is non-error"),
+        (None, "local NetworkError The client encountered a local network error."),
+        (None, "passthrough workload-specific response"),
+        (None, "permission_denied"),
+        (None, "provider_unavailable"),
+        (None, "not_found"),
+        (None, "refusal"),
+        (None, "server"),
+        (None, "timeout"),
+        (None, "unmapped"),
+        (None, "api_error"),
+    ],
+)
+def test_d1_587_ambiguous_success_and_local_rows_remain_unknown(
+    status_code: object,
+    message: str,
+) -> None:
+    """Ambiguous, excluded, successful, and local signals never cool."""
+    event = clsf.classify_failure(status_code=status_code, message=message)
+    assert event.class_name == "unknown"
+    assert event.origin == "unknown"
+    assert event.confidence == "unknown"
+    assert not fv.is_coolable(event)
+
+
+def test_d1_587_exact_machine_codes_do_not_override_structured_statuses() -> None:
+    """Known HTTP and JSON-RPC statuses retain structured precedence."""
+    http_4xx_event = clsf.classify_failure(
+        status_code=400,
+        message="server_error",
+    )
+    assert http_4xx_event.class_name == "provider_4xx_other"
+    assert http_4xx_event.confidence == "structured"
+    assert http_4xx_event.evidence.get("status_code") == "400"
+
+    http_event = clsf.classify_failure(status_code=500, message="server_error")
+    assert http_event.class_name == "provider_5xx"
+    assert http_event.confidence == "structured"
+    assert http_event.evidence.get("status_code") == "500"
+
+    rpc_event = clsf.classify_failure(status_code=-32603, message="server_error")
+    assert rpc_event.class_name == "transient"
+    assert rpc_event.confidence == "structured"
+    assert rpc_event.evidence.get("json_rpc_code") == "-32603"
+
+
 def test_client_cancelled_asyncio_cancelled_error_is_never_coolable() -> None:
     """asyncio.CancelledError (caller abort) classifies client/never-coolable."""
     import asyncio
@@ -602,7 +757,7 @@ def test_csv_coverage_checklist() -> None:
 
 
 def test_d1_587_provider_reachable_residual_totals_are_exact() -> None:
-    """Acceptance claim: exactly 23 unknown residual rows across 21 gap classes."""
+    """Acceptance claim: exactly 18 unknown residual rows across 17 gap classes."""
     rows = _load_catalog_rows()
     residual_classes: set[str] = set()
     residual_count = 0
@@ -618,8 +773,8 @@ def test_d1_587_provider_reachable_residual_totals_are_exact() -> None:
         residual_count += 1
         residual_classes.add(row["Normalized Class"])
 
-    assert residual_count == 23
-    assert len(residual_classes) == 21
+    assert residual_count == 18
+    assert len(residual_classes) == 17
     assert residual_classes == set(_KNOWN_COVERAGE_GAPS)
 
 
@@ -640,6 +795,8 @@ _TUI_MARKER_AMBIGUOUS_CODES = frozenset(
         "max_output_tokens",
         # Shared machine-code token with provider invalid-request residuals.
         "invalid_request",
+        # Shared machine-code token with the provider server-error mapping.
+        "server_error",
     }
 )
 

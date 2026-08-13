@@ -131,6 +131,17 @@ _INVALID_REQUEST_MARKERS = (
     "unprocessable",
 )
 
+# D1-587: unambiguous residual provider machine codes. Exact catalog tokens
+# only; hyphen-aware boundaries and negation/docs guards prevent prose or
+# glued variants from cooling candidates.
+_EXACT_MACHINE_CODE_MAPPINGS = (
+    ("previous_response_not_found", "provider_4xx_other", False),
+    ("websocket_connection_limit_reached", "transient", True),
+    ("server_error", "provider_5xx", True),
+    ("vector_store_timeout", "transient", True),
+    ("precondition_failed", "provider_4xx_other", False),
+)
+
 # JSON-RPC wire codes observed in Wire mode catalog fixtures.
 # Exact token form only: reject glued/prefixed junk such as x-32600y / --32600.
 _JSON_RPC_CODE_RE = re.compile(
@@ -259,8 +270,9 @@ def classify_failure(
 
     D1-587 grows mappings for fixture-backed image-content sub-errors,
     JSON-RPC negative wire codes, HTTP-200-body stream failures,
-    usage/limit/quota machine codes, invalid-request machine codes, and
-    provider-overload markers without changing the open ``FailureEvent`` schema.
+    usage/limit/quota machine codes, invalid-request machine codes,
+    provider-overload markers, and exact residual machine codes without
+    changing the open ``FailureEvent`` schema.
     """
     text = (message or "").lower()
     evidence: dict[str, str] = {}
@@ -437,6 +449,16 @@ def classify_failure(
         )
         if invalid_event is not None:
             return invalid_event
+
+        if status_code is None:
+            machine_code_event = _classify_exact_machine_code_markers(
+                text=text,
+                provider=provider,
+                confidence="marker",
+                evidence=evidence,
+            )
+            if machine_code_event is not None:
+                return machine_code_event
 
         if _any_strict_machine_code_marker(text, _OVERLOAD_MARKERS):
             return _event(
@@ -643,6 +665,28 @@ def _classify_invalid_request_markers(
             retryable=False,
             evidence=evidence,
         )
+    return None
+
+
+def _classify_exact_machine_code_markers(
+    *,
+    text: str,
+    provider: Optional[str],
+    confidence: fv.Confidence,
+    evidence: dict[str, str],
+) -> Optional[fv.FailureEvent]:
+    """Map only the unambiguous residual provider machine-code markers."""
+    for marker, class_name, retryable in _EXACT_MACHINE_CODE_MAPPINGS:
+        if _strict_machine_code_marker_match(text, marker):
+            return _event(
+                class_name=class_name,
+                origin="upstream",
+                confidence=confidence,
+                provider=provider,
+                scope="provider",
+                retryable=retryable,
+                evidence=evidence,
+            )
     return None
 
 
