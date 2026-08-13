@@ -26,6 +26,8 @@ GROUPS = (
         paths=(
             ".wheel-build/",
             "litellm/integrations/aawm_agent_identity/",
+            "litellm/integrations/aawm_agent_quality_rules.py",
+            "litellm/integrations/aawm_agent_quality_rules.json",
             "litellm/integrations/aawm_payload_capture.py",
         ),
         version_file=ROOT / ".wheel-build" / "pyproject.toml",

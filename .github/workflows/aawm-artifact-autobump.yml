@@ -12,6 +12,8 @@ on:
       - "litellm/bundled_model_prices_and_context_window_fallback.json"
       - "scripts/build_model_config_bundle.py"
       - "litellm/integrations/aawm_agent_identity/**"
+      - "litellm/integrations/aawm_agent_quality_rules.py"
+      - "litellm/integrations/aawm_agent_quality_rules.json"
       - "litellm/integrations/aawm_payload_capture.py"
       - "litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py"
       - "context-replacement/**"
@@ -49,11 +51,17 @@ jobs:
           bumped = payload.get("bumped", [])
           tags = " ".join(item["tag"] for item in bumped)
           version_files = " ".join(item["version_file"] for item in bumped)
+          callback_bumped = any(item["name"] == "callback" for item in bumped)
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
               handle.write(f"has_bumps={'true' if bumped else 'false'}\n")
+              handle.write(f"callback_bumped={'true' if callback_bumped else 'false'}\n")
               handle.write(f"tags={tags}\n")
               handle.write(f"version_files={version_files}\n")
           PY
+
+      - name: Sync callback quality rules
+        if: steps.bump.outputs.callback_bumped == 'true'
+        run: python3 scripts/sync_aawm_agent_quality_rules_to_wheel.py
 
       - name: Commit version bumps
         if: steps.bump.outputs.has_bumps == 'true'
@@ -61,6 +69,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add ${{ steps.bump.outputs.version_files }}
+          if [ "${{ steps.bump.outputs.callback_bumped }}" = "true" ]; then
+            git add \
+              .wheel-build/aawm_litellm_callbacks/aawm_agent_quality_rules.py \
+              .wheel-build/aawm_litellm_callbacks/aawm_agent_quality_rules.json
+          fi
           git commit -m "chore(release): bump artifact versions"
           git push origin HEAD:main
 

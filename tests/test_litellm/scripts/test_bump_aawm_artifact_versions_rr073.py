@@ -17,6 +17,8 @@ _BACKUP_REL = "litellm/model_prices_and_context_window_backup.json"
 _CANONICAL_REL = "model_prices_and_context_window.json"
 _IDENTITY_PACKAGE_REL = "litellm/integrations/aawm_agent_identity/"
 _IDENTITY_PACKAGE_GLOB = "litellm/integrations/aawm_agent_identity/**"
+_QUALITY_RULE_PY_REL = "litellm/integrations/aawm_agent_quality_rules.py"
+_QUALITY_RULE_JSON_REL = "litellm/integrations/aawm_agent_quality_rules.json"
 
 
 def _load_bump_module():
@@ -50,6 +52,8 @@ def test_callback_group_watches_identity_package_recursively(bump_mod) -> None:
     callback = _callback_group(bump_mod)
     assert _IDENTITY_PACKAGE_REL in callback.paths
     assert "litellm/integrations/aawm_agent_identity.py" not in callback.paths
+    assert _QUALITY_RULE_PY_REL in callback.paths
+    assert _QUALITY_RULE_JSON_REL in callback.paths
     assert bump_mod._path_matches(
         "litellm/integrations/aawm_agent_identity/__init__.py",
         callback.paths,
@@ -58,6 +62,57 @@ def test_callback_group_watches_identity_package_recursively(bump_mod) -> None:
         "litellm/integrations/aawm_agent_identity/future_module.py",
         callback.paths,
     )
+
+
+@pytest.mark.parametrize(
+    "changed_file",
+    (_QUALITY_RULE_PY_REL, _QUALITY_RULE_JSON_REL),
+)
+def test_callback_group_bumps_for_only_canonical_quality_rule_change(
+    bump_mod,
+    changed_file,
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    """Each canonical quality-rule file selects only the callback artifact."""
+    temporary_groups = []
+    for group in bump_mod.GROUPS:
+        version_file = tmp_path / f"{group.name}-version"
+        if group.name in {"callback", "control_plane"}:
+            version_file.write_text('version = "1.2.3"\n', encoding="utf-8")
+        else:
+            version_file.write_text("1.2.3\n", encoding="utf-8")
+        temporary_groups.append(
+            bump_mod.ArtifactGroup(
+                name=group.name,
+                paths=group.paths,
+                version_file=version_file,
+                pattern=group.pattern,
+                tag_prefix=group.tag_prefix,
+            )
+        )
+
+    monkeypatch.setattr(bump_mod, "GROUPS", tuple(temporary_groups))
+    monkeypatch.setattr(
+        bump_mod,
+        "_get_changed_files",
+        lambda before, after: [changed_file],
+    )
+
+    rc = bump_mod.main(["--before", "abc", "--after", "def", "--write"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["bumped"] == [
+        {
+            "name": "callback",
+            "old_version": "1.2.3",
+            "new_version": "1.2.4",
+            "tag": "cb-v1.2.4",
+            "version_file": str(tmp_path / "callback-version"),
+        }
+    ]
 
 
 def test_config_group_watches_bundled_fallback_not_nonexistent_backup(bump_mod) -> None:

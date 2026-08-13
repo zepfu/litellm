@@ -62,6 +62,15 @@ packaged files with their canonical sources. This keeps the callback overlay
 independently deployable without combining it with the base LiteLLM package or
 another overlay wheel.
 
+#### D1-527B: Callback artifact autobump selection
+
+The callback artifact group watches both canonical quality-rule files, so a
+Python-only or JSON-only quality-rule change selects exactly the callback wheel.
+The autobump workflow runs
+`python scripts/sync_aawm_agent_quality_rules_to_wheel.py` before committing the
+version bump and stages the generated callback-wheel copies. This preserves the
+callback wheel's independent version and release boundary.
+
 Release workflow:
 
 - `.github/workflows/aawm-callback.yml`
