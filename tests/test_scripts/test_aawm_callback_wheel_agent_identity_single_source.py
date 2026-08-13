@@ -27,6 +27,11 @@ CANONICAL_PACKAGE = (
 CANONICAL_INIT = CANONICAL_PACKAGE / "__init__.py"
 CHECKOUT_LOADER = WHEEL_BUILD / "aawm_litellm_callbacks" / "agent_identity.py"
 PYPROJECT = WHEEL_BUILD / "pyproject.toml"
+CANONICAL_QUALITY_RULES = REPO_ROOT / "litellm" / "integrations"
+QUALITY_RULE_FILES = (
+    "aawm_agent_quality_rules.py",
+    "aawm_agent_quality_rules.json",
+)
 REQUIRED_PACKAGE_MODULES = (
     "__init__.py",
     "interfaces.py",
@@ -126,6 +131,12 @@ def test_built_callback_wheel_ships_canonical_agent_identity_not_loader(
 
     with zipfile.ZipFile(wheel_path) as archive:
         assert packaged_loader == CHECKOUT_LOADER.read_bytes()
+        for file_name in QUALITY_RULE_FILES:
+            member = f"aawm_litellm_callbacks/{file_name}"
+            assert member in member_names
+            assert archive.read(member) == (
+                CANONICAL_QUALITY_RULES / file_name
+            ).read_bytes()
         for module_name in REQUIRED_PACKAGE_MODULES:
             member = (
                 "litellm/integrations/aawm_agent_identity/"

@@ -50,6 +50,18 @@ full copies under `.wheel-build/`. Guard with
 `python scripts/sync_aawm_agent_identity_to_wheel.py --check` (read-only;
 does not copy sources).
 
+#### D1-527A: Callback quality-rule generation/parity
+
+`litellm/integrations/aawm_agent_quality_rules.py` and
+`litellm/integrations/aawm_agent_quality_rules.json` are the canonical quality
+rule sources. Run `python scripts/sync_aawm_agent_quality_rules_to_wheel.py` to
+generate the matching callback-wheel copies under
+`.wheel-build/aawm_litellm_callbacks/`; `--check` verifies both files without
+writing. The focused parity test and callback wheel-build test compare both
+packaged files with their canonical sources. This keeps the callback overlay
+independently deployable without combining it with the base LiteLLM package or
+another overlay wheel.
+
 Release workflow:
 
 - `.github/workflows/aawm-callback.yml`
