@@ -54,6 +54,7 @@ _DEFAULT_MAX_SECONDS = 1800.0
 
 _QUOTA_MARKERS = ("quota",)
 _CAPACITY_MARKERS = ("capacity",)
+_OVERLOAD_MARKERS = ("provider_overloaded", "overloaded_error")
 _RATE_LIMIT_MARKERS = ("rate limit", "rate-limit", "too many requests")
 _AUTH_MARKERS = ("api key", "unauthorized", "invalid auth", "auth")
 _CLIENT_CANCELLED_MARKERS = ("cancelled", "canceled", "cancel")
@@ -258,8 +259,8 @@ def classify_failure(
 
     D1-587 grows mappings for fixture-backed image-content sub-errors,
     JSON-RPC negative wire codes, HTTP-200-body stream failures,
-    usage/limit/quota machine codes, and invalid-request machine codes
-    without changing the open ``FailureEvent`` schema.
+    usage/limit/quota machine codes, invalid-request machine codes, and
+    provider-overload markers without changing the open ``FailureEvent`` schema.
     """
     text = (message or "").lower()
     evidence: dict[str, str] = {}
@@ -437,6 +438,16 @@ def classify_failure(
         if invalid_event is not None:
             return invalid_event
 
+        if _any_strict_machine_code_marker(text, _OVERLOAD_MARKERS):
+            return _event(
+                class_name="capacity",
+                origin="upstream",
+                confidence="marker",
+                provider=provider,
+                scope="provider",
+                retryable=True,
+                evidence=evidence,
+            )
     if any(marker in text for marker in _CAPACITY_MARKERS):
         return _event(
             class_name="capacity",
@@ -581,13 +592,12 @@ def _classify_limit_or_quota_markers(
     return None
 
 
-def _invalid_request_marker_match(text: str, marker: str) -> bool:
-    """Exact invalid-request token match with hyphen treated as identifier-adjacent.
+def _strict_machine_code_marker_match(text: str, marker: str) -> bool:
+    """Match a machine-code token with hyphen treated as identifier-adjacent.
 
     Narrower than :func:`_marker_match`: left/right boundaries reject both
     alphanumerics/underscore *and* hyphen so catalog tokens do not match
-    hyphen-glued variants such as ``invalid_request-error`` or
-    ``string_too_long-extra``. Global marker matching is unchanged.
+    hyphen-glued variants. Global marker matching is unchanged.
     """
     if not marker:
         return False
@@ -602,8 +612,17 @@ def _invalid_request_marker_match(text: str, marker: str) -> bool:
     return False
 
 
+def _invalid_request_marker_match(text: str, marker: str) -> bool:
+    """Match an invalid-request machine-code token exactly."""
+    return _strict_machine_code_marker_match(text, marker)
+
+
 def _any_invalid_request_marker(text: str, markers: tuple[str, ...]) -> bool:
     return any(_invalid_request_marker_match(text, marker) for marker in markers)
+
+
+def _any_strict_machine_code_marker(text: str, markers: tuple[str, ...]) -> bool:
+    return any(_strict_machine_code_marker_match(text, marker) for marker in markers)
 
 
 def _classify_invalid_request_markers(

@@ -59,7 +59,8 @@ _TUI_LAYERS = frozenset({"TUI hook", "TUI/headless"})
 # codes. A class remains listed while any provider-reachable catalog row in
 # that class still classifies as unknown (local/client network, non-error
 # 2xx/3xx, passthrough shells, overload/timeout/server shells, permission/
-# plan restrictions, or successful length truncation).
+# plan restrictions, provider-overload marker codes, or successful length
+# truncation).
 _KNOWN_COVERAGE_GAPS = frozenset(
     {
         "Layered/platform passthrough",
@@ -73,7 +74,6 @@ _KNOWN_COVERAGE_GAPS = frozenset(
         "Permission/policy block",
         "Plan/tool restriction",
         "Precondition/conflict",
-        "Provider overload",
         "Provider unavailable",
         "Reconnect",
         "Result indirection",
@@ -410,6 +410,21 @@ _D1_587_THEME_FIXTURE_CASES: tuple[tuple[object, str, str, str, str], ...] = (
         "upstream",
         "marker",
     ),
+    # Provider-overload marker codes
+    (
+        None,
+        "provider_overloaded The selected upstream provider is overloaded.",
+        "capacity",
+        "upstream",
+        "marker",
+    ),
+    (
+        None,
+        "overloaded_error Anthropic-compatible provider overload/unavailability failure.",
+        "capacity",
+        "upstream",
+        "marker",
+    ),
 )
 
 
@@ -442,7 +457,7 @@ def test_d1_587_theme_fixtures_classify(
     expected_origin: str,
     expected_confidence: str,
 ) -> None:
-    """Image-content, JSON-RPC, stream, usage/limit, and invalid-request fixtures map to registered classes."""
+    """D1-587 fixture themes map to registered classes."""
     registry = clsf.register_d1_587_failure_classes()
     event = clsf.classify_failure(status_code=status_code, message=message)
     assert event.class_name == expected_class
@@ -587,7 +602,7 @@ def test_csv_coverage_checklist() -> None:
 
 
 def test_d1_587_provider_reachable_residual_totals_are_exact() -> None:
-    """Acceptance claim: exactly 25 unknown residual rows across 22 gap classes."""
+    """Acceptance claim: exactly 23 unknown residual rows across 21 gap classes."""
     rows = _load_catalog_rows()
     residual_classes: set[str] = set()
     residual_count = 0
@@ -603,8 +618,8 @@ def test_d1_587_provider_reachable_residual_totals_are_exact() -> None:
         residual_count += 1
         residual_classes.add(row["Normalized Class"])
 
-    assert residual_count == 25
-    assert len(residual_classes) == 22
+    assert residual_count == 23
+    assert len(residual_classes) == 21
     assert residual_classes == set(_KNOWN_COVERAGE_GAPS)
 
 
@@ -691,6 +706,26 @@ def test_d1_587_negated_docs_and_junk_remain_unknown_and_not_coolable(
 ) -> None:
     """Negated, documentation-only, zero-hit, and junk tokens must not cool."""
     event = clsf.classify_failure(status_code=status_code, message=message)
+    assert event.class_name == "unknown"
+    assert event.origin == "unknown"
+    assert event.confidence == "unknown"
+    assert not fv.is_coolable(event)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "provider_overloaded documentation only",
+        "overloaded_error docs only",
+        "provider_overloaded-extra",
+        "not-provider_overloaded",
+        "overloaded_error-extra",
+        "not-overloaded_error",
+    ],
+)
+def test_d1_587_overload_markers_require_exact_non_docs_tokens(message: str) -> None:
+    """Overload codes reject docs-only, negated, and hyphen-glued forms."""
+    event = clsf.classify_failure(status_code=None, message=message)
     assert event.class_name == "unknown"
     assert event.origin == "unknown"
     assert event.confidence == "unknown"
