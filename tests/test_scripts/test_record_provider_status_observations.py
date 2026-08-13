@@ -7015,16 +7015,49 @@ def test_build_codex_oauth_auth_observation_sanitizes_refresh_failure() -> None:
 
 def test_run_due_sidecar_tasks_persists_codex_auth_observation_when_apply_enabled(
     monkeypatch,
+    tmp_path,
 ) -> None:
+    wall_now = datetime(2026, 6, 19, 12, 0, tzinfo=timezone.utc)
+    inventory = _codex_oauth_inventory("account1", root=tmp_path)
+    record = inventory.records[0]
+    record.auth_path.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": _build_test_jwt(
+                        {"exp": int((wall_now + timedelta(minutes=30)).timestamp())}
+                    ),
+                    "refresh_token": "refresh-account1",
+                    "account_id": "acct-account1",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    record.auth_path.chmod(0o600)
     config = _codex_oauth_auth_persist_config(
         codex_force_refresh=True,
         codex_refresh_interval_seconds=3600.0,
+        codex_oauth_inventory=inventory,
     )
-    record = config.codex_oauth_inventory.records[0]
     captured = {}
 
     def fake_refresh(selected_record, **kwargs):
         kwargs["on_token_endpoint_attempt"]()
+        selected_record.auth_path.write_text(
+            json.dumps(
+                {
+                    "tokens": {
+                        "access_token": _build_test_jwt(
+                            {"exp": int((wall_now + timedelta(hours=1)).timestamp())}
+                        ),
+                        "refresh_token": "rotated-refresh-account1",
+                        "account_id": "acct-account1",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
         return {
             "attempted": True,
             "refreshed": True,
@@ -7055,7 +7088,7 @@ def test_run_due_sidecar_tasks_persists_codex_auth_observation_when_apply_enable
         config,
         loop.SidecarTaskState(),
         now_monotonic=100.0,
-        now_wall=datetime(2026, 6, 19, 12, 0, tzinfo=timezone.utc),
+        now_wall=wall_now,
     )
 
     refresh_events = [event for event in events if event.get("event") == "codex_oauth_refresh"]

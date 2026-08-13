@@ -1626,7 +1626,8 @@ redacted before they enter the returned summary or sidecar telemetry. The dev
 LiteLLM container mounts the same host directory read-only. In dev compose the
 sidecar runs with `AAWM_XAI_OAUTH_REFRESH_ENABLED=1`,
 `AAWM_XAI_OAUTH_AUTH_FILE` set to the expanded host path for
-`~/.litellm/xai/oauth-auth.json`, and a one-hour refresh interval.
+`~/.litellm/xai/oauth-auth.json`, a five-minute eligibility and actual-attempt
+interval, a 15-minute refresh buffer, and forced refresh disabled.
 
 Each managed xAI OAuth refresh attempt writes sanitized provider-auth telemetry
 into `provider_auth_observations` and `provider_auth_current`. Rows use provider
