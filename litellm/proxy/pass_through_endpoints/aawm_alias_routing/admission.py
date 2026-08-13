@@ -1,4 +1,4 @@
-"""D1-564 provider/account lane admission (first durable body).
+"""D1-564 provider/account lane admission.
 
 Fail-fast admission for resolved upstream provider/account lanes:
 
@@ -10,8 +10,8 @@ Fail-fast admission for resolved upstream provider/account lanes:
 * confirmed current account/usage exhaustion returns an immediate structured 429
 * never queues, sleeps, background-retries, or waits through long resets
 
-Later D1-564 bodies own adaptive fairness, warning aggregation, token-weight
-budgets, and live canary proof. This module only provides the reservation seam.
+Admission remains fail-fast: it never waits for capacity or a provider reset.
+Token estimates are bounded reservations, not usage accounting or billing.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from fastapi import HTTPException
 from . import durable
 from .state import alias_routing_state
 
-logger = logging.getLogger("LiteLLMProxy")
+logger = logging.getLogger("LiteLLM Proxy")
 
 # Durable keyspace is intentionally distinct from cooldown / session-owner keys.
 _ADMISSION_STATE_FAMILY = "provider-lane"
@@ -43,6 +43,13 @@ _DEFAULT_MAX_IN_FLIGHT = 64
 _DEFAULT_LEASE_TTL_SECONDS = 120.0
 _MIN_LEASE_TTL_SECONDS = 5.0
 _MAX_LEASE_TTL_SECONDS = 900.0
+_DEFAULT_LARGE_CONTEXT_TOKENS = 1_000_000
+_DEFAULT_LARGE_CONTEXT_MAX_IN_FLIGHT = 2
+_DEFAULT_RESERVED_INTERACTIVE_CAPACITY = 0
+_DEFAULT_TOKEN_WEIGHT_QUANTUM = 64_000
+_DEFAULT_WARNING_INTERVAL_SECONDS = 30.0
+_DEFAULT_WARNING_SUMMARY_INTERVAL_SECONDS = 300.0
+_MAX_WARNING_STATES = 1024
 
 _SUPPORTED_LIMIT_SCOPES = frozenset(
     {
@@ -85,6 +92,13 @@ class AdmissionLease:
     account_hash: Optional[str]
     held: bool = True
     durable: bool = True
+    input_tokens: int = 0
+    output_tokens: int = 0
+    unified_tokens: int = 0
+    weighted_units: int = 1
+    capacity_class: str = "standard"
+    large_context: bool = False
+    reserved_interactive: bool = False
 
 
 @dataclass(frozen=True)
@@ -105,18 +119,34 @@ class AdmissionDecision:
     inflight_after: Optional[int] = None
     max_in_flight: Optional[int] = None
     detail_code: str = "aawm_provider_lane_admission_denied"
+    input_tokens: int = 0
+    output_tokens: int = 0
+    unified_tokens: int = 0
+    weighted_units: int = 1
+    capacity_class: str = "standard"
+    large_context: bool = False
+    reserved_interactive: bool = False
+    max_input_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = None
+    max_unified_tokens: Optional[int] = None
+    max_large_context_in_flight: Optional[int] = None
+    reserved_interactive_capacity: Optional[int] = None
 
 
 # Process-local counter used only when Redis is unconfigured (unit tests /
 # single-process). Never replaces durable multi-worker reservation.
 _local_inflight_by_lane: dict[str, int] = {}
 _local_leases: dict[str, dict[str, Any]] = {}
+_local_accounting_by_lane: dict[str, dict[str, int]] = {}
+_admission_warning_states: dict[str, dict[str, Any]] = {}
 
 
 def reset_admission_state_for_tests() -> None:
     """Clear process-local admission counters/leases (tests only)."""
     _local_inflight_by_lane.clear()
     _local_leases.clear()
+    _local_accounting_by_lane.clear()
+    _admission_warning_states.clear()
 
 
 def _clean_str(value: Any) -> Optional[str]:
@@ -136,6 +166,35 @@ def _parse_positive_int(value: Optional[str], *, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(1, parsed)
+
+
+def _parse_nonnegative_int(value: Any, *, default: int = 0) -> int:
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, parsed)
+
+
+def _parse_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    cleaned = (_clean_str(value) or "").lower()
+    if cleaned in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    if cleaned in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return default
+
+
+def _env_nonnegative_int(name: str, *, default: int) -> int:
+    return _parse_nonnegative_int(os.getenv(name), default=default)
 
 
 def _parse_ttl_seconds(value: Optional[str], *, default: float) -> float:
@@ -162,6 +221,341 @@ def get_provider_lane_admission_lease_ttl_seconds() -> float:
         os.getenv("AAWM_PROVIDER_LANE_ADMISSION_LEASE_TTL_SECONDS"),
         default=_DEFAULT_LEASE_TTL_SECONDS,
     )
+
+
+def get_provider_lane_admission_token_weight_quantum() -> int:
+    return _parse_positive_int(
+        os.getenv("AAWM_PROVIDER_LANE_ADMISSION_TOKEN_WEIGHT_QUANTUM"),
+        default=_DEFAULT_TOKEN_WEIGHT_QUANTUM,
+    )
+
+
+def get_provider_lane_admission_large_context_tokens() -> int:
+    return _parse_positive_int(
+        os.getenv("AAWM_PROVIDER_LANE_ADMISSION_LARGE_CONTEXT_TOKENS"),
+        default=_DEFAULT_LARGE_CONTEXT_TOKENS,
+    )
+
+
+def get_provider_lane_admission_large_context_max_in_flight() -> int:
+    return _parse_positive_int(
+        os.getenv("AAWM_PROVIDER_LANE_ADMISSION_LARGE_CONTEXT_MAX_IN_FLIGHT"),
+        default=_DEFAULT_LARGE_CONTEXT_MAX_IN_FLIGHT,
+    )
+
+
+def get_provider_lane_admission_reserved_interactive_capacity() -> int:
+    return _env_nonnegative_int(
+        "AAWM_PROVIDER_LANE_ADMISSION_RESERVED_INTERACTIVE_CAPACITY",
+        default=_DEFAULT_RESERVED_INTERACTIVE_CAPACITY,
+    )
+
+
+def get_provider_lane_admission_max_input_tokens(
+    *, max_in_flight: Optional[int] = None
+) -> int:
+    cap = (
+        max_in_flight
+        if max_in_flight is not None
+        else get_provider_lane_admission_max_in_flight()
+    )
+    return _env_nonnegative_int(
+        "AAWM_PROVIDER_LANE_ADMISSION_MAX_INPUT_TOKENS",
+        default=cap * get_provider_lane_admission_token_weight_quantum(),
+    )
+
+
+def get_provider_lane_admission_max_output_tokens(
+    *, max_in_flight: Optional[int] = None
+) -> int:
+    cap = (
+        max_in_flight
+        if max_in_flight is not None
+        else get_provider_lane_admission_max_in_flight()
+    )
+    return _env_nonnegative_int(
+        "AAWM_PROVIDER_LANE_ADMISSION_MAX_OUTPUT_TOKENS",
+        default=cap * get_provider_lane_admission_token_weight_quantum(),
+    )
+
+
+def get_provider_lane_admission_max_unified_tokens(
+    *, max_in_flight: Optional[int] = None
+) -> int:
+    cap = (
+        max_in_flight
+        if max_in_flight is not None
+        else get_provider_lane_admission_max_in_flight()
+    )
+    return _env_nonnegative_int(
+        "AAWM_PROVIDER_LANE_ADMISSION_MAX_UNIFIED_TOKENS",
+        default=cap * get_provider_lane_admission_token_weight_quantum(),
+    )
+
+
+def get_provider_lane_admission_warning_interval_seconds() -> float:
+    return _parse_ttl_seconds(
+        os.getenv("AAWM_PROVIDER_LANE_ADMISSION_WARNING_INTERVAL_SECONDS"),
+        default=_DEFAULT_WARNING_INTERVAL_SECONDS,
+    )
+
+
+def get_provider_lane_admission_warning_summary_interval_seconds() -> float:
+    return _parse_ttl_seconds(
+        os.getenv("AAWM_PROVIDER_LANE_ADMISSION_WARNING_SUMMARY_INTERVAL_SECONDS"),
+        default=_DEFAULT_WARNING_SUMMARY_INTERVAL_SECONDS,
+    )
+
+
+def _mapping_value(roots: list[Mapping[str, Any]], keys: tuple[str, ...]) -> Any:
+    for root in roots:
+        for key in keys:
+            value = root.get(key)
+            if value is not None:
+                return value
+    return None
+
+
+def _request_roots(
+    candidate: Mapping[str, Any],
+    selection: Optional[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    roots: list[Mapping[str, Any]] = []
+    if selection is not None:
+        roots.append(selection)
+    roots.append(candidate)
+    for root in tuple(roots):
+        for key in (
+            "request_body",
+            "prepared_request_body",
+            "request",
+            "body",
+            "token_estimates",
+            "usage",
+            "metadata",
+        ):
+            nested = root.get(key)
+            if isinstance(nested, Mapping):
+                roots.append(nested)
+    return roots
+
+
+def estimate_provider_lane_tokens(
+    *,
+    candidate: Mapping[str, Any],
+    selection: Optional[Mapping[str, Any]] = None,
+    input_tokens: Optional[int] = None,
+    output_tokens: Optional[int] = None,
+    unified_tokens: Optional[int] = None,
+    estimated_input_tokens: Optional[int] = None,
+    estimated_output_tokens: Optional[int] = None,
+    estimated_unified_tokens: Optional[int] = None,
+) -> tuple[int, int, int]:
+    """Resolve bounded request token estimates without inspecting secrets."""
+    roots = _request_roots(candidate, selection)
+    input_value = input_tokens
+    if input_value is None:
+        input_value = estimated_input_tokens
+    if input_value is None:
+        input_value = _mapping_value(
+            roots,
+            (
+                "input_tokens",
+                "estimated_input_tokens",
+                "prompt_tokens",
+                "input_token_count",
+            ),
+        )
+    output_value = output_tokens
+    if output_value is None:
+        output_value = estimated_output_tokens
+    if output_value is None:
+        output_value = _mapping_value(
+            roots,
+            (
+                "output_tokens",
+                "estimated_output_tokens",
+                "completion_tokens",
+                "max_tokens",
+                "max_output_tokens",
+            ),
+        )
+    unified_value = unified_tokens
+    if unified_value is None:
+        unified_value = estimated_unified_tokens
+    if unified_value is None:
+        unified_value = _mapping_value(
+            roots,
+            (
+                "unified_tokens",
+                "estimated_unified_tokens",
+                "total_tokens",
+                "total_token_count",
+            ),
+        )
+    input_count = _parse_nonnegative_int(input_value)
+    output_count = _parse_nonnegative_int(output_value)
+    unified_count = _parse_nonnegative_int(unified_value)
+    return input_count, output_count, max(unified_count, input_count + output_count)
+
+
+def resolve_reserved_interactive(
+    *,
+    candidate: Mapping[str, Any],
+    selection: Optional[Mapping[str, Any]] = None,
+    reserved_interactive: Optional[bool] = None,
+) -> bool:
+    if reserved_interactive is not None:
+        return bool(reserved_interactive)
+    for root in (selection, candidate):
+        if isinstance(root, Mapping) and _parse_bool(root.get("in_flight_session")):
+            return True
+    return False
+
+
+def resolve_large_context(
+    *,
+    candidate: Mapping[str, Any],
+    selection: Optional[Mapping[str, Any]] = None,
+    unified_tokens: int,
+    large_context: Optional[bool] = None,
+) -> bool:
+    if large_context is not None:
+        return bool(large_context)
+    explicit = _mapping_value(
+        _request_roots(candidate, selection),
+        ("large_context", "is_large_context", "large_context_request"),
+    )
+    if explicit is not None:
+        return _parse_bool(explicit)
+    return unified_tokens >= get_provider_lane_admission_large_context_tokens()
+
+
+def _capacity_class(*, large_context: bool, reserved_interactive: bool) -> str:
+    if large_context and reserved_interactive:
+        return "large_context_interactive"
+    if large_context:
+        return "large_context"
+    if reserved_interactive:
+        return "interactive"
+    return "standard"
+
+
+def weighted_token_units(
+    unified_tokens: int,
+    *,
+    quantum: Optional[int] = None,
+    minimum_units: int = 1,
+) -> int:
+    """Convert an estimated unified-token request into bounded fair units."""
+    quantum_i = quantum or get_provider_lane_admission_token_weight_quantum()
+    return max(
+        max(1, int(minimum_units)),
+        int(math.ceil(max(0, int(unified_tokens)) / max(1, quantum_i))),
+    )
+
+
+def _warning_context(
+    *,
+    candidate: Mapping[str, Any],
+    selection: Optional[Mapping[str, Any]],
+    alias_model: Optional[str] = None,
+    alias_family: Optional[str] = None,
+    client_id: Optional[str] = None,
+) -> tuple[str, str, str]:
+    roots = _request_roots(candidate, selection)
+    model = alias_model or _clean_str(
+        _mapping_value(roots, ("alias_model", "requested_model", "model"))
+    ) or "unknown"
+    alias = alias_family or _clean_str(
+        _mapping_value(roots, ("alias_family", "route_family", "alias"))
+    ) or "unknown"
+    client = client_id or _clean_str(
+        _mapping_value(
+            roots,
+            ("client_id", "client", "user_id", "session_id", "request_id"),
+        )
+    ) or "unknown"
+    return model, alias, client
+
+
+def record_provider_lane_admission_warning(
+    *,
+    decision: AdmissionDecision,
+    candidate: Mapping[str, Any],
+    selection: Optional[Mapping[str, Any]] = None,
+    alias_model: Optional[str] = None,
+    alias_family: Optional[str] = None,
+    client_id: Optional[str] = None,
+    now_epoch: Optional[float] = None,
+) -> None:
+    """Log the first lane warning, then bounded aggregate summaries."""
+    if decision.allowed:
+        return
+    now = time.time() if now_epoch is None else float(now_epoch)
+    model, alias, client = _warning_context(
+        candidate=candidate,
+        selection=selection,
+        alias_model=alias_model,
+        alias_family=alias_family,
+        client_id=client_id,
+    )
+    scope = decision.limit_scope or "unknown"
+    key = f"{decision.lane_fingerprint}:{decision.reason}:{scope}"
+    state = _admission_warning_states.get(key)
+    if state is None:
+        if len(_admission_warning_states) >= _MAX_WARNING_STATES:
+            oldest_key = min(
+                _admission_warning_states,
+                key=lambda item: float(
+                    _admission_warning_states[item].get("last_event_at") or 0.0
+                ),
+            )
+            _admission_warning_states.pop(oldest_key, None)
+        state = {
+            "first_logged": False,
+            "first_at": now,
+            "last_event_at": now,
+            "last_summary_at": now,
+            "summary_count": 0,
+            "total_count": 0,
+        }
+        _admission_warning_states[key] = state
+
+    state["last_event_at"] = now
+    state["total_count"] = int(state.get("total_count") or 0) + 1
+    fields = {
+        "provider": decision.provider,
+        "model": model,
+        "alias": alias,
+        "client": client,
+        "lane_fingerprint": decision.lane_fingerprint,
+        "limit_scope": scope,
+        "reset_at": decision.reset_at or "unknown",
+        "reason": decision.reason,
+    }
+    if not state["first_logged"]:
+        state["first_logged"] = True
+        logger.warning("provider-lane admission warning: %s", fields)
+        return
+
+    state["summary_count"] = int(state.get("summary_count") or 0) + 1
+    summary_interval = get_provider_lane_admission_warning_summary_interval_seconds()
+    last_summary_at = float(state.get("last_summary_at") or 0.0)
+    if now - last_summary_at < summary_interval:
+        return
+    summary_count = int(state.get("summary_count") or 0)
+    if summary_count <= 0:
+        state["last_summary_at"] = now
+        return
+    logger.warning(
+        "provider-lane admission warning summary: %s count=%d total=%d",
+        fields,
+        summary_count,
+        int(state.get("total_count") or 0),
+    )
+    state["summary_count"] = 0
+    state["last_summary_at"] = now
 
 
 def normalize_limit_scope(value: Any) -> str:
@@ -417,6 +811,19 @@ def _decision_from_exhaustion(
     provider: str,
     account_hash: Optional[str],
     observation: Mapping[str, Any],
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    unified_tokens: int = 0,
+    weighted_units: int = 1,
+    capacity_class: str = "standard",
+    large_context: bool = False,
+    reserved_interactive: bool = False,
+    max_in_flight: Optional[int] = None,
+    max_input_tokens: Optional[int] = None,
+    max_output_tokens: Optional[int] = None,
+    max_unified_tokens: Optional[int] = None,
+    max_large_context_in_flight: Optional[int] = None,
+    reserved_interactive_capacity: Optional[int] = None,
 ) -> AdmissionDecision:
     reset_hint = observation.get("reset_hint_seconds")
     try:
@@ -439,6 +846,19 @@ def _decision_from_exhaustion(
         exhaustion_kind=_clean_str(observation.get("exhaustion_kind")),
         quota_period=_clean_str(observation.get("quota_period")),
         detail_code="aawm_provider_lane_account_exhausted",
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        unified_tokens=unified_tokens,
+        weighted_units=weighted_units,
+        capacity_class=capacity_class,
+        large_context=large_context,
+        reserved_interactive=reserved_interactive,
+        max_in_flight=max_in_flight,
+        max_input_tokens=max_input_tokens,
+        max_output_tokens=max_output_tokens,
+        max_unified_tokens=max_unified_tokens,
+        max_large_context_in_flight=max_large_context_in_flight,
+        reserved_interactive_capacity=reserved_interactive_capacity,
     )
 
 
@@ -472,22 +892,30 @@ def _namespaced_key(redis_cache: Any, cache_key: str) -> str:
     return cache_key
 
 
-# Inflight accounting uses a HASH of active lease_key -> units plus per-lease
-# keys. Reservation always reclaims expired/missing leases first so a shared
-# counter cannot be kept artificially high by newer traffic refreshing TTL.
+# Inflight accounting uses a HASH of active lease_key -> canonical lease JSON
+# plus per-lease TTL keys. Reservation always reclaims expired/missing or
+# malformed leases first so durable multi-worker accounting stays exact.
 _LUA_RESERVE = """
 local inflight_hash = KEYS[1]
 local lease_key = KEYS[2]
 local max_in_flight = tonumber(ARGV[1])
-local units = tonumber(ARGV[2])
+local weighted_units = tonumber(ARGV[2])
 local ttl = tonumber(ARGV[3])
 local token = ARGV[4]
 local payload = ARGV[5]
+local max_input_tokens = tonumber(ARGV[6])
+local max_output_tokens = tonumber(ARGV[7])
+local max_unified_tokens = tonumber(ARGV[8])
+local max_large_context_in_flight = tonumber(ARGV[9])
 
-if max_in_flight == nil or units == nil or ttl == nil then
+if max_in_flight == nil or weighted_units == nil or ttl == nil or
+   max_input_tokens == nil or max_output_tokens == nil or
+   max_unified_tokens == nil or max_large_context_in_flight == nil then
   return {-2, 0}
 end
-if units < 1 then
+if max_in_flight < 0 or weighted_units < 1 or ttl < 1 or
+   max_input_tokens < 0 or max_output_tokens < 0 or
+   max_unified_tokens < 0 or max_large_context_in_flight < 0 then
   return {-2, 0}
 end
 
@@ -495,32 +923,93 @@ if redis.call('EXISTS', lease_key) == 1 then
   return {-3, 0}
 end
 
--- Reclaim expired/missing leases before capacity check (bounded by max_in_flight).
+local payload_ok, requested = pcall(cjson.decode, payload)
+if not payload_ok or type(requested) ~= 'table' then
+  return {-2, 0}
+end
+local requested_input = tonumber(requested['input_tokens'])
+local requested_output = tonumber(requested['output_tokens'])
+local requested_unified = tonumber(requested['unified_tokens'])
+local requested_weighted = tonumber(requested['weighted_units'])
+local requested_large = requested['large_context'] == true and 1 or 0
+if requested_input == nil or requested_output == nil or requested_unified == nil or
+   requested_weighted == nil or requested_input < 0 or requested_output < 0 or
+   requested_unified < 0 or requested_weighted ~= weighted_units or
+   requested['reservation_token'] ~= token or
+   type(requested['large_context']) ~= 'boolean' then
+  return {-2, 0}
+end
+
 local all = redis.call('HGETALL', inflight_hash)
-local current = 0
+local current_weighted = 0
+local current_input = 0
+local current_output = 0
+local current_unified = 0
+local current_large = 0
 for i = 1, #all, 2 do
   local existing_lease = all[i]
-  local existing_units = tonumber(all[i + 1]) or 0
-  if redis.call('EXISTS', existing_lease) == 1 then
-    current = current + existing_units
-  else
+  local existing_raw = all[i + 1]
+  local existing_ok, existing = pcall(cjson.decode, existing_raw)
+  if redis.call('EXISTS', existing_lease) == 0 then
     redis.call('HDEL', inflight_hash, existing_lease)
+  elseif not existing_ok or type(existing) ~= 'table' then
+    redis.call('HDEL', inflight_hash, existing_lease)
+    redis.call('DEL', existing_lease)
+  else
+    local existing_weighted = tonumber(existing['weighted_units'])
+    local existing_input = tonumber(existing['input_tokens'])
+    local existing_output = tonumber(existing['output_tokens'])
+    local existing_unified = tonumber(existing['unified_tokens'])
+    if existing_weighted == nil or existing_input == nil or
+       existing_output == nil or existing_unified == nil or
+       existing_weighted < 1 or existing_input < 0 or
+       existing_output < 0 or existing_unified < 0 or
+       type(existing['reservation_token']) ~= 'string' or
+       type(existing['large_context']) ~= 'boolean' then
+      redis.call('HDEL', inflight_hash, existing_lease)
+      redis.call('DEL', existing_lease)
+    else
+      current_weighted = current_weighted + existing_weighted
+      current_input = current_input + existing_input
+      current_output = current_output + existing_output
+      current_unified = current_unified + existing_unified
+      if existing['large_context'] == true then
+        current_large = current_large + 1
+      end
+    end
   end
 end
 
-if (current + units) > max_in_flight then
-  if current <= 0 then
+local function deny(code)
+  if current_weighted <= 0 then
     redis.call('DEL', inflight_hash)
   else
     redis.call('EXPIRE', inflight_hash, ttl)
   end
-  return {0, current}
+  return {code, current_weighted}
 end
 
-redis.call('HSET', inflight_hash, lease_key, units)
+if (current_weighted + weighted_units) > max_in_flight then
+  return deny(0)
+end
+if (current_input + requested_input) > max_input_tokens then
+  return deny(-4)
+end
+if (current_output + requested_output) > max_output_tokens then
+  return deny(-5)
+end
+if (current_unified + requested_unified) > max_unified_tokens then
+  return deny(-6)
+end
+if requested_large == 1 and
+   (current_large + requested_large) > max_large_context_in_flight then
+  return deny(-7)
+end
+
+redis.call('HSET', inflight_hash, lease_key, payload)
 redis.call('SET', lease_key, payload, 'EX', ttl)
 redis.call('EXPIRE', inflight_hash, ttl)
-return {1, current + units}
+return {1, current_weighted + weighted_units}
 """
 
 
@@ -530,20 +1019,17 @@ local lease_key = KEYS[2]
 local token = ARGV[1]
 
 local raw = redis.call('GET', lease_key)
+local owned = false
 if raw then
   local ok, current = pcall(cjson.decode, raw)
   if ok and type(current) == 'table' then
-    if current['reservation_token'] ~= token then
-      -- Not our lease; still reclaim any expired siblings below.
-      raw = nil
-    end
+    owned = current['reservation_token'] == token
   else
     redis.call('DEL', lease_key)
-    raw = nil
   end
 end
 
-if raw then
+if owned then
   redis.call('HDEL', inflight_hash, lease_key)
   redis.call('DEL', lease_key)
 end
@@ -554,14 +1040,29 @@ local all = redis.call('HGETALL', inflight_hash)
 local remaining = 0
 for i = 1, #all, 2 do
   local existing_lease = all[i]
-  local existing_units = tonumber(all[i + 1]) or 0
-  if existing_lease == lease_key then
-    -- Drop our entry even if the lease key already expired.
+  local existing_raw = all[i + 1]
+  local existing_ok, existing = pcall(cjson.decode, existing_raw)
+  if redis.call('EXISTS', existing_lease) == 0 then
     redis.call('HDEL', inflight_hash, existing_lease)
-  elseif redis.call('EXISTS', existing_lease) == 1 then
-    remaining = remaining + existing_units
+  elseif not existing_ok or type(existing) ~= 'table' then
+    redis.call('HDEL', inflight_hash, existing_lease)
+    redis.call('DEL', existing_lease)
   else
-    redis.call('HDEL', inflight_hash, existing_lease)
+    local existing_weighted = tonumber(existing['weighted_units'])
+    local existing_input = tonumber(existing['input_tokens'])
+    local existing_output = tonumber(existing['output_tokens'])
+    local existing_unified = tonumber(existing['unified_tokens'])
+    if existing_weighted == nil or existing_input == nil or
+       existing_output == nil or existing_unified == nil or
+       existing_weighted < 1 or existing_input < 0 or
+       existing_output < 0 or existing_unified < 0 or
+       type(existing['reservation_token']) ~= 'string' or
+       type(existing['large_context']) ~= 'boolean' then
+      redis.call('HDEL', inflight_hash, existing_lease)
+      redis.call('DEL', existing_lease)
+    else
+      remaining = remaining + existing_weighted
+    end
   end
 end
 
@@ -570,16 +1071,13 @@ if remaining <= 0 then
   remaining = 0
 end
 
-if raw then
-  return {1, remaining}
-end
 -- Lease already gone: treat as reclaimed if hash entry was dropped.
 return {1, remaining}
 """
 
 
 def _reclaim_expired_local_leases(*, now_epoch: Optional[float] = None) -> None:
-    """Drop expired local leases and subtract their units (test/memory mode)."""
+    """Drop expired local leases and subtract their exact accounting."""
     now = time.time() if now_epoch is None else float(now_epoch)
     expired_tokens = [
         token
@@ -591,15 +1089,30 @@ def _reclaim_expired_local_leases(*, now_epoch: Optional[float] = None) -> None:
         if record is None:
             continue
         lane = str(record.get("lane_fingerprint") or "")
-        units = int(record.get("units") or 1)
         if not lane:
             continue
+        units = int(record.get("units") or 1)
         current = int(_local_inflight_by_lane.get(lane, 0))
         remaining = max(0, current - units)
         if remaining == 0:
             _local_inflight_by_lane.pop(lane, None)
         else:
             _local_inflight_by_lane[lane] = remaining
+        accounting = _local_accounting_by_lane.get(lane)
+        if accounting is None:
+            continue
+        for field in ("input_tokens", "output_tokens", "unified_tokens"):
+            accounting[field] = max(
+                0,
+                int(accounting.get(field) or 0) - int(record.get(field) or 0),
+            )
+        accounting["large_context_count"] = max(
+            0,
+            int(accounting.get("large_context_count") or 0)
+            - int(record.get("large_context_count") or 0),
+        )
+        if not any(accounting.values()):
+            _local_accounting_by_lane.pop(lane, None)
 
 
 def _local_reserve(
@@ -611,9 +1124,52 @@ def _local_reserve(
     lease_ttl_seconds: float,
     provider: str,
     account_hash: Optional[str],
+    input_tokens: int,
+    output_tokens: int,
+    unified_tokens: int,
+    weighted_units: int,
+    capacity_class: str,
+    large_context: bool,
+    reserved_interactive: bool,
+    max_input_tokens: int,
+    max_output_tokens: int,
+    max_unified_tokens: int,
+    max_large_context_in_flight: int,
+    reserved_interactive_capacity: int,
     now_epoch: Optional[float] = None,
 ) -> AdmissionDecision:
     _reclaim_expired_local_leases(now_epoch=now_epoch)
+    accounting = _local_accounting_by_lane.get(lane_fingerprint) or {}
+    accounting_checks = (
+        ("input", "input_tokens", input_tokens, max_input_tokens),
+        ("output", "output_tokens", output_tokens, max_output_tokens),
+        ("unified", "unified_tokens", unified_tokens, max_unified_tokens),
+    )
+    for limit_scope, field, requested, maximum in accounting_checks:
+        if int(accounting.get(field) or 0) + requested > maximum:
+            return AdmissionDecision(
+                allowed=False,
+                reason=AdmissionDenyReason.CAPACITY_UNAVAILABLE.value,
+                lane_fingerprint=lane_fingerprint,
+                provider=provider,
+                account_hash=account_hash,
+                max_in_flight=max_in_flight,
+                limit_scope=limit_scope,
+                detail_code="aawm_provider_lane_capacity_unavailable",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                unified_tokens=unified_tokens,
+                weighted_units=weighted_units,
+                capacity_class=capacity_class,
+                large_context=large_context,
+                reserved_interactive=reserved_interactive,
+                max_input_tokens=max_input_tokens,
+                max_output_tokens=max_output_tokens,
+                max_unified_tokens=max_unified_tokens,
+                max_large_context_in_flight=max_large_context_in_flight,
+                reserved_interactive_capacity=reserved_interactive_capacity,
+            )
+
     current = int(_local_inflight_by_lane.get(lane_fingerprint, 0))
     if current + units > max_in_flight:
         return AdmissionDecision(
@@ -625,16 +1181,69 @@ def _local_reserve(
             inflight_after=current,
             max_in_flight=max_in_flight,
             limit_scope="concurrency",
-            detail_code="aawm_provider_lane_capacity_unavailable",
+            detail_code=(
+                "aawm_provider_lane_large_context_capacity_unavailable"
+                if large_context
+                else "aawm_provider_lane_capacity_unavailable"
+            ),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            unified_tokens=unified_tokens,
+            weighted_units=weighted_units,
+            capacity_class=capacity_class,
+            large_context=large_context,
+            reserved_interactive=reserved_interactive,
+            max_input_tokens=max_input_tokens,
+            max_output_tokens=max_output_tokens,
+            max_unified_tokens=max_unified_tokens,
+            max_large_context_in_flight=max_large_context_in_flight,
+            reserved_interactive_capacity=reserved_interactive_capacity,
         )
+    current_large_context = int(accounting.get("large_context_count") or 0)
+    if large_context and current_large_context + 1 > max_large_context_in_flight:
+        return AdmissionDecision(
+            allowed=False,
+            reason=AdmissionDenyReason.CAPACITY_UNAVAILABLE.value,
+            lane_fingerprint=lane_fingerprint,
+            provider=provider,
+            account_hash=account_hash,
+            inflight_after=current,
+            max_in_flight=max_in_flight,
+            limit_scope="concurrency",
+            detail_code="aawm_provider_lane_large_context_capacity_unavailable",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            unified_tokens=unified_tokens,
+            weighted_units=weighted_units,
+            capacity_class=capacity_class,
+            large_context=large_context,
+            reserved_interactive=reserved_interactive,
+            max_input_tokens=max_input_tokens,
+            max_output_tokens=max_output_tokens,
+            max_unified_tokens=max_unified_tokens,
+            max_large_context_in_flight=max_large_context_in_flight,
+            reserved_interactive_capacity=reserved_interactive_capacity,
+        )
+
     new_count = current + units
     _local_inflight_by_lane[lane_fingerprint] = new_count
+    _local_accounting_by_lane[lane_fingerprint] = {
+        "input_tokens": int(accounting.get("input_tokens") or 0) + input_tokens,
+        "output_tokens": int(accounting.get("output_tokens") or 0) + output_tokens,
+        "unified_tokens": int(accounting.get("unified_tokens") or 0)
+        + unified_tokens,
+        "large_context_count": current_large_context + int(large_context),
+    }
     now = time.time() if now_epoch is None else float(now_epoch)
     _local_leases[reservation_token] = {
         "lane_fingerprint": lane_fingerprint,
         "units": units,
         "reservation_token": reservation_token,
         "expires_at": now + lease_ttl_seconds,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "unified_tokens": unified_tokens,
+        "large_context_count": int(large_context),
     }
     lease = AdmissionLease(
         lane_fingerprint=lane_fingerprint,
@@ -651,6 +1260,13 @@ def _local_reserve(
         account_hash=account_hash,
         held=True,
         durable=False,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        unified_tokens=unified_tokens,
+        weighted_units=weighted_units,
+        capacity_class=capacity_class,
+        large_context=large_context,
+        reserved_interactive=reserved_interactive,
     )
     return AdmissionDecision(
         allowed=True,
@@ -662,6 +1278,18 @@ def _local_reserve(
         inflight_after=new_count,
         max_in_flight=max_in_flight,
         limit_scope="concurrency",
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        unified_tokens=unified_tokens,
+        weighted_units=weighted_units,
+        capacity_class=capacity_class,
+        large_context=large_context,
+        reserved_interactive=reserved_interactive,
+        max_input_tokens=max_input_tokens,
+        max_output_tokens=max_output_tokens,
+        max_unified_tokens=max_unified_tokens,
+        max_large_context_in_flight=max_large_context_in_flight,
+        reserved_interactive_capacity=reserved_interactive_capacity,
     )
 
 
@@ -677,9 +1305,21 @@ def _local_release(lease: AdmissionLease) -> bool:
         _local_inflight_by_lane.pop(lane, None)
     else:
         _local_inflight_by_lane[lane] = remaining
+    accounting = _local_accounting_by_lane.get(lane)
+    if accounting is not None:
+        for field in ("input_tokens", "output_tokens", "unified_tokens"):
+            accounting[field] = max(
+                0,
+                int(accounting.get(field) or 0) - int(record.get(field) or 0),
+            )
+        accounting["large_context_count"] = max(
+            0,
+            int(accounting.get("large_context_count") or 0)
+            - int(record.get("large_context_count") or 0),
+        )
+        if not any(accounting.values()):
+            _local_accounting_by_lane.pop(lane, None)
     return True
-
-
 
 def _parse_lua_pair(result: Any) -> tuple[int, int]:
     code = 0
@@ -714,6 +1354,18 @@ def _decision_from_reserve_code(
     reserve_units: int,
     ttl: float,
     cap: int,
+    input_tokens: int,
+    output_tokens: int,
+    unified_tokens: int,
+    weighted_units: int,
+    capacity_class: str,
+    large_context: bool,
+    reserved_interactive: bool,
+    max_input_tokens: int,
+    max_output_tokens: int,
+    max_unified_tokens: int,
+    max_large_context_in_flight: int,
+    reserved_interactive_capacity: int,
 ) -> AdmissionDecision:
     if code == 1:
         lease = AdmissionLease(
@@ -727,6 +1379,13 @@ def _decision_from_reserve_code(
             account_hash=account_hash,
             held=True,
             durable=True,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            unified_tokens=unified_tokens,
+            weighted_units=weighted_units,
+            capacity_class=capacity_class,
+            large_context=large_context,
+            reserved_interactive=reserved_interactive,
         )
         return AdmissionDecision(
             allowed=True,
@@ -738,8 +1397,27 @@ def _decision_from_reserve_code(
             inflight_after=inflight_after,
             max_in_flight=cap,
             limit_scope="concurrency",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            unified_tokens=unified_tokens,
+            weighted_units=weighted_units,
+            capacity_class=capacity_class,
+            large_context=large_context,
+            reserved_interactive=reserved_interactive,
+            max_input_tokens=max_input_tokens,
+            max_output_tokens=max_output_tokens,
+            max_unified_tokens=max_unified_tokens,
+            max_large_context_in_flight=max_large_context_in_flight,
+            reserved_interactive_capacity=reserved_interactive_capacity,
         )
-    if code == 0:
+    denial_scope_by_code = {
+        0: "concurrency",
+        -4: "input",
+        -5: "output",
+        -6: "unified",
+        -7: "concurrency",
+    }
+    if code in denial_scope_by_code:
         return AdmissionDecision(
             allowed=False,
             reason=AdmissionDenyReason.CAPACITY_UNAVAILABLE.value,
@@ -748,8 +1426,24 @@ def _decision_from_reserve_code(
             account_hash=account_hash,
             inflight_after=inflight_after,
             max_in_flight=cap,
-            limit_scope="concurrency",
-            detail_code="aawm_provider_lane_capacity_unavailable",
+            limit_scope=denial_scope_by_code[code],
+            detail_code=(
+                "aawm_provider_lane_large_context_capacity_unavailable"
+                if code == -7
+                else "aawm_provider_lane_capacity_unavailable"
+            ),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            unified_tokens=unified_tokens,
+            weighted_units=weighted_units,
+            capacity_class=capacity_class,
+            large_context=large_context,
+            reserved_interactive=reserved_interactive,
+            max_input_tokens=max_input_tokens,
+            max_output_tokens=max_output_tokens,
+            max_unified_tokens=max_unified_tokens,
+            max_large_context_in_flight=max_large_context_in_flight,
+            reserved_interactive_capacity=reserved_interactive_capacity,
         )
     return AdmissionDecision(
         allowed=True,
@@ -759,9 +1453,21 @@ def _decision_from_reserve_code(
         account_hash=account_hash,
         max_in_flight=cap,
         limit_scope="concurrency",
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        unified_tokens=unified_tokens,
+        weighted_units=weighted_units,
+        capacity_class=capacity_class,
+        large_context=large_context,
+        reserved_interactive=reserved_interactive,
+        max_input_tokens=max_input_tokens,
+        max_output_tokens=max_output_tokens,
+        max_unified_tokens=max_unified_tokens,
+        max_large_context_in_flight=max_large_context_in_flight,
+        reserved_interactive_capacity=reserved_interactive_capacity,
     )
 
-async def reserve_provider_lane_admission(
+async def reserve_provider_lane_admission(  # noqa: PLR0915
     *,
     candidate: Mapping[str, Any],
     selection: Optional[Mapping[str, Any]] = None,
@@ -794,6 +1500,51 @@ async def reserve_provider_lane_admission(
         lane_key=lane_key,
     )
 
+    input_tokens, output_tokens, unified_tokens = estimate_provider_lane_tokens(
+        candidate=candidate,
+        selection=selection,
+    )
+    weighted_units = weighted_token_units(unified_tokens, minimum_units=units)
+    large_context = resolve_large_context(
+        candidate=candidate,
+        selection=selection,
+        unified_tokens=unified_tokens,
+    )
+    reserved_interactive = resolve_reserved_interactive(
+        candidate=candidate,
+        selection=selection,
+    )
+    capacity_class = _capacity_class(
+        large_context=large_context,
+        reserved_interactive=reserved_interactive,
+    )
+    original_cap = max(
+        0,
+        int(max_in_flight)
+        if max_in_flight is not None
+        else get_provider_lane_admission_max_in_flight(),
+    )
+    max_input_tokens = get_provider_lane_admission_max_input_tokens(
+        max_in_flight=original_cap
+    )
+    max_output_tokens = get_provider_lane_admission_max_output_tokens(
+        max_in_flight=original_cap
+    )
+    max_unified_tokens = get_provider_lane_admission_max_unified_tokens(
+        max_in_flight=original_cap
+    )
+    max_large_context_in_flight = (
+        get_provider_lane_admission_large_context_max_in_flight()
+    )
+    reserved_interactive_capacity = (
+        get_provider_lane_admission_reserved_interactive_capacity()
+    )
+    cap = (
+        original_cap
+        if reserved_interactive
+        else max(0, original_cap - reserved_interactive_capacity)
+    )
+
     observation = resolve_lane_quota_observation(
         candidate=candidate,
         selection=selection,
@@ -804,19 +1555,34 @@ async def reserve_provider_lane_admission(
         observation, now_epoch=now_epoch
     )
     if exhausted is not None:
-        return _decision_from_exhaustion(
+        decision = _decision_from_exhaustion(
             lane_fingerprint=lane_fingerprint,
             provider=provider,
             account_hash=account_hash,
             observation=exhausted,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            unified_tokens=unified_tokens,
+            weighted_units=weighted_units,
+            capacity_class=capacity_class,
+            large_context=large_context,
+            reserved_interactive=reserved_interactive,
+            max_in_flight=cap,
+            max_input_tokens=max_input_tokens,
+            max_output_tokens=max_output_tokens,
+            max_unified_tokens=max_unified_tokens,
+            max_large_context_in_flight=max_large_context_in_flight,
+            reserved_interactive_capacity=reserved_interactive_capacity,
         )
+        record_provider_lane_admission_warning(
+            decision=decision,
+            candidate=candidate,
+            selection=selection,
+            now_epoch=now_epoch,
+        )
+        return decision
 
-    reserve_units = max(1, int(units))
-    cap = (
-        int(max_in_flight)
-        if max_in_flight is not None
-        else get_provider_lane_admission_max_in_flight()
-    )
+    reserve_units = weighted_units
     ttl = (
         float(lease_ttl_seconds)
         if lease_ttl_seconds is not None
@@ -828,8 +1594,8 @@ async def reserve_provider_lane_admission(
     redis_cache, redis_error = await _get_redis_cache()
     if redis_cache is None:
         if allow_local_fallback:
-            # Unconfigured Redis (tests / memory mode): local counter only.
-            return _local_reserve(
+            # Unconfigured Redis (tests / memory mode): local accounting only.
+            decision = _local_reserve(
                 lane_fingerprint=lane_fingerprint,
                 units=reserve_units,
                 max_in_flight=cap,
@@ -837,8 +1603,27 @@ async def reserve_provider_lane_admission(
                 lease_ttl_seconds=ttl,
                 provider=provider,
                 account_hash=account_hash,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                unified_tokens=unified_tokens,
+                weighted_units=weighted_units,
+                capacity_class=capacity_class,
+                large_context=large_context,
+                reserved_interactive=reserved_interactive,
+                max_input_tokens=max_input_tokens,
+                max_output_tokens=max_output_tokens,
+                max_unified_tokens=max_unified_tokens,
+                max_large_context_in_flight=max_large_context_in_flight,
+                reserved_interactive_capacity=reserved_interactive_capacity,
                 now_epoch=now_epoch,
             )
+            record_provider_lane_admission_warning(
+                decision=decision,
+                candidate=candidate,
+                selection=selection,
+                now_epoch=now_epoch,
+            )
+            return decision
         return AdmissionDecision(
             allowed=True,
             reason=AdmissionAdmitReason.REDIS_UNAVAILABLE_DEGRADED.value,
@@ -847,6 +1632,18 @@ async def reserve_provider_lane_admission(
             account_hash=account_hash,
             max_in_flight=cap,
             limit_scope="concurrency",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            unified_tokens=unified_tokens,
+            weighted_units=weighted_units,
+            capacity_class=capacity_class,
+            large_context=large_context,
+            reserved_interactive=reserved_interactive,
+            max_input_tokens=max_input_tokens,
+            max_output_tokens=max_output_tokens,
+            max_unified_tokens=max_unified_tokens,
+            max_large_context_in_flight=max_large_context_in_flight,
+            reserved_interactive_capacity=reserved_interactive_capacity,
         )
 
     client = await _raw_redis_client(redis_cache)
@@ -864,6 +1661,18 @@ async def reserve_provider_lane_admission(
             account_hash=account_hash,
             max_in_flight=cap,
             limit_scope="concurrency",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            unified_tokens=unified_tokens,
+            weighted_units=weighted_units,
+            capacity_class=capacity_class,
+            large_context=large_context,
+            reserved_interactive=reserved_interactive,
+            max_input_tokens=max_input_tokens,
+            max_output_tokens=max_output_tokens,
+            max_unified_tokens=max_unified_tokens,
+            max_large_context_in_flight=max_large_context_in_flight,
+            reserved_interactive_capacity=reserved_interactive_capacity,
         )
 
     counter_key = build_admission_counter_cache_key(lane_fingerprint=lane_fingerprint)
@@ -877,6 +1686,20 @@ async def reserve_provider_lane_admission(
             "units": reserve_units,
             "provider": provider,
             "account_hash": account_hash,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "unified_tokens": unified_tokens,
+            "weighted_units": weighted_units,
+            "capacity_class": capacity_class,
+            "large_context": large_context,
+            "reserved_interactive": reserved_interactive,
+            "original_max_in_flight": original_cap,
+            "max_in_flight": cap,
+            "max_input_tokens": max_input_tokens,
+            "max_output_tokens": max_output_tokens,
+            "max_unified_tokens": max_unified_tokens,
+            "max_large_context_in_flight": max_large_context_in_flight,
+            "reserved_interactive_capacity": reserved_interactive_capacity,
             "reserved_at_epoch": time.time() if now_epoch is None else float(now_epoch),
         },
         separators=(",", ":"),
@@ -893,6 +1716,10 @@ async def reserve_provider_lane_admission(
             str(int(math.ceil(ttl))),
             reservation_token,
             payload,
+            str(max_input_tokens),
+            str(max_output_tokens),
+            str(max_unified_tokens),
+            str(max_large_context_in_flight),
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -907,10 +1734,22 @@ async def reserve_provider_lane_admission(
             account_hash=account_hash,
             max_in_flight=cap,
             limit_scope="concurrency",
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            unified_tokens=unified_tokens,
+            weighted_units=weighted_units,
+            capacity_class=capacity_class,
+            large_context=large_context,
+            reserved_interactive=reserved_interactive,
+            max_input_tokens=max_input_tokens,
+            max_output_tokens=max_output_tokens,
+            max_unified_tokens=max_unified_tokens,
+            max_large_context_in_flight=max_large_context_in_flight,
+            reserved_interactive_capacity=reserved_interactive_capacity,
         )
 
     code, inflight_after = _parse_lua_pair(result)
-    return _decision_from_reserve_code(
+    decision = _decision_from_reserve_code(
         code=code,
         inflight_after=inflight_after,
         lane_fingerprint=lane_fingerprint,
@@ -922,7 +1761,26 @@ async def reserve_provider_lane_admission(
         reserve_units=reserve_units,
         ttl=ttl,
         cap=cap,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        unified_tokens=unified_tokens,
+        weighted_units=weighted_units,
+        capacity_class=capacity_class,
+        large_context=large_context,
+        reserved_interactive=reserved_interactive,
+        max_input_tokens=max_input_tokens,
+        max_output_tokens=max_output_tokens,
+        max_unified_tokens=max_unified_tokens,
+        max_large_context_in_flight=max_large_context_in_flight,
+        reserved_interactive_capacity=reserved_interactive_capacity,
     )
+    record_provider_lane_admission_warning(
+        decision=decision,
+        candidate=candidate,
+        selection=selection,
+        now_epoch=now_epoch,
+    )
+    return decision
 
 
 async def release_provider_lane_admission(
