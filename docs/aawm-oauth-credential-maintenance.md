@@ -223,6 +223,14 @@ tokens, credential paths, and secrets are never emitted. There is no
 `api.openai.com` API-key fallback, `~/.codex/auth.json` enrollment, directory
 scan, backup-file, or glob path for managed proxy Codex OAuth dispatch.
 
+When `LITELLM_CODEX_OAUTH_INVENTORY` is configured, every otherwise-unclaimed
+request with an explicit model to `/openai_passthrough/responses` uses that
+account inventory regardless of whether model metadata recognizes the model.
+Provider-specific xAI/Grok, Alibaba, Kimi, OpenRouter, and other claimed routes
+are selected earlier and keep ownership. Model metadata describes capabilities
+and pricing but is not credential admission. There is no `OPENAI_API_KEY`
+fallback for those otherwise-unclaimed explicit Responses requests.
+
 ## Shared atomic 0600 publication
 
 All credential writers share the same private publish pipeline under
