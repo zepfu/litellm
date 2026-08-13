@@ -22,6 +22,7 @@ from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
 from fastapi import HTTPException, Request
 
 from litellm._logging import verbose_proxy_logger
+from litellm.utils import get_model_info
 
 from . import cooldown_state as _cooldown_state
 from .cooldown_state import _attach_aawm_alias_routing_state_sources
@@ -316,6 +317,109 @@ def _codex_auto_agent_candidate_public_shape(
 
 def _is_auto_agent_candidate_state_available(state: dict[str, Any]) -> bool:
     return state["cooldown_seconds"] <= 0 and state.get("skip_reason") is None
+
+
+def _cohere_observation_exhausted(
+    observation: Mapping[str, Any],
+    *,
+    period: str,
+    rpm_limit: Optional[float] = None,
+) -> bool:
+    if period == "rpm" and rpm_limit is None:
+        return False
+    used_names = (
+        ("quota_used", "monthly_used", "used_monthly", "used")
+        if period == "monthly"
+        else ("quota_used", "rpm_used", "rolling_minute_used", "used")
+    )
+    used = next(
+        (
+            float(value)
+            for name in used_names
+            if (value := observation.get(name)) is not None
+            and not isinstance(value, bool)
+            and _is_finite_number(value)
+        ),
+        None,
+    )
+    if used is None:
+        return False
+    if period == "monthly":
+        return used >= 1000
+    return used >= float(rpm_limit)
+
+
+def _is_finite_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _cohere_local_quota_exhausted(
+    candidate: Mapping[str, Any],
+    *,
+    state_manager: Any = alias_routing_state,
+    now_epoch: Optional[float] = None,
+) -> tuple[bool, Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+    if (
+        str(candidate.get("provider") or "").strip().lower() != "cohere"
+        or str(candidate.get("lane_key") or "").strip() != "cohere_native"
+    ):
+        return False, None, None
+    model = str(candidate.get("model") or "").strip()
+    monthly = state_manager.resolve_cohere_monthly_observation(
+        now_epoch=now_epoch
+    )
+    if _cohere_observation_exhausted(monthly or {}, period="monthly"):
+        return True, monthly, None
+    try:
+        model_info = get_model_info(
+            model=model,
+            custom_llm_provider="cohere",
+        )
+    except Exception:
+        model_info = None
+    rpm = model_info.get("rpm") if isinstance(model_info, Mapping) else None
+    if not _is_finite_number(rpm) or float(rpm) <= 0:
+        return False, monthly, None
+    rpm_observation = state_manager.resolve_cohere_rpm_observation(
+        model=model,
+        now_epoch=now_epoch,
+    )
+    return (
+        _cohere_observation_exhausted(
+            rpm_observation or {},
+            period="rpm",
+            rpm_limit=float(rpm),
+        ),
+        monthly,
+        rpm_observation,
+    )
+
+
+def _apply_cohere_local_quota_state(
+    state: dict[str, Any],
+    *,
+    now_epoch: Optional[float] = None,
+) -> dict[str, Any]:
+    candidate = state.get("candidate")
+    if not isinstance(candidate, Mapping):
+        return state
+    candidate_with_lane = {**candidate, "lane_key": state.get("lane_key")}
+    exhausted, monthly, rpm = _cohere_local_quota_exhausted(
+        candidate_with_lane,
+        now_epoch=now_epoch,
+    )
+    for period, observation in (("monthly", monthly), ("rpm", rpm)):
+        if observation is not None:
+            state.setdefault("cohere_quota_observations", {})[period] = observation
+    if exhausted and state.get("skip_reason") is None:
+        state["skip_reason"] = "quota_exhausted"
+        state["cooldown_state_source"] = "cohere_local_quota"
+    return state
 
 
 def _build_auto_agent_skipped_candidates_from_states(
@@ -1357,6 +1461,16 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_state_source=cooldown_state_source,
         skip_reason=skip_reason,
     )
+    quota_state = _apply_cohere_local_quota_state(
+        {
+            "candidate": candidate,
+            "lane_key": lane_key,
+            "skip_reason": skip_reason,
+            "cooldown_state_source": cooldown_state_source,
+        }
+    )
+    skip_reason = quota_state.get("skip_reason")
+    cooldown_state_source = quota_state.get("cooldown_state_source")
     if forced_cooldown_seconds is not None and forced_cooldown_seconds > cooldown_seconds:
         await _apply_codex_auto_agent_forced_candidate_cooldown(
             cooldown_key=cooldown_key,
@@ -1381,6 +1495,10 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         state["attempted_provider_call"] = attempted_provider_call
     if managed_account_cooldown_scope is not None:
         state["cooldown_scope"] = managed_account_cooldown_scope
+    if quota_state.get("cohere_quota_observations"):
+        state["cohere_quota_observations"] = quota_state[
+            "cohere_quota_observations"
+        ]
     return state
 
 

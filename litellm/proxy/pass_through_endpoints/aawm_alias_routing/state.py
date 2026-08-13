@@ -50,6 +50,184 @@ _ALIAS_FAMILY_CANONICAL_MAP: dict[str, str] = {
 
 _DEFAULT_CANONICAL_FAMILY = "codex"
 
+_COHERE_PROVIDER = "cohere"
+_COHERE_NATIVE_LANE = "cohere_native"
+_COHERE_MONTHLY_PERIODS = frozenset({"month", "monthly", "calendar_month"})
+_COHERE_RPM_PERIODS = frozenset(
+    {"minute", "per_minute", "rolling", "rolling_minute", "rpm"}
+)
+_COHERE_GENERIC_QUOTA_FIELDS = (
+    "provider",
+    "model",
+    "quota_key",
+    "quota_type",
+    "limit_scope",
+    "quota_period",
+    "window_minutes",
+    "remaining_pct",
+    "observed_at",
+    "expected_reset_at",
+    "status",
+    "exhausted",
+    "source",
+)
+
+
+def _cohere_numeric(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
+def _cohere_timestamp(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+    if isinstance(value, datetime):
+        resolved = value
+    elif isinstance(value, str):
+        try:
+            resolved = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if resolved.tzinfo is None:
+        resolved = resolved.replace(tzinfo=timezone.utc)
+    return resolved.timestamp()
+
+
+def _cohere_local_marker(observation: Mapping[str, Any]) -> bool:
+    if str(observation.get("provider") or "").strip().lower() != _COHERE_PROVIDER:
+        return False
+    lane = observation.get("lane") or observation.get("lane_key")
+    if lane is not None and str(lane).strip() != _COHERE_NATIVE_LANE:
+        return False
+    return (
+        observation.get("locally_counted") is True
+        or str(observation.get("source") or "").strip().lower()
+        == "locally_counted"
+    )
+
+
+def _cohere_period(observation: Mapping[str, Any]) -> Optional[str]:
+    quota_type = str(observation.get("quota_type") or "").strip().lower()
+    quota_period = str(observation.get("quota_period") or "").strip().lower()
+    if quota_type in {"monthly", "month"} or quota_period in _COHERE_MONTHLY_PERIODS:
+        return "monthly"
+    if quota_type in {"rpm", "requests_per_minute"} or quota_period in _COHERE_RPM_PERIODS:
+        return "rpm"
+    return None
+
+
+def _cohere_used(
+    observation: Mapping[str, Any],
+    *,
+    period: str,
+) -> Optional[float]:
+    used_names = (
+        ("quota_used", "monthly_used", "month_used", "used_monthly", "used")
+        if period == "monthly"
+        else (
+            "quota_used",
+            "rpm_used",
+            "rolling_minute_used",
+            "minute_used",
+            "used",
+        )
+    )
+    return next(
+        (
+            parsed
+            for name in used_names
+            if (parsed := _cohere_numeric(observation.get(name))) is not None
+        ),
+        None,
+    )
+
+
+def _cohere_exhausted(
+    observation: Mapping[str, Any],
+    *,
+    period: str,
+) -> Optional[bool]:
+    limit_names = (
+        ("monthly_limit", "month_limit", "limit")
+        if period == "monthly"
+        else ("rpm_limit", "rolling_minute_limit", "minute_limit", "limit")
+    )
+    used = _cohere_used(observation, period=period)
+    limit = next(
+        (
+            parsed
+            for name in limit_names
+            if (parsed := _cohere_numeric(observation.get(name))) is not None
+        ),
+        None,
+    )
+    if used is None:
+        return None
+    if period == "monthly":
+        return used >= 1000
+    if limit is None or limit <= 0:
+        return None
+    return used >= limit
+
+
+def _build_cohere_local_quota_observations(
+    observation: Mapping[str, Any],
+) -> list[tuple[tuple[str, str, str, str, str], dict[str, Any]]]:
+    if not _cohere_local_marker(observation):
+        return []
+    period = _cohere_period(observation)
+    if period is None:
+        return []
+    observed_at = _cohere_timestamp(observation.get("observed_at"))
+    if observed_at is None:
+        return []
+    model = str(observation.get("model") or "").strip()
+    if period == "rpm" and not model:
+        return []
+    normalized = {
+        key: observation.get(key) for key in _COHERE_GENERIC_QUOTA_FIELDS
+    }
+    normalized["provider"] = _COHERE_PROVIDER
+    normalized["model"] = model or None
+    normalized["observed_at"] = observed_at
+    normalized["expected_reset_at"] = _cohere_timestamp(
+        observation.get("expected_reset_at")
+    )
+    remaining_pct = _cohere_numeric(observation.get("remaining_pct"))
+    normalized["remaining_pct"] = (
+        remaining_pct
+        if remaining_pct is not None and 0 <= remaining_pct <= 100
+        else None
+    )
+    normalized["quota_period"] = observation.get("quota_period") or period
+    normalized["quota_type"] = observation.get("quota_type") or period
+    normalized["source"] = observation.get("source") or "locally_counted"
+    normalized["quota_used"] = _cohere_used(observation, period=period)
+    normalized["exhausted"] = _cohere_exhausted(observation, period=period)
+    quota_key = str(observation.get("quota_key") or "cohere").strip()
+    normalized["quota_key"] = quota_key
+    key = (
+        _COHERE_PROVIDER,
+        "" if period == "monthly" else model,
+        "",
+        f"{quota_key}:{period}",
+        "",
+    )
+    return [(key, normalized)]
+
 
 def validate_alias_family(alias_family: str) -> str:
     """Strictly validate and canonicalize an alias_family label.
@@ -1273,6 +1451,9 @@ class AliasRoutingStateManager:
             tuple[str, str, str, str, str], dict[str, Any]
         ] = {}
         self._normalized_quota_observations_lock = threading.Lock()
+        self._cohere_local_quota_observations: dict[
+            tuple[str, str], dict[str, Any]
+        ] = {}
         self.codex_quota_hydration_lock = asyncio.Lock()
         self._codex_quota_hydrated_until_by_environment_account_hash: dict[
             tuple[str, str], float
@@ -1405,6 +1586,12 @@ class AliasRoutingStateManager:
 
     @staticmethod
     def _quota_observation_timestamp(value: Any) -> Optional[float]:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                return None
+            return parsed if math.isfinite(parsed) else None
         if isinstance(value, datetime):
             resolved = value
         elif isinstance(value, str):
@@ -1418,12 +1605,99 @@ class AliasRoutingStateManager:
             resolved = resolved.replace(tzinfo=timezone.utc)
         return resolved.timestamp()
 
+    def record_cohere_local_quota_observations(
+        self, observations: Sequence[Mapping[str, Any]]
+    ) -> None:
+        """Retain the latest locally-counted Cohere monthly/RPM observations."""
+        prepared = [
+            entry
+            for observation in observations
+            for _key, entry in _build_cohere_local_quota_observations(observation)
+        ]
+        if not prepared:
+            return
+        with self._normalized_quota_observations_lock:
+            for observation in prepared:
+                period = _cohere_period(observation) or str(
+                    observation.get("quota_type") or ""
+                ).strip().lower()
+                model = "" if period == "monthly" else str(
+                    observation.get("model") or ""
+                ).strip()
+                key = (period, model)
+                current = self._cohere_local_quota_observations.get(key)
+                if current is None or observation["observed_at"] >= current["observed_at"]:
+                    self._cohere_local_quota_observations[key] = observation
+            bound_memory_map(
+                self._cohere_local_quota_observations,
+                max_size=self.max_size,
+            )
+
+    def _resolve_cohere_local_quota_observation(
+        self,
+        *,
+        period: str,
+        model: str = "",
+        max_age_seconds: float = 900.0,
+        now_epoch: Optional[float] = None,
+    ) -> Optional[dict[str, Any]]:
+        now = time.time() if now_epoch is None else float(now_epoch)
+        key = (period, "" if period == "monthly" else str(model).strip())
+        with self._normalized_quota_observations_lock:
+            observation = self._cohere_local_quota_observations.get(key)
+            if observation is None:
+                return None
+            resolved = dict(observation)
+        observed_at = self._quota_observation_timestamp(resolved.get("observed_at"))
+        reset_at = self._quota_observation_timestamp(
+            resolved.get("expected_reset_at")
+        )
+        if (
+            observed_at is None
+            or now < observed_at
+            or now - observed_at > max_age_seconds
+            or (reset_at is not None and reset_at <= now)
+        ):
+            return None
+        return resolved
+
+    def resolve_cohere_monthly_observation(
+        self,
+        *,
+        max_age_seconds: float = 900.0,
+        now_epoch: Optional[float] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Resolve the current shared monthly Cohere observation."""
+        return self._resolve_cohere_local_quota_observation(
+            period="monthly",
+            max_age_seconds=max_age_seconds,
+            now_epoch=now_epoch,
+        )
+
+    def resolve_cohere_rpm_observation(
+        self,
+        *,
+        model: str,
+        max_age_seconds: float = 900.0,
+        now_epoch: Optional[float] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Resolve the current exact-model Cohere RPM observation."""
+        return self._resolve_cohere_local_quota_observation(
+            period="rpm",
+            model=model,
+            max_age_seconds=max_age_seconds,
+            now_epoch=now_epoch,
+        )
+
     def record_normalized_quota_observations(
         self, observations: Sequence[Mapping[str, Any]]
     ) -> None:
         """Cache provider-normalized quota observations for routing decisions."""
+        self.record_cohere_local_quota_observations(observations)
         prepared: list[tuple[tuple[str, str, str, str, str], dict[str, Any]]] = []
         for observation in observations:
+            if _cohere_local_marker(observation):
+                continue
             provider = str(observation.get("provider") or "").strip()
             remaining = observation.get("remaining_pct")
             observed_at = self._quota_observation_timestamp(
@@ -1611,6 +1885,7 @@ class AliasRoutingStateManager:
         self._codex_quota_hydrated_until_by_environment_account_hash.clear()
         with self._normalized_quota_observations_lock:
             self._normalized_quota_observations.clear()
+            self._cohere_local_quota_observations.clear()
 
     async def candidate_probe_lock(
         self,

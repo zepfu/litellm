@@ -313,6 +313,12 @@ class PassThroughEndpointLogging:
             if rpm_remaining_value is None
             else max(0, int(rpm_remaining_value or 0))
         )
+        rpm_used_value = getattr(state, "rpm_used", None)
+        rpm_used = (
+            None
+            if rpm_used_value is None
+            else max(0, int(rpm_used_value or 0))
+        )
         if rpm_limit is None or rpm_remaining is None or rpm_limit <= 0:
             rpm_limit = None
             rpm_remaining = None
@@ -333,6 +339,7 @@ class PassThroughEndpointLogging:
             quota_period: str,
             remaining: Optional[int],
             limit: Optional[int],
+            quota_used: Optional[int],
             expected_reset_at: datetime,
             window_minutes: Optional[int],
         ) -> dict[str, Any]:
@@ -349,6 +356,7 @@ class PassThroughEndpointLogging:
                 "limit_scope": "credential",
                 "quota_period": quota_period,
                 "window_minutes": window_minutes,
+                "quota_used": quota_used,
                 "remaining_pct": remaining_pct,
                 "observed_at": observed_at_utc.isoformat(),
                 "expected_reset_at": expected_reset_at.isoformat(),
@@ -369,6 +377,7 @@ class PassThroughEndpointLogging:
                 quota_period="calendar_month",
                 remaining=monthly_remaining,
                 limit=monthly_limit,
+                quota_used=monthly_used,
                 expected_reset_at=month_end,
                 window_minutes=None,
             ),
@@ -377,6 +386,11 @@ class PassThroughEndpointLogging:
                 quota_period="rolling",
                 remaining=rpm_remaining,
                 limit=rpm_limit,
+                quota_used=(
+                    rpm_used
+                    if rpm_limit is not None and rpm_remaining is not None
+                    else None
+                ),
                 expected_reset_at=observed_at_utc + timedelta(minutes=1),
                 window_minutes=1,
             ),

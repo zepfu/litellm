@@ -129,6 +129,7 @@ async def test_direct_non_stream_success_counts_once_and_publishes_normalized_ob
             "limit_scope",
             "quota_period",
             "window_minutes",
+            "quota_used",
             "remaining_pct",
             "observed_at",
             "expected_reset_at",
@@ -144,6 +145,11 @@ async def test_direct_non_stream_success_counts_once_and_publishes_normalized_ob
         "monthly",
         "rpm",
     }
+    observations_by_type = {
+        observation["quota_type"]: observation for observation in observations
+    }
+    assert observations_by_type["monthly"]["quota_used"] == 1
+    assert observations_by_type["rpm"]["quota_used"] == 1
 
 
 @pytest.mark.asyncio
@@ -253,8 +259,10 @@ async def test_observations_use_state_limits_and_remaining_values():
         for observation in callback_kwargs["rate_limit_observations"]
     }
     assert observations["monthly"]["remaining_pct"] == pytest.approx(99.75)
+    assert observations["monthly"]["quota_used"] == 3
     assert observations["monthly"]["exhausted"] is False
     assert observations["rpm"]["remaining_pct"] == pytest.approx(57.142857)
+    assert observations["rpm"]["quota_used"] == 3
     assert observations["rpm"]["exhausted"] is False
 
 
@@ -270,6 +278,7 @@ async def test_unknown_rpm_state_remains_unknown():
         observation["quota_type"]: observation
         for observation in callback_kwargs["rate_limit_observations"]
     }
+    assert observations["rpm"]["quota_used"] is None
     assert observations["rpm"]["remaining_pct"] is None
     assert observations["rpm"]["exhausted"] is None
     assert observations["rpm"]["status"] == "unknown"
