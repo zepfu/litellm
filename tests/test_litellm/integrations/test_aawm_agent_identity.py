@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +29,7 @@ from litellm.integrations.aawm_agent_identity import (
     _persist_session_history_records,
     _persist_session_history_record,
 )
+from litellm.integrations.aawm_session_history import spool as session_history_spool
 from litellm.integrations.langfuse.langfuse import LangFuseLogger
 
 
@@ -11157,6 +11159,325 @@ def test_session_history_spool_loads_legacy_json_artifacts(
     loaded_records = aawm_agent_identity._load_session_history_spool_records(paths[0])
     assert loaded_records[0]["litellm_call_id"] == "call-legacy-json"
     assert loaded_records[0]["start_time"] == observed_at
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_reason"),
+    [
+        ("not-json", "invalid_json"),
+        ('{"type":"future"}\n', "unsupported_record_type"),
+        ("", "empty_payload"),
+        ('{"type":"record","record":{"value":', "truncated_payload"),
+    ],
+)
+def test_session_history_spool_quarantine_emits_supported_reason(
+    monkeypatch,
+    tmp_path,
+    payload,
+    expected_reason,
+) -> None:
+    path = tmp_path / "artifact.jsonl"
+    path.write_text(payload, encoding="utf-8")
+    events = []
+    monkeypatch.setattr(
+        session_history_spool,
+        "_emit_session_history_spool_quarantine_event",
+        lambda **kwargs: events.append(kwargs),
+    )
+
+    with pytest.raises(Exception) as load_error:
+        session_history_spool._load_session_history_spool_records(str(path))
+    session_history_spool._session_history_spool_bad_record(str(path), load_error.value)
+
+    bad_path = path.with_name(path.name + ".bad")
+    assert not path.exists()
+    assert bad_path.exists()
+    assert events[0]["reason"] == expected_reason
+    assert events[0]["bad_path"] == str(bad_path)
+    assert events[0]["renamed"] is True
+    assert events[0]["artifact_metadata"]["size_bytes"] == len(payload.encode())
+
+
+def test_session_history_spool_quarantine_redacts_content_and_fingerprints_artifacts(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    secret = "sk-" + "a" * 24
+    secret_marker = "unclassified-secret-marker"
+    first_path = tmp_path / f"{secret_marker}-one.jsonl"
+    second_path = tmp_path / f"{secret_marker}-two.jsonl"
+    payload = json.dumps({"type": "record", "record": {"secret": secret}})
+    first_path.write_text(payload, encoding="utf-8")
+    second_path.write_text(payload, encoding="utf-8")
+    events = []
+    warning_mock = MagicMock()
+    exception_mock = MagicMock()
+
+    runtime_error_logging = SimpleNamespace(
+        build_agent_terminal_error_record=lambda **kwargs: {"context": {}},
+        append_agent_terminal_error=lambda record: events.append(record),
+    )
+    monkeypatch.setattr(
+        session_history_spool,
+        "_writer_importlib",
+        lambda: SimpleNamespace(
+            import_module=lambda _name: runtime_error_logging,
+        ),
+    )
+    monkeypatch.setattr(session_history_spool.verbose_logger, "warning", warning_mock)
+    monkeypatch.setattr(session_history_spool.verbose_logger, "exception", exception_mock)
+
+    session_history_spool._session_history_spool_bad_record(
+        str(first_path),
+        ValueError("session_history spool payload is not valid JSON"),
+    )
+    session_history_spool._session_history_spool_bad_record(
+        str(second_path),
+        ValueError("session_history spool payload is not valid JSON"),
+    )
+
+    assert len(events) == 2
+    serialized_event_text = json.dumps(events, sort_keys=True)
+    assert secret not in serialized_event_text
+    assert secret_marker not in serialized_event_text
+    first_reference = session_history_spool._sanitize_session_history_spool_artifact_path(
+        str(first_path)
+    )
+    second_reference = session_history_spool._sanitize_session_history_spool_artifact_path(
+        str(second_path)
+    )
+    assert re.fullmatch(r"spool://[0-9a-f]{64}", first_reference)
+    assert re.fullmatch(r"spool://[0-9a-f]{64}", second_reference)
+    assert session_history_spool._sanitize_session_history_spool_artifact_path(
+        f"{first_path}.bad"
+    ) == f"{first_reference}.bad"
+    assert events[0]["context"]["artifact_path"] == first_reference
+    assert events[0]["context"]["bad_path"] == f"{first_reference}.bad"
+    assert events[0]["context"]["artifact_hash"] == events[1]["context"]["artifact_hash"]
+    assert events[0]["context"]["artifact_identity"] != events[1]["context"]["artifact_identity"]
+    assert events[0]["fingerprint"] != events[1]["fingerprint"]
+    assert events[0]["context"]["size_bytes"] == len(payload.encode())
+    assert events[0]["context"]["line_count"] == 1
+    assert events[0]["context"]["retryable"] is False
+    assert events[0]["context"]["disposition"] == "quarantined"
+    logger_text = json.dumps(
+        [call.args for call in warning_mock.call_args_list + exception_mock.call_args_list],
+        default=str,
+        sort_keys=True,
+    )
+    assert secret_marker not in logger_text
+
+
+def test_session_history_spool_quarantine_reports_rename_failure(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "artifact.jsonl"
+    path.write_text("not-json", encoding="utf-8")
+    events = []
+    warning_mock = MagicMock()
+    exception_mock = MagicMock()
+    monkeypatch.setattr(
+        session_history_spool.os,
+        "replace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("rename blocked")),
+    )
+    monkeypatch.setattr(
+        session_history_spool,
+        "_emit_session_history_spool_quarantine_event",
+        lambda **kwargs: events.append(kwargs),
+    )
+    monkeypatch.setattr(session_history_spool.verbose_logger, "warning", warning_mock)
+    monkeypatch.setattr(session_history_spool.verbose_logger, "exception", exception_mock)
+
+    session_history_spool._session_history_spool_bad_record(
+        str(path),
+        ValueError("session_history spool payload is not valid JSON"),
+    )
+
+    assert path.exists()
+    assert not path.with_name(path.name + ".bad").exists()
+    assert events[0]["renamed"] is False
+    assert events[0]["reason"] == "invalid_json"
+    logger_text = json.dumps(
+        [call.args for call in warning_mock.call_args_list + exception_mock.call_args_list],
+        default=str,
+        sort_keys=True,
+    )
+    assert "rename_failed" in logger_text
+    assert "moved" not in logger_text
+    assert str(path) not in logger_text
+
+
+def test_session_history_spool_quarantine_log_redacts_unclassified_exception(
+    monkeypatch,
+    tmp_path,
+    caplog,
+) -> None:
+    secret_filename = "secret-spool-file.jsonl"
+    secret_path = tmp_path / secret_filename
+    standalone_secret = "standalone-secret-value"
+    secret_path.write_text("not-json", encoding="utf-8")
+    monkeypatch.setattr(
+        session_history_spool,
+        "_emit_session_history_spool_quarantine_event",
+        lambda **_kwargs: None,
+    )
+    caplog.set_level(logging.WARNING, logger=session_history_spool.verbose_logger.name)
+
+    exception = RuntimeError(
+        f"unclassified failure at {secret_path} containing {standalone_secret}"
+    )
+    session_history_spool._session_history_spool_bad_record(
+        str(secret_path),
+        exception,
+    )
+
+    formatted_logs = caplog.text
+    opaque_path = session_history_spool._sanitize_session_history_spool_artifact_path(
+        str(secret_path)
+    )
+    assert secret_filename not in formatted_logs
+    assert str(secret_path) not in formatted_logs
+    assert standalone_secret not in formatted_logs
+    assert "Traceback" not in formatted_logs
+    assert opaque_path in formatted_logs
+    assert f"{opaque_path}.bad" in formatted_logs
+    assert "reason=unreadable_payload" in formatted_logs
+    assert "disposition=quarantined" in formatted_logs
+
+
+def test_session_history_spool_quarantine_sink_failure_does_not_recurse(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "artifact.jsonl"
+    path.write_text("not-json", encoding="utf-8")
+    append_calls = []
+    warning_mock = MagicMock()
+
+    def failing_append(record):
+        append_calls.append(record)
+        raise RuntimeError("intake sink unavailable")
+
+    runtime_error_logging = SimpleNamespace(
+        build_agent_terminal_error_record=lambda **kwargs: {"context": {}},
+        append_agent_terminal_error=failing_append,
+    )
+    monkeypatch.setattr(
+        session_history_spool,
+        "_writer_importlib",
+        lambda: SimpleNamespace(
+            import_module=lambda _name: runtime_error_logging,
+        ),
+    )
+    monkeypatch.setattr(session_history_spool.verbose_logger, "warning", warning_mock)
+
+    session_history_spool._session_history_spool_bad_record(
+        str(path),
+        ValueError("session_history spool payload is not valid JSON"),
+    )
+
+    assert len(append_calls) == 1
+    assert path.with_name(path.name + ".bad").exists()
+    assert any("failed to emit structured" in call.args[0] for call in warning_mock.call_args_list)
+
+
+def test_session_history_spool_quarantine_dedupes_attempt_but_keeps_distinct_artifacts(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    first_path = tmp_path / "first.jsonl"
+    second_path = tmp_path / "second.jsonl"
+    first_path.write_text("not-json", encoding="utf-8")
+    second_path.write_text("not-json", encoding="utf-8")
+    events = []
+    monkeypatch.setattr(
+        session_history_spool.os,
+        "replace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("rename blocked")),
+    )
+    monkeypatch.setattr(
+        session_history_spool,
+        "_emit_session_history_spool_quarantine_event",
+        lambda **kwargs: events.append(kwargs),
+    )
+    quarantine_attempt_seen = set()
+    error = ValueError("session_history spool payload is not valid JSON")
+
+    session_history_spool._session_history_spool_bad_record(
+        str(first_path),
+        error,
+        quarantine_attempt_seen=quarantine_attempt_seen,
+    )
+    session_history_spool._session_history_spool_bad_record(
+        str(first_path),
+        error,
+        quarantine_attempt_seen=quarantine_attempt_seen,
+    )
+    session_history_spool._session_history_spool_bad_record(
+        str(second_path),
+        error,
+        quarantine_attempt_seen=quarantine_attempt_seen,
+    )
+
+    assert len(events) == 2
+    assert {event["path"] for event in events} == {
+        str(first_path),
+        str(second_path),
+    }
+
+
+def test_session_history_spool_quarantine_retries_rename_on_later_drain_iteration(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    path = tmp_path / "artifact.jsonl"
+    path.write_text("not-json", encoding="utf-8")
+    events = []
+    listings = iter(
+        (
+            SimpleNamespace(paths=(str(path),), availability="available"),
+            SimpleNamespace(paths=(str(path),), availability="available"),
+            SimpleNamespace(paths=(), availability="available"),
+        )
+    )
+    replace_calls = []
+    original_replace = session_history_spool.os.replace
+
+    def replace_with_retry(source: str, destination: str) -> None:
+        replace_calls.append((source, destination))
+        if len(replace_calls) == 1:
+            raise OSError("rename blocked")
+        original_replace(source, destination)
+
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "get_secret_str",
+        lambda key: str(tmp_path)
+        if key == aawm_agent_identity._AAWM_SESSION_HISTORY_SPOOL_DIR_ENV
+        else None,
+    )
+    monkeypatch.setattr(aawm_agent_identity, "_get_session_history_batch_size", lambda: 1)
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_get_session_history_spool_replay_backoff_seconds",
+        lambda: (),
+    )
+    monkeypatch.setattr(aawm_agent_identity, "_list_session_history_spool", lambda: next(listings))
+    monkeypatch.setattr(session_history_spool.os, "replace", replace_with_retry)
+    monkeypatch.setattr(
+        session_history_spool,
+        "_emit_session_history_spool_quarantine_event",
+        lambda **kwargs: events.append(kwargs),
+    )
+
+    aawm_agent_identity._session_history_spool_drainer_main()
+
+    assert len(replace_calls) == 2
+    assert [event["renamed"] for event in events] == [False, True]
+    assert path.with_name(path.name + ".bad").exists()
+    assert not path.exists()
 
 
 def test_failed_session_history_batch_logs_spool_failure_severity(

@@ -6,9 +6,9 @@ import hashlib
 import json
 import os
 import queue
+import re
 import threading
 import time
-import re
 from datetime import datetime, timezone
 from typing import (
     Any,
@@ -16,6 +16,7 @@ from typing import (
     List,
     NamedTuple,
     Optional,
+    Set,
     Tuple,
     Union,
     cast,
@@ -375,27 +376,248 @@ def _load_session_history_spool_record(path: str) -> Dict[str, Any]:
     return records[0]
 
 
-def _session_history_spool_bad_record(path: str, exc: Exception) -> None:
+def _session_history_spool_quarantine_reason(exc: Exception) -> str:
+    messages: List[str] = []
+    current: Optional[BaseException] = exc
+    json_decode_error: Optional[json.JSONDecodeError] = None
+    while current is not None:
+        messages.append(str(current).lower())
+        if isinstance(current, json.JSONDecodeError):
+            json_decode_error = current
+        current = current.__cause__ or current.__context__
+    message = " ".join(messages)
+    if "payload is empty" in message:
+        return "empty_payload"
+    if (
+        "unsupported type" in message
+        or "non-object" in message
+        or "not a json object" in message
+    ):
+        return "unsupported_record_type"
+    if "truncated" in message:
+        return "truncated_payload"
+    if json_decode_error is not None:
+        document_length = len(json_decode_error.doc)
+        if document_length == 0 or json_decode_error.pos >= document_length - 1:
+            return "truncated_payload"
+        return "invalid_json"
+    if "not valid json" in message:
+        return "invalid_json"
+    return "unreadable_payload"
+
+
+def _sanitize_session_history_spool_artifact_path(path: str) -> str:
+    normalized_path = os.path.abspath(os.path.normpath(path))
+    bad_suffix = ".bad" if normalized_path.endswith(".bad") else ""
+    hash_input = normalized_path[: -len(bad_suffix)] if bad_suffix else normalized_path
+    digest = hashlib.sha256(hash_input.encode("utf-8")).hexdigest()
+    return f"spool://{digest}{bad_suffix}"
+
+
+def _session_history_spool_safe_exception_message(
+    path: str,
+    bad_path: str,
+    exc: Exception,
+) -> str:
+    message = _call("_format_exception_for_warning", exc)
+    path_replacements = (
+        (os.path.abspath(os.path.normpath(bad_path)), _sanitize_session_history_spool_artifact_path(bad_path)),
+        (os.path.abspath(os.path.normpath(path)), _sanitize_session_history_spool_artifact_path(path)),
+        (bad_path, _sanitize_session_history_spool_artifact_path(bad_path)),
+        (path, _sanitize_session_history_spool_artifact_path(path)),
+        (os.path.basename(bad_path), _sanitize_session_history_spool_artifact_path(bad_path)),
+        (os.path.basename(path), _sanitize_session_history_spool_artifact_path(path)),
+    )
+    for raw_path, opaque_path in sorted(path_replacements, key=lambda item: len(item[0]), reverse=True):
+        if raw_path:
+            message = message.replace(raw_path, opaque_path)
+    return message
+
+
+def _session_history_spool_artifact_metadata(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, "rb") as artifact_file:
+            digest = hashlib.sha256()
+            size_bytes = 0
+            line_count = 0
+            while chunk := artifact_file.read(1024 * 1024):
+                digest.update(chunk)
+                size_bytes += len(chunk)
+                line_count += chunk.count(b"\n")
+        if size_bytes and line_count == 0:
+            line_count = 1
+        return {
+            "artifact_hash": digest.hexdigest(),
+            "artifact_hash_source": "content",
+            "size_bytes": size_bytes,
+            "line_count": line_count,
+        }
+    except OSError:
+        try:
+            artifact_stat = os.stat(path)
+            stat_summary = "|".join(
+                (
+                    os.path.abspath(path),
+                    str(artifact_stat.st_size),
+                    str(artifact_stat.st_mtime_ns),
+                    str(getattr(artifact_stat, "st_ino", 0)),
+                )
+            )
+            size_bytes: Optional[int] = artifact_stat.st_size
+        except OSError:
+            stat_summary = os.path.abspath(path)
+            size_bytes = None
+        return {
+            "artifact_hash": hashlib.sha256(stat_summary.encode("utf-8")).hexdigest(),
+            "artifact_hash_source": "path_metadata",
+            "size_bytes": size_bytes,
+            "line_count": None,
+        }
+
+
+def _session_history_spool_quarantine_fingerprint(
+    path: str,
+    artifact_hash: str,
+    reason: str,
+) -> Tuple[str, str]:
+    artifact_identity = hashlib.sha256(
+        f"{os.path.abspath(path)}|{artifact_hash}".encode("utf-8")
+    ).hexdigest()
+    fingerprint = hashlib.sha256(
+        f"{artifact_identity}|{reason}".encode("utf-8")
+    ).hexdigest()
+    return artifact_identity, fingerprint
+
+
+def _emit_session_history_spool_quarantine_event(
+    *,
+    path: str,
+    bad_path: str,
+    reason: str,
+    artifact_metadata: Dict[str, Any],
+    renamed: bool,
+) -> None:
+    sanitized_path = _sanitize_session_history_spool_artifact_path(path)
+    sanitized_bad_path = _sanitize_session_history_spool_artifact_path(bad_path)
+    artifact_identity, fingerprint = _session_history_spool_quarantine_fingerprint(
+        path,
+        artifact_metadata["artifact_hash"],
+        reason,
+    )
+    disposition = "quarantined" if renamed else "rename_failed"
+    retryable = not renamed
+    context = {
+        "source": "session_history_spool",
+        "artifact_path": sanitized_path,
+        "bad_path": sanitized_bad_path,
+        "artifact_identity": artifact_identity,
+        "artifact_hash": artifact_metadata["artifact_hash"],
+        "artifact_hash_source": artifact_metadata["artifact_hash_source"],
+        "reason": reason,
+        "size_bytes": artifact_metadata["size_bytes"],
+        "line_count": artifact_metadata["line_count"],
+        "retryable": retryable,
+        "disposition": disposition,
+        "quarantined": renamed,
+    }
+    try:
+        runtime_error_logging = _writer_importlib().import_module(
+            "litellm.proxy.aawm_runtime_error_logging"
+        )
+        record = runtime_error_logging.build_agent_terminal_error_record(
+            error_context={
+                "source": "session_history_spool",
+                "failure_kind": "session_history_spool_quarantine",
+                "error_code": "aawm_session_history_spool_quarantined",
+            },
+            terminal_outcome=(
+                "session_history_spool_quarantined"
+                if renamed
+                else "session_history_spool_quarantine_failed"
+            ),
+            fallback_result=disposition,
+            redispatch_required=False,
+            agent_session_killed=False,
+        )
+        record["message"] = (
+            "Session history spool artifact quarantined"
+            if renamed
+            else "Session history spool artifact quarantine failed"
+        )
+        record["fingerprint"] = fingerprint
+        record["context"].update(context)
+        runtime_error_logging.append_agent_terminal_error(record)
+    except Exception:
+        verbose_logger.warning(
+            "AawmAgentIdentity: failed to emit structured session_history spool "
+            "quarantine intake (disposition=%s, reason=%s)",
+            disposition,
+            reason,
+        )
+
+
+def _session_history_spool_bad_record(
+    path: str,
+    exc: Exception,
+    *,
+    quarantine_attempt_seen: Optional[Set[Tuple[str, str]]] = None,
+) -> None:
+    opaque_path = _sanitize_session_history_spool_artifact_path(path)
     if isinstance(exc, FileNotFoundError):
         verbose_logger.warning(
             "AawmAgentIdentity: skipped missing session_history spool record "
             "during replay (path=%s): %s",
-            path,
-            _call("_format_exception_for_warning", exc),
+            opaque_path,
+            _session_history_spool_safe_exception_message(path, path, exc),
         )
         return
 
     bad_path = f"{path}.bad"
+    opaque_bad_path = _sanitize_session_history_spool_artifact_path(bad_path)
+    reason = _session_history_spool_quarantine_reason(exc)
+    artifact_metadata = _session_history_spool_artifact_metadata(path)
+    dedupe_key = (os.path.abspath(path), artifact_metadata["artifact_hash"])
+    if quarantine_attempt_seen is not None and dedupe_key in quarantine_attempt_seen:
+        verbose_logger.warning(
+            "AawmAgentIdentity: suppressed duplicate session_history spool "
+            "quarantine intake for the same processing attempt "
+            "(reason=%s, disposition=duplicate_suppressed)",
+            reason,
+        )
+        return
+    if quarantine_attempt_seen is not None:
+        quarantine_attempt_seen.add(dedupe_key)
+    renamed = True
     try:
         os.replace(path, bad_path)
     except OSError:
-        pass
-    verbose_logger.exception(
-        "AawmAgentIdentity: moved unreadable session_history spool record to "
-        "%s: %s",
-        bad_path,
-        _call("_format_exception_for_warning", exc),
+        renamed = False
+    _emit_session_history_spool_quarantine_event(
+        path=path,
+        bad_path=bad_path,
+        reason=reason,
+        artifact_metadata=artifact_metadata,
+        renamed=renamed,
     )
+    disposition = "quarantined" if renamed else "rename_failed"
+    if renamed:
+        verbose_logger.warning(
+            "AawmAgentIdentity: quarantined unreadable session_history spool "
+            "record (path=%s, target=%s, reason=%s, disposition=%s)",
+            opaque_path,
+            opaque_bad_path,
+            reason,
+            disposition,
+        )
+    else:
+        verbose_logger.warning(
+            "AawmAgentIdentity: failed to quarantine unreadable session_history "
+            "spool record (path=%s, target=%s, reason=%s, disposition=%s)",
+            opaque_path,
+            opaque_bad_path,
+            reason,
+            disposition,
+        )
 
 
 def _session_history_spool_drainer_main() -> None:
@@ -426,6 +648,7 @@ def _session_history_spool_drainer_main() -> None:
                 _call("_session_history_spool_summary", paths),
             )
 
+            quarantine_attempt_seen: Set[Tuple[str, str]] = set()
             batch_paths = paths[:batch_size]
             batch: List[Dict[str, Any]] = []
             kept_paths: List[str] = []
@@ -441,7 +664,11 @@ def _session_history_spool_drainer_main() -> None:
                         _call("_format_exception_for_warning", exc),
                     )
                 except Exception as exc:
-                    _session_history_spool_bad_record(path, exc)
+                    _session_history_spool_bad_record(
+                        path,
+                        exc,
+                        quarantine_attempt_seen=quarantine_attempt_seen,
+                    )
 
             if not batch:
                 continue
