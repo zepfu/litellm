@@ -2213,3 +2213,27 @@ ON CONFLICT (decision_key) DO UPDATE SET
     user_authorization = COALESCE(NULLIF(session_history_codex_review_decisions.user_authorization, ''), NULLIF(EXCLUDED.user_authorization, '')),
     metadata = COALESCE(EXCLUDED.metadata, '{}'::jsonb) || COALESCE(session_history_codex_review_decisions.metadata, '{}'::jsonb)
 """
+
+_AAWM_COHERE_ACCEPTED_CALLS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS public.cohere_accepted_calls (
+    accepted_at TIMESTAMPTZ NOT NULL,
+    month_start DATE NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'cohere'
+        CHECK (provider = 'cohere'),
+    credential_scope TEXT NOT NULL DEFAULT 'cohere_trial_default'
+        CHECK (credential_scope = 'cohere_trial_default'),
+    model TEXT,
+    litellm_call_id TEXT NOT NULL UNIQUE,
+    session_id TEXT,
+    trace_id TEXT,
+    source TEXT NOT NULL,
+    evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+"""
+_AAWM_COHERE_ACCEPTED_CALLS_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS cohere_accepted_calls_month_start_accepted_at_idx "
+    "ON public.cohere_accepted_calls (month_start, accepted_at)",
+    "CREATE INDEX IF NOT EXISTS cohere_accepted_calls_model_accepted_at_idx "
+    "ON public.cohere_accepted_calls (model, accepted_at)",
+)
