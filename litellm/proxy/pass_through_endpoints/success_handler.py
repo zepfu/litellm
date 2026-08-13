@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Union
 from urllib.parse import urlparse
 
@@ -57,6 +57,8 @@ _XAI_OAUTH_RATE_LIMIT_HEADER_PREFIXES = (
 _XAI_OAUTH_RATE_LIMIT_HEADER_NAMES = {
     "retry-after",
 }
+_COHERE_DIRECT_ROUTE_FAMILY = "codex_cohere_chat_completions_adapter"
+_COHERE_LOCAL_OBSERVATION_SOURCE = "locally_counted"
 
 
 class PassThroughEndpointLogging:
@@ -193,6 +195,284 @@ class PassThroughEndpointLogging:
         )
         if sanitized_headers:
             metadata["anthropic_response_headers"] = sanitized_headers
+
+    @staticmethod
+    def _cohere_context_value(
+        *,
+        name: str,
+        kwargs: dict,
+        logging_obj: LiteLLMLoggingObj,
+    ) -> Any:
+        model_call_details = getattr(logging_obj, "model_call_details", None)
+        metadata = {}
+        litellm_params = kwargs.get("litellm_params")
+        if isinstance(litellm_params, dict) and isinstance(
+            litellm_params.get("metadata"), dict
+        ):
+            metadata = litellm_params["metadata"]
+
+        for values in (kwargs, metadata, model_call_details):
+            if isinstance(values, dict) and name in values:
+                value = values[name]
+                if value is not None:
+                    return value
+        value = getattr(logging_obj, name, None)
+        if value is not None:
+            return value
+        return None
+
+    def _is_direct_cohere_success(
+        self,
+        *,
+        httpx_response: httpx.Response,
+        url_route: str,
+        custom_llm_provider: Optional[str],
+        kwargs: dict,
+        logging_obj: LiteLLMLoggingObj,
+    ) -> bool:
+        status_code = getattr(httpx_response, "status_code", None)
+        if status_code != 200:
+            return False
+
+        parsed_url = urlparse(url_route)
+        path = parsed_url.path if parsed_url.scheme else url_route
+        if not parsed_url.scheme or not is_cohere_api_url(url_route):
+            return False
+        normalized_path = path[:-1] if path.endswith("/") else path
+        if normalized_path != "/v2/chat":
+            return False
+        if str(custom_llm_provider or "").strip().lower() != "cohere":
+            return False
+        if not self.is_cohere_route(
+            url_route,
+            custom_llm_provider=custom_llm_provider,
+        ):
+            return False
+
+        route_family = self._cohere_context_value(
+            name="passthrough_route_family",
+            kwargs=kwargs,
+            logging_obj=logging_obj,
+        )
+        if route_family is None:
+            route_family = self._cohere_context_value(
+                name="route_family",
+                kwargs=kwargs,
+                logging_obj=logging_obj,
+            )
+        return route_family == _COHERE_DIRECT_ROUTE_FAMILY
+
+    @staticmethod
+    def _cohere_text_context_value(
+        *,
+        name: str,
+        kwargs: dict,
+        logging_obj: LiteLLMLoggingObj,
+    ) -> Optional[str]:
+        value = PassThroughEndpointLogging._cohere_context_value(
+            name=name,
+            kwargs=kwargs,
+            logging_obj=logging_obj,
+        )
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        return value or None
+
+    @staticmethod
+    def _cohere_rate_limit_observations(
+        *,
+        state: Any,
+        model: Optional[str],
+        observed_at: datetime,
+    ) -> list[dict[str, Any]]:
+        observed_at_utc = observed_at
+        if observed_at_utc.tzinfo is None:
+            observed_at_utc = observed_at_utc.replace(tzinfo=timezone.utc)
+        else:
+            observed_at_utc = observed_at_utc.astimezone(timezone.utc)
+
+        monthly_limit = max(0, int(getattr(state, "monthly_limit", 0) or 0))
+        monthly_used = max(0, int(getattr(state, "monthly_used", 0) or 0))
+        monthly_remaining_value = getattr(state, "monthly_remaining", None)
+        if monthly_remaining_value is None:
+            monthly_remaining_value = monthly_limit - monthly_used
+        monthly_remaining = max(0, int(monthly_remaining_value or 0))
+        if monthly_limit > 0:
+            monthly_remaining = min(monthly_limit, monthly_remaining)
+
+        rpm_limit_value = getattr(state, "rpm_limit", None)
+        rpm_remaining_value = getattr(state, "rpm_remaining", None)
+        rpm_limit = (
+            None
+            if rpm_limit_value is None
+            else max(0, int(rpm_limit_value or 0))
+        )
+        rpm_remaining = (
+            None
+            if rpm_remaining_value is None
+            else max(0, int(rpm_remaining_value or 0))
+        )
+        if rpm_limit is None or rpm_remaining is None or rpm_limit <= 0:
+            rpm_limit = None
+            rpm_remaining = None
+        else:
+            rpm_remaining = min(rpm_limit, rpm_remaining)
+
+        month_end = getattr(state, "month_end", None)
+        if not isinstance(month_end, datetime):
+            month_end = observed_at_utc
+        if month_end.tzinfo is None:
+            month_end = month_end.replace(tzinfo=timezone.utc)
+        else:
+            month_end = month_end.astimezone(timezone.utc)
+
+        def _observation(
+            *,
+            quota_type: str,
+            quota_period: str,
+            remaining: Optional[int],
+            limit: Optional[int],
+            expected_reset_at: datetime,
+            window_minutes: Optional[int],
+        ) -> dict[str, Any]:
+            quota_is_known = remaining is not None and limit is not None and limit > 0
+            remaining_pct = (
+                round((remaining / limit) * 100, 4) if quota_is_known else None
+            )
+            exhausted = remaining <= 0 if quota_is_known else None
+            return {
+                "provider": "cohere",
+                "model": model,
+                "quota_key": "cohere_trial_default",
+                "quota_type": quota_type,
+                "limit_scope": "credential",
+                "quota_period": quota_period,
+                "window_minutes": window_minutes,
+                "remaining_pct": remaining_pct,
+                "observed_at": observed_at_utc.isoformat(),
+                "expected_reset_at": expected_reset_at.isoformat(),
+                "status": (
+                    "exhausted"
+                    if exhausted is True
+                    else "available"
+                    if exhausted is False
+                    else "unknown"
+                ),
+                "exhausted": exhausted,
+                "source": _COHERE_LOCAL_OBSERVATION_SOURCE,
+            }
+
+        return [
+            _observation(
+                quota_type="monthly",
+                quota_period="calendar_month",
+                remaining=monthly_remaining,
+                limit=monthly_limit,
+                expected_reset_at=month_end,
+                window_minutes=None,
+            ),
+            _observation(
+                quota_type="rpm",
+                quota_period="rolling",
+                remaining=rpm_remaining,
+                limit=rpm_limit,
+                expected_reset_at=observed_at_utc + timedelta(minutes=1),
+                window_minutes=1,
+            ),
+        ]
+
+    async def _record_direct_cohere_success(
+        self,
+        *,
+        httpx_response: httpx.Response,
+        logging_obj: LiteLLMLoggingObj,
+        url_route: str,
+        custom_llm_provider: Optional[str],
+        end_time: datetime,
+        result: str,
+        request_body: dict,
+        kwargs: dict,
+    ) -> None:
+        if result != "complete":
+            return
+
+        if not self._is_direct_cohere_success(
+            httpx_response=httpx_response,
+            url_route=url_route,
+            custom_llm_provider=custom_llm_provider,
+            kwargs=kwargs,
+            logging_obj=logging_obj,
+        ):
+            return
+
+        litellm_call_id = self._cohere_text_context_value(
+            name="litellm_call_id",
+            kwargs=kwargs,
+            logging_obj=logging_obj,
+        )
+        if litellm_call_id is None:
+            verbose_proxy_logger.warning(
+                "Cohere accepted-call accounting skipped: missing stable call id"
+            )
+            return
+
+        model = request_body.get("model") if isinstance(request_body, dict) else None
+        if not isinstance(model, str) or not model.strip():
+            model = self._cohere_text_context_value(
+                name="model",
+                kwargs=kwargs,
+                logging_obj=logging_obj,
+            )
+        else:
+            model = model.strip()
+
+        session_id = self._cohere_text_context_value(
+            name="session_id",
+            kwargs=kwargs,
+            logging_obj=logging_obj,
+        )
+        trace_id = self._cohere_text_context_value(
+            name="trace_id",
+            kwargs=kwargs,
+            logging_obj=logging_obj,
+        )
+
+        try:
+            from litellm.integrations.aawm_session_history.cohere_accepted_calls import (  # noqa: PLC0415
+                CohereAcceptedCallState,
+                record_cohere_accepted_call,
+            )
+
+            state = await record_cohere_accepted_call(
+                litellm_call_id=litellm_call_id,
+                accepted_at=end_time,
+                model=model,
+                session_id=session_id,
+                trace_id=trace_id,
+                source=_COHERE_DIRECT_ROUTE_FAMILY,
+            )
+            if not isinstance(state, CohereAcceptedCallState):
+                raise TypeError("unexpected Cohere accepted-call state")
+        except Exception as exc:
+            verbose_proxy_logger.warning(
+                "Cohere accepted-call accounting failed: %s",
+                type(exc).__name__,
+            )
+            return
+
+        observations = self._cohere_rate_limit_observations(
+            state=state,
+            model=model,
+            observed_at=end_time,
+        )
+        metadata = self._ensure_metadata(kwargs)
+        existing_observations = metadata.get("rate_limit_observations")
+        if not isinstance(existing_observations, list):
+            existing_observations = []
+        existing_observations.extend(observations)
+        metadata["rate_limit_observations"] = existing_observations
+        kwargs["rate_limit_observations"] = existing_observations
 
     @staticmethod
     def _ensure_standard_logging_object(
@@ -682,6 +962,16 @@ class PassThroughEndpointLogging:
         record_aawm_route_rollup_turn(
             kwargs,
             response_body=response_body,
+        )
+        await self._record_direct_cohere_success(
+            httpx_response=httpx_response,
+            logging_obj=logging_obj,
+            url_route=url_route,
+            custom_llm_provider=custom_llm_provider,
+            end_time=end_time,
+            result=result,
+            request_body=request_body,
+            kwargs=kwargs,
         )
         await self._handle_logging(
             logging_obj=logging_obj,
