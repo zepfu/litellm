@@ -30,7 +30,7 @@ def _normalize_repository_identity(value: Any) -> Optional[str]:
             netloc = parsed.netloc.split("@", 1)[-1]
             path = parsed.path.strip("/")
             if parsed.scheme == "file" and path:
-                cleaned = path.rstrip("/").rsplit("/", 1)[-1]
+                cleaned = _canonicalize_linked_worktree_repository(path) or path.rstrip("/").rsplit("/", 1)[-1]
             elif netloc.lower().endswith("github.com") and path:
                 cleaned = path
             else:
@@ -65,6 +65,10 @@ def _normalize_repository_identity_from_absolute_path(
     if normalized_path == codex_memory_root:
         return _CODEX_MEMORY_ROOT_REPOSITORY
 
+    canonical_repository = _canonicalize_linked_worktree_repository(normalized_path)
+    if canonical_repository:
+        return canonical_repository
+
     path_parts = normalized_path.rsplit("/", 1)
     basename = path_parts[-1]
     if basename.lower() in _AAWM_REPO_INSTRUCTION_FILENAMES and len(path_parts) > 1:
@@ -89,6 +93,83 @@ def _normalize_repository_identity_from_absolute_path(
         return None
 
     return basename
+
+
+def _run_git_repository_command(path: str, *arguments: str) -> Optional[str]:
+    subprocess = __import__("subprocess")
+    try:
+        result = subprocess.run(
+            ["git", "-C", path, *arguments],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except (OSError, ValueError):
+        return None
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    return output or None
+
+
+def _canonicalize_linked_worktree_repository(path: str) -> Optional[str]:
+    candidate = path
+    while candidate and not os.path.isdir(candidate):
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            return None
+        candidate = parent
+    if not candidate:
+        return None
+
+    top_level = _run_git_repository_command(candidate, "rev-parse", "--show-toplevel")
+    git_dir = _run_git_repository_command(candidate, "rev-parse", "--git-dir")
+    common_dir = _run_git_repository_command(candidate, "rev-parse", "--git-common-dir")
+    if not top_level or not git_dir or not common_dir:
+        return None
+
+    top_level = os.path.realpath(top_level)
+
+    def _absolute_git_path(git_path: str) -> str:
+        if os.path.isabs(git_path):
+            return os.path.realpath(git_path)
+        return os.path.realpath(os.path.join(top_level, git_path))
+
+    git_dir = _absolute_git_path(git_dir)
+    common_dir = _absolute_git_path(common_dir)
+
+    remote_names = _run_git_repository_command(candidate, "remote")
+    for remote_name in ("origin", *(remote_names or "").splitlines()):
+        if not remote_name:
+            continue
+        remote_url = _run_git_repository_command(
+            candidate,
+            "remote",
+            "get-url",
+            remote_name,
+        )
+        repository = _normalize_repository_identity(remote_url) if remote_url else None
+        if repository:
+            return repository
+
+    common_repository_root = (
+        os.path.dirname(common_dir)
+        if os.path.basename(common_dir) == ".git"
+        else common_dir
+    )
+    return os.path.basename(common_repository_root.rstrip("/")) or None
+
+
+def _extract_project_path_from_turn_metadata(value: Any) -> Optional[str]:
+    source = _coerce_mapping(value)
+    return _clean_non_empty_string(source.get("project_path")) if source else None
+
+
+def _extract_current_project_path_from_headers(headers: Any) -> Optional[str]:
+    project_path = _extract_project_path_from_turn_metadata(
+        _get_header_value(headers, "x-codex-turn-metadata")
+    )
+    return project_path
 
 
 def _extract_repository_identity_from_text(value: str) -> Optional[str]:
@@ -193,6 +274,8 @@ def _apply_codex_memory_workflow_repository(
 _HOST_FUNCTION_NAMES = (
     "_normalize_repository_identity",
     "_normalize_repository_identity_from_absolute_path",
+    "_run_git_repository_command",
+    "_canonicalize_linked_worktree_repository",
     "_extract_repository_identity_from_text",
     "_extract_repository_identity_from_value",
     "_extract_repository_identity_from_metadata_sources",

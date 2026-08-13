@@ -447,13 +447,13 @@ def _normalize_passthrough_repository(value: str) -> Optional[str]:
         path = parsed.path.strip("/")
         netloc = parsed.netloc.split("@", 1)[-1]
         if parsed.scheme == "file" and path:
-            cleaned = path.rstrip("/").rsplit("/", 1)[-1]
+            cleaned = _canonicalize_passthrough_repository_path(path) or path.rstrip("/").rsplit("/", 1)[-1]
         elif netloc.lower().endswith("github.com") and path:
             cleaned = path
         else:
             cleaned = f"{netloc}/{path}".strip("/")
     elif cleaned.startswith("/"):
-        cleaned = cleaned.rstrip("/").rsplit("/", 1)[-1]
+        cleaned = _canonicalize_passthrough_repository_path(cleaned.rstrip("/")) or cleaned.rstrip("/").rsplit("/", 1)[-1]
     if cleaned.endswith(".git"):
         cleaned = cleaned[:-4]
     cleaned = cleaned.strip("/")
@@ -473,6 +473,71 @@ def _normalize_passthrough_repository(value: str) -> Optional[str]:
         return None
 
     return cleaned
+
+
+def _run_passthrough_git_command(path: str, *arguments: str) -> Optional[str]:
+    subprocess = __import__("subprocess")
+    try:
+        result = subprocess.run(
+            ["git", "-C", path, *arguments],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+    except (OSError, ValueError):
+        return None
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    return output or None
+
+
+def _canonicalize_passthrough_repository_path(path: str) -> Optional[str]:
+    candidate = path
+    while candidate and not os.path.isdir(candidate):
+        parent = os.path.dirname(candidate)
+        if parent == candidate:
+            return None
+        candidate = parent
+    if not candidate:
+        return None
+
+    top_level = _run_passthrough_git_command(candidate, "rev-parse", "--show-toplevel")
+    git_dir = _run_passthrough_git_command(candidate, "rev-parse", "--git-dir")
+    common_dir = _run_passthrough_git_command(candidate, "rev-parse", "--git-common-dir")
+    if not top_level or not git_dir or not common_dir:
+        return None
+
+    top_level = os.path.realpath(top_level)
+
+    def _absolute_git_path(git_path: str) -> str:
+        if os.path.isabs(git_path):
+            return os.path.realpath(git_path)
+        return os.path.realpath(os.path.join(top_level, git_path))
+
+    git_dir = _absolute_git_path(git_dir)
+    common_dir = _absolute_git_path(common_dir)
+
+    remote_names = _run_passthrough_git_command(candidate, "remote")
+    for remote_name in ("origin", *(remote_names or "").splitlines()):
+        if not remote_name:
+            continue
+        remote_url = _run_passthrough_git_command(
+            candidate,
+            "remote",
+            "get-url",
+            remote_name,
+        )
+        repository = _normalize_passthrough_repository(remote_url) if remote_url else None
+        if repository:
+            return repository
+
+    common_repository_root = (
+        os.path.dirname(common_dir)
+        if os.path.basename(common_dir) == ".git"
+        else common_dir
+    )
+    return os.path.basename(common_repository_root.rstrip("/")) or None
 
 
 def _extract_passthrough_repository_from_text(value: str) -> Optional[str]:
@@ -553,10 +618,45 @@ def _extract_passthrough_repository_from_body_text(value: Any) -> Optional[str]:
     return _walk_request_value_with_budget(value, visitor=_visitor)
 
 
+def _get_passthrough_header_value(headers: dict[str, Any], header_name: str) -> Any:
+    wanted = header_name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == wanted:
+            return value
+    return None
+
+
+def _extract_passthrough_current_project_path(headers: dict[str, Any]) -> Optional[str]:
+    raw_metadata = _get_passthrough_header_value(headers, "x-codex-turn-metadata")
+    if isinstance(raw_metadata, dict):
+        project_path = raw_metadata.get("project_path")
+    elif isinstance(raw_metadata, str):
+        project_path = _get_nested_str_value(raw_metadata, ("project_path",))
+    else:
+        project_path = None
+    if isinstance(project_path, str) and project_path.strip():
+        return project_path.strip()
+    return None
+
+
 def _extract_passthrough_repository(
     request: Any,
     request_body: Optional[dict[str, Any]] = None,
 ) -> Optional[str]:
+    headers = _safe_get_headers(request)
+    for header_name in _PASSTHROUGH_REPOSITORY_HEADER_NAMES:
+        value = _get_passthrough_header_value(headers, header_name)
+        if isinstance(value, str) and value.strip():
+            repository = _normalize_passthrough_repository(value)
+            if repository:
+                return repository
+
+    current_project_path = _extract_passthrough_current_project_path(headers)
+    if current_project_path:
+        repository = _normalize_passthrough_repository(current_project_path)
+        if repository:
+            return repository
+
     if isinstance(request_body, dict):
         for path in (
             ("repository",),
@@ -602,11 +702,6 @@ def _extract_passthrough_repository(
         if repository:
             return repository
 
-    headers = _safe_get_headers(request)
-    for header_name in _PASSTHROUGH_REPOSITORY_HEADER_NAMES:
-        value = headers.get(header_name)
-        if isinstance(value, str) and value.strip():
-            return _normalize_passthrough_repository(value)
     return None
 
 

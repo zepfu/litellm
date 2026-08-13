@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -422,6 +424,121 @@ def test_extract_passthrough_repository_from_cwd_text() -> None:
     request = _FakeRequest()
     body = {"messages": [{"content": "<cwd>/home/user/projects/litellm</cwd>"}]}
     assert metadata._extract_passthrough_repository(request, body) == "litellm"
+
+
+def test_extract_passthrough_repository_prefers_explicit_header_over_inferred_text() -> None:
+    request = _FakeRequest(
+        {
+            "x-aawm-repository": "https://github.com/example/canonical.git",
+            "x-codex-turn-metadata": json.dumps(
+                {"project_path": "/home/user/projects/current-worktree"}
+            ),
+        }
+    )
+    body = {
+        "repository": "/home/user/projects/stale-worktree",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "cwd=file:///home/user/projects/assistant-worktree",
+            },
+            {
+                "type": "function_call_output",
+                "output": "cwd=file:///home/user/projects/tool-worktree",
+            },
+        ],
+    }
+
+    assert metadata._extract_passthrough_repository(request, body) == "example/canonical"
+
+
+def test_extract_passthrough_repository_prefers_current_project_path_over_body() -> None:
+    request = _FakeRequest(
+        {
+            "x-codex-turn-metadata": json.dumps(
+                {"project_path": "/home/user/projects/aawm-tap"}
+            )
+        }
+    )
+    body = {
+        "repository": "/home/user/projects/stale-worktree",
+        "messages": [
+            {
+                "role": "user",
+                "content": "<cwd>/home/user/projects/old-worktree</cwd>",
+            }
+        ],
+    }
+
+    assert metadata._extract_passthrough_repository(request, body) == "aawm-tap"
+
+
+def test_prepare_passthrough_observability_uses_trusted_repository() -> None:
+    request = _FakeRequest(
+        {
+            "x-codex-turn-metadata": json.dumps(
+                {"project_path": "/home/user/projects/aawm-tap"}
+            )
+        }
+    )
+    body = {
+        "model": "codex",
+        "messages": [
+            {"role": "user", "content": "<cwd>/home/user/projects/stale-worktree</cwd>"},
+            {
+                "type": "function_call_output",
+                "output": "cwd=file:///home/user/projects/tool-worktree",
+            },
+        ],
+    }
+
+    prepared_body = metadata._prepare_request_body_for_passthrough_observability(
+        request,
+        body,
+    )
+
+    assert prepared_body["litellm_metadata"]["repository"] == "aawm-tap"
+
+
+def test_normalize_passthrough_repository_canonicalizes_linked_worktree(
+    tmp_path: Any,
+) -> None:
+    repository_root = tmp_path / "canonical-repository"
+    repository_root.mkdir()
+
+    def run_git(*arguments: str, cwd: Any = repository_root) -> None:
+        subprocess.run(
+            ["git", "-C", str(cwd), *arguments],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    run_git("init", "-q")
+    run_git("config", "user.email", "test@example.com")
+    run_git("config", "user.name", "Test User")
+    (repository_root / "README.md").write_text("repository\n")
+    run_git("add", "README.md")
+    run_git("commit", "-qm", "initial")
+    run_git(
+        "remote",
+        "add",
+        "origin",
+        "https://github.com/example/canonical-repository.git",
+    )
+
+    linked_worktree = tmp_path / "task-worktree"
+    run_git("worktree", "add", "-q", "--detach", str(linked_worktree), "HEAD")
+
+    assert metadata._normalize_passthrough_repository(str(repository_root)) == (
+        "example/canonical-repository"
+    )
+    assert metadata._normalize_passthrough_repository(
+        str(linked_worktree / "nested" / "task")
+    ) == "example/canonical-repository"
+    assert metadata._normalize_passthrough_repository(str(tmp_path / "not-a-repository")) == (
+        "not-a-repository"
+    )
 
 
 def test_get_passthrough_trace_environment_uses_env_callback() -> None:
