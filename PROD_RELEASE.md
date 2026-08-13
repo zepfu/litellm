@@ -59,6 +59,19 @@ one-off incident investigation. Normal release validation should use the named
 target profile so port, container, and Langfuse environment checks stay tied
 together.
 
+## `litellm-dev` Direct-Rebuild Gate
+
+Before stopping or replacing live `litellm-dev`, build the exact latest
+`origin/develop` and start that exact image as an isolated disposable candidate,
+preserving the relevant runtime configuration and mount contract on an unused
+loopback port. Require image-identity readiness, an initialized alias-facade
+no-egress invocation, and one real non-Anthropic alias canary that records the
+resolved upstream and disables fallback. Scan candidate logs for tracebacks,
+`NameError`, and HTTP 500s. After candidate acceptance, fetch and recheck
+`origin/develop`; if its tip moved, rebuild and repeat validation. Cut over only
+with a rollback checkpoint, prove the live canary, then delete the checkpoint.
+This gate applies only to `litellm-dev`; never touch `aawm-litellm`.
+
 ## Anthropic Model Routing TOS Boundary
 
 Release validation must determine Anthropic model traffic from the selected
