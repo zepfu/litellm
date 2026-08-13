@@ -9666,6 +9666,51 @@
         "output_vector_size": 1536,
         "supports_embedding_image_input": true
     },
+    "cohere/north-mini-code-1-0": {
+        "comment": "Cohere trial-key route; no verified production list price.",
+        "litellm_provider": "cohere",
+        "max_input_tokens": 256000,
+        "max_output_tokens": 64000,
+        "max_tokens": 64000,
+        "mode": "chat",
+        "provider_specific_entry": {
+            "cohere": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "provider_trial_reference",
+                    "billing_mode": "cohere_trial_key_reference",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "cohere",
+                        "model": "cohere/north-mini-code-1-0"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_applicable",
+                    "equivalence_evidence": "Cohere documents free trial-key usage with model-specific request limits; no verified production list price is represented.",
+                    "source": {
+                        "kind": "official_provider_catalog",
+                        "label": "Cohere North Mini Code model and rate-limit documentation",
+                        "urls": [
+                            "https://docs.cohere.com/docs/north-mini-code-1.0",
+                            "https://docs.cohere.com/v2/docs/rate-limits"
+                        ],
+                        "version": "2026-08-13",
+                        "verified_on": "2026-08-13"
+                    },
+                    "unpriced_reason": "production_list_price_unverified"
+                }
+            }
+        },
+        "rpm": 20,
+        "source": "https://docs.cohere.com/docs/north-mini-code-1.0",
+        "supports_function_calling": true,
+        "supports_native_streaming": true,
+        "supports_reasoning": true,
+        "supports_response_schema": true,
+        "supports_tool_choice": true
+    },
     "cohere.rerank-v3-5:0": {
         "input_cost_per_query": 0.002,
         "input_cost_per_token": 0.0,

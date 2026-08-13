@@ -4,12 +4,14 @@ from typing import Any, Dict
 
 import pytest
 
+import litellm
 from litellm.integrations import aawm_agent_identity
 
 
 ROOT = Path(__file__).resolve().parents[3]
 CANONICAL_CATALOG = ROOT / "model_prices_and_context_window.json"
 BUNDLED_CATALOG = ROOT / "litellm/bundled_model_prices_and_context_window_fallback.json"
+NORTH_MINI_CODE_MODEL = "cohere/north-mini-code-1-0"
 
 
 def _load_catalog() -> Dict[str, Any]:
@@ -58,6 +60,31 @@ def test_should_keep_reference_pricing_catalogs_equal_and_gate_unverified_routes
         ]["aawm_reference_pricing"]["unpriced_reason"]
         == "no_exact_paid_flash_equivalence"
     )
+
+
+def test_should_resolve_direct_cohere_north_mini_code_rpm_and_catalog_parity(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    canonical = json.loads(CANONICAL_CATALOG.read_text(encoding="utf-8"))
+    bundled = json.loads(BUNDLED_CATALOG.read_text(encoding="utf-8"))
+    monkeypatch.setattr(litellm, "model_cost", canonical)
+
+    direct_entry = canonical[NORTH_MINI_CODE_MODEL]
+    assert direct_entry == bundled[NORTH_MINI_CODE_MODEL]
+    assert direct_entry["litellm_provider"] == "cohere"
+    assert direct_entry["rpm"] == 20
+    assert direct_entry["provider_specific_entry"]["cohere"][
+        "aawm_reference_pricing"
+    ]["status"] == "unpriced"
+    assert "input_cost_per_token" not in direct_entry
+    assert "output_cost_per_token" not in direct_entry
+
+    model_info = litellm.get_model_info(NORTH_MINI_CODE_MODEL)
+    assert model_info["litellm_provider"] == "cohere"
+    assert model_info["rpm"] == 20
+    assert canonical["openrouter/cohere/north-mini-code:free"][
+        "litellm_provider"
+    ] == "openrouter"
 
 
 def test_should_fail_closed_on_exact_provider_key_mismatch(catalog):
