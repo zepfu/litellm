@@ -266,6 +266,24 @@ class TestCohereLaneSelection:
         assert "skip_reason" not in state
 
     @pytest.mark.asyncio
+    async def test_initialized_proxy_facade_resolves_cohere_quota_helpers(
+        self, _selection_runtime
+    ):
+        from litellm.proxy.pass_through_endpoints import (
+            llm_passthrough_endpoints as lpe,
+        )
+
+        state = await lpe._build_codex_auto_agent_candidate_state(
+            _request("/v1/responses"),
+            candidate_template=_cohere_candidate(
+                route_family=_CODEX_COHERE_ROUTE_FAMILY
+            ),
+        )
+
+        assert state["lane_key"] == policy.CODEX_AUTO_AGENT_COHERE_LANE_KEY
+        assert "skip_reason" not in state
+
+    @pytest.mark.asyncio
     async def test_lane_key_does_not_depend_on_request_credentials(
         self, _selection_runtime
     ):

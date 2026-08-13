@@ -3680,6 +3680,13 @@ def install(host_globals: dict) -> None:
     host_globals["_attach_aawm_alias_routing_state_sources"] = (
         _cooldown_state._attach_aawm_alias_routing_state_sources
     )
+    for _name in (
+        "_is_finite_number",
+        "_cohere_observation_exhausted",
+        "_cohere_local_quota_exhausted",
+        "_apply_cohere_local_quota_state",
+    ):
+        host_globals[_name] = _mod[_name]
     # Copy seam variables into host_globals so rebound functions resolve them.
     host_globals.update({
         "alias_routing_state": alias_routing_state,
