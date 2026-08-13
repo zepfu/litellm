@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import inspect
 from pathlib import Path
 from types import SimpleNamespace
@@ -254,19 +255,20 @@ class TestPureDetectors:
 
 
 class TestPreserveDistinctFunctionCallIdentity:
-    def test_leaves_distinct_id_and_call_id_untouched(self):
+    def test_leaves_distinct_native_id_and_call_id_untouched(self):
         body = {
             "output": [
                 {
                     "type": "function_call",
-                    "id": "fc_abc",
+                    "id": "fc_685c42deefc0819a822b6936faaa30be0c76bc1491ab6619",
                     "call_id": "provider_1",
                     "name": "tool",
                 }
             ]
         }
         out = pv._preserve_distinct_function_call_identity_fields(body)
-        assert out["output"][0]["id"] == "fc_abc"
+        assert out is body
+        assert out["output"][0]["id"] == "fc_685c42deefc0819a822b6936faaa30be0c76bc1491ab6619"
         assert out["output"][0]["call_id"] == "provider_1"
         assert out["output"][0]["id"] != out["output"][0]["call_id"]
 
@@ -284,34 +286,148 @@ class TestPreserveDistinctFunctionCallIdentity:
         assert out["output"][0]["id"] == "fc_only"
         assert "call_id" not in out["output"][0]
 
-    def test_does_not_synthesize_missing_id_from_call_id(self):
+    def test_repairs_missing_or_malformed_item_id_from_call_id_byte_preserving(self):
+        """OPENAI-007: typed function_call item id is repaired via shared helper."""
+        from litellm.responses.litellm_completion_transformation.function_call_identity import (
+            generate_responses_function_call_item_id,
+            resolve_responses_function_call_identity,
+        )
+
+        spaced_call = " call_ws"
+        expected_item_id, expected_call_id = resolve_responses_function_call_identity(
+            spaced_call
+        )
+        assert expected_call_id == spaced_call
+        assert expected_item_id == generate_responses_function_call_item_id(spaced_call)
+
         body = {
             "output": [
                 {
                     "type": "function_call",
-                    "call_id": "provider_only",
+                    "id": "not-a-native-fc",
+                    "call_id": spaced_call,
                     "name": "tool",
-                }
+                    "arguments": '{"x":1}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "do_not_touch_me",
+                    "output": "ok",
+                },
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "content": [{"type": "output_text", "text": "hi"}],
+                },
             ]
         }
         out = pv._preserve_distinct_function_call_identity_fields(body)
-        assert out["output"][0]["call_id"] == "provider_only"
-        assert "id" not in out["output"][0]
+        assert out is not body
+        fc = out["output"][0]
+        assert fc["call_id"] == spaced_call
+        assert fc["id"] == expected_item_id
+        assert fc["arguments"] == '{"x":1}'
+        # Never change function_call_output.call_id or nested/untyped fields.
+        assert out["output"][1]["call_id"] == "do_not_touch_me"
+        assert out["output"][2]["id"] == "msg_1"
 
-    def test_drops_blank_identity_placeholders_without_backfill(self):
+    def test_repairs_blank_item_id_from_call_id_without_mutating_call_id(self):
+        from litellm.responses.litellm_completion_transformation.function_call_identity import (
+            resolve_responses_function_call_identity,
+        )
+
+        call_id = "provider_1"
+        expected_item_id, _ = resolve_responses_function_call_identity(call_id)
         body = {
             "output": [
                 {
                     "type": "function_call",
                     "id": "",
-                    "call_id": "provider_1",
+                    "call_id": call_id,
                     "name": "tool",
                 }
             ]
         }
         out = pv._preserve_distinct_function_call_identity_fields(body)
-        assert "id" not in out["output"][0]
-        assert out["output"][0]["call_id"] == "provider_1"
+        assert out["output"][0]["call_id"] == call_id
+        assert out["output"][0]["id"] == expected_item_id
+
+
+
+from starlette.responses import Response as StarletteResponse
+
+
+class TestValidateSerializesFunctionCallIdentityRepair:
+    def test_nonstream_identity_repair_is_serialized_without_other_flags(self, monkeypatch):
+        """OPENAI-007: identity-only repair must still serialize the normalized body."""
+        from litellm.responses.litellm_completion_transformation.function_call_identity import (
+            resolve_responses_function_call_identity,
+        )
+
+        call_id = " call_ws"
+        expected_item_id, _ = resolve_responses_function_call_identity(call_id)
+        body = {
+            "id": "resp_identity",
+            "status": "completed",
+            "output": [
+                {
+                    "type": "function_call",
+                    "id": "malformed",
+                    "call_id": call_id,
+                    "name": "tool",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "leave_me",
+                    "output": "x",
+                },
+            ],
+        }
+        raw = json.dumps(body).encode("utf-8")
+        response = StarletteResponse(content=raw, media_type="application/json")
+
+        fn_ns = pv._validate_codex_auto_agent_responses_payload.__globals__
+        monkeypatch.setitem(
+            fn_ns,
+            "_decode_http_response_body",
+            lambda b: b if isinstance(b, (bytes, bytearray)) else bytes(b),
+        )
+        monkeypatch.setitem(fn_ns, "_is_failed_responses_body", lambda _body: False)
+        monkeypatch.setitem(
+            fn_ns,
+            "_try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body",
+            lambda *a, **k: None,
+        )
+        monkeypatch.setitem(
+            fn_ns,
+            "_restore_adapted_custom_tool_calls_in_response_body",
+            lambda response_body, **k: (response_body, 0, None),
+        )
+        monkeypatch.setitem(
+            fn_ns,
+            "_restore_adapted_namespace_tool_calls_in_response_body",
+            lambda response_body, **k: (response_body, 0),
+        )
+        monkeypatch.setitem(
+            fn_ns,
+            "_is_codex_auto_agent_malformed_tool_call_text_output",
+            lambda _body: False,
+        )
+
+        validated = asyncio.run(
+            pv._validate_codex_auto_agent_responses_payload(
+                response,
+                adapter_model="test-model",
+                adapter="codex_auto_agent_kimi_responses",
+                adapter_label="test",
+            )
+        )
+        assert validated is not response
+        payload = json.loads(validated.body.decode("utf-8"))
+        assert payload["output"][0]["call_id"] == call_id
+        assert payload["output"][0]["id"] == expected_item_id
+        assert payload["output"][1]["call_id"] == "leave_me"
 
 
 class TestMalformedToolCallTextDetector:

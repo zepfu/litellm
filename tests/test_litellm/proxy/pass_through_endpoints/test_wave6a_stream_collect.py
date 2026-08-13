@@ -235,11 +235,29 @@ class TestResponsesOutputStreamKey:
         result = sc._responses_output_stream_key(output_index=0)
         assert result == "output:0"
 
-    def test_whitespace_call_id_skipped(self) -> None:
+    def test_whitespace_only_call_id_skipped(self) -> None:
         result = sc._responses_output_stream_key(
             item={"type": "function_call", "call_id": "  ", "id": "real_id"}
         )
         assert result == "real_id"
+
+    def test_function_call_call_id_is_byte_preserving_and_not_collapsed(self) -> None:
+        """OPENAI-007: 'call_ws' and ' call_ws' stay distinct collection keys."""
+        a = sc._responses_output_stream_key(
+            item={"type": "function_call", "call_id": "call_ws", "id": "fc_a"}
+        )
+        b = sc._responses_output_stream_key(
+            item={"type": "function_call", "call_id": " call_ws", "id": "fc_b"}
+        )
+        assert a == "call_ws"
+        assert b == " call_ws"
+        assert a != b
+
+        # Non-function-call message ids continue to strip for stable merge keys.
+        msg = sc._responses_output_stream_key(
+            item={"type": "message", "id": " msg_1 "}
+        )
+        assert msg == "msg_1"
 
 
 # ===========================================================================
@@ -296,6 +314,29 @@ class TestMergeResponsesOutputLists:
         streamed = [{"type": "message", "id": "m1"}, "garbage", None]  # type: ignore[list-item]
         result = sc._merge_responses_output_lists(None, streamed)
         assert len(result) == 1
+
+    def test_whitespace_distinct_function_call_ids_do_not_merge(self) -> None:
+        """OPENAI-007: byte-distinct function_call call_ids keep distinct aliases."""
+        streamed = [
+            {
+                "type": "function_call",
+                "call_id": "call_ws",
+                "id": "fc_aaa_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "arguments": '{"a":1}',
+            },
+            {
+                "type": "function_call",
+                "call_id": " call_ws",
+                "id": "fc_bbb_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "arguments": '{"b":2}',
+            },
+        ]
+        result = sc._merge_responses_output_lists(None, streamed)
+        assert len(result) == 2
+        call_ids = [item["call_id"] for item in result]
+        item_ids = [item["id"] for item in result]
+        assert call_ids == ["call_ws", " call_ws"]
+        assert item_ids[0] != item_ids[1]
 
 
 # ===========================================================================

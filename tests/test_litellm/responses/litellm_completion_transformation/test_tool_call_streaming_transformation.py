@@ -205,10 +205,17 @@ def test_completion_responses_stream_records_bounded_tool_metadata():
     [tool_state] = metadata["responses_stream_tool_state"]
     assert tool_state["type"] == "function_call"
     assert tool_state["call_id"] == "call_time"
+    expected_item_id, expected_call_id = resolve_responses_function_call_identity(
+        "call_time"
+    )
+    assert expected_call_id == "call_time"
+    assert tool_state["id"] == expected_item_id
+    assert tool_state["id"] != tool_state["call_id"]
     assert tool_state["arguments_compacted"] is True
     assert tool_state["arguments_size_bytes"] > 0
     assert isinstance(tool_state["arguments_hash"], str)
     assert "arguments" not in tool_state
+    assert "content" not in tool_state
     assert logging_metadata == metadata
 
 

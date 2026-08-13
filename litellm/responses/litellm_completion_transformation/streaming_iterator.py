@@ -175,9 +175,18 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             "mcp_call",
         }:
             call_id = self._response_event_field(item, "call_id")
+            item_id = self._response_event_field(item, "id")
             if not isinstance(call_id, str) or not call_id:
-                call_id = self._response_event_field(item, "id")
+                call_id = item_id if isinstance(item_id, str) else None
             if isinstance(call_id, str) and call_id:
+                # OPENAI-007 diagnostics: keep bounded provider call_id and the
+                # generated/native fc_* item id. Never include arguments/content.
+                if item_type == "function_call":
+                    if not isinstance(item_id, str) or not item_id:
+                        item_id, _ = self._resolve_tool_stream_identity(call_id)
+                    else:
+                        # Ensure stream maps stay consistent with emitted ids.
+                        self._tool_item_id_by_call_id.setdefault(call_id, item_id)
                 existing = self._responses_stream_tool_state_by_call_id.get(
                     call_id, {}
                 )
@@ -197,6 +206,8 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                         "arguments_size_bytes", 0
                     ),
                 }
+                if item_type == "function_call" and isinstance(item_id, str) and item_id:
+                    updated["id"] = item_id
                 if arguments:
                     encoded_arguments = arguments.encode("utf-8")
                     updated["arguments_hash"] = hashlib.sha256(

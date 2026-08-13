@@ -470,8 +470,10 @@ def _preserve_distinct_function_call_identity_fields(
     Preserve distinct Responses function_call ``id`` / ``call_id`` fields.
 
     OPENAI-007: ``call_id`` is exclusively the upstream provider tool id and
-    ``id`` is the Responses item id (``fc_*``). Adapter validation must not
-    invent one field from the other when only one is present.
+    ``id`` is the Responses item id (``fc_*``). For typed ``function_call``
+    output only, repair malformed/non-native item ids deterministically through
+    the shared identity helper using ``call_id``, while preserving ``call_id``
+    byte-for-byte and leaving valid native ``fc_*`` ids untouched.
     """
     if not isinstance(response_body, dict):
         return response_body
@@ -490,16 +492,40 @@ def _preserve_distinct_function_call_identity_fields(
         item_id = clean_item.get("id")
         call_id = clean_item.get("call_id")
 
-        # Drop blank placeholders only. Never synthesize id from call_id or
-        # call_id from id when the counterpart is missing.
+        # Drop blank placeholders only. Never invent call_id from id.
         if "id" in clean_item and not (isinstance(item_id, str) and item_id.strip()):
             clean_item.pop("id", None)
+            item_id = None
             changed = True
         if "call_id" in clean_item and not (
             isinstance(call_id, str) and call_id.strip()
         ):
             clean_item.pop("call_id", None)
+            call_id = None
             changed = True
+
+        # Repair malformed/non-native item ids from provider call_id only.
+        # Preserve call_id byte-for-byte and leave valid native fc_* item ids
+        # untouched. Never mutate function_call_output or nested/untyped fields.
+        # Import inside the function so install()-rebound host globals still work.
+        if isinstance(call_id, str) and call_id.strip():
+            from litellm.responses.litellm_completion_transformation.function_call_identity import (
+                is_native_responses_function_call_item_id,
+                resolve_responses_function_call_identity,
+            )
+
+            resolved_item_id, _resolved_call_id = (
+                resolve_responses_function_call_identity(call_id)
+            )
+            item_id_is_native = (
+                isinstance(item_id, str)
+                and bool(item_id.strip())
+                and is_native_responses_function_call_item_id(item_id)
+            )
+            if not item_id_is_native and resolved_item_id:
+                if clean_item.get("id") != resolved_item_id:
+                    clean_item["id"] = resolved_item_id
+                    changed = True
 
         preserved_output.append(clean_item)
 
@@ -587,10 +613,13 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             peek.response,
             event_summaries=event_summaries,
         )
+        identity_changed = False
         if isinstance(response_body, dict):
-            response_body = _preserve_distinct_function_call_identity_fields(
+            preserved_body = _preserve_distinct_function_call_identity_fields(
                 response_body
             )
+            identity_changed = preserved_body is not response_body
+            response_body = preserved_body
         if _is_failed_responses_body(response_body):  # noqa: F821
             _raise_codex_auto_agent_failed_responses_payload(
                 response_body=response_body,
@@ -599,7 +628,7 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 adapter_label=adapter_label,
                 stream_event_summaries=event_summaries,
             )
-        response_changed = False
+        response_changed = identity_changed
         repaired_body = (
             _try_repair_codex_auto_agent_grok_native_composer_literal_tool_call_response_body(  # noqa: F821
                 response_body,
@@ -676,10 +705,13 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             response_body = json.loads(_decode_http_response_body(response.body))  # noqa: F821
         except Exception:
             return response
+        identity_changed = False
         if isinstance(response_body, dict):
-            response_body = _preserve_distinct_function_call_identity_fields(
+            preserved_body = _preserve_distinct_function_call_identity_fields(
                 response_body
             )
+            identity_changed = preserved_body is not response_body
+            response_body = preserved_body
         if isinstance(response_body, dict) and _is_failed_responses_body(response_body):  # noqa: F821
             _raise_codex_auto_agent_failed_responses_payload(
                 response_body=response_body,
@@ -735,7 +767,13 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                     adapter_label=adapter_label,
                     intake_context=intake_context,
                 )
-            if isinstance(repaired_body, dict) or restored_custom_tool_count or restored_namespace_tool_count:
+            # Serialize identity repairs even when no unrelated repair flag is set.
+            if (
+                identity_changed
+                or isinstance(repaired_body, dict)
+                or restored_custom_tool_count
+                or restored_namespace_tool_count
+            ):
                 return Response(
                     content=json.dumps(response_body),
                     media_type=response.media_type or "application/json",

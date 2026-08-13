@@ -85,9 +85,25 @@ def install(host_globals: dict) -> None:
             _rebound.__dict__.update(_obj.__dict__)
         _mod[_name] = _rebound
         host_globals[_name] = _rebound
+    # Pure local helper used by rebound OPENAI-007 identity keying.
+    host_globals["_function_call_identity_token"] = _mod["_function_call_identity_token"]
 
 
 # -- Extracted functions -------------------------------------------------
+
+
+def _function_call_identity_token(value: Any) -> Optional[str]:
+    """Return a non-blank function_call identity token without stripping bytes.
+
+    OPENAI-007: provider ``call_id`` values are byte-preserving collection keys.
+    Whitespace-only placeholders are still ignored; every other non-empty string
+    keeps its exact bytes so ``call_ws`` and `` call_ws`` remain distinct.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    if not value.strip():
+        return None
+    return value
 
 
 def _responses_output_stream_key(
@@ -102,12 +118,24 @@ def _responses_output_stream_key(
         raw_type = item.get("type")
         if isinstance(raw_type, str) and raw_type.strip():
             item_type = raw_type.strip()
-        for key in ("call_id", "id"):
-            value = item.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    if isinstance(item_id, str) and item_id.strip():
-        return item_id.strip()
+        # OPENAI-007: function_call provider call_id / fc_* item id are
+        # byte-preserving identity keys. Do not strip or collapse byte-distinct
+        # values such as "call_ws" vs " call_ws".
+        if item_type == "function_call":
+            for key in ("call_id", "id"):
+                token = _function_call_identity_token(item.get(key))
+                if token is not None:
+                    return token
+        else:
+            for key in ("call_id", "id"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    # Arguments events typically carry item_id only. Preserve non-blank bytes so
+    # generated fc_* ids with surrounding whitespace cannot collapse.
+    token = _function_call_identity_token(item_id)
+    if token is not None:
+        return token
     # RR-054 #46: include type in synthetic keys so distinct item types at the same
     # fallback index do not silently merge.
     type_prefix = f"{item_type}:" if item_type else ""
@@ -143,16 +171,35 @@ def _merge_responses_output_lists(
             ordered_keys.append(key)
         merged_by_key[key] = dict(item)
         index_keys.setdefault(index, key)
-        for alias in (item.get("id"), item.get("call_id")):
-            if isinstance(alias, str) and alias.strip():
-                aliases[alias.strip()] = key
+        item_type = item.get("type")
+        if item_type == "function_call":
+            for alias in (item.get("id"), item.get("call_id")):
+                token = _function_call_identity_token(alias)
+                if token is not None:
+                    aliases[token] = key
+        else:
+            for alias in (item.get("id"), item.get("call_id")):
+                if isinstance(alias, str) and alias.strip():
+                    aliases[alias.strip()] = key
 
     for index, item in enumerate(completed_output or []):
         if not isinstance(item, dict):
             continue
-        item_aliases = [
-            value.strip() for value in (item.get("call_id"), item.get("id")) if isinstance(value, str) and value.strip()
-        ]
+        if item.get("type") == "function_call":
+            item_aliases = [
+                token
+                for token in (
+                    _function_call_identity_token(item.get("call_id")),
+                    _function_call_identity_token(item.get("id")),
+                )
+                if token is not None
+            ]
+        else:
+            item_aliases = [
+                value.strip()
+                for value in (item.get("call_id"), item.get("id"))
+                if isinstance(value, str) and value.strip()
+            ]
         terminal_key: Optional[str] = next(
             (aliases[value] for value in item_aliases if value in aliases),
             None,
@@ -250,9 +297,16 @@ def _record_collected_responses_output_item_event(
 
     if isinstance(output_index, int):
         key_by_output_index[output_index] = key
-    for alias in (raw_key, item.get("id"), item.get("call_id")):
-        if isinstance(alias, str) and alias.strip():
-            key_aliases[alias.strip()] = key
+    item_type = item.get("type")
+    if item_type == "function_call":
+        for alias in (raw_key, item.get("id"), item.get("call_id")):
+            token = _function_call_identity_token(alias)
+            if token is not None:
+                key_aliases[token] = key
+    else:
+        for alias in (raw_key, item.get("id"), item.get("call_id")):
+            if isinstance(alias, str) and alias.strip():
+                key_aliases[alias.strip()] = key
 
 
 def _record_collected_responses_arguments_event(
@@ -285,7 +339,11 @@ def _record_collected_responses_arguments_event(
         # item_id: function_call.call_id is the exclusive upstream provider id and
         # may intentionally differ from the fc_* item id (OPENAI-007).
         existing = {"type": item_type}
-        if isinstance(item_id, str) and item_id.strip():
+        if item_type == "function_call":
+            token = _function_call_identity_token(item_id)
+            if token is not None:
+                existing["id"] = token
+        elif isinstance(item_id, str) and item_id.strip():
             existing["id"] = item_id.strip()
 
     value = _mapping_or_attr_get(event, "arguments")
@@ -300,7 +358,11 @@ def _record_collected_responses_arguments_event(
     output_items[key] = existing
     if isinstance(output_index, int):
         key_by_output_index[output_index] = key
-    if isinstance(item_id, str) and item_id.strip():
+    if existing.get("type") == "function_call":
+        token = _function_call_identity_token(item_id)
+        if token is not None:
+            key_aliases[token] = key
+    elif isinstance(item_id, str) and item_id.strip():
         key_aliases[item_id.strip()] = key
 
 
