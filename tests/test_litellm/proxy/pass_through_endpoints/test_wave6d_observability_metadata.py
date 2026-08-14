@@ -426,6 +426,58 @@ def test_extract_passthrough_repository_from_cwd_text() -> None:
     assert metadata._extract_passthrough_repository(request, body) == "litellm"
 
 
+def test_extract_passthrough_repository_prefers_current_input_over_stale_messages() -> None:
+    request = _FakeRequest()
+    body = {
+        "input": "cwd=file:///home/user/projects/litellm",
+        "instructions": "# AGENTS.md instructions for /home/user/projects/stale-worktree",
+        "messages": [
+            {
+                "type": "assistant",
+                "content": "cwd=file:///home/user/projects/stale-worktree@thoth",
+            }
+        ],
+    }
+
+    assert metadata._extract_passthrough_repository(request, body) == "litellm"
+
+
+def test_extract_passthrough_repository_uses_current_turn_tool_output_as_last_fallback() -> None:
+    request = _FakeRequest()
+    body = {
+        "messages": [
+            {
+                "type": "user",
+                "content": "No repository is present yet.",
+            },
+            {
+                "type": "function_call_output",
+                "output": "cwd=file:///home/user/projects/stale-worktree@thoth",
+            },
+        ],
+    }
+
+    assert metadata._extract_passthrough_repository(request, body) == "stale-worktree@thoth"
+
+
+def test_extract_passthrough_repository_falls_back_to_historical_assistant_prompt() -> None:
+    request = _FakeRequest()
+    body = {
+        "messages": [
+            {
+                "type": "user",
+                "content": "No path in this turn.",
+            },
+            {
+                "role": "assistant",
+                "content": "tool result: cwd=file:///home/user/projects/stale-worktree@thoth",
+            },
+        ],
+    }
+
+    assert metadata._extract_passthrough_repository(request, body) == "stale-worktree@thoth"
+
+
 def test_extract_passthrough_repository_prefers_explicit_header_over_inferred_text() -> None:
     request = _FakeRequest(
         {

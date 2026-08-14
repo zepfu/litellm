@@ -346,11 +346,39 @@ _PASSTHROUGH_REPOSITORY_TEXT_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
     re.compile(r"<cwd>\s*[`'\"]?(?P<path>[^<`'\"]+)</cwd>"),
     re.compile(r"AGENTS\.md instructions for\s+[`'\"]?(?P<path>/[^\n<`'\"]+)"),
-    re.compile(r"\bcwd\b\s*[:=]\s*[`'\"]?(?P<path>/[^`'\"\n<]+)"),
+    re.compile(
+        r"\bcwd\b\s*[:=]\s*[`'\"]?(?P<path>(?:file://|/)[^`'\"\n<,]+)"
+    ),
     re.compile(
         r"\*{0,2}Workspace Directories:\*{0,2}\s*\n\s*[-*]\s*[`'\"]?(?P<path>/[^\n`'\"]+)",
         re.IGNORECASE,
     ),
+)
+_PASSTHROUGH_REPOSITORY_TEXT_SCAN_ROOT_KEYS: tuple[str, ...] = (
+    "input",
+    "messages",
+    "system",
+    "request",
+    "instructions",
+)
+_PASSTHROUGH_REPOSITORY_TEXT_CURRENT_TURN_BLOCKED_ITEM_TYPES: frozenset[str] = frozenset(
+    {
+        "custom_tool_call",
+        "custom_tool_call_output",
+        "function_call",
+        "function_call_output",
+        "reasoning",
+        "tool_output",
+        "tool_result",
+        "tool_search_call",
+        "tool_search_output",
+    }
+)
+_PASSTHROUGH_REPOSITORY_TEXT_CURRENT_TURN_BLOCKED_ROLES: frozenset[str] = frozenset(
+    {
+        "assistant",
+        "tool",
+    }
 )
 _PASSTHROUGH_REPOSITORY_PLACEHOLDER_VALUES: set[str] = {
     "...",
@@ -554,6 +582,7 @@ def _walk_request_value_with_budget(
     value: object,
     *,
     visitor: Callable[[object, int], Optional[_WalkResultT]],
+    should_skip: Optional[Callable[[object, int], bool]] = None,
     max_depth: int = _AAWM_REQUEST_BODY_WALK_MAX_DEPTH,
     max_nodes: int = _AAWM_REQUEST_BODY_WALK_MAX_NODES,
     _depth: int = 0,
@@ -567,6 +596,8 @@ def _walk_request_value_with_budget(
     _state["nodes"] += 1
     if _state["nodes"] > max_nodes:
         return None
+    if should_skip is not None and should_skip(value, _depth):
+        return None
     result = visitor(value, _depth)
     if result is not None:
         return result
@@ -575,6 +606,7 @@ def _walk_request_value_with_budget(
             found = _walk_request_value_with_budget(
                 child,
                 visitor=visitor,
+                should_skip=should_skip,
                 max_depth=max_depth,
                 max_nodes=max_nodes,
                 _depth=_depth + 1,
@@ -587,6 +619,7 @@ def _walk_request_value_with_budget(
             found = _walk_request_value_with_budget(
                 child,
                 visitor=visitor,
+                should_skip=should_skip,
                 max_depth=max_depth,
                 max_nodes=max_nodes,
                 _depth=_depth + 1,
@@ -597,7 +630,32 @@ def _walk_request_value_with_budget(
     return None
 
 
-def _extract_passthrough_repository_from_body_text(value: Any) -> Optional[str]:
+def _should_skip_passthrough_repository_text_scan(
+    node: Any,
+    _depth: int,
+    *,
+    skip_current_turn_nodes: bool,
+) -> bool:
+    if not isinstance(node, dict):
+        return False
+    if not skip_current_turn_nodes:
+        return False
+    role = node.get("role")
+    if isinstance(role, str) and role.strip().lower() in _PASSTHROUGH_REPOSITORY_TEXT_CURRENT_TURN_BLOCKED_ROLES:
+        return True
+    item_type = node.get("type")
+    return (
+        isinstance(item_type, str)
+        and item_type.strip().lower()
+        in _PASSTHROUGH_REPOSITORY_TEXT_CURRENT_TURN_BLOCKED_ITEM_TYPES
+    )
+
+
+def _extract_passthrough_repository_from_body_text(
+    value: Any,
+    *,
+    skip_current_turn_nodes: bool = False,
+) -> Optional[str]:
     def _visitor(node: object, _depth: int) -> Optional[str]:
         if isinstance(node, str):
             return _extract_passthrough_repository_from_text(node)
@@ -615,7 +673,15 @@ def _extract_passthrough_repository_from_body_text(value: Any) -> Optional[str]:
                 repository = _normalize_passthrough_repository(child)
                 if repository:
                     return repository
-    return _walk_request_value_with_budget(value, visitor=_visitor)
+    return _walk_request_value_with_budget(
+        value,
+        visitor=_visitor,
+        should_skip=lambda node, depth: _should_skip_passthrough_repository_text_scan(
+            node,
+            depth,
+            skip_current_turn_nodes=skip_current_turn_nodes,
+        ),
+    )
 
 
 def _get_passthrough_header_value(headers: dict[str, Any], header_name: str) -> Any:
@@ -698,7 +764,22 @@ def _extract_passthrough_repository(
             value = _get_nested_str_value(request_body, path)
             if value:
                 return _normalize_passthrough_repository(value)
-        repository = _extract_passthrough_repository_from_body_text(request_body)
+
+        for key in _PASSTHROUGH_REPOSITORY_TEXT_SCAN_ROOT_KEYS:
+            child = request_body.get(key)
+            if child is None:
+                continue
+            repository = _extract_passthrough_repository_from_body_text(
+                child,
+                skip_current_turn_nodes=True,
+            )
+            if repository:
+                return repository
+
+        repository = _extract_passthrough_repository_from_body_text(
+            request_body,
+            skip_current_turn_nodes=False,
+        )
         if repository:
             return repository
 
