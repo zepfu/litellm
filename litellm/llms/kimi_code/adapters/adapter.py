@@ -707,6 +707,20 @@ def _handle_kimi_adapter_exception(
                 }
             },
         ) from exc
+    if (
+        metadata.get("kind") == "quota"
+        and metadata.get("scope") == "managed_account"
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "message": "Managed Kimi Code usage quota is exhausted.",
+                    "type": "rate_limit_error",
+                    "code": "kimi_code_quota_exhausted",
+                }
+            },
+        ) from exc
 
 
 async def prepare_codex_kimi_chat_completions_adapter_route(

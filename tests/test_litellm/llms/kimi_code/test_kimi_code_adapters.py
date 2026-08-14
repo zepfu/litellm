@@ -1893,6 +1893,89 @@ async def test_should_preserve_alias_probe_auth_metadata_and_original_failure(
 
 
 @pytest.mark.asyncio
+async def test_should_return_bounded_429_for_direct_managed_quota_failure():
+    raw_provider_detail = "billing cycle usage limit reached: raw-provider-detail"
+    upstream_failure = _KimiAdapterFailure(
+        status_code=403,
+        message=raw_provider_detail,
+    )
+
+    with (
+        patch(
+            "litellm.acompletion",
+            new=AsyncMock(side_effect=upstream_failure),
+        ),
+        pytest.raises(HTTPException) as caught,
+    ):
+        await _handle_codex_kimi_chat_completions_adapter_route(
+            endpoint="/v1/responses",
+            request=_request(),
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body={
+                "model": "kimi_code/k3-high",
+                "input": "hello",
+                "stream": False,
+            },
+            adapter_model="kimi_code/k3-high",
+        )
+
+    assert caught.value.status_code == 429
+    assert caught.value.detail == {
+        "error": {
+            "message": "Managed Kimi Code usage quota is exhausted.",
+            "type": "rate_limit_error",
+            "code": "kimi_code_quota_exhausted",
+        }
+    }
+    assert raw_provider_detail not in json.dumps(caught.value.detail)
+    assert not hasattr(caught.value, "kimi_code_probe_failure_metadata")
+
+
+@pytest.mark.asyncio
+async def test_should_preserve_alias_probe_quota_metadata_and_original_failure():
+    upstream_failure = _KimiAdapterFailure(
+        status_code=403,
+        message="billing cycle usage limit reached: raw-provider-detail",
+    )
+
+    with (
+        patch(
+            "litellm.acompletion",
+            new=AsyncMock(side_effect=upstream_failure),
+        ),
+        pytest.raises(_KimiAdapterFailure) as caught,
+    ):
+        await _handle_codex_kimi_chat_completions_adapter_route(
+            endpoint="/v1/responses",
+            request=_request(),
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body={
+                "model": "kimi_code/k3-high",
+                "input": "hello",
+                "stream": False,
+            },
+            adapter_model="kimi_code/k3-high",
+            use_alias_candidate_probe=True,
+        )
+
+    assert caught.value is upstream_failure
+    assert upstream_failure.kimi_code_probe_failure_metadata == {
+        "kind": "quota",
+        "scope": "managed_account",
+        "upstream_id": "k3",
+        "metadata_gate": "none",
+        "status_code": 403,
+        "trace_id": "trace-safe",
+        "reset_reason": "quota_exhausted",
+    }
+    assert "raw-provider-detail" not in json.dumps(
+        upstream_failure.kimi_code_probe_failure_metadata
+    )
+
+
+@pytest.mark.asyncio
 async def test_should_leave_unrelated_direct_failure_unchanged():
     upstream_failure = _KimiAdapterFailure(
         status_code=500,
