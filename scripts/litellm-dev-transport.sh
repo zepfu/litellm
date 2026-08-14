@@ -311,7 +311,16 @@ cmd_activate() {
   require_cmd tailscale
 
   socket_listen_check "$SERVICE_IP" "$SERVICE_PORT"
-  tailscale serve --service="${TAILSCALE_SERVICE}" --tun --yes
+
+  if ! tailscale serve clear "${TAILSCALE_SERVICE}"; then
+    die "failed to clear existing configuration for ${TAILSCALE_SERVICE}"
+  fi
+
+  if ! tailscale serve --service="${TAILSCALE_SERVICE}" --tun --yes; then
+    rollback_tailscale
+    die "failed to configure TUN for ${TAILSCALE_SERVICE}; rollback restored to tcp:${SERVICE_PORT} -> tcp://127.0.0.1:${SERVICE_PORT}"
+  fi
+
   printf 'activate complete: %s\n' "$TAILSCALE_SERVICE"
 }
 
