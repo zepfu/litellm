@@ -961,25 +961,35 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     return selected_auth, selection_state, metadata_body
 
 
-def is_direct_codex_usage_limit_error(exc: HTTPException) -> bool:
+def is_direct_codex_usage_limit_error(exc: Exception) -> bool:
     """Return whether a direct Codex request hit account quota exhaustion."""
-    if exc.status_code != 429 or not isinstance(exc.detail, dict):
+    status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    try:
+        parsed_status_code = int(status_code)
+    except (TypeError, ValueError):
         return False
-    error = exc.detail.get("error")
+    detail = getattr(exc, "detail", None)
+    if parsed_status_code != 429 or not isinstance(detail, dict):
+        return False
+    error = detail.get("error")
     return bool(
         isinstance(error, dict)
         and error.get("code") == "usage_limit_reached"
-        and exc.detail.get("failover_disposition") == "usage_limit_reached"
+        and detail.get("failover_disposition") == "usage_limit_reached"
     )
 
 
 def direct_codex_usage_limit_retry_after_seconds(
-    exc: HTTPException,
+    exc: Exception,
     *,
     now_epoch: Optional[float] = None,
 ) -> float:
     """Resolve the provider reset interval, with a bounded fallback."""
-    headers = exc.headers or {}
+    headers = getattr(exc, "upstream_headers", None)
+    if not isinstance(headers, dict):
+        headers = getattr(exc, "headers", None)
+    if not isinstance(headers, dict):
+        headers = {}
     retry_after = headers.get("Retry-After") or headers.get("retry-after")
     try:
         parsed_retry_after = float(retry_after)
@@ -988,7 +998,8 @@ def direct_codex_usage_limit_retry_after_seconds(
     if parsed_retry_after > 0:
         return parsed_retry_after
 
-    detail = exc.detail if isinstance(exc.detail, dict) else {}
+    raw_detail = getattr(exc, "detail", None)
+    detail = raw_detail if isinstance(raw_detail, dict) else {}
     quota = detail.get("quota")
     if isinstance(quota, dict):
         try:

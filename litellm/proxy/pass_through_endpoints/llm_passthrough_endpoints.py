@@ -3410,7 +3410,7 @@ async def _retry_direct_codex_oauth_after_usage_limit(
     request: Request,
     request_body: dict[str, Any],
     selection: dict[str, Any],
-    exc: HTTPException,
+    exc: Exception,
 ) -> Optional[tuple[Any, dict[str, Any]]]:
     cooldown_seconds = (
         _aawm_codex_oauth.direct_codex_usage_limit_retry_after_seconds(exc)
@@ -5762,7 +5762,7 @@ async def openai_proxy_route(
                 extra_headers=extra_headers,
                 forward_headers=forward_headers,
             )
-        except HTTPException as exc:
+        except (HTTPException, ProxyException) as exc:
             if (
                 not use_direct_codex_oauth_inventory
                 or direct_codex_selection_state is None
