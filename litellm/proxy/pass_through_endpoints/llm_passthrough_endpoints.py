@@ -3446,6 +3446,9 @@ async def _retry_direct_codex_oauth_after_usage_limit(
             },
             error_class="usage_limit_reached",
             has_continuation_state=selection.get("request_mode") != "fresh",
+            has_previous_response_id=bool(
+                request_body.get("previous_response_id")
+            ),
         )
     )
     if not retry_planned:

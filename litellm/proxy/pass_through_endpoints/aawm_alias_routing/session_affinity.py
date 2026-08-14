@@ -126,6 +126,7 @@ _OWNER_ATTRIBUTE_FIELDS = (
     "account_lane",
     "endpoint_contract",
     "state_format",
+    "credential_affinity",
     "ingress",
     "requested_model",
     "alias_family",
@@ -140,6 +141,7 @@ _CORE_OWNER_ATTRIBUTE_KEYS = (
     "account_lane",
     "endpoint_contract",
     "state_format",
+    "credential_affinity",
 )
 
 _REQUIRED_OWNER_ATTRIBUTE_KEYS = (
@@ -351,6 +353,7 @@ def build_session_owner_attributes(
     ingress: Any = None,
     requested_model: Any = None,
     alias_family: Any = None,
+    credential_affinity: Any = None,
     candidate: Optional[Mapping[str, Any]] = None,
     extra: Optional[Mapping[str, Any]] = None,
 ) -> Payload:
@@ -391,6 +394,8 @@ def build_session_owner_attributes(
         requested_model = source.get("requested_model") or source.get("alias_model")
     if alias_family is None:
         alias_family = source.get("alias_family")
+    if credential_affinity is None:
+        credential_affinity = source.get("codex_oauth_credential_affinity")
 
     attributes: Payload = {}
     values = {
@@ -402,6 +407,7 @@ def build_session_owner_attributes(
         "account_lane": account_lane,
         "endpoint_contract": endpoint_contract,
         "state_format": state_format,
+        "credential_affinity": credential_affinity,
         "ingress": ingress,
         "requested_model": requested_model,
         "alias_family": alias_family,
@@ -431,6 +437,25 @@ def _core_owner_attributes(attributes: Mapping[str, Any]) -> Payload:
     }
 
 
+def _accounts_are_interchangeable(
+    left: Mapping[str, Any],
+    right: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    right = right or {}
+    providers = {
+        str(left.get("provider") or "").strip().lower(),
+        str(right.get("provider") or "").strip().lower(),
+    }
+    providers.discard("")
+    if providers != {"openai"}:
+        return False
+    return any(
+        str(attrs.get("credential_affinity") or "").strip().lower()
+        == "interchangeable"
+        for attrs in (left, right)
+    )
+
+
 def build_session_owner_id(
     *,
     attributes: Optional[Mapping[str, Any]] = None,
@@ -454,15 +479,20 @@ def build_session_owner_id(
             if value is not None and str(value).strip() != "":
                 merged[key] = value
         attrs = cast(Payload, merged)
+    interchangeable = _accounts_are_interchangeable(attrs)
     parts = [
         str(attrs.get("provider") or "unknown"),
         str(attrs.get("model") or "unknown"),
         str(attrs.get("route_family") or "unknown"),
         str(
-            attrs.get("account_lane")
-            or attrs.get("account_hash")
-            or attrs.get("account_label")
-            or "default"
+            "interchangeable"
+            if interchangeable
+            else (
+                attrs.get("account_lane")
+                or attrs.get("account_hash")
+                or attrs.get("account_label")
+                or "default"
+            )
         ),
         str(attrs.get("endpoint_contract") or "default"),
         str(attrs.get("state_format") or "default"),
@@ -473,6 +503,8 @@ def build_session_owner_id(
 def route_requires_account_identity(attributes: Mapping[str, Any]) -> bool:
     """True when ownership promotion must carry credential/account identity."""
 
+    if _accounts_are_interchangeable(attributes):
+        return False
     if attributes.get("account_lane") or attributes.get("account_hash"):
         return True
     if attributes.get("account_label"):
@@ -556,6 +588,15 @@ def _attributes_exactly_equal(
 ) -> bool:
     left_core = _core_owner_attributes(left)
     right_core = _core_owner_attributes(right)
+    if _accounts_are_interchangeable(left_core, right_core):
+        for key in (
+            "account_hash",
+            "account_label",
+            "account_lane",
+            "credential_affinity",
+        ):
+            left_core.pop(key, None)
+            right_core.pop(key, None)
     if set(left_core.keys()) != set(right_core.keys()):
         return False
     for key, value in left_core.items():
@@ -584,6 +625,10 @@ def _compatibility_mismatch_reason(
     if not requested_attributes:
         return None
     requested_core = _core_owner_attributes(requested_attributes)
+    interchangeable = _accounts_are_interchangeable(
+        owner_attrs,
+        requested_core,
+    )
     if require_exact_attributes:
         if not _attributes_exactly_equal(left=owner_attrs, right=requested_core):
             return "session_owner: requested route does not exactly match owner"
@@ -593,11 +638,12 @@ def _compatibility_mismatch_reason(
         own = _clean_optional_str(owner_attrs.get(key))
         if req is not None and own is not None and req != own:
             return f"session_owner: {key} mismatch owner={own} requested={req}"
-    for key in ("account_hash", "account_lane", "account_label"):
-        req = _clean_optional_str(requested_core.get(key))
-        own = _clean_optional_str(owner_attrs.get(key))
-        if req is not None and own is not None and req != own:
-            return f"session_owner: {key} mismatch"
+    if not interchangeable:
+        for key in ("account_hash", "account_lane", "account_label"):
+            req = _clean_optional_str(requested_core.get(key))
+            own = _clean_optional_str(owner_attrs.get(key))
+            if req is not None and own is not None and req != own:
+                return f"session_owner: {key} mismatch"
     for key in ("endpoint_contract", "state_format"):
         req = _clean_optional_str(requested_core.get(key))
         own = _clean_optional_str(owner_attrs.get(key))
@@ -678,11 +724,14 @@ def owner_record_as_affinity_hint(
         "last_resort": False,
         "affinity_state_source": "session_owner",
     }
-    if attrs.get("account_label"):
+    interchangeable = _accounts_are_interchangeable(attrs)
+    if interchangeable:
+        affinity["codex_oauth_credential_affinity"] = "interchangeable"
+    if attrs.get("account_label") and not interchangeable:
         affinity["codex_oauth_account_label"] = attrs.get("account_label")
-    if attrs.get("account_hash"):
+    if attrs.get("account_hash") and not interchangeable:
         affinity["codex_oauth_account_hash"] = attrs.get("account_hash")
-    if attrs.get("account_lane"):
+    if attrs.get("account_lane") and not interchangeable:
         affinity["codex_oauth_lane_key"] = attrs.get("account_lane")
     return {k: v for k, v in affinity.items() if v is not None}
 

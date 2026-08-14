@@ -29,7 +29,16 @@ _SAFE_LABEL_RE = re.compile(r"\A[a-z][a-z0-9._-]{0,63}\Z")
 _ACCOUNT_HASH_RE = re.compile(
     rf"\A[0-9a-f]{{{CODEX_OAUTH_ACCOUNT_HASH_LENGTH}}}\Z"
 )
-_ROOT_FIELDS = frozenset({"schema_version", "accounts"})
+_ROOT_FIELDS = frozenset({"schema_version", "routing", "accounts"})
+_ROOT_REQUIRED_FIELDS = frozenset({"schema_version", "accounts"})
+_ROUTING_FIELDS = frozenset(
+    {
+        "credential_affinity",
+        "strategy",
+        "balance_band_percentage_points",
+        "within_band_strategy",
+    }
+)
 _ACCOUNT_FIELDS = frozenset(
     {
         "label",
@@ -99,10 +108,27 @@ class CodexOAuthCredentialRecord:
 
 
 @dataclass(frozen=True)
+class CodexOAuthRoutingPolicy:
+    """Optional account-pool routing policy with backward-compatible defaults."""
+
+    credential_affinity: str = "pinned"
+    strategy: str = "priority"
+    balance_band_percentage_points: float = 10.0
+    within_band_strategy: str = "priority"
+
+    @property
+    def accounts_are_interchangeable(self) -> bool:
+        return self.credential_affinity == "interchangeable"
+
+
+@dataclass(frozen=True)
 class CodexOAuthInventory:
     """Immutable inventory with deterministic priority/declaration ordering."""
 
     records: tuple[CodexOAuthCredentialRecord, ...]
+    routing: CodexOAuthRoutingPolicy = field(
+        default_factory=CodexOAuthRoutingPolicy
+    )
 
     def ordered_records(
         self,
@@ -211,11 +237,19 @@ def parse_codex_oauth_inventory(payload: Any) -> CodexOAuthInventory:
         raise CodexOAuthInventoryError(
             "Codex OAuth inventory must contain a JSON object."
         )
-    _validate_exact_fields(
-        payload,
-        expected=_ROOT_FIELDS,
-        subject="Codex OAuth inventory",
-    )
+    actual_fields = set(payload)
+    missing_fields = _ROOT_REQUIRED_FIELDS - actual_fields
+    unknown_fields = actual_fields - _ROOT_FIELDS
+    if missing_fields:
+        raise CodexOAuthInventoryError(
+            "Codex OAuth inventory is missing required fields: "
+            f"{sorted(missing_fields)}."
+        )
+    if unknown_fields:
+        raise CodexOAuthInventoryError(
+            "Codex OAuth inventory contains unknown fields: "
+            f"{sorted(unknown_fields)}."
+        )
 
     schema_version = payload.get("schema_version")
     if (
@@ -233,6 +267,7 @@ def parse_codex_oauth_inventory(payload: Any) -> CodexOAuthInventory:
             "Codex OAuth inventory accounts must be a non-empty array."
         )
 
+    routing = _parse_routing_policy(payload.get("routing"))
     records: list[CodexOAuthCredentialRecord] = []
     seen_labels: set[str] = set()
     seen_paths: dict[str, str] = {}
@@ -266,7 +301,53 @@ def parse_codex_oauth_inventory(payload: Any) -> CodexOAuthInventory:
         seen_account_hashes[record.expected_account_hash] = record.label
         records.append(record)
 
-    return CodexOAuthInventory(records=tuple(records))
+    return CodexOAuthInventory(records=tuple(records), routing=routing)
+
+
+def _parse_routing_policy(value: Any) -> CodexOAuthRoutingPolicy:
+    if value is None:
+        return CodexOAuthRoutingPolicy()
+    if not isinstance(value, dict):
+        raise CodexOAuthInventoryError(
+            "Codex OAuth inventory routing must contain a JSON object."
+        )
+    _validate_exact_fields(
+        value,
+        expected=_ROUTING_FIELDS,
+        subject="Codex OAuth inventory routing",
+    )
+    credential_affinity = value.get("credential_affinity", "pinned")
+    if credential_affinity not in {"pinned", "interchangeable"}:
+        raise CodexOAuthInventoryError(
+            "Codex OAuth routing credential_affinity is unsupported."
+        )
+    strategy = value.get("strategy", "priority")
+    if strategy not in {"priority", "dual_quota_balance"}:
+        raise CodexOAuthInventoryError(
+            "Codex OAuth routing strategy is unsupported."
+        )
+    within_band_strategy = value.get("within_band_strategy", "priority")
+    if within_band_strategy not in {"priority", "weighted_round_robin"}:
+        raise CodexOAuthInventoryError(
+            "Codex OAuth routing within_band_strategy is unsupported."
+        )
+    raw_band = value.get("balance_band_percentage_points", 10.0)
+    if (
+        not isinstance(raw_band, (int, float))
+        or isinstance(raw_band, bool)
+        or not math.isfinite(float(raw_band))
+        or not 0 < float(raw_band) <= 100
+    ):
+        raise CodexOAuthInventoryError(
+            "Codex OAuth routing balance_band_percentage_points must be "
+            "greater than 0 and at most 100."
+        )
+    return CodexOAuthRoutingPolicy(
+        credential_affinity=credential_affinity,
+        strategy=strategy,
+        balance_band_percentage_points=float(raw_band),
+        within_band_strategy=within_band_strategy,
+    )
 
 
 def load_codex_oauth_credential(
@@ -667,6 +748,7 @@ __all__ = [
     "CodexOAuthIdentityMismatchError",
     "CodexOAuthInventory",
     "CodexOAuthInventoryError",
+    "CodexOAuthRoutingPolicy",
     "codex_oauth_account_identity_hash",
     "get_codex_oauth_token_data",
     "get_codex_oauth_token_expiry",

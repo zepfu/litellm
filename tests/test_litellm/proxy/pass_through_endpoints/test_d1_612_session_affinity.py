@@ -1794,3 +1794,47 @@ async def test_d614_full_wrapper_records_owner_409_once_before_egress() -> None:
     assert exc.detail["attempted_provider_call"] is False
     assert exc.detail["canonical_session_identity"] == session_id
     assert proxy_logging.post_call_failure_hook.await_args.kwargs["traceback_str"] is None
+
+
+def test_interchangeable_openai_owner_ignores_account_identity_only() -> None:
+    account1 = sa.build_session_owner_attributes(
+        provider="openai",
+        model="gpt-5.6-sol",
+        route_family="codex_responses",
+        account_label="account1",
+        account_hash="hash-account-1",
+        account_lane="codex-oauth:account1:hash-account-1",
+        endpoint_contract="codex_responses",
+        state_format="codex_responses",
+        credential_affinity="interchangeable",
+    )
+    account2 = sa.build_session_owner_attributes(
+        provider="openai",
+        model="gpt-5.6-sol",
+        route_family="codex_responses",
+        account_label="account2",
+        account_hash="hash-account-2",
+        account_lane="codex-oauth:account2:hash-account-2",
+        endpoint_contract="codex_responses",
+        state_format="codex_responses",
+        credential_affinity="interchangeable",
+    )
+
+    assert sa.build_session_owner_id(attributes=account1) == (
+        sa.build_session_owner_id(attributes=account2)
+    )
+    assert sa._attributes_exactly_equal(left=account1, right=account2)
+    hint = sa.owner_record_as_affinity_hint(
+        {
+            "state": "owned",
+            "owner": "owner",
+            "attributes": account1,
+        }
+    )
+    assert hint is not None
+    assert "codex_oauth_account_label" not in hint
+
+    assert not sa._attributes_exactly_equal(
+        left=account1,
+        right=dict(account2, model="gpt-5.6-terra"),
+    )

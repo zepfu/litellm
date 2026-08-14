@@ -78,8 +78,15 @@ def _account(
     }
 
 
-def _inventory_json(accounts: list[dict[str, Any]]) -> str:
-    return json.dumps({"schema_version": 1, "accounts": accounts})
+def _inventory_json(
+    accounts: list[dict[str, Any]],
+    *,
+    routing: dict[str, Any] | None = None,
+) -> str:
+    payload: dict[str, Any] = {"schema_version": 1, "accounts": accounts}
+    if routing is not None:
+        payload["routing"] = routing
+    return json.dumps(payload)
 
 
 def _request(headers: dict[str, str] | None = None) -> Request:
@@ -160,6 +167,35 @@ def test_inventory_is_explicit_ordered_and_model_eligible(tmp_path: Path) -> Non
     assert inventory.select_record(model="other-model").label == "account1"
     assert inventory.records[0].weight == 1.0
     assert str(inventory.records[0].auth_path) not in repr(inventory.records[0])
+    assert inventory.routing.credential_affinity == "pinned"
+
+
+def test_inventory_parses_interchangeable_dual_quota_policy(
+    tmp_path: Path,
+) -> None:
+    account = _account(
+        tmp_path,
+        label="account1",
+        account_id="acct-one",
+        priority=10,
+        models=["*"],
+    )
+    inventory = load_codex_oauth_inventory(
+        _inventory_json(
+            [account],
+            routing={
+                "credential_affinity": "interchangeable",
+                "strategy": "dual_quota_balance",
+                "balance_band_percentage_points": 10,
+                "within_band_strategy": "weighted_round_robin",
+            },
+        )
+    )
+
+    assert inventory.routing.accounts_are_interchangeable is True
+    assert inventory.routing.strategy == "dual_quota_balance"
+    assert inventory.routing.balance_band_percentage_points == 10.0
+    assert inventory.routing.within_band_strategy == "weighted_round_robin"
 
 
 @pytest.mark.parametrize(

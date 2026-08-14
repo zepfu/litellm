@@ -1861,6 +1861,44 @@ class AliasRoutingStateManager:
             "windows": windows,
         }
 
+    def resolve_normalized_quota_windows_for_account(
+        self,
+        *,
+        provider: str,
+        account_hash: str,
+        max_age_seconds: float = 900.0,
+        now_epoch: Optional[float] = None,
+    ) -> list[dict[str, Any]]:
+        """Return every fresh quota-family window for one managed account."""
+        now = time.time() if now_epoch is None else now_epoch
+        selected_account_hash = str(account_hash or "").strip()
+        if not selected_account_hash:
+            return []
+        with self._normalized_quota_observations_lock:
+            observations = [
+                (key, dict(observation))
+                for key, observation in self._normalized_quota_observations.items()
+                for obs_provider, _obs_model, obs_account, _quota, _environment in (key,)
+                if obs_provider == provider and obs_account == selected_account_hash
+            ]
+        return [
+            {
+                **observation,
+                "account_hash": key[2],
+                "environment": key[4] or None,
+                "observation_age_seconds": max(
+                    0.0,
+                    now - observation["observed_at"],
+                ),
+            }
+            for key, observation in observations
+            if 0 <= now - observation["observed_at"] <= max_age_seconds
+            and (
+                observation.get("expected_reset_at") is None
+                or observation["expected_reset_at"] > now
+            )
+        ]
+
     def reset_for_tests(self) -> None:
         """Clear all manager-owned process-local state IN PLACE (test-support only).
 

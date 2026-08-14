@@ -40,6 +40,7 @@ from litellm.secret_managers import codex_oauth_inventory
 from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialRecord,
     CodexOAuthInventory,
+    CodexOAuthRoutingPolicy,
 )
 
 
@@ -87,6 +88,18 @@ def _inventory() -> CodexOAuthInventory:
             _record("account1", "hash-account-1", 10, 0),
             _record("account2", "hash-account-2", 20, 1),
         )
+    )
+
+
+def _interchangeable_inventory() -> CodexOAuthInventory:
+    return CodexOAuthInventory(
+        records=_inventory().records,
+        routing=CodexOAuthRoutingPolicy(
+            credential_affinity="interchangeable",
+            strategy="dual_quota_balance",
+            balance_band_percentage_points=10.0,
+            within_band_strategy="weighted_round_robin",
+        ),
     )
 
 
@@ -1498,6 +1511,139 @@ async def test_direct_responses_request_local_usage_limit_selects_next_account(
     assert second["candidate"]["codex_oauth_account_label"] == "account2"
     assert second["failover_ordinal"] == 1
     assert second["prior_account_outcome"]["outcome"] == "usage_limit_reached"
+    alias_routing_state.reset_for_tests()
+
+
+def test_interchangeable_continuation_failover_excludes_previous_response_id() -> None:
+    request = _request()
+    candidate = {
+        **_candidate(),
+        "codex_oauth_account_label": "account1",
+        "codex_oauth_account_hash": "hash-account-1",
+        "codex_oauth_lane_key": "codex-oauth:account1:hash-account-1",
+        "codex_oauth_credential_affinity": "interchangeable",
+    }
+    selection_state = {"candidate": candidate, "failover_ordinal": 0}
+    attempt = {
+        "failure_phase": "direct_openai_provider_response",
+        "attempted_provider_call": True,
+    }
+
+    assert selection._plan_codex_oauth_account_failover(
+        request,
+        candidate=candidate,
+        selection=selection_state,
+        attempt_record=attempt,
+        error_class="usage_limit_reached",
+        has_continuation_state=True,
+        has_previous_response_id=False,
+    )
+
+    second_request = _request()
+    assert not selection._plan_codex_oauth_account_failover(
+        second_request,
+        candidate=candidate,
+        selection=selection_state,
+        attempt_record=dict(attempt),
+        error_class="usage_limit_reached",
+        has_continuation_state=True,
+        has_previous_response_id=True,
+    )
+
+
+def test_interchangeable_policy_removes_legacy_account_affinity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        codex_oauth_inventory,
+        "load_codex_oauth_inventory",
+        _interchangeable_inventory,
+    )
+    legacy = {
+        **_candidate(),
+        "codex_oauth_account_label": "account1",
+        "codex_oauth_account_hash": "hash-account-1",
+        "codex_oauth_lane_key": "codex-oauth:account1:hash-account-1",
+    }
+
+    adjusted = selection._apply_codex_oauth_inventory_affinity_policy(legacy)
+    assert adjusted is not None
+    assert adjusted["codex_oauth_credential_affinity"] == "interchangeable"
+    assert "codex_oauth_account_label" not in adjusted
+    assert "codex_oauth_account_hash" not in adjusted
+    assert "codex_oauth_lane_key" not in adjusted
+
+
+def test_dual_quota_balance_and_within_band_alternation() -> None:
+    inventory = _interchangeable_inventory()
+    states = [
+        {
+            "candidate": {
+                **_candidate(),
+                "codex_oauth_account_label": record.label,
+                "codex_oauth_account_hash": record.expected_account_hash,
+                "codex_oauth_lane_key": (
+                    f"codex-oauth:{record.label}:{record.expected_account_hash}"
+                ),
+                "codex_oauth_account_weight": record.weight,
+                "codex_oauth_credential_affinity": (
+                    inventory.routing.credential_affinity
+                ),
+                "codex_oauth_selection_strategy": inventory.routing.strategy,
+                "codex_oauth_balance_band_pp": 10.0,
+                "codex_oauth_within_band_strategy": (
+                    inventory.routing.within_band_strategy
+                ),
+            },
+            "cooldown_seconds": 0.0,
+        }
+        for record in inventory.records
+    ]
+    now = datetime.now(timezone.utc)
+    alias_routing_state.reset_for_tests()
+    alias_routing_state.record_normalized_quota_observations(
+        [
+            *_record_account_windows(
+                account_hash="hash-account-1",
+                observed_at=now,
+                five_hour_remaining=80.0,
+                weekly_remaining=35.0,
+            ),
+            *_record_account_windows(
+                account_hash="hash-account-2",
+                observed_at=now,
+                five_hour_remaining=80.0,
+                weekly_remaining=70.0,
+            ),
+            *_record_account_windows(
+                account_hash="hash-account-1",
+                observed_at=now,
+                five_hour_remaining=80.0,
+                weekly_remaining=52.0,
+                model="gpt-5.3-codex-spark",
+            ),
+            *_record_account_windows(
+                account_hash="hash-account-2",
+                observed_at=now,
+                five_hour_remaining=80.0,
+                weekly_remaining=48.0,
+                model="gpt-5.3-codex-spark",
+            ),
+        ]
+    )
+    selected = selection._select_first_available_codex_oauth_account_state(states)
+    assert selected["candidate"]["codex_oauth_account_label"] == "account2"
+    assert selected["selection_diagnostics"]["controlling_quota_family"] == (
+        "overall"
+    )
+
+    alias_routing_state.reset_for_tests()
+    first = selection._select_first_available_codex_oauth_account_state(states)
+    second = selection._select_first_available_codex_oauth_account_state(states)
+    assert [
+        first["candidate"]["codex_oauth_account_label"],
+        second["candidate"]["codex_oauth_account_label"],
+    ] == ["account1", "account2"]
     alias_routing_state.reset_for_tests()
 
 

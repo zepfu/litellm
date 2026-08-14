@@ -265,6 +265,9 @@ async def handle_alias_route(  # noqa: PLR0915
     attempts: list[dict[str, Any]] = []
     last_retryable_exc: Optional[Exception] = None
     has_continuation_state = _codex_auto_agent_request_has_continuation_state(prepared_request_body)
+    has_previous_response_id = bool(
+        prepared_request_body.get("previous_response_id")
+    )
     native_grok_continuation_transient_max_attempts = (
         _get_codex_auto_agent_native_grok_continuation_transient_max_attempts()
     )
@@ -396,6 +399,7 @@ async def handle_alias_route(  # noqa: PLR0915
                 attempt_record=attempt_record,
                 error_class=admission_error_class,
                 has_continuation_state=has_continuation_state,
+                has_previous_response_id=has_previous_response_id,
             )
             if account_failover_planned:
                 provider_candidate_attempts = max(
@@ -752,6 +756,7 @@ async def handle_alias_route(  # noqa: PLR0915
                     attempt_record=attempt_record,
                     error_class=error_class,
                     has_continuation_state=has_continuation_state,
+                    has_previous_response_id=has_previous_response_id,
                 )
                 if cooldown_scope == "none" and not has_continuation_state:
                     _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
@@ -759,7 +764,11 @@ async def handle_alias_route(  # noqa: PLR0915
                         candidate=candidate,
                         lane_key=selection.get("lane_key"),
                     )
-                if has_continuation_state and cooldown_scope != "none":
+                if (
+                    has_continuation_state
+                    and cooldown_scope != "none"
+                    and not account_failover_planned
+                ):
                     attempt_record["status"] = "terminal_in_flight_cooldown_set"
                     failure_body = _record_auto_agent_alias_attempt_failure(
                         alias_family=alias_family,

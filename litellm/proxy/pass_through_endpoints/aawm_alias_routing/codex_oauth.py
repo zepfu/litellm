@@ -660,8 +660,21 @@ async def _resolve_model_less_direct_codex_oauth_contexts(
     try:
         inventory = load_codex_oauth_inventory()
         records = inventory.ordered_records(enabled_only=True, model=None)
+        routing_fields = {
+            "codex_oauth_credential_affinity": (
+                inventory.routing.credential_affinity
+            ),
+            "codex_oauth_selection_strategy": inventory.routing.strategy,
+            "codex_oauth_balance_band_pp": (
+                inventory.routing.balance_band_percentage_points
+            ),
+            "codex_oauth_within_band_strategy": (
+                inventory.routing.within_band_strategy
+            ),
+        }
     except CodexOAuthInventoryError:
         records = ()
+        routing_fields = {}
 
     if not records:
         return [
@@ -688,6 +701,7 @@ async def _resolve_model_less_direct_codex_oauth_contexts(
             "codex_oauth_lane_key": lane_key,
             "codex_oauth_account_priority": record.priority,
             "codex_oauth_account_weight": record.weight,
+            **routing_fields,
         }
         context: dict[str, Any] = {
             "candidate": account_candidate,
@@ -772,6 +786,30 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         "last_resort": False,
         "selection_priority": 100,
     }
+    try:
+        from litellm.secret_managers.codex_oauth_inventory import (
+            load_codex_oauth_inventory,
+        )
+
+        routing = load_codex_oauth_inventory().routing
+    except Exception:  # noqa: BLE001
+        routing = None
+    interchangeable_accounts = bool(
+        routing is not None and routing.accounts_are_interchangeable
+    )
+    if routing is not None:
+        candidate_template.update(
+            {
+                "codex_oauth_credential_affinity": routing.credential_affinity,
+                "codex_oauth_selection_strategy": routing.strategy,
+                "codex_oauth_balance_band_pp": (
+                    routing.balance_band_percentage_points
+                ),
+                "codex_oauth_within_band_strategy": (
+                    routing.within_band_strategy
+                ),
+            }
+        )
 
     affinity: Optional[dict[str, Any]] = None
     session_identity = _sa.resolve_canonical_session_identity(request, body)
@@ -780,13 +818,14 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             session_identity=session_identity,
         )
         if owner_error is None and isinstance(owner_record, dict):
-            affinity = _direct_codex_oauth_affinity_from_session_owner(
-                _sa.owner_record_as_affinity_hint(owner_record),
-                model=model,
-            )
+            if not interchangeable_accounts:
+                affinity = _direct_codex_oauth_affinity_from_session_owner(
+                    _sa.owner_record_as_affinity_hint(owner_record),
+                    model=model,
+                )
 
     # Body/request metadata pin (continuation metadata) when no owner pin.
-    if affinity is None:
+    if affinity is None and not interchangeable_accounts:
         metadata = body.get("litellm_metadata")
         meta = metadata if isinstance(metadata, dict) else {}
         pin_label = _clean_codex_auth_value(
@@ -899,14 +938,27 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     ):
         selection_reason = "request_metadata_pin"
     else:
-        selection_reason = "direct_inventory_first_available"
+        selection_reason = (
+            "direct_inventory_interchangeable"
+            if interchangeable_accounts
+            else "direct_inventory_first_available"
+        )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import (
+        _codex_auto_agent_request_has_continuation_state,
+    )
+
     selection_state = {
         **selected_state,
         "selection_reason": selection_reason,
         "skipped": skipped,
         "alias_model": model,
         "request_mode": (
-            "ordinary_continuation" if affinity is not None else "fresh"
+            "ordinary_continuation"
+            if (
+                affinity is not None
+                or _codex_auto_agent_request_has_continuation_state(body)
+            )
+            else "fresh"
         ),
     }
 

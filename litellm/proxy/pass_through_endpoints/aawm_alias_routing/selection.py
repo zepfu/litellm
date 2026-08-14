@@ -297,6 +297,10 @@ def _codex_auto_agent_candidate_public_shape(
         ("codex_oauth_lane_key", "account_lane"),
         ("codex_oauth_account_priority", "account_priority"),
         ("codex_oauth_account_weight", "account_weight"),
+        ("codex_oauth_credential_affinity", "credential_affinity"),
+        ("codex_oauth_selection_strategy", "selection_strategy"),
+        ("codex_oauth_balance_band_pp", "balance_band_percentage_points"),
+        ("codex_oauth_within_band_strategy", "within_band_strategy"),
     ):
         value = candidate.get(source_field)
         if value is not None:
@@ -308,6 +312,16 @@ def _codex_auto_agent_candidate_public_shape(
     if reason is not None:
         shaped["reason"] = reason
     return shaped
+
+
+def _codex_oauth_routing_candidate_fields(inventory: Any) -> dict[str, Any]:
+    routing = inventory.routing
+    return {
+        "codex_oauth_credential_affinity": routing.credential_affinity,
+        "codex_oauth_selection_strategy": routing.strategy,
+        "codex_oauth_balance_band_pp": routing.balance_band_percentage_points,
+        "codex_oauth_within_band_strategy": routing.within_band_strategy,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -609,11 +623,17 @@ def _plan_codex_oauth_account_failover(
     attempt_record: dict[str, Any],
     error_class: str,
     has_continuation_state: bool,
+    has_previous_response_id: bool = False,
 ) -> bool:
     """Plan the sole request-local account move after a pre-response failure."""
     if not _is_codex_oauth_account_candidate(candidate):
         return False
-    if has_continuation_state:
+    interchangeable = (
+        candidate.get("codex_oauth_credential_affinity") == "interchangeable"
+    )
+    if has_continuation_state and (
+        not interchangeable or has_previous_response_id
+    ):
         return False
 
     failover_ordinal = int(selection.get("failover_ordinal") or 0)
@@ -996,6 +1016,11 @@ def _candidate_matches_affinity(
         return False
     if not _candidate_uses_codex_oauth(candidate):
         return True
+    if (
+        affinity.get("codex_oauth_credential_affinity")
+        == "interchangeable"
+    ):
+        return True
     return all(
         candidate.get(field) == affinity.get(field)
         for field in (
@@ -1004,6 +1029,39 @@ def _candidate_matches_affinity(
             "codex_oauth_lane_key",
         )
     )
+
+
+def _apply_codex_oauth_inventory_affinity_policy(
+    affinity: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not isinstance(affinity, dict):
+        return affinity
+    if affinity.get("provider") != _CODEX_AUTO_AGENT_NATIVE_PROVIDER:
+        return affinity
+    if affinity.get("route_family") not in {
+        "codex_responses",
+        "anthropic_openai_responses_adapter",
+    }:
+        return affinity
+    try:
+        from litellm.secret_managers.codex_oauth_inventory import (
+            load_codex_oauth_inventory,
+        )
+
+        routing = load_codex_oauth_inventory().routing
+    except Exception:  # noqa: BLE001
+        return affinity
+    if not routing.accounts_are_interchangeable:
+        return affinity
+    adjusted = dict(affinity)
+    for field in (
+        "codex_oauth_account_label",
+        "codex_oauth_account_hash",
+        "codex_oauth_lane_key",
+    ):
+        adjusted.pop(field, None)
+    adjusted["codex_oauth_credential_affinity"] = "interchangeable"
+    return adjusted
 
 
 def _codex_oauth_quota_json_mapping(value: Any) -> dict[str, Any]:
@@ -1199,6 +1257,11 @@ async def _resolve_codex_oauth_account_candidate_contexts(
     pinned_label: Optional[str] = None
     pinned_hash: Optional[str] = None
     pinned_lane: Optional[str] = None
+    interchangeable_affinity = bool(
+        affinity is not None
+        and affinity.get("codex_oauth_credential_affinity")
+        == "interchangeable"
+    )
     if affinity is not None:
         pinned_label = str(
             affinity.get("codex_oauth_account_label") or ""
@@ -1209,7 +1272,10 @@ async def _resolve_codex_oauth_account_candidate_contexts(
         pinned_lane = str(
             affinity.get("codex_oauth_lane_key") or ""
         ).strip() or None
-        if not all((pinned_label, pinned_hash, pinned_lane)):
+        if (
+            not interchangeable_affinity
+            and not all((pinned_label, pinned_hash, pinned_lane))
+        ):
             return [
                 {
                     "candidate": {
@@ -1240,7 +1306,19 @@ async def _resolve_codex_oauth_account_candidate_contexts(
 
     try:
         inventory = load_codex_oauth_inventory()
-        if pinned_label is not None:
+        routing_fields = {
+            "codex_oauth_credential_affinity": (
+                inventory.routing.credential_affinity
+            ),
+            "codex_oauth_selection_strategy": inventory.routing.strategy,
+            "codex_oauth_balance_band_pp": (
+                inventory.routing.balance_band_percentage_points
+            ),
+            "codex_oauth_within_band_strategy": (
+                inventory.routing.within_band_strategy
+            ),
+        }
+        if pinned_label is not None and not interchangeable_affinity:
             records = (
                 inventory.select_record(label=pinned_label, model=model),
             )
@@ -1251,6 +1329,7 @@ async def _resolve_codex_oauth_account_candidate_contexts(
             )
     except CodexOAuthInventoryError:
         records = ()
+        routing_fields = {}
 
     if not records:
         unavailable_candidate = dict(candidate_template)
@@ -1289,6 +1368,7 @@ async def _resolve_codex_oauth_account_candidate_contexts(
             "codex_oauth_lane_key": lane_key,
             "codex_oauth_account_priority": record.priority,
             "codex_oauth_account_weight": record.weight,
+            **routing_fields,
         }
         context: dict[str, Any] = {
             "candidate": account_candidate,
@@ -1669,6 +1749,149 @@ def _prefer_codex_oauth_weekly_balanced_state(
     return selected
 
 
+def _codex_oauth_dual_family_remaining(
+    state: Mapping[str, Any],
+) -> dict[str, Optional[float]]:
+    candidate = state.get("candidate")
+    if not isinstance(candidate, Mapping):
+        return {"overall": None, "spark": None}
+    account_hash = str(
+        candidate.get("codex_oauth_account_hash") or ""
+    ).strip()
+    windows = alias_routing_state.resolve_normalized_quota_windows_for_account(
+        provider=str(candidate.get("provider") or ""),
+        account_hash=account_hash,
+        max_age_seconds=30.0,
+    )
+    return {
+        family: _codex_oauth_weekly_remaining_pct_from_windows(
+            _filter_codex_oauth_quota_windows_for_family(
+                windows,
+                family=family,
+            )
+        )
+        for family in ("overall", "spark")
+    }
+
+
+def _select_codex_oauth_weighted_round_robin_state(
+    states: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    weighted_states: list[tuple[dict[str, Any], float]] = []
+    for state in states:
+        candidate = state["candidate"]
+        try:
+            weight = float(candidate.get("codex_oauth_account_weight", 1.0))
+        except (TypeError, ValueError):
+            weight = 1.0
+        weighted_states.append((state, max(0.01, weight)))
+    minimum_weight = min(weight for _state, weight in weighted_states)
+    slot_counts = [
+        max(1, min(100, int(round(weight / minimum_weight))))
+        for _state, weight in weighted_states
+    ]
+    slots = [
+        state
+        for ordinal in range(max(slot_counts))
+        for (state, _weight), slot_count in zip(weighted_states, slot_counts)
+        if ordinal < slot_count
+    ]
+    identities = ",".join(
+        str(state["candidate"].get("codex_oauth_account_hash") or "")
+        for state in states
+    )
+    cursor_key = ("codex_oauth_accounts", identities)
+    cursor = alias_routing_state.round_robin_cursor.get(cursor_key, 0)
+    selected = slots[cursor % len(slots)]
+    alias_routing_state.round_robin_cursor[cursor_key] = cursor + 1
+    return selected
+
+
+def _prefer_codex_oauth_dual_quota_balanced_state(
+    states: Sequence[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if len(states) < 2:
+        return states[0] if states else None
+    candidate = states[0].get("candidate")
+    if not isinstance(candidate, Mapping):
+        return None
+    if candidate.get("codex_oauth_selection_strategy") != "dual_quota_balance":
+        return None
+    try:
+        band = float(candidate.get("codex_oauth_balance_band_pp", 10.0))
+    except (TypeError, ValueError):
+        band = 10.0
+
+    observations = {
+        str(state["candidate"].get("codex_oauth_account_hash") or ""): (
+            _codex_oauth_dual_family_remaining(state)
+        )
+        for state in states
+    }
+    spreads: dict[str, float] = {}
+    for family in ("overall", "spark"):
+        values = [
+            family_values[family]
+            for family_values in observations.values()
+            if family_values[family] is not None
+        ]
+        if len(values) >= 2:
+            spreads[family] = max(values) - min(values)
+
+    constrained = [
+        family for family, spread in spreads.items()
+        if spread + 1e-9 >= band
+    ]
+    if constrained:
+        controlling_family = max(
+            constrained,
+            key=lambda family: (spreads[family], family == "overall"),
+        )
+        scored = [
+            (
+                observations[
+                    str(state["candidate"].get("codex_oauth_account_hash") or "")
+                ][controlling_family],
+                state,
+            )
+            for state in states
+        ]
+        known = [(value, state) for value, state in scored if value is not None]
+        if known:
+            selected = max(known, key=lambda item: item[0])[1]
+            selected = dict(selected)
+            selected["selection_diagnostics"] = {
+                **dict(selected.get("selection_diagnostics") or {}),
+                "strategy": "dual_quota_balance",
+                "balance_band_percentage_points": band,
+                "controlling_quota_family": controlling_family,
+                "weekly_remaining_spreads_pp": {
+                    key: round(value, 3) for key, value in spreads.items()
+                },
+                "account_weekly_remaining_pct": observations,
+            }
+            return selected
+
+    if (
+        candidate.get("codex_oauth_within_band_strategy")
+        == "weighted_round_robin"
+    ):
+        selected = dict(
+            _select_codex_oauth_weighted_round_robin_state(states)
+        )
+        selected["selection_diagnostics"] = {
+            **dict(selected.get("selection_diagnostics") or {}),
+            "strategy": "weighted_round_robin",
+            "balance_band_percentage_points": band,
+            "weekly_remaining_spreads_pp": {
+                key: round(value, 3) for key, value in spreads.items()
+            },
+            "account_weekly_remaining_pct": observations,
+        }
+        return selected
+    return None
+
+
 def _select_first_available_codex_oauth_account_state(
     states: Sequence[dict[str, Any]],
 ) -> Optional[dict[str, Any]]:
@@ -1680,6 +1903,9 @@ def _select_first_available_codex_oauth_account_state(
     ]
     if not available:
         return None
+    dual_balanced = _prefer_codex_oauth_dual_quota_balanced_state(available)
+    if dual_balanced is not None:
+        return dual_balanced
     balanced = _prefer_codex_oauth_weekly_balanced_state(available)
     return balanced if balanced is not None else available[0]
 
@@ -2116,17 +2342,29 @@ async def _build_codex_auto_agent_affinity_candidate_state(
         affinity=affinity,
     )
     await _aawm_selection._hydrate_codex_oauth_quota_observations(contexts)
-    context = contexts[0]
-    state = await _build_codex_auto_agent_candidate_state(
-        request,
-        candidate_template=context["candidate"],
-        openai_lane_key=context["lane_key"],
-    )
-    return _apply_codex_oauth_account_context_to_state(
-        request,
-        state,
-        context=context,
-    )
+    states: list[dict[str, Any]] = []
+    for context in contexts:
+        state = await _build_codex_auto_agent_candidate_state(
+            request,
+            candidate_template=context["candidate"],
+            openai_lane_key=context["lane_key"],
+        )
+        states.append(
+            _apply_codex_oauth_account_context_to_state(
+                request,
+                state,
+                context=context,
+            )
+        )
+    if (
+        affinity.get("codex_oauth_credential_affinity")
+        == "interchangeable"
+    ):
+        return (
+            _select_first_available_codex_oauth_account_state(states)
+            or states[0]
+        )
+    return states[0]
 
 
 async def _build_anthropic_auto_agent_affinity_candidate_state(
@@ -2959,6 +3197,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         if existing_affinity is not None:
             affinity_bypassed = True
 
+    affinity = _apply_codex_oauth_inventory_affinity_policy(affinity)
     if affinity is not None:
         affinity_candidate = _find_codex_auto_agent_affinity_candidate(
             affinity,
@@ -3576,6 +3815,7 @@ _HOST_FUNCTION_NAMES = (
     "_extract_codex_request_redispatch_ordinal",
     "_resolve_codex_request_mode_and_ordinal",
     "_codex_auto_agent_candidate_public_shape",
+    "_codex_oauth_routing_candidate_fields",
     "_is_auto_agent_candidate_state_available",
     "_build_auto_agent_skipped_candidates_from_states",
     "_get_codex_auto_agent_request_local_cooldown_key",
@@ -3605,6 +3845,7 @@ _HOST_FUNCTION_NAMES = (
     "_candidate_uses_codex_oauth",
     "_is_codex_oauth_account_candidate",
     "_candidate_matches_affinity",
+    "_apply_codex_oauth_inventory_affinity_policy",
     "_resolve_codex_oauth_account_candidate_contexts",
     "_get_anthropic_auto_agent_candidate_cooldown_state",
     "_build_codex_auto_agent_candidate_state",
@@ -3625,6 +3866,9 @@ _HOST_FUNCTION_NAMES = (
     "_codex_oauth_weekly_remaining_pct_from_windows",
     "_codex_oauth_state_weekly_remaining_pct",
     "_prefer_codex_oauth_weekly_balanced_state",
+    "_codex_oauth_dual_family_remaining",
+    "_select_codex_oauth_weighted_round_robin_state",
+    "_prefer_codex_oauth_dual_quota_balanced_state",
     "_select_first_available_codex_oauth_account_state",
     "_apply_codex_oauth_account_context_to_state",
     "_build_codex_auto_agent_affinity_candidate_state",

@@ -2,7 +2,10 @@
 # - account1: sourced from Seshat ~/.codex/auth.json; owner rdkick+openai@pm.me
 # - account2: sourced from Thoth ~/.codex/auth.json; owner rdkick+openai2@pm.me
 x-codex-oauth-inventory: &codex-oauth-inventory >-
-  LITELLM_CODEX_OAUTH_INVENTORY={"schema_version":1,"accounts":[
+  LITELLM_CODEX_OAUTH_INVENTORY={"schema_version":1,"routing":{
+  "credential_affinity":"interchangeable","strategy":"dual_quota_balance",
+  "balance_band_percentage_points":10,
+  "within_band_strategy":"weighted_round_robin"},"accounts":[
   {"label":"account1","auth_path":"/home/zepfu/.codex/oauth.account1.json",
   "lock_path":"/home/zepfu/.codex/oauth.account1.json.lock","priority":10,
   "weight":1.0,"enabled":${AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED:-true},

@@ -205,16 +205,29 @@ cache. Confirmed exhaustion requires a fresh window with `exhausted=true` and
 not treated as confirmed exhaustion and does not by itself remove an otherwise
 admissible account.
 
-Within one request, routing may make at most one immediate pre-first-byte move
-to another admissible account after a capacity, rate-limit, usage-limit, or
-candidate-unavailable failure. After the first response byte, or after that
-single account move is consumed, no further account failover is planned for the
-request. Continuations stay account-pinned to the affinity label/hash/lane and
-fail fast with a structured safe `429` when that pinned account is unavailable;
-they do not search sibling accounts. When no account is admissible for a new
-selection, the proxy returns a structured safe `429` that may include skipped
-candidate metadata and terminal reset information built only from configured
-labels, expected account hashes, lanes, and public quota window fields.
+The optional inventory `routing` object controls account-pool behavior. Its
+backward-compatible default is account-pinned priority order. A configured
+`credential_affinity: interchangeable` pool keeps provider, model, route,
+endpoint, and encrypted-state-format session affinity while treating account
+label/hash/lane as per-attempt telemetry. Stateless continuation input may then
+make at most one immediate pre-first-byte move to another admissible account
+after a capacity, rate-limit, usage-limit, or candidate-unavailable failure.
+Requests carrying `previous_response_id` remain account-bound because that
+state is stored by the provider. After the first response byte, or after the
+single account move is consumed, no further account failover is planned.
+
+With `strategy: dual_quota_balance`, routing evaluates the overall seven-day
+Codex and Codex Spark seven-day families together. If either account spread is
+at or above `balance_band_percentage_points`, the selector favors the account
+with more remaining quota in the most constrained family. When both families
+are within the configured band, `within_band_strategy:
+weighted_round_robin` regularly alternates eligible accounts according to
+their inventory weights. Missing or stale observations do not create quota
+facts; the within-band policy supplies the configured deterministic fallback.
+When no account is admissible, the proxy returns a structured safe `429` that
+may include skipped candidate metadata and terminal reset information built
+only from configured labels, expected account hashes, lanes, and public quota
+window fields.
 
 Selected-account identity in request state, attempt records, and operator-facing
 errors is limited to the stable label, expected hash, lane key, priority/weight,
