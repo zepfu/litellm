@@ -2527,6 +2527,21 @@ def request_session_owner_already_guarded(request: Any) -> bool:
     return value is True
 
 
+def reset_released_request_session_owner_guard(request: Any) -> bool:
+    """Allow a fresh-request retry after its reservation was released."""
+    if request is None:
+        return False
+    state = getattr(request, "state", None)
+    if state is None:
+        return False
+    lease = get_request_session_owner_lease(request)
+    if lease is not None and not lease.released:
+        return False
+    setattr(state, _REQUEST_STATE_LEASE_ATTR, None)
+    setattr(state, _REQUEST_STATE_GUARDED_ATTR, False)
+    return True
+
+
 async def ensure_session_owner_guard_for_request(
     *,
     request: Any = None,

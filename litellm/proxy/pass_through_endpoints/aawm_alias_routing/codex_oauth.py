@@ -961,6 +961,51 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     return selected_auth, selection_state, metadata_body
 
 
+def is_direct_codex_usage_limit_error(exc: HTTPException) -> bool:
+    """Return whether a direct Codex request hit account quota exhaustion."""
+    if exc.status_code != 429 or not isinstance(exc.detail, dict):
+        return False
+    error = exc.detail.get("error")
+    return bool(
+        isinstance(error, dict)
+        and error.get("code") == "usage_limit_reached"
+        and exc.detail.get("failover_disposition") == "usage_limit_reached"
+    )
+
+
+def direct_codex_usage_limit_retry_after_seconds(
+    exc: HTTPException,
+    *,
+    now_epoch: Optional[float] = None,
+) -> float:
+    """Resolve the provider reset interval, with a bounded fallback."""
+    headers = exc.headers or {}
+    retry_after = headers.get("Retry-After") or headers.get("retry-after")
+    try:
+        parsed_retry_after = float(retry_after)
+    except (TypeError, ValueError):
+        parsed_retry_after = 0.0
+    if parsed_retry_after > 0:
+        return parsed_retry_after
+
+    detail = exc.detail if isinstance(exc.detail, dict) else {}
+    quota = detail.get("quota")
+    if isinstance(quota, dict):
+        try:
+            resets_in_seconds = float(quota.get("resets_in_seconds"))
+        except (TypeError, ValueError):
+            resets_in_seconds = 0.0
+        if resets_in_seconds > 0:
+            return resets_in_seconds
+        try:
+            resets_at = float(quota.get("resets_at"))
+        except (TypeError, ValueError):
+            resets_at = 0.0
+        if resets_at > 0:
+            return max(1.0, resets_at - (time.time() if now_epoch is None else now_epoch))
+    return 300.0
+
+
 # ---------------------------------------------------------------------------
 # Codex-native-auth request detection
 # ---------------------------------------------------------------------------

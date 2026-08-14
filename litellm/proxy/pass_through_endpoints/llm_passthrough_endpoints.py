@@ -3405,6 +3405,67 @@ async def llm_passthrough_factory_proxy_route(
     return received_value
 
 
+async def _retry_direct_codex_oauth_after_usage_limit(
+    *,
+    request: Request,
+    request_body: dict[str, Any],
+    selection: dict[str, Any],
+    exc: HTTPException,
+) -> Optional[tuple[Any, dict[str, Any]]]:
+    cooldown_seconds = (
+        _aawm_codex_oauth.direct_codex_usage_limit_retry_after_seconds(exc)
+    )
+    cooldown_key = str(selection.get("cooldown_key") or "").strip()
+    if cooldown_key and cooldown_seconds > 0:
+        _publish_codex_cooldown_memory(
+            keys=(cooldown_key,),
+            seconds=cooldown_seconds,
+        )
+        try:
+            await _persist_codex_cooldown_durable(
+                keys=(cooldown_key,),
+                seconds=cooldown_seconds,
+            )
+        except Exception as persist_exc:  # noqa: BLE001
+            verbose_proxy_logger.warning(
+                "Direct Codex account cooldown persistence failed; "
+                "continuing request-local failover (error_class=%s)",
+                persist_exc.__class__.__name__,
+            )
+
+    candidate = selection.get("candidate")
+    retry_planned = (
+        isinstance(candidate, dict)
+        and _aawm_selection._plan_codex_oauth_account_failover(
+            request,
+            candidate=candidate,
+            selection=selection,
+            attempt_record={
+                "failure_phase": "direct_openai_provider_response",
+                "attempted_provider_call": True,
+            },
+            error_class="usage_limit_reached",
+            has_continuation_state=selection.get("request_mode") != "fresh",
+        )
+    )
+    if not retry_planned:
+        return None
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as _sa,
+    )
+
+    if not _sa.reset_released_request_session_owner_guard(request):
+        return None
+    retry_auth, retry_selection, _metadata = (
+        await _aawm_codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+            request,
+            request_body=request_body,
+        )
+    )
+    return retry_auth, retry_selection
+
+
 @router.api_route(
     "/gemini/{endpoint:path}",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
@@ -5656,6 +5717,7 @@ async def openai_proxy_route(
     openai_api_key: Optional[str] = None
     forward_headers = False
     extra_headers: Optional[dict[str, str]] = None
+    direct_codex_selection_state: Optional[dict[str, Any]] = None
     if is_oa_xai_request:
         base_target_url = os.getenv("LITELLM_XAI_OAUTH_API_BASE") or XAI_API_BASE
     elif is_grok_native_oauth_request:
@@ -5667,7 +5729,7 @@ async def openai_proxy_route(
         # upstream auth never depend on inbound client bearer / account ids.
         (
             selected_auth,
-            _selection_state,
+            direct_codex_selection_state,
             _metadata_body,
         ) = await _aawm_codex_oauth.select_and_bind_direct_codex_oauth_inventory(
             request,
@@ -5687,17 +5749,39 @@ async def openai_proxy_route(
         if openai_api_key is None:
             raise Exception("Required 'OPENAI_API_KEY' in environment to make pass-through calls to OpenAI.")
 
-    return await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
-        endpoint=endpoint,
-        request=request,
-        fastapi_response=fastapi_response,
-        user_api_key_dict=user_api_key_dict,
-        base_target_url=base_target_url,
-        api_key=openai_api_key,
-        custom_llm_provider=litellm.LlmProviders.OPENAI,
-        extra_headers=extra_headers,
-        forward_headers=forward_headers,
-    )
+    while True:
+        try:
+            return await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                base_target_url=base_target_url,
+                api_key=openai_api_key,
+                custom_llm_provider=litellm.LlmProviders.OPENAI,
+                extra_headers=extra_headers,
+                forward_headers=forward_headers,
+            )
+        except HTTPException as exc:
+            if (
+                not use_direct_codex_oauth_inventory
+                or direct_codex_selection_state is None
+                or not _aawm_codex_oauth.is_direct_codex_usage_limit_error(exc)
+            ):
+                raise
+            retry = await _retry_direct_codex_oauth_after_usage_limit(
+                request=request,
+                request_body=request_body,
+                selection=direct_codex_selection_state,
+                exc=exc,
+            )
+            if retry is None:
+                raise
+            retry_auth, direct_codex_selection_state = retry
+            base_target_url = os.getenv("CHATGPT_API_BASE") or CHATGPT_API_BASE
+            openai_api_key = None
+            extra_headers = dict(retry_auth.headers)
+            forward_headers = False
 
 
 

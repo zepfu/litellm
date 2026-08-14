@@ -20,6 +20,7 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     candidate_loop,
     codex_oauth,
+    selection,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
     AliasRouteServices,
@@ -1457,6 +1458,46 @@ async def test_direct_responses_skips_exhausted_account_and_fails_over(
         item.get("cooldown_state_source") == "normalized_quota_observation"
         for item in account1_skipped
     ), f"account1 cooldown source missing: {account1_skipped!r}"
+    alias_routing_state.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_direct_responses_request_local_usage_limit_selects_next_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_direct_inventory_auth(monkeypatch)
+    request = _direct_request()
+    body = {"model": "gpt-5.6-sol", "input": "hello"}
+    alias_routing_state.reset_for_tests()
+
+    _auth, first, _metadata = (
+        await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+            request,
+            request_body=body,
+        )
+    )
+    assert first["candidate"]["codex_oauth_account_label"] == "account1"
+    assert selection._plan_codex_oauth_account_failover(
+        request,
+        candidate=first["candidate"],
+        selection=first,
+        attempt_record={
+            "failure_phase": "direct_openai_provider_response",
+            "attempted_provider_call": True,
+        },
+        error_class="usage_limit_reached",
+        has_continuation_state=False,
+    )
+
+    _auth, second, _metadata = (
+        await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+            request,
+            request_body=body,
+        )
+    )
+    assert second["candidate"]["codex_oauth_account_label"] == "account2"
+    assert second["failover_ordinal"] == 1
+    assert second["prior_account_outcome"]["outcome"] == "usage_limit_reached"
     alias_routing_state.reset_for_tests()
 
 
