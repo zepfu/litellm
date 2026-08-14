@@ -311,7 +311,7 @@ cmd_activate() {
   require_cmd tailscale
 
   socket_listen_check "$SERVICE_IP" "$SERVICE_PORT"
-  tailscale serve --service="${TAILSCALE_SERVICE}" --tun --tcp "${SERVICE_PORT}" --yes
+  tailscale serve --service="${TAILSCALE_SERVICE}" --tun --yes
   printf 'activate complete: %s\n' "$TAILSCALE_SERVICE"
 }
 
