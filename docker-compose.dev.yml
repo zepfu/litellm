@@ -31,6 +31,7 @@ services:
         max-file: "5"
     ports:
       - "127.0.0.1:4001:4001"
+      - "100.109.19.233:4001:4001"
     volumes:
       # Mount source for live code changes (identity package + key files)
       - ./litellm/integrations/aawm_agent_identity:/app/litellm/integrations/aawm_agent_identity

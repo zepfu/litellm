@@ -72,6 +72,44 @@ resolved upstream and disables fallback. Scan candidate logs for tracebacks,
 with a rollback checkpoint, prove the live canary, then delete the checkpoint.
 This gate applies only to `litellm-dev`; never touch `aawm-litellm`.
 
+## D1-622 `litellm-dev` Transport Binding
+
+Use this sequence for the D1-622 service transport: install once, apply before every
+`litellm-dev` direct rebuild, verify status, then rollback if needed.
+
+- Install:
+  - Keep existing `127.0.0.1:4001` bind.
+  - Add explicit `100.109.19.233:4001:4001` in `docker-compose.dev.yml`.
+  - Install `scripts/litellm-dev-transport.sh` and `scripts/litellm-dev-transport.service`.
+  - Persisted install sequence (dev-only):
+    - `sudo chmod +x /home/zepfu/projects/litellm/scripts/litellm-dev-transport.sh`
+    - `sudo install -m 0644 /home/zepfu/projects/litellm/scripts/litellm-dev-transport.service /etc/systemd/system/litellm-dev-transport.service`
+    - `sudo systemctl daemon-reload`
+    - `sudo systemctl enable litellm-dev-transport.service`
+    - `sudo systemctl start litellm-dev-transport.service`
+    - `sudo /home/zepfu/projects/litellm/scripts/litellm-dev-transport.sh status`
+  - Keep this strictly dev-scoped: no production service dependency or wrapper changes.
+- Apply:
+  1. `sudo /home/zepfu/projects/litellm/scripts/litellm-dev-transport.sh prepare`
+  2. Recreate/restart dev proxy as part of the direct rebuild sequence.
+  3. `sudo /home/zepfu/projects/litellm/scripts/litellm-dev-transport.sh activate`
+- Status:
+  - `sudo /home/zepfu/projects/litellm/scripts/litellm-dev-transport.sh status`
+- Rollback:
+  1. `sudo /home/zepfu/projects/litellm/scripts/litellm-dev-transport.sh rollback`
+     (restores `svc:litellm-dev` as `tcp:4001 -> tcp://127.0.0.1:4001`)
+     `svc:litellm-dev` and the `100.109.19.233` dummy VIP/NFT guard are intentionally retained so future `litellm-dev` recreates can still bind.
+  2. Confirm VIP/NFT and service mapping state with `sudo /home/zepfu/projects/litellm/scripts/litellm-dev-transport.sh status`.
+
+When a direct rebuild is needed, run `prepare` before the compose rebuild/recreate step
+(to re-establish the dummy VIP and nft table if needed), then run `activate` only after the
+VIP listener is actually accepting on `100.109.19.233:4001`.
+
+Compose render/build requires both approved external values:
+`AAWM_CODEX_OAUTH_ACCOUNT1_EXPECTED_HASH` and `AAWM_CODEX_OAUTH_ACCOUNT2_EXPECTED_HASH`.
+Do not add these secrets in-repo; provide them in the environment for production rendering/builds.
+Use non-secret placeholders only for local static syntax checks when current environment values are unavailable.
+
 ## Anthropic Model Routing TOS Boundary
 
 Release validation must determine Anthropic model traffic from the selected

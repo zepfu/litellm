@@ -1,0 +1,13 @@
+[Unit]
+Description=Prepare D1-622 LiteLLM dev transport
+Wants=network-online.target
+After=network-online.target NetworkManager.service
+Before=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/zepfu/projects/litellm
+ExecStart=/home/zepfu/projects/litellm/scripts/litellm-dev-transport.sh prepare
+
+[Install]
+WantedBy=multi-user.target
