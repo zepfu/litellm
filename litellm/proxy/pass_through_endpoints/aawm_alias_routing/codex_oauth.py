@@ -7,6 +7,7 @@ depends on the pass-through header prefix constant).
 
 from __future__ import annotations
 
+import ast
 import base64
 import json
 import os
@@ -961,6 +962,23 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
     return selected_auth, selection_state, metadata_body
 
 
+def _direct_codex_error_detail(exc: Exception) -> dict[str, Any]:
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict):
+        return detail
+    message = getattr(exc, "message", None)
+    if not isinstance(message, str) or len(message) > 65_536:
+        return {}
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            parsed = parser(message)
+        except (TypeError, ValueError, SyntaxError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
 def is_direct_codex_usage_limit_error(exc: Exception) -> bool:
     """Return whether a direct Codex request hit account quota exhaustion."""
     status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
@@ -968,8 +986,8 @@ def is_direct_codex_usage_limit_error(exc: Exception) -> bool:
         parsed_status_code = int(status_code)
     except (TypeError, ValueError):
         return False
-    detail = getattr(exc, "detail", None)
-    if parsed_status_code != 429 or not isinstance(detail, dict):
+    detail = _direct_codex_error_detail(exc)
+    if parsed_status_code != 429 or not detail:
         return False
     error = detail.get("error")
     return bool(
@@ -998,8 +1016,7 @@ def direct_codex_usage_limit_retry_after_seconds(
     if parsed_retry_after > 0:
         return parsed_retry_after
 
-    raw_detail = getattr(exc, "detail", None)
-    detail = raw_detail if isinstance(raw_detail, dict) else {}
+    detail = _direct_codex_error_detail(exc)
     quota = detail.get("quota")
     if isinstance(quota, dict):
         try:

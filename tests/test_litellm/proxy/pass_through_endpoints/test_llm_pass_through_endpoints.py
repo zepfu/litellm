@@ -27807,18 +27807,17 @@ class TestOpenAIPassthroughRoute:
             )
             attempts.append(authorization)
             if authorization == "Bearer account1":
-                exc = ProxyException(
-                    message="usage limit reached",
-                    type="None",
-                    param=None,
-                    code=429,
-                )
-                exc.detail = {
+                detail = {
                     "error": {"code": "usage_limit_reached"},
                     "quota": {"resets_in_seconds": 900},
                     "failover_disposition": "usage_limit_reached",
                 }
-                exc.upstream_headers = {"Retry-After": "900"}
+                exc = ProxyException(
+                    message=str(detail),
+                    type="None",
+                    param=None,
+                    code=429,
+                )
                 raise exc
             return Response(content=b"ok", status_code=200)
 
