@@ -516,6 +516,130 @@ def route_requires_account_identity(attributes: Mapping[str, Any]) -> bool:
     return any(marker in blob for marker in _ACCOUNT_SCOPED_ROUTE_MARKERS)
 
 
+# Exact OpenAI/Codex model-list paths. Do not treat /models/{id} as discovery.
+_OPENAI_MODELS_DISCOVERY_PATHS = frozenset(
+    {
+        "/models",
+        "/v1/models",
+        "/openai/models",
+        "/openai/v1/models",
+        "/openai_passthrough/models",
+        "/openai_passthrough/v1/models",
+        "/backend-api/codex/models",
+    }
+)
+
+
+def _normalize_openai_models_discovery_path(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8")
+        except Exception:  # noqa: BLE001
+            return None
+    path = getattr(value, "path", None)
+    raw = path if isinstance(path, str) and path else (value if isinstance(value, str) else None)
+    if not isinstance(raw, str):
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    raw = raw.split("?", 1)[0].split("#", 1)[0]
+    if "://" in raw:
+        _, rest = raw.split("://", 1)
+        slash = rest.find("/")
+        raw = rest[slash:] if slash >= 0 else "/"
+    if not raw.startswith("/"):
+        raw = "/" + raw
+    if len(raw) > 1:
+        raw = raw.rstrip("/")
+    return raw or None
+
+
+def _iter_openai_models_discovery_paths(
+    request: Any,
+    *,
+    endpoint: Any = None,
+    url: Any = None,
+) -> list[str]:
+    candidates = [endpoint, url]
+    if request is not None:
+        candidates.append(getattr(request, "url", None))
+        scope = getattr(request, "scope", None)
+        if isinstance(scope, Mapping):
+            candidates.append(scope.get("path"))
+            candidates.append(scope.get("raw_path"))
+    paths: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = _normalize_openai_models_discovery_path(candidate)
+        if normalized is None or normalized in seen:
+            continue
+        seen.add(normalized)
+        paths.append(normalized)
+    return paths
+
+
+def _request_has_inbound_openai_auth(request: Any) -> bool:
+    headers = getattr(request, "headers", None) if request is not None else None
+    if headers is None:
+        return False
+    try:
+        items = headers.items()  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        return False
+    for name, value in items:
+        if str(name).lower() not in {"authorization", "api-key"}:
+            continue
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _request_uses_codex_native_auth_markers(request: Any) -> bool:
+    if request is None:
+        return False
+    try:
+        from .codex_oauth import _request_uses_codex_native_auth
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        return bool(_request_uses_codex_native_auth(request))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def should_skip_session_owner_for_openai_models_discovery(
+    request: Any = None,
+    *,
+    endpoint: Any = None,
+    url: Any = None,
+) -> bool:
+    """True for authenticated Codex-native GET OpenAI/Codex model listing.
+
+    OPENAI-013: ``GET /models`` and ``GET /v1/models`` create no generation or
+    continuation state, so both enforcement layers skip reservation/validation.
+    Responses, chat, and other state-bearing calls remain guarded.
+    """
+
+    method = getattr(request, "method", None) if request is not None else None
+    if not isinstance(method, str) or method.upper() != "GET":
+        return False
+    if not _request_has_inbound_openai_auth(request):
+        return False
+    if not _request_uses_codex_native_auth_markers(request):
+        return False
+    return any(
+        path in _OPENAI_MODELS_DISCOVERY_PATHS
+        for path in _iter_openai_models_discovery_paths(
+            request,
+            endpoint=endpoint,
+            url=url,
+        )
+    )
+
+
 def incomplete_owner_attribute_reason(
     attributes: Optional[Mapping[str, Any]],
     *,

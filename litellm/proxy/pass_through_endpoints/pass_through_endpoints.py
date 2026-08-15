@@ -3652,6 +3652,11 @@ async def _aawm_session_owner_pre_send_guard(
             ),
         )
     sa = _session_affinity_mod()
+    if sa.should_skip_session_owner_for_openai_models_discovery(
+        request,
+        url=url,
+    ):
+        return
     if sa.request_session_owner_already_guarded(request):
         # Renew held reservation before potentially long upstream I/O.
         lease = sa.get_request_session_owner_lease(request)

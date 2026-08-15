@@ -27335,6 +27335,9 @@ class TestOpenAIPassthroughRoute:
         GET /models and /v1/models from a Codex-native authenticated client should use
         inbound headers and the ChatGPT passthrough backend.
         """
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            session_affinity as sa,
+        )
         from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
             openai_proxy_route,
         )
@@ -27350,6 +27353,11 @@ class TestOpenAIPassthroughRoute:
             "user-agent": "codex_exec/0.145.0",
         }
         mock_request.query_params = {"client_version": expected_client_version}
+        mock_request.url = SimpleNamespace(
+            path=f"/openai_passthrough/{endpoint}"
+        )
+        mock_request.scope = {"path": f"/openai_passthrough/{endpoint}"}
+        mock_request.state = SimpleNamespace()
         mock_response = MagicMock(spec=Response)
         mock_user_api_key_dict = MagicMock()
 
@@ -27357,7 +27365,21 @@ class TestOpenAIPassthroughRoute:
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials"
         ) as mock_get_credentials, patch(
             "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
-        ) as mock_create_route:
+        ) as mock_create_route, patch.object(
+            sa,
+            "ensure_session_owner_guard_for_request",
+            new=AsyncMock(
+                side_effect=AssertionError(
+                    "Codex-native GET /models must skip session-owner reservation"
+                )
+            ),
+        ) as mock_ensure, patch.object(
+            sa,
+            "raise_session_owner_redispatch_required",
+            side_effect=AssertionError(
+                "Codex-native GET /models must not raise session-owner 409"
+            ),
+        ) as mock_raise:
             mock_endpoint_func = AsyncMock(return_value={"data": []})
             mock_create_route.return_value = mock_endpoint_func
 
@@ -27376,6 +27398,116 @@ class TestOpenAIPassthroughRoute:
             assert call_args["custom_headers"] == {}
             assert call_args["_forward_headers"] is True
             assert result == {"data": []}
+            mock_ensure.assert_not_called()
+            mock_raise.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_openai_passthrough_codex_native_responses_still_invokes_session_owner_guard(
+        self,
+    ):
+        """
+        Generation still requires session-owner reservation/validation. Model-list
+        discovery is the only Codex-native GET exclusion.
+        """
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            session_affinity as sa,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            durable as durable_mod,
+        )
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            openai_proxy_route,
+        )
+        from tests.test_litellm.proxy.pass_through_endpoints.test_d1_612_session_affinity import (
+            _FakeRedisCache,
+            _patch_dual,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.headers = {
+            "content-type": "application/json",
+            "authorization": "Bearer server-selected-token",
+            "chatgpt-account-id": "acct_123",
+            "originator": "codex_exec",
+            "session_id": "sess_123",
+            "user-agent": "codex_exec/0.145.0",
+        }
+        mock_request.query_params = {}
+        mock_request.url = SimpleNamespace(path="/openai_passthrough/v1/responses")
+        mock_request.scope = {"path": "/openai_passthrough/v1/responses"}
+        mock_request.state = SimpleNamespace()
+        request_body = {
+            "model": "gpt-5.4-codex",
+            "input": [{"role": "user", "content": "ping"}],
+        }
+        mock_request.body = AsyncMock(
+            return_value=json.dumps(request_body).encode("utf-8")
+        )
+        mock_request.json = AsyncMock(return_value=request_body)
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+        redis = _FakeRedisCache()
+        guard_calls: list[dict[str, Any]] = []
+
+        async def _capture_guard(**kwargs):
+            guard_calls.append(kwargs)
+            return await real_ensure(**kwargs)
+
+        real_ensure = sa.ensure_session_owner_guard_for_request
+        with _patch_dual(redis), patch.object(
+            durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+        ), patch.object(
+            sa,
+            "ensure_session_owner_guard_for_request",
+            side_effect=_capture_guard,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_alias_model",
+            return_value=None,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_oa_xai_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_grok_native_oauth_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._should_use_direct_codex_oauth_inventory",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials",
+            return_value="sk-test-key",
+        ) as mock_get_credentials, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+        ) as mock_create_route:
+            mock_endpoint_func = AsyncMock(
+                return_value={"id": "resp_123", "status": "completed"}
+            )
+            mock_create_route.return_value = mock_endpoint_func
+
+            try:
+                result = await openai_proxy_route(
+                    endpoint="v1/responses",
+                    request=mock_request,
+                    fastapi_response=mock_response,
+                    user_api_key_dict=mock_user_api_key_dict,
+                )
+            except HTTPException as exc:
+                assert exc.status_code == 409
+                detail = exc.detail
+                assert detail["error"]["code"] == (
+                    "aawm_session_owner_redispatch_required"
+                )
+                requested = detail.get("candidate") or {}
+            else:
+                mock_create_route.assert_called_once()
+                assert result == {"id": "resp_123", "status": "completed"}
+                assert guard_calls
+                requested = guard_calls[0].get("requested_attributes") or {}
+        mock_get_credentials.assert_called_once()
+        assert requested.get("model") == "gpt-5.4-codex"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("endpoint", ["models", "v1/models"])

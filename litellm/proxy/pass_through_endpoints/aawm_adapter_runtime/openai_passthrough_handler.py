@@ -563,7 +563,11 @@ class BaseOpenAIPassThroughHandler:
             )
 
         session_owner_lease = None
-        if not _sa.request_session_owner_already_guarded(request):
+        if not _sa.should_skip_session_owner_for_openai_models_discovery(
+            request,
+            endpoint=endpoint,
+            url=updated_url,
+        ) and not _sa.request_session_owner_already_guarded(request):
             direct_body = endpoint_custom_body if isinstance(endpoint_custom_body, dict) else {}
             canonical_session_identity = _sa.resolve_canonical_session_identity(
                 request,
