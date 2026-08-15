@@ -18,10 +18,12 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     codex_candidate_calls,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    attempt_records,
     candidate_loop,
     codex_oauth,
     selection,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import rollup
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
     AliasRouteServices,
     CooldownPublicationPlan,
@@ -583,7 +585,13 @@ def _loop_services(
         publish_cooldown_memory_fn=lambda **kwargs: None,
         persist_cooldown_fn=_persist,
         set_session_affinity_fn=_set_affinity,
-        add_alias_metadata_fn=lambda body, **kwargs: dict(body),
+        add_alias_metadata_fn=lambda body, **kwargs: {
+            **dict(body),
+            "litellm_metadata": {
+                "aawm_alias_routing_audit_events": [],
+                "codex_auto_agent_attempts": list(kwargs.get("attempts") or []),
+            },
+        },
         raise_redispatch_fn=(
             raise_redispatch
             if raise_redispatch is not None
@@ -687,6 +695,28 @@ async def test_candidate_loop_allows_exactly_one_account_move(
     assert exc_info.value.status_code == 429
     assert selected_labels == ["account1", "account2"]
     assert performed_labels == ["account1", "account2"]
+    request_identity = attempt_records._resolve_auto_agent_alias_request_identity(
+        request
+    )
+    assert request_identity
+    request_outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    assert request_outcome["outcome"] == "failed"
+    assert request_outcome["request_identity"] == request_identity
+    captured_attempts = list(request_outcome.get("attempts") or [])
+    assert [item["account_label"] for item in captured_attempts] == [
+        "account1",
+        "account2",
+    ]
+    assert captured_attempts[0]["request_outcome"] == "pending_failover"
+    assert captured_attempts[1]["request_outcome"] == "failed"
+    terminal_event = {
+        "event_type": "no_candidate_available",
+        "request_outcome": "failed",
+        "request_identity": request_identity,
+        "candidates": captured_attempts,
+        "failure_class": "capacity_exhausted",
+    }
+    assert rollup._auto_agent_alias_route_rollup_status(terminal_event) == "Exhausted"
 
 
 @pytest.mark.asyncio
@@ -762,6 +792,79 @@ async def test_candidate_loop_continuation_usage_limit_fails_over_interchangeabl
     assert response.status_code == 200
     assert selected_labels == ["account1", "account2"]
     assert performed_labels == ["account1", "account2"]
+    request_identity = attempt_records._resolve_auto_agent_alias_request_identity(
+        request
+    )
+    assert request_identity
+    request_outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    assert request_outcome["outcome"] == "recovered"
+    assert request_outcome["request_identity"] == request_identity
+    captured_attempts = list(request_outcome.get("attempts") or [])
+    assert [item["account_label"] for item in captured_attempts] == [
+        "account1",
+        "account2",
+    ]
+    assert captured_attempts[0]["error_class"] == "usage_limit_reached"
+    assert captured_attempts[0]["request_outcome"] == "pending_failover"
+    assert captured_attempts[1]["status"] == "recovered"
+    assert captured_attempts[1]["request_outcome"] == "recovered"
+    pending_event = {
+        "event_type": "candidate_retryable_failure",
+        "candidate_status": captured_attempts[0].get("status"),
+        "failure_class": captured_attempts[0].get("error_class"),
+        "request_outcome": captured_attempts[0].get("request_outcome"),
+        "account_failover_planned": True,
+        "request_identity": request_identity,
+        "error_status_code": 429,
+    }
+    recovered_event = {
+        "event_type": "candidate_recovered",
+        "candidate_status": "recovered",
+        "request_outcome": "recovered",
+        "request_identity": request_identity,
+    }
+    assert rollup._auto_agent_alias_route_rollup_status(pending_event) is None
+    assert rollup._auto_agent_alias_route_rollup_status(recovered_event) == "Recovered"
+
+
+def test_recovered_failover_does_not_override_unrelated_request_failure() -> None:
+    recovered_event = {
+        "event_type": "candidate_recovered",
+        "candidate_status": "recovered",
+        "request_outcome": "recovered",
+        "request_identity": "call-recovered",
+        "alias_model": "basic",
+        "model": "gpt-5.3-codex",
+        "failure_class": "usage_limit_reached",
+        "error_status_code": 429,
+    }
+    failed_event = {
+        "event_type": "no_candidate_available",
+        "request_outcome": "failed",
+        "request_identity": "call-failed",
+        "alias_model": "basic",
+        "model": "gpt-5.3-codex",
+        "failure_class": "usage_limit_reached",
+        "error_status_code": 429,
+    }
+    assert rollup._auto_agent_alias_route_rollup_status(recovered_event) == "Recovered"
+    assert rollup._auto_agent_alias_route_rollup_status(failed_event) == "Exhausted"
+    assert rollup._auto_agent_alias_event_request_identity(recovered_event) == (
+        "call-recovered"
+    )
+    assert rollup._auto_agent_alias_event_request_identity(failed_event) == (
+        "call-failed"
+    )
+    pending_same_request = {
+        "event_type": "candidate_retryable_failure",
+        "candidate_status": "cooldown_set",
+        "failure_class": "usage_limit_reached",
+        "request_outcome": "pending_failover",
+        "account_failover_planned": True,
+        "request_identity": "call-recovered",
+        "error_status_code": 429,
+    }
+    assert rollup._auto_agent_alias_route_rollup_status(pending_same_request) is None
 
 
 @pytest.mark.asyncio

@@ -49,6 +49,9 @@ def configure_rollup_runtime(
             {
                 "_resolve_auto_agent_alias_route_rollup_outgoing_target": _resolve_auto_agent_alias_route_rollup_outgoing_target,
                 "_auto_agent_alias_model_rollup_label": _auto_agent_alias_model_rollup_label,
+                "_auto_agent_alias_event_request_identity": _auto_agent_alias_event_request_identity,
+                "_auto_agent_alias_request_outcome_is_recovered": _auto_agent_alias_request_outcome_is_recovered,
+                "_auto_agent_alias_request_outcome_is_pending_failover": _auto_agent_alias_request_outcome_is_pending_failover,
                 "_auto_agent_alias_route_rollup_status": _auto_agent_alias_route_rollup_status,
                 "_auto_agent_alias_route_status_message": _auto_agent_alias_route_status_message,
                 "_build_auto_agent_alias_rollup_group_header_label": _build_auto_agent_alias_rollup_group_header_label,
@@ -90,14 +93,46 @@ def _auto_agent_alias_model_rollup_label(event: dict[str, Any]) -> Optional[str]
     return model or alias_model
 
 
+def _auto_agent_alias_event_request_identity(event: dict[str, Any]) -> Optional[str]:
+    for key in ("request_identity", "litellm_call_id"):
+        value = event.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _auto_agent_alias_request_outcome_is_recovered(event: dict[str, Any]) -> bool:
+    request_outcome = str(event.get("request_outcome") or "")
+    candidate_status = str(event.get("candidate_status") or "")
+    event_type = str(event.get("event_type") or "")
+    return (
+        request_outcome == "recovered"
+        or candidate_status == "recovered"
+        or event_type == "candidate_recovered"
+    )
+
+
+def _auto_agent_alias_request_outcome_is_pending_failover(event: dict[str, Any]) -> bool:
+    request_outcome = str(event.get("request_outcome") or "")
+    return bool(
+        request_outcome == "pending_failover"
+        or event.get("account_failover_planned")
+    ) and not _auto_agent_alias_request_outcome_is_recovered(event)
+
+
 def _auto_agent_alias_route_rollup_status(event: dict[str, Any]) -> Optional[str]:
     event_type = str(event.get("event_type") or "")
     candidate_status = str(event.get("candidate_status") or "")
     selection_reason = str(event.get("selection_reason") or "")
     failure_class = str(event.get("failure_class") or "")
     cooldown_scope = str(event.get("cooldown_scope") or "")
+    if _auto_agent_alias_request_outcome_is_recovered(event):
+        return "Recovered"
     if event_type == "no_candidate_available":
         return "Exhausted"
+    if _auto_agent_alias_request_outcome_is_pending_failover(event):
+        # Same-request account failover is diagnostic until the request ends.
+        return None
     if "auth_degraded" in candidate_status or "auth_degraded" in selection_reason:
         return "Degraded"
     # request-local / no-cooldown failures must not look like durable cool-downs.
@@ -180,6 +215,13 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
     status = _auto_agent_alias_route_rollup_status(event)
     if status is None:
         return
+    request_identity = _auto_agent_alias_event_request_identity(event)
+    if (
+        status in {"Failed", "Exhausted"}
+        and request_identity
+        and _auto_agent_alias_request_outcome_is_recovered(event)
+    ):
+        status = "Recovered"
     alias_model = _clean_codex_auth_value(event.get("alias_model"))
     model_labels: list[str] = []
     model_label = _auto_agent_alias_model_rollup_label(event)
@@ -206,7 +248,10 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
             status=status,
             message=message,
         )
-
+    if status == "Recovered" and request_identity:
+        # Keep recovery request-local so it cannot overwrite another request's
+        # terminal failure on the same interval subline.
+        return
     group_header_label = _resolve_auto_agent_alias_route_rollup_group_header_label(event)
     incoming_endpoint = _clean_codex_auth_value(event.get("incoming_endpoint"))
     outgoing_target = (
@@ -225,6 +270,13 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
     effort = _normalize_aawm_route_log_reasoning_effort(
         event.get("reasoning_effort_native_value")
     )
+    origin_kwargs: dict[str, Any] = {}
+    if request_identity:
+        from litellm.proxy.aawm_route_logging import _AawmRouteRollupOriginIdentity
+
+        origin_kwargs["origin_identity"] = _AawmRouteRollupOriginIdentity(
+            litellm_call_id=request_identity,
+        )
     for label in model_labels:
         record_aawm_route_rollup(
             group_header_label=group_header_label,
@@ -235,6 +287,7 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
             turns=0,
             status=status,
             message=_clean_codex_auth_value(event.get("source_error")),
+            **origin_kwargs,
         )
 
 
@@ -287,6 +340,18 @@ def install(host_globals: dict) -> None:
     host_globals.setdefault(
         "_normalize_aawm_route_log_reasoning_effort",
         _normalize_aawm_route_log_reasoning_effort,
+    )
+    host_globals.setdefault(
+        "_auto_agent_alias_event_request_identity",
+        _auto_agent_alias_event_request_identity,
+    )
+    host_globals.setdefault(
+        "_auto_agent_alias_request_outcome_is_recovered",
+        _auto_agent_alias_request_outcome_is_recovered,
+    )
+    host_globals.setdefault(
+        "_auto_agent_alias_request_outcome_is_pending_failover",
+        _auto_agent_alias_request_outcome_is_pending_failover,
     )
 
     # Copy seam variables into host_globals so rebound functions resolve them.

@@ -13,10 +13,14 @@ from __future__ import annotations
 
 import copy
 from typing import Any, Callable, Mapping, Optional
+from uuid import uuid4
 
 from fastapi import Request
 
 from .lane_keys import _CODEX_REASONING_EFFORT_TIER_INDEX
+
+_AAWM_ALIAS_REQUEST_CALL_ID_STATE_KEY = "aawm_alias_request_litellm_call_id"
+_AAWM_ALIAS_REQUEST_OUTCOME_STATE_KEY = "aawm_alias_request_outcome"
 
 # ---------------------------------------------------------------------------
 # Injected runtime seams (god-module / error_signals / classification / state)
@@ -209,6 +213,163 @@ def configure_attempt_records_runtime(  # noqa: PLR0915
         {name: _mod[name] for name in _RUNTIME_STATE_NAMES},
         previous_module_values,
     )
+
+
+# ---------------------------------------------------------------------------
+# Request-identity outcome reconciliation (OPENAI-012)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_auto_agent_alias_request_identity(
+    request: Request,
+) -> Optional[str]:
+    """Return the request-local call identity when one is already bound."""
+
+    request_state = getattr(request, "state", None)
+    if request_state is None:
+        return None
+    existing = getattr(
+        request_state,
+        _AAWM_ALIAS_REQUEST_CALL_ID_STATE_KEY,
+        None,
+    )
+    if isinstance(existing, str) and existing.strip():
+        return existing.strip()
+    return None
+
+
+def _bind_auto_agent_alias_request_identity(request: Request) -> Optional[str]:
+    """Bind one request-local identity without consulting interval-global state."""
+
+    existing = _resolve_auto_agent_alias_request_identity(request)
+    if existing is not None:
+        return existing
+    request_state = getattr(request, "state", None)
+    if request_state is None:
+        return None
+    identity = None
+    for key in ("litellm_call_id", "call_id", "request_id"):
+        value = getattr(request_state, key, None)
+        if isinstance(value, str) and value.strip():
+            identity = value.strip()
+            break
+    if identity is None:
+        identity = str(uuid4())
+    setattr(request_state, _AAWM_ALIAS_REQUEST_CALL_ID_STATE_KEY, identity)
+    return identity
+
+
+def _auto_agent_alias_request_outcome_state(
+    request: Request,
+) -> dict[str, Any]:
+    """Return the request-local outcome record; never interval-global."""
+
+    request_state = getattr(request, "state", None)
+    if request_state is None:
+        return {
+            "request_identity": None,
+            "pending_failover": False,
+            "outcome": None,
+            "attempts": [],
+        }
+    existing = getattr(
+        request_state,
+        _AAWM_ALIAS_REQUEST_OUTCOME_STATE_KEY,
+        None,
+    )
+    if isinstance(existing, dict):
+        if existing.get("request_identity") is None:
+            identity = _resolve_auto_agent_alias_request_identity(request)
+            if identity is not None:
+                existing["request_identity"] = identity
+        return existing
+    outcome = {
+        "request_identity": _resolve_auto_agent_alias_request_identity(request),
+        "pending_failover": False,
+        "outcome": None,
+        "attempts": [],
+    }
+    setattr(request_state, _AAWM_ALIAS_REQUEST_OUTCOME_STATE_KEY, outcome)
+    return outcome
+
+
+def _stamp_auto_agent_alias_request_identity(
+    *,
+    request: Request,
+    target: dict[str, Any],
+) -> Optional[str]:
+    identity = _bind_auto_agent_alias_request_identity(request)
+    if identity is None:
+        identity = _auto_agent_alias_request_outcome_state(request).get(
+            "request_identity"
+        )
+    if not isinstance(identity, str) or not identity:
+        return None
+    target["request_identity"] = identity
+    target.setdefault("litellm_call_id", identity)
+    return identity
+
+
+def _mark_auto_agent_alias_request_failover_pending(
+    request: Request,
+    attempt_record: dict[str, Any],
+) -> dict[str, Any]:
+    """Remember a same-request account move without hiding the failed attempt."""
+
+    outcome = _auto_agent_alias_request_outcome_state(request)
+    identity = _stamp_auto_agent_alias_request_identity(
+        request=request,
+        target=attempt_record,
+    )
+    if identity is not None:
+        outcome["request_identity"] = identity
+    outcome["pending_failover"] = True
+    if outcome.get("outcome") != "recovered":
+        outcome["outcome"] = "pending_failover"
+    attempt_record["account_failover_planned"] = True
+    attempt_record["request_outcome"] = "pending_failover"
+    return outcome
+
+
+def _mark_auto_agent_alias_request_terminal_failure(
+    request: Request,
+    attempt_record: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    outcome = _auto_agent_alias_request_outcome_state(request)
+    if attempt_record is not None:
+        identity = _stamp_auto_agent_alias_request_identity(
+            request=request,
+            target=attempt_record,
+        )
+        if identity is not None:
+            outcome["request_identity"] = identity
+        attempt_record["request_outcome"] = "failed"
+    outcome["pending_failover"] = False
+    outcome["outcome"] = "failed"
+    return outcome
+
+
+def _mark_auto_agent_alias_request_recovered(
+    request: Request,
+    attempt_record: dict[str, Any],
+) -> dict[str, Any]:
+    outcome = _auto_agent_alias_request_outcome_state(request)
+    recovered = bool(outcome.get("pending_failover") or outcome.get("outcome") == "recovered")
+    identity = _stamp_auto_agent_alias_request_identity(
+        request=request,
+        target=attempt_record,
+    )
+    if identity is not None:
+        outcome["request_identity"] = identity
+    if recovered:
+        outcome["pending_failover"] = False
+        outcome["outcome"] = "recovered"
+        attempt_record["status"] = "recovered"
+        attempt_record["request_outcome"] = "recovered"
+    else:
+        attempt_record.setdefault("status", "succeeded")
+        attempt_record["request_outcome"] = attempt_record.get("status") or "succeeded"
+    return outcome
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +609,16 @@ def _record_auto_agent_alias_attempt_failure(
             redispatch_required=redispatch_required,
         )
         audit_events = [audit_event]
+    if attempt_record.get("account_failover_planned"):
+        _mark_auto_agent_alias_request_failover_pending(request, attempt_record)
+        audit_event["account_failover_planned"] = True
+        audit_event["request_outcome"] = "pending_failover"
+    elif attempt_record.get("account_failover_limit_reached") or redispatch_required:
+        _mark_auto_agent_alias_request_terminal_failure(request, attempt_record)
+        if attempt_record.get("account_failover_limit_reached"):
+            audit_event["account_failover_limit_reached"] = True
+        audit_event["request_outcome"] = "failed"
+    _stamp_auto_agent_alias_request_identity(request=request, target=audit_event)
     _emit_auto_agent_alias_route_event(
         audit_event,
         level="warning",
@@ -461,6 +632,74 @@ def _record_auto_agent_alias_attempt_failure(
             request_body=prepared_request_body,
         )
     return failure_body
+
+
+def _record_auto_agent_alias_attempt_success(
+    *,
+    alias_family: str,
+    alias_model: str,
+    request: Request,
+    prepared_request_body: dict[str, Any],
+    selection: dict[str, Any],
+    attempts: list[dict[str, Any]],
+    attempt_record: dict[str, Any],
+    add_alias_metadata_fn: Callable[..., dict[str, Any]],
+) -> dict[str, Any]:
+    """Record same-request alternate-account recovery without hiding prior failures."""
+
+    outcome = _mark_auto_agent_alias_request_recovered(request, attempt_record)
+    recovered = outcome.get("outcome") == "recovered"
+    success_body = add_alias_metadata_fn(
+        prepared_request_body,
+        request=request,
+        selection=selection,
+        attempts=attempts,
+    )
+    if _safe_set_request_parsed_body is not None:
+        _safe_set_request_parsed_body(request, success_body)
+    if not recovered or _emit_auto_agent_alias_route_event is None:
+        return success_body
+
+    success_metadata = success_body.get("litellm_metadata")
+    full_audit_events = (
+        success_metadata.get("aawm_alias_routing_audit_events")
+        if isinstance(success_metadata, dict)
+        else None
+    )
+    audit_events = [event for event in full_audit_events or [] if isinstance(event, dict)]
+    audit_event = audit_events[-1] if audit_events else None
+    if audit_event is None and _build_auto_agent_alias_audit_event is not None:
+        audit_event = _build_auto_agent_alias_audit_event(
+            alias_family=alias_family,
+            alias_model=alias_model,
+            request=request,
+            request_body=prepared_request_body,
+            selection=selection,
+            candidate=attempt_record,
+            event_type="candidate_recovered",
+            candidate_status=attempt_record.get("status") or "recovered",
+            attempt_number=len(attempts),
+            selected=True,
+            selection_reason=selection.get("selection_reason"),
+            lane_key=selection.get("lane_key"),
+            cooldown_key=selection.get("cooldown_key"),
+            attempted_provider_call=attempt_record.get("attempted_provider_call"),
+        )
+    if audit_event is None:
+        audit_event = {
+            "event_type": "candidate_recovered",
+            "candidate_status": attempt_record.get("status") or "recovered",
+            "alias_family": alias_family,
+            "alias_model": alias_model,
+            "selected": True,
+            "selection_reason": selection.get("selection_reason"),
+        }
+    audit_event["event_type"] = "candidate_recovered"
+    audit_event["candidate_status"] = attempt_record.get("status") or "recovered"
+    audit_event["request_outcome"] = "recovered"
+    _stamp_auto_agent_alias_request_identity(request=request, target=audit_event)
+    _emit_auto_agent_alias_route_event(audit_event)
+    return success_body
 
 
 # ---------------------------------------------------------------------------
@@ -956,6 +1195,7 @@ _HOST_FUNCTION_NAMES = (
     "_record_auto_agent_alias_attempt_started",
     "_record_codex_failure_evidence",
     "_record_auto_agent_alias_attempt_failure",
+    "_record_auto_agent_alias_attempt_success",
     "_extract_codex_reasoning_effort",
     "_get_codex_reasoning_effort_ceiling",
     "_normalize_codex_reasoning_effort_for_resolved_route",

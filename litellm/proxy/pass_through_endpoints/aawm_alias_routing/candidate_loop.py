@@ -236,6 +236,22 @@ async def handle_alias_route(  # noqa: PLR0915
     )
     _apply_request_local_cooldown_from_plan = _lpe._apply_request_local_cooldown_from_plan
     _record_auto_agent_alias_attempt_failure = _lpe._record_auto_agent_alias_attempt_failure
+    from . import attempt_records as _attempt_records
+
+    _record_auto_agent_alias_attempt_success = getattr(
+        _lpe,
+        "_record_auto_agent_alias_attempt_success",
+        _attempt_records._record_auto_agent_alias_attempt_success,
+    )
+    _bind_auto_agent_alias_request_identity = (
+        _attempt_records._bind_auto_agent_alias_request_identity
+    )
+    _mark_auto_agent_alias_request_failover_pending = (
+        _attempt_records._mark_auto_agent_alias_request_failover_pending
+    )
+    _mark_auto_agent_alias_request_terminal_failure = (
+        _attempt_records._mark_auto_agent_alias_request_terminal_failure
+    )
     _is_codex_auto_agent_native_grok_continuation_transient_retry_eligible = (
         _lpe._is_codex_auto_agent_native_grok_continuation_transient_retry_eligible
     )
@@ -262,7 +278,10 @@ async def handle_alias_route(  # noqa: PLR0915
     )
 
     register_aawm_route_rollup_access_log_replacement(request)
+    _bind_auto_agent_alias_request_identity(request)
     attempts: list[dict[str, Any]] = []
+    request_outcome = _attempt_records._auto_agent_alias_request_outcome_state(request)
+    request_outcome["attempts"] = attempts
     last_retryable_exc: Optional[Exception] = None
     has_continuation_state = _codex_auto_agent_request_has_continuation_state(prepared_request_body)
     has_previous_response_id = bool(
@@ -314,6 +333,12 @@ async def handle_alias_route(  # noqa: PLR0915
                 }
             },
         )
+        last_attempt = attempts[-1] if attempts else None
+        if isinstance(last_attempt, dict):
+            _mark_auto_agent_alias_request_terminal_failure(
+                request,
+                last_attempt,
+            )
         _emit_auto_agent_alias_no_candidate_event(
             alias_family=alias_family,
             alias_model=alias_model,
@@ -405,6 +430,10 @@ async def handle_alias_route(  # noqa: PLR0915
                 provider_candidate_attempts = max(
                     0,
                     provider_candidate_attempts - 1,
+                )
+                _mark_auto_agent_alias_request_failover_pending(
+                    request,
+                    attempt_record,
                 )
                 _record_auto_agent_alias_attempt_failure(
                     alias_family=alias_family,
@@ -666,6 +695,16 @@ async def handle_alias_route(  # noqa: PLR0915
                             candidate,
                         )
                         assert response is not None
+                        _record_auto_agent_alias_attempt_success(
+                            alias_family=alias_family,
+                            alias_model=alias_model,
+                            request=request,
+                            prepared_request_body=prepared_request_body,
+                            selection=selection,
+                            attempts=attempts,
+                            attempt_record=attempt_record,
+                            add_alias_metadata_fn=add_alias_metadata_fn,
+                        )
                         return response
 
                     # --- Cooldown mutation: NO pre-held probe lock ------------
@@ -815,6 +854,10 @@ async def handle_alias_route(  # noqa: PLR0915
                     provider_candidate_attempts = max(
                         0,
                         provider_candidate_attempts - 1,
+                    )
+                    _mark_auto_agent_alias_request_failover_pending(
+                        request,
+                        attempt_record,
                     )
                     _record_auto_agent_alias_attempt_failure(
                         alias_family=alias_family,
