@@ -331,6 +331,7 @@ def _record_codex_failure_evidence(
     cooldown_key: str,
     exc: Any,
     attempt_record: dict[str, Any],
+    cooldown_seconds: Optional[float] = None,
 ) -> None:
     """Classify and record the current Codex alias failure evidence.
 
@@ -339,9 +340,9 @@ def _record_codex_failure_evidence(
     failure counts toward its N-of-M threshold on this attempt. The evidence
     is attached to the caller-provided configured alias and exact selected
     cooldown key. Classification inputs (status code, source-error text,
-    retry-after) are extracted directly from the raised exception rather than
-    the post-apply attempt record, because those record fields are not
-    populated until after the cooldown decision.
+    retry-after) are resolved before the post-apply attempt record exists so
+    evidence classification can run before the cooldown decision, because those
+    record fields are not populated until after the cooldown decision.
 
     ``origin`` (upstream/client/unknown; only ``upstream`` ever advances a key
     toward cooling) is stamped on the attempt record for downstream audit.
@@ -358,12 +359,15 @@ def _record_codex_failure_evidence(
 
     error_status_code = _extract_exception_status_code(exc)
     source_error = _get_codex_auto_agent_source_error_summary(exc, status_code=error_status_code)
-    retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(exc)
+    raw_retry_after_seconds = _parse_codex_auto_agent_header_wait_seconds(exc)
+    effective_retry_after_seconds = cooldown_seconds
+    if effective_retry_after_seconds is None:
+        effective_retry_after_seconds = raw_retry_after_seconds
     event = _classify_failure(
         status_code=error_status_code,
         provider=None,
         message=str(source_error or ""),
-        retry_after_seconds=retry_after_seconds,
+        retry_after_seconds=effective_retry_after_seconds,
     )
     attempt_record["origin"] = event.origin
     _codex_failure_evidence_gate_record(

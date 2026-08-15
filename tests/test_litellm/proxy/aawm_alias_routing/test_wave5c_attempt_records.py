@@ -13,9 +13,6 @@ import pytest
 from fastapi import Request
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import attempt_records
-from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals import (
-    _get_codex_auto_agent_cooldown_seconds,
-)
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +305,7 @@ class TestRetryableAttemptRecord:
             }
         }
 
-        cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(exc)
+        cooldown_seconds = 10800.0
         assert cooldown_seconds == 10800.0
 
         attempt_records._update_codex_auto_agent_retryable_attempt_record(
@@ -432,6 +429,74 @@ class TestAttemptStarted:
 
 
 class TestCodexFailureEvidence:
+    def test_records_policy_capped_cooldown_for_usage_limit(self) -> None:
+        classify_calls: list[dict[str, Any]] = []
+
+        def _capture_classify(**kwargs: Any) -> _FakeClassificationEvent:
+            classify_calls.append(dict(kwargs))
+            return _FakeClassificationEvent()
+
+        attempt_records._classify_failure = _capture_classify
+
+        record: dict[str, Any] = {}
+        exc = Exception("usage limit reached")
+        exc._status_code = 429  # type: ignore[attr-defined]
+        exc._tokens = {"usage_limit_reached"}  # type: ignore[attr-defined]
+        exc._retry_after = 422681.0  # type: ignore[attr-defined]
+        cooldown_seconds = 10800.0
+
+        attempt_records._record_codex_failure_evidence(
+            canonical_alias="test-alias",
+            cooldown_key="openai:gpt-5:openai",
+            exc=exc,
+            attempt_record=record,
+            cooldown_seconds=cooldown_seconds,
+        )
+
+        assert cooldown_seconds == 10800.0
+        assert classify_calls == [
+            {
+                "status_code": 429,
+                "provider": None,
+                "message": "error:429",
+                "retry_after_seconds": 10800.0,
+            }
+        ]
+        assert record["origin"] == "upstream"
+
+    def test_records_raw_retry_after_for_non_usage_failure(self) -> None:
+        classify_calls: list[dict[str, Any]] = []
+
+        def _capture_classify(**kwargs: Any) -> _FakeClassificationEvent:
+            classify_calls.append(dict(kwargs))
+            return _FakeClassificationEvent()
+
+        attempt_records._classify_failure = _capture_classify
+
+        record: dict[str, Any] = {}
+        exc = Exception("rate limited")
+        exc._status_code = 429  # type: ignore[attr-defined]
+        exc._tokens = {"rate_limited"}  # type: ignore[attr-defined]
+        exc._retry_after = 5.0  # type: ignore[attr-defined]
+
+        attempt_records._record_codex_failure_evidence(
+            canonical_alias="test-alias",
+            cooldown_key="openai:gpt-5:openai",
+            exc=exc,
+            attempt_record=record,
+            cooldown_seconds=None,
+        )
+
+        assert classify_calls == [
+            {
+                "status_code": 429,
+                "provider": None,
+                "message": "error:429",
+                "retry_after_seconds": 5.0,
+            }
+        ]
+        assert record["origin"] == "upstream"
+
     def test_records_once_and_stamps_origin(self, _configure_attempt_records: _StubState) -> None:
         state = _configure_attempt_records
         record: dict[str, Any] = {}
