@@ -460,6 +460,40 @@ class TestResolvePublicationPlan:
         )
         assert plan.duration_seconds == 0.0
 
+    def test_managed_openai_usage_limit_allows_ttl_shrink(
+        self, configured_runtime: dict
+    ) -> None:
+        configured_runtime["scope_fn"].return_value = "candidate"
+        plan = _resolve_auto_agent_cooldown_publication_plan(
+            request=None,
+            candidate={
+                "provider": "openai",
+                "model": "gpt-5.3-codex",
+                "route_family": "codex_responses",
+                "codex_oauth_account_hash": "account-hash",
+                "codex_oauth_lane_key": "codex-oauth:account:hash",
+            },
+            lane_key="codex-oauth:account:hash",
+            selected_cooldown_key="openai:gpt-5.3-codex:account",
+            cooldown_seconds=30.0,
+            error_class="usage_limit_reached",
+        )
+        assert plan.allow_ttl_shrink is True
+
+    def test_unmanaged_usage_limit_keeps_monotonic_ttl(
+        self, configured_runtime: dict
+    ) -> None:
+        configured_runtime["scope_fn"].return_value = "candidate"
+        plan = _resolve_auto_agent_cooldown_publication_plan(
+            request=None,
+            candidate={"provider": "openai", "model": "gpt-5.3-codex"},
+            lane_key="lane",
+            selected_cooldown_key="openai:gpt-5.3-codex:lane",
+            cooldown_seconds=30.0,
+            error_class="usage_limit_reached",
+        )
+        assert plan.allow_ttl_shrink is False
+
 
 # ---------------------------------------------------------------------------
 # _persist_codex_cooldown_durable / _persist_anthropic_cooldown_durable
@@ -479,6 +513,18 @@ class TestPersistDurable:
         assert calls[0].kwargs["state_key"] == "k1"
         assert calls[1].kwargs["state_key"] == "k2"
         assert calls[0].kwargs["ttl_seconds"] == 60.0
+
+    @pytest.mark.asyncio
+    async def test_persist_codex_usage_limit_can_shrink_ttl(
+        self, configured_runtime: dict
+    ) -> None:
+        write = configured_runtime["write_durable"]
+        await _persist_codex_cooldown_durable(
+            keys=("k-usage",),
+            seconds=30.0,
+            allow_ttl_shrink=True,
+        )
+        assert write.await_args.kwargs["allow_ttl_shrink"] is True
 
     @pytest.mark.asyncio
     async def test_persist_codex_zero_seconds_skips(

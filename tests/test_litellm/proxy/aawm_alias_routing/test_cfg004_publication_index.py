@@ -1693,6 +1693,44 @@ async def test_republish_shorter_ttl_aligns_expiry_with_preserved_redis_ttl_exec
     )
 
 
+@_fakeredis_skip
+@pytest.mark.asyncio
+async def test_republish_usage_limit_can_shrink_cooldown_ttl_executable() -> None:
+    """The managed OpenAI usage-limit exception opts out of Lua max TTL."""
+    import json as _json_mod
+
+    r = _fakeredis_aioredis.FakeRedis(decode_responses=False)
+    dual_cache = _make_fakeredis_dual_cache(r)
+    cd_key = build_aawm_alias_routing_durable_cache_key(
+        alias_family="codex", state_kind="cooldown", state_key="usage-key"
+    )
+
+    with patch(f"{_DURABLE_MOD}.get_aawm_alias_routing_dual_cache", return_value=dual_cache):
+        await publish_cooldown_transaction(
+            alias_family="codex",
+            identity_hash="hash-usage",
+            cooldown_keys=["usage-key"],
+            lane_members=["lane-usage"],
+            ttl_seconds=600.0,
+        )
+        await publish_cooldown_transaction(
+            alias_family="codex",
+            identity_hash="hash-usage",
+            cooldown_keys=["usage-key"],
+            lane_members=["lane-usage"],
+            ttl_seconds=30.0,
+            allow_ttl_shrink=True,
+        )
+
+    ttl = await r.ttl(cd_key)
+    assert 29 <= ttl <= 30, f"usage-limit TTL should shrink to ~30s, got {ttl}"
+    raw = await r.get(cd_key)
+    assert raw is not None
+    payload = _json_mod.loads(raw)
+    remaining = payload["expires_at_epoch"] - time.time()
+    assert 29.0 <= remaining <= 31.0
+
+
 # ---------------------------------------------------------------------------
 # CFG-004 regression: identity index TTL -1 must remain persistent
 # ---------------------------------------------------------------------------

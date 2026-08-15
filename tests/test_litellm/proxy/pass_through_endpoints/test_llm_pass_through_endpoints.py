@@ -27743,6 +27743,7 @@ class TestOpenAIPassthroughRoute:
         mock_publish.assert_called_once_with(
             keys=("openai:gpt-5.6-sol:codex-oauth:account1:hash-account-1",),
             seconds=900.0,
+            allow_ttl_shrink=True,
         )
         mock_persist.assert_awaited_once()
 
@@ -27859,6 +27860,7 @@ class TestOpenAIPassthroughRoute:
         mock_publish.assert_called_once_with(
             keys=("openai:gpt-5.6-sol:codex-oauth:account1:hash-account-1",),
             seconds=900.0,
+            allow_ttl_shrink=True,
         )
         mock_persist.assert_awaited_once()
 
@@ -27994,16 +27996,16 @@ class TestOpenAIPassthroughRoute:
             for call in mock_publish.call_args_list
         ]
         assert publish_calls == [
-            {"keys": ("openai:gpt-5.6-sol:codex-oauth:account1:hash-account-1",), "seconds": 900.0},
-            {"keys": ("openai:gpt-5.6-sol:codex-oauth:account2:hash-account-2",), "seconds": 300.0},
+            {"keys": ("openai:gpt-5.6-sol:codex-oauth:account1:hash-account-1",), "seconds": 900.0, "allow_ttl_shrink": True},
+            {"keys": ("openai:gpt-5.6-sol:codex-oauth:account2:hash-account-2",), "seconds": 300.0, "allow_ttl_shrink": True},
         ]
         assert mock_persist.await_count == 2
         persist_calls = [
             call.kwargs for call in mock_persist.await_args_list
         ]
         assert persist_calls == [
-            {"keys": ("openai:gpt-5.6-sol:codex-oauth:account1:hash-account-1",), "seconds": 900.0},
-            {"keys": ("openai:gpt-5.6-sol:codex-oauth:account2:hash-account-2",), "seconds": 300.0},
+            {"keys": ("openai:gpt-5.6-sol:codex-oauth:account1:hash-account-1",), "seconds": 900.0, "allow_ttl_shrink": True},
+            {"keys": ("openai:gpt-5.6-sol:codex-oauth:account2:hash-account-2",), "seconds": 300.0, "allow_ttl_shrink": True},
         ]
         assert mock_plan_codex_oauth_account_failover.call_count == 2
         first_call = mock_plan_codex_oauth_account_failover.call_args_list[0]

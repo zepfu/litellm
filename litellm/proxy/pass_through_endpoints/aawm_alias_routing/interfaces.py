@@ -139,6 +139,7 @@ class CooldownPublicationPlan:
     request_local_action: Optional[str] = None
     grok_account_quota_exhausted: bool = False
     kimi_failure_metadata: Optional[dict[str, Any]] = None
+    allow_ttl_shrink: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +219,13 @@ class PublishCooldownMemoryFn(Protocol):
     lock is released (R3-1 single-flight). Must not await.
     """
 
-    def __call__(self, *, keys: Sequence[str], seconds: float) -> None:
+    def __call__(
+        self,
+        *,
+        keys: Sequence[str],
+        seconds: float,
+        allow_ttl_shrink: bool = False,
+    ) -> None:
         ...
 
 
@@ -305,7 +312,13 @@ class GetCooldownSecondsFn(Protocol):
 class PersistCooldownFn(Protocol):
     """Persist cooldown keys to durable Redis (post-release, may await)."""
 
-    async def __call__(self, *, keys: Sequence[str], seconds: float) -> None:
+    async def __call__(
+        self,
+        *,
+        keys: Sequence[str],
+        seconds: float,
+        allow_ttl_shrink: bool = False,
+    ) -> None:
         ...
 
 

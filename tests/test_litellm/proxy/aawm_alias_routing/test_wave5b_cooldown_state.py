@@ -426,6 +426,27 @@ class TestMemoryPublication:
         _publish_codex_cooldown_memory(keys=["nk-1"], seconds=30.0)
         assert "nk-1" not in fresh_manager.codex.cooldown_negative_until_monotonic_by_key
 
+    def test_publish_usage_limit_can_shrink_existing_cooldown(
+        self, fresh_manager: AliasRoutingStateManager
+    ) -> None:
+        _publish_codex_cooldown_memory(keys=["shrink-1"], seconds=600.0)
+        long_until = fresh_manager.codex.cooldown_until_monotonic_by_key["shrink-1"]
+
+        _publish_codex_cooldown_memory(keys=["shrink-1"], seconds=30.0)
+        assert (
+            fresh_manager.codex.cooldown_until_monotonic_by_key["shrink-1"]
+            >= long_until
+        )
+
+        _publish_codex_cooldown_memory(
+            keys=["shrink-1"],
+            seconds=30.0,
+            allow_ttl_shrink=True,
+        )
+        short_until = fresh_manager.codex.cooldown_until_monotonic_by_key["shrink-1"]
+        assert short_until < long_until
+        assert 0.0 < short_until - time.monotonic() <= 30.0
+
     def test_publish_empty_keys_is_noop(
         self, fresh_manager: AliasRoutingStateManager
     ) -> None:

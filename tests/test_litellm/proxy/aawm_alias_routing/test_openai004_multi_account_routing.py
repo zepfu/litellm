@@ -559,6 +559,7 @@ def _loop_services(
     *,
     select_candidate: Any,
     perform_candidate: Any,
+    raise_redispatch: Any = None,
 ) -> AliasRouteServices:
     def _resolve_publication(**kwargs: Any) -> CooldownPublicationPlan:
         return CooldownPublicationPlan(
@@ -583,8 +584,12 @@ def _loop_services(
         persist_cooldown_fn=_persist,
         set_session_affinity_fn=_set_affinity,
         add_alias_metadata_fn=lambda body, **kwargs: dict(body),
-        raise_redispatch_fn=lambda **kwargs: pytest.fail(
-            "unexpected continuation redispatch"
+        raise_redispatch_fn=(
+            raise_redispatch
+            if raise_redispatch is not None
+            else lambda **kwargs: pytest.fail(
+                "unexpected continuation redispatch"
+            )
         ),
     )
 
@@ -594,15 +599,19 @@ def _account_selection(
     account_hash: str,
     *,
     failover_ordinal: int,
+    credential_affinity: str | None = None,
 ) -> dict[str, Any]:
     lane = f"codex-oauth:{account_label}:{account_hash}"
+    candidate = {
+        **_candidate(),
+        "codex_oauth_account_label": account_label,
+        "codex_oauth_account_hash": account_hash,
+        "codex_oauth_lane_key": lane,
+    }
+    if credential_affinity is not None:
+        candidate["codex_oauth_credential_affinity"] = credential_affinity
     return {
-        "candidate": {
-            **_candidate(),
-            "codex_oauth_account_label": account_label,
-            "codex_oauth_account_hash": account_hash,
-            "codex_oauth_lane_key": lane,
-        },
+        "candidate": candidate,
         "lane_key": lane,
         "cooldown_key": f"openai:gpt-5.3-codex:{lane}",
         "selection_reason": (
@@ -678,6 +687,158 @@ async def test_candidate_loop_allows_exactly_one_account_move(
     assert exc_info.value.status_code == 429
     assert selected_labels == ["account1", "account2"]
     assert performed_labels == ["account1", "account2"]
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_continuation_usage_limit_fails_over_interchangeable_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    monkeypatch.setattr(
+        lpe,
+        "_codex_auto_agent_request_has_continuation_state",
+        lambda body: True,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc, *args, candidate=None, **kwargs: "usage_limit_reached",
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_get_codex_auto_agent_cooldown_seconds",
+        lambda exc, *, candidate: 30.0,
+    )
+    request = _request()
+    selected_labels: list[str] = []
+    performed_labels: list[str] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        context = getattr(
+            request.state,
+            "aawm_codex_oauth_request_local_failover_context",
+            None,
+        )
+        account = "account2" if context is not None else "account1"
+        selected_labels.append(account)
+        return _account_selection(
+            account,
+            f"hash-{account}",
+            failover_ordinal=1 if context is not None else 0,
+            credential_affinity="interchangeable",
+        )
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        account = candidate["codex_oauth_account_label"]
+        performed_labels.append(account)
+        if account == "account1":
+            raise RuntimeError("usage limit reached")
+        return Response(content=b"recovered", status_code=200)
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    response = await candidate_loop.handle_alias_route(
+        _loop_services(
+            select_candidate=_select,
+            perform_candidate=_perform,
+        ),
+        alias_family="codex_auto_agent",
+        alias_model="basic",
+        request=request,
+        prepared_request_body={"model": "basic", "input": [{"role": "user"}]},
+        max_candidate_attempts=1,
+        get_active_cooldown_state_fn=_zero,
+        attempts_metadata_key="codex_auto_agent_attempts",
+        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+        no_candidate_detail="no candidate",
+        log_label="Codex",
+    )
+
+    assert response.status_code == 200
+    assert selected_labels == ["account1", "account2"]
+    assert performed_labels == ["account1", "account2"]
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_previous_response_usage_limit_uses_redispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    monkeypatch.setattr(
+        lpe,
+        "_codex_auto_agent_request_has_continuation_state",
+        lambda body: True,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc, *args, candidate=None, **kwargs: "usage_limit_reached",
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_get_codex_auto_agent_cooldown_seconds",
+        lambda exc, *, candidate: 30.0,
+    )
+    request = _request()
+    performed_labels: list[str] = []
+    redispatch_calls: list[dict[str, Any]] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        return _account_selection(
+            "account1",
+            "hash-account-1",
+            failover_ordinal=0,
+            credential_affinity="interchangeable",
+        )
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        performed_labels.append(candidate["codex_oauth_account_label"])
+        raise RuntimeError("usage limit reached")
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    class _RedispatchSignal(Exception):
+        pass
+
+    def _raise_redispatch(**kwargs: Any) -> None:
+        redispatch_calls.append(kwargs)
+        raise _RedispatchSignal()
+
+    with pytest.raises(_RedispatchSignal):
+        await candidate_loop.handle_alias_route(
+            _loop_services(
+                select_candidate=_select,
+                perform_candidate=_perform,
+                raise_redispatch=_raise_redispatch,
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body={
+                "model": "basic",
+                "previous_response_id": "response-1",
+            },
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_zero,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidate",
+            log_label="Codex",
+        )
+
+    assert performed_labels == ["account1"]
+    assert len(redispatch_calls) == 1
+    assert redispatch_calls[0]["error_class"] == "usage_limit_reached"
 
 
 @pytest.mark.asyncio

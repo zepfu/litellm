@@ -129,6 +129,18 @@ def configure_cooldown_apply_runtime(
 # ---------------------------------------------------------------------------
 
 
+def _is_managed_openai_usage_limit_candidate(
+    candidate: dict[str, Any],
+    error_class: Optional[str],
+) -> bool:
+    return bool(
+        error_class == "usage_limit_reached"
+        and candidate.get("provider") == "openai"
+        and candidate.get("codex_oauth_account_hash")
+        and candidate.get("codex_oauth_lane_key")
+    )
+
+
 def _resolve_auto_agent_cooldown_publication_plan(
     *,
     request: Optional[Request],
@@ -172,6 +184,10 @@ def _resolve_auto_agent_cooldown_publication_plan(
     )
     is_last_resort = bool(candidate.get("last_resort"))
     duration = max(0.0, float(cooldown_seconds))
+    allow_ttl_shrink = _is_managed_openai_usage_limit_candidate(
+        candidate,
+        error_class,
+    )
     if (
         codex_failure_evidence_alias is not None
         and cooldown_scope not in {"none", "request_local"}
@@ -253,6 +269,7 @@ def _resolve_auto_agent_cooldown_publication_plan(
             applied_scope="candidate",
             grok_account_quota_exhausted=grok_account_quota_exhausted,
             kimi_failure_metadata=kimi_failure_metadata,
+            allow_ttl_shrink=allow_ttl_shrink,
         )
     # request_local: no shared keys; the loop applies the request-local
     # cooldown + exclusion post-release.
@@ -270,23 +287,38 @@ def _resolve_auto_agent_cooldown_publication_plan(
 # ---------------------------------------------------------------------------
 
 
-async def _persist_codex_cooldown_durable(*, keys: Sequence[str], seconds: float) -> None:
+async def _persist_codex_cooldown_durable(
+    *,
+    keys: Sequence[str],
+    seconds: float,
+    allow_ttl_shrink: bool = False,
+) -> None:
     """Persist codex cooldown keys to durable Redis (post-release, R3-1)."""
     assert _write_durable_payload is not None
     ttl_seconds = max(0.0, float(seconds))
     if ttl_seconds <= 0:
         return
     for key in keys:
+        write_kwargs = {
+            "alias_family": "codex",
+            "state_kind": "cooldown",
+            "state_key": key,
+            "payload": {"cooldown_key": key},
+            "ttl_seconds": ttl_seconds,
+        }
+        if allow_ttl_shrink:
+            write_kwargs["allow_ttl_shrink"] = True
         await _write_durable_payload(
-            alias_family="codex",
-            state_kind="cooldown",
-            state_key=key,
-            payload={"cooldown_key": key},
-            ttl_seconds=ttl_seconds,
+            **write_kwargs,
         )
 
 
-async def _persist_anthropic_cooldown_durable(*, keys: Sequence[str], seconds: float) -> None:
+async def _persist_anthropic_cooldown_durable(
+    *,
+    keys: Sequence[str],
+    seconds: float,
+    allow_ttl_shrink: bool = False,
+) -> None:
     """Persist anthropic cooldown keys to durable Redis (post-release, R3-1)."""
     assert _write_durable_payload is not None
     ttl_seconds = max(0.0, float(seconds))
@@ -695,12 +727,17 @@ async def execute_cooldown_publication_transaction(  # noqa: PLR0915
                     )
 
                 # Execute atomic durable transaction BEFORE local mutation.
+                transaction_kwargs = {
+                    "alias_family": index_family,
+                    "identity_hash": identity_hash,
+                    "cooldown_keys": list(plan.durable_keys),
+                    "lane_members": list(plan.durable_keys),
+                    "ttl_seconds": plan.duration_seconds,
+                }
+                if plan.allow_ttl_shrink:
+                    transaction_kwargs["allow_ttl_shrink"] = True
                 txn_result = await publish_cooldown_transaction(
-                    alias_family=index_family,
-                    identity_hash=identity_hash,
-                    cooldown_keys=list(plan.durable_keys),
-                    lane_members=list(plan.durable_keys),
-                    ttl_seconds=plan.duration_seconds,
+                    **transaction_kwargs,
                 )
 
                 # 3c+3d. Memory publish + local commit under rollback
@@ -710,10 +747,13 @@ async def execute_cooldown_publication_transaction(  # noqa: PLR0915
                 try:
                     # Memory publish (after durable commit succeeds).
                     if plan.memory_keys:
-                        publish_cooldown_memory_fn(
-                            keys=plan.memory_keys,
-                            seconds=plan.duration_seconds,
-                        )
+                        memory_kwargs = {
+                            "keys": plan.memory_keys,
+                            "seconds": plan.duration_seconds,
+                        }
+                        if plan.allow_ttl_shrink:
+                            memory_kwargs["allow_ttl_shrink"] = True
+                        publish_cooldown_memory_fn(**memory_kwargs)
 
                     # Local commit: update index under the same mutation lease.
                     outcome = state_mgr.lane_identity_index.register_batch(
@@ -763,18 +803,24 @@ async def execute_cooldown_publication_transaction(  # noqa: PLR0915
             else:
                 # 3e. Memory publish (Redis unconfigured or no durable keys).
                 if plan.memory_keys:
-                    publish_cooldown_memory_fn(
-                        keys=plan.memory_keys,
-                        seconds=plan.duration_seconds,
-                    )
+                    memory_kwargs = {
+                        "keys": plan.memory_keys,
+                        "seconds": plan.duration_seconds,
+                    }
+                    if plan.allow_ttl_shrink:
+                        memory_kwargs["allow_ttl_shrink"] = True
+                    publish_cooldown_memory_fn(**memory_kwargs)
 
                 # Legacy persist (only when Redis is unconfigured, NOT when
                 # configured-but-unhealthy -- that case already failed closed).
                 if not _has_strict_redis and not _redis_configured and plan.durable_keys:
-                    await persist_cooldown_fn(
-                        keys=plan.durable_keys,
-                        seconds=plan.duration_seconds,
-                    )
+                    persist_kwargs = {
+                        "keys": plan.durable_keys,
+                        "seconds": plan.duration_seconds,
+                    }
+                    if plan.allow_ttl_shrink:
+                        persist_kwargs["allow_ttl_shrink"] = True
+                    await persist_cooldown_fn(**persist_kwargs)
 
         finally:
             # Step 4: Release in reverse order.

@@ -309,10 +309,12 @@ async def write_aawm_alias_routing_durable_payload(  # noqa: PLR0915
     state_key: str,
     payload: Payload,
     ttl_seconds: float,
+    allow_ttl_shrink: bool = False,
 ) -> bool:
     """Write durable payload with max-expiry semantics (RR-054 #2).
 
-    Never truncate a longer existing expires_at_epoch with a shorter write.
+    Never truncate a longer existing expires_at_epoch with a shorter write
+    unless the caller explicitly allows a usage-limit replacement.
     Also write-through DualCache memory when available for process coherency.
     """
     dual_cache = get_aawm_alias_routing_dual_cache()
@@ -378,7 +380,11 @@ async def write_aawm_alias_routing_durable_payload(  # noqa: PLR0915
             durable_payload.pop("expires_at_epoch", None)
             durable_payload[PERSISTENT_MARKER] = True
             ttl = -1.0  # Signal persistent to Redis (no expiry).
-        elif existing_expires is not None and existing_expires >= new_expires:
+        elif (
+            existing_expires is not None
+            and existing_expires >= new_expires
+            and not allow_ttl_shrink
+        ):
             durable_payload = dict(existing_payload)
             # Preserve longer expiry; merge new payload fields without shrinking expiry.
             for key, value in payload.items():
@@ -970,9 +976,10 @@ PHASE_LOCAL_COMMITTED = "LOCAL_COMMITTED"
 #   ARGV[5]  = transaction_id
 #   ARGV[6]  = receipt_json (serialized receipt payload)
 #   ARGV[7]  = cooldown_value_json (serialized cooldown payload)
-#   ARGV[8..8+N-1]   = lane_key members for identity registration
-#                      (one per identity key, cycled if M < N)
-#   ARGV[8..8+M-1] = lane member for each identity key
+#   ARGV[8]           = allow_ttl_shrink (1/0)
+#   ARGV[9..9+N-1]    = lane_key members for identity registration
+#                       (one per identity key, cycled if M < N)
+#   ARGV[9..9+M-1]    = lane member for each identity key
 #
 # Returns:
 #   1  -> success (all mutations applied)
@@ -991,6 +998,7 @@ local max_lanes = tonumber(ARGV[4])
 local txn_id = ARGV[5]
 local receipt_json = ARGV[6]
 local cd_value_json = ARGV[7]
+local allow_ttl_shrink = tonumber(ARGV[8]) == 1
 
 -- Phase 1: Aggregate unique-member capacity preflight.
 -- All identity keys in one transaction map to the same identity set.
@@ -1001,7 +1009,7 @@ if num_id > 0 then
     local seen = {}
     local new_count = 0
     for i = 1, num_id do
-        local member = ARGV[7 + i]
+        local member = ARGV[8 + i]
         if not seen[member] then
             seen[member] = true
             local is_member = redis.call('SISMEMBER', id_key, member)
@@ -1036,7 +1044,7 @@ end
 -- Phase 3: Register all lane members
 for i = 1, num_id do
     local id_key = KEYS[1 + num_cd + i]
-    local member = ARGV[7 + i]
+    local member = ARGV[8 + i]
     -- Read pre-image TTL BEFORE SADD: an absent key returns -2; after
     -- SADD creates it, TTL would return -1 which must NOT be confused
     -- with a genuinely persistent key.
@@ -1073,7 +1081,7 @@ for i = 1, num_cd do
     local effective_ttl = req_ttl
     if old_ttl == -1 then
         effective_ttl = -1
-    elseif old_ttl == -2 then
+    elseif old_ttl == -2 or allow_ttl_shrink then
         effective_ttl = req_ttl
     else
         if old_ttl > effective_ttl then
@@ -1207,6 +1215,7 @@ async def publish_cooldown_transaction(  # noqa: PLR0915
     ttl_seconds: float,
     max_lanes_per_identity: int = 64,
     cooldown_payload: Optional[dict] = None,
+    allow_ttl_shrink: bool = False,
 ) -> CooldownTransactionResult:
     """Execute the atomic cooldown publication transaction.
 
@@ -1306,7 +1315,8 @@ async def publish_cooldown_transaction(  # noqa: PLR0915
 
     # KEYS: [receipt, cd_keys..., id_keys...]
     keys = [ns_receipt] + ns_cd_keys + ns_id_keys
-    # ARGV: [num_cd, num_id, req_ttl, max_lanes, txn_id, receipt_json, cd_value_json, lane_members...]
+    # ARGV: [num_cd, num_id, req_ttl, max_lanes, txn_id, receipt_json,
+    #        cd_value_json, allow_ttl_shrink, lane_members...]
     argv = [
         str(num_cd),
         str(num_id),
@@ -1315,6 +1325,7 @@ async def publish_cooldown_transaction(  # noqa: PLR0915
         transaction_id,
         receipt_json,
         cd_value_json,
+        "1" if allow_ttl_shrink else "0",
     ] + list(lane_members)
 
     try:

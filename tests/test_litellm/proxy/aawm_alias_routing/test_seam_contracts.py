@@ -250,10 +250,12 @@ _CALLBACK_PARAMETER_KINDS: dict[str, dict[str, inspect._ParameterKind]] = {
     "publish_cooldown_memory_fn": {
         "keys": inspect.Parameter.KEYWORD_ONLY,
         "seconds": inspect.Parameter.KEYWORD_ONLY,
+        "allow_ttl_shrink": inspect.Parameter.KEYWORD_ONLY,
     },
     "persist_cooldown_fn": {
         "keys": inspect.Parameter.KEYWORD_ONLY,
         "seconds": inspect.Parameter.KEYWORD_ONLY,
+        "allow_ttl_shrink": inspect.Parameter.KEYWORD_ONLY,
     },
     "set_session_affinity_fn": {
         "session_key": inspect.Parameter.POSITIONAL_OR_KEYWORD,
@@ -602,6 +604,7 @@ def _typed_publish_cooldown_memory(
     *,
     keys: Sequence[str],
     seconds: float,
+    allow_ttl_shrink: bool = False,
 ) -> None:
     return None
 
@@ -610,6 +613,7 @@ async def _typed_persist_cooldown(
     *,
     keys: Sequence[str],
     seconds: float,
+    allow_ttl_shrink: bool = False,
 ) -> None:
     return None
 

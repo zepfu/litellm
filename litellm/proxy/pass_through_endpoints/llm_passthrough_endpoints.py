@@ -3423,11 +3423,13 @@ async def _retry_direct_codex_oauth_after_usage_limit(
         _publish_codex_cooldown_memory(
             keys=(cooldown_key,),
             seconds=cooldown_seconds,
+            allow_ttl_shrink=True,
         )
         try:
             await _persist_codex_cooldown_durable(
                 keys=(cooldown_key,),
                 seconds=cooldown_seconds,
+                allow_ttl_shrink=True,
             )
         except Exception as persist_exc:  # noqa: BLE001
             verbose_proxy_logger.warning(

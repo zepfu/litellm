@@ -577,7 +577,12 @@ async def _get_anthropic_auto_agent_merged_codex_openai_cooldown_state(
 # ---------------------------------------------------------------------------
 
 
-def _publish_codex_cooldown_memory(*, keys: Sequence[str], seconds: float) -> None:
+def _publish_codex_cooldown_memory(
+    *,
+    keys: Sequence[str],
+    seconds: float,
+    allow_ttl_shrink: bool = False,
+) -> None:
     """Synchronously publish cooldowns into codex family memory (R3-1).
 
     Direct ``state.py`` writes -- no awaitable lock -- so the retry loop can
@@ -586,10 +591,22 @@ def _publish_codex_cooldown_memory(*, keys: Sequence[str], seconds: float) -> No
     """
     mgr = _require_manager()
     for key in keys:
-        mgr.codex.set_cooldown_memory(key, seconds)
+        if allow_ttl_shrink:
+            mgr.codex.set_cooldown_memory(
+                key,
+                seconds,
+                allow_ttl_shrink=True,
+            )
+        else:
+            mgr.codex.set_cooldown_memory(key, seconds)
 
 
-def _publish_anthropic_cooldown_memory(*, keys: Sequence[str], seconds: float) -> None:
+def _publish_anthropic_cooldown_memory(
+    *,
+    keys: Sequence[str],
+    seconds: float,
+    allow_ttl_shrink: bool = False,
+) -> None:
     """Synchronously publish cooldowns into anthropic family memory (R3-1)."""
     mgr = _require_manager()
     for key in keys:

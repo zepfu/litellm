@@ -378,10 +378,11 @@ class AliasFamilyState:
         cooldown_seconds: float,
         *,
         max_size: int = DEFAULT_MEMORY_STATE_MAX_SIZE,
+        allow_ttl_shrink: bool = False,
     ) -> None:
         until = time.monotonic() + max(0.0, float(cooldown_seconds))
         current_until = self.cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
-        if until > current_until:
+        if allow_ttl_shrink or until > current_until:
             self.cooldown_until_monotonic_by_key[cooldown_key] = until
             self.clear_negative_cache(cooldown_key)
             bound_memory_map(self.cooldown_until_monotonic_by_key, max_size=max_size)

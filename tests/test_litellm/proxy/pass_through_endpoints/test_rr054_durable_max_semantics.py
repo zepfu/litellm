@@ -92,6 +92,47 @@ async def test_rr054_durable_max_expiry_keeps_longer_existing_cooldown() -> None
 
 
 @pytest.mark.asyncio
+async def test_rr054_durable_usage_limit_can_shrink_existing_cooldown() -> None:
+    existing_expires = time.time() + 3600.0
+    dual = _dual_cache(
+        existing={
+            "cooldown_key": "cand-usage",
+            "failure_class": "capacity",
+            "expires_at_epoch": existing_expires,
+        }
+    )
+
+    with patch.object(
+        durable_mod, "get_aawm_alias_routing_dual_cache", return_value=dual
+    ), patch.object(
+        durable_mod,
+        "build_aawm_alias_routing_durable_cache_key",
+        return_value="rr054:max:usage-limit-shrink",
+    ):
+        before = time.time()
+        ok = await durable_mod.write_aawm_alias_routing_durable_payload(
+            alias_family="codex",
+            state_kind="cooldown",
+            state_key="cand-usage",
+            payload={
+                "cooldown_key": "cand-usage",
+                "failure_class": "usage_limit_reached",
+            },
+            ttl_seconds=30.0,
+            allow_ttl_shrink=True,
+        )
+        after = time.time()
+
+    assert ok is True
+    kwargs = dual.redis_cache.async_set_cache.await_args.kwargs
+    written = kwargs["value"]
+    assert written["failure_class"] == "usage_limit_reached"
+    assert written["expires_at_epoch"] >= before + 29.0
+    assert written["expires_at_epoch"] <= after + 31.0
+    assert kwargs["ttl"] == pytest.approx(30.0, abs=1.0)
+
+
+@pytest.mark.asyncio
 async def test_rr054_durable_max_expiry_extends_when_new_ttl_is_longer() -> None:
     existing_expires = time.time() + 10.0
     dual = _dual_cache(
