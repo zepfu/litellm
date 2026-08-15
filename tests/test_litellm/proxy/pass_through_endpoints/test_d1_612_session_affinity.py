@@ -1838,3 +1838,124 @@ def test_interchangeable_openai_owner_ignores_account_identity_only() -> None:
         left=account1,
         right=dict(account2, model="gpt-5.6-terra"),
     )
+
+
+def _openai_responses_owner_attrs(
+    *,
+    route_family: str,
+    model: str = "gpt-5.6-sol",
+    account_hash: str = "acct-1",
+    account_label: str = "primary",
+    account_lane: str = "lane-a",
+    endpoint_contract: str = "openai_responses",
+    state_format: str = "openai_responses",
+    provider: str = "openai",
+) -> dict[str, Any]:
+    return {
+        "provider": provider,
+        "model": model,
+        "route_family": route_family,
+        "endpoint_contract": endpoint_contract,
+        "state_format": state_format,
+        "account_hash": account_hash,
+        "account_label": account_label,
+        "account_lane": account_lane,
+    }
+
+
+def _owned_record(attributes: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "state": "owned",
+        "owner": "owner",
+        "attributes": attributes,
+    }
+
+
+def test_openai_responses_route_family_aliases_are_equivalent() -> None:
+    historical = _openai_responses_owner_attrs(route_family="codex_responses")
+    current = _openai_responses_owner_attrs(route_family="codex_oauth")
+    passthrough = _openai_responses_owner_attrs(route_family="openai_responses")
+
+    assert sa._openai_responses_route_families_are_equivalent(historical, current)
+    assert sa._openai_responses_route_families_are_equivalent(current, historical)
+    assert sa._openai_responses_route_families_are_equivalent(historical, passthrough)
+    assert sa._attributes_exactly_equal(left=historical, right=current)
+    assert sa._attributes_exactly_equal(left=current, right=passthrough)
+    assert sa._compatibility_mismatch_reason(
+        owner_record=_owned_record(historical),
+        requested_attributes=current,
+        require_exact_attributes=True,
+    ) is None
+    assert sa._compatibility_mismatch_reason(
+        owner_record=_owned_record(current),
+        requested_attributes=historical,
+        require_exact_attributes=False,
+    ) is None
+    assert sa.build_session_owner_id(attributes=historical) != (
+        sa.build_session_owner_id(attributes=current)
+    )
+
+
+def test_openai_responses_route_family_aliases_remain_strict_nearby() -> None:
+    owner = _openai_responses_owner_attrs(route_family="codex_responses")
+    cases = [
+        _openai_responses_owner_attrs(route_family="codex_oauth", model="gpt-5.6-terra"),
+        _openai_responses_owner_attrs(route_family="codex_oauth", account_lane="lane-b"),
+        _openai_responses_owner_attrs(
+            route_family="codex_oauth",
+            endpoint_contract="codex_responses",
+        ),
+        _openai_responses_owner_attrs(
+            route_family="codex_oauth",
+            state_format="codex_responses",
+        ),
+        _openai_responses_owner_attrs(
+            route_family="codex_oauth",
+            provider="xai",
+        ),
+        _openai_responses_owner_attrs(route_family="openai"),
+    ]
+    for requested in cases:
+        assert not sa._attributes_exactly_equal(left=owner, right=requested)
+        assert sa._compatibility_mismatch_reason(
+            owner_record=_owned_record(owner),
+            requested_attributes=requested,
+            require_exact_attributes=True,
+        ) is not None
+        assert sa._compatibility_mismatch_reason(
+            owner_record=_owned_record(owner),
+            requested_attributes=requested,
+            require_exact_attributes=False,
+        ) is not None
+
+
+@pytest.mark.asyncio
+async def test_direct_openai_responses_owner_accepts_historical_codex_oauth_aliases() -> None:
+    redis = _FakeRedisCache()
+    historical = _openai_responses_owner_attrs(route_family="codex_oauth")
+    current = _openai_responses_owner_attrs(route_family="codex_responses")
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        reserved = await sa.guard_session_owner_before_egress(
+            session_identity="sess-openai-014-compat",
+            requested_attributes=historical,
+        )
+        promoted = await sa.promote_session_owner_reservation(
+            session_identity="sess-openai-014-compat",
+            reservation_token=reserved.reservation_token,
+            attributes=historical,
+        )
+        assert promoted.outcome is sa.SessionOwnerMutationOutcome.PROMOTED
+        continuation = await sa.ensure_session_owner_guard_for_request(
+            session_identity="sess-openai-014-compat",
+            requested_attributes=current,
+            require_exact_attributes=True,
+        )
+        stored = await sa.get_session_owner_record(
+            session_identity="sess-openai-014-compat"
+        )
+
+    assert continuation.decision is sa.SessionOwnerGuardDecision.COMPATIBLE_OWNER
+    assert stored[0] is not None
+    assert stored[0]["attributes"]["route_family"] == "codex_oauth"
