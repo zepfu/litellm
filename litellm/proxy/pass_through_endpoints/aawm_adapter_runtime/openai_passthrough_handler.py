@@ -70,6 +70,9 @@ class OpenAIPassThroughHandlerRuntime:
     resolve_codex_auto_agent_alias_model_fn: Callable[
         ..., Optional[str]
     ]
+    resolve_auto_agent_alias_route_host_attribution_fn: Callable[
+        ["Request"], Awaitable[dict[str, Optional[str]]]
+    ]
     add_route_family_logging_metadata_fn: Callable[
         [dict[str, Any], str], dict[str, Any]
     ]
@@ -388,6 +391,28 @@ class BaseOpenAIPassThroughHandler:
             ):
                 is_codex_responses_request = True
             if is_codex_responses_request:
+                codex_route_host_attribution = (
+                    await rt.resolve_auto_agent_alias_route_host_attribution_fn(request)
+                )
+                litellm_metadata = prepared_request_body.get("litellm_metadata")
+                if not isinstance(litellm_metadata, dict):
+                    litellm_metadata = {}
+                for key in (
+                    "client_ip",
+                    "client_ip_source",
+                    "host_name",
+                    "host_name_source",
+                ):
+                    value = codex_route_host_attribution.get(key)
+                    if value is None:
+                        continue
+                    if key == "client_ip" and litellm_metadata.get("client_ip"):
+                        continue
+                    litellm_metadata[key] = value
+                prepared_request_body = {
+                    **prepared_request_body,
+                    "litellm_metadata": litellm_metadata,
+                }
                 prepared_request_body = (
                     rt.add_route_family_logging_metadata_fn(
                         prepared_request_body,
@@ -836,6 +861,11 @@ def build_runtime_from_host() -> OpenAIPassThroughHandlerRuntime:
             _host,
             "llm_passthrough_endpoints",
             "_prepare_request_body_for_passthrough_observability",
+        ),
+        resolve_auto_agent_alias_route_host_attribution_fn=_late_bound_callback(
+            _host,
+            "llm_passthrough_endpoints",
+            "_aresolve_auto_agent_alias_route_host_attribution",
         ),
         safe_set_request_parsed_body_fn=_late_bound_callback(
             _host, "llm_passthrough_endpoints", "_safe_set_request_parsed_body"

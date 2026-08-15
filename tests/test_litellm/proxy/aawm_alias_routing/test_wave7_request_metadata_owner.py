@@ -640,6 +640,31 @@ class TestAsyncHostAttribution:
             result = await _aresolve_auto_agent_alias_route_host_attribution(request)
             assert result == _NEUTRAL_ATTRIBUTION
 
+    async def test_writes_request_state_with_resolved_attribution(self):
+        expected_result = {
+            "client_ip": "100.110.233.24",
+            "client_ip_source": "x-forwarded-for",
+            "host_name": "mahaf",
+            "host_name_source": "dns",
+        }
+
+        async def fake_aresolve(req, *, allow_blocking_lookup):
+            assert allow_blocking_lookup is True
+            return expected_result
+
+        request = _FakeRequest()
+        request.client = SimpleNamespace(host="203.0.113.2")
+        request.state = SimpleNamespace()
+
+        with patch.dict(
+            _aresolve_auto_agent_alias_route_host_attribution.__globals__,
+            {"aresolve_aawm_route_host_attribution": fake_aresolve},
+        ):
+            result = await _aresolve_auto_agent_alias_route_host_attribution(request)
+
+        assert result == expected_result
+        assert getattr(request.state, "aawm_route_host_attribution") == expected_result
+
 
 # ---------------------------------------------------------------------------
 # install() contract
@@ -654,6 +679,10 @@ class TestInstall:
             assert name in host, f"missing {name} in host_globals"
             assert host[name] is getattr(request_metadata, name)
             assert host[name].__globals__ is host
+        assert (
+            host["_set_aawm_route_host_attribution_request_state"]
+            is request_metadata._set_aawm_route_host_attribution_request_state
+        )
 
     def test_install_copies_seam_when_configured(self):
         host: dict[str, Any] = {}

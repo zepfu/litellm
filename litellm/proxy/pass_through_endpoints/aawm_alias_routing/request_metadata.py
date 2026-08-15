@@ -21,6 +21,7 @@ from litellm.proxy.aawm_route_logging import (
     _select_aawm_route_host_attribution_for_request,
     aresolve_aawm_route_host_attribution,
     resolve_aawm_route_host_attribution,
+    _set_aawm_route_host_attribution_request_state,
 )
 from litellm.proxy.common_utils.http_parsing_utils import (
     _safe_get_request_headers,
@@ -281,10 +282,12 @@ async def _aresolve_auto_agent_alias_route_host_attribution(
     if cached is not None:
         return cached
     try:
-        return await aresolve_aawm_route_host_attribution(
+        attribution = await aresolve_aawm_route_host_attribution(
             request,
             allow_blocking_lookup=True,
         )
+        _set_aawm_route_host_attribution_request_state(request, attribution)
+        return attribution
     except Exception:
         return {
             "client_ip": None,
@@ -350,6 +353,10 @@ def install(host_globals: dict) -> None:
         (
             "aresolve_aawm_route_host_attribution",
             aresolve_aawm_route_host_attribution,
+        ),
+        (
+            "_set_aawm_route_host_attribution_request_state",
+            _set_aawm_route_host_attribution_request_state,
         ),
         ("_normalize_tui_family", _normalize_tui_family),
     ):

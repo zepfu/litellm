@@ -26,6 +26,7 @@ import dataclasses
 import sys
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from types import ModuleType
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -36,6 +37,9 @@ import pytest
 import litellm
 from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy import pass_through_endpoints as pass_through_package
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.request_metadata import (
+    _aresolve_auto_agent_alias_route_host_attribution,
+)
 
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_passthrough_handler import (
     BaseOpenAIPassThroughHandler,
@@ -73,6 +77,14 @@ def _make_runtime(**overrides: Any) -> OpenAIPassThroughHandlerRuntime:
         join_grok_passthrough_url_fn=lambda **kw: "https://grok.test/v1/responses",
         request_uses_codex_native_auth_fn=lambda req: False,
         resolve_codex_auto_agent_alias_model_fn=lambda body, **kw: None,
+        resolve_auto_agent_alias_route_host_attribution_fn=AsyncMock(
+            return_value={
+                "client_ip": None,
+                "client_ip_source": None,
+                "host_name": None,
+                "host_name_source": None,
+            }
+        ),
         add_route_family_logging_metadata_fn=lambda body, fam: body,
         apply_codex_tool_description_patches_fn=lambda body: (body, []),
         drop_unsupported_codex_hosted_tools_fn=lambda body: (body, []),
@@ -125,6 +137,14 @@ def _synthetic_host() -> ModuleType:
         "_request_uses_codex_native_auth": lambda request: False,
         "_resolve_codex_auto_agent_alias_model": (
             lambda body, **kwargs: None
+        ),
+        "_aresolve_auto_agent_alias_route_host_attribution": AsyncMock(
+            return_value={
+                "client_ip": None,
+                "client_ip_source": None,
+                "host_name": None,
+                "host_name_source": None,
+            }
         ),
         "_add_route_family_logging_metadata": lambda body, family: body,
         "_apply_codex_tool_description_patches_to_request_body": (
@@ -211,6 +231,7 @@ class TestRuntimeDataclass:
             "join_grok_passthrough_url_fn",
             "request_uses_codex_native_auth_fn",
             "resolve_codex_auto_agent_alias_model_fn",
+            "resolve_auto_agent_alias_route_host_attribution_fn",
             "add_route_family_logging_metadata_fn",
             "apply_codex_tool_description_patches_fn",
             "drop_unsupported_codex_hosted_tools_fn",
@@ -755,6 +776,75 @@ class TestBaseHandlerDispatch:
             "tool_choice",
             "breakout",
         ]
+
+    def test_codex_dispatch_awaits_host_attribution_and_merges_metadata(self):
+        events: list[str] = []
+        expected_host_attribution = {
+            "client_ip": "100.110.233.24",
+            "client_ip_source": "x-forwarded-for",
+            "host_name": "mahaf",
+            "host_name_source": "dns",
+        }
+        request = _fake_request("POST")
+        request.state = SimpleNamespace()
+
+        async def fake_aresolve(req, *, allow_blocking_lookup):
+            events.append("resolve")
+            assert allow_blocking_lookup is True
+            assert req is request
+            return expected_host_attribution
+
+        async def dispatch_fn(
+            *,
+            prepared_request_body: dict[str, Any],
+            **kwargs: Any,
+        ) -> MagicMock:
+            events.append("dispatch")
+            metadata = prepared_request_body.get("litellm_metadata", {})
+            assert metadata["client_ip"] == "100.110.233.24"
+            assert metadata["client_ip_source"] == "x-forwarded-for"
+            assert metadata["host_name"] == "mahaf"
+            assert metadata["host_name_source"] == "dns"
+            assert getattr(request.state, "aawm_route_host_attribution") == {
+                "client_ip": "100.110.233.24",
+                "client_ip_source": "x-forwarded-for",
+                "host_name": "mahaf",
+                "host_name_source": "dns",
+            }
+            return MagicMock(name="dispatched-response")
+
+        with patch.dict(
+            _aresolve_auto_agent_alias_route_host_attribution.__globals__,
+            {
+                "aresolve_aawm_route_host_attribution": fake_aresolve,
+            },
+        ):
+            install_runtime(
+                _make_runtime(
+                    resolve_codex_auto_agent_alias_model_fn=(
+                        lambda body, **kwargs: "basic"
+                    ),
+                    resolve_auto_agent_alias_route_host_attribution_fn=(
+                        _aresolve_auto_agent_alias_route_host_attribution
+                    ),
+                    add_route_family_logging_metadata_fn=lambda body, family: body,
+                    try_dispatch_codex_request_fn=dispatch_fn,
+                )
+            )
+            result = asyncio.run(
+                BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+                    endpoint="/v1/responses",
+                    request=request,
+                    fastapi_response=MagicMock(),
+                    user_api_key_dict=MagicMock(),
+                    base_target_url="https://api.openai.com",
+                    api_key="sk-test",
+                    custom_llm_provider=litellm.LlmProviders.OPENAI,
+                )
+            )
+
+        assert result is not None
+        assert events == ["resolve", "dispatch"]
 
 
 # ---------------------------------------------------------------------------
