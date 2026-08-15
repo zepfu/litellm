@@ -351,6 +351,52 @@ async def test_aawm_alias_routing_redis_tracks_namespace_and_key_prefix(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_aawm_alias_routing_redis_status_follows_runtime_namespace_drift(
+    monkeypatch,
+):
+    _reset_aawm_alias_env(monkeypatch)
+    monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_HOST", "aawm-host")
+    monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "prod")
+
+    fake_cache = _build_fake_aawm_alias_cache()
+
+    with patch(
+        "litellm.proxy.aawm_alias_routing_redis.RedisCache",
+        side_effect=lambda *args, **kwargs: fake_cache,
+    ) as mock_redis_ctor:
+        manager = AAWMAliasRoutingRedisManager()
+        await manager.initialize()
+
+        init_status = manager.get_status()
+        assert init_status["namespace"] == "aawm-routing-prod-v1"
+        assert init_status["key_prefix"] == "aawm:alias-routing:aawm-routing-prod-v1"
+        assert mock_redis_ctor.call_count == 1
+
+        monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
+        drifted_namespace = (
+            aawm_alias_routing_redis.resolve_alias_routing_state_namespace()
+        )
+        drifted_status = manager.get_status()
+        durable_key = _build_aawm_alias_routing_durable_cache_key(
+            alias_family="codex",
+            state_kind="cooldown",
+            state_key="runtime-drift",
+        )
+
+        assert drifted_namespace == "aawm-routing-dev-v1"
+        assert drifted_status["namespace"] == drifted_namespace
+        assert drifted_status["key_prefix"] == manager._build_key_prefix(
+            drifted_namespace
+        )
+        assert drifted_status["key_prefix"] == "aawm:alias-routing:aawm-routing-dev-v1"
+        assert durable_key.startswith(f"{drifted_status['key_prefix']}:")
+        # Drift is observability-only: do not reconnect or rebuild Redis clients.
+        assert mock_redis_ctor.call_count == 1
+        assert manager.get_dual_cache() is not None
+        assert manager.get_dual_cache().redis_cache is fake_cache
+
+
+@pytest.mark.asyncio
 async def test_aawm_alias_routing_redis_initialize_is_idempotent(monkeypatch):
     _reset_aawm_alias_env(monkeypatch)
     monkeypatch.setenv("AAWM_ALIAS_ROUTING_REDIS_HOST", "aawm-host")

@@ -695,7 +695,9 @@ class AAWMAliasRoutingRedisManager:
 
     def get_status(self) -> Dict[str, Any]:
         """Return sanitized runtime status for alias-routing state cache."""
-        namespace = self._namespace or self.DEFAULT_NAMESPACE
+        # Report the same live namespace/key prefix durable key construction uses.
+        # Do not reuse the initialize-time snapshot; runtime env can drift.
+        namespace = resolve_alias_routing_state_namespace() or self.DEFAULT_NAMESPACE
         mode = "redis" if self._is_cache_attached() else "memory"
         self_heal_active = bool(
             self._self_heal_armed
