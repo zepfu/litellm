@@ -18,6 +18,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 from fastapi import Request
 
 from litellm.proxy.aawm_route_logging import (
+    _select_aawm_route_host_attribution_for_request,
     aresolve_aawm_route_host_attribution,
     resolve_aawm_route_host_attribution,
 )
@@ -249,6 +250,12 @@ def _resolve_auto_agent_alias_route_host_attribution(
     Async request paths that need a full lookup should await
     ``_aresolve_auto_agent_alias_route_host_attribution``.
     """
+    cached = _select_aawm_route_host_attribution_for_request(
+        request=request,
+        metadata={},
+    )
+    if cached is not None:
+        return cached
     try:
         return resolve_aawm_route_host_attribution(
             request,
@@ -267,6 +274,12 @@ async def _aresolve_auto_agent_alias_route_host_attribution(
     request: Request,
 ) -> dict[str, Optional[str]]:
     """Async host attribution that offloads DNS via aresolve (RR-054 #4)."""
+    cached = _select_aawm_route_host_attribution_for_request(
+        request=request,
+        metadata={},
+    )
+    if cached is not None:
+        return cached
     try:
         return await aresolve_aawm_route_host_attribution(
             request,
@@ -326,6 +339,10 @@ def install(host_globals: dict) -> None:
         ("parse_qsl", parse_qsl),
         ("urlencode", urlencode),
         ("urlparse", urlparse),
+        (
+            "_select_aawm_route_host_attribution_for_request",
+            _select_aawm_route_host_attribution_for_request,
+        ),
         (
             "resolve_aawm_route_host_attribution",
             resolve_aawm_route_host_attribution,

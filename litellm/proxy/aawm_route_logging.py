@@ -45,6 +45,7 @@ _AAWM_ROUTE_ROLLUP_MAX_SUBLINES = 16
 _AAWM_ROUTE_ROLLUP_MAX_ORIGIN_IDENTITIES = 256
 _AAWM_ROUTE_ROLLUP_MAX_REVIEW_RATIONALES = 8
 _AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY = "aawm_route_rollup_context"
+_AAWM_ROUTE_HOST_ATTRIBUTION_STATE_KEY = "aawm_route_host_attribution"
 _AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY = (
     "_aawm_parsed_codex_review_decisions"
 )
@@ -1119,6 +1120,104 @@ def _extract_aawm_route_request_client_ip(
                 return normalized_ip, "x_forwarded_for"
 
     return normalized_ip, "request_client"
+
+
+def _normalize_aawm_route_host_attribution(
+    value: Any,
+) -> Optional[dict[str, Optional[str]]]:
+    if not isinstance(value, dict):
+        return None
+    attribution = {
+        "client_ip": _normalize_aawm_route_client_ip(value.get("client_ip")),
+        "client_ip_source": _clean_aawm_route_log_field(value.get("client_ip_source")),
+        "host_name": _clean_aawm_route_log_field(value.get("host_name")),
+        "host_name_source": _clean_aawm_route_log_field(
+            value.get("host_name_source")
+        ),
+    }
+    if not any(attribution.values()):
+        return None
+    return attribution
+
+
+def _get_aawm_route_host_attribution_from_request_state(
+    request: Optional[Request],
+) -> Optional[dict[str, Optional[str]]]:
+    if request is None:
+        return None
+    request_state = getattr(request, "state", None)
+    if request_state is None:
+        return None
+    return _normalize_aawm_route_host_attribution(
+        getattr(request_state, _AAWM_ROUTE_HOST_ATTRIBUTION_STATE_KEY, None)
+    )
+
+
+def _set_aawm_route_host_attribution_request_state(
+    request: Optional[Request],
+    attribution: Any,
+) -> None:
+    if request is None:
+        return
+    request_state = getattr(request, "state", None)
+    if request_state is None:
+        return
+    normalized = _normalize_aawm_route_host_attribution(attribution)
+    if normalized is None:
+        return
+    setattr(request_state, _AAWM_ROUTE_HOST_ATTRIBUTION_STATE_KEY, normalized)
+
+
+def _extract_aawm_route_host_attribution_from_metadata(
+    metadata: Optional[dict[str, Any]],
+) -> Optional[dict[str, Optional[str]]]:
+    if not isinstance(metadata, dict):
+        return None
+    return _normalize_aawm_route_host_attribution(
+        {
+            "client_ip": (
+                metadata.get("client_ip")
+                or metadata.get("requester_ip_address")
+            ),
+            "client_ip_source": metadata.get("client_ip_source"),
+            "host_name": metadata.get("host_name"),
+            "host_name_source": metadata.get("host_name_source"),
+        }
+    )
+
+
+def _select_aawm_route_host_attribution_for_request(
+    request: Optional[Request],
+    metadata: dict[str, Any],
+) -> Optional[dict[str, Optional[str]]]:
+    """Return precomputed host attribution that still matches request IP.
+
+    State-scoped attribution from pre-call should be reused on the same request
+    when the computed client IP still matches.  Stale metadata/state is ignored
+    so fresh request data remains authoritative.
+    """
+    if request is None:
+        return None
+
+    try:
+        request_client_ip, _ = _extract_aawm_route_request_client_ip(request)
+    except Exception:  # noqa: BLE001
+        request_client_ip = None
+
+    cached = _get_aawm_route_host_attribution_from_request_state(request)
+    if cached is not None:
+        if request_client_ip is None or cached.get("client_ip") == request_client_ip:
+            return cached
+
+    metadata_attribution = _extract_aawm_route_host_attribution_from_metadata(
+        metadata,
+    )
+    if metadata_attribution is None:
+        return None
+    metadata_client_ip = metadata_attribution.get("client_ip")
+    if request_client_ip is None or metadata_client_ip == request_client_ip:
+        return metadata_attribution
+    return None
 
 
 def resolve_aawm_route_host_attribution(
@@ -2422,7 +2521,12 @@ def build_aawm_route_rollup_context(
         normalizer=_normalize_aawm_route_log_tenant_repository_label,
     )
     if request is not None:
-        host_attribution = resolve_aawm_route_host_attribution(request)
+        host_attribution = _select_aawm_route_host_attribution_for_request(
+            request=request,
+            metadata=metadata,
+        )
+        if host_attribution is None:
+            host_attribution = resolve_aawm_route_host_attribution(request)
     else:
         host_attribution = resolve_aawm_route_host_attribution(
             request,

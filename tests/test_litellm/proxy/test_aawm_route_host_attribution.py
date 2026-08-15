@@ -385,6 +385,148 @@ def test_build_aawm_route_rollup_context_uses_current_request_xff_over_stale_met
     )
 
 
+def test_build_aawm_route_rollup_context_uses_cached_request_state_attribution(monkeypatch):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    request = Mock(spec=Request)
+    request.method = "POST"
+    request.url = "http://127.0.0.1:4001/openai_passthrough/responses"
+    request.headers = {"user-agent": "codex-cli/0.142.5"}
+    request.client = SimpleNamespace(host="100.99.1.5", port=12345)
+    request.scope = {
+        "path": "/openai_passthrough/responses",
+        "query_string": b"",
+        "client": ("100.99.1.5", 12345),
+    }
+    request.state = SimpleNamespace()
+    route_logging._set_aawm_route_host_attribution_request_state(
+        request,
+        {
+            "client_ip": "100.99.1.5",
+            "client_ip_source": "request_client",
+            "host_name": "cached-host",
+            "host_name_source": "cache",
+        },
+    )
+    kwargs = {
+        "litellm_params": {
+            "metadata": {
+                "repository": "aawm-infrastructure",
+            }
+        }
+    }
+
+    def fail_if_resolved(*args, **kwargs):
+        raise AssertionError("cached request-state attribution should be used")
+
+    monkeypatch.setattr(route_logging, "resolve_aawm_route_host_attribution", fail_if_resolved)
+
+    context = build_aawm_route_rollup_context(
+        request=request,
+        target="https://chatgpt.com/backend-api/codex/responses",
+        request_body={"model": "gpt-5.5"},
+        kwargs=kwargs,
+    )
+
+    assert context is not None
+    assert context["client_ip"] == "100.99.1.5"
+    assert context["host_name"] == "cached-host"
+
+
+def test_build_aawm_route_rollup_context_uses_cached_metadata_attribution_when_ip_matches_request(monkeypatch):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    request = Mock(spec=Request)
+    request.method = "POST"
+    request.url = "http://127.0.0.1:4001/openai_passthrough/responses"
+    request.headers = {"user-agent": "codex-cli/0.142.5"}
+    request.client = SimpleNamespace(host="100.99.1.5", port=12345)
+    request.scope = {
+        "path": "/openai_passthrough/responses",
+        "query_string": b"",
+        "client": ("100.99.1.5", 12345),
+    }
+
+    def fail_if_resolved(*args, **kwargs):
+        raise AssertionError("cached metadata attribution should be used")
+
+    monkeypatch.setattr(route_logging, "resolve_aawm_route_host_attribution", fail_if_resolved)
+
+    context = build_aawm_route_rollup_context(
+        request=request,
+        target="https://chatgpt.com/backend-api/codex/responses",
+        request_body={"model": "gpt-5.5"},
+        kwargs={
+            "litellm_params": {
+                "metadata": {
+                    "repository": "aawm-infrastructure",
+                    "client_ip": "100.99.1.5",
+                    "client_ip_source": "request_client",
+                    "host_name": "metadata-host",
+                    "host_name_source": "metadata",
+                }
+            }
+        },
+    )
+
+    assert context is not None
+    assert context["host_name"] == "metadata-host"
+
+
+def test_build_aawm_route_rollup_context_rejects_stale_request_state_attribution(monkeypatch):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    request = Mock(spec=Request)
+    request.method = "POST"
+    request.url = "http://127.0.0.1:4001/openai_passthrough/responses"
+    request.headers = {"user-agent": "codex-cli/0.142.5"}
+    request.client = SimpleNamespace(host="100.99.1.5", port=12345)
+    request.scope = {
+        "path": "/openai_passthrough/responses",
+        "query_string": b"",
+        "client": ("100.99.1.5", 12345),
+    }
+    request.state = SimpleNamespace()
+    route_logging._set_aawm_route_host_attribution_request_state(
+        request,
+        {
+            "client_ip": "172.18.0.1",
+            "client_ip_source": "request_client",
+            "host_name": "stale-host",
+            "host_name_source": "cache",
+        },
+    )
+    kwargs = {
+        "litellm_params": {
+            "metadata": {
+                "repository": "aawm-infrastructure",
+            }
+        }
+    }
+
+    resolve_call = Mock(
+        return_value={
+            "client_ip": "100.99.1.5",
+            "client_ip_source": "request_client",
+            "host_name": "resolved-host",
+            "host_name_source": "reverse_dns",
+        }
+    )
+    monkeypatch.setattr(route_logging, "resolve_aawm_route_host_attribution", resolve_call)
+
+    context = build_aawm_route_rollup_context(
+        request=request,
+        target="https://chatgpt.com/backend-api/codex/responses",
+        request_body={"model": "gpt-5.5"},
+        kwargs=kwargs,
+    )
+
+    assert context is not None
+    assert context["client_ip"] == "100.99.1.5"
+    assert context["host_name"] == "resolved-host"
+    resolve_call.assert_called_once_with(request)
+
+
 def test_build_aawm_route_rollup_context_uses_metadata_without_request(
     monkeypatch,
 ):

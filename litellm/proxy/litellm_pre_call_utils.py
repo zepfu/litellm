@@ -20,7 +20,10 @@ from litellm.proxy._types import (
     TeamCallbackMetadata,
     UserAPIKeyAuth,
 )
-from litellm.proxy.aawm_route_logging import aresolve_aawm_route_host_attribution
+from litellm.proxy.aawm_route_logging import (
+    _set_aawm_route_host_attribution_request_state,
+    aresolve_aawm_route_host_attribution,
+)
 from litellm.proxy.common_utils.http_parsing_utils import _safe_get_request_headers
 
 # Cache special headers as a frozenset for O(1) lookup performance
@@ -1219,6 +1222,7 @@ async def add_litellm_data_to_request(  # noqa: PLR0915
         general_settings=general_settings,
         allow_blocking_lookup=True,
     )
+    _set_aawm_route_host_attribution_request_state(request, host_attribution)
     if host_attribution.get("client_ip"):
         data[_metadata_variable_name]["client_ip"] = host_attribution["client_ip"]
         data[_metadata_variable_name]["requester_ip_address"] = host_attribution[

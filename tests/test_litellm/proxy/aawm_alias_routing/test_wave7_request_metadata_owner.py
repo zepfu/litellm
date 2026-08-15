@@ -11,6 +11,7 @@ import ast
 import inspect
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import MagicMock, patch
 
@@ -464,6 +465,58 @@ class TestExtractIncomingEndpoint:
 
 
 class TestSyncHostAttribution:
+    def test_prefers_cached_request_state_attribution(self):
+        fake_result = {
+            "client_ip": "10.0.0.1",
+            "client_ip_source": "x-forwarded-for",
+            "host_name": "state-host",
+            "host_name_source": "state",
+        }
+        request = _FakeRequest()
+        request.client = SimpleNamespace(host="10.0.0.1")
+        request.state = SimpleNamespace(aawm_route_host_attribution=fake_result)
+
+        with patch.dict(
+            _resolve_auto_agent_alias_route_host_attribution.__globals__,
+            {
+                "resolve_aawm_route_host_attribution": MagicMock(
+                    side_effect=AssertionError("state must win")
+                )
+            },
+        ):
+            result = _resolve_auto_agent_alias_route_host_attribution(request)
+            assert result == fake_result
+
+    def test_stale_request_state_delegates_to_resolver(self):
+        stale_result = {
+            "client_ip": "10.0.0.1",
+            "client_ip_source": "request_client",
+            "host_name": "stale-host",
+            "host_name_source": "state",
+        }
+        fresh_result = {
+            "client_ip": "10.0.0.2",
+            "client_ip_source": "request_client",
+            "host_name": "fresh-host",
+            "host_name_source": "reverse-dns",
+        }
+        request = _FakeRequest()
+        request.client = SimpleNamespace(host="10.0.0.2")
+        request.state = SimpleNamespace(aawm_route_host_attribution=stale_result)
+        mock_resolve = MagicMock(return_value=fresh_result)
+
+        with patch.dict(
+            _resolve_auto_agent_alias_route_host_attribution.__globals__,
+            {"resolve_aawm_route_host_attribution": mock_resolve},
+        ):
+            result = _resolve_auto_agent_alias_route_host_attribution(request)
+
+        assert result == fresh_result
+        mock_resolve.assert_called_once_with(
+            request,
+            allow_blocking_lookup=False,
+        )
+
     def test_delegates_to_resolver(self):
         fake_result = {
             "client_ip": "10.0.0.1",
@@ -503,6 +556,58 @@ class TestSyncHostAttribution:
 
 
 class TestAsyncHostAttribution:
+    async def test_prefers_cached_request_state_attribution(self):
+        fake_result = {
+            "client_ip": "10.0.0.1",
+            "client_ip_source": "x-forwarded-for",
+            "host_name": "state-host",
+            "host_name_source": "state",
+        }
+        request = _FakeRequest()
+        request.client = SimpleNamespace(host="10.0.0.1")
+        request.state = SimpleNamespace(aawm_route_host_attribution=fake_result)
+
+        async def fail_async(req, *, allow_blocking_lookup):
+            raise AssertionError("state must win")
+
+        with patch.dict(
+            _aresolve_auto_agent_alias_route_host_attribution.__globals__,
+            {"aresolve_aawm_route_host_attribution": fail_async},
+        ):
+            result = await _aresolve_auto_agent_alias_route_host_attribution(request)
+            assert result == fake_result
+
+    async def test_stale_request_state_delegates_to_async_resolver(self):
+        stale_result = {
+            "client_ip": "10.0.0.1",
+            "client_ip_source": "request_client",
+            "host_name": "stale-host",
+            "host_name_source": "state",
+        }
+        fresh_result = {
+            "client_ip": "10.0.0.2",
+            "client_ip_source": "request_client",
+            "host_name": "fresh-host",
+            "host_name_source": "reverse-dns",
+        }
+        request = _FakeRequest()
+        request.client = SimpleNamespace(host="10.0.0.2")
+        request.state = SimpleNamespace(aawm_route_host_attribution=stale_result)
+        calls = []
+
+        async def fake_aresolve(req, *, allow_blocking_lookup):
+            calls.append((req, allow_blocking_lookup))
+            return fresh_result
+
+        with patch.dict(
+            _aresolve_auto_agent_alias_route_host_attribution.__globals__,
+            {"aresolve_aawm_route_host_attribution": fake_aresolve},
+        ):
+            result = await _aresolve_auto_agent_alias_route_host_attribution(request)
+
+        assert result == fresh_result
+        assert calls == [(request, True)]
+
     async def test_delegates_to_async_resolver(self):
         fake_result = {
             "client_ip": "192.168.1.1",
