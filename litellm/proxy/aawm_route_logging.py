@@ -1331,6 +1331,8 @@ _AAWM_ROUTE_ROLLUP_STATUS_VALUES = (
     "Cooling Down",
     "Failed",
     "Exhausted",
+    "Incomplete",
+    "Recovered",
 )
 _aawm_route_rollup_lock = threading.Lock()
 _aawm_route_rollup_accumulator: Optional["AawmRouteRollupAccumulator"] = None
@@ -1998,6 +2000,7 @@ class AawmRouteRollupAccumulator:
 
         subline_key = (cleaned_model_label, cleaned_effort, cleaned_outgoing_target)
         subline = group.sublines.get(subline_key)
+        subline_already_existed = subline is not None
         if subline is None:
             if len(group.subline_order) >= self._max_sublines:
                 emitted_lines.extend(
@@ -2019,6 +2022,14 @@ class AawmRouteRollupAccumulator:
             subline.turns += turns
             if origin_identity is not None:
                 subline.register_origin_identity(origin_identity)
+            if (
+                subline_already_existed
+                and normalized_status is None
+                and subline.status == "Incomplete"
+            ):
+                group.event_sequence += 1
+                subline.status = "Recovered"
+                subline.status_sequence = group.event_sequence
         if normalized_status is not None:
             group.event_sequence += 1
             subline.status = normalized_status

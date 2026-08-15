@@ -15,6 +15,14 @@ from litellm.proxy.pass_through_endpoints.success_handler import PassThroughEndp
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
 
 
+def _responses_sse_event(payload: dict) -> bytes:
+    return (
+        f"event: {payload['type']}\ndata: "
+        + json.dumps(payload, separators=(",", ":"))
+        + "\n\n"
+    ).encode("utf-8")
+
+
 def test_stream_line_accumulator_matches_raw_bytes_converter():
     raw_bytes = [
         b'data: {"type":"message_start"}\n\n',
@@ -282,6 +290,7 @@ async def test_chunk_processor_increments_summary_lines_for_codex_responses(monk
 
     async def _aiter_bytes():
         yield b'data: {"delta":1}\n\n'
+        yield b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
         yield b"data: [DONE]\n\n"
 
     response = MagicMock()
@@ -316,9 +325,14 @@ async def test_chunk_processor_increments_summary_lines_for_codex_responses(monk
 
     await asyncio.sleep(0.05)
 
-    assert chunks == [b'data: {"delta":1}\n\n', b"data: [DONE]\n\n"]
+    assert chunks == [
+        b'data: {"delta":1}\n\n',
+        b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+        b"data: [DONE]\n\n",
+    ]
     assert route_kwargs["precomputed_lines"] == [
         'data: {"delta":1}',
+        'data: {"type":"response.completed","response":{"status":"completed"}}',
         "data: [DONE]",
     ]
 
@@ -376,6 +390,7 @@ async def test_chunk_processor_skips_raw_bytes_when_summary_finalize_and_capture
 
     async def _aiter_bytes():
         yield b'data: {"delta":1}\n\n'
+        yield b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
         yield b"data: [DONE]\n\n"
 
     response = MagicMock()
@@ -411,10 +426,15 @@ async def test_chunk_processor_skips_raw_bytes_when_summary_finalize_and_capture
 
     await asyncio.sleep(0.05)
 
-    assert chunks == [b'data: {"delta":1}\n\n', b"data: [DONE]\n\n"]
+    assert chunks == [
+        b'data: {"delta":1}\n\n',
+        b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+        b"data: [DONE]\n\n",
+    ]
     assert route_kwargs["raw_bytes"] == []
     assert route_kwargs["precomputed_lines"] == [
         'data: {"delta":1}',
+        'data: {"type":"response.completed","response":{"status":"completed"}}',
         "data: [DONE]",
     ]
     assert (
@@ -437,6 +457,7 @@ async def test_chunk_processor_keeps_raw_bytes_when_summary_finalize_and_capture
 
     async def _aiter_bytes():
         yield b'data: {"delta":1}\n\n'
+        yield b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
         yield b"data: [DONE]\n\n"
 
     response = MagicMock()
@@ -472,13 +493,19 @@ async def test_chunk_processor_keeps_raw_bytes_when_summary_finalize_and_capture
 
     await asyncio.sleep(0.05)
 
-    assert chunks == [b'data: {"delta":1}\n\n', b"data: [DONE]\n\n"]
+    assert chunks == [
+        b'data: {"delta":1}\n\n',
+        b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+        b"data: [DONE]\n\n",
+    ]
     assert route_kwargs["raw_bytes"] == [
         b'data: {"delta":1}\n\n',
+        b'data: {"type":"response.completed","response":{"status":"completed"}}\n\n',
         b"data: [DONE]\n\n",
     ]
     assert route_kwargs["precomputed_lines"] == [
         'data: {"delta":1}',
+        'data: {"type":"response.completed","response":{"status":"completed"}}',
         "data: [DONE]",
     ]
     assert (
@@ -490,79 +517,47 @@ async def test_chunk_processor_keeps_raw_bytes_when_summary_finalize_and_capture
 
 
 @pytest.mark.asyncio
-async def test_chunk_processor_synthesizes_once_for_codex_clean_eof(  # noqa: PLR0915
-    monkeypatch,
-):
+async def test_chunk_processor_synthesizes_completed_for_complete_text(monkeypatch):
     monkeypatch.setenv(
         PassThroughStreamingHandler._AAWM_STREAM_SUMMARY_FIRST_FINALIZE_ENV,
         "1",
     )
-    monkeypatch.setenv("AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS", "1")
-
-    first_chunk = (
-        b'event: response.created\ndata: {"type":"response.created",'
-        b'"response":{"id":"resp-partial","status":"in_progress"}}\n\n'
-    )
-    second_chunk = (
-        b'event: response.output_text.delta\ndata: {"type":'
-        b'"response.output_text.delta","delta":"exact bytes"}\n\n'
-    )
+    provider_chunks = [
+        _responses_sse_event(
+            {
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {
+                    "id": "resp-complete",
+                    "model": "gpt-5.4",
+                    "status": "in_progress",
+                },
+            }
+        ),
+        _responses_sse_event(
+            {
+                "type": "response.output_text.done",
+                "sequence_number": 1,
+                "item_id": "msg_1",
+                "output_index": 0,
+                "content_index": 0,
+                "text": "complete text",
+            }
+        ),
+    ]
 
     async def _aiter_bytes():
-        yield first_chunk
-        yield second_chunk + b"data: [DONE]\n\n"
-        yield b"data: [DO"
-        yield b"NE]\n\n"
+        for provider_chunk in provider_chunks:
+            yield provider_chunk
 
     response = MagicMock()
     response.headers = httpx.Headers({})
     response.aiter_bytes = _aiter_bytes
-
     logging_obj = MagicMock()
     logging_obj._update_completion_start_time = MagicMock()
-    metadata_at_failure: dict = {}
-
-    async def _capture_failure(**kwargs):
-        metadata_at_failure.update(
-            success_handler_kwargs["litellm_params"]["metadata"]
-        )
-
-    logging_obj.async_failure_handler = AsyncMock(side_effect=_capture_failure)
-    logging_obj.async_success_handler = AsyncMock()
+    logging_obj.async_failure_handler = AsyncMock()
     route_handler = AsyncMock()
-    status_events: list[dict] = []
-    rollup_events: list[dict] = []
-
-    success_handler_kwargs = {
-        "litellm_params": {
-            "metadata": {
-                "existing_marker": "preserved",
-                "aawm_route_rollup_context": {
-                    "group_header_label": "Codex/litellm",
-                    "incoming_endpoint": "/openai_passthrough/responses",
-                    "outgoing_target": (
-                        "https://chatgpt.com/backend-api/codex/responses"
-                    ),
-                    "model_label": "work",
-                    "reasoning_effort": "high",
-                },
-            }
-        }
-    }
-    error_log_context = {
-        "provider": "openai",
-        "model": "gpt-5.4",
-        "model_alias": "work",
-        "route_family": "codex_responses",
-    }
-    monkeypatch.setattr(
-        "litellm.proxy.pass_through_endpoints.streaming_handler.emit_aawm_route_status_event",
-        lambda **kwargs: status_events.append(kwargs),
-    )
-    monkeypatch.setattr(
-        "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup",
-        lambda **kwargs: rollup_events.append(kwargs),
-    )
+    success_handler_kwargs = {"litellm_params": {"metadata": {}}}
 
     with patch.object(
         PassThroughStreamingHandler,
@@ -580,78 +575,409 @@ async def test_chunk_processor_synthesizes_once_for_codex_clean_eof(  # noqa: PL
             url_route="https://chatgpt.com/backend-api/codex/responses",
             custom_llm_provider="openai",
             success_handler_kwargs=success_handler_kwargs,
-            error_log_context=error_log_context,
         ):
             chunks.append(chunk)
 
     await asyncio.sleep(0.05)
 
-    assert chunks[:2] == [first_chunk, second_chunk]
-    combined = b"".join(chunks)
-    assert combined.startswith(first_chunk + second_chunk)
-    assert combined.count(b"event: response.incomplete") == 1
-    assert combined.count(b"data: [DONE]") == 1
-    assert combined.index(b"event: response.incomplete") < combined.index(
-        b"data: [DONE]"
-    )
-
-    incomplete_payload = json.loads(
+    terminal_payload = json.loads(
         chunks[-2].split(b"\ndata: ", 1)[1].removesuffix(b"\n\n")
     )
-    assert incomplete_payload["type"] == "response.incomplete"
-    assert incomplete_payload["response"]["status"] == "incomplete"
-    assert incomplete_payload["response"]["incomplete_details"]["reason"] == (
-        "upstream_stream_ended_without_terminal_event"
+    assert chunks[: len(provider_chunks)] == provider_chunks
+    assert terminal_payload["type"] == "response.completed"
+    assert terminal_payload["response"]["status"] == "completed"
+    assert b"".join(chunks).count(b"data: [DONE]") == 1
+    tracker_metadata = success_handler_kwargs["litellm_params"]["metadata"][
+        "aawm_stream_tracker_state"
+    ]
+    assert tracker_metadata["final_assistant_output"] is True
+    assert tracker_metadata["provider_terminal_observed"] is False
+    assert tracker_metadata["synthetic_terminal_event_type"] == "response.completed"
+    route_handler.assert_awaited_once()
+    logging_obj.async_failure_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_chunk_processor_synthesizes_incomplete_for_open_state(monkeypatch):
+    monkeypatch.setenv(
+        PassThroughStreamingHandler._AAWM_STREAM_SUMMARY_FIRST_FINALIZE_ENV,
+        "1",
     )
-    assert chunks[-1] == b"data: [DONE]\n\n"
+    provider_chunks = [
+        _responses_sse_event(
+            {
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {
+                    "id": "resp-open",
+                    "model": "gpt-5.4",
+                    "status": "in_progress",
+                },
+            }
+        ),
+        _responses_sse_event(
+            {
+                "type": "response.output_item.added",
+                "sequence_number": 1,
+                "output_index": 0,
+                "item": {
+                    "id": "msg_open",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "in_progress",
+                    "content": [],
+                },
+            }
+        ),
+    ]
 
-    metadata = success_handler_kwargs["litellm_params"]["metadata"]
-    assert metadata["existing_marker"] == "preserved"
-    assert metadata["aawm_stream_interrupted"] is True
-    assert metadata["aawm_stream_incomplete"] is True
-    assert metadata["aawm_stream_terminal_emitted"] is True
-    assert metadata["aawm_stream_replayable"] is False
-    assert metadata["stream_hidden_retry_safe"] is False
-    assert metadata["aawm_route_rollup_turn_suppressed"] is True
-    assert metadata_at_failure["aawm_stream_terminal_emitted"] is True
-    assert metadata_at_failure["aawm_stream_incomplete"] is True
-    logging_obj.async_failure_handler.assert_awaited_once()
-    logging_obj.async_success_handler.assert_not_awaited()
-    route_handler.assert_not_awaited()
-    assert len(status_events) == 1
-    assert status_events[0]["status"] == "Failed"
-    assert status_events[0]["alias_model"] == "work"
-    assert len(rollup_events) == 1
-    assert rollup_events[0]["status"] == "Failed"
-    assert rollup_events[0]["model_label"] == "work"
-    assert rollup_events[0]["turns"] == 0
+    async def _aiter_bytes():
+        for provider_chunk in provider_chunks:
+            yield provider_chunk
 
-    assert (
-        await PassThroughStreamingHandler._terminalize_post_first_byte_responses_clean_eof(
+    response = MagicMock()
+    response.headers = httpx.Headers({})
+    response.aiter_bytes = _aiter_bytes
+    logging_obj = MagicMock()
+    logging_obj._update_completion_start_time = MagicMock()
+    logging_obj.async_failure_handler = AsyncMock()
+    route_handler = AsyncMock()
+    success_handler_kwargs = {"litellm_params": {"metadata": {}}}
+
+    with patch.object(
+        PassThroughStreamingHandler,
+        "_route_streaming_logging_to_handler",
+        route_handler,
+    ):
+        chunks = []
+        async for chunk in PassThroughStreamingHandler.chunk_processor(
+            response=response,
+            request_body={"model": "gpt-5.4"},
             litellm_logging_obj=logging_obj,
             endpoint_type=EndpointType.OPENAI,
+            start_time=datetime.now(),
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
             url_route="https://chatgpt.com/backend-api/codex/responses",
             custom_llm_provider="openai",
-            start_time=datetime.now(),
-            error_log_context=error_log_context,
             success_handler_kwargs=success_handler_kwargs,
-            chunk_count=4,
-            total_stream_bytes=sum(
-                len(chunk)
-                for chunk in (
-                    first_chunk,
-                    second_chunk + b"data: [DONE]\n\n",
-                    b"data: [DO",
-                    b"NE]\n\n",
-                )
-            ),
-        )
-        == []
+        ):
+            chunks.append(chunk)
+
+    await asyncio.sleep(0.05)
+
+    terminal_payload = json.loads(
+        chunks[-2].split(b"\ndata: ", 1)[1].removesuffix(b"\n\n")
     )
-    logging_obj.async_failure_handler.assert_awaited_once()
-    logging_obj.async_success_handler.assert_not_awaited()
-    assert len(status_events) == 1
-    assert len(rollup_events) == 1
+    assert chunks[: len(provider_chunks)] == provider_chunks
+    assert terminal_payload["type"] == "response.incomplete"
+    assert terminal_payload["response"]["incomplete_details"]["reason"] == (
+        "upstream_stream_incomplete_item_state"
+    )
+    tracker_metadata = success_handler_kwargs["litellm_params"]["metadata"][
+        "aawm_stream_tracker_state"
+    ]
+    assert tracker_metadata["open_state_counts"]["output_items"] == 1
+    assert tracker_metadata["synthetic_terminal_event_type"] == "response.incomplete"
+    route_handler.assert_awaited_once()
+    logging_obj.async_failure_handler.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_chunk_processor_marks_split_partial_frame_incomplete(monkeypatch):
+    monkeypatch.setenv(
+        PassThroughStreamingHandler._AAWM_STREAM_SUMMARY_FIRST_FINALIZE_ENV,
+        "1",
+    )
+    provider_chunks = [
+        _responses_sse_event(
+            {
+                "type": "response.created",
+                "sequence_number": 0,
+                "response": {
+                    "id": "resp-partial-frame",
+                    "model": "gpt-5.4",
+                    "status": "in_progress",
+                },
+            }
+        ),
+        _responses_sse_event(
+            {
+                "type": "response.output_text.done",
+                "sequence_number": 1,
+                "item_id": "msg_1",
+                "output_index": 0,
+                "content_index": 0,
+                "text": "complete text",
+            }
+        ),
+        b'data: {"type":"response.output_text.delta"',
+    ]
+
+    async def _aiter_bytes():
+        for provider_chunk in provider_chunks:
+            yield provider_chunk
+
+    response = MagicMock()
+    response.headers = httpx.Headers({})
+    response.aiter_bytes = _aiter_bytes
+    logging_obj = MagicMock()
+    logging_obj._update_completion_start_time = MagicMock()
+    route_handler = AsyncMock()
+    success_handler_kwargs = {"litellm_params": {"metadata": {}}}
+
+    with patch.object(
+        PassThroughStreamingHandler,
+        "_route_streaming_logging_to_handler",
+        route_handler,
+    ):
+        chunks = []
+        async for chunk in PassThroughStreamingHandler.chunk_processor(
+            response=response,
+            request_body={"model": "gpt-5.4"},
+            litellm_logging_obj=logging_obj,
+            endpoint_type=EndpointType.OPENAI,
+            start_time=datetime.now(),
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            custom_llm_provider="openai",
+            success_handler_kwargs=success_handler_kwargs,
+        ):
+            chunks.append(chunk)
+
+    await asyncio.sleep(0.05)
+
+    terminal_payload = json.loads(
+        chunks[-2].split(b"\ndata: ", 1)[1].removesuffix(b"\n\n")
+    )
+    assert chunks[: len(provider_chunks)] == provider_chunks
+    assert terminal_payload["response"]["incomplete_details"]["reason"] == (
+        "upstream_stream_partial_frame"
+    )
+    tracker_metadata = success_handler_kwargs["litellm_params"]["metadata"][
+        "aawm_stream_tracker_state"
+    ]
+    assert tracker_metadata["partial_frame"] is True
+    route_handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_chunk_processor_deduplicates_done_for_synthetic_terminal(monkeypatch):
+    monkeypatch.setenv(
+        PassThroughStreamingHandler._AAWM_STREAM_SUMMARY_FIRST_FINALIZE_ENV,
+        "1",
+    )
+    provider_chunks = [
+        _responses_sse_event(
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp-done",
+                    "model": "gpt-5.4",
+                    "status": "in_progress",
+                },
+            }
+        ),
+        _responses_sse_event(
+            {
+                "type": "response.output_text.done",
+                "item_id": "msg_1",
+                "output_index": 0,
+                "content_index": 0,
+                "text": "complete text",
+            }
+        ),
+        b"data: [DONE]\n\n",
+    ]
+
+    async def _aiter_bytes():
+        for provider_chunk in provider_chunks:
+            yield provider_chunk
+
+    response = MagicMock()
+    response.headers = httpx.Headers({})
+    response.aiter_bytes = _aiter_bytes
+    logging_obj = MagicMock()
+    logging_obj._update_completion_start_time = MagicMock()
+    route_handler = AsyncMock()
+
+    with patch.object(
+        PassThroughStreamingHandler,
+        "_route_streaming_logging_to_handler",
+        route_handler,
+    ):
+        chunks = []
+        async for chunk in PassThroughStreamingHandler.chunk_processor(
+            response=response,
+            request_body={"model": "gpt-5.4"},
+            litellm_logging_obj=logging_obj,
+            endpoint_type=EndpointType.OPENAI,
+            start_time=datetime.now(),
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            custom_llm_provider="openai",
+            success_handler_kwargs={"litellm_params": {"metadata": {}}},
+        ):
+            chunks.append(chunk)
+
+    await asyncio.sleep(0.05)
+
+    combined = b"".join(chunks)
+    assert chunks[:2] == provider_chunks[:2]
+    assert combined.count(b"data: [DONE]") == 1
+    assert chunks[-1] == b"data: [DONE]\n\n"
+    assert b'"type":"response.completed"' in chunks[-2]
+    route_handler.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_chunks", "expected_terminal_type", "expected_route_status"),
+    [
+        (
+            [
+                _responses_sse_event(
+                    {
+                        "type": "response.created",
+                        "response": {
+                            "id": "resp-success-complete",
+                            "model": "gpt-5.4",
+                            "status": "in_progress",
+                        },
+                    }
+                ),
+                _responses_sse_event(
+                    {
+                        "type": "response.output_text.done",
+                        "item_id": "msg_1",
+                        "output_index": 0,
+                        "content_index": 0,
+                        "text": "complete text",
+                    }
+                ),
+            ],
+            "response.completed",
+            None,
+        ),
+        (
+            [
+                _responses_sse_event(
+                    {
+                        "type": "response.created",
+                        "response": {
+                            "id": "resp-success-incomplete",
+                            "model": "gpt-5.4",
+                            "status": "in_progress",
+                        },
+                    }
+                ),
+                _responses_sse_event(
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "id": "msg_open",
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "in_progress",
+                            "content": [],
+                        },
+                    }
+                ),
+            ],
+            "response.incomplete",
+            "Incomplete",
+        ),
+    ],
+    ids=["completed-omission-normal-success", "incomplete-zero-turn-status"],
+)
+async def test_chunk_processor_synthetic_terminal_reconciles_route_accounting_once(
+    monkeypatch,
+    provider_chunks,
+    expected_terminal_type,
+    expected_route_status,
+):
+    monkeypatch.setenv(
+        PassThroughStreamingHandler._AAWM_STREAM_SUMMARY_FIRST_FINALIZE_ENV,
+        "1",
+    )
+
+    async def _aiter_bytes():
+        for provider_chunk in provider_chunks:
+            yield provider_chunk
+
+    response = MagicMock()
+    response.headers = httpx.Headers({})
+    response.aiter_bytes = _aiter_bytes
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {}
+    logging_obj._update_completion_start_time = MagicMock()
+    success_called = asyncio.Event()
+
+    async def _capture_success(**kwargs):
+        success_called.set()
+
+    logging_obj.async_success_handler = AsyncMock(side_effect=_capture_success)
+    logging_obj.async_failure_handler = AsyncMock()
+    logging_obj._should_run_sync_callbacks_for_async_calls.return_value = False
+    success_handler_kwargs = {
+        "litellm_params": {
+            "metadata": {
+                "aawm_route_rollup_context": {
+                    "group_header_label": "litellm#Codex[0.141.0]",
+                    "incoming_endpoint": "/openai_passthrough/responses",
+                    "outgoing_target": "chatgpt.com/backend-api/codex/responses",
+                    "model_label": "gpt-5.4",
+                    "reasoning_effort": "high",
+                }
+            }
+        },
+        "standard_logging_object": {"metadata": {}, "request_tags": []},
+    }
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.OpenAIPassthroughLoggingHandler._handle_logging_openai_collected_chunks",
+        return_value={"result": {"response": "ok"}, "kwargs": {}},
+    ) as collected_handler, patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup_turn"
+    ) as record_turn, patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.emit_aawm_route_status_event"
+    ) as emit_status, patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup"
+    ) as record_rollup:
+        chunks = []
+        async for chunk in PassThroughStreamingHandler.chunk_processor(
+            response=response,
+            request_body={"model": "gpt-5.4"},
+            litellm_logging_obj=logging_obj,
+            endpoint_type=EndpointType.OPENAI,
+            start_time=datetime.now(),
+            passthrough_success_handler_obj=MagicMock(spec=PassThroughEndpointLogging),
+            url_route="https://chatgpt.com/backend-api/codex/responses",
+            custom_llm_provider="openai",
+            success_handler_kwargs=success_handler_kwargs,
+        ):
+            chunks.append(chunk)
+
+        await asyncio.wait_for(success_called.wait(), timeout=1)
+
+    assert f'"type":"{expected_terminal_type}"'.encode() in b"".join(chunks)
+    collected_handler.assert_called_once()
+    logging_obj.async_success_handler.assert_awaited_once()
+    logging_obj.async_failure_handler.assert_not_awaited()
+    if expected_route_status is None:
+        record_turn.assert_called_once()
+        response_body = record_turn.call_args.kwargs["response_body"]
+        assert response_body["status"] == "completed"
+        emit_status.assert_not_called()
+        record_rollup.assert_not_called()
+    else:
+        record_turn.assert_not_called()
+        emit_status.assert_called_once()
+        assert emit_status.call_args.kwargs["status"] == expected_route_status
+        record_rollup.assert_called_once()
+        rollup_kwargs = record_rollup.call_args.kwargs
+        assert rollup_kwargs["status"] == expected_route_status
+        assert rollup_kwargs["turns"] == 0
 
 
 def test_record_post_first_byte_stream_terminal_rollup_preserves_reasoning_effort():

@@ -1508,6 +1508,156 @@ def test_build_session_history_metadata_does_not_flip_worker_exhaustion_to_succe
     assert history["worker_context_exhaustion_completed"] is False
 
 
+def test_build_session_history_metadata_persists_stream_state() -> None:
+    from litellm.integrations.aawm_agent_identity import _build_session_history_metadata
+
+    metadata = {
+        "aawm_stream_tracker_state": {"event_count": 8, "partial_frame": False},
+        "aawm_stream_synthetic_terminal": True,
+        "aawm_stream_terminal_event_type": "response.incomplete",
+        "aawm_stream_incomplete_reason": "upstream_stream_ended_without_terminal_event",
+        "aawm_stream_recovery_outcome": "exhausted",
+        "aawm_stream_recovery_parent_litellm_call_id": "call-originating",
+        "aawm_stream_recovery_previous_response_id": "resp-previous",
+    }
+
+    history = _build_session_history_metadata(
+        metadata=metadata,
+        request_tags=[],
+        tenant_id=None,
+    )
+
+    for key, value in metadata.items():
+        assert history[key] == value
+
+
+def test_build_session_history_record_persists_stream_recovery_metadata() -> None:
+    kwargs = _base_kwargs(trace_name="codex.responses")
+    kwargs["model"] = "gpt-5.4"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-continuation-current"
+    kwargs["standard_logging_object"]["status"] = "success"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-stream-recovery",
+            "aawm_stream_recovery_parent_litellm_call_id": "call-originating",
+        }
+    )
+    kwargs["passthrough_logging_payload"]["request_body"] = {
+        "model": "gpt-5.4",
+        "previous_response_id": "resp-previous",
+    }
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-current",
+            "status": "completed",
+            "metadata": {
+                "aawm_stream_tracker_state": {
+                    "event_count": 5,
+                    "open_state_counts": {},
+                    "partial_frame": False,
+                },
+                "aawm_stream_synthetic_terminal": False,
+                "aawm_stream_terminal_event_type": "response.completed",
+            },
+            "usage": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
+            "output": [],
+        },
+        start_time="2026-08-15T05:00:00Z",
+        end_time="2026-08-15T05:00:01Z",
+    )
+
+    assert record is not None
+    assert record["provider_response_id"] == "resp-current"
+    assert record["session_id"] == "session-stream-recovery"
+    assert record["litellm_call_id"] == "call-continuation-current"
+    assert record["metadata"]["aawm_stream_tracker_state"] == {
+        "event_count": 5,
+        "open_state_counts": {},
+        "partial_frame": False,
+    }
+    assert record["metadata"]["aawm_stream_synthetic_terminal"] is False
+    assert record["metadata"]["aawm_stream_terminal_event_type"] == "response.completed"
+    assert record["metadata"]["aawm_stream_recovery_previous_response_id"] == (
+        "resp-previous"
+    )
+    assert record["metadata"]["aawm_stream_recovery_parent_litellm_call_id"] == (
+        "call-originating"
+    )
+    assert record["metadata"]["aawm_stream_recovery_outcome"] == "recovered"
+
+
+def test_build_session_history_record_uses_metadata_provider_response_id() -> None:
+    kwargs = _base_kwargs(trace_name="codex.responses")
+    kwargs["model"] = "gpt-5.4"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-provider-response-metadata"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-provider-response-metadata",
+            "provider_response_id": "resp-from-callback-metadata",
+        }
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={"usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4}},
+        start_time="2026-08-15T05:01:00Z",
+        end_time="2026-08-15T05:01:01Z",
+    )
+
+    assert record is not None
+    assert record["provider_response_id"] == "resp-from-callback-metadata"
+    assert record["session_id"] == "session-provider-response-metadata"
+    assert record["litellm_call_id"] == "call-provider-response-metadata"
+
+
+@pytest.mark.parametrize(
+    ("previous_response_id", "parent_litellm_call_id", "status"),
+    [
+        (None, "call-originating", "success"),
+        ("resp-previous", None, "success"),
+        ("resp-previous", "call-originating", "failure"),
+    ],
+)
+def test_build_session_history_record_requires_explicit_successful_recovery_correlation(
+    previous_response_id: str | None,
+    parent_litellm_call_id: str | None,
+    status: str,
+) -> None:
+    kwargs = _base_kwargs(trace_name="codex.responses")
+    kwargs["model"] = "gpt-5.4"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-continuation-current"
+    kwargs["standard_logging_object"]["status"] = status
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-stream-recovery",
+            "aawm_stream_recovery_outcome": "recovered",
+            "aawm_stream_recovery_parent_litellm_call_id": parent_litellm_call_id,
+            "aawm_stream_recovery_previous_response_id": previous_response_id,
+        }
+    )
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-current",
+            "usage": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14},
+        },
+        start_time="2026-08-15T05:02:00Z",
+        end_time="2026-08-15T05:02:01Z",
+    )
+
+    assert record is not None
+    assert "aawm_stream_recovery_outcome" not in record["metadata"]
+
+
 def test_build_session_history_record_uses_repository_header_and_metadata() -> None:
     kwargs = _base_kwargs()
     kwargs["model"] = "gpt-5.4-mini"

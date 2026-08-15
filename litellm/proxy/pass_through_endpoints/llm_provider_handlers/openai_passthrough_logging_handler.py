@@ -58,6 +58,1195 @@ _MODEL_PRICE_DISK_MISS_CACHE: set[str] = set()
 _MODEL_PRICE_DISK_MISS_CACHE_MAXSIZE = 4096
 
 
+class _ResponsesSSEStateTracker:
+    """Track decoded Responses SSE events and emit synthetic terminal payloads.
+
+    The tracker is intentionally private and bounded: it stores compact state,
+    hashes tool arguments, and emits stable omission metadata whenever parsed
+    streams exceed internal bounds.
+    """
+
+    _EVENT_TYPES_LIMIT = 64
+    _IDENTITY_BYTES_LIMIT = 1024
+    _ITEM_TEXT_BYTES_LIMIT = 6 * 1024
+    _ITEM_ALIAS_LIMIT = 128
+    _OPEN_STREAM_LIMIT = 128
+    _TOOL_ITEM_LIMIT = 32
+    _USAGE_BYTES_LIMIT = 16 * 1024
+
+    _TERMINAL_EVENTS = set(RESPONSES_API_TERMINAL_STREAM_EVENTS)
+    _BASE_RESPONSE_EVENTS = {"response.created", "response.in_progress"}
+    _TOOL_ITEM_TYPES = {
+        "code_interpreter_call",
+        "computer_call",
+        "file_search_call",
+        "function_call",
+        "image_generation_call",
+        "mcp_call",
+        "local_shell_call",
+        "apply_patch_call",
+        "custom_tool_call",
+        "shell_call",
+        "web_search_call",
+    }
+    _ARGUMENT_TOOL_ITEM_TYPES = {
+        "apply_patch_call",
+        "custom_tool_call",
+        "function_call",
+        "mcp_call",
+    }
+    _ITEM_STATUSES = {"completed", "failed", "in_progress", "incomplete"}
+    _TOOL_LIFECYCLE_SUFFIXES = {
+        "completed",
+        "failed",
+        "in_progress",
+        "interpreting",
+        "searching",
+    }
+
+    _OUTPUT_TEXT_EVENTS = {
+        "response.output_text.delta",
+        "response.output_text.done",
+    }
+    _REFUSAL_EVENTS = {"response.refusal.delta", "response.refusal.done"}
+    _CONTENT_EVENTS = {"response.content_part.added", "response.content_part.done"}
+    _REASONING_EVENTS = {
+        "response.reasoning_summary_part.added",
+        "response.reasoning_summary_part.done",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_summary_text.done",
+    }
+    _TOOL_ARGUMENT_EVENTS = {
+        "response.custom_tool_call_input.delta",
+        "response.custom_tool_call_input.done",
+        "response.function_call_arguments.delta",
+        "response.function_call_arguments.done",
+        "response.mcp_call_arguments.delta",
+        "response.mcp_call_arguments.done",
+    }
+    _OUTPUT_ITEM_EVENTS = {"response.output_item.added", "response.output_item.done"}
+
+    def __init__(self, *, fallback_model: str) -> None:
+        self._event_count = 0
+        self._seen_event_types: set[str] = set()
+        self._unsupported_event_types: set[str] = set()
+        self._omitted_event_types = 0
+
+        self._last_sequence_number: Optional[int] = None
+        self._last_event_had_sequence_number = False
+        self._sequence_numbers_seen = 0
+
+        self._response_payload: Dict[str, Any] = {}
+        self._has_response_envelope = False
+        self._terminal_event_type: Optional[str] = None
+        self._synthetic_terminal_event_type: Optional[str] = None
+
+        self._usage_payload: Optional[Dict[str, Any]] = None
+        self._usage_omitted = False
+
+        self._item_states: Dict[str, Dict[str, Any]] = {}
+        self._item_order: List[str] = []
+        self._item_key_by_output_index: Dict[int, str] = {}
+        self._item_key_aliases: Dict[str, str] = {}
+
+        self._open_output_items: set[str] = set()
+        self._open_text_items: set[str] = set()
+        self._open_refusal_items: set[str] = set()
+        self._open_reasoning_items: set[str] = set()
+        self._open_content_items: set[str] = set()
+        self._open_tool_argument_items: set[str] = set()
+        self._open_tool_lifecycle_items: set[str] = set()
+
+        self._parse_ambiguity = False
+        self._sequence_ambiguity = False
+        self._partial_frame = False
+        self._state_omitted = False
+        self._omitted_tool_items = 0
+        self._omitted_output_text_bytes = 0
+        self._fallback_model = self._bounded_string(fallback_model) or "unknown"
+
+    @staticmethod
+    def _coerce_non_empty_str(value: Any) -> Optional[str]:
+        if isinstance(value, str):
+            value = value.strip()
+            return value if value else None
+        return None
+
+    def _bounded_string(self, value: Any) -> Optional[str]:
+        normalized = self._coerce_non_empty_str(value)
+        if normalized is None:
+            return None
+        encoded = normalized.encode("utf-8")
+        if len(encoded) <= self._IDENTITY_BYTES_LIMIT:
+            return normalized
+        self._state_omitted = True
+        return encoded[: self._IDENTITY_BYTES_LIMIT].decode("utf-8", "ignore")
+
+    @staticmethod
+    def _stream_item_key(
+        *,
+        item: Optional[dict] = None,
+        item_id: Any = None,
+        output_index: Any = None,
+        fallback_key: str,
+    ) -> str:
+        if isinstance(item, dict):
+            for key in ("id", "call_id"):
+                value = _ResponsesSSEStateTracker._coerce_non_empty_str(item.get(key))
+                if value:
+                    return value
+        value = _ResponsesSSEStateTracker._coerce_non_empty_str(item_id)
+        if value:
+            return value
+        if isinstance(output_index, int):
+            return f"output:{output_index}"
+        return fallback_key
+
+    def _mark_parse_ambiguity(self) -> None:
+        self._parse_ambiguity = True
+
+    def _mark_sequence_ambiguity(self) -> None:
+        self._sequence_ambiguity = True
+
+    def _record_sequence_number(self, event: dict) -> None:
+        if "sequence_number" not in event:
+            self._last_event_had_sequence_number = False
+            return
+
+        sequence_number = event.get("sequence_number")
+        if (
+            not isinstance(sequence_number, int)
+            or isinstance(sequence_number, bool)
+            or sequence_number < 0
+        ):
+            self._mark_parse_ambiguity()
+            self._last_event_had_sequence_number = False
+            return
+
+        self._sequence_numbers_seen += 1
+        if self._last_sequence_number is not None:
+            if sequence_number <= self._last_sequence_number:
+                self._mark_sequence_ambiguity()
+            elif (
+                self._last_event_had_sequence_number
+                and sequence_number != self._last_sequence_number + 1
+            ):
+                self._mark_sequence_ambiguity()
+        self._last_sequence_number = sequence_number
+        self._last_event_had_sequence_number = True
+
+    @staticmethod
+    def _stream_key(item_key: str, parsed_chunk: dict, stream_type: str) -> str:
+        content_index = parsed_chunk.get("content_index")
+        summary_index = parsed_chunk.get("summary_index")
+        index = content_index if isinstance(content_index, int) else summary_index
+        suffix = str(index) if isinstance(index, int) else "default"
+        return f"{item_key}:{stream_type}:{suffix}"
+
+    def _open_stream(self, open_streams: set[str], stream_key: str) -> None:
+        if stream_key in open_streams:
+            return
+        total_open_streams = sum(self._open_state_counts().values())
+        if total_open_streams >= self._OPEN_STREAM_LIMIT:
+            self._state_omitted = True
+            return
+        open_streams.add(stream_key)
+
+    @staticmethod
+    def _canonicalize_payload(event: Any) -> Optional[dict]:
+        if not isinstance(event, dict):
+            return None
+        response_payload = event.get("response")
+        if isinstance(response_payload, dict):
+            return response_payload
+        if {"id", "model", "status", "object"}.intersection(event.keys()):
+            return event
+        return None
+
+    def _track_response_envelope(self, event: dict, response_payload: dict) -> None:
+        self._has_response_envelope = self._has_response_envelope or isinstance(
+            event.get("response"), dict
+        )
+        for key, value in (
+            ("id", self._bounded_string(response_payload.get("id"))),
+            ("model", self._bounded_string(response_payload.get("model"))),
+            ("object", self._bounded_string(response_payload.get("object"))),
+        ):
+            if value is None:
+                continue
+            existing = self._response_payload.get(key)
+            if existing is not None and existing != value:
+                self._mark_sequence_ambiguity()
+                continue
+            self._response_payload[key] = value
+
+        created_at = response_payload.get(
+            "created_at", response_payload.get("created")
+        )
+        if isinstance(created_at, str):
+            created_at = self._bounded_string(created_at)
+        elif isinstance(created_at, bool) or not isinstance(
+            created_at, (int, float, type(None))
+        ):
+            self._mark_parse_ambiguity()
+            created_at = None
+        if created_at is not None:
+            existing_created_at = self._response_payload.get("created_at")
+            if existing_created_at is not None and existing_created_at != created_at:
+                self._mark_sequence_ambiguity()
+            else:
+                self._response_payload["created_at"] = created_at
+
+        status = self._bounded_string(response_payload.get("status"))
+        if status is not None:
+            self._response_payload["status"] = status.lower()
+        if response_payload.get("error") is not None:
+            self._response_payload["error_seen"] = True
+        if response_payload.get("incomplete_details") is not None:
+            self._response_payload["incomplete_details_seen"] = True
+
+    @staticmethod
+    def _coerce_payload_item_type(item: Any) -> Optional[str]:
+        if not isinstance(item, dict):
+            return None
+        return _ResponsesSSEStateTracker._coerce_non_empty_str(item.get("type"))
+
+    def _get_item_state(self, key: str) -> Dict[str, Any]:
+        state = self._item_states.get(key)
+        if state is not None:
+            return state
+
+        if len(self._item_states) >= self._TOOL_ITEM_LIMIT:
+            self._omitted_tool_items += 1
+            self._state_omitted = True
+            return {}
+
+        state = {
+            "id": None,
+            "call_id": None,
+            "name": None,
+            "role": None,
+            "item_type": None,
+            "output_added": False,
+            "output_done": False,
+            "status": None,
+            "text_open": False,
+            "text_done": False,
+            "refusal_open": False,
+            "refusal_done": False,
+            "content_open": False,
+            "content_done": False,
+            "reasoning_open": False,
+            "reasoning_done": False,
+            "tool_arguments_open": False,
+            "tool_arguments_done": False,
+            "tool_lifecycle_done": False,
+            "tool_argument_delta_hasher": hashlib.sha256(),
+            "tool_argument_delta_size_bytes": 0,
+            "tool_argument_final_hash": None,
+            "tool_argument_final_size_bytes": 0,
+            "tool_argument_size_bytes": 0,
+            "text": "",
+            "text_bytes": 0,
+            "text_delta_hasher": hashlib.sha256(),
+            "text_hash": None,
+            "text_truncated": False,
+            "refusal": "",
+            "refusal_bytes": 0,
+            "refusal_delta_hasher": hashlib.sha256(),
+            "refusal_hash": None,
+            "refusal_truncated": False,
+        }
+        self._item_states[key] = state
+        self._item_order.append(key)
+        return state
+
+    def _resolve_item_key(self, parsed_chunk: dict) -> Optional[str]:
+        item = parsed_chunk.get("item")
+        item_id = parsed_chunk.get("item_id")
+        output_index = parsed_chunk.get("output_index")
+        if isinstance(output_index, bool):
+            self._mark_parse_ambiguity()
+            output_index = None
+        aliases = [
+            value
+            for value in (
+                self._bounded_string(item_id),
+                self._bounded_string(item.get("id"))
+                if isinstance(item, dict)
+                else None,
+                self._bounded_string(item.get("call_id"))
+                if isinstance(item, dict)
+                else None,
+            )
+            if value is not None
+        ]
+        existing_keys = {
+            self._item_key_aliases[alias]
+            for alias in aliases
+            if alias in self._item_key_aliases
+        }
+        if isinstance(output_index, int) and output_index in self._item_key_by_output_index:
+            existing_keys.add(self._item_key_by_output_index[output_index])
+        if len(existing_keys) > 1:
+            self._mark_sequence_ambiguity()
+        if existing_keys:
+            key = sorted(existing_keys)[0]
+        else:
+            fallback = f"output:{output_index}" if isinstance(output_index, int) else ""
+            key = self._stream_item_key(
+                item=item if isinstance(item, dict) else None,
+                item_id=item_id,
+                output_index=output_index,
+                fallback_key=fallback,
+            )
+        if not key:
+            self._mark_parse_ambiguity()
+            return None
+
+        if isinstance(output_index, int):
+            existing = self._item_key_by_output_index.get(output_index)
+            if existing is not None and existing != key:
+                self._mark_sequence_ambiguity()
+            if existing is not None or len(self._item_key_by_output_index) < self._ITEM_ALIAS_LIMIT:
+                self._item_key_by_output_index[output_index] = key
+            else:
+                self._state_omitted = True
+        for alias in aliases:
+            existing = self._item_key_aliases.get(alias)
+            if existing is not None and existing != key:
+                self._mark_sequence_ambiguity()
+            if existing is not None or len(self._item_key_aliases) < self._ITEM_ALIAS_LIMIT:
+                self._item_key_aliases[alias] = key
+            else:
+                self._state_omitted = True
+        return key
+
+    def _consume_terminal_event(
+        self,
+        event_type: str,
+        response_payload: dict,
+        event: dict,
+    ) -> None:
+        if self._terminal_event_type is not None:
+            self._mark_sequence_ambiguity()
+        self._terminal_event_type = event_type
+        self._track_response_envelope(response_payload=response_payload, event=event)
+
+    def _set_item_value(
+        self,
+        state: Dict[str, Any],
+        key: str,
+        value: Any,
+    ) -> None:
+        normalized = self._bounded_string(value)
+        if normalized is None:
+            return
+        existing = state.get(key)
+        if existing is not None and existing != normalized:
+            self._mark_sequence_ambiguity()
+            return
+        state[key] = normalized
+
+    def _consume_output_item_event(  # noqa: PLR0915
+        self, event_type: str, parsed_chunk: dict
+    ) -> None:
+        item = parsed_chunk.get("item")
+        if not isinstance(item, dict):
+            self._mark_parse_ambiguity()
+            return
+
+        key = self._resolve_item_key(parsed_chunk)
+        if not isinstance(key, str):
+            self._mark_parse_ambiguity()
+            return
+        state = self._get_item_state(key)
+        if not state:
+            return
+
+        for field in ("id", "call_id", "name", "role"):
+            self._set_item_value(state, field, item.get(field))
+        item_type = self._coerce_payload_item_type(item)
+        if item_type is not None:
+            self._set_item_value(state, "item_type", item_type)
+        else:
+            self._mark_parse_ambiguity()
+
+        status = self._coerce_non_empty_str(item.get("status"))
+        if status:
+            status = status.lower()
+            if status not in self._ITEM_STATUSES:
+                self._mark_parse_ambiguity()
+                status = None
+        if status:
+            current_status = state.get("status")
+            if current_status in {"completed", "failed", "incomplete"} and (
+                current_status != status
+            ):
+                self._mark_sequence_ambiguity()
+            else:
+                state["status"] = status
+
+        if event_type == "response.output_item.added":
+            if state.get("output_done") or state.get("output_added"):
+                self._mark_sequence_ambiguity()
+            state["output_added"] = True
+            self._open_stream(self._open_output_items, key)
+            return
+
+        if event_type == "response.output_item.done":
+            if state.get("output_done"):
+                self._mark_sequence_ambiguity()
+                return
+            state["output_done"] = True
+            state["output_added"] = True
+            self._open_output_items.discard(key)
+            self._open_tool_lifecycle_items.discard(key)
+            if state.get("status") in {None, "in_progress"}:
+                state["status"] = "completed"
+
+            if state.get("item_type") == "message":
+                content = item.get("content")
+                if content is not None and not isinstance(content, list):
+                    self._mark_parse_ambiguity()
+                elif isinstance(content, list):
+                    for part in content:
+                        if not isinstance(part, dict):
+                            self._mark_parse_ambiguity()
+                            continue
+                        if part.get("type") == "output_text":
+                            self._replace_final_text_value(
+                                "text", state, part.get("text")
+                            )
+                        elif part.get("type") == "refusal":
+                            self._replace_final_text_value(
+                                "refusal", state, part.get("refusal")
+                            )
+
+            if state.get("item_type") in self._TOOL_ITEM_TYPES:
+                arguments = item.get("arguments", item.get("input"))
+                if arguments is not None:
+                    self._finalize_tool_arguments(state, key, arguments)
+            return
+
+    def _append_text_stream_value(
+        self,
+        bucket: str,
+        state: Dict[str, Any],
+        value: str,
+    ) -> None:
+        if not isinstance(value, str):
+            self._mark_parse_ambiguity()
+            return
+        if state.get(f"{bucket}_done"):
+            self._mark_sequence_ambiguity()
+            return
+
+        encoded = value.encode("utf-8")
+        state[f"{bucket}_delta_hasher"].update(encoded)
+        state[f"{bucket}_bytes"] = state.get(f"{bucket}_bytes", 0) + len(encoded)
+        retained = state.get(bucket, "").encode("utf-8")
+        if len(retained) < self._ITEM_TEXT_BYTES_LIMIT:
+            retained += encoded[: self._ITEM_TEXT_BYTES_LIMIT - len(retained)]
+            state[bucket] = retained.decode("utf-8", "ignore")
+        state[f"{bucket}_hash"] = state[f"{bucket}_delta_hasher"].hexdigest()
+        state[f"{bucket}_truncated"] = (
+            state[f"{bucket}_bytes"] > self._ITEM_TEXT_BYTES_LIMIT
+        )
+
+    def _replace_final_text_value(
+        self,
+        bucket: str,
+        state: Dict[str, Any],
+        value: Any,
+    ) -> None:
+        if not isinstance(value, str):
+            self._mark_parse_ambiguity()
+            return
+
+        encoded = value.encode("utf-8")
+        final_hash = hashlib.sha256(encoded).hexdigest()
+        if state.get(f"{bucket}_done"):
+            if (
+                state.get(f"{bucket}_bytes") != len(encoded)
+                or state.get(f"{bucket}_hash") != final_hash
+            ):
+                self._mark_sequence_ambiguity()
+            return
+        if state.get(f"{bucket}_bytes", 0) and (
+            state.get(f"{bucket}_bytes") != len(encoded)
+            or state[f"{bucket}_delta_hasher"].hexdigest() != final_hash
+        ):
+            self._mark_sequence_ambiguity()
+
+        state[f"{bucket}_bytes"] = len(encoded)
+        state[f"{bucket}_hash"] = final_hash
+        state[f"{bucket}_truncated"] = len(encoded) > self._ITEM_TEXT_BYTES_LIMIT
+        state[bucket] = encoded[: self._ITEM_TEXT_BYTES_LIMIT].decode(
+            "utf-8", "ignore"
+        )
+        state[f"{bucket}_done"] = True
+
+    def _consume_text_stream(self, parsed_chunk: dict, stream_type: str) -> None:
+        key = self._resolve_item_key(parsed_chunk)
+        if not isinstance(key, str):
+            self._mark_parse_ambiguity()
+            return
+        state = self._get_item_state(key)
+        if not state:
+            return
+
+        event_type = parsed_chunk.get("type")
+        is_done = str(event_type).endswith(".done")
+        stream_key = self._stream_key(key, parsed_chunk, stream_type)
+        if state.get("item_type") is None:
+            state["item_type"] = "message"
+        if state.get("role") is None:
+            state["role"] = "assistant"
+
+        if stream_type == "text":
+            state["text_open"] = True
+            if is_done:
+                self._replace_final_text_value(
+                    "text", state, parsed_chunk.get("text")
+                )
+                self._open_text_items.discard(stream_key)
+            else:
+                self._append_text_stream_value(
+                    "text", state, parsed_chunk.get("delta")
+                )
+                self._open_stream(self._open_text_items, stream_key)
+            return
+
+        state["refusal_open"] = True
+        if is_done:
+            self._replace_final_text_value(
+                "refusal", state, parsed_chunk.get("refusal")
+            )
+            self._open_refusal_items.discard(stream_key)
+        else:
+            self._append_text_stream_value(
+                "refusal", state, parsed_chunk.get("delta")
+            )
+            self._open_stream(self._open_refusal_items, stream_key)
+
+    def _consume_reasoning_or_content_stream(
+        self,
+        event_type: str,
+        key: str,
+        parsed_chunk: dict,
+    ) -> None:
+        if event_type in {"response.content_part.added", "response.content_part.done"}:
+            state = self._get_item_state(key)
+            if not state:
+                return
+            part = parsed_chunk.get("part")
+            if not isinstance(part, dict):
+                self._mark_parse_ambiguity()
+                return
+            stream_key = self._stream_key(key, parsed_chunk, "content")
+            if event_type.endswith(".added"):
+                state["content_open"] = True
+                self._open_stream(self._open_content_items, stream_key)
+            else:
+                state["content_done"] = True
+                self._open_content_items.discard(stream_key)
+                if part.get("type") == "output_text":
+                    self._replace_final_text_value("text", state, part.get("text"))
+                elif part.get("type") == "refusal":
+                    self._replace_final_text_value(
+                        "refusal", state, part.get("refusal")
+                    )
+            return
+
+        state = self._get_item_state(key)
+        if not state:
+            return
+        if event_type.startswith("response.reasoning_summary_"):
+            stream_type = "reasoning_part" if "_part." in event_type else "reasoning_text"
+            stream_key = f"{key}:{stream_type}"
+            if event_type.endswith(".added") or event_type.endswith(".delta"):
+                value = (
+                    parsed_chunk.get("part")
+                    if event_type.endswith(".added")
+                    else parsed_chunk.get("delta")
+                )
+                if (
+                    event_type.endswith(".added")
+                    and not isinstance(value, dict)
+                ) or (event_type.endswith(".delta") and not isinstance(value, str)):
+                    self._mark_parse_ambiguity()
+                    return
+                state["reasoning_open"] = True
+                self._open_stream(self._open_reasoning_items, stream_key)
+            else:
+                value = (
+                    parsed_chunk.get("part")
+                    if "_part." in event_type
+                    else parsed_chunk.get("text")
+                )
+                if ("_part." in event_type and not isinstance(value, dict)) or (
+                    "_part." not in event_type and not isinstance(value, str)
+                ):
+                    self._mark_parse_ambiguity()
+                    return
+                state["reasoning_done"] = True
+                self._open_reasoning_items.discard(stream_key)
+
+    def _consume_tool_argument_event(self, event_type: str, parsed_chunk: dict) -> None:
+        key = self._resolve_item_key(parsed_chunk)
+        if not isinstance(key, str):
+            self._mark_parse_ambiguity()
+            return
+
+        state = self._get_item_state(key)
+        if not state:
+            return
+        if state.get("item_type") is None:
+            if event_type.startswith("response.mcp_call_arguments"):
+                state["item_type"] = "mcp_call"
+            elif event_type.startswith("response.custom_tool_call_input"):
+                state["item_type"] = "custom_tool_call"
+            else:
+                state["item_type"] = "function_call"
+
+        if event_type.endswith(".done"):
+            self._finalize_tool_arguments(
+                state,
+                key,
+                parsed_chunk.get("arguments", parsed_chunk.get("input")),
+            )
+            return
+
+        value = parsed_chunk.get("delta")
+        if not isinstance(value, str):
+            self._mark_parse_ambiguity()
+            return
+        if state.get("tool_arguments_done"):
+            self._mark_sequence_ambiguity()
+            return
+        encoded = value.encode("utf-8")
+        state["tool_argument_delta_hasher"].update(encoded)
+        state["tool_argument_delta_size_bytes"] += len(encoded)
+        state["tool_argument_size_bytes"] = state[
+            "tool_argument_delta_size_bytes"
+        ]
+        state["tool_arguments_open"] = True
+        self._open_stream(self._open_tool_argument_items, key)
+
+    def _finalize_tool_arguments(
+        self,
+        state: Dict[str, Any],
+        key: str,
+        value: Any,
+    ) -> None:
+        if not isinstance(value, str):
+            self._mark_parse_ambiguity()
+            return
+        encoded = value.encode("utf-8")
+        final_hash = hashlib.sha256(encoded).hexdigest()
+        if state.get("tool_arguments_done"):
+            if (
+                state.get("tool_argument_final_hash") != final_hash
+                or state.get("tool_argument_final_size_bytes") != len(encoded)
+            ):
+                self._mark_sequence_ambiguity()
+            return
+        if state.get("tool_argument_delta_size_bytes", 0) and (
+            state.get("tool_argument_delta_size_bytes") != len(encoded)
+            or state["tool_argument_delta_hasher"].hexdigest() != final_hash
+        ):
+            self._mark_sequence_ambiguity()
+
+        state["tool_arguments_done"] = True
+        state["tool_arguments_open"] = False
+        state["tool_argument_final_hash"] = final_hash
+        state["tool_argument_final_size_bytes"] = len(encoded)
+        state["tool_argument_size_bytes"] = len(encoded)
+        self._open_tool_argument_items.discard(key)
+
+    def _consume_tool_lifecycle_event(
+        self,
+        event_type: str,
+        parsed_chunk: dict,
+    ) -> bool:
+        if not event_type.startswith("response."):
+            return False
+        item_type, separator, suffix = event_type.removeprefix("response.").rpartition(
+            "."
+        )
+        if (
+            not separator
+            or item_type not in self._TOOL_ITEM_TYPES
+            or suffix not in self._TOOL_LIFECYCLE_SUFFIXES
+        ):
+            return False
+
+        key = self._resolve_item_key(parsed_chunk)
+        if key is None:
+            return True
+        state = self._get_item_state(key)
+        if not state:
+            return True
+        self._set_item_value(state, "item_type", item_type)
+        if suffix in {"in_progress", "interpreting", "searching"}:
+            if state.get("tool_lifecycle_done") or state.get("status") in {
+                "completed",
+                "failed",
+                "incomplete",
+            }:
+                self._mark_sequence_ambiguity()
+            else:
+                state["status"] = "in_progress"
+            self._open_stream(self._open_tool_lifecycle_items, key)
+            return True
+
+        if state.get("status") in {"completed", "failed", "incomplete"}:
+            expected_status = "failed" if suffix == "failed" else "completed"
+            if state.get("status") != expected_status:
+                self._mark_sequence_ambiguity()
+        state["tool_lifecycle_done"] = True
+        state["status"] = "failed" if suffix == "failed" else "completed"
+        self._open_tool_lifecycle_items.discard(key)
+        return True
+
+    def _rebuild_tool_argument_state(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        arguments_hash = state.get("tool_argument_final_hash")
+        arguments_size = state.get("tool_argument_final_size_bytes", 0)
+        if arguments_hash is None and state.get("tool_argument_delta_size_bytes", 0):
+            arguments_hash = state["tool_argument_delta_hasher"].hexdigest()
+            arguments_size = state.get("tool_argument_delta_size_bytes", 0)
+        return {
+            "arguments_done": bool(state.get("tool_arguments_done", False)),
+            "arguments_hash": arguments_hash,
+            "arguments_hash_algorithm": "sha256",
+            "arguments_raw_bytes_retained": 0,
+            "arguments_size_bytes": arguments_size,
+            "tool_arguments_open": bool(state.get("tool_arguments_open", False)),
+        }
+
+    def _consume_usage(self, response_payload: dict) -> None:
+        usage = response_payload.get("usage")
+        if not isinstance(usage, dict):
+            return
+        try:
+            serialized_usage = json.dumps(
+                usage,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        except (TypeError, ValueError):
+            self._usage_payload = None
+            self._usage_omitted = True
+            return
+        if len(serialized_usage.encode("utf-8")) > self._USAGE_BYTES_LIMIT:
+            self._usage_payload = None
+            self._usage_omitted = True
+            return
+        self._usage_payload = json.loads(serialized_usage)
+        self._usage_omitted = False
+
+    def consume(self, decoded_event: Any) -> None:  # noqa: PLR0915
+        if not isinstance(decoded_event, dict):
+            self._mark_parse_ambiguity()
+            return
+
+        self._event_count += 1
+        event_type = decoded_event.get("type")
+        if not isinstance(event_type, str) or not event_type.strip():
+            self._mark_parse_ambiguity()
+            return
+        event_type = event_type.strip()
+        encoded_event_type = event_type.encode("utf-8")
+        if len(encoded_event_type) > self._IDENTITY_BYTES_LIMIT:
+            self._state_omitted = True
+            event_type = encoded_event_type[: self._IDENTITY_BYTES_LIMIT].decode(
+                "utf-8", "ignore"
+            )
+
+        if (
+            event_type not in self._seen_event_types
+            and len(self._seen_event_types) >= self._EVENT_TYPES_LIMIT
+        ):
+            self._omitted_event_types += 1
+        else:
+            self._seen_event_types.add(event_type)
+        self._record_sequence_number(decoded_event)
+
+        response_id = self._bounded_string(decoded_event.get("response_id"))
+        if response_id is not None:
+            existing_response_id = self._response_payload.get("id")
+            if existing_response_id is not None and existing_response_id != response_id:
+                self._mark_sequence_ambiguity()
+            elif existing_response_id is None:
+                self._response_payload["id"] = response_id
+
+        response_payload = self._canonicalize_payload(decoded_event)
+        if response_payload:
+            self._track_response_envelope(
+                response_payload=response_payload, event=decoded_event
+            )
+            self._consume_usage(response_payload)
+        elif event_type in self._BASE_RESPONSE_EVENTS:
+            self._mark_parse_ambiguity()
+
+        if event_type in self._TERMINAL_EVENTS:
+            if not isinstance(response_payload, dict):
+                self._mark_parse_ambiguity()
+                response_payload = {}
+            self._consume_terminal_event(event_type, response_payload, decoded_event)
+            return
+        if self._terminal_event_type is not None:
+            self._mark_sequence_ambiguity()
+            return
+
+        if event_type in self._BASE_RESPONSE_EVENTS:
+            return
+
+        if event_type in self._OUTPUT_ITEM_EVENTS:
+            self._consume_output_item_event(event_type, decoded_event)
+            return
+
+        if event_type in self._OUTPUT_TEXT_EVENTS:
+            self._consume_text_stream(decoded_event, stream_type="text")
+            return
+
+        if event_type in self._REFUSAL_EVENTS:
+            self._consume_text_stream(decoded_event, stream_type="refusal")
+            return
+
+        if event_type in self._CONTENT_EVENTS or event_type in self._REASONING_EVENTS:
+            key = self._resolve_item_key(decoded_event)
+            if isinstance(key, str):
+                self._consume_reasoning_or_content_stream(
+                    event_type, key, decoded_event
+                )
+            else:
+                self._mark_parse_ambiguity()
+            return
+
+        if event_type in self._TOOL_ARGUMENT_EVENTS:
+            self._consume_tool_argument_event(event_type, decoded_event)
+            return
+
+        if self._consume_tool_lifecycle_event(event_type, decoded_event):
+            return
+
+        if event_type in {"response.output_text.annotation.added", "token_count"}:
+            return
+
+        if len(self._unsupported_event_types) < self._EVENT_TYPES_LIMIT:
+            self._unsupported_event_types.add(event_type)
+        else:
+            self._omitted_event_types += 1
+
+    def _has_open_streams(self) -> bool:
+        return bool(
+            self._open_output_items
+            or self._open_text_items
+            or self._open_refusal_items
+            or self._open_reasoning_items
+            or self._open_content_items
+            or self._open_tool_argument_items
+            or self._open_tool_lifecycle_items
+        )
+
+    def _has_failed_outputs(self) -> bool:
+        for key in self._item_order:
+            if key not in self._item_states:
+                continue
+            if self._item_states[key].get("status") in {
+                "failed",
+                "incomplete",
+                "in_progress",
+            }:
+                return True
+        return False
+
+    def _has_final_assistant_output(self) -> bool:
+        for state in self._item_states.values():
+            if state.get("status") in {"failed", "incomplete", "in_progress"}:
+                continue
+            if state.get("role") not in {None, "assistant"}:
+                continue
+            if state.get("item_type") not in {None, "message"}:
+                continue
+            if state.get("text_done") and state.get("text_bytes", 0) > 0:
+                return True
+            if state.get("refusal_done") and state.get("refusal_bytes", 0) > 0:
+                return True
+        return False
+
+    def _has_final_tool_call(self) -> bool:
+        for state in self._item_states.values():
+            item_type = state.get("item_type")
+            if item_type not in self._TOOL_ITEM_TYPES:
+                continue
+            if state.get("status") in {"failed", "incomplete", "in_progress"}:
+                continue
+            if not (
+                state.get("output_done") or state.get("tool_lifecycle_done")
+            ):
+                continue
+            if item_type in self._ARGUMENT_TOOL_ITEM_TYPES and not state.get(
+                "tool_arguments_done"
+            ):
+                continue
+            return True
+        return False
+
+    def _open_state_counts(self) -> Dict[str, int]:
+        return {
+            "content_parts": len(self._open_content_items),
+            "output_items": len(self._open_output_items),
+            "output_text": len(self._open_text_items),
+            "reasoning": len(self._open_reasoning_items),
+            "refusals": len(self._open_refusal_items),
+            "tool_arguments": len(self._open_tool_argument_items),
+            "tool_lifecycle": len(self._open_tool_lifecycle_items),
+        }
+
+    @property
+    def provider_terminal_observed(self) -> bool:
+        return self._terminal_event_type is not None
+
+    @property
+    def provider_terminal_event_type(self) -> Optional[str]:
+        return self._terminal_event_type
+
+    @property
+    def synthetic_terminal_event_type(self) -> Optional[str]:
+        return self._synthetic_terminal_event_type
+
+    @property
+    def has_partial_frame(self) -> bool:
+        return self._partial_frame
+
+    @property
+    def has_ambiguity(self) -> bool:
+        return self._parse_ambiguity or self._sequence_ambiguity
+
+    @property
+    def has_open_items(self) -> bool:
+        return self._has_open_streams()
+
+    def mark_partial_frame(self) -> None:
+        self._partial_frame = True
+
+    def mark_parse_ambiguity(self) -> None:
+        self._mark_parse_ambiguity()
+
+    def _build_tool_output_item(self, key: str, state: Dict[str, Any]) -> Dict[str, Any]:
+        item: Dict[str, Any] = {
+            "id": state.get("id") or key,
+            "type": state.get("item_type") or "unknown",
+        }
+        for field in ("call_id", "name", "role"):
+            if state.get(field) is not None:
+                item[field] = state[field]
+        content: List[Dict[str, Any]] = []
+        if state.get("text_done"):
+            content.append(
+                {
+                    "annotations": [],
+                    "text": state.get("text", ""),
+                    "type": "output_text",
+                }
+            )
+        if state.get("refusal_done"):
+            content.append(
+                {
+                    "refusal": state.get("refusal", ""),
+                    "type": "refusal",
+                }
+            )
+        if content:
+            item["content"] = content
+        if state.get("item_type") in self._TOOL_ITEM_TYPES:
+            item["aawm_argument_summary"] = self._rebuild_tool_argument_state(state)
+        if state.get("status"):
+            item["status"] = state.get("status")
+        elif state.get("output_done"):
+            item["status"] = "completed"
+
+        return item
+
+    def _build_omission_metadata(self) -> Dict[str, Any]:
+        omitted_text_bytes = 0
+        for state in self._item_states.values():
+            omitted_text_bytes += max(
+                0,
+                int(state.get("text_bytes", 0))
+                - len(str(state.get("text", "")).encode("utf-8")),
+            )
+            omitted_text_bytes += max(
+                0,
+                int(state.get("refusal_bytes", 0))
+                - len(str(state.get("refusal", "")).encode("utf-8")),
+            )
+        self._omitted_output_text_bytes = omitted_text_bytes
+        return {
+            "responses_stream_events_seen": self._event_count,
+            "responses_stream_event_types_omitted": self._omitted_event_types,
+            "responses_stream_state_omitted": self._state_omitted,
+            "responses_stream_tool_items_omitted": self._omitted_tool_items,
+            "responses_stream_output_text_bytes_truncated": bool(
+                self._omitted_output_text_bytes
+            ),
+            "responses_stream_output_text_bytes_omitted": self._omitted_output_text_bytes,
+            "responses_stream_unsupported_event_types": sorted(
+                self._unsupported_event_types
+            ),
+            "responses_stream_parse_ambiguity": self._parse_ambiguity,
+            "responses_stream_sequence_ambiguity": self._sequence_ambiguity,
+            "responses_stream_tool_argument_raw_bytes_retained": 0,
+            "responses_stream_usage_omitted": self._usage_omitted,
+        }
+
+    def _tool_argument_summaries(self) -> List[Dict[str, Any]]:
+        summaries: List[Dict[str, Any]] = []
+        for key in self._item_order:
+            state = self._item_states.get(key)
+            if state is None or state.get("item_type") not in self._TOOL_ITEM_TYPES:
+                continue
+            summaries.append(
+                {
+                    "item_id": state.get("id") or key,
+                    "item_type": state.get("item_type"),
+                    **self._rebuild_tool_argument_state(state),
+                }
+            )
+        return summaries
+
+    def _item_status_counts(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for state in self._item_states.values():
+            status = state.get("status") or "unknown"
+            counts[status] = counts.get(status, 0) + 1
+        return dict(sorted(counts.items()))
+
+    def metadata_summary(self) -> Dict[str, Any]:
+        return {
+            "event_count": self._event_count,
+            "final_assistant_output": self._has_final_assistant_output(),
+            "final_tool_call": self._has_final_tool_call(),
+            "item_status_counts": self._item_status_counts(),
+            "last_sequence_number": self._last_sequence_number,
+            "omission_metadata": self._build_omission_metadata(),
+            "open_state_counts": self._open_state_counts(),
+            "parse_ambiguity": self._parse_ambiguity,
+            "partial_frame": self._partial_frame,
+            "provider_terminal_event_type": self._terminal_event_type,
+            "provider_terminal_observed": self.provider_terminal_observed,
+            "response_base_envelope_seen": self._has_response_envelope,
+            "response_identity_seen": bool(self._response_payload.get("id")),
+            "sequence_ambiguity": self._sequence_ambiguity,
+            "sequence_numbers_seen": self._sequence_numbers_seen,
+            "state_omitted": self._state_omitted,
+            "synthetic_terminal_event_type": self._synthetic_terminal_event_type,
+            "tool_argument_summaries": self._tool_argument_summaries(),
+            "unsupported_event_types": sorted(self._unsupported_event_types),
+        }
+
+    def _build_incomplete_payload(self, reason: str) -> Dict[str, Any]:
+        return self._build_synthetic_terminal_event(
+            event_type="response.incomplete",
+            incomplete_reason=reason,
+        )
+
+    def _build_completed_payload(self) -> Dict[str, Any]:
+        return self._build_synthetic_terminal_event(
+            event_type="response.completed",
+        )
+
+    def _build_synthetic_terminal_event(
+        self,
+        *,
+        event_type: Literal["response.completed", "response.incomplete"],
+        incomplete_reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self._synthetic_terminal_event_type = event_type
+        response_payload: Dict[str, Any] = {
+            "metadata": {
+                "aawm_stream_omission_metadata": self._build_omission_metadata(),
+                "aawm_stream_provider_terminal_omitted": True,
+                "aawm_stream_synthetic_terminal": True,
+                "aawm_stream_tracker_state": self.metadata_summary(),
+            },
+            "model": self._response_payload.get("model") or self._fallback_model,
+            "object": self._response_payload.get("object") or "response",
+            "output": [
+                self._build_tool_output_item(key, self._item_states[key])
+                for key in self._item_order
+                if key in self._item_states
+            ],
+            "status": "completed"
+            if event_type == "response.completed"
+            else "incomplete",
+        }
+        if "id" in self._response_payload:
+            response_payload["id"] = self._response_payload["id"]
+        if "created_at" in self._response_payload:
+            response_payload["created_at"] = self._response_payload["created_at"]
+        if self._usage_payload is not None:
+            response_payload["usage"] = self._usage_payload
+        if incomplete_reason is not None:
+            response_payload["incomplete_details"] = {"reason": incomplete_reason}
+            response_payload["metadata"][
+                "aawm_stream_incomplete_reason"
+            ] = incomplete_reason
+
+        synthetic_event: Dict[str, Any] = {
+            "response": response_payload,
+            "type": event_type,
+        }
+        if self._last_sequence_number is not None and not self._sequence_ambiguity:
+            synthetic_event["sequence_number"] = self._last_sequence_number + 1
+        return synthetic_event
+
+    def _determine_incomplete_reason(self) -> Optional[str]:
+        if self._partial_frame:
+            return "upstream_stream_partial_frame"
+        if not self._has_response_envelope or not self._response_payload.get("id"):
+            return "upstream_stream_missing_base_envelope"
+        if self._parse_ambiguity:
+            return "upstream_stream_parse_ambiguity"
+        if self._sequence_ambiguity:
+            return "upstream_stream_sequence_ambiguity"
+        if self._state_omitted:
+            return "upstream_stream_state_omitted"
+        if self._unsupported_event_types:
+            return "upstream_stream_unsupported_payload_shape"
+        if (
+            self._response_payload.get("error_seen")
+            or self._response_payload.get("incomplete_details_seen")
+            or self._response_payload.get("status") in {"failed", "incomplete"}
+            or self._has_failed_outputs()
+        ):
+            return "upstream_stream_incomplete_item_state"
+        if self._has_open_streams():
+            return "upstream_stream_unfinished_streams"
+        if not (
+            self._has_final_assistant_output() or self._has_final_tool_call()
+        ):
+            return "upstream_stream_missing_final_assistant_or_tool_output"
+        return None
+
+    def classify_clean_eof(self) -> Optional[Dict[str, Any]]:
+        """Return one synthetic terminal event when the provider omitted its own."""
+        if self._terminal_event_type is not None:
+            return None
+        incomplete_reason = self._determine_incomplete_reason()
+        if incomplete_reason is not None:
+            return self._build_incomplete_payload(incomplete_reason)
+        return self._build_completed_payload()
+
+    def synthetic_terminal_payload_at_eof(self) -> Optional[Dict[str, Any]]:
+        """Compatibility alias for ``classify_clean_eof``."""
+        return self.classify_clean_eof()
+
+
 def _reset_model_price_lookup_caches() -> None:
     """Clear on-disk model-price map and negative-lookup caches.
 
@@ -75,6 +1264,44 @@ class OpenAIPassthroughLoggingHandler(BasePassthroughLoggingHandler):
     @property
     def llm_provider_name(self) -> LlmProviders:
         return LlmProviders.OPENAI
+
+    @staticmethod
+    def _create_responses_sse_state_tracker(
+        *,
+        fallback_model: str,
+    ) -> _ResponsesSSEStateTracker:
+        return _ResponsesSSEStateTracker(fallback_model=fallback_model)
+
+    @staticmethod
+    def _consume_responses_sse_event(
+        tracker: _ResponsesSSEStateTracker,
+        decoded_event: Any,
+    ) -> None:
+        tracker.consume(decoded_event)
+
+    @staticmethod
+    def _mark_responses_sse_partial_frame(
+        tracker: _ResponsesSSEStateTracker,
+    ) -> None:
+        tracker.mark_partial_frame()
+
+    @staticmethod
+    def _mark_responses_sse_parse_ambiguity(
+        tracker: _ResponsesSSEStateTracker,
+    ) -> None:
+        tracker.mark_parse_ambiguity()
+
+    @staticmethod
+    def _responses_sse_tracker_metadata(
+        tracker: _ResponsesSSEStateTracker,
+    ) -> Dict[str, Any]:
+        return tracker.metadata_summary()
+
+    @staticmethod
+    def _classify_responses_sse_clean_eof(
+        tracker: _ResponsesSSEStateTracker,
+    ) -> Optional[Dict[str, Any]]:
+        return tracker.classify_clean_eof()
 
     @staticmethod
     def _is_openai_compatible_hostname(hostname: Optional[str]) -> bool:

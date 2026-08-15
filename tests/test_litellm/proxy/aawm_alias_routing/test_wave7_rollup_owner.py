@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
+from litellm.proxy import aawm_route_logging
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import rollup as rollup_mod
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup import (
     _auto_agent_alias_model_rollup_label,
@@ -257,6 +258,74 @@ class TestRollupStatus:
         assert _auto_agent_alias_route_rollup_status({}) is None
 
 
+class TestRouteRollupStatusValues:
+    def test_new_status_values_are_accepted(self):
+        assert "Incomplete" in aawm_route_logging._AAWM_ROUTE_ROLLUP_STATUS_VALUES
+        assert "Recovered" in aawm_route_logging._AAWM_ROUTE_ROLLUP_STATUS_VALUES
+        assert (
+            aawm_route_logging._normalize_aawm_route_rollup_status("incomplete")
+            == "Incomplete"
+        )
+        assert (
+            aawm_route_logging._normalize_aawm_route_rollup_status("recovered")
+            == "Recovered"
+        )
+
+    def test_recovered_is_rendered_with_status_brackets(self):
+        assert (
+            aawm_route_logging._format_aawm_route_rollup_status_tag("Recovered")
+            == " [Recovered]"
+        )
+        assert (
+            aawm_route_logging._format_aawm_route_rollup_status_tag("incomplete")
+            == " [Incomplete]"
+        )
+
+    def test_same_subline_success_recovers_incomplete(self):
+        accumulator = aawm_route_logging.AawmRouteRollupAccumulator(
+            interval_seconds=60
+        )
+        route = {
+            "group_header_label": "litellm#Codex[0.141.0]",
+            "incoming_endpoint": "/openai_passthrough/responses",
+            "outgoing_target": "chatgpt.com/backend-api/codex/responses",
+            "model_label": "gpt-5.4",
+            "effort": "high",
+        }
+
+        accumulator.record(**route, turns=0, status="Incomplete")
+        accumulator.record(**route, turns=1)
+
+        lines = accumulator.flush(force=True)
+        assert lines[1].endswith("gpt-5.4:high - Turns: 1 [Recovered]")
+
+    def test_different_subline_success_does_not_recover_incomplete(self):
+        accumulator = aawm_route_logging.AawmRouteRollupAccumulator(
+            interval_seconds=60
+        )
+        common_route = {
+            "group_header_label": "litellm#Codex[0.141.0]",
+            "incoming_endpoint": "/openai_passthrough/responses",
+            "outgoing_target": "chatgpt.com/backend-api/codex/responses",
+            "model_label": "gpt-5.4",
+        }
+
+        accumulator.record(
+            **common_route,
+            effort="high",
+            turns=0,
+            status="Incomplete",
+        )
+        accumulator.record(**common_route, effort="low", turns=1)
+
+        lines = accumulator.flush(force=True)
+        assert any(
+            line.endswith("gpt-5.4:high - Turns: 0 [Incomplete]")
+            for line in lines
+        )
+        assert any(line.endswith("gpt-5.4:low - Turns: 1") for line in lines)
+
+
 # ---------------------------------------------------------------------------
 # _auto_agent_alias_route_status_message
 # ---------------------------------------------------------------------------
@@ -480,6 +549,29 @@ class TestRecordRouteStatusRollup:
         event = self._make_event(route_family=None, outgoing_target=None)
         _record_auto_agent_alias_route_status_rollup(event)
         assert mock_record.call_args.kwargs["outgoing_target"] == "candidate_selection"
+
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.record_aawm_route_rollup",
+    )
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.emit_aawm_route_status_event",
+    )
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup._auto_agent_alias_route_rollup_status",
+        return_value="Recovered",
+    )
+    def test_zero_turn_recovered_status_rollup(self, mock_status, mock_emit, mock_record):
+        event = self._make_event()
+        _record_auto_agent_alias_route_status_rollup(event)
+        assert mock_record.call_args.kwargs["turns"] == 0
+        assert mock_record.call_args.kwargs["status"] == "Recovered"
+        mock_emit.assert_called_once_with(
+            alias_model="basic",
+            model_label="gpt-4o",
+            status="Recovered",
+            message="route status changed",
+        )
+        assert mock_status.call_count == 1
 
     @patch(
         "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.record_aawm_route_rollup",

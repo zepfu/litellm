@@ -83,6 +83,10 @@ class _PassThroughStreamLineAccumulator:
         self._pending = ""
         return self.lines
 
+    def has_pending_frame(self) -> bool:
+        buffered_bytes, _ = self._decoder.getstate()
+        return bool(self._pending or buffered_bytes)
+
 
 def _strip_chunk_line(raw_line: str) -> str:
     return raw_line.strip()
@@ -688,6 +692,12 @@ class PassThroughStreamingHandler:
         try:
             raw_bytes: List[bytes] = []
             line_accumulator: Optional[_PassThroughStreamLineAccumulator] = None
+            model_name = PassThroughStreamingHandler._extract_model_for_cost_injection(
+                request_body=request_body,
+                url_route=url_route,
+                endpoint_type=endpoint_type,
+                litellm_logging_obj=litellm_logging_obj,
+            )
             is_fork_owned_responses_stream = (
                 PassThroughStreamingHandler._is_openai_responses_stream(
                     endpoint_type=endpoint_type,
@@ -697,6 +707,13 @@ class PassThroughStreamingHandler:
             )
             responses_terminal_accumulator = (
                 _PassThroughStreamLineAccumulator()
+                if is_fork_owned_responses_stream
+                else None
+            )
+            responses_sse_tracker = (
+                OpenAIPassthroughLoggingHandler._create_responses_sse_state_tracker(
+                    fallback_model=model_name or "unknown"
+                )
                 if is_fork_owned_responses_stream
                 else None
             )
@@ -752,13 +769,34 @@ class PassThroughStreamingHandler:
                     line_accumulator.feed(chunk)
                 _mark_first_emitted_chunk()
 
-            # Extract model name for cost injection
-            model_name = PassThroughStreamingHandler._extract_model_for_cost_injection(
-                request_body=request_body,
-                url_route=url_route,
-                endpoint_type=endpoint_type,
-                litellm_logging_obj=litellm_logging_obj,
-            )
+            def _consume_responses_lines(lines: List[str]) -> None:
+                nonlocal responses_terminal_seen
+                if responses_sse_tracker is None:
+                    return
+                if not responses_terminal_seen:
+                    responses_terminal_seen = (
+                        PassThroughStreamingHandler._responses_lines_have_terminal_event(
+                            lines
+                        )
+                    )
+                for raw_line in lines:
+                    line = _strip_chunk_line(raw_line)
+                    if not line.startswith("data:"):
+                        continue
+                    payload_text = line.removeprefix("data:").strip()
+                    if payload_text == "[DONE]":
+                        continue
+                    try:
+                        decoded_event = json.loads(payload_text)
+                    except json.JSONDecodeError:
+                        OpenAIPassthroughLoggingHandler._mark_responses_sse_parse_ambiguity(
+                            responses_sse_tracker
+                        )
+                        continue
+                    OpenAIPassthroughLoggingHandler._consume_responses_sse_event(
+                        responses_sse_tracker,
+                        decoded_event,
+                    )
 
             async for chunk in response.aiter_bytes():
                 current_chunk_at = datetime.now()
@@ -808,12 +846,7 @@ class PassThroughStreamingHandler:
                         custom_llm_provider=custom_llm_provider,
                     )
                     responses_terminal_accumulator.feed(chunk)
-                    if not responses_terminal_seen:
-                        responses_terminal_seen = (
-                            PassThroughStreamingHandler._responses_lines_have_terminal_event(
-                                responses_terminal_accumulator.lines
-                            )
-                        )
+                    _consume_responses_lines(responses_terminal_accumulator.lines)
                     responses_terminal_accumulator.lines.clear()
 
                     if responses_terminal_seen:
@@ -878,37 +911,47 @@ class PassThroughStreamingHandler:
                 yield chunk
 
             if responses_terminal_accumulator is not None:
-                if not responses_terminal_seen:
-                    responses_terminal_seen = (
-                        PassThroughStreamingHandler._responses_lines_have_terminal_event(
-                            responses_terminal_accumulator.finish()
-                        )
+                if responses_terminal_accumulator.has_pending_frame():
+                    OpenAIPassthroughLoggingHandler._mark_responses_sse_partial_frame(
+                        responses_sse_tracker
                     )
+                else:
+                    _consume_responses_lines(responses_terminal_accumulator.finish())
 
                 terminal_chunks: List[bytes] = []
                 if first_emitted_at is not None and not responses_terminal_seen:
-                    terminal_chunks = await PassThroughStreamingHandler._terminalize_post_first_byte_responses_clean_eof(
-                        litellm_logging_obj=litellm_logging_obj,
-                        endpoint_type=endpoint_type,
-                        url_route=url_route,
-                        custom_llm_provider=custom_llm_provider,
-                        start_time=start_time,
-                        error_log_context=error_log_context,
-                        success_handler_kwargs=success_handler_kwargs,
-                        chunk_count=chunk_count,
-                        total_stream_bytes=total_stream_bytes,
+                    synthetic_terminal = OpenAIPassthroughLoggingHandler._classify_responses_sse_clean_eof(
+                        responses_sse_tracker
                     )
+                    if synthetic_terminal is not None:
+                        event_type = synthetic_terminal["type"]
+                        terminal_chunks = [
+                            (
+                                f"event: {event_type}\ndata: "
+                                + json.dumps(
+                                    synthetic_terminal,
+                                    separators=(",", ":"),
+                                )
+                                + "\n\n"
+                            ).encode("utf-8"),
+                            b"data: [DONE]\n\n",
+                        ]
 
                 if terminal_chunks:
                     held_responses_done_suffix = b""
                     for terminal_chunk in terminal_chunks:
                         _record_responses_wire_chunk(terminal_chunk)
                         yield terminal_chunk
-                    return
                 elif held_responses_done_suffix:
                     _record_responses_wire_chunk(held_responses_done_suffix)
                     yield held_responses_done_suffix
                     held_responses_done_suffix = b""
+
+                metadata["aawm_stream_tracker_state"] = (
+                    OpenAIPassthroughLoggingHandler._responses_sse_tracker_metadata(
+                        responses_sse_tracker
+                    )
+                )
 
             # After all chunks are processed, handle post-processing
             end_time = datetime.now()
@@ -1802,7 +1845,44 @@ class PassThroughStreamingHandler:
                 local_prepare_ms=local_prepare_ms,
             )
             metadata = PassThroughStreamingHandler._ensure_streaming_metadata(kwargs)
-            if not (
+            tracker_state = metadata.get("aawm_stream_tracker_state")
+            synthetic_terminal_event_type = (
+                tracker_state.get("synthetic_terminal_event_type")
+                if isinstance(tracker_state, dict)
+                else None
+            )
+            if synthetic_terminal_event_type == "response.incomplete":
+                context = metadata.get("aawm_route_rollup_context")
+                if isinstance(context, dict):
+                    model_label = str(
+                        context.get("model_label")
+                        or request_body.get("model")
+                        or "unknown-model"
+                    )
+                    message = (
+                        "provider terminal omitted; synthetic response.incomplete"
+                    )
+                    emit_aawm_route_status_event(
+                        alias_model=request_body.get("model") or model_label,
+                        model_label=model_label,
+                        status="Incomplete",
+                        message=message,
+                    )
+                    record_aawm_route_rollup(
+                        group_header_label=str(
+                            context.get("group_header_label") or ""
+                        ),
+                        incoming_endpoint=str(
+                            context.get("incoming_endpoint") or ""
+                        ),
+                        outgoing_target=str(context.get("outgoing_target") or ""),
+                        model_label=model_label,
+                        effort=str(context.get("reasoning_effort") or "none"),
+                        turns=0,
+                        status="Incomplete",
+                        message=message,
+                    )
+            elif not (
                 metadata.get("aawm_stream_interrupted")
                 or metadata.get("aawm_route_rollup_turn_suppressed")
             ):

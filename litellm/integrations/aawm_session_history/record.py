@@ -1074,6 +1074,105 @@ def _build_session_history_record(  # noqa: PLR0915
 
     message = _extract_first_response_message(result)
     request_body = _extract_provider_cache_request_body(kwargs)
+    stream_history_metadata_sources = list(
+        _iter_litellm_metadata_sources(kwargs, metadata)
+    )
+    result_metadata = _maybe_get(result, "metadata")
+    if isinstance(result_metadata, dict):
+        stream_history_metadata_sources.append(result_metadata)
+
+    stream_history_metadata_keys = (
+        "aawm_stream_tracker_state",
+        "aawm_stream_synthetic_terminal",
+        "aawm_stream_terminal_event_type",
+        "aawm_stream_incomplete_reason",
+        "aawm_stream_recovery_outcome",
+        "aawm_stream_recovery_parent_litellm_call_id",
+        "aawm_stream_recovery_previous_response_id",
+    )
+    for metadata_source in stream_history_metadata_sources:
+        for key in stream_history_metadata_keys:
+            value = metadata_source.get(key)
+            if metadata.get(key) is None and value is not None:
+                metadata[key] = value
+
+    recovery_previous_response_id = _first_non_empty_string(
+        *(
+            metadata_source.get(key)
+            for metadata_source in stream_history_metadata_sources
+            for key in (
+                "aawm_stream_recovery_previous_response_id",
+                "previous_response_id",
+            )
+        ),
+        request_body.get("previous_response_id")
+        if isinstance(request_body, dict)
+        else None,
+    )
+    recovery_parent_litellm_call_id = _first_non_empty_string(
+        *(
+            metadata_source.get(key)
+            for metadata_source in stream_history_metadata_sources
+            for key in (
+                "aawm_stream_recovery_parent_litellm_call_id",
+                "originating_litellm_call_id",
+                "parent_litellm_call_id",
+            )
+        )
+    )
+    provider_response_id = _first_non_empty_string(
+        _maybe_get(result, "id"),
+        *(
+            metadata_source.get("provider_response_id")
+            for metadata_source in stream_history_metadata_sources
+        ),
+    )
+    if recovery_previous_response_id is not None:
+        metadata["aawm_stream_recovery_previous_response_id"] = (
+            recovery_previous_response_id
+        )
+    if recovery_parent_litellm_call_id is not None:
+        metadata["aawm_stream_recovery_parent_litellm_call_id"] = (
+            recovery_parent_litellm_call_id
+        )
+
+    recovery_status = _first_non_empty_string(
+        standard_logging_object.get("status"),
+        metadata.get("source_status"),
+        _maybe_get(result, "status"),
+        hidden_params.get("responses_terminal_status"),
+    )
+    recovery_failed_statuses = {
+        "error",
+        "canceled",
+        "cancelled",
+        "failed",
+        "failure",
+        "incomplete",
+        "response.canceled",
+        "response.cancelled",
+        "response.failed",
+        "response.incomplete",
+    }
+    recovery_succeeded = (
+        recovery_status is None
+        or recovery_status.strip().lower() not in recovery_failed_statuses
+    )
+    existing_recovery_outcome = _first_non_empty_string(
+        metadata.get("aawm_stream_recovery_outcome")
+    )
+    if (
+        recovery_succeeded
+        and recovery_previous_response_id is not None
+        and recovery_parent_litellm_call_id is not None
+    ):
+        metadata["aawm_stream_recovery_outcome"] = "recovered"
+    elif (
+        existing_recovery_outcome is not None
+        and existing_recovery_outcome.lower() == "recovered"
+    ):
+        metadata.pop("aawm_stream_recovery_outcome", None)
+
     reasoning_fields = _derive_session_history_reasoning_fields(
         metadata=metadata,
         message=message,
@@ -1323,7 +1422,7 @@ def _build_session_history_record(  # noqa: PLR0915
         "litellm_call_id": kwargs.get("litellm_call_id"),
         "session_id": session_id,
         "trace_id": trace_id,
-        "provider_response_id": _maybe_get(result, "id"),
+        "provider_response_id": provider_response_id,
         "provider": resolved_provider,
         "model": resolved_model,
         "inbound_model_alias": inbound_model_alias,
