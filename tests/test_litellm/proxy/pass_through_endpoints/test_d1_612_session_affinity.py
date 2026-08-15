@@ -1840,15 +1840,15 @@ def test_interchangeable_openai_owner_ignores_account_identity_only() -> None:
     )
 
 
-def _openai_responses_owner_attrs(
+def _managed_direct_openai_owner_attrs(
     *,
     route_family: str,
+    endpoint_contract: str,
+    state_format: str,
     model: str = "gpt-5.6-sol",
     account_hash: str = "acct-1",
     account_label: str = "primary",
     account_lane: str = "lane-a",
-    endpoint_contract: str = "openai_responses",
-    state_format: str = "openai_responses",
     provider: str = "openai",
 ) -> dict[str, Any]:
     return {
@@ -1863,6 +1863,26 @@ def _openai_responses_owner_attrs(
     }
 
 
+def _legacy_managed_direct_openai_owner_attrs(**over: Any) -> dict[str, Any]:
+    attrs = _managed_direct_openai_owner_attrs(
+        route_family="codex_responses",
+        endpoint_contract="codex_responses",
+        state_format="codex_responses",
+    )
+    attrs.update(over)
+    return attrs
+
+
+def _current_managed_direct_openai_owner_attrs(**over: Any) -> dict[str, Any]:
+    attrs = _managed_direct_openai_owner_attrs(
+        route_family="codex_oauth",
+        endpoint_contract="openai_responses",
+        state_format="openai_responses",
+    )
+    attrs.update(over)
+    return attrs
+
+
 def _owned_record(attributes: dict[str, Any]) -> dict[str, Any]:
     return {
         "state": "owned",
@@ -1871,16 +1891,22 @@ def _owned_record(attributes: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def test_openai_responses_route_family_aliases_are_equivalent() -> None:
-    historical = _openai_responses_owner_attrs(route_family="codex_responses")
-    current = _openai_responses_owner_attrs(route_family="codex_oauth")
-    passthrough = _openai_responses_owner_attrs(route_family="openai_responses")
+def test_managed_direct_openai_owner_shapes_are_equivalent() -> None:
+    historical = _legacy_managed_direct_openai_owner_attrs()
+    current = _current_managed_direct_openai_owner_attrs()
+    public = _managed_direct_openai_owner_attrs(
+        route_family="openai_responses",
+        endpoint_contract="openai_responses",
+        state_format="openai_responses",
+    )
 
-    assert sa._openai_responses_route_families_are_equivalent(historical, current)
-    assert sa._openai_responses_route_families_are_equivalent(current, historical)
-    assert sa._openai_responses_route_families_are_equivalent(historical, passthrough)
+    assert sa._managed_direct_openai_owner_shapes_are_equivalent(historical, current)
+    assert sa._managed_direct_openai_owner_shapes_are_equivalent(current, historical)
+    assert not sa._managed_direct_openai_owner_shapes_are_equivalent(historical, public)
+    assert not sa._managed_direct_openai_owner_shapes_are_equivalent(current, public)
     assert sa._attributes_exactly_equal(left=historical, right=current)
-    assert sa._attributes_exactly_equal(left=current, right=passthrough)
+    assert sa._attributes_exactly_equal(left=current, right=historical)
+    assert not sa._attributes_exactly_equal(left=historical, right=public)
     assert sa._compatibility_mismatch_reason(
         owner_record=_owned_record(historical),
         requested_attributes=current,
@@ -1894,26 +1920,40 @@ def test_openai_responses_route_family_aliases_are_equivalent() -> None:
     assert sa.build_session_owner_id(attributes=historical) != (
         sa.build_session_owner_id(attributes=current)
     )
+    assert sa.owner_record_as_affinity_hint(_owned_record(historical))["route_family"] == (
+        "codex_responses"
+    )
+    assert sa.owner_record_as_affinity_hint(_owned_record(current))["route_family"] == (
+        "codex_oauth"
+    )
 
 
-def test_openai_responses_route_family_aliases_remain_strict_nearby() -> None:
-    owner = _openai_responses_owner_attrs(route_family="codex_responses")
+def test_managed_direct_openai_owner_shapes_remain_strict_nearby() -> None:
+    owner = _legacy_managed_direct_openai_owner_attrs()
     cases = [
-        _openai_responses_owner_attrs(route_family="codex_oauth", model="gpt-5.6-terra"),
-        _openai_responses_owner_attrs(route_family="codex_oauth", account_lane="lane-b"),
-        _openai_responses_owner_attrs(
+        _current_managed_direct_openai_owner_attrs(model="gpt-5.6-terra"),
+        _current_managed_direct_openai_owner_attrs(account_lane="lane-b"),
+        _current_managed_direct_openai_owner_attrs(provider="xai"),
+        _managed_direct_openai_owner_attrs(
+            route_family="openai_responses",
+            endpoint_contract="openai_responses",
+            state_format="openai_responses",
+        ),
+        _managed_direct_openai_owner_attrs(
             route_family="codex_oauth",
             endpoint_contract="codex_responses",
-        ),
-        _openai_responses_owner_attrs(
-            route_family="codex_oauth",
             state_format="codex_responses",
         ),
-        _openai_responses_owner_attrs(
-            route_family="codex_oauth",
-            provider="xai",
+        _managed_direct_openai_owner_attrs(
+            route_family="codex_responses",
+            endpoint_contract="openai_responses",
+            state_format="openai_responses",
         ),
-        _openai_responses_owner_attrs(route_family="openai"),
+        _managed_direct_openai_owner_attrs(
+            route_family="codex_oauth",
+            endpoint_contract="openai_responses",
+            state_format="codex_responses",
+        ),
     ]
     for requested in cases:
         assert not sa._attributes_exactly_equal(left=owner, right=requested)
@@ -1930,32 +1970,47 @@ def test_openai_responses_route_family_aliases_remain_strict_nearby() -> None:
 
 
 @pytest.mark.asyncio
-async def test_direct_openai_responses_owner_accepts_historical_codex_oauth_aliases() -> None:
+async def test_direct_openai_owner_accepts_legacy_and_current_managed_shapes() -> None:
     redis = _FakeRedisCache()
-    historical = _openai_responses_owner_attrs(route_family="codex_oauth")
-    current = _openai_responses_owner_attrs(route_family="codex_responses")
+    historical = _legacy_managed_direct_openai_owner_attrs()
+    current = _current_managed_direct_openai_owner_attrs()
+    public = _managed_direct_openai_owner_attrs(
+        route_family="openai_responses",
+        endpoint_contract="openai_responses",
+        state_format="openai_responses",
+    )
     with _patch_dual(redis), patch.object(
         durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
     ):
         reserved = await sa.guard_session_owner_before_egress(
-            session_identity="sess-openai-014-compat",
+            session_identity="sess-openai-015-compat",
             requested_attributes=historical,
         )
         promoted = await sa.promote_session_owner_reservation(
-            session_identity="sess-openai-014-compat",
+            session_identity="sess-openai-015-compat",
             reservation_token=reserved.reservation_token,
             attributes=historical,
         )
         assert promoted.outcome is sa.SessionOwnerMutationOutcome.PROMOTED
         continuation = await sa.ensure_session_owner_guard_for_request(
-            session_identity="sess-openai-014-compat",
+            session_identity="sess-openai-015-compat",
             requested_attributes=current,
             require_exact_attributes=True,
         )
+        public_guard = await sa.ensure_session_owner_guard_for_request(
+            session_identity="sess-openai-015-compat",
+            requested_attributes=public,
+            require_exact_attributes=True,
+            raise_on_redispatch=False,
+        )
         stored = await sa.get_session_owner_record(
-            session_identity="sess-openai-014-compat"
+            session_identity="sess-openai-015-compat"
         )
 
     assert continuation.decision is sa.SessionOwnerGuardDecision.COMPATIBLE_OWNER
+    assert public_guard.decision is sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
+    assert "exactly match" in (public_guard.mismatch_reason or "")
     assert stored[0] is not None
-    assert stored[0]["attributes"]["route_family"] == "codex_oauth"
+    assert stored[0]["attributes"]["route_family"] == "codex_responses"
+    assert stored[0]["attributes"]["endpoint_contract"] == "codex_responses"
+    assert stored[0]["attributes"]["state_format"] == "codex_responses"

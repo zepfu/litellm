@@ -705,40 +705,47 @@ def _record_state(record: Optional[Mapping[str, Any]]) -> Optional[str]:
     return None
 
 
-_OPENAI_RESPONSES_ROUTE_FAMILY_ALIASES = frozenset(
+_MANAGED_DIRECT_OPENAI_OWNER_SHAPES = frozenset(
     {
-        "codex_oauth",
-        "codex_responses",
-        "openai_responses",
+        ("codex_responses", "codex_responses", "codex_responses"),
+        ("codex_oauth", "openai_responses", "openai_responses"),
     }
 )
 
 
-def _openai_responses_route_families_are_equivalent(
+def _managed_direct_openai_owner_shape(
+    attributes: Mapping[str, Any],
+) -> Optional[tuple[str, str, str]]:
+    """Return the complete managed direct-OpenAI tuple when it is exact."""
+
+    if _clean_optional_str(attributes.get("provider")) != "openai":
+        return None
+    shape = (
+        _clean_optional_str(attributes.get("route_family")),
+        _clean_optional_str(attributes.get("endpoint_contract")),
+        _clean_optional_str(attributes.get("state_format")),
+    )
+    if None in shape:
+        return None
+    typed = (str(shape[0]), str(shape[1]), str(shape[2]))
+    if typed not in _MANAGED_DIRECT_OPENAI_OWNER_SHAPES:
+        return None
+    return typed
+
+
+def _managed_direct_openai_owner_shapes_are_equivalent(
     left: Mapping[str, Any],
     right: Mapping[str, Any],
 ) -> bool:
-    """Treat historical/current direct OpenAI Responses families as one contract.
+    """Treat the two complete managed direct-OpenAI owner tuples as one contract.
 
-    Comparison-only. Stored attributes and owner ids remain unchanged.
+    Comparison-only. Stored attributes, owner ids, and public
+    openai_responses/openai_responses/openai_responses remain distinct.
     """
 
-    providers = {
-        _clean_optional_str(left.get("provider")),
-        _clean_optional_str(right.get("provider")),
-    }
-    if providers != {"openai"}:
-        return False
-    for attrs in (left, right):
-        if _clean_optional_str(attrs.get("endpoint_contract")) != "openai_responses":
-            return False
-        if _clean_optional_str(attrs.get("state_format")) != "openai_responses":
-            return False
-    families = {
-        _clean_optional_str(left.get("route_family")),
-        _clean_optional_str(right.get("route_family")),
-    }
-    return bool(families) and families <= _OPENAI_RESPONSES_ROUTE_FAMILY_ALIASES
+    left_shape = _managed_direct_openai_owner_shape(left)
+    right_shape = _managed_direct_openai_owner_shape(right)
+    return left_shape is not None and right_shape is not None
 
 
 def _attributes_exactly_equal(
@@ -757,9 +764,10 @@ def _attributes_exactly_equal(
         ):
             left_core.pop(key, None)
             right_core.pop(key, None)
-    if _openai_responses_route_families_are_equivalent(left_core, right_core):
-        left_core.pop("route_family", None)
-        right_core.pop("route_family", None)
+    if _managed_direct_openai_owner_shapes_are_equivalent(left_core, right_core):
+        for key in ("route_family", "endpoint_contract", "state_format"):
+            left_core.pop(key, None)
+            right_core.pop(key, None)
     if set(left_core.keys()) != set(right_core.keys()):
         return False
     for key, value in left_core.items():
@@ -796,14 +804,14 @@ def _compatibility_mismatch_reason(
         if not _attributes_exactly_equal(left=owner_attrs, right=requested_core):
             return "session_owner: requested route does not exactly match owner"
         return None
-    equivalent_openai_responses = (
-        _openai_responses_route_families_are_equivalent(
+    equivalent_managed_direct_openai = (
+        _managed_direct_openai_owner_shapes_are_equivalent(
             owner_attrs,
             requested_core,
         )
     )
     for key in ("provider", "model", "route_family"):
-        if key == "route_family" and equivalent_openai_responses:
+        if key == "route_family" and equivalent_managed_direct_openai:
             continue
         req = _clean_optional_str(requested_core.get(key))
         own = _clean_optional_str(owner_attrs.get(key))
@@ -816,6 +824,8 @@ def _compatibility_mismatch_reason(
             if req is not None and own is not None and req != own:
                 return f"session_owner: {key} mismatch"
     for key in ("endpoint_contract", "state_format"):
+        if equivalent_managed_direct_openai:
+            continue
         req = _clean_optional_str(requested_core.get(key))
         own = _clean_optional_str(owner_attrs.get(key))
         if req is not None and own is not None and req != own:
