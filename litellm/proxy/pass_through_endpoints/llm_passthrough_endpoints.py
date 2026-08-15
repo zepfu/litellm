@@ -3415,6 +3415,9 @@ async def _retry_direct_codex_oauth_after_usage_limit(
     cooldown_seconds = (
         _aawm_codex_oauth.direct_codex_usage_limit_retry_after_seconds(exc)
     )
+    retry_after_hint = _aawm_codex_oauth.direct_codex_usage_limit_raw_reset_hint(
+        exc
+    )
     cooldown_key = str(selection.get("cooldown_key") or "").strip()
     if cooldown_key and cooldown_seconds > 0:
         _publish_codex_cooldown_memory(
@@ -3434,16 +3437,19 @@ async def _retry_direct_codex_oauth_after_usage_limit(
             )
 
     candidate = selection.get("candidate")
+    retry_attempt_record = {
+        "failure_phase": "direct_openai_provider_response",
+        "attempted_provider_call": True,
+        "cooldown_seconds": round(float(cooldown_seconds), 3),
+    }
+    retry_attempt_record.update(retry_after_hint)
     retry_planned = (
         isinstance(candidate, dict)
         and _aawm_selection._plan_codex_oauth_account_failover(
             request,
             candidate=candidate,
             selection=selection,
-            attempt_record={
-                "failure_phase": "direct_openai_provider_response",
-                "attempted_provider_call": True,
-            },
+            attempt_record=retry_attempt_record,
             error_class="usage_limit_reached",
             has_continuation_state=selection.get("request_mode") != "fresh",
             has_previous_response_id=bool(

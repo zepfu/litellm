@@ -672,6 +672,10 @@ def _plan_codex_oauth_account_failover(
         value = selection.get(field)
         if value is not None:
             prior_account_outcome[field] = value
+    for field in ("cooldown_seconds", "provider_resets_in_seconds", "provider_resets_at"):
+        value = attempt_record.get(field)
+        if value is not None:
+            prior_account_outcome[field] = value
     prior_account_outcome = {
         key: value
         for key, value in prior_account_outcome.items()

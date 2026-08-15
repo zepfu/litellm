@@ -63,6 +63,22 @@ def _request(*, authorization: str | None = None) -> Request:
     )
 
 
+_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS = (
+    "LITELLM_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS"
+)
+
+
+class _DirectCodexUsageLimitError(Exception):
+    def __init__(
+        self,
+        *,
+        upstream_headers: dict[str, Any] | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
+        self.upstream_headers = upstream_headers or {}
+        self.detail = detail or {}
+
+
 def _record(
     label: str,
     account_hash: str,
@@ -1777,3 +1793,130 @@ def test_should_bind_direct_inventory_for_concrete_codex_targets() -> None:
         )
         is False
     )
+
+
+def test_direct_codex_usage_limit_retry_after_far_future_reset_is_capped() -> None:
+    detail = {"quota": {"resets_in_seconds": 60_000.0}}
+    exc = _DirectCodexUsageLimitError(detail=detail)
+    assert (
+        codex_oauth.direct_codex_usage_limit_retry_after_seconds(
+            exc,
+            now_epoch=0.0,
+        )
+        == 10_800.0
+    )
+
+
+def test_direct_codex_usage_limit_retry_after_retry_after_is_capped() -> None:
+    exc = _DirectCodexUsageLimitError(
+        upstream_headers={"Retry-After": "60_000"},
+    )
+    assert (
+        codex_oauth.direct_codex_usage_limit_retry_after_seconds(
+            exc,
+            now_epoch=0.0,
+        )
+        == 10_800.0
+    )
+
+
+def test_direct_codex_usage_limit_retry_after_resets_at_is_capped() -> None:
+    detail = {"quota": {"resets_at": 600_000.0}}
+    exc = _DirectCodexUsageLimitError(detail=detail)
+    assert (
+        codex_oauth.direct_codex_usage_limit_retry_after_seconds(
+            exc,
+            now_epoch=0.0,
+        )
+        == 10_800.0
+    )
+
+
+def test_direct_codex_usage_limit_retry_after_uses_configured_lower_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS, "120")
+    exc = _DirectCodexUsageLimitError(
+        detail={"quota": {"resets_in_seconds": 600.0}},
+    )
+    assert (
+        codex_oauth.direct_codex_usage_limit_retry_after_seconds(
+            exc,
+            now_epoch=0.0,
+        )
+        == 120.0
+    )
+
+
+def test_direct_codex_usage_limit_retry_after_caps_fallback_when_provider_reset_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS, "120")
+    exc = _DirectCodexUsageLimitError(
+        detail={"quota": {"resets_in_seconds": "not-a-number"}},
+    )
+    assert (
+        codex_oauth.direct_codex_usage_limit_retry_after_seconds(
+            exc,
+            now_epoch=0.0,
+        )
+        == 120.0
+    )
+
+
+def test_direct_codex_usage_limit_retry_after_falls_back_to_default_for_invalid_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS, "-1")
+    exc = _DirectCodexUsageLimitError(
+        detail={"quota": {"resets_in_seconds": 60_000.0}},
+    )
+    assert (
+        codex_oauth.direct_codex_usage_limit_retry_after_seconds(
+            exc,
+            now_epoch=0.0,
+        )
+        == 10_800.0
+    )
+
+
+@pytest.mark.parametrize(
+    "cap_value",
+    ["nan", "inf", "-inf"],
+)
+def test_direct_codex_usage_limit_retry_after_rejects_non_finite_caps(
+    monkeypatch: pytest.MonkeyPatch,
+    cap_value: str,
+) -> None:
+    monkeypatch.setenv(_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS, cap_value)
+    exc = _DirectCodexUsageLimitError(
+        detail={"quota": {"resets_in_seconds": 60_000.0}},
+    )
+    assert (
+        codex_oauth.direct_codex_usage_limit_retry_after_seconds(
+            exc,
+            now_epoch=0.0,
+        )
+        == 10_800.0
+    )
+
+
+def test_direct_codex_usage_limit_retry_after_fallback_to_300_seconds() -> None:
+    exc = _DirectCodexUsageLimitError()
+    assert (
+        codex_oauth.direct_codex_usage_limit_retry_after_seconds(
+            exc,
+            now_epoch=0.0,
+        )
+        == 300.0
+    )
+
+
+def test_direct_codex_usage_limit_retry_after_does_not_mutate_exception_detail() -> None:
+    detail = {"quota": {"resets_in_seconds": 60_000.0, "other": "value"}}
+    exc = _DirectCodexUsageLimitError(detail=detail)
+    _ = codex_oauth.direct_codex_usage_limit_retry_after_seconds(
+        exc,
+        now_epoch=0.0,
+    )
+    assert exc.detail == {"quota": {"resets_in_seconds": 60_000.0, "other": "value"}}

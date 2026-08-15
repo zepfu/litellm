@@ -27863,6 +27863,164 @@ class TestOpenAIPassthroughRoute:
         mock_persist.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_openai011_fresh_direct_usage_limit_retries_then_terminal(self):
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            codex_oauth,
+            selection as codex_selection,
+        )
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            openai_proxy_route,
+        )
+
+        body = {"model": "gpt-5.6-sol", "input": "hello"}
+        request = self._openai006_request()
+
+        def _auth(label: str, account_hash: str):
+            return codex_oauth.CodexOAuthRequestAuth(
+                account_label=label,
+                account_hash=account_hash,
+                lane_key=f"codex-oauth:{label}:{account_hash}",
+                headers={"Authorization": f"Bearer {label}"},
+            )
+
+        def _selection(label: str, account_hash: str, ordinal: int):
+            lane = f"codex-oauth:{label}:{account_hash}"
+            return {
+                "candidate": {
+                    "provider": "openai",
+                    "model": "gpt-5.6-sol",
+                    "route_family": "codex_responses",
+                    "codex_oauth_account_label": label,
+                    "codex_oauth_account_hash": account_hash,
+                    "codex_oauth_lane_key": lane,
+                },
+                "lane_key": lane,
+                "cooldown_key": f"openai:gpt-5.6-sol:{lane}",
+                "failover_ordinal": ordinal,
+                "request_mode": "fresh",
+            }
+
+        bindings = [
+            (_auth("account1", "hash-account-1"), _selection("account1", "hash-account-1", 0), body),
+            (_auth("account2", "hash-account-2"), _selection("account2", "hash-account-2", 1), body),
+        ]
+
+        first_exc = HTTPException(
+            status_code=429,
+            detail={
+                "error": {"code": "usage_limit_reached", "message": "quota exhausted"},
+                "quota": {"resets_in_seconds": 900},
+                "failover_disposition": "usage_limit_reached",
+                "account": "account1",
+            },
+            headers={"Retry-After": "900"},
+        )
+        terminal_exc = HTTPException(
+            status_code=429,
+            detail={
+                "error": {"code": "usage_limit_reached", "message": "quota exhausted"},
+                "failover_disposition": "usage_limit_reached",
+                "account": "account2",
+                "terminal": True,
+            },
+        )
+
+        attempts: list[str] = []
+        calls: list[dict[str, Any]] = []
+
+        async def _fake_base(**kwargs):
+            captured = dict(kwargs)
+            authorization = (captured.get("extra_headers") or {}).get("Authorization")
+            attempts.append(authorization)
+            calls.append(
+                {
+                    "endpoint": captured.get("endpoint"),
+                    "extra_headers": dict(captured.get("extra_headers") or {}),
+                    "api_key": captured.get("api_key"),
+                }
+            )
+            if authorization == "Bearer account1":
+                raise first_exc
+            raise terminal_exc
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_alias_model",
+            return_value=None,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_oa_xai_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_grok_native_oauth_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth.select_and_bind_direct_codex_oauth_inventory",
+            new=AsyncMock(side_effect=bindings),
+        ) as mock_bind, patch.object(
+            llm_passthrough_endpoints.BaseOpenAIPassThroughHandler,
+            "_base_openai_pass_through_handler",
+            new=_fake_base,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._aawm_selection._plan_codex_oauth_account_failover",
+            wraps=codex_selection._plan_codex_oauth_account_failover,
+        ) as mock_plan_codex_oauth_account_failover, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._publish_codex_cooldown_memory"
+        ) as mock_publish, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_codex_cooldown_durable",
+            new=AsyncMock(),
+        ) as mock_persist:
+            with pytest.raises(HTTPException) as exc_info:
+                await openai_proxy_route(
+                    endpoint="v1/responses",
+                    request=request,
+                    fastapi_response=Response(),
+                    user_api_key_dict=object(),  # type: ignore[arg-type]
+                )
+
+        assert attempts == ["Bearer account1", "Bearer account2"]
+        assert mock_bind.await_count == 2
+        assert exc_info.value is terminal_exc
+        assert exc_info.value.detail.get("account") == "account2"
+        assert calls[0]["endpoint"] == "v1/responses"
+        assert calls[1]["endpoint"] == "v1/responses"
+        assert calls[0]["extra_headers"].get("Authorization") == "Bearer account1"
+        assert calls[1]["extra_headers"].get("Authorization") == "Bearer account2"
+        assert calls[0]["api_key"] is None and calls[1]["api_key"] is None
+        assert mock_publish.call_count == 2
+        publish_calls = [
+            call.kwargs
+            for call in mock_publish.call_args_list
+        ]
+        assert publish_calls == [
+            {"keys": ("openai:gpt-5.6-sol:codex-oauth:account1:hash-account-1",), "seconds": 900.0},
+            {"keys": ("openai:gpt-5.6-sol:codex-oauth:account2:hash-account-2",), "seconds": 300.0},
+        ]
+        assert mock_persist.await_count == 2
+        persist_calls = [
+            call.kwargs for call in mock_persist.await_args_list
+        ]
+        assert persist_calls == [
+            {"keys": ("openai:gpt-5.6-sol:codex-oauth:account1:hash-account-1",), "seconds": 900.0},
+            {"keys": ("openai:gpt-5.6-sol:codex-oauth:account2:hash-account-2",), "seconds": 300.0},
+        ]
+        assert mock_plan_codex_oauth_account_failover.call_count == 2
+        first_call = mock_plan_codex_oauth_account_failover.call_args_list[0]
+        second_call = mock_plan_codex_oauth_account_failover.call_args_list[1]
+        assert first_call.kwargs["candidate"]["codex_oauth_account_label"] == "account1"
+        first_attempt_record = first_call.kwargs["attempt_record"]
+        assert first_attempt_record["cooldown_seconds"] == 900.0
+        assert first_attempt_record["provider_resets_in_seconds"] == 900.0
+        assert second_call.kwargs["candidate"]["codex_oauth_account_label"] == "account2"
+        assert second_call.kwargs["attempt_record"].get("provider_resets_in_seconds") is None
+        prior_account_outcome = request.state.aawm_codex_oauth_request_local_failover_context[
+            "prior_account_outcome"
+        ]
+        assert prior_account_outcome["provider_resets_in_seconds"] == 900.0
+        assert prior_account_outcome["cooldown_seconds"] == 900.0
+
+    @pytest.mark.asyncio
     async def test_openai006_continuation_usage_limit_does_not_switch_accounts(
         self, monkeypatch
     ):

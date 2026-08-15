@@ -13,6 +13,9 @@ import pytest
 from fastapi import Request
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import attempt_records
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals import (
+    _get_codex_auto_agent_cooldown_seconds,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +60,7 @@ def _configure_attempt_records():  # noqa: PLR0915
         "_parse_codex_auto_agent_header_wait_seconds",
         "_get_codex_auto_agent_source_error_summary",
         "_build_safe_kimi_code_selection_telemetry",
+        "_extract_codex_auto_agent_usage_limit_raw_quota_resets",
         "_extract_exception_status_code",
         "_safe_set_request_parsed_body",
         "_emit_auto_agent_alias_route_event",
@@ -286,6 +290,39 @@ class TestRetryableAttemptRecord:
         assert record["status"] == "retryable_no_cooldown"
         assert "cooldown_seconds" not in record
         assert record["cooldown_scope"] == "none"
+
+    def test_usage_limit_attaches_raw_quota_resets_while_cooldown_is_capped(self) -> None:
+        record: dict[str, Any] = {}
+        exc = Exception("usage limit reached")
+        exc._status_code = 429  # type: ignore[attr-defined]
+        exc._tokens = {"usage_limit_reached"}  # type: ignore[attr-defined]
+        exc._type_code = (None, None)  # type: ignore[attr-defined]
+        exc._retry_after = 200000.0  # type: ignore[attr-defined]
+        exc.detail = {  # type: ignore[attr-defined]
+            "error": {
+                "code": "usage_limit_reached",
+                "quota": {
+                    "resets_in_seconds": 500000.0,
+                    "resets_at": 900000.0,
+                },
+            }
+        }
+
+        cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(exc)
+        assert cooldown_seconds == 10800.0
+
+        attempt_records._update_codex_auto_agent_retryable_attempt_record(
+            attempt_record=record,
+            exc=exc,
+            error_class="usage_limit_reached",
+            cooldown_seconds=cooldown_seconds,
+            cooldown_scope="candidate",
+            alias_model="codex-auto-agent",
+        )
+
+        assert record["cooldown_seconds"] == 10800.0
+        assert record["provider_resets_in_seconds"] == 500000.0
+        assert record["provider_resets_at"] == 900000.0
 
     def test_kimi_telemetry_attached_when_all_present(self, _configure_attempt_records: _StubState) -> None:
         state = _configure_attempt_records

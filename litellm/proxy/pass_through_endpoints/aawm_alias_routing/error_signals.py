@@ -14,6 +14,7 @@ Grok side-channel module are used where those modules own the symbols.
 from __future__ import annotations
 
 import ast
+import math
 import json
 import os
 import random
@@ -231,6 +232,47 @@ def _parse_json_payloads_from_text_candidates(
             continue
         parsed_payloads.append(parsed)
     return parsed_payloads
+
+
+def _extract_codex_auto_agent_usage_limit_raw_quota_resets(
+    exc: Any,
+) -> dict[str, float]:
+    """Extract sanitized raw provider reset hints for usage-limit telemetry."""
+
+    def _consume_quota_payload(payload: dict[str, Any], output: dict[str, float]) -> None:
+        for source_field, output_field in (
+            ("resets_in_seconds", "provider_resets_in_seconds"),
+            ("resets_at", "provider_resets_at"),
+        ):
+            raw_value = payload.get(source_field)
+            try:
+                value = float(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value) or value <= 0:
+                continue
+            output[output_field] = value
+
+    reset_hints: dict[str, float] = {}
+    for error in _iter_codex_auto_agent_error_blocks(exc):
+        if isinstance(error, dict):
+            quota_payload = error.get("quota")
+            if isinstance(quota_payload, dict):
+                _consume_quota_payload(quota_payload, reset_hints)
+
+    detail = _extract_adapter_exception_detail(exc)
+    if isinstance(detail, dict):
+        quota_payload = detail.get("quota")
+        if isinstance(quota_payload, dict):
+            _consume_quota_payload(quota_payload, reset_hints)
+
+        nested_error = detail.get("error")
+        if isinstance(nested_error, dict):
+            nested_quota_payload = nested_error.get("quota")
+            if isinstance(nested_quota_payload, dict):
+                _consume_quota_payload(nested_quota_payload, reset_hints)
+
+    return reset_hints
 
 
 # ---------------------------------------------------------------------------
@@ -1178,6 +1220,20 @@ def _parse_codex_auto_agent_header_wait_seconds(exc: Any) -> Optional[float]:
     return min(wait_candidates)
 
 
+def _resolve_codex_auto_agent_usage_limit_cooldown_max_seconds() -> float:
+    raw_max_cooldown = os.getenv(
+        "LITELLM_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS",
+        "10800",
+    )
+    try:
+        max_cooldown = float(raw_max_cooldown)
+    except (TypeError, ValueError):
+        max_cooldown = 10800.0
+    if max_cooldown <= 0 or not math.isfinite(max_cooldown):
+        return 10800.0
+    return max_cooldown
+
+
 def _get_codex_auto_agent_cooldown_seconds(
     exc: Any,
     *,
@@ -1185,10 +1241,21 @@ def _get_codex_auto_agent_cooldown_seconds(
 ) -> float:
     assert _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS is not None
     header_wait = _parse_codex_auto_agent_header_wait_seconds(exc)
+    usage_limit_max_seconds = _resolve_codex_auto_agent_usage_limit_cooldown_max_seconds()
     error_class = _classify_codex_auto_agent_retryable_exhaustion(
         exc, candidate=candidate
     )
     tokens = _extract_codex_auto_agent_error_tokens(exc)
+    if error_class == "usage_limit_reached":
+        resolved = _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS
+        if header_wait is not None:
+            resolved = min(
+                max(_CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS, header_wait),
+                usage_limit_max_seconds,
+            )
+        else:
+            resolved = min(resolved, usage_limit_max_seconds)
+        return resolved
     if header_wait is not None:
         resolved = max(_CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS, header_wait)
     elif (
@@ -1197,8 +1264,6 @@ def _get_codex_auto_agent_cooldown_seconds(
         resolved = _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
     elif _is_codex_auto_agent_transient_internal_error_class(error_class):
         resolved = _CODEX_AUTO_AGENT_DEFAULT_TRANSIENT_COOLDOWN_SECONDS
-    elif "usage_limit_reached" in tokens:
-        resolved = _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS
     elif error_class == "malformed_tool_call_text":
         resolved = _CODEX_AUTO_AGENT_MALFORMED_TOOL_CALL_COOLDOWN_SECONDS
     elif "RESOURCE_EXHAUSTED" in tokens or "RATE_LIMIT_EXCEEDED" in tokens:

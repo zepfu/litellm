@@ -11,6 +11,7 @@ import ast
 import base64
 import json
 import os
+import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1055,6 +1056,16 @@ def direct_codex_usage_limit_retry_after_seconds(
     now_epoch: Optional[float] = None,
 ) -> float:
     """Resolve the provider reset interval, with a bounded fallback."""
+    max_cooldown_seconds = os.getenv(
+        "LITELLM_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS", "10800"
+    )
+    try:
+        max_cooldown_seconds = float(max_cooldown_seconds)
+        if not math.isfinite(max_cooldown_seconds) or max_cooldown_seconds <= 0:
+            max_cooldown_seconds = 10800.0
+    except (TypeError, ValueError):
+        max_cooldown_seconds = 10800.0
+
     headers = getattr(exc, "upstream_headers", None)
     if not isinstance(headers, dict):
         headers = getattr(exc, "headers", None)
@@ -1066,7 +1077,7 @@ def direct_codex_usage_limit_retry_after_seconds(
     except (TypeError, ValueError):
         parsed_retry_after = 0.0
     if parsed_retry_after > 0:
-        return parsed_retry_after
+        return min(parsed_retry_after, max_cooldown_seconds)
 
     detail = _direct_codex_error_detail(exc)
     quota = detail.get("quota")
@@ -1076,14 +1087,44 @@ def direct_codex_usage_limit_retry_after_seconds(
         except (TypeError, ValueError):
             resets_in_seconds = 0.0
         if resets_in_seconds > 0:
-            return resets_in_seconds
+            return min(resets_in_seconds, max_cooldown_seconds)
         try:
             resets_at = float(quota.get("resets_at"))
         except (TypeError, ValueError):
             resets_at = 0.0
         if resets_at > 0:
-            return max(1.0, resets_at - (time.time() if now_epoch is None else now_epoch))
-    return 300.0
+            return min(
+                max(
+                    1.0,
+                    resets_at - (time.time() if now_epoch is None else now_epoch),
+                ),
+                max_cooldown_seconds,
+            )
+    return min(300.0, max_cooldown_seconds)
+
+
+def direct_codex_usage_limit_raw_reset_hint(
+    exc: Exception,
+) -> dict[str, float]:
+    """Return sanitized raw quota reset hints from direct usage-limit errors."""
+    detail = _direct_codex_error_detail(exc)
+    quota = detail.get("quota")
+    if not isinstance(quota, dict):
+        return {}
+
+    hint: dict[str, float] = {}
+    for source_field, output_field in (
+        ("resets_in_seconds", "provider_resets_in_seconds"),
+        ("resets_at", "provider_resets_at"),
+    ):
+        try:
+            value = float(quota.get(source_field))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value) or value <= 0:
+            continue
+        hint[output_field] = value
+    return hint
 
 
 # ---------------------------------------------------------------------------

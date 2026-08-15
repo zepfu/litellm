@@ -55,6 +55,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals impor
     _parse_json_payloads_from_text_candidates,
     _parse_rate_limit_reset_wait_seconds_from_headers,
     _parse_retry_after_seconds_from_headers,
+    _extract_codex_auto_agent_usage_limit_raw_quota_resets,
     _plan_codex_auto_agent_native_grok_continuation_transient_retry,
     configure_error_signals_runtime,
 )
@@ -305,6 +306,28 @@ class TestClassification:
     def test_classify_none_for_unknown(self):
         exc = _FakeExc(message="all good")
         assert _classify_codex_auto_agent_retryable_exhaustion(exc) is None
+
+
+class TestUsageLimitQuotaHints:
+    def test_extracts_raw_usage_limit_reset_hints(self):
+        exc = _FakeExc(
+            detail={
+                "error": {
+                    "code": "usage_limit_reached",
+                    "quota": {
+                        "resets_in_seconds": "500000",
+                        "resets_at": "900000",
+                    },
+                }
+            }
+        )
+
+        hints = _extract_codex_auto_agent_usage_limit_raw_quota_resets(exc)
+
+        assert hints == {
+            "provider_resets_in_seconds": 500000.0,
+            "provider_resets_at": 900000.0,
+        }
 
     def test_classify_alibaba_unsupported_model_by_structured_code(self):
         exc = _FakeExc(
@@ -680,6 +703,79 @@ class TestHeaderWaitAndCooldown:
         exc.upstream_headers = {"retry-after": "14400"}
         seconds = _get_codex_auto_agent_cooldown_seconds(exc)
         assert seconds == 14400.0
+
+    def test_cooldown_seconds_usage_limit_header_capped_default(self, monkeypatch):
+        monkeypatch.delenv(
+            "LITELLM_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS",
+            raising=False,
+        )
+        exc = _FakeExc(message="usage_limit_reached")
+        exc.upstream_headers = {"retry-after": "200000"}
+        seconds = _get_codex_auto_agent_cooldown_seconds(exc)
+        assert seconds == 10800.0
+
+    def test_cooldown_seconds_usage_limit_header_capped_by_configured_lower_value(self, monkeypatch):
+        monkeypatch.setenv(
+            "LITELLM_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS",
+            "1800",
+        )
+        exc = _FakeExc(message="usage_limit_reached")
+        exc.upstream_headers = {"retry-after": "7200"}
+        seconds = _get_codex_auto_agent_cooldown_seconds(exc)
+        assert seconds == 1800.0
+
+    def test_cooldown_seconds_usage_limit_header_capped_invalid_config_value(self, monkeypatch):
+        exc = _FakeExc(message="usage_limit_reached")
+        exc.upstream_headers = {"retry-after": "200000"}
+
+        monkeypatch.setenv(
+            "LITELLM_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS",
+            "not-a-number",
+        )
+        assert _get_codex_auto_agent_cooldown_seconds(exc) == 10800.0
+
+        monkeypatch.setenv(
+            "LITELLM_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS",
+            "-10",
+        )
+        seconds = _get_codex_auto_agent_cooldown_seconds(exc)
+        assert seconds == 10800.0
+
+    def test_cooldown_seconds_usage_limit_fallback_uses_capped_default_when_reset_invalid(self, monkeypatch):
+        monkeypatch.setenv(
+            "LITELLM_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS",
+            "300",
+        )
+        exc = _FakeExc(message="usage_limit_reached")
+        exc.upstream_headers = {}
+        seconds = _get_codex_auto_agent_cooldown_seconds(exc)
+        assert seconds == 300.0
+
+    def test_cooldown_seconds_usage_limit_non_finite_config_value(self, monkeypatch):
+        exc = _FakeExc(message="usage_limit_reached")
+        exc.upstream_headers = {"retry-after": "200000"}
+
+        for value in ("nan", "inf", "-inf"):
+            monkeypatch.setenv(
+                "LITELLM_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS",
+                value,
+            )
+            assert _get_codex_auto_agent_cooldown_seconds(exc) == 10800.0
+
+    def test_cooldown_seconds_transient_and_capacity_not_capped_by_usage_limit_config(self, monkeypatch):
+        monkeypatch.setenv(
+            "LITELLM_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS",
+            "1800",
+        )
+
+        transient_exc = _FakeExc(message="bad gateway")
+        transient_exc.status_code = 502
+        transient_seconds = _get_codex_auto_agent_cooldown_seconds(transient_exc)
+        assert transient_seconds == 30.0
+
+        capacity_exc = _FakeExc(message="model capacity exhausted")
+        capacity_seconds = _get_codex_auto_agent_cooldown_seconds(capacity_exc)
+        assert capacity_seconds == 3 * 60 * 60.0
 
     def test_spark_durable_cooldown(self):
         exc = _FakeExc(message="too many requests")

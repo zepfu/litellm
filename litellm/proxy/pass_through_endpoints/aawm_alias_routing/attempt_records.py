@@ -30,6 +30,9 @@ _extract_codex_auto_agent_error_type_and_code: Optional[
 _parse_codex_auto_agent_header_wait_seconds: Optional[Callable[..., Optional[float]]] = None
 _get_codex_auto_agent_source_error_summary: Optional[Callable[..., Optional[str]]] = None
 _build_safe_kimi_code_selection_telemetry: Optional[Callable[..., dict[str, Any]]] = None
+_extract_codex_auto_agent_usage_limit_raw_quota_resets: Optional[
+    Callable[..., dict[str, float]]
+] = None
 
 # --- god-module / host seams ---
 _extract_exception_status_code: Optional[Callable[..., Optional[int]]] = None
@@ -69,6 +72,7 @@ _RUNTIME_STATE_NAMES = (
     "_parse_codex_auto_agent_header_wait_seconds",
     "_get_codex_auto_agent_source_error_summary",
     "_build_safe_kimi_code_selection_telemetry",
+    "_extract_codex_auto_agent_usage_limit_raw_quota_resets",
     "_extract_exception_status_code",
     "_safe_set_request_parsed_body",
     "_emit_auto_agent_alias_route_event",
@@ -114,6 +118,9 @@ def configure_attempt_records_runtime(  # noqa: PLR0915
     parse_header_wait_seconds: Callable[..., Optional[float]],
     get_source_error_summary: Callable[..., Optional[str]],
     build_kimi_telemetry: Callable[..., dict[str, Any]],
+    extract_usage_limit_raw_quota_resets: Optional[
+        Callable[..., dict[str, float]]
+    ] = None,
     # god-module / host
     extract_status_code: Callable[..., Optional[int]],
     safe_set_parsed_body: Callable[..., None],
@@ -150,6 +157,17 @@ def configure_attempt_records_runtime(  # noqa: PLR0915
     _get_codex_auto_agent_source_error_summary = get_source_error_summary
     global _build_safe_kimi_code_selection_telemetry
     _build_safe_kimi_code_selection_telemetry = build_kimi_telemetry
+    global _extract_codex_auto_agent_usage_limit_raw_quota_resets
+    if extract_usage_limit_raw_quota_resets is None:
+        from . import error_signals as _error_signals
+
+        _extract_codex_auto_agent_usage_limit_raw_quota_resets = (
+            _error_signals._extract_codex_auto_agent_usage_limit_raw_quota_resets
+        )
+    else:
+        _extract_codex_auto_agent_usage_limit_raw_quota_resets = (
+            extract_usage_limit_raw_quota_resets
+        )
     global _extract_exception_status_code
     _extract_exception_status_code = extract_status_code
     global _safe_set_request_parsed_body
@@ -214,6 +232,7 @@ def _update_codex_auto_agent_retryable_attempt_record(
     assert _extract_codex_auto_agent_error_type_and_code is not None
     assert _parse_codex_auto_agent_header_wait_seconds is not None
     assert _get_codex_auto_agent_source_error_summary is not None
+    assert _extract_codex_auto_agent_usage_limit_raw_quota_resets is not None
 
     error_tokens = _extract_codex_auto_agent_error_tokens(exc)
     error_status_code = _extract_exception_status_code(exc)
@@ -243,6 +262,10 @@ def _update_codex_auto_agent_retryable_attempt_record(
         update["error_code"] = str(error_code)
     if retry_after_seconds is not None:
         update["retry_after_seconds"] = round(float(retry_after_seconds), 3)
+    if error_class == "usage_limit_reached":
+        update.update(
+            _extract_codex_auto_agent_usage_limit_raw_quota_resets(exc)
+        )
     if candidate is not None and kimi_failure_metadata is not None:
         assert _build_safe_kimi_code_selection_telemetry is not None
         update["kimi_code_failure"] = _build_safe_kimi_code_selection_telemetry(
