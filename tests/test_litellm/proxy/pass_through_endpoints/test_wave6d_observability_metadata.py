@@ -442,6 +442,24 @@ def test_extract_passthrough_repository_prefers_current_input_over_stale_message
     assert metadata._extract_passthrough_repository(request, body) == "litellm"
 
 
+def test_extract_passthrough_repository_prefers_current_instructions_over_historical_responses_input(
+    ) -> None:
+    request = _FakeRequest()
+    body = {
+        "input": [
+            {"type": "message", "role": "assistant", "content": "done"},
+            {
+                "type": "message",
+                "role": "user",
+                "content": "cwd=file:///home/user/projects/stale-worktree",
+            },
+        ],
+        "instructions": "# AGENTS.md instructions for /home/user/projects/litellm",
+    }
+
+    assert metadata._extract_passthrough_repository(request, body) == "litellm"
+
+
 def test_extract_passthrough_repository_uses_current_turn_tool_output_as_last_fallback() -> None:
     request = _FakeRequest()
     body = {

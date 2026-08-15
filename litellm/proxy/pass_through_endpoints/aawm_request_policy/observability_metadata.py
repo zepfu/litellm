@@ -684,6 +684,32 @@ def _extract_passthrough_repository_from_body_text(
     )
 
 
+def _extract_latest_current_turn_user_repository(value: Any) -> Optional[str]:
+    """Extract repository from the latest user-context entry.
+
+    This keeps current-turn user context ahead of older user/assistant/tool text,
+    while avoiding broad historical fallback when a current user turn clearly
+    drives repository context.
+    """
+    if not isinstance(value, list):
+        return None
+
+    for item in reversed(value):
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        if not isinstance(role, str) or role.strip().lower() != "user":
+            continue
+        repository = _extract_passthrough_repository_from_body_text(
+            item,
+            skip_current_turn_nodes=False,
+        )
+        if repository:
+            return repository
+
+    return None
+
+
 def _get_passthrough_header_value(headers: dict[str, Any], header_name: str) -> Any:
     wanted = header_name.lower()
     for key, value in headers.items():
@@ -764,6 +790,23 @@ def _extract_passthrough_repository(
             value = _get_nested_str_value(request_body, path)
             if value:
                 return _normalize_passthrough_repository(value)
+
+        if isinstance(request_body.get("input"), list):
+            instructions = request_body.get("instructions")
+            if instructions is not None:
+                repository = _extract_passthrough_repository_from_body_text(
+                    instructions,
+                    skip_current_turn_nodes=False,
+                )
+                if repository:
+                    return repository
+
+            for current_turn_source in ("input", "messages"):
+                current_turn_repository = _extract_latest_current_turn_user_repository(
+                    request_body.get(current_turn_source)
+                )
+                if current_turn_repository:
+                    return current_turn_repository
 
         for key in _PASSTHROUGH_REPOSITORY_TEXT_SCAN_ROOT_KEYS:
             child = request_body.get(key)
