@@ -231,6 +231,7 @@ async def handle_alias_route(  # noqa: PLR0915
     _exclude_codex_auto_agent_request_local_candidate_without_cooldown = (
         _lpe._exclude_codex_auto_agent_request_local_candidate_without_cooldown
     )
+    _codex_oauth_candidate_slot = _lpe._codex_oauth_candidate_slot
     _plan_codex_oauth_account_failover = (
         _lpe._plan_codex_oauth_account_failover
     )
@@ -294,7 +295,7 @@ async def handle_alias_route(  # noqa: PLR0915
     # attempts. Must not reset when the outer candidate-selection loop re-enters.
     native_grok_continuation_transient_provider_attempts = 0
     provider_candidate_attempts = 0
-    account_failover_attempts = 0
+    account_failover_attempts_by_slot: dict[Optional[str], int] = {}
 
     def _raise_terminal_alias_failure(exc: Exception) -> Any:
         last_attempt = attempts[-1] if attempts else {}
@@ -369,7 +370,17 @@ async def handle_alias_route(  # noqa: PLR0915
         candidate = selection["candidate"]
         failover_ordinal = int(selection.get("failover_ordinal") or 0)
         if failover_ordinal > 0:
-            account_failover_attempts += 1
+            account_failover_slot = _codex_oauth_candidate_slot(candidate)
+            account_failover_attempts = (
+                account_failover_attempts_by_slot.get(
+                    account_failover_slot,
+                    0,
+                )
+                + 1
+            )
+            account_failover_attempts_by_slot[account_failover_slot] = (
+                account_failover_attempts
+            )
             if account_failover_attempts > 1:
                 raise HTTPException(
                     status_code=status.HTTP_429_TOO_MANY_REQUESTS,

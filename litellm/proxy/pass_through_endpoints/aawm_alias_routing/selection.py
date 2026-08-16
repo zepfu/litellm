@@ -583,13 +583,23 @@ def _block_codex_oauth_request_local_candidate_slot(
 
 def _get_codex_oauth_request_local_failover_context(
     request: Request,
+    *,
+    candidate: Optional[dict[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     context = getattr(
         request.state,
         "aawm_codex_oauth_request_local_failover_context",
         None,
     )
-    return dict(context) if isinstance(context, dict) else None
+    if not isinstance(context, dict):
+        return None
+    context = dict(context)
+    if (
+        candidate is not None
+        and context.get("slot") != _codex_oauth_candidate_slot(candidate)
+    ):
+        return None
+    return context
 
 
 def _apply_codex_oauth_failover_context_to_state(
@@ -600,10 +610,12 @@ def _apply_codex_oauth_failover_context_to_state(
     if not _is_codex_oauth_account_candidate(candidate):
         return state
     state["failover_ordinal"] = 0
-    context = _get_codex_oauth_request_local_failover_context(request)
+    context = _get_codex_oauth_request_local_failover_context(
+        request,
+        candidate=candidate,
+    )
     if (
         context is None
-        or context.get("slot") != _codex_oauth_candidate_slot(candidate)
         or context.get("prior_account_hash")
         == candidate.get("codex_oauth_account_hash")
     ):
@@ -625,7 +637,7 @@ def _plan_codex_oauth_account_failover(
     has_continuation_state: bool,
     has_previous_response_id: bool = False,
 ) -> bool:
-    """Plan the sole request-local account move after a pre-response failure."""
+    """Plan the sole request-local account move for one candidate slot."""
     if not _is_codex_oauth_account_candidate(candidate):
         return False
     interchangeable = (
@@ -637,7 +649,10 @@ def _plan_codex_oauth_account_failover(
         return False
 
     failover_ordinal = int(selection.get("failover_ordinal") or 0)
-    existing = _get_codex_oauth_request_local_failover_context(request)
+    existing = _get_codex_oauth_request_local_failover_context(
+        request,
+        candidate=candidate,
+    )
     if failover_ordinal > 0 or existing is not None:
         _block_codex_oauth_request_local_candidate_slot(
             request,

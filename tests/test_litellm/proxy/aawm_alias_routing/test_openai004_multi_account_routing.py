@@ -720,6 +720,83 @@ async def test_candidate_loop_allows_exactly_one_account_move(
 
 
 @pytest.mark.asyncio
+async def test_candidate_loop_tracks_account_failover_per_candidate_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    request = _request()
+    planned_attempts = [
+        ("codex-auto-review", "account1", "hash-account-1", 0),
+        ("codex-auto-review", "account2", "hash-account-2", 1),
+        ("gpt-5.6-sol", "account1", "hash-account-1", 0),
+        ("gpt-5.6-sol", "account2", "hash-account-2", 1),
+    ]
+    selected_attempts: list[tuple[str, str]] = []
+    performed_attempts: list[tuple[str, str]] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        model, account_label, account_hash, failover_ordinal = planned_attempts[
+            len(selected_attempts)
+        ]
+        selected_attempts.append((model, account_label))
+        selection_state = _account_selection(
+            account_label,
+            account_hash,
+            failover_ordinal=failover_ordinal,
+        )
+        selection_state["candidate"]["model"] = model
+        selection_state["cooldown_key"] = (
+            f"openai:{model}:{selection_state['lane_key']}"
+        )
+        return selection_state
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        attempt = (
+            candidate["model"],
+            candidate["codex_oauth_account_label"],
+        )
+        performed_attempts.append(attempt)
+        if len(performed_attempts) < len(planned_attempts):
+            raise RuntimeError("account capacity exhausted")
+        return Response(content=b"recovered", status_code=200)
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    response = await candidate_loop.handle_alias_route(
+        _loop_services(
+            select_candidate=_select,
+            perform_candidate=_perform,
+        ),
+        alias_family="codex_auto_agent",
+        alias_model="codex-auto-review",
+        request=request,
+        prepared_request_body={"model": "codex-auto-review"},
+        max_candidate_attempts=2,
+        get_active_cooldown_state_fn=_zero,
+        attempts_metadata_key="codex_auto_agent_attempts",
+        skipped_candidates_metadata_key=(
+            "codex_auto_agent_skipped_candidates"
+        ),
+        no_candidate_detail="no candidate",
+        log_label="Codex",
+    )
+
+    assert response.status_code == 200
+    assert selected_attempts == [
+        ("codex-auto-review", "account1"),
+        ("codex-auto-review", "account2"),
+        ("gpt-5.6-sol", "account1"),
+        ("gpt-5.6-sol", "account2"),
+    ]
+    assert performed_attempts == selected_attempts
+
+
+@pytest.mark.asyncio
 async def test_candidate_loop_continuation_usage_limit_fails_over_interchangeable_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
