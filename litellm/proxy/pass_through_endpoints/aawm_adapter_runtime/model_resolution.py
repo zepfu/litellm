@@ -311,8 +311,15 @@ def _resolve_codex_auto_agent_alias_model(
         _lookup_active_snapshot_canonical_alias,
     )
 
+    requested_model = request_body.get("model")
+    if (
+        isinstance(requested_model, str)
+        and requested_model.strip().casefold() == "chatgpt/codex-auto-review"
+    ):
+        requested_model = "codex-auto-review"
+
     return _lookup_active_snapshot_canonical_alias(
-        request_body.get("model"),
+        requested_model,
         request=request,
     )
 

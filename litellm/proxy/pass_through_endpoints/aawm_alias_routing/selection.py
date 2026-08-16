@@ -2974,10 +2974,16 @@ def _attach_session_owner_selection_fields(
     *,
     canonical_session_identity: Optional[str],
     session_owner_guard: Any,
+    session_owner_identity: Optional[str] = None,
 ) -> dict[str, Any]:
     sa = _session_affinity_mod()
+    effective_owner_identity = (
+        canonical_session_identity
+        if session_owner_identity is None
+        else session_owner_identity
+    )
     provenance = getattr(session_owner_guard, "provenance", None) or sa.build_session_owner_provenance(
-        session_identity=canonical_session_identity,
+        session_identity=effective_owner_identity,
         decision=getattr(
             getattr(session_owner_guard, "decision", None),
             "value",
@@ -2990,6 +2996,7 @@ def _attach_session_owner_selection_fields(
         reservation_token=getattr(session_owner_guard, "reservation_token", None),
     )
     selection["canonical_session_identity"] = canonical_session_identity
+    selection["session_owner_identity"] = effective_owner_identity
     selection["session_owner_decision"] = provenance.get("session_owner_decision")
     selection["session_owner_id"] = provenance.get("session_owner_id")
     selection["session_owner_mismatch_reason"] = provenance.get(
@@ -3019,8 +3026,17 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     assert _resolve_codex_session_key is not None
     assert _has_continuation_state is not None
     assert _get_codex_session_affinity is not None
+    requested_alias_model = request_body.get("model")
+    alias_lookup_model = (
+        "codex-auto-review"
+        if (
+            isinstance(requested_alias_model, str)
+            and requested_alias_model.strip().casefold() == "chatgpt/codex-auto-review"
+        )
+        else requested_alias_model
+    )
     alias_model = _lookup_active_snapshot_canonical_alias(
-        request_body.get("model"),
+        alias_lookup_model,
         request=request,
     )
     if alias_model is None:
@@ -3034,6 +3050,30 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 }
             },
         )
+    sa = _session_affinity_mod()
+    resolved_session_identity = sa.resolve_canonical_session_identity(
+        request,
+        request_body,
+    )
+    canonical_session_identity = resolved_session_identity
+    session_owner_identity = resolved_session_identity
+    if alias_model == "codex-auto-review":
+        parent_session_identity = (
+            sa.get_request_codex_auto_review_parent_session_identity(request)
+            or resolved_session_identity
+        )
+        sa.activate_codex_auto_review_session_identity(
+            request=request,
+            parent_session_identity=parent_session_identity,
+        )
+        canonical_session_identity = (
+            sa.get_request_codex_auto_review_parent_session_identity(request)
+            or parent_session_identity
+        )
+        session_owner_identity = sa.resolve_canonical_session_identity(
+            request,
+            request_body,
+        )
     client_product_label = _extract_client_product_label(request, request_body)
     session_key = _resolve_codex_session_key(
         request,
@@ -3046,21 +3086,16 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         request_body=request_body,
     )
 
-    sa = _session_affinity_mod()
-    canonical_session_identity = sa.resolve_canonical_session_identity(
-        request,
-        request_body,
-    )
     # Read-path ownership check before free selection. Reservation happens at
     # pre-egress once a concrete candidate is chosen (candidate_loop).
     session_owner_record, _cache_key, session_owner_error = await sa.get_session_owner_record(
-        session_identity=canonical_session_identity,
+        session_identity=session_owner_identity,
         request=request,
         wait_for_foreign_reservation=True,
     )
     if session_owner_error is not None:
         sa.raise_session_owner_redispatch_required(
-            session_identity=canonical_session_identity,
+            session_identity=session_owner_identity,
             alias_model=alias_model,
             failure_phase="session_owner_redis_unavailable",
             message=(
@@ -3070,11 +3105,11 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             ),
             guard=sa.SessionOwnerGuardResult(
                 decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
-                session_identity=canonical_session_identity,
+                session_identity=session_owner_identity,
                 cache_key=_cache_key,
                 mismatch_reason=session_owner_error,
                 provenance=sa.build_session_owner_provenance(
-                    session_identity=canonical_session_identity,
+                    session_identity=session_owner_identity,
                     decision="redispatch_required",
                     mismatch_reason=session_owner_error,
                     cache_key=_cache_key,
@@ -3095,7 +3130,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         ),
         "mismatch_reason": None,
         "provenance": sa.build_session_owner_provenance(
-            session_identity=canonical_session_identity,
+            session_identity=session_owner_identity,
             decision="unowned",
             owner_record=session_owner_record,
             cache_key=_cache_key,
@@ -3113,13 +3148,13 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     ) -> dict[str, Any]:
         if not sa.is_replay_safe_session_owner_redispatch_body(request_body):
             sa.raise_session_owner_redispatch_required(
-                session_identity=canonical_session_identity,
+                session_identity=session_owner_identity,
                 alias_model=alias_model,
                 candidate=candidate,
                 failure_phase="session_owner_redispatch_previous_response_id",
                 guard=sa.SessionOwnerGuardResult(
                     decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
-                    session_identity=canonical_session_identity,
+                    session_identity=session_owner_identity,
                     cache_key=_cache_key,
                     owner_record=session_owner_record,
                     owner_id=session_owner_record.get("owner"),
@@ -3127,7 +3162,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 ),
                 request=request,
             )
-        if canonical_session_identity is None:
+        if session_owner_identity is None:
             sa.raise_session_owner_redispatch_required(
                 session_identity=None,
                 alias_model=alias_model,
@@ -3145,13 +3180,13 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             )
         if sa.request_has_effective_session_identity(request):
             sa.raise_session_owner_redispatch_required(
-                session_identity=canonical_session_identity,
+                session_identity=session_owner_identity,
                 alias_model=alias_model,
                 candidate=candidate,
                 failure_phase="session_owner_effective_identity_conflict",
                 guard=sa.SessionOwnerGuardResult(
                     decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
-                    session_identity=canonical_session_identity,
+                    session_identity=session_owner_identity,
                     cache_key=_cache_key,
                     owner_record=session_owner_record,
                     owner_id=session_owner_record.get("owner"),
@@ -3161,17 +3196,17 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             )
         effective_identity = sa.activate_session_owner_redispatch_effective_identity(
             request=request,
-            base_session_identity=canonical_session_identity,
+            base_session_identity=session_owner_identity,
         )
         if effective_identity is None:
             sa.raise_session_owner_redispatch_required(
-                session_identity=canonical_session_identity,
+                session_identity=session_owner_identity,
                 alias_model=alias_model,
                 candidate=candidate,
                 failure_phase=failure_phase,
                 guard=sa.SessionOwnerGuardResult(
                     decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
-                    session_identity=canonical_session_identity,
+                    session_identity=session_owner_identity,
                     cache_key=_cache_key,
                     owner_record=session_owner_record,
                     owner_id=session_owner_record.get("owner"),
@@ -3190,7 +3225,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             {
                 "decision": "compatible_owner",
                 "provenance": sa.build_session_owner_provenance(
-                    session_identity=canonical_session_identity,
+                    session_identity=session_owner_identity,
                     decision="compatible_owner",
                     owner_record=session_owner_record,
                     owner_id=session_owner_record.get("owner"),
@@ -3201,18 +3236,18 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         if affinity is None:
             # Owned but unusable attributes => fail before free selection.
             sa.raise_session_owner_redispatch_required(
-                session_identity=canonical_session_identity,
+                session_identity=session_owner_identity,
                 alias_model=alias_model,
                 failure_phase="session_owner_owned_record_unusable",
                 guard=sa.SessionOwnerGuardResult(
                     decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
-                    session_identity=canonical_session_identity,
+                    session_identity=session_owner_identity,
                     cache_key=_cache_key,
                     owner_record=session_owner_record,
                     owner_id=session_owner_record.get("owner"),
                     mismatch_reason="session_owner: owned record missing usable attributes",
                     provenance=sa.build_session_owner_provenance(
-                        session_identity=canonical_session_identity,
+                        session_identity=session_owner_identity,
                         decision="redispatch_required",
                         owner_record=session_owner_record,
                         owner_id=session_owner_record.get("owner"),
@@ -3224,18 +3259,18 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             )
     elif isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "reserved":
         sa.raise_session_owner_redispatch_required(
-            session_identity=canonical_session_identity,
+            session_identity=session_owner_identity,
             alias_model=alias_model,
             failure_phase="session_owner_competing_reservation",
             guard=sa.SessionOwnerGuardResult(
                 decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
-                session_identity=canonical_session_identity,
+                session_identity=session_owner_identity,
                 cache_key=_cache_key,
                 owner_record=session_owner_record,
                 owner_id=session_owner_record.get("owner"),
                 mismatch_reason="session_owner: concurrent reservation held by another request",
                 provenance=sa.build_session_owner_provenance(
-                    session_identity=canonical_session_identity,
+                    session_identity=session_owner_identity,
                     decision="redispatch_required",
                     owner_record=session_owner_record,
                     owner_id=session_owner_record.get("owner"),
@@ -3332,6 +3367,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 ),
                 canonical_session_identity=canonical_session_identity,
                 session_owner_guard=type("G", (), session_owner_guard_meta)(),
+                session_owner_identity=session_owner_identity,
             )
         if (
             isinstance(session_owner_record, dict)
@@ -3346,19 +3382,19 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             # Owned/cooldown owner is unavailable: fail before free selection.
             if session_owner_record is not None and sa._record_state(session_owner_record) == "owned":
                 sa.raise_session_owner_redispatch_required(
-                    session_identity=canonical_session_identity,
+                    session_identity=session_owner_identity,
                     alias_model=alias_model,
                     candidate=affinity_state.get("candidate"),
                     failure_phase="session_owner_owner_cooldown",
                     guard=sa.SessionOwnerGuardResult(
                         decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
-                        session_identity=canonical_session_identity,
+                        session_identity=session_owner_identity,
                         cache_key=_cache_key,
                         owner_record=session_owner_record,
                         owner_id=session_owner_record.get("owner"),
                         mismatch_reason="session_owner: owner unavailable (cooldown)",
                         provenance=sa.build_session_owner_provenance(
-                            session_identity=canonical_session_identity,
+                            session_identity=session_owner_identity,
                             decision="redispatch_required",
                             owner_record=session_owner_record,
                             owner_id=session_owner_record.get("owner"),
@@ -3437,6 +3473,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             ),
             canonical_session_identity=canonical_session_identity,
             session_owner_guard=type("G", (), session_owner_guard_meta)(),
+            session_owner_identity=session_owner_identity,
         )
 
     state = _select_available_state(
@@ -3467,6 +3504,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             ),
             canonical_session_identity=canonical_session_identity,
             session_owner_guard=type("G", (), session_owner_guard_meta)(),
+            session_owner_identity=session_owner_identity,
         )
 
     detail: dict[str, Any] = {

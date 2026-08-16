@@ -352,3 +352,48 @@ aliases:
     assert snapshot_e.config_hash != snapshot_a.config_hash, (
         "a route_family change must produce a different semantic digest"
     )
+
+
+def test_codex_auto_review_yaml_compiles_native_openai_then_sota_reference() -> None:
+    """Dedicated auto-review YAML is native OpenAI first, then ``sota``."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+        AliasReference,
+        RoutingCandidate,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    alias = snapshot.aliases["codex-auto-review"]
+    assert alias.dispatch is None
+    assert len(alias.candidates) == 2
+
+    native, fallback = alias.candidates
+    assert isinstance(native, RoutingCandidate)
+    assert (native.provider, native.model, native.route_family) == (
+        "openai",
+        "codex-auto-review",
+        "codex_responses",
+    )
+    assert native.priority > fallback.priority
+    assert isinstance(fallback, AliasReference)
+    assert fallback.alias_name == "sota"
+    assert "sota" in snapshot.aliases
+
+    invalid = """
+defaults: {}
+aliases:
+  - name: codex-auto-review
+    candidates:
+      - provider: openai
+        model: codex-auto-review
+        route_family: codex_responses
+        priority: 100
+      - alias_reference: sota
+        priority: 90
+        unknown_key: true
+"""
+    with pytest.raises((ValidationError, compiler.ConfigCompileError)):
+        compiler.compile_yaml(invalid)

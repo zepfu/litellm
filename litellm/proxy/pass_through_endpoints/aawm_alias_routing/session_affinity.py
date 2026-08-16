@@ -118,6 +118,13 @@ _SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_DOMAIN_SEPARATOR = (
 _REQUEST_STATE_EFFECTIVE_SESSION_IDENTITY_ATTR = (
     "_aawm_session_owner_effective_identity"
 )
+_CODEX_AUTO_REVIEW_SESSION_IDENTITY_SUFFIX = ":codex-auto-review"
+_REQUEST_STATE_CODEX_AUTO_REVIEW_SESSION_IDENTITY_ATTR = (
+    "_aawm_codex_auto_review_session_identity"
+)
+_REQUEST_STATE_CODEX_AUTO_REVIEW_PARENT_SESSION_IDENTITY_ATTR = (
+    "_aawm_codex_auto_review_parent_session_identity"
+)
 _RECORD_STATE_FIELD = "state"
 _RECORD_OWNER_FIELD = "owner"
 _RECORD_ATTRIBUTES_FIELD = "attributes"
@@ -224,8 +231,119 @@ def get_request_effective_session_identity(request: Any) -> Optional[str]:
     return _clean_optional_str(value)
 
 
+def get_request_codex_auto_review_session_identity(request: Any) -> Optional[str]:
+    """Return the server-only Codex auto-review identity set on *request*."""
+
+    if request is None:
+        return None
+    state = getattr(request, "state", None)
+    if state is None:
+        return None
+    try:
+        state_values = object.__getattribute__(state, "_state")
+    except AttributeError:
+        state_values = None
+    if isinstance(state_values, Mapping):
+        return _clean_optional_str(
+            state_values.get(_REQUEST_STATE_CODEX_AUTO_REVIEW_SESSION_IDENTITY_ATTR)
+        )
+    try:
+        value = object.__getattribute__(
+            state, _REQUEST_STATE_CODEX_AUTO_REVIEW_SESSION_IDENTITY_ATTR
+        )
+    except AttributeError:
+        return None
+    return _clean_optional_str(value)
+
+
+def get_request_codex_auto_review_parent_session_identity(
+    request: Any,
+) -> Optional[str]:
+    """Return the logical parent identity for a Codex auto-review request."""
+
+    if request is None:
+        return None
+    state = getattr(request, "state", None)
+    if state is None:
+        return None
+    try:
+        state_values = object.__getattribute__(state, "_state")
+    except AttributeError:
+        state_values = None
+    if isinstance(state_values, Mapping):
+        return _clean_optional_str(
+            state_values.get(
+                _REQUEST_STATE_CODEX_AUTO_REVIEW_PARENT_SESSION_IDENTITY_ATTR
+            )
+        )
+    try:
+        value = object.__getattribute__(
+            state, _REQUEST_STATE_CODEX_AUTO_REVIEW_PARENT_SESSION_IDENTITY_ATTR
+        )
+    except AttributeError:
+        return None
+    return _clean_optional_str(value)
+
+
 def request_has_effective_session_identity(request: Any) -> bool:
     return get_request_effective_session_identity(request) is not None
+
+
+def activate_codex_auto_review_session_identity(
+    *,
+    request: Any,
+    parent_session_identity: Optional[str],
+) -> Optional[str]:
+    """Set one deterministic server-side identity for a Codex auto-review request."""
+
+    if request is None:
+        return None
+    state = getattr(request, "state", None)
+    if state is None:
+        return None
+    existing_identity = get_request_codex_auto_review_session_identity(request)
+    if existing_identity is not None:
+        if get_request_codex_auto_review_parent_session_identity(request) is None:
+            parent_identity = (
+                existing_identity[
+                    : -len(_CODEX_AUTO_REVIEW_SESSION_IDENTITY_SUFFIX)
+                ]
+                if existing_identity.endswith(
+                    _CODEX_AUTO_REVIEW_SESSION_IDENTITY_SUFFIX
+                )
+                else existing_identity
+            )
+            setattr(
+                state,
+                _REQUEST_STATE_CODEX_AUTO_REVIEW_PARENT_SESSION_IDENTITY_ATTR,
+                parent_identity or existing_identity,
+            )
+        return existing_identity
+    parent_identity = _clean_optional_str(parent_session_identity)
+    if parent_identity is None:
+        return None
+    if parent_identity.endswith(_CODEX_AUTO_REVIEW_SESSION_IDENTITY_SUFFIX):
+        review_identity = parent_identity
+        logical_parent_identity = (
+            parent_identity[: -len(_CODEX_AUTO_REVIEW_SESSION_IDENTITY_SUFFIX)]
+            or parent_identity
+        )
+    else:
+        logical_parent_identity = parent_identity
+        review_identity = (
+            f"{parent_identity}{_CODEX_AUTO_REVIEW_SESSION_IDENTITY_SUFFIX}"
+        )
+    setattr(
+        state,
+        _REQUEST_STATE_CODEX_AUTO_REVIEW_PARENT_SESSION_IDENTITY_ATTR,
+        logical_parent_identity,
+    )
+    setattr(
+        state,
+        _REQUEST_STATE_CODEX_AUTO_REVIEW_SESSION_IDENTITY_ATTR,
+        review_identity,
+    )
+    return review_identity
 
 
 def activate_session_owner_redispatch_effective_identity(
@@ -308,6 +426,10 @@ def resolve_canonical_session_identity(
     effective_identity = get_request_effective_session_identity(request)
     if effective_identity is not None:
         return effective_identity
+
+    review_identity = get_request_codex_auto_review_session_identity(request)
+    if review_identity is not None:
+        return review_identity
 
     body = request_body if isinstance(request_body, Mapping) else {}
     metadata = body.get("litellm_metadata") if isinstance(body, Mapping) else None

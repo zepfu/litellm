@@ -585,12 +585,35 @@ async def handle_alias_route(  # noqa: PLR0915
                     session_owner_lease = None
                     try:
                         sa = _session_affinity_mod()
+                        session_owner_identity = selection.get(
+                            "session_owner_identity"
+                        )
                         canonical_session_identity = selection.get(
                             "canonical_session_identity"
-                        ) or sa.resolve_canonical_session_identity(
-                            request,
-                            prepared_request_body,
                         )
+                        resolved_session_identity = None
+                        if (
+                            session_owner_identity is None
+                            or canonical_session_identity is None
+                        ):
+                            resolved_session_identity = (
+                                sa.resolve_canonical_session_identity(
+                                    request,
+                                    prepared_request_body,
+                                )
+                            )
+                        if canonical_session_identity is None:
+                            canonical_session_identity = (
+                                sa.get_request_codex_auto_review_parent_session_identity(
+                                    request
+                                )
+                                or resolved_session_identity
+                            )
+                        if session_owner_identity is None:
+                            session_owner_identity = (
+                                resolved_session_identity
+                                or canonical_session_identity
+                            )
                         owner_attributes = sa.build_session_owner_attributes(
                             candidate=candidate,
                             ingress=alias_family,
@@ -603,7 +626,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         guard = await sa.ensure_session_owner_guard_for_request(
                             request=request,
                             request_body=prepared_request_body,
-                            session_identity=canonical_session_identity,
+                            session_identity=session_owner_identity,
                             requested_attributes=owner_attributes,
                             candidate=candidate,
                             alias_model=selection.get("alias_model") or alias_model,
@@ -612,6 +635,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         session_owner_lease = sa.get_request_session_owner_lease(request)
                         # Expose reservation metadata on attempt selection.
                         selection["canonical_session_identity"] = canonical_session_identity
+                        selection["session_owner_identity"] = session_owner_identity
                         selection["session_owner_decision"] = guard.decision.value
                         selection["session_owner_reservation_token"] = (
                             guard.reservation_token
@@ -640,7 +664,7 @@ async def handle_alias_route(  # noqa: PLR0915
                             # ownership as established. Still surface structured error
                             # for non-streaming callers by raising.
                             sa.raise_session_owner_redispatch_required(
-                                session_identity=canonical_session_identity,
+                                session_identity=session_owner_identity,
                                 mutation=promote_result,
                                 alias_model=selection.get("alias_model") or alias_model,
                                 candidate=candidate,

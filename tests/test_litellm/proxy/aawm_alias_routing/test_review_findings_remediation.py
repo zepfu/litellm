@@ -15,6 +15,7 @@ so each finding's fix can be validated independently.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import AsyncIterator
 from unittest.mock import MagicMock
 
@@ -124,6 +125,44 @@ def test_configured_alias_routes_to_snapshot_derived_candidates() -> None:
     )
     models = [c["model"] for c in candidates]
     assert "openrouter/snapshot-only-model" in models
+
+
+def test_chatgpt_codex_auto_review_normalizes_to_logical_alias() -> None:
+    snapshot = compiler.compile_yaml(
+        """
+defaults: {}
+aliases:
+  - name: codex-auto-review
+    candidates:
+      - provider: openai
+        model: codex-auto-review
+        route_family: codex_responses
+        priority: 100
+"""
+    )
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    request = _minimal_request()
+    request.state = SimpleNamespace()
+
+    namespaced = model_resolution._resolve_codex_auto_agent_alias_model(
+        {"model": "chatgpt/codex-auto-review"},
+        "/v1/responses",
+        request=request,
+    )
+    canonical = model_resolution._resolve_codex_auto_agent_alias_model(
+        {"model": "codex-auto-review"},
+        "/v1/responses",
+        request=request,
+    )
+    unrelated = model_resolution._resolve_codex_auto_agent_alias_model(
+        {"model": "chatgpt/gpt-5.4"},
+        "/v1/responses",
+        request=request,
+    )
+
+    assert namespaced == "codex-auto-review"
+    assert canonical == "codex-auto-review"
+    assert unrelated is None
 
 
 # ---------------------------------------------------------------------------

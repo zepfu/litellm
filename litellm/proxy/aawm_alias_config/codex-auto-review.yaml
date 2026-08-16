@@ -1,0 +1,18 @@
+# AAWM alias-routing config for inbound ``codex-auto-review``.
+# Provider and model selection stay in YAML: the native OpenAI
+# ``codex-auto-review`` contract is first, then the existing
+# provider-neutral ``sota`` alias. Invalid documents fail closed
+# through the shared compiler.
+
+defaults: {}
+
+aliases:
+  - name: codex-auto-review
+    candidates:
+      - provider: openai
+        model: codex-auto-review
+        route_family: codex_responses
+        priority: 100
+
+      - alias_reference: sota
+        priority: 90

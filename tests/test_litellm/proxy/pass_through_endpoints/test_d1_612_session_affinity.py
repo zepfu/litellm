@@ -1439,6 +1439,67 @@ def test_effective_redispatch_identity_is_deterministic_server_only_and_single_g
     assert sa.get_request_effective_session_identity(mock_request) is None
 
 
+def test_codex_auto_review_identity_is_exact_idempotent_and_canonical() -> None:
+    from starlette.datastructures import State
+
+    request = type("Req", (), {})()
+    request.state = State()
+    request.headers = {"x-thread-id": " parent-thread "}
+    parent_identity = sa.resolve_canonical_session_identity(request=request)
+
+    first = sa.activate_codex_auto_review_session_identity(
+        request=request,
+        parent_session_identity=parent_identity,
+    )
+    second = sa.activate_codex_auto_review_session_identity(
+        request=request,
+        parent_session_identity=first,
+    )
+    already_suffixed_request = type("Req", (), {})()
+    already_suffixed_request.state = State()
+    already_suffixed = sa.activate_codex_auto_review_session_identity(
+        request=already_suffixed_request,
+        parent_session_identity=first,
+    )
+
+    assert first == second == already_suffixed == "parent-thread:codex-auto-review"
+    assert sa.get_request_codex_auto_review_session_identity(request) == first
+    assert (
+        sa.get_request_codex_auto_review_parent_session_identity(request)
+        == "parent-thread"
+    )
+    assert (
+        sa.get_request_codex_auto_review_parent_session_identity(
+            already_suffixed_request
+        )
+        == "parent-thread"
+    )
+    assert (
+        sa.resolve_canonical_session_identity(
+            request=request,
+            request_body={"thread_id": "body-thread"},
+        )
+        == first
+    )
+    assert sa.request_has_effective_session_identity(request) is False
+    effective_identity = sa.activate_session_owner_redispatch_effective_identity(
+        request=request,
+        base_session_identity=first,
+    )
+    assert effective_identity is not None
+    assert (
+        sa.resolve_canonical_session_identity(
+            request=request,
+            request_body={"thread_id": "body-thread"},
+        )
+        == effective_identity
+    )
+    assert (
+        sa.get_request_codex_auto_review_parent_session_identity(request)
+        == "parent-thread"
+    )
+
+
 def _codex_selector_request(thread_id: str = "selector-thread") -> Any:
     request = type("Req", (), {})()
     request.state = type("State", (), {})()
@@ -1449,6 +1510,7 @@ def _codex_selector_request(thread_id: str = "selector-thread") -> Any:
 def _patch_codex_selector_basics(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, dict[str, Any]]:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import selection as sel
 
+    selector_globals = sel._select_codex_auto_agent_candidate.__globals__
     selected_candidate = {
         "provider": "openai",
         "model": "gpt-5.4-codex",
@@ -1459,27 +1521,37 @@ def _patch_codex_selector_basics(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, 
         "cooldown_seconds": 0.0,
         "failover_ordinal": 0,
     }
-    monkeypatch.setattr(
-        sel, "_lookup_active_snapshot_canonical_alias", lambda *_args, **_kwargs: "alias"
+    monkeypatch.setitem(
+        selector_globals,
+        "_lookup_active_snapshot_canonical_alias",
+        lambda *_args, **_kwargs: "alias",
     )
-    monkeypatch.setattr(sel, "_extract_client_product_label", lambda *_args: None)
-    monkeypatch.setattr(sel, "_resolve_codex_session_key", lambda *_args, **_kwargs: "key")
-    monkeypatch.setattr(sel, "_has_continuation_state", lambda _body: True)
-    monkeypatch.setattr(sel, "_get_codex_session_affinity", AsyncMock(return_value=None))
-    monkeypatch.setattr(sel, "_apply_codex_oauth_inventory_affinity_policy", lambda value: value)
-    monkeypatch.setattr(sel, "_build_auto_agent_skipped_candidates_from_states", lambda _states: [])
-    monkeypatch.setattr(
-        sel,
+    monkeypatch.setitem(selector_globals, "_extract_client_product_label", lambda *_args: None)
+    monkeypatch.setitem(
+        selector_globals, "_resolve_codex_session_key", lambda *_args, **_kwargs: "key"
+    )
+    monkeypatch.setitem(selector_globals, "_has_continuation_state", lambda _body: True)
+    monkeypatch.setitem(
+        selector_globals, "_get_codex_session_affinity", AsyncMock(return_value=None)
+    )
+    monkeypatch.setitem(
+        selector_globals, "_apply_codex_oauth_inventory_affinity_policy", lambda value: value
+    )
+    monkeypatch.setitem(
+        selector_globals, "_build_auto_agent_skipped_candidates_from_states", lambda _states: []
+    )
+    monkeypatch.setitem(
+        selector_globals,
         "_attach_aawm_alias_routing_state_sources",
         lambda selection, **_kwargs: selection,
     )
-    monkeypatch.setattr(
-        sel,
+    monkeypatch.setitem(
+        selector_globals,
         "_build_codex_auto_agent_candidate_states",
         AsyncMock(return_value=[selected_state]),
     )
-    monkeypatch.setattr(
-        sel,
+    monkeypatch.setitem(
+        selector_globals,
         "_select_available_state",
         lambda _request, states, **_kwargs: states[0] if states else None,
     )
@@ -1487,10 +1559,103 @@ def _patch_codex_selector_basics(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, 
 
 
 @pytest.mark.asyncio
+async def test_codex_auto_review_selector_uses_review_owner_identity_without_mutating_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sel, candidate = _patch_codex_selector_basics(monkeypatch)
+    monkeypatch.setitem(
+        sel._select_codex_auto_agent_candidate.__globals__,
+        "_lookup_active_snapshot_canonical_alias",
+        lambda *_args, **_kwargs: "codex-auto-review",
+    )
+    owner_lookup = AsyncMock(return_value=(None, "review-owner-key", None))
+    monkeypatch.setattr(sa, "get_session_owner_record", owner_lookup)
+    request = _codex_selector_request("parent-thread")
+    request_body = {
+        "model": "codex-auto-review",
+        "input": [
+            {
+                "type": "function_call",
+                "name": "inspect",
+                "call_id": "call-review",
+            }
+        ],
+        "litellm_metadata": {
+            "agent_id": "review-agent",
+            "review": {"mode": "auto"},
+        },
+    }
+    body_before = json.loads(json.dumps(request_body))
+    headers_before = dict(request.headers)
+
+    selected = await sel._select_codex_auto_agent_candidate(
+        request=request,
+        request_body=request_body,
+    )
+
+    review_identity = "parent-thread:codex-auto-review"
+    owner_lookup.assert_awaited_once_with(
+        session_identity=review_identity,
+        request=request,
+        wait_for_foreign_reservation=True,
+    )
+    assert selected["candidate"] == candidate
+    assert selected["canonical_session_identity"] == "parent-thread"
+    assert selected["session_owner_identity"] == review_identity
+    assert sa.get_request_codex_auto_review_session_identity(request) == review_identity
+    assert (
+        sa.get_request_codex_auto_review_parent_session_identity(request)
+        == "parent-thread"
+    )
+    assert request_body == body_before
+    assert request.headers == headers_before
+
+
+@pytest.mark.asyncio
+async def test_namespaced_codex_auto_review_lookup_uses_canonical_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sel, candidate = _patch_codex_selector_basics(monkeypatch)
+    alias_lookup = MagicMock(return_value="codex-auto-review")
+    monkeypatch.setitem(
+        sel._select_codex_auto_agent_candidate.__globals__,
+        "_lookup_active_snapshot_canonical_alias",
+        alias_lookup,
+    )
+    monkeypatch.setattr(
+        sa,
+        "get_session_owner_record",
+        AsyncMock(return_value=(None, "review-owner-key", None)),
+    )
+    request = _codex_selector_request("namespaced-parent")
+    request_body = {
+        "model": "  ChatGPT/Codex-Auto-Review  ",
+        "input": [{"type": "function_call", "name": "inspect"}],
+    }
+    body_before = json.loads(json.dumps(request_body))
+
+    selected = await sel._select_codex_auto_agent_candidate(
+        request=request,
+        request_body=request_body,
+    )
+
+    alias_lookup.assert_called_once_with("codex-auto-review", request=request)
+    assert request_body == body_before
+    assert selected["candidate"] == candidate
+    assert selected["alias_model"] == "codex-auto-review"
+    assert selected["canonical_session_identity"] == "namespaced-parent"
+    assert (
+        selected["session_owner_identity"]
+        == "namespaced-parent:codex-auto-review"
+    )
+
+
+@pytest.mark.asyncio
 async def test_codex_compatible_owned_redispatch_metadata_remains_pinned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sel, candidate = _patch_codex_selector_basics(monkeypatch)
+    selector_globals = sel._select_codex_auto_agent_candidate.__globals__
     request = _codex_selector_request()
     owner_record = {
         "state": "owned",
@@ -1503,16 +1668,22 @@ async def test_codex_compatible_owned_redispatch_metadata_remains_pinned(
         AsyncMock(return_value=(owner_record, "owner-key", None)),
     )
     monkeypatch.setattr(sa, "owner_record_as_affinity_hint", lambda _record: dict(candidate))
-    monkeypatch.setattr(
-        sel, "_find_codex_auto_agent_affinity_candidate", lambda *_args, **_kwargs: dict(candidate)
+    monkeypatch.setitem(
+        selector_globals,
+        "_find_codex_auto_agent_affinity_candidate",
+        lambda *_args, **_kwargs: dict(candidate),
     )
-    monkeypatch.setattr(
-        sel,
+    monkeypatch.setitem(
+        selector_globals,
         "_build_codex_auto_agent_affinity_candidate_state",
         AsyncMock(return_value={"candidate": dict(candidate), "cooldown_seconds": 0.0}),
     )
-    monkeypatch.setattr(sel, "_candidate_matches_affinity", lambda *_args: True)
-    monkeypatch.setattr(sel, "_is_auto_agent_candidate_state_available", lambda _state: True)
+    monkeypatch.setitem(selector_globals, "_candidate_matches_affinity", lambda *_args: True)
+    monkeypatch.setitem(
+        selector_globals,
+        "_is_auto_agent_candidate_state_available",
+        lambda _state: True,
+    )
     activate = MagicMock(wraps=sa.activate_session_owner_redispatch_effective_identity)
     monkeypatch.setattr(sa, "activate_session_owner_redispatch_effective_identity", activate)
 
@@ -1532,10 +1703,16 @@ async def test_codex_compatible_owned_redispatch_metadata_remains_pinned(
 
 
 @pytest.mark.asyncio
-async def test_codex_replay_safe_owned_alias_mismatch_uses_effective_identity(
+async def test_codex_auto_review_replay_safe_owned_alias_mismatch_uses_effective_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sel, candidate = _patch_codex_selector_basics(monkeypatch)
+    selector_globals = sel._select_codex_auto_agent_candidate.__globals__
+    monkeypatch.setitem(
+        selector_globals,
+        "_lookup_active_snapshot_canonical_alias",
+        lambda *_args, **_kwargs: "codex-auto-review",
+    )
     request = _codex_selector_request("base-thread")
     owner_record = {
         "state": "owned",
@@ -1548,7 +1725,7 @@ async def test_codex_replay_safe_owned_alias_mismatch_uses_effective_identity(
     }
 
     async def _get_owner_record(*, session_identity: str | None, **_kwargs: Any) -> tuple[Any, str, None]:
-        if session_identity == "base-thread":
+        if session_identity == "base-thread:codex-auto-review":
             return owner_record, "owner-key", None
         assert session_identity is not None
         assert session_identity.startswith("aawm-session-owner-redispatch-v1:")
@@ -1560,11 +1737,15 @@ async def test_codex_replay_safe_owned_alias_mismatch_uses_effective_identity(
         "owner_record_as_affinity_hint",
         lambda _record: dict(owner_record["attributes"]),
     )
-    monkeypatch.setattr(sel, "_find_codex_auto_agent_affinity_candidate", lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(
+        selector_globals,
+        "_find_codex_auto_agent_affinity_candidate",
+        lambda *_args, **_kwargs: None,
+    )
     selected = await sel._select_codex_auto_agent_candidate(
         request=request,
         request_body={
-            "model": "alias",
+            "model": "codex-auto-review",
             "input": [
                 {"type": "reasoning", "summary": [{"type": "text", "text": "r"}]},
                 {"type": "function_call", "name": "inspect", "call_id": "call-1"},
@@ -1575,8 +1756,13 @@ async def test_codex_replay_safe_owned_alias_mismatch_uses_effective_identity(
 
     assert selected["selection_reason"] == "first_available"
     assert selected["candidate"] == candidate
-    assert selected["canonical_session_identity"].startswith(
+    assert selected["canonical_session_identity"] == "base-thread"
+    assert selected["session_owner_identity"].startswith(
         "aawm-session-owner-redispatch-v1:"
+    )
+    assert (
+        sa.get_request_codex_auto_review_parent_session_identity(request)
+        == "base-thread"
     )
     assert selected["affinity_bypassed"] is True
 
@@ -1586,6 +1772,7 @@ async def test_codex_owned_alias_mismatch_with_previous_response_id_stays_409(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sel, _candidate = _patch_codex_selector_basics(monkeypatch)
+    selector_globals = sel._select_codex_auto_agent_candidate.__globals__
     request = _codex_selector_request("base-thread")
     owner_record = {
         "state": "owned",
@@ -1602,7 +1789,11 @@ async def test_codex_owned_alias_mismatch_with_previous_response_id_stays_409(
         "owner_record_as_affinity_hint",
         lambda _record: dict(owner_record["attributes"]),
     )
-    monkeypatch.setattr(sel, "_find_codex_auto_agent_affinity_candidate", lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(
+        selector_globals,
+        "_find_codex_auto_agent_affinity_candidate",
+        lambda *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(
         sa,
         "raise_session_owner_redispatch_required",
@@ -1628,6 +1819,7 @@ async def test_codex_effective_identity_second_owned_conflict_stays_409(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sel, _candidate = _patch_codex_selector_basics(monkeypatch)
+    selector_globals = sel._select_codex_auto_agent_candidate.__globals__
     request = _codex_selector_request("base-thread")
     effective_identity = sa.activate_session_owner_redispatch_effective_identity(
         request=request,
@@ -1649,7 +1841,11 @@ async def test_codex_effective_identity_second_owned_conflict_stays_409(
         "owner_record_as_affinity_hint",
         lambda _record: dict(owner_record["attributes"]),
     )
-    monkeypatch.setattr(sel, "_find_codex_auto_agent_affinity_candidate", lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(
+        selector_globals,
+        "_find_codex_auto_agent_affinity_candidate",
+        lambda *_args, **_kwargs: None,
+    )
     activate = MagicMock(wraps=sa.activate_session_owner_redispatch_effective_identity)
     monkeypatch.setattr(sa, "activate_session_owner_redispatch_effective_identity", activate)
     monkeypatch.setattr(
