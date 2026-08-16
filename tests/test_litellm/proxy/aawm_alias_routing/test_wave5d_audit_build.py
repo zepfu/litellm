@@ -369,21 +369,25 @@ class TestBuildAuditEventShape:
         native effort values must survive audit construction unclamped and
         name the native field ``reasoning.effort``.
         """
+        selection = _minimal_selection(
+            lane_key="xai:oa_xai/grok-4.6:production",
+        )
+        candidate = _minimal_candidate(
+            provider="xai",
+            model="oa_xai/grok-4.6",
+            route_family="codex_xai_oauth_responses_adapter",
+            reasoning_effort_requested="xhigh",
+            reasoning_effort_native_value="xhigh",
+            reasoning_effort_native_field="reasoning.effort",
+            reasoning_effort_native_provider="xai",
+        )
         event = _build_auto_agent_alias_audit_event(
             alias_family="codex",
             alias_model="sota-xai",
             request=_make_request(),
             request_body={},
-            selection=_minimal_selection(),
-            candidate=_minimal_candidate(
-                provider="xai",
-                model="oa_xai/grok-4.6",
-                route_family="codex_xai_oauth_responses_adapter",
-                reasoning_effort_requested="xhigh",
-                reasoning_effort_native_value="xhigh",
-                reasoning_effort_native_field="reasoning.effort",
-                reasoning_effort_native_provider="xai",
-            ),
+            selection=selection,
+            candidate=candidate,
             event_type="candidate_selected",
             candidate_status="selected",
         )
@@ -393,6 +397,9 @@ class TestBuildAuditEventShape:
         assert event["reasoning_effort_native_provider"] == "xai"
         assert event["model"] == "oa_xai/grok-4.6"
         assert event["provider"] == "xai"
+        assert event["lane_key"] == "xai:oa_xai/grok-4.6:production"
+        assert candidate["model"] == "oa_xai/grok-4.6"
+        assert selection["lane_key"] == "xai:oa_xai/grok-4.6:production"
 
 
 # ---------------------------------------------------------------------------

@@ -160,8 +160,23 @@ class TestModelRollupLabel:
 
     def test_sota_xai_model_label(self):
         """XAI-008: rollup model label renders grok-4.6(sota-xai)."""
-        event = {"model": "grok-4.6", "alias_model": "sota-xai"}
+        event = {
+            "provider": "xai",
+            "model": "oa_xai/grok-4.6",
+            "alias_model": "sota-xai",
+        }
         assert _auto_agent_alias_model_rollup_label(event) == "grok-4.6(sota-xai)"
+
+    def test_oa_xai_prefix_is_not_normalized_for_another_provider(self):
+        event = {
+            "provider": "openai",
+            "model": "oa_xai/grok-4.6",
+            "alias_model": "sota-xai",
+        }
+        assert (
+            _auto_agent_alias_model_rollup_label(event)
+            == "oa_xai/grok-4.6(sota-xai)"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -896,40 +911,50 @@ class TestRecordRouteStatusRollup:
         assert mock_record.call_args.kwargs["effort"] == "none"
         assert mock_record.call_args.kwargs["turns"] == 0
 
-    @patch(
-        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.record_aawm_route_rollup",
-    )
-    @patch(
-        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.emit_aawm_route_status_event",
-    )
-    def test_sota_xai_rollup_records_model_label_and_xhigh_effort(
-        self, mock_emit, mock_record
-    ):
-        """XAI-008: route rollup records grok-4.6(sota-xai) with effort xhigh."""
+    def test_sota_xai_rollup_renders_production_label_and_xhigh_effort(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """XAI-008: production audit data renders the exact rollup label."""
+        accumulator = aawm_route_logging.AawmRouteRollupAccumulator(
+            interval_seconds=60
+        )
+        mock_emit = MagicMock()
+        monkeypatch.setattr(
+            rollup_mod,
+            "record_aawm_route_rollup",
+            lambda **kwargs: accumulator.record(**kwargs),
+        )
+        monkeypatch.setattr(
+            rollup_mod,
+            "emit_aawm_route_status_event",
+            mock_emit,
+        )
         event = self._make_event(
             alias_model="sota-xai",
-            model="grok-4.6",
+            provider="xai",
+            model="oa_xai/grok-4.6",
             route_family="codex_xai_oauth_responses_adapter",
             reasoning_effort_native_value="xhigh",
+            lane_key="xai:oa_xai/grok-4.6:production",
+            request_outcome="recovered",
         )
         _record_auto_agent_alias_route_status_rollup(event)
 
+        assert event["model"] == "oa_xai/grok-4.6"
+        assert event["lane_key"] == "xai:oa_xai/grok-4.6:production"
         mock_emit.assert_called_once_with(
             alias_model="sota-xai",
             model_label="grok-4.6",
             status="Exhausted",
             message="route status changed",
         )
-        mock_record.assert_called_once_with(
-            group_header_label="myrepo@myhost",
-            incoming_endpoint="/v1/chat/completions",
-            outgoing_target="codex_xai_oauth_responses_adapter",
-            model_label="grok-4.6(sota-xai)",
-            effort="xhigh",
-            turns=0,
-            status="Exhausted",
-            message=None,
+        lines = accumulator.flush(force=True)
+        assert (
+            lines[1].split(" - Turns:", maxsplit=1)[0]
+            == " - grok-4.6(sota-xai):xhigh"
         )
+        assert "[Exhausted]" in lines[1]
 
 
 # ---------------------------------------------------------------------------

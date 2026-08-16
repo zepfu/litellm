@@ -88,6 +88,13 @@ def _resolve_auto_agent_alias_route_rollup_outgoing_target(
 def _auto_agent_alias_model_rollup_label(event: dict[str, Any]) -> Optional[str]:
     model = _clean_codex_auth_value(event.get("model"))
     alias_model = _clean_codex_auth_value(event.get("alias_model"))
+    if (
+        model is not None
+        and _clean_codex_auth_value(event.get("provider")) == "xai"
+        and model.startswith("oa_xai/")
+    ):
+        # Keep the provider-bound audit model intact; this is display-only.
+        model = model.removeprefix("oa_xai/")
     if model and alias_model and model != alias_model:
         return f"{model}({alias_model})"
     return model or alias_model
@@ -258,11 +265,15 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
         for candidate in candidates:
             if not isinstance(candidate, dict):
                 continue
-            candidate_model = _clean_codex_auth_value(candidate.get("model"))
-            if candidate_model and alias_model and candidate_model != alias_model:
-                candidate_model = f"{candidate_model}({alias_model})"
-            if candidate_model and candidate_model not in model_labels:
-                model_labels.append(candidate_model)
+            candidate_label = _auto_agent_alias_model_rollup_label(
+                {
+                    "model": candidate.get("model"),
+                    "alias_model": alias_model,
+                    "provider": candidate.get("provider") or event.get("provider"),
+                }
+            )
+            if candidate_label and candidate_label not in model_labels:
+                model_labels.append(candidate_label)
     if not model_labels:
         return
 
