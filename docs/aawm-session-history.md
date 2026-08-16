@@ -1883,6 +1883,16 @@ Those events also contribute zero-turn rollup sublines so multiple failed
 candidates remain visible in the same bucket. Rollups flush on the configured
 interval and at process shutdown via a shutdown-safe flush helper.
 
+Terminal rollup state is request-scoped when LiteLLM has a stable call ID: a
+`Recovered` event reconciles only that request's prior terminal state, so an
+unrelated direct or alias `Failed`/`Exhausted` event on the same
+model/effort/target subline remains visible. A routine successful
+`codex_oauth_account_failover` recovery with no error evidence skips only its
+standalone status line; its request audit record and zero-turn aggregate state
+remain intact. Recoveries carrying a `409`, provider-error evidence, or
+redispatch state, as well as non-routine recovery, failure, and exhaustion
+events, continue to emit standalone status lines.
+
 Successful streaming and non-streaming Codex auto-agent requests adapted to
 OpenCode Zen chat completions or OpenRouter chat completions also register
 native access-log replacement and completed-turn rollups. Their rollup sublines

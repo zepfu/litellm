@@ -174,6 +174,14 @@ class TestRollupStatus:
         event = {"event_type": "no_candidate_available"}
         assert _auto_agent_alias_route_rollup_status(event) == "Exhausted"
 
+    def test_exhausted_wins_over_stale_recovery_marker(self):
+        event = {
+            "event_type": "no_candidate_available",
+            "candidate_status": "recovered",
+            "request_outcome": "recovered",
+        }
+        assert _auto_agent_alias_route_rollup_status(event) == "Exhausted"
+
     def test_degraded_candidate_status(self):
         event = {"candidate_status": "auth_degraded_fallback"}
         assert _auto_agent_alias_route_rollup_status(event) == "Degraded"
@@ -329,6 +337,119 @@ class TestRouteRollupStatusValues:
             for line in lines
         )
         assert any(line.endswith("gpt-5.4:low - Turns: 1") for line in lines)
+
+
+class TestRequestScopedTerminalRollupState:
+    @staticmethod
+    def _route() -> dict[str, str]:
+        return {
+            "group_header_label": "litellm#Codex[0.146.0]",
+            "incoming_endpoint": "/openai_passthrough/responses",
+            "outgoing_target": "chatgpt.com/backend-api/codex/responses",
+            "model_label": "gpt-5.3-codex(work)",
+            "effort": "high",
+        }
+
+    def test_direct_failure_and_alias_recovery_share_request_identity(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        accumulator = aawm_route_logging.AawmRouteRollupAccumulator(
+            interval_seconds=60
+        )
+        route = self._route()
+        monkeypatch.setattr(
+            aawm_route_logging,
+            "aawm_route_rollups_enabled",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            aawm_route_logging,
+            "record_aawm_route_rollup",
+            lambda **kwargs: accumulator.record(**kwargs),
+        )
+        monkeypatch.setattr(
+            rollup_mod,
+            "record_aawm_route_rollup",
+            lambda **kwargs: accumulator.record(**kwargs),
+        )
+        monkeypatch.setattr(
+            rollup_mod,
+            "emit_aawm_route_status_event",
+            MagicMock(),
+        )
+        failure_kwargs = {
+            "litellm_params": {
+                "metadata": {
+                    aawm_route_logging._AAWM_ROUTE_ROLLUP_CONTEXT_METADATA_KEY: {
+                        **route,
+                        "reasoning_effort": route["effort"],
+                    },
+                    "litellm_call_id": "shared-request",
+                }
+            }
+        }
+
+        assert aawm_route_logging.record_aawm_route_rollup_failure(
+            failure_kwargs,
+            message="direct provider failure",
+        )
+        _record_auto_agent_alias_route_status_rollup(
+            {
+                "event_type": "candidate_recovered",
+                "candidate_status": "recovered",
+                "request_outcome": "recovered",
+                "request_identity": "shared-request",
+                "selection_reason": "session_affinity",
+                "alias_model": "work",
+                "model": "gpt-5.3-codex",
+                "rollup_group_header_label": route["group_header_label"],
+                "incoming_endpoint": route["incoming_endpoint"],
+                "outgoing_target": route["outgoing_target"],
+                "reasoning_effort_native_value": route["effort"],
+            }
+        )
+
+        lines = accumulator.flush(force=True)
+        assert lines[1].endswith(
+            "gpt-5.3-codex(work):high - Turns: 0 [Recovered]"
+        )
+
+    def test_recovery_keeps_concurrent_same_subline_exhaustion_visible(self) -> None:
+        accumulator = aawm_route_logging.AawmRouteRollupAccumulator(
+            interval_seconds=60
+        )
+        route = self._route()
+        exhausted_identity = aawm_route_logging._AawmRouteRollupOriginIdentity(
+            litellm_call_id="all-accounts-exhausted"
+        )
+        recovered_identity = aawm_route_logging._AawmRouteRollupOriginIdentity(
+            litellm_call_id="recovered-request"
+        )
+
+        accumulator.record(
+            **route,
+            turns=0,
+            status="Exhausted",
+            origin_identity=exhausted_identity,
+        )
+        accumulator.record(
+            **route,
+            turns=0,
+            status="Failed",
+            origin_identity=recovered_identity,
+        )
+        accumulator.record(
+            **route,
+            turns=0,
+            status="Recovered",
+            origin_identity=recovered_identity,
+        )
+
+        lines = accumulator.flush(force=True)
+        assert lines[1].endswith(
+            "gpt-5.3-codex(work):high - Turns: 0 [Exhausted]"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +698,102 @@ class TestRecordRouteStatusRollup:
             message="route status changed",
         )
         assert mock_status.call_count == 1
+
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.record_aawm_route_rollup",
+    )
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.emit_aawm_route_status_event",
+    )
+    def test_routine_oauth_failover_recovery_skips_only_standalone_status(
+        self,
+        mock_emit,
+        mock_record,
+    ):
+        event = self._make_event(
+            event_type="candidate_recovered",
+            candidate_status="recovered",
+            request_outcome="recovered",
+            request_identity="routine-recovery",
+            selection_reason="codex_oauth_account_failover",
+        )
+        _record_auto_agent_alias_route_status_rollup(event)
+
+        mock_emit.assert_not_called()
+        mock_record.assert_called_once()
+        assert mock_record.call_args.kwargs["status"] == "Recovered"
+        assert (
+            mock_record.call_args.kwargs["origin_identity"].litellm_call_id
+            == "routine-recovery"
+        )
+
+    def test_recovery_status_emit_negative_controls(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        cases = [
+            ("http_409", {"error_status_code": 409}, "Recovered"),
+            (
+                "provider_error",
+                {"source_error": "provider rejected request"},
+                "Recovered",
+            ),
+            ("redispatch", {"redispatch_required": True}, "Recovered"),
+            (
+                "non_routine_recovery",
+                {"selection_reason": "session_affinity"},
+                "Recovered",
+            ),
+            (
+                "failure",
+                {
+                    "event_type": "candidate_retryable_failure",
+                    "candidate_status": "retryable_no_cooldown",
+                    "request_outcome": "failed",
+                    "failure_class": "provider_error",
+                    "error_status_code": 503,
+                    "cooldown_scope": "none",
+                },
+                "Failed",
+            ),
+            (
+                "exhaustion",
+                {
+                    "event_type": "no_candidate_available",
+                    "candidate_status": "exhausted",
+                    "request_outcome": "failed",
+                },
+                "Exhausted",
+            ),
+        ]
+        for name, overrides, expected_status in cases:
+            mock_emit = MagicMock()
+            mock_record = MagicMock()
+            monkeypatch.setattr(
+                rollup_mod,
+                "emit_aawm_route_status_event",
+                mock_emit,
+            )
+            monkeypatch.setattr(
+                rollup_mod,
+                "record_aawm_route_rollup",
+                mock_record,
+            )
+            event = self._make_event(
+                event_type="candidate_recovered",
+                candidate_status="recovered",
+                request_outcome="recovered",
+                request_identity=f"{name}-request",
+                selection_reason="codex_oauth_account_failover",
+            )
+            event.update(overrides)
+
+            _record_auto_agent_alias_route_status_rollup(event)
+
+            mock_emit.assert_called_once()
+            mock_record.assert_called_once()
+            assert mock_emit.call_args.kwargs["status"] == expected_status, name
+            assert mock_record.call_args.kwargs["status"] == expected_status, name
 
     @patch(
         "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.record_aawm_route_rollup",

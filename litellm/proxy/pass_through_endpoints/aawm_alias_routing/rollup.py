@@ -126,10 +126,10 @@ def _auto_agent_alias_route_rollup_status(event: dict[str, Any]) -> Optional[str
     selection_reason = str(event.get("selection_reason") or "")
     failure_class = str(event.get("failure_class") or "")
     cooldown_scope = str(event.get("cooldown_scope") or "")
-    if _auto_agent_alias_request_outcome_is_recovered(event):
-        return "Recovered"
     if event_type == "no_candidate_available":
         return "Exhausted"
+    if _auto_agent_alias_request_outcome_is_recovered(event):
+        return "Recovered"
     if _auto_agent_alias_request_outcome_is_pending_failover(event):
         # Same-request account failover is diagnostic until the request ends.
         return None
@@ -186,6 +186,38 @@ def _auto_agent_alias_route_status_message(event: dict[str, Any]) -> str:
     return "; ".join(parts) or "route status changed"
 
 
+def _should_emit_auto_agent_alias_route_status_event(
+    event: dict[str, Any],
+    *,
+    status: str,
+) -> bool:
+    """Keep routine successful OAuth failover recovery out of standalone logs."""
+
+    if (
+        status != "Recovered"
+        or event.get("selection_reason") != "codex_oauth_account_failover"
+    ):
+        return True
+    if event.get("redispatch_required") or event.get("redispatch_threshold_crossed"):
+        return True
+    if event.get("error_status_code") is not None or event.get("status_code") is not None:
+        return True
+    if isinstance(event.get("error_tokens"), list) and event["error_tokens"]:
+        return True
+    return any(
+        _clean_codex_auth_value(event.get(key)) is not None
+        for key in (
+            "source_error",
+            "failure_class",
+            "error_type",
+            "error_code",
+            "error_message",
+            "error",
+            "failure_phase",
+        )
+    )
+
+
 def _build_auto_agent_alias_rollup_group_header_label(
     *,
     repository: Optional[str],
@@ -216,12 +248,6 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
     if status is None:
         return
     request_identity = _auto_agent_alias_event_request_identity(event)
-    if (
-        status in {"Failed", "Exhausted"}
-        and request_identity
-        and _auto_agent_alias_request_outcome_is_recovered(event)
-    ):
-        status = "Recovered"
     alias_model = _clean_codex_auth_value(event.get("alias_model"))
     model_labels: list[str] = []
     model_label = _auto_agent_alias_model_rollup_label(event)
@@ -241,17 +267,14 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
         return
 
     message = _auto_agent_alias_route_status_message(event)
-    for label in model_labels:
-        emit_aawm_route_status_event(
-            alias_model=alias_model,
-            model_label=label.split("(", 1)[0],
-            status=status,
-            message=message,
-        )
-    if status == "Recovered" and request_identity:
-        # Keep recovery request-local so it cannot overwrite another request's
-        # terminal failure on the same interval subline.
-        return
+    if _should_emit_auto_agent_alias_route_status_event(event, status=status):
+        for label in model_labels:
+            emit_aawm_route_status_event(
+                alias_model=alias_model,
+                model_label=label.split("(", 1)[0],
+                status=status,
+                message=message,
+            )
     group_header_label = _resolve_auto_agent_alias_route_rollup_group_header_label(event)
     incoming_endpoint = _clean_codex_auth_value(event.get("incoming_endpoint"))
     outgoing_target = (
@@ -352,6 +375,10 @@ def install(host_globals: dict) -> None:
     host_globals.setdefault(
         "_auto_agent_alias_request_outcome_is_pending_failover",
         _auto_agent_alias_request_outcome_is_pending_failover,
+    )
+    host_globals.setdefault(
+        "_should_emit_auto_agent_alias_route_status_event",
+        _should_emit_auto_agent_alias_route_status_event,
     )
 
     # Copy seam variables into host_globals so rebound functions resolve them.

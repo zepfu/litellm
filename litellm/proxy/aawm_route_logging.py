@@ -1334,6 +1334,9 @@ _AAWM_ROUTE_ROLLUP_STATUS_VALUES = (
     "Incomplete",
     "Recovered",
 )
+_AAWM_ROUTE_ROLLUP_REQUEST_TERMINAL_STATUS_VALUES = frozenset(
+    {"Failed", "Exhausted", "Recovered"}
+)
 _aawm_route_rollup_lock = threading.Lock()
 _aawm_route_rollup_accumulator: Optional["AawmRouteRollupAccumulator"] = None
 _aawm_route_rollup_flush_stop = threading.Event()
@@ -1816,6 +1819,13 @@ class _AawmRouteRollupReviewCorrelation:
     parent_thread_id: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class _AawmRouteRollupRequestTerminalState:
+    status: str
+    sequence: int
+    message: Optional[str] = None
+
+
 @dataclass
 class _AawmRouteRollupSubline:
     turns: int = 0
@@ -1825,6 +1835,10 @@ class _AawmRouteRollupSubline:
     origin_identities: set[_AawmRouteRollupOriginIdentity] = field(
         default_factory=set
     )
+    request_terminal_states: dict[str, _AawmRouteRollupRequestTerminalState] = (
+        field(default_factory=dict)
+    )
+    unscoped_terminal_state: Optional[_AawmRouteRollupRequestTerminalState] = None
     approved_reviews: int = 0
     approved_rationales: list[str] = field(default_factory=list)
     denied_reviews: int = 0
@@ -1837,6 +1851,64 @@ class _AawmRouteRollupSubline:
         if len(self.origin_identities) >= _AAWM_ROUTE_ROLLUP_MAX_ORIGIN_IDENTITIES:
             return
         self.origin_identities.add(identity)
+
+    def record_terminal_status(
+        self,
+        *,
+        status: str,
+        sequence: int,
+        message: Optional[str],
+        origin_identity: Optional[_AawmRouteRollupOriginIdentity],
+    ) -> None:
+        state = _AawmRouteRollupRequestTerminalState(
+            status=status,
+            sequence=sequence,
+            message=message,
+        )
+        request_identity = (
+            _normalize_aawm_route_rollup_identity(origin_identity.litellm_call_id)
+            if origin_identity is not None
+            else None
+        )
+        if request_identity and (
+            request_identity in self.request_terminal_states
+            or len(self.request_terminal_states)
+            < _AAWM_ROUTE_ROLLUP_MAX_ORIGIN_IDENTITIES
+        ):
+            self.request_terminal_states[request_identity] = state
+        elif not (
+            state.status == "Recovered"
+            and self.unscoped_terminal_state is not None
+            and self.unscoped_terminal_state.status in {"Failed", "Exhausted"}
+        ):
+            # A terminal state without a stable request identity cannot be
+            # reconciled safely by a later recovered request.
+            self.unscoped_terminal_state = state
+
+        effective_state = self._effective_terminal_state()
+        if effective_state is None:
+            return
+        self.status = effective_state.status
+        self.status_sequence = effective_state.sequence
+        self.message = effective_state.message
+
+    def _effective_terminal_state(
+        self,
+    ) -> Optional[_AawmRouteRollupRequestTerminalState]:
+        states = list(self.request_terminal_states.values())
+        if self.unscoped_terminal_state is not None:
+            states.append(self.unscoped_terminal_state)
+        if not states:
+            return None
+
+        unresolved = [
+            state
+            for state in states
+            if state.status in {"Failed", "Exhausted"}
+        ]
+        if unresolved:
+            return max(unresolved, key=lambda state: state.sequence)
+        return max(states, key=lambda state: state.sequence)
 
     @staticmethod
     def _append_review_rationale(
@@ -2018,6 +2090,30 @@ class AawmRouteRollupAccumulator:
             group.sublines[subline_key] = subline
             group.subline_order.append(subline_key)
 
+        self._record_subline_activity(
+            group=group,
+            subline=subline,
+            subline_already_existed=subline_already_existed,
+            turns=turns,
+            normalized_status=normalized_status,
+            message=cleaned_message,
+            origin_identity=origin_identity,
+        )
+
+        emitted_lines.extend(self.flush_due(now=now))
+        return emitted_lines
+
+    @staticmethod
+    def _record_subline_activity(
+        *,
+        group: _AawmRouteRollupGroup,
+        subline: _AawmRouteRollupSubline,
+        subline_already_existed: bool,
+        turns: int,
+        normalized_status: Optional[str],
+        message: Optional[str],
+        origin_identity: Optional[_AawmRouteRollupOriginIdentity],
+    ) -> None:
         if turns > 0:
             subline.turns += turns
             if origin_identity is not None:
@@ -2030,15 +2126,25 @@ class AawmRouteRollupAccumulator:
                 group.event_sequence += 1
                 subline.status = "Recovered"
                 subline.status_sequence = group.event_sequence
-        if normalized_status is not None:
-            group.event_sequence += 1
-            subline.status = normalized_status
-            subline.status_sequence = group.event_sequence
-        if cleaned_message is not None:
-            subline.message = cleaned_message
+        if normalized_status is None:
+            if message is not None:
+                subline.message = message
+            return
 
-        emitted_lines.extend(self.flush_due(now=now))
-        return emitted_lines
+        group.event_sequence += 1
+        if normalized_status in _AAWM_ROUTE_ROLLUP_REQUEST_TERMINAL_STATUS_VALUES:
+            subline.record_terminal_status(
+                status=normalized_status,
+                sequence=group.event_sequence,
+                message=message,
+                origin_identity=origin_identity,
+            )
+            return
+
+        subline.status = normalized_status
+        subline.status_sequence = group.event_sequence
+        if message is not None:
+            subline.message = message
 
     def _matching_origin_sublines(
         self,
@@ -2750,6 +2856,39 @@ def _attach_codex_review_decision_event(
     kwargs[_AAWM_PARSED_CODEX_REVIEW_DECISIONS_KWARGS_KEY] = [event]
 
 
+def _build_aawm_route_rollup_origin_identity(
+    context: dict[str, Any],
+    *,
+    metadata: Optional[dict[str, Any]] = None,
+) -> Optional[_AawmRouteRollupOriginIdentity]:
+    if context.get("is_codex_auto_review") is True:
+        return None
+
+    def _identity_value(key: str) -> Optional[str]:
+        return _normalize_aawm_route_rollup_identity(
+            context.get(key)
+        ) or _normalize_aawm_route_rollup_identity(
+            metadata.get(key) if isinstance(metadata, dict) else None
+        )
+
+    candidate_identity = _AawmRouteRollupOriginIdentity(
+        litellm_call_id=_identity_value("litellm_call_id"),
+        canonical_session_identity=_identity_value("canonical_session_identity"),
+        actor_id=_identity_value("origin_actor_id"),
+        thread_id=_identity_value("origin_thread_id"),
+    )
+    if not any(
+        (
+            candidate_identity.litellm_call_id,
+            candidate_identity.canonical_session_identity,
+            candidate_identity.actor_id,
+            candidate_identity.thread_id,
+        )
+    ):
+        return None
+    return candidate_identity
+
+
 def record_aawm_route_rollup_turn(
     kwargs: Optional[dict],
     *,
@@ -2803,32 +2942,6 @@ def record_aawm_route_rollup_turn(
     if not aawm_route_rollups_enabled():
         return
 
-    origin_identity: Optional[_AawmRouteRollupOriginIdentity] = None
-    if not is_codex_auto_review:
-        candidate_identity = _AawmRouteRollupOriginIdentity(
-            litellm_call_id=_normalize_aawm_route_rollup_identity(
-                context.get("litellm_call_id")
-            ),
-            canonical_session_identity=_normalize_aawm_route_rollup_identity(
-                context.get("canonical_session_identity")
-            ),
-            actor_id=_normalize_aawm_route_rollup_identity(
-                context.get("origin_actor_id")
-            ),
-            thread_id=_normalize_aawm_route_rollup_identity(
-                context.get("origin_thread_id")
-            ),
-        )
-        if any(
-            (
-                candidate_identity.litellm_call_id,
-                candidate_identity.canonical_session_identity,
-                candidate_identity.actor_id,
-                candidate_identity.thread_id,
-            )
-        ):
-            origin_identity = candidate_identity
-
     record_aawm_route_rollup(
         group_header_label=str(context.get("group_header_label") or ""),
         incoming_endpoint=str(context.get("incoming_endpoint") or ""),
@@ -2836,7 +2949,7 @@ def record_aawm_route_rollup_turn(
         model_label=str(context.get("model_label") or ""),
         effort=str(context.get("reasoning_effort") or "none"),
         turns=turns,
-        origin_identity=origin_identity,
+        origin_identity=_build_aawm_route_rollup_origin_identity(context),
         review_decision=review_decision,
         review_correlation=review_correlation,
         now=now,
@@ -2867,6 +2980,10 @@ def record_aawm_route_rollup_failure(
         turns=0,
         status=status,
         message=message,
+        origin_identity=_build_aawm_route_rollup_origin_identity(
+            context,
+            metadata=metadata,
+        ),
         now=now,
     )
     return True
