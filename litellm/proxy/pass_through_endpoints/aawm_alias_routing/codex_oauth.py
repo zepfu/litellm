@@ -247,6 +247,11 @@ def _bind_codex_oauth_candidate_to_request(
         **identity,
         "model": str(candidate.get("model") or ""),
     }
+    credential_affinity = _clean_codex_auth_value(
+        candidate.get("codex_oauth_credential_affinity")
+    )
+    if credential_affinity is not None:
+        bound["credential_affinity"] = credential_affinity
     setattr(request.state, "aawm_codex_oauth_selected_account", bound)
     return dict(bound)
 
@@ -266,6 +271,11 @@ def _get_bound_codex_oauth_candidate_identity(
     if identity is None:
         return None
     identity["model"] = str(bound.get("model") or "")
+    credential_affinity = _clean_codex_auth_value(
+        bound.get("credential_affinity")
+    )
+    if credential_affinity is not None:
+        identity["credential_affinity"] = credential_affinity
     return identity
 
 

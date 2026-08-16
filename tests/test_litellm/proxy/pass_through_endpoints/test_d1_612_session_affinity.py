@@ -2400,6 +2400,76 @@ def test_interchangeable_openai_owner_ignores_account_identity_only() -> None:
     )
 
 
+def test_bound_codex_oauth_affinity_matches_legacy_account2_owner() -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        codex_oauth,
+    )
+
+    request = _codex_selector_request("legacy-account2-owner")
+    candidate = {
+        "codex_oauth_account_label": "account1",
+        "codex_oauth_account_hash": "hash-account-1",
+        "codex_oauth_lane_key": "codex-oauth:account1:hash-account-1",
+        "model": "gpt-5.6-sol",
+        "codex_oauth_credential_affinity": "interchangeable",
+        "access_token": "secret-token",
+    }
+    bound = codex_oauth._bind_codex_oauth_candidate_to_request(
+        request,
+        candidate,
+    )
+    identity = codex_oauth._get_bound_codex_oauth_candidate_identity(request)
+    assert bound is not None
+    assert identity is not None
+    assert bound["credential_affinity"] == "interchangeable"
+    assert identity["credential_affinity"] == "interchangeable"
+    assert "access_token" not in bound
+    assert "access_token" not in identity
+
+    owner_attrs = sa.build_session_owner_attributes(
+        provider="openai",
+        model="gpt-5.6-sol",
+        route_family="codex_oauth",
+        account_label="account2",
+        account_hash="hash-account-2",
+        account_lane="codex-oauth:account2:hash-account-2",
+        endpoint_contract="openai_responses",
+        state_format="openai_responses",
+    )
+    assert "credential_affinity" not in owner_attrs
+    requested_attrs = sa.build_session_owner_attributes(
+        provider="openai",
+        model="gpt-5.6-sol",
+        route_family="codex_oauth",
+        endpoint_contract="openai_responses",
+        state_format="openai_responses",
+        extra={
+            key: value
+            for key, value in {
+                "account_label": identity.get("account_label"),
+                "account_hash": identity.get("account_hash"),
+                "account_lane": identity.get("lane_key"),
+                "credential_affinity": identity.get("credential_affinity"),
+            }.items()
+            if value
+        },
+    )
+    assert requested_attrs.get("credential_affinity") == "interchangeable"
+    assert sa._attributes_exactly_equal(left=owner_attrs, right=requested_attrs)
+    assert (
+        sa._compatibility_mismatch_reason(
+            owner_record={
+                "state": "owned",
+                "owner": "owner",
+                "attributes": owner_attrs,
+            },
+            requested_attributes=requested_attrs,
+            require_exact_attributes=True,
+        )
+        is None
+    )
+
+
 def _managed_direct_openai_owner_attrs(
     *,
     route_family: str,

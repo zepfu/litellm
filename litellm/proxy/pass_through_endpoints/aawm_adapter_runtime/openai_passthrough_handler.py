@@ -637,6 +637,9 @@ class BaseOpenAIPassThroughHandler:
                                 "account_lane": bound_codex_oauth_identity.get(
                                     "lane_key"
                                 ),
+                                "credential_affinity": bound_codex_oauth_identity.get(
+                                    "credential_affinity"
+                                ),
                             }.items()
                             if value
                         },
