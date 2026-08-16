@@ -706,6 +706,28 @@ class TestReasoningEffort:
         assert result_body["reasoning"]["effort"] == "high"
 
 
+class TestReasoningEffortSotaXai:
+    def test_normalize_noop_for_sota_xai_managed_route_preserves_xhigh(self) -> None:
+        """XAI-008: the managed sota-xai route never applies codex-openai clamping.
+
+        The codex reasoning ceiling is gated on the openai provider and
+        ``codex_responses`` route family, so a caller ``xhigh`` on the managed
+        xAI Responses route passes through unchanged.
+        """
+        body = {"model": "oa_xai/grok-4.6", "reasoning": {"effort": "xhigh"}}
+        route = {
+            "provider": "xai",
+            "route_family": "codex_xai_oauth_responses_adapter",
+            "model": "oa_xai/grok-4.6",
+        }
+        result_body, meta = attempt_records._normalize_codex_reasoning_effort_for_resolved_route(
+            body, resolved_route=route
+        )
+        assert result_body is body
+        assert result_body["reasoning"] == {"effort": "xhigh"}
+        assert meta == {}
+
+
 # ---------------------------------------------------------------------------
 # _add_codex_auto_agent_alias_metadata
 # ---------------------------------------------------------------------------
@@ -785,6 +807,55 @@ class TestCodexAliasMetadata:
 
         # reasoning metadata merged into last attempt
         assert "codex_reasoning_effort" in attempts[-1]
+
+    def test_sota_xai_caller_xhigh_preserved_in_body_and_metadata(self) -> None:
+        """XAI-008: caller xhigh on oa_xai/grok-4.6 survives onto the provider body.
+
+        The managed sota-xai candidate carries no configured effort override
+        (the YAML ``max`` override was removed), so the caller-selected
+        ``xhigh`` must remain ``xhigh`` in the provider-bound body and the
+        requested/native audit metadata must name the native field
+        ``reasoning.effort``.
+        """
+        request = _make_request()
+        body = {"model": "sota-xai", "reasoning": {"effort": "xhigh"}}
+        selection = self._selection(
+            candidate={
+                "provider": "xai",
+                "model": "oa_xai/grok-4.6",
+                "route_family": "codex_xai_oauth_responses_adapter",
+                "last_resort": False,
+            },
+            lane_key="xai:oa_xai/grok-4.6",
+            cooldown_key="cd:xai:oa_xai/grok-4.6",
+            alias_model="sota-xai",
+        )
+
+        result = attempt_records._add_codex_auto_agent_alias_metadata(
+            body, request=request, selection=selection, attempts=[]
+        )
+
+        # Provider-bound body keeps caller xhigh under the native field.
+        assert result["model"] == "oa_xai/grok-4.6"
+        assert result["reasoning"] == {"effort": "xhigh"}
+        assert "reasoning_effort" not in result
+
+        # Caller body is not mutated (deep-copied per attempt).
+        assert body["reasoning"] == {"effort": "xhigh"}
+
+        meta = result["litellm_metadata"]
+        assert meta["codex_auto_agent_selected_model"] == "oa_xai/grok-4.6"
+        assert meta["codex_auto_agent_selected_provider"] == "xai"
+        # No codex clamp metadata is produced for the non-codex managed route.
+        assert "reasoning_effort_clamped_from" not in meta
+        # Audit construction surfaces requested/native effort metadata.
+        audit_events = meta["codex_auto_agent_audit_events"]
+        assert audit_events
+        event_candidate = audit_events[0]["selection"]["candidate"]
+        assert event_candidate["reasoning_effort_requested"] == "xhigh"
+        assert event_candidate["reasoning_effort_native_value"] == "xhigh"
+        assert event_candidate["reasoning_effort_native_field"] == "reasoning.effort"
+        assert event_candidate["reasoning_effort_native_provider"] == "xai"
 
     def test_last_resort_tag(self) -> None:
         request = _make_request()

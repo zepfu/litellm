@@ -1482,6 +1482,12 @@ The config-driven `sota-xai` route uses this order:
 
 1. `oa_xai/grok-4.6` via the managed xAI OAuth Responses adapter
 
+The managed `sota-xai` candidate has no candidate-level reasoning override.
+For caller `reasoning.effort=xhigh`, the outbound `oa_xai/grok-4.6` request
+keeps `xhigh` unchanged. Session/request metadata records the requested/native
+effort as `xhigh`, together with the provider-native field/provider; the route
+rollup is `grok-4.6(sota-xai):xhigh`.
+
 
 Grok 4.6 is the active managed `sota-xai` candidate. Historical native Grok 4.5
 behavior remains distinct: generic `aawm_codex_auto_agent_candidate_unavailable`
@@ -1734,8 +1740,10 @@ Rows must never include access tokens, refresh tokens, raw auth-file contents,
 or the raw auth-file path.
 
 Grok native and `oa_xai/*` Responses candidates remove request fields, hosted
-tools, and `reasoning` input items that the selected Grok-family model declares
-unsupported. This includes `reasoning` items that carry `encrypted_content` from
+tools, and unsupported `reasoning` input items that the selected Grok-family
+model declares unsupported. This does not strip the supported
+`reasoning.effort=xhigh` field on managed `sota-xai` Grok 4.6. This includes
+`reasoning` items that carry `encrypted_content` from
 another provider's compacted Responses state; forwarding those blobs to Grok can
 trigger provider errors such as `Could not decode the compaction blob`. Ordinary
 non-reasoning continuation items, including `function_call` and

@@ -5,6 +5,7 @@ from typing import Iterator
 import litellm
 import pytest
 
+from litellm.utils import supports_xhigh_reasoning_effort
 from litellm.llms.xai.reference_cost import (
     build_xai_grok_46_reference_cost_metadata,
     calculate_xai_reference_cost,
@@ -74,11 +75,52 @@ def test_should_keep_grok_46_catalog_entries_in_parity() -> None:
             "supports_web_search",
             "custom_tool_function_adapters",
             "unsupported_hosted_tools",
-            "unsupported_request_params",
-            "unsupported_input_item_types",
             "rewrite_input_item_types",
         ):
             assert native[capability] == retained[capability]
+
+
+def test_should_advertise_grok_46_xhigh_support_and_reasoning_fields() -> None:
+    for catalog_path in CATALOG_PATHS:
+        catalog = json.loads(catalog_path.read_text())
+        for model in ("xai/grok-4.6", "oa_xai/grok-4.6"):
+            entry = catalog[model]
+            assert entry["supports_xhigh_reasoning_effort"] is True
+            assert entry["unsupported_request_params"] == ["external_web_access"]
+            assert "unsupported_input_item_types" not in entry
+
+
+def test_should_advertise_grok_46_collaboration_namespace_tool_adapters() -> None:
+    expected_collaboration = [
+        "followup_task",
+        "interrupt_agent",
+        "list_agents",
+        "send_message",
+        "spawn_agent",
+        "wait_agent",
+    ]
+    for catalog_path in CATALOG_PATHS:
+        catalog = json.loads(catalog_path.read_text())
+        for model in ("xai/grok-4.6", "oa_xai/grok-4.6"):
+            entry = catalog[model]
+            assert entry["namespace_tool_function_adapters"] == {
+                "collaboration": expected_collaboration
+            }
+
+
+def test_should_report_grok_46_xhigh_support_through_capability_lookup() -> None:
+    assert (
+        supports_xhigh_reasoning_effort(
+            model="xai/grok-4.6", custom_llm_provider="xai"
+        )
+        is True
+    )
+    assert (
+        supports_xhigh_reasoning_effort(
+            model="oa_xai/grok-4.6", custom_llm_provider="xai"
+        )
+        is True
+    )
 
 
 def test_should_register_native_and_managed_grok_46_descriptors() -> None:
@@ -99,6 +141,14 @@ def test_should_activate_grok_46_for_sota_xai() -> None:
 
     assert "model: oa_xai/grok-4.6" in yaml_text
     assert "model: oa_xai/grok-4.5" not in yaml_text
+
+
+def test_should_not_override_caller_reasoning_effort_for_sota_xai() -> None:
+    yaml_path = REPO_ROOT / "litellm/proxy/aawm_alias_config/sota-xai.yaml"
+    yaml_text = yaml_path.read_text()
+
+    assert "reasoning_effort: max" not in yaml_text
+    assert "reasoning_effort" not in yaml_text
 
 
 @pytest.mark.parametrize(
@@ -301,4 +351,65 @@ def test_should_leave_managed_grok_46_session_history_invoice_cost_unknown() -> 
 
     db_metadata = json.loads(_build_session_history_db_payload(record)[52])
     for key, value in persisted.items():
+        assert db_metadata[key] == value
+
+
+def test_should_persist_requested_and_native_xhigh_reasoning_effort_metadata() -> None:
+    effort_metadata = {
+        "reasoning_effort_requested": "xhigh",
+        "reasoning_effort_source": "reasoning.effort",
+        "reasoning_effort_native_provider": "xai",
+        "reasoning_effort_native_value": "xhigh",
+        "reasoning_effort_native_field": "reasoning.effort",
+        "reasoning_effort_supported_ceiling": "xhigh",
+        "reasoning_effort_resolved_model": "oa_xai/grok-4.6",
+        "reasoning_effort_resolved_provider": "xai",
+        "reasoning_effort_candidate_attempt": 1,
+        "reasoning_effort_mapping_reason": "within_supported_ceiling",
+    }
+    record = _build_session_history_record(
+        kwargs={
+            "litellm_call_id": "call-grok-46-xhigh",
+            "model": "oa_xai/grok-4.6",
+            "custom_llm_provider": "xai",
+            "call_type": "acompletion",
+            "litellm_params": {
+                "metadata": {
+                    "session_id": "session-grok-46-xhigh",
+                    "requested_model_alias": "sota-xai",
+                    "model_alias_label": "sota-xai",
+                    "xai_oauth_public_model": "oa_xai/grok-4.6",
+                    "xai_oauth_upstream_model": "xai/grok-4.6",
+                    **effort_metadata,
+                }
+            },
+            "standard_logging_object": {"metadata": {}, "request_tags": []},
+            "passthrough_logging_payload": {
+                "request_body": {"reasoning": {"effort": "xhigh"}}
+            },
+        },
+        result={
+            "id": "resp-grok-46-xhigh",
+            "model": "grok-4.6",
+            "usage": {
+                "prompt_tokens": 100_000,
+                "completion_tokens": 10_000,
+                "total_tokens": 110_000,
+            },
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        },
+        start_time="2026-08-16T12:00:00Z",
+        end_time="2026-08-16T12:00:01Z",
+        allow_runtime_identity=False,
+    )
+
+    assert record is not None
+    persisted = record["metadata"]
+    for key, value in effort_metadata.items():
+        assert persisted[key] == value
+    assert "reasoning_effort_clamped_from" not in persisted
+    assert "reasoning_effort_clamp_reason" not in persisted
+
+    db_metadata = json.loads(_build_session_history_db_payload(record)[52])
+    for key, value in effort_metadata.items():
         assert db_metadata[key] == value

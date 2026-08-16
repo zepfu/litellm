@@ -362,6 +362,38 @@ class TestBuildAuditEventShape:
         assert event["reasoning_effort_requested"] == "high"
         assert event["reasoning_effort_source"] == "metadata"
 
+    def test_sota_xai_requested_native_xhigh_propagated(self):
+        """XAI-008: audit propagation retains requested/native xhigh.
+
+        For the managed sota-xai route, the attempt record's requested and
+        native effort values must survive audit construction unclamped and
+        name the native field ``reasoning.effort``.
+        """
+        event = _build_auto_agent_alias_audit_event(
+            alias_family="codex",
+            alias_model="sota-xai",
+            request=_make_request(),
+            request_body={},
+            selection=_minimal_selection(),
+            candidate=_minimal_candidate(
+                provider="xai",
+                model="oa_xai/grok-4.6",
+                route_family="codex_xai_oauth_responses_adapter",
+                reasoning_effort_requested="xhigh",
+                reasoning_effort_native_value="xhigh",
+                reasoning_effort_native_field="reasoning.effort",
+                reasoning_effort_native_provider="xai",
+            ),
+            event_type="candidate_selected",
+            candidate_status="selected",
+        )
+        assert event["reasoning_effort_requested"] == "xhigh"
+        assert event["reasoning_effort_native_value"] == "xhigh"
+        assert event["reasoning_effort_native_field"] == "reasoning.effort"
+        assert event["reasoning_effort_native_provider"] == "xai"
+        assert event["model"] == "oa_xai/grok-4.6"
+        assert event["provider"] == "xai"
+
 
 # ---------------------------------------------------------------------------
 # Cooldown-key fallback

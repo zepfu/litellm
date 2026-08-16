@@ -40570,9 +40570,20 @@
         "supports_function_calling": true,
         "supports_reasoning": true,
         "supports_tool_choice": true,
+        "supports_xhigh_reasoning_effort": true,
         "custom_tool_function_adapters": [
             "apply_patch"
         ],
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
         "unsupported_hosted_tools": [
             "custom",
             "image_generation",
@@ -40580,13 +40591,7 @@
             "tool_search"
         ],
         "unsupported_request_params": [
-            "external_web_access",
-            "reasoning",
-            "reasoning_effort",
-            "reasoningEffort"
-        ],
-        "unsupported_input_item_types": [
-            "reasoning"
+            "external_web_access"
         ],
         "rewrite_input_item_types": [
             "function_call",
@@ -40654,9 +40659,20 @@
         "supports_function_calling": true,
         "supports_reasoning": true,
         "supports_tool_choice": true,
+        "supports_xhigh_reasoning_effort": true,
         "custom_tool_function_adapters": [
             "apply_patch"
         ],
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
         "unsupported_hosted_tools": [
             "custom",
             "image_generation",
@@ -40664,13 +40680,7 @@
             "tool_search"
         ],
         "unsupported_request_params": [
-            "external_web_access",
-            "reasoning",
-            "reasoning_effort",
-            "reasoningEffort"
-        ],
-        "unsupported_input_item_types": [
-            "reasoning"
+            "external_web_access"
         ],
         "rewrite_input_item_types": [
             "function_call",

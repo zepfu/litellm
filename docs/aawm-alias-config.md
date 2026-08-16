@@ -144,6 +144,11 @@ order:
 4. OpenCode Zen big-pickle
 5. Alibaba Token Plan qwen3.6-flash
 
+The managed `sota-xai` candidate has no candidate-level reasoning override:
+caller `reasoning.effort=xhigh` is sent unchanged to `oa_xai/grok-4.6`, with
+requested/native effort metadata and the provider-native field/provider
+recorded. Its route rollup is `grok-4.6(sota-xai):xhigh`.
+
 The final candidate is mutually exclusive by originating TUI:
 
 - Claude-origin requests use native Anthropic Haiku only.

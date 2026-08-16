@@ -7,4 +7,3 @@ aliases:
         model: oa_xai/grok-4.6
         route_family: codex_xai_oauth_responses_adapter
         priority: 100
-        reasoning_effort: max

@@ -158,6 +158,11 @@ class TestModelRollupLabel:
     def test_neither(self):
         assert _auto_agent_alias_model_rollup_label({}) is None
 
+    def test_sota_xai_model_label(self):
+        """XAI-008: rollup model label renders grok-4.6(sota-xai)."""
+        event = {"model": "grok-4.6", "alias_model": "sota-xai"}
+        assert _auto_agent_alias_model_rollup_label(event) == "grok-4.6(sota-xai)"
+
 
 # ---------------------------------------------------------------------------
 # _auto_agent_alias_route_rollup_status
@@ -673,6 +678,41 @@ class TestRecordRouteStatusRollup:
         )
         assert mock_record.call_args.kwargs["effort"] == "none"
         assert mock_record.call_args.kwargs["turns"] == 0
+
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.record_aawm_route_rollup",
+    )
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.emit_aawm_route_status_event",
+    )
+    def test_sota_xai_rollup_records_model_label_and_xhigh_effort(
+        self, mock_emit, mock_record
+    ):
+        """XAI-008: route rollup records grok-4.6(sota-xai) with effort xhigh."""
+        event = self._make_event(
+            alias_model="sota-xai",
+            model="grok-4.6",
+            route_family="codex_xai_oauth_responses_adapter",
+            reasoning_effort_native_value="xhigh",
+        )
+        _record_auto_agent_alias_route_status_rollup(event)
+
+        mock_emit.assert_called_once_with(
+            alias_model="sota-xai",
+            model_label="grok-4.6",
+            status="Exhausted",
+            message="route status changed",
+        )
+        mock_record.assert_called_once_with(
+            group_header_label="myrepo@myhost",
+            incoming_endpoint="/v1/chat/completions",
+            outgoing_target="codex_xai_oauth_responses_adapter",
+            model_label="grok-4.6(sota-xai)",
+            effort="xhigh",
+            turns=0,
+            status="Exhausted",
+            message=None,
+        )
 
 
 # ---------------------------------------------------------------------------

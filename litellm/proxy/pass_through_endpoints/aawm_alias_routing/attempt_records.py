@@ -22,6 +22,23 @@ from .lane_keys import _CODEX_REASONING_EFFORT_TIER_INDEX
 _AAWM_ALIAS_REQUEST_CALL_ID_STATE_KEY = "aawm_alias_request_litellm_call_id"
 _AAWM_ALIAS_REQUEST_OUTCOME_STATE_KEY = "aawm_alias_request_outcome"
 
+# Capability helper resolved lazily (import-safe within the litellm package).
+# Unlike the injected ``_get_model_info`` seam, this reads the real model
+# catalog and is the config-driven source of truth for xAI xhigh support.
+_supports_xhigh_reasoning_effort: Optional[Callable[..., bool]] = None
+
+
+def _resolve_supports_xhigh_reasoning_effort() -> Optional[Callable[..., bool]]:
+    global _supports_xhigh_reasoning_effort
+    if _supports_xhigh_reasoning_effort is None:
+        try:
+            from litellm.utils import supports_xhigh_reasoning_effort
+
+            _supports_xhigh_reasoning_effort = supports_xhigh_reasoning_effort
+        except Exception:
+            return None
+    return _supports_xhigh_reasoning_effort
+
 # ---------------------------------------------------------------------------
 # Injected runtime seams (god-module / error_signals / classification / state)
 # ---------------------------------------------------------------------------
@@ -766,6 +783,74 @@ def _get_codex_reasoning_effort_ceiling(
     return None
 
 
+def _get_xai_reasoning_effort_ceiling(
+    resolved_route: dict[str, Any],
+) -> Optional[str]:
+    """Return the supported reasoning-effort ceiling for the managed xAI route.
+
+    XAI-008: capability-recognition only. Capability is read from the model
+    catalog via the config-driven ``supports_xhigh_reasoning_effort`` helper,
+    never from the model name.
+    """
+    model = resolved_route.get("model")
+    if not isinstance(model, str) or not model:
+        return None
+    supports_xhigh = _resolve_supports_xhigh_reasoning_effort()
+    if supports_xhigh is None:
+        return None
+    try:
+        if supports_xhigh(model=model, custom_llm_provider="xai") is True:
+            return "xhigh"
+    except Exception:
+        return None
+    return None
+
+
+def _build_xai_reasoning_effort_metadata(
+    request_body: dict[str, Any],
+    *,
+    candidate: dict[str, Any],
+    attempt_number: Optional[int] = None,
+) -> dict[str, Any]:
+    """Build audit-only native reasoning-effort metadata for managed xAI routes.
+
+    XAI-008: the xAI Responses adapter never clamps and never rewrites the
+    caller's effort on the request body, so the shared clamping normalizer is
+    a strict no-op for this route. When the caller effort is within the
+    model's catalog-advertised ceiling, the standard reasoning metadata keys
+    are still emitted (native provider ``xai``, native field
+    ``reasoning.effort``) so audit, session-history, and rollup consumers see
+    the requested/native value instead of empty metadata.
+    """
+    if (
+        candidate.get("provider") != "xai"
+        or candidate.get("route_family") != "codex_xai_oauth_responses_adapter"
+    ):
+        return {}
+    requested_effort, native_field = _extract_codex_reasoning_effort(request_body)
+    if requested_effort not in _CODEX_REASONING_EFFORT_TIER_INDEX or native_field is None:
+        return {}
+    supported_ceiling = _get_xai_reasoning_effort_ceiling(candidate)
+    if supported_ceiling is None:
+        return {}
+    if _CODEX_REASONING_EFFORT_TIER_INDEX[requested_effort] > _CODEX_REASONING_EFFORT_TIER_INDEX[supported_ceiling]:
+        return {}
+    metadata: dict[str, Any] = {
+        "reasoning_effort_requested": requested_effort,
+        "reasoning_effort_source": native_field,
+        "reasoning_effort_native_provider": "xai",
+        "reasoning_effort_native_value": requested_effort,
+        "reasoning_effort_native_field": native_field,
+        "reasoning_effort_supported_ceiling": supported_ceiling,
+        "reasoning_effort_resolved_model": str(candidate["model"]),
+        "reasoning_effort_resolved_provider": "xai",
+        "reasoning_effort_mapping_reason": "within_supported_ceiling",
+    }
+    if attempt_number is not None:
+        metadata["reasoning_effort_candidate_attempt"] = attempt_number
+    return metadata
+
+
 def _normalize_codex_reasoning_effort_for_resolved_route(
     request_body: dict[str, Any],
     *,
@@ -935,6 +1020,16 @@ def _add_codex_auto_agent_alias_metadata(
         resolved_route=candidate,
         attempt_number=attempt_number,
     )
+    if not reasoning_effort_metadata:
+        # XAI-008: the shared normalizer is a strict no-op for the managed xAI
+        # Responses route (no clamping, body preserved). Surface audit-only
+        # native reasoning metadata when the caller effort is within the
+        # model's catalog-advertised ceiling.
+        reasoning_effort_metadata = _build_xai_reasoning_effort_metadata(
+            updated_body,
+            candidate=candidate,
+            attempt_number=attempt_number,
+        )
     if configured_reasoning_effort:
         reasoning_effort_metadata = {
             **reasoning_effort_metadata,

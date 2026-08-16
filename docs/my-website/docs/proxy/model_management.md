@@ -42,6 +42,11 @@ Config-driven alias routing uses:
 
 - `sota-openai`: `gpt-5.6-sol`
 - `sota-xai`: `oa_xai/grok-4.6`
+- Managed `sota-xai` has no candidate-level reasoning override: caller
+  `reasoning.effort=xhigh` is sent unchanged to `oa_xai/grok-4.6`. Request
+  metadata records the requested/native effort as `xhigh` and the
+  provider-native field/provider; the route rollup is
+  `grok-4.6(sota-xai):xhigh`.
 - `sota`: selects the producer-family `sota-*` alias from TUI origin, defaulting to `sota-openai`.
 - Grok 4.6 (`xai/grok-4.6`, `oa_xai/grok-4.6`): 500k context; created 1785974400 (2026-08-06T00:00:00Z), owned by xAI, no aliases, source `https://docs.x.ai/developers/models/grok-4.6`, verified 2026-08-12; input $2/M, output $6/M, cached input $0.50/M, image input $2/M image tokens; above 200k whole-request input tokens, input/cache/output are $4/$1/$12 per million; managed-route session history records this as a reference rate with invoice cost unknown
 - `sota-alibaba`: `alibaba_token_plan/qwen3.8-max` → `alibaba_token_plan/qwen3.7-max`

@@ -458,6 +458,114 @@ def test_sanitizer_should_return_original_identity_when_unchanged(
     assert changes == []
 
 
+def test_sanitizer_should_preserve_reasoning_effort_xhigh() -> None:
+    _configure(
+        _merge_litellm_metadata=lambda *args, **kwargs: (
+            pytest.fail("metadata callback must not run")
+        )
+    )
+    body = {
+        "model": "xai/grok-4.6",
+        "input": "hello",
+        "reasoning": {"effort": "xhigh"},
+    }
+
+    updated, removed, changes = (
+        request_prep._sanitize_xai_responses_request_body(body)
+    )
+
+    assert updated is body
+    assert updated["reasoning"] == {"effort": "xhigh"}
+    assert removed == []
+    assert changes == []
+
+
+def test_sanitizer_should_preserve_reasoning_effort_xhigh_when_rewriting() -> None:
+    _configure()
+    body = {
+        "model": "xai/grok-4.6",
+        "input": "hello",
+        "instructions": "drop me",
+        "reasoning": {"effort": "xhigh"},
+    }
+
+    updated, removed, changes = (
+        request_prep._sanitize_xai_responses_request_body(body)
+    )
+
+    assert updated is not body
+    assert "instructions" not in updated
+    assert updated["reasoning"] == {"effort": "xhigh"}
+    assert "instructions" in removed
+    assert "reasoning" not in removed
+    assert changes == []
+
+
+@pytest.mark.asyncio
+async def test_oa_xai_sanitize_should_preserve_reasoning_effort_xhigh() -> None:
+    async def prepare(body: Payload) -> bool:
+        body.update(
+            {
+                "api_base": "https://api.x.ai/v1",
+                "api_key": "key",
+                "custom_llm_provider": "xai",
+            }
+        )
+        return True
+
+    def drop_reasoning_history(
+        body: Payload,
+    ) -> tuple[Payload, list[Payload]]:
+        items = body.get("input")
+        if not isinstance(items, list):
+            return body, []
+        kept: list[Any] = []
+        removed: list[Payload] = []
+        for item in items:
+            if isinstance(item, dict) and item.get("type") == "reasoning":
+                removed.append(item)
+            else:
+                kept.append(item)
+        updated = dict(body)
+        updated["input"] = kept
+        return updated, removed
+
+    _configure(
+        prepare_oa_xai_request=prepare,
+        _drop_unsupported_codex_input_items_from_request_body=(
+            drop_reasoning_history
+        ),
+        _sanitize_xai_responses_request_body_in_place=(
+            request_prep._sanitize_xai_responses_request_body_in_place
+        ),
+    )
+    prior_reasoning_item = {
+        "type": "reasoning",
+        "id": "rsn_prior",
+        "summary": [],
+    }
+    user_item = {
+        "type": "message",
+        "role": "user",
+        "content": "hello",
+    }
+    body: Payload = {
+        "model": "oa-xai/grok-4.6",
+        "reasoning": {"effort": "xhigh"},
+        "input": [prior_reasoning_item, user_item],
+    }
+
+    result = await request_prep._prepare_oa_xai_passthrough_request(
+        body,
+        sanitize_responses_request=True,
+    )
+
+    assert result == (True, "https://api.x.ai/v1", "key")
+    assert body["reasoning"] == {"effort": "xhigh"}
+    assert body["input"] == [user_item]
+    assert prior_reasoning_item not in body["input"]
+
+
 def test_sanitizer_should_propagate_mapping_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

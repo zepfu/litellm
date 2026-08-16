@@ -84,9 +84,28 @@ class TestXAIResponsesAPITransformation:
         supported = config.get_supported_openai_params("grok-4-fast")
         
         assert "instructions" not in supported, "instructions should not be supported"
+        assert "reasoning" in supported, "reasoning should be supported"
         assert "tools" in supported, "tools should be supported"
         assert "temperature" in supported, "temperature should be supported"
         assert "model" in supported, "model should be supported"
+
+    def test_map_openai_params_preserves_reasoning_effort_xhigh(self):
+        """Keep OpenAI Responses-shaped reasoning.effort='xhigh' on the xAI mapper."""
+        config = XAIResponsesAPIConfig()
+
+        params = ResponsesAPIOptionalRequestParams(
+            reasoning={"effort": "xhigh"},
+            temperature=0.2,
+        )
+
+        result = config.map_openai_params(
+            response_api_optional_params=params,
+            model="grok-4.6",
+            drop_params=True,
+        )
+
+        assert result.get("reasoning") == {"effort": "xhigh"}
+        assert result.get("temperature") == 0.2
 
     def test_xai_responses_endpoint_url(self):
         """Test that get_complete_url returns correct XAI endpoint"""
