@@ -109,6 +109,15 @@ class SessionOwnerLease:
 
 
 _SESSION_OWNER_STATE_KIND = "session_owner"
+_SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX = (
+    "aawm-session-owner-redispatch-v1:"
+)
+_SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_DOMAIN_SEPARATOR = (
+    "aawm-session-owner-redispatch-v1\x00"
+)
+_REQUEST_STATE_EFFECTIVE_SESSION_IDENTITY_ATTR = (
+    "_aawm_session_owner_effective_identity"
+)
 _RECORD_STATE_FIELD = "state"
 _RECORD_OWNER_FIELD = "owner"
 _RECORD_ATTRIBUTES_FIELD = "attributes"
@@ -190,6 +199,75 @@ def _clean_session_identity(session_identity: str) -> str:
     return cleaned
 
 
+def get_request_effective_session_identity(request: Any) -> Optional[str]:
+    """Return the server-only redispatch identity already set on *request*."""
+
+    if request is None:
+        return None
+    state = getattr(request, "state", None)
+    if state is None:
+        return None
+    try:
+        state_values = object.__getattribute__(state, "_state")
+    except AttributeError:
+        state_values = None
+    if isinstance(state_values, Mapping):
+        return _clean_optional_str(
+            state_values.get(_REQUEST_STATE_EFFECTIVE_SESSION_IDENTITY_ATTR)
+        )
+    try:
+        value = object.__getattribute__(
+            state, _REQUEST_STATE_EFFECTIVE_SESSION_IDENTITY_ATTR
+        )
+    except AttributeError:
+        return None
+    return _clean_optional_str(value)
+
+
+def request_has_effective_session_identity(request: Any) -> bool:
+    return get_request_effective_session_identity(request) is not None
+
+
+def activate_session_owner_redispatch_effective_identity(
+    *,
+    request: Any,
+    base_session_identity: Optional[str],
+) -> Optional[str]:
+    """Set one deterministic server-side redispatch identity for this request.
+
+    The identity is derived only from the already resolved canonical base
+    identity. It is never exposed through request headers or request bodies,
+    and an existing effective identity is never derived again.
+    """
+
+    if request is None:
+        return None
+    state = getattr(request, "state", None)
+    if state is None or get_request_effective_session_identity(request) is not None:
+        return None
+    base = _clean_optional_str(base_session_identity)
+    if base is None:
+        return None
+    digest = hashlib.sha256(
+        (
+            _SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_DOMAIN_SEPARATOR + base
+        ).encode("utf-8")
+    ).hexdigest()
+    effective_identity = (
+        f"{_SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX}{digest}"
+    )
+    setattr(state, _REQUEST_STATE_EFFECTIVE_SESSION_IDENTITY_ATTR, effective_identity)
+    return effective_identity
+
+
+def is_replay_safe_session_owner_redispatch_body(
+    request_body: Optional[Mapping[str, Any]],
+) -> bool:
+    """Whether a full request body can be replayed under one new owner key."""
+
+    return isinstance(request_body, Mapping) and "previous_response_id" not in request_body
+
+
 def _strip_legacy_affinity_prefixes(raw: str) -> str:
     """Return the bare session id from legacy alias:session:lane keys."""
 
@@ -226,6 +304,10 @@ def resolve_canonical_session_identity(
         if cleaned is None:
             return None
         return _strip_legacy_affinity_prefixes(cleaned)
+
+    effective_identity = get_request_effective_session_identity(request)
+    if effective_identity is not None:
+        return effective_identity
 
     body = request_body if isinstance(request_body, Mapping) else {}
     metadata = body.get("litellm_metadata") if isinstance(body, Mapping) else None
@@ -2770,6 +2852,45 @@ def reset_released_request_session_owner_guard(request: Any) -> bool:
     setattr(state, _REQUEST_STATE_LEASE_ATTR, None)
     setattr(state, _REQUEST_STATE_GUARDED_ATTR, False)
     return True
+
+
+def clear_non_held_request_session_owner_lease(request: Any) -> bool:
+    """Clear only a failed guard result that did not acquire a reservation."""
+
+    if request is None:
+        return False
+    state = getattr(request, "state", None)
+    if state is None:
+        return False
+    lease = get_request_session_owner_lease(request)
+    if lease is not None and lease.held_reservation:
+        return False
+    setattr(state, _REQUEST_STATE_LEASE_ATTR, None)
+    setattr(state, _REQUEST_STATE_GUARDED_ATTR, False)
+    return True
+
+
+def is_exact_owned_session_owner_route_mismatch(
+    *,
+    guard: SessionOwnerGuardResult,
+    requested_attributes: Mapping[str, Any],
+) -> bool:
+    """Return whether a guard failure is an exact, complete owned-route mismatch."""
+
+    if guard.decision is not SessionOwnerGuardDecision.REDISPATCH_REQUIRED:
+        return False
+    owner_record = guard.owner_record
+    if not isinstance(owner_record, Mapping) or _record_state(owner_record) != "owned":
+        return False
+    owner_attributes = _owner_attributes(owner_record)
+    requested = _core_owner_attributes(requested_attributes)
+    if not owner_attributes or not requested:
+        return False
+    if incomplete_owner_attribute_reason(owner_attributes, for_promotion=True):
+        return False
+    if incomplete_owner_attribute_reason(requested, for_promotion=True):
+        return False
+    return dict(owner_attributes) != dict(requested)
 
 
 async def ensure_session_owner_guard_for_request(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from typing import Any, Optional
@@ -1388,6 +1389,369 @@ async def test_direct_account_scoped_missing_identity_fails_before_send() -> Non
         )
     assert g2.decision is sa.SessionOwnerGuardDecision.UNOWNED_RESERVED
     assert g2.held_reservation is True
+
+
+def test_effective_redispatch_identity_is_deterministic_server_only_and_single_generation() -> None:
+    from starlette.datastructures import State
+
+    first_request = type("Req", (), {})()
+    first_request.state = State()
+    first_request.headers = {"x-thread-id": "untrusted-thread-a", "x-test": "one"}
+    second_request = type("Req", (), {})()
+    second_request.state = State()
+    second_request.headers = {"x-thread-id": "untrusted-thread-b", "x-test": "two"}
+    headers_before = dict(first_request.headers)
+    base_identity = "canonical-base-thread"
+
+    first = sa.activate_session_owner_redispatch_effective_identity(
+        request=first_request,
+        base_session_identity=base_identity,
+    )
+    second = sa.activate_session_owner_redispatch_effective_identity(
+        request=second_request,
+        base_session_identity=base_identity,
+    )
+
+    expected = (
+        f"{sa._SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX}"
+        f"{hashlib.sha256((sa._SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_DOMAIN_SEPARATOR + base_identity).encode('utf-8')).hexdigest()}"
+    )
+    assert first == expected
+    assert second == expected
+    assert first_request.headers == headers_before
+    assert (
+        sa.resolve_canonical_session_identity(
+            first_request,
+            {"agent_id": "untrusted-agent", "thread_id": "other-thread"},
+        )
+        == expected
+    )
+    assert (
+        sa.activate_session_owner_redispatch_effective_identity(
+            request=first_request,
+            base_session_identity=expected,
+        )
+        is None
+    )
+    assert sa.get_request_effective_session_identity(first_request) == expected
+    mock_request = type("Req", (), {})()
+    mock_request.state = MagicMock()
+    assert sa.get_request_effective_session_identity(mock_request) is None
+
+
+def _codex_selector_request(thread_id: str = "selector-thread") -> Any:
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    request.headers = {"x-thread-id": thread_id}
+    return request
+
+
+def _patch_codex_selector_basics(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, dict[str, Any]]:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import selection as sel
+
+    selected_candidate = {
+        "provider": "openai",
+        "model": "gpt-5.4-codex",
+        "route_family": "codex_oauth",
+    }
+    selected_state = {
+        "candidate": selected_candidate,
+        "cooldown_seconds": 0.0,
+        "failover_ordinal": 0,
+    }
+    monkeypatch.setattr(
+        sel, "_lookup_active_snapshot_canonical_alias", lambda *_args, **_kwargs: "alias"
+    )
+    monkeypatch.setattr(sel, "_extract_client_product_label", lambda *_args: None)
+    monkeypatch.setattr(sel, "_resolve_codex_session_key", lambda *_args, **_kwargs: "key")
+    monkeypatch.setattr(sel, "_has_continuation_state", lambda _body: True)
+    monkeypatch.setattr(sel, "_get_codex_session_affinity", AsyncMock(return_value=None))
+    monkeypatch.setattr(sel, "_apply_codex_oauth_inventory_affinity_policy", lambda value: value)
+    monkeypatch.setattr(sel, "_build_auto_agent_skipped_candidates_from_states", lambda _states: [])
+    monkeypatch.setattr(
+        sel,
+        "_attach_aawm_alias_routing_state_sources",
+        lambda selection, **_kwargs: selection,
+    )
+    monkeypatch.setattr(
+        sel,
+        "_build_codex_auto_agent_candidate_states",
+        AsyncMock(return_value=[selected_state]),
+    )
+    monkeypatch.setattr(
+        sel,
+        "_select_available_state",
+        lambda _request, states, **_kwargs: states[0] if states else None,
+    )
+    return sel, selected_candidate
+
+
+@pytest.mark.asyncio
+async def test_codex_compatible_owned_redispatch_metadata_remains_pinned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sel, candidate = _patch_codex_selector_basics(monkeypatch)
+    request = _codex_selector_request()
+    owner_record = {
+        "state": "owned",
+        "owner": "owner-a",
+        "attributes": dict(candidate),
+    }
+    monkeypatch.setattr(
+        sa,
+        "get_session_owner_record",
+        AsyncMock(return_value=(owner_record, "owner-key", None)),
+    )
+    monkeypatch.setattr(sa, "owner_record_as_affinity_hint", lambda _record: dict(candidate))
+    monkeypatch.setattr(
+        sel, "_find_codex_auto_agent_affinity_candidate", lambda *_args, **_kwargs: dict(candidate)
+    )
+    monkeypatch.setattr(
+        sel,
+        "_build_codex_auto_agent_affinity_candidate_state",
+        AsyncMock(return_value={"candidate": dict(candidate), "cooldown_seconds": 0.0}),
+    )
+    monkeypatch.setattr(sel, "_candidate_matches_affinity", lambda *_args: True)
+    monkeypatch.setattr(sel, "_is_auto_agent_candidate_state_available", lambda _state: True)
+    activate = MagicMock(wraps=sa.activate_session_owner_redispatch_effective_identity)
+    monkeypatch.setattr(sa, "activate_session_owner_redispatch_effective_identity", activate)
+
+    selected = await sel._select_codex_auto_agent_candidate(
+        request=request,
+        request_body={
+            "model": "alias",
+            "litellm_metadata": {"redispatch_ordinal": 1},
+            "input": [{"type": "function_call", "name": "inspect"}],
+        },
+    )
+
+    assert selected["selection_reason"] == "session_affinity"
+    assert selected["request_mode"] == "fresh_redispatch"
+    assert selected["candidate"] == candidate
+    activate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_codex_replay_safe_owned_alias_mismatch_uses_effective_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sel, candidate = _patch_codex_selector_basics(monkeypatch)
+    request = _codex_selector_request("base-thread")
+    owner_record = {
+        "state": "owned",
+        "owner": "owner-a",
+        "attributes": {
+            "provider": "other",
+            "model": "removed-model",
+            "route_family": "other_route",
+        },
+    }
+
+    async def _get_owner_record(*, session_identity: str | None, **_kwargs: Any) -> tuple[Any, str, None]:
+        if session_identity == "base-thread":
+            return owner_record, "owner-key", None
+        assert session_identity is not None
+        assert session_identity.startswith("aawm-session-owner-redispatch-v1:")
+        return None, "effective-key", None
+
+    monkeypatch.setattr(sa, "get_session_owner_record", _get_owner_record)
+    monkeypatch.setattr(
+        sa,
+        "owner_record_as_affinity_hint",
+        lambda _record: dict(owner_record["attributes"]),
+    )
+    monkeypatch.setattr(sel, "_find_codex_auto_agent_affinity_candidate", lambda *_args, **_kwargs: None)
+    selected = await sel._select_codex_auto_agent_candidate(
+        request=request,
+        request_body={
+            "model": "alias",
+            "input": [
+                {"type": "reasoning", "summary": [{"type": "text", "text": "r"}]},
+                {"type": "function_call", "name": "inspect", "call_id": "call-1"},
+                {"type": "function_call_output", "call_id": "call-1", "output": "ok"},
+            ],
+        },
+    )
+
+    assert selected["selection_reason"] == "first_available"
+    assert selected["candidate"] == candidate
+    assert selected["canonical_session_identity"].startswith(
+        "aawm-session-owner-redispatch-v1:"
+    )
+    assert selected["affinity_bypassed"] is True
+
+
+@pytest.mark.asyncio
+async def test_codex_owned_alias_mismatch_with_previous_response_id_stays_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sel, _candidate = _patch_codex_selector_basics(monkeypatch)
+    request = _codex_selector_request("base-thread")
+    owner_record = {
+        "state": "owned",
+        "owner": "owner-a",
+        "attributes": {"provider": "other", "model": "removed", "route_family": "other"},
+    }
+    monkeypatch.setattr(
+        sa,
+        "get_session_owner_record",
+        AsyncMock(return_value=(owner_record, "owner-key", None)),
+    )
+    monkeypatch.setattr(
+        sa,
+        "owner_record_as_affinity_hint",
+        lambda _record: dict(owner_record["attributes"]),
+    )
+    monkeypatch.setattr(sel, "_find_codex_auto_agent_affinity_candidate", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        sa,
+        "raise_session_owner_redispatch_required",
+        lambda **kwargs: (_ for _ in ()).throw(HTTPException(status_code=409, detail=kwargs)),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await sel._select_codex_auto_agent_candidate(
+            request=request,
+            request_body={
+                "model": "alias",
+                "previous_response_id": "resp-owned",
+                "input": [{"type": "function_call", "name": "inspect"}],
+            },
+        )
+
+    assert exc_info.value.status_code == 409
+    assert sa.get_request_effective_session_identity(request) is None
+
+
+@pytest.mark.asyncio
+async def test_codex_effective_identity_second_owned_conflict_stays_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sel, _candidate = _patch_codex_selector_basics(monkeypatch)
+    request = _codex_selector_request("base-thread")
+    effective_identity = sa.activate_session_owner_redispatch_effective_identity(
+        request=request,
+        base_session_identity="base-thread",
+    )
+    assert effective_identity is not None
+    owner_record = {
+        "state": "owned",
+        "owner": "owner-b",
+        "attributes": {"provider": "other", "model": "removed", "route_family": "other"},
+    }
+    monkeypatch.setattr(
+        sa,
+        "get_session_owner_record",
+        AsyncMock(return_value=(owner_record, "effective-key", None)),
+    )
+    monkeypatch.setattr(
+        sa,
+        "owner_record_as_affinity_hint",
+        lambda _record: dict(owner_record["attributes"]),
+    )
+    monkeypatch.setattr(sel, "_find_codex_auto_agent_affinity_candidate", lambda *_args, **_kwargs: None)
+    activate = MagicMock(wraps=sa.activate_session_owner_redispatch_effective_identity)
+    monkeypatch.setattr(sa, "activate_session_owner_redispatch_effective_identity", activate)
+    monkeypatch.setattr(
+        sa,
+        "raise_session_owner_redispatch_required",
+        lambda **kwargs: (_ for _ in ()).throw(HTTPException(status_code=409, detail=kwargs)),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await sel._select_codex_auto_agent_candidate(
+            request=request,
+            request_body={"model": "alias", "input": [{"type": "reasoning"}]},
+        )
+
+    assert exc_info.value.status_code == 409
+    activate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_direct_openai_guard_retries_once_with_effective_identity_and_preserves_attributes() -> None:
+    redis = _FakeRedisCache()
+    request = _codex_selector_request("direct-base-thread")
+    old_attributes = sa.build_session_owner_attributes(
+        provider="openai",
+        model="gpt-4o-mini",
+        route_family="openai_responses",
+        endpoint_contract="openai_responses",
+        state_format="openai_responses",
+        ingress="openai_passthrough",
+        requested_model="gpt-4o-mini",
+    )
+    requested_attributes = sa.build_session_owner_attributes(
+        provider="openai",
+        model="gpt-5.4-codex",
+        route_family="codex_oauth",
+        endpoint_contract="openai_responses",
+        state_format="openai_responses",
+        ingress="openai_passthrough",
+        requested_model="gpt-5.4-codex",
+        extra={
+            "account_label": "direct-account",
+            "account_hash": "direct-hash",
+            "account_lane": "direct-lane",
+        },
+    )
+    body = {"model": "gpt-5.4-codex", "input": [{"type": "function_call"}]}
+
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        initial = await sa.guard_session_owner_before_egress(
+            session_identity="direct-base-thread",
+            requested_attributes=old_attributes,
+        )
+        promoted = await sa.promote_session_owner_reservation(
+            session_identity="direct-base-thread",
+            reservation_token=initial.reservation_token,
+            attributes=old_attributes,
+        )
+        assert promoted.outcome is sa.SessionOwnerMutationOutcome.PROMOTED
+
+        original_guard = sa.guard_session_owner_before_egress
+        with patch.object(
+            sa,
+            "guard_session_owner_before_egress",
+            new=AsyncMock(side_effect=original_guard),
+        ) as guard_mock:
+            first = await sa.ensure_session_owner_guard_for_request(
+                request=request,
+                request_body=body,
+                session_identity="direct-base-thread",
+                requested_attributes=requested_attributes,
+                require_exact_attributes=True,
+                raise_on_redispatch=False,
+            )
+            assert sa.is_exact_owned_session_owner_route_mismatch(
+                guard=first,
+                requested_attributes=requested_attributes,
+            )
+            assert sa.clear_non_held_request_session_owner_lease(request) is True
+            effective_identity = sa.activate_session_owner_redispatch_effective_identity(
+                request=request,
+                base_session_identity="direct-base-thread",
+            )
+            assert effective_identity is not None
+            second = await sa.ensure_session_owner_guard_for_request(
+                request=request,
+                request_body=body,
+                session_identity=effective_identity,
+                requested_attributes=requested_attributes,
+                require_exact_attributes=True,
+                raise_on_redispatch=False,
+            )
+
+    assert first.decision is sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
+    assert second.held_reservation is True
+    assert guard_mock.await_count == 2
+    assert guard_mock.await_args_list[0].kwargs["requested_attributes"] == requested_attributes
+    assert guard_mock.await_args_list[1].kwargs["requested_attributes"] == requested_attributes
+    lease = sa.get_request_session_owner_lease(request)
+    assert lease is not None
+    assert lease.attributes == requested_attributes
 
 
 @pytest.mark.asyncio

@@ -679,7 +679,7 @@ class BaseOpenAIPassThroughHandler:
                             ),
                             request=request,
                         )
-                await _sa.ensure_session_owner_guard_for_request(
+                guard = await _sa.ensure_session_owner_guard_for_request(
                     request=request,
                     request_body=direct_body,
                     session_identity=canonical_session_identity,
@@ -689,7 +689,57 @@ class BaseOpenAIPassThroughHandler:
                     else None,
                     require_exact_attributes=True,
                     failure_phase="session_owner_direct_openai_pre_egress",
+                    raise_on_redispatch=False,
                 )
+                if (
+                    guard.decision
+                    is _sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
+                ):
+                    can_retry_with_effective_identity = (
+                        _sa.is_exact_owned_session_owner_route_mismatch(
+                            guard=guard,
+                            requested_attributes=requested_attributes,
+                        )
+                        and _sa.is_replay_safe_session_owner_redispatch_body(
+                            direct_body
+                        )
+                        and not _sa.request_has_effective_session_identity(request)
+                    )
+                    if can_retry_with_effective_identity and _sa.clear_non_held_request_session_owner_lease(
+                        request
+                    ):
+                        effective_identity = _sa.activate_session_owner_redispatch_effective_identity(
+                            request=request,
+                            base_session_identity=canonical_session_identity,
+                        )
+                        if effective_identity is not None:
+                            guard = await _sa.ensure_session_owner_guard_for_request(
+                                request=request,
+                                request_body=direct_body,
+                                session_identity=effective_identity,
+                                requested_attributes=requested_attributes,
+                                alias_model=str(requested_model)
+                                if requested_model is not None
+                                else None,
+                                require_exact_attributes=True,
+                                failure_phase="session_owner_direct_openai_pre_egress",
+                                raise_on_redispatch=False,
+                            )
+                    if (
+                        guard.decision
+                        is _sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
+                    ):
+                        _sa.raise_session_owner_redispatch_required(
+                            session_identity=guard.session_identity
+                            or canonical_session_identity,
+                            guard=guard,
+                            alias_model=str(requested_model)
+                            if requested_model is not None
+                            else None,
+                            candidate=requested_attributes,
+                            failure_phase="session_owner_direct_openai_pre_egress",
+                            request=request,
+                        )
         session_owner_lease = _sa.get_request_session_owner_lease(request)
 
         try:
