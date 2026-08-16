@@ -29,6 +29,20 @@ LiteLLM is a unified interface for 100+ LLMs that:
 
 ## ORCHESTRATOR PROMPT GUIDANCE
 
+Global `~/.codex/AGENTS.md` rules control authorization, testing scope,
+orchestration, queue handling, and safety. This file adds LiteLLM-specific
+technical requirements. Once LiteLLM implementation is authorized, keeping
+documentation for the affected behavior synchronized is included in that
+authorization; testing scope remains controlled by the global rules.
+
+### Implementation Ownership
+
+Implement LiteLLM-owned behavior in this repository and remain compatible with
+the unmodified stock Codex client. Do not use a Codex fork, source change,
+custom build, or deployment as a LiteLLM solution unless the operator
+explicitly authorizes work in the Codex repository. TODOs, handoffs, and agent
+recommendations do not grant that authorization.
+
 ### Anthropic Model Routing TOS Boundary
 
 Anthropic/Claude models may receive traffic only through Claude-native or
@@ -65,8 +79,7 @@ bug report against the final provider call. The expected question is always:
 what could this fork do to make the next dispatch smoother, clearer, easier to
 debug, or less likely to require operator correction? That includes massaging
 system prompts, changing alias-level injected guidance, adjusting tool
-advertisement/schema shape, recording better attempt metadata, or creating a
-handoff when the fix belongs in an orchestrator or sibling surface.
+advertisement/schema shape, or recording better attempt metadata.
 
 For every investigation file, explicitly evaluate whether LiteLLM can improve
 the end-to-end workflow by changing any of:
@@ -85,54 +98,7 @@ the end-to-end workflow by changing any of:
 
 Capacity-only 429/high-demand failures may not be fixable with prompting, but
 they can still reveal gaps in retry telemetry, cooldown policy, redispatch
-threshold handling, or operator-facing failure logs. Read-only violations,
-null completions, missing required final phrases, setup-only completions, and
-unrelated output should usually produce at least one concrete prompt,
-tool-shape, validation, or telemetry proposal unless there is already an
-active TODO covering the same class.
-
-Any follow-up action should be added under
-`.analysis/todo.md` `Proposals (Pending Operator Feedback)` until approved. The
-investigation disposition should name the proposal ID instead of recording
-`Proposal IDs: none` for an actionable alias-flow improvement.
-
-If the improvement belongs outside this repository, write a precise handoff
-document instead of silently dropping it. Creating the handoff is part of this
-repo's process ownership and does not require separate operator approval;
-implementing the sibling-repo change still does.
-
-### Runtime Error Log Intake
-
-At the start of TODO-driven work, inspect `.analysis/*-error.jsonl` files and
-legacy `.analysis/*-error.log` files in addition to `investigate-*`, `handoff-*`,
-and request-style intake files. Treat these files as error intake, not as the
-durable work queue.
-
-Structured JSONL is the preferred runtime error intake format. Each file is
-append-safe and contains one JSON object per line. Use the event fields to group
-and triage failures, but keep `.analysis/todo.md` as the source of truth for
-active work.
-
-For every active error-intake file, add or update an entry in `.analysis/todo.md`
-for the underlying resolution. The TODO entry should capture the environment
-name, error detail, traceback context, intended fix, acceptance evidence, and a
-specific requirement to clean up the source `*-error.jsonl` or legacy
-`*-error.log` file when the error is resolved.
-
-When reading JSONL intake, expect each event to include at least:
-- `environment`, `observed_at`, `logger`, `level`, and `message`
-- `traceback`, `traceback_text`, `traceback_lines`, and `raw_text` so the exact
-  traceback remains inspectable
-- `fingerprint` for grouping repeated failures
-- `context` fields when available for `source`, `container`, `endpoint`,
-  `upstream_url`, `provider`, `model`, `model_alias`, `route_family`,
-  `status_code`, `trace_id`, and `litellm_call_id`
-
-Do not mark an error-intake-driven item complete until the underlying error is
-fixed, verification evidence is recorded, and the corresponding active
-`.analysis/*-error.jsonl` or legacy `.analysis/*-error.log` file has been
-deleted or archived out of active intake. Keep `.analysis/todo.md` as the source
-of truth for active work.
+threshold handling, or operator-facing failure logs.
 
 ### Broad Discovery Subtasks
 
@@ -181,10 +147,8 @@ state or an inventory contract that was not included in the session.
    - Ensure compatibility with both Pydantic v1 and v2
 
 3. **Testing**:
-   - Add tests in appropriate `tests/` subdirectories
-   - Include both unit tests and integration tests
-   - Test provider-specific functionality thoroughly
-   - Consider adding load tests for performance-critical changes
+   - Follow the global testing-scope rules.
+   - Put required focused tests in the appropriate existing `tests/` directory.
 
 ### MAKING CODE CHANGES FOR THE UI (IGNORE FOR BACKEND)
 
@@ -196,6 +160,8 @@ state or an inventory contract that was not included in the session.
    - Use these components as much as possible and avoid building new components unless needed
 
 3. **Testing**:
+   - Apply these conventions only when focused UI tests are required by the
+     global testing-scope rules.
    - The codebase uses **Vitest** and **React Testing Library**
    - **Query Priority Order**: Use query methods in this order: `getByRole`, `getByLabelText`, `getByPlaceholderText`, `getByText`, `getByTestId`
    - **Always use `screen`** instead of destructuring from `render()` (e.g., use `screen.getByText()` not `getByText`)
@@ -275,23 +241,24 @@ When opening issues or pull requests, follow these templates:
 - Explain motivation and use case with concrete examples
 
 ### Pull Requests (`.github/pull_request_template.md`)
-- Add at least 1 test in `tests/litellm/`
-- Ensure `make test-unit` passes
+- Follow the global testing-scope rules and the current pull-request template
+- Run `make test-unit` only when the authorized test scope or pull-request
+  process requires it
 
 
 ## TESTING CONSIDERATIONS
 
-1. **Provider Tests**: Test against real provider APIs when possible
-2. **Proxy Tests**: Include authentication, rate limiting, and routing tests
-3. **Performance Tests**: Load testing for high-throughput scenarios
-4. **Integration Tests**: End-to-end workflows including tool calling
+Use the global testing-scope rules to choose the smallest focused test surface.
+Existing provider, proxy, performance, and integration suites are available
+when the authorized change requires them.
 
 ## DOCUMENTATION
 
-- Keep documentation in sync with code changes
-- Update provider documentation when adding new providers
-- Include code examples for new features
-- Update changelog and release notes
+- Keep current consumer and maintainer documentation synchronized with changed
+  behavior.
+- Update provider documentation when provider behavior changes.
+- Add examples, changelog entries, and release notes only when the affected
+  public contract or publication workflow requires them.
 
 ## SECURITY CONSIDERATIONS
 
@@ -361,11 +328,14 @@ When opening issues or pull requests, follow these templates:
 
 - Follow existing patterns in the codebase
 - Check similar provider implementations
-- Ensure comprehensive test coverage
+- Follow the global focused-testing requirements
 - Update documentation appropriately
 - Consider backward compatibility impact
 
 ## Cursor Cloud specific instructions
+
+This section applies only when the active environment is Cursor Cloud. It does
+not describe the Thoth host or its LiteLLM deployment.
 
 ### Environment
 
