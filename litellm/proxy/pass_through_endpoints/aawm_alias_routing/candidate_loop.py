@@ -45,6 +45,7 @@ from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.cohere im
 )
 
 from . import error_signals as _error_signals
+from . import dev_fault_plan as _dev_fault_plan
 from .interfaces import (
     AliasRouteServices,
     ClassifyKimiFailureFn,
@@ -658,6 +659,10 @@ async def handle_alias_route(  # noqa: PLR0915
                         if guard.provenance:
                             selection["session_owner_provenance"] = guard.provenance
 
+                        _dev_fault_plan._raise_if_openai_fault_plan_slot_fails(
+                            request,
+                            candidate=candidate,
+                        )
                         response = await perform_candidate_request_fn(
                             candidate=candidate,
                             candidate_body=candidate_body,

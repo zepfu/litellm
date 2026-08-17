@@ -413,6 +413,7 @@ from .aawm_alias_routing import retry as _aawm_alias_retry  # noqa: F401
 from .aawm_alias_routing import streaming as _aawm_alias_streaming  # noqa: F401 - Wave 6F facade host binding
 from .aawm_alias_routing import candidate_loop as _aawm_alias_candidate_loop
 from .aawm_alias_routing import durable as _aawm_alias_durable
+from .aawm_alias_routing import dev_fault_plan as _aawm_dev_fault_plan
 
 # Wave 4 pure-leaf extraction imports
 from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen import constants as _opencode_zen_constants
@@ -3439,12 +3440,23 @@ async def _retry_direct_codex_oauth_after_usage_limit(
             )
 
     candidate = selection.get("candidate")
-    retry_attempt_record = {
-        "failure_phase": "direct_openai_provider_response",
-        "attempted_provider_call": True,
-        "cooldown_seconds": round(float(cooldown_seconds), 3),
-    }
-    retry_attempt_record.update(retry_after_hint)
+    injected_attempt_record = (
+        _aawm_dev_fault_plan.update_direct_openai_managed_failure_attempt(
+            request,
+            request_body,
+            selection=selection,
+            exc=exc,
+            cooldown_seconds=cooldown_seconds,
+        )
+    )
+    retry_attempt_record = injected_attempt_record
+    if retry_attempt_record is None:
+        retry_attempt_record = {
+            "failure_phase": "direct_openai_provider_response",
+            "attempted_provider_call": True,
+            "cooldown_seconds": round(float(cooldown_seconds), 3),
+        }
+        retry_attempt_record.update(retry_after_hint)
     retry_planned = (
         isinstance(candidate, dict)
         and _aawm_selection._plan_codex_oauth_account_failover(
@@ -3458,6 +3470,12 @@ async def _retry_direct_codex_oauth_after_usage_limit(
                 request_body.get("previous_response_id")
             ),
         )
+    )
+    _aawm_dev_fault_plan.note_direct_openai_managed_failure(
+        request,
+        request_body,
+        selection=selection,
+        attempt_record=injected_attempt_record,
     )
     if not retry_planned:
         return None
@@ -5663,7 +5681,7 @@ async def vertex_proxy_route(
     methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
     tags=["OpenAI Pass-through", "pass-through"],
 )
-async def openai_proxy_route(
+async def openai_proxy_route(  # noqa: PLR0915
     endpoint: str,
     request: Request,
     fastapi_response: Response,
@@ -5762,7 +5780,13 @@ async def openai_proxy_route(
 
     while True:
         try:
-            return await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+            if use_direct_codex_oauth_inventory:
+                _aawm_dev_fault_plan.note_direct_openai_managed_attempt(
+                    request,
+                    request_body,
+                    selection=direct_codex_selection_state,
+                )
+            response = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
                 endpoint=endpoint,
                 request=request,
                 fastapi_response=fastapi_response,
@@ -5773,6 +5797,13 @@ async def openai_proxy_route(
                 extra_headers=extra_headers,
                 forward_headers=forward_headers,
             )
+            if use_direct_codex_oauth_inventory:
+                _aawm_dev_fault_plan.note_direct_openai_managed_success(
+                    request,
+                    request_body,
+                    selection=direct_codex_selection_state,
+                )
+            return response
         except (HTTPException, ProxyException) as exc:
             if (
                 not use_direct_codex_oauth_inventory
@@ -5787,6 +5818,11 @@ async def openai_proxy_route(
                 exc=exc,
             )
             if retry is None:
+                _aawm_dev_fault_plan.note_direct_openai_managed_terminal_exhaustion(
+                    request,
+                    request_body,
+                    selection=direct_codex_selection_state,
+                )
                 raise
             retry_auth, direct_codex_selection_state = retry
             base_target_url = os.getenv("CHATGPT_API_BASE") or CHATGPT_API_BASE
