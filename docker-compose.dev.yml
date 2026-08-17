@@ -265,6 +265,10 @@ services:
       - AAWM_ALIAS_ROUTE_LOG_HEALTHY=${AAWM_ALIAS_ROUTE_LOG_HEALTHY:-0}
       # CFG-004 Finding 6: environment label on the litellm-dev service itself.
       - AAWM_LITELLM_ENVIRONMENT=litellm-dev
+      # OPENAI-017/018 and CFG-019 acceptance controls (fail-closed defaults).
+      - AAWM_OPENAI_FAULT_PLAN_ENABLED=${AAWM_OPENAI_FAULT_PLAN_ENABLED:-0}
+      - AAWM_CFG004_ACCEPTANCE_ENABLED=${AAWM_CFG004_ACCEPTANCE_ENABLED:-0}
+      - AAWM_CFG004_ACCEPTANCE_RUN_ID=${AAWM_CFG004_ACCEPTANCE_RUN_ID:-}
     networks:
       - default
       - aawm_default

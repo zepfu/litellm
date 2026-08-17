@@ -147,6 +147,33 @@ def test_litellm_dev_has_no_hardcoded_billing_version() -> None:
     assert "AAWM_GROK_BILLING_CLIENT_VERSION" not in litellm_dev
 
 
+def test_litellm_dev_wires_fail_closed_acceptance_controls() -> None:
+    compose = _COMPOSE_PATH.read_text(encoding="utf-8")
+    litellm_dev = _service_block(compose, "litellm-dev")
+
+    assert (
+        "- AAWM_OPENAI_FAULT_PLAN_ENABLED=${AAWM_OPENAI_FAULT_PLAN_ENABLED:-0}"
+        in litellm_dev
+    )
+    assert (
+        "- AAWM_CFG004_ACCEPTANCE_ENABLED=${AAWM_CFG004_ACCEPTANCE_ENABLED:-0}"
+        in litellm_dev
+    )
+    assert (
+        "- AAWM_CFG004_ACCEPTANCE_RUN_ID=${AAWM_CFG004_ACCEPTANCE_RUN_ID:-}"
+        in litellm_dev
+    )
+
+    for service_name in (
+        "aawm-alias-routing-redis",
+        "provider-status-observations",
+    ):
+        other = _service_block(compose, service_name)
+        assert "AAWM_OPENAI_FAULT_PLAN_ENABLED" not in other
+        assert "AAWM_CFG004_ACCEPTANCE_ENABLED" not in other
+        assert "AAWM_CFG004_ACCEPTANCE_RUN_ID" not in other
+
+
 # ---------------------------------------------------------------------------
 # Compose: provider-status-observations service
 # ---------------------------------------------------------------------------
