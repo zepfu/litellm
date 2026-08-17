@@ -472,6 +472,37 @@ async def run_retry_loop(
     )
 
 
+_INVALID_TOOL_DETAIL_LIMIT = 200
+_QUOTE_CHARS = ('"', "'", "\u201c", "\u201d", "\u2018", "\u2019")
+
+
+def _is_completion_invalid_tool_error(
+    runtime: Runtime,
+    exc: object,
+) -> bool:
+    if extract_exception_status_code(runtime, exc) != 400:
+        return False
+    raw_message = extract_raw_message(runtime, exc)
+    if not isinstance(raw_message, str) or not raw_message:
+        return False
+    lowered = raw_message.casefold()
+    tools_text = lowered.replace("`", "")
+    function_text = lowered
+    for quote in _QUOTE_CHARS:
+        function_text = function_text.replace(quote, "")
+    return (
+        "invalid tools" in tools_text
+        and "expected function" in function_text
+    )
+
+
+def _bounded_completion_invalid_tool_detail(detail: str) -> str:
+    compact = " ".join(detail.split())
+    if len(compact) <= _INVALID_TOOL_DETAIL_LIMIT:
+        return compact
+    return compact[: _INVALID_TOOL_DETAIL_LIMIT - 3] + "..."
+
+
 async def perform_completion_operation(
     runtime: Runtime,
     *,
@@ -480,14 +511,31 @@ async def perform_completion_operation(
     log_warnings: bool = True,
     use_alias_candidate_probe: bool = False,
 ) -> RetryResultT:
-    return await run_retry_loop(
-        runtime,
-        adapter_model=adapter_model,
-        operation=operation,
-        log_warnings=log_warnings,
-        use_alias_candidate_probe=use_alias_candidate_probe,
-        attempt_label="OpenRouter completion adapter",
-    )
+    try:
+        return await run_retry_loop(
+            runtime,
+            adapter_model=adapter_model,
+            operation=operation,
+            log_warnings=log_warnings,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+            attempt_label="OpenRouter completion adapter",
+        )
+    except Exception as exc:
+        if (
+            use_alias_candidate_probe
+            and _is_completion_invalid_tool_error(runtime, exc)
+        ):
+            raw_message = extract_raw_message(runtime, exc)
+            detail_text = (
+                raw_message
+                if isinstance(raw_message, str) and raw_message
+                else str(exc)
+            )
+            runtime.raise_candidate_unavailable(
+                "OpenRouter completion invalid-tool: "
+                + _bounded_completion_invalid_tool_detail(detail_text)
+            )
+        raise
 
 
 async def perform_pass_through_request(

@@ -25464,12 +25464,23 @@
         "supports_tool_choice": true
     },
     "openrouter/cohere/north-mini-code:free": {
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
         "input_cost_per_token": 0.0,
         "litellm_provider": "openrouter",
         "max_input_tokens": 1000000,
         "max_output_tokens": 1000000,
         "max_tokens": 1000000,
         "mode": "chat",
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "spawn_agent"
+            ],
+            "exec": [
+                "exec_command"
+            ]
+        },
         "output_cost_per_token": 0.0,
         "provider_specific_entry": {
             "openrouter": {
@@ -25507,7 +25518,21 @@
         "source": "https://openrouter.ai/",
         "supports_function_calling": true,
         "supports_prompt_caching": false,
-        "supports_tool_choice": true
+        "supports_reasoning": false,
+        "supports_tool_choice": true,
+        "unsupported_hosted_tools": [
+            "computer_use",
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search"
+        ],
+        "unsupported_input_item_types": [
+            "custom_tool_call",
+            "custom_tool_call_output",
+            "reasoning"
+        ]
     },
     "openrouter/owl-alpha": {
         "litellm_provider": "openrouter",

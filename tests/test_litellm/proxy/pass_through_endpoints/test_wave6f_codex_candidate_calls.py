@@ -705,6 +705,10 @@ class TestOpenRouterCompletionNamespaceToolAdaptation:
     namespace tools to flat dispatchable function tools before the chat
     completion transform, preserving tool call/result IDs."""
 
+    @staticmethod
+    def _passthrough_request_policy(body):
+        return body, []
+
     @pytest.mark.asyncio
     async def test_completion_transform_receives_flat_dispatchable_tools(self):  # noqa: PLR0915
         """The transform boundary receives flat spawn_agent/exec_command tools
@@ -773,6 +777,21 @@ class TestOpenRouterCompletionNamespaceToolAdaptation:
 
         host["_adapt_codex_namespace_tools_to_functions_from_request_body"] = (
             mock_adapt_namespace
+        )
+        host["_adapt_codex_custom_tools_to_functions_from_request_body"] = (
+            self._passthrough_request_policy
+        )
+        host["_apply_codex_tool_description_patches_to_request_body"] = (
+            self._passthrough_request_policy
+        )
+        host["_drop_unsupported_codex_hosted_tools_from_request_body"] = (
+            self._passthrough_request_policy
+        )
+        host["_drop_unsupported_codex_input_items_from_request_body"] = (
+            self._passthrough_request_policy
+        )
+        host["_drop_tool_choice_without_tools_from_request_body"] = (
+            self._passthrough_request_policy
         )
         host["_get_openrouter_api_key"] = MagicMock(return_value="sk-test")
         host["_get_openrouter_completion_adapter_upstream_model"] = MagicMock(
@@ -917,6 +936,306 @@ class TestOpenRouterCompletionNamespaceToolAdaptation:
         assert emit_kwargs["provider_bound_body"] is completion_kwargs
         assert emit_kwargs["provider_bound_body"]["reasoning_effort"] == "high"
         assert emit_kwargs["request_body"]["model"] == "test-model"
+
+    @pytest.mark.asyncio
+    @staticmethod
+    def _mixed_openrouter_request_body() -> dict[str, Any]:
+        empty_object = {"type": "object", "properties": {}}
+        return {
+            "model": "openrouter/cohere/north-mini-code:free",
+            "input": [
+                {"type": "reasoning", "id": "rs-drop", "summary": []},
+                {
+                    "type": "custom_tool_call",
+                    "id": "ctc-drop",
+                    "call_id": "ctc-drop",
+                    "name": "apply_patch",
+                    "input": "---",
+                },
+                {
+                    "type": "function_call",
+                    "id": "call-abc-123",
+                    "call_id": "call-abc-123",
+                    "name": "functions.collaboration.spawn_agent",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "result-def-456",
+                    "call_id": "call-abc-123",
+                    "output": "ok",
+                },
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "Grep", "parameters": empty_object},
+                },
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a patch.",
+                },
+                {
+                    "type": "namespace",
+                    "name": "functions.collaboration",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "spawn_agent",
+                            "parameters": empty_object,
+                        }
+                    ],
+                },
+                {
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "spawn_agent",
+                            "parameters": empty_object,
+                        }
+                    ],
+                },
+                {
+                    "type": "namespace",
+                    "name": "functions.exec",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "exec_command",
+                            "parameters": empty_object,
+                        }
+                    ],
+                },
+                {
+                    "type": "namespace",
+                    "name": "exec",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "exec_command",
+                            "parameters": empty_object,
+                        }
+                    ],
+                },
+                {"type": "custom", "name": "unsupported_custom"},
+                {
+                    "type": "namespace",
+                    "name": "functions.unsupported",
+                    "tools": [{"type": "function", "name": "unsupported_ns"}],
+                },
+                {"type": "tool_search", "name": "tool_search"},
+                {"type": "web_search", "name": "web_search"},
+                {"type": "image_generation", "name": "image_generation"},
+                {"type": "computer_use", "name": "computer_use"},
+            ],
+        }
+
+    @staticmethod
+    def _install_real_openrouter_helpers(host: dict[str, Any]) -> None:
+        from fastapi.responses import Response, StreamingResponse
+        from litellm.proxy.pass_through_endpoints import (
+            llm_passthrough_endpoints as lpe,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_passthrough_handler import (
+            build_runtime_from_host,
+            install_runtime,
+        )
+        import httpx as _httpx
+        import json as _json
+        import litellm as _litellm
+        from typing import cast as _cast
+
+        install_runtime(build_runtime_from_host())
+        host["Response"] = Response
+        host["StreamingResponse"] = StreamingResponse
+        for helper_name in (
+            "_adapt_codex_custom_tools_to_functions_from_request_body",
+            "_adapt_codex_namespace_tools_to_functions_from_request_body",
+            "_apply_codex_tool_description_patches_to_request_body",
+            "_drop_unsupported_codex_hosted_tools_from_request_body",
+            "_drop_unsupported_codex_input_items_from_request_body",
+            "_drop_tool_choice_without_tools_from_request_body",
+        ):
+            host[helper_name] = getattr(lpe, helper_name)
+        host.update(
+            {
+                "_get_openrouter_api_key": MagicMock(return_value="sk-test"),
+                "_get_openrouter_completion_adapter_upstream_model": MagicMock(
+                    return_value=None
+                ),
+                "_get_openrouter_target_base": MagicMock(
+                    return_value="https://openrouter.ai"
+                ),
+                "_build_openrouter_default_headers": MagicMock(return_value={}),
+                "_get_proxy_shared_aiohttp_session": MagicMock(return_value=None),
+                "_merge_litellm_metadata": MagicMock(
+                    side_effect=lambda body, **kw: body
+                ),
+                "_add_route_family_logging_metadata": MagicMock(
+                    side_effect=lambda body, family: body
+                ),
+                "_build_langfuse_span_descriptor": MagicMock(return_value={}),
+                "_build_adapted_route_rollup_kwargs": MagicMock(return_value={}),
+                "_emit_adapted_route_access_log": MagicMock(),
+                "_annotate_request_scope_for_adapted_access_log": MagicMock(),
+                "_record_adapted_completed_route_rollup_turn": MagicMock(),
+                "_apply_openrouter_completion_message_sanitization": MagicMock(
+                    side_effect=lambda **kw: (
+                        kw["request_body"],
+                        {
+                            "model": "openrouter-upstream",
+                            "messages": [],
+                            "tools": kw["request_body"].get("tools"),
+                        },
+                        kw["litellm_metadata"],
+                    )
+                ),
+                "_perform_openrouter_completion_adapter_operation": AsyncMock(
+                    return_value=MagicMock()
+                ),
+                "_serialize_responses_adapter_response": MagicMock(
+                    return_value='{"id":"resp-1","output":[],"status":"completed"}'
+                ),
+                "_is_codex_auto_agent_malformed_tool_call_text_output": MagicMock(
+                    return_value=False
+                ),
+                "_is_codex_auto_agent_empty_success_responses_body": MagicMock(
+                    return_value=False
+                ),
+                "_build_responses_response_from_adapter_response": MagicMock(
+                    return_value=MagicMock()
+                ),
+                "_build_malformed_tool_call_intake_context": MagicMock(return_value={}),
+                "_validate_codex_auto_agent_responses_payload": AsyncMock(
+                    return_value=MagicMock()
+                ),
+                "httpx": _httpx,
+                "litellm": _litellm,
+                "cast": _cast,
+                "ResponsesAPIOptionalRequestParams": dict,
+                "json": _json,
+            }
+        )
+
+        class _MockHelpers:
+            @staticmethod
+            def validate_outgoing_egress(**kwargs):
+                return None
+
+        host["HttpPassThroughEndpointHelpers"] = _MockHelpers
+        codex_candidate_calls.install(host)
+
+    @staticmethod
+    def _tool_name(tool: dict[str, Any]) -> str | None:
+        nested = tool.get("function")
+        if isinstance(nested, dict) and isinstance(nested.get("name"), str):
+            return nested["name"]
+        name = tool.get("name")
+        return name if isinstance(name, str) else None
+
+    @staticmethod
+    def _assert_shaped_openrouter_request(
+        *,
+        result: Any,
+        host: dict[str, Any],
+        request_body: dict[str, Any],
+        canonical_snapshot: dict[str, Any],
+        captured_transform_kwargs: list[dict[str, Any]],
+    ) -> None:
+        assert result is host["_validate_codex_auto_agent_responses_payload"].return_value
+        assert len(captured_transform_kwargs) == 1
+        provider_request = captured_transform_kwargs[0]["responses_api_request"]
+        provider_tools = provider_request.get("tools") or []
+        assert provider_tools
+        assert all(
+            isinstance(tool, dict) and tool.get("type") == "function"
+            for tool in provider_tools
+        )
+        tool_names = {
+            TestOpenRouterCompletionNamespaceToolAdaptation._tool_name(tool)
+            for tool in provider_tools
+            if isinstance(tool, dict)
+        }
+        assert {
+            "Grep",
+            "apply_patch",
+            "spawn_agent",
+            "exec_command",
+        } <= tool_names
+        assert tool_names.isdisjoint(
+            {
+                "unsupported_custom",
+                "unsupported_ns",
+                "tool_search",
+                "web_search",
+                "image_generation",
+                "computer_use",
+            }
+        )
+        provider_input = captured_transform_kwargs[0].get("input") or []
+        assert all(
+            not (
+                isinstance(item, dict)
+                and item.get("type") in {"reasoning", "custom", "custom_tool_call"}
+            )
+            for item in provider_input
+        )
+        assert {"call-abc-123", "result-def-456"} <= {
+            item.get("id") for item in provider_input if isinstance(item, dict)
+        }
+        validate_kwargs = host[
+            "_validate_codex_auto_agent_responses_payload"
+        ].await_args.kwargs
+        assert validate_kwargs["request_body"] is request_body
+        assert request_body == canonical_snapshot
+        host["_perform_openrouter_completion_adapter_operation"].assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_completion_transform_shapes_mixed_tools_without_raising(self):
+        """Real catalog/policy helpers shape mixed Codex tools for OpenRouter."""
+        host: dict[str, Any] = {"__builtins__": __builtins__}
+        self._install_real_openrouter_helpers(host)
+        request_body = self._mixed_openrouter_request_body()
+        canonical_snapshot = deepcopy(request_body)
+        captured_transform_kwargs: list[dict[str, Any]] = []
+
+        def capture_transform(**kwargs):
+            captured_transform_kwargs.append(kwargs)
+            return {
+                "model": kwargs.get("model"),
+                "messages": [],
+                "tools": kwargs.get("responses_api_request", {}).get("tools"),
+            }
+
+        mock_config_cls = MagicMock()
+        mock_config_cls.transform_responses_api_request_to_chat_completion_request.side_effect = (
+            capture_transform
+        )
+        mock_config_cls.transform_chat_completion_response_to_responses_api_response.return_value = (
+            MagicMock()
+        )
+        with unittest.mock.patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig",
+            mock_config_cls,
+        ):
+            result = await host[
+                "_perform_codex_auto_agent_openrouter_completion_request"
+            ](
+                request=MagicMock(headers={"x-test": "1"}),
+                adapter_model="openrouter/cohere/north-mini-code:free",
+                request_body=request_body,
+                use_alias_candidate_probe=True,
+            )
+        self._assert_shaped_openrouter_request(
+            result=result,
+            host=host,
+            request_body=request_body,
+            canonical_snapshot=canonical_snapshot,
+            captured_transform_kwargs=captured_transform_kwargs,
+        )
 
 
 # -- CFG-004 regression: encrypted reasoning in tool call arguments --

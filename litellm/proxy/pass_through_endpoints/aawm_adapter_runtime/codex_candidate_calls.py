@@ -2215,17 +2215,39 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
             ],
         },
     )
-    # Restore dispatchable tool identities: adapt namespace tools to flat
-    # function tools before the chat-completion transformation so upstream
-    # sees spawn_agent / exec_command, not functions.collaboration.spawn_agent
-    # / functions.exec.  Tool call/result IDs are preserved by the adapter.
+    # Restore dispatchable tool identities before the chat-completion
+    # transformation. Match the Cohere/Kimi/Alibaba Responses prep order:
+    # adapt custom tools, flatten namespace tools, apply description
+    # patches, drop unsupported hosted tools and input items, then clean
+    # incompatible tool_choice. Upstream chat-completions (including
+    # OpenRouter -> Cohere) accept only function tools.
     # Retain the canonical (namespaced) body for response validation so
     # tool_call_restore can reconstruct the original namespace map.
     canonical_request_body = request_body
     (
         request_body,
+        _adapted_custom_tools,
+    ) = _adapt_codex_custom_tools_to_functions_from_request_body(request_body)
+    (
+        request_body,
         _adapted_namespace_tools,
     ) = _adapt_codex_namespace_tools_to_functions_from_request_body(request_body)
+    (
+        request_body,
+        _tool_description_patch_events,
+    ) = _apply_codex_tool_description_patches_to_request_body(request_body)
+    (
+        request_body,
+        _unsupported_hosted_tools,
+    ) = _drop_unsupported_codex_hosted_tools_from_request_body(request_body)
+    (
+        request_body,
+        _unsupported_input_items,
+    ) = _drop_unsupported_codex_input_items_from_request_body(request_body)
+    (
+        request_body,
+        _removed_tool_choice,
+    ) = _drop_tool_choice_without_tools_from_request_body(request_body)
     request_input = request_body.get("input") or ""
     responses_api_request = cast(
         ResponsesAPIOptionalRequestParams,

@@ -380,3 +380,77 @@ async def test_rr054_openrouter_passthrough_retry_forwards_transport_policy() ->
         assert call["caller_managed_hidden_retry"] is True
     assert len(sleeps) == 1
     assert 0 < sleeps[0] <= 1
+
+
+def _invalid_tool_400() -> ProviderError:
+    return ProviderError(
+        "wrapped OpenRouter error",
+        status_code=400,
+        detail={
+            "error": {
+                "metadata": {
+                    "raw": 'Invalid `tools`: "expected function"',
+                }
+            }
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_rr054_openrouter_completion_invalid_tool_probe_is_unavailable() -> None:
+    runtime = _runtime()
+    exc = _invalid_tool_400()
+
+    async def _operation() -> object:
+        raise exc
+
+    with pytest.raises(
+        CandidateUnavailable,
+        match="OpenRouter completion invalid-tool",
+    ):
+        await retry_transport.perform_completion_operation(
+            runtime,
+            adapter_model="openrouter/example",
+            operation=_operation,
+            use_alias_candidate_probe=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_rr054_openrouter_completion_invalid_tool_non_probe_stays_original() -> None:
+    runtime = _runtime()
+    exc = _invalid_tool_400()
+
+    async def _operation() -> object:
+        raise exc
+
+    with pytest.raises(ProviderError) as raised:
+        await retry_transport.perform_completion_operation(
+            runtime,
+            adapter_model="openrouter/example",
+            operation=_operation,
+            use_alias_candidate_probe=False,
+        )
+    assert raised.value is exc
+
+
+@pytest.mark.asyncio
+async def test_rr054_openrouter_completion_unrelated_400_probe_stays_original() -> None:
+    runtime = _runtime()
+    exc = ProviderError(
+        "wrapped OpenRouter error",
+        status_code=400,
+        detail={"error": {"metadata": {"raw": "bad request"}}},
+    )
+
+    async def _operation() -> object:
+        raise exc
+
+    with pytest.raises(ProviderError) as raised:
+        await retry_transport.perform_completion_operation(
+            runtime,
+            adapter_model="openrouter/example",
+            operation=_operation,
+            use_alias_candidate_probe=True,
+        )
+    assert raised.value is exc
