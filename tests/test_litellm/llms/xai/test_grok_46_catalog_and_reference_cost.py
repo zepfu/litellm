@@ -86,8 +86,15 @@ def test_should_advertise_grok_46_xhigh_support_and_reasoning_fields() -> None:
         for model in ("xai/grok-4.6", "oa_xai/grok-4.6"):
             entry = catalog[model]
             assert entry["supports_xhigh_reasoning_effort"] is True
-            assert entry["unsupported_request_params"] == ["external_web_access"]
-            assert "unsupported_input_item_types" not in entry
+            assert entry["unsupported_request_params"] == [
+                "external_web_access",
+                "reasoning_effort",
+                "reasoningEffort",
+            ]
+            # Nested reasoning.effort remains allowed; only flat aliases are rejected.
+            assert "reasoning" not in entry["unsupported_request_params"]
+            # Reasoning history input items are rejected.
+            assert entry["unsupported_input_item_types"] == ["reasoning"]
 
 
 def test_should_advertise_grok_46_collaboration_namespace_tool_adapters() -> None:

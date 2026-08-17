@@ -145,7 +145,16 @@ def _configure_attempt_records():  # noqa: PLR0915
         return str(value).lower().strip() or None
 
     def _load_bundled_cost() -> dict[str, Any]:
-        return {}
+        return {
+            "oa_xai/grok-4.6": {
+                "supports_xhigh_reasoning_effort": True,
+                "supports_reasoning": True,
+            },
+            "xai/grok-4.6": {
+                "supports_xhigh_reasoning_effort": True,
+                "supports_reasoning": True,
+            },
+        }
 
     def _get_model_info(*, model: str, custom_llm_provider: str) -> dict[str, Any]:
         if model == "gpt-5":
@@ -848,6 +857,16 @@ class TestCodexAliasMetadata:
         assert meta["codex_auto_agent_selected_provider"] == "xai"
         # No codex clamp metadata is produced for the non-codex managed route.
         assert "reasoning_effort_clamped_from" not in meta
+        # Already-generated native xAI effort metadata is merged top-level.
+        assert meta["reasoning_effort_requested"] == "xhigh"
+        assert meta["reasoning_effort_source"] == "reasoning.effort"
+        assert meta["reasoning_effort_native_provider"] == "xai"
+        assert meta["reasoning_effort_native_value"] == "xhigh"
+        assert meta["reasoning_effort_native_field"] == "reasoning.effort"
+        assert meta["reasoning_effort_supported_ceiling"] == "xhigh"
+        assert meta["reasoning_effort_resolved_model"] == "oa_xai/grok-4.6"
+        assert meta["reasoning_effort_resolved_provider"] == "xai"
+        assert meta["reasoning_effort_mapping_reason"] == "within_supported_ceiling"
         # Audit construction surfaces requested/native effort metadata.
         audit_events = meta["codex_auto_agent_audit_events"]
         assert audit_events
@@ -856,6 +875,110 @@ class TestCodexAliasMetadata:
         assert event_candidate["reasoning_effort_native_value"] == "xhigh"
         assert event_candidate["reasoning_effort_native_field"] == "reasoning.effort"
         assert event_candidate["reasoning_effort_native_provider"] == "xai"
+
+    def test_sota_xai_caller_xhigh_reaches_attempt_and_top_level_metadata(self) -> None:
+        """XAI-008: caller xhigh lands on the attempt record and top-level metadata."""
+        request = _make_request()
+        body = {"model": "sota-xai", "reasoning": {"effort": "xhigh"}}
+        selection = self._selection(
+            candidate={
+                "provider": "xai",
+                "model": "oa_xai/grok-4.6",
+                "route_family": "codex_xai_oauth_responses_adapter",
+                "last_resort": False,
+            },
+            lane_key="xai:oa_xai/grok-4.6",
+            cooldown_key="cd:xai:oa_xai/grok-4.6",
+            alias_model="sota-xai",
+        )
+        attempts: list[dict[str, Any]] = [{"status": "pending"}]
+
+        result = attempt_records._add_codex_auto_agent_alias_metadata(
+            body, request=request, selection=selection, attempts=attempts
+        )
+
+        assert result["reasoning"] == {"effort": "xhigh"}
+        assert attempts[-1]["reasoning_effort_requested"] == "xhigh"
+        assert attempts[-1]["reasoning_effort_native_value"] == "xhigh"
+        assert attempts[-1]["reasoning_effort_native_field"] == "reasoning.effort"
+        assert attempts[-1]["reasoning_effort_native_provider"] == "xai"
+        assert attempts[-1]["reasoning_effort_candidate_attempt"] == 1
+
+        meta = result["litellm_metadata"]
+        assert meta["reasoning_effort_requested"] == "xhigh"
+        assert meta["reasoning_effort_native_value"] == "xhigh"
+        assert meta["reasoning_effort_native_field"] == "reasoning.effort"
+        assert meta["reasoning_effort_native_provider"] == "xai"
+        assert meta["reasoning_effort_candidate_attempt"] == 1
+        assert meta["codex_auto_agent_attempts"] is attempts
+
+    def test_sota_xai_xhigh_metadata_survives_when_effective_map_lacks_managed_entry(
+        self,
+    ) -> None:
+        """XAI-008: bundled catalog still supplies xhigh when the live map does not."""
+        request = _make_request()
+        body = {"model": "sota-xai", "reasoning": {"effort": "xhigh"}}
+        selection = self._selection(
+            candidate={
+                "provider": "xai",
+                "model": "oa_xai/grok-4.6",
+                "route_family": "codex_xai_oauth_responses_adapter",
+                "last_resort": False,
+            },
+            lane_key="xai:oa_xai/grok-4.6",
+            cooldown_key="cd:xai:oa_xai/grok-4.6",
+            alias_model="sota-xai",
+        )
+        attempts: list[dict[str, Any]] = [{"status": "pending"}]
+        previous_supports_xhigh = attempt_records._supports_xhigh_reasoning_effort
+        previous_model_cost = attempt_records._model_cost
+        previous_get_model_info = attempt_records._get_model_info
+        previous_bundled = attempt_records._load_bundled_model_cost_map_for_codex_policy
+
+        def _effective_map_lacks_managed_entry(**_kwargs: Any) -> bool:
+            return False
+
+        def _missing_model_info(**_kwargs: Any) -> dict[str, Any]:
+            raise Exception("managed entry missing from effective runtime map")
+
+        def _repository_catalog() -> dict[str, Any]:
+            return {
+                "oa_xai/grok-4.6": {"supports_xhigh_reasoning_effort": True},
+            }
+
+        attempt_records._supports_xhigh_reasoning_effort = (
+            _effective_map_lacks_managed_entry
+        )
+        attempt_records._model_cost = {"unrelated/model": {"supports_reasoning": True}}
+        attempt_records._get_model_info = _missing_model_info
+        attempt_records._load_bundled_model_cost_map_for_codex_policy = (
+            _repository_catalog
+        )
+        try:
+            result = attempt_records._add_codex_auto_agent_alias_metadata(
+                body, request=request, selection=selection, attempts=attempts
+            )
+        finally:
+            attempt_records._supports_xhigh_reasoning_effort = previous_supports_xhigh
+            attempt_records._model_cost = previous_model_cost
+            attempt_records._get_model_info = previous_get_model_info
+            attempt_records._load_bundled_model_cost_map_for_codex_policy = (
+                previous_bundled
+            )
+
+        assert result["reasoning"] == {"effort": "xhigh"}
+        assert attempts[-1]["reasoning_effort_requested"] == "xhigh"
+        assert attempts[-1]["reasoning_effort_native_value"] == "xhigh"
+        assert attempts[-1]["reasoning_effort_native_field"] == "reasoning.effort"
+        assert attempts[-1]["reasoning_effort_native_provider"] == "xai"
+        assert attempts[-1]["reasoning_effort_supported_ceiling"] == "xhigh"
+
+        meta = result["litellm_metadata"]
+        assert meta["reasoning_effort_requested"] == "xhigh"
+        assert meta["reasoning_effort_native_value"] == "xhigh"
+        assert meta["reasoning_effort_native_field"] == "reasoning.effort"
+        assert meta["reasoning_effort_native_provider"] == "xai"
+        assert meta["reasoning_effort_supported_ceiling"] == "xhigh"
 
     def test_last_resort_tag(self) -> None:
         request = _make_request()

@@ -40591,7 +40591,9 @@
             "tool_search"
         ],
         "unsupported_request_params": [
-            "external_web_access"
+            "external_web_access",
+            "reasoning_effort",
+            "reasoningEffort"
         ],
         "rewrite_input_item_types": [
             "function_call",
@@ -40599,7 +40601,10 @@
         ],
         "supports_vision": true,
         "supports_web_search": true,
-        "verified": "2026-08-12"
+        "verified": "2026-08-12",
+        "unsupported_input_item_types": [
+            "reasoning"
+        ]
     },
     "xai/grok-4.5": {
         "litellm_provider": "xai",
@@ -40680,7 +40685,9 @@
             "tool_search"
         ],
         "unsupported_request_params": [
-            "external_web_access"
+            "external_web_access",
+            "reasoning_effort",
+            "reasoningEffort"
         ],
         "rewrite_input_item_types": [
             "function_call",
@@ -40688,7 +40695,10 @@
         ],
         "supports_vision": true,
         "supports_web_search": true,
-        "verified": "2026-08-12"
+        "verified": "2026-08-12",
+        "unsupported_input_item_types": [
+            "reasoning"
+        ]
     },
     "oa_xai/grok-4.5": {
         "litellm_provider": "xai",

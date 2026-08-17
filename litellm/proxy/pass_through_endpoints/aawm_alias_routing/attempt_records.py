@@ -789,20 +789,48 @@ def _get_xai_reasoning_effort_ceiling(
     """Return the supported reasoning-effort ceiling for the managed xAI route.
 
     XAI-008: capability-recognition only. Capability is read from the model
-    catalog via the config-driven ``supports_xhigh_reasoning_effort`` helper,
-    never from the model name.
+    catalog via the config-driven ``supports_xhigh_reasoning_effort`` flag,
+    never from the model name. Prefer the effective runtime map, then fall
+    back to the same repository/bundled catalog used by request preparation.
     """
+    assert _get_model_info is not None
+    assert _model_cost is not None
+    assert _load_bundled_model_cost_map_for_codex_policy is not None
+
     model = resolved_route.get("model")
     if not isinstance(model, str) or not model:
         return None
     supports_xhigh = _resolve_supports_xhigh_reasoning_effort()
-    if supports_xhigh is None:
-        return None
+    if supports_xhigh is not None:
+        try:
+            if supports_xhigh(model=model, custom_llm_provider="xai") is True:
+                return "xhigh"
+        except Exception:
+            pass
+
+    model_info_sources: list[Mapping[str, Any]] = []
     try:
-        if supports_xhigh(model=model, custom_llm_provider="xai") is True:
-            return "xhigh"
+        resolved_model_info = _get_model_info(
+            model=model,
+            custom_llm_provider="xai",
+        )
+        if isinstance(resolved_model_info, dict):
+            model_info_sources.append(resolved_model_info)
     except Exception:
-        return None
+        pass
+    for model_cost in (
+        _model_cost,
+        _load_bundled_model_cost_map_for_codex_policy(),
+    ):
+        catalog_model_info = model_cost.get(model)
+        if isinstance(catalog_model_info, dict):
+            model_info_sources.append(catalog_model_info)
+
+    if any(
+        model_info.get("supports_xhigh_reasoning_effort") is True
+        for model_info in model_info_sources
+    ):
+        return "xhigh"
     return None
 
 
@@ -1097,6 +1125,15 @@ def _add_codex_auto_agent_alias_metadata(
                     ),
                 }
                 if default_reasoning_applied
+                else {}
+            ),
+            **(
+                reasoning_effort_metadata
+                if (
+                    candidate.get("provider") == "xai"
+                    and candidate.get("route_family") == "codex_xai_oauth_responses_adapter"
+                    and reasoning_effort_metadata
+                )
                 else {}
             ),
             "codex_auto_agent_selection_reason": selection.get("selection_reason"),
