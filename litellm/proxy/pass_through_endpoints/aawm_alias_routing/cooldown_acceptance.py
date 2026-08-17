@@ -2,7 +2,8 @@
 
 POST /aawm/alias-routing/cooldowns/acceptance
 
-Operations: prepare, inspect, restore.
+Operations: prepare, inspect, restore, seed_durable, inspect_durable,
+request_local_seed.
 
 Lane derivation reuses the EXACT provider-aware branch from
 ``selection._build_codex_auto_agent_candidate_state`` and builds cooldown
@@ -14,10 +15,14 @@ Durable seeding publishes ALL candidates first (fail closed), then mutates
 local memory/index.  Rollback uses ``rollback_cooldown_transaction`` with
 the retained journals.  Restore verifies absence via
 ``verify_aawm_alias_routing_durable_absence`` and ``inspect_identity_set``.
+
+CFG-019 adds Redis-only ``seed_durable``, restart-safe ``inspect_durable``,
+and request-local-only ``request_local_seed`` without provider calls.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -37,10 +42,12 @@ from .durable import (
     delete_aawm_alias_routing_durable_key,
     get_aawm_alias_routing_dual_cache,
     get_aawm_alias_routing_state_namespace,
+    inspect_aawm_alias_routing_durable_key,
     publish_cooldown_transaction,
     rollback_cooldown_transaction,
     RollbackDriftError,
     RollbackReceiptMissingError,
+    UNBOUNDED_EXPIRY,
     verify_aawm_alias_routing_durable_absence,
 )
 from .lane_keys import (
@@ -86,11 +93,51 @@ _MIN_TTL_SECONDS = 10.0
 _OPERATION_PREPARE = "prepare"
 _OPERATION_INSPECT = "inspect"
 _OPERATION_RESTORE = "restore"
-_VALID_OPERATIONS = frozenset({_OPERATION_PREPARE, _OPERATION_INSPECT, _OPERATION_RESTORE})
+_OPERATION_SEED_DURABLE = "seed_durable"
+_OPERATION_INSPECT_DURABLE = "inspect_durable"
+_OPERATION_REQUEST_LOCAL_SEED = "request_local_seed"
+_VALID_OPERATIONS = frozenset({
+    _OPERATION_PREPARE,
+    _OPERATION_INSPECT,
+    _OPERATION_RESTORE,
+    _OPERATION_SEED_DURABLE,
+    _OPERATION_INSPECT_DURABLE,
+    _OPERATION_REQUEST_LOCAL_SEED,
+})
 
 _PREPARE_FIELDS = frozenset({"operation", "run_id", "alias", "ingress", "provider", "model", "ttl_seconds", "codex_oauth_account_id"})
 _INSPECT_FIELDS = frozenset({"operation", "run_id"})
 _RESTORE_FIELDS = frozenset({"operation", "run_id"})
+_SEED_DURABLE_FIELDS = frozenset({
+    "operation",
+    "run_id",
+    "alias",
+    "ingress",
+    "provider",
+    "model",
+    "ttl_seconds",
+    "codex_oauth_account_id",
+})
+_INSPECT_DURABLE_FIELDS = frozenset({
+    "operation",
+    "run_id",
+    "alias",
+    "ingress",
+    "provider",
+    "model",
+    "route_family",
+    "codex_oauth_account_id",
+})
+_REQUEST_LOCAL_SEED_FIELDS = frozenset({
+    "operation",
+    "run_id",
+    "alias",
+    "ingress",
+    "provider",
+    "model",
+    "ttl_seconds",
+    "codex_oauth_account_id",
+})
 
 # Codex OAuth account descriptor: authoritative Mahaf account-id format is a
 # canonical UUID (8-4-4-4-12 lowercase hex with hyphens, exactly 36 chars).
@@ -236,8 +283,14 @@ def _validate_body(body: dict[str, Any]) -> tuple[str, str]:
         allowed = _PREPARE_FIELDS
     elif operation == _OPERATION_INSPECT:
         allowed = _INSPECT_FIELDS
-    else:
+    elif operation == _OPERATION_RESTORE:
         allowed = _RESTORE_FIELDS
+    elif operation == _OPERATION_SEED_DURABLE:
+        allowed = _SEED_DURABLE_FIELDS
+    elif operation == _OPERATION_INSPECT_DURABLE:
+        allowed = _INSPECT_DURABLE_FIELDS
+    else:
+        allowed = _REQUEST_LOCAL_SEED_FIELDS
 
     extra = set(body.keys()) - allowed
     if extra:
@@ -400,6 +453,10 @@ def _resolve_eligible_candidates(
             "route_family": c.get("route_family") or "",
             "config_epoch_tag": c.get("config_epoch_tag"),
             "cooldown_identity_tag": c.get("cooldown_identity_tag"),
+            # Preserve any managed OpenAI Codex OAuth lane identity attached
+            # to the resolved candidate so CFG-019 handler paths seed and
+            # inspect the configured account lane, not a derived default.
+            "codex_oauth_lane_key": c.get("codex_oauth_lane_key"),
         })
     return canonical_alias, result
 
@@ -1150,6 +1207,719 @@ async def _handle_restore(  # noqa: PLR0915 - bounded acceptance handler
     }
 
 
+
+# ---------------------------------------------------------------------------
+# CFG-019 generic alias-routing cooldown controls
+# ---------------------------------------------------------------------------
+
+
+def _sanitize_identifier(value: str) -> str:
+    """Return a secret-safe hash of a raw identity or lane key."""
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+
+def _public_ttl_seconds(value: object) -> Optional[float]:
+    return _finite_ttl_seconds(value)
+
+
+def _finite_ttl_seconds(value: object) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    if parsed != parsed or parsed in {float("inf"), float("-inf")} or parsed <= 0.0:
+        return None
+    return parsed
+
+
+def _ttl_is_unbounded(value: object, payload: object = None) -> bool:
+    if value is UNBOUNDED_EXPIRY:
+        return True
+    if isinstance(payload, dict) and payload.get("persistent") is True:
+        return True
+    return False
+
+
+def _validate_acceptance_alias(body: dict[str, Any]) -> str:
+    alias = body.get("alias")
+    if not isinstance(alias, str) or not alias.strip():
+        raise HTTPException(status_code=400, detail={
+            "error": "invalid_alias",
+            "message": "alias must be a non-empty string",
+        })
+    return alias.strip()
+
+
+def _validate_acceptance_ingress(body: dict[str, Any]) -> str:
+    ingress = body.get("ingress")
+    if not isinstance(ingress, str) or ingress.strip().lower() != "codex":
+        raise HTTPException(status_code=400, detail={
+            "error": "invalid_ingress",
+            "message": "ingress must be 'codex'",
+        })
+    return "codex"
+
+
+def _validate_acceptance_ttl(body: dict[str, Any]) -> float:
+    ttl_raw = body.get("ttl_seconds")
+    if not isinstance(ttl_raw, (int, float)) or isinstance(ttl_raw, bool):
+        raise HTTPException(status_code=400, detail={
+            "error": "invalid_ttl",
+            "message": "ttl_seconds must be a number",
+        })
+    ttl = float(ttl_raw)
+    if ttl < _MIN_TTL_SECONDS or ttl > _MAX_TTL_SECONDS:
+        raise HTTPException(status_code=400, detail={
+            "error": "invalid_ttl",
+            "message": f"ttl_seconds must be between {_MIN_TTL_SECONDS} and {_MAX_TTL_SECONDS}",
+        })
+    return ttl
+
+
+def _validate_acceptance_provider_model(body: dict[str, Any]) -> tuple[str, str]:
+    provider = body.get("provider")
+    model = body.get("model")
+    if not isinstance(provider, str) or not provider.strip():
+        raise HTTPException(status_code=400, detail={
+            "error": "invalid_target",
+            "message": "provider must be a non-empty string",
+        })
+    if not isinstance(model, str) or not model.strip():
+        raise HTTPException(status_code=400, detail={
+            "error": "invalid_target",
+            "message": "model must be a non-empty string",
+        })
+    normalized_provider = provider.strip()
+    if normalized_provider != "openai":
+        raise HTTPException(status_code=400, detail={
+            "error": "unsupported_provider",
+            "message": "new acceptance operations require a configured OpenAI target",
+        })
+    return normalized_provider, model.strip()
+
+
+def _match_snapshot_candidate(
+    candidates: list[dict[str, Any]],
+    *,
+    provider: str,
+    model: str,
+    route_family: Optional[str] = None,
+) -> dict[str, Any]:
+    matches = [
+        candidate
+        for candidate in candidates
+        if candidate["provider"] == provider and candidate["model"] == model
+        and (
+            route_family is None
+            or (candidate.get("route_family") or "") == route_family
+        )
+    ]
+    if not matches:
+        raise HTTPException(status_code=404, detail={
+            "error": "target_not_found",
+            "message": "target candidate not in active eligible inventory",
+        })
+    if len(matches) > 1:
+        raise HTTPException(status_code=409, detail={
+            "error": "ambiguous_target",
+            "message": "provider/model matches multiple eligible candidates",
+        })
+    return matches[0]
+
+
+def _validate_acceptance_route_family(body: dict[str, Any]) -> Optional[str]:
+    """Optional prior route_family for post-change/removal inspection.
+
+    Restart-safe handle letting ``inspect_durable`` re-derive a previously
+    seeded cooldown identity/key after the old candidate has changed
+    semantically or been removed from the active snapshot.
+    """
+    raw = body.get("route_family")
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise HTTPException(status_code=400, detail={
+            "error": "invalid_route_family",
+            "message": "route_family must be a string",
+        })
+    return raw.strip()
+
+
+def _resolve_prior_seeded_candidate(
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the prior seeded identity handle from request-supplied fields.
+
+    Re-derives only the alias-scoped identity hash from validated public
+    target fields.  Never accepts raw cooldown keys, lane keys, or hashes.
+    """
+    canonical_alias, candidate = _resolve_generic_target_candidate(
+        body,
+        require_active_candidate=False,
+    )
+    route_family = candidate["route_family"]
+    return {
+        "provider": candidate["provider"],
+        "model": candidate["model"],
+        "route_family": route_family,
+        "cooldown_identity_tag": (
+            f"alias:{canonical_alias}:{candidate['provider']}"
+            f":{candidate['model']}:{route_family}"
+        ),
+    }
+
+
+def _resolve_generic_target_candidate(
+    body: dict[str, Any],
+    *,
+    require_active_candidate: bool = True,
+) -> tuple[str, dict[str, Any]]:
+    alias = _validate_acceptance_alias(body)
+    _validate_acceptance_ingress(body)
+    provider, model = _validate_acceptance_provider_model(body)
+    route_family = _validate_acceptance_route_family(body)
+    canonical_alias, candidates = _resolve_eligible_candidates(alias)
+    try:
+        candidate = _match_snapshot_candidate(
+            candidates,
+            provider=provider,
+            model=model,
+            route_family=route_family,
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        if (
+            require_active_candidate
+            or route_family is None
+            or detail.get("error") != "target_not_found"
+        ):
+            raise
+        # Prior candidate is absent from the active snapshot; return the
+        # request-supplied target fields so inspection can re-derive the
+        # previously seeded identity hash.
+        return canonical_alias, {
+            "provider": provider,
+            "model": model,
+            "route_family": route_family,
+        }
+    if candidate.get("provider") != "openai":
+        raise HTTPException(status_code=400, detail={
+            "error": "unsupported_provider",
+            "message": "new acceptance operations require a configured OpenAI target",
+        })
+    return canonical_alias, candidate
+
+
+def _resolve_cfg019_openai_lane_key(
+    request: Request,
+    candidate: dict[str, Any],
+    *,
+    codex_oauth_account_id: Optional[str],
+) -> str:
+    configured = candidate.get("codex_oauth_lane_key")
+    if isinstance(configured, str) and configured.strip():
+        return configured.strip()
+    return resolve_production_lane_key(
+        request,
+        candidate,
+        codex_oauth_account_id=codex_oauth_account_id,
+    )
+
+
+def _resolve_cfg019_openai_cooldown_key(
+    request: Request,
+    candidate: dict[str, Any],
+    *,
+    codex_oauth_account_id: Optional[str],
+    cooldown_identity_candidate: Optional[dict[str, Any]] = None,
+) -> str:
+    """Build the durable cooldown key for the seeded OpenAI candidate.
+
+    ``cooldown_identity_candidate`` optionally carries the prior seeded
+    candidate (provider/model/route_family/identity tag) so post-change or
+    post-removal inspection re-derives the exact old durable key, while the
+    lane key still comes from the current request/auth or a configured
+    managed lane.
+    """
+    identity_source = (
+        cooldown_identity_candidate
+        if cooldown_identity_candidate is not None
+        else candidate
+    )
+    lane_key = _resolve_cfg019_openai_lane_key(
+        request,
+        candidate,
+        codex_oauth_account_id=codex_oauth_account_id,
+    )
+    return _codex_auto_agent_candidate_key(
+        identity_source,
+        lane_key,
+        cooldown_identity_tag=identity_source.get("cooldown_identity_tag"),
+    )
+
+
+def _reject_seed_durable_prestate(
+    *,
+    inspection: Any,
+    key_inspection: Any,
+    cooldown_key: str,
+    requested_ttl: float,
+) -> None:
+    if _ttl_is_unbounded(
+        getattr(key_inspection, "ttl_remaining_seconds", None),
+        getattr(key_inspection, "payload", None),
+    ) or _ttl_is_unbounded(getattr(inspection, "ttl_remaining_seconds", None)):
+        raise HTTPException(status_code=409, detail={
+            "error": "prestate_unbounded",
+            "message": "existing durable cooldown is unbounded or persistent",
+        })
+    members = getattr(inspection, "members", None)
+    if bool(getattr(inspection, "exists", False)) and int(getattr(inspection, "cardinality", 0) or 0) > 0:
+        if not isinstance(members, (set, frozenset, list, tuple)):
+            raise HTTPException(status_code=409, detail={
+                "error": "prestate_conflict",
+                "message": "existing durable identity state conflicts with bounded seed",
+            })
+        extra = set(members) - {cooldown_key}
+        if extra:
+            raise HTTPException(status_code=409, detail={
+                "error": "prestate_conflict",
+                "message": "existing durable identity state conflicts with bounded seed",
+            })
+    if bool(getattr(key_inspection, "exists", False)):
+        existing_ttl = _finite_ttl_seconds(
+            getattr(key_inspection, "ttl_remaining_seconds", None)
+        )
+        if existing_ttl is None or existing_ttl > requested_ttl:
+            raise HTTPException(status_code=409, detail={
+                "error": "prestate_conflict",
+                "message": "existing durable cooldown conflicts with bounded seed",
+            })
+
+
+def _require_finite_bounded_ttl(*, actual_ttl: object, requested_ttl: float) -> float:
+    remaining = _finite_ttl_seconds(actual_ttl)
+    if remaining is None or remaining > requested_ttl:
+        raise HTTPException(status_code=500, detail={
+            "error": "seed_verification_failed",
+            "message": "durable cooldown TTL is not finite and within the requested bound",
+        })
+    return remaining
+
+
+async def _inspect_seed_durable_prestate(
+    *,
+    identity_hash: str,
+    cooldown_key: str,
+    requested_ttl: float,
+) -> None:
+    try:
+        inspection = await inspect_identity_set(
+            alias_family="codex",
+            identity_hash=identity_hash,
+        )
+        key_inspection = await inspect_aawm_alias_routing_durable_key(
+            alias_family="codex",
+            state_kind="cooldown",
+            state_key=cooldown_key,
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail={
+            "error": "seed_prestate_inspect_failed",
+            "message": "durable prestate inspection failed before seeding",
+        })
+    _reject_seed_durable_prestate(
+        inspection=inspection,
+        key_inspection=key_inspection,
+        cooldown_key=cooldown_key,
+        requested_ttl=requested_ttl,
+    )
+
+
+async def _verify_seed_durable_postcondition(
+    *,
+    identity_hash: str,
+    cooldown_key: str,
+    requested_ttl: float,
+) -> float:
+    try:
+        inspection = await inspect_identity_set(
+            alias_family="codex",
+            identity_hash=identity_hash,
+        )
+        key_inspection = await inspect_aawm_alias_routing_durable_key(
+            alias_family="codex",
+            state_kind="cooldown",
+            state_key=cooldown_key,
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail={
+            "error": "seed_verification_failed",
+            "message": "durable cooldown inspection failed after seeding",
+        })
+    if not (inspection.exists and inspection.cardinality > 0 and key_inspection.exists):
+        raise HTTPException(status_code=500, detail={
+            "error": "seed_verification_failed",
+            "message": "durable cooldown not active after seeding",
+        })
+    return _require_finite_bounded_ttl(
+        actual_ttl=key_inspection.ttl_remaining_seconds,
+        requested_ttl=requested_ttl,
+    )
+
+
+def _reject_seed_durable_local_mutation(
+    *,
+    run_id: str,
+    prepared_before: bool,
+    local_before: int,
+    index_before: int,
+    family_state: Any,
+    state_mgr: AliasRoutingStateManager,
+    cooldown_key: str,
+) -> None:
+    if (
+        len(family_state.cooldown_until_monotonic_by_key) != local_before
+        or family_state.cooldown_until_monotonic_by_key.get(cooldown_key, 0.0) > time.monotonic()
+    ):
+        raise HTTPException(status_code=500, detail={
+            "error": "local_mutation_forbidden",
+            "message": "seed_durable must not mutate process-local cooldown state",
+        })
+    if len(state_mgr.lane_identity_index) != index_before:
+        raise HTTPException(status_code=500, detail={
+            "error": "local_mutation_forbidden",
+            "message": "seed_durable must not register process-local identity index",
+        })
+    if run_id in _prepared_runs and prepared_before is False:
+        raise HTTPException(status_code=500, detail={
+            "error": "prepared_run_mutation_forbidden",
+            "message": "seed_durable must not store prepared-run state",
+        })
+
+
+def _sanitized_identity_fields(
+    *,
+    identity_hash: str,
+    cooldown_key: str,
+    config_identity: str,
+) -> dict[str, str]:
+    return {
+        "identity_hash": _sanitize_identifier(identity_hash),
+        "lane_hash": _sanitize_identifier(cooldown_key),
+        "config_hash": _sanitize_identifier(config_identity),
+    }
+
+
+async def _handle_seed_durable(
+    body: dict[str, Any],
+    run_id: str,
+    request: Request,
+    state_mgr: AliasRoutingStateManager,
+) -> dict[str, Any]:
+    """Write only the bounded durable Redis cooldown for one candidate.
+
+    Retains the ``publish_cooldown_transaction`` receipt/journal for the
+    duration of the operation.  If bounded post-seed TTL verification
+    fails, rolls back ONLY this transaction (``rollback_cooldown_transaction``)
+    so no unrelated durable state is touched.
+    """
+    ttl = _validate_acceptance_ttl(body)
+    codex_oauth_account_id = _validate_codex_oauth_account_id(
+        body.get("codex_oauth_account_id")
+    )
+    _require_durable_cache()
+    canonical_alias, candidate = _resolve_generic_target_candidate(body)
+    identity_hash = resolve_lane_identity_hash(candidate=candidate)
+    cooldown_key = _resolve_cfg019_openai_cooldown_key(
+        request,
+        candidate,
+        codex_oauth_account_id=codex_oauth_account_id,
+    )
+
+    family_state = state_mgr.codex
+    prepared_before = run_id in _prepared_runs
+    index_before = len(state_mgr.lane_identity_index)
+    async with family_state.lock:
+        local_before = len(family_state.cooldown_until_monotonic_by_key)
+
+    await _inspect_seed_durable_prestate(
+        identity_hash=identity_hash,
+        cooldown_key=cooldown_key,
+        requested_ttl=ttl,
+    )
+    try:
+        txn_result = await publish_cooldown_transaction(
+            alias_family="codex",
+            identity_hash=identity_hash,
+            cooldown_keys=[cooldown_key],
+            lane_members=[cooldown_key],
+            ttl_seconds=ttl,
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail={
+            "error": "durable_publication_failed",
+            "message": "durable publication failed",
+        })
+
+    async with family_state.lock:
+        _reject_seed_durable_local_mutation(
+            run_id=run_id,
+            prepared_before=prepared_before,
+            local_before=local_before,
+            index_before=index_before,
+            family_state=family_state,
+            state_mgr=state_mgr,
+            cooldown_key=cooldown_key,
+        )
+    try:
+        remaining = await _verify_seed_durable_postcondition(
+            identity_hash=identity_hash,
+            cooldown_key=cooldown_key,
+            requested_ttl=ttl,
+        )
+    except HTTPException:
+        # Bounded post-seed TTL verification failed: roll back ONLY this
+        # transaction's journaled preimages.  Do not touch unrelated durable
+        # state.  Rollback failure is surfaced (never suppressed) per the
+        # durable rollback contract.
+        await rollback_cooldown_transaction(
+            alias_family="codex",
+            journal=txn_result.journal,
+        )
+        raise
+
+    snapshot = get_active_routing_snapshot()
+    config_identity = snapshot.config_version if snapshot is not None else ""
+    logger.info(
+        "aawm_cfg019_acceptance_seed_durable run_id=%s alias=%s ttl=%.1f",
+        run_id,
+        canonical_alias,
+        ttl,
+    )
+    return {
+        "result": "seeded_durable",
+        "run_id": run_id,
+        "attempted_provider_call": False,
+        "durable_cooldown_active": True,
+        "local_cooldown_active": False,
+        "request_local_cooldown_active": False,
+        "prepared_run_stored": False,
+        "state_source": "durable_cache",
+        "ttl_seconds": remaining,
+        **_sanitized_identity_fields(
+            identity_hash=identity_hash,
+            cooldown_key=cooldown_key,
+            config_identity=config_identity,
+        ),
+        "environment": _REQUIRED_ENVIRONMENT,
+        "namespace": f"{_NAMESPACE_PREFIX}{run_id}",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _handle_inspect_durable(
+    body: dict[str, Any],
+    run_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    """Inspect Redis cooldown state without prepared-run memory.
+
+    Restart-safe and free of prepared-run/global mutable state: identity is
+    re-derived purely from the sanitized request handle (validated public
+    provider/model/route_family target fields).  When the request supplies a
+    prior ``route_family`` and that candidate has changed semantically or been
+    removed from the active snapshot, the previously seeded identity is
+    re-derived so invalidation can be proven.
+    """
+    codex_oauth_account_id = _validate_codex_oauth_account_id(
+        body.get("codex_oauth_account_id")
+    )
+    _require_durable_cache()
+    # Current lane source is the active provider/model candidate only.
+    # The request's prior route_family is a sanitized identity handle and
+    # must not be required to still exist in the live snapshot.
+    active_lane_body = {
+        key: value for key, value in body.items() if key != "route_family"
+    }
+    try:
+        _, candidate = _resolve_generic_target_candidate(active_lane_body)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        if detail.get("error") != "target_not_found":
+            raise
+        # The prior managed-OAuth candidate was removed. Never derive the
+        # old OAuth lane from request auth. The validated account-id field
+        # is the restart-safe configured-lane descriptor and reconstructs
+        # the same production ``chatgpt-account:<uuid>`` lane used at seed.
+        if codex_oauth_account_id is None:
+            raise HTTPException(status_code=400, detail={
+                "error": "missing_codex_oauth_account_id",
+                "message": (
+                    "removed managed-OAuth inspection requires a validated "
+                    "codex_oauth_account_id"
+                ),
+            })
+        candidate = _resolve_prior_seeded_candidate(body)
+        candidate["codex_oauth_lane_key"] = _resolve_cfg019_openai_lane_key(
+            request,
+            {
+                "provider": candidate["provider"],
+                "model": candidate["model"],
+            },
+            codex_oauth_account_id=codex_oauth_account_id,
+        )
+    # Build the restart-safe prior-identity handle: when the prior candidate
+    # (keyed by the request's route_family) has changed semantically or been
+    # removed from the active snapshot, this re-derives the previously
+    # seeded alias-scoped identity tag from validated public fields; when
+    # still present it matches the active candidate.  No raw
+    # provider/model/route/lane/credential/body data is exposed downstream
+    # -- only sanitized hashes are returned.
+    prior_candidate = _resolve_prior_seeded_candidate(body)
+    identity_hash = resolve_lane_identity_hash(candidate=prior_candidate)
+    cooldown_key = _resolve_cfg019_openai_cooldown_key(
+        request,
+        candidate,
+        codex_oauth_account_id=codex_oauth_account_id,
+        cooldown_identity_candidate=prior_candidate,
+    )
+    try:
+        inspection = await inspect_identity_set(
+            alias_family="codex",
+            identity_hash=identity_hash,
+        )
+        key_inspection = await inspect_aawm_alias_routing_durable_key(
+            alias_family="codex",
+            state_kind="cooldown",
+            state_key=cooldown_key,
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail={
+            "error": "durable_inspect_failed",
+            "message": "durable cooldown inspection failed",
+        })
+
+    durable_active = bool(
+        inspection.exists and inspection.cardinality > 0 and key_inspection.exists
+    )
+    snapshot = get_active_routing_snapshot()
+    config_identity = snapshot.config_version if snapshot is not None else ""
+    return {
+        "result": "inspected_durable",
+        "run_id": run_id,
+        "attempted_provider_call": False,
+        "durable_cooldown_active": durable_active,
+        "prepared_run_required": False,
+        "state_source": "durable_cache" if durable_active else "absent",
+        "ttl_seconds": _public_ttl_seconds(key_inspection.ttl_remaining_seconds),
+        **_sanitized_identity_fields(
+            identity_hash=identity_hash,
+            cooldown_key=cooldown_key,
+            config_identity=config_identity,
+        ),
+        "environment": _REQUIRED_ENVIRONMENT,
+        "namespace": f"{_NAMESPACE_PREFIX}{run_id}",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _handle_request_local_seed(
+    body: dict[str, Any],
+    run_id: str,
+    request: Request,
+    state_mgr: AliasRoutingStateManager,
+) -> dict[str, Any]:
+    """Seed request-local cooldown state only; no Redis or shared process mutation."""
+    from . import selection as _selection
+
+    ttl = _validate_acceptance_ttl(body)
+    codex_oauth_account_id = _validate_codex_oauth_account_id(
+        body.get("codex_oauth_account_id")
+    )
+    _, candidate = _resolve_generic_target_candidate(body)
+    lane_key = _resolve_cfg019_openai_lane_key(
+        request,
+        candidate,
+        codex_oauth_account_id=codex_oauth_account_id,
+    )
+    request_local_key = _selection._get_codex_auto_agent_request_local_cooldown_key(
+        candidate=candidate,
+        lane_key=lane_key,
+    )
+    prepared_before = run_id in _prepared_runs
+    index_before = len(state_mgr.lane_identity_index)
+    family_state = state_mgr.codex
+    async with family_state.lock:
+        local_before = dict(family_state.cooldown_until_monotonic_by_key)
+    _selection._apply_request_local_cooldown_from_plan(
+        request,
+        candidate=candidate,
+        lane_key=lane_key,
+        cooldown_seconds=ttl,
+    )
+    remaining = _selection._get_codex_auto_agent_request_local_cooldown_seconds(
+        request,
+        cooldown_key=request_local_key,
+    )
+    if remaining <= 0:
+        raise HTTPException(status_code=400, detail={
+            "error": "request_local_seed_failed",
+            "message": "request-local cooldown was not applied",
+        })
+    async with family_state.lock:
+        local_after = dict(family_state.cooldown_until_monotonic_by_key)
+    if local_after != local_before:
+        raise HTTPException(status_code=500, detail={
+            "error": "local_mutation_forbidden",
+            "message": "request_local_seed must not mutate process-local cooldown state",
+        })
+    if len(state_mgr.lane_identity_index) != index_before:
+        raise HTTPException(status_code=500, detail={
+            "error": "local_mutation_forbidden",
+            "message": "request_local_seed must not register process-local identity index",
+        })
+    if run_id in _prepared_runs and prepared_before is False:
+        raise HTTPException(status_code=500, detail={
+            "error": "prepared_run_mutation_forbidden",
+            "message": "request_local_seed must not store prepared-run state",
+        })
+
+    snapshot = get_active_routing_snapshot()
+    config_identity = snapshot.config_version if snapshot is not None else ""
+    logger.info(
+        "aawm_cfg019_acceptance_request_local_seed run_id=%s ttl=%.1f",
+        run_id,
+        ttl,
+    )
+    return {
+        "result": "seeded_request_local",
+        "run_id": run_id,
+        "attempted_provider_call": False,
+        "durable_cooldown_active": False,
+        "local_cooldown_active": False,
+        "request_local_cooldown_active": True,
+        "prepared_run_stored": False,
+        "state_source": "request_local",
+        "ttl_seconds": remaining,
+        **_sanitized_identity_fields(
+            identity_hash=resolve_lane_identity_hash(candidate=candidate),
+            cooldown_key=request_local_key,
+            config_identity=config_identity,
+        ),
+        "environment": _REQUIRED_ENVIRONMENT,
+        "namespace": f"{_NAMESPACE_PREFIX}{run_id}",
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Endpoint handler
 # ---------------------------------------------------------------------------
@@ -1182,7 +1952,12 @@ async def handle_cooldown_acceptance(
 
     if operation == _OPERATION_PREPARE:
         return await _handle_prepare(body, run_id, request, state_mgr)
-    elif operation == _OPERATION_INSPECT:
+    if operation == _OPERATION_INSPECT:
         return await _handle_inspect(run_id, request, state_mgr)
-    else:
+    if operation == _OPERATION_RESTORE:
         return await _handle_restore(run_id, state_mgr)
+    if operation == _OPERATION_SEED_DURABLE:
+        return await _handle_seed_durable(body, run_id, request, state_mgr)
+    if operation == _OPERATION_INSPECT_DURABLE:
+        return await _handle_inspect_durable(body, run_id, request)
+    return await _handle_request_local_seed(body, run_id, request, state_mgr)

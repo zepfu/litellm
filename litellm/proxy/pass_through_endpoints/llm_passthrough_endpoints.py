@@ -1007,7 +1007,7 @@ async def _aawm_alias_routing_cooldown_acceptance_endpoint(
 ) -> dict[str, Any]:
     """Dev-only acceptance harness for CFG-004 criterion 11.
 
-    Operations: prepare, inspect, restore.
+    Operations: prepare, inspect, restore, seed_durable, inspect_durable, request_local_seed.
     Gated on exact environment, enable flag, run_id, namespace, topology,
     PROXY_ADMIN role, and master-key authentication.
     """
