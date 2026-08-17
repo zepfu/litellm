@@ -2248,6 +2248,17 @@ def _merge_passthrough_request_shape_metadata(
         metadata["aawm_passthrough_tool_type_counts"] = _count_passthrough_item_types(
             tools
         )
+        function_tool_names: list[str] = []
+        for tool in tools:
+            if not isinstance(tool, dict) or tool.get("type") != "function":
+                continue
+            tool_name = _clean_passthrough_error_context_value(tool.get("name"))
+            if tool_name:
+                function_tool_names.append(tool_name)
+        if function_tool_names:
+            metadata[
+                "aawm_passthrough_provider_bound_function_tool_names"
+            ] = function_tool_names[:40]
 
 
 def _headers_for_json_passthrough_egress(

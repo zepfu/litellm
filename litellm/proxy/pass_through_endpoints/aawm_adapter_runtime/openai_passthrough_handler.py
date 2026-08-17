@@ -18,6 +18,7 @@ Do NOT import ``llm_passthrough_endpoints`` at module scope.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -37,6 +38,12 @@ if TYPE_CHECKING:
     from fastapi import Request, Response
 
     from litellm.proxy._types import UserAPIKeyAuth
+
+
+def _identity_codex_tool_adapter(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[Any]]:
+    return request_body, []
 
 
 # ---------------------------------------------------------------------------
@@ -109,9 +116,20 @@ class OpenAIPassThroughHandlerRuntime:
     try_dispatch_codex_request_fn: Callable[
         ..., Awaitable[Optional["Response"]]
     ]
+    validate_codex_auto_agent_responses_payload_fn: Callable[
+        ..., Awaitable["Response"]
+    ]
 
     # -- Route checks ------------------------------------------------------
     is_assistants_api_request_fn: Callable[["Request"], bool]
+
+    # -- Direct managed xAI tool adaptation --------------------------------
+    adapt_codex_custom_tools_to_functions_fn: Callable[
+        [dict[str, Any]], tuple[dict[str, Any], Any]
+    ] = _identity_codex_tool_adapter
+    adapt_codex_namespace_tools_to_functions_fn: Callable[
+        [dict[str, Any]], tuple[dict[str, Any], Any]
+    ] = _identity_codex_tool_adapter
 
 
 # ---------------------------------------------------------------------------
@@ -363,6 +381,7 @@ class BaseOpenAIPassThroughHandler:
         egress_credential_family: Optional[str] = None
         expected_target_family: Optional[str] = None
         endpoint_custom_body: Optional[dict[str, Any]] = None
+        canonical_managed_oa_xai_request_body: Optional[dict[str, Any]] = None
         bound_codex_oauth_identity: Optional[dict[str, str]] = None
         try:
             from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
@@ -390,6 +409,13 @@ class BaseOpenAIPassThroughHandler:
                 is not None
             ):
                 is_codex_responses_request = True
+            is_managed_oa_xai_request = rt.is_oa_xai_request_body_fn(
+                prepared_request_body
+            )
+            if is_managed_oa_xai_request:
+                canonical_managed_oa_xai_request_body = copy.deepcopy(
+                    prepared_request_body
+                )
             if is_codex_responses_request:
                 codex_route_host_attribution = (
                     await rt.resolve_auto_agent_alias_route_host_attribution_fn(request)
@@ -419,6 +445,20 @@ class BaseOpenAIPassThroughHandler:
                         "codex_responses",
                     )
                 )
+            if is_codex_responses_request or is_managed_oa_xai_request:
+                if is_managed_oa_xai_request:
+                    (
+                        prepared_request_body,
+                        _codex_adapted_custom_tools,
+                    ) = rt.adapt_codex_custom_tools_to_functions_fn(
+                        prepared_request_body
+                    )
+                    (
+                        prepared_request_body,
+                        _codex_adapted_namespace_tools,
+                    ) = rt.adapt_codex_namespace_tools_to_functions_fn(
+                        prepared_request_body
+                    )
                 (
                     prepared_request_body,
                     _codex_tool_description_patch_events,
@@ -443,9 +483,7 @@ class BaseOpenAIPassThroughHandler:
                 ) = rt.drop_unsupported_codex_input_items_fn(
                     prepared_request_body
                 )
-                if rt.is_oa_xai_request_body_fn(
-                    prepared_request_body
-                ) or rt.is_grok_native_oauth_request_body_fn(
+                if is_managed_oa_xai_request or rt.is_grok_native_oauth_request_body_fn(
                     prepared_request_body
                 ):
                     (
@@ -454,11 +492,12 @@ class BaseOpenAIPassThroughHandler:
                     ) = rt.drop_tool_choice_without_tools_fn(
                         prepared_request_body
                     )
-                prepared_request_body = (
-                    rt.add_codex_request_breakout_logging_metadata_fn(
-                        prepared_request_body
+                if is_codex_responses_request:
+                    prepared_request_body = (
+                        rt.add_codex_request_breakout_logging_metadata_fn(
+                            prepared_request_body
+                        )
                     )
-                )
             oa_xai_context = (
                 await BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
                     endpoint=endpoint,
@@ -752,6 +791,29 @@ class BaseOpenAIPassThroughHandler:
                 user_api_key_dict,
                 custom_body=endpoint_custom_body,
             )
+            status_code = getattr(response, "status_code", None)
+            if (
+                isinstance(status_code, int)
+                and 200 <= status_code < 300
+                and canonical_managed_oa_xai_request_body is not None
+                and rt.is_openai_responses_endpoint_fn(endpoint)
+            ):
+                provider_bound_body = (
+                    endpoint_custom_body
+                    if isinstance(endpoint_custom_body, dict)
+                    else {}
+                )
+                response = await rt.validate_codex_auto_agent_responses_payload_fn(
+                    response,
+                    adapter_model=str(
+                        provider_bound_body.get("model")
+                        or canonical_managed_oa_xai_request_body.get("model")
+                        or "unknown-model"
+                    ),
+                    adapter="direct_managed_xai_responses",
+                    adapter_label="xAI OAuth",
+                    request_body=canonical_managed_oa_xai_request_body,
+                )
         except Exception:
             await _sa.finalize_session_owner_lease_on_failure(session_owner_lease)
             raise
@@ -936,7 +998,22 @@ def build_runtime_from_host() -> OpenAIPassThroughHandlerRuntime:
         try_dispatch_codex_request_fn=_late_bound_callback(
             _host, "llm_passthrough_endpoints", "try_dispatch_codex_request"
         ),
+        validate_codex_auto_agent_responses_payload_fn=_late_bound_callback(
+            _host,
+            "llm_passthrough_endpoints",
+            "_validate_codex_auto_agent_responses_payload",
+        ),
         is_assistants_api_request_fn=_late_bound_callback(
             RouteChecks, "RouteChecks", "_is_assistants_api_request"
+        ),
+        adapt_codex_custom_tools_to_functions_fn=_late_bound_callback(
+            _host,
+            "llm_passthrough_endpoints",
+            "_adapt_codex_custom_tools_to_functions_from_request_body",
+        ),
+        adapt_codex_namespace_tools_to_functions_fn=_late_bound_callback(
+            _host,
+            "llm_passthrough_endpoints",
+            "_adapt_codex_namespace_tools_to_functions_from_request_body",
         ),
     )

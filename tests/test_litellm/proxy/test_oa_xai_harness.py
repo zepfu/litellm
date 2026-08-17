@@ -235,6 +235,111 @@ def test_xai_route_descriptors_keep_unknown_managed_policy_and_native_boundary()
     assert oauth.normalize_grok_native_oauth_model("xai/grok-future") is None
 
 
+def test_direct_oa_xai_uses_existing_flatten_patch_and_sanitize_helpers():
+    from litellm.proxy.pass_through_endpoints import (
+        llm_passthrough_endpoints as lpe,
+    )
+
+    collaboration_names = [
+        "followup_task",
+        "interrupt_agent",
+        "list_agents",
+        "send_message",
+        "spawn_agent",
+        "wait_agent",
+    ]
+    body = {
+        "model": "oa_xai/grok-4.6",
+        "tools": [
+            {
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch.",
+                "format": {
+                    "type": "grammar",
+                    "syntax": "lark",
+                    "definition": "start: /.+/",
+                },
+            },
+            {
+                "type": "namespace",
+                "name": "collaboration",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": name,
+                        "description": (
+                            "Only use spawn_agent if and only if the user "
+                            "explicitly asks for sub-agents, delegation, or "
+                            "parallel agent work."
+                            if name == "spawn_agent"
+                            else f"{name} description"
+                        ),
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                (
+                                    "message"
+                                    if name == "spawn_agent"
+                                    else f"{name}_value"
+                                ): {"type": "string"}
+                            },
+                        },
+                    }
+                    for name in collaboration_names
+                ],
+            },
+            {"type": "tool_search", "name": "tool_search"},
+        ],
+        "reasoning_effort": "high",
+        "input": [
+            {"type": "message", "role": "user", "content": "inspect"},
+            {"type": "reasoning", "id": "rs_drop", "summary": []},
+        ],
+    }
+
+    assert lpe._is_oa_xai_request_body(body) is True
+    assert lpe._is_grok_native_oauth_request_body(body) is False
+    prepared, _ = lpe._adapt_codex_custom_tools_to_functions_from_request_body(
+        body
+    )
+    prepared, _ = lpe._adapt_codex_namespace_tools_to_functions_from_request_body(
+        prepared
+    )
+    prepared, _ = lpe._apply_codex_tool_description_patches_to_request_body(
+        prepared
+    )
+    prepared, _ = lpe._drop_unsupported_codex_hosted_tools_from_request_body(
+        prepared
+    )
+    prepared, _ = lpe._drop_unsupported_codex_request_params_from_request_body(
+        prepared
+    )
+    prepared, _ = lpe._drop_unsupported_codex_input_items_from_request_body(
+        prepared
+    )
+
+    assert [tool["name"] for tool in prepared["tools"]] == [
+        "apply_patch",
+        *collaboration_names,
+    ]
+    assert all(tool["type"] == "function" for tool in prepared["tools"])
+    assert "reasoning_effort" not in prepared
+    assert prepared["input"] == [
+        {"type": "message", "role": "user", "content": "inspect"}
+    ]
+    spawn_tool = next(
+        tool for tool in prepared["tools"] if tool["name"] == "spawn_agent"
+    )
+    assert "Use subagents to parallelize independent work" in (
+        spawn_tool["description"]
+    )
+    assert "Only use spawn_agent if and only if" not in spawn_tool["description"]
+    assert {"agent_type", "model", "fork_turns", "message"}.issubset(
+        spawn_tool["parameters"]["properties"]
+    )
+
+
 def test_litellm_dev_grok_native_oidc_auth_is_sidecar_refreshed_read_only() -> None:
     compose_path = Path(__file__).resolve().parents[3] / "docker-compose.dev.yml"
     compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))

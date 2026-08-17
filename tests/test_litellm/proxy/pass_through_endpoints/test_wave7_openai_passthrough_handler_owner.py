@@ -23,8 +23,10 @@ from __future__ import annotations
 import ast
 import asyncio
 import dataclasses
+import json
 import sys
 from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from types import ModuleType
@@ -101,6 +103,9 @@ def _make_runtime(**overrides: Any) -> OpenAIPassThroughHandlerRuntime:
         get_request_body_fn=AsyncMock(return_value={}),
         create_pass_through_route_fn=MagicMock(),
         try_dispatch_codex_request_fn=AsyncMock(return_value=None),
+        validate_codex_auto_agent_responses_payload_fn=AsyncMock(
+            side_effect=lambda response, **kwargs: response
+        ),
         is_assistants_api_request_fn=lambda req: False,
     )
     defaults.update(overrides)
@@ -147,6 +152,12 @@ def _synthetic_host() -> ModuleType:
             }
         ),
         "_add_route_family_logging_metadata": lambda body, family: body,
+        "_adapt_codex_custom_tools_to_functions_from_request_body": (
+            lambda body: (body, [])
+        ),
+        "_adapt_codex_namespace_tools_to_functions_from_request_body": (
+            lambda body: (body, [])
+        ),
         "_apply_codex_tool_description_patches_to_request_body": (
             lambda body: (body, [])
         ),
@@ -174,6 +185,9 @@ def _synthetic_host() -> ModuleType:
             return_value=AsyncMock(return_value="synthetic-response")
         ),
         "try_dispatch_codex_request": AsyncMock(return_value=None),
+        "_validate_codex_auto_agent_responses_payload": AsyncMock(
+            side_effect=lambda response, **kwargs: response
+        ),
     }
     for name, callback in callbacks.items():
         setattr(host, name, callback)
@@ -233,6 +247,8 @@ class TestRuntimeDataclass:
             "resolve_codex_auto_agent_alias_model_fn",
             "resolve_auto_agent_alias_route_host_attribution_fn",
             "add_route_family_logging_metadata_fn",
+            "adapt_codex_custom_tools_to_functions_fn",
+            "adapt_codex_namespace_tools_to_functions_fn",
             "apply_codex_tool_description_patches_fn",
             "drop_unsupported_codex_hosted_tools_fn",
             "drop_unsupported_codex_request_params_fn",
@@ -246,6 +262,7 @@ class TestRuntimeDataclass:
             "get_request_body_fn",
             "create_pass_through_route_fn",
             "try_dispatch_codex_request_fn",
+            "validate_codex_auto_agent_responses_payload_fn",
             "is_assistants_api_request_fn",
         }
         assert names == expected
@@ -614,8 +631,174 @@ class TestBaseHandlerDispatch:
             "Bearer xai-key"
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_direct_managed_oa_xai_restores_canonical_namespace_and_ids(
+        self,
+        stream: bool,
+    ):
+        from fastapi.responses import Response, StreamingResponse
+        from litellm.proxy.pass_through_endpoints import (
+            llm_passthrough_endpoints as lpe,
+        )
+
+        item_id = "fc_685c42deefc0819a822b6936faaa30be0c76bc1491ab6619"
+        call_id = "call_direct_oa_xai_spawn"
+        request_body = {
+            "model": "oa_xai/grok-4.6",
+            "stream": stream,
+            "previous_response_id": "resp_direct_oa_xai_continuation",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "spawn_agent",
+                            "description": "Spawn an agent.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {
+                                    "message": {"type": "string"}
+                                },
+                            },
+                        }
+                    ],
+                }
+            ],
+            "input": [
+                {
+                    "type": "function_call",
+                    "id": "fc_direct_continuation",
+                    "call_id": "call_direct_continuation",
+                    "namespace": "collaboration",
+                    "name": "spawn_agent",
+                    "arguments": '{"message":"continue"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "fco_direct_continuation",
+                    "call_id": "call_direct_continuation",
+                    "output": "continued",
+                },
+            ],
+        }
+        canonical_snapshot = deepcopy(request_body)
+        response_body = {
+            "id": "resp_direct_oa_xai_result",
+            "status": "completed",
+            "model": "xai/grok-4.6",
+            "output": [
+                {
+                    "type": "function_call",
+                    "id": item_id,
+                    "call_id": call_id,
+                    "name": "spawn_agent",
+                    "arguments": '{"message":"inspect"}',
+                }
+            ],
+        }
+        if stream:
+            upstream_response = StreamingResponse(
+                lpe._responses_sse_from_repaired_response_body(response_body),
+                media_type="text/event-stream",
+            )
+        else:
+            upstream_response = Response(
+                content=json.dumps(response_body),
+                media_type="application/json",
+            )
+        endpoint_func = AsyncMock(return_value=upstream_response)
+
+        async def prepare_managed_xai(body, **kwargs):
+            body["model"] = "xai/grok-4.6"
+            return True, "https://api.x.ai", "xai-key"
+
+        install_runtime(
+            _make_runtime(
+                get_request_body_fn=AsyncMock(return_value=request_body),
+                is_oa_xai_request_body_fn=lambda body: True,
+                adapt_codex_custom_tools_to_functions_fn=(
+                    lpe._adapt_codex_custom_tools_to_functions_from_request_body
+                ),
+                adapt_codex_namespace_tools_to_functions_fn=(
+                    lpe._adapt_codex_namespace_tools_to_functions_from_request_body
+                ),
+                apply_codex_tool_description_patches_fn=(
+                    lpe._apply_codex_tool_description_patches_to_request_body
+                ),
+                drop_unsupported_codex_hosted_tools_fn=(
+                    lpe._drop_unsupported_codex_hosted_tools_from_request_body
+                ),
+                drop_unsupported_codex_request_params_fn=(
+                    lpe._drop_unsupported_codex_request_params_from_request_body
+                ),
+                drop_unsupported_codex_input_items_fn=(
+                    lpe._drop_unsupported_codex_input_items_from_request_body
+                ),
+                prepare_oa_xai_passthrough_request_fn=prepare_managed_xai,
+                to_xai_native_passthrough_model_fn=(
+                    lpe._to_xai_native_passthrough_model
+                ),
+                create_pass_through_route_fn=MagicMock(
+                    return_value=endpoint_func
+                ),
+                validate_codex_auto_agent_responses_payload_fn=(
+                    lpe._validate_codex_auto_agent_responses_payload
+                ),
+            )
+        )
+
+        result = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+            endpoint="/v1/responses",
+            request=_fake_request("POST"),
+            fastapi_response=MagicMock(),
+            user_api_key_dict=MagicMock(),
+            base_target_url="https://api.openai.com",
+            api_key="sk-test",
+            custom_llm_provider=litellm.LlmProviders.OPENAI,
+        )
+
+        assert request_body == canonical_snapshot
+        provider_body = endpoint_func.await_args.kwargs["custom_body"]
+        assert provider_body["model"] == "grok-4.6"
+        assert provider_body["tools"][0]["type"] == "function"
+        assert provider_body["tools"][0]["name"] == "spawn_agent"
+        assert "namespace" not in provider_body["input"][0]
+        assert provider_body["input"][0]["id"] == "fc_direct_continuation"
+        assert provider_body["input"][0]["call_id"] == "call_direct_continuation"
+        assert provider_body["input"][1] == canonical_snapshot["input"][1]
+
+        if isinstance(result, StreamingResponse):
+            chunks = [chunk async for chunk in result.body_iterator]
+            rendered = "".join(
+                chunk.decode() if isinstance(chunk, bytes) else str(chunk)
+                for chunk in chunks
+            )
+            payloads = [
+                json.loads(line.removeprefix("data: "))
+                for line in rendered.splitlines()
+                if line.startswith("data: {")
+            ]
+            restored_item = next(
+                payload["item"]
+                for payload in payloads
+                if isinstance(payload.get("item"), dict)
+                and payload["item"].get("type") == "function_call"
+            )
+        else:
+            restored_item = json.loads(result.body)["output"][0]
+
+        assert restored_item["namespace"] == "collaboration"
+        assert restored_item["id"] == item_id
+        assert restored_item["call_id"] == call_id
+
     def test_grok_responses_has_priority_over_codex_dispatch(self):
         dispatch = AsyncMock(return_value=MagicMock())
+        adapt_custom = MagicMock(side_effect=lambda body: (body, []))
+        adapt_namespace = MagicMock(side_effect=lambda body: (body, []))
+        validate_response = AsyncMock(side_effect=lambda response, **kwargs: response)
         endpoint_func = AsyncMock(return_value="grok-ok")
         create_fn = MagicMock(return_value=endpoint_func)
         install_runtime(
@@ -629,6 +812,9 @@ class TestBaseHandlerDispatch:
                         {"model": "grok-native"},
                     )
                 ),
+                adapt_codex_custom_tools_to_functions_fn=adapt_custom,
+                adapt_codex_namespace_tools_to_functions_fn=adapt_namespace,
+                validate_codex_auto_agent_responses_payload_fn=validate_response,
                 try_dispatch_codex_request_fn=dispatch,
                 create_pass_through_route_fn=create_fn,
             )
@@ -656,6 +842,9 @@ class TestBaseHandlerDispatch:
         )
         assert route_kwargs["custom_headers"] == {"x-grok-auth": "oauth"}
         assert route_kwargs["egress_credential_family"] == "xai"
+        adapt_custom.assert_not_called()
+        adapt_namespace.assert_not_called()
+        validate_response.assert_not_awaited()
         endpoint_func.assert_awaited_once()
         assert endpoint_func.await_args.kwargs["custom_body"] == {
             "model": "grok-native"
@@ -736,6 +925,8 @@ class TestBaseHandlerDispatch:
                 add_route_family_logging_metadata_fn=(
                     lambda body, family: events.append("route") or body
                 ),
+                adapt_codex_custom_tools_to_functions_fn=_step("custom"),
+                adapt_codex_namespace_tools_to_functions_fn=_step("namespace"),
                 apply_codex_tool_description_patches_fn=_step("patch"),
                 drop_unsupported_codex_hosted_tools_fn=_step("hosted"),
                 drop_unsupported_codex_request_params_fn=_step("params"),
@@ -767,12 +958,14 @@ class TestBaseHandlerDispatch:
 
         assert result is dispatch_result
         assert events == [
+            "is_oa",
             "route",
+            "custom",
+            "namespace",
             "patch",
             "hosted",
             "params",
             "input",
-            "is_oa",
             "tool_choice",
             "breakout",
         ]

@@ -210,6 +210,7 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "aawm_tool_definition_captured_count",
     "aawm_tool_definition_sources",
     "aawm_tool_definition_names",
+    "aawm_passthrough_provider_bound_function_tool_names",
     "aawm_tool_definition_types",
     "aawm_tool_definition_snapshot_hash",
     "aawm_tool_definition_snapshot_truncated",

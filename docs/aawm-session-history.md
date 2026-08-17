@@ -2011,6 +2011,9 @@ Compact metadata may include:
 - `aawm_tool_definition_sources`: request fields that contributed definitions,
   such as `["tools"]` or `["functions"]`.
 - `aawm_tool_definition_names`: bounded list of advertised tool/function names.
+- `aawm_passthrough_provider_bound_function_tool_names`: bounded list of
+  provider-bound function tool names observed at egress. This is egress proof
+  and is distinct from the ingress `aawm_tool_definition_names` list.
 - `aawm_tool_definition_types`: bounded list of advertised tool/function types.
 - `aawm_tool_definition_snapshot_hash`: SHA-256 hash of the sanitized snapshot.
 - `aawm_tool_definition_snapshot_truncated`: `true` when the captured snapshot
@@ -2295,6 +2298,12 @@ xAI/Grok sanitizer decodes it back to the original upstream response id before
 egress. The encoded id is only for LiteLLM deployment affinity; xAI and Grok
 must receive the raw upstream id, otherwise compacted continuations can fail
 with provider errors such as `Could not decode the compaction blob`.
+
+For managed `oa_xai`/`sota-xai` flows only, Grok 4.6 collaboration namespace
+children are flattened into provider-bound function tools and sanitized before
+egress. The resulting function calls and results are restored to stock Codex
+collaboration tool calls and results, preserving continuation IDs. Native Grok
+flows remain separate and unchanged.
 
 For AAWM Codex aliases, hosted-tool support is evaluated again after the alias
 has selected a concrete xAI/Grok candidate such as `grok-composer-2.5-fast` or

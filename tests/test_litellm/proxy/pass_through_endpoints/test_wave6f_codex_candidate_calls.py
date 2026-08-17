@@ -7,9 +7,11 @@ success/failure/stream behavior, callback ordering, and absence of god import.
 from __future__ import annotations
 
 import ast
+import copy
 import inspect
 import json
 import pathlib
+from copy import deepcopy
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -31,6 +33,7 @@ EXPECTED_PUBLIC_SYMBOLS = frozenset(
         "_perform_codex_auto_agent_native_openai_request",
         "_perform_codex_auto_agent_grok_native_responses_request",
         "_perform_codex_auto_agent_oa_xai_responses_request",
+        "_bind_responses_stream_timeout_terminalizer",
         "_validate_codex_auto_agent_openrouter_responses_stream",
         "_perform_codex_auto_agent_openrouter_responses_request",
         "_perform_codex_auto_agent_openrouter_completion_request",
@@ -80,7 +83,7 @@ class TestSymbolInventory:
                 callable(getattr(codex_candidate_calls, name))
                 for name in codex_candidate_calls._HOST_FUNCTION_NAMES
             )
-            == 25
+            == 26
         )
 
 
@@ -364,6 +367,333 @@ class TestCallbackOrdering:
         assert emit_kwargs["request_body"]["model"] == "alibaba-alias"
         assert emit_kwargs["provider_bound_body"] is completion_kwargs
         assert emit_kwargs["provider_bound_body"]["reasoning_effort"] == "low"
+
+
+class TestSotaXaiCandidateToolAdaptation:
+    _MODEL = "oa_xai/grok-4.6"
+    _COLLABORATION_NAMES = [
+        "followup_task",
+        "interrupt_agent",
+        "list_agents",
+        "send_message",
+        "spawn_agent",
+        "wait_agent",
+    ]
+    _ITEM_ID = "fc_685c42deefc0819a822b6936faaa30be0c76bc1491ab6619"
+    _CALL_ID = "call_sota_xai_spawn"
+
+    @classmethod
+    def _request_body(cls, *, stream: bool) -> dict[str, Any]:
+        collaboration_tools = []
+        for name in cls._COLLABORATION_NAMES:
+            collaboration_tools.append(
+                {
+                    "type": "function",
+                    "name": name,
+                    "description": (
+                        "Only use spawn_agent if and only if the user explicitly "
+                        "asks for sub-agents, delegation, or parallel agent work."
+                        if name == "spawn_agent"
+                        else f"{name} description"
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            (
+                                "message" if name == "spawn_agent" else f"{name}_value"
+                            ): {"type": "string"}
+                        },
+                    },
+                }
+            )
+        return {
+            "model": cls._MODEL,
+            "stream": stream,
+            "previous_response_id": "resp_sota_xai_continuation",
+            "litellm_metadata": {"model_alias": "sota-xai"},
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "apply_patch",
+                    "description": "Apply a patch.",
+                    "format": {
+                        "type": "grammar",
+                        "syntax": "lark",
+                        "definition": "start: /.+/",
+                    },
+                },
+                {
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "tools": collaboration_tools,
+                },
+                {"type": "tool_search", "name": "tool_search"},
+            ],
+            "reasoning_effort": "high",
+            "input": [
+                {"type": "reasoning", "id": "rs_sota_xai_drop", "summary": []},
+                {
+                    "type": "function_call",
+                    "id": "fc_continuation_input",
+                    "call_id": "call_continuation_input",
+                    "namespace": "collaboration",
+                    "name": "send_message",
+                    "arguments": '{"send_message_value":"continue"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "id": "fco_continuation_input",
+                    "call_id": "call_continuation_input",
+                    "output": "continued",
+                },
+            ],
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stream", [False, True])
+    async def test_candidate_flattens_patches_and_restores_canonical_ids(  # noqa: PLR0915
+        self,
+        stream: bool,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        from fastapi.responses import Response, StreamingResponse
+        from litellm.llms.xai import oauth
+        from litellm.proxy.pass_through_endpoints import (
+            llm_passthrough_endpoints as lpe,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_passthrough_handler import (
+            BaseOpenAIPassThroughHandler,
+            build_runtime_from_host,
+            install_runtime,
+        )
+
+        events: list[str] = []
+        stage_bodies: dict[str, dict[str, Any]] = {}
+        prepare_input_bodies: list[dict[str, Any]] = []
+        provider_bound_bodies: list[dict[str, Any]] = []
+        validator_request_bodies: list[dict[str, Any]] = []
+        intake_request_bodies: list[dict[str, Any]] = []
+        request_body = self._request_body(stream=stream)
+        canonical_snapshot = deepcopy(request_body)
+        response_body = {
+            "id": "resp_sota_xai_result",
+            "status": "completed",
+            "model": self._MODEL,
+            "output": [
+                {
+                    "type": "function_call",
+                    "id": self._ITEM_ID,
+                    "call_id": self._CALL_ID,
+                    "name": "spawn_agent",
+                    "arguments": '{"message":"inspect"}',
+                }
+            ],
+        }
+        candidate_fn = lpe._perform_codex_auto_agent_oa_xai_responses_request
+        assert candidate_fn.__globals__ is lpe.__dict__
+        assert candidate_fn.__globals__["copy"] is copy
+        assert "deepcopy" not in candidate_fn.__globals__
+
+        install_runtime(build_runtime_from_host())
+        original_prepare = (
+            BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context
+        )
+        original_custom = (
+            lpe._adapt_codex_custom_tools_to_functions_from_request_body
+        )
+        original_namespace = (
+            lpe._adapt_codex_namespace_tools_to_functions_from_request_body
+        )
+        original_patch = (
+            lpe._apply_codex_tool_description_patches_to_request_body
+        )
+        original_validate = lpe._validate_codex_auto_agent_responses_payload
+
+        class _Handler:
+            @staticmethod
+            async def _prepare_openai_oa_xai_context(
+                *,
+                endpoint: str,
+                request_body: dict[str, Any],
+            ):
+                assert endpoint == "/v1/responses"
+                events.append("prepare")
+                prepare_input_bodies.append(deepcopy(request_body))
+                return await original_prepare(
+                    endpoint=endpoint,
+                    request_body=request_body,
+                )
+
+            @staticmethod
+            def _assemble_headers(*, api_key: str, request: Any):
+                assert api_key == "xai-token"
+                return {"authorization": "Bearer xai-token"}
+
+        async def _pass_through_request(**kwargs: Any):
+            events.append("pass")
+            provider_bound_bodies.append(deepcopy(kwargs["custom_body"]))
+            if stream:
+                return StreamingResponse(
+                    lpe._responses_sse_from_repaired_response_body(response_body),
+                    media_type="text/event-stream",
+                )
+            return Response(
+                content=json.dumps(response_body),
+                media_type="application/json",
+            )
+
+        async def _validate(response: Any, **kwargs: Any):
+            events.append("validate")
+            validator_request_bodies.append(deepcopy(kwargs["request_body"]))
+            return await original_validate(response, **kwargs)
+
+        def _intake_context(
+            request: Any,
+            body: dict[str, Any],
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            events.append("intake")
+            intake_request_bodies.append(deepcopy(body))
+            return {}
+
+        def _recording_step(name: str, callback: Any):
+            def _apply(body: dict[str, Any]):
+                events.append(name)
+                result = callback(body)
+                stage_bodies[name] = deepcopy(result[0])
+                return result
+
+            return _apply
+
+        monkeypatch.setattr(
+            lpe,
+            "_adapt_codex_custom_tools_to_functions_from_request_body",
+            _recording_step("custom", original_custom),
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_adapt_codex_namespace_tools_to_functions_from_request_body",
+            _recording_step("namespace", original_namespace),
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_apply_codex_tool_description_patches_to_request_body",
+            _recording_step("patch", original_patch),
+        )
+        monkeypatch.setattr(lpe, "BaseOpenAIPassThroughHandler", _Handler)
+        monkeypatch.setattr(lpe, "pass_through_request", _pass_through_request)
+        monkeypatch.setattr(
+            lpe,
+            "_validate_codex_auto_agent_responses_payload",
+            _validate,
+        )
+        monkeypatch.setattr(
+            lpe,
+            "_build_malformed_tool_call_intake_context",
+            _intake_context,
+        )
+        monkeypatch.setattr(
+            oauth,
+            "get_xai_oauth_access_token",
+            AsyncMock(return_value="xai-token"),
+        )
+
+        result = await candidate_fn(
+            endpoint="/v1/responses",
+            request=MagicMock(headers={}),
+            user_api_key_dict=MagicMock(),
+            request_body=request_body,
+        )
+
+        assert events == [
+            "custom",
+            "namespace",
+            "patch",
+            "prepare",
+            "pass",
+            "intake",
+            "validate",
+        ]
+        assert [tool.get("name") for tool in stage_bodies["namespace"]["tools"]] == [
+            "apply_patch",
+            *self._COLLABORATION_NAMES,
+            "tool_search",
+        ]
+        assert all(
+            tool["type"] == "function"
+            for tool in stage_bodies["namespace"]["tools"][:-1]
+        )
+        assert stage_bodies["namespace"]["tools"][-1]["type"] == "tool_search"
+        assert prepare_input_bodies == [stage_bodies["patch"]]
+
+        provider_body = provider_bound_bodies[0]
+        provider_tools = provider_body["tools"]
+        assert [tool["name"] for tool in provider_tools] == [
+            "apply_patch",
+            *self._COLLABORATION_NAMES,
+        ]
+        assert all(tool["type"] == "function" for tool in provider_tools)
+        collaboration_tools = {
+            tool["name"]: tool for tool in provider_tools if tool["name"] != "apply_patch"
+        }
+        assert set(collaboration_tools) == set(self._COLLABORATION_NAMES)
+        for name, tool in collaboration_tools.items():
+            assert isinstance(tool["description"], str)
+            assert isinstance(tool["parameters"], dict)
+            if name != "spawn_agent":
+                assert tool["description"] == f"{name} description"
+                assert f"{name}_value" in tool["parameters"]["properties"]
+        spawn_tool = collaboration_tools["spawn_agent"]
+        assert "Use subagents to parallelize independent work" in (
+            spawn_tool["description"]
+        )
+        assert "Only use spawn_agent if and only if" not in spawn_tool["description"]
+        assert {
+            "agent_type",
+            "model",
+            "fork_turns",
+            "message",
+        }.issubset(spawn_tool["parameters"]["properties"])
+        assert "reasoning_effort" not in provider_body
+        assert provider_body["model"] == "grok-4.6"
+        assert provider_body["input"][0] == {
+            "type": "function_call",
+            "id": "fc_continuation_input",
+            "call_id": "call_continuation_input",
+            "name": "send_message",
+            "arguments": '{"send_message_value":"continue"}',
+        }
+        assert provider_body["input"][1] == canonical_snapshot["input"][2]
+        assert request_body == canonical_snapshot
+        assert validator_request_bodies == [canonical_snapshot]
+        assert intake_request_bodies == [canonical_snapshot]
+        assert validator_request_bodies[0]["previous_response_id"] == (
+            "resp_sota_xai_continuation"
+        )
+
+        if isinstance(result, StreamingResponse):
+            chunks = [chunk async for chunk in result.body_iterator]
+            rendered = "".join(
+                chunk.decode() if isinstance(chunk, bytes) else str(chunk)
+                for chunk in chunks
+            )
+            payloads = [
+                json.loads(line.removeprefix("data: "))
+                for line in rendered.splitlines()
+                if line.startswith("data: {")
+            ]
+            restored_item = next(
+                payload["item"]
+                for payload in payloads
+                if isinstance(payload.get("item"), dict)
+                and payload["item"].get("type") == "function_call"
+            )
+        else:
+            restored_item = json.loads(result.body)["output"][0]
+
+        assert restored_item["namespace"] == "collaboration"
+        assert restored_item["id"] == self._ITEM_ID
+        assert restored_item["call_id"] == self._CALL_ID
 
 
 

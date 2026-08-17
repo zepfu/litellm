@@ -7,6 +7,7 @@ Do not import llm_passthrough_endpoints at module scope.
 from __future__ import annotations
 # ruff: noqa: F821 - free names resolve via host globals after install() rebind
 
+import copy
 import json
 from types import FunctionType
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
@@ -876,10 +877,23 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
     user_api_key_dict: Any,
     request_body: dict[str, Any],
 ) -> Response:
+    canonical_request_body = copy.deepcopy(request_body)
     (
         adapted_request_body,
         _adapted_custom_tools,
     ) = _adapt_codex_custom_tools_to_functions_from_request_body(request_body)
+    (
+        adapted_request_body,
+        _adapted_namespace_tools,
+    ) = _adapt_codex_namespace_tools_to_functions_from_request_body(
+        adapted_request_body
+    )
+    (
+        adapted_request_body,
+        _tool_description_patch_events,
+    ) = _apply_codex_tool_description_patches_to_request_body(
+        adapted_request_body
+    )
     try:
         oa_xai_context = await BaseOpenAIPassThroughHandler._prepare_openai_oa_xai_context(
             endpoint=endpoint,
@@ -922,17 +936,17 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         raise
     return await _validate_codex_auto_agent_responses_payload(
         response,
-        adapter_model=str(oa_xai_prepared_body.get("model") or request_body.get("model") or "unknown-model"),
+        adapter_model=str(oa_xai_prepared_body.get("model") or canonical_request_body.get("model") or "unknown-model"),
         adapter="codex_auto_agent_xai_oauth_responses",
         adapter_label="xAI OAuth",
         intake_context=_build_malformed_tool_call_intake_context(
             request,
-            request_body,
+            canonical_request_body,
             adapter="codex_auto_agent_xai_oauth_responses",
             upstream_url=str(updated_url),
             provider="xai",
         ),
-        request_body=request_body,
+        request_body=canonical_request_body,
     )
 
 

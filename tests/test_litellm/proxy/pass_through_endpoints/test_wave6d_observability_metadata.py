@@ -730,6 +730,61 @@ def test_prepare_request_body_for_passthrough_observability() -> None:
     assert "aawm_tool_definition_count" in lm
 
 
+def test_provider_bound_function_names_are_exact_allowlisted_and_persisted() -> None:
+    from litellm.integrations import aawm_agent_identity
+    from litellm.integrations.aawm_agent_identity.constants import (
+        _AAWM_SESSION_HISTORY_METADATA_KEYS,
+    )
+    from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+        _merge_passthrough_request_shape_metadata,
+    )
+
+    provider_bound_names = [
+        "apply_patch",
+        "followup_task",
+        "interrupt_agent",
+        "list_agents",
+        "send_message",
+        "spawn_agent",
+        "wait_agent",
+    ]
+    request_metadata = {
+        "aawm_tool_definition_names": [
+            "apply_patch",
+            "collaboration",
+            "tool_search",
+        ]
+    }
+
+    _merge_passthrough_request_shape_metadata(
+        request_metadata,
+        request=_FakeRequest({"content-type": "application/json"}),
+        parsed_body={
+            "tools": [
+                {"type": "custom", "name": "apply_patch"},
+                {"type": "namespace", "name": "collaboration"},
+            ]
+        },
+        provider_bound_body={
+            "tools": [
+                {"type": "function", "name": name}
+                for name in provider_bound_names
+            ]
+        },
+    )
+
+    key = "aawm_passthrough_provider_bound_function_tool_names"
+    assert request_metadata[key] == provider_bound_names
+    assert request_metadata["aawm_tool_definition_names"] != request_metadata[key]
+    assert key in _AAWM_SESSION_HISTORY_METADATA_KEYS
+    persisted_metadata = aawm_agent_identity._build_session_history_metadata(
+        metadata=request_metadata,
+        request_tags=[],
+        tenant_id=None,
+    )
+    assert persisted_metadata[key] == provider_bound_names
+
+
 def test_shared_observability_does_not_import_langfuse_identity_headers() -> None:
     request = _FakeRequest(
         {

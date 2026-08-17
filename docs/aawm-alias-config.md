@@ -149,6 +149,12 @@ caller `reasoning.effort=xhigh` is sent unchanged to `oa_xai/grok-4.6`, with
 requested/native effort metadata and the provider-native field/provider
 recorded. Its route rollup is `grok-4.6(sota-xai):xhigh`.
 
+For this managed `oa_xai`/`sota-xai` flow, Grok 4.6 collaboration namespace
+children are flattened into provider-bound function tools and sanitized before
+egress. Provider function calls and results are restored to stock Codex
+collaboration tool calls and results with continuation IDs preserved. Native
+Grok remains a separate, unchanged flow.
+
 The final candidate is mutually exclusive by originating TUI:
 
 - Claude-origin requests use native Anthropic Haiku only.
