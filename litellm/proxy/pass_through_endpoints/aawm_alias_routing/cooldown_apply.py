@@ -574,15 +574,18 @@ def resolve_lane_identity_hash(
 ) -> str:
     """Compute a secret-safe identity hash from public candidate identity.
 
-    Identity is derived from provider:model:route_family ONLY -- never from
-    lane_key or credentials.  One identity maps to multiple credential-derived
-    lane keys.  Reconstructible after process restart from the active candidate
-    enumeration without knowing any lane_key.
+    Snapshot candidates use their alias-scoped ``cooldown_identity_tag``.
+    Static candidates without that tag retain the provider:model:route_family
+    identity used by managed-account/Kimi and legacy routes.  Identity never
+    includes lane keys or credentials, so one identity can map to multiple
+    credential-derived lane keys.
     """
-    provider = str(candidate.get("provider") or "")
-    model = str(candidate.get("model") or "")
-    route_family = str(candidate.get("route_family") or "")
-    identity_input = f"{provider}:{model}:{route_family}"
+    identity_input = str(candidate.get("cooldown_identity_tag") or "")
+    if not identity_input:
+        provider = str(candidate.get("provider") or "")
+        model = str(candidate.get("model") or "")
+        route_family = str(candidate.get("route_family") or "")
+        identity_input = f"{provider}:{model}:{route_family}"
     return hashlib.sha256(identity_input.encode("utf-8")).hexdigest()
 
 

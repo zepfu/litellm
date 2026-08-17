@@ -478,7 +478,7 @@ def _get_codex_auto_agent_request_local_cooldown_key(
     return _codex_auto_agent_candidate_key(
         candidate,
         lane_key or "__default__",
-        epoch_tag=candidate.get("config_epoch_tag"),
+        cooldown_identity_tag=candidate.get("cooldown_identity_tag"),
     )
 
 
@@ -1496,9 +1496,15 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         lane_key = _CODEX_AUTO_AGENT_OPENCODE_LANE_KEY
     else:
         lane_key = openai_lane_key
-    # Snapshot-resolved candidates carry the active config epoch into state keys.
-    _epoch_tag = candidate.get("config_epoch_tag")
-    cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=_epoch_tag)
+    # Config hash remains snapshot/affinity metadata. Cooldown keys use only
+    # the stable candidate semantic identity, with no old-config-hash fallback.
+    _config_epoch_tag = candidate.get("config_epoch_tag")
+    _cooldown_identity_tag = candidate.get("cooldown_identity_tag")
+    cooldown_key = _codex_auto_agent_candidate_key(
+        candidate,
+        lane_key,
+        cooldown_identity_tag=_cooldown_identity_tag,
+    )
     (
         cooldown_seconds,
         initial_cooldown_state_source,
@@ -1584,8 +1590,8 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         "cooldown_seconds": cooldown_seconds,
         "cooldown_state_source": cooldown_state_source,
     }
-    if _epoch_tag is not None:
-        state["config_epoch_tag"] = _epoch_tag
+    if _config_epoch_tag is not None:
+        state["config_epoch_tag"] = _config_epoch_tag
     if skip_reason is not None:
         state["skip_reason"] = skip_reason
     if failure_phase is not None:
@@ -2221,8 +2227,13 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         lane_key = anthropic_lane_key
     else:
         lane_key = openai_lane_key
-    _epoch_tag = candidate.get("config_epoch_tag")
-    cooldown_key = _codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=_epoch_tag)
+    _config_epoch_tag = candidate.get("config_epoch_tag")
+    _cooldown_identity_tag = candidate.get("cooldown_identity_tag")
+    cooldown_key = _codex_auto_agent_candidate_key(
+        candidate,
+        lane_key,
+        cooldown_identity_tag=_cooldown_identity_tag,
+    )
     (
         cooldown_seconds,
         initial_cooldown_state_source,
@@ -2306,8 +2317,8 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         "cooldown_seconds": cooldown_seconds,
         "cooldown_state_source": cooldown_state_source,
     }
-    if _epoch_tag is not None:
-        state["config_epoch_tag"] = _epoch_tag
+    if _config_epoch_tag is not None:
+        state["config_epoch_tag"] = _config_epoch_tag
     if skip_reason is not None:
         state["skip_reason"] = skip_reason
     if failure_phase is not None:

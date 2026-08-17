@@ -550,6 +550,7 @@ def _resolve_target_from_active_snapshot(
                 "provider": cand["provider"],
                 "model": cand["model"],
                 "route_family": rf,
+                "cooldown_identity_tag": cand.get("cooldown_identity_tag"),
             }
             distinct_identities.add(
                 resolve_lane_identity_hash(candidate=cand_dict)
@@ -576,6 +577,7 @@ def _resolve_target_from_active_snapshot(
             "provider": cand["provider"],
             "model": cand["model"],
             "route_family": rf,
+            "cooldown_identity_tag": cand.get("cooldown_identity_tag"),
         }
         id_hash = resolve_lane_identity_hash(candidate=cand_dict)
         if id_hash in seen_hashes:

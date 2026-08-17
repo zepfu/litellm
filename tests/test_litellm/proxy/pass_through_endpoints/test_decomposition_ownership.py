@@ -707,14 +707,22 @@ class TestLaneKeysParity:
         key = lpe._codex_auto_agent_candidate_key(candidate, "")
         assert key == "anthropic:claude-3:__default__"
 
-    def test_candidate_key_with_epoch_tag(self):
+    def test_candidate_key_with_cooldown_identity_tag(self):
         candidate = {"provider": "openai", "model": "gpt-4o"}
-        key = lpe._codex_auto_agent_candidate_key(candidate, "lane-1", epoch_tag="abc123")
-        assert key == "habc123:openai:gpt-4o:lane-1"
+        key = lpe._codex_auto_agent_candidate_key(
+            candidate,
+            "lane-1",
+            cooldown_identity_tag="alias:basic:openai:gpt-4o:codex",
+        )
+        assert key == "halias:basic:openai:gpt-4o:codex:openai:gpt-4o:lane-1"
 
-    def test_candidate_key_none_epoch_tag(self):
+    def test_candidate_key_none_cooldown_identity_tag(self):
         candidate = {"provider": "openai", "model": "gpt-4o"}
-        key = lpe._codex_auto_agent_candidate_key(candidate, "lane-1", epoch_tag=None)
+        key = lpe._codex_auto_agent_candidate_key(
+            candidate,
+            "lane-1",
+            cooldown_identity_tag=None,
+        )
         assert key == "openai:gpt-4o:lane-1"
 
     def test_resolve_xai_lane_key_oauth(self):

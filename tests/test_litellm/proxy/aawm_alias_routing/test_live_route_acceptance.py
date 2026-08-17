@@ -35,7 +35,6 @@ values.
 from __future__ import annotations
 
 import asyncio
-import inspect
 from types import SimpleNamespace
 from typing import Any, Callable, Optional, Sequence
 from unittest.mock import AsyncMock, MagicMock
@@ -195,7 +194,7 @@ def _lane_key_for_model(model: str) -> str:
     return lane_keys._codex_auto_agent_candidate_key(
         candidate,
         lane_key,
-        epoch_tag=candidate.get("config_epoch_tag"),
+        cooldown_identity_tag=candidate.get("cooldown_identity_tag"),
     )
 
 
@@ -1355,13 +1354,13 @@ aliases:
 
 
 # ===========================================================================
-# Wave 3: R3-4 -- semantic-digest cooldown epochs + continuation-safe affinity
+# Wave 3: R3-4 -- stable cooldown identity + continuation-safe affinity
 # ===========================================================================
 
 _REFRESH_PATH = "/aawm/alias-config/refresh"
 
 
-async def test_snapshot_epoch_tag_is_scoped_to_resolved_alias_candidates() -> None:
+async def test_snapshot_config_hash_and_cooldown_identity_are_scoped_separately() -> None:
     snapshot = compiler.compile_yaml(
         """
 defaults: {}
@@ -1398,6 +1397,13 @@ aliases:
     ]
     assert basic[0]["config_epoch_tag"] == snapshot.config_hash
     assert other[0]["config_epoch_tag"] == snapshot.config_hash
+    assert basic[0]["cooldown_identity_tag"] == (
+        "alias:basic:opencode_zen:shared-model:codex_opencode_zen_adapter"
+    )
+    assert other[0]["cooldown_identity_tag"] == (
+        "alias:other:openrouter:shared-model:"
+        "codex_openrouter_completion_adapter"
+    )
 
 
 async def test_snapshot_selection_exposes_top_level_config_epoch_tag() -> None:
@@ -1429,6 +1435,10 @@ aliases:
 
     assert selection_result["config_epoch_tag"] == snapshot.config_hash
     assert typed_selection.config_epoch_tag == snapshot.config_hash
+    assert selection_result["candidate"]["cooldown_identity_tag"] == (
+        "alias:basic:openrouter:tagged-selection:"
+        "codex_openrouter_completion_adapter"
+    )
 
 
 class _ASGIClient:
@@ -1455,33 +1465,67 @@ async def _post_refresh(client: _ASGIClient, yaml_str: str) -> httpx.Response:
     return await client.post(_REFRESH_PATH, json={"yaml": yaml_str})
 
 
-def _wave3_epoch_keys_enabled() -> bool:
-    return "epoch_tag" in inspect.signature(
-        lane_keys._codex_auto_agent_candidate_key
-    ).parameters
+def _bypass_session_owner_for_cooldown_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep this cooldown test independent of the durable owner subsystem."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity,
+    )
+
+    async def _get_unowned_session_owner_record(**_kwargs: Any) -> tuple[None, None, None]:
+        return None, None, None
+
+    async def _allow_unowned_session_owner(
+        *,
+        session_identity: Optional[str] = None,
+        **_kwargs: Any,
+    ) -> Any:
+        return session_affinity.SessionOwnerGuardResult(
+            decision=session_affinity.SessionOwnerGuardDecision.NO_SESSION,
+            session_identity=session_identity,
+        )
+
+    monkeypatch.setattr(
+        session_affinity,
+        "get_session_owner_record",
+        _get_unowned_session_owner_record,
+    )
+    monkeypatch.setattr(
+        session_affinity,
+        "ensure_session_owner_guard_for_request",
+        _allow_unowned_session_owner,
+    )
 
 
 def _snapshot_candidate_key(
     snapshot: Any,
     model: str,
     *,
-    provider: str = "openrouter",
+    alias_name: str = "basic",
+    provider: Optional[str] = "openrouter",
     lane_key: str = policy.CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY,
 ) -> str:
-    candidate = {
-        "provider": provider,
-        "model": model,
-        "route_family": "codex_openrouter_completion_adapter",
-        "last_resort": False,
-    }
-    if not _wave3_epoch_keys_enabled():
-        return lane_keys._codex_auto_agent_candidate_key(candidate, lane_key)
-
-    expected = f"h{snapshot.config_hash}:{provider}:{model}:{lane_key}"
+    assert snapshot_select.get_active_routing_snapshot() is snapshot
+    candidate = next(
+        candidate
+        for candidate in snapshot_select._select_snapshot_candidates(
+            alias_name,
+            ingress="codex",
+        )
+        if candidate["model"] == model
+        and (provider is None or candidate["provider"] == provider)
+    )
+    assert candidate["config_epoch_tag"] == snapshot.config_hash
+    cooldown_identity_tag = candidate["cooldown_identity_tag"]
+    expected = (
+        f"h{cooldown_identity_tag}:{candidate['provider']}:"
+        f"{candidate['model']}:{lane_key}"
+    )
     actual = lane_keys._codex_auto_agent_candidate_key(
         candidate,
         lane_key,
-        epoch_tag=snapshot.config_hash,
+        cooldown_identity_tag=cooldown_identity_tag,
     )
     assert actual == expected
     return actual
@@ -1578,7 +1622,7 @@ aliases:
 
 
 # ---------------------------------------------------------------------------
-# (R3-4, scenario d1) changed refresh invalidates cooldown for reused identity
+# (CFG-019, scenario d1) priority refresh preserves cooldown for reused identity
 # ---------------------------------------------------------------------------
 
 _D1_SNAPSHOT_A = """
@@ -1612,15 +1656,16 @@ aliases:
 """
 
 
-async def test_scenario_d1_changed_refresh_invalidates_cooldown_for_reused_identity() -> None:
-    """R3-4 RED pre-fix: activate snapshot A (2 candidates); structured-429
-    the leader (cools its epoch-tagged key); verify a second request selects
-    the fallback; POST snapshot B reusing BOTH identities with changed
-    priority (different config_hash); third request must select the leader
-    again and the upstream stub must observe a FRESH probe.
+async def test_scenario_d1_priority_refresh_preserves_cooldown_for_reused_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A priority-only refresh changes ``config_hash`` but not cooldown identity.
 
-    Pre-fix failure: bare-key cooldown persists across the swap; third request
-    still selects fallback."""
+    After the leader cools under snapshot A, snapshot B reuses its alias,
+    provider, model, resolved route semantics, and lane. The third request
+    must still select the fallback rather than re-probe the cooled leader.
+    """
+    _bypass_session_owner_for_cooldown_contract(monkeypatch)
     client = _refresh_client()
 
     # Activate snapshot A
@@ -1668,7 +1713,7 @@ async def test_scenario_d1_changed_refresh_invalidates_cooldown_for_reused_ident
             f"expected fallback while leader cools, got {calls!r}"
         )
 
-        # Activate snapshot B (changed priority -> different config_hash)
+        # Activate snapshot B (changed priority -> different config_hash).
         resp_b = await _post_refresh(client, _D1_SNAPSHOT_B)
         assert resp_b.status_code == 200
         assert resp_b.json()["changed"] is True
@@ -1677,31 +1722,160 @@ async def test_scenario_d1_changed_refresh_invalidates_cooldown_for_reused_ident
         assert snapshot_b is not None
         leader_key_b = _snapshot_candidate_key(snapshot_b, "d1-leader")
 
-        # Stop failing the leader
+        # If the stable cooldown identity were wrong, a fresh probe would now
+        # succeed and expose the regression.
         fail_leader = False
 
-        # Request 3: epoch-tagged key invalidated -> leader selected again
+        # Request 3: priority did not change candidate semantics, so the
+        # existing leader cooldown survives and fallback remains selected.
         calls.clear()
         result3 = await _drive_wrapper(session_id="d1-session-3")
         assert isinstance(result3, Response)
-        assert calls == ["d1-leader"], (
-            "R3-4: after a changed refresh, the epoch-tagged cooldown key must "
-            "differ from the old snapshot's key, so the leader must be probed "
-            f"again (fresh probe). Got calls={calls!r}. Pre-fix: bare-key "
-            "cooldown persists across the swap."
+        assert calls == ["d1-fallback"], (
+            "CFG-019: a priority-only refresh must preserve the leader "
+            f"cooldown. Got calls={calls!r}."
         )
-        assert leader_key_b != leader_key_a
+        assert leader_key_b == leader_key_a
         assert alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(
-            leader_key_a
+            leader_key_b
         ) > 0
-        assert (
-            alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(
-                leader_key_b
-            )
-            == 0.0
-        )
     finally:
         restore()
+
+
+@pytest.mark.parametrize(
+    (
+        "change",
+        "provider_a",
+        "model_a",
+        "route_family_a",
+        "provider_b",
+        "model_b",
+        "route_family_b",
+    ),
+    [
+        (
+            "provider",
+            "openrouter",
+            "semantic-model",
+            "codex_openrouter_completion_adapter",
+            "opencode_zen",
+            "semantic-model",
+            "codex_opencode_zen_adapter",
+        ),
+        (
+            "model",
+            "openrouter",
+            "semantic-model-a",
+            "codex_openrouter_completion_adapter",
+            "openrouter",
+            "semantic-model-b",
+            "codex_openrouter_completion_adapter",
+        ),
+        (
+            "resolved route semantics",
+            "openrouter",
+            "semantic-model",
+            "codex_openrouter_completion_adapter",
+            "openrouter",
+            "semantic-model",
+            "codex_responses",
+        ),
+    ],
+)
+async def test_candidate_semantic_change_invalidates_only_its_cooldown_identity(
+    change: str,
+    provider_a: str,
+    model_a: str,
+    route_family_a: str,
+    provider_b: str,
+    model_b: str,
+    route_family_b: str,
+) -> None:
+    snapshot_a = compiler.compile_yaml(
+        f"""
+defaults: {{}}
+aliases:
+  - name: basic
+    candidates:
+      - provider: {provider_a}
+        model: {model_a}
+        route_family: {route_family_a}
+        priority: 100
+"""
+    )
+    snapshot_select.set_active_routing_snapshot(snapshot_a)
+    key_a = _snapshot_candidate_key(
+        snapshot_a,
+        model_a,
+        provider=provider_a,
+        lane_key="semantic-lane",
+    )
+    await cooldown_state._set_codex_auto_agent_cooldown(key_a, 60.0)
+    assert alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(key_a) > 0
+
+    snapshot_b = compiler.compile_yaml(
+        f"""
+defaults: {{}}
+aliases:
+  - name: basic
+    candidates:
+      - provider: {provider_b}
+        model: {model_b}
+        route_family: {route_family_b}
+        priority: 100
+"""
+    )
+    snapshot_select.set_active_routing_snapshot(snapshot_b)
+    key_b = _snapshot_candidate_key(
+        snapshot_b,
+        model_b,
+        provider=provider_b,
+        lane_key="semantic-lane",
+    )
+
+    assert snapshot_b.config_hash != snapshot_a.config_hash
+    assert key_b != key_a, f"{change} change must rotate cooldown identity"
+    assert alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(key_b) == 0.0
+
+
+async def test_same_candidate_in_distinct_aliases_has_isolated_cooldown_identity() -> None:
+    snapshot = compiler.compile_yaml(
+        """
+defaults: {}
+aliases:
+  - name: basic
+    candidates:
+      - provider: openrouter
+        model: shared-alias-model
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+  - name: other
+    candidates:
+      - provider: openrouter
+        model: shared-alias-model
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+"""
+    )
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    basic_key = _snapshot_candidate_key(
+        snapshot,
+        "shared-alias-model",
+        alias_name="basic",
+        lane_key="shared-lane",
+    )
+    other_key = _snapshot_candidate_key(
+        snapshot,
+        "shared-alias-model",
+        alias_name="other",
+        lane_key="shared-lane",
+    )
+
+    assert basic_key != other_key
+    await cooldown_state._set_codex_auto_agent_cooldown(basic_key, 60.0)
+    assert alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(basic_key) > 0
+    assert alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(other_key) == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1709,11 +1883,13 @@ async def test_scenario_d1_changed_refresh_invalidates_cooldown_for_reused_ident
 # ---------------------------------------------------------------------------
 
 
-async def test_scenario_d2_noop_refresh_retains_cooldown() -> None:
-    """Regression pin (passes pre-fix): after a failure under snapshot A,
-    re-POST IDENTICAL YAML (changed=False, same snapshot object); assert the
-    cooldown REMAINS (same semantic config_hash -> same tag -> same key).
-    Guards against counter-based epoch implementations that bump on no-op."""
+async def test_scenario_d2_noop_refresh_retains_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression pin: after a failure under snapshot A, re-POST IDENTICAL
+    YAML (changed=False, same snapshot object); assert the cooldown remains
+    because the candidate's stable identity and key are unchanged."""
+    _bypass_session_owner_for_cooldown_contract(monkeypatch)
     client = _refresh_client()
 
     yaml_str = """
@@ -1774,8 +1950,8 @@ aliases:
     # Cooldown must REMAIN
     remaining_after = alias_state.alias_routing_state.codex.get_memory_cooldown_remaining(leader_key)
     assert remaining_after > 0, (
-        "no-op refresh must not invalidate the cooldown (same semantic "
-        f"config_hash -> same tag -> same key); remaining={remaining_after}"
+        "no-op refresh must not invalidate the cooldown; "
+        f"remaining={remaining_after}"
     )
 
 
@@ -1858,10 +2034,9 @@ async def test_scenario_d3_semantically_identical_refresh_retains_state() -> Non
         for key, value in alias_state.alias_routing_state.codex.session_affinity_by_key.items()
     }
     assert len(affinity_before) == 1
-    if _wave3_epoch_keys_enabled():
-        assert next(iter(affinity_before.values()))["config_hash"] == (
-            snapshot_before.config_hash
-        )
+    assert next(iter(affinity_before.values()))["config_hash"] == (
+        snapshot_before.config_hash
+    )
 
     # Cool one candidate to have a cooldown to retain
     model_a_key = _snapshot_candidate_key(snapshot_before, "d3-model-a")
@@ -2001,10 +2176,9 @@ async def test_scenario_d4_changed_refresh_preserves_compatible_continuation_aff
             for key, value in alias_state.alias_routing_state.codex.session_affinity_by_key.items()
         }
         assert len(affinity_before) == 1
-        if _wave3_epoch_keys_enabled():
-            assert next(iter(affinity_before.values()))["config_hash"] == (
-                resp_a.json()["active_config_hash"]
-            )
+        assert next(iter(affinity_before.values()))["config_hash"] == (
+            resp_a.json()["active_config_hash"]
+        )
 
         # Refresh to snapshot B (changed priority, same provider/model/route_family)
         resp_b = await _post_refresh(client, _D4_SNAPSHOT_B)

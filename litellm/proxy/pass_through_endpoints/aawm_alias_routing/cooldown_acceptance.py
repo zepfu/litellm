@@ -346,8 +346,12 @@ def resolve_production_cooldown_key(
     lane_key = resolve_production_lane_key(
         request, candidate, codex_oauth_account_id=codex_oauth_account_id,
     )
-    epoch_tag = candidate.get("config_epoch_tag")
-    return _codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=epoch_tag)
+    cooldown_identity_tag = candidate.get("cooldown_identity_tag")
+    return _codex_auto_agent_candidate_key(
+        candidate,
+        lane_key,
+        cooldown_identity_tag=cooldown_identity_tag,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +399,7 @@ def _resolve_eligible_candidates(
             "model": c["model"],
             "route_family": c.get("route_family") or "",
             "config_epoch_tag": c.get("config_epoch_tag"),
+            "cooldown_identity_tag": c.get("cooldown_identity_tag"),
         })
     return canonical_alias, result
 

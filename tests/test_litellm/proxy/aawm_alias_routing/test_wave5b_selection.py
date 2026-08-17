@@ -166,7 +166,7 @@ def _configure_selection():
                 lambda candidate: "xai:default"
             ),
             "_codex_auto_agent_candidate_key": (
-                lambda candidate, lane_key, epoch_tag=None: (
+                lambda candidate, lane_key, cooldown_identity_tag=None: (
                     f"{candidate.get('provider')}:{candidate.get('model')}:{lane_key}"
                 )
             ),

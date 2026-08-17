@@ -20,11 +20,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.candidate_loop import (
+    _default_lane_identity_hash,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_apply import (
+    execute_cooldown_publication_transaction,
+    resolve_lane_identity_hash,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_clear import (
     CooldownClearRequest,
     _check_admin_auth,
     _check_topology_gate,
     _emit_audit_event,
+    _execute_clear,
+    _hydrate_identities_from_durable,
     _hydrate_from_local_index,
     _parse_and_validate_request,
     _ResolvedTarget,
@@ -37,8 +46,12 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot imp
     RoutingCandidate,
     RoutingSnapshot,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
+    CooldownPublicationPlan,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     AliasRoutingStateManager,
+    ClaimOutcome,
 )
 
 # ---------------------------------------------------------------------------
@@ -46,6 +59,8 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
 # ---------------------------------------------------------------------------
 
 _CLEAR_MOD = "litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_clear"
+_APPLY_MOD = "litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_apply"
+_DURABLE_MOD = "litellm.proxy.pass_through_endpoints.aawm_alias_routing.durable"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -245,6 +260,191 @@ def fresh_manager() -> AliasRoutingStateManager:
 @pytest.fixture(autouse=True)
 def _topology_gate_open(monkeypatch):
     monkeypatch.setenv("AAWM_ALIAS_ROUTING_COOLDOWN_CLEAR_SINGLE_WORKER", "1")
+
+
+# ---------------------------------------------------------------------------
+# CFG-019 alias-scoped control-plane identity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_shared_route_aliases_keep_control_plane_membership_isolated(  # noqa: PLR0915
+    fresh_manager: AliasRoutingStateManager,
+) -> None:
+    shared_candidate = _make_candidate()
+    snapshot = RoutingSnapshot(
+        aliases={
+            alias_name: RoutingAlias(
+                name=alias_name,
+                distribution_strategy=None,
+                candidates=(shared_candidate,),
+            )
+            for alias_name in ("alias-a", "alias-b")
+        },
+        config_epoch=1,
+        config_hash="shared-config-hash",
+        config_version="shared-confi",
+    )
+
+    with patch(f"{_CLEAR_MOD}.get_active_routing_snapshot", return_value=snapshot):
+        target_a = _resolve_target_from_active_snapshot(
+            CooldownClearRequest(alias="alias-a", ingress="codex")
+        )
+        target_b = _resolve_target_from_active_snapshot(
+            CooldownClearRequest(alias="alias-b", ingress="codex")
+        )
+
+    candidate_base = {
+        "provider": shared_candidate.provider,
+        "model": shared_candidate.model,
+        "route_family": shared_candidate.route_family,
+    }
+    candidate_a = {
+        **candidate_base,
+        "cooldown_identity_tag": (
+            "alias:alias-a:openai:gpt-4o:codex_openai_responses"
+        ),
+    }
+    candidate_b = {
+        **candidate_base,
+        "cooldown_identity_tag": (
+            "alias:alias-b:openai:gpt-4o:codex_openai_responses"
+        ),
+    }
+    identity_a = target_a.identities[0].identity_hash
+    identity_b = target_b.identities[0].identity_hash
+    assert identity_a == resolve_lane_identity_hash(candidate=candidate_a)
+    assert identity_b == resolve_lane_identity_hash(candidate=candidate_b)
+    assert identity_a != identity_b
+    assert _default_lane_identity_hash(candidate=candidate_a) == identity_a
+    assert _default_lane_identity_hash(candidate=candidate_b) == identity_b
+
+    lane_a = "halias-a:openai:gpt-4o:lane"
+    lane_b = "halias-b:openai:gpt-4o:lane"
+    dual_cache = _make_mock_dual_cache()
+    publish_mock = AsyncMock(
+        side_effect=[MagicMock(journal=MagicMock()), MagicMock(journal=MagicMock())]
+    )
+
+    def publish_memory(*, keys, seconds):
+        for key in keys:
+            fresh_manager.codex.set_cooldown_memory(key, seconds)
+
+    with (
+        patch(f"{_APPLY_MOD}._state_manager", fresh_manager),
+        patch(
+            f"{_DURABLE_MOD}.get_aawm_alias_routing_dual_cache",
+            return_value=dual_cache,
+        ),
+        patch(f"{_DURABLE_MOD}.publish_cooldown_transaction", publish_mock),
+    ):
+        for candidate, lane_key in (
+            (candidate_a, lane_a),
+            (candidate_b, lane_b),
+        ):
+            await execute_cooldown_publication_transaction(
+                alias_family="codex",
+                candidate=candidate,
+                plan=CooldownPublicationPlan(
+                    memory_keys=(lane_key,),
+                    durable_keys=(lane_key,),
+                    duration_seconds=300.0,
+                    applied_scope="candidate",
+                ),
+                publish_cooldown_memory_fn=publish_memory,
+                persist_cooldown_fn=AsyncMock(),
+            )
+
+    assert [
+        call.kwargs["identity_hash"] for call in publish_mock.await_args_list
+    ] == [identity_a, identity_b]
+    assert fresh_manager.lane_identity_index.lanes_for(identity_a) == frozenset(
+        {lane_a}
+    )
+    assert fresh_manager.lane_identity_index.lanes_for(identity_b) == frozenset(
+        {lane_b}
+    )
+
+    registry = fresh_manager.publication_intents
+    reservation = registry.create_clear_reservation(
+        alias_family="codex",
+        identity_hashes=frozenset({identity_a}),
+        cooldown_keys=frozenset({lane_a}),
+    )
+    blocked = registry.claim_publication_or_wait(
+        alias_family="codex",
+        cooldown_keys=frozenset({lane_a}),
+        identity_hash=identity_a,
+    )
+    isolated = registry.claim_publication_or_wait(
+        alias_family="codex",
+        cooldown_keys=frozenset({lane_b}),
+        identity_hash=identity_b,
+    )
+    assert blocked.outcome is ClaimOutcome.BLOCKED_BY_CLEAR
+    assert isolated.outcome is ClaimOutcome.LEADER
+    assert isolated.intent is not None
+    registry.release_claim(isolated.intent)
+
+    _hydrate_from_local_index(target_a, fresh_manager)
+    _hydrate_from_local_index(target_b, fresh_manager)
+    inspections = {
+        identity_a: _make_identity_inspection(
+            members=frozenset({lane_a}), cardinality=1
+        ),
+        identity_b: _make_identity_inspection(
+            members=frozenset({lane_b}), cardinality=1
+        ),
+    }
+
+    async def inspect_identity(*, identity_hash, **_kwargs):
+        return inspections[identity_hash]
+
+    with (
+        patch(
+            f"{_CLEAR_MOD}.get_aawm_alias_routing_dual_cache",
+            return_value=dual_cache,
+        ),
+        patch(
+            f"{_CLEAR_MOD}.inspect_identity_set",
+            new_callable=AsyncMock,
+            side_effect=inspect_identity,
+        ) as inspect_mock,
+    ):
+        await _hydrate_identities_from_durable(target_a)
+        await _hydrate_identities_from_durable(target_b)
+
+    assert {
+        call.kwargs["identity_hash"] for call in inspect_mock.await_args_list
+    } == {identity_a, identity_b}
+    assert target_a.identities[0].lane_keys == [lane_a]
+    assert target_b.identities[0].lane_keys == [lane_b]
+
+    durable_clear = AsyncMock(
+        return_value=MagicMock(keys_deleted=1, members_removed=1)
+    )
+    with (
+        patch(f"{_CLEAR_MOD}._execute_durable_clear", durable_clear),
+        patch(
+            f"{_CLEAR_MOD}._verify_postconditions",
+            new_callable=AsyncMock,
+        ),
+    ):
+        assert await _execute_clear(target_a, fresh_manager) == (1, 1)
+
+    durable_clear.assert_awaited_once_with(
+        family="codex",
+        identity_hash=identity_a,
+        cooldown_keys=[lane_a],
+        lane_members=[lane_a],
+    )
+    assert fresh_manager.lane_identity_index.lanes_for(identity_a) == frozenset()
+    assert fresh_manager.lane_identity_index.lanes_for(identity_b) == frozenset(
+        {lane_b}
+    )
+    assert fresh_manager.codex.get_memory_cooldown_remaining(lane_a) == 0.0
+    assert fresh_manager.codex.get_memory_cooldown_remaining(lane_b) > 0.0
+    registry.complete_clear_reservation(reservation)
 
 
 # ---------------------------------------------------------------------------

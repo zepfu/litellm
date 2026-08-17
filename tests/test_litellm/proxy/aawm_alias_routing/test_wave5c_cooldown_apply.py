@@ -833,7 +833,7 @@ class TestSetCodexCandidateCooldowns:
         )
 
     @pytest.mark.asyncio
-    async def test_request_local_scope_via_compat_entry(
+    async def test_request_local_scope_via_compat_entry_is_non_durable(
         self, configured_runtime: dict
     ) -> None:
         configured_runtime["scope_fn"].return_value = "request_local"
@@ -850,6 +850,8 @@ class TestSetCodexCandidateCooldowns:
         assert result == "request_local"
         configured_runtime["rl_set_fn"].assert_called_once()
         configured_runtime["rl_exclude_fn"].assert_called_once()
+        configured_runtime["codex_set"].assert_not_awaited()
+        configured_runtime["write_durable"].assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

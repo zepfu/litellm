@@ -69,8 +69,9 @@ class CandidateSelection:
     """Typed result of candidate selection for one loop attempt.
 
     Mirrors the keys the retry loop consumes off the legacy selector's dict
-    return value. ``config_epoch_tag`` is reserved for the Wave-3 semantic
-    cooldown-epoch work and defaults to ``None`` (bare/legacy keys) here.
+    return value. ``config_epoch_tag`` carries snapshot config-hash metadata
+    for affinity compatibility; cooldown identity stays on the selected
+    candidate and defaults to a bare/legacy key when absent.
     """
 
     candidate: AliasCandidate

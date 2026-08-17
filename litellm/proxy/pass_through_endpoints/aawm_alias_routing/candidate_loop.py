@@ -112,14 +112,17 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 def _default_lane_identity_hash(*, candidate: dict[str, Any]) -> str:
     """Secret-safe identity hash from public candidate identity (fallback).
 
-    Mirrors ``cooldown_apply.resolve_lane_identity_hash``: identity is derived
-    from ``provider:model:route_family`` ONLY -- never from lane_key or
-    credentials -- so one identity maps to many credential-derived lane keys.
+    Mirrors ``cooldown_apply.resolve_lane_identity_hash``: snapshot candidates
+    use ``cooldown_identity_tag`` while static candidates retain the
+    ``provider:model:route_family`` fallback. Identity never includes lane keys
+    or credentials.
     """
-    provider = str(candidate.get("provider") or "")
-    model = str(candidate.get("model") or "")
-    route_family = str(candidate.get("route_family") or "")
-    identity_input = f"{provider}:{model}:{route_family}"
+    identity_input = str(candidate.get("cooldown_identity_tag") or "")
+    if not identity_input:
+        provider = str(candidate.get("provider") or "")
+        model = str(candidate.get("model") or "")
+        route_family = str(candidate.get("route_family") or "")
+        identity_input = f"{provider}:{model}:{route_family}"
     return hashlib.sha256(identity_input.encode("utf-8")).hexdigest()
 
 

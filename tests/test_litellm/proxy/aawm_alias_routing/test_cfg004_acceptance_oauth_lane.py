@@ -45,7 +45,11 @@ def _openai_candidate() -> dict:
         "model": "gpt-5.3-codex",
         "route_family": "codex_openai_chat_completions_adapter",
         "priority": 1,
-        "config_epoch_tag": "abc123",
+        "config_epoch_tag": "unrelated-snapshot-hash",
+        "cooldown_identity_tag": (
+            "alias:basic:openai:gpt-5.3-codex:"
+            "codex_openai_chat_completions_adapter"
+        ),
     }
 
 
@@ -193,8 +197,8 @@ class TestOpenAILaneIdentity:
         # is present.  The acceptance descriptor must produce the same key.
         assert acceptance_lane == f"chatgpt-account:{_CANONICAL_UUID}"
 
-    def test_cooldown_key_uses_exact_lane_and_epoch(self):
-        """Full cooldown key embeds the chatgpt-account lane and epoch tag."""
+    def test_cooldown_key_uses_exact_lane_and_stable_identity(self):
+        """Full cooldown key embeds the chatgpt-account lane and stable tag."""
         candidate = _openai_candidate()
 
         req = _bare_request()
@@ -203,13 +207,14 @@ class TestOpenAILaneIdentity:
         )
 
         # _codex_auto_agent_candidate_key format:
-        # h{epoch}:{provider}:{model}:{lane_key}
+        # h{cooldown_identity}:{provider}:{model}:{lane_key}
         expected = (
-            f"h{candidate['config_epoch_tag']}:"
+            f"h{candidate['cooldown_identity_tag']}:"
             f"{candidate['provider']}:{candidate['model']}:"
             f"chatgpt-account:{_CANONICAL_UUID}"
         )
         assert acceptance_key == expected
+        assert candidate["config_epoch_tag"] not in acceptance_key
 
     def test_without_descriptor_delegates_to_request_header_resolution(self):
         """When descriptor is absent, lane derives from request headers via

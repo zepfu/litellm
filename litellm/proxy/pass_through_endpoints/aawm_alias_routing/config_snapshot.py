@@ -107,10 +107,11 @@ class RoutingSnapshot:
     successful compile; it is **telemetry ordering only** and MUST NOT be
     used to invalidate runtime routing state.  ``config_hash`` is a
     deterministic SHA-256 *semantic digest* of the fully validated,
-    inheritance-resolved compiled representation. Snapshot-resolved
-    candidate state keys embed the full digest as a tag; the durable state-key
-    namespace itself is unchanged. Affinity payloads intentionally persist
-    ``config_hash`` as compatibility metadata for continuation validation.
+    inheritance-resolved compiled representation. Snapshot-resolved cooldown
+    keys instead use a stable tag scoped to owning alias, provider, model, and
+    resolved route semantics; the durable state-key namespace itself is
+    unchanged. Affinity payloads intentionally persist ``config_hash`` as
+    compatibility metadata for continuation validation.
     ``config_version`` is a human-facing identity string (first 12 hex chars
     of ``config_hash``).
     ``source_hash`` (optional) is the SHA-256 of the raw source YAML,

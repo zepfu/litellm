@@ -232,19 +232,23 @@ def _codex_auto_agent_candidate_key(
     candidate: dict[str, Any],
     lane_key: str,
     *,
-    epoch_tag: Optional[str] = None,
+    cooldown_identity_tag: Optional[str] = None,
 ) -> str:
     """Build the canonical cooldown/evidence/probe state key for a candidate.
 
-    When ``epoch_tag`` is set (snapshot-resolved aliases only), the key is
-    prefixed with ``h{epoch_tag}:`` so that a semantic config change
-    invalidates cooldowns earned under the previous config generation.
-    Static/legacy routes and Kimi managed-account keys pass no epoch_tag
-    and keep bare keys.
+    CFG-019: when ``cooldown_identity_tag`` is set (snapshot-resolved aliases
+    only) it is the stable per-candidate semantic identity tag
+    ``alias:<canonical-alias>:{provider}:{model}:{route_family}`` and the key
+    is prefixed with ``h{cooldown_identity_tag}:``. Scoping the tag to the
+    owning alias plus the candidate's provider/model/resolved route semantics
+    means an unrelated alias or config change preserves the cooldown, while a
+    genuine semantic change to that candidate invalidates only its own
+    identity. The global ``snapshot.config_hash`` is deliberately NOT part of
+    cooldown identity.
 
-    Deliberate cooldown semantics: a cooldown earned under semantic config N
-    vanishes for semantic config N+1 requests (operator-intended re-probe).
-    Wave-2 exact-key single-flight limits the resulting probe storm.
+    Static/legacy routes and Kimi managed-account keys pass no
+    ``cooldown_identity_tag`` and keep bare keys (account-global by design).
+
     Affinity is explicitly excluded from this invalidation rule -- session
     pins survive config changes as long as the candidate remains compatible.
     """
@@ -253,8 +257,8 @@ def _codex_auto_agent_candidate_key(
         candidate["model"],
         lane_key or "__default__",
     )
-    if epoch_tag:
-        return "h{}:{}".format(epoch_tag, base)
+    if cooldown_identity_tag:
+        return "h{}:{}".format(cooldown_identity_tag, base)
     return base
 
 def _resolve_codex_auto_agent_xai_lane_key(candidate: dict[str, Any]) -> str:

@@ -150,28 +150,22 @@ async def _run_alias_once(
 
 def _live_cooldown_key() -> str:
     """Return the exact state key for the resolved snapshot candidate."""
-    candidate: dict[str, Any] = {
-        "provider": "openrouter",
-        "model": "openrouter/round2-live-model",
-        "route_family": "codex_openrouter_completion_adapter",
-        "last_resort": False,
-    }
     lane_key = policy.CODEX_AUTO_AGENT_OPENROUTER_LANE_KEY
     snapshot = snapshot_select.get_active_routing_snapshot()
-    epoch_tag: str | None = None
-    if snapshot is not None:
-        alias = snapshot.aliases.get("basic")
-        identity = (
-            candidate["provider"],
-            candidate["model"],
-            candidate["route_family"],
+    assert snapshot is not None
+    candidate = next(
+        candidate
+        for candidate in snapshot_select._select_snapshot_candidates(
+            "basic",
+            ingress="codex",
         )
-        if alias is not None and any(
-            (compiled.provider, compiled.model, compiled.route_family) == identity
-            for compiled in alias.candidates
-        ):
-            epoch_tag = snapshot.config_hash
-    return lane_keys._codex_auto_agent_candidate_key(candidate, lane_key, epoch_tag=epoch_tag)
+        if candidate["model"] == "openrouter/round2-live-model"
+    )
+    return lane_keys._codex_auto_agent_candidate_key(
+        candidate,
+        lane_key,
+        cooldown_identity_tag=candidate.get("cooldown_identity_tag"),
+    )
 
 
 @pytest.mark.asyncio

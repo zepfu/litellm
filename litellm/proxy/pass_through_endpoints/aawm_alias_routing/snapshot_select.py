@@ -146,8 +146,9 @@ def _routing_candidate_to_public_dict(
     """Shape a compiled ``RoutingCandidate`` into the legacy candidate-dict form.
 
     When ``epoch_tag`` is provided (snapshot-resolved candidates), it is
-    carried as ``config_epoch_tag`` so downstream state-key construction
-    can prefix cooldown/evidence/probe keys with the semantic digest.
+    carried as ``config_epoch_tag`` for snapshot contracts such as affinity
+    compatibility. CFG-019 carries cooldown identity separately so global
+    ``snapshot.config_hash`` does not control cooldown/evidence/probe keys.
     """
     shaped: dict[str, Any] = {
         "provider": candidate.provider,
@@ -412,6 +413,20 @@ def _shape_snapshot_candidate(
         return None
 
 
+def _snapshot_cooldown_identity_tag(
+    *,
+    owning_alias: str,
+    candidate: Mapping[str, Any],
+) -> str:
+    """Return the stable cooldown identity for one resolved alias candidate."""
+    return "alias:{}:{}:{}:{}".format(
+        owning_alias,
+        candidate["provider"],
+        candidate["model"],
+        candidate["route_family"],
+    )
+
+
 def _resolve_snapshot_alias_candidates(
     alias_name: str,
     *,
@@ -488,10 +503,17 @@ def _resolve_snapshot_alias_candidates(
         shaped = _shape_snapshot_candidate(
             entry,
             ingress=ingress,
+            # Preserve the full snapshot digest for affinity compatibility and
+            # other snapshot contracts. CFG-019 uses the distinct, stable
+            # cooldown_identity_tag below for cooldown/evidence/probe keys.
             epoch_tag=snapshot.config_hash,
         )
         if shaped is None:
             continue
+        shaped["cooldown_identity_tag"] = _snapshot_cooldown_identity_tag(
+            owning_alias=alias.name,
+            candidate=shaped,
+        )
         shaped["selection_priority"] = entry.priority
         shaped["resolved_alias"] = alias.name
         shaped["alias_path"] = list(next_path)
@@ -534,6 +556,10 @@ def _routing_candidate_to_anthropic_public_dict(
     epoch_tag: Optional[str] = None,
 ) -> dict[str, Any]:
     """Shape a compiled candidate for Anthropic ingress using its anthropic_route_family.
+
+    ``epoch_tag`` (when provided) carries the full snapshot config hash as
+    ``config_epoch_tag`` for affinity compatibility. CFG-019 derives cooldown
+    identity from the resolved public ``route_family`` after shaping.
 
     Fail closed: if the candidate has no resolved anthropic_route_family
     (should not happen after compile-time validation), raise ValueError.

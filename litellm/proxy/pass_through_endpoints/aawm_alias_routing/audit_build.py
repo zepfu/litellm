@@ -218,7 +218,9 @@ def _build_auto_agent_alias_audit_event(
         lane_key = selection.get("lane_key")
     if cooldown_key is None and lane_key is not None:
         cooldown_key = _codex_auto_agent_candidate_key(
-            candidate, lane_key, epoch_tag=candidate.get("config_epoch_tag"),
+            candidate,
+            lane_key,
+            cooldown_identity_tag=candidate.get("cooldown_identity_tag"),
         )
     context = _get_auto_agent_alias_request_context(
         request,

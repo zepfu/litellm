@@ -313,6 +313,9 @@ class TestProductionLaneKeyEquality:
             "model": model,
             "route_family": route_family,
             "config_epoch_tag": "abcdef123456",
+            "cooldown_identity_tag": (
+                f"alias:basic:{provider}:{model}:{route_family}"
+            ),
         }
         request = _make_request(auth_header="Bearer sk-test-auth-value")
 

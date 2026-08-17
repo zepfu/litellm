@@ -436,18 +436,24 @@ class TestCooldownKeyFallback:
         # Derived key: provider:model:lane_key
         assert event["cooldown_key"] == "openai:gpt-4.1:openai:gpt-4.1:codex"
 
-    def test_cooldown_key_with_epoch_tag(self):
+    def test_cooldown_key_with_stable_identity_tag(self):
         event = _build_auto_agent_alias_audit_event(
             alias_family="codex",
             alias_model="codex-auto",
             request=_make_request(),
             request_body={},
             selection=_minimal_selection(lane_key="lane1"),
-            candidate=_minimal_candidate(config_epoch_tag="abc"),
+            candidate=_minimal_candidate(
+                config_epoch_tag="snapshot-hash",
+                cooldown_identity_tag="alias:basic:openai:gpt-4.1:codex",
+            ),
             event_type="candidate_selected",
             candidate_status="selected",
         )
-        assert event["cooldown_key"] == "habc:openai:gpt-4.1:lane1"
+        assert (
+            event["cooldown_key"]
+            == "halias:basic:openai:gpt-4.1:codex:openai:gpt-4.1:lane1"
+        )
 
     def test_lane_key_fallback_to_selection(self):
         event = _build_auto_agent_alias_audit_event(

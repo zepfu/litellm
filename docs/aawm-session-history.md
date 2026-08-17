@@ -1223,7 +1223,14 @@ Operational notes:
 - Durable key shape:
   `aawm:alias-routing:{namespace}:{family}:{kind}:{sha256_hex(state_key)}` where
   `family` is `codex` or `anthropic`, and `kind` is `affinity` or `cooldown`.
-  The raw client/session state key is not stored in Redis.
+  The raw client/session state key is not stored in Redis. Snapshot-resolved
+  cooldown state keys use a stable identity of owning alias, provider, model,
+  and resolved route/lane semantics rather than the global `config_hash`, so
+  unrelated alias changes and priority/weight/schedule changes preserve a live
+  cooldown while a provider/model/route semantic change rotates only that
+  candidate key. `config_hash` remains affinity and snapshot/round-robin
+  metadata; request-local exclusions never write durable state, and managed
+  Kimi account keys remain intentionally account-global and untagged.
 - Durable payloads store absolute wall-clock expiry (`expires_at_epoch` via
   `time.time()`). Process-local maps still use monotonic expiry for the fast path.
 - `AAWM_ALIAS_ROUTING_REDIS_*` settings only control alias-routing state
