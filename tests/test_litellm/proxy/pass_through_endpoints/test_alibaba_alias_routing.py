@@ -91,7 +91,7 @@ def _reset_alibaba_alias_state() -> None:
 
 
 def test_should_register_all_alibaba_aliases_for_both_ingresses() -> None:
-    for alias in ("sota-alibaba", "sota-deepseek"):
+    for alias in ("sota-alibaba", "sota-deepseek", "sota-zai"):
         assert (
             snapshot_select._lookup_active_snapshot_canonical_alias(alias)
             == alias
@@ -120,6 +120,15 @@ def test_should_register_all_alibaba_aliases_for_both_ingresses() -> None:
             candidate["provider"] == "alibaba_token_plan"
             for candidate in anthropic_candidates
         )
+    zai_candidates = snapshot_select._select_snapshot_candidates(
+        "sota-zai",
+        ingress="codex",
+    )
+    assert [candidate["model"] for candidate in zai_candidates] == [
+        "alibaba_token_plan/glm-5.2"
+    ]
+
+
 @pytest.mark.asyncio
 async def test_should_preserve_alibaba_continuation_affinity_per_ingress() -> None:
     codex_request = _request("/v1/responses")

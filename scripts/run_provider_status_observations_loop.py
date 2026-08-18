@@ -269,6 +269,7 @@ ALIBABA_TOKEN_PLAN_ACTIVE_MODELS = (
     "alibaba_token_plan/deepseek-v4-flash-0731",
     "alibaba_token_plan/qwen3.6-flash",
     "alibaba_token_plan/deepseek-v4-pro",
+    "alibaba_token_plan/glm-5.2",
 )
 ALIBABA_TOKEN_PLAN_SOURCE = "alibaba_token_plan_usage"
 ALIBABA_TOKEN_PLAN_PARSER_VERSION = "alibaba_token_plan_usage_v3"

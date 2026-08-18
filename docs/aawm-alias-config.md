@@ -228,6 +228,14 @@ credentials; Terra uses `codex_responses` (projected to
 `anthropic_openai_responses_adapter` on Anthropic ingress) and keeps its
 OpenAI/Codex credential domain on both ingresses.
 
+## Maintained `sota-zai` alias behavior (CFG-021)
+
+The public `sota-zai` alias is compiled from `sota-zai.yaml`. Its first
+candidate is Alibaba Token Plan `glm-5.2` on
+`codex_alibaba_token_plan_chat_completions_adapter`. A later Z.AI Coding
+Plan route belongs on this same alias as another candidate; do not invent a
+second public name.
+
 ## Provider-native credential boundary
 
 Anthropic/Claude model traffic must egress exclusively through
