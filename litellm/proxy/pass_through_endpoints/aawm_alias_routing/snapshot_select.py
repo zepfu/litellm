@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 from typing import Any, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from fastapi import Request
@@ -12,6 +12,7 @@ from .config_snapshot import (
     AliasReference as _AliasReference,
     RoutingCandidate as _RoutingSnapshotCandidate,
     RoutingSnapshot as _RoutingSnapshot,
+    ScheduleWindow as _ScheduleWindow,
     active_routing_snapshot_holder as _active_routing_snapshot_holder,
 )
 from .request_metadata import _normalize_tui_family
@@ -344,16 +345,48 @@ def _is_tui_excluded_candidate_eligible(
     )
 
 
+def _clock_seconds(value: time) -> int:
+    return value.hour * 3600 + value.minute * 60 + value.second
+
+
+def _is_schedule_window_active(
+    schedule: Optional[_ScheduleWindow],
+    *,
+    now_utc: datetime,
+) -> bool:
+    """Return True when *schedule* admits new affinity at *now_utc*."""
+    if schedule is None:
+        return True
+    if schedule.kind == "absolute":
+        if schedule.start is None or schedule.end is None:
+            return False
+        return schedule.start <= now_utc <= schedule.end
+    if (
+        schedule.start_time is None
+        or schedule.end_time is None
+        or schedule.utc_offset is None
+    ):
+        return False
+    local_now = now_utc.astimezone(timezone(schedule.utc_offset)).timetz().replace(
+        tzinfo=None, microsecond=0
+    )
+    now_seconds = _clock_seconds(local_now)
+    start_seconds = _clock_seconds(schedule.start_time)
+    end_seconds = _clock_seconds(schedule.end_time)
+    if start_seconds == end_seconds:
+        return False
+    if start_seconds < end_seconds:
+        return start_seconds <= now_seconds < end_seconds
+    return now_seconds >= start_seconds or now_seconds < end_seconds
+
+
 def _is_snapshot_candidate_in_schedule_window(
-    candidate: _RoutingSnapshotCandidate,
+    candidate: _RoutingSnapshotCandidate | _AliasReference,
     *,
     now_utc: datetime,
 ) -> bool:
     """Schedule gate: only prevents NEW affinity, never evicts existing state."""
-    schedule = candidate.schedule
-    if schedule is None:
-        return True
-    return schedule.start <= now_utc <= schedule.end
+    return _is_schedule_window_active(candidate.schedule, now_utc=now_utc)
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +505,13 @@ def _resolve_snapshot_alias_candidates(
         ):
             continue
         if isinstance(entry, _AliasReference):
+            if (
+                not include_out_of_schedule
+                and not _is_snapshot_candidate_in_schedule_window(
+                    entry, now_utc=now_utc
+                )
+            ):
+                continue
             children = _resolve_snapshot_alias_candidates(
                 entry.alias_name,
                 ingress=ingress,

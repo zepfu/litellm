@@ -20,6 +20,7 @@ import hashlib
 import itertools
 import json
 import threading
+from datetime import timedelta
 from typing import Optional
 
 import yaml
@@ -120,12 +121,58 @@ def _validate_cohere_credential_domain(
         )
 
 
-def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> RoutingCandidate:
-    schedule = (
-        ScheduleWindow(start=candidate.schedule.start, end=candidate.schedule.end)
-        if candidate.schedule is not None
-        else None
+def _format_fixed_utc_offset(offset: timedelta) -> str:
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "-" if total_minutes < 0 else "+"
+    hours, minutes = divmod(abs(total_minutes), 60)
+    return f"{sign}{hours:02d}:{minutes:02d}"
+
+
+def _compile_schedule(
+    schedule: Optional[schema.ScheduleWindowConfig],
+) -> Optional[ScheduleWindow]:
+    if schedule is None:
+        return None
+    if schedule.kind == "absolute":
+        return ScheduleWindow(
+            kind="absolute",
+            start=schedule.start,
+            end=schedule.end,
+        )
+    return ScheduleWindow(
+        kind="daily",
+        start_time=schedule.start_time,
+        end_time=schedule.end_time,
+        utc_offset=schedule.utc_offset,
     )
+
+
+def _canonical_schedule_repr(
+    schedule: Optional[ScheduleWindow],
+) -> Optional[dict[str, object]]:
+    if schedule is None:
+        return None
+    if schedule.kind == "absolute":
+        assert schedule.start is not None
+        assert schedule.end is not None
+        return {
+            "end": schedule.end.isoformat(),
+            "kind": "absolute",
+            "start": schedule.start.isoformat(),
+        }
+    assert schedule.start_time is not None
+    assert schedule.end_time is not None
+    assert schedule.utc_offset is not None
+    return {
+        "end_time": schedule.end_time.isoformat(),
+        "kind": "daily",
+        "start_time": schedule.start_time.isoformat(),
+        "utc_offset": _format_fixed_utc_offset(schedule.utc_offset),
+    }
+
+
+def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> RoutingCandidate:
+    schedule = _compile_schedule(candidate.schedule)
     error_rules = tuple(ErrorRule(class_name=rule.class_name, cools=rule.cools) for rule in candidate.error_rules)
     anthropic_rf = schema.resolve_anthropic_route_family(
         candidate.route_family,
@@ -210,6 +257,7 @@ def _compile_alias_reference(
         weight=alias_ref.weight,
         tui_attached=alias_ref.tui_attached,
         tui_excluded=alias_ref.tui_excluded,
+        schedule=_compile_schedule(alias_ref.schedule),
     )
 
 
@@ -318,6 +366,7 @@ def _canonical_snapshot_repr(aliases: dict[str, RoutingAlias]) -> str:
                         "type": "alias_reference",
                         "alias_name": entry.alias_name,
                         "priority": entry.priority,
+                        "schedule": _canonical_schedule_repr(entry.schedule),
                         "tui_attached": entry.tui_attached,
                         "tui_excluded": entry.tui_excluded,
                         "weight": entry.weight,
@@ -337,14 +386,7 @@ def _canonical_snapshot_repr(aliases: dict[str, RoutingAlias]) -> str:
                         "anthropic_route_family": entry.anthropic_route_family,
                         "route_family": entry.route_family,
                         "reasoning_effort": entry.reasoning_effort,
-                        "schedule": (
-                            {
-                                "end": entry.schedule.end.isoformat(),
-                                "start": entry.schedule.start.isoformat(),
-                            }
-                            if entry.schedule is not None
-                            else None
-                        ),
+                        "schedule": _canonical_schedule_repr(entry.schedule),
                         "tui_attached": entry.tui_attached,
                         "tui_excluded": entry.tui_excluded,
                         "weight": entry.weight,

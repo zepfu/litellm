@@ -14,17 +14,21 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from types import MappingProxyType
-from typing import Mapping, Optional
+from typing import Literal, Mapping, Optional
 
 
 @dataclass(frozen=True, slots=True)
 class ScheduleWindow:
-    """Compiled UTC schedule window."""
+    """Compiled absolute UTC or recurring daily schedule window."""
 
-    start: datetime
-    end: datetime
+    kind: Literal["absolute", "daily"]
+    start: Optional[datetime] = None
+    end: Optional[datetime] = None
+    start_time: Optional[time] = None
+    end_time: Optional[time] = None
+    utc_offset: Optional[timedelta] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +48,7 @@ class AliasReference:
     weight: float
     tui_attached: Optional[str] = None
     tui_excluded: Optional[str] = None
+    schedule: Optional[ScheduleWindow] = None
 
 
 @dataclass(frozen=True, slots=True)

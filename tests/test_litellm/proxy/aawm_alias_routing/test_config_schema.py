@@ -202,6 +202,78 @@ def test_schedule_windows_utc_only() -> None:
         )
 
 
+def test_daily_schedule_requires_offset_and_rejects_mixed_forms() -> None:
+    daily = schema.CandidateConfig.model_validate(
+        _base_candidate(
+            schedule={
+                "start_time": "22:00:00",
+                "end_time": "08:00:00",
+                "utc_offset": "+08:00",
+            }
+        )
+    )
+    assert daily.schedule is not None
+    assert daily.schedule.kind == "daily"
+
+    reference = schema.AliasReferenceCandidateConfig.model_validate(
+        {
+            "alias_reference": "sota-deepseek",
+            "priority": 110,
+            "schedule": {
+                "start_time": "22:00",
+                "end_time": "08:00",
+                "utc_offset": "UTC+8",
+            },
+        }
+    )
+    assert reference.schedule is not None
+    assert reference.schedule.kind == "daily"
+
+    with pytest.raises(ValidationError):
+        schema.CandidateConfig.model_validate(
+            _base_candidate(
+                schedule={
+                    "start_time": "22:00:00",
+                    "end_time": "08:00:00",
+                }
+            )
+        )
+    with pytest.raises(ValidationError):
+        schema.CandidateConfig.model_validate(
+            _base_candidate(
+                schedule={
+                    "start": "2026-07-01T00:00:00Z",
+                    "end": "2026-07-15T00:00:00Z",
+                    "utc_offset": "+08:00",
+                }
+            )
+        )
+    with pytest.raises(ValidationError):
+        schema.CandidateConfig.model_validate(
+            _base_candidate(schedule={"start_time": "22:00:00+08:00"})
+        )
+    with pytest.raises(ValidationError):
+        schema.CandidateConfig.model_validate(
+            _base_candidate(
+                schedule={
+                    "start_time": "2026-07-01",
+                    "end_time": "08:00:00",
+                    "utc_offset": "+08:00",
+                }
+            )
+        )
+    with pytest.raises(ValidationError):
+        schema.CandidateConfig.model_validate(
+            _base_candidate(
+                schedule={
+                    "start_time": "22:00:00",
+                    "end_time": "08:00:00",
+                    "utc_offset": "Asia/Shanghai",
+                }
+            )
+        )
+
+
 def test_inheritance_resolves() -> None:
     """Typed inheritance (defaults -> alias -> candidate) merges without duplicate-definition ambiguity."""
     document = schema.RoutingConfigDocument.model_validate(

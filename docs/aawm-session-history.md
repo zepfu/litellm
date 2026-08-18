@@ -1526,12 +1526,15 @@ Claude origins only the native Anthropic Sonnet tail, and finally
 `gpt-5.6-luna`. `work-other` is an ordinary configured alias and a valid
 exact-name / `alias_reference` target; it is omitted from Codex and Claude TUI
 selection only because those clients' explicit model-definition inclusion lists
-leave it out. `expert` uses
-Claude-origin native Anthropic `claude-opus-5` first, then universal
+leave it out. During `22:00-08:00 UTC+8`, `work-other` promotes
+`sota-deepseek` ahead of `sota-moonshot` and `sota-xai`; outside that window
+new selection is Moonshot then xAI. `expert` promotes
+`alibaba_token_plan/qwen3.8-max` first during the same daily window, then
+Claude-origin native Anthropic `claude-opus-5`, then universal
 `gpt-5.6-terra` as the last resort with authoritative `reasoning_effort: max`
-on both candidates (CFG-006). Canonical Opus 5 is inherently 1M-context, so
+on every compiled candidate (CFG-006). Canonical Opus 5 is inherently 1M-context, so
 there is no `claude-opus-5[1m]` selector; Terra is the direct/default
-candidate for Codex/non-Claude/missing/unknown origins and remains eligible
+candidate for Codex/non-Claude/missing/unknown origins outside the window and remains eligible
 for Claude after an Opus failure. Anthropic models remain native Anthropic
 egress only.
 

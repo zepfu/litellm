@@ -1,10 +1,11 @@
-"""CFG-013 Body D: canonical ``expert`` alias acceptance tests.
+"""CFG-013 / CFG-020 canonical ``expert`` alias acceptance tests.
 
 Verifies the checked-in canonical config directory compiles a public
-``expert`` alias with exactly two candidates -- Claude-origin native
-Anthropic ``claude-opus-5`` first, universal OpenAI/Codex ``gpt-5.6-terra``
-last resort -- with authoritative ``reasoning_effort: max`` on both (CFG-006),
-and that both ingress projections preserve the provider-native credential
+``expert`` alias with three candidates -- nightly Alibaba Qwen 3.8 Max,
+Claude-origin native Anthropic ``claude-opus-5``, and universal
+OpenAI/Codex ``gpt-5.6-terra`` last resort -- with authoritative
+``reasoning_effort: max`` on every compiled candidate (CFG-006), and that
+both ingress projections preserve the provider-native credential
 boundary.
 
 Canonical Opus 5 is inherently a 1M-context model; there is deliberately no
@@ -15,6 +16,8 @@ No provider egress, no synthetic LLM calls, no TUI harness.
 """
 
 from __future__ import annotations
+
+from datetime import datetime, timezone
 
 import pytest
 from fastapi import Request
@@ -34,8 +37,11 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select imp
 )
 
 _EXPERT_ALIAS = "expert"
+_QWEN = ("alibaba_token_plan", "alibaba_token_plan/qwen3.8-max")
 _OPUS = ("anthropic", "claude-opus-5")
 _TERRA = ("openai", "gpt-5.6-terra")
+_WINDOW_OPEN = datetime(2026, 8, 18, 15, 0, tzinfo=timezone.utc)  # 23:00 UTC+8
+_WINDOW_CLOSED = datetime(2026, 8, 18, 1, 0, tzinfo=timezone.utc)  # 09:00 UTC+8
 
 
 # ---------------------------------------------------------------------------
@@ -77,11 +83,13 @@ def _projected(
     *,
     ingress: str,
     client_product_label: str | None,
+    now_utc: datetime,
 ) -> tuple[dict, ...]:
     return _select_snapshot_candidates(
         _EXPERT_ALIAS,
         ingress=ingress,
         client_product_label=client_product_label,
+        now_utc=now_utc,
     )
 
 
@@ -91,7 +99,7 @@ def _projected(
 
 
 class TestCanonicalDirectoryCompile:
-    def test_expert_is_public_with_exactly_two_candidates_in_order(
+    def test_expert_is_public_with_three_candidates_in_order(
         self, canonical_snapshot: RoutingSnapshot
     ) -> None:
         assert _EXPERT_ALIAS in canonical_snapshot.aliases
@@ -101,14 +109,14 @@ class TestCanonicalDirectoryCompile:
             (candidate.provider, candidate.model)
             for candidate in alias.candidates
         ]
-        assert identities == [_OPUS, _TERRA]
+        assert identities == [_QWEN, _OPUS, _TERRA]
 
-    def test_both_candidates_carry_authoritative_max_reasoning(
+    def test_all_candidates_carry_authoritative_max_reasoning(
         self, canonical_snapshot: RoutingSnapshot
     ) -> None:
         alias = canonical_snapshot.aliases[_EXPERT_ALIAS]
         efforts = [candidate.reasoning_effort for candidate in alias.candidates]
-        assert efforts == ["max", "max"]
+        assert efforts == ["max", "max", "max"]
 
     def test_no_duplicate_1m_opus_candidate(
         self, canonical_snapshot: RoutingSnapshot
@@ -122,7 +130,12 @@ class TestCanonicalDirectoryCompile:
     def test_opus_is_claude_attached_anthropic_native(
         self, canonical_snapshot: RoutingSnapshot
     ) -> None:
-        opus = canonical_snapshot.aliases[_EXPERT_ALIAS].candidates[0]
+        qwen = canonical_snapshot.aliases[_EXPERT_ALIAS].candidates[0]
+        assert qwen.route_family == "codex_alibaba_token_plan_chat_completions_adapter"
+        assert qwen.schedule is not None
+        assert qwen.schedule.kind == "daily"
+        assert qwen.tui_attached is None
+        opus = canonical_snapshot.aliases[_EXPERT_ALIAS].candidates[1]
         assert opus.route_family == "anthropic_messages"
         assert opus.anthropic_route_family == "anthropic_messages"
         assert opus.tui_attached == "Claude"
@@ -132,7 +145,7 @@ class TestCanonicalDirectoryCompile:
     def test_terra_is_unexcluded_universal_last_resort(
         self, canonical_snapshot: RoutingSnapshot
     ) -> None:
-        terra = canonical_snapshot.aliases[_EXPERT_ALIAS].candidates[1]
+        terra = canonical_snapshot.aliases[_EXPERT_ALIAS].candidates[2]
         assert terra.route_family == "codex_responses"
         assert terra.tui_attached is None
         assert terra.tui_excluded is None
@@ -145,13 +158,14 @@ class TestCanonicalDirectoryCompile:
 
 
 class TestAnthropicIngressProjection:
-    def test_claude_origin_projects_opus_then_terra(
+    def test_claude_origin_outside_window_projects_opus_then_terra(
         self, active_snapshot: RoutingSnapshot
     ) -> None:
         candidates = _projected(
             active_snapshot,
             ingress="anthropic",
             client_product_label="claude-code/2.1.0",
+            now_utc=_WINDOW_CLOSED,
         )
         assert [
             (candidate["provider"], candidate["model"]) for candidate in candidates
@@ -162,6 +176,23 @@ class TestAnthropicIngressProjection:
         assert candidates[1]["reasoning_effort"] == "max"
         assert candidates[0]["last_resort"] is False
         assert candidates[1]["last_resort"] is True
+
+    def test_claude_origin_inside_window_projects_qwen_then_opus_then_terra(
+        self, active_snapshot: RoutingSnapshot
+    ) -> None:
+        candidates = _projected(
+            active_snapshot,
+            ingress="anthropic",
+            client_product_label="claude-code/2.1.0",
+            now_utc=_WINDOW_OPEN,
+        )
+        assert [
+            (candidate["provider"], candidate["model"]) for candidate in candidates
+        ] == [_QWEN, _OPUS, _TERRA]
+        assert (
+            candidates[0]["route_family"]
+            == "anthropic_alibaba_token_plan_chat_completions_adapter"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +220,7 @@ class TestCodexIngressProjection:
             active_snapshot,
             ingress="codex",
             client_product_label=client_product_label,
+            now_utc=_WINDOW_CLOSED,
         )
         assert [
             (candidate["provider"], candidate["model"]) for candidate in candidates
@@ -209,11 +241,47 @@ class TestCodexIngressProjection:
             active_snapshot,
             ingress="anthropic",
             client_product_label=None,
+            now_utc=_WINDOW_CLOSED,
         )
         assert [
             (candidate["provider"], candidate["model"]) for candidate in candidates
         ] == [_TERRA]
         assert candidates[0]["route_family"] == "anthropic_openai_responses_adapter"
+
+    def test_codex_inside_window_projects_qwen_then_terra(
+        self, active_snapshot: RoutingSnapshot
+    ) -> None:
+        candidates = _projected(
+            active_snapshot,
+            ingress="codex",
+            client_product_label="codex/0.50.0",
+            now_utc=_WINDOW_OPEN,
+        )
+        assert [
+            (candidate["provider"], candidate["model"]) for candidate in candidates
+        ] == [_QWEN, _TERRA]
+        assert (
+            candidates[0]["route_family"]
+            == "codex_alibaba_token_plan_chat_completions_adapter"
+        )
+        assert all(
+            candidate["route_family"] != "anthropic_messages"
+            for candidate in candidates
+        )
+
+    def test_closed_window_still_preserves_qwen_for_existing_owners(
+        self, active_snapshot: RoutingSnapshot
+    ) -> None:
+        candidates = _select_snapshot_candidates(
+            _EXPERT_ALIAS,
+            ingress="codex",
+            client_product_label="codex/0.50.0",
+            now_utc=_WINDOW_CLOSED,
+            include_out_of_schedule=True,
+        )
+        assert [
+            (candidate["provider"], candidate["model"]) for candidate in candidates
+        ] == [_QWEN, _TERRA]
 
 
 # ---------------------------------------------------------------------------
@@ -270,13 +338,15 @@ class TestRetryableOpusFailureFallsBackToTerra:
         # Primary (non-last-resort) tier is fully cooled down after the
         # retryable Opus failure.
         assert (
-            selection._select_available_state(request, states, last_resort=False)
+            selection._select_available_state(
+                request, states, ingress="anthropic", last_resort=False
+            )
             is None
         )
 
         # The fallback tier reaches Terra.
         picked = selection._select_available_state(
-            request, states, last_resort=True
+            request, states, ingress="anthropic", last_resort=True
         )
         assert picked is not None
         assert picked["candidate"]["provider"] == "openai"

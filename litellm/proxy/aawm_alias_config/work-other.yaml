@@ -3,9 +3,13 @@ defaults: {}
 aliases:
   - name: work-other
     candidates:
-      - alias_reference: sota-xai
-        priority: 100
-      - alias_reference: sota-alibaba
-        priority: 90
+      - alias_reference: sota-deepseek
+        priority: 110
+        schedule:
+          start_time: "22:00:00"
+          end_time: "08:00:00"
+          utc_offset: "+08:00"
       - alias_reference: sota-moonshot
-        priority: 80
+        priority: 100
+      - alias_reference: sota-xai
+        priority: 90

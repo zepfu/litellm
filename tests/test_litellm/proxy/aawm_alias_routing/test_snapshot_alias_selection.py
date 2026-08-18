@@ -365,3 +365,198 @@ aliases:
         assert identities(referenced_anthropic) == identities(direct_anthropic)
     finally:
         snapshot_select.set_active_routing_snapshot(previous)
+
+
+def test_daily_alias_reference_schedule_is_half_open_and_wraps_midnight() -> None:
+    snapshot = compiler.compile_yaml(
+        """
+defaults: {}
+aliases:
+  - name: parent
+    candidates:
+      - alias_reference: night
+        priority: 110
+        schedule:
+          start_time: "22:00:00"
+          end_time: "08:00:00"
+          utc_offset: "+08:00"
+      - alias_reference: always
+        priority: 100
+  - name: night
+    candidates:
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/deepseek-v4-pro
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 100
+  - name: always
+    candidates:
+      - provider: kimi_code
+        model: kimi_code/k3
+        route_family: codex_kimi_chat_completions_adapter
+        priority: 100
+"""
+    )
+    previous = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    try:
+        window_start = dt.datetime(2026, 8, 17, 14, 0, tzinfo=dt.timezone.utc)
+        just_before_end = dt.datetime(2026, 8, 17, 23, 59, 59, tzinfo=dt.timezone.utc)
+        window_end = dt.datetime(2026, 8, 18, 0, 0, tzinfo=dt.timezone.utc)
+
+        def models(now: dt.datetime) -> list[str]:
+            return [
+                str(candidate["model"])
+                for candidate in snapshot_select._select_snapshot_candidates(
+                    "parent",
+                    ingress="codex",
+                    now_utc=now,
+                )
+            ]
+
+        assert models(window_start) == [
+            "alibaba_token_plan/deepseek-v4-pro",
+            "kimi_code/k3",
+        ]
+        assert models(just_before_end) == [
+            "alibaba_token_plan/deepseek-v4-pro",
+            "kimi_code/k3",
+        ]
+        assert models(window_end) == ["kimi_code/k3"]
+        preserved = [
+            str(candidate["model"])
+            for candidate in snapshot_select._select_snapshot_candidates(
+                "parent",
+                ingress="codex",
+                now_utc=window_end,
+                include_out_of_schedule=True,
+            )
+        ]
+        assert preserved == [
+            "alibaba_token_plan/deepseek-v4-pro",
+            "kimi_code/k3",
+        ]
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous)
+
+
+def test_same_day_daily_schedule_is_half_open() -> None:
+    snapshot = compiler.compile_yaml(
+        """
+defaults: {}
+aliases:
+  - name: scheduled
+    candidates:
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/qwen3.8-max
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 110
+        schedule:
+          start_time: "09:00:00"
+          end_time: "17:00:00"
+          utc_offset: "+00:00"
+      - provider: openai
+        model: gpt-5.6-terra
+        route_family: codex_responses
+        priority: 0
+"""
+    )
+    previous = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    try:
+        window_start = dt.datetime(2026, 8, 18, 9, 0, tzinfo=dt.timezone.utc)
+        just_before_end = dt.datetime(2026, 8, 18, 16, 59, 59, tzinfo=dt.timezone.utc)
+        window_end = dt.datetime(2026, 8, 18, 17, 0, tzinfo=dt.timezone.utc)
+
+        def models(now: dt.datetime) -> list[str]:
+            return [
+                str(candidate["model"])
+                for candidate in snapshot_select._select_snapshot_candidates(
+                    "scheduled",
+                    ingress="codex",
+                    now_utc=now,
+                )
+            ]
+
+        assert models(window_start) == [
+            "alibaba_token_plan/qwen3.8-max",
+            "gpt-5.6-terra",
+        ]
+        assert models(just_before_end) == [
+            "alibaba_token_plan/qwen3.8-max",
+            "gpt-5.6-terra",
+        ]
+        assert models(window_end) == ["gpt-5.6-terra"]
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous)
+
+
+def test_canonical_work_other_promotes_deepseek_only_inside_daily_window() -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    previous = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    try:
+        inside = snapshot_select._select_snapshot_candidates(
+            "work-other",
+            ingress="codex",
+            now_utc=dt.datetime(2026, 8, 18, 15, 0, tzinfo=dt.timezone.utc),
+        )
+        outside = snapshot_select._select_snapshot_candidates(
+            "work-other",
+            ingress="codex",
+            now_utc=dt.datetime(2026, 8, 18, 1, 0, tzinfo=dt.timezone.utc),
+        )
+        assert [candidate["model"] for candidate in inside] == [
+            "alibaba_token_plan/deepseek-v4-pro",
+            "kimi_code/k3",
+            "oa_xai/grok-4.6",
+        ]
+        assert [candidate["model"] for candidate in outside] == [
+            "kimi_code/k3",
+            "oa_xai/grok-4.6",
+        ]
+        assert all(
+            "qwen" not in str(candidate["model"])
+            for candidate in (*inside, *outside)
+        )
+
+        inside_anthropic = snapshot_select._select_snapshot_candidates(
+            "work-other",
+            ingress="anthropic",
+            now_utc=dt.datetime(2026, 8, 18, 15, 0, tzinfo=dt.timezone.utc),
+        )
+        outside_anthropic = snapshot_select._select_snapshot_candidates(
+            "work-other",
+            ingress="anthropic",
+            now_utc=dt.datetime(2026, 8, 18, 1, 0, tzinfo=dt.timezone.utc),
+        )
+        assert [candidate["model"] for candidate in inside_anthropic] == [
+            "alibaba_token_plan/deepseek-v4-pro",
+            "kimi_code/k3",
+            "oa_xai/grok-4.6",
+        ]
+        assert [candidate["model"] for candidate in outside_anthropic] == [
+            "kimi_code/k3",
+            "oa_xai/grok-4.6",
+        ]
+        assert (
+            inside_anthropic[0]["route_family"]
+            == "anthropic_alibaba_token_plan_chat_completions_adapter"
+        )
+        preserved = snapshot_select._select_snapshot_candidates(
+            "work-other",
+            ingress="codex",
+            now_utc=dt.datetime(2026, 8, 18, 1, 0, tzinfo=dt.timezone.utc),
+            include_out_of_schedule=True,
+        )
+        assert [candidate["model"] for candidate in preserved] == [
+            "alibaba_token_plan/deepseek-v4-pro",
+            "kimi_code/k3",
+            "oa_xai/grok-4.6",
+        ]
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous)

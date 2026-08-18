@@ -15,8 +15,9 @@ and are never checked against a closed registry.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -139,26 +140,125 @@ def _require_registered_route_family(value: Optional[str]) -> Optional[str]:
     return value
 
 
+def _parse_local_clock_time(value: object) -> time:
+    if isinstance(value, time):
+        if value.tzinfo is not None:
+            raise ValueError("daily schedule clock times must not include a timezone")
+        return value.replace(microsecond=0)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("daily schedule clock times must be HH:MM or HH:MM:SS")
+    raw = value.strip()
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            parsed = datetime.strptime(raw, fmt).time()
+        except ValueError:
+            continue
+        return parsed.replace(microsecond=0)
+    raise ValueError("daily schedule clock times must be HH:MM or HH:MM:SS")
+
+
+def _parse_fixed_utc_offset(value: object) -> timedelta:
+    if isinstance(value, timedelta):
+        offset = value
+    elif isinstance(value, str) and value.strip():
+        raw = value.strip()
+        if raw.upper() in {"UTC", "Z"}:
+            offset = timedelta(0)
+        else:
+            match = None
+            for pattern in (
+                r"^UTC(?P<sign>[+-])(?P<hours>\d{1,2})(?::?(?P<minutes>\d{2}))?$",
+                r"^(?P<sign>[+-])(?P<hours>\d{1,2})(?::(?P<minutes>\d{2}))?$",
+            ):
+                match = re.fullmatch(pattern, raw, flags=re.IGNORECASE)
+                if match is not None:
+                    break
+            if match is None:
+                raise ValueError(
+                    "daily schedule utc_offset must be a fixed offset such as +08:00"
+                )
+            hours = int(match.group("hours"))
+            minutes = int(match.group("minutes") or 0)
+            if hours > 18 or minutes > 59:
+                raise ValueError("daily schedule utc_offset is out of range")
+            sign = -1 if match.group("sign") == "-" else 1
+            offset = timedelta(hours=hours, minutes=minutes) * sign
+    else:
+        raise ValueError("daily schedule utc_offset must be a fixed offset such as +08:00")
+    if offset.total_seconds() % 60:
+        raise ValueError("daily schedule utc_offset must be a whole-minute offset")
+    return offset
+
+
 class ScheduleWindowConfig(BaseModel):
-    """A UTC-only schedule window (e.g. a promo period for a candidate)."""
+    """Absolute UTC or recurring daily local-time window for a candidate."""
 
     model_config = ConfigDict(extra="forbid")
 
-    start: datetime
-    end: datetime
+    start: Optional[datetime] = None
+    end: Optional[datetime] = None
+    start_time: Optional[time] = None
+    end_time: Optional[time] = None
+    utc_offset: Optional[timedelta] = None
 
     @field_validator("start", "end")
     @classmethod
-    def _require_utc(cls, value: datetime) -> datetime:
+    def _require_utc(cls, value: Optional[datetime]) -> Optional[datetime]:
+        if value is None:
+            return None
         if value.tzinfo is None or value.utcoffset() != timedelta(0):
             raise ValueError("schedule window times must be UTC (offset zero)")
         return value
 
+    @field_validator("start_time", "end_time", mode="before")
+    @classmethod
+    def _parse_daily_clock(cls, value: object) -> object:
+        if value is None:
+            return None
+        return _parse_local_clock_time(value)
+
+    @field_validator("utc_offset", mode="before")
+    @classmethod
+    def _parse_daily_offset(cls, value: object) -> object:
+        if value is None:
+            return None
+        return _parse_fixed_utc_offset(value)
+
     @model_validator(mode="after")
-    def _require_end_after_start(self) -> "ScheduleWindowConfig":
-        if self.end < self.start:
-            raise ValueError(f"schedule window end ({self.end!r}) must not precede start ({self.start!r})")
+    def _require_exclusive_schedule_shape(self) -> "ScheduleWindowConfig":
+        has_absolute = self.start is not None or self.end is not None
+        has_daily = (
+            self.start_time is not None
+            or self.end_time is not None
+            or self.utc_offset is not None
+        )
+        if has_absolute and has_daily:
+            raise ValueError(
+                "schedule cannot mix absolute start/end with daily start_time/end_time/utc_offset"
+            )
+        if has_absolute:
+            if self.start is None or self.end is None:
+                raise ValueError("absolute schedule windows require both start and end")
+            if self.end < self.start:
+                raise ValueError(
+                    f"schedule window end ({self.end!r}) must not precede start ({self.start!r})"
+                )
+            return self
+        if (
+            self.start_time is None
+            or self.end_time is None
+            or self.utc_offset is None
+        ):
+            raise ValueError(
+                "daily schedule windows require start_time, end_time, and utc_offset"
+            )
         return self
+
+    @property
+    def kind(self) -> Literal["absolute", "daily"]:
+        if self.start is not None and self.end is not None:
+            return "absolute"
+        return "daily"
 
 
 class ErrorRuleConfig(BaseModel):
@@ -183,6 +283,7 @@ class AliasReferenceCandidateConfig(BaseModel):
     weight: float = 1.0
     tui_attached: Optional[str] = None
     tui_excluded: Optional[str] = None
+    schedule: Optional[ScheduleWindowConfig] = None
 
     @field_validator("weight")
     @classmethod

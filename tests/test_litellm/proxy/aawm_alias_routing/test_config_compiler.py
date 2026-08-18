@@ -160,6 +160,132 @@ aliases:
     promo_candidate = snapshot.aliases["basic"].candidates[0]
     assert promo_candidate.schedule is not None
     assert promo_candidate.schedule.start.utcoffset().total_seconds() == 0
+    assert promo_candidate.schedule.kind == "absolute"
+
+
+def test_daily_schedule_windows_compile_and_change_config_hash() -> None:
+    absolute = """
+defaults: {}
+aliases:
+  - name: scheduled
+    candidates:
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/qwen3.8-max
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 100
+        schedule:
+          start: "2026-07-01T00:00:00Z"
+          end: "2026-07-15T00:00:00Z"
+"""
+    daily = """
+defaults: {}
+aliases:
+  - name: scheduled
+    candidates:
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/qwen3.8-max
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 100
+        schedule:
+          start_time: "22:00:00"
+          end_time: "08:00:00"
+          utc_offset: "+08:00"
+"""
+    snapshot_absolute = compiler.compile_yaml(absolute)
+    snapshot_daily = compiler.compile_yaml(daily)
+    daily_candidate = snapshot_daily.aliases["scheduled"].candidates[0]
+    assert daily_candidate.schedule is not None
+    assert daily_candidate.schedule.kind == "daily"
+    assert snapshot_absolute.config_hash != snapshot_daily.config_hash
+
+
+def test_alias_reference_schedule_participates_in_config_hash() -> None:
+    """CFG-020: alias_reference schedules feed the semantic digest."""
+    unscheduled = """
+defaults: {}
+aliases:
+  - name: parent
+    candidates:
+      - alias_reference: child
+        priority: 110
+  - name: child
+    candidates:
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/deepseek-v4-pro
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 100
+"""
+    scheduled = """
+defaults: {}
+aliases:
+  - name: parent
+    candidates:
+      - alias_reference: child
+        priority: 110
+        schedule:
+          start_time: "22:00:00"
+          end_time: "08:00:00"
+          utc_offset: "+08:00"
+  - name: child
+    candidates:
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/deepseek-v4-pro
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 100
+"""
+    equivalent = """
+defaults: {}
+aliases:
+  - name: parent
+    candidates:
+      - alias_reference: child
+        priority: 110
+        schedule:
+          start_time: "22:00"
+          end_time: "08:00"
+          utc_offset: "UTC+8"
+  - name: child
+    candidates:
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/deepseek-v4-pro
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 100
+"""
+    snapshot_plain = compiler.compile_yaml(unscheduled)
+    snapshot_scheduled = compiler.compile_yaml(scheduled)
+    snapshot_equivalent = compiler.compile_yaml(equivalent)
+    reference = snapshot_scheduled.aliases["parent"].candidates[0]
+    assert reference.schedule is not None
+    assert reference.schedule.kind == "daily"
+    assert snapshot_plain.config_hash != snapshot_scheduled.config_hash
+    assert snapshot_equivalent.config_hash == snapshot_scheduled.config_hash
+
+
+def test_canonical_work_other_compiles_scheduled_deepseek_without_alibaba() -> None:
+    """CFG-020: work-other promotes scheduled DeepSeek and drops sota-alibaba."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+        AliasReference,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    alias = snapshot.aliases["work-other"]
+    assert all(isinstance(entry, AliasReference) for entry in alias.candidates)
+    identities = [(entry.alias_name, entry.priority) for entry in alias.candidates]
+    assert identities == [
+        ("sota-deepseek", 110),
+        ("sota-moonshot", 100),
+        ("sota-xai", 90),
+    ]
+    deepseek = alias.candidates[0]
+    assert deepseek.schedule is not None
+    assert deepseek.schedule.kind == "daily"
+    assert all(entry.alias_name != "sota-alibaba" for entry in alias.candidates)
+    owner = snapshot.aliases["sota-deepseek"].candidates[0]
+    assert owner.schedule is None
 
 
 def test_inheritance_resolves_at_compile() -> None:

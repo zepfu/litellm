@@ -201,24 +201,70 @@ absent from Codex and Claude TUI selection only because those clients' explicit
 model-definition inclusion lists omit it, not because YAML or Python marks it
 internal.
 
-## Maintained `expert` alias behavior (CFG-013)
+During the daily half-open window `22:00-08:00 UTC+8` (CFG-020), `work-other`
+promotes `alias_reference: sota-deepseek` (`alibaba_token_plan/deepseek-v4-pro`)
+ahead of `sota-moonshot` and `sota-xai`. Outside that window the DeepSeek
+reference is omitted from new selection, so the order is Moonshot, then xAI.
+Qwen 3.8 Max and Qwen 3.7 Max are not `work-other` candidates. Closing the
+window prevents new affinity and does not evict an existing session owner.
+
+## Maintained `expert` alias behavior (CFG-013 / CFG-020)
 
 The `expert` alias is compiled from `expert.yaml` in the canonical directory.
-It has exactly two candidates:
+It has three compiled candidates:
 
-1. **Claude-origin requests only** (`tui_attached: Claude`): native Anthropic
-   `claude-opus-5`, highest priority. Canonical Opus 5 is inherently a
-   1M-context model, so there is no `claude-opus-5[1m]` selector; a second
-   selector would duplicate the same upstream model.
-2. **Universal last resort** (`priority: 0`): OpenAI/Codex `gpt-5.6-terra`.
-   Terra carries no `tui_excluded` gate, so it is the direct/default candidate
-   for Codex, non-Claude, missing, unknown, and otherwise unconfigured
-   origins, and it remains available to Claude as the fallback after an Opus
-   failure.
+1. **Nightly promotion** (CFG-020): Alibaba Token Plan `qwen3.8-max` at
+   priority 110, scheduled `22:00-08:00 UTC+8`. This leaf is first for every
+   ingress while the window is open. It is not a `sota-alibaba` reference, so
+   Qwen 3.7 Max is not pulled in.
+2. **Claude-origin requests only** (`tui_attached: Claude`): native Anthropic
+   `claude-opus-5`. Canonical Opus 5 is inherently a 1M-context model, so there
+   is no `claude-opus-5[1m]` selector; a second selector would duplicate the
+   same upstream model.
+3. **Universal last resort** (`priority: 0`): OpenAI/Codex `gpt-5.6-terra`.
+   Terra carries no `tui_excluded` gate, so it remains available to Claude as
+   the fallback after an Opus failure and is the direct/default candidate
+   outside the nightly window for Codex, non-Claude, missing, unknown, and
+   otherwise unconfigured origins.
 
-Both candidates carry authoritative `reasoning_effort: max`. This value
-replaces caller-provided reasoning through the shared CFG-006 candidate
+In-window Claude-origin order is Qwen, then Opus, then Terra. In-window Codex
+and non-Claude order is Qwen, then Terra. Outside the window the previous
+Opus/Terra behavior is unchanged. Closing the window prevents new affinity
+and does not evict an existing session owner.
+
+Qwen, Opus, and Terra all carry authoritative `reasoning_effort: max`. This
+value replaces caller-provided reasoning through the shared CFG-006 candidate
 pipeline; there is no expert-specific reasoning precedence.
+
+## Candidate schedule windows
+
+A candidate or `alias_reference` may carry an optional `schedule`. Two
+mutually exclusive forms are accepted:
+
+```yaml
+schedule:
+  start: "2026-07-01T00:00:00Z"
+  end: "2026-07-15T00:00:00Z"
+```
+
+```yaml
+schedule:
+  start_time: "22:00:00"
+  end_time: "08:00:00"
+  utc_offset: "+08:00"
+```
+
+Absolute windows stay UTC-only and closed-closed (`start <= now <= end`).
+Daily windows require a local start time, local end time, and a fixed
+`utc_offset`. They are half-open: `22:00:00` is included, `07:59:59` is
+included, and `08:00:00` is excluded. When `start_time` is later than
+`end_time`, the window wraps midnight in that offset. Mixing the two forms,
+omitting the offset, using a date-only value, or applying a timezone-bearing
+clock time fails closed. `utc_offset: "+08:00"` is a fixed offset; it is not
+host-local time and does not apply daylight-saving rules.
+
+The schedule gate applies only to new affinity. Existing session owners are
+still found through `include_out_of_schedule` membership.
 
 The provider-native credential boundary applies: Opus uses
 `anthropic_messages` on both ingress projections and must egress exclusively
