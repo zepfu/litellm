@@ -106,12 +106,20 @@ def test_should_advertise_grok_46_collaboration_namespace_tool_adapters() -> Non
         "spawn_agent",
         "wait_agent",
     ]
+    expected_multi_agent_v1 = [
+        "close_agent",
+        "resume_agent",
+        "send_input",
+        "spawn_agent",
+        "wait_agent",
+    ]
     for catalog_path in CATALOG_PATHS:
         catalog = json.loads(catalog_path.read_text())
         for model in ("xai/grok-4.6", "oa_xai/grok-4.6"):
             entry = catalog[model]
             assert entry["namespace_tool_function_adapters"] == {
-                "collaboration": expected_collaboration
+                "collaboration": expected_collaboration,
+                "multi_agent_v1": expected_multi_agent_v1,
             }
 
 

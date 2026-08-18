@@ -12331,7 +12331,14 @@ def test_kimi_apply_patch_custom_tool_adapter_metadata_is_bundled(
                 "send_message",
                 "spawn_agent",
                 "wait_agent",
-            ]
+            ],
+            "multi_agent_v1": [
+                "close_agent",
+                "resume_agent",
+                "send_input",
+                "spawn_agent",
+                "wait_agent",
+            ],
         }
         assert model_catalog[model]["unsupported_hosted_tools"] == [
             "custom",
@@ -12344,7 +12351,19 @@ def test_kimi_apply_patch_custom_tool_adapter_metadata_is_bundled(
             "custom_tool_call",
             "custom_tool_call_output",
         ]
-    assert "custom_tool_function_adapters" not in model_catalog["kimi_code/k3"]
+    assert model_catalog["kimi_code/k3"]["namespace_tool_function_adapters"] == {
+        "collaboration": [
+            "followup_task",
+            "interrupt_agent",
+            "list_agents",
+            "send_message",
+            "spawn_agent",
+            "wait_agent",
+        ]
+    }
+    assert "multi_agent_v1" not in model_catalog["kimi_code/k3"][
+        "namespace_tool_function_adapters"
+    ]
 
 
 @pytest.mark.parametrize("model", ["kimi_code/k3-high", "kimi_code/k3-max"])

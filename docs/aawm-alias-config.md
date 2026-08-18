@@ -150,10 +150,11 @@ caller `reasoning.effort=xhigh` is sent unchanged to `oa_xai/grok-4.6`, with
 requested/native effort metadata and the provider-native field/provider
 recorded. Its route rollup is `grok-4.6(sota-xai):xhigh`.
 
-For this managed `oa_xai`/`sota-xai` flow, Grok 4.6 collaboration namespace
-children are flattened into provider-bound function tools and sanitized before
-egress. Provider function calls and results are restored to stock Codex
-collaboration tool calls and results with continuation IDs preserved. Native
+For this managed `oa_xai`/`sota-xai` flow, Grok 4.6 adapts both the
+`collaboration` and `multi_agent_v1` namespaces. Those children are flattened
+into provider-bound function tools and sanitized before egress. Provider
+function calls and results are restored to stock Codex collaboration and
+`multi_agent_v1` tool calls and results with continuation IDs preserved. Native
 Grok remains a separate, unchanged flow.
 
 Managed `oa_xai` Responses preparation applies the existing catalog/model-

@@ -2307,11 +2307,12 @@ egress. The encoded id is only for LiteLLM deployment affinity; xAI and Grok
 must receive the raw upstream id, otherwise compacted continuations can fail
 with provider errors such as `Could not decode the compaction blob`.
 
-For managed `oa_xai`/`sota-xai` flows only, Grok 4.6 collaboration namespace
-children are flattened into provider-bound function tools and sanitized before
-egress. The resulting function calls and results are restored to stock Codex
-collaboration tool calls and results, preserving continuation IDs. Native Grok
-flows remain separate and unchanged.
+For managed `oa_xai`/`sota-xai` flows only, Grok 4.6 adapts both the
+`collaboration` and `multi_agent_v1` namespaces. Those children are flattened
+into provider-bound function tools and sanitized before egress. The resulting
+function calls and results are restored to stock Codex collaboration and
+`multi_agent_v1` tool calls and results, preserving continuation IDs. Native
+Grok flows remain separate and unchanged.
 
 Shared namespace restoration consults the originally advertised tool schema
 before the response reaches Codex. Finite integral floats are converted to

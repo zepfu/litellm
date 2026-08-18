@@ -231,3 +231,41 @@ def test_should_load_all_token_plan_models_from_the_bundled_catalog(
         assert model_info["supports_function_calling"] is True
         assert model_info["supports_parallel_function_calling"] is True
         assert model_info["namespace_tool_function_adapters"]["collaboration"]
+
+
+_QWEN_TOKEN_PLAN_MODELS_WITH_MULTI_AGENT_V1 = (
+    "alibaba_token_plan/qwen3.8-max-preview",
+    "alibaba_token_plan/qwen3.8-max",
+    "alibaba_token_plan/qwen3.7-plus",
+    "alibaba_token_plan/qwen3.7-max",
+    "alibaba_token_plan/qwen3.6-flash",
+)
+_EXPECTED_COLLABORATION_ADAPTERS = [
+    "followup_task",
+    "interrupt_agent",
+    "list_agents",
+    "send_message",
+    "spawn_agent",
+    "wait_agent",
+]
+_EXPECTED_MULTI_AGENT_V1_ADAPTERS = [
+    "close_agent",
+    "resume_agent",
+    "send_input",
+    "spawn_agent",
+    "wait_agent",
+]
+
+
+def test_should_advertise_qwen_collaboration_and_multi_agent_v1_adapters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
+    local_model_cost = litellm.get_model_cost_map(url="unused")
+
+    for model in _QWEN_TOKEN_PLAN_MODELS_WITH_MULTI_AGENT_V1:
+        assert local_model_cost[model]["namespace_tool_function_adapters"] == {
+            "collaboration": _EXPECTED_COLLABORATION_ADAPTERS,
+            "multi_agent_v1": _EXPECTED_MULTI_AGENT_V1_ADAPTERS,
+        }

@@ -83,6 +83,13 @@
                 "send_message",
                 "spawn_agent",
                 "wait_agent"
+            ],
+            "multi_agent_v1": [
+                "close_agent",
+                "resume_agent",
+                "send_input",
+                "spawn_agent",
+                "wait_agent"
             ]
         },
         "source": "https://www.alibabacloud.com/help/en/model-studio/coding-plan",
@@ -144,6 +151,13 @@
                 "interrupt_agent",
                 "list_agents",
                 "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ],
+            "multi_agent_v1": [
+                "close_agent",
+                "resume_agent",
+                "send_input",
                 "spawn_agent",
                 "wait_agent"
             ]
@@ -212,6 +226,13 @@
                 "send_message",
                 "spawn_agent",
                 "wait_agent"
+            ],
+            "multi_agent_v1": [
+                "close_agent",
+                "resume_agent",
+                "send_input",
+                "spawn_agent",
+                "wait_agent"
             ]
         },
         "source": "https://www.alibabacloud.com/help/en/model-studio/model-pricing",
@@ -276,6 +297,13 @@
                 "interrupt_agent",
                 "list_agents",
                 "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ],
+            "multi_agent_v1": [
+                "close_agent",
+                "resume_agent",
+                "send_input",
                 "spawn_agent",
                 "wait_agent"
             ]
@@ -358,6 +386,13 @@
                 "interrupt_agent",
                 "list_agents",
                 "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ],
+            "multi_agent_v1": [
+                "close_agent",
+                "resume_agent",
+                "send_input",
                 "spawn_agent",
                 "wait_agent"
             ]
@@ -600,6 +635,13 @@
                 "send_message",
                 "spawn_agent",
                 "wait_agent"
+            ],
+            "multi_agent_v1": [
+                "close_agent",
+                "resume_agent",
+                "send_input",
+                "spawn_agent",
+                "wait_agent"
             ]
         },
         "default_reasoning_effort": "high",
@@ -642,6 +684,13 @@
                 "interrupt_agent",
                 "list_agents",
                 "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ],
+            "multi_agent_v1": [
+                "close_agent",
+                "resume_agent",
+                "send_input",
                 "spawn_agent",
                 "wait_agent"
             ]
@@ -40670,6 +40719,13 @@
                 "send_message",
                 "spawn_agent",
                 "wait_agent"
+            ],
+            "multi_agent_v1": [
+                "close_agent",
+                "resume_agent",
+                "send_input",
+                "spawn_agent",
+                "wait_agent"
             ]
         },
         "unsupported_hosted_tools": [
@@ -40762,6 +40818,13 @@
                 "interrupt_agent",
                 "list_agents",
                 "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ],
+            "multi_agent_v1": [
+                "close_agent",
+                "resume_agent",
+                "send_input",
                 "spawn_agent",
                 "wait_agent"
             ]
