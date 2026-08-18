@@ -6,6 +6,9 @@ the durable queue remains `.analysis/todo.md`, while `*-error.jsonl` files are
 short-lived structured intake artifacts that should be converted into TODO items
 and then cleaned up after resolution.
 
+A client abort (`starlette.requests.ClientDisconnect`) while LiteLLM reads the
+inbound request body is logged at DEBUG and is not an ERROR-intake event.
+
 During the migration window, agents should also inspect legacy
 `.analysis/*-error.log` files. Those plain-text files are retained for discovery
 only until all writers and intake instructions have moved to JSONL.

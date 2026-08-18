@@ -7,6 +7,7 @@ import orjson
 import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect
 
 sys.path.insert(
     0, os.path.abspath("../../../..")
@@ -835,3 +836,104 @@ def test_safe_get_request_headers_state_unavailable():
 
     result = _safe_get_request_headers(mock_request)
     assert result == {"content-type": "application/json"}
+
+
+def _disconnect_log_messages(mock_logger) -> list[str]:
+    messages: list[str] = []
+    for call in mock_logger.debug.call_args_list + mock_logger.info.call_args_list:
+        if call.args:
+            messages.append(str(call.args[0]))
+    return messages
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_on_body_read_is_not_logged_as_exception():
+    """
+    A client abort while reading request.body() must return {} and must not
+    be logged through verbose_proxy_logger.exception.
+    """
+    mock_request = MagicMock()
+    mock_request.body = AsyncMock(side_effect=ClientDisconnect())
+    mock_request.headers = {"content-type": "application/json"}
+    mock_request.scope = {}
+    mock_request.state._cached_headers = None
+
+    with patch(
+        "litellm.proxy.common_utils.http_parsing_utils.verbose_proxy_logger"
+    ) as mock_logger:
+        result = await _read_request_body(mock_request)
+
+    assert result == {}
+    mock_logger.exception.assert_not_called()
+    assert mock_logger.debug.called or mock_logger.info.called
+    assert any("ClientDisconnect" in message for message in _disconnect_log_messages(mock_logger))
+
+
+@pytest.mark.asyncio
+async def test_client_disconnect_on_form_read_is_not_logged_as_exception():
+    """
+    A client abort while reading request.form() must return {} and must not
+    be logged through verbose_proxy_logger.exception.
+    """
+    mock_request = MagicMock()
+    mock_request.form = AsyncMock(side_effect=ClientDisconnect())
+    mock_request.headers = {"content-type": "application/x-www-form-urlencoded"}
+    mock_request.scope = {}
+    mock_request.state._cached_headers = None
+
+    with patch(
+        "litellm.proxy.common_utils.http_parsing_utils.verbose_proxy_logger"
+    ) as mock_logger:
+        result = await _read_request_body(mock_request)
+
+    assert result == {}
+    mock_logger.exception.assert_not_called()
+    assert mock_logger.debug.called or mock_logger.info.called
+    assert any("ClientDisconnect" in message for message in _disconnect_log_messages(mock_logger))
+
+
+@pytest.mark.asyncio
+async def test_unexpected_body_read_error_still_logs_exception():
+    """
+    Non-disconnect failures while reading the body still use the exception
+    logger and still return the empty-body contract.
+    """
+    mock_request = MagicMock()
+    mock_request.body = AsyncMock(side_effect=ValueError("boom"))
+    mock_request.headers = {"content-type": "application/json"}
+    mock_request.scope = {}
+    mock_request.state._cached_headers = None
+
+    with patch(
+        "litellm.proxy.common_utils.http_parsing_utils.verbose_proxy_logger"
+    ) as mock_logger:
+        result = await _read_request_body(mock_request)
+
+    assert result == {}
+    mock_logger.exception.assert_called_once()
+    assert "Unexpected error reading request body" in str(
+        mock_logger.exception.call_args.args[0]
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_json_body_still_raises_proxy_exception():
+    """
+    Invalid JSON still raises ProxyException and does not use the unexpected
+    exception path.
+    """
+    mock_request = MagicMock()
+    mock_request.body = AsyncMock(return_value=b'{"model":')
+    mock_request.headers = {"content-type": "application/json"}
+    mock_request.scope = {}
+    mock_request.state._cached_headers = None
+
+    with patch(
+        "litellm.proxy.common_utils.http_parsing_utils.verbose_proxy_logger"
+    ) as mock_logger:
+        with pytest.raises(ProxyException) as exc_info:
+            await _read_request_body(mock_request)
+
+    assert exc_info.value.code == "400"
+    assert "Invalid JSON payload" in exc_info.value.message
+    mock_logger.exception.assert_not_called()

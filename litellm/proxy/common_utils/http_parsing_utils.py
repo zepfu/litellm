@@ -4,6 +4,7 @@ from typing import Any, Collection, Dict, List, Optional
 
 import orjson
 from fastapi import Request, UploadFile, status
+from starlette.requests import ClientDisconnect
 
 from litellm._logging import verbose_proxy_logger
 from litellm.proxy._types import ProxyException
@@ -88,6 +89,11 @@ async def _read_request_body(request: Optional[Request]) -> Dict:
         # Re-raise ProxyException as-is
         verbose_proxy_logger.error(f"Invalid JSON payload received: {str(e)}")
         raise
+    except ClientDisconnect:
+        verbose_proxy_logger.debug(
+            "ClientDisconnect while reading request body; returning empty body"
+        )
+        return {}
     except Exception as e:
         # Catch unexpected errors to avoid crashes
         verbose_proxy_logger.exception(
