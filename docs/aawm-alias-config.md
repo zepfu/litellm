@@ -142,7 +142,8 @@ order:
 2. OpenRouter Owl Alpha
 3. OpenCode Zen deepseek-v4-flash
 4. OpenCode Zen big-pickle
-5. Alibaba Token Plan qwen3.6-flash
+5. Alibaba Token Plan deepseek-v4-flash-0731
+6. Alibaba Token Plan qwen3.6-flash
 
 The managed `sota-xai` candidate has no candidate-level reasoning override:
 caller `reasoning.effort=xhigh` is sent unchanged to `oa_xai/grok-4.6`, with
@@ -170,11 +171,12 @@ candidates are the `qwen3.8-max-preview` promo, `kimi-for-coding`, and
 Cost metadata for these shared candidates is route-specific. OpenRouter North
 may carry a third-party hosted reference baseline, while Owl Alpha is
 unpriced. OpenCode Big Pickle and its free DeepSeek route remain unpriced, and
-Alibaba Qwen 3.6 is reference-priced only under the subscription
-`actual_invoice_cost_known=false` contract, using the international Model
-Studio direct list rate rather than claiming Token Plan subscription invoice
-economics. Reference totals are provenance metadata and never standard spend
-or `response_cost_usd`; Luna remains the last-resort actual routed fallback.
+Alibaba DeepSeek V4 Flash and Qwen 3.6 are reference-priced only under the
+subscription `actual_invoice_cost_known=false` contract, using the
+international Model Studio direct list rate rather than claiming Token Plan
+subscription invoice economics. Reference totals are provenance metadata and
+never standard spend or `response_cost_usd`; Luna remains the last-resort
+actual routed fallback.
 
 ## Maintained `work` and `work-other` alias behavior
 

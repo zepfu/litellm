@@ -9031,11 +9031,17 @@
         {
           "candidate_order": 4,
           "provider": "alibaba_token_plan",
-          "model": "alibaba_token_plan/qwen3.6-flash",
+          "model": "alibaba_token_plan/deepseek-v4-flash-0731",
           "route_family": "codex_alibaba_token_plan_chat_completions_adapter"
         },
         {
           "candidate_order": 5,
+          "provider": "alibaba_token_plan",
+          "model": "alibaba_token_plan/qwen3.6-flash",
+          "route_family": "codex_alibaba_token_plan_chat_completions_adapter"
+        },
+        {
+          "candidate_order": 6,
           "provider": "openai",
           "model": "gpt-5.6-luna",
           "route_family": "codex_responses"
@@ -9171,6 +9177,7 @@
                 "openrouter/owl-alpha",
                 "deepseek-v4-flash",
                 "big-pickle",
+                "alibaba_token_plan/deepseek-v4-flash-0731",
                 "alibaba_token_plan/qwen3.6-flash",
                 "gpt-5.6-luna"
               ]
@@ -9214,6 +9221,11 @@
                 "provider": "opencode_zen",
                 "model": "big-pickle",
                 "route_family": "codex_opencode_zen_adapter"
+              },
+              {
+                "provider": "alibaba_token_plan",
+                "model": "alibaba_token_plan/deepseek-v4-flash-0731",
+                "route_family": "codex_alibaba_token_plan_chat_completions_adapter"
               },
               {
                 "provider": "alibaba_token_plan",
@@ -9333,11 +9345,17 @@
         {
           "candidate_order": 4,
           "provider": "alibaba_token_plan",
-          "model": "alibaba_token_plan/qwen3.6-flash",
+          "model": "alibaba_token_plan/deepseek-v4-flash-0731",
           "route_family": "anthropic_alibaba_token_plan_chat_completions_adapter"
         },
         {
           "candidate_order": 5,
+          "provider": "alibaba_token_plan",
+          "model": "alibaba_token_plan/qwen3.6-flash",
+          "route_family": "anthropic_alibaba_token_plan_chat_completions_adapter"
+        },
+        {
+          "candidate_order": 6,
           "provider": "anthropic",
           "model": "claude-haiku-4-5-20251001",
           "route_family": "anthropic_messages"
@@ -9425,6 +9443,7 @@
                 "openrouter/owl-alpha",
                 "deepseek-v4-flash",
                 "big-pickle",
+                "alibaba_token_plan/deepseek-v4-flash-0731",
                 "alibaba_token_plan/qwen3.6-flash",
                 "claude-haiku-4-5-20251001"
               ]
@@ -9465,6 +9484,11 @@
                 "provider": "opencode_zen",
                 "model": "big-pickle",
                 "route_family": "anthropic_opencode_zen_completion_adapter"
+              },
+              {
+                "provider": "alibaba_token_plan",
+                "model": "alibaba_token_plan/deepseek-v4-flash-0731",
+                "route_family": "anthropic_alibaba_token_plan_chat_completions_adapter"
               },
               {
                 "provider": "alibaba_token_plan",

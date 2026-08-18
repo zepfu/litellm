@@ -28,6 +28,7 @@ ALIBABA_TOKEN_PLAN_MODEL_IDS = frozenset(
         "qwen3.7-plus",
         "qwen3.7-max",
         "qwen3.6-flash",
+        "deepseek-v4-flash-0731",
         "deepseek-v4-pro",
         "glm-5.2",
     }

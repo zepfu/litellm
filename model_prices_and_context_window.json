@@ -379,6 +379,69 @@
             "custom_tool_call_output"
         ]
     },
+    "alibaba_token_plan/deepseek-v4-flash-0731": {
+        "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "litellm_provider": "alibaba_token_plan",
+        "mode": "chat",
+        "provider_specific_entry": {
+            "alibaba_token_plan": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "provider_subscription_reference",
+                    "billing_mode": "alibaba_token_plan_subscription",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "alibaba_token_plan",
+                        "model": "alibaba_token_plan/deepseek-v4-flash-0731"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_applicable",
+                    "equivalence_evidence": "Subscription invoice tariff is not exposed.",
+                    "source": {
+                        "kind": "official_provider_catalog",
+                        "label": "Alibaba Model Studio Coding Plan",
+                        "urls": [
+                            "https://www.alibabacloud.com/help/en/model-studio/coding-plan"
+                        ],
+                        "version": "2026-08-16",
+                        "verified_on": "2026-08-16"
+                    },
+                    "unpriced_reason": "public_per_token_rate_unavailable"
+                }
+            }
+        },
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "source": "https://www.alibabacloud.com/help/en/model-studio/coding-plan",
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true,
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search"
+        ],
+        "unsupported_input_item_types": [
+            "custom_tool_call",
+            "custom_tool_call_output"
+        ]
+    },
     "alibaba_token_plan/deepseek-v4-pro": {
         "comment": "Alibaba Token Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
         "custom_tool_function_adapters": [

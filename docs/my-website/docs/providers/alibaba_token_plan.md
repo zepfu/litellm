@@ -20,8 +20,13 @@ alias routes remain separate.
 - `alibaba_token_plan/qwen3.7-plus`
 - `alibaba_token_plan/qwen3.7-max`
 - `alibaba_token_plan/qwen3.6-flash`
+- `alibaba_token_plan/deepseek-v4-flash-0731`
 - `alibaba_token_plan/deepseek-v4-pro`
 - `alibaba_token_plan/glm-5.2`
+
+Alibaba's public Coding Plan documentation uses the family label
+`deepseek-v4-flash`; the authenticated Token Plan model catalog advertises the
+routable ID `deepseek-v4-flash-0731`, which is the identity configured here.
 
 Other model IDs are rejected locally. The provider always resolves the public
 LiteLLM model identity to the unprefixed provider model before egress. A public

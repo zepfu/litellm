@@ -40,6 +40,11 @@ aliases:
         priority: 50
 
       - provider: alibaba_token_plan
+        model: alibaba_token_plan/deepseek-v4-flash-0731
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 45
+
+      - provider: alibaba_token_plan
         model: alibaba_token_plan/qwen3.6-flash
         route_family: codex_alibaba_token_plan_chat_completions_adapter
         priority: 40

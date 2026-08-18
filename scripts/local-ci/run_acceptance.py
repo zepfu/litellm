@@ -4266,6 +4266,12 @@ _REQUIRED_AVAILABILITY_WINDOWS: dict[tuple[str, str], frozenset[str]] = {
     ("alibaba_token_plan", "alibaba_token_plan/qwen3.8-max-preview"): frozenset(
         {"alibaba_token_plan_5h:credits", "alibaba_token_plan_7d:credits"}
     ),
+    (
+        "alibaba_token_plan",
+        "alibaba_token_plan/deepseek-v4-flash-0731",
+    ): frozenset(
+        {"alibaba_token_plan_5h:credits", "alibaba_token_plan_7d:credits"}
+    ),
     ("alibaba_token_plan", "alibaba_token_plan/qwen3.6-flash"): frozenset(
         {"alibaba_token_plan_5h:credits", "alibaba_token_plan_7d:credits"}
     ),
