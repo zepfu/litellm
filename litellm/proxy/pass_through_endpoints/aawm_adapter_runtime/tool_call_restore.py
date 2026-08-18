@@ -58,6 +58,12 @@ from litellm.proxy._types import ProxyException
 _HOST_FUNCTION_NAMES = (
     "_restore_adapted_custom_tool_calls_in_response_body",
     "_advertised_namespace_tool_function_adapter_map",
+    "_advertised_namespace_tool_argument_schemas",
+    "_schema_requires_integer",
+    "_is_finite_integral_float",
+    "_repair_namespace_argument_value",
+    "_repair_adapted_namespace_tool_arguments",
+    "_attach_namespace_argument_repair_metadata",
     "_restore_adapted_namespace_tool_call_item",
     "_restore_adapted_namespace_tool_calls_in_response_body",
     "_adapted_custom_tool_stream_state_keys",
@@ -183,22 +189,225 @@ def _advertised_namespace_tool_function_adapter_map(
     }
 
 
+def _advertised_namespace_tool_argument_schemas(
+    request_body: Optional[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(request_body, dict):
+        return {}
+
+    schemas: dict[str, dict[str, Any]] = {}
+
+    def _add_tool(tool: Any) -> None:
+        if not isinstance(tool, dict):
+            return
+
+        function_block = tool.get("function")
+        name = tool.get("name")
+        parameters = tool.get("parameters")
+        if isinstance(function_block, dict):
+            if not isinstance(name, str) or not name.strip():
+                name = function_block.get("name")
+            if not isinstance(parameters, dict):
+                parameters = function_block.get("parameters")
+
+        normalized_name = _normalize_low_cardinality_tag_value(name)  # noqa: F821
+        if normalized_name and isinstance(parameters, dict):
+            schemas[normalized_name] = parameters
+
+        children = tool.get("tools")
+        if isinstance(children, list):
+            for child in children:
+                _add_tool(child)
+
+    for source in (request_body.get("tools"), request_body.get("functions")):
+        if not isinstance(source, list):
+            continue
+        for tool in source:
+            _add_tool(tool)
+    return schemas
+
+
+def _schema_requires_integer(schema: dict[str, Any]) -> bool:
+    schema_type = schema.get("type")
+    if schema_type == "integer":
+        return True
+    if isinstance(schema_type, list):
+        non_null = [candidate for candidate in schema_type if candidate != "null"]
+        return non_null == ["integer"]
+    return False
+
+
+def _is_finite_integral_float(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, float):
+        return False
+    return (
+        value == value
+        and value not in {float("inf"), float("-inf")}
+        and value.is_integer()
+    )
+
+
+def _repair_namespace_argument_value(
+    value: Any,
+    schema: Any,
+    path: str,
+) -> tuple[Any, list[str]]:
+    if not isinstance(schema, dict):
+        return value, []
+    if _schema_requires_integer(schema) and _is_finite_integral_float(value):
+        return int(value), [path or "value"]
+
+    schema_type = schema.get("type")
+    allowed_types = schema_type if isinstance(schema_type, list) else [schema_type]
+    repaired_fields: list[str] = []
+
+    if isinstance(value, dict) and (
+        schema_type in {None, "object"} or "object" in allowed_types
+    ):
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            properties = {}
+        additional_properties = schema.get("additionalProperties")
+        repaired_object: dict[str, Any] = {}
+        changed = False
+        for key, child in value.items():
+            child_schema = properties.get(key)
+            if not isinstance(child_schema, dict) and isinstance(
+                additional_properties, dict
+            ):
+                child_schema = additional_properties
+            child_path = f"{path}.{key}" if path else str(key)
+            repaired_child, child_fields = _repair_namespace_argument_value(
+                child, child_schema, child_path
+            )
+            repaired_object[key] = repaired_child
+            if child_fields:
+                changed = True
+                repaired_fields.extend(child_fields)
+        return (repaired_object if changed else value), repaired_fields
+
+    if isinstance(value, list) and (
+        schema_type == "array" or "array" in allowed_types
+    ):
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            repaired_list: list[Any] = []
+            changed = False
+            for index, child in enumerate(value):
+                child_path = f"{path}[{index}]" if path else f"[{index}]"
+                repaired_child, child_fields = _repair_namespace_argument_value(
+                    child, item_schema, child_path
+                )
+                repaired_list.append(repaired_child)
+                if child_fields:
+                    changed = True
+                    repaired_fields.extend(child_fields)
+            return (repaired_list if changed else value), repaired_fields
+    return value, []
+
+
+def _repair_adapted_namespace_tool_arguments(
+    arguments: Any,
+    parameters: Optional[dict[str, Any]],
+) -> tuple[Any, list[str]]:
+    if not isinstance(parameters, dict):
+        return arguments, []
+
+    parsed_arguments = arguments
+    encoded_string = False
+    if isinstance(arguments, str):
+        try:
+            parsed_arguments = json.loads(arguments)
+        except Exception:
+            return arguments, []
+        encoded_string = True
+    if not isinstance(parsed_arguments, dict):
+        return arguments, []
+
+    repaired_arguments, repaired_fields = _repair_namespace_argument_value(
+        parsed_arguments, parameters, ""
+    )
+    if not repaired_fields:
+        return arguments, []
+    if encoded_string:
+        return json.dumps(repaired_arguments, ensure_ascii=False), repaired_fields
+    return repaired_arguments, repaired_fields
+
+
+def _attach_namespace_argument_repair_metadata(
+    response_body: dict[str, Any],
+    repairs: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not repairs:
+        return response_body
+
+    names = sorted(
+        {
+            str(item["name"])
+            for item in repairs
+            if isinstance(item.get("name"), str) and item.get("name")
+        }
+    )
+    fields = sorted(
+        {
+            str(field)
+            for item in repairs
+            if isinstance(item.get("fields"), list)
+            for field in item["fields"]
+            if isinstance(field, str) and field
+        }
+    )
+    metadata = response_body.get("litellm_metadata")
+    updated_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    updated_metadata["codex_namespace_tool_argument_repair_count"] = sum(
+        len(item["fields"])
+        for item in repairs
+        if isinstance(item.get("fields"), list)
+    )
+    updated_metadata["codex_namespace_tool_argument_repair_names"] = names
+    updated_metadata["codex_namespace_tool_argument_repair_fields"] = fields
+    return {**response_body, "litellm_metadata": updated_metadata}
+
+
 def _restore_adapted_namespace_tool_call_item(
     item: Any,
     *,
     namespace_by_name: dict[str, str],
+    schema_by_name: Optional[dict[str, dict[str, Any]]] = None,
+    repair_records: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[Any, int]:
     if not isinstance(item, dict) or item.get("type") != "function_call":
         return item, 0
 
     item_name = _normalize_low_cardinality_tag_value(item.get("name"))  # noqa: F821
-    namespace = namespace_by_name.get(item_name or "")
-    if namespace is None or item.get("namespace") is not None:
-        return item, 0
+    restored_item = item
+    restored_count = 0
 
-    restored_item = dict(item)
-    restored_item["namespace"] = namespace
-    return restored_item, 1
+    namespace = namespace_by_name.get(item_name or "")
+    if namespace is not None and item.get("namespace") is None:
+        restored_item = dict(item)
+        restored_item["namespace"] = namespace
+        restored_count = 1
+
+    schema = None if schema_by_name is None else schema_by_name.get(item_name or "")
+    if schema is not None:
+        repaired_arguments, repaired_fields = _repair_adapted_namespace_tool_arguments(
+            restored_item.get("arguments"),
+            schema,
+        )
+        if repaired_fields:
+            if restored_item is item:
+                restored_item = dict(item)
+            restored_item["arguments"] = repaired_arguments
+            restored_count = 1
+            if repair_records is not None:
+                repair_records.append(
+                    {
+                        "name": item_name,
+                        "fields": repaired_fields,
+                    }
+                )
+    return restored_item, restored_count
 
 
 def _restore_adapted_namespace_tool_calls_in_response_body(
@@ -218,12 +427,16 @@ def _restore_adapted_namespace_tool_calls_in_response_body(
     if not isinstance(output, list):
         return response_body, 0
 
+    schema_by_name = _advertised_namespace_tool_argument_schemas(request_body)
     restored_output: list[Any] = []
     restored_count = 0
+    repair_records: list[dict[str, Any]] = []
     for item in output:
         restored_item, item_restored_count = _restore_adapted_namespace_tool_call_item(
             item,
             namespace_by_name=namespace_by_name,
+            schema_by_name=schema_by_name,
+            repair_records=repair_records,
         )
         restored_output.append(restored_item)
         restored_count += item_restored_count
@@ -233,7 +446,7 @@ def _restore_adapted_namespace_tool_calls_in_response_body(
 
     restored_body = dict(response_body)
     restored_body["output"] = restored_output
-    return restored_body, restored_count
+    return _attach_namespace_argument_repair_metadata(restored_body, repair_records), restored_count
 
 
 def _adapted_custom_tool_stream_state_keys(
@@ -460,6 +673,8 @@ def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
     event_payload: dict[str, Any],
     *,
     namespace_by_name: dict[str, str],
+    schema_by_name: Optional[dict[str, dict[str, Any]]] = None,
+    repair_records: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[dict[str, Any], int]:
     restored_payload = event_payload
     restored_count = 0
@@ -467,11 +682,40 @@ def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
     item, item_restored_count = _restore_adapted_namespace_tool_call_item(
         event_payload.get("item"),
         namespace_by_name=namespace_by_name,
+        schema_by_name=schema_by_name,
+        repair_records=repair_records,
     )
     if item_restored_count:
         restored_payload = dict(restored_payload)
         restored_payload["item"] = item
         restored_count += item_restored_count
+
+    if event_payload.get("type") == "response.function_call_arguments.done":
+        item_name = _normalize_low_cardinality_tag_value(  # noqa: F821
+            event_payload.get("name")
+        )
+        if item_name is None and isinstance(item, dict):
+            item_name = _normalize_low_cardinality_tag_value(item.get("name"))  # noqa: F821
+        schema = None if schema_by_name is None else schema_by_name.get(item_name or "")
+        if schema is not None:
+            repaired_arguments, repaired_fields = (
+                _repair_adapted_namespace_tool_arguments(
+                    event_payload.get("arguments"),
+                    schema,
+                )
+            )
+            if repaired_fields:
+                if restored_payload is event_payload:
+                    restored_payload = dict(event_payload)
+                restored_payload["arguments"] = repaired_arguments
+                restored_count += 1
+                if repair_records is not None:
+                    repair_records.append(
+                        {
+                            "name": item_name,
+                            "fields": repaired_fields,
+                        }
+                    )
 
     response_body = event_payload.get("response")
     if isinstance(response_body, dict):
@@ -483,6 +727,8 @@ def _restore_adapted_namespace_tool_calls_in_stream_event_payload(
                 restored_item, output_item_restored_count = _restore_adapted_namespace_tool_call_item(
                     output_item,
                     namespace_by_name=namespace_by_name,
+                    schema_by_name=schema_by_name,
+                    repair_records=repair_records,
                 )
                 restored_output.append(restored_item)
                 response_restored_count += output_item_restored_count
@@ -501,6 +747,8 @@ def _restore_adapted_namespace_tool_calls_in_sse_event_block(
     event_block: str,
     *,
     namespace_by_name: dict[str, str],
+    schema_by_name: Optional[dict[str, dict[str, Any]]] = None,
+    repair_records: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[str, int]:
     lines = event_block.splitlines()
     data_line_indexes = [index for index, line in enumerate(lines) if line.startswith("data:")]
@@ -520,6 +768,8 @@ def _restore_adapted_namespace_tool_calls_in_sse_event_block(
     restored_payload, restored_count = _restore_adapted_namespace_tool_calls_in_stream_event_payload(
         event_payload,
         namespace_by_name=namespace_by_name,
+        schema_by_name=schema_by_name,
+        repair_records=repair_records,
     )
     if not restored_count:
         return event_block, 0
@@ -551,6 +801,7 @@ def _restore_adapted_namespace_tool_calls_in_streaming_response(
     if not namespace_by_name:
         return response
 
+    schema_by_name = _advertised_namespace_tool_argument_schemas(request_body)
     original_iterator = response.body_iterator
 
     async def _restoring_iterator() -> Any:
@@ -562,6 +813,7 @@ def _restore_adapted_namespace_tool_calls_in_streaming_response(
             restored_block, _ = _restore_adapted_namespace_tool_calls_in_sse_event_block(
                 event_block,
                 namespace_by_name=namespace_by_name,
+                schema_by_name=schema_by_name,
             )
             if has_trailing_separator:
                 yield f"{restored_block}\n\n"

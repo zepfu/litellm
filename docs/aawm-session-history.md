@@ -2313,6 +2313,13 @@ egress. The resulting function calls and results are restored to stock Codex
 collaboration tool calls and results, preserving continuation IDs. Native Grok
 flows remain separate and unchanged.
 
+Shared namespace restoration consults the originally advertised tool schema
+before the response reaches Codex. Finite integral floats are converted to
+integers only when that property requires `integer`; non-integral floats,
+bools, strings, unknown fields, and `number` schemas are left unchanged.
+Incremental `function_call_arguments.delta` fragments are not rewritten.
+Bounded repair metadata records only tool names, field names, and count.
+
 Managed `oa_xai` Responses preparation applies the existing catalog/model-
 metadata-driven `rewrite_input_item_types` continuation rewrite before
 `_sanitize_xai_responses_request_body_in_place`. The rewrite consults model

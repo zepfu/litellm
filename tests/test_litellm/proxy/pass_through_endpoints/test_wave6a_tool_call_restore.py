@@ -1,6 +1,6 @@
 """Wave 6A Author C tool_call_restore module-local tests.
 
-AST structure, dependency isolation, and behavior tests for the 14 extracted
+AST structure, dependency isolation, and behavior tests for the extracted
 tool-call restore symbols plus the repaired-output-ID host seam.
 """
 
@@ -25,6 +25,12 @@ MODULE_PATH = Path(mod.__file__).resolve()
 EXPECTED_SYMBOLS = (
     "_restore_adapted_custom_tool_calls_in_response_body",
     "_advertised_namespace_tool_function_adapter_map",
+    "_advertised_namespace_tool_argument_schemas",
+    "_schema_requires_integer",
+    "_is_finite_integral_float",
+    "_repair_namespace_argument_value",
+    "_repair_adapted_namespace_tool_arguments",
+    "_attach_namespace_argument_repair_metadata",
     "_restore_adapted_namespace_tool_call_item",
     "_restore_adapted_namespace_tool_calls_in_response_body",
     "_adapted_custom_tool_stream_state_keys",
@@ -146,7 +152,7 @@ def host_deps(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestASTStructure:
-    """All 15 symbols must be top-level function defs in the module."""
+    """All extracted restore symbols must be top-level function defs."""
 
     def test_all_symbols_present(self) -> None:
         tree = ast.parse(MODULE_PATH.read_text())
@@ -356,6 +362,185 @@ class TestNamespaceToolRestore:
         )
         assert ns_count == 0
         assert ns_result is body
+
+
+# ===========================================================================
+# SECTION 4B - Schema-driven integer argument repair
+# ===========================================================================
+
+
+_WAIT_AGENT_INTEGER_SCHEMA = {
+    "type": "object",
+    "properties": {"timeout_ms": {"type": "integer"}},
+    "additionalProperties": False,
+}
+
+
+class TestNamespaceArgumentRepair:
+    """Convert only finite integral floats where the advertised schema is integer."""
+
+    def test_repairs_integral_float_timeout_ms(self) -> None:
+        repaired, fields = mod._repair_adapted_namespace_tool_arguments(
+            json.dumps({"timeout_ms": 120000.0}),
+            _WAIT_AGENT_INTEGER_SCHEMA,
+        )
+        assert json.loads(repaired) == {"timeout_ms": 120000}
+        assert isinstance(json.loads(repaired)["timeout_ms"], int)
+        assert fields == ["timeout_ms"]
+
+    def test_leaves_number_schema_float_unchanged(self) -> None:
+        arguments = json.dumps({"timeout_ms": 120000.0})
+        repaired, fields = mod._repair_adapted_namespace_tool_arguments(
+            arguments,
+            {
+                "type": "object",
+                "properties": {"timeout_ms": {"type": "number"}},
+            },
+        )
+        assert repaired == arguments
+        assert fields == []
+
+    def test_leaves_nonconvertible_values_unchanged(self) -> None:
+        payload = {
+            "flag": True,
+            "count": 3,
+            "label": "120000.0",
+            "timeout_ms": 120000.5,
+            "unknown": 1.0,
+        }
+        repaired, fields = mod._repair_adapted_namespace_tool_arguments(
+            json.dumps(payload),
+            {
+                "type": "object",
+                "properties": {
+                    "flag": {"type": "boolean"},
+                    "count": {"type": "integer"},
+                    "label": {"type": "string"},
+                    "timeout_ms": {"type": "integer"},
+                },
+            },
+        )
+        assert json.loads(repaired) == payload
+        assert fields == []
+
+    def test_leaves_nan_and_infinity_unchanged(self) -> None:
+        payload = {"timeout_ms": float("nan")}
+        repaired, fields = mod._repair_adapted_namespace_tool_arguments(
+            payload,
+            _WAIT_AGENT_INTEGER_SCHEMA,
+        )
+        assert repaired is payload
+        assert fields == []
+        payload = {"timeout_ms": float("inf")}
+        repaired, fields = mod._repair_adapted_namespace_tool_arguments(
+            payload,
+            _WAIT_AGENT_INTEGER_SCHEMA,
+        )
+        assert repaired is payload
+        assert fields == []
+
+    def test_leaves_incomplete_json_string_unchanged(self) -> None:
+        arguments = '{"timeout_ms": 120000.'
+        repaired, fields = mod._repair_adapted_namespace_tool_arguments(
+            arguments,
+            _WAIT_AGENT_INTEGER_SCHEMA,
+        )
+        assert repaired == arguments
+        assert fields == []
+
+    def test_restore_item_repairs_existing_namespace(self, host_deps: None) -> None:
+        item = {
+            "type": "function_call",
+            "name": "wait_agent",
+            "namespace": "collaboration",
+            "call_id": "call_wait",
+            "arguments": json.dumps({"timeout_ms": 120000.0}),
+        }
+        records: list[dict[str, Any]] = []
+        restored, count = mod._restore_adapted_namespace_tool_call_item(
+            item,
+            namespace_by_name={"wait_agent": "collaboration"},
+            schema_by_name={"wait_agent": _WAIT_AGENT_INTEGER_SCHEMA},
+            repair_records=records,
+        )
+        assert count == 1
+        assert restored["namespace"] == "collaboration"
+        assert restored["call_id"] == "call_wait"
+        assert json.loads(restored["arguments"]) == {"timeout_ms": 120000}
+        assert records == [{"name": "wait_agent", "fields": ["timeout_ms"]}]
+
+    def test_response_body_repairs_timeout_and_records_bounded_metadata(
+        self, host_deps: None
+    ) -> None:
+        request_body = {
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "ns_adapter",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "tool_a",
+                            "parameters": _WAIT_AGENT_INTEGER_SCHEMA,
+                        }
+                    ],
+                }
+            ]
+        }
+        body = {
+            "output": [
+                {
+                    "type": "function_call",
+                    "name": "tool_a",
+                    "call_id": "call_wait",
+                    "arguments": json.dumps({"timeout_ms": 120000.0}),
+                }
+            ]
+        }
+        result, count = mod._restore_adapted_namespace_tool_calls_in_response_body(
+            body, request_body=request_body, adapter_model="test-model",
+        )
+        assert count == 1
+        restored_item = result["output"][0]
+        assert restored_item["namespace"] == "ns_adapter"
+        assert restored_item["call_id"] == "call_wait"
+        assert json.loads(restored_item["arguments"]) == {"timeout_ms": 120000}
+        metadata = result["litellm_metadata"]
+        assert metadata["codex_namespace_tool_argument_repair_count"] == 1
+        assert metadata["codex_namespace_tool_argument_repair_names"] == ["tool_a"]
+        assert metadata["codex_namespace_tool_argument_repair_fields"] == ["timeout_ms"]
+        assert "120000" not in json.dumps(metadata)
+
+    def test_stream_delta_is_not_rewritten(self, host_deps: None) -> None:
+        payload = {
+            "type": "response.function_call_arguments.delta",
+            "name": "tool_a",
+            "delta": '{"timeout_ms": 120000.',
+        }
+        result, count = mod._restore_adapted_namespace_tool_calls_in_stream_event_payload(
+            payload,
+            namespace_by_name={"tool_a": "ns_adapter"},
+            schema_by_name={"tool_a": _WAIT_AGENT_INTEGER_SCHEMA},
+        )
+        assert count == 0
+        assert result is payload
+        assert result["delta"] == '{"timeout_ms": 120000.'
+
+    def test_stream_arguments_done_is_repaired(self, host_deps: None) -> None:
+        payload = {
+            "type": "response.function_call_arguments.done",
+            "name": "tool_a",
+            "call_id": "call_wait",
+            "arguments": json.dumps({"timeout_ms": 120000.0}),
+        }
+        result, count = mod._restore_adapted_namespace_tool_calls_in_stream_event_payload(
+            payload,
+            namespace_by_name={"tool_a": "ns_adapter"},
+            schema_by_name={"tool_a": _WAIT_AGENT_INTEGER_SCHEMA},
+        )
+        assert count == 1
+        assert result["call_id"] == "call_wait"
+        assert json.loads(result["arguments"]) == {"timeout_ms": 120000}
 
 
 # ===========================================================================
