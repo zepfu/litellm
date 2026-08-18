@@ -507,6 +507,7 @@ async def _prepare_oa_xai_passthrough_request(
             request_body
         )
         runtime._replace_request_body_in_place(request_body, updated_body)
+        _rewrite_grok_native_unsupported_input_items_in_place(request_body)
         runtime._sanitize_xai_responses_request_body_in_place(request_body)
         (
             updated_body,

@@ -2305,6 +2305,14 @@ egress. The resulting function calls and results are restored to stock Codex
 collaboration tool calls and results, preserving continuation IDs. Native Grok
 flows remain separate and unchanged.
 
+Managed `oa_xai` Responses preparation applies the existing catalog/model-
+metadata-driven `rewrite_input_item_types` continuation rewrite before
+`_sanitize_xai_responses_request_body_in_place`. The rewrite consults model
+metadata rather than hardcoded model-name checks, so prior `function_call` and
+`function_call_output` items are rewritten only when that catalog field
+requests it. This is a source-level managed `oa_xai` contract only; runtime
+and container acceptance are not claimed.
+
 For AAWM Codex aliases, hosted-tool support is evaluated again after the alias
 has selected a concrete xAI/Grok candidate such as `grok-composer-2.5-fast` or
 `oa_xai/grok-build`. This catches provider-invalid Codex tool variants, including
@@ -2432,6 +2440,9 @@ Rows affected by this path may include:
   no typed tool definitions were present in the outgoing payload.
 - `xai_tool_choice_without_tools_removed_reason`: currently `missing_tools`
   when `tool_choice` was removed because no usable tools survived.
+- Managed `oa_xai` catalog-driven continuation rewrite evidence is
+  low-cardinality and excludes argument payload values. Runtime and
+  container acceptance are not claimed.
 
 Related route metadata distinguishes Codex and native Grok traffic:
 

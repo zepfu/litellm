@@ -682,6 +682,10 @@ async def test_oa_xai_sanitize_callbacks_should_run_in_exact_order(
         events.append("sanitize")
         return [], []
 
+    def rewrite_input(_: Payload) -> list[Payload]:
+        events.append("input-rewrite")
+        return []
+
     _configure(
         prepare_oa_xai_request=prepare,
         _drop_unsupported_codex_hosted_tools_from_request_body=drop("hosted"),
@@ -690,6 +694,11 @@ async def test_oa_xai_sanitize_callbacks_should_run_in_exact_order(
         _drop_tool_choice_without_tools_from_request_body=drop("choice"),
         _replace_request_body_in_place=replace,
         _sanitize_xai_responses_request_body_in_place=sanitize,
+    )
+    monkeypatch.setattr(
+        request_prep,
+        "_rewrite_grok_native_unsupported_input_items_in_place",
+        rewrite_input,
     )
     body: Payload = {"model": "oa-xai/grok"}
 
@@ -707,6 +716,7 @@ async def test_oa_xai_sanitize_callbacks_should_run_in_exact_order(
         "replace",
         "items",
         "replace",
+        "input-rewrite",
         "sanitize",
         "choice",
         "replace",
@@ -719,6 +729,117 @@ async def test_oa_xai_sanitize_callbacks_should_run_in_exact_order(
         "items_done": True,
         "choice_done": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_oa_xai_sanitize_should_rewrite_prior_tool_history_from_stubbed_metadata() -> None:
+    async def prepare(body: Payload) -> bool:
+        body.update(
+            {
+                "api_base": "https://api.x.ai/v1",
+                "api_key": "key",
+                "custom_llm_provider": "xai",
+            }
+        )
+        return True
+
+    model_calls: list[Any] = []
+
+    def rewrite_types(model: Any) -> set[str]:
+        model_calls.append(model)
+        return {"function_call", "function_call_output"}
+
+    _configure(
+        prepare_oa_xai_request=prepare,
+        _get_rewrite_input_item_types_for_model=rewrite_types,
+    )
+    body: Payload = {
+        "model": "oa-xai/grok",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call-1",
+                "name": "lookup",
+                "arguments": {"query": "value"},
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": {"value": 3},
+            },
+        ],
+    }
+
+    result = await request_prep._prepare_oa_xai_passthrough_request(
+        body,
+        sanitize_responses_request=True,
+    )
+
+    assert result == (True, "https://api.x.ai/v1", "key")
+    assert model_calls == ["oa-xai/grok"]
+    assert body["input"][0]["type"] == "message"
+    assert body["input"][0]["role"] == "assistant"
+    assert "lookup" in body["input"][0]["content"]
+    assert body["input"][1]["type"] == "message"
+    assert body["input"][1]["role"] == "user"
+    assert "call-1" in body["input"][1]["content"]
+    assert body["litellm_metadata"]["grok_native_input_item_rewrite_count"] == 2
+    assert body["litellm_metadata"]["grok_native_input_item_rewrite_types"] == [
+        "function_call",
+        "function_call_output",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_oa_xai_sanitize_should_leave_tool_history_when_rewrite_metadata_absent() -> None:
+    async def prepare(body: Payload) -> bool:
+        body.update(
+            {
+                "api_base": "https://api.x.ai/v1",
+                "api_key": "key",
+                "custom_llm_provider": "xai",
+            }
+        )
+        return True
+
+    model_calls: list[Any] = []
+
+    def rewrite_types(model: Any) -> set[str]:
+        model_calls.append(model)
+        return set()
+
+    _configure(
+        prepare_oa_xai_request=prepare,
+        _get_rewrite_input_item_types_for_model=rewrite_types,
+    )
+    function_call_item = {
+        "type": "function_call",
+        "call_id": "call-1",
+        "name": "lookup",
+        "arguments": {"query": "value"},
+    }
+    function_call_output_item = {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": {"value": 3},
+    }
+    body: Payload = {
+        "model": "oa-xai/grok",
+        "input": [function_call_item, function_call_output_item],
+    }
+
+    result = await request_prep._prepare_oa_xai_passthrough_request(
+        body,
+        sanitize_responses_request=True,
+    )
+
+    assert result == (True, "https://api.x.ai/v1", "key")
+    assert model_calls == ["oa-xai/grok"]
+    assert body["input"] == [function_call_item, function_call_output_item]
+    metadata = body.get("litellm_metadata")
+    assert isinstance(metadata, dict)
+    assert "grok_native_input_item_rewrite_count" not in metadata
+    assert "grok-native-input-item-rewritten" not in metadata.get("tags", [])
 
 
 @pytest.mark.asyncio

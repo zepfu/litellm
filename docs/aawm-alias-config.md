@@ -156,6 +156,13 @@ egress. Provider function calls and results are restored to stock Codex
 collaboration tool calls and results with continuation IDs preserved. Native
 Grok remains a separate, unchanged flow.
 
+Managed `oa_xai` Responses preparation applies the existing catalog/model-
+metadata-driven `rewrite_input_item_types` continuation rewrite before xAI
+request sanitization. The rewrite runs only when model metadata requests those
+input-item types; it does not use hardcoded model-name checks. This describes
+managed `oa_xai` behavior only and does not claim runtime or container
+acceptance.
+
 The final candidate is mutually exclusive by originating TUI:
 
 - Claude-origin requests use native Anthropic Haiku only.
