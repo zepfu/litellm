@@ -914,6 +914,10 @@ def _build_session_history_metadata(
         value = metadata.get(key)
         if value is not None:
             history_metadata[key] = _json_safe_rate_limit_value(value)
+    for key in ("canonical_thread_id", "parent_thread_id"):
+        value = metadata.get(key)
+        if value is not None and key not in history_metadata:
+            history_metadata[key] = _json_safe_rate_limit_value(value)
 
     return history_metadata
 
@@ -925,16 +929,21 @@ def _build_session_history_record(  # noqa: PLR0915
     end_time: Any,
     allow_runtime_identity: bool = True,
 ) -> Optional[Dict[str, Any]]:
-    session_id = _extract_session_id(kwargs)
-    if not session_id:
-        return None
-
     litellm_params = kwargs.get("litellm_params") or {}
     metadata = litellm_params.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
         litellm_params["metadata"] = metadata
         kwargs["litellm_params"] = litellm_params
+    for identity_key in ("canonical_thread_id", "parent_thread_id"):
+        if metadata.get(identity_key) is None:
+            for source in _iter_litellm_metadata_sources(kwargs, metadata):
+                if source.get(identity_key) is not None:
+                    metadata[identity_key] = source.get(identity_key)
+                    break
+    session_id = _extract_session_id(kwargs)
+    if not session_id:
+        return None
     _promote_worker_context_exhaustion_metadata(kwargs, metadata)
     standard_logging_object = kwargs.get("standard_logging_object") or {}
     _enrich_claude_permission_check_metadata(

@@ -46,8 +46,21 @@ def _candidate(provider: str = "openai", model: str = "gpt-4o", last_resort: boo
 
 def _set_selection_runtime(name: str, value: Any) -> None:
     """Update both the package attribute and rebound function globals."""
-    setattr(selection, name, value)
-    selection._select_codex_auto_agent_candidate.__globals__[name] = value
+    _set_selection_runtime_value(name, value)
+
+
+def _set_selection_runtime_value(
+    name: str,
+    value: Any,
+    monkeypatch: pytest.MonkeyPatch | None = None,
+) -> None:
+    target_globals = selection._select_codex_auto_agent_candidate.__globals__
+    if monkeypatch is None:
+        setattr(selection, name, value)
+        target_globals[name] = value
+        return
+    monkeypatch.setattr(selection, name, value)
+    monkeypatch.setitem(target_globals, name, value)
 
 
 def _set_selection_candidates(
@@ -90,6 +103,7 @@ def _configure_selection():
         "_resolve_codex_session_key",
         "_resolve_anthropic_session_key",
         "_has_continuation_state",
+        "_has_account_bound_state",
         "_lookup_active_snapshot_canonical_alias",
         "_resolve_aawm_alias_selection_enumeration",
         "_is_grok_account_quota_candidate",
@@ -100,6 +114,11 @@ def _configure_selection():
     previous_runtime = {
         name: getattr(selection, name)
         for name in runtime_names
+    }
+    runtime_globals = selection._build_codex_auto_agent_candidate_state.__globals__
+    _MISSING = object()
+    previous_runtime_globals = {
+        name: runtime_globals.get(name, _MISSING) for name in runtime_names
     }
     runtime = {
         "_get_codex_active_cooldown_state": _zero_cooldown_state,
@@ -114,6 +133,7 @@ def _configure_selection():
         "_resolve_codex_session_key": lambda r, b, *, alias_model: None,
         "_resolve_anthropic_session_key": lambda r, b, *, alias_model: None,
         "_has_continuation_state": lambda v: False,
+        "_has_account_bound_state": lambda v: False,
         "_lookup_active_snapshot_canonical_alias": (
             lambda model, *, request=None: (
                 "basic"
@@ -148,12 +168,12 @@ def _configure_selection():
         resolve_codex_session_key=lambda r, b, *, alias_model: None,
         resolve_anthropic_session_key=lambda r, b, *, alias_model: None,
         has_continuation_state=lambda v: False,
+        has_account_bound_state=lambda v: False,
         is_grok_account_quota_candidate=lambda c: False,
         get_grok_account_quota_lane_cooldown_key=lambda c, lk: None,
         is_kimi_code_candidate=lambda c: isinstance(c, dict) and c.get("provider") == "kimi_code",
         get_kimi_managed_account_cooldown_key=lambda: "kimi_code:__managed_account__:kimi_code_managed_account",
     )
-    runtime_globals = selection._build_codex_auto_agent_candidate_state.__globals__
     runtime.update(
         {
             "_resolve_codex_auto_agent_openai_cooldown_lane_key": (
@@ -178,6 +198,11 @@ def _configure_selection():
     finally:
         for name, value in previous_runtime.items():
             setattr(selection, name, value)
+        for name, value in previous_runtime_globals.items():
+            if value is _MISSING:
+                runtime_globals.pop(name, None)
+            else:
+                runtime_globals[name] = value
 
 
 # ---------------------------------------------------------------------------
@@ -1199,3 +1224,500 @@ class TestFindCandidate:
             request=_make_request(),
         )
         assert found is None
+
+
+# ---------------------------------------------------------------------------
+# Codex account-bound owner selection
+# ---------------------------------------------------------------------------
+
+
+def _oauth_account_candidate(
+    *,
+    label: str = "account1",
+    account_hash: str = "hash-account-1",
+) -> dict[str, Any]:
+    return {
+        "provider": "openai",
+        "model": "gpt-5.3-codex",
+        "route_family": "codex_responses",
+        "last_resort": False,
+        "codex_oauth_account_label": label,
+        "codex_oauth_account_hash": account_hash,
+        "codex_oauth_lane_key": f"codex-oauth:{label}:{account_hash}",
+        "codex_oauth_credential_affinity": "interchangeable",
+    }
+
+
+def _owned_interchangeable_record(
+    *,
+    label: str = "account1",
+    account_hash: str = "hash-account-1",
+) -> dict[str, Any]:
+    return {
+        "state": "owned",
+        "owner": "owner-1",
+        "attributes": {
+            "provider": "openai",
+            "model": "gpt-5.3-codex",
+            "route_family": "codex_responses",
+            "account_label": label,
+            "account_hash": account_hash,
+            "account_lane": f"codex-oauth:{label}:{account_hash}",
+            "credential_affinity": "interchangeable",
+        },
+    }
+
+
+class TestCodexAccountBound:
+    def test_unbound_policy_does_not_create_permanent_slots(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(
+            "litellm.secret_managers.codex_oauth_inventory.load_codex_oauth_inventory",
+            lambda: SimpleNamespace(
+                routing=SimpleNamespace(accounts_are_interchangeable=True)
+            ),
+        )
+        adjusted = selection._apply_codex_oauth_inventory_affinity_policy(
+            _oauth_account_candidate()
+        )
+        assert adjusted is not None
+        assert adjusted["codex_oauth_credential_affinity"] == "interchangeable"
+        assert "codex_oauth_account_label" not in adjusted
+        assert "codex_oauth_account_hash" not in adjusted
+        assert "codex_oauth_lane_key" not in adjusted
+
+    def test_account_bound_policy_preserves_creating_lane(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(
+            "litellm.secret_managers.codex_oauth_inventory.load_codex_oauth_inventory",
+            lambda: SimpleNamespace(
+                routing=SimpleNamespace(accounts_are_interchangeable=True)
+            ),
+        )
+        affinity = _oauth_account_candidate()
+        adjusted = selection._apply_codex_oauth_inventory_affinity_policy(
+            affinity,
+            account_bound=True,
+        )
+        assert adjusted is not None
+        assert adjusted["codex_oauth_credential_affinity"] == "interchangeable"
+        assert adjusted["codex_oauth_account_label"] == "account1"
+        assert adjusted["codex_oauth_lane_key"] == (
+            "codex-oauth:account1:hash-account-1"
+        )
+
+    def test_owner_hint_omits_account_identity_by_default(self) -> None:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            session_affinity as sa,
+        )
+
+        default_hint = sa.owner_record_as_affinity_hint(
+            _owned_interchangeable_record()
+        )
+        assert default_hint is not None
+        assert default_hint["codex_oauth_credential_affinity"] == "interchangeable"
+        assert "codex_oauth_account_label" not in default_hint
+        assert "codex_oauth_lane_key" not in default_hint
+
+        pinned = sa.owner_record_as_affinity_hint(
+            _owned_interchangeable_record(),
+            preserve_account_identity=True,
+        )
+        assert pinned is not None
+        assert pinned["codex_oauth_account_label"] == "account1"
+        assert pinned["codex_oauth_lane_key"] == (
+            "codex-oauth:account1:hash-account-1"
+        )
+
+    def test_pre_state_failover_remains_available(self) -> None:
+        candidate = _oauth_account_candidate()
+        planned = selection._plan_codex_oauth_account_failover(
+            _make_request(),
+            candidate=candidate,
+            selection={"candidate": candidate, "failover_ordinal": 0},
+            attempt_record={
+                "failure_phase": "direct_openai_provider_response",
+                "attempted_provider_call": True,
+            },
+            error_class="usage_limit_reached",
+            has_continuation_state=True,
+            has_previous_response_id=False,
+            has_account_bound_state=False,
+        )
+        assert planned is True
+
+    def test_account_bound_state_blocks_failover(self) -> None:
+        candidate = _oauth_account_candidate()
+        planned = selection._plan_codex_oauth_account_failover(
+            _make_request(),
+            candidate=candidate,
+            selection={
+                "candidate": candidate,
+                "failover_ordinal": 0,
+                "has_account_bound_state": True,
+            },
+            attempt_record={
+                "failure_phase": "direct_openai_provider_response",
+                "attempted_provider_call": True,
+            },
+            error_class="usage_limit_reached",
+            has_continuation_state=True,
+            has_previous_response_id=False,
+            has_account_bound_state=True,
+        )
+        assert planned is False
+
+    def test_safe_metadata_exposes_lane_not_payload(self) -> None:
+        attached = selection._attach_account_bound_selection_metadata(
+            {
+                "candidate": {
+                    **_oauth_account_candidate(),
+                    "encrypted_content": "do-not-leak",
+                    "Authorization": "Bearer secret",
+                }
+            },
+            has_account_bound_state=True,
+            affinity={
+                "codex_oauth_lane_key": (
+                    "codex-oauth:account1:hash-account-1"
+                ),
+                "encrypted_content": "do-not-leak",
+            },
+        )
+        assert attached["has_account_bound_state"] is True
+        assert attached["account_bound_classification"] == "account_bound"
+        assert attached["account_bound_owner_lane"] == (
+            "codex-oauth:account1:hash-account-1"
+        )
+        assert "encrypted_content" not in attached
+        assert "Authorization" not in attached
+
+    @pytest.mark.asyncio
+    async def test_fresh_unbound_selection_keeps_first_available(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _set_selection_runtime_value(
+            "_has_account_bound_state",
+            lambda _body: False,
+            monkeypatch,
+        )
+        candidates = (
+            _candidate("openai", "gpt-4o"),
+            _candidate("xai", "grok-4", last_resort=True),
+        )
+        _set_selection_candidates(candidates)
+
+        result = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body={"model": "basic"},
+        )
+        assert result["selection_reason"] == "first_available"
+        assert result["candidate"]["provider"] == "openai"
+        assert result["has_account_bound_state"] is False
+        assert result["account_bound_classification"] == "unbound"
+        assert "account_bound_owner_lane" not in result
+
+    def _patch_bound_owner_selector(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        affinity_state: dict[str, Any],
+        stub_classifier: bool = True,
+    ) -> AsyncMock:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            session_affinity as sa,
+        )
+
+        async def _owned(**_kwargs):
+            return (_owned_interchangeable_record(), "cache-key", None)
+
+        monkeypatch.setattr(sa, "get_session_owner_record", _owned)
+        monkeypatch.setattr(
+            sa,
+            "resolve_canonical_session_identity",
+            lambda *_args, **_kwargs: "sess-openai-019",
+        )
+        if stub_classifier:
+            _set_selection_runtime_value(
+                "_has_account_bound_state",
+                lambda _body: True,
+                monkeypatch,
+            )
+        _set_selection_runtime_value(
+            "_apply_codex_oauth_inventory_affinity_policy",
+            lambda affinity, *, account_bound=False: affinity,
+            monkeypatch,
+        )
+        _set_selection_runtime_value(
+            "_find_codex_auto_agent_affinity_candidate",
+            lambda *_args, **_kwargs: {
+                "provider": "openai",
+                "model": "gpt-5.3-codex",
+                "route_family": "codex_responses",
+                "last_resort": False,
+            },
+            monkeypatch,
+        )
+        _set_selection_runtime_value(
+            "_build_codex_auto_agent_affinity_candidate_state",
+            AsyncMock(return_value=affinity_state),
+            monkeypatch,
+        )
+        alternate = AsyncMock(
+            side_effect=AssertionError("alternate account selection must not run")
+        )
+        _set_selection_runtime_value(
+            "_build_codex_auto_agent_candidate_states",
+            alternate,
+            monkeypatch,
+        )
+        return alternate
+
+    @pytest.mark.asyncio
+    async def test_bound_owner_pins_creating_lane(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pinned = _oauth_account_candidate()
+        affinity_state = {
+            "candidate": pinned,
+            "lane_key": pinned["codex_oauth_lane_key"],
+            "cooldown_seconds": 0.0,
+            "skip_reason": None,
+            "cooldown_state_source": "local_fallback",
+        }
+        alternate = self._patch_bound_owner_selector(
+            monkeypatch,
+            affinity_state=affinity_state,
+        )
+
+        result = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body={"model": "basic"},
+        )
+        assert result["selection_reason"] == "session_affinity"
+        assert result["candidate"]["codex_oauth_account_label"] == "account1"
+        assert result["has_account_bound_state"] is True
+        assert result["account_bound_classification"] == "account_bound"
+        assert result["account_bound_owner_lane"] == pinned["codex_oauth_lane_key"]
+        alternate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unavailable_bound_owner_fails_closed_without_alternate(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pinned = _oauth_account_candidate()
+        affinity_state = {
+            "candidate": pinned,
+            "lane_key": pinned["codex_oauth_lane_key"],
+            "cooldown_seconds": 0.0,
+            "skip_reason": "quota_exhausted",
+            "failure_phase": "quota_exhausted",
+            "cooldown_state_source": "local_fallback",
+        }
+        alternate = self._patch_bound_owner_selector(
+            monkeypatch,
+            affinity_state=affinity_state,
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={"model": "basic"},
+            )
+        detail = exc_info.value.detail
+        assert exc_info.value.status_code == 429
+        assert detail["redispatch_required"] is True
+        assert detail["error"]["code"] == (
+            "aawm_codex_auto_agent_redispatch_required"
+        )
+        assert detail["failure_phase"] == "account_bound_owner_unavailable"
+        assert detail["attempted_provider_call"] is False
+        alternate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resp_previous_response_id_pins_creating_lane(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pinned = _oauth_account_candidate()
+        affinity_state = {
+            "candidate": pinned,
+            "lane_key": pinned["codex_oauth_lane_key"],
+            "cooldown_seconds": 0.0,
+            "skip_reason": None,
+            "cooldown_state_source": "local_fallback",
+        }
+        alternate = self._patch_bound_owner_selector(
+            monkeypatch,
+            affinity_state=affinity_state,
+            stub_classifier=False,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            audit_build,
+        )
+
+        _set_selection_runtime_value(
+            "_has_account_bound_state",
+            audit_build._aawm_auto_agent_audit_request_has_account_bound_state,
+            monkeypatch,
+        )
+
+        result = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body={"model": "basic", "previous_response_id": "resp_123"},
+        )
+        assert result["selection_reason"] == "session_affinity"
+        assert result["candidate"]["codex_oauth_account_label"] == "account1"
+        assert result["has_account_bound_state"] is True
+        assert result["account_bound_classification"] == "account_bound"
+        assert result["account_bound_owner_lane"] == pinned["codex_oauth_lane_key"]
+        alternate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resp_previous_response_id_fails_closed_without_alternate(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pinned = _oauth_account_candidate()
+        affinity_state = {
+            "candidate": pinned,
+            "lane_key": pinned["codex_oauth_lane_key"],
+            "cooldown_seconds": 0.0,
+            "skip_reason": "quota_exhausted",
+            "failure_phase": "quota_exhausted",
+            "cooldown_state_source": "local_fallback",
+        }
+        alternate = self._patch_bound_owner_selector(
+            monkeypatch,
+            affinity_state=affinity_state,
+            stub_classifier=False,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            audit_build,
+        )
+
+        _set_selection_runtime_value(
+            "_has_account_bound_state",
+            audit_build._aawm_auto_agent_audit_request_has_account_bound_state,
+            monkeypatch,
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={"model": "basic", "previous_response_id": "resp_123"},
+            )
+        detail = exc_info.value.detail
+        assert exc_info.value.status_code == 429
+        assert detail["redispatch_required"] is True
+        assert detail["error"]["code"] == (
+            "aawm_codex_auto_agent_redispatch_required"
+        )
+        assert detail["failure_phase"] == "account_bound_owner_unavailable"
+        assert detail["attempted_provider_call"] is False
+        alternate.assert_not_awaited()
+
+
+    @pytest.mark.asyncio
+    async def test_installed_host_classifier_marks_bound_payloads(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from litellm.proxy.pass_through_endpoints import (
+            llm_passthrough_endpoints as lpe,
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            audit_build,
+        )
+
+        host_classifier = getattr(
+            lpe,
+            "_aawm_auto_agent_audit_request_has_account_bound_state",
+        )
+        assert callable(host_classifier)
+        assert host_classifier is audit_build._aawm_auto_agent_audit_request_has_account_bound_state
+        assert not hasattr(
+            lpe,
+            "_codex_auto_agent_request_has_account_bound_state",
+        )
+        # Isolate from the autouse fixture's false stub. Bind the canonical
+        # installed host classifier into the selection runtime seam.
+        _set_selection_runtime_value(
+            "_has_account_bound_state",
+            host_classifier,
+            monkeypatch,
+        )
+
+        bound_bodies = (
+            {
+                "model": "basic",
+                "previous_response_id": "resp_123",
+            },
+            {
+                "model": "basic",
+                "encrypted_content": "SECRET_ENCRYPTED_BLOB",
+            },
+            {
+                "model": "basic",
+                "input": [{"item_reference": {"id": "rs_nested_ref_123"}}],
+            },
+            {
+                "model": "basic",
+                "input": [{"type": "reasoning", "summary": []}],
+            },
+            {
+                "model": "basic",
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "output": "SECRET_TOOL_OUTPUT",
+                    }
+                ],
+            },
+        )
+        fresh_body = {
+            "model": "basic",
+            "input": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there"},
+            ],
+        }
+        for bound_body in bound_bodies:
+            assert host_classifier(bound_body) is True
+        assert host_classifier(fresh_body) is False
+
+        # Selector now exercises the canonical installed classifier via the
+        # existing selection runtime seam. Do not stub that classifier.
+        pinned = _oauth_account_candidate()
+        affinity_state = {
+            "candidate": pinned,
+            "lane_key": pinned["codex_oauth_lane_key"],
+            "cooldown_seconds": 0.0,
+            "skip_reason": None,
+            "cooldown_state_source": "local_fallback",
+        }
+        alternate = self._patch_bound_owner_selector(
+            monkeypatch,
+            affinity_state=affinity_state,
+            stub_classifier=False,
+        )
+
+        result = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body=bound_bodies[0],
+        )
+        assert result["has_account_bound_state"] is True
+        assert result["account_bound_classification"] == "account_bound"
+        assert result["account_bound_owner_lane"] == pinned["codex_oauth_lane_key"]
+        alternate.assert_not_awaited()

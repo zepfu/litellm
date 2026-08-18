@@ -2194,6 +2194,8 @@ def _build_alias_routing_audit_only_record(
     for key in (
         "session_id",
         "session_key",
+        "canonical_thread_id",
+        "parent_thread_id",
         "trace_id",
         "litellm_call_id",
         "agent_id",
@@ -2213,10 +2215,15 @@ def _build_alias_routing_audit_only_record(
         value = primary.get(key)
         if value is not None and key not in record_metadata:
             record_metadata[key] = value
+    durable_session_id = (
+        session_id
+        or primary.get("canonical_thread_id")
+        or primary.get("session_id")
+    )
     return {
         "_skip_session_history": True,
         "litellm_call_id": litellm_call_id or primary.get("litellm_call_id"),
-        "session_id": session_id or primary.get("session_id"),
+        "session_id": durable_session_id,
         "model": model or primary.get("model") or primary.get("alias_model"),
         "provider": provider or primary.get("provider"),
         "aawm_alias_routing_audit_events": normalized_events,
@@ -2503,6 +2510,9 @@ def _extract_session_id(kwargs: Dict[str, Any]) -> Optional[str]:
     )
 
     for candidate in (
+        metadata.get("canonical_thread_id") if isinstance(metadata, dict) else None,
+        standard_metadata.get("canonical_thread_id") if isinstance(standard_metadata, dict) else None,
+        standard_logging_object.get("canonical_thread_id"),
         litellm_params.get("litellm_session_id"),
         kwargs.get("litellm_session_id"),
         metadata.get("session_id"),
@@ -2541,6 +2551,17 @@ def _extract_session_id(kwargs: Dict[str, Any]) -> Optional[str]:
             "standard_logging_object.trace_id",
             standard_logging_object.get("trace_id"),
             True,
+        ),
+        ("metadata.parent_thread_id", metadata.get("parent_thread_id"), False),
+        (
+            "standard_metadata.parent_thread_id",
+            standard_metadata.get("parent_thread_id") if isinstance(standard_metadata, dict) else None,
+            False,
+        ),
+        (
+            "standard_logging_object.parent_thread_id",
+            standard_logging_object.get("parent_thread_id"),
+            False,
         ),
         ("kwargs.litellm_call_id", kwargs.get("litellm_call_id"), True),
     )

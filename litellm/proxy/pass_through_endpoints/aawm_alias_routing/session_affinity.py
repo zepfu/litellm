@@ -1094,6 +1094,8 @@ def attach_session_owner_metadata(
 
 def owner_record_as_affinity_hint(
     owner_record: Optional[Mapping[str, Any]],
+    *,
+    preserve_account_identity: bool = False,
 ) -> Optional[dict[str, Any]]:
     if not isinstance(owner_record, Mapping):
         return None
@@ -1112,11 +1114,12 @@ def owner_record_as_affinity_hint(
     interchangeable = _accounts_are_interchangeable(attrs)
     if interchangeable:
         affinity["codex_oauth_credential_affinity"] = "interchangeable"
-    if attrs.get("account_label") and not interchangeable:
+    include_account_identity = preserve_account_identity or not interchangeable
+    if attrs.get("account_label") and include_account_identity:
         affinity["codex_oauth_account_label"] = attrs.get("account_label")
-    if attrs.get("account_hash") and not interchangeable:
+    if attrs.get("account_hash") and include_account_identity:
         affinity["codex_oauth_account_hash"] = attrs.get("account_hash")
-    if attrs.get("account_lane") and not interchangeable:
+    if attrs.get("account_lane") and include_account_identity:
         affinity["codex_oauth_lane_key"] = attrs.get("account_lane")
     return {k: v for k, v in affinity.items() if v is not None}
 

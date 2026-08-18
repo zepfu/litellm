@@ -1348,6 +1348,8 @@ Common keys include:
 
 - `requested_model_alias` / `model_alias_label`: the inbound config-driven
   alias, such as `basic`, `work`, or `sota-openai`.
+- `canonical_thread_id`: the durable current/child thread key.
+- `parent_thread_id`: the explicit parent-thread linkage, when present.
 - `aawm_alias_routing_audit_events`: ordered events for skipped, failed, and
   selected candidates.
 - `codex_auto_agent_attempts` or `anthropic_auto_agent_attempts`: candidate
@@ -1355,6 +1357,12 @@ Common keys include:
 - `codex_auto_agent_skipped_candidates` or
   `anthropic_auto_agent_skipped_candidates`: candidates skipped because of
   cooldown or stateful session-affinity cooldown.
+
+`canonical_thread_id` and `parent_thread_id` flow through audit-only metadata,
+session history, and route rollups. The child `canonical_thread_id` takes
+precedence for current-thread attribution; `parent_thread_id` is retained only
+as the explicit linkage. Both are bounded identifiers/classifications and do
+not contain transcript, prompt, credential, or provider-payload content.
 
 Managed Kimi Code account/auth/quota/provider-capacity failures use the shared
 `kimi_code_managed_account` lane, so they suppress K3 and managed K2.7

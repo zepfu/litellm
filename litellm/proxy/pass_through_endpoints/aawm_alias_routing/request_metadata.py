@@ -43,6 +43,10 @@ _get_codex_auto_agent_header: Optional[
 
 _HOST_FUNCTION_NAMES = (
     "_extract_auto_agent_alias_session_id",
+    "_extract_auto_agent_alias_canonical_thread_id",
+    "_extract_auto_agent_alias_parent_thread_id",
+    "_first_auto_agent_alias_identity_from_mappings",
+    "_first_auto_agent_alias_identity_from_headers",
     "_extract_auto_agent_alias_metadata_value",
     "_normalize_auto_agent_alias_client_product",
     "_extract_auto_agent_alias_client_product_label",
@@ -112,6 +116,123 @@ def _extract_auto_agent_alias_session_id(
         if header_value is not None:
             return header_value
     return None
+
+
+def _first_auto_agent_alias_identity_from_mappings(
+    request_body: dict[str, Any],
+    keys: tuple[str, ...],
+) -> Optional[str]:
+    if not isinstance(request_body, dict):
+        return None
+    mappings: list[Any] = [
+        request_body.get("litellm_metadata"),
+        request_body.get("metadata"),
+        request_body.get("source"),
+    ]
+    for mapping in list(mappings):
+        if isinstance(mapping, dict):
+            mappings.append(mapping.get("source"))
+    for mapping in mappings:
+        if not isinstance(mapping, dict):
+            continue
+        for key in keys:
+            value = _clean_codex_auth_value(mapping.get(key))
+            if value is not None:
+                return value
+    for key in keys:
+        value = _clean_codex_auth_value(request_body.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _first_auto_agent_alias_identity_from_headers(
+    request: Request,
+    header_keys: tuple[str, ...],
+    underscore_keys: frozenset[str],
+) -> Optional[str]:
+    headers = _safe_get_request_headers(request)
+    if not isinstance(headers, dict) or not headers:
+        return None
+    header_getter = _get_codex_auto_agent_header
+    if header_getter is not None:
+        for header_name in header_keys:
+            header_value = header_getter(headers, header_name)
+            if header_value is not None:
+                return header_value
+    else:
+        lowered = {
+            key.lower(): value
+            for key, value in headers.items()
+            if isinstance(key, str)
+        }
+        for header_name in header_keys:
+            cleaned = _clean_codex_auth_value(lowered.get(header_name.lower()))
+            if cleaned is not None:
+                return cleaned
+    for key, value in headers.items():
+        if not isinstance(key, str):
+            continue
+        if key.lower().replace("-", "_") in underscore_keys:
+            cleaned = _clean_codex_auth_value(value)
+            if cleaned is not None:
+                return cleaned
+    return None
+
+
+def _extract_auto_agent_alias_canonical_thread_id(
+    request: Request,
+    request_body: dict[str, Any],
+) -> Optional[str]:
+    """Return the spawned-child / current thread identity only."""
+    metadata_value = _first_auto_agent_alias_identity_from_mappings(
+        request_body,
+        (
+            "thread_id",
+            "aawm_thread_id",
+            "codex_thread_id",
+            "claude_thread_id",
+        ),
+    )
+    if metadata_value is not None:
+        return metadata_value
+    return _first_auto_agent_alias_identity_from_headers(
+        request,
+        (
+            "thread-id",
+            "x-thread-id",
+            "x-aawm-thread-id",
+            "x-codex-thread-id",
+            "x-claude-thread-id",
+        ),
+        frozenset(
+            {
+                "thread_id",
+                "x_thread_id",
+                "x_aawm_thread_id",
+                "x_codex_thread_id",
+                "x_claude_thread_id",
+            }
+        ),
+    )
+
+
+def _extract_auto_agent_alias_parent_thread_id(
+    request: Request,
+    request_body: dict[str, Any],
+) -> Optional[str]:
+    """Return the explicit parent-thread link only."""
+    metadata_value = _first_auto_agent_alias_identity_from_mappings(
+        request_body,
+        ("parent_thread_id",),
+    )
+    if metadata_value is not None:
+        return metadata_value
+    return _first_auto_agent_alias_identity_from_headers(
+        request,
+        ("x-codex-parent-thread-id",),
+        frozenset({"x_codex_parent_thread_id", "parent_thread_id"}),
+    )
 
 
 def _extract_auto_agent_alias_metadata_value(

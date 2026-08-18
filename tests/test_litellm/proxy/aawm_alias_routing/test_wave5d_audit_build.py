@@ -16,6 +16,7 @@ import pytest
 from fastapi import HTTPException
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_build import (
+    _aawm_auto_agent_audit_request_has_account_bound_state,
     _build_auto_agent_alias_audit_event,
     _build_auto_agent_alias_audit_events,
     _codex_auto_agent_request_has_continuation_state,
@@ -828,3 +829,296 @@ class TestContinuationState:
             ],
         }
         assert _codex_auto_agent_request_has_continuation_state(body) is False
+
+
+
+# ---------------------------------------------------------------------------
+# _aawm_auto_agent_audit_request_has_account_bound_state
+# ---------------------------------------------------------------------------
+
+
+class TestAccountBoundState:
+    def test_encrypted_content(self):
+        body = {"encrypted_content": "SECRET_ENCRYPTED_BLOB"}
+        assert _aawm_auto_agent_audit_request_has_account_bound_state(body) is True
+        assert _codex_auto_agent_request_has_continuation_state(body) is True
+
+    def test_nested_rs_reference(self):
+        body = {"input": [{"item_reference": {"id": "rs_nested_ref_123"}}]}
+        assert _aawm_auto_agent_audit_request_has_account_bound_state(body) is True
+        assert _codex_auto_agent_request_has_continuation_state(body) is True
+
+    def test_reasoning_item(self):
+        body = {"input": [{"type": "reasoning", "summary": []}]}
+        assert _aawm_auto_agent_audit_request_has_account_bound_state(body) is True
+        assert _codex_auto_agent_request_has_continuation_state(body) is True
+
+    def test_function_call_output(self):
+        body = {
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "output": "SECRET_TOOL_OUTPUT",
+                }
+            ]
+        }
+        assert _aawm_auto_agent_audit_request_has_account_bound_state(body) is True
+        assert _codex_auto_agent_request_has_continuation_state(body) is True
+
+    def test_fresh_conversation_false(self):
+        body = {
+            "model": "gpt-4.1",
+            "input": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi there"},
+            ],
+        }
+        assert _aawm_auto_agent_audit_request_has_account_bound_state(body) is False
+        assert _codex_auto_agent_request_has_continuation_state(body) is False
+
+    def test_ordinary_rs_text_is_unbound_and_fresh(self):
+        body = {
+            "model": "gpt-4.1",
+            "instructions": "rs_regular_user_text",
+            "input": [
+                {"role": "user", "content": "rs_regular_user_text"},
+                {"output": "rs_regular_user_text"},
+            ],
+        }
+        assert _aawm_auto_agent_audit_request_has_account_bound_state(body) is False
+        assert _codex_auto_agent_request_has_continuation_state(body) is False
+        assert _aawm_auto_agent_audit_request_has_account_bound_state(
+            "rs_regular_user_text"
+        ) is False
+        assert _codex_auto_agent_request_has_continuation_state(
+            "rs_regular_user_text"
+        ) is False
+
+    def test_previous_response_id_resp_123_is_bound(self):
+        body = {"previous_response_id": "resp_123"}
+        assert _aawm_auto_agent_audit_request_has_account_bound_state(body) is True
+        assert _codex_auto_agent_request_has_continuation_state(body) is True
+
+    def test_previous_response_id_rs_is_bound(self):
+        body = {"previous_response_id": "rs_response-1"}
+        assert _aawm_auto_agent_audit_request_has_account_bound_state(body) is True
+        assert _codex_auto_agent_request_has_continuation_state(body) is True
+
+    def test_previous_response_id_blank_none_non_string_remain_unbound(self):
+        for value in ("", "   ", None, 123, False, ["resp_123"]):
+            body = {"previous_response_id": value}
+            assert _aawm_auto_agent_audit_request_has_account_bound_state(body) is False
+
+    def test_item_reference_type_rs_id_is_bound(self):
+        body = {"input": [{"type": "item_reference", "id": "rs_item_ref_123"}]}
+        assert _aawm_auto_agent_audit_request_has_account_bound_state(body) is True
+        assert _codex_auto_agent_request_has_continuation_state(body) is True
+
+    def test_item_reference_string_rs_is_bound(self):
+        body = {"input": [{"item_reference": "rs_string_ref_123"}]}
+        assert _aawm_auto_agent_audit_request_has_account_bound_state(body) is True
+        assert _codex_auto_agent_request_has_continuation_state(body) is True
+
+    def test_falsy_encrypted_content_ignored(self):
+        assert _aawm_auto_agent_audit_request_has_account_bound_state(
+            {"encrypted_content": ""}
+        ) is False
+        assert _aawm_auto_agent_audit_request_has_account_bound_state(
+            {"encrypted_content": None}
+        ) is False
+
+    def test_cycle_safety(self):
+        cyclic: dict[str, Any] = {"key": "value"}
+        cyclic["self"] = cyclic
+        assert _aawm_auto_agent_audit_request_has_account_bound_state(cyclic) is False
+
+    def test_does_not_expose_content(self):
+        body = {
+            "encrypted_content": "SECRET_ENCRYPTED_BLOB",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "output": "SECRET_TOOL_OUTPUT",
+                    "id": "rs_secret_ref",
+                }
+            ],
+        }
+        result = _aawm_auto_agent_audit_request_has_account_bound_state(body)
+        assert result is True
+        assert result is not body
+        assert "SECRET_ENCRYPTED_BLOB" not in str(result)
+        assert "SECRET_TOOL_OUTPUT" not in str(result)
+
+
+class TestAuditEventThreadIdentity:
+    def test_attaches_canonical_and_parent_without_content(self):
+        secret = "SECRET_ENCRYPTED_BLOB"
+        prompt = "raw user prompt must not leak"
+        tool_args = '{"command":"cat /etc/shadow"}'
+        credential = "sk-secret-credential"
+
+        def _identity_context(request: Any, request_body: dict) -> dict[str, Any]:
+            ctx = dict(_fake_get_request_context(request, request_body))
+            ctx["canonical_thread_id"] = "child-thread-9"
+            ctx["parent_thread_id"] = "parent-thread-9"
+            ctx["session_id"] = "child-thread-9"
+            return ctx
+
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            audit_build as _audit_build_mod,
+        )
+
+        # Override only the request-context seam. A second
+        # configure_audit_build_runtime() call would push another host-globals
+        # restore-stack frame that the autouse fixture cannot pop, leaking
+        # this test's callback into later Wave 5D files.
+        previous_get_request_context = (
+            _audit_build_mod._get_auto_agent_alias_request_context
+        )
+        setattr(
+            _audit_build_mod,
+            "_get_auto_agent_alias_request_context",
+            _identity_context,
+        )
+        try:
+            body = {
+                "encrypted_content": secret,
+                "instructions": prompt,
+                "input": [
+                    {
+                        "type": "function_call",
+                        "name": "shell",
+                        "arguments": tool_args,
+                    }
+                ],
+                "litellm_metadata": {"authorization": credential},
+            }
+            event = _build_auto_agent_alias_audit_event(
+                alias_family="codex",
+                alias_model="codex-auto",
+                request=_make_request(),
+                request_body=body,
+                selection=_minimal_selection(),
+                candidate=_minimal_candidate(),
+                event_type="candidate_selected",
+                candidate_status="selected",
+            )
+            assert event["canonical_thread_id"] == "child-thread-9"
+            assert event["parent_thread_id"] == "parent-thread-9"
+            assert event["session_id"] == "child-thread-9"
+            serialized = str(event)
+            assert secret not in serialized
+            assert prompt not in serialized
+            assert tool_args not in serialized
+            assert credential not in serialized
+        finally:
+            setattr(
+                _audit_build_mod,
+                "_get_auto_agent_alias_request_context",
+                previous_get_request_context,
+            )
+
+
+class TestAuditEventAccountBoundClassification:
+    def test_unbound_classification_and_selected_lane_survive_without_content(self):
+        prompt = "raw user prompt must not leak"
+        credential = "sk-secret-credential"
+        lane = "codex-oauth:account1:hash-account-1"
+        event = _build_auto_agent_alias_audit_event(
+            alias_family="codex",
+            alias_model="codex-auto",
+            request=_make_request(),
+            request_body={
+                "instructions": prompt,
+                "litellm_metadata": {"authorization": credential},
+            },
+            selection=_minimal_selection(
+                has_account_bound_state=False,
+                account_bound_classification="unbound",
+            ),
+            candidate=_minimal_candidate(codex_oauth_lane_key=lane),
+            event_type="candidate_selected",
+            candidate_status="selected",
+        )
+        assert event["has_account_bound_state"] is False
+        assert event["account_bound_classification"] == "unbound"
+        assert event["account_lane"] == lane
+        serialized = str(event)
+        assert prompt not in serialized
+        assert credential not in serialized
+
+    def test_account_bound_classification_and_failure_class_survive_without_content(
+        self,
+    ):
+        secret = "SECRET_ENCRYPTED_BLOB"
+        prompt = "raw user prompt must not leak"
+        tool_args = '{"command":"cat /etc/shadow"}'
+        credential = "sk-secret-credential"
+        lane = "codex-oauth:account1:hash-account-1"
+        event = _build_auto_agent_alias_audit_event(
+            alias_family="codex",
+            alias_model="codex-auto",
+            request=_make_request(),
+            request_body={
+                "encrypted_content": secret,
+                "instructions": prompt,
+                "input": [
+                    {
+                        "type": "function_call",
+                        "name": "shell",
+                        "arguments": tool_args,
+                    }
+                ],
+                "previous_response_id": "resp_123",
+                "litellm_metadata": {"authorization": credential},
+            },
+            selection=_minimal_selection(
+                has_account_bound_state=True,
+                account_bound_classification="account_bound",
+            ),
+            candidate=_minimal_candidate(codex_oauth_lane_key=lane),
+            event_type="candidate_retryable_failure",
+            candidate_status="cooldown_set",
+            failure_class="item_not_found",
+        )
+        assert event["has_account_bound_state"] is True
+        assert event["account_bound_classification"] == "account_bound"
+        assert event["account_lane"] == lane
+        assert event["failure_class"] == "item_not_found"
+        serialized = str(event)
+        assert secret not in serialized
+        assert prompt not in serialized
+        assert tool_args not in serialized
+        assert credential not in serialized
+
+    def test_attempt_error_class_maps_to_failure_class_with_classification(self):
+        lane = "codex-oauth:account1:hash-account-1"
+        events = _build_auto_agent_alias_audit_events(
+            alias_family="codex",
+            alias_model="codex-auto",
+            request=_make_request(),
+            request_body={"encrypted_content": "SECRET_ENCRYPTED_BLOB"},
+            selection=_minimal_selection(
+                has_account_bound_state=True,
+                account_bound_classification="account_bound",
+            ),
+            attempts=[
+                {
+                    "provider": "openai",
+                    "model": "gpt-4.1",
+                    "route_family": "openai",
+                    "status": "cooldown_set",
+                    "error_class": "item_not_found",
+                    "account_lane": lane,
+                    "litellm_call_id": "call-rs-1",
+                }
+            ],
+        )
+        assert len(events) == 1
+        event = events[0]
+        assert event["has_account_bound_state"] is True
+        assert event["account_bound_classification"] == "account_bound"
+        assert event["account_lane"] == lane
+        assert event["failure_class"] == "item_not_found"
+        assert event["provider"] == "openai"
+        assert "SECRET_ENCRYPTED_BLOB" not in str(event)

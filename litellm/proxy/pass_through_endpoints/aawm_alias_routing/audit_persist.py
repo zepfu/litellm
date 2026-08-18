@@ -240,7 +240,23 @@ def _persist_auto_agent_alias_audit_only_events_best_effort(  # noqa: PLR0915
         or metadata.get("model_alias_label"),
         max_length=96,
     )
-    session_id_hash = _sanitize_identifier(primary.get("session_id"))
+    # Canonical spawned-child thread identity is the durable session key
+    # when present; parent-only clients keep primary.session_id.
+    durable_session_id = primary.get("canonical_thread_id") or primary.get(
+        "session_id"
+    )
+    for key in (
+        "canonical_thread_id",
+        "parent_thread_id",
+        "has_account_bound_state",
+        "account_bound_classification",
+        "account_lane",
+        "failure_class",
+    ):
+        value = primary.get(key)
+        if value is not None:
+            metadata[key] = value
+    session_id_hash = _sanitize_identifier(durable_session_id)
     litellm_call_id_hash = _sanitize_identifier(primary.get("litellm_call_id"))
     trace_id_hash = _sanitize_identifier(primary.get("trace_id"))
 
@@ -268,7 +284,7 @@ def _persist_auto_agent_alias_audit_only_events_best_effort(  # noqa: PLR0915
     try:
         record = _build_alias_routing_audit_only_record(
             events=events,
-            session_id=primary.get("session_id"),
+            session_id=durable_session_id,
             litellm_call_id=primary.get("litellm_call_id"),
             model=primary.get("model") or primary.get("alias_model"),
             provider=primary.get("provider"),

@@ -89,6 +89,7 @@ _extract_client_product_label: Optional[
 _resolve_codex_session_key: Optional[Callable[..., Optional[str]]] = None
 _resolve_anthropic_session_key: Optional[Callable[..., Optional[str]]] = None
 _has_continuation_state: Optional[Callable[[Any], bool]] = None
+_has_account_bound_state: Optional[Callable[[Any], bool]] = None
 _is_grok_account_quota_candidate: Optional[
     Callable[[Optional[dict[str, Any]]], bool]
 ] = None
@@ -162,6 +163,7 @@ def configure_selection_runtime(
     resolve_codex_session_key: Callable[..., Optional[str]],
     resolve_anthropic_session_key: Callable[..., Optional[str]],
     has_continuation_state: Callable[[Any], bool],
+    has_account_bound_state: Optional[Callable[[Any], bool]] = None,
     is_grok_account_quota_candidate: Callable[[Optional[dict[str, Any]]], bool],
     get_grok_account_quota_lane_cooldown_key: Callable[[Any, Optional[str]], Optional[str]],
     is_kimi_code_candidate: Callable[[Optional[dict[str, Any]]], bool],
@@ -198,6 +200,8 @@ def configure_selection_runtime(
     _resolve_anthropic_session_key = resolve_anthropic_session_key
     global _has_continuation_state
     _has_continuation_state = has_continuation_state
+    global _has_account_bound_state
+    _has_account_bound_state = has_account_bound_state
     global _is_grok_account_quota_candidate
     _is_grok_account_quota_candidate = is_grok_account_quota_candidate
     global _get_grok_account_quota_lane_cooldown_key
@@ -636,9 +640,12 @@ def _plan_codex_oauth_account_failover(
     error_class: str,
     has_continuation_state: bool,
     has_previous_response_id: bool = False,
+    has_account_bound_state: bool = False,
 ) -> bool:
     """Plan the sole request-local account move for one candidate slot."""
     if not _is_codex_oauth_account_candidate(candidate):
+        return False
+    if has_account_bound_state or selection.get("has_account_bound_state"):
         return False
     interchangeable = (
         candidate.get("codex_oauth_credential_affinity") == "interchangeable"
@@ -1023,6 +1030,44 @@ def _is_codex_oauth_account_candidate(
     )
 
 
+def _affinity_pins_account_identity(
+    affinity: Optional[Mapping[str, Any]],
+) -> bool:
+    if not isinstance(affinity, Mapping):
+        return False
+    return any(
+        str(affinity.get(field) or "").strip()
+        for field in (
+            "codex_oauth_account_label",
+            "codex_oauth_account_hash",
+            "codex_oauth_lane_key",
+        )
+    )
+
+
+def _attach_account_bound_selection_metadata(
+    selection: dict[str, Any],
+    *,
+    has_account_bound_state: bool,
+    affinity: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    selection["has_account_bound_state"] = bool(has_account_bound_state)
+    selection["account_bound_classification"] = (
+        "account_bound" if has_account_bound_state else "unbound"
+    )
+    if not has_account_bound_state:
+        return selection
+    candidate = selection.get("candidate")
+    lane = None
+    if isinstance(affinity, Mapping):
+        lane = affinity.get("codex_oauth_lane_key")
+    if not lane and isinstance(candidate, Mapping):
+        lane = candidate.get("codex_oauth_lane_key")
+    if lane:
+        selection["account_bound_owner_lane"] = lane
+    return selection
+
+
 def _candidate_matches_affinity(
     candidate: dict[str, Any],
     affinity: dict[str, Any],
@@ -1038,8 +1083,22 @@ def _candidate_matches_affinity(
     if (
         affinity.get("codex_oauth_credential_affinity")
         == "interchangeable"
+        and not _affinity_pins_account_identity(affinity)
     ):
         return True
+    if (
+        affinity.get("codex_oauth_credential_affinity")
+        == "interchangeable"
+    ):
+        return all(
+            affinity.get(field) is None
+            or candidate.get(field) == affinity.get(field)
+            for field in (
+                "codex_oauth_account_label",
+                "codex_oauth_account_hash",
+                "codex_oauth_lane_key",
+            )
+        )
     return all(
         candidate.get(field) == affinity.get(field)
         for field in (
@@ -1052,6 +1111,8 @@ def _candidate_matches_affinity(
 
 def _apply_codex_oauth_inventory_affinity_policy(
     affinity: Optional[dict[str, Any]],
+    *,
+    account_bound: bool = False,
 ) -> Optional[dict[str, Any]]:
     if not isinstance(affinity, dict):
         return affinity
@@ -1073,12 +1134,13 @@ def _apply_codex_oauth_inventory_affinity_policy(
     if not routing.accounts_are_interchangeable:
         return affinity
     adjusted = dict(affinity)
-    for field in (
-        "codex_oauth_account_label",
-        "codex_oauth_account_hash",
-        "codex_oauth_lane_key",
-    ):
-        adjusted.pop(field, None)
+    if not (account_bound and _affinity_pins_account_identity(adjusted)):
+        for field in (
+            "codex_oauth_account_label",
+            "codex_oauth_account_hash",
+            "codex_oauth_lane_key",
+        ):
+            adjusted.pop(field, None)
     adjusted["codex_oauth_credential_affinity"] = "interchangeable"
     return adjusted
 
@@ -1281,6 +1343,9 @@ async def _resolve_codex_oauth_account_candidate_contexts(
         and affinity.get("codex_oauth_credential_affinity")
         == "interchangeable"
     )
+    pin_interchangeable_account = bool(
+        interchangeable_affinity and _affinity_pins_account_identity(affinity)
+    )
     if affinity is not None:
         pinned_label = str(
             affinity.get("codex_oauth_account_label") or ""
@@ -1337,7 +1402,9 @@ async def _resolve_codex_oauth_account_candidate_contexts(
                 inventory.routing.within_band_strategy
             ),
         }
-        if pinned_label is not None and not interchangeable_affinity:
+        if pinned_label is not None and (
+            not interchangeable_affinity or pin_interchangeable_account
+        ):
             records = (
                 inventory.select_record(label=pinned_label, model=model),
             )
@@ -2389,6 +2456,7 @@ async def _build_codex_auto_agent_affinity_candidate_state(
     if (
         affinity.get("codex_oauth_credential_affinity")
         == "interchangeable"
+        and not _affinity_pins_account_identity(affinity)
     ):
         return (
             _select_first_available_codex_oauth_account_state(states)
@@ -3051,6 +3119,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     assert _extract_client_product_label is not None
     assert _resolve_codex_session_key is not None
     assert _has_continuation_state is not None
+    assert _has_account_bound_state is not None
     assert _get_codex_session_affinity is not None
     requested_alias_model = request_body.get("model")
     alias_lookup_model = (
@@ -3107,6 +3176,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         alias_model=alias_model,
     )
     has_continuation_state = _has_continuation_state(request_body)
+    has_account_bound_state = _has_account_bound_state(request_body)
     request_mode, redispatch_ordinal = _resolve_codex_request_mode_and_ordinal(
         has_continuation_state=has_continuation_state,
         request_body=request_body,
@@ -3246,7 +3316,10 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         )
 
     if isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "owned":
-        affinity = sa.owner_record_as_affinity_hint(session_owner_record)
+        affinity = sa.owner_record_as_affinity_hint(
+            session_owner_record,
+            preserve_account_identity=has_account_bound_state,
+        )
         session_owner_guard_meta.update(
             {
                 "decision": "compatible_owner",
@@ -3315,7 +3388,10 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         if existing_affinity is not None:
             affinity_bypassed = True
 
-    affinity = _apply_codex_oauth_inventory_affinity_policy(affinity)
+    affinity = _apply_codex_oauth_inventory_affinity_policy(
+        affinity,
+        account_bound=has_account_bound_state,
+    )
     if affinity is not None:
         affinity_candidate = _find_codex_auto_agent_affinity_candidate(
             affinity,
@@ -3324,6 +3400,31 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             request=request,
         )
         if affinity_candidate is None:
+            if has_account_bound_state and _affinity_pins_account_identity(affinity):
+                pinned_candidate_shape = {
+                    "provider": affinity.get("provider"),
+                    "model": affinity.get("model"),
+                    "route_family": affinity.get("route_family"),
+                    "last_resort": bool(affinity.get("last_resort")),
+                }
+                for field in (
+                    "codex_oauth_account_label",
+                    "codex_oauth_account_hash",
+                    "codex_oauth_lane_key",
+                ):
+                    if affinity.get(field) is not None:
+                        pinned_candidate_shape[field] = affinity.get(field)
+                _raise_codex_auto_agent_redispatch_required(
+                    candidate=pinned_candidate_shape,
+                    lane_key=affinity.get("codex_oauth_lane_key"),
+                    cooldown_seconds=0.0,
+                    error_tokens=set(),
+                    alias_model=alias_model,
+                    error_class="candidate_unavailable",
+                    cooldown_scope="account",
+                    failure_phase="account_bound_owner_unavailable",
+                    attempted_provider_call=False,
+                )
             if (
                 isinstance(session_owner_record, dict)
                 and sa._record_state(session_owner_record) == "owned"
@@ -3375,34 +3476,70 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             )
             and _is_auto_agent_candidate_state_available(affinity_state)
         ):
-            return _attach_session_owner_selection_fields(
-                _attach_aawm_alias_routing_state_sources(
-                    {
-                        **affinity_state,
-                        "alias_model": alias_model,
-                        "session_key": session_key,
-                        "selection_reason": "session_affinity",
-                        "skipped": [],
-                        "in_flight_session": True,
-                        "request_mode": request_mode,
-                        "redispatch_ordinal": redispatch_ordinal,
-                        "affinity_bypassed": affinity_bypassed,
-                    },
-                    affinity=affinity,
-                    selected_state=affinity_state,
+            return _attach_account_bound_selection_metadata(
+                _attach_session_owner_selection_fields(
+                    _attach_aawm_alias_routing_state_sources(
+                        {
+                            **affinity_state,
+                            "alias_model": alias_model,
+                            "session_key": session_key,
+                            "selection_reason": "session_affinity",
+                            "skipped": [],
+                            "in_flight_session": True,
+                            "request_mode": request_mode,
+                            "redispatch_ordinal": redispatch_ordinal,
+                            "affinity_bypassed": affinity_bypassed,
+                        },
+                        affinity=affinity,
+                        selected_state=affinity_state,
+                    ),
+                    canonical_session_identity=canonical_session_identity,
+                    session_owner_guard=type("G", (), session_owner_guard_meta)(),
+                    session_owner_identity=session_owner_identity,
                 ),
-                canonical_session_identity=canonical_session_identity,
-                session_owner_guard=type("G", (), session_owner_guard_meta)(),
-                session_owner_identity=session_owner_identity,
+                has_account_bound_state=has_account_bound_state,
+                affinity=affinity,
             )
         if (
             isinstance(session_owner_record, dict)
             and sa._record_state(session_owner_record) == "owned"
         ):
+            if has_account_bound_state:
+                _raise_codex_auto_agent_redispatch_required(
+                    candidate=dict(affinity_state.get("candidate") or {}),
+                    lane_key=affinity_state.get("lane_key")
+                    or affinity.get("codex_oauth_lane_key"),
+                    cooldown_seconds=0.0,
+                    error_tokens=set(),
+                    alias_model=alias_model,
+                    error_class="candidate_unavailable",
+                    cooldown_scope="account",
+                    failure_phase="account_bound_owner_unavailable",
+                    attempted_provider_call=False,
+                    skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
+                        [affinity_state]
+                    ),
+                )
             return await _reselect_owned_affinity_with_effective_identity(
                 candidate=affinity_state.get("candidate"),
                 failure_phase="session_owner_owned_affinity_unavailable",
                 mismatch_reason="session_owner: owner candidate unavailable",
+            )
+        if has_account_bound_state and _affinity_pins_account_identity(affinity):
+            _raise_codex_auto_agent_redispatch_required(
+                candidate=dict(affinity_state.get("candidate") or affinity),
+                lane_key=affinity_state.get("lane_key")
+                or affinity.get("codex_oauth_lane_key"),
+                cooldown_seconds=0.0,
+                error_tokens=set(),
+                alias_model=alias_model,
+                error_class="candidate_unavailable",
+                cooldown_scope="account",
+                failure_phase="account_bound_owner_unavailable",
+                attempted_provider_call=False,
+                skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
+                    [affinity_state]
+                ),
             )
         if affinity_state["cooldown_seconds"] > 0:
             # Owned/cooldown owner is unavailable: fail before free selection.
@@ -3483,23 +3620,27 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             if int(state.get("failover_ordinal") or 0) > 0
             else "first_available"
         )
-        return _attach_session_owner_selection_fields(
-            _attach_aawm_alias_routing_state_sources(
-                {
-                    **state,
-                    "alias_model": alias_model,
-                    "session_key": session_key,
-                    "selection_reason": selection_reason,
-                    "skipped": skipped,
-                    "request_mode": request_mode,
-                    "redispatch_ordinal": redispatch_ordinal,
-                    "affinity_bypassed": affinity_bypassed,
-                },
-                selected_state=state,
+        return _attach_account_bound_selection_metadata(
+            _attach_session_owner_selection_fields(
+                _attach_aawm_alias_routing_state_sources(
+                    {
+                        **state,
+                        "alias_model": alias_model,
+                        "session_key": session_key,
+                        "selection_reason": selection_reason,
+                        "skipped": skipped,
+                        "request_mode": request_mode,
+                        "redispatch_ordinal": redispatch_ordinal,
+                        "affinity_bypassed": affinity_bypassed,
+                    },
+                    selected_state=state,
+                ),
+                canonical_session_identity=canonical_session_identity,
+                session_owner_guard=type("G", (), session_owner_guard_meta)(),
+                session_owner_identity=session_owner_identity,
             ),
-            canonical_session_identity=canonical_session_identity,
-            session_owner_guard=type("G", (), session_owner_guard_meta)(),
-            session_owner_identity=session_owner_identity,
+            has_account_bound_state=has_account_bound_state,
+            affinity=affinity,
         )
 
     state = _select_available_state(
@@ -3514,23 +3655,27 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             if int(state.get("failover_ordinal") or 0) > 0
             else "last_resort"
         )
-        return _attach_session_owner_selection_fields(
-            _attach_aawm_alias_routing_state_sources(
-                {
-                    **state,
-                    "alias_model": alias_model,
-                    "session_key": session_key,
-                    "selection_reason": selection_reason,
-                    "skipped": skipped,
-                    "request_mode": request_mode,
-                    "redispatch_ordinal": redispatch_ordinal,
-                    "affinity_bypassed": affinity_bypassed,
-                },
-                selected_state=state,
+        return _attach_account_bound_selection_metadata(
+            _attach_session_owner_selection_fields(
+                _attach_aawm_alias_routing_state_sources(
+                    {
+                        **state,
+                        "alias_model": alias_model,
+                        "session_key": session_key,
+                        "selection_reason": selection_reason,
+                        "skipped": skipped,
+                        "request_mode": request_mode,
+                        "redispatch_ordinal": redispatch_ordinal,
+                        "affinity_bypassed": affinity_bypassed,
+                    },
+                    selected_state=state,
+                ),
+                canonical_session_identity=canonical_session_identity,
+                session_owner_guard=type("G", (), session_owner_guard_meta)(),
+                session_owner_identity=session_owner_identity,
             ),
-            canonical_session_identity=canonical_session_identity,
-            session_owner_guard=type("G", (), session_owner_guard_meta)(),
-            session_owner_identity=session_owner_identity,
+            has_account_bound_state=has_account_bound_state,
+            affinity=affinity,
         )
 
     detail: dict[str, Any] = {
@@ -3990,6 +4135,8 @@ _HOST_FUNCTION_NAMES = (
     "_find_anthropic_auto_agent_affinity_candidate",
     "_candidate_uses_codex_oauth",
     "_is_codex_oauth_account_candidate",
+    "_affinity_pins_account_identity",
+    "_attach_account_bound_selection_metadata",
     "_candidate_matches_affinity",
     "_apply_codex_oauth_inventory_affinity_policy",
     "_resolve_codex_oauth_account_candidate_contexts",
@@ -4046,6 +4193,16 @@ def install(host_globals: dict) -> None:
     rebound object is published to both this module and the host module.
     """
     _mod = globals()
+    global _has_account_bound_state
+    if _has_account_bound_state is None:
+        # audit_build.install() publishes the distinct account-bound classifier
+        # into the host module before selection install runs. Adopt it when the
+        # host did not pass an explicit has_account_bound_state callback.
+        _host_classifier = host_globals.get(
+            "_aawm_auto_agent_audit_request_has_account_bound_state"
+        )
+        if callable(_host_classifier):
+            _has_account_bound_state = _host_classifier
     for _name in _HOST_FUNCTION_NAMES:
         _obj = _mod[_name]
         _rebound = _FunctionType(
@@ -4095,6 +4252,7 @@ def install(host_globals: dict) -> None:
         "_resolve_codex_session_key": _resolve_codex_session_key,
         "_resolve_anthropic_session_key": _resolve_anthropic_session_key,
         "_has_continuation_state": _has_continuation_state,
+        "_has_account_bound_state": _has_account_bound_state,
         "_find_anthropic_auto_agent_affinity_candidate": _find_anthropic_auto_agent_affinity_candidate,
         "_lookup_active_snapshot_canonical_alias": _lookup_active_snapshot_canonical_alias,
         "_resolve_aawm_alias_selection_enumeration": _resolve_aawm_alias_selection_enumeration,

@@ -20,6 +20,28 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import attempt_reco
 # ---------------------------------------------------------------------------
 
 
+_WAVE5C_AUDIT_EVENT_STUB_KEYS = {
+    "codex_auto_agent_audit_events",
+    "anthropic_auto_agent_audit_events",
+    "aawm_alias_routing_audit_events",
+}
+
+
+def _serialized_recorded_alias_surfaces(
+    meta: dict[str, Any],
+    attempts: list[dict[str, Any]],
+) -> str:
+    """Serialize emitted metadata/attempts, not the audit-event stub echo."""
+    recorded_meta = {
+        key: value
+        for key, value in meta.items()
+        if key not in _WAVE5C_AUDIT_EVENT_STUB_KEYS
+    }
+    # Incoming request metadata is preserved by merge; it is not a persist surface.
+    recorded_meta.pop("authorization", None)
+    return str({"meta": recorded_meta, "attempts": attempts})
+
+
 def _make_request() -> Request:
     """Create a minimal Request with a fresh .state namespace."""
     scope = {
@@ -1100,6 +1122,154 @@ class TestCodexAliasMetadata:
         assert audit_events[0]["attempts"][-1]["redispatch_ordinal"] == 2
         assert audit_events[0]["attempts"][-1]["affinity_bypassed"] is True
 
+    def test_three_children_keep_distinct_canonical_thread_ids(self) -> None:
+        parent = "01a012a1-2a97-7622-837c-3066ec78f02f"
+        children = [
+            "01a012a6-c49a-7a42-899d-de19e2af2e9e",
+            "01a012b0-e33f-7153-9e20-6af4560b4cec",
+            "01a012b0-e58e-7372-b7d9-38bc36db15e7",
+        ]
+        identities: list[str] = []
+        for child in children:
+            body = {
+                "model": "codex-auto-agent",
+                "litellm_metadata": {
+                    "session_id": parent,
+                    "thread_id": child,
+                    "parent_thread_id": parent,
+                },
+            }
+            result = attempt_records._add_codex_auto_agent_alias_metadata(
+                body,
+                request=_make_request(),
+                selection=self._selection(),
+                attempts=[],
+            )
+            meta = result["litellm_metadata"]
+            assert meta["canonical_thread_id"] == child
+            assert meta["parent_thread_id"] == parent
+            identities.append(meta["canonical_thread_id"])
+        assert identities == children
+        assert len(set(identities)) == 3
+
+    def test_parent_only_body_does_not_invent_child_identity(self) -> None:
+        body = {
+            "model": "codex-auto-agent",
+            "litellm_metadata": {"session_id": "session-parent-only"},
+        }
+        result = attempt_records._add_codex_auto_agent_alias_metadata(
+            body,
+            request=_make_request(),
+            selection=self._selection(),
+            attempts=[],
+        )
+        meta = result["litellm_metadata"]
+        assert meta["canonical_thread_id"] is None
+        assert meta["parent_thread_id"] is None
+
+    def test_unbound_classification_and_selected_lane_survive_without_content(
+        self,
+    ) -> None:
+        prompt = "raw user prompt must not leak"
+        credential = "sk-secret-credential"
+        body = {
+            "model": "codex-auto-agent",
+            "instructions": prompt,
+            "litellm_metadata": {"authorization": credential},
+        }
+        lane = "codex-oauth:account1:hash-account-1"
+        selection = self._selection(
+            has_account_bound_state=False,
+            account_bound_classification="unbound",
+        )
+        selection["candidate"]["codex_oauth_lane_key"] = lane
+        attempts: list[dict[str, Any]] = [
+            {
+                "status": "started",
+                "provider": "openai",
+                "error_class": "item_not_found",
+                "litellm_call_id": "call-unbound-1",
+            }
+        ]
+
+        result = attempt_records._add_codex_auto_agent_alias_metadata(
+            body,
+            request=_make_request(),
+            selection=selection,
+            attempts=attempts,
+        )
+
+        meta = result["litellm_metadata"]
+        assert meta["has_account_bound_state"] is False
+        assert meta["account_bound_classification"] == "unbound"
+        assert meta["codex_auto_agent_selected_account_lane"] == lane
+        assert attempts[-1]["has_account_bound_state"] is False
+        assert attempts[-1]["account_bound_classification"] == "unbound"
+        assert attempts[-1]["error_class"] == "item_not_found"
+        assert attempts[-1]["provider"] == "openai"
+        assert attempts[-1]["litellm_call_id"] == "call-unbound-1"
+        serialized = _serialized_recorded_alias_surfaces(meta, attempts)
+        assert prompt not in serialized
+        assert credential not in serialized
+
+    def test_account_bound_classification_and_selected_lane_survive_without_content(
+        self,
+    ) -> None:
+        secret = "SECRET_ENCRYPTED_BLOB"
+        prompt = "raw user prompt must not leak"
+        tool_args = '{"command":"cat /etc/shadow"}'
+        credential = "sk-secret-credential"
+        body = {
+            "model": "codex-auto-agent",
+            "encrypted_content": secret,
+            "instructions": prompt,
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": tool_args,
+                }
+            ],
+            "previous_response_id": "resp_123",
+            "litellm_metadata": {"authorization": credential},
+        }
+        lane = "codex-oauth:account1:hash-account-1"
+        selection = self._selection(
+            has_account_bound_state=True,
+            account_bound_classification="account_bound",
+        )
+        selection["candidate"]["codex_oauth_lane_key"] = lane
+        attempts: list[dict[str, Any]] = [
+            {
+                "status": "cooldown_set",
+                "provider": "openai",
+                "error_class": "item_not_found",
+                "litellm_call_id": "call-bound-1",
+            }
+        ]
+
+        result = attempt_records._add_codex_auto_agent_alias_metadata(
+            body,
+            request=_make_request(),
+            selection=selection,
+            attempts=attempts,
+        )
+
+        meta = result["litellm_metadata"]
+        assert meta["has_account_bound_state"] is True
+        assert meta["account_bound_classification"] == "account_bound"
+        assert meta["codex_auto_agent_selected_account_lane"] == lane
+        assert attempts[-1]["has_account_bound_state"] is True
+        assert attempts[-1]["account_bound_classification"] == "account_bound"
+        assert attempts[-1]["error_class"] == "item_not_found"
+        assert attempts[-1]["provider"] == "openai"
+        assert attempts[-1]["litellm_call_id"] == "call-bound-1"
+        serialized = _serialized_recorded_alias_surfaces(meta, attempts)
+        assert secret not in serialized
+        assert prompt not in serialized
+        assert tool_args not in serialized
+        assert credential not in serialized
+
 
 # ---------------------------------------------------------------------------
 # _add_anthropic_auto_agent_alias_metadata
@@ -1254,3 +1424,105 @@ class TestAnthropicAliasMetadata:
         assert audit_events[0]["attempts"][-1]["request_mode"] == "fresh_redispatch"
         assert audit_events[0]["attempts"][-1]["redispatch_ordinal"] == 2
         assert audit_events[0]["attempts"][-1]["affinity_bypassed"] is True
+
+    def test_three_children_keep_distinct_canonical_thread_ids(self) -> None:
+        parent = "01a012a1-2a97-7622-837c-3066ec78f02f"
+        children = [
+            "01a012a6-c49a-7a42-899d-de19e2af2e9e",
+            "01a012b0-e33f-7153-9e20-6af4560b4cec",
+            "01a012b0-e58e-7372-b7d9-38bc36db15e7",
+        ]
+        identities: list[str] = []
+        for child in children:
+            body = {
+                "model": "claude-auto-agent",
+                "litellm_metadata": {
+                    "session_id": parent,
+                    "thread_id": child,
+                    "parent_thread_id": parent,
+                },
+            }
+            result = attempt_records._add_anthropic_auto_agent_alias_metadata(
+                body,
+                request=_make_request(),
+                selection=self._selection(),
+                attempts=[],
+            )
+            meta = result["litellm_metadata"]
+            assert meta["canonical_thread_id"] == child
+            assert meta["parent_thread_id"] == parent
+            identities.append(meta["canonical_thread_id"])
+        assert identities == children
+        assert len(set(identities)) == 3
+
+    def test_parent_only_body_does_not_invent_child_identity(self) -> None:
+        body = {
+            "model": "claude-auto-agent",
+            "litellm_metadata": {"session_id": "session-parent-only"},
+        }
+        result = attempt_records._add_anthropic_auto_agent_alias_metadata(
+            body,
+            request=_make_request(),
+            selection=self._selection(),
+            attempts=[],
+        )
+        meta = result["litellm_metadata"]
+        assert meta["canonical_thread_id"] is None
+        assert meta["parent_thread_id"] is None
+
+    def test_account_bound_classification_and_selected_lane_survive_without_content(
+        self,
+    ) -> None:
+        secret = "SECRET_ENCRYPTED_BLOB"
+        prompt = "raw user prompt must not leak"
+        tool_args = '{"command":"cat /etc/shadow"}'
+        credential = "sk-secret-credential"
+        body = {
+            "model": "claude-auto-agent",
+            "encrypted_content": secret,
+            "instructions": prompt,
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": tool_args,
+                }
+            ],
+            "previous_response_id": "resp_123",
+            "litellm_metadata": {"authorization": credential},
+        }
+        lane = "codex-oauth:account1:hash-account-1"
+        selection = self._selection(
+            has_account_bound_state=True,
+            account_bound_classification="account_bound",
+        )
+        selection["candidate"]["codex_oauth_lane_key"] = lane
+        attempts: list[dict[str, Any]] = [
+            {
+                "status": "cooldown_set",
+                "provider": "anthropic",
+                "error_class": "item_not_found",
+                "litellm_call_id": "call-anth-bound-1",
+            }
+        ]
+
+        result = attempt_records._add_anthropic_auto_agent_alias_metadata(
+            body,
+            request=_make_request(),
+            selection=selection,
+            attempts=attempts,
+        )
+
+        meta = result["litellm_metadata"]
+        assert meta["has_account_bound_state"] is True
+        assert meta["account_bound_classification"] == "account_bound"
+        assert meta["anthropic_auto_agent_selected_account_lane"] == lane
+        assert attempts[-1]["has_account_bound_state"] is True
+        assert attempts[-1]["account_bound_classification"] == "account_bound"
+        assert attempts[-1]["error_class"] == "item_not_found"
+        assert attempts[-1]["provider"] == "anthropic"
+        serialized = _serialized_recorded_alias_surfaces(meta, attempts)
+        assert secret not in serialized
+        assert prompt not in serialized
+        assert tool_args not in serialized
+        assert credential not in serialized

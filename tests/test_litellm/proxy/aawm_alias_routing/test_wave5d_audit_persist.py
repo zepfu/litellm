@@ -332,3 +332,179 @@ class TestPersistAuditOnlyEvents:
             # Must not raise
             result = audit_persist._persist_auto_agent_alias_audit_only_events_best_effort(events)
         assert result == "fail_build"
+
+    def test_child_canonical_thread_id_is_durable_session_id(self):
+        parent = "01a012a1-2a97-7622-837c-3066ec78f02f"
+        child = "01a012a6-c49a-7a42-899d-de19e2af2e9e"
+        events = [
+            {
+                "event_type": "terminal_no_candidate",
+                "alias_model": "test-alias",
+                "session_id": parent,
+                "canonical_thread_id": child,
+                "parent_thread_id": parent,
+            }
+        ]
+        mock_module = MagicMock()
+        mock_module._build_alias_routing_audit_only_record.return_value = {"record": True}
+        mock_module._spool_session_history_records.return_value = None
+        with patch.dict(
+            "sys.modules",
+            {"litellm.integrations.aawm_agent_identity": mock_module},
+        ):
+            result = audit_persist._persist_auto_agent_alias_audit_only_events_best_effort(events)
+        assert result == "spool_only"
+        call_kwargs = mock_module._build_alias_routing_audit_only_record.call_args[1]
+        assert call_kwargs["session_id"] == child
+        assert call_kwargs["metadata"]["canonical_thread_id"] == child
+        assert call_kwargs["metadata"]["parent_thread_id"] == parent
+        assert call_kwargs["metadata"]["aawm_alias_routing_audit_only"] is True
+
+    def test_three_children_under_one_parent_remain_independently_queryable(self):
+        parent = "01a012a1-2a97-7622-837c-3066ec78f02f"
+        children = [
+            "01a012a6-c49a-7a42-899d-de19e2af2e9e",
+            "01a012b0-e33f-7153-9e20-6af4560b4cec",
+            "01a012b0-e58e-7372-b7d9-38bc36db15e7",
+        ]
+        durable_ids: list[str] = []
+        mock_module = MagicMock()
+        mock_module._build_alias_routing_audit_only_record.return_value = {"record": True}
+        mock_module._spool_session_history_records.return_value = None
+        with patch.dict(
+            "sys.modules",
+            {"litellm.integrations.aawm_agent_identity": mock_module},
+        ):
+            for child in children:
+                events = [
+                    {
+                        "event_type": "terminal_no_candidate",
+                        "alias_model": "test-alias",
+                        "session_id": parent,
+                        "canonical_thread_id": child,
+                        "parent_thread_id": parent,
+                    }
+                ]
+                result = audit_persist._persist_auto_agent_alias_audit_only_events_best_effort(
+                    events
+                )
+                assert result == "spool_only"
+                call_kwargs = mock_module._build_alias_routing_audit_only_record.call_args[1]
+                durable_ids.append(call_kwargs["session_id"])
+                assert call_kwargs["metadata"]["parent_thread_id"] == parent
+        assert durable_ids == children
+        assert len(set(durable_ids)) == 3
+
+    def test_parent_only_event_keeps_parent_session_id(self):
+        events = [
+            {
+                "event_type": "terminal_no_candidate",
+                "alias_model": "test-alias",
+                "session_id": "session-parent-only",
+            }
+        ]
+        mock_module = MagicMock()
+        mock_module._build_alias_routing_audit_only_record.return_value = {"record": True}
+        mock_module._spool_session_history_records.return_value = None
+        with patch.dict(
+            "sys.modules",
+            {"litellm.integrations.aawm_agent_identity": mock_module},
+        ):
+            result = audit_persist._persist_auto_agent_alias_audit_only_events_best_effort(events)
+        assert result == "spool_only"
+        call_kwargs = mock_module._build_alias_routing_audit_only_record.call_args[1]
+        assert call_kwargs["session_id"] == "session-parent-only"
+        assert "canonical_thread_id" not in call_kwargs["metadata"]
+        assert "parent_thread_id" not in call_kwargs["metadata"]
+
+    def test_sanitized_logging_hashes_durable_child_identity(self):
+        parent = "secret-parent-thread-aaaa"
+        child = "secret-child-thread-bbbb"
+        events = [
+            {
+                "event_type": "terminal_no_candidate",
+                "alias_model": "test-alias",
+                "session_id": parent,
+                "canonical_thread_id": child,
+                "parent_thread_id": parent,
+                "litellm_call_id": "secret-call-cccc",
+            }
+        ]
+        mock_module = MagicMock()
+        mock_module._build_alias_routing_audit_only_record.side_effect = ValueError("boom")
+        with patch.dict(
+            "sys.modules",
+            {"litellm.integrations.aawm_agent_identity": mock_module},
+        ):
+            with patch.object(audit_persist.verbose_proxy_logger, "warning") as mock_warn:
+                audit_persist._persist_auto_agent_alias_audit_only_events_best_effort(events)
+                for call in mock_warn.call_args_list:
+                    all_args = " ".join(str(a) for a in call[0])
+                    assert parent not in all_args
+                    assert child not in all_args
+                    assert "secret-call-cccc" not in all_args
+
+    def test_classification_and_selected_lane_survive_persist_without_content(self):
+        secret = "SECRET_ENCRYPTED_BLOB"
+        prompt = "raw user prompt must not leak"
+        tool_args = '{"command":"cat /etc/shadow"}'
+        credential = "sk-secret-credential"
+        lane = "codex-oauth:account1:hash-account-1"
+        events = [
+            {
+                "event_type": "candidate_retryable_failure",
+                "alias_model": "test-alias",
+                "session_id": "child-thread-9",
+                "canonical_thread_id": "child-thread-9",
+                "parent_thread_id": "parent-thread-9",
+                "has_account_bound_state": True,
+                "account_bound_classification": "account_bound",
+                "account_lane": lane,
+                "failure_class": "item_not_found",
+                "provider": "openai",
+                "litellm_call_id": "call-bound-1",
+            }
+        ]
+        request_body = {
+            "encrypted_content": secret,
+            "instructions": prompt,
+            "input": [
+                {
+                    "type": "function_call",
+                    "name": "shell",
+                    "arguments": tool_args,
+                }
+            ],
+            "litellm_metadata": {
+                "requested_model_alias": "codex-auto",
+                "authorization": credential,
+            },
+        }
+        mock_module = MagicMock()
+        mock_module._build_alias_routing_audit_only_record.return_value = {"record": True}
+        mock_module._spool_session_history_records.return_value = None
+        with patch.dict(
+            "sys.modules",
+            {"litellm.integrations.aawm_agent_identity": mock_module},
+        ):
+            result = audit_persist._persist_auto_agent_alias_audit_only_events_best_effort(
+                events,
+                request_body=request_body,
+            )
+        assert result == "spool_only"
+        call_kwargs = mock_module._build_alias_routing_audit_only_record.call_args[1]
+        metadata = call_kwargs["metadata"]
+        persisted_events = call_kwargs["events"]
+        assert metadata["has_account_bound_state"] is True
+        assert metadata["account_bound_classification"] == "account_bound"
+        assert metadata["account_lane"] == lane
+        assert metadata["failure_class"] == "item_not_found"
+        assert persisted_events[0]["has_account_bound_state"] is True
+        assert persisted_events[0]["account_bound_classification"] == "account_bound"
+        assert persisted_events[0]["account_lane"] == lane
+        assert persisted_events[0]["failure_class"] == "item_not_found"
+        serialized = str({"kwargs": call_kwargs, "metadata": metadata})
+        assert secret not in serialized
+        assert prompt not in serialized
+        assert tool_args not in serialized
+        assert credential not in serialized

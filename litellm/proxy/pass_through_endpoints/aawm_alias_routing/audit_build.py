@@ -234,6 +234,8 @@ def _build_auto_agent_alias_audit_event(
         "alias_family": alias_family,
         "alias_model": alias_model,
         "session_id": context.get("session_id"),
+        "canonical_thread_id": context.get("canonical_thread_id"),
+        "parent_thread_id": context.get("parent_thread_id"),
         "agent_id": _extract_auto_agent_alias_metadata_value(
             request_body,
             "agent_id",
@@ -318,6 +320,15 @@ def _build_auto_agent_alias_audit_event(
         value = candidate.get(field)
         if value is None:
             value = selection.get(field)
+        if value is not None:
+            event[field] = value
+    for field in (
+        "has_account_bound_state",
+        "account_bound_classification",
+    ):
+        value = selection.get(field)
+        if value is None:
+            value = candidate.get(field)
         if value is not None:
             event[field] = value
 
@@ -451,10 +462,73 @@ def _build_auto_agent_alias_audit_events(
     return events
 
 
+def _aawm_auto_agent_audit_request_has_account_bound_state(
+    request_body: Any,
+    _seen: Optional[set[int]] = None,
+) -> bool:
+    """Return True when request state is bound to a prior Responses account.
+
+    Presence-only: never copies payload content, encrypted content, prompts,
+    credentials, or tool arguments.
+
+    The name is deliberately distinct from any host-module or sibling-module
+    global so Wave 5B/5D host-globals rebinding cannot collide two owners on
+    one ``llm_passthrough_endpoints`` name.  Recursion resolves through this
+    module's own namespace (not the rebound host globals) so the installed
+    rebound object keeps working even after host rebind.
+    """
+    value = request_body
+    if isinstance(value, (dict, list)):
+        if _seen is None:
+            _seen = set()
+        value_id = id(value)
+        if value_id in _seen:
+            return False
+        _seen.add(value_id)
+
+    if isinstance(value, dict):
+        previous_response_id = value.get("previous_response_id")
+        if isinstance(previous_response_id, str) and previous_response_id.strip():
+            return True
+        item_type = value.get("type")
+        item_id = value.get("id")
+        if (
+            item_type == "item_reference"
+            and isinstance(item_id, str)
+            and item_id.startswith("rs_")
+        ):
+            return True
+        item_reference = value.get("item_reference")
+        if isinstance(item_reference, str) and item_reference.startswith("rs_"):
+            return True
+        if isinstance(item_reference, dict):
+            referenced_id = item_reference.get("id")
+            if isinstance(referenced_id, str) and referenced_id.startswith("rs_"):
+                return True
+        if value.get("encrypted_content"):
+            return True
+        if item_type in {"reasoning", "function_call_output"}:
+            return True
+        return any(
+            _aawm_auto_agent_audit_request_has_account_bound_state(child, _seen)
+            for child in value.values()
+        )
+    if isinstance(value, list):
+        return any(
+            _aawm_auto_agent_audit_request_has_account_bound_state(item, _seen)
+            for item in value
+        )
+    return False
+
+
 def _codex_auto_agent_request_has_continuation_state(
     value: Any,
     _seen: Optional[set[int]] = None,
 ) -> bool:
+    if _seen is None and _aawm_auto_agent_audit_request_has_account_bound_state(
+        value
+    ):
+        return True
     if isinstance(value, (dict, list)):
         if _seen is None:
             _seen = set()
@@ -505,6 +579,7 @@ _HOST_FUNCTION_NAMES = (
     "_build_auto_agent_alias_audit_event",
     "_build_auto_agent_alias_audit_events",
     "_codex_auto_agent_request_has_continuation_state",
+    "_aawm_auto_agent_audit_request_has_account_bound_state",
 )
 
 

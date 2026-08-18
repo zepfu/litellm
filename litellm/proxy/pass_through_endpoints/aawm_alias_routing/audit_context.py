@@ -21,6 +21,10 @@ from typing_extensions import NotRequired, TypedDict
 from litellm.proxy.common_utils.http_parsing_utils import _safe_get_request_headers
 
 from .codex_oauth import _clean_codex_auth_value
+from .request_metadata import (
+    _extract_auto_agent_alias_canonical_thread_id,
+    _extract_auto_agent_alias_parent_thread_id,
+)
 from .types import Payload
 
 # ---------------------------------------------------------------------------
@@ -538,6 +542,8 @@ def _get_or_create_auto_agent_alias_request_call_id(
 class _AutoAgentAliasRequestContext(TypedDict):
     agent_dispatch: dict[str, Any]
     session_id: Optional[str]
+    canonical_thread_id: Optional[str]
+    parent_thread_id: Optional[str]
     litellm_call_id: str
     trace_id: Optional[str]
     repository: Optional[str]
@@ -558,6 +564,8 @@ def _normalize_auto_agent_alias_request_context(
     context: _AutoAgentAliasRequestContext = {
         "agent_dispatch": (dict(agent_dispatch_value) if isinstance(agent_dispatch_value, dict) else {}),
         "session_id": _clean_optional_string(value.get("session_id")),
+        "canonical_thread_id": _clean_optional_string(value.get("canonical_thread_id")),
+        "parent_thread_id": _clean_optional_string(value.get("parent_thread_id")),
         "litellm_call_id": _clean_optional_string(value.get("litellm_call_id")) or str(uuid4()),
         "trace_id": _clean_optional_string(value.get("trace_id")),
         "repository": _clean_optional_string(value.get("repository")),
@@ -622,15 +630,28 @@ def _get_auto_agent_alias_request_context(
             request_body,
         )
         host_attribution = _resolve_auto_agent_alias_route_host_attribution(request)
+        canonical_thread_id = _extract_auto_agent_alias_canonical_thread_id(
+            request,
+            request_body,
+        )
+        parent_thread_id = _extract_auto_agent_alias_parent_thread_id(
+            request,
+            request_body,
+        )
+        legacy_session_id = _extract_auto_agent_alias_session_id(
+            request,
+            request_body,
+        )
         cached = {
             "agent_dispatch": _extract_auto_agent_alias_agent_dispatch_fields(
                 request,
                 request_body,
             ),
-            "session_id": _extract_auto_agent_alias_session_id(
-                request,
-                request_body,
+            "session_id": (
+                canonical_thread_id or legacy_session_id or parent_thread_id
             ),
+            "canonical_thread_id": canonical_thread_id,
+            "parent_thread_id": parent_thread_id,
             "litellm_call_id": _get_or_create_auto_agent_alias_request_call_id(
                 request,
                 request_body,
@@ -703,6 +724,12 @@ def _attach_auto_agent_alias_terminal_context_fields(
 
     if event.get("session_id") is None:
         event["session_id"] = context.get("session_id")
+
+    if event.get("canonical_thread_id") is None:
+        event["canonical_thread_id"] = context.get("canonical_thread_id")
+
+    if event.get("parent_thread_id") is None:
+        event["parent_thread_id"] = context.get("parent_thread_id")
 
     if event.get("litellm_call_id") is None:
         event["litellm_call_id"] = context.get("litellm_call_id")
@@ -790,6 +817,14 @@ def install(host_globals: dict) -> None:
         ("_extract_auto_agent_alias_session_id", _extract_auto_agent_alias_session_id),
         ("_build_auto_agent_alias_rollup_group_header_label", _build_auto_agent_alias_rollup_group_header_label),
         ("_codex_auto_agent_request_has_continuation_state", _codex_auto_agent_request_has_continuation_state),
+        (
+            "_extract_auto_agent_alias_canonical_thread_id",
+            _extract_auto_agent_alias_canonical_thread_id,
+        ),
+        (
+            "_extract_auto_agent_alias_parent_thread_id",
+            _extract_auto_agent_alias_parent_thread_id,
+        ),
     ):
         host_globals.setdefault(_sk, _sv)
 

@@ -434,13 +434,19 @@ async def test_continuation_affinity_pins_account_and_fails_fast(
             request=_request(),
             request_body={
                 "model": "basic",
-                "previous_response_id": "response-1",
+                "previous_response_id": "resp_123",
             },
         )
+    detail = exc_info.value.detail
     assert exc_info.value.status_code == 429
     assert loaded_labels == ["account1"]
-    assert exc_info.value.detail["candidate"]["account_label"] == "account1"
-    assert exc_info.value.detail["failure_phase"] == "pre_dispatch_auth"
+    assert detail["candidate"]["account_label"] == "account1"
+    assert detail["redispatch_required"] is True
+    assert detail["error"]["code"] == (
+        "aawm_codex_auto_agent_redispatch_required"
+    )
+    assert detail["failure_phase"] == "account_bound_owner_unavailable"
+    assert detail["attempted_provider_call"] is False
 
 
 def _patch_candidate_loop_host(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1929,6 +1935,489 @@ def test_interchangeable_policy_removes_legacy_account_affinity(
     assert "codex_oauth_account_label" not in adjusted
     assert "codex_oauth_account_hash" not in adjusted
     assert "codex_oauth_lane_key" not in adjusted
+
+
+def test_account_bound_policy_preserves_creating_account_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        codex_oauth_inventory,
+        "load_codex_oauth_inventory",
+        _interchangeable_inventory,
+    )
+    affinity = {
+        **_candidate(),
+        "codex_oauth_account_label": "account1",
+        "codex_oauth_account_hash": "hash-account-1",
+        "codex_oauth_lane_key": "codex-oauth:account1:hash-account-1",
+        "codex_oauth_credential_affinity": "interchangeable",
+    }
+
+    adjusted = selection._apply_codex_oauth_inventory_affinity_policy(
+        affinity,
+        account_bound=True,
+    )
+    assert adjusted is not None
+    assert adjusted["codex_oauth_credential_affinity"] == "interchangeable"
+    assert adjusted["codex_oauth_account_label"] == "account1"
+    assert adjusted["codex_oauth_account_hash"] == "hash-account-1"
+    assert adjusted["codex_oauth_lane_key"] == (
+        "codex-oauth:account1:hash-account-1"
+    )
+
+
+def test_owner_hint_preserves_account_identity_only_when_requested() -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+
+    record = {
+        "state": "owned",
+        "owner": "owner",
+        "attributes": {
+            "provider": "openai",
+            "model": "gpt-5.3-codex",
+            "route_family": "codex_responses",
+            "account_label": "account1",
+            "account_hash": "hash-account-1",
+            "account_lane": "codex-oauth:account1:hash-account-1",
+            "credential_affinity": "interchangeable",
+        },
+    }
+    default_hint = sa.owner_record_as_affinity_hint(record)
+    assert default_hint is not None
+    assert default_hint["codex_oauth_credential_affinity"] == "interchangeable"
+    assert "codex_oauth_account_label" not in default_hint
+    assert "codex_oauth_account_hash" not in default_hint
+    assert "codex_oauth_lane_key" not in default_hint
+
+    pinned = sa.owner_record_as_affinity_hint(
+        record,
+        preserve_account_identity=True,
+    )
+    assert pinned is not None
+    assert pinned["codex_oauth_credential_affinity"] == "interchangeable"
+    assert pinned["codex_oauth_account_label"] == "account1"
+    assert pinned["codex_oauth_account_hash"] == "hash-account-1"
+    assert pinned["codex_oauth_lane_key"] == (
+        "codex-oauth:account1:hash-account-1"
+    )
+
+
+def test_account_bound_state_blocks_interchangeable_failover() -> None:
+    request = _request()
+    candidate = {
+        **_candidate(),
+        "codex_oauth_account_label": "account1",
+        "codex_oauth_account_hash": "hash-account-1",
+        "codex_oauth_lane_key": "codex-oauth:account1:hash-account-1",
+        "codex_oauth_credential_affinity": "interchangeable",
+    }
+    selection_state = {
+        "candidate": candidate,
+        "failover_ordinal": 0,
+        "has_account_bound_state": True,
+    }
+    attempt = {
+        "failure_phase": "direct_openai_provider_response",
+        "attempted_provider_call": True,
+    }
+
+    assert not selection._plan_codex_oauth_account_failover(
+        request,
+        candidate=candidate,
+        selection=selection_state,
+        attempt_record=attempt,
+        error_class="usage_limit_reached",
+        has_continuation_state=True,
+        has_previous_response_id=False,
+        has_account_bound_state=True,
+    )
+
+
+def _owned_interchangeable_record(label: str = "account1") -> dict[str, Any]:
+    account_hash = f"hash-{label.replace('account', 'account-')}"
+    if label == "account1":
+        account_hash = "hash-account-1"
+    elif label == "account2":
+        account_hash = "hash-account-2"
+    return {
+        "state": "owned",
+        "owner": "owner-1",
+        "attributes": {
+            "provider": "openai",
+            "model": "gpt-5.3-codex",
+            "route_family": "codex_responses",
+            "account_label": label,
+            "account_hash": account_hash,
+            "account_lane": f"codex-oauth:{label}:{account_hash}",
+            "credential_affinity": "interchangeable",
+        },
+    }
+
+
+def _patch_account_bound_selector(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    bound: bool,
+    owner_label: str = "account1",
+    stub_classifier: bool = True,
+) -> list[str]:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+
+    loaded: list[str] = []
+    inventory = _interchangeable_inventory()
+    monkeypatch.setattr(
+        codex_oauth_inventory,
+        "load_codex_oauth_inventory",
+        lambda: inventory,
+    )
+
+    async def _auth(request: Request, record: CodexOAuthCredentialRecord):
+        loaded.append(record.label)
+        return await _healthy_auth(request, record)
+
+    monkeypatch.setattr(
+        codex_oauth,
+        "_load_codex_oauth_headers_for_record",
+        _auth,
+    )
+    _patch_selector_runtime(monkeypatch)
+    if stub_classifier:
+        monkeypatch.setattr(
+            lpe,
+            "_has_account_bound_state",
+            lambda _body: bound,
+        )
+    else:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            audit_build,
+        )
+
+        monkeypatch.setattr(
+            lpe,
+            "_has_account_bound_state",
+            audit_build._aawm_auto_agent_audit_request_has_account_bound_state,
+        )
+    monkeypatch.setattr(
+        sa,
+        "resolve_canonical_session_identity",
+        lambda *a, **k: "sess-openai-019",
+    )
+
+    async def _owned(**_kwargs):
+        return (_owned_interchangeable_record(owner_label), "cache-key", None)
+
+    monkeypatch.setattr(sa, "get_session_owner_record", _owned)
+    return loaded
+
+
+@pytest.mark.asyncio
+async def test_unbound_owner_keeps_quota_weighted_interchangeable_balancing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = _patch_account_bound_selector(monkeypatch, bound=False)
+    now = datetime.now(timezone.utc)
+    alias_routing_state.record_normalized_quota_observations(
+        [
+            _quota_observation(
+                account_hash="hash-account-1",
+                observed_at=now,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=True,
+            ),
+            _quota_observation(
+                account_hash="hash-account-2",
+                observed_at=now,
+                reset_at=now + timedelta(days=2),
+                quota_period="seven_day",
+                window_minutes=10080,
+                exhausted=False,
+                remaining_pct=80.0,
+            ),
+        ]
+    )
+
+    selected = await lpe._select_codex_auto_agent_candidate(
+        request=_request(),
+        request_body={"model": "basic"},
+    )
+    assert selected["candidate"]["codex_oauth_account_label"] == "account2"
+    assert selected["has_account_bound_state"] is False
+    assert selected["account_bound_classification"] == "unbound"
+    assert "account1" in loaded
+    assert "account2" in loaded
+    assert selected["selection_reason"] in {
+        "session_affinity",
+        "first_available",
+        "codex_oauth_account_failover",
+    }
+
+
+@pytest.mark.asyncio
+async def test_account_bound_owner_pins_creating_lane_despite_interchangeable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = _patch_account_bound_selector(
+        monkeypatch,
+        bound=True,
+        owner_label="account1",
+    )
+    now = datetime.now(timezone.utc)
+    alias_routing_state.record_normalized_quota_observations(
+        [
+            _quota_observation(
+                account_hash="hash-account-1",
+                observed_at=now,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=False,
+                remaining_pct=10.0,
+            ),
+            _quota_observation(
+                account_hash="hash-account-2",
+                observed_at=now,
+                reset_at=now + timedelta(days=2),
+                quota_period="seven_day",
+                window_minutes=10080,
+                exhausted=False,
+                remaining_pct=90.0,
+            ),
+        ]
+    )
+    alternate = AsyncMock(
+        side_effect=AssertionError("alternate account selection must not run")
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_build_codex_auto_agent_candidate_states",
+        alternate,
+    )
+
+    selected = await lpe._select_codex_auto_agent_candidate(
+        request=_request(),
+        request_body={"model": "basic"},
+    )
+    assert selected["candidate"]["codex_oauth_account_label"] == "account1"
+    assert selected["candidate"]["codex_oauth_account_hash"] == "hash-account-1"
+    assert selected["has_account_bound_state"] is True
+    assert selected["account_bound_classification"] == "account_bound"
+    assert selected["account_bound_owner_lane"] == (
+        "codex-oauth:account1:hash-account-1"
+    )
+    assert loaded == ["account1"]
+    alternate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_bound_owner_fails_closed_without_alternate_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = _patch_account_bound_selector(
+        monkeypatch,
+        bound=True,
+        owner_label="account1",
+    )
+    now = datetime.now(timezone.utc)
+    alias_routing_state.record_normalized_quota_observations(
+        [
+            _quota_observation(
+                account_hash="hash-account-1",
+                observed_at=now,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=True,
+            ),
+            _quota_observation(
+                account_hash="hash-account-2",
+                observed_at=now,
+                reset_at=now + timedelta(days=2),
+                quota_period="seven_day",
+                window_minutes=10080,
+                exhausted=False,
+                remaining_pct=90.0,
+            ),
+        ]
+    )
+    alternate = AsyncMock(
+        side_effect=AssertionError("alternate account selection must not run")
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_build_codex_auto_agent_candidate_states",
+        alternate,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await lpe._select_codex_auto_agent_candidate(
+            request=_request(),
+            request_body={"model": "basic"},
+        )
+    detail = exc_info.value.detail
+    assert exc_info.value.status_code == 429
+    assert detail["redispatch_required"] is True
+    assert detail["error"]["code"] == "aawm_codex_auto_agent_redispatch_required"
+    assert detail["failure_phase"] == "account_bound_owner_unavailable"
+    assert detail["attempted_provider_call"] is False
+    assert loaded == ["account1"]
+    alternate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resp_previous_response_id_pins_creating_lane(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = _patch_account_bound_selector(
+        monkeypatch,
+        bound=True,
+        owner_label="account1",
+        stub_classifier=False,
+    )
+    now = datetime.now(timezone.utc)
+    alias_routing_state.record_normalized_quota_observations(
+        [
+            _quota_observation(
+                account_hash="hash-account-1",
+                observed_at=now,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=False,
+                remaining_pct=10.0,
+            ),
+            _quota_observation(
+                account_hash="hash-account-2",
+                observed_at=now,
+                reset_at=now + timedelta(days=2),
+                quota_period="seven_day",
+                window_minutes=10080,
+                exhausted=False,
+                remaining_pct=90.0,
+            ),
+        ]
+    )
+    alternate = AsyncMock(
+        side_effect=AssertionError("alternate account selection must not run")
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_build_codex_auto_agent_candidate_states",
+        alternate,
+    )
+
+    selected = await lpe._select_codex_auto_agent_candidate(
+        request=_request(),
+        request_body={"model": "basic", "previous_response_id": "resp_123"},
+    )
+    assert selected["candidate"]["codex_oauth_account_label"] == "account1"
+    assert selected["candidate"]["codex_oauth_account_hash"] == "hash-account-1"
+    assert selected["has_account_bound_state"] is True
+    assert selected["account_bound_classification"] == "account_bound"
+    assert selected["account_bound_owner_lane"] == (
+        "codex-oauth:account1:hash-account-1"
+    )
+    assert loaded == ["account1"]
+    alternate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resp_previous_response_id_fails_closed_without_alternate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = _patch_account_bound_selector(
+        monkeypatch,
+        bound=True,
+        owner_label="account1",
+        stub_classifier=False,
+    )
+    now = datetime.now(timezone.utc)
+    alias_routing_state.record_normalized_quota_observations(
+        [
+            _quota_observation(
+                account_hash="hash-account-1",
+                observed_at=now,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=True,
+            ),
+            _quota_observation(
+                account_hash="hash-account-2",
+                observed_at=now,
+                reset_at=now + timedelta(days=2),
+                quota_period="seven_day",
+                window_minutes=10080,
+                exhausted=False,
+                remaining_pct=90.0,
+            ),
+        ]
+    )
+    alternate = AsyncMock(
+        side_effect=AssertionError("alternate account selection must not run")
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_build_codex_auto_agent_candidate_states",
+        alternate,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await lpe._select_codex_auto_agent_candidate(
+            request=_request(),
+            request_body={"model": "basic", "previous_response_id": "resp_123"},
+        )
+    detail = exc_info.value.detail
+    assert exc_info.value.status_code == 429
+    assert detail["redispatch_required"] is True
+    assert detail["error"]["code"] == "aawm_codex_auto_agent_redispatch_required"
+    assert detail["failure_phase"] == "account_bound_owner_unavailable"
+    assert detail["attempted_provider_call"] is False
+    assert loaded == ["account1"]
+    alternate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_account_bound_resolve_does_not_consult_alternate_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded: list[str] = []
+    monkeypatch.setattr(
+        codex_oauth_inventory,
+        "load_codex_oauth_inventory",
+        _interchangeable_inventory,
+    )
+
+    async def _auth(request: Request, record: CodexOAuthCredentialRecord):
+        loaded.append(record.label)
+        return await _healthy_auth(request, record)
+
+    monkeypatch.setattr(
+        codex_oauth,
+        "_load_codex_oauth_headers_for_record",
+        _auth,
+    )
+    affinity = {
+        **_candidate(),
+        "codex_oauth_account_label": "account2",
+        "codex_oauth_account_hash": "hash-account-2",
+        "codex_oauth_lane_key": "codex-oauth:account2:hash-account-2",
+        "codex_oauth_credential_affinity": "interchangeable",
+    }
+    contexts = await selection._resolve_codex_oauth_account_candidate_contexts(
+        _request(),
+        candidate_template=_candidate(),
+        affinity=affinity,
+    )
+    assert [
+        context["candidate"]["codex_oauth_account_label"] for context in contexts
+    ] == ["account2"]
+    assert loaded == ["account2"]
 
 
 def test_dual_quota_balance_and_within_band_alternation() -> None:

@@ -8952,6 +8952,133 @@ def test_build_alias_routing_audit_only_record_promotes_terminal_event_metadata(
     assert record["metadata"]["cooldown_state_source"] == "durable_cache"
 
 
+def test_build_alias_routing_audit_only_record_uses_canonical_child_identity() -> None:
+    parent = "01a012a1-2a97-7622-837c-3066ec78f02f"
+    child = "01a012a6-c49a-7a42-899d-de19e2af2e9e"
+    record = aawm_agent_identity._build_alias_routing_audit_only_record(
+        events=[
+            {
+                "event_type": "no_candidate_available",
+                "session_id": parent,
+                "canonical_thread_id": child,
+                "parent_thread_id": parent,
+                "alias_model": "sota",
+            }
+        ]
+    )
+
+    assert record["_skip_session_history"] is True
+    assert record["session_id"] == child
+    assert record["metadata"]["canonical_thread_id"] == child
+    assert record["metadata"]["parent_thread_id"] == parent
+    assert record["metadata"]["session_id"] == parent
+
+
+def test_extract_session_id_prefers_canonical_thread_id_over_parent_session() -> None:
+    kwargs = {
+        "litellm_params": {
+            "metadata": {
+                "session_id": "01a012a1-2a97-7622-837c-3066ec78f02f",
+                "canonical_thread_id": "01a012a6-c49a-7a42-899d-de19e2af2e9e",
+                "parent_thread_id": "01a012a1-2a97-7622-837c-3066ec78f02f",
+            }
+        },
+        "standard_logging_object": {},
+    }
+
+    assert aawm_agent_identity._extract_session_id(kwargs) == (
+        "01a012a6-c49a-7a42-899d-de19e2af2e9e"
+    )
+
+
+def test_extract_session_id_parent_only_keeps_existing_session_id() -> None:
+    kwargs = {
+        "litellm_params": {"metadata": {"session_id": "session-parent-only"}},
+        "standard_logging_object": {},
+    }
+
+    assert aawm_agent_identity._extract_session_id(kwargs) == "session-parent-only"
+
+
+def test_build_session_history_record_keys_three_children_by_canonical_thread() -> None:
+    parent = "01a012a1-2a97-7622-837c-3066ec78f02f"
+    children = [
+        "01a012a6-c49a-7a42-899d-de19e2af2e9e",
+        "01a012b0-e33f-7153-9e20-6af4560b4cec",
+        "01a012b0-e58e-7372-b7d9-38bc36db15e7",
+    ]
+    families = (
+        ("openai", "gpt-5.5", "codex_responses"),
+        ("anthropic", "claude-sonnet-4-20250514", "anthropic_messages"),
+    )
+    result = {
+        "id": "resp-d1-635",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+        "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+    }
+    for provider, model, route_family in families:
+        session_ids: list[str] = []
+        for child in children:
+            kwargs = _base_kwargs(trace_name="codex" if provider == "openai" else "claude-code")
+            kwargs["model"] = model
+            kwargs["custom_llm_provider"] = provider
+            kwargs["call_type"] = "pass_through_endpoint"
+            kwargs["litellm_call_id"] = f"call-{child}"
+            kwargs["litellm_params"]["metadata"].update(
+                {
+                    "session_id": parent,
+                    "passthrough_route_family": route_family,
+                }
+            )
+            kwargs["litellm_params"]["litellm_metadata"] = {
+                "canonical_thread_id": child,
+                "parent_thread_id": parent,
+            }
+            record = _build_session_history_record(
+                kwargs=kwargs,
+                result=result,
+                start_time="2026-08-18T00:00:00Z",
+                end_time="2026-08-18T00:00:01Z",
+            )
+            assert record is not None
+            assert record.get("_skip_session_history") is not True
+            assert record["session_id"] == child
+            assert record["metadata"]["canonical_thread_id"] == child
+            assert record["metadata"]["parent_thread_id"] == parent
+            session_ids.append(record["session_id"])
+        assert session_ids == children
+        assert len(set(session_ids)) == 3
+
+
+def test_build_session_history_record_parent_only_keeps_existing_session_id() -> None:
+    kwargs = _base_kwargs(trace_name="codex")
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["call_type"] = "pass_through_endpoint"
+    kwargs["litellm_call_id"] = "call-parent-only"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-parent-only",
+            "passthrough_route_family": "codex_responses",
+        }
+    )
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={
+            "id": "resp-parent-only",
+            "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
+            "choices": [{"message": {"role": "assistant", "content": "ack"}}],
+        },
+        start_time="2026-08-18T00:00:00Z",
+        end_time="2026-08-18T00:00:01Z",
+    )
+    assert record is not None
+    assert record.get("_skip_session_history") is not True
+    assert record["session_id"] == "session-parent-only"
+    assert "canonical_thread_id" not in record["metadata"]
+    assert "parent_thread_id" not in record["metadata"]
+
+
 def test_build_session_history_record_extracts_exact_role_sentence_for_explorer() -> None:
     kwargs = _base_kwargs(trace_name="codex")
     kwargs["litellm_call_id"] = "call-codex-explorer-role"

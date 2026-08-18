@@ -751,3 +751,152 @@ class TestCleanOptionalString:
     def test_none_for_empty(self):
         assert audit_context._clean_optional_string("") is None
         assert audit_context._clean_optional_string("   ") is None
+
+
+
+# ---------------------------------------------------------------------------
+# Tests: canonical child / parent thread identity
+# ---------------------------------------------------------------------------
+
+
+class TestThreadIdentityContext:
+    def test_three_children_remain_distinct_under_same_parent(self):
+        parent = "parent-thread-shared"
+        children = ("child-thread-a", "child-thread-b", "child-thread-c")
+        seen = []
+        for child in children:
+            request = _make_request()
+            body = {
+                "litellm_metadata": {
+                    "session_id": "shared-session",
+                    "thread_id": child,
+                    "parent_thread_id": parent,
+                }
+            }
+            ctx = audit_context._get_auto_agent_alias_request_context(request, body)
+            seen.append(ctx["canonical_thread_id"])
+            assert ctx["canonical_thread_id"] == child
+            assert ctx["parent_thread_id"] == parent
+            assert ctx["session_id"] == child
+        assert seen == list(children)
+        assert len(set(seen)) == 3
+
+    def test_context_cache_preserves_child_identity(self):
+        request = _make_request()
+        body = {
+            "litellm_metadata": {
+                "session_id": "legacy-session",
+                "thread_id": "child-cached",
+                "parent_thread_id": "parent-cached",
+            }
+        }
+        first = audit_context._get_auto_agent_alias_request_context(request, body)
+        second = audit_context._get_auto_agent_alias_request_context(request, body)
+        assert first["canonical_thread_id"] == "child-cached"
+        assert second["canonical_thread_id"] == "child-cached"
+        assert first["session_id"] == "child-cached"
+        assert second["session_id"] == "child-cached"
+        assert first["parent_thread_id"] == "parent-cached"
+        assert second["parent_thread_id"] == "parent-cached"
+
+    def test_parent_only_falls_back_to_existing_session(self):
+        request = _make_request()
+        body = {
+            "litellm_metadata": {
+                "session_id": "legacy-session",
+                "parent_thread_id": "parent-only",
+            }
+        }
+        ctx = audit_context._get_auto_agent_alias_request_context(request, body)
+        assert ctx["canonical_thread_id"] is None
+        assert ctx["parent_thread_id"] == "parent-only"
+        assert ctx["session_id"] == "legacy-session"
+
+    def test_parent_only_without_session_uses_parent(self):
+        request = _make_request()
+        body = {"litellm_metadata": {"parent_thread_id": "parent-only"}}
+        ctx = audit_context._get_auto_agent_alias_request_context(request, body)
+        assert ctx["canonical_thread_id"] is None
+        assert ctx["parent_thread_id"] == "parent-only"
+        assert ctx["session_id"] == "parent-only"
+
+    def test_header_child_and_parent_identity(self):
+        headers = [
+            (b"x-codex-thread-id", b"child-from-header"),
+            (b"x-codex-parent-thread-id", b"parent-from-header"),
+            (b"authorization", b"Bearer secret-token"),
+        ]
+        request = _make_request(headers=headers)
+        ctx = audit_context._get_auto_agent_alias_request_context(request, {})
+        assert ctx["canonical_thread_id"] == "child-from-header"
+        assert ctx["parent_thread_id"] == "parent-from-header"
+        assert ctx["session_id"] == "child-from-header"
+
+    def test_normalize_preserves_thread_identity(self):
+        raw = {
+            "canonical_thread_id": "  child-norm  ",
+            "parent_thread_id": "  parent-norm  ",
+            "session_id": "  child-norm  ",
+            "litellm_call_id": "call-1",
+        }
+        ctx = audit_context._normalize_auto_agent_alias_request_context(raw)
+        assert ctx["canonical_thread_id"] == "child-norm"
+        assert ctx["parent_thread_id"] == "parent-norm"
+        assert ctx["session_id"] == "child-norm"
+
+    def test_terminal_attach_includes_thread_link(self):
+        request = _make_request()
+        body = {
+            "litellm_metadata": {
+                "thread_id": "child-event",
+                "parent_thread_id": "parent-event",
+                "session_id": "legacy-session",
+            }
+        }
+        event: dict[str, Any] = {"event_type": "route_attempt"}
+        result = audit_context._attach_auto_agent_alias_terminal_context_fields(
+            event, request=request, request_body=body
+        )
+        assert result["canonical_thread_id"] == "child-event"
+        assert result["parent_thread_id"] == "parent-event"
+        assert result["session_id"] == "child-event"
+
+    def test_no_content_leakage_in_context_or_event(self):
+        secret = "SECRET_ENCRYPTED_BLOB"
+        prompt = "raw user prompt must not leak"
+        tool_args = '{"command":"cat /etc/shadow"}'
+        credential = "sk-secret-credential"
+        request = _make_request(
+            headers=[(b"authorization", credential.encode("utf-8"))]
+        )
+        body = {
+            "encrypted_content": secret,
+            "instructions": prompt,
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "output": "SECRET_TOOL_OUTPUT",
+                    "arguments": tool_args,
+                    "id": "rs_nested_ref",
+                }
+            ],
+            "litellm_metadata": {
+                "thread_id": "child-safe",
+                "parent_thread_id": "parent-safe",
+                "session_id": "legacy-session",
+                "authorization": credential,
+            },
+        }
+        ctx = audit_context._get_auto_agent_alias_request_context(request, body)
+        event: dict[str, Any] = {"event_type": "route_attempt"}
+        attached = audit_context._attach_auto_agent_alias_terminal_context_fields(
+            event, request=request, request_body=body
+        )
+        assert ctx["canonical_thread_id"] == "child-safe"
+        assert ctx["parent_thread_id"] == "parent-safe"
+        serialized = f"{ctx}{attached}"
+        assert secret not in serialized
+        assert prompt not in serialized
+        assert tool_args not in serialized
+        assert credential not in serialized
+        assert "SECRET_TOOL_OUTPUT" not in serialized

@@ -1528,6 +1528,8 @@ _AAWM_ROUTE_LOG_TOP_LEVEL_METADATA_KEYS = (
     + (
         _AAWM_ROUTE_LOG_REASONING_EFFORT_METADATA_KEY,
         "canonical_session_identity",
+        "canonical_thread_id",
+        "parent_thread_id",
         "litellm_call_id",
         "logical_model",
         "trace_name",
@@ -2558,6 +2560,10 @@ def _get_aawm_route_rollup_canonical_session_identity(
 ) -> Optional[str]:
     return _first_aawm_route_log_value(
         *identity_sources,
+        keys=("canonical_thread_id",),
+        normalizer=_normalize_aawm_route_rollup_identity,
+    ) or _first_aawm_route_log_value(
+        *identity_sources,
         keys=("canonical_session_identity",),
         normalizer=_normalize_aawm_route_rollup_identity,
     ) or _first_aawm_route_log_value(
@@ -2676,6 +2682,10 @@ def build_aawm_route_rollup_context(
         normalizer=_normalize_aawm_route_rollup_identity,
     )
     origin_thread_id = _first_aawm_route_log_value(
+        *identity_sources,
+        keys=("canonical_thread_id",),
+        normalizer=_normalize_aawm_route_rollup_identity,
+    ) or _first_aawm_route_log_value(
         *identity_sources,
         keys=_AAWM_ROUTE_ROLLUP_THREAD_ID_METADATA_KEYS,
         normalizer=_normalize_aawm_route_rollup_identity,

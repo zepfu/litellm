@@ -212,9 +212,15 @@ endpoint, and encrypted-state-format session affinity while treating account
 label/hash/lane as per-attempt telemetry. Stateless continuation input may then
 make at most one immediate pre-first-byte move to another admissible account
 after a capacity, rate-limit, usage-limit, or candidate-unavailable failure.
-Requests carrying `previous_response_id` remain account-bound because that
-state is stored by the provider. After the first response byte, or after the
-single account move is consumed, no further account failover is planned.
+Any presence of account-bound Responses state, including `previous_response_id`,
+encrypted content, reasoning items, or function-call output, pins the request
+to the recorded account even in an interchangeable pool. If that account is
+unavailable, routing fails closed and does not try an alternate account. Fresh
+requests retain quota balancing and the permitted pre-state failover described
+above. The state itself is not persisted by the routing metadata: encrypted
+content, prompts, credentials, and raw account identifiers are excluded. After
+the first response byte, or after the single account move is consumed, no
+further account failover is planned.
 
 With `strategy: dual_quota_balance`, routing evaluates the overall seven-day
 Codex and Codex Spark seven-day families together. If either account spread is

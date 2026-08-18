@@ -786,10 +786,14 @@ Terminal-agent JSONL intake intentionally omits:
 - tool arguments and tool result bodies
 - credentials, OAuth tokens, API keys, cookies, and authorization headers
 - raw request or response bodies
+- encrypted continuation content and reasoning content
 
 Only bounded/redacted route metadata, identity fields, request-shape summaries,
-and failure classification tokens are recorded. Full-payload capture remains a
-separate, stronger operator opt-in and is not enabled by terminal-agent intake.
+and failure classification tokens are recorded. Account-bound or pinned-lane
+diagnostics identify only the bounded lane/classification and never expose the
+continuation, reasoning, or other request/response payload. Full-payload capture
+remains a separate, stronger operator opt-in and is not enabled by terminal-agent
+intake.
 
 ## Agent intake workflow
 

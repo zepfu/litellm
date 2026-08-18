@@ -18,6 +18,10 @@ from uuid import uuid4
 from fastapi import Request
 
 from .lane_keys import _CODEX_REASONING_EFFORT_TIER_INDEX
+from .request_metadata import (
+    _extract_auto_agent_alias_canonical_thread_id,
+    _extract_auto_agent_alias_parent_thread_id,
+)
 
 _AAWM_ALIAS_REQUEST_CALL_ID_STATE_KEY = "aawm_alias_request_litellm_call_id"
 _AAWM_ALIAS_REQUEST_OUTCOME_STATE_KEY = "aawm_alias_request_outcome"
@@ -1078,7 +1082,13 @@ def _add_codex_auto_agent_alias_metadata(
             }
     selection_trace_values = {
         key: selection[key]
-        for key in ("request_mode", "redispatch_ordinal", "affinity_bypassed")
+        for key in (
+            "request_mode",
+            "redispatch_ordinal",
+            "affinity_bypassed",
+            "has_account_bound_state",
+            "account_bound_classification",
+        )
         if key in selection
     }
     if attempts and selection_trace_values:
@@ -1091,6 +1101,14 @@ def _add_codex_auto_agent_alias_metadata(
         request_body=request_body,
         selection=audit_selection,
         attempts=attempts,
+    )
+    canonical_thread_id = _extract_auto_agent_alias_canonical_thread_id(
+        request,
+        updated_body,
+    )
+    parent_thread_id = _extract_auto_agent_alias_parent_thread_id(
+        request,
+        updated_body,
     )
     return _merge_litellm_metadata(
         updated_body,
@@ -1139,6 +1157,8 @@ def _add_codex_auto_agent_alias_metadata(
             "codex_auto_agent_selection_reason": selection.get("selection_reason"),
             "codex_auto_agent_affinity_state_source": selection.get("affinity_state_source"),
             "canonical_session_identity": selection.get("canonical_session_identity"),
+            "canonical_thread_id": canonical_thread_id,
+            "parent_thread_id": parent_thread_id,
             "session_owner_decision": selection.get("session_owner_decision"),
             "session_owner_id": selection.get("session_owner_id"),
             "session_owner_mismatch_reason": selection.get("session_owner_mismatch_reason"),
@@ -1147,6 +1167,10 @@ def _add_codex_auto_agent_alias_metadata(
             "codex_auto_agent_request_mode": selection.get("request_mode"),
             "codex_auto_agent_redispatch_ordinal": selection.get("redispatch_ordinal"),
             "codex_auto_agent_affinity_bypassed": selection.get("affinity_bypassed"),
+            "has_account_bound_state": selection.get("has_account_bound_state"),
+            "account_bound_classification": selection.get(
+                "account_bound_classification"
+            ),
             "codex_auto_agent_selected_account_label": candidate.get(
                 "codex_oauth_account_label"
             ),
@@ -1236,7 +1260,13 @@ def _add_anthropic_auto_agent_alias_metadata(
             }
     selection_trace_values = {
         key: selection[key]
-        for key in ("request_mode", "redispatch_ordinal", "affinity_bypassed")
+        for key in (
+            "request_mode",
+            "redispatch_ordinal",
+            "affinity_bypassed",
+            "has_account_bound_state",
+            "account_bound_classification",
+        )
         if key in selection
     }
     if attempts and selection_trace_values:
@@ -1249,6 +1279,14 @@ def _add_anthropic_auto_agent_alias_metadata(
         request_body=request_body,
         selection=audit_selection,
         attempts=attempts,
+    )
+    canonical_thread_id = _extract_auto_agent_alias_canonical_thread_id(
+        request,
+        updated_body,
+    )
+    parent_thread_id = _extract_auto_agent_alias_parent_thread_id(
+        request,
+        updated_body,
     )
     return _merge_litellm_metadata(
         updated_body,
@@ -1281,6 +1319,8 @@ def _add_anthropic_auto_agent_alias_metadata(
             "anthropic_auto_agent_selection_reason": selection.get("selection_reason"),
             "anthropic_auto_agent_affinity_state_source": selection.get("affinity_state_source"),
             "canonical_session_identity": selection.get("canonical_session_identity"),
+            "canonical_thread_id": canonical_thread_id,
+            "parent_thread_id": parent_thread_id,
             "session_owner_decision": selection.get("session_owner_decision"),
             "session_owner_id": selection.get("session_owner_id"),
             "session_owner_mismatch_reason": selection.get("session_owner_mismatch_reason"),
@@ -1289,6 +1329,10 @@ def _add_anthropic_auto_agent_alias_metadata(
             "anthropic_auto_agent_request_mode": selection.get("request_mode"),
             "anthropic_auto_agent_redispatch_ordinal": selection.get("redispatch_ordinal"),
             "anthropic_auto_agent_affinity_bypassed": selection.get("affinity_bypassed"),
+            "has_account_bound_state": selection.get("has_account_bound_state"),
+            "account_bound_classification": selection.get(
+                "account_bound_classification"
+            ),
             "anthropic_auto_agent_selected_account_label": candidate.get(
                 "codex_oauth_account_label"
             ),

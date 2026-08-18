@@ -3130,6 +3130,128 @@ class TestAawmRouteRollup:
         assert context["review_originating_litellm_call_id"] is None
         assert "ignored_prompt" not in context
 
+    def test_route_rollup_uses_canonical_child_thread_identity(self):
+        from litellm.proxy.aawm_route_logging import (
+            build_aawm_route_rollup_context,
+        )
+
+        parent = "01a012a1-2a97-7622-837c-3066ec78f02f"
+        child = "01a012a6-c49a-7a42-899d-de19e2af2e9e"
+        request = _build_aawm_route_log_request(
+            url="http://127.0.0.1:4001/openai_passthrough/responses",
+            headers={"user-agent": "codex-cli/0.147.0"},
+        )
+        request.state.aawm_alias_request_context = {
+            "session_id": child,
+            "canonical_thread_id": child,
+            "parent_thread_id": parent,
+            "litellm_call_id": "call-child-audit",
+        }
+
+        context = build_aawm_route_rollup_context(
+            request=request,
+            target="https://chatgpt.com/backend-api/codex/responses",
+            request_body={
+                "model": "gpt-5.5",
+                "litellm_metadata": {
+                    "repository": "litellm",
+                    "session_id": parent,
+                    "canonical_session_identity": parent,
+                    "thread_id": parent,
+                },
+            },
+        )
+
+        assert context is not None
+        assert context["canonical_session_identity"] == child
+        assert context["origin_thread_id"] == child
+        assert context["review_parent_thread_id"] == parent
+
+    def test_route_rollup_three_children_remain_independently_queryable(self):
+        from litellm.proxy.aawm_route_logging import (
+            build_aawm_route_rollup_context,
+        )
+
+        parent = "01a012a1-2a97-7622-837c-3066ec78f02f"
+        children = [
+            "01a012a6-c49a-7a42-899d-de19e2af2e9e",
+            "01a012b0-e33f-7153-9e20-6af4560b4cec",
+            "01a012b0-e58e-7372-b7d9-38bc36db15e7",
+        ]
+        identities = []
+        for child in children:
+            request = _build_aawm_route_log_request(
+                url="http://127.0.0.1:4001/openai_passthrough/responses",
+                headers={"user-agent": "codex-cli/0.147.0"},
+            )
+            request.state.aawm_alias_request_context = {
+                "session_id": child,
+                "canonical_thread_id": child,
+                "parent_thread_id": parent,
+            }
+            context = build_aawm_route_rollup_context(
+                request=request,
+                target="https://chatgpt.com/backend-api/codex/responses",
+                request_body={
+                    "model": "gpt-5.5",
+                    "litellm_metadata": {
+                        "repository": "litellm",
+                        "session_id": parent,
+                    },
+                },
+            )
+            assert context is not None
+            identities.append(
+                (
+                    context["canonical_session_identity"],
+                    context["origin_thread_id"],
+                    context["review_parent_thread_id"],
+                )
+            )
+        assert [item[0] for item in identities] == children
+        assert [item[1] for item in identities] == children
+        assert {item[2] for item in identities} == {parent}
+
+    def test_route_rollup_parent_only_clients_keep_existing_identity(self):
+        from litellm.proxy.aawm_route_logging import (
+            build_aawm_route_rollup_context,
+        )
+
+        request = _build_aawm_route_log_request(
+            url="http://127.0.0.1:4001/openai_passthrough/responses",
+            headers={
+                "user-agent": "codex-cli/0.147.0",
+                "x-codex-parent-thread-id": "thread-parent-header",
+            },
+        )
+        request.state.aawm_alias_request_context = {
+            "session_id": "session-audit",
+            "litellm_call_id": "call-review-audit",
+            "agent_dispatch": {"agent_id": "agent-review-audit"},
+        }
+
+        context = build_aawm_route_rollup_context(
+            request=request,
+            target="https://chatgpt.com/backend-api/codex/responses",
+            request_body={
+                "model": "codex-auto-review",
+                "litellm_metadata": {"repository": "litellm"},
+                "x-codex-turn-metadata": json.dumps(
+                    {
+                        "project_path": "/home/zepfu/projects/litellm",
+                        "session_id": "session-body",
+                        "thread_id": "thread-review",
+                        "parent_agent_id": "agent-parent",
+                    }
+                ),
+            },
+        )
+
+        assert context is not None
+        assert context["canonical_session_identity"] == "session-body"
+        assert context["origin_thread_id"] == "thread-review"
+        assert context["review_parent_thread_id"] == "thread-parent-header"
+
     def test_route_rollup_header_and_subline_formatting(self):
         from datetime import datetime
 
