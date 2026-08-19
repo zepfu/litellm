@@ -517,8 +517,13 @@ def _add_codex_auto_agent_text_error_tokens(
         "model is at capacity" in text_lower and "try a different model" in text_lower
     ):
         tokens.add("MODEL_AT_CAPACITY")
-    if "model is overloaded" in text_lower or "overloaded_error" in text_lower:
+    if (
+        "server_overloaded" in text_lower
+        or "model is overloaded" in text_lower
+        or "overloaded_error" in text_lower
+    ):
         tokens.add("MODEL_OVERLOADED")
+        tokens.add("server_overloaded")
     if "busy upstream" in text_lower or ("upstream" in text_lower and "busy" in text_lower):
         tokens.add("UPSTREAM_BUSY")
     if "rate_limit_exceeded" in text_lower or "rate limit" in text_lower:
@@ -1150,7 +1155,9 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "candidate_unavailable"
     if "usage_limit_reached" in tokens:
         return "usage_limit_reached"
-    if tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS:
+    if "server_overloaded" in tokens or tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS:
+        if "server_overloaded" in tokens:
+            return "server_overloaded"
         return "capacity_exhausted"
     if tokens & _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS:
         return "rate_limited"
@@ -1181,6 +1188,76 @@ def _classify_codex_auto_agent_retryable_exhaustion(
 
 def _is_codex_auto_agent_retryable_exhaustion(exc: Any) -> bool:
     return _classify_codex_auto_agent_retryable_exhaustion(exc) is not None
+
+
+_RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES = frozenset(
+    {
+        "server_overloaded",
+        "upstream_overloaded",
+        "capacity_exhausted",
+        "upstream_transient_internal",
+    }
+)
+_RESPONSES_PRE_COMMIT_ACCOUNT_EXHAUSTION_CLASSES = frozenset(
+    {
+        "usage_limit_reached",
+    }
+)
+RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS = 10.0
+RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS = 2
+
+
+def plan_responses_pre_commit_retry(
+    *,
+    error_class: Optional[str],
+    same_account_transient_attempts: int,
+) -> dict[str, Any]:
+    """Decide same-account delayed retry vs account rotation before SSE commit.
+
+    Transient capacity (`server_overloaded` and equivalents) waits 10s and
+    retries once on the same account. Definitive exhaustion rotates accounts
+    immediately. A second transient failure is a pre-stream 503.
+    """
+    normalized = str(error_class or "")
+    if normalized in _RESPONSES_PRE_COMMIT_ACCOUNT_EXHAUSTION_CLASSES:
+        return {
+            "action": "rotate_account",
+            "retry_same_account": False,
+            "apply_account_exhaustion_cooldown": True,
+            "wait_seconds": 0.0,
+            "http_status": 429,
+            "retryable": False,
+            "error_class": normalized,
+        }
+    if normalized in _RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES:
+        if same_account_transient_attempts < RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS:
+            return {
+                "action": "retry_same_account",
+                "retry_same_account": True,
+                "apply_account_exhaustion_cooldown": False,
+                "wait_seconds": RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
+                "http_status": 503,
+                "retryable": True,
+                "error_class": normalized,
+            }
+        return {
+            "action": "pre_stream_unavailable",
+            "retry_same_account": False,
+            "apply_account_exhaustion_cooldown": False,
+            "wait_seconds": RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
+            "http_status": 503,
+            "retryable": True,
+            "error_class": normalized,
+        }
+    return {
+        "action": "terminal",
+        "retry_same_account": False,
+        "apply_account_exhaustion_cooldown": False,
+        "wait_seconds": 0.0,
+        "http_status": 502,
+        "retryable": False,
+        "error_class": normalized or "provider_terminal_error",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1259,7 +1336,8 @@ def _get_codex_auto_agent_cooldown_seconds(
     if header_wait is not None:
         resolved = max(_CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS, header_wait)
     elif (
-        error_class in {"capacity_exhausted", "upstream_overloaded"} or tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS
+        error_class in {"capacity_exhausted", "upstream_overloaded", "server_overloaded"}
+        or tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS
     ):
         resolved = _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS
     elif _is_codex_auto_agent_transient_internal_error_class(error_class):
@@ -1472,6 +1550,7 @@ _HOST_FUNCTION_NAMES = (
     "_is_codex_auto_agent_grok_account_quota_exhaustion",
     "_classify_codex_auto_agent_retryable_exhaustion",
     "_is_codex_auto_agent_retryable_exhaustion",
+    "plan_responses_pre_commit_retry",
     "_parse_codex_auto_agent_header_wait_seconds",
     "_get_codex_auto_agent_cooldown_seconds",
     "_iter_codex_auto_agent_error_blocks",

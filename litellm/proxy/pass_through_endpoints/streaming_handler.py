@@ -59,6 +59,141 @@ def _truthy_env_flag(name: str) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+_RESPONSES_NON_SUBSTANTIVE_LIFECYCLE_EVENTS = frozenset(
+    {
+        "response.created",
+        "response.in_progress",
+    }
+)
+_RESPONSES_PRE_COMMIT_FAILURE_EVENTS = frozenset({"response.failed", "error"})
+_RESPONSES_SUBSTANTIVE_EVENT_PREFIXES = (
+    "response.output_text",
+    "response.output_item",
+    "response.content_part",
+    "response.refusal",
+    "response.reasoning",
+    "response.function_call",
+    "response.custom_tool_call",
+    "response.mcp_call",
+    "response.file_search",
+    "response.web_search",
+    "response.code_interpreter",
+    "response.image_generation",
+    "response.computer",
+    "response.apply_patch",
+    "response.local_shell",
+    "response.shell",
+)
+_RESPONSES_PRE_COMMIT_MAX_BUFFER_BYTES = 64 * 1024
+_RESPONSES_PRE_COMMIT_MAX_EVENTS = 16
+RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS = 10.0
+RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS = 2
+_RESPONSES_TRANSIENT_CAPACITY_CLASSES = frozenset(
+    {
+        "server_overloaded",
+        "upstream_overloaded",
+        "capacity_exhausted",
+        "upstream_transient_internal",
+    }
+)
+_RESPONSES_ACCOUNT_EXHAUSTION_CLASSES = frozenset(
+    {
+        "usage_limit_reached",
+    }
+)
+
+
+class ResponsesStreamPreCommitFailure(Exception):
+    """Upstream Responses stream failed before any substantive client byte."""
+
+    def __init__(
+        self,
+        *,
+        error_class: str,
+        classification: str,
+        retryable: bool,
+        retry_after_seconds: float = RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
+        error_code: Optional[str] = None,
+        error_type: Optional[str] = None,
+        message: Optional[str] = None,
+        status_code: Optional[int] = None,
+        pre_commit_retry_exhausted: bool = False,
+        error_payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.error_class = error_class
+        self.classification = classification
+        self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
+        self.error_code = error_code
+        self.error_type = error_type
+        self.status_code = status_code
+        self.pre_commit_retry_exhausted = pre_commit_retry_exhausted
+        self.error_payload = error_payload if isinstance(error_payload, dict) else None
+        self.message = message or classification
+        self.detail = {
+            "error": {
+                "message": self.message,
+                "type": error_class,
+                "code": error_code or classification,
+                "retryable": retryable,
+            }
+        }
+        super().__init__(self.message)
+
+    def as_http_exception(self):
+        from fastapi import HTTPException, status as fastapi_status
+
+        if self.status_code is not None:
+            status_code = int(self.status_code)
+        elif self.error_class in _RESPONSES_ACCOUNT_EXHAUSTION_CLASSES:
+            status_code = fastapi_status.HTTP_429_TOO_MANY_REQUESTS
+        elif self.retryable or self.error_class in _RESPONSES_TRANSIENT_CAPACITY_CLASSES:
+            status_code = fastapi_status.HTTP_503_SERVICE_UNAVAILABLE
+        else:
+            status_code = fastapi_status.HTTP_502_BAD_GATEWAY
+        headers = None
+        if self.retryable or self.pre_commit_retry_exhausted:
+            retry_after = self.retry_after_seconds
+            if retry_after is None or retry_after <= 0:
+                retry_after = RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS
+            if retry_after == int(retry_after):
+                retry_after_header = str(int(retry_after))
+            else:
+                retry_after_header = str(retry_after)
+            headers = {"Retry-After": retry_after_header}
+        return HTTPException(
+            status_code=status_code,
+            detail=self.detail,
+            headers=headers,
+        )
+
+
+class _PrefixedHttpxByteStream:
+    """Replay peeked SSE bytes, then continue the original upstream iterator."""
+
+    def __init__(
+        self,
+        response: httpx.Response,
+        prefix: List[bytes],
+        remainder: Any = None,
+    ) -> None:
+        self._response = response
+        self._prefix = prefix
+        self._remainder = remainder
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._response, name)
+
+    async def aiter_bytes(self):
+        for chunk in self._prefix:
+            if chunk:
+                yield chunk
+        if self._remainder is None:
+            return
+        async for chunk in self._remainder:
+            yield chunk
+
+
 class _PassThroughStreamLineAccumulator:
     """Incrementally decode raw stream bytes into non-empty SSE/log lines."""
 
@@ -126,6 +261,9 @@ class PassThroughStreamingHandler:
         "response.failed",
         "response.incomplete",
     }
+    _RESPONSES_NON_SUBSTANTIVE_LIFECYCLE_EVENTS = (
+        _RESPONSES_NON_SUBSTANTIVE_LIFECYCLE_EVENTS
+    )
 
     @staticmethod
     def _is_openai_responses_stream(
@@ -245,6 +383,311 @@ class PassThroughStreamingHandler:
             if event_type in PassThroughStreamingHandler._RESPONSES_TERMINAL_EVENTS:
                 return True
         return False
+
+    @staticmethod
+    def _iter_responses_sse_events(
+        lines: List[str],
+    ) -> List[tuple[Optional[str], Optional[Dict[str, Any]]]]:
+        events: List[tuple[Optional[str], Optional[Dict[str, Any]]]] = []
+        pending_event_type: Optional[str] = None
+        for raw_line in lines:
+            line = _strip_chunk_line(raw_line)
+            if not line:
+                continue
+            if line.startswith("event:"):
+                pending_event_type = line.removeprefix("event:").strip() or None
+                continue
+            if not line.startswith("data:"):
+                continue
+            payload_text = line.removeprefix("data:").strip()
+            if payload_text == "[DONE]":
+                events.append(("[DONE]", None))
+                pending_event_type = None
+                continue
+            payload: Optional[Dict[str, Any]] = None
+            payload_type: Optional[str] = None
+            try:
+                decoded = json.loads(payload_text)
+            except (TypeError, json.JSONDecodeError):
+                decoded = None
+            if isinstance(decoded, dict):
+                payload = decoded
+                raw_type = decoded.get("type")
+                if isinstance(raw_type, str) and raw_type.strip():
+                    payload_type = raw_type.strip()
+            event_type = pending_event_type or payload_type
+            events.append((event_type, payload))
+            pending_event_type = None
+        if pending_event_type is not None:
+            events.append((pending_event_type, None))
+        return events
+
+    @staticmethod
+    def _is_responses_non_substantive_lifecycle_event(
+        event_type: Optional[str],
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if event_type in _RESPONSES_NON_SUBSTANTIVE_LIFECYCLE_EVENTS:
+            if not isinstance(payload, dict):
+                return True
+            response_payload = payload.get("response")
+            if isinstance(response_payload, dict):
+                if response_payload.get("status") in {"failed", "incomplete"}:
+                    return False
+                if response_payload.get("error") is not None:
+                    return False
+                output = response_payload.get("output")
+                if isinstance(output, list) and any(output):
+                    return False
+            return True
+        if event_type == "response.completed":
+            return False
+        return False
+
+    @staticmethod
+    def _is_responses_substantive_event(
+        event_type: Optional[str],
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if event_type is None or event_type == "[DONE]":
+            return False
+        if event_type in _RESPONSES_PRE_COMMIT_FAILURE_EVENTS:
+            return False
+        if event_type in PassThroughStreamingHandler._RESPONSES_TERMINAL_EVENTS:
+            return event_type == "response.completed"
+        if event_type in _RESPONSES_NON_SUBSTANTIVE_LIFECYCLE_EVENTS:
+            return not PassThroughStreamingHandler._is_responses_non_substantive_lifecycle_event(
+                event_type,
+                payload,
+            )
+        if event_type.startswith(_RESPONSES_SUBSTANTIVE_EVENT_PREFIXES):
+            return True
+        return event_type.startswith("response.")
+
+    @staticmethod
+    def _extract_responses_stream_error_payload(
+        event_type: Optional[str],
+        payload: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return None
+        if event_type == "error":
+            nested = payload.get("error")
+            if isinstance(nested, dict):
+                return nested
+            return payload
+        if event_type == "response.failed":
+            response_payload = payload.get("response")
+            if isinstance(response_payload, dict):
+                nested = response_payload.get("error")
+                if isinstance(nested, dict):
+                    return {**nested, "response": response_payload}
+                if response_payload.get("status") == "failed":
+                    return {"response": response_payload, "code": "response.failed"}
+            nested = payload.get("error")
+            if isinstance(nested, dict):
+                return nested
+            return payload
+        response_payload = payload.get("response")
+        if isinstance(response_payload, dict) and (
+            response_payload.get("status") == "failed"
+            or response_payload.get("error") is not None
+        ):
+            nested = response_payload.get("error")
+            if isinstance(nested, dict):
+                return {**nested, "response": response_payload}
+            return {"response": response_payload, "code": "response.failed"}
+        return None
+
+    @staticmethod
+    def _classify_responses_pre_commit_error(
+        error_payload: Optional[Dict[str, Any]],
+    ) -> tuple[str, str, bool]:
+        tokens: set[str] = set()
+        if isinstance(error_payload, dict):
+            for key in ("code", "type", "param"):
+                value = error_payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    tokens.add(value.strip().lower())
+            message = error_payload.get("message")
+            if isinstance(message, str) and message.strip():
+                tokens.add(message.strip().lower())
+            response_payload = error_payload.get("response")
+            if isinstance(response_payload, dict):
+                nested = response_payload.get("error")
+                if isinstance(nested, dict):
+                    for key in ("code", "type"):
+                        value = nested.get(key)
+                        if isinstance(value, str) and value.strip():
+                            tokens.add(value.strip().lower())
+                    nested_message = nested.get("message")
+                    if isinstance(nested_message, str) and nested_message.strip():
+                        tokens.add(nested_message.strip().lower())
+        joined = " ".join(sorted(tokens))
+        if any(
+            marker in joined
+            for marker in (
+                "usage_limit_reached",
+                "usage limit",
+                "quota exceeded",
+                "quota exhausted",
+                "weekly limit",
+            )
+        ):
+            return "usage_limit_reached", "usage_limit_reached", False
+        if any(
+            marker in joined
+            for marker in (
+                "server_overloaded",
+                "overloaded_error",
+                "model is overloaded",
+                "upstream_overloaded",
+                "high demand",
+                "model_capacity_exhausted",
+                "model at capacity",
+                "upstream busy",
+            )
+        ):
+            return "server_overloaded", "transient_capacity", True
+        return "provider_terminal_error", "provider_terminal_error", False
+
+    @staticmethod
+    def _inspect_responses_pre_commit_chunks(
+        chunks: List[bytes],
+    ) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
+        lines = PassThroughStreamingHandler._chunk_lines(chunks)
+        events = PassThroughStreamingHandler._iter_responses_sse_events(lines)
+        if not events:
+            return "empty", None, None
+        if len(events) > _RESPONSES_PRE_COMMIT_MAX_EVENTS:
+            return "substantive", None, None
+        first_error_payload: Optional[Dict[str, Any]] = None
+        first_error_event: Optional[str] = None
+        saw_lifecycle = False
+        for event_type, payload in events:
+            if event_type == "[DONE]":
+                continue
+            error_payload = (
+                PassThroughStreamingHandler._extract_responses_stream_error_payload(
+                    event_type,
+                    payload,
+                )
+            )
+            if error_payload is not None or event_type in _RESPONSES_PRE_COMMIT_FAILURE_EVENTS:
+                if first_error_payload is None:
+                    first_error_payload = error_payload or payload
+                    first_error_event = event_type
+                continue
+            if PassThroughStreamingHandler._is_responses_non_substantive_lifecycle_event(
+                event_type,
+                payload,
+            ):
+                saw_lifecycle = True
+                continue
+            if PassThroughStreamingHandler._is_responses_substantive_event(
+                event_type,
+                payload,
+            ):
+                return "substantive", None, event_type
+            if event_type not in {None, ""}:
+                return "substantive", None, event_type
+        if first_error_payload is not None or first_error_event is not None:
+            return "failed", first_error_payload, first_error_event
+        if saw_lifecycle:
+            return "lifecycle", None, None
+        return "empty", None, None
+
+    @staticmethod
+    def _build_responses_pre_commit_failure(
+        *,
+        error_payload: Optional[Dict[str, Any]],
+        event_type: Optional[str],
+        pre_commit_retry_exhausted: bool = False,
+        retry_after_seconds: float = RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
+    ) -> ResponsesStreamPreCommitFailure:
+        error_class, classification, retryable = (
+            PassThroughStreamingHandler._classify_responses_pre_commit_error(
+                error_payload
+            )
+        )
+        sanitized_message = None
+        error_code = None
+        error_type = None
+        if isinstance(error_payload, dict):
+            sanitized_message = (
+                OpenAIPassthroughLoggingHandler._sanitize_responses_terminal_error_for_logging(
+                    error_payload
+                )
+            )
+            raw_code = error_payload.get("code")
+            raw_type = error_payload.get("type")
+            if isinstance(raw_code, str) and raw_code.strip():
+                error_code = raw_code.strip()
+            if isinstance(raw_type, str) and raw_type.strip():
+                error_type = raw_type.strip()
+        if not sanitized_message:
+            sanitized_message = classification
+        if pre_commit_retry_exhausted and retryable:
+            retryable = True
+        return ResponsesStreamPreCommitFailure(
+            error_class=error_class,
+            classification=classification,
+            retryable=retryable,
+            retry_after_seconds=retry_after_seconds,
+            error_code=error_code or event_type,
+            error_type=error_type or event_type,
+            message=sanitized_message,
+            pre_commit_retry_exhausted=pre_commit_retry_exhausted,
+            error_payload=error_payload,
+        )
+
+    @staticmethod
+    async def peek_responses_pre_commit_stream(
+        response: httpx.Response,
+        *,
+        max_buffer_bytes: int = _RESPONSES_PRE_COMMIT_MAX_BUFFER_BYTES,
+    ) -> tuple[httpx.Response, Optional[ResponsesStreamPreCommitFailure]]:
+        """Hold lifecycle-only Responses bytes until a commit or pre-SSE failure."""
+        peeked: List[bytes] = []
+        buffered_bytes = 0
+        iterator = response.aiter_bytes()
+        while True:
+            try:
+                chunk = await iterator.__anext__()
+            except StopAsyncIteration:
+                iterator = None
+                break
+            if not chunk:
+                continue
+            peeked.append(chunk)
+            buffered_bytes += len(chunk)
+            if buffered_bytes > max_buffer_bytes:
+                return _PrefixedHttpxByteStream(response, peeked, iterator), None
+            decision, error_payload, event_type = (
+                PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(peeked)
+            )
+            if decision == "failed":
+                return (
+                    _PrefixedHttpxByteStream(response, peeked, iterator),
+                    PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                        error_payload=error_payload,
+                        event_type=event_type,
+                    ),
+                )
+            if decision == "substantive":
+                return _PrefixedHttpxByteStream(response, peeked, iterator), None
+        decision, error_payload, event_type = (
+            PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(peeked)
+        )
+        if decision == "failed":
+            return (
+                _PrefixedHttpxByteStream(response, peeked, iterator),
+                PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                    error_payload=error_payload,
+                    event_type=event_type,
+                ),
+            )
+        return _PrefixedHttpxByteStream(response, peeked, iterator), None
 
     @staticmethod
     def _dedupe_done_chunks(
@@ -1622,13 +2065,20 @@ class PassThroughStreamingHandler:
             or context.get("model_label")
             or "unknown-model"
         )
-        detail = (
-            f"stream_failure_stage={failure_context.get('stream_failure_stage')}; "
-            f"stream_chunks_seen={failure_context.get('stream_chunks_seen')}; "
-            f"stream_bytes_seen={failure_context.get('stream_bytes_seen')}; "
-            f"failure_kind={failure_context.get('failure_kind')}; "
-            f"message={exc}"
+        classification = (
+            failure_context.get("error_class")
+            or failure_context.get("failure_kind")
         )
+        detail_parts = [
+            f"stream_failure_stage={failure_context.get('stream_failure_stage')}",
+            f"stream_chunks_seen={failure_context.get('stream_chunks_seen')}",
+            f"stream_bytes_seen={failure_context.get('stream_bytes_seen')}",
+            f"failure_kind={failure_context.get('failure_kind')}",
+        ]
+        if classification:
+            detail_parts.append(f"classification={classification}")
+        detail_parts.append(f"message={exc}")
+        detail = "; ".join(detail_parts)
         emit_aawm_route_status_event(
             alias_model=failure_context.get("model_alias") or model_label,
             model_label=str(model_label),
@@ -1929,6 +2379,124 @@ class PassThroughStreamingHandler:
         return handler_branch
 
     @staticmethod
+    def _reconcile_responses_stream_error_payload(
+        *,
+        all_chunks: List[str],
+        terminal_payload: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        events = PassThroughStreamingHandler._iter_responses_sse_events(all_chunks)
+        first_error: Optional[Dict[str, Any]] = None
+        failed_error: Optional[Dict[str, Any]] = None
+        for event_type, payload in events:
+            extracted = PassThroughStreamingHandler._extract_responses_stream_error_payload(
+                event_type,
+                payload,
+            )
+            if extracted is None:
+                continue
+            if event_type == "error" and first_error is None:
+                first_error = extracted
+            if event_type == "response.failed" and failed_error is None:
+                failed_error = extracted
+        if isinstance(terminal_payload, dict) and isinstance(
+            terminal_payload.get("error"), dict
+        ):
+            failed_error = failed_error or terminal_payload.get("error")
+        if first_error is None:
+            return failed_error
+        if failed_error is None:
+            return first_error
+        first_code = first_error.get("code") if isinstance(first_error, dict) else None
+        failed_code = failed_error.get("code") if isinstance(failed_error, dict) else None
+        if first_code and failed_code and first_code == failed_code:
+            return failed_error
+        first_type = first_error.get("type") if isinstance(first_error, dict) else None
+        failed_type = failed_error.get("type") if isinstance(failed_error, dict) else None
+        if first_type and failed_type and first_type == failed_type:
+            return failed_error
+        return failed_error or first_error
+
+    @staticmethod
+    async def _finalize_failed_responses_stream(
+        *,
+        litellm_logging_obj: LiteLLMLoggingObj,
+        kwargs: Dict[str, Any],
+        metadata: Dict[str, Any],
+        all_chunks: List[str],
+        request_body: dict,
+        start_time: datetime,
+        end_time: datetime,
+        terminal_event_type: Optional[str],
+        terminal_payload: Optional[Dict[str, Any]],
+        handler_branch_state: List[str],
+    ) -> None:
+        metadata["aawm_route_rollup_turn_suppressed"] = True
+        metadata["aawm_stream_interrupted"] = True
+        metadata["aawm_responses_stream_failed"] = True
+        error_payload = PassThroughStreamingHandler._reconcile_responses_stream_error_payload(
+            all_chunks=all_chunks,
+            terminal_payload=terminal_payload,
+        )
+        error_class, classification, retryable = (
+            PassThroughStreamingHandler._classify_responses_pre_commit_error(
+                error_payload
+            )
+        )
+        sanitized_message = None
+        if isinstance(error_payload, dict):
+            sanitized_message = (
+                OpenAIPassthroughLoggingHandler._sanitize_responses_terminal_error_for_logging(
+                    error_payload
+                )
+            )
+        if not sanitized_message:
+            sanitized_message = classification
+        metadata["aawm_responses_stream_failure_class"] = error_class
+        metadata["aawm_responses_stream_failure_classification"] = classification
+        metadata["aawm_responses_stream_failure_retryable"] = retryable
+        failure_exc = ResponsesStreamPreCommitFailure(
+            error_class=error_class,
+            classification=classification,
+            retryable=retryable,
+            error_payload=error_payload if isinstance(error_payload, dict) else None,
+            message=sanitized_message,
+        )
+        failure_context = {
+            "failure_kind": classification,
+            "stream_failure_stage": "responses_stream_failed",
+            "error_class": error_class,
+            "model": request_body.get("model") if isinstance(request_body, dict) else None,
+        }
+        metadata.update(failure_context)
+        PassThroughStreamingHandler._sync_logging_obj_model_call_details_from_kwargs(
+            litellm_logging_obj,
+            kwargs,
+        )
+        PassThroughStreamingHandler._set_streaming_handler_branch(
+            handler_branch_state,
+            "async_failure_handler",
+        )
+        try:
+            await litellm_logging_obj.async_failure_handler(
+                exception=failure_exc,
+                traceback_exception=None,
+                start_time=start_time,
+                end_time=end_time,
+            )
+        except Exception as logging_exc:
+            verbose_proxy_logger.exception(
+                "async_failure_handler failed after Responses stream failure: %s",
+                str(logging_exc),
+            )
+        if not metadata.get("aawm_stream_terminal_emitted"):
+            PassThroughStreamingHandler._record_post_first_byte_stream_terminal_rollup(
+                success_handler_kwargs=kwargs,
+                failure_context=failure_context,
+                exc=failure_exc,
+            )
+        metadata["aawm_stream_terminal_emitted"] = True
+
+    @staticmethod
     async def _route_streaming_logging_to_handler(
         litellm_logging_obj: LiteLLMLoggingObj,
         passthrough_success_handler_obj: PassThroughEndpointLogging,
@@ -2012,6 +2580,43 @@ class PassThroughStreamingHandler:
                 if isinstance(tracker_state, dict)
                 else None
             )
+            terminal_event_type, terminal_payload = (
+                OpenAIPassthroughLoggingHandler._extract_terminal_response_payload_from_stream(
+                    all_chunks
+                )
+            )
+            if terminal_event_type is None and isinstance(tracker_state, dict):
+                tracker_terminal = tracker_state.get("provider_terminal_event_type")
+                if isinstance(tracker_terminal, str) and tracker_terminal:
+                    terminal_event_type = tracker_terminal
+            responses_failed = (
+                PassThroughStreamingHandler._is_openai_responses_stream(
+                    endpoint_type=endpoint_type,
+                    url_route=url_route,
+                    custom_llm_provider=custom_llm_provider,
+                )
+                and (
+                    terminal_event_type == "response.failed"
+                    or (
+                        isinstance(terminal_payload, dict)
+                        and terminal_payload.get("status") == "failed"
+                    )
+                )
+            )
+            if responses_failed:
+                await PassThroughStreamingHandler._finalize_failed_responses_stream(
+                    litellm_logging_obj=litellm_logging_obj,
+                    kwargs=kwargs,
+                    metadata=metadata,
+                    all_chunks=all_chunks,
+                    request_body=request_body,
+                    start_time=start_time,
+                    end_time=end_time,
+                    terminal_event_type=terminal_event_type,
+                    terminal_payload=terminal_payload,
+                    handler_branch_state=handler_branch_state,
+                )
+                return
             if synthetic_terminal_event_type == "response.incomplete":
                 context = metadata.get("aawm_route_rollup_context")
                 if isinstance(context, dict):

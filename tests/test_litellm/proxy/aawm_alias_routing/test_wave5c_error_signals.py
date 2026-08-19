@@ -280,6 +280,10 @@ class TestClassification:
         exc = _FakeExc(message="model capacity exhausted")
         assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "capacity_exhausted"
 
+    def test_classify_server_overloaded(self):
+        exc = _FakeExc(message="server_overloaded")
+        assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "server_overloaded"
+
     def test_classify_rate_limited_by_token(self):
         exc = _FakeExc(message="too many requests")
         assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "rate_limited"

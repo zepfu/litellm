@@ -300,6 +300,7 @@ async def handle_alias_route(  # noqa: PLR0915
     native_grok_continuation_transient_provider_attempts = 0
     provider_candidate_attempts = 0
     account_failover_attempts_by_slot: dict[Optional[str], int] = {}
+    same_account_transient_attempts_by_slot: dict[Optional[str], int] = {}
 
     def _raise_terminal_alias_failure(exc: Exception) -> Any:
         last_attempt = attempts[-1] if attempts else {}
@@ -750,8 +751,50 @@ async def handle_alias_route(  # noqa: PLR0915
                         )
                         return response
 
+                    early_pre_commit_error_class = (
+                        _classify_kimi_code_auto_agent_probe_failure(
+                            _get_safe_kimi_code_probe_failure_metadata(
+                                probe_failure_exc,
+                                candidate=candidate,
+                            )
+                        )
+                    )
+                    if early_pre_commit_error_class is None:
+                        early_pre_commit_error_class = (
+                            _classify_codex_cohere_candidate_failure(
+                                probe_failure_exc,
+                                candidate=candidate,
+                                is_codex_alias=codex_failure_evidence_alias is not None,
+                            )
+                        )
+                    if early_pre_commit_error_class is None:
+                        early_pre_commit_error_class = (
+                            _classify_codex_auto_agent_retryable_exhaustion(
+                                probe_failure_exc, candidate=candidate
+                            )
+                        )
+                    early_pre_commit_retry_plan = (
+                        _error_signals.plan_responses_pre_commit_retry(
+                            error_class=early_pre_commit_error_class,
+                            same_account_transient_attempts=(
+                                same_account_transient_attempts_by_slot.get(
+                                    _codex_oauth_candidate_slot(candidate),
+                                    0,
+                                )
+                                + 1
+                            ),
+                        )
+                    )
+                    skip_cooldown_for_same_account_retry = (
+                        early_pre_commit_retry_plan["action"]
+                        in {"retry_same_account", "pre_stream_unavailable"}
+                    )
+
                     # --- Cooldown mutation: NO pre-held probe lock ------------
-                    if probe_failure_plan is not None:
+                    if (
+                        probe_failure_plan is not None
+                        and not skip_cooldown_for_same_account_retry
+                    ):
                         await _lpe.execute_cooldown_publication_transaction(
                             alias_family=alias_family,
                             candidate=candidate,
@@ -791,6 +834,84 @@ async def handle_alias_route(  # noqa: PLR0915
                 if error_class is None:
                     raise failure_exc
                 last_retryable_exc = failure_exc
+                account_slot = _codex_oauth_candidate_slot(candidate)
+                same_account_transient_attempts_by_slot[account_slot] = (
+                    same_account_transient_attempts_by_slot.get(account_slot, 0) + 1
+                    if error_class
+                    in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
+                    else same_account_transient_attempts_by_slot.get(account_slot, 0)
+                )
+                pre_commit_retry_plan = _error_signals.plan_responses_pre_commit_retry(
+                    error_class=error_class,
+                    same_account_transient_attempts=(
+                        same_account_transient_attempts_by_slot.get(account_slot, 0)
+                    ),
+                )
+                if pre_commit_retry_plan["action"] == "retry_same_account":
+                    wait_seconds = float(pre_commit_retry_plan["wait_seconds"] or 0.0)
+                    attempt_record["pre_commit_retry"] = {
+                        "action": pre_commit_retry_plan["action"],
+                        "error_class": error_class,
+                        "wait_seconds": wait_seconds,
+                        "apply_account_exhaustion_cooldown": False,
+                    }
+                    _record_auto_agent_alias_attempt_failure(
+                        alias_family=alias_family,
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        error_class=error_class,
+                        add_alias_metadata_fn=add_alias_metadata_fn,
+                    )
+                    if wait_seconds > 0:
+                        await asyncio.sleep(wait_seconds)
+                    attempt_record = _codex_auto_agent_candidate_public_shape(
+                        candidate,
+                        lane_key=selection.get("lane_key"),
+                        reason="responses_pre_commit_same_account_retry",
+                    )
+                    attempts.append(attempt_record)
+                    _record_auto_agent_alias_attempt_started(
+                        alias_family=alias_family,
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        add_alias_metadata_fn=add_alias_metadata_fn,
+                    )
+                    continue
+                if pre_commit_retry_plan["action"] == "pre_stream_unavailable":
+                    attempt_record["pre_commit_retry"] = {
+                        "action": pre_commit_retry_plan["action"],
+                        "error_class": error_class,
+                        "wait_seconds": pre_commit_retry_plan["wait_seconds"],
+                        "apply_account_exhaustion_cooldown": False,
+                        "retryable": True,
+                    }
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail={
+                            "error": {
+                                "message": (
+                                    "Upstream Responses stream failed before "
+                                    "the first client byte."
+                                ),
+                                "type": error_class,
+                                "code": "responses_pre_commit_retry_exhausted",
+                                "retryable": True,
+                            }
+                        },
+                        headers={
+                            "Retry-After": str(
+                                int(pre_commit_retry_plan["wait_seconds"] or 10)
+                            )
+                        },
+                    )
                 cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(
                     failure_exc,
                     candidate=candidate,

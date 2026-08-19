@@ -96,7 +96,13 @@ from litellm.types.utils import (
     all_litellm_params,
 )
 
-from .streaming_handler import PassThroughStreamingHandler
+from .streaming_handler import (
+    RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS,
+    RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
+    PassThroughStreamingHandler,
+    ResponsesStreamPreCommitFailure,
+    _RESPONSES_TRANSIENT_CAPACITY_CLASSES,
+)
 from .success_handler import PassThroughEndpointLogging
 
 from .provider_failure_classifiers import (  # noqa: F401
@@ -1234,6 +1240,13 @@ def _get_passthrough_hidden_retry_budget_seconds() -> float:
 def _classify_passthrough_hidden_retry_failure(
     exc: Exception,
 ) -> Tuple[Optional[int], str, Optional[str],]:
+    if isinstance(exc, ResponsesStreamPreCommitFailure):
+        status_code = 503 if exc.retryable else exc.status_code
+        return (
+            status_code,
+            exc.error_class,
+            exc.classification,
+        )
     if isinstance(exc, httpx.HTTPStatusError):
         status_code = exc.response.status_code
         return status_code, f"http_status_{status_code}", None
@@ -1270,6 +1283,12 @@ def _is_passthrough_pre_first_byte_hidden_retryable(
     status_code: Optional[int],
     failure_class: str,
 ) -> bool:
+    if isinstance(exc, ResponsesStreamPreCommitFailure):
+        return bool(
+            exc.retryable
+            and exc.error_class in _RESPONSES_TRANSIENT_CAPACITY_CLASSES
+            and not exc.pre_commit_retry_exhausted
+        )
     if status_code == 429:
         return False
     if status_code in PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES:
@@ -1506,6 +1525,12 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
                 status_code=status_code,
                 failure_class=failure_class,
             )
+            if (
+                isinstance(exc, ResponsesStreamPreCommitFailure)
+                and attempt_number >= RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS
+            ):
+                should_retry = False
+                exc.pre_commit_retry_exhausted = True
             if not should_retry or attempt_number >= max_attempts:
                 _record_passthrough_hidden_retry_metadata(
                     kwargs,
@@ -1523,9 +1548,15 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
                 )
                 raise
 
-            wait_seconds = _get_passthrough_hidden_retry_wait_seconds(
-                attempt_number - 1
-            )
+            if isinstance(exc, ResponsesStreamPreCommitFailure):
+                wait_seconds = float(
+                    exc.retry_after_seconds
+                    or RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS
+                )
+            else:
+                wait_seconds = _get_passthrough_hidden_retry_wait_seconds(
+                    attempt_number - 1
+                )
             elapsed_seconds = time.monotonic() - start_monotonic
             # Stop when wall-clock budget is already exhausted, or when the next
             # fixed backoff alone would push total elapsed past the ceiling.
@@ -4314,6 +4345,19 @@ async def pass_through_request(  # noqa: PLR0915
                         e,
                         error_content,
                     ) from e
+                if PassThroughStreamingHandler._is_openai_responses_stream(
+                    endpoint_type=endpoint_type,
+                    url_route=str(url),
+                    custom_llm_provider=custom_llm_provider,
+                ):
+                    (
+                        response,
+                        pre_commit_failure,
+                    ) = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+                        response
+                    )
+                    if pre_commit_failure is not None:
+                        raise pre_commit_failure
                 return response, req
 
             try:
@@ -4326,6 +4370,11 @@ async def pass_through_request(  # noqa: PLR0915
                     operation=_send_stream_pre_first_byte,
                     caller_managed_hidden_retry=caller_managed_hidden_retry,
                 )
+            except ResponsesStreamPreCommitFailure as pre_commit_exc:
+                await _aawm_session_owner_on_upstream_result(
+                    request=request, success=False
+                )
+                raise pre_commit_exc.as_http_exception() from pre_commit_exc
             except Exception:
                 await _aawm_session_owner_on_upstream_result(
                     request=request, success=False
