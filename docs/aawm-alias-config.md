@@ -559,11 +559,15 @@ route.
 
 For COHERE-002 usage observations, the source identity is limited to accepted
 direct Codex Cohere terminal HTTP 200 `/v2/chat` calls with
-`provider=cohere` and `lane=cohere_native`. Calls are counted once by stable
-`litellm_call_id` and recorded as `source=locally_counted`; OpenRouter remains
-separate. Anthropic adapter integration and Anthropic testing or acceptance are
-not part of this Cohere contract. Migration, deployment, and authenticated
-acceptance remain separately authorized.
+`provider=cohere`, `lane=cohere_native`, and
+`credential_scope=cohere_trial_default`. Calls are counted once by stable
+`litellm_call_id` in `public.locally_counted_accepted_calls`. Display snapshots
+still go to `rate_limit_observations` as `source=locally_counted`. OpenRouter
+free daily remains on the `session_history` meter until a later cutover;
+OpenCode Zen and NVIDIA NIM have no local numeric policy in this commit.
+Anthropic adapter integration and Anthropic testing or acceptance are not part
+of this Cohere contract. Migration, deployment, and authenticated acceptance
+remain separately authorized.
 
 ### Dev compatibility key
 

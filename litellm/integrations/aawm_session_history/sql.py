@@ -2214,26 +2214,30 @@ ON CONFLICT (decision_key) DO UPDATE SET
     metadata = COALESCE(EXCLUDED.metadata, '{}'::jsonb) || COALESCE(session_history_codex_review_decisions.metadata, '{}'::jsonb)
 """
 
-_AAWM_COHERE_ACCEPTED_CALLS_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS public.cohere_accepted_calls (
+_AAWM_LOCALLY_COUNTED_ACCEPTED_CALLS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS public.locally_counted_accepted_calls (
     accepted_at TIMESTAMPTZ NOT NULL,
-    month_start DATE NOT NULL,
-    provider TEXT NOT NULL DEFAULT 'cohere'
-        CHECK (provider = 'cohere'),
-    credential_scope TEXT NOT NULL DEFAULT 'cohere_trial_default'
-        CHECK (credential_scope = 'cohere_trial_default'),
+    provider TEXT NOT NULL,
+    credential_scope TEXT NOT NULL,
+    lane TEXT,
     model TEXT,
-    litellm_call_id TEXT NOT NULL UNIQUE,
+    litellm_call_id TEXT NOT NULL,
     session_id TEXT,
     trace_id TEXT,
     source TEXT NOT NULL,
     evidence JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (provider, credential_scope, litellm_call_id)
 )
 """
+_AAWM_LOCALLY_COUNTED_ACCEPTED_CALLS_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS locally_counted_accepted_calls_provider_scope_accepted_at_idx "
+    "ON public.locally_counted_accepted_calls (provider, credential_scope, accepted_at)",
+    "CREATE INDEX IF NOT EXISTS locally_counted_accepted_calls_provider_scope_model_accepted_at_idx "
+    "ON public.locally_counted_accepted_calls (provider, credential_scope, model, accepted_at)",
+)
+# COHERE-002 now uses the generic ledger; keep the old names as aliases.
+_AAWM_COHERE_ACCEPTED_CALLS_TABLE_SQL = _AAWM_LOCALLY_COUNTED_ACCEPTED_CALLS_TABLE_SQL
 _AAWM_COHERE_ACCEPTED_CALLS_INDEX_STATEMENTS = (
-    "CREATE INDEX IF NOT EXISTS cohere_accepted_calls_month_start_accepted_at_idx "
-    "ON public.cohere_accepted_calls (month_start, accepted_at)",
-    "CREATE INDEX IF NOT EXISTS cohere_accepted_calls_model_accepted_at_idx "
-    "ON public.cohere_accepted_calls (model, accepted_at)",
+    _AAWM_LOCALLY_COUNTED_ACCEPTED_CALLS_INDEX_STATEMENTS
 )

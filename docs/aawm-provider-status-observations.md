@@ -45,18 +45,22 @@ writes rows to `public.provider_status_observations`.
 ## COHERE-002: direct native usage observations
 
 Accepted direct Cohere terminal HTTP 200 `/v2/chat` calls are counted exactly
-once by stable `litellm_call_id`. These observations are locally derived with
-`source=locally_counted`, not provider-reported. Monthly usage is shared per
-credential with a locally enforced monthly limit of 1000; numeric `quota_used`
-comes from the accepted-call ledger. RPM usage is exact-model and is compared with model
-metadata. Missing or unknown RPM metadata, and missing or non-numeric usage,
-remain unknown and do not block. Stale or reset observations are ignored.
+once by stable `litellm_call_id`. The immutable event ledger is
+`public.locally_counted_accepted_calls`; snapshots still go to
+`rate_limit_observations` as `source=locally_counted`, not provider-reported.
+Monthly usage is shared per credential with a locally enforced monthly limit of
+1000; numeric `quota_used` is counted from `accepted_at`. RPM usage is
+exact-model and is compared with model metadata. Missing or unknown RPM
+metadata, and missing or non-numeric usage, remain unknown and do not block.
+Stale or reset observations are ignored.
 
-This contract applies only to `provider=cohere`, `lane=cohere_native`, and the
-direct Codex Cohere route. OpenRouter is separate. Anthropic adapter
-integration and Anthropic testing or acceptance are not part of Cohere work.
-Migration, deployment, and authenticated acceptance have not been performed;
-each remains separately authorized.
+This contract applies only to `provider=cohere`, `lane=cohere_native`,
+`credential_scope=cohere_trial_default`, and the direct Codex Cohere route.
+OpenRouter free daily remains on the `session_history` meter until a later
+cutover. OpenCode Zen and NVIDIA NIM have no local numeric policy in this
+commit. Anthropic adapter integration and Anthropic testing or acceptance are
+not part of Cohere work. Migration, deployment, and authenticated acceptance
+have not been performed; each remains separately authorized.
 
 `scripts/run_provider_status_observations_loop.py` emits one
 `provider_status_observations_cycle` JSON line per cycle. The aggregate fields

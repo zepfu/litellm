@@ -875,18 +875,23 @@ values, tokens, and key material must never be persisted in session history,
 metadata, traces, logs, or documentation.
 
 Accepted direct Cohere terminal HTTP 200 `/v2/chat` calls are counted exactly
-once by stable `litellm_call_id`. The resulting observations use
-`source=locally_counted`, not provider-reported values. Monthly usage is shared
-per credential with limit `1000`, and numeric `quota_used` comes from the
-accepted-call ledger. RPM usage is exact-model and compared with model
-metadata; unknown or missing RPM metadata or numeric usage remains unknown and
-does not block. Stale or reset observations are ignored.
+once by stable `litellm_call_id`. The immutable event ledger is
+`public.locally_counted_accepted_calls`; snapshots still go to
+`public.rate_limit_observations` as `source=locally_counted`, not
+provider-reported values. Monthly usage is shared per credential with limit
+`1000`, and numeric `quota_used` is counted from `accepted_at` in that ledger.
+RPM usage is exact-model and compared with model metadata; unknown or missing
+RPM metadata or numeric usage remains unknown and does not block. Stale or
+reset observations are ignored.
 
-This applies only to `provider=cohere`, `lane=cohere_native`, and the direct
-Codex Cohere route; OpenRouter remains separate. Anthropic adapter integration
-and Anthropic testing or acceptance are outside Cohere work. Migration,
-deployment, and authenticated acceptance have not been performed and remain
-separately authorized.
+This applies only to `provider=cohere`, `lane=cohere_native`,
+`credential_scope=cohere_trial_default`, and the direct Codex Cohere route.
+OpenRouter free daily remains on the `session_history` meter until a later
+cutover; do not dual-write those calls into the ledger yet. OpenCode Zen and
+NVIDIA NIM have no local numeric policy in this commit. Anthropic adapter
+integration and Anthropic testing or acceptance are outside Cohere work.
+Migration, deployment, and authenticated acceptance have not been performed
+and remain separately authorized.
 
 The 2026-08-12 catalog includes the current undiscounted international Alibaba
 Cloud Model Studio direct list rates as references: Qwen 3.6 uses the base
@@ -913,6 +918,17 @@ a standard response cost or callback generation cost.
 snapshots discovered during normal request logging and quota probes. The
 canonical grouping fields are `provider`, `client`, `account_hash`, `model`,
 `quota_key`, `quota_period`, `quota_type`, and `source`.
+
+Locally counted accepted calls are an event ledger, not a snapshot table.
+`public.locally_counted_accepted_calls` stores one immutable row per
+`(provider, credential_scope, litellm_call_id)` with `accepted_at`; window
+counts are derived from that timestamp (UTC calendar month, UTC calendar day,
+or a rolling second window). Display snapshots still land in
+`rate_limit_observations` with `source=locally_counted`. OpenRouter free daily
+shared-pool usage continues to be reconstructed by counting `session_history`
+until a later cutover. OpenCode Zen and NVIDIA NIM helpers exist for a later
+commit, but this commit does not invent numeric limits or success-path inserts
+for those providers.
 
 The normalized progress fields are:
 
