@@ -843,6 +843,7 @@ const sidebars = {
         "providers/cohere",
         "providers/cometapi",
         "providers/compactifai",
+        "providers/cursor_agent",
         "providers/custom_llm_server",
         "providers/alibaba_token_plan",
         "providers/dashscope",

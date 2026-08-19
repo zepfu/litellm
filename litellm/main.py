@@ -2370,6 +2370,39 @@ def completion(  # type: ignore # noqa: PLR0915
                 logging_obj=logging,
                 client=client,
             )
+        elif custom_llm_provider == "cursor_agent":
+            api_base = (
+                api_base
+                or litellm.api_base
+                or get_secret_str("CURSOR_AGENT_API_BASE")
+                or litellm.CursorAgentConfig()._get_provider_info(None, None)[0]
+            )
+            api_key = (
+                api_key
+                or litellm.api_key
+                or get_secret_str("CURSOR_AUTH_TOKEN")
+                or get_secret_str("CURSOR_API_KEY")
+            )
+            headers = headers or litellm.headers or {}
+            response = base_llm_http_handler.completion(
+                model=model,
+                stream=stream,
+                messages=messages,
+                acompletion=acompletion,
+                api_base=api_base,
+                model_response=model_response,
+                optional_params=optional_params,
+                litellm_params=litellm_params,
+                shared_session=shared_session,
+                custom_llm_provider=custom_llm_provider,
+                timeout=timeout,
+                headers=headers,
+                encoding=_get_encoding(),
+                api_key=api_key,
+                logging_obj=logging,
+                client=client,
+                provider_config=provider_config,
+            )
         elif custom_llm_provider == "a2a":
             # A2A (Agent-to-Agent) Protocol
             # Resolve agent configuration from registry if model format is "a2a/<agent-name>"

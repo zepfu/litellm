@@ -218,6 +218,7 @@ LLM_CONFIG_NAMES = (
     "GroqChatConfig",
     "BedrockMantleChatConfig",
     "A2AConfig",
+    "CursorAgentConfig",
     "GenAIHubOrchestrationConfig",
     "VoyageEmbeddingConfig",
     "VoyageContextualEmbeddingConfig",
@@ -878,6 +879,10 @@ _LLM_CONFIGS_IMPORT_MAP = {
         "BedrockMantleChatConfig",
     ),
     "A2AConfig": (".llms.a2a.chat.transformation", "A2AConfig"),
+    "CursorAgentConfig": (
+        ".llms.cursor_agent.chat.transformation",
+        "CursorAgentConfig",
+    ),
     "GenAIHubOrchestrationConfig": (
         ".llms.sap.chat.transformation",
         "GenAIHubOrchestrationConfig",

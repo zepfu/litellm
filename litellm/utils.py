@@ -8182,6 +8182,7 @@ class ProviderConfigManager:
                 False,
             ),
             LlmProviders.A2A: (lambda: litellm.A2AConfig(), False),
+            LlmProviders.CURSOR_AGENT: (lambda: litellm.CursorAgentConfig(), False),
             LlmProviders.BYTEZ: (lambda: litellm.BytezChatConfig(), False),
             LlmProviders.DATABRICKS: (lambda: litellm.DatabricksConfig(), False),
             LlmProviders.XAI: (lambda: litellm.XAIChatConfig(), False),

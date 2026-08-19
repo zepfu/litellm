@@ -1609,6 +1609,9 @@ if TYPE_CHECKING:
         BedrockMantleChatConfig as BedrockMantleChatConfig,
     )
     from .llms.a2a.chat.transformation import A2AConfig as A2AConfig
+    from .llms.cursor_agent.chat.transformation import (
+        CursorAgentConfig as CursorAgentConfig,
+    )
     from .llms.voyage.embedding.transformation import (
         VoyageEmbeddingConfig as VoyageEmbeddingConfig,
     )

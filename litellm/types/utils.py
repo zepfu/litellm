@@ -3351,6 +3351,7 @@ class LlmProviders(str, Enum):
     XIAOMI_MIMO = "xiaomi_mimo"
     LITELLM_AGENT = "litellm_agent"
     CURSOR = "cursor"
+    CURSOR_AGENT = "cursor_agent"
     BEDROCK_MANTLE = "bedrock_mantle"
 
 
