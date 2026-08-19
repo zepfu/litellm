@@ -2,6 +2,7 @@
 Call Hook for LiteLLM Proxy which allows Langfuse prompt management.
 """
 
+import asyncio
 import os
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union, cast
@@ -37,6 +38,59 @@ else:
     LangfuseClass = Any
     LiteLLMLoggingObj = Any
 in_memory_dynamic_logger_cache = DynamicLoggingCache()
+
+
+def _get_langfuse_proxy_loop() -> Optional[asyncio.AbstractEventLoop]:
+    """Return the proxy/logging-worker loop when it is still running."""
+    try:
+        from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+        loop = getattr(GLOBAL_LOGGING_WORKER, "_bound_loop", None)
+    except Exception:
+        return None
+    if loop is None or loop.is_closed():
+        return None
+    try:
+        if loop.is_running():
+            return loop
+    except Exception:
+        return None
+    return None
+
+
+def _run_langfuse_async_event(async_function, *args, **kwargs):
+    """
+    Run a Langfuse async log method from a sync callback.
+
+    `run_async_function` probes `asyncio.get_running_loop()` and then handles
+    "no running event loop" in its except block. A later Langfuse failure
+    inside that block chains the probe as `RuntimeError: no running event loop`
+    and pollutes ERROR. Keep that probe off the Langfuse path: hop to the
+    proxy loop when one exists, otherwise run locally without the probe.
+    """
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+
+    if running_loop is not None:
+        return run_async_function(async_function, *args, **kwargs)
+
+    try:
+        proxy_loop = _get_langfuse_proxy_loop()
+        if proxy_loop is not None:
+            return asyncio.run_coroutine_threadsafe(
+                async_function(*args, **kwargs),
+                proxy_loop,
+            ).result()
+        return asyncio.run(async_function(*args, **kwargs))
+    except RuntimeError as e:
+        if "event loop" not in str(e).lower():
+            raise
+        from litellm._logging import verbose_logger
+
+        verbose_logger.debug("Langfuse logging skipped: no running event loop (%s)", e)
+        return None
 
 
 @lru_cache(maxsize=10)
@@ -290,12 +344,12 @@ class LangfusePromptManagement(LangFuseLogger, PromptManagementBase, CustomLogge
         )
 
     def log_success_event(self, kwargs, response_obj, start_time, end_time):
-        return run_async_function(
+        return _run_langfuse_async_event(
             self.async_log_success_event, kwargs, response_obj, start_time, end_time
         )
 
     def log_failure_event(self, kwargs, response_obj, start_time, end_time):
-        return run_async_function(
+        return _run_langfuse_async_event(
             self.async_log_failure_event, kwargs, response_obj, start_time, end_time
         )
 

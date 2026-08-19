@@ -2440,7 +2440,10 @@ class LangFuseLogger:
                     "prompt_management_metadata"
                 ] = prompt_management_metadata
             if isinstance(metadata, dict):
-                for key, value in metadata.items():
+                # Snapshot first so a concurrent metadata mutation cannot raise
+                # "dictionary changed size during iteration" on this side-channel.
+                metadata_snapshot = {**metadata}
+                for key, value in metadata_snapshot.items():
                     # generate langfuse tags - Default Tags sent to Langfuse from LiteLLM Proxy
                     if (
                         litellm.langfuse_default_tags is not None

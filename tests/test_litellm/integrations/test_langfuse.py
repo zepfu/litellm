@@ -1101,6 +1101,53 @@ class TestLangfuseUsageDetails(unittest.TestCase):
         )
         self.mock_langfuse_span.end.assert_called()
 
+    def test_log_langfuse_v2_metadata_mutation_during_iteration_does_not_raise(self):
+        """Concurrent metadata inserts must not raise during _log_langfuse_v2."""
+
+        class MutatingOnStr:
+            def __init__(self, bucket):
+                self.bucket = bucket
+
+            def __str__(self):
+                self.bucket["injected_during_iteration"] = "concurrent"
+                return "tag-value"
+
+        metadata = {
+            "my_tag": None,
+            "session_id": "sess-mutate",
+            "generation_name": "gen-mutate",
+            "keep": "yes",
+        }
+        metadata["my_tag"] = MutatingOnStr(metadata)
+        kwargs = self._build_langfuse_kwargs(
+            self._build_standard_logging_payload(trace_id="std-trace-mutate")
+        )
+        self.last_trace_kwargs = {}
+
+        with patch(
+            "litellm.integrations.langfuse.langfuse._add_prompt_to_generation_params",
+            side_effect=lambda generation_params, **kwargs: generation_params,
+            create=True,
+        ), patch.object(litellm, "langfuse_default_tags", ["my_tag"]):
+            result = self.logger._log_langfuse_v2(
+                user_id="user-1",
+                metadata=metadata,
+                litellm_params={"metadata": {}},
+                output=None,
+                start_time=datetime.datetime.utcnow(),
+                end_time=datetime.datetime.utcnow(),
+                kwargs=kwargs,
+                optional_params={},
+                input=None,
+                response_obj=None,
+                level="DEFAULT",
+                litellm_call_id="call-id-mutate",
+            )
+
+        self.assertEqual(result[0], "std-trace-mutate")
+        self.assertIn("injected_during_iteration", metadata)
+        self.assertEqual(self.last_trace_kwargs.get("session_id"), "sess-mutate")
+
 
 def test_failure_handler_langfuse_kwargs_excludes_original_response():
     """
