@@ -4,26 +4,25 @@
 from __future__ import annotations
 
 import argparse
-import base64
-import errno
 import hashlib
-import html
+import hmac
+import http.client
 import importlib
 import json
 import math
 import os
 import re
 import signal
-import stat
+import socket
+import ssl
 import sys
 import time
 import traceback
 import uuid
 from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timedelta, timezone
-from http.cookiejar import Cookie, CookieJar, DefaultCookiePolicy
 from pathlib import Path
-from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Union
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -255,12 +254,11 @@ DEFAULT_ALIBABA_QUOTA_POLL_ENABLED = False
 DEFAULT_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS = 300.0
 DEFAULT_ALIBABA_SUBSCRIPTION_POLL_INTERVAL_SECONDS = 21_600.0
 DEFAULT_ALIBABA_QUOTA_POLL_HTTP_TIMEOUT_SECONDS = 30.0
-DEFAULT_ALIBABA_QUOTA_GATEWAY_URL = "https://bailian-singapore-cs.alibabacloud.com/data/api.json"
+DEFAULT_ALIBABA_QUOTA_GATEWAY_URL = (
+    "https://bailian-singapore-cs.alibabacloud.com/cli/api.json"
+)
 DEFAULT_ALIBABA_QUOTA_POLL_MAX_ATTEMPTS = 2
 DEFAULT_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS = 0.5
-DEFAULT_ALIBABA_WEB_AUTH_FILE = "/home/zepfu/.alibaba/token-plan-session.json"
-ALIBABA_WEB_AUTH_FILE_VERSION = 1
-ALIBABA_WEB_AUTH_FILE_MAX_BYTES = 16_384
 ALIBABA_TOKEN_PLAN_USAGE_API = "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/usage"
 ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API = "zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/subscription"
 ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API = (
@@ -270,9 +268,10 @@ ALIBABA_TOKEN_PLAN_COMMODITY_CODE = "sfm_tokenplansolo_public_intl"
 ALIBABA_TOKEN_PLAN_CONSOLE_URL = (
     "https://modelstudio.console.alibabacloud.com/ap-southeast-1" "?tab=plan#/efm/subscription/token-plan/personal"
 )
-ALIBABA_TOKEN_PLAN_USER_INFO_URL = (
-    "https://modelstudio.console.alibabacloud.com/tool/user/info.json"
-)
+ALIBABA_TOKEN_PLAN_MINT_HOST = "modelstudio.ap-southeast-1.aliyuncs.com"
+ALIBABA_TOKEN_PLAN_MINT_PATH = "/modelstudio/cli/generateAccessToken"
+ALIBABA_TOKEN_PLAN_MINT_ACTION = "GenerateCLIAccessToken"
+ALIBABA_TOKEN_PLAN_MINT_VERSION = "2026-02-10"
 ALIBABA_TOKEN_PLAN_CLIENT = "qwen-cloud-console"
 ALIBABA_TOKEN_PLAN_PROVIDER = "alibaba_token_plan"
 ALIBABA_TOKEN_PLAN_MODEL = "qwen-token-plan"
@@ -547,15 +546,10 @@ class AlibabaQuotaPollError(ValueError):
         attempt_count: int,
         retry_count: int,
         endpoint: str,
-        cookie_only_attempted: bool = True,
-        bootstrap_attempted: bool = False,
-        bootstrap_succeeded: bool = False,
-        bootstrap_source: Optional[str] = None,
-        cookie_names: Optional[Sequence[str]] = None,
-        cookie_count: int = 0,
-        token_fallback_attempted: bool = False,
-        token_fallback_succeeded: bool = False,
-        token_fallback_source: Optional[str] = None,
+        mint_attempted: bool = False,
+        mint_succeeded: bool = False,
+        refresh_attempted: bool = False,
+        refresh_succeeded: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -563,115 +557,47 @@ class AlibabaQuotaPollError(ValueError):
         self.attempt_count = max(1, attempt_count)
         self.retry_count = max(0, retry_count)
         self.endpoint = endpoint
-        self.cookie_only_attempted = cookie_only_attempted
-        self.bootstrap_attempted = bootstrap_attempted
-        self.bootstrap_succeeded = bootstrap_succeeded
-        self.bootstrap_source = bootstrap_source
-        self.cookie_names = list(cookie_names or ())
-        self.cookie_count = max(0, cookie_count)
-        self.token_fallback_attempted = token_fallback_attempted
-        self.token_fallback_succeeded = token_fallback_succeeded
-        self.token_fallback_source = token_fallback_source
+        self.mint_attempted = mint_attempted
+        self.mint_succeeded = mint_succeeded
+        self.refresh_attempted = refresh_attempted
+        self.refresh_succeeded = refresh_succeeded
 
 
-class AlibabaWebAuthError(ValueError):
-    """Invalid or unavailable Alibaba web-session configuration."""
+class AlibabaAuthError(ValueError):
+    """Invalid or unavailable Alibaba RAM / console-token configuration."""
 
 
-class _AlibabaCookiePolicy(DefaultCookiePolicy):
-    """Restrict Alibaba session cookies to the two required HTTPS origins."""
-
-    def __init__(self, allowed_hosts: Collection[str]) -> None:
-        super().__init__(strict_ns_domain=self.DomainStrictNonDomain)
-        self.allowed_hosts = frozenset(host.lower().rstrip(".") for host in allowed_hosts)
-
-    @staticmethod
-    def _request_host(request: urllib_request.Request) -> Optional[str]:
-        host = urlsplit(request.full_url).hostname
-        return host.lower().rstrip(".") if host else None
-
-    def _cookie_domain_allowed(self, cookie: Cookie) -> bool:
-        domain = cookie.domain.lower().lstrip(".").rstrip(".")
-        return bool(
-            domain
-            and any(
-                host == domain or host.endswith(f".{domain}")
-                for host in self.allowed_hosts
-            )
-        )
-
-    def set_ok(self, cookie: Cookie, request: urllib_request.Request) -> bool:
-        return bool(
-            self._request_host(request) in self.allowed_hosts
-            and self._cookie_domain_allowed(cookie)
-            and super().set_ok(cookie, request)
-        )
-
-    def return_ok(self, cookie: Cookie, request: urllib_request.Request) -> bool:
-        return bool(
-            self._request_host(request) in self.allowed_hosts
-            and self._cookie_domain_allowed(cookie)
-            and super().return_ok(cookie, request)
-        )
-
-    def domain_return_ok(self, domain: str, request: urllib_request.Request) -> bool:
-        normalized_domain = domain.lower().lstrip(".").rstrip(".")
-        return bool(
-            self._request_host(request) in self.allowed_hosts
-            and any(
-                host == normalized_domain or host.endswith(f".{normalized_domain}")
-                for host in self.allowed_hosts
-            )
-            and super().domain_return_ok(domain, request)
-        )
+AlibabaWebAuthError = AlibabaAuthError
 
 
 @dataclass
-class AlibabaWebSession:
-    """Process-lifetime in-memory Alibaba console session."""
+class AlibabaConsoleSession:
+    """Process-lifetime in-memory RAM-minted console Bearer session."""
 
-    ticket_fingerprint: str
-    allowed_hosts: frozenset[str]
-    cookie_jar: CookieJar
-    opener: Any
-    sec_token: Optional[str] = None
-
-    def cookie_metadata(self) -> Dict[str, Any]:
-        cookie_names = sorted(cookie.name for cookie in self.cookie_jar)
-        return {
-            "cookie_names": cookie_names,
-            "cookie_count": len(cookie_names),
-        }
+    credential_fingerprint: str
+    access_token: Optional[str] = None
 
 
 @dataclass
 class AlibabaQuotaFetchState:
     """Mutable metadata for one bounded Alibaba endpoint fetch."""
 
-    session: AlibabaWebSession
-    request_auth: Dict[str, str]
-    cookie_only_attempted: bool
+    session: AlibabaConsoleSession
     attempt_count: int = 0
     retry_count: int = 0
-    bootstrap_attempted: bool = False
-    bootstrap_succeeded: bool = False
-    bootstrap_source: Optional[str] = None
-    token_fallback_attempted: bool = False
-    token_fallback_succeeded: bool = False
-    token_fallback_source: Optional[str] = None
+    mint_attempted: bool = False
+    mint_succeeded: bool = False
+    refresh_attempted: bool = False
+    refresh_succeeded: bool = False
 
     def error_metadata(self) -> Dict[str, Any]:
         return {
             "attempt_count": self.attempt_count,
             "retry_count": self.retry_count,
-            "cookie_only_attempted": self.cookie_only_attempted,
-            "bootstrap_attempted": self.bootstrap_attempted,
-            "bootstrap_succeeded": self.bootstrap_succeeded,
-            "bootstrap_source": self.bootstrap_source,
-            "token_fallback_attempted": self.token_fallback_attempted,
-            "token_fallback_succeeded": self.token_fallback_succeeded,
-            "token_fallback_source": self.token_fallback_source,
-            **self.session.cookie_metadata(),
+            "mint_attempted": self.mint_attempted,
+            "mint_succeeded": self.mint_succeeded,
+            "refresh_attempted": self.refresh_attempted,
+            "refresh_succeeded": self.refresh_succeeded,
         }
 
     def result_metadata(self) -> Dict[str, Any]:
@@ -1427,7 +1353,6 @@ class ProviderStatusLoopConfig:
     alibaba_subscription_poll_interval_seconds: float = DEFAULT_ALIBABA_SUBSCRIPTION_POLL_INTERVAL_SECONDS
     alibaba_quota_poll_http_timeout_seconds: float = DEFAULT_ALIBABA_QUOTA_POLL_HTTP_TIMEOUT_SECONDS
     alibaba_quota_gateway_url: str = DEFAULT_ALIBABA_QUOTA_GATEWAY_URL
-    alibaba_web_auth_file: str = DEFAULT_ALIBABA_WEB_AUTH_FILE
     alibaba_quota_poll_max_attempts: int = DEFAULT_ALIBABA_QUOTA_POLL_MAX_ATTEMPTS
     alibaba_quota_poll_retry_backoff_seconds: float = DEFAULT_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS
     grok_billing_poll_enabled: bool = DEFAULT_GROK_BILLING_POLL_ENABLED
@@ -1519,7 +1444,8 @@ class SidecarTaskState:
     alibaba_subscription_last_attempt_monotonic: Optional[float] = None
     alibaba_subscription_payload: Optional[Dict[str, Any]] = None
     alibaba_auth_fingerprint: Optional[str] = None
-    alibaba_web_session: Optional[AlibabaWebSession] = None
+    alibaba_access_token: Optional[str] = None
+    alibaba_console_session: Optional[AlibabaConsoleSession] = None
     grok_billing_last_attempt_monotonic: Optional[float] = None
     cursor_agent_usage_last_attempt_monotonic: Optional[float] = None
     codex_reset_credit_last_attempt_monotonic_by_label: Dict[str, float] = (
@@ -2280,7 +2206,10 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "AAWM_ALIBABA_QUOTA_POLL_ENABLED",
             DEFAULT_ALIBABA_QUOTA_POLL_ENABLED,
         ),
-        help=("Poll Alibaba Token Plan console quota telemetry with the existing " "ALIBABA_WEB_KEY session envelope."),
+        help=(
+            "Poll Alibaba Token Plan console quota telemetry with a RAM-minted "
+            "console Bearer token."
+        ),
     )
     alibaba_quota_group.add_argument(
         "--no-alibaba-quota-poll",
@@ -2332,20 +2261,9 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             DEFAULT_ALIBABA_QUOTA_GATEWAY_URL,
         ),
         help=(
-            "Alibaba ModelStudio gateway base URL. Defaults to "
-            "AAWM_ALIBABA_QUOTA_GATEWAY_URL or the Singapore console gateway."
-        ),
-    )
-    parser.add_argument(
-        "--alibaba-web-auth-file",
-        default=os.getenv(
-            "AAWM_ALIBABA_WEB_AUTH_FILE",
-            DEFAULT_ALIBABA_WEB_AUTH_FILE,
-        ),
-        help=(
-            "Private Alibaba Token Plan login-ticket JSON file. Defaults to "
-            "AAWM_ALIBABA_WEB_AUTH_FILE or "
-            f"{DEFAULT_ALIBABA_WEB_AUTH_FILE}."
+            "Alibaba ModelStudio CLI gateway URL. Defaults to "
+            "AAWM_ALIBABA_QUOTA_GATEWAY_URL or the Singapore /cli/api.json "
+            "gateway."
         ),
     )
     parser.add_argument(
@@ -2910,8 +2828,6 @@ def _validate_alibaba_quota_config_args(args: argparse.Namespace) -> None:
         raise SystemExit("--alibaba-quota-poll-http-timeout-seconds must be greater than 0")
     if not str(args.alibaba_quota_gateway_url).strip():
         raise SystemExit("--alibaba-quota-gateway-url must not be empty")
-    if not str(args.alibaba_web_auth_file).strip():
-        raise SystemExit("--alibaba-web-auth-file must not be empty")
     if args.alibaba_quota_poll_max_attempts <= 0:
         raise SystemExit("--alibaba-quota-poll-max-attempts must be greater than 0")
     if args.alibaba_quota_poll_retry_backoff_seconds < 0:
@@ -3081,7 +2997,6 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         alibaba_subscription_poll_interval_seconds=(args.alibaba_subscription_poll_interval_seconds),
         alibaba_quota_poll_http_timeout_seconds=(args.alibaba_quota_poll_http_timeout_seconds),
         alibaba_quota_gateway_url=str(args.alibaba_quota_gateway_url).strip(),
-        alibaba_web_auth_file=str(args.alibaba_web_auth_file).strip(),
         alibaba_quota_poll_max_attempts=args.alibaba_quota_poll_max_attempts,
         alibaba_quota_poll_retry_backoff_seconds=(args.alibaba_quota_poll_retry_backoff_seconds),
         grok_billing_poll_enabled=args.grok_billing_poll_enabled,
@@ -6671,256 +6586,391 @@ def _persist_cursor_agent_usage_observations(
     return inserted_count
 
 
-def _validate_alibaba_login_ticket(value: Any, *, source: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise AlibabaWebAuthError(
-            f"{source} does not contain a usable login_ticket."
-        )
-    ticket = value.strip()
-    if "\r" in ticket or "\n" in ticket:
-        raise AlibabaWebAuthError(f"{source} contains an invalid login_ticket.")
-    return ticket
+def _alibaba_secret_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip()
 
 
-def _read_alibaba_web_auth_file(auth_file: str) -> Dict[str, Any]:
-    path = Path(auth_file).expanduser()
-    flags = os.O_RDONLY
-    if hasattr(os, "O_CLOEXEC"):
-        flags |= os.O_CLOEXEC
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    if hasattr(os, "O_NONBLOCK"):
-        flags |= os.O_NONBLOCK
-
-    try:
-        fd = os.open(path, flags)
-    except FileNotFoundError:
-        raise
-    except OSError as exc:
-        if exc.errno == errno.ELOOP:
-            raise AlibabaWebAuthError(
-                "Alibaba web auth file must not be a symlink."
-            ) from None
-        raise AlibabaWebAuthError("Alibaba web auth file could not be opened.") from exc
-
-    try:
-        file_stat = os.fstat(fd)
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise AlibabaWebAuthError(
-                "Alibaba web auth file must be a regular file."
-            )
-        if stat.S_IMODE(file_stat.st_mode) != 0o600:
-            raise AlibabaWebAuthError(
-                "Alibaba web auth file must use mode 0600."
-            )
-        if file_stat.st_size > ALIBABA_WEB_AUTH_FILE_MAX_BYTES:
-            raise AlibabaWebAuthError("Alibaba web auth file is too large.")
-        with os.fdopen(fd, "rb") as handle:
-            fd = -1
-            raw_payload = handle.read(ALIBABA_WEB_AUTH_FILE_MAX_BYTES + 1)
-    finally:
-        if fd >= 0:
-            os.close(fd)
-
-    if len(raw_payload) > ALIBABA_WEB_AUTH_FILE_MAX_BYTES:
-        raise AlibabaWebAuthError("Alibaba web auth file is too large.")
-    try:
-        payload = json.loads(raw_payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise AlibabaWebAuthError(
-            "Alibaba web auth file is not valid JSON."
-        ) from exc
-    if not isinstance(payload, Mapping):
-        raise AlibabaWebAuthError("Alibaba web auth file must contain a JSON object.")
-    if set(payload) != {"version", "login_ticket"}:
-        raise AlibabaWebAuthError(
-            "Alibaba web auth file must contain only version and login_ticket."
-        )
-    if payload.get("version") != ALIBABA_WEB_AUTH_FILE_VERSION:
-        raise AlibabaWebAuthError(
-            "Alibaba web auth file uses an unsupported version."
-        )
-    return {
-        "login_ticket": _validate_alibaba_login_ticket(
-            payload.get("login_ticket"),
-            source="Alibaba web auth file",
-        ),
-        "auth_source": "auth_file",
-        "credential_reloaded": True,
-    }
-
-
-def _load_alibaba_web_key_fallback() -> Dict[str, Any]:
-    raw_key = os.getenv("ALIBABA_WEB_KEY", "").strip()
-    if not raw_key:
-        raise AlibabaWebAuthError(
-            "Alibaba web auth file is unavailable and ALIBABA_WEB_KEY "
-            "migration fallback is not configured."
-        )
-    try:
-        padding = "=" * (-len(raw_key) % 4)
-        decoded = base64.urlsafe_b64decode(raw_key + padding)
-        payload = json.loads(decoded.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise AlibabaWebAuthError("ALIBABA_WEB_KEY is not a valid versioned envelope.") from exc
-    if not isinstance(payload, Mapping) or payload.get("v") != 1:
-        raise AlibabaWebAuthError("ALIBABA_WEB_KEY uses an unsupported envelope version.")
-
-    return {
-        "login_ticket": _validate_alibaba_login_ticket(
-            payload.get("login_ticket"),
-            source="ALIBABA_WEB_KEY",
-        ),
-        "auth_source": "ALIBABA_WEB_KEY",
-        "credential_reloaded": False,
-    }
-
-
-def _load_alibaba_web_auth(
+def _load_alibaba_ram_auth(
     config: ProviderStatusLoopConfig,
 ) -> Dict[str, Any]:
-    try:
-        return _read_alibaba_web_auth_file(config.alibaba_web_auth_file)
-    except FileNotFoundError:
-        return _load_alibaba_web_key_fallback()
-
-
-def _alibaba_login_ticket_fingerprint(login_ticket: str) -> str:
-    return hashlib.sha256(login_ticket.encode("utf-8")).hexdigest()
-
-
-def _alibaba_session_hosts(config: ProviderStatusLoopConfig) -> frozenset[str]:
-    console = urlsplit(ALIBABA_TOKEN_PLAN_CONSOLE_URL)
-    gateway = urlsplit(config.alibaba_quota_gateway_url)
-    if (
-        console.scheme.lower() != "https"
-        or gateway.scheme.lower() != "https"
-        or not console.hostname
-        or not gateway.hostname
+    del config
+    access_key_id = _alibaba_secret_text(os.getenv("ALIBABA_RAM_KEY"))
+    access_key_secret = _alibaba_secret_text(os.getenv("ALIBABA_RAM_SECRET"))
+    principal = _alibaba_secret_text(os.getenv("ALIBABA_RAM_PRINCIPAL"))
+    if not access_key_id or not access_key_secret:
+        raise AlibabaAuthError("Alibaba RAM credentials are incomplete.")
+    if any(character in access_key_id for character in "\r\n") or any(
+        character in access_key_secret for character in "\r\n"
     ):
-        raise AlibabaWebAuthError(
-            "Alibaba web session endpoints must use configured HTTPS hosts."
+        raise AlibabaAuthError("Alibaba RAM credentials are invalid.")
+    fingerprint_material = access_key_id.encode("utf-8")
+    principal_hash = None
+    if principal:
+        principal_hash = hashlib.sha256(principal.encode("utf-8")).hexdigest()
+        fingerprint_material += b"|" + principal_hash.encode("ascii")
+    return {
+        "access_key_id": access_key_id,
+        "access_key_secret": access_key_secret,
+        "auth_source": "ALIBABA_RAM_KEY",
+        "credential_reloaded": True,
+        "credential_fingerprint": hashlib.sha256(fingerprint_material).hexdigest(),
+        "principal_hash": principal_hash,
+    }
+
+
+def _alibaba_host_is_china(host: Optional[str]) -> bool:
+    if not host:
+        return False
+    normalized = host.lower().rstrip(".")
+    return any(
+        marker in normalized
+        for marker in (
+            "cn-beijing",
+            "dashscope.aliyuncs.com",
+            "token-plan.cn-beijing.maas.aliyuncs.com",
+            "modelstudio.cn-beijing.aliyuncs.com",
         )
-    return frozenset(
+    ) or normalized.endswith(".aliyun.com")
+
+
+def _alibaba_sha256_hex(value: Union[str, bytes]) -> str:
+    payload = value.encode("utf-8") if isinstance(value, str) else value
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _alibaba_hmac_sha256_hex(secret: str, value: str) -> str:
+    return hmac.new(
+        secret.encode("utf-8"),
+        value.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _alibaba_mint_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _alibaba_mint_nonce() -> str:
+    return str(uuid.uuid4())
+
+
+def _alibaba_acs3_signed_headers(
+    *,
+    access_key_id: str,
+    access_key_secret: str,
+    host: str,
+    pathname: str,
+    action: str,
+    version: str,
+    method: str = "POST",
+    body: str = "",
+    query_string: str = "",
+    acs_date: Optional[str] = None,
+    signature_nonce: Optional[str] = None,
+) -> Dict[str, str]:
+    hashed_payload = _alibaba_sha256_hex(body.encode("utf-8") if isinstance(body, str) else body)
+    headers = {
+        "host": host,
+        "x-acs-action": action,
+        "x-acs-version": version,
+        "x-acs-date": acs_date
+        or _alibaba_mint_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "x-acs-signature-nonce": signature_nonce or _alibaba_mint_nonce(),
+        "x-acs-content-sha256": hashed_payload,
+        "content-type": "application/json",
+    }
+    signed_header_names = sorted(
+        name
+        for name in headers
+        if name == "host" or name == "content-type" or name.startswith("x-acs-")
+    )
+    canonical_headers = "".join(
+        f"{name}:{headers[name]}\n" for name in signed_header_names
+    )
+    signed_headers = ";".join(signed_header_names)
+    canonical_request = "\n".join(
+        (
+            method,
+            pathname,
+            query_string,
+            canonical_headers,
+            signed_headers,
+            hashed_payload,
+        )
+    )
+    string_to_sign = f"ACS3-HMAC-SHA256\n{_alibaba_sha256_hex(canonical_request)}"
+    signature = _alibaba_hmac_sha256_hex(access_key_secret, string_to_sign)
+    headers["authorization"] = (
+        "ACS3-HMAC-SHA256 "
+        f"Credential={access_key_id},"
+        f"SignedHeaders={signed_headers},"
+        f"Signature={signature}"
+    )
+    return headers
+
+
+class _AlibabaIPv4HTTPSConnection(http.client.HTTPSConnection):
+    """Force the mint TCP connect onto IPv4."""
+
+    def connect(self) -> None:
+        if self.timeout is socket._GLOBAL_DEFAULT_TIMEOUT:
+            timeout = socket.getdefaulttimeout()
+        else:
+            timeout = self.timeout
+        infos = socket.getaddrinfo(
+            self.host,
+            self.port,
+            socket.AF_INET,
+            socket.SOCK_STREAM,
+        )
+        if not infos:
+            raise OSError("Alibaba mint host has no IPv4 address.")
+        family, socktype, proto, _canonname, sockaddr = infos[0]
+        sock = socket.socket(family, socktype, proto)
+        if timeout is not None:
+            sock.settimeout(timeout)
+        sock.connect(sockaddr)
+        context = self._context
+        if context is None:
+            context = ssl.create_default_context()
+        self.sock = context.wrap_socket(sock, server_hostname=self.host)
+
+
+def _alibaba_ipv4_https_post(
+    *,
+    host: str,
+    path: str,
+    headers: Mapping[str, str],
+    body: bytes,
+    timeout_seconds: float,
+) -> tuple[int, str]:
+    connection = _AlibabaIPv4HTTPSConnection(host, timeout=timeout_seconds)
+    try:
+        connection.request("POST", path, body=body, headers=dict(headers))
+        response = connection.getresponse()
+        payload = response.read().decode("utf-8", errors="replace")
+        return int(response.status), payload
+    finally:
+        connection.close()
+
+
+ALIBABA_QUOTA_HTTP_OPEN_FN: Callable[..., Any] = urllib_request.urlopen
+ALIBABA_MINT_HTTP_POST_FN = _alibaba_ipv4_https_post
+
+
+def _extract_alibaba_cli_access_token(payload: Mapping[str, Any]) -> Optional[str]:
+    token = payload.get("cliAccessToken")
+    if isinstance(token, str) and token.strip():
+        return token.strip()
+    for key in ("data", "Data", "result", "Result"):
+        nested = payload.get(key)
+        if isinstance(nested, Mapping):
+            token = _extract_alibaba_cli_access_token(nested)
+            if token is not None:
+                return token
+    return None
+
+
+def _alibaba_mint_payload_is_auth_failure(
+    *,
+    status_code: Optional[int],
+    payload: Optional[Mapping[str, Any]],
+) -> bool:
+    if status_code in {401, 403}:
+        return True
+    if not isinstance(payload, Mapping):
+        return False
+    if payload.get("Success") is False or payload.get("success") is False:
+        return _alibaba_error_text_matches_auth_allowlist(
+            {
+                "errorCode": payload.get("Code") or payload.get("code") or payload.get("errorCode"),
+                "errorMsg": payload.get("Message") or payload.get("message") or payload.get("errorMsg"),
+            }
+        )
+    return _alibaba_error_text_matches_auth_allowlist(
         {
-            console.hostname.lower().rstrip("."),
-            gateway.hostname.lower().rstrip("."),
+            "errorCode": payload.get("Code") or payload.get("code") or payload.get("errorCode"),
+            "errorMsg": payload.get("Message") or payload.get("message") or payload.get("errorMsg"),
         }
     )
 
 
-def _seed_alibaba_login_ticket(
-    cookie_jar: CookieJar,
+def _mint_alibaba_console_access_token(
+    config: ProviderStatusLoopConfig,
+    auth: Mapping[str, Any],
     *,
-    allowed_hosts: Collection[str],
-    login_ticket: str,
+    acs_date: Optional[str] = None,
+    signature_nonce: Optional[str] = None,
+) -> str:
+    host = ALIBABA_TOKEN_PLAN_MINT_HOST
+    if _alibaba_host_is_china(host):
+        raise AlibabaAuthError("Alibaba Token Plan mint host is not the international endpoint.")
+    signed_headers = _alibaba_acs3_signed_headers(
+        access_key_id=str(auth["access_key_id"]),
+        access_key_secret=str(auth["access_key_secret"]),
+        host=host,
+        pathname=ALIBABA_TOKEN_PLAN_MINT_PATH,
+        action=ALIBABA_TOKEN_PLAN_MINT_ACTION,
+        version=ALIBABA_TOKEN_PLAN_MINT_VERSION,
+        method="POST",
+        body="",
+        query_string="",
+        acs_date=acs_date,
+        signature_nonce=signature_nonce,
+    )
+    request_headers = {
+        "host": signed_headers["host"],
+        "content-type": signed_headers["content-type"],
+        "x-acs-action": signed_headers["x-acs-action"],
+        "x-acs-version": signed_headers["x-acs-version"],
+        "x-acs-date": signed_headers["x-acs-date"],
+        "x-acs-signature-nonce": signed_headers["x-acs-signature-nonce"],
+        "x-acs-content-sha256": signed_headers["x-acs-content-sha256"],
+        "authorization": signed_headers["authorization"],
+    }
+    try:
+        status_code, response_body = ALIBABA_MINT_HTTP_POST_FN(
+            host=host,
+            path=ALIBABA_TOKEN_PLAN_MINT_PATH,
+            headers=request_headers,
+            body=b"",
+            timeout_seconds=config.alibaba_quota_poll_http_timeout_seconds,
+        )
+    except (TimeoutError, OSError, ssl.SSLError) as exc:
+        raise _alibaba_quota_poll_error(
+            endpoint="authentication",
+            status_code=None,
+            telemetry_class="transport",
+            attempt_count=1,
+            retry_count=0,
+            mint_attempted=True,
+            message=(
+                "Alibaba Token Plan console token mint failed while contacting "
+                "the international mint host."
+            ),
+        ) from exc
+    payload: Optional[Mapping[str, Any]] = None
+    try:
+        loaded = json.loads(response_body) if response_body else None
+        if isinstance(loaded, Mapping):
+            payload = loaded
+    except json.JSONDecodeError:
+        payload = None
+    if _alibaba_mint_payload_is_auth_failure(status_code=status_code, payload=payload):
+        raise _alibaba_quota_poll_error(
+            endpoint="authentication",
+            status_code=status_code,
+            telemetry_class="auth",
+            attempt_count=1,
+            retry_count=0,
+            mint_attempted=True,
+            message="Alibaba Token Plan console token mint was denied.",
+        )
+    token = _extract_alibaba_cli_access_token(payload or {})
+    if status_code != 200 or token is None:
+        raise _alibaba_quota_poll_error(
+            endpoint="authentication",
+            status_code=status_code,
+            telemetry_class="auth" if status_code in {401, 403} else "malformed_telemetry",
+            attempt_count=1,
+            retry_count=0,
+            mint_attempted=True,
+            message="Alibaba Token Plan console token mint returned no usable token.",
+        )
+    return token
+
+
+def _cache_alibaba_access_token(
+    task_state: Optional[SidecarTaskState],
+    session: AlibabaConsoleSession,
 ) -> None:
-    for host in allowed_hosts:
-        cookie_jar.set_cookie(
-            Cookie(
-                version=0,
-                name="login_aliyunid_ticket",
-                value=login_ticket,
-                port=None,
-                port_specified=False,
-                domain=host,
-                domain_specified=False,
-                domain_initial_dot=False,
-                path="/",
-                path_specified=True,
-                secure=True,
-                expires=None,
-                discard=True,
-                comment=None,
-                comment_url=None,
-                rest={},
-                rfc2109=False,
-            )
-        )
+    if task_state is None:
+        return
+    task_state.alibaba_access_token = session.access_token
+    task_state.alibaba_console_session = session
 
 
-def _alibaba_login_ticket_cookie_snapshot(
-    session: AlibabaWebSession,
-) -> Dict[tuple[str, str], str]:
-    return {
-        (cookie.domain, cookie.path): cookie.value
-        for cookie in session.cookie_jar
-        if cookie.name == "login_aliyunid_ticket"
-    }
-
-
-def _canonicalize_rotated_alibaba_login_ticket(
-    session: AlibabaWebSession,
-    *,
-    previous: Mapping[tuple[str, str], str],
-) -> bool:
-    changed_values = {
-        cookie.value
-        for cookie in session.cookie_jar
-        if cookie.name == "login_aliyunid_ticket"
-        and previous.get((cookie.domain, cookie.path)) != cookie.value
-    }
-    if not changed_values:
-        return False
-    if len(changed_values) != 1:
-        raise AlibabaWebAuthError(
-            "Alibaba web session returned ambiguous login ticket cookies."
-        )
-    canonical_ticket = _validate_alibaba_login_ticket(
-        changed_values.pop(),
-        source="Alibaba web session",
-    )
-    for cookie in list(session.cookie_jar):
-        if cookie.name == "login_aliyunid_ticket":
-            session.cookie_jar.clear(cookie.domain, cookie.path, cookie.name)
-    _seed_alibaba_login_ticket(
-        session.cookie_jar,
-        allowed_hosts=session.allowed_hosts,
-        login_ticket=canonical_ticket,
-    )
-    return True
-
-
-def _new_alibaba_web_session(
-    config: ProviderStatusLoopConfig,
-    *,
-    login_ticket: str,
-) -> AlibabaWebSession:
-    allowed_hosts = _alibaba_session_hosts(config)
-    cookie_jar = CookieJar(policy=_AlibabaCookiePolicy(allowed_hosts))
-    _seed_alibaba_login_ticket(
-        cookie_jar,
-        allowed_hosts=allowed_hosts,
-        login_ticket=login_ticket,
-    )
-    return AlibabaWebSession(
-        ticket_fingerprint=_alibaba_login_ticket_fingerprint(login_ticket),
-        allowed_hosts=allowed_hosts,
-        cookie_jar=cookie_jar,
-        opener=urllib_request.build_opener(
-            urllib_request.HTTPCookieProcessor(cookie_jar)
-        ),
-    )
-
-
-def _ensure_alibaba_web_session(
-    config: ProviderStatusLoopConfig,
+def _ensure_alibaba_console_session(
     state: SidecarTaskState,
     *,
-    login_ticket: str,
-) -> tuple[AlibabaWebSession, bool]:
-    fingerprint = _alibaba_login_ticket_fingerprint(login_ticket)
-    previous = state.alibaba_web_session
-    ticket_reset = bool(
-        previous is not None and previous.ticket_fingerprint != fingerprint
+    auth: Mapping[str, Any],
+) -> tuple[AlibabaConsoleSession, bool]:
+    fingerprint = str(auth["credential_fingerprint"])
+    previous = state.alibaba_console_session
+    credential_reset = bool(
+        previous is not None and previous.credential_fingerprint != fingerprint
     )
-    if previous is None or ticket_reset:
-        state.alibaba_web_session = _new_alibaba_web_session(
-            config,
-            login_ticket=login_ticket,
+    if previous is None or credential_reset:
+        cached_token = None if credential_reset else state.alibaba_access_token
+        state.alibaba_console_session = AlibabaConsoleSession(
+            credential_fingerprint=fingerprint,
+            access_token=cached_token,
         )
-    assert state.alibaba_web_session is not None
-    return state.alibaba_web_session, ticket_reset
+        if credential_reset:
+            state.alibaba_access_token = None
+    elif previous.access_token is None and state.alibaba_access_token:
+        previous.access_token = state.alibaba_access_token
+    assert state.alibaba_console_session is not None
+    _cache_alibaba_access_token(state, state.alibaba_console_session)
+    return state.alibaba_console_session, credential_reset
+
+
+def _ensure_alibaba_console_access_token(
+    config: ProviderStatusLoopConfig,
+    session: AlibabaConsoleSession,
+    auth: Mapping[str, Any],
+    state: AlibabaQuotaFetchState,
+    *,
+    task_state: Optional[SidecarTaskState] = None,
+) -> str:
+    if session.access_token:
+        _cache_alibaba_access_token(task_state, session)
+        return session.access_token
+    state.mint_attempted = True
+    token = _mint_alibaba_console_access_token(config, auth)
+    session.access_token = token
+    state.mint_succeeded = True
+    _cache_alibaba_access_token(task_state, session)
+    return token
+
+
+def _refresh_alibaba_console_access_token(
+    config: ProviderStatusLoopConfig,
+    session: AlibabaConsoleSession,
+    auth: Mapping[str, Any],
+    state: AlibabaQuotaFetchState,
+    *,
+    endpoint: str,
+    status_code: Optional[int],
+    task_state: Optional[SidecarTaskState] = None,
+) -> None:
+    if state.refresh_attempted:
+        raise _alibaba_quota_poll_error(
+            endpoint=endpoint,
+            status_code=status_code,
+            telemetry_class="auth",
+            **state.error_metadata(),
+        )
+    state.refresh_attempted = True
+    state.mint_attempted = True
+    session.access_token = None
+    _cache_alibaba_access_token(task_state, session)
+    try:
+        token = _mint_alibaba_console_access_token(config, auth)
+    except AlibabaQuotaPollError as exc:
+        raise _alibaba_quota_poll_error(
+            endpoint=endpoint,
+            status_code=exc.status_code if exc.endpoint == "authentication" else status_code,
+            telemetry_class=exc.telemetry_class,
+            message=str(exc),
+            **state.error_metadata(),
+        ) from exc
+    session.access_token = token
+    state.mint_succeeded = True
+    state.refresh_succeeded = True
+    _cache_alibaba_access_token(task_state, session)
 
 
 def _alibaba_quota_request_url(
@@ -6929,6 +6979,13 @@ def _alibaba_quota_request_url(
     api_name: str,
 ) -> str:
     parsed = urlsplit(config.alibaba_quota_gateway_url)
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme.lower() != "https" or not hostname:
+        raise AlibabaAuthError("Alibaba quota gateway must use a configured HTTPS host.")
+    if _alibaba_host_is_china(hostname):
+        raise AlibabaAuthError(
+            "Alibaba Token Plan quota polling does not use China console hosts."
+        )
     existing = [
         (key, value)
         for key, value in parse_qsl(parsed.query, keep_blank_values=True)
@@ -6940,7 +6997,6 @@ def _alibaba_quota_request_url(
             ("action", "IntlBroadScopeAspnGateway"),
             ("product", "sfm_bailian"),
             ("api", api_name),
-            ("_v", "undefined"),
         ]
     )
     return parsed._replace(query=query).geturl()
@@ -6968,7 +7024,7 @@ def _build_alibaba_quota_request(
     config: ProviderStatusLoopConfig,
     *,
     api_name: str,
-    auth: Mapping[str, str],
+    access_token: str,
 ) -> urllib_request.Request:
     data: Dict[str, Any] = {
         "cornerstoneParam": _alibaba_cornerstone_param(),
@@ -6982,21 +7038,18 @@ def _build_alibaba_quota_request(
         "V": "1.0",
         "Data": data,
     }
-    body_fields = [
-        ("params", json.dumps(request_params, separators=(",", ":"))),
-        ("region", "ap-southeast-1"),
-    ]
-    sec_token = auth.get("sec_token")
-    if isinstance(sec_token, str) and sec_token.strip():
-        body_fields.append(("sec_token", sec_token.strip()))
-    body = urlencode(body_fields).encode("utf-8")
+    body = urlencode(
+        [
+            ("params", json.dumps(request_params, separators=(",", ":"))),
+            ("region", "ap-southeast-1"),
+        ]
+    ).encode("utf-8")
     return urllib_request.Request(
         _alibaba_quota_request_url(config, api_name=api_name),
         data=body,
         headers={
             "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": ALIBABA_TOKEN_PLAN_CONSOLE_URL,
-            "User-Agent": "Mozilla/5.0",
+            "Authorization": f"Bearer {access_token}",
         },
         method="POST",
     )
@@ -7020,15 +7073,10 @@ def _alibaba_quota_poll_error(
     attempt_count: int,
     retry_count: int,
     message: Optional[str] = None,
-    cookie_only_attempted: bool = True,
-    bootstrap_attempted: bool = False,
-    bootstrap_succeeded: bool = False,
-    bootstrap_source: Optional[str] = None,
-    cookie_names: Optional[Sequence[str]] = None,
-    cookie_count: int = 0,
-    token_fallback_attempted: bool = False,
-    token_fallback_succeeded: bool = False,
-    token_fallback_source: Optional[str] = None,
+    mint_attempted: bool = False,
+    mint_succeeded: bool = False,
+    refresh_attempted: bool = False,
+    refresh_succeeded: bool = False,
 ) -> AlibabaQuotaPollError:
     if message is None:
         message = f"Alibaba Token Plan {endpoint} poll failed"
@@ -7042,142 +7090,10 @@ def _alibaba_quota_poll_error(
         attempt_count=attempt_count,
         retry_count=retry_count,
         endpoint=endpoint,
-        cookie_only_attempted=cookie_only_attempted,
-        bootstrap_attempted=bootstrap_attempted,
-        bootstrap_succeeded=bootstrap_succeeded,
-        bootstrap_source=bootstrap_source,
-        cookie_names=cookie_names,
-        cookie_count=cookie_count,
-        token_fallback_attempted=token_fallback_attempted,
-        token_fallback_succeeded=token_fallback_succeeded,
-        token_fallback_source=token_fallback_source,
-    )
-
-
-def _alibaba_session_request(url: str) -> urllib_request.Request:
-    return urllib_request.Request(
-        url,
-        headers={
-            "Referer": ALIBABA_TOKEN_PLAN_CONSOLE_URL,
-            "User-Agent": "Mozilla/5.0",
-        },
-        method="GET",
-    )
-
-
-def _valid_alibaba_sec_token(value: Any) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    token = value.strip()
-    if not token or len(token) > 4096 or "\r" in token or "\n" in token:
-        return None
-    return token
-
-
-def _extract_alibaba_sec_token_from_payload(value: Any) -> Optional[str]:
-    if isinstance(value, Mapping):
-        for key, child in value.items():
-            normalized_key = re.sub(r"[^a-z0-9]", "", str(key).lower())
-            if normalized_key == "sectoken":
-                token = _valid_alibaba_sec_token(child)
-                if token is not None:
-                    return token
-        for child in value.values():
-            token = _extract_alibaba_sec_token_from_payload(child)
-            if token is not None:
-                return token
-    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        for child in value:
-            token = _extract_alibaba_sec_token_from_payload(child)
-            if token is not None:
-                return token
-    return None
-
-
-def _extract_alibaba_sec_token_from_text(value: str) -> Optional[str]:
-    decoded = html.unescape(value)
-    try:
-        payload = json.loads(decoded)
-    except json.JSONDecodeError:
-        payload = None
-    token = _extract_alibaba_sec_token_from_payload(payload)
-    if token is not None:
-        return token
-    match = re.search(
-        r"""(?ix)
-        (?:["']?(?:sec_token|secToken)["']?)
-        \s*[:=]\s*
-        ["']([^"'\r\n]+)["']
-        """,
-        decoded,
-    )
-    return _valid_alibaba_sec_token(match.group(1)) if match else None
-
-
-def _bootstrap_alibaba_web_session(
-    config: ProviderStatusLoopConfig,
-    session: AlibabaWebSession,
-) -> tuple[Optional[str], str]:
-    console_url = urlsplit(ALIBABA_TOKEN_PLAN_CONSOLE_URL)._replace(fragment="").geturl()
-    candidates = (
-        ("dashboard", console_url),
-        ("user_info", ALIBABA_TOKEN_PLAN_USER_INFO_URL),
-    )
-    successful_source: Optional[str] = None
-    for source, url in candidates:
-        ticket_snapshot = _alibaba_login_ticket_cookie_snapshot(session)
-        try:
-            with session.opener.open(
-                _alibaba_session_request(url),
-                timeout=config.alibaba_quota_poll_http_timeout_seconds,
-            ) as response:
-                status_code = int(
-                    getattr(response, "status", None) or response.getcode()
-                )
-                response_body = response.read(1_048_577)
-        except (
-            urllib_error.HTTPError,
-            urllib_error.URLError,
-            TimeoutError,
-            OSError,
-        ):
-            continue
-        _canonicalize_rotated_alibaba_login_ticket(
-            session,
-            previous=ticket_snapshot,
-        )
-        if status_code < 200 or status_code >= 300 or len(response_body) > 1_048_576:
-            continue
-        if successful_source is None:
-            successful_source = source
-        token = _extract_alibaba_sec_token_from_text(
-            response_body.decode("utf-8", errors="replace")
-        )
-        if token is not None:
-            session.sec_token = token
-            return token, source
-    if successful_source is not None:
-        return None, successful_source
-    raise AlibabaWebAuthError(
-        "Alibaba web session bootstrap did not produce a usable console response."
-    )
-
-
-def _alibaba_quota_response_requires_sec_token(
-    *,
-    status_code: Optional[int],
-    response_body: Optional[str],
-) -> bool:
-    del status_code
-    normalized = (response_body or "").lower()
-    return any(
-        hint in normalized
-        for hint in (
-            "sec_token",
-            "sectoken",
-            "security token",
-            "csrf token",
-        )
+        mint_attempted=mint_attempted,
+        mint_succeeded=mint_succeeded,
+        refresh_attempted=refresh_attempted,
+        refresh_succeeded=refresh_succeeded,
     )
 
 
@@ -7236,9 +7152,12 @@ _ALIBABA_AUTH_STRONG_KEYWORDS = frozenset(
     {
         "needlogin",
         "notlogin",
+        "notlogined",
         "unlogin",
         "unauthorized",
         "unauthenticated",
+        "notauthorized",
+        "notauthorised",
         "loginrequired",
         "authenticationfailed",
         "authfailure",
@@ -7246,6 +7165,7 @@ _ALIBABA_AUTH_STRONG_KEYWORDS = frozenset(
         "nopermission",
         "permissiondenied",
         "accessdenied",
+        "authoritypolicies",
     }
 )
 _ALIBABA_AUTH_WEAK_KEYWORDS = frozenset(
@@ -7325,6 +7245,8 @@ def _alibaba_error_text_matches_auth_allowlist(response: Mapping[str, Any]) -> b
         value = response.get(field)
         if isinstance(value, str):
             haystack_parts.append(value)
+        elif value is not None:
+            haystack_parts.append(str(value))
     if not haystack_parts:
         return False
     raw = " ".join(haystack_parts)
@@ -7437,58 +7359,29 @@ def _extract_alibaba_console_reset_card_list(
     return provider_data
 
 
-def _apply_alibaba_session_bootstrap(
-    config: ProviderStatusLoopConfig,
-    state: AlibabaQuotaFetchState,
-    *,
-    endpoint: str,
-    status_code: Optional[int],
-) -> None:
-    state.bootstrap_attempted = True
-    state.session.sec_token = None
-    state.request_auth.pop("sec_token", None)
-    try:
-        sec_token, source = _bootstrap_alibaba_web_session(
-            config,
-            state.session,
-        )
-    except AlibabaWebAuthError:
-        raise _alibaba_quota_poll_error(
-            endpoint=endpoint,
-            status_code=status_code,
-            telemetry_class="auth",
-            **state.error_metadata(),
-        ) from None
-    state.bootstrap_source = source
-    if sec_token is not None:
-        state.request_auth["sec_token"] = sec_token
-        state.token_fallback_attempted = True
-        state.token_fallback_succeeded = True
-        state.token_fallback_source = source
-
-
 def _handle_alibaba_quota_http_error(
     config: ProviderStatusLoopConfig,
     state: AlibabaQuotaFetchState,
     exc: urllib_error.HTTPError,
     *,
     endpoint: str,
+    auth: Mapping[str, Any],
+    task_state: Optional[SidecarTaskState] = None,
 ) -> None:
     try:
-        response_body = exc.read().decode("utf-8", errors="replace")
+        exc.read()
     except Exception:
-        response_body = None
-    token_required = _alibaba_quota_response_requires_sec_token(
-        status_code=exc.code,
-        response_body=response_body,
-    )
-    auth_failure = exc.code in {401, 403} or token_required
-    if not state.bootstrap_attempted and auth_failure:
-        _apply_alibaba_session_bootstrap(
+        pass
+    auth_failure = exc.code in {401, 403}
+    if auth_failure and not state.refresh_attempted:
+        _refresh_alibaba_console_access_token(
             config,
+            state.session,
+            auth,
             state,
             endpoint=endpoint,
             status_code=exc.code,
+            task_state=task_state,
         )
         return
     if auth_failure:
@@ -7549,6 +7442,8 @@ def _parse_alibaba_quota_success(
     endpoint: str,
     status_code: Optional[int],
     response_body: Optional[str],
+    auth: Mapping[str, Any],
+    task_state: Optional[SidecarTaskState] = None,
 ) -> Optional[Any]:
     if status_code is None or status_code < 200 or status_code >= 300:
         raise _alibaba_quota_poll_error(
@@ -7580,25 +7475,6 @@ def _parse_alibaba_quota_success(
             ),
             **state.error_metadata(),
         )
-    token_required = _alibaba_quota_response_requires_sec_token(
-        status_code=status_code,
-        response_body=response_body,
-    )
-    if not state.bootstrap_attempted and token_required:
-        _apply_alibaba_session_bootstrap(
-            config,
-            state,
-            endpoint=endpoint,
-            status_code=status_code,
-        )
-        return None
-    if token_required:
-        raise _alibaba_quota_poll_error(
-            endpoint=endpoint,
-            status_code=status_code,
-            telemetry_class="auth",
-            **state.error_metadata(),
-        )
     try:
         if endpoint == "reset_cards":
             return _extract_alibaba_console_reset_card_list(
@@ -7607,12 +7483,15 @@ def _parse_alibaba_quota_success(
             )
         return _extract_alibaba_console_data(payload, endpoint=endpoint)
     except AlibabaQuotaPollError as exc:
-        if exc.telemetry_class == "auth" and not state.bootstrap_attempted:
-            _apply_alibaba_session_bootstrap(
+        if exc.telemetry_class == "auth" and not state.refresh_attempted:
+            _refresh_alibaba_console_access_token(
                 config,
+                state.session,
+                auth,
                 state,
                 endpoint=endpoint,
                 status_code=status_code,
+                task_state=task_state,
             )
             return None
         raise _alibaba_quota_poll_error(
@@ -7630,32 +7509,35 @@ def _fetch_alibaba_quota_payload(
     api_name: str,
     endpoint: str,
     auth: Mapping[str, Any],
-    session: Optional[AlibabaWebSession] = None,
+    session: Optional[AlibabaConsoleSession] = None,
+    task_state: Optional[SidecarTaskState] = None,
 ) -> Dict[str, Any]:
     if session is None:
-        session = _new_alibaba_web_session(
-            config,
-            login_ticket=str(auth["login_ticket"]),
+        session = AlibabaConsoleSession(
+            credential_fingerprint=str(auth["credential_fingerprint"]),
+            access_token=(
+                None if task_state is None else task_state.alibaba_access_token
+            ),
         )
-    request_auth: Dict[str, str] = {}
-    if session.sec_token is not None:
-        request_auth["sec_token"] = session.sec_token
-    state = AlibabaQuotaFetchState(
-        session=session,
-        request_auth=request_auth,
-        cookie_only_attempted="sec_token" not in request_auth,
-    )
+    state = AlibabaQuotaFetchState(session=session)
     while True:
+        access_token = _ensure_alibaba_console_access_token(
+            config,
+            session,
+            auth,
+            state,
+            task_state=task_state,
+        )
         state.attempt_count += 1
         request = _build_alibaba_quota_request(
             config,
             api_name=api_name,
-            auth=state.request_auth,
+            access_token=access_token,
         )
         status_code: Optional[int] = None
         response_body: Optional[str] = None
         try:
-            with session.opener.open(
+            with ALIBABA_QUOTA_HTTP_OPEN_FN(
                 request,
                 timeout=config.alibaba_quota_poll_http_timeout_seconds,
             ) as response:
@@ -7667,6 +7549,8 @@ def _fetch_alibaba_quota_payload(
                 state,
                 exc,
                 endpoint=endpoint,
+                auth=auth,
+                task_state=task_state,
             )
             continue
         except (urllib_error.URLError, TimeoutError, OSError) as exc:
@@ -7684,11 +7568,12 @@ def _fetch_alibaba_quota_payload(
             endpoint=endpoint,
             status_code=status_code,
             response_body=response_body,
+            auth=auth,
+            task_state=task_state,
         )
         if provider_payload is None:
             continue
-        if state.bootstrap_attempted:
-            state.bootstrap_succeeded = True
+        _cache_alibaba_access_token(task_state, session)
         return {
             "status_code": status_code,
             "payload": provider_payload,
@@ -8196,11 +8081,13 @@ def _alibaba_quota_request_contract_summary(
         "reset_card_contract": ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API,
         "parser_version": ALIBABA_TOKEN_PLAN_PARSER_VERSION,
         "reset_card_parser_version": ALIBABA_TOKEN_PLAN_RESET_CARD_PARSER_VERSION,
-        "configured_auth_file": bool(config.alibaba_web_auth_file),
         "auth_source": None,
-        "header_names": ["content-type", "cookie", "referer", "user-agent"],
-        "cookie_only_first": None,
-        "sec_token_persisted": False,
+        "header_names": ["authorization", "content-type"],
+        "token_cached": False,
+        "mint_attempted": False,
+        "mint_succeeded": False,
+        "refresh_attempted": False,
+        "refresh_succeeded": False,
         "usage_interval_seconds": config.alibaba_quota_poll_interval_seconds,
         "subscription_interval_seconds": (config.alibaba_subscription_poll_interval_seconds),
         "poll_max_attempts": max(1, config.alibaba_quota_poll_max_attempts),
@@ -10720,11 +10607,10 @@ def _alibaba_subscription_refresh_due(
     state: SidecarTaskState,
     *,
     now_monotonic: float,
-    login_ticket: str,
+    credential_fingerprint: str,
 ) -> bool:
-    auth_fingerprint = _alibaba_login_ticket_fingerprint(login_ticket)
-    auth_changed = state.alibaba_auth_fingerprint != auth_fingerprint
-    state.alibaba_auth_fingerprint = auth_fingerprint
+    auth_changed = state.alibaba_auth_fingerprint != credential_fingerprint
+    state.alibaba_auth_fingerprint = credential_fingerprint
     return bool(
         auth_changed
         or state.alibaba_subscription_payload is None
@@ -10743,30 +10629,18 @@ def _merge_alibaba_fetch_summary(
     summary[f"{endpoint}_status_code"] = fetched["status_code"]
     summary[f"{endpoint}_attempt_count"] = fetched.get("attempt_count", 1)
     summary[f"{endpoint}_retry_count"] = fetched.get("retry_count", 0)
-    if "cookie_only_attempted" in fetched:
-        summary["cookie_only_first"] = bool(fetched["cookie_only_attempted"])
-    summary["bootstrap_attempted"] = bool(
-        summary["bootstrap_attempted"] or fetched.get("bootstrap_attempted")
+    summary["mint_attempted"] = bool(
+        summary["mint_attempted"] or fetched.get("mint_attempted")
     )
-    summary["bootstrap_succeeded"] = bool(
-        summary["bootstrap_succeeded"] or fetched.get("bootstrap_succeeded")
+    summary["mint_succeeded"] = bool(
+        summary["mint_succeeded"] or fetched.get("mint_succeeded")
     )
-    if fetched.get("bootstrap_source"):
-        summary["bootstrap_source"] = fetched["bootstrap_source"]
-    summary["token_fallback_attempted"] = bool(
-        summary["token_fallback_attempted"]
-        or fetched.get("token_fallback_attempted")
+    summary["refresh_attempted"] = bool(
+        summary["refresh_attempted"] or fetched.get("refresh_attempted")
     )
-    summary["token_fallback_succeeded"] = bool(
-        summary["token_fallback_succeeded"]
-        or fetched.get("token_fallback_succeeded")
+    summary["refresh_succeeded"] = bool(
+        summary["refresh_succeeded"] or fetched.get("refresh_succeeded")
     )
-    if fetched.get("token_fallback_source"):
-        summary["token_fallback_source"] = fetched["token_fallback_source"]
-    if "cookie_names" in fetched:
-        summary["cookie_names"] = list(fetched["cookie_names"])
-    if "cookie_count" in fetched:
-        summary["cookie_count"] = int(fetched["cookie_count"])
 
 
 def _record_alibaba_poll_failure(
@@ -10774,6 +10648,7 @@ def _record_alibaba_poll_failure(
     exc: BaseException,
 ) -> None:
     summary["telemetry_status"] = "degraded"
+    summary["last_good_state_retained"] = True
     summary["error_class"] = exc.__class__.__name__
     summary["error_message"] = _redacted_failure_message(str(exc))
     if isinstance(exc, AlibabaQuotaPollError):
@@ -10782,19 +10657,22 @@ def _record_alibaba_poll_failure(
         summary[f"{exc.endpoint}_status_code"] = exc.status_code
         summary[f"{exc.endpoint}_attempt_count"] = exc.attempt_count
         summary[f"{exc.endpoint}_retry_count"] = exc.retry_count
-        summary["cookie_only_first"] = exc.cookie_only_attempted
-        summary["bootstrap_attempted"] = exc.bootstrap_attempted
-        summary["bootstrap_succeeded"] = exc.bootstrap_succeeded
-        summary["bootstrap_source"] = exc.bootstrap_source
-        summary["cookie_names"] = exc.cookie_names
-        summary["cookie_count"] = exc.cookie_count
-        summary["token_fallback_attempted"] = exc.token_fallback_attempted
-        summary["token_fallback_succeeded"] = exc.token_fallback_succeeded
-        summary["token_fallback_source"] = exc.token_fallback_source
+        summary["mint_attempted"] = bool(
+            summary.get("mint_attempted") or exc.mint_attempted
+        )
+        summary["mint_succeeded"] = bool(
+            summary.get("mint_succeeded") or exc.mint_succeeded
+        )
+        summary["refresh_attempted"] = bool(
+            summary.get("refresh_attempted") or exc.refresh_attempted
+        )
+        summary["refresh_succeeded"] = bool(
+            summary.get("refresh_succeeded") or exc.refresh_succeeded
+        )
     elif isinstance(exc, probes.ProviderStatusDatabaseWriteSkipped):
         summary["telemetry_class"] = "database_write_skipped"
         summary["error_endpoint"] = "database"
-    elif isinstance(exc, AlibabaWebAuthError):
+    elif isinstance(exc, AlibabaAuthError):
         summary["telemetry_class"] = "auth"
         summary["error_endpoint"] = "authentication"
     elif isinstance(exc, ValueError):
@@ -10844,33 +10722,25 @@ def _run_alibaba_quota_poll_task(
         "error_class": None,
         "error_message": None,
         "credential_reloaded": False,
-        "bootstrap_attempted": False,
-        "bootstrap_succeeded": False,
-        "bootstrap_source": None,
-        "token_fallback_attempted": False,
-        "token_fallback_succeeded": False,
-        "token_fallback_source": None,
-        "cookie_names": [],
-        "cookie_count": 0,
-        "ticket_reset": False,
+        "credential_reset": False,
+        "last_good_state_retained": False,
         **_alibaba_quota_request_contract_summary(config),
     }
     try:
-        auth = _load_alibaba_web_auth(config)
+        auth = _load_alibaba_ram_auth(config)
         summary["auth_source"] = auth["auth_source"]
         summary["credential_reloaded"] = bool(auth["credential_reloaded"])
-        session, ticket_reset = _ensure_alibaba_web_session(
-            config,
+        session, credential_reset = _ensure_alibaba_console_session(
             state,
-            login_ticket=str(auth["login_ticket"]),
+            auth=auth,
         )
-        summary["ticket_reset"] = ticket_reset
-        summary.update(session.cookie_metadata())
+        summary["credential_reset"] = credential_reset
+        summary["token_cached"] = bool(session.access_token)
         subscription_due = _alibaba_subscription_refresh_due(
             config,
             state,
             now_monotonic=now_monotonic,
-            login_ticket=str(auth["login_ticket"]),
+            credential_fingerprint=str(auth["credential_fingerprint"]),
         )
         if subscription_due:
             state.alibaba_subscription_last_attempt_monotonic = now_monotonic
@@ -10881,6 +10751,7 @@ def _run_alibaba_quota_poll_task(
                 endpoint="subscription",
                 auth=auth,
                 session=session,
+                task_state=state,
             )
             _merge_alibaba_fetch_summary(
                 summary,
@@ -10902,6 +10773,7 @@ def _run_alibaba_quota_poll_task(
             endpoint="usage",
             auth=auth,
             session=session,
+            task_state=state,
         )
         _merge_alibaba_fetch_summary(summary, fetched_usage, endpoint="usage")
         payloads = _build_alibaba_quota_rate_limit_payloads(
@@ -10925,6 +10797,7 @@ def _run_alibaba_quota_poll_task(
             endpoint="reset_cards",
             auth=auth,
             session=session,
+            task_state=state,
         )
         _merge_alibaba_fetch_summary(
             summary,
@@ -10972,9 +10845,9 @@ def _run_alibaba_quota_poll_task(
             )
             summary["reset_card_persisted"] = True
         summary["telemetry_status"] = "valid"
+        summary["token_cached"] = bool(state.alibaba_access_token)
     except Exception as exc:
-        if state.alibaba_web_session is not None:
-            summary.update(state.alibaba_web_session.cookie_metadata())
+        summary["token_cached"] = bool(state.alibaba_access_token)
         _record_alibaba_poll_failure(summary, exc)
 
     return {

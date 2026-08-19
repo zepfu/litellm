@@ -116,19 +116,20 @@ totals are metadata only and do not populate `response_cost` or
 AAWM deployments may enable the provider-status sidecar's read-only
 ModelStudio quota poll. It records the Token Plan 5-hour and 7-day Credit
 windows without sending model traffic or using the plan-specific inference API
-key. See `docs/aawm-provider-status-observations.md` for the
-`AAWM_ALIBABA_WEB_AUTH_FILE` session-file contract, polling cadence, stored
-quota keys, and degraded-session behavior. During migration, `ALIBABA_WEB_KEY`
-remains a fallback while `AAWM_ALIBABA_WEB_AUTH_FILE` is proven in dev; remove
-that fallback after proof.
+key. The sidecar mints a console Bearer from RAM `ALIBABA_RAM_KEY` /
+`ALIBABA_RAM_SECRET` (optional `ALIBABA_RAM_PRINCIPAL`) and calls the
+Singapore CLI gateway `/cli/api.json`. See
+`docs/aawm-provider-status-observations.md` for the RAM mint contract,
+polling cadence, stored quota keys, and degraded last-good behavior.
 
-The same maintained web session also observes the manual weekly reset-card
+The same RAM-minted Bearer also observes the manual weekly reset-card
 inventory through the console's read-only reset-card list contract. Manual
 cards are separate from the automatic rolling 5-hour and 7-day quota-window
 resets. The sidecar records sanitized card type and validity timestamps plus a
 hashed card identity and lifecycle state; it never stores the raw card number
-and never consumes or applies a reset. Available-card totals and per-card
-current state are exposed through the shared provider-credit observations.
+and never consumes or applies a reset (`/reset-card/use` is out of scope).
+Available-card totals and per-card current state are exposed through the
+shared provider-credit observations.
 
 LiteLLM does not invent a per-token price for this subscription. Consumers must
 not interpret a null invoice cost as a free request.

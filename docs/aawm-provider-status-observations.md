@@ -613,66 +613,38 @@ valid and transitions any previously available cards without fabricating a
 card row. The poll event exposes the aggregate as
 `reset_card_available_count`.
 
-Authentication is file-driven and reloaded on each due poll. The sidecar reads
-`AAWM_ALIBABA_WEB_AUTH_FILE` (default:
-`/home/zepfu/.alibaba/token-plan-session.json`) and requires a JSON payload in
-this exact shape:
+Authentication uses international RAM access-key credentials, not a console
+ticket file, cookie jar, or `sec_token`. On each due poll the sidecar reads
+`ALIBABA_RAM_KEY` and `ALIBABA_RAM_SECRET` (optional
+`ALIBABA_RAM_PRINCIPAL` contributes only to a hashed fingerprint). Those
+credentials sign one ACS3-HMAC-SHA256 `GenerateCLIAccessToken` POST to
+`modelstudio.ap-southeast-1.aliyuncs.com` `/modelstudio/cli/generateAccessToken`
+(API version `2026-02-10`) with an empty body. The returned `cliAccessToken`
+is cached in process memory and sent as `Authorization: Bearer` to the
+Singapore ModelStudio CLI gateway
+`https://bailian-singapore-cs.alibabacloud.com/cli/api.json`. Gateway form
+bodies carry only `params` plus `region=ap-southeast-1`. China console hosts
+are rejected.
 
-```json
-{"version":1,"login_ticket":"..."}
-```
+The cached Bearer is reused across subscription, usage, and reset-card list
+calls and across poll cycles. A known application-level authentication
+envelope (`NotLogined`, `NoPermission`, `Team.NotAuthorised`,
+`AuthorityPolicies.NoPermission`, or the narrow login/session allowlist) or
+an HTTP 401/403 triggers at most one remint per endpoint fetch, followed by a
+single replay. A still-failing replay fails closed as `auth` with no second
+mint. Mint HTTP 401/403 or a `NoPermission` mint envelope is also `auth`.
+Failed polls keep last-good subscription and reset-card current state.
 
-The auth file must be a regular file at the mounted path, not a symlink, and
-mode `0600`. The file payload seeds the console session; the auth mount is
-read-only and the sidecar never writes it.
-
-The canonical `login_ticket` seeds a process-lifetime in-memory console
-session. The session is a stdlib `CookieJar` behind an
-`HTTPCookieProcessor` opener with an origin-restricted cookie policy that
-accepts and returns cookies only for the ModelStudio console and gateway
-HTTPS hosts; no other origin's cookies are stored or forwarded. The ticket
-is seeded as a `login_aliyunid_ticket` cookie on those hosts. If a poll
-reloads the auth file and the ticket fingerprint has changed, the session
-(jar and cached token) is discarded and rebuilt from the new ticket; this
-reset is reported as value-free `ticket_reset=true`. The session lives in
-sidecar memory only and is never persisted to disk; it is discarded on
-process exit.
-
-The first quota fetch in a new process-lifetime session starts cookie-only.
-Response `Set-Cookie` updates are retained in memory across subscription,
-usage, and reset-card list calls and across poll cycles. If a bootstrap
-discovers a `sec_token`, it is cached only in that in-memory session, so later
-fetches may include it on their initial request. The `cookie_only_first`
-telemetry field reports whether the initial request of the reported fetch
-actually omitted `sec_token`.
-
-When a quota response is a known application-level authentication envelope
-(the narrow fail-closed auth classification), or an HTTP 401/403, the sidecar
-runs one bounded session bootstrap even when the envelope carries no
-`sec_token` hint: a dashboard request, then `/tool/user/info.json`, both
-through the session opener so their response cookies renew the in-memory
-session. At most one bootstrap runs per endpoint fetch, followed by a single
-replay of the original call; a still-failing replay fails closed as `auth`
-with no second bootstrap. If the bootstrap response exposes a `sec_token`, it
-is attached to the replayed call and remains available to later fetches, but
-is never persisted.
-
-Each `alibaba_quota_poll` event reports the legacy `token_fallback_*` fields
-(retained for compatibility; a bootstrap that yields a `sec_token` also sets
-them) plus value-free session telemetry: `bootstrap_attempted`,
-`bootstrap_succeeded`, `bootstrap_source` (`dashboard` or `user_info`),
-`cookie_names` (sorted cookie names only, never values), `cookie_count`, and
-`ticket_reset`. No cookie value, ticket, account identifier, or response body
+Each `alibaba_quota_poll` event reports value-free mint telemetry:
+`auth_source`, `token_cached`, `mint_attempted`, `mint_succeeded`,
+`refresh_attempted`, `refresh_succeeded`, and `credential_reset`. No RAM
+secret, principal, Bearer token, account identifier, cookie, or response body
 is ever logged or persisted.
 
 The sidecar does not copy the Token Plan inference API key, run browser
-flows, launch secondary CLIs, ask for passwords, or automate MFA. Session
-lifetime is finite: expired sessions are surfaced as degraded events until
-`AAWM_ALIBABA_WEB_AUTH_FILE` is replaced.
-
-The replacement procedure is atomic write-to-temp plus rename to the configured
-path. A replaced file is picked up automatically on the next due poll without
-container restart.
+flows, launch `bl` or other secondary CLIs, ask for passwords, or automate
+MFA. Credential rotation is a process environment change; a new RAM
+fingerprint discards the cached Bearer and remints on the next due poll.
 
 The usage and manual reset-card list requests run at startup and then on the
 configured usage cadence. Subscription metadata is refreshed at startup and
@@ -683,10 +655,11 @@ the raw identifier is not persisted.
 
 Relevant environment variables:
 
-- `AAWM_ALIBABA_WEB_AUTH_FILE`: file-backed session bootstrap for quota polling.
-  Defaults to `/home/zepfu/.alibaba/token-plan-session.json`.
-- `ALIBABA_WEB_KEY`: legacy migration fallback only. Never log or persist its
-  decoded values in database fields. Remove this fallback after dev proof.
+- `ALIBABA_RAM_KEY`: RAM access-key ID used to mint the console Bearer.
+- `ALIBABA_RAM_SECRET`: RAM access-key secret used for ACS3 mint signing.
+  Never log or persist this value.
+- `ALIBABA_RAM_PRINCIPAL`: optional RAM principal. Used only to hash the
+  in-memory credential fingerprint; never logged or persisted.
 - `AAWM_ALIBABA_QUOTA_POLL_ENABLED`: enables the scheduled poll.
 - `AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS`: minimum seconds between usage
   polls; the managed sidecar default is `300`.
@@ -694,9 +667,10 @@ Relevant environment variables:
   subscription refreshes; the managed sidecar default is `21600`.
 - `AAWM_ALIBABA_QUOTA_POLL_HTTP_TIMEOUT_SECONDS`: request timeout; the managed
   sidecar default is `30`.
-- `AAWM_ALIBABA_QUOTA_GATEWAY_URL`: override for the undocumented ModelStudio
-  gateway base URL. Keep the default unless contract verification proves a
-  provider change.
+- `AAWM_ALIBABA_QUOTA_GATEWAY_URL`: override for the ModelStudio CLI gateway.
+  Defaults to `https://bailian-singapore-cs.alibabacloud.com/cli/api.json`.
+  Keep the default unless contract verification proves a provider change.
+  China hosts are not valid overrides.
 - `AAWM_ALIBABA_QUOTA_POLL_MAX_ATTEMPTS`: bounded attempts per endpoint call;
   the managed sidecar default is `2`.
 - `AAWM_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS`: base exponential backoff for
@@ -708,9 +682,10 @@ credit observation/insert counts, and whether the reset-card state was
 persisted. Runtime success requires HTTP 200 responses, an active subscription,
 valid recognized usage windows, a valid reset-card array (including an empty
 array), successful configured persistence, and no credential, raw response,
-raw card number, account identity, cookie value, or traceback in container
-logs. Authentication, transport, HTTP, envelope, or field-validation failures
-are degraded and leave the last-known reset-card current state unchanged.
+raw card number, account identity, RAM secret, Bearer token, or traceback in
+container logs. Authentication, transport, HTTP, envelope, or field-validation
+failures are degraded and leave the last-known reset-card current state
+unchanged. The reset-card poll is list-only and never calls `/reset-card/use`.
 
 Anthropic unified response headers persist separate weekly buckets:
 

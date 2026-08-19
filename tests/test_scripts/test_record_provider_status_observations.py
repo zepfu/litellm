@@ -5,13 +5,10 @@ import os
 import time
 from argparse import Namespace
 from datetime import datetime, timedelta, timezone
-from email.message import Message
 from io import BytesIO
 from pathlib import Path
 from subprocess import TimeoutExpired
 from urllib import error as urllib_error
-from urllib import request as urllib_request
-from urllib import response as urllib_response
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -541,7 +538,6 @@ def _alibaba_quota_poll_config(**overrides):
         alibaba_subscription_poll_interval_seconds=21600.0,
         alibaba_quota_poll_http_timeout_seconds=30.0,
         alibaba_quota_gateway_url=loop.DEFAULT_ALIBABA_QUOTA_GATEWAY_URL,
-        alibaba_web_auth_file="/nonexistent/aawm-test-alibaba-session.json",
         alibaba_quota_poll_max_attempts=2,
         alibaba_quota_poll_retry_backoff_seconds=0.5,
     )
@@ -550,38 +546,50 @@ def _alibaba_quota_poll_config(**overrides):
     return config
 
 
-def _alibaba_web_key(
-    *,
-    login_ticket: str = "login-ticket-secret",
-    sec_token: str = "security-token-secret",
-) -> str:
-    payload = {
-        "v": 1,
-        "login_ticket": login_ticket,
-        "sec_token": sec_token,
-    }
-    return (
-        base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
-        .rstrip(b"=")
-        .decode("ascii")
-    )
+ALIBABA_TEST_RAM_KEY = "LTAI5tTestAccessKeyId"
+ALIBABA_TEST_RAM_SECRET = "testAccessKeySecretValue"
+ALIBABA_TEST_RAM_PRINCIPAL = "ram-principal-test"
+ALIBABA_TEST_ACS_DATE = "2026-08-19T12:00:00Z"
+ALIBABA_TEST_SIGNATURE_NONCE = "fixed-nonce-00000000-0000-4000-8000-000000000001"
+ALIBABA_TEST_EMPTY_BODY_SHA256 = (
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+)
+ALIBABA_TEST_ACS3_SIGNATURE = (
+    "ebe667be26342cb207e85b1e5c9f74acbc2e8065521a7f7b559f7cc8bf35f562"
+)
 
 
-def _write_alibaba_web_auth_file(
-    path: Path,
+def _set_alibaba_ram_env(
+    monkeypatch,
     *,
-    login_ticket: str = "login-ticket-secret",
+    access_key_id: str = ALIBABA_TEST_RAM_KEY,
+    access_key_secret: str = ALIBABA_TEST_RAM_SECRET,
+    principal: str | None = ALIBABA_TEST_RAM_PRINCIPAL,
 ) -> None:
-    path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "login_ticket": login_ticket,
-            }
-        ),
-        encoding="utf-8",
-    )
-    path.chmod(0o600)
+    monkeypatch.delenv("ALIBABA_WEB_KEY", raising=False)
+    monkeypatch.delenv("AAWM_ALIBABA_WEB_AUTH_FILE", raising=False)
+    monkeypatch.setenv("ALIBABA_RAM_KEY", access_key_id)
+    monkeypatch.setenv("ALIBABA_RAM_SECRET", access_key_secret)
+    if principal is None:
+        monkeypatch.delenv("ALIBABA_RAM_PRINCIPAL", raising=False)
+    else:
+        monkeypatch.setenv("ALIBABA_RAM_PRINCIPAL", principal)
+
+
+def _clear_alibaba_ram_env(monkeypatch) -> None:
+    for name in (
+        "ALIBABA_RAM_KEY",
+        "ALIBABA_RAM_SECRET",
+        "ALIBABA_RAM_PRINCIPAL",
+        "ALIBABA_WEB_KEY",
+        "AAWM_ALIBABA_WEB_AUTH_FILE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _alibaba_ram_auth(monkeypatch, **kwargs):
+    _set_alibaba_ram_env(monkeypatch, **kwargs)
+    return loop._load_alibaba_ram_auth(_alibaba_quota_poll_config())
 
 
 class _FakeAlibabaHTTPResponse:
@@ -602,36 +610,112 @@ class _FakeAlibabaHTTPResponse:
         return None
 
 
-class _FakeAlibabaOpener:
-    def __init__(self, open_fn) -> None:
-        self._open_fn = open_fn
-
-    def open(self, request, timeout):
-        return self._open_fn(request, timeout)
+def _alibaba_http_success(payload) -> _FakeAlibabaHTTPResponse:
+    body = payload if isinstance(payload, (bytes, str)) else json.dumps(payload)
+    return _FakeAlibabaHTTPResponse(body)
 
 
-class _AlibabaHTTPSHandler(urllib_request.BaseHandler):
-    def __init__(self, open_fn) -> None:
-        self._open_fn = open_fn
+def _alibaba_mint_ok(token: str = "cli-access-token-secret") -> tuple[int, str]:
+    return 200, json.dumps({"cliAccessToken": token, "Success": True})
 
-    def https_open(self, request):
-        payload, status, set_cookies = self._open_fn(request)
-        headers = Message()
-        for cookie in set_cookies:
-            headers.add_header("Set-Cookie", cookie)
-        return urllib_response.addinfourl(
-            BytesIO(payload.encode("utf-8")),
-            headers,
-            request.full_url,
-            code=status,
+
+def _alibaba_mint_nopermission() -> tuple[int, str]:
+    return 200, json.dumps(
+        {
+            "Success": False,
+            "Code": "NoPermission",
+            "Message": "RAM secret-looking-denied-detail",
+        }
+    )
+
+
+def _install_alibaba_mint(monkeypatch, *responses):
+    remaining = list(responses)
+    calls: list[dict] = []
+
+    def fake_mint(*, host, path, headers, body, timeout_seconds):
+        calls.append(
+            {
+                "host": host,
+                "path": path,
+                "headers": dict(headers),
+                "body": body,
+                "timeout_seconds": timeout_seconds,
+            }
         )
+        if not remaining:
+            raise AssertionError("unexpected extra Alibaba mint call")
+        return remaining.pop(0)
+
+    monkeypatch.setattr(loop, "ALIBABA_MINT_HTTP_POST_FN", fake_mint)
+    return calls
 
 
-def _set_alibaba_test_opener(session, open_fn) -> None:
-    opener = urllib_request.OpenerDirector()
-    opener.add_handler(urllib_request.HTTPCookieProcessor(session.cookie_jar))
-    opener.add_handler(_AlibabaHTTPSHandler(open_fn))
-    session.opener = opener
+def _install_alibaba_quota_open(monkeypatch, handler):
+    calls: list = []
+
+    def fake_open(request, timeout=None):
+        calls.append(request)
+        return handler(request, timeout)
+
+    monkeypatch.setattr(loop, "ALIBABA_QUOTA_HTTP_OPEN_FN", fake_open)
+    return calls
+
+
+def _alibaba_gateway_success_handler(
+    *,
+    usage_payload=None,
+    subscription_payload=None,
+    reset_cards=None,
+):
+    usage = (
+        _alibaba_weekly_only_usage_payload()
+        if usage_payload is None
+        else usage_payload
+    )
+    subscription = (
+        _alibaba_subscription_payload()
+        if subscription_payload is None
+        else subscription_payload
+    )
+    cards = [] if reset_cards is None else reset_cards
+
+    def handler(request, timeout):
+        del timeout
+        api_name = parse_qs(urlsplit(request.full_url).query).get("api", [None])[0]
+        if api_name == loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API:
+            payload = subscription
+        elif api_name == loop.ALIBABA_TOKEN_PLAN_USAGE_API:
+            payload = usage
+        elif api_name == loop.ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API:
+            payload = cards
+        else:
+            raise AssertionError(f"unexpected Alibaba gateway api {api_name!r}")
+        return _alibaba_http_success(_alibaba_console_envelope(payload))
+
+    return handler
+
+
+def _assert_no_alibaba_secrets(serialized: str, extra: tuple[str, ...] = ()) -> None:
+    forbidden = (
+        ALIBABA_TEST_RAM_SECRET,
+        ALIBABA_TEST_RAM_PRINCIPAL,
+        "cli-access-token-secret",
+        "console-bearer-secret",
+        "stale-bearer-secret",
+        "login-ticket-secret",
+        "security-token-secret",
+        "sec_token",
+        "login_aliyunid_ticket",
+        "RAM secret-looking-denied-detail",
+        *extra,
+    )
+    for secret in forbidden:
+        assert secret not in serialized, secret
+
+
+def _alibaba_poll_events(events) -> list[dict]:
+    return [event for event in events if event.get("event") == "alibaba_quota_poll"]
 
 
 def _alibaba_console_envelope(data) -> dict:
@@ -654,6 +738,13 @@ def _alibaba_usage_payload() -> dict:
         "per5HourResetTime": 1784686920000,
         "per1WeekPercentage": 0.5,
         "per1WeekResetTime": 1785083160000,
+    }
+
+
+def _alibaba_weekly_only_usage_payload() -> dict:
+    return {
+        "per1WeekResetTime": 1786299120000,
+        "per1WeekPercentage": 1.0,
     }
 
 
@@ -2961,11 +3052,7 @@ def test_loop_config_reads_alibaba_quota_poll_env_defaults(monkeypatch) -> None:
     monkeypatch.setenv("AAWM_ALIBABA_QUOTA_POLL_HTTP_TIMEOUT_SECONDS", "45")
     monkeypatch.setenv(
         "AAWM_ALIBABA_QUOTA_GATEWAY_URL",
-        "https://example.invalid/data/api.json",
-    )
-    monkeypatch.setenv(
-        "AAWM_ALIBABA_WEB_AUTH_FILE",
-        "/tmp/alibaba-session.json",
+        "https://bailian-singapore-cs.alibabacloud.com/cli/api.json",
     )
     monkeypatch.setenv("AAWM_ALIBABA_QUOTA_POLL_MAX_ATTEMPTS", "4")
     monkeypatch.setenv("AAWM_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS", "1.25")
@@ -2976,159 +3063,140 @@ def test_loop_config_reads_alibaba_quota_poll_env_defaults(monkeypatch) -> None:
     assert config.alibaba_quota_poll_interval_seconds == 600.0
     assert config.alibaba_subscription_poll_interval_seconds == 43200.0
     assert config.alibaba_quota_poll_http_timeout_seconds == 45.0
-    assert config.alibaba_quota_gateway_url == "https://example.invalid/data/api.json"
-    assert config.alibaba_web_auth_file == "/tmp/alibaba-session.json"
+    assert config.alibaba_quota_gateway_url == loop.DEFAULT_ALIBABA_QUOTA_GATEWAY_URL
+    assert not hasattr(config, "alibaba_web_auth_file")
     assert config.alibaba_quota_poll_max_attempts == 4
     assert config.alibaba_quota_poll_retry_backoff_seconds == 1.25
+    assert loop.DEFAULT_ALIBABA_QUOTA_GATEWAY_URL.endswith("/cli/api.json")
 
 
-def test_alibaba_auth_file_precedes_env_and_request_is_cookie_only(
-    tmp_path,
+def test_alibaba_ram_auth_signs_empty_body_and_builds_bearer_request(
     monkeypatch,
+    capsys,
 ) -> None:
-    auth_path = tmp_path / "token-plan-session.json"
-    _write_alibaba_web_auth_file(auth_path)
-    monkeypatch.setenv(
-        "ALIBABA_WEB_KEY",
-        _alibaba_web_key(login_ticket="legacy-login-ticket"),
+    config = _alibaba_quota_poll_config()
+    auth = _alibaba_ram_auth(monkeypatch)
+    headers = loop._alibaba_acs3_signed_headers(
+        access_key_id=auth["access_key_id"],
+        access_key_secret=auth["access_key_secret"],
+        host=loop.ALIBABA_TOKEN_PLAN_MINT_HOST,
+        pathname=loop.ALIBABA_TOKEN_PLAN_MINT_PATH,
+        action=loop.ALIBABA_TOKEN_PLAN_MINT_ACTION,
+        version=loop.ALIBABA_TOKEN_PLAN_MINT_VERSION,
+        method="POST",
+        body="",
+        query_string="",
+        acs_date=ALIBABA_TEST_ACS_DATE,
+        signature_nonce=ALIBABA_TEST_SIGNATURE_NONCE,
     )
-    config = _alibaba_quota_poll_config(
-        alibaba_web_auth_file=str(auth_path),
-    )
-
-    auth = loop._load_alibaba_web_auth(config)
     request = loop._build_alibaba_quota_request(
         config,
         api_name=loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API,
-        auth=auth,
+        access_token="console-bearer-secret",
     )
-    session = loop._new_alibaba_web_session(
-        config,
-        login_ticket=auth["login_ticket"],
-    )
-    session.cookie_jar.add_cookie_header(request)
-
     query = parse_qs(urlsplit(request.full_url).query)
     body = parse_qs((request.data or b"").decode("utf-8"))
     params = json.loads(body["params"][0])
+    captured = capsys.readouterr()
+
+    assert loop.ALIBABA_TOKEN_PLAN_MINT_HOST.endswith(".aliyuncs.com")
+    assert not loop._alibaba_host_is_china(loop.ALIBABA_TOKEN_PLAN_MINT_HOST)
+    assert not loop._alibaba_host_is_china(urlsplit(config.alibaba_quota_gateway_url).hostname)
+    assert headers["x-acs-action"] == "GenerateCLIAccessToken"
+    assert headers["x-acs-version"] == "2026-02-10"
+    assert headers["x-acs-content-sha256"] == ALIBABA_TEST_EMPTY_BODY_SHA256
+    assert headers["authorization"].startswith("ACS3-HMAC-SHA256 Credential=")
+    assert f"Signature={ALIBABA_TEST_ACS3_SIGNATURE}" in headers["authorization"]
+    assert ALIBABA_TEST_RAM_SECRET not in headers["authorization"]
+    assert urlsplit(request.full_url).path == "/cli/api.json"
     assert query["api"] == [loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API]
     assert query["action"] == ["IntlBroadScopeAspnGateway"]
     assert body["region"] == ["ap-southeast-1"]
+    assert set(body) == {"params", "region"}
+    assert request.get_header("Authorization") == "Bearer console-bearer-secret"
+    assert request.get_header("Cookie") is None
     assert "sec_token" not in body
-    assert "password" not in body
-    assert "mfa" not in body
-    assert request.get_header("Cookie") == ("login_aliyunid_ticket=login-ticket-secret")
-    assert request.get_header("Authorization") is None
-    assert request.get_header("Cookie").count("=") == 1
-    assert auth["auth_source"] == "auth_file"
+    assert "_v" not in query
+    assert auth["auth_source"] == "ALIBABA_RAM_KEY"
     assert auth["credential_reloaded"] is True
     assert params["Api"] == loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API
-    assert params["Data"]["queryInstanceInfoRequest"] == {"commodityCode": loop.ALIBABA_TOKEN_PLAN_COMMODITY_CODE}
-    assert params["Data"]["cornerstoneParam"]["userNickName"] == ""
-    assert params["Data"]["cornerstoneParam"]["userPrincipalName"] == ""
-
-
-@pytest.mark.parametrize(
-    "encoded_payload",
-    [
-        "",
-        "not-base64",
-        base64.urlsafe_b64encode(b'{"v":2}').decode("ascii"),
-        base64.urlsafe_b64encode(b'{"v":1,"sec_token":"token"}').decode("ascii"),
-    ],
-)
-def test_alibaba_web_envelope_rejects_missing_or_invalid_auth(
-    monkeypatch,
-    encoded_payload,
-) -> None:
-    if encoded_payload:
-        monkeypatch.setenv("ALIBABA_WEB_KEY", encoded_payload)
-    else:
-        monkeypatch.delenv("ALIBABA_WEB_KEY", raising=False)
-
-    with pytest.raises(loop.AlibabaWebAuthError):
-        loop._load_alibaba_web_auth(
-            _alibaba_quota_poll_config(
-                alibaba_web_auth_file="/missing/alibaba-session.json",
-            )
-        )
-
-
-def test_alibaba_web_key_is_migration_fallback_and_sec_token_is_ignored(
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("ALIBABA_WEB_KEY", _alibaba_web_key())
-    config = _alibaba_quota_poll_config(
-        alibaba_web_auth_file="/missing/alibaba-session.json",
-    )
-
-    auth = loop._load_alibaba_web_auth(config)
-
-    assert auth == {
-        "login_ticket": "login-ticket-secret",
-        "auth_source": "ALIBABA_WEB_KEY",
-        "credential_reloaded": False,
+    assert params["Data"]["queryInstanceInfoRequest"] == {
+        "commodityCode": loop.ALIBABA_TOKEN_PLAN_COMMODITY_CODE
     }
+    _assert_no_alibaba_secrets(json.dumps(headers) + captured.out + captured.err)
 
 
 @pytest.mark.parametrize(
-    ("payload", "mode", "error_match"),
+    "env_updates",
     [
-        ({"version": 1, "login_ticket": "ticket"}, 0o640, "mode 0600"),
-        ({"version": 2, "login_ticket": "ticket"}, 0o600, "unsupported version"),
-        (
-            {"version": 1, "login_ticket": "ticket", "sec_token": "secret"},
-            0o600,
-            "only version and login_ticket",
-        ),
+        {"ALIBABA_RAM_KEY": "", "ALIBABA_RAM_SECRET": ALIBABA_TEST_RAM_SECRET},
+        {"ALIBABA_RAM_KEY": ALIBABA_TEST_RAM_KEY, "ALIBABA_RAM_SECRET": ""},
+        {"ALIBABA_RAM_KEY": "bad\nkey", "ALIBABA_RAM_SECRET": ALIBABA_TEST_RAM_SECRET},
     ],
 )
-def test_alibaba_auth_file_rejects_unsafe_or_invalid_contract(
-    tmp_path,
+def test_alibaba_ram_auth_rejects_incomplete_or_invalid_credentials(
     monkeypatch,
-    payload,
-    mode,
-    error_match,
+    env_updates,
 ) -> None:
-    auth_path = tmp_path / "token-plan-session.json"
-    auth_path.write_text(json.dumps(payload), encoding="utf-8")
-    auth_path.chmod(mode)
-    monkeypatch.setenv("ALIBABA_WEB_KEY", _alibaba_web_key())
+    _set_alibaba_ram_env(monkeypatch)
+    for name, value in env_updates.items():
+        if value:
+            monkeypatch.setenv(name, value)
+        else:
+            monkeypatch.delenv(name, raising=False)
 
-    with pytest.raises(loop.AlibabaWebAuthError, match=error_match):
-        loop._load_alibaba_web_auth(
-            _alibaba_quota_poll_config(
-                alibaba_web_auth_file=str(auth_path),
-            )
+    with pytest.raises(loop.AlibabaAuthError):
+        loop._load_alibaba_ram_auth(_alibaba_quota_poll_config())
+
+
+def test_alibaba_china_hosts_are_never_selected() -> None:
+    config = _alibaba_quota_poll_config()
+    assert loop._alibaba_host_is_china("dashscope.aliyuncs.com") is True
+    assert loop._alibaba_host_is_china("token-plan.cn-beijing.maas.aliyuncs.com") is True
+    assert loop._alibaba_host_is_china("modelstudio.cn-beijing.aliyuncs.com") is True
+    assert loop._alibaba_host_is_china("bailian.console.aliyun.com") is True
+    assert loop._alibaba_host_is_china(loop.ALIBABA_TOKEN_PLAN_MINT_HOST) is False
+    assert (
+        loop._alibaba_host_is_china(
+            urlsplit(loop.DEFAULT_ALIBABA_QUOTA_GATEWAY_URL).hostname
         )
-
-
-def test_alibaba_auth_file_rejects_symlink_and_malformed_json(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    target = tmp_path / "target.json"
-    _write_alibaba_web_auth_file(target)
-    symlink = tmp_path / "token-plan-session.json"
-    symlink.symlink_to(target)
-    monkeypatch.setenv("ALIBABA_WEB_KEY", _alibaba_web_key())
-
-    with pytest.raises(loop.AlibabaWebAuthError, match="symlink"):
-        loop._load_alibaba_web_auth(
+        is False
+    )
+    with pytest.raises(loop.AlibabaAuthError, match="China"):
+        loop._alibaba_quota_request_url(
             _alibaba_quota_poll_config(
-                alibaba_web_auth_file=str(symlink),
-            )
+                alibaba_quota_gateway_url="https://bailian.console.aliyun.com/cli/api.json"
+            ),
+            api_name=loop.ALIBABA_TOKEN_PLAN_USAGE_API,
         )
+    assert "cn-beijing" not in config.alibaba_quota_gateway_url
+    assert "aliyun.com" not in urlsplit(config.alibaba_quota_gateway_url).hostname
 
-    malformed = tmp_path / "malformed.json"
-    malformed.write_text('{"version":1,', encoding="utf-8")
-    malformed.chmod(0o600)
-    with pytest.raises(loop.AlibabaWebAuthError, match="not valid JSON"):
-        loop._load_alibaba_web_auth(
-            _alibaba_quota_poll_config(
-                alibaba_web_auth_file=str(malformed),
-            )
-        )
+
+def test_alibaba_quota_request_never_uses_cookie_or_ticket_file(monkeypatch) -> None:
+    config = _alibaba_quota_poll_config()
+    auth = _alibaba_ram_auth(monkeypatch)
+    request = loop._build_alibaba_quota_request(
+        config,
+        api_name=loop.ALIBABA_TOKEN_PLAN_USAGE_API,
+        access_token="console-bearer-secret",
+    )
+    body = parse_qs((request.data or b"").decode("utf-8"))
+    query = parse_qs(urlsplit(request.full_url).query)
+
+    assert "login_ticket" not in auth
+    assert "sec_token" not in auth
+    assert "cookie_jar" not in vars(loop.AlibabaConsoleSession("fingerprint"))
+    assert request.get_header("Authorization") == "Bearer console-bearer-secret"
+    assert request.get_header("Cookie") is None
+    assert "sec_token" not in body
+    assert "login_aliyunid_ticket" not in body
+    assert "_v" not in query
+    assert not hasattr(config, "alibaba_web_auth_file")
+    assert not hasattr(loop, "_load_alibaba_web_auth")
+    assert not hasattr(loop, "_new_alibaba_web_session")
+    assert not hasattr(loop, "_bootstrap_alibaba_web_session")
+    assert not hasattr(loop, "AlibabaWebSession")
 
 
 def test_alibaba_quota_payloads_map_consumed_fractions_and_hash_identity() -> None:
@@ -3790,57 +3858,145 @@ def test_alibaba_quota_payloads_reject_partial_5h_window() -> None:
         )
 
 
-@pytest.mark.parametrize("status_code", [401, 403])
-def test_fetch_alibaba_quota_payload_bootstraps_and_replays_http_auth_failure(
-    status_code,
-) -> None:
-    config = _alibaba_quota_poll_config(alibaba_quota_poll_max_attempts=3)
-    session = loop._new_alibaba_web_session(
-        config,
-        login_ticket="login-ticket-secret",
+def test_alibaba_acs3_mint_signs_empty_body_on_intl_host(monkeypatch, capsys) -> None:
+    mint_calls = _install_alibaba_mint(monkeypatch, _alibaba_mint_ok("console-bearer-secret"))
+    token = loop._mint_alibaba_console_access_token(
+        _alibaba_quota_poll_config(),
+        _alibaba_ram_auth(monkeypatch),
+        acs_date=ALIBABA_TEST_ACS_DATE,
+        signature_nonce=ALIBABA_TEST_SIGNATURE_NONCE,
     )
-    calls = {"quota": 0, "bootstrap": 0}
+    captured = capsys.readouterr()
+    request = mint_calls[0]
 
-    def fake_open(request, timeout):
-        del timeout
-        if request.method == "GET":
-            calls["bootstrap"] += 1
-            return _FakeAlibabaHTTPResponse(
-                '<script>{"sec_token":"resolved-token-secret"}</script>'
-            )
-        calls["quota"] += 1
-        if calls["quota"] == 1:
-            raise urllib_error.HTTPError(
-                config.alibaba_quota_gateway_url,
-                status_code,
-                "auth failure",
-                hdrs=None,
-                fp=BytesIO(b"{}"),
-            )
-        return _FakeAlibabaHTTPResponse(
-            json.dumps(_alibaba_console_envelope(_alibaba_usage_payload()))
+    assert token == "console-bearer-secret"
+    assert request["host"] == "modelstudio.ap-southeast-1.aliyuncs.com"
+    assert request["path"] == "/modelstudio/cli/generateAccessToken"
+    assert request["body"] == b""
+    assert request["headers"]["x-acs-action"] == "GenerateCLIAccessToken"
+    assert request["headers"]["x-acs-version"] == "2026-02-10"
+    assert request["headers"]["x-acs-content-sha256"] == ALIBABA_TEST_EMPTY_BODY_SHA256
+    assert request["headers"]["authorization"].endswith(
+        f"Signature={ALIBABA_TEST_ACS3_SIGNATURE}"
+    )
+    assert not loop._alibaba_host_is_china(request["host"])
+    _assert_no_alibaba_secrets(
+        json.dumps(request["headers"]) + captured.out + captured.err
+    )
+
+
+@pytest.mark.parametrize(
+    ("status_code", "payload"),
+    [
+        (403, {"Code": "NoPermission", "Message": "denied", "Success": False}),
+        (200, {"Code": "NoPermission", "Message": "denied", "Success": False}),
+        (403, {"success": False, "errorCode": "Forbidden", "errorMsg": "denied"}),
+    ],
+)
+def test_alibaba_mint_permission_denied_is_auth_and_keeps_last_good(
+    monkeypatch,
+    status_code,
+    payload,
+) -> None:
+    monkeypatch.setattr(
+        loop,
+        "ALIBABA_MINT_HTTP_POST_FN",
+        lambda **_kwargs: (status_code, json.dumps(payload)),
+    )
+    auth = _alibaba_ram_auth(monkeypatch)
+    last_good_subscription = loop._parse_alibaba_subscription_payload(
+        _alibaba_subscription_payload()
+    )
+    state = loop.SidecarTaskState(
+        alibaba_auth_fingerprint=str(auth["credential_fingerprint"]),
+        alibaba_quota_last_attempt_monotonic=0.0,
+        alibaba_subscription_last_attempt_monotonic=50.0,
+        alibaba_subscription_payload=last_good_subscription,
+    )
+
+    with pytest.raises(loop.AlibabaQuotaPollError) as exc_info:
+        loop._mint_alibaba_console_access_token(
+            _alibaba_quota_poll_config(),
+            auth,
         )
 
-    session.opener = _FakeAlibabaOpener(fake_open)
+    events = _alibaba_poll_events(
+        loop.run_due_sidecar_tasks(
+            _alibaba_quota_poll_config(),
+            state,
+            now_monotonic=400.0,
+        )
+    )
 
-    fetched = loop._fetch_alibaba_quota_payload(
+    assert exc_info.value.telemetry_class == "auth"
+    assert exc_info.value.endpoint == "authentication"
+    assert exc_info.value.mint_attempted is True
+    assert events[0]["telemetry_class"] == "auth"
+    assert events[0]["error_endpoint"] == "authentication"
+    assert events[0]["last_good_state_retained"] is True
+    assert events[0]["mint_attempted"] is True
+    assert events[0]["mint_succeeded"] is False
+    assert events[0]["subscription_refreshed"] is False
+    assert events[0]["persisted"] is False
+    assert state.alibaba_subscription_payload is last_good_subscription
+    assert "NoPermission" not in str(exc_info.value)
+    _assert_no_alibaba_secrets(str(exc_info.value) + json.dumps(events))
+
+
+def test_fetch_alibaba_quota_payload_mints_once_and_reuses_cached_bearer(
+    monkeypatch,
+) -> None:
+    config = _alibaba_quota_poll_config()
+    auth = _alibaba_ram_auth(monkeypatch)
+    mint_calls = _install_alibaba_mint(
+        monkeypatch, _alibaba_mint_ok("console-bearer-secret")
+    )
+
+    def handler(request, timeout):
+        del timeout
+        body = parse_qs((request.data or b"").decode("utf-8"))
+        assert set(body) == {"params", "region"}
+        assert request.get_header("Cookie") is None
+        return _alibaba_http_success(_alibaba_console_envelope(_alibaba_usage_payload()))
+
+    gateway_calls = _install_alibaba_quota_open(monkeypatch, handler)
+    state = loop.SidecarTaskState()
+    session = loop.AlibabaConsoleSession(credential_fingerprint=auth["credential_fingerprint"])
+
+    first = loop._fetch_alibaba_quota_payload(
         config,
         api_name=loop.ALIBABA_TOKEN_PLAN_USAGE_API,
         endpoint="usage",
-        auth={"login_ticket": "login-ticket-secret"},
+        auth=auth,
         session=session,
+        task_state=state,
+    )
+    second = loop._fetch_alibaba_quota_payload(
+        config,
+        api_name=loop.ALIBABA_TOKEN_PLAN_USAGE_API,
+        endpoint="usage",
+        auth=auth,
+        session=session,
+        task_state=state,
     )
 
-    assert calls == {"quota": 2, "bootstrap": 1}
-    assert fetched["status_code"] == 200
-    assert fetched["attempt_count"] == 2
-    assert fetched["retry_count"] == 0
-    assert fetched["bootstrap_attempted"] is True
-    assert fetched["bootstrap_succeeded"] is True
-    assert fetched["bootstrap_source"] == "dashboard"
-    assert fetched["token_fallback_attempted"] is True
-    assert fetched["token_fallback_succeeded"] is True
-    assert fetched["token_fallback_source"] == "dashboard"
+    assert len(mint_calls) == 1
+    assert mint_calls[0]["host"] == loop.ALIBABA_TOKEN_PLAN_MINT_HOST
+    assert mint_calls[0]["path"] == loop.ALIBABA_TOKEN_PLAN_MINT_PATH
+    assert mint_calls[0]["body"] == b""
+    assert [
+        request.get_header("Authorization") for request in gateway_calls
+    ] == [
+        "Bearer console-bearer-secret",
+        "Bearer console-bearer-secret",
+    ]
+    assert first["payload"] == _alibaba_usage_payload()
+    assert second["payload"] == _alibaba_usage_payload()
+    assert first["mint_attempted"] is True
+    assert first["mint_succeeded"] is True
+    assert second["mint_attempted"] is False
+    assert state.alibaba_access_token == "console-bearer-secret"
+    assert session.access_token == "console-bearer-secret"
 
 
 @pytest.mark.parametrize("failure_kind", ["429", "503", "transport"])
@@ -3852,41 +4008,26 @@ def test_fetch_alibaba_quota_payload_retries_transient_failure(
         alibaba_quota_poll_max_attempts=2,
         alibaba_quota_poll_retry_backoff_seconds=0.5,
     )
-    session = loop._new_alibaba_web_session(
-        config,
-        login_ticket="login-ticket-secret",
-    )
     attempts = {"count": 0}
     sleeps: list[float] = []
 
     def fake_urlopen(request, timeout):
-        del request, timeout
+        del timeout
+        assert request.get_header("Authorization") == "Bearer console-bearer-secret"
         attempts["count"] += 1
         if attempts["count"] == 1:
             if failure_kind == "transport":
                 raise urllib_error.URLError("temporary connection failure")
-            status_code = int(failure_kind)
             raise urllib_error.HTTPError(
                 config.alibaba_quota_gateway_url,
-                status_code,
+                int(failure_kind),
                 "temporary failure",
                 hdrs=None,
                 fp=BytesIO(b"{}"),
             )
-        payload = _alibaba_console_envelope(_alibaba_usage_payload())
-        return type(
-            "Resp",
-            (),
-            {
-                "status": 200,
-                "getcode": lambda self: 200,
-                "read": lambda self: json.dumps(payload).encode("utf-8"),
-                "__enter__": lambda self: self,
-                "__exit__": lambda self, *args: None,
-            },
-        )()
+        return _alibaba_http_success(_alibaba_console_envelope(_alibaba_usage_payload()))
 
-    session.opener = _FakeAlibabaOpener(fake_urlopen)
+    _install_alibaba_quota_open(monkeypatch, fake_urlopen)
     monkeypatch.setattr(
         loop,
         "ALIBABA_QUOTA_POLL_SLEEP_FN",
@@ -3897,8 +4038,11 @@ def test_fetch_alibaba_quota_payload_retries_transient_failure(
         config,
         api_name=loop.ALIBABA_TOKEN_PLAN_USAGE_API,
         endpoint="usage",
-        auth={"login_ticket": "login-ticket-secret"},
-        session=session,
+        auth=_alibaba_ram_auth(monkeypatch),
+        session=loop.AlibabaConsoleSession(
+            credential_fingerprint="fingerprint",
+            access_token="console-bearer-secret",
+        ),
     )
 
     assert fetched["status_code"] == 200
@@ -3908,348 +4052,212 @@ def test_fetch_alibaba_quota_payload_retries_transient_failure(
     assert sleeps == [0.5]
 
 
-def test_bootstrap_alibaba_session_prefers_dashboard_then_user_info() -> None:
+def test_fetch_alibaba_quota_payload_gateway_success_uses_cli_api_and_bearer(
+    monkeypatch,
+) -> None:
     config = _alibaba_quota_poll_config()
-    session = loop._new_alibaba_web_session(
-        config,
-        login_ticket="login-ticket-secret",
+    inner = _alibaba_gateway_success_handler(
+        usage_payload=_alibaba_weekly_only_usage_payload(),
+        reset_cards=[],
     )
-    calls: list[str] = []
 
-    def dashboard_urlopen(request, timeout):
-        del timeout
-        calls.append(request.full_url)
-        return _FakeAlibabaHTTPResponse(
-            '<script>window.session={"sec_token":"dashboard-token-secret"}</script>'
-        )
-
-    session.opener = _FakeAlibabaOpener(dashboard_urlopen)
-    assert loop._bootstrap_alibaba_web_session(
-        config,
-        session,
-    ) == ("dashboard-token-secret", "dashboard")
-    assert len(calls) == 1
-
-    calls.clear()
-
-    def user_info_urlopen(request, timeout):
-        del timeout
-        calls.append(request.full_url)
-        if request.full_url == loop.ALIBABA_TOKEN_PLAN_USER_INFO_URL:
-            return _FakeAlibabaHTTPResponse(
-                json.dumps({"data": {"secToken": "user-info-token-secret"}})
-            )
-        return _FakeAlibabaHTTPResponse("<html>no token</html>")
-
-    session.opener = _FakeAlibabaOpener(user_info_urlopen)
-    assert loop._bootstrap_alibaba_web_session(
-        config,
-        session,
-    ) == ("user-info-token-secret", "user_info")
-    assert calls[-1] == loop.ALIBABA_TOKEN_PLAN_USER_INFO_URL
-
-
-def test_fetch_alibaba_quota_payload_uses_one_bounded_session_bootstrap() -> None:
-    config = _alibaba_quota_poll_config(alibaba_quota_poll_max_attempts=1)
-    session = loop._new_alibaba_web_session(
-        config,
-        login_ticket="login-ticket-secret",
-    )
-    quota_bodies: list[dict[str, list[str]]] = []
-    dashboard_calls = 0
-
-    def fake_urlopen(request, timeout):
-        nonlocal dashboard_calls
-        del timeout
-        if request.method == "GET":
-            dashboard_calls += 1
-            return _FakeAlibabaHTTPResponse(
-                '<script>{"sec_token":"resolved-token-secret"}</script>'
-            )
+    def handler(request, timeout):
+        query = parse_qs(urlsplit(request.full_url).query)
         body = parse_qs((request.data or b"").decode("utf-8"))
-        quota_bodies.append(body)
-        if len(quota_bodies) == 1:
-            raise urllib_error.HTTPError(
-                request.full_url,
-                400,
-                "token required",
-                hdrs=None,
-                fp=BytesIO(b'{"message":"sec_token is required"}'),
-            )
-        return _FakeAlibabaHTTPResponse(
-            json.dumps(_alibaba_console_envelope(_alibaba_usage_payload()))
-        )
+        request._alibaba_seen = {
+            "path": urlsplit(request.full_url).path,
+            "api": query["api"][0],
+            "authorization": request.get_header("Authorization"),
+            "cookie": request.get_header("Cookie"),
+            "body_keys": sorted(body),
+        }
+        return inner(request, timeout)
 
-    session.opener = _FakeAlibabaOpener(fake_urlopen)
-
-    fetched = loop._fetch_alibaba_quota_payload(
+    calls = _install_alibaba_quota_open(monkeypatch, handler)
+    session = loop.AlibabaConsoleSession(
+        credential_fingerprint="fingerprint",
+        access_token="console-bearer-secret",
+    )
+    usage = loop._fetch_alibaba_quota_payload(
         config,
         api_name=loop.ALIBABA_TOKEN_PLAN_USAGE_API,
         endpoint="usage",
-        auth={"login_ticket": "login-ticket-secret"},
+        auth=_alibaba_ram_auth(monkeypatch),
         session=session,
     )
-
-    assert "sec_token" not in quota_bodies[0]
-    assert quota_bodies[1]["sec_token"] == ["resolved-token-secret"]
-    assert dashboard_calls == 1
-    assert fetched["attempt_count"] == 2
-    assert fetched["retry_count"] == 0
-    assert fetched["bootstrap_attempted"] is True
-    assert fetched["bootstrap_succeeded"] is True
-    assert fetched["bootstrap_source"] == "dashboard"
-    assert fetched["token_fallback_attempted"] is True
-    assert fetched["token_fallback_succeeded"] is True
-    assert fetched["token_fallback_source"] == "dashboard"
-
-
-def test_fetch_alibaba_auth_envelope_bootstrap_reuses_cookie_on_replay() -> None:
-    config = _alibaba_quota_poll_config(alibaba_quota_poll_max_attempts=1)
-    session = loop._new_alibaba_web_session(
+    subscription = loop._fetch_alibaba_quota_payload(
         config,
-        login_ticket="login-ticket-secret",
-    )
-    quota_calls = 0
-    bootstrap_calls = 0
-    replay_cookie = ""
-
-    def fake_open(request):
-        nonlocal bootstrap_calls, quota_calls, replay_cookie
-        if request.method == "GET":
-            bootstrap_calls += 1
-            if request.full_url == loop.ALIBABA_TOKEN_PLAN_USER_INFO_URL:
-                return ("{}", 200, [])
-            return (
-                "<html>cookie-only bootstrap</html>",
-                200,
-                [
-                    "console_session=bootstrap-cookie-secret; "
-                    "Domain=.alibabacloud.com; Path=/; Secure; HttpOnly"
-                ],
-            )
-        quota_calls += 1
-        if quota_calls == 1:
-            return (json.dumps(_alibaba_auth_envelope_live()), 200, [])
-        replay_cookie = request.get_header("Cookie") or ""
-        body = parse_qs((request.data or b"").decode("utf-8"))
-        assert "sec_token" not in body
-        return (
-            json.dumps(_alibaba_console_envelope(_alibaba_usage_payload())),
-            200,
-            [],
-        )
-
-    _set_alibaba_test_opener(session, fake_open)
-
-    fetched = loop._fetch_alibaba_quota_payload(
-        config,
-        api_name=loop.ALIBABA_TOKEN_PLAN_USAGE_API,
-        endpoint="usage",
-        auth={"login_ticket": "login-ticket-secret"},
+        api_name=loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API,
+        endpoint="subscription",
+        auth=_alibaba_ram_auth(monkeypatch),
         session=session,
     )
+    reset_cards = loop._fetch_alibaba_quota_payload(
+        config,
+        api_name=loop.ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API,
+        endpoint="reset_cards",
+        auth=_alibaba_ram_auth(monkeypatch),
+        session=session,
+    )
+    seen = [request._alibaba_seen for request in calls]
 
-    assert quota_calls == 2
-    assert bootstrap_calls == 2
-    assert "console_session=bootstrap-cookie-secret" in replay_cookie
-    assert fetched["bootstrap_attempted"] is True
-    assert fetched["bootstrap_succeeded"] is True
-    assert fetched["bootstrap_source"] == "dashboard"
-    assert fetched["token_fallback_attempted"] is False
-    assert fetched["token_fallback_succeeded"] is False
-    assert fetched["token_fallback_source"] is None
-    assert fetched["cookie_names"] == [
-        "console_session",
-        "login_aliyunid_ticket",
-        "login_aliyunid_ticket",
+    assert [row["path"] for row in seen] == ["/cli/api.json"] * 3
+    assert [row["api"] for row in seen] == [
+        loop.ALIBABA_TOKEN_PLAN_USAGE_API,
+        loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API,
+        loop.ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API,
     ]
-    assert fetched["cookie_count"] == 3
+    assert {row["authorization"] for row in seen} == {"Bearer console-bearer-secret"}
+    assert all(row["cookie"] is None for row in seen)
+    assert all(row["body_keys"] == ["params", "region"] for row in seen)
+    assert usage["payload"]["per1WeekPercentage"] == 1.0
+    assert "per5HourPercentage" not in usage["payload"]
+    assert subscription["payload"] == _alibaba_subscription_payload()
+    assert reset_cards["payload"] == []
 
 
-def test_alibaba_login_ticket_rotation_is_canonical_across_allowed_hosts() -> None:
-    config = _alibaba_quota_poll_config()
-    session = loop._new_alibaba_web_session(
-        config,
-        login_ticket="stale-login-ticket-secret",
-    )
-
-    def fake_open(request):
-        assert request.method == "GET"
-        return (
-            '<script>{"sec_token":"resolved-token-secret"}</script>',
-            200,
-            [
-                "login_aliyunid_ticket=renewed-login-ticket-secret; "
-                "Domain=.alibabacloud.com; Path=/; Secure; HttpOnly"
-            ],
-        )
-
-    _set_alibaba_test_opener(session, fake_open)
-
-    assert loop._bootstrap_alibaba_web_session(
-        config,
-        session,
-    ) == ("resolved-token-secret", "dashboard")
-
-    console_request = urllib_request.Request(loop.ALIBABA_TOKEN_PLAN_CONSOLE_URL)
-    gateway_request = urllib_request.Request(config.alibaba_quota_gateway_url)
-    session.cookie_jar.add_cookie_header(console_request)
-    session.cookie_jar.add_cookie_header(gateway_request)
-
-    assert console_request.get_header("Cookie") == (
-        "login_aliyunid_ticket=renewed-login-ticket-secret"
-    )
-    assert gateway_request.get_header("Cookie") == (
-        "login_aliyunid_ticket=renewed-login-ticket-secret"
-    )
-    assert {
-        (cookie.domain, cookie.value)
-        for cookie in session.cookie_jar
-        if cookie.name == "login_aliyunid_ticket"
-    } == {
-        (host, "renewed-login-ticket-secret") for host in session.allowed_hosts
-    }
-    assert session.cookie_metadata() == {
-        "cookie_names": [
-            "login_aliyunid_ticket",
-            "login_aliyunid_ticket",
-        ],
-        "cookie_count": 2,
-    }
-
-
-def test_alibaba_cookie_jar_rejects_off_origin_cookies_and_sends() -> None:
-    config = _alibaba_quota_poll_config()
-    session = loop._new_alibaba_web_session(
-        config,
-        login_ticket="login-ticket-secret",
-    )
-    console_request = urllib_request.Request(loop.ALIBABA_TOKEN_PLAN_CONSOLE_URL)
-    headers = Message()
-    headers.add_header(
-        "Set-Cookie",
-        "off_origin=off-origin-secret; Domain=evil.invalid; Path=/; Secure",
-    )
-    response = urllib_response.addinfourl(
-        BytesIO(b""),
-        headers,
-        console_request.full_url,
-        code=200,
-    )
-
-    session.cookie_jar.extract_cookies(response, console_request)
-
-    assert session.cookie_metadata() == {
-        "cookie_names": [
-            "login_aliyunid_ticket",
-            "login_aliyunid_ticket",
-        ],
-        "cookie_count": 2,
-    }
-    off_origin_request = urllib_request.Request("https://evil.invalid/")
-    session.cookie_jar.add_cookie_header(off_origin_request)
-    assert off_origin_request.get_header("Cookie") is None
-
-
-def test_fetch_alibaba_quota_payload_fails_closed_when_bootstrap_fails() -> None:
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_fetch_alibaba_quota_payload_remints_once_on_http_auth_failure(
+    monkeypatch,
+    status_code,
+) -> None:
     config = _alibaba_quota_poll_config(alibaba_quota_poll_max_attempts=3)
-    session = loop._new_alibaba_web_session(
-        config,
-        login_ticket="login-ticket-secret",
-    )
-    calls = {"quota": 0, "bootstrap": 0}
+    mint_calls = []
+    quota_calls = []
 
-    def fake_open(request, timeout):
-        del timeout
-        if request.method == "GET":
-            calls["bootstrap"] += 1
-            raise urllib_error.URLError("bootstrap unavailable")
-        calls["quota"] += 1
-        raise urllib_error.HTTPError(
-            request.full_url,
-            401,
-            "auth failure",
-            hdrs=None,
-            fp=BytesIO(b'{"unlogged":"account-secret"}'),
-        )
-
-    session.opener = _FakeAlibabaOpener(fake_open)
-
-    with pytest.raises(loop.AlibabaQuotaPollError) as exc_info:
-        loop._fetch_alibaba_quota_payload(
-            config,
-            api_name=loop.ALIBABA_TOKEN_PLAN_USAGE_API,
-            endpoint="usage",
-            auth={"login_ticket": "login-ticket-secret"},
-            session=session,
-        )
-
-    assert calls == {"quota": 1, "bootstrap": 2}
-    assert exc_info.value.telemetry_class == "auth"
-    assert exc_info.value.attempt_count == 1
-    assert exc_info.value.retry_count == 0
-    assert exc_info.value.bootstrap_attempted is True
-    assert exc_info.value.bootstrap_succeeded is False
-    assert exc_info.value.bootstrap_source is None
-    assert exc_info.value.cookie_names == [
-        "login_aliyunid_ticket",
-        "login_aliyunid_ticket",
-    ]
-    assert exc_info.value.cookie_count == 2
-    assert "account-secret" not in str(exc_info.value)
-
-
-def test_fetch_alibaba_quota_payload_does_not_repeat_session_bootstrap() -> None:
-    config = _alibaba_quota_poll_config(alibaba_quota_poll_max_attempts=1)
-    session = loop._new_alibaba_web_session(
-        config,
-        login_ticket="login-ticket-secret",
-    )
-    quota_calls = 0
-    dashboard_calls = 0
+    def fake_mint(_config, _auth, **_kwargs):
+        mint_calls.append("mint")
+        return "console-bearer-secret"
 
     def fake_urlopen(request, timeout):
-        nonlocal quota_calls, dashboard_calls
         del timeout
-        if request.method == "GET":
-            dashboard_calls += 1
-            return _FakeAlibabaHTTPResponse(
-                '<script>{"sec_token":"resolved-token-secret"}</script>'
+        quota_calls.append(request.get_header("Authorization"))
+        if len(quota_calls) == 1:
+            raise urllib_error.HTTPError(
+                config.alibaba_quota_gateway_url,
+                status_code,
+                "auth failure",
+                hdrs=None,
+                fp=BytesIO(b"{}"),
             )
-        quota_calls += 1
-        raise urllib_error.HTTPError(
-            request.full_url,
-            400,
-            "token required",
-            hdrs=None,
-            fp=BytesIO(b'{"message":"sec_token is required"}'),
+        return _alibaba_http_success(_alibaba_console_envelope(_alibaba_usage_payload()))
+
+    monkeypatch.setattr(loop, "_mint_alibaba_console_access_token", fake_mint)
+    monkeypatch.setattr(loop, "ALIBABA_QUOTA_HTTP_OPEN_FN", fake_urlopen)
+    fetched = loop._fetch_alibaba_quota_payload(
+        config,
+        api_name=loop.ALIBABA_TOKEN_PLAN_USAGE_API,
+        endpoint="usage",
+        auth=_alibaba_ram_auth(monkeypatch),
+        session=loop.AlibabaConsoleSession(
+            credential_fingerprint="fingerprint",
+            access_token="stale-bearer-secret",
+        ),
+    )
+
+    assert mint_calls == ["mint"]
+    assert quota_calls == [
+        "Bearer stale-bearer-secret",
+        "Bearer console-bearer-secret",
+    ]
+    assert fetched["status_code"] == 200
+    assert fetched["attempt_count"] == 2
+    assert fetched["refresh_attempted"] is True
+    assert fetched["refresh_succeeded"] is True
+    assert fetched["mint_succeeded"] is True
+
+
+def test_fetch_alibaba_notlogined_remints_once_then_succeeds(monkeypatch) -> None:
+    config = _alibaba_quota_poll_config(alibaba_quota_poll_max_attempts=1)
+    mint_calls = []
+    quota_calls = []
+
+    def fake_mint(_config, _auth, **_kwargs):
+        mint_calls.append("mint")
+        return "console-bearer-secret"
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        quota_calls.append(request.get_header("Authorization"))
+        if len(quota_calls) == 1:
+            return _alibaba_http_success(
+                _alibaba_auth_envelope_live(
+                    error_code="NotLogined",
+                    error_msg="please login via gateway console",
+                )
+            )
+        return _alibaba_http_success(_alibaba_console_envelope(_alibaba_usage_payload()))
+
+    monkeypatch.setattr(loop, "_mint_alibaba_console_access_token", fake_mint)
+    monkeypatch.setattr(loop, "ALIBABA_QUOTA_HTTP_OPEN_FN", fake_urlopen)
+    fetched = loop._fetch_alibaba_quota_payload(
+        config,
+        api_name=loop.ALIBABA_TOKEN_PLAN_USAGE_API,
+        endpoint="usage",
+        auth=_alibaba_ram_auth(monkeypatch),
+        session=loop.AlibabaConsoleSession(
+            credential_fingerprint="fingerprint",
+            access_token="stale-bearer-secret",
+        ),
+    )
+
+    assert mint_calls == ["mint"]
+    assert quota_calls == [
+        "Bearer stale-bearer-secret",
+        "Bearer console-bearer-secret",
+    ]
+    assert fetched["payload"] == _alibaba_usage_payload()
+    assert fetched["refresh_attempted"] is True
+    assert fetched["refresh_succeeded"] is True
+
+
+def test_fetch_alibaba_second_auth_failure_does_not_mint_again(monkeypatch) -> None:
+    config = _alibaba_quota_poll_config(alibaba_quota_poll_max_attempts=3)
+    mint_calls = []
+    quota_calls = []
+
+    def fake_mint(_config, _auth, **_kwargs):
+        mint_calls.append("mint")
+        return "console-bearer-secret"
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        quota_calls.append(request.get_header("Authorization"))
+        return _alibaba_http_success(
+            _alibaba_auth_envelope_live(
+                error_code="NotLogined",
+                error_msg="please login via gateway console",
+            )
         )
 
-    session.opener = _FakeAlibabaOpener(fake_urlopen)
+    monkeypatch.setattr(loop, "_mint_alibaba_console_access_token", fake_mint)
+    monkeypatch.setattr(loop, "ALIBABA_QUOTA_HTTP_OPEN_FN", fake_urlopen)
 
     with pytest.raises(loop.AlibabaQuotaPollError) as exc_info:
         loop._fetch_alibaba_quota_payload(
             config,
             api_name=loop.ALIBABA_TOKEN_PLAN_USAGE_API,
             endpoint="usage",
-            auth={"login_ticket": "login-ticket-secret"},
-            session=session,
+            auth=_alibaba_ram_auth(monkeypatch),
+            session=loop.AlibabaConsoleSession(
+                credential_fingerprint="fingerprint",
+                access_token="stale-bearer-secret",
+            ),
         )
 
-    assert quota_calls == 2
-    assert dashboard_calls == 1
+    assert mint_calls == ["mint"]
+    assert quota_calls == [
+        "Bearer stale-bearer-secret",
+        "Bearer console-bearer-secret",
+    ]
     assert exc_info.value.telemetry_class == "auth"
-    assert exc_info.value.attempt_count == 2
-    assert exc_info.value.retry_count == 0
-    assert exc_info.value.bootstrap_attempted is True
-    assert exc_info.value.bootstrap_succeeded is False
-    assert exc_info.value.bootstrap_source == "dashboard"
-    assert exc_info.value.token_fallback_attempted is True
-    assert exc_info.value.token_fallback_succeeded is True
-    assert exc_info.value.token_fallback_source == "dashboard"
+    assert exc_info.value.refresh_attempted is True
+    assert exc_info.value.refresh_succeeded is True
+    assert exc_info.value.mint_attempted is True
+    assert "NotLogined" not in str(exc_info.value)
 
 
-def test_alibaba_quota_error_preserves_token_fallback_compatibility() -> None:
+def test_alibaba_quota_error_preserves_mint_telemetry() -> None:
     exc = loop.AlibabaQuotaPollError(
         "sanitized auth failure",
         status_code=401,
@@ -4257,39 +4265,45 @@ def test_alibaba_quota_error_preserves_token_fallback_compatibility() -> None:
         attempt_count=2,
         retry_count=0,
         endpoint="usage",
-        token_fallback_attempted=True,
-        token_fallback_succeeded=True,
-        token_fallback_source="dashboard",
+        mint_attempted=True,
+        mint_succeeded=True,
+        refresh_attempted=True,
+        refresh_succeeded=True,
     )
     summary = {
         "telemetry_status": None,
         "error_class": None,
         "error_message": None,
+        "mint_attempted": False,
+        "mint_succeeded": False,
+        "refresh_attempted": False,
+        "refresh_succeeded": False,
     }
 
     loop._record_alibaba_poll_failure(summary, exc)
 
-    assert exc.token_fallback_attempted is True
-    assert exc.token_fallback_succeeded is True
-    assert exc.token_fallback_source == "dashboard"
-    assert summary["token_fallback_attempted"] is True
-    assert summary["token_fallback_succeeded"] is True
-    assert summary["token_fallback_source"] == "dashboard"
+    assert summary["mint_attempted"] is True
+    assert summary["mint_succeeded"] is True
+    assert summary["refresh_attempted"] is True
+    assert summary["refresh_succeeded"] is True
+    assert summary["last_good_state_retained"] is True
 
 
 def test_run_due_sidecar_tasks_schedules_alibaba_quota_inventory(
     monkeypatch,
 ) -> None:
     config = _alibaba_quota_poll_config()
-    monkeypatch.setenv("ALIBABA_WEB_KEY", _alibaba_web_key())
+    _set_alibaba_ram_env(monkeypatch)
     calls: list[str] = []
     reset_fetch_count = 0
     reset_persisted = []
 
-    def fake_fetch(_config, *, api_name, endpoint, auth, session):
+    def fake_fetch(_config, *, api_name, endpoint, auth, session, task_state=None, **kwargs):
         nonlocal reset_fetch_count
-        assert auth["login_ticket"] == "login-ticket-secret"
-        assert isinstance(session, loop.AlibabaWebSession)
+        del kwargs
+        assert auth["auth_source"] == "ALIBABA_RAM_KEY"
+        assert isinstance(session, loop.AlibabaConsoleSession)
+        assert isinstance(task_state, loop.SidecarTaskState)
         calls.append(endpoint)
         if api_name == loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API:
             data = _alibaba_subscription_payload()
@@ -4306,7 +4320,10 @@ def test_run_due_sidecar_tasks_schedules_alibaba_quota_inventory(
             "payload": data,
             "attempt_count": 1,
             "retry_count": 0,
-            "cookie_only_attempted": True,
+            "mint_attempted": endpoint == "subscription",
+            "mint_succeeded": endpoint == "subscription",
+            "refresh_attempted": False,
+            "refresh_succeeded": False,
         }
 
     monkeypatch.setattr(loop, "_fetch_alibaba_quota_payload", fake_fetch)
@@ -4352,11 +4369,10 @@ def test_run_due_sidecar_tasks_schedules_alibaba_quota_inventory(
         first[0]["reset_card_persisted"],
         first[0]["telemetry_status"],
         first[0]["auth_source"],
-        first[0]["cookie_only_first"],
-        first[0]["sec_token_persisted"],
-        first[0]["token_fallback_attempted"],
-        first[0]["token_fallback_succeeded"],
-        first[0]["token_fallback_source"],
+        first[0]["mint_attempted"],
+        first[0]["mint_succeeded"],
+        first[0]["token_cached"],
+        first[0]["gateway_path"],
     ) == (
         "alibaba_quota_poll",
         True,
@@ -4369,12 +4385,11 @@ def test_run_due_sidecar_tasks_schedules_alibaba_quota_inventory(
         2,
         True,
         "valid",
-        "ALIBABA_WEB_KEY",
+        "ALIBABA_RAM_KEY",
+        True,
         True,
         False,
-        False,
-        False,
-        None,
+        "/cli/api.json",
     )
     assert (
         usage_only[0]["subscription_refreshed"],
@@ -4382,209 +4397,153 @@ def test_run_due_sidecar_tasks_schedules_alibaba_quota_inventory(
         usage_only[0]["reset_card_persisted"],
         usage_only[0]["telemetry_class"],
         usage_only[0]["error_endpoint"],
-    ) == (False, True, False, "malformed_telemetry", "reset_cards")
+        usage_only[0]["last_good_state_retained"],
+    ) == (False, True, False, "malformed_telemetry", "reset_cards", True)
     assert refreshed[0]["subscription_refreshed"] is True
     assert len(reset_persisted) == 2
     serialized = json.dumps(first + usage_only + refreshed)
-    assert all(
-        secret not in serialized
-        for secret in (
-            "instance-secret-identifier",
-            "login-ticket-secret",
-            "security-token-secret",
-            "reset-card-secret-invalid",
-            "invalid-expiry",
-        )
+    _assert_no_alibaba_secrets(
+        serialized,
+        extra=("instance-secret-identifier", "reset-card-secret-invalid", "invalid-expiry"),
     )
 
 
-def test_run_due_sidecar_tasks_reuses_alibaba_cookies_across_polls(
+def test_run_due_sidecar_tasks_reuses_cached_alibaba_bearer_across_polls(
     monkeypatch,
 ) -> None:
     config = _alibaba_quota_poll_config(apply=False)
-    monkeypatch.setenv("ALIBABA_WEB_KEY", _alibaba_web_key())
-    session = loop._new_alibaba_web_session(
-        config,
-        login_ticket="login-ticket-secret",
+    auth = _alibaba_ram_auth(monkeypatch)
+    mint_calls = _install_alibaba_mint(
+        monkeypatch, _alibaba_mint_ok("console-bearer-secret")
     )
-    gateway_host = urlsplit(config.alibaba_quota_gateway_url).hostname
-    calls: list[tuple[str, str, dict[str, list[str]]]] = []
-
-    def fake_open(request):
-        api_name = parse_qs(urlsplit(request.full_url).query)["api"][0]
-        body = parse_qs((request.data or b"").decode("utf-8"))
-        calls.append((api_name, request.get_header("Cookie") or "", body))
-        if api_name == loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API:
-            return (
-                json.dumps(
-                    _alibaba_console_envelope(_alibaba_subscription_payload())
-                ),
-                200,
-                [
-                    f"quota_session=quota-cookie-secret; Domain={gateway_host}; "
-                    "Path=/; Secure; HttpOnly"
-                ],
-            )
-        if api_name == loop.ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API:
-            return (
-                json.dumps(_alibaba_console_envelope(_alibaba_reset_card_payload())),
-                200,
-                [],
-            )
-        return (
-            json.dumps(_alibaba_console_envelope(_alibaba_usage_payload())),
-            200,
-            [],
-        )
-
-    _set_alibaba_test_opener(session, fake_open)
-    state = loop.SidecarTaskState(alibaba_web_session=session)
-
+    gateway_calls = _install_alibaba_quota_open(
+        monkeypatch,
+        _alibaba_gateway_success_handler(reset_cards=_alibaba_reset_card_payload()),
+    )
+    state = loop.SidecarTaskState()
     first = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
-    session.sec_token = "cached-security-token-secret"
     second = loop.run_due_sidecar_tasks(config, state, now_monotonic=401.0)
+    apis = [
+        parse_qs(urlsplit(request.full_url).query)["api"][0]
+        for request in gateway_calls
+    ]
+    bodies = [
+        parse_qs((request.data or b"").decode("utf-8")) for request in gateway_calls
+    ]
 
-    assert [api_name for api_name, _cookie, _body in calls] == [
+    assert len(mint_calls) == 1
+    assert mint_calls[0]["host"] == loop.ALIBABA_TOKEN_PLAN_MINT_HOST
+    assert mint_calls[0]["path"] == loop.ALIBABA_TOKEN_PLAN_MINT_PATH
+    assert mint_calls[0]["body"] == b""
+    assert apis == [
         loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API,
         loop.ALIBABA_TOKEN_PLAN_USAGE_API,
         loop.ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API,
         loop.ALIBABA_TOKEN_PLAN_USAGE_API,
         loop.ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API,
     ]
-    assert "quota_session=" not in calls[0][1]
-    assert "quota_session=quota-cookie-secret" in calls[1][1]
-    assert "quota_session=quota-cookie-secret" in calls[2][1]
-    assert "quota_session=quota-cookie-secret" in calls[3][1]
-    assert "quota_session=quota-cookie-secret" in calls[4][1]
-    assert "sec_token" not in calls[0][2]
-    assert "sec_token" not in calls[1][2]
-    assert "sec_token" not in calls[2][2]
-    assert calls[3][2]["sec_token"] == ["cached-security-token-secret"]
-    assert calls[4][2]["sec_token"] == ["cached-security-token-secret"]
-    assert state.alibaba_web_session is session
-    assert first[0]["cookie_only_first"] is True
-    assert second[0]["cookie_only_first"] is False
-    assert first[0]["cookie_names"] == [
-        "login_aliyunid_ticket",
-        "login_aliyunid_ticket",
-        "quota_session",
-    ]
-    assert first[0]["cookie_count"] == 3
-    assert second[0]["cookie_names"] == first[0]["cookie_names"]
+    assert {
+        request.get_header("Authorization") for request in gateway_calls
+    } == {"Bearer console-bearer-secret"}
+    assert all(request.get_header("Cookie") is None for request in gateway_calls)
+    assert all("sec_token" not in body for body in bodies)
+    assert state.alibaba_access_token == "console-bearer-secret"
+    assert first[0]["mint_attempted"] is True
+    assert second[0]["mint_attempted"] is False
+    assert first[0]["token_cached"] is True
+    assert second[0]["token_cached"] is True
     serialized = json.dumps(first + second)
-    assert "quota-cookie-secret" not in serialized
-    assert "cached-security-token-secret" not in serialized
+    _assert_no_alibaba_secrets(serialized)
+    assert auth["principal_hash"] is not None
 
 
-def test_run_due_sidecar_tasks_hot_reloads_replaced_auth_file(
-    tmp_path,
+def test_run_due_sidecar_tasks_resets_cached_token_when_ram_fingerprint_changes(
     monkeypatch,
 ) -> None:
-    auth_path = tmp_path / "token-plan-session.json"
-    _write_alibaba_web_auth_file(auth_path, login_ticket="first-ticket-secret")
-    config = _alibaba_quota_poll_config(
-        apply=False,
-        alibaba_web_auth_file=str(auth_path),
-    )
-    calls: list[tuple[str, str, loop.AlibabaWebSession]] = []
+    config = _alibaba_quota_poll_config(apply=False)
+    _set_alibaba_ram_env(monkeypatch)
+    mint_tokens = iter(["first-bearer-secret", "second-bearer-secret"])
+    calls: list[str] = []
 
-    def fake_fetch(_config, *, api_name, endpoint, auth, session):
-        calls.append((endpoint, auth["login_ticket"], session))
+    def fake_mint(_config, _auth, **_kwargs):
+        return next(mint_tokens)
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        calls.append(request.get_header("Authorization"))
+        api_name = parse_qs(urlsplit(request.full_url).query)["api"][0]
         if api_name == loop.ALIBABA_TOKEN_PLAN_SUBSCRIPTION_API:
             payload = _alibaba_subscription_payload()
         elif api_name == loop.ALIBABA_TOKEN_PLAN_RESET_CARD_LIST_API:
-            payload = _alibaba_reset_card_payload()
+            payload = []
         else:
             payload = _alibaba_usage_payload()
-        return {
-            "status_code": 200,
-            "payload": payload,
-            "attempt_count": 1,
-            "retry_count": 0,
-        }
+        return _alibaba_http_success(_alibaba_console_envelope(payload))
 
-    monkeypatch.setattr(loop, "_fetch_alibaba_quota_payload", fake_fetch)
+    monkeypatch.setattr(loop, "_mint_alibaba_console_access_token", fake_mint)
+    monkeypatch.setattr(loop, "ALIBABA_QUOTA_HTTP_OPEN_FN", fake_urlopen)
     state = loop.SidecarTaskState()
-
     first = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
-    replacement = tmp_path / "replacement.json"
-    _write_alibaba_web_auth_file(
-        replacement,
-        login_ticket="second-ticket-secret",
-    )
-    os.replace(replacement, auth_path)
+    monkeypatch.setenv("ALIBABA_RAM_KEY", "LTAI5tRotatedAccessKeyId")
     second = loop.run_due_sidecar_tasks(config, state, now_monotonic=401.0)
 
-    assert [(endpoint, ticket) for endpoint, ticket, _session in calls] == [
-        ("subscription", "first-ticket-secret"),
-        ("usage", "first-ticket-secret"),
-        ("reset_cards", "first-ticket-secret"),
-        ("subscription", "second-ticket-secret"),
-        ("usage", "second-ticket-secret"),
-        ("reset_cards", "second-ticket-secret"),
-    ]
-    assert calls[0][2] is calls[1][2]
-    assert calls[0][2] is calls[2][2]
-    assert calls[3][2] is calls[4][2]
-    assert calls[3][2] is calls[5][2]
-    assert calls[0][2] is not calls[3][2]
-    assert first[0]["credential_reloaded"] is True
-    assert first[0]["ticket_reset"] is False
-    assert second[0]["credential_reloaded"] is True
+    assert calls[:3] == ["Bearer first-bearer-secret"] * 3
+    assert calls[3:] == ["Bearer second-bearer-secret"] * 3
+    assert first[0]["credential_reset"] is False
+    assert second[0]["credential_reset"] is True
     assert second[0]["subscription_refreshed"] is True
-    assert second[0]["ticket_reset"] is True
+    assert state.alibaba_access_token == "second-bearer-secret"
+    serialized = json.dumps(first + second)
+    _assert_no_alibaba_secrets(serialized, extra=("first-bearer-secret", "second-bearer-secret"))
 
 
 def test_run_due_sidecar_tasks_redacts_alibaba_failure(monkeypatch) -> None:
     config = _alibaba_quota_poll_config()
-    monkeypatch.setenv("ALIBABA_WEB_KEY", _alibaba_web_key())
+    _set_alibaba_ram_env(monkeypatch)
 
-    def fake_fetch(_config, *, api_name, endpoint, auth, session):
-        del api_name, endpoint, auth, session
+    def fake_fetch(_config, *, api_name, endpoint, auth, session, task_state=None, **kwargs):
+        del api_name, endpoint, auth, session, task_state, kwargs
         raise ValueError(
-            "sec_token=security-token-secret "
-            "login_aliyunid_ticket=login-ticket-secret "
+            "Authorization=Bearer console-bearer-secret "
+            "ALIBABA_RAM_SECRET=testAccessKeySecretValue "
             "password=password-secret mfa=mfa-secret"
         )
 
     monkeypatch.setattr(loop, "_fetch_alibaba_quota_payload", fake_fetch)
-
-    events = loop.run_due_sidecar_tasks(
-        config,
-        loop.SidecarTaskState(),
-        now_monotonic=100.0,
+    events = _alibaba_poll_events(
+        loop.run_due_sidecar_tasks(
+            config,
+            loop.SidecarTaskState(),
+            now_monotonic=100.0,
+        )
     )
-
     event_json = json.dumps(events)
     assert events[0]["event"] == "alibaba_quota_poll"
     assert events[0]["telemetry_status"] == "degraded"
     assert "REDACTED" in events[0]["error_message"]
-    assert "security-token-secret" not in event_json
-    assert "login-ticket-secret" not in event_json
-    assert "password-secret" not in event_json
-    assert "mfa-secret" not in event_json
+    _assert_no_alibaba_secrets(event_json, extra=("password-secret", "mfa-secret"))
 
 
 def test_run_due_sidecar_tasks_reports_missing_alibaba_auth_without_traceback(
     monkeypatch,
 ) -> None:
-    monkeypatch.delenv("ALIBABA_WEB_KEY", raising=False)
+    _clear_alibaba_ram_env(monkeypatch)
 
-    events = loop.run_due_sidecar_tasks(
-        _alibaba_quota_poll_config(),
-        loop.SidecarTaskState(),
-        now_monotonic=100.0,
+    events = _alibaba_poll_events(
+        loop.run_due_sidecar_tasks(
+            _alibaba_quota_poll_config(),
+            loop.SidecarTaskState(),
+            now_monotonic=100.0,
+        )
     )
 
     assert events[0]["event"] == "alibaba_quota_poll"
     assert events[0]["telemetry_status"] == "degraded"
     assert events[0]["telemetry_class"] == "auth"
     assert events[0]["error_endpoint"] == "authentication"
-    assert events[0]["error_class"] == "AlibabaWebAuthError"
-    assert events[0]["error_message"] == (
-        "Alibaba web auth file is unavailable and ALIBABA_WEB_KEY migration "
-        "fallback is not configured."
-    )
+    assert events[0]["error_class"] == "AlibabaAuthError"
+    assert events[0]["error_message"] == "Alibaba RAM credentials are incomplete."
+    assert events[0]["last_good_state_retained"] is True
     assert "traceback" not in events[0]
 
 
@@ -4592,17 +4551,18 @@ def test_run_due_sidecar_tasks_clears_stale_subscription_on_refresh_failure(
     monkeypatch,
 ) -> None:
     config = _alibaba_quota_poll_config()
-    monkeypatch.setenv("ALIBABA_WEB_KEY", _alibaba_web_key())
+    _set_alibaba_ram_env(monkeypatch)
     state = loop.SidecarTaskState(
         alibaba_quota_last_attempt_monotonic=100.0,
         alibaba_subscription_last_attempt_monotonic=100.0,
+        alibaba_access_token="last-good-bearer-secret",
         alibaba_subscription_payload=loop._parse_alibaba_subscription_payload(
             _alibaba_subscription_payload()
         ),
     )
 
-    def fake_fetch(_config, *, api_name, endpoint, auth, session):
-        del api_name, endpoint, auth, session
+    def fake_fetch(_config, *, api_name, endpoint, auth, session, task_state=None, **kwargs):
+        del api_name, endpoint, auth, session, task_state, kwargs
         raise loop.AlibabaQuotaPollError(
             "Alibaba Token Plan subscription poll failed with HTTP 503.",
             status_code=503,
@@ -4613,15 +4573,101 @@ def test_run_due_sidecar_tasks_clears_stale_subscription_on_refresh_failure(
         )
 
     monkeypatch.setattr(loop, "_fetch_alibaba_quota_payload", fake_fetch)
-
-    events = loop.run_due_sidecar_tasks(
-        config,
-        state,
-        now_monotonic=21700.0,
+    events = _alibaba_poll_events(
+        loop.run_due_sidecar_tasks(config, state, now_monotonic=21700.0)
     )
 
     assert events[0]["telemetry_status"] == "degraded"
+    assert events[0]["last_good_state_retained"] is True
     assert state.alibaba_subscription_payload is None
+    assert state.alibaba_access_token == "last-good-bearer-secret"
+
+
+def test_alibaba_empty_reset_card_list_synthesizes_lifecycle(monkeypatch) -> None:
+    config = _alibaba_quota_poll_config()
+    observed_at = datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)
+    subscription = loop._parse_alibaba_subscription_payload(_alibaba_subscription_payload())
+    visible_rows, available_count = loop._build_alibaba_reset_card_observations(
+        config,
+        observed_at=observed_at,
+        reset_cards=_alibaba_reset_card_payload(),
+        subscription=subscription,
+        status_code=200,
+        attempt_count=1,
+        retry_count=0,
+    )
+    monkeypatch.setattr(
+        probes,
+        "load_provider_credit_current_rows",
+        lambda *_args, **_kwargs: [
+            dict(visible_rows[0], status="available"),
+            dict(visible_rows[1], status="available"),
+            dict(visible_rows[0], credit_identity="already-used", status="used"),
+        ],
+    )
+    empty_rows, empty_count = loop._build_alibaba_reset_card_observations(
+        config,
+        observed_at=observed_at,
+        reset_cards=[],
+        subscription=subscription,
+        status_code=200,
+        attempt_count=1,
+        retry_count=0,
+    )
+    lifecycle_rows = loop._synthesize_alibaba_reset_card_lifecycle_observations(
+        config,
+        observed_at=observed_at,
+        account_hash=subscription["account_hash"],
+        visible_identities=set(),
+        visible_card_count=0,
+        available_count=empty_count,
+        status_code=200,
+        attempt_count=1,
+        retry_count=0,
+    )
+    assert empty_rows == []
+    assert empty_count == 0
+    assert available_count == 1
+    assert {
+        row["status"]: row["evidence"]["lifecycle_reason"]
+        for row in lifecycle_rows
+    } == {
+        "used": "card_missing_before_expiry",
+        "expired": "card_past_expiry",
+    }
+
+
+def test_alibaba_poll_never_invokes_bl_or_china_hosts(monkeypatch) -> None:
+    invoked = []
+    loop_src = (
+        Path(__file__).resolve().parents[2]
+        / "scripts/run_provider_status_observations_loop.py"
+    ).read_text(encoding="utf-8")
+
+    def fake_run(*args, **kwargs):
+        invoked.append((args, kwargs))
+        raise AssertionError("bl must not be invoked")
+
+    monkeypatch.setattr(loop, "ALIBABA_MINT_HTTP_POST_FN", lambda **_kwargs: pytest.fail("live mint"))
+    monkeypatch.setattr(loop, "ALIBABA_QUOTA_HTTP_OPEN_FN", lambda *_args, **_kwargs: pytest.fail("live gateway"))
+    monkeypatch.setattr("subprocess.run", fake_run, raising=False)
+    config = _alibaba_quota_poll_config()
+    request = loop._build_alibaba_quota_request(
+        config,
+        api_name=loop.ALIBABA_TOKEN_PLAN_USAGE_API,
+        access_token="console-bearer-secret",
+    )
+    assert invoked == []
+    assert "import subprocess" not in loop_src
+    assert '["bl"]' not in loop_src
+    assert "'bl'" not in loop_src
+    assert "/data/api.json" not in loop_src
+    assert "login_ticket" not in loop_src
+    assert "sec_token" not in loop_src
+    assert "AlibabaWebSession" not in loop_src
+    assert urlsplit(request.full_url).hostname == "bailian-singapore-cs.alibabacloud.com"
+    assert not loop._alibaba_host_is_china(urlsplit(request.full_url).hostname)
+    assert not loop._alibaba_host_is_china(loop.ALIBABA_TOKEN_PLAN_MINT_HOST)
 
 
 def test_persist_alibaba_quota_observations_uses_sidecar_db_path(
@@ -4671,26 +4717,30 @@ def test_persist_alibaba_quota_observations_uses_sidecar_db_path(
 def test_compose_wires_alibaba_quota_poll_defaults() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     compose_text = (repo_root / "docker-compose.dev.yml").read_text()
+    start = compose_text.index("\n  provider-status-observations:\n")
+    end = compose_text.index("\nnetworks:", start)
+    sidecar = compose_text[start:end]
 
+    assert "/home/zepfu/.alibaba" not in sidecar
+    assert "AAWM_ALIBABA_WEB_AUTH_FILE" not in sidecar
+    assert "ALIBABA_WEB_KEY" not in sidecar
+    assert "ALIBABA_RAM_KEY=${ALIBABA_RAM_KEY:-}" in sidecar
+    assert "ALIBABA_RAM_SECRET=${ALIBABA_RAM_SECRET:-}" in sidecar
+    assert "ALIBABA_RAM_PRINCIPAL=${ALIBABA_RAM_PRINCIPAL:-}" in sidecar
     assert (
-        "/home/zepfu/.alibaba:/home/zepfu/.alibaba:ro"
-        in compose_text
+        "AAWM_ALIBABA_QUOTA_GATEWAY_URL=${AAWM_ALIBABA_QUOTA_GATEWAY_URL:-"
+        "https://bailian-singapore-cs.alibabacloud.com/cli/api.json}"
+        in sidecar
     )
-    assert (
-        "AAWM_ALIBABA_WEB_AUTH_FILE=${AAWM_ALIBABA_WEB_AUTH_FILE:-"
-        "/home/zepfu/.alibaba/token-plan-session.json}"
-        in compose_text
-    )
-    assert "ALIBABA_WEB_KEY=${ALIBABA_WEB_KEY:-}" in compose_text
-    assert "AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS=${AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS:-300}" in compose_text
+    assert "AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS=${AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS:-300}" in sidecar
     assert (
         "AAWM_ALIBABA_SUBSCRIPTION_POLL_INTERVAL_SECONDS=${AAWM_ALIBABA_SUBSCRIPTION_POLL_INTERVAL_SECONDS:-21600}"
-        in compose_text
+        in sidecar
     )
-    assert "AAWM_ALIBABA_QUOTA_POLL_MAX_ATTEMPTS=${AAWM_ALIBABA_QUOTA_POLL_MAX_ATTEMPTS:-2}" in compose_text
+    assert "AAWM_ALIBABA_QUOTA_POLL_MAX_ATTEMPTS=${AAWM_ALIBABA_QUOTA_POLL_MAX_ATTEMPTS:-2}" in sidecar
     assert (
         "AAWM_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS=${AAWM_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS:-0.5}"
-        in compose_text
+        in sidecar
     )
 
 
@@ -8332,7 +8382,10 @@ def test_codex_quota_poll_failure_does_not_suppress_other_account(
             raise RuntimeError("account1 unavailable")
         return {
             "status_code": 200,
-            "payload": _codex_quota_payload(),
+            "payload": _codex_quota_payload(
+                primary_reset="2026-12-08T18:00:00Z",
+                secondary_reset="2026-12-15T12:00:00Z",
+            ),
             "auth_context": {
                 "access_token": "token-account2",
                 "account_id": "acct-account2",
@@ -8346,6 +8399,13 @@ def test_codex_quota_poll_failure_does_not_suppress_other_account(
 
     monkeypatch.setattr(loop, "_fetch_codex_reset_credit_payload", fake_fetch)
 
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr(loop, "datetime", _FrozenDateTime)
     events = loop._run_codex_reset_credit_poll_task(
         config,
         loop.SidecarTaskState(),

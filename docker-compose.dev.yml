@@ -323,8 +323,6 @@ services:
       # Grok native client-version cache (xai-002). Read-only directory mount;
       # the billing poller reads the version written by the host CLI.
       - ${AAWM_GROK_CLIENT_VERSION_CACHE_DIR:-/home/zepfu/.cache/aawm/grok}:/run/aawm/grok:ro
-      # Alibaba Token Plan sidecar session file source for quota polling.
-      - /home/zepfu/.alibaba:/home/zepfu/.alibaba:ro
     environment:
       - AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-pgbouncer-aawm-dev}
       - AAWM_DB_PORT=${LITELLM_AAWM_DB_PORT:-6432}
@@ -403,16 +401,15 @@ services:
       - AAWM_KIMI_USAGE_POLL_ENABLED=${AAWM_KIMI_USAGE_POLL_ENABLED:-1}
       - AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS=${AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS:-3600}
       - AAWM_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS=${AAWM_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS:-30}
-      # Alibaba quota polling reads operator-managed session state from a file.
-      # Keep env fallback only for migration until runtime proof deprecates it.
-      - AAWM_ALIBABA_WEB_AUTH_FILE=${AAWM_ALIBABA_WEB_AUTH_FILE:-/home/zepfu/.alibaba/token-plan-session.json}
-      # Migration fallback only: do not rely on this once file-based auth is proven.
-      - ALIBABA_WEB_KEY=${ALIBABA_WEB_KEY:-}
+      # Alibaba Token Plan quota polling mints a console Bearer from RAM AK/SK.
+      - ALIBABA_RAM_KEY=${ALIBABA_RAM_KEY:-}
+      - ALIBABA_RAM_SECRET=${ALIBABA_RAM_SECRET:-}
+      - ALIBABA_RAM_PRINCIPAL=${ALIBABA_RAM_PRINCIPAL:-}
       - AAWM_ALIBABA_QUOTA_POLL_ENABLED=${AAWM_ALIBABA_QUOTA_POLL_ENABLED:-1}
       - AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS=${AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS:-300}
       - AAWM_ALIBABA_SUBSCRIPTION_POLL_INTERVAL_SECONDS=${AAWM_ALIBABA_SUBSCRIPTION_POLL_INTERVAL_SECONDS:-21600}
       - AAWM_ALIBABA_QUOTA_POLL_HTTP_TIMEOUT_SECONDS=${AAWM_ALIBABA_QUOTA_POLL_HTTP_TIMEOUT_SECONDS:-30}
-      - AAWM_ALIBABA_QUOTA_GATEWAY_URL=${AAWM_ALIBABA_QUOTA_GATEWAY_URL:-https://bailian-singapore-cs.alibabacloud.com/data/api.json}
+      - AAWM_ALIBABA_QUOTA_GATEWAY_URL=${AAWM_ALIBABA_QUOTA_GATEWAY_URL:-https://bailian-singapore-cs.alibabacloud.com/cli/api.json}
       - AAWM_ALIBABA_QUOTA_POLL_MAX_ATTEMPTS=${AAWM_ALIBABA_QUOTA_POLL_MAX_ATTEMPTS:-2}
       - AAWM_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS=${AAWM_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS:-0.5}
       - AAWM_CODEX_RESET_CREDIT_POLL_ENABLED=${AAWM_CODEX_RESET_CREDIT_POLL_ENABLED:-1}
