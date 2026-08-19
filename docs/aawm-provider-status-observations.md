@@ -571,6 +571,13 @@ Relevant environment variables:
 Auth matches CURSOR-004: `CURSOR_AUTH_TOKEN` preferred, then
 `CURSOR_API_KEY` as Bearer. `CURSOR_CLI_KEY` is ignored.
 
+The slim provider-status image packages only the stdlib Cursor usage
+helpers `litellm/llms/cursor_agent/usage.py` and
+`litellm/llms/cursor_agent/usage_client.py`, plus empty
+`/app/litellm/llms/__init__.py` and
+`/app/litellm/llms/cursor_agent/__init__.py`. It does not copy
+`common_utils.py`, repo package inits, or the full `litellm` tree.
+
 ## Alibaba Token Plan quota polling
 
 The provider-status sidecar can poll the authenticated ModelStudio Token Plan

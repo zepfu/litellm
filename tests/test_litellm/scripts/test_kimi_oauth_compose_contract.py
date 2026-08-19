@@ -95,6 +95,19 @@ def test_provider_status_image_packages_kimi_oauth_refresh_dependencies() -> Non
 
     assert "/app/litellm/__init__.py" in dockerfile
     assert "/app/litellm/secret_managers/__init__.py" in dockerfile
+    assert "/app/litellm/llms/__init__.py" in dockerfile
+    assert "/app/litellm/llms/cursor_agent/__init__.py" in dockerfile
+    assert (
+        "COPY litellm/llms/cursor_agent/usage.py "
+        "/app/litellm/llms/cursor_agent/usage.py"
+    ) in dockerfile
+    assert (
+        "COPY litellm/llms/cursor_agent/usage_client.py "
+        "/app/litellm/llms/cursor_agent/usage_client.py"
+    ) in dockerfile
+    assert "COPY litellm/llms/cursor_agent/common_utils.py" not in dockerfile
+    assert "COPY litellm/llms/__init__.py" not in dockerfile
+    assert "COPY litellm/llms/cursor_agent/__init__.py" not in dockerfile
     assert "COPY litellm /app/litellm" not in dockerfile
     assert "python-dotenv" not in dockerfile
     assert 'pip install --no-cache-dir "litellm' not in dockerfile

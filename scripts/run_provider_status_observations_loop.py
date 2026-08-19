@@ -78,7 +78,7 @@ from litellm.secret_managers.codex_oauth_inventory import (
     load_codex_oauth_credential,
     load_codex_oauth_inventory,
 )
-from litellm.llms.cursor_agent.common_utils import (
+from litellm.llms.cursor_agent.usage_client import (
     CURSOR_AGENT_DASHBOARD_HOST,
     build_dashboard_headers,
     current_period_usage_url,

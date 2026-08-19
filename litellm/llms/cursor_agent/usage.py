@@ -17,7 +17,7 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from .common_utils import CURSOR_AGENT_PROVIDER
+from .usage_client import CURSOR_AGENT_PROVIDER
 
 CURSOR_AGENT_USAGE_SOURCE = "cursor_agent_usage"
 CURSOR_AGENT_USAGE_PARSER_VERSION = "cursor_agent_usage_v1"

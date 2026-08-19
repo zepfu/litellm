@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
+import os
+import shutil
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +17,7 @@ import pytest
 
 _REPO = Path(__file__).resolve().parents[3]
 _SCRIPT = _REPO / "scripts" / "run_provider_status_observations_loop.py"
+_DOCKERFILE = _REPO / "docker" / "Dockerfile.provider_status_observations"
 
 
 def _load() -> ModuleType:
@@ -287,3 +292,137 @@ def test_cursor_agent_usage_poll_respects_interval(loop, tmp_path, monkeypatch) 
     second = loop._run_cursor_agent_usage_poll_task(config, state, now_monotonic=10.0)
     assert first["observation_count"] == 1
     assert second is None
+
+
+def _dockerfile_copy_pairs(dockerfile: str) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for line in dockerfile.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("COPY "):
+            continue
+        parts = stripped.split()
+        pairs.append((parts[1], parts[2]))
+    return pairs
+
+
+def _dockerfile_touch_paths(dockerfile: str) -> list[str]:
+    paths: list[str] = []
+    in_touch = False
+    for line in dockerfile.splitlines():
+        stripped = line.strip().rstrip("\\").strip()
+        if stripped.startswith("RUN touch"):
+            in_touch = True
+            remainder = stripped[len("RUN touch") :].strip()
+            if remainder:
+                paths.append(remainder)
+            continue
+        if in_touch:
+            if not stripped:
+                in_touch = False
+                continue
+            if stripped.startswith("RUN ") or stripped.startswith("COPY "):
+                in_touch = False
+                continue
+            paths.append(stripped)
+    return paths
+
+
+def test_sidecar_image_loop_imports_without_common_utils(tmp_path: Path) -> None:
+    """Copy only Dockerfile-selected files and import the loop as the image would."""
+    dockerfile = _DOCKERFILE.read_text(encoding="utf-8")
+    image_root = tmp_path / "app"
+    image_root.mkdir()
+
+    for src_rel, dest in _dockerfile_copy_pairs(dockerfile):
+        src = _REPO / src_rel
+        dest_path = image_root / dest.removeprefix("/app/")
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest_path)
+
+    for dest in _dockerfile_touch_paths(dockerfile):
+        dest_path = image_root / dest.removeprefix("/app/")
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path.write_text("", encoding="utf-8")
+
+    assert not (image_root / "litellm/llms/cursor_agent/common_utils.py").exists()
+    assert (image_root / "litellm/llms/cursor_agent/usage.py").exists()
+    assert (image_root / "litellm/llms/cursor_agent/usage_client.py").exists()
+    assert (image_root / "litellm/llms/__init__.py").read_text(encoding="utf-8") == ""
+    assert (
+        image_root / "litellm/llms/cursor_agent/__init__.py"
+    ).read_text(encoding="utf-8") == ""
+
+    loop_script = image_root / "scripts" / "run_provider_status_observations_loop.py"
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", str(tmp_path)),
+        "PYTHONPATH": str(image_root),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONNOUSERSITE": "1",
+    }
+    loader = r"""
+import importlib.util
+import sys
+from pathlib import Path
+
+script = Path(sys.argv[1]).resolve()
+image_root = Path(sys.argv[2]).resolve()
+sys.path.insert(0, str(image_root))
+
+spec = importlib.util.spec_from_file_location(
+    "run_provider_status_observations_loop_sidecar_image",
+    script,
+)
+assert spec is not None and spec.loader is not None
+mod = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = mod
+spec.loader.exec_module(mod)
+
+import litellm
+import litellm.llms.cursor_agent.usage as usage
+import litellm.llms.cursor_agent.usage_client as usage_client
+
+assert Path(litellm.__file__).resolve().parent == image_root / "litellm"
+assert Path(usage.__file__).resolve().parent == image_root / "litellm" / "llms" / "cursor_agent"
+assert Path(usage_client.__file__).resolve().parent == (
+    image_root / "litellm" / "llms" / "cursor_agent"
+)
+assert "litellm.llms.cursor_agent.common_utils" not in sys.modules
+try:
+    import litellm.llms.cursor_agent.common_utils  # noqa: F401
+except ModuleNotFoundError:
+    pass
+else:
+    raise AssertionError("slim image imported common_utils")
+print("imported_ok")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", loader, str(loop_script), str(image_root)],
+        cwd=str(image_root),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "imported_ok" in completed.stdout
+    assert "ModuleNotFoundError" not in completed.stderr
+
+
+def test_usage_client_is_stdlib_only() -> None:
+    usage_client = (
+        _REPO / "litellm" / "llms" / "cursor_agent" / "usage_client.py"
+    ).read_text(encoding="utf-8")
+    tree = ast.parse(usage_client)
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level != 0:
+                pytest.fail("usage_client.py must not use relative imports")
+            assert node.module is not None
+            imported.add(node.module.split(".", 1)[0])
+    assert "httpx" not in imported
+    assert "litellm" not in imported
+    assert "common_utils" not in imported

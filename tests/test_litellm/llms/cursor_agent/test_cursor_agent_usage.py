@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
+from litellm.llms.cursor_agent import common_utils, usage_client
 from litellm.llms.cursor_agent.common_utils import (
     CURSOR_AGENT_DASHBOARD_HOST,
     CURSOR_AGENT_TURN_HOST,
@@ -16,6 +17,10 @@ from litellm.llms.cursor_agent.usage import (
     grok_bot_reevaluation_checkpoint,
     hash_cursor_agent_account_identity,
     parse_current_period_usage,
+)
+from litellm.llms.cursor_agent.usage_client import (
+    CursorAgentUsageAuthError,
+    resolve_access_token as resolve_usage_access_token,
 )
 
 
@@ -42,6 +47,16 @@ def _camelcase_usage_payload(**overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def test_common_utils_reexports_stdlib_usage_helpers():
+    assert common_utils.current_period_usage_url is usage_client.current_period_usage_url
+    assert common_utils.build_dashboard_headers is usage_client.build_dashboard_headers
+    assert common_utils.build_turn_headers is usage_client.build_turn_headers
+    assert common_utils.cursor_agent_user_agent is usage_client.cursor_agent_user_agent
+    assert common_utils.resolve_dashboard_api_base is usage_client.resolve_dashboard_api_base
+    assert common_utils.CURSOR_AGENT_DASHBOARD_HOST is usage_client.CURSOR_AGENT_DASHBOARD_HOST
+    assert common_utils.CURSOR_AGENT_USAGE_PATH is usage_client.CURSOR_AGENT_USAGE_PATH
 
 
 def test_usage_url_is_dashboard_connect_not_cloud_agents():
@@ -149,6 +164,23 @@ def test_malformed_included_spend_is_not_persisted_as_zero():
     )
     assert snapshot["state"] == "malformed"
     assert snapshot["quota_used"] is None
+
+
+def test_usage_client_resolve_access_token_ignores_cli_key_and_never_exchanges(
+    monkeypatch,
+):
+    monkeypatch.setenv("CURSOR_CLI_KEY", "cli-key-must-be-ignored")
+    monkeypatch.delenv("CURSOR_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    with pytest.raises(CursorAgentUsageAuthError):
+        resolve_usage_access_token(allow_exchange=True)
+
+    monkeypatch.setenv("CURSOR_API_KEY", "raw-api-key")
+    assert resolve_usage_access_token(allow_exchange=True) == "raw-api-key"
+
+    monkeypatch.setenv("CURSOR_AUTH_TOKEN", "stored-access-token")
+    assert resolve_usage_access_token(None, allow_exchange=True) == "stored-access-token"
+    assert resolve_usage_access_token("explicit-access") == "explicit-access"
 
 
 def test_no_cli_subprocess_on_usage_parse():

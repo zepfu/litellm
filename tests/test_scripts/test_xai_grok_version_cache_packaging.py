@@ -84,6 +84,31 @@ def test_dockerfile_creates_secret_managers_init_for_import() -> None:
     assert "/app/litellm/secret_managers/__init__.py" in dockerfile
 
 
+def test_dockerfile_packages_stdlib_cursor_usage_helpers() -> None:
+    """The slim sidecar copies stdlib Cursor usage helpers, not common_utils."""
+    dockerfile = _DOCKERFILE_PATH.read_text(encoding="utf-8")
+
+    assert (
+        "COPY litellm/llms/cursor_agent/usage.py "
+        "/app/litellm/llms/cursor_agent/usage.py"
+    ) in dockerfile
+    assert (
+        "COPY litellm/llms/cursor_agent/usage_client.py "
+        "/app/litellm/llms/cursor_agent/usage_client.py"
+    ) in dockerfile
+    assert "/app/litellm/llms/__init__.py" in dockerfile
+    assert "/app/litellm/llms/cursor_agent/__init__.py" in dockerfile
+    assert "COPY litellm/llms/cursor_agent/common_utils.py" not in dockerfile
+    assert "COPY litellm/llms/__init__.py" not in dockerfile
+    assert "COPY litellm/llms/cursor_agent/__init__.py" not in dockerfile
+    assert "COPY litellm/__init__.py" not in dockerfile
+    assert "COPY litellm /app/litellm" not in dockerfile
+    assert 'pip install "litellm' not in dockerfile
+    assert "pip install litellm" not in dockerfile
+    assert "httpx" not in dockerfile
+    assert 'pip install --no-cache-dir "psycopg[binary]==3.3.4"' in dockerfile
+
+
 def test_dockerfile_has_no_hardcoded_billing_version() -> None:
     dockerfile = _DOCKERFILE_PATH.read_text(encoding="utf-8")
 
