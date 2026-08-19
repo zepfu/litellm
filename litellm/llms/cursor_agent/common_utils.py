@@ -6,7 +6,6 @@ This package is `cursor_agent`. It must not reuse Cloud Agents `cursor`.
 
 from __future__ import annotations
 
-import platform
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,19 +18,56 @@ from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.llms.openai import AllMessageValues
 
-CURSOR_AGENT_PROVIDER = "cursor_agent"
-CLOUD_AGENTS_PROVIDER = "cursor"
-CURSOR_AGENT_TURN_HOST = "https://agentn.global.api5.cursor.sh"
-CURSOR_AGENT_DASHBOARD_HOST = "https://api2.cursor.sh"
-CURSOR_AGENT_RUN_PATH = "/agent.v1.AgentService/Run"
-CURSOR_AGENT_USAGE_PATH = (
-    "/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
+from .constants import (
+    CLOUD_AGENTS_PROVIDER,
+    CURSOR_AGENT_AUTH_EXCHANGE_PATH,
+    CURSOR_AGENT_CLIENT_VERSION,
+    CURSOR_AGENT_DASHBOARD_HOST,
+    CURSOR_AGENT_PROVIDER,
+    CURSOR_AGENT_RUN_PATH,
+    CURSOR_AGENT_TURN_HOST,
+    CURSOR_AGENT_USAGE_PATH,
+    CURSOR_API_KEY_ENV,
+    CURSOR_AUTH_TOKEN_ENV,
+    CURSOR_CLI_KEY_ENV,
 )
-CURSOR_AGENT_AUTH_EXCHANGE_PATH = "/auth/exchange_user_api_key"
-CURSOR_AGENT_CLIENT_VERSION = "2026.08.11-e8db854"
-CURSOR_API_KEY_ENV = "CURSOR_API_KEY"
-CURSOR_AUTH_TOKEN_ENV = "CURSOR_AUTH_TOKEN"
-CURSOR_CLI_KEY_ENV = "CURSOR_CLI_KEY"
+from .dashboard import (
+    build_dashboard_headers,
+    build_turn_headers,
+    cursor_agent_user_agent,
+    current_period_usage_url,
+    resolve_dashboard_api_base,
+)
+
+__all__ = [
+    "CLOUD_AGENTS_PROVIDER",
+    "CURSOR_AGENT_AUTH_EXCHANGE_PATH",
+    "CURSOR_AGENT_CLIENT_VERSION",
+    "CURSOR_AGENT_DASHBOARD_HOST",
+    "CURSOR_AGENT_PROVIDER",
+    "CURSOR_AGENT_RUN_PATH",
+    "CURSOR_AGENT_TURN_HOST",
+    "CURSOR_AGENT_USAGE_PATH",
+    "CURSOR_API_KEY_ENV",
+    "CURSOR_AUTH_TOKEN_ENV",
+    "CURSOR_CLI_KEY_ENV",
+    "CursorAgentError",
+    "auth_exchange_url",
+    "build_dashboard_headers",
+    "build_run_request",
+    "build_turn_headers",
+    "cursor_agent_user_agent",
+    "current_period_usage_url",
+    "exchange_api_key_for_access_token",
+    "extract_text_from_agent_payload",
+    "extract_user_text",
+    "resolve_access_token",
+    "resolve_dashboard_api_base",
+    "resolve_provider_info",
+    "resolve_turn_api_base",
+    "run_url",
+    "strip_provider_prefix",
+]
 
 
 class CursorAgentError(BaseLLMException):
@@ -50,16 +86,6 @@ class CursorAgentError(BaseLLMException):
         )
 
 
-def cursor_agent_user_agent() -> str:
-    system = platform.system().lower() or "linux"
-    machine = platform.machine().lower() or "x64"
-    if machine in {"x86_64", "amd64"}:
-        machine = "x64"
-    elif machine in {"aarch64", "arm64"}:
-        machine = "arm64"
-    return f"Cursor-CLI/{CURSOR_AGENT_CLIENT_VERSION} ({system} {machine})"
-
-
 def strip_provider_prefix(model: str) -> str:
     if model.startswith(f"{CURSOR_AGENT_PROVIDER}/"):
         return model.split("/", 1)[1]
@@ -68,10 +94,6 @@ def strip_provider_prefix(model: str) -> str:
 
 def resolve_turn_api_base(api_base: Optional[str]) -> str:
     return (api_base or CURSOR_AGENT_TURN_HOST).rstrip("/")
-
-
-def resolve_dashboard_api_base(api_base: Optional[str] = None) -> str:
-    return (api_base or CURSOR_AGENT_DASHBOARD_HOST).rstrip("/")
 
 
 def run_url(api_base: Optional[str] = None) -> str:
@@ -85,11 +107,6 @@ def auth_exchange_url(dashboard_base: Optional[str] = None) -> str:
     return (
         f"{resolve_dashboard_api_base(dashboard_base)}{CURSOR_AGENT_AUTH_EXCHANGE_PATH}"
     )
-
-
-def current_period_usage_url(dashboard_base: Optional[str] = None) -> str:
-    """Dashboard unary Connect path. Not Cloud Agents GET /v0/me."""
-    return f"{resolve_dashboard_api_base(dashboard_base)}{CURSOR_AGENT_USAGE_PATH}"
 
 
 def resolve_provider_info(
@@ -175,60 +192,6 @@ def exchange_api_key_for_access_token(
             message="cursor_agent API key exchange did not return accessToken",
         )
     return str(access_token)
-
-
-def build_turn_headers(
-    access_token: str,
-    extra_headers: Optional[Dict[str, Any]] = None,
-    *,
-    request_id: Optional[str] = None,
-    http2: bool = True,
-) -> Dict[str, str]:
-    """
-    Build HTTP/2 AgentService/Run headers.
-
-    `x-cursor-streaming` is an HTTP/1.1 RunSSE interceptor header and is never
-    set here. Checksum is not part of the Agent CLI turn.
-    """
-    _ = http2
-    headers: Dict[str, str] = {
-        "authorization": f"Bearer {access_token}",
-        "user-agent": cursor_agent_user_agent(),
-        "x-cursor-client-version": f"cli-{CURSOR_AGENT_CLIENT_VERSION}",
-        "x-cursor-client-type": "cli",
-        "x-ghost-mode": "true",
-        "x-request-id": request_id or str(uuid.uuid4()),
-        "connect-protocol-version": "1",
-        "content-type": "application/json",
-    }
-    if extra_headers:
-        for key, value in extra_headers.items():
-            if value is None:
-                continue
-            lowered = key.lower()
-            if lowered in {
-                "authorization",
-                "x-cursor-streaming",
-                "x-cursor-checksum",
-            }:
-                continue
-            headers[lowered] = str(value)
-    return headers
-
-
-def build_dashboard_headers(
-    access_token: str,
-    extra_headers: Optional[Dict[str, Any]] = None,
-    *,
-    request_id: Optional[str] = None,
-) -> Dict[str, str]:
-    """Headers for DashboardService unary Connect JSON RPCs."""
-    return build_turn_headers(
-        access_token,
-        extra_headers=extra_headers,
-        request_id=request_id,
-        http2=True,
-    )
 
 
 def extract_user_text(messages: List[AllMessageValues]) -> str:

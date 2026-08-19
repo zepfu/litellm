@@ -46,10 +46,16 @@ COPY litellm/secret_managers/codex_oauth_inventory.py /app/litellm/secret_manage
 COPY litellm/secret_managers/kimi_native_contract.py /app/litellm/secret_managers/kimi_native_contract.py
 # Grok native client-version cache contract (pure-stdlib, xai-002).
 COPY litellm/secret_managers/grok_native_version_contract.py /app/litellm/secret_managers/grok_native_version_contract.py
+# Stdlib Cursor Agent usage helpers (not the full cursor_agent provider).
+COPY litellm/llms/cursor_agent/constants.py /app/litellm/llms/cursor_agent/constants.py
+COPY litellm/llms/cursor_agent/dashboard.py /app/litellm/llms/cursor_agent/dashboard.py
+COPY litellm/llms/cursor_agent/usage.py /app/litellm/llms/cursor_agent/usage.py
 RUN touch \
     /app/scripts/__init__.py \
     /app/litellm/__init__.py \
-    /app/litellm/secret_managers/__init__.py
+    /app/litellm/secret_managers/__init__.py \
+    /app/litellm/llms/__init__.py \
+    /app/litellm/llms/cursor_agent/__init__.py
 
 # The sanitized Kimi native descriptor is mounted read-only by compose at
 # /app/kimi-descriptor.  The image itself ships only the contract module and

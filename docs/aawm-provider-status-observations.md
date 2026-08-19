@@ -571,6 +571,11 @@ Relevant environment variables:
 Auth matches CURSOR-004: `CURSOR_AUTH_TOKEN` preferred, then
 `CURSOR_API_KEY` as Bearer. `CURSOR_CLI_KEY` is ignored.
 
+The provider-status sidecar image ships only the stdlib Cursor usage
+helpers (`constants.py`, `dashboard.py`, and `usage.py`). It does not
+package the full `cursor_agent` provider, `common_utils.py`, or `httpx`.
+Dashboard polling uses `urllib` with those stdlib helpers.
+
 ## Alibaba Token Plan quota polling
 
 The provider-status sidecar can poll the authenticated ModelStudio Token Plan
