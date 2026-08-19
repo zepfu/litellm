@@ -55,6 +55,44 @@ def test_basic_yaml_compiles() -> None:
     assert first.config_version == second.config_version
     assert first.config_epoch != second.config_epoch
 
+    basic_candidates = first.aliases["basic"].candidates
+    north_pairs = [
+        (candidate.provider, candidate.model, candidate.route_family)
+        for candidate in basic_candidates
+        if candidate.model
+        in {
+            "cohere/north-mini-code-1-0",
+            "openrouter/cohere/north-mini-code:free",
+        }
+    ]
+    assert north_pairs == [
+        (
+            "cohere",
+            "cohere/north-mini-code-1-0",
+            "codex_cohere_chat_completions_adapter",
+        ),
+        (
+            "openrouter",
+            "openrouter/cohere/north-mini-code:free",
+            "codex_openrouter_completion_adapter",
+        ),
+    ]
+    direct_index = next(
+        index
+        for index, candidate in enumerate(basic_candidates)
+        if candidate.provider == "cohere"
+        and candidate.model == "cohere/north-mini-code-1-0"
+    )
+    openrouter_index = next(
+        index
+        for index, candidate in enumerate(basic_candidates)
+        if candidate.provider == "openrouter"
+        and candidate.model == "openrouter/cohere/north-mini-code:free"
+    )
+    assert direct_index < openrouter_index
+    assert basic_candidates[direct_index].priority == 90
+    assert basic_candidates[openrouter_index].priority == 80
+
 
 def test_refresh_endpoint_registered() -> None:
     """``POST /aawm/alias-config/refresh`` is registered on the pass-through router."""

@@ -1,11 +1,16 @@
 # AAWM alias-routing config for the ``basic`` alias (CFG-008).
-# Every origin shares the common OpenRouter/OpenCode/Alibaba prefix, then
-# receives a mutually exclusive TUI-specific last resort:
+# Every origin shares the common Cohere/OpenRouter/OpenCode/Alibaba prefix,
+# then receives a mutually exclusive TUI-specific last resort:
 #   - Claude-origin requests only: native Anthropic Haiku
 #     (tui_attached: Claude; Luna is excluded via tui_excluded).
 #   - Codex and every non-Claude/missing/unknown origin: gpt-5.6-luna with
 #     authoritative ``reasoning_effort: low`` applied through the shared
 #     CFG-006 candidate pipeline (Haiku is gated out via tui_attached).
+#
+# Direct Cohere North Mini Code is an independent ``provider: cohere`` /
+# ``lane=cohere_native`` lane. The OpenRouter North Mini Code candidate is
+# a separate fallback and must not share capacity, error, or cooldown state.
+# Anthropic skip for Cohere is existing design (Codex-only route family).
 #
 # Compiled by config_compiler.compile_yaml() into an immutable RoutingSnapshot.
 # priority: 0 is reserved for last-resort candidates and is always placed
@@ -17,6 +22,11 @@ defaults: {}
 aliases:
   - name: basic
     candidates:
+      - provider: cohere
+        model: cohere/north-mini-code-1-0
+        route_family: codex_cohere_chat_completions_adapter
+        priority: 90
+
       - provider: openrouter
         model: openrouter/cohere/north-mini-code:free
         route_family: codex_openrouter_completion_adapter

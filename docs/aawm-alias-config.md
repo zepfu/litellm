@@ -138,12 +138,16 @@ generated from every snapshot alias and do not invent a denylist.
 The maintained alias name is `basic`. Every request uses this common candidate
 order:
 
-1. OpenRouter Cohere North Mini Code free
-2. OpenRouter Owl Alpha
-3. OpenCode Zen deepseek-v4-flash
-4. OpenCode Zen big-pickle
-5. Alibaba Token Plan deepseek-v4-flash-0731
-6. Alibaba Token Plan qwen3.6-flash
+1. Direct Cohere North Mini Code (`cohere/north-mini-code-1-0`,
+   `provider: cohere`, `codex_cohere_chat_completions_adapter`,
+   `lane=cohere_native`)
+2. OpenRouter Cohere North Mini Code free
+   (`openrouter/cohere/north-mini-code:free`) as an independent fallback
+3. OpenRouter Owl Alpha
+4. OpenCode Zen deepseek-v4-flash
+5. OpenCode Zen big-pickle
+6. Alibaba Token Plan deepseek-v4-flash-0731
+7. Alibaba Token Plan qwen3.6-flash
 
 The managed `sota-xai` candidate has no candidate-level reasoning override:
 caller `reasoning.effort=xhigh` is sent unchanged to `oa_xai/grok-4.6`, with
@@ -528,6 +532,13 @@ route.
   endpoint. Aliases that include Cohere candidates set the exact `model` string
   and `provider: cohere` in YAML; the selected route family is
   `codex_cohere_chat_completions_adapter` and the lane is `cohere_native`.
+- `basic.yaml` now carries both lanes as independent candidates. Direct trial
+  capacity is preferred: `provider: cohere`, `model: cohere/north-mini-code-1-0`,
+  `route_family: codex_cohere_chat_completions_adapter`, `priority: 90`. The
+  OpenRouter fallback remains `provider: openrouter`,
+  `model: openrouter/cohere/north-mini-code:free`,
+  `route_family: codex_openrouter_completion_adapter`, `priority: 80`. Do not
+  merge capacity, error, or cooldown state across those lanes.
 - Direct Cohere is separate from OpenRouter. An OpenRouter candidate such as
   `openrouter/cohere/north-mini-code:free` remains an OpenRouter request and must not be
   recorded or interpreted as direct Cohere-native traffic.

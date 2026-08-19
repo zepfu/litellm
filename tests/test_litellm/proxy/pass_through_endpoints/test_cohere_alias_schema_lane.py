@@ -10,6 +10,7 @@ No provider egress, no synthetic LLM calls.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
@@ -34,6 +35,14 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_schema impor
 
 _CODEX_COHERE_ROUTE_FAMILY = "codex_cohere_chat_completions_adapter"
 _COHERE_MODEL = "cohere/command-a-03-2025"
+_REPO_ROOT = os.path.dirname(
+    os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    )
+)
+_BASIC_YAML_PATH = os.path.join(
+    _REPO_ROOT, "litellm", "proxy", "aawm_alias_config", "basic.yaml"
+)
 
 _COHERE_ALIAS_YAML = """\
 defaults: {}
@@ -237,6 +246,37 @@ aliases:
 """
         with pytest.raises((ValidationError, ConfigCompileError)):
             compile_yaml(raw)
+
+    def test_basic_yaml_keeps_direct_cohere_ahead_of_openrouter_fallback(self):
+        with open(_BASIC_YAML_PATH, "r", encoding="utf-8") as handle:
+            snapshot = compile_yaml(handle.read())
+
+        basic_candidates = snapshot.aliases["basic"].candidates
+        north_pairs = [
+            (candidate.provider, candidate.model, candidate.route_family)
+            for candidate in basic_candidates
+            if candidate.model
+            in {
+                "cohere/north-mini-code-1-0",
+                "openrouter/cohere/north-mini-code:free",
+            }
+        ]
+        assert north_pairs == [
+            (
+                "cohere",
+                "cohere/north-mini-code-1-0",
+                _CODEX_COHERE_ROUTE_FAMILY,
+            ),
+            (
+                "openrouter",
+                "openrouter/cohere/north-mini-code:free",
+                "codex_openrouter_completion_adapter",
+            ),
+        ]
+        assert basic_candidates[0].provider == "cohere"
+        assert basic_candidates[0].priority == 90
+        assert basic_candidates[1].provider == "openrouter"
+        assert basic_candidates[1].priority == 80
 
 
 # ---------------------------------------------------------------------------
