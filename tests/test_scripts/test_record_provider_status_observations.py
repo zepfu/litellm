@@ -1413,6 +1413,13 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         "AAWM_GROK_BILLING_POLL_ENABLED=${AAWM_GROK_BILLING_POLL_ENABLED:-1}"
         in compose_text
     )
+    for expected_cursor_usage_setting in (
+        "AAWM_CURSOR_AGENT_USAGE_POLL_ENABLED=${AAWM_CURSOR_AGENT_USAGE_POLL_ENABLED:-0}",
+        "AAWM_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS=${AAWM_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS:-3600}",
+        "AAWM_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS=${AAWM_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS:-30}",
+        "AAWM_CURSOR_AGENT_USAGE_DASHBOARD_URL=${AAWM_CURSOR_AGENT_USAGE_DASHBOARD_URL:-https://api2.cursor.sh}",
+    ):
+        assert expected_cursor_usage_setting in compose_text
     assert (
         "AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS=${AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS:-3600}"
         in compose_text

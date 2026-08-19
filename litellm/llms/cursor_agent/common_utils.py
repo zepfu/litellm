@@ -24,6 +24,9 @@ CLOUD_AGENTS_PROVIDER = "cursor"
 CURSOR_AGENT_TURN_HOST = "https://agentn.global.api5.cursor.sh"
 CURSOR_AGENT_DASHBOARD_HOST = "https://api2.cursor.sh"
 CURSOR_AGENT_RUN_PATH = "/agent.v1.AgentService/Run"
+CURSOR_AGENT_USAGE_PATH = (
+    "/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
+)
 CURSOR_AGENT_AUTH_EXCHANGE_PATH = "/auth/exchange_user_api_key"
 CURSOR_AGENT_CLIENT_VERSION = "2026.08.11-e8db854"
 CURSOR_API_KEY_ENV = "CURSOR_API_KEY"
@@ -82,6 +85,11 @@ def auth_exchange_url(dashboard_base: Optional[str] = None) -> str:
     return (
         f"{resolve_dashboard_api_base(dashboard_base)}{CURSOR_AGENT_AUTH_EXCHANGE_PATH}"
     )
+
+
+def current_period_usage_url(dashboard_base: Optional[str] = None) -> str:
+    """Dashboard unary Connect path. Not Cloud Agents GET /v0/me."""
+    return f"{resolve_dashboard_api_base(dashboard_base)}{CURSOR_AGENT_USAGE_PATH}"
 
 
 def resolve_provider_info(
@@ -206,6 +214,21 @@ def build_turn_headers(
                 continue
             headers[lowered] = str(value)
     return headers
+
+
+def build_dashboard_headers(
+    access_token: str,
+    extra_headers: Optional[Dict[str, Any]] = None,
+    *,
+    request_id: Optional[str] = None,
+) -> Dict[str, str]:
+    """Headers for DashboardService unary Connect JSON RPCs."""
+    return build_turn_headers(
+        access_token,
+        extra_headers=extra_headers,
+        request_id=request_id,
+        http2=True,
+    )
 
 
 def extract_user_text(messages: List[AllMessageValues]) -> str:

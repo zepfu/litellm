@@ -519,6 +519,54 @@ This is an interpretation-only documentation update. It adds no
 `session_history` or observation schema, view, or API change, so no
 `dashboard-shell` handoff is needed.
 
+## Cursor Agent monthly usage observations
+
+The optional Cursor Agent usage poll records account-scoped monthly
+included spend from Dashboard Connect
+`POST /aiserver.v1.DashboardService/GetCurrentPeriodUsage` on
+`https://api2.cursor.sh`. This is not Cloud Agents `GET /v0/me`, not the
+`agentn` turn host, and not `public.provider_status_observations`.
+
+Persisted rows use `source=cursor_agent_usage`, `provider=cursor_agent`,
+`client=cursor-agent`, `model=cursor-agent`, `quota_key=cursor_agent_monthly:cents`,
+`quota_period=monthly`, and `quota_type=cents`. Mapping from the 2026-08-12
+camelCase dashboard dump (spend in USD cents):
+
+- `quota_used` ← `planUsage.includedSpend`
+- `quota_limit` ← `planUsage.limit`
+- `quota_remaining` ← `planUsage.remaining`
+- `quota_period` ← `monthly`
+
+`totalPercentUsed` / `autoPercentUsed` / `apiPercentUsed` are **not**
+`totalSpend / limit`. The trustworthy included fraction is
+`includedSpend / limit`. Account identity is hashed; raw tokens and
+account ids are never persisted. Failed refreshes emit a sanitized
+`cursor_agent_usage_poll` event with `last_good_state_retained=true` and
+do not write a replacement row, so the last valid observation stays.
+
+Weekly Cursor Grok Bot used/limit/reset remains truthful unknown. There
+is no weekly `quota_key`. Do not treat xAI Grok Build weekly credits or
+BugBot license RPCs as Grok Bot. Reevaluate only when
+`AAWM_CURSOR_AGENT_GROK_BOT_USAGE_SOURCE` names a verified Dashboard or
+Connect RPC; that env is a checkpoint, not a quota source.
+
+Relevant environment variables:
+
+- `AAWM_CURSOR_AGENT_USAGE_POLL_ENABLED`: enables the scheduled poll.
+  Defaults to disabled so the sidecar does not send live dashboard traffic.
+- `AAWM_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS`: minimum seconds between
+  attempts; default `3600`.
+- `AAWM_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS`: dashboard RPC
+  timeout; default `30`.
+- `AAWM_CURSOR_AGENT_USAGE_DASHBOARD_URL`: Dashboard host override;
+  default `https://api2.cursor.sh`.
+- `AAWM_CURSOR_AGENT_GROK_BOT_USAGE_SOURCE`: optional reevaluation
+  checkpoint for a future weekly Grok Bot RPC. Empty keeps Grok Bot
+  unknown.
+
+Auth matches CURSOR-004: `CURSOR_AUTH_TOKEN` preferred, then
+`CURSOR_API_KEY` as Bearer. `CURSOR_CLI_KEY` is ignored.
+
 ## Alibaba Token Plan quota polling
 
 The provider-status sidecar can poll the authenticated ModelStudio Token Plan

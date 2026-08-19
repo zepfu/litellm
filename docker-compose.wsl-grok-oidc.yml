@@ -259,6 +259,7 @@ services:
       - AAWM_ALIBABA_QUOTA_POLL_ENABLED=0
       - AAWM_CODEX_RESET_CREDIT_POLL_ENABLED=0
       - AAWM_GROK_BILLING_POLL_ENABLED=0
+      - AAWM_CURSOR_AGENT_USAGE_POLL_ENABLED=0
       - AAWM_OBSERVABILITY_ANOMALY_SCAN_ENABLED=0
     healthcheck:
       # Combined credential/process health only. Never print or log token material.

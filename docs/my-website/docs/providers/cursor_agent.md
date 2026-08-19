@@ -49,9 +49,42 @@ print(response)
 Supported first slugs: `composer-2.5`, `cursor-grok-4.6-high`. Pricing and
 alias YAML are not part of this provider landing.
 
+## Monthly usage
+
+Account-scoped monthly included spend is read from Dashboard Connect
+`POST /aiserver.v1.DashboardService/GetCurrentPeriodUsage` on
+`https://api2.cursor.sh`. That RPC is not Cloud Agents `GET /v0/me` and
+is not the `agentn` turn.
+
+When the provider-status sidecar is explicitly enabled
+(`AAWM_CURSOR_AGENT_USAGE_POLL_ENABLED=1` or
+`--cursor-agent-usage-poll-enabled`), it maps:
+
+| Observation field | Dashboard field |
+|---|---|
+| `quota_used` | `planUsage.includedSpend` (USD cents) |
+| `quota_limit` | `planUsage.limit` |
+| `quota_remaining` | `planUsage.remaining` |
+| `quota_period` | `monthly` |
+
+The included fraction is `includedSpend / limit`. Do not treat
+`totalPercentUsed` / `autoPercentUsed` / `apiPercentUsed` as
+`totalSpend / limit`. Account identity is hashed. Failed refreshes keep
+the last valid `public.rate_limit_observations` row.
+
+Weekly Cursor Grok Bot used/limit/reset is still unknown. There is no
+weekly `quota_key`. Do not treat xAI Grok Build weekly credits or BugBot
+license RPCs as Grok Bot. Set
+`AAWM_CURSOR_AGENT_GROK_BOT_USAGE_SOURCE` only when a verified weekly
+source exists; until then the checkpoint stays unknown.
+
+The poller is disabled by default so LiteLLM does not send live
+dashboard traffic.
+
 ## What this is not
 
 - Cloud Agents `/v0/agents` on `https://api.cursor.com`
 - OpenAI `/v1/chat/completions`
 - HTTP/1.1 `RunSSE` + `BidiAppend`
 - A `cursor-agent` / `agent` subprocess
+- Cloud Agents `GET /v0/me` usage

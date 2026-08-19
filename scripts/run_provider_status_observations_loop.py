@@ -79,6 +79,23 @@ from litellm.secret_managers.codex_oauth_inventory import (
     load_codex_oauth_credential,
     load_codex_oauth_inventory,
 )
+from litellm.llms.cursor_agent.common_utils import (
+    CURSOR_AGENT_DASHBOARD_HOST,
+    build_dashboard_headers,
+    current_period_usage_url,
+    resolve_access_token,
+)
+from litellm.llms.cursor_agent.usage import (
+    CURSOR_AGENT_MONTHLY_QUOTA_KEY,
+    CURSOR_AGENT_USAGE_CLIENT,
+    CURSOR_AGENT_USAGE_MODEL,
+    CURSOR_AGENT_USAGE_PARSER_VERSION,
+    CURSOR_AGENT_USAGE_QUOTA_PERIOD,
+    CURSOR_AGENT_USAGE_QUOTA_TYPE,
+    CURSOR_AGENT_USAGE_SOURCE,
+    grok_bot_reevaluation_checkpoint,
+    parse_current_period_usage,
+)
 
 
 TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -281,6 +298,10 @@ ALIBABA_TOKEN_PLAN_RESET_CARD_SOURCE = "alibaba_token_plan_reset_card_list"
 ALIBABA_TOKEN_PLAN_RESET_CARD_PARSER_VERSION = "alibaba_token_plan_reset_card_v1"
 ALIBABA_QUOTA_RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 ALIBABA_QUOTA_POLL_SLEEP_FN: Callable[[float], None] = time.sleep
+DEFAULT_CURSOR_AGENT_USAGE_POLL_ENABLED = False
+DEFAULT_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS = 3600.0
+DEFAULT_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS = 30.0
+DEFAULT_CURSOR_AGENT_USAGE_DASHBOARD_URL = CURSOR_AGENT_DASHBOARD_HOST
 DEFAULT_GROK_BILLING_POLL_ENABLED = False
 DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS = 3600.0
 DEFAULT_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS = 30.0
@@ -468,6 +489,25 @@ class CodexResetCreditPollError(ValueError):
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.attempt_count = max(1, attempt_count)
+        self.retry_count = max(0, retry_count)
+
+
+class CursorAgentUsagePollError(ValueError):
+    """Sanitized Cursor Agent usage-poll failure with a non-secret classification."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int],
+        telemetry_class: str,
+        attempt_count: int,
+        retry_count: int,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.telemetry_class = telemetry_class
         self.attempt_count = max(1, attempt_count)
         self.retry_count = max(0, retry_count)
 
@@ -1395,6 +1435,14 @@ class ProviderStatusLoopConfig:
     grok_billing_poll_http_timeout_seconds: float = (
         DEFAULT_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS
     )
+    cursor_agent_usage_poll_enabled: bool = DEFAULT_CURSOR_AGENT_USAGE_POLL_ENABLED
+    cursor_agent_usage_poll_interval_seconds: float = (
+        DEFAULT_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS
+    )
+    cursor_agent_usage_poll_http_timeout_seconds: float = (
+        DEFAULT_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS
+    )
+    cursor_agent_usage_dashboard_url: str = DEFAULT_CURSOR_AGENT_USAGE_DASHBOARD_URL
     grok_billing_url: str = DEFAULT_GROK_BILLING_URL
     grok_billing_client_version: Optional[str] = None
     grok_billing_client_version_source: Optional[str] = None
@@ -1473,6 +1521,7 @@ class SidecarTaskState:
     alibaba_auth_fingerprint: Optional[str] = None
     alibaba_web_session: Optional[AlibabaWebSession] = None
     grok_billing_last_attempt_monotonic: Optional[float] = None
+    cursor_agent_usage_last_attempt_monotonic: Optional[float] = None
     codex_reset_credit_last_attempt_monotonic_by_label: Dict[str, float] = (
         dataclass_field(default_factory=dict)
     )
@@ -2474,6 +2523,64 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "Defaults to AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS or 0.5."
         ),
     )
+    cursor_usage_group = parser.add_mutually_exclusive_group()
+    cursor_usage_group.add_argument(
+        "--cursor-agent-usage-poll-enabled",
+        dest="cursor_agent_usage_poll_enabled",
+        action="store_true",
+        default=_env_bool(
+            "AAWM_CURSOR_AGENT_USAGE_POLL_ENABLED",
+            DEFAULT_CURSOR_AGENT_USAGE_POLL_ENABLED,
+        ),
+        help=(
+            "Poll Cursor Dashboard GetCurrentPeriodUsage into "
+            "rate_limit_observations. Disabled by default so the sidecar "
+            "does not send live dashboard traffic. Defaults to "
+            "AAWM_CURSOR_AGENT_USAGE_POLL_ENABLED or false."
+        ),
+    )
+    cursor_usage_group.add_argument(
+        "--no-cursor-agent-usage-poll",
+        dest="cursor_agent_usage_poll_enabled",
+        action="store_false",
+        help="Disable Cursor Agent monthly usage polling.",
+    )
+    parser.add_argument(
+        "--cursor-agent-usage-poll-interval-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS",
+            DEFAULT_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS,
+        ),
+        help=(
+            "Minimum seconds between Cursor Agent usage poll attempts. "
+            "Defaults to AAWM_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS or 3600."
+        ),
+    )
+    parser.add_argument(
+        "--cursor-agent-usage-poll-http-timeout-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS",
+            DEFAULT_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS,
+        ),
+        help=(
+            "HTTP timeout for Cursor Dashboard usage polling. Defaults to "
+            "AAWM_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS or 30."
+        ),
+    )
+    parser.add_argument(
+        "--cursor-agent-usage-dashboard-url",
+        default=os.getenv(
+            "AAWM_CURSOR_AGENT_USAGE_DASHBOARD_URL",
+            DEFAULT_CURSOR_AGENT_USAGE_DASHBOARD_URL,
+        ),
+        help=(
+            "Cursor Dashboard host for GetCurrentPeriodUsage. Defaults to "
+            "AAWM_CURSOR_AGENT_USAGE_DASHBOARD_URL or https://api2.cursor.sh. "
+            "This is not the agentn turn host and not Cloud Agents /v0/me."
+        ),
+    )
 
     codex_credit_group = parser.add_mutually_exclusive_group()
     codex_credit_group.add_argument(
@@ -2640,6 +2747,7 @@ def _validate_config_args(args: argparse.Namespace) -> None:
     _validate_kimi_usage_config_args(args)
     _validate_alibaba_quota_config_args(args)
     _validate_grok_billing_config_args(args)
+    _validate_cursor_agent_usage_config_args(args)
     _validate_observability_anomaly_scan_config_args(args)
     _validate_codex_reset_credit_poll_config_args(args)
 
@@ -2810,6 +2918,19 @@ def _validate_alibaba_quota_config_args(args: argparse.Namespace) -> None:
         raise SystemExit("--alibaba-quota-poll-retry-backoff-seconds must be non-negative")
 
 
+def _validate_cursor_agent_usage_config_args(args: argparse.Namespace) -> None:
+    if args.cursor_agent_usage_poll_interval_seconds <= 0:
+        raise SystemExit(
+            "--cursor-agent-usage-poll-interval-seconds must be greater than 0"
+        )
+    if args.cursor_agent_usage_poll_http_timeout_seconds <= 0:
+        raise SystemExit(
+            "--cursor-agent-usage-poll-http-timeout-seconds must be greater than 0"
+        )
+    if not str(args.cursor_agent_usage_dashboard_url).strip():
+        raise SystemExit("--cursor-agent-usage-dashboard-url must not be empty")
+
+
 def _validate_grok_billing_config_args(args: argparse.Namespace) -> None:
     if args.grok_billing_poll_interval_seconds <= 0:
         raise SystemExit("--grok-billing-poll-interval-seconds must be greater than 0")
@@ -2966,6 +3087,16 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         grok_billing_poll_enabled=args.grok_billing_poll_enabled,
         grok_billing_poll_interval_seconds=args.grok_billing_poll_interval_seconds,
         grok_billing_poll_http_timeout_seconds=args.grok_billing_poll_http_timeout_seconds,
+        cursor_agent_usage_poll_enabled=args.cursor_agent_usage_poll_enabled,
+        cursor_agent_usage_poll_interval_seconds=(
+            args.cursor_agent_usage_poll_interval_seconds
+        ),
+        cursor_agent_usage_poll_http_timeout_seconds=(
+            args.cursor_agent_usage_poll_http_timeout_seconds
+        ),
+        cursor_agent_usage_dashboard_url=str(
+            args.cursor_agent_usage_dashboard_url
+        ).strip(),
         grok_billing_url=args.grok_billing_url,
         grok_billing_client_version=args.grok_billing_client_version,
         grok_billing_client_version_source=(
@@ -6293,6 +6424,232 @@ def _persist_kimi_usage_observations(
             try:
                 with conn.cursor() as cur:
                     _set_kimi_usage_database_timeouts(
+                        cur,
+                        lock_timeout_ms=config.db_lock_timeout_ms,
+                        statement_timeout_ms=config.db_statement_timeout_ms,
+                    )
+                    for payload in payloads:
+                        cur.execute(GROK_BILLING_RATE_LIMIT_INSERT_SQL, payload)
+                        inserted_count += max(0, cur.rowcount)
+            except (
+                probes.psycopg.errors.LockNotAvailable,
+                probes.psycopg.errors.QueryCanceled,
+            ) as exc:
+                conn.rollback()
+                raise probes.ProviderStatusDatabaseWriteSkipped(
+                    error_class=exc.__class__.__name__,
+                    message=str(exc),
+                ) from exc
+    except probes.ProviderStatusDatabaseWriteSkipped:
+        raise
+    return inserted_count
+
+
+def _cursor_agent_usage_http_telemetry_class(status_code: int) -> str:
+    if status_code in {401, 403}:
+        return "auth"
+    if status_code == 404:
+        return "not_found"
+    if status_code == 429:
+        return "rate_limit"
+    if status_code >= 500:
+        return "upstream"
+    return "http_error"
+
+
+def _cursor_agent_usage_poll_error(
+    *,
+    status_code: Optional[int],
+    telemetry_class: str,
+    attempt_count: int,
+    retry_count: int,
+    message: Optional[str] = None,
+) -> CursorAgentUsagePollError:
+    if message is None:
+        message = "Cursor Agent usage poll failed"
+        if status_code is not None:
+            message += f" with HTTP {status_code}"
+        message += "."
+    return CursorAgentUsagePollError(
+        message,
+        status_code=status_code,
+        telemetry_class=telemetry_class,
+        attempt_count=attempt_count,
+        retry_count=retry_count,
+    )
+
+
+def _cursor_agent_usage_url(config: ProviderStatusLoopConfig) -> str:
+    return current_period_usage_url(config.cursor_agent_usage_dashboard_url)
+
+
+def _fetch_cursor_agent_usage_payload(
+    config: ProviderStatusLoopConfig,
+) -> Dict[str, Any]:
+    attempt_count = 1
+    retry_count = 0
+    try:
+        access_token = resolve_access_token(allow_exchange=False)
+    except Exception as exc:
+        raise _cursor_agent_usage_poll_error(
+            status_code=None,
+            telemetry_class="auth",
+            attempt_count=attempt_count,
+            retry_count=retry_count,
+            message="Cursor Agent usage poll has no usable access token.",
+        ) from exc
+
+    usage_url = _cursor_agent_usage_url(config)
+    headers = build_dashboard_headers(access_token)
+    request = urllib_request.Request(
+        usage_url,
+        data=b"{}",
+        headers=headers,
+        method="POST",
+    )
+    response_body: Optional[str] = None
+    try:
+        with urllib_request.urlopen(
+            request,
+            timeout=config.cursor_agent_usage_poll_http_timeout_seconds,
+        ) as response:
+            status_code = int(getattr(response, "status", None) or response.getcode())
+            if 200 <= status_code < 300:
+                response_body = response.read().decode("utf-8")
+    except urllib_error.HTTPError as exc:
+        status_code = exc.code
+    except (urllib_error.URLError, TimeoutError, OSError) as exc:
+        raise _cursor_agent_usage_poll_error(
+            status_code=None,
+            telemetry_class="transport",
+            attempt_count=attempt_count,
+            retry_count=retry_count,
+            message="Cursor Agent usage poll failed while contacting the dashboard.",
+        ) from exc
+
+    if status_code < 200 or status_code >= 300:
+        raise _cursor_agent_usage_poll_error(
+            status_code=status_code,
+            telemetry_class=_cursor_agent_usage_http_telemetry_class(status_code),
+            attempt_count=attempt_count,
+            retry_count=retry_count,
+        )
+
+    try:
+        payload = json.loads(response_body or "")
+    except json.JSONDecodeError as exc:
+        raise _cursor_agent_usage_poll_error(
+            status_code=status_code,
+            telemetry_class="malformed_telemetry",
+            attempt_count=attempt_count,
+            retry_count=retry_count,
+            message="Cursor Dashboard usage endpoint returned invalid JSON.",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise _cursor_agent_usage_poll_error(
+            status_code=status_code,
+            telemetry_class="malformed_telemetry",
+            attempt_count=attempt_count,
+            retry_count=retry_count,
+            message="Cursor Dashboard usage endpoint returned a non-object payload.",
+        )
+    return {
+        "status_code": status_code,
+        "payload": payload,
+        "attempt_count": attempt_count,
+        "retry_count": retry_count,
+        "usage_url": usage_url,
+    }
+
+
+def _build_cursor_agent_usage_rate_limit_payloads(
+    config: ProviderStatusLoopConfig,
+    *,
+    observed_at: datetime,
+    response_body: Mapping[str, Any],
+) -> tuple[list[tuple[Any, ...]], Dict[str, Any]]:
+    _ = config
+    snapshot = parse_current_period_usage(response_body)
+    grok_bot = snapshot.get("grok_bot") or grok_bot_reevaluation_checkpoint()
+    parser_summary: Dict[str, Any] = {
+        "source_version": CURSOR_AGENT_USAGE_PARSER_VERSION,
+        "window_state": snapshot["state"],
+        "account_identity_hashed": snapshot.get("account_hash") is not None,
+        "account_identity_fields": list(snapshot.get("account_identity_fields") or []),
+        "quota_key": CURSOR_AGENT_MONTHLY_QUOTA_KEY,
+        "quota_period": CURSOR_AGENT_USAGE_QUOTA_PERIOD,
+        "weekly_grok_bot": grok_bot.get("status"),
+        "weekly_grok_bot_quota_key": grok_bot.get("quota_key"),
+        "weekly_grok_bot_reevaluation_ready": bool(grok_bot.get("reevaluation_ready")),
+        "valid_window_count": 0,
+    }
+    account_hash = snapshot.get("account_hash")
+    if not account_hash:
+        parser_summary["telemetry_status"] = "missing_account_identity"
+        return [], parser_summary
+    if snapshot["state"] not in {"valid_zero", "valid_nonzero"}:
+        parser_summary["telemetry_status"] = snapshot["state"]
+        return [], parser_summary
+
+    parser_summary["telemetry_status"] = "valid"
+    parser_summary["valid_window_count"] = 1
+    payload = (
+        observed_at,
+        CURSOR_AGENT_USAGE_CLIENT,
+        None,
+        account_hash,
+        "cursor_agent",
+        CURSOR_AGENT_USAGE_MODEL,
+        CURSOR_AGENT_MONTHLY_QUOTA_KEY,
+        CURSOR_AGENT_USAGE_QUOTA_PERIOD,
+        CURSOR_AGENT_USAGE_QUOTA_TYPE,
+        snapshot.get("billing_period_end_at"),
+        snapshot.get("remaining_pct"),
+        snapshot.get("quota_limit"),
+        snapshot.get("quota_used"),
+        snapshot.get("quota_remaining"),
+        snapshot.get("billing_period_start_at"),
+        snapshot.get("billing_period_end_at"),
+        json.dumps(snapshot.get("raw_provider_fields") or {}, sort_keys=True),
+        json.dumps(snapshot.get("evidence") or {}, sort_keys=True),
+        CURSOR_AGENT_USAGE_SOURCE,
+        None,
+        None,
+        f"cursor-agent-usage-poll-{observed_at.strftime('%Y%m%d%H%M%S')}",
+    )
+    return [payload], parser_summary
+
+
+def _set_cursor_agent_usage_database_timeouts(
+    cur: Any,
+    *,
+    lock_timeout_ms: int,
+    statement_timeout_ms: int,
+) -> None:
+    cur.execute(
+        "SELECT set_config('application_name', %s, false)",
+        (f"{probes._provider_status_db_application_name()}-cursor-agent-usage",),
+    )
+    cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",))
+    cur.execute(
+        "SELECT set_config('statement_timeout', %s, true)",
+        (f"{statement_timeout_ms}ms",),
+    )
+
+
+def _persist_cursor_agent_usage_observations(
+    config: ProviderStatusLoopConfig,
+    payloads: Sequence[tuple[Any, ...]],
+) -> int:
+    if not payloads:
+        return 0
+    dsn = _resolve_dsn(config)
+    inserted_count = 0
+    try:
+        with probes.psycopg.connect(dsn) as conn:
+            try:
+                with conn.cursor() as cur:
+                    _set_cursor_agent_usage_database_timeouts(
                         cur,
                         lock_timeout_ms=config.db_lock_timeout_ms,
                         statement_timeout_ms=config.db_statement_timeout_ms,
@@ -10275,6 +10632,89 @@ def _run_kimi_usage_poll_task(
     }
 
 
+def _run_cursor_agent_usage_poll_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+) -> Optional[Dict[str, Any]]:
+    if not config.cursor_agent_usage_poll_enabled:
+        return None
+    last_attempt = state.cursor_agent_usage_last_attempt_monotonic
+    if (
+        last_attempt is not None
+        and now_monotonic - last_attempt
+        < config.cursor_agent_usage_poll_interval_seconds
+    ):
+        return None
+
+    state.cursor_agent_usage_last_attempt_monotonic = now_monotonic
+    observed_at = datetime.now(timezone.utc)
+    grok_bot = grok_bot_reevaluation_checkpoint()
+    summary: Dict[str, Any] = {
+        "attempted": True,
+        "persisted": False,
+        "skipped": False,
+        "usage_url": _cursor_agent_usage_url(config),
+        "observation_count": 0,
+        "inserted_count": 0,
+        "status_code": None,
+        "attempt_count": 0,
+        "retry_count": 0,
+        "telemetry_class": None,
+        "telemetry_status": None,
+        "error_class": None,
+        "error_message": None,
+        "weekly_grok_bot": grok_bot["status"],
+        "weekly_grok_bot_quota_key": grok_bot["quota_key"],
+        "weekly_grok_bot_reevaluation_ready": bool(grok_bot["reevaluation_ready"]),
+        "last_good_state_retained": False,
+    }
+    try:
+        fetched = _fetch_cursor_agent_usage_payload(config)
+        summary["status_code"] = fetched["status_code"]
+        summary["attempt_count"] = fetched.get("attempt_count", 1)
+        summary["retry_count"] = fetched.get("retry_count", 0)
+        payloads, parser_summary = _build_cursor_agent_usage_rate_limit_payloads(
+            config,
+            observed_at=observed_at,
+            response_body=fetched["payload"],
+        )
+        summary.update(parser_summary)
+        summary["observation_count"] = len(payloads)
+        if config.apply:
+            summary["inserted_count"] = _persist_cursor_agent_usage_observations(
+                config,
+                payloads,
+            )
+            summary["persisted"] = bool(payloads)
+        if summary["telemetry_status"] in {
+            "malformed",
+            "missing_account_identity",
+            "absent",
+        }:
+            summary["telemetry_class"] = "malformed_telemetry"
+            summary["last_good_state_retained"] = True
+    except Exception as exc:
+        summary["error_class"] = exc.__class__.__name__
+        summary["error_message"] = _redacted_failure_message(str(exc))
+        summary["last_good_state_retained"] = True
+        if isinstance(exc, CursorAgentUsagePollError):
+            summary["status_code"] = exc.status_code
+            summary["telemetry_class"] = exc.telemetry_class
+            summary["attempt_count"] = exc.attempt_count
+            summary["retry_count"] = exc.retry_count
+        else:
+            summary["telemetry_class"] = "malformed_telemetry"
+
+    return {
+        "event": "cursor_agent_usage_poll",
+        "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+        "environment": config.environment,
+        **summary,
+    }
+
+
 def _alibaba_subscription_refresh_due(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
@@ -10727,6 +11167,7 @@ def run_due_sidecar_tasks(
         (_run_xai_oauth_refresh_task, "xai_oauth_refresh"),
         (_run_kimi_oauth_refresh_task, "kimi_oauth_refresh"),
         (_run_kimi_usage_poll_task, "kimi_usage_poll"),
+        (_run_cursor_agent_usage_poll_task, "cursor_agent_usage_poll"),
         (_run_alibaba_quota_poll_task, "alibaba_quota_poll"),
         (_run_grok_billing_poll_task, "grok_billing_poll"),
         (_run_codex_reset_credit_poll_task, "codex_reset_credit_poll"),

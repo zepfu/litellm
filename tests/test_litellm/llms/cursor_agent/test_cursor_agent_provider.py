@@ -16,6 +16,7 @@ from litellm.llms.cursor_agent.common_utils import (
     auth_exchange_url,
     build_run_request,
     build_turn_headers,
+    current_period_usage_url,
     extract_text_from_agent_payload,
     resolve_access_token,
     resolve_dashboard_api_base,
@@ -54,8 +55,13 @@ def test_default_hosts_are_split():
     assert auth_exchange_url(None) == (
         "https://api2.cursor.sh/auth/exchange_user_api_key"
     )
+    assert current_period_usage_url(None) == (
+        "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
+    )
     assert CURSOR_AGENT_TURN_HOST not in auth_exchange_url(None)
+    assert CURSOR_AGENT_TURN_HOST not in current_period_usage_url(None)
     assert CURSOR_AGENT_DASHBOARD_HOST not in run_url(None)
+    assert "/v0/me" not in current_period_usage_url(None)
 
 
 def test_complete_url_is_agent_service_run():
