@@ -147,12 +147,22 @@ order:
 4. OpenCode Zen deepseek-v4-flash
 5. OpenCode Zen big-pickle
 6. Alibaba Token Plan deepseek-v4-flash-0731
-7. Alibaba Token Plan qwen3.6-flash
+7. Cursor Agent Composer 2.5 standard (`cursor_agent/composer-2.5`,
+   `provider: cursor_agent`, `codex_cursor_agent_aiserver_adapter`,
+   priority 42). Distinct from `composer-2.5-fast` and from xAI
+   `grok-composer-2.5-fast`. Alias YAML uses `cursor_agent`, not Cloud
+   Agents `cursor`.
+8. Alibaba Token Plan qwen3.6-flash
 
 The managed `sota-xai` candidate has no candidate-level reasoning override:
 caller `reasoning.effort=xhigh` is sent unchanged to `oa_xai/grok-4.6`, with
 requested/native effort metadata and the provider-native field/provider
-recorded. Its route rollup is `grok-4.6(sota-xai):xhigh`.
+recorded. Its route rollup is `grok-4.6(sota-xai):xhigh`. `sota-xai` then
+appends Cursor Grok (`cursor_agent/cursor-grok-4.6-high`, priority 90) as a
+lower-priority fallback so `work` / `work-other` inherit it. Cursor Grok
+stays distinct from `oa_xai/grok-4.6` and `xai/grok-4.6`; xAI remains
+preferred. Codex/Anthropic Cursor Agent alias dispatch is fail-closed in
+this catalog wave and does not route through Cloud Agents `cursor`.
 
 For this managed `oa_xai`/`sota-xai` flow, Grok 4.6 adapts both the
 `collaboration` and `multi_agent_v1` namespaces. Those children are flattened
@@ -186,7 +196,10 @@ unpriced. OpenCode Big Pickle and its free DeepSeek route remain unpriced, and
 Alibaba DeepSeek V4 Flash and Qwen 3.6 are reference-priced only under the
 subscription `actual_invoice_cost_known=false` contract, using the
 international Model Studio direct list rate rather than claiming Token Plan
-subscription invoice economics. Reference totals are provenance metadata and
+subscription invoice economics. Cursor Composer 2.5 standard and Cursor Grok
+4.6 publish public Cursor list rates as reference-only
+(`actual_invoice_cost_known=false`); Cursor Models pool / subscription
+invoice cost remains unknown. Reference totals are provenance metadata and
 never standard spend or `response_cost_usd`; Luna remains the last-resort
 actual routed fallback.
 
@@ -208,7 +221,8 @@ internal.
 During the daily half-open window `22:00-08:00 UTC+8` (CFG-020), `work-other`
 promotes `alias_reference: sota-deepseek` (`alibaba_token_plan/deepseek-v4-pro`)
 ahead of `sota-moonshot` and `sota-xai`. Outside that window the DeepSeek
-reference is omitted from new selection, so the order is Moonshot, then xAI.
+reference is omitted from new selection, so the order is Moonshot, then xAI
+(`oa_xai/grok-4.6` preferred, then inherited `cursor_agent/cursor-grok-4.6-high`).
 Qwen 3.8 Max and Qwen 3.7 Max are not `work-other` candidates. Closing the
 window prevents new affinity and does not evict an existing session owner.
 

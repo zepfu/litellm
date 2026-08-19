@@ -7,3 +7,11 @@ aliases:
         model: oa_xai/grok-4.6
         route_family: codex_xai_oauth_responses_adapter
         priority: 100
+
+      # Cursor Grok 4.6 stays distinct from managed oa_xai/grok-4.6 and
+      # native xai/grok-4.6. Lower priority keeps xAI preferred; work /
+      # work-other inherit this candidate via alias_reference.
+      - provider: cursor_agent
+        model: cursor_agent/cursor-grok-4.6-high
+        route_family: codex_cursor_agent_aiserver_adapter
+        priority: 90

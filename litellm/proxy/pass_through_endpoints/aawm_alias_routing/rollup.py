@@ -77,6 +77,12 @@ def _resolve_auto_agent_alias_route_rollup_outgoing_target(
         return _get_anthropic_adapter_access_log_target_label(target_url)
     route_family_target_labels = {
         "codex_cohere_chat_completions_adapter": "api.cohere.com/v2/chat",
+        "codex_cursor_agent_aiserver_adapter": (
+            "agentn.global.api5.cursor.sh/agent.v1.AgentService/Run"
+        ),
+        "anthropic_cursor_agent_aiserver_adapter": (
+            "agentn.global.api5.cursor.sh/agent.v1.AgentService/Run"
+        ),
         "codex_opencode_zen_adapter": "opencode.ai/zen/v1/chat/completions",
         "codex_openrouter_completion_adapter": "openrouter.ai/api/v1/chat/completions",
         "anthropic_opencode_zen_responses_adapter": "opencode.ai/zen/v1/responses",

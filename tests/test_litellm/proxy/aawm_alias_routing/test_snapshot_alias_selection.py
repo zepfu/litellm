@@ -514,10 +514,12 @@ def test_canonical_work_other_promotes_deepseek_only_inside_daily_window() -> No
             "alibaba_token_plan/deepseek-v4-pro",
             "kimi_code/k3",
             "oa_xai/grok-4.6",
+            "cursor_agent/cursor-grok-4.6-high",
         ]
         assert [candidate["model"] for candidate in outside] == [
             "kimi_code/k3",
             "oa_xai/grok-4.6",
+            "cursor_agent/cursor-grok-4.6-high",
         ]
         assert all(
             "qwen" not in str(candidate["model"])
@@ -538,10 +540,12 @@ def test_canonical_work_other_promotes_deepseek_only_inside_daily_window() -> No
             "alibaba_token_plan/deepseek-v4-pro",
             "kimi_code/k3",
             "oa_xai/grok-4.6",
+            "cursor_agent/cursor-grok-4.6-high",
         ]
         assert [candidate["model"] for candidate in outside_anthropic] == [
             "kimi_code/k3",
             "oa_xai/grok-4.6",
+            "cursor_agent/cursor-grok-4.6-high",
         ]
         assert (
             inside_anthropic[0]["route_family"]
@@ -557,6 +561,7 @@ def test_canonical_work_other_promotes_deepseek_only_inside_daily_window() -> No
             "alibaba_token_plan/deepseek-v4-pro",
             "kimi_code/k3",
             "oa_xai/grok-4.6",
+            "cursor_agent/cursor-grok-4.6-high",
         ]
     finally:
         snapshot_select.set_active_routing_snapshot(previous)

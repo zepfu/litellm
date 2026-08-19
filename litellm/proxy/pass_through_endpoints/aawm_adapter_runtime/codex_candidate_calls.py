@@ -320,6 +320,10 @@ async def _perform_codex_auto_agent_alias_candidate_request(
     _bind_codex_oauth_candidate_to_request(request, candidate)
     adapter_model = candidate["model"]
     cohere_provider = globals().get("_CODEX_AUTO_AGENT_COHERE_PROVIDER", "cohere")
+    cursor_agent_provider = globals().get(
+        "_CODEX_AUTO_AGENT_CURSOR_AGENT_PROVIDER", "cursor_agent"
+    )
+
     async def _openrouter_completion() -> Response:
         return await _perform_codex_auto_agent_openrouter_completion_request(
             request=request,
@@ -406,6 +410,16 @@ async def _perform_codex_auto_agent_alias_candidate_request(
             use_alias_candidate_probe=True,
         )
 
+    async def _cursor_agent() -> Response:
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            _raise_cursor_agent_alias_not_implemented,
+        )
+
+        _raise_cursor_agent_alias_not_implemented(
+            ingress="codex",
+            candidate=candidate,
+        )
+
     async def _native() -> Response:
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
             _codex_oauth_responses_target_url,
@@ -431,6 +445,7 @@ async def _perform_codex_auto_agent_alias_candidate_request(
             _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER: _kimi_code,
             _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER: _alibaba_token_plan,
             cohere_provider: _cohere,
+            cursor_agent_provider: _cursor_agent,
         },
         route_family_handlers={
             _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER: {
@@ -444,6 +459,46 @@ async def _perform_codex_auto_agent_alias_candidate_request(
         },
         default_handler=_native,
     )
+
+
+def _raise_cursor_agent_alias_not_implemented(
+    *,
+    ingress: str,
+    candidate: dict[str, Any],
+) -> None:
+    """Fail closed for Cursor Agent alias dispatch in this catalog wave.
+
+    Catalog/alias selection may compile ``cursor_agent`` candidates, but the
+    Codex/Anthropic aiserver adapter is not implemented yet. Do not fall
+    through to Cloud Agents ``cursor`` or native Codex/OpenAI credentials.
+    """
+    from litellm.proxy._types import ProxyException
+
+    model = str(candidate.get("model") or "")
+    route_family = str(candidate.get("route_family") or "")
+    message = (
+        "aawm_codex_auto_agent_candidate_unavailable: "
+        "cursor_agent alias dispatch is not implemented for this wave; "
+        f"ingress={ingress} model={model} route_family={route_family}. "
+        "Do not route through Cloud Agents cursor."
+    )
+    exc = ProxyException(
+        message=message,
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    setattr(
+        exc,
+        "detail",
+        {
+            "error": {
+                "message": message,
+                "code": "aawm_codex_auto_agent_candidate_unavailable",
+            }
+        },
+    )
+    raise exc
 
 
 def _build_codex_cohere_adapter_request_body(

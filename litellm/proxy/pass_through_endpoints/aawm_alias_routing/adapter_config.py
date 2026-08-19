@@ -225,6 +225,30 @@ CODEX_COHERE_CHAT_COMPLETIONS = AnthropicCompletionAdapterConfig(
     custom_llm_provider="cohere",
 )
 
+CODEX_CURSOR_AGENT_AISERVER = AnthropicCompletionAdapterConfig(
+    adapter="codex_cursor_agent_aiserver_adapter",
+    adapter_label="Cursor Agent",
+    route_family="codex_cursor_agent_aiserver_adapter",
+    tag_prefix="codex-cursor-agent-aiserver-adapter",
+    span_name="codex.cursor_agent_aiserver_adapter",
+    target_endpoint_label="cursor_agent:/agent.v1.AgentService/Run",
+    credential_family="cursor_agent",
+    expected_target_family="cursor_agent",
+    custom_llm_provider="cursor_agent",
+)
+
+ANTHROPIC_CURSOR_AGENT_AISERVER = AnthropicCompletionAdapterConfig(
+    adapter="anthropic_cursor_agent_aiserver_adapter",
+    adapter_label="Cursor Agent",
+    route_family="anthropic_cursor_agent_aiserver_adapter",
+    tag_prefix="anthropic-cursor-agent-aiserver-adapter",
+    span_name="anthropic.cursor_agent_aiserver_adapter",
+    target_endpoint_label="cursor_agent:/agent.v1.AgentService/Run",
+    credential_family="cursor_agent",
+    expected_target_family="cursor_agent",
+    custom_llm_provider="cursor_agent",
+)
+
 def responses_finalize_kwargs(
     config: AnthropicResponsesAdapterConfig,
     *,

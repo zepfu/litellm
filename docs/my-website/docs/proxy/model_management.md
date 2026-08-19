@@ -41,19 +41,23 @@ combines maximum reasoning with proactive subagent delegation, not an API
 Config-driven alias routing uses:
 
 - `sota-openai`: `gpt-5.6-sol`
-- `sota-xai`: `oa_xai/grok-4.6`
+- `sota-xai`: `oa_xai/grok-4.6` (priority 100), then
+  `cursor_agent/cursor-grok-4.6-high` (priority 90)
 - Managed `sota-xai` has no candidate-level reasoning override: caller
   `reasoning.effort=xhigh` is sent unchanged to `oa_xai/grok-4.6`. Request
   metadata records the requested/native effort as `xhigh` and the
   provider-native field/provider; the route rollup is
-  `grok-4.6(sota-xai):xhigh`.
+  `grok-4.6(sota-xai):xhigh`. Cursor Grok is a lower-priority inherited
+  fallback, distinct from `oa_xai/grok-4.6` and `xai/grok-4.6`.
 - `sota`: selects the producer-family `sota-*` alias from TUI origin, defaulting to `sota-openai`.
 - Grok 4.6 (`xai/grok-4.6`, `oa_xai/grok-4.6`): 500k context; created 1785974400 (2026-08-06T00:00:00Z), owned by xAI, no aliases, source `https://docs.x.ai/developers/models/grok-4.6`, verified 2026-08-12; input $2/M, output $6/M, cached input $0.50/M, image input $2/M image tokens; above 200k whole-request input tokens, input/cache/output are $4/$1/$12 per million; managed-route session history records this as a reference rate with invoice cost unknown
+- Cursor Agent Composer 2.5 standard (`cursor_agent/composer-2.5`): CLI slug `composer-2.5`, not Fast and not xAI `grok-composer-2.5-fast`; public list $0.50/$0.20/$2.50 per million input/cache-read/output, reference-only with invoice cost unknown
+- Cursor Grok 4.6 (`cursor_agent/cursor-grok-4.6-high`): CLI slug `cursor-grok-4.6-high`, distinct from `oa_xai/grok-4.6` and `xai/grok-4.6`; public list $2/$0.50/$6 per million input/cache-read/output, reference-only with invoice cost unknown; temporary launch discount is not baked in
 - `sota-alibaba`: `alibaba_token_plan/qwen3.8-max` → `alibaba_token_plan/qwen3.7-max`
 - `sota-zai`: `alibaba_token_plan/glm-5.2`
-- `basic`: the config-driven low-cost alias
+- `basic`: the config-driven low-cost alias; Cursor Composer 2.5 standard (`cursor_agent/composer-2.5`) sits at priority 42 after `alibaba_token_plan/deepseek-v4-flash-0731`
 - `work`: `gpt-5.3-codex-spark` → nested `work-other` alias reference → Claude-only native Sonnet tail → `gpt-5.6-luna`
-- `work-other`: ordinary configured alias and valid exact-name / `alias_reference` target; omitted from Codex and Claude TUI selection only by those clients' explicit model-definition inclusion lists. During `22:00-08:00 UTC+8` the order is `sota-deepseek` (`alibaba_token_plan/deepseek-v4-pro`), then `sota-moonshot`, then `sota-xai`. Outside that window DeepSeek is omitted from new selection. Qwen Max models are not `work-other` candidates.
+- `work-other`: ordinary configured alias and valid exact-name / `alias_reference` target; omitted from Codex and Claude TUI selection only by those clients' explicit model-definition inclusion lists. During `22:00-08:00 UTC+8` the order is `sota-deepseek` (`alibaba_token_plan/deepseek-v4-pro`), then `sota-moonshot`, then `sota-xai` (`oa_xai/grok-4.6` preferred, then inherited `cursor_agent/cursor-grok-4.6-high`). Outside that window DeepSeek is omitted from new selection. Qwen Max models are not `work-other` candidates.
 - `expert`: during `22:00-08:00 UTC+8`, `alibaba_token_plan/qwen3.8-max` is first for every ingress. Claude-origin in-window order is Qwen, then native Anthropic `claude-opus-5`, then universal `gpt-5.6-terra`. Codex / non-Claude in-window order is Qwen, then Terra. Outside the window the previous Opus/Terra behavior is unchanged. Canonical Opus 5 is inherently 1M-context; there is no `claude-opus-5[1m]` selector. All three compiled candidates use authoritative `reasoning_effort: max` via the CFG-006 candidate pipeline. Opus egresses only through Anthropic-native credentials; Terra keeps its OpenAI/Codex credential domain on both ingresses.
 
 Config-driven AAWM aliases and candidates come only from the compiled YAML

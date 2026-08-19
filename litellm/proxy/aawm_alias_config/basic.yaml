@@ -54,6 +54,14 @@ aliases:
         route_family: codex_alibaba_token_plan_chat_completions_adapter
         priority: 45
 
+      # Cursor Composer 2.5 standard is distinct from Fast. Alias YAML uses
+      # cursor_agent, not Cloud Agents cursor. Dispatch is fail-closed until
+      # the Codex/Anthropic Cursor Agent adapter wave lands.
+      - provider: cursor_agent
+        model: cursor_agent/composer-2.5
+        route_family: codex_cursor_agent_aiserver_adapter
+        priority: 42
+
       - provider: alibaba_token_plan
         model: alibaba_token_plan/qwen3.6-flash
         route_family: codex_alibaba_token_plan_chat_completions_adapter

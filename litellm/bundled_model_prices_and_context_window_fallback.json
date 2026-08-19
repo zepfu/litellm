@@ -9823,6 +9823,96 @@
         "supports_response_schema": true,
         "supports_tool_choice": true
     },
+    "cursor_agent/composer-2.5": {
+        "comment": "Cursor Agent CLI Composer 2.5 standard. Distinct from composer-2.5-fast and from xAI grok-composer-2.5-fast. Public Cursor list rates are reference-only; Cursor Models pool / subscription invoice cost is unknown.",
+        "litellm_provider": "cursor_agent",
+        "max_input_tokens": 200000,
+        "max_output_tokens": 200000,
+        "max_tokens": 200000,
+        "mode": "chat",
+        "provider_specific_entry": {
+            "cursor_agent": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "priced",
+                    "kind": "provider_catalog_reference_tariff",
+                    "billing_mode": "cursor_agent_subscription_reference",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "cursor_agent",
+                        "model": "cursor_agent/composer-2.5"
+                    },
+                    "rates": {
+                        "input_usd_per_million_tokens": 0.5,
+                        "cache_read_usd_per_million_tokens": 0.2,
+                        "output_usd_per_million_tokens": 2.5
+                    },
+                    "cache_mode": "cache_read",
+                    "equivalence_status": "direct_reference",
+                    "equivalence_evidence": "Public Cursor Composer 2.5 standard list rates from cursor.com/docs/models-and-pricing; not Cursor Models pool or subscription invoice economics. Distinct from Composer 2.5 Fast ($3/$0.50/$15) and from xAI grok-composer-2.5-fast.",
+                    "source": {
+                        "kind": "official_provider_direct_list_rate_catalog",
+                        "label": "Cursor Models and Pricing",
+                        "urls": [
+                            "https://cursor.com/docs/models-and-pricing"
+                        ],
+                        "version": "2026-08-19",
+                        "verified_on": "2026-08-19"
+                    }
+                }
+            }
+        },
+        "source": "https://cursor.com/docs/models-and-pricing",
+        "supports_function_calling": true,
+        "supports_tool_choice": true
+    },
+    "cursor_agent/cursor-grok-4.6-high": {
+        "comment": "Cursor Agent CLI Cursor Grok 4.6 high-effort. Distinct from oa_xai/grok-4.6 and xai/grok-4.6. Public Cursor list rates are reference-only; Cursor Models pool / subscription invoice cost is unknown. Temporary 50% Grok 4.6 launch discount is not baked in.",
+        "litellm_provider": "cursor_agent",
+        "max_input_tokens": 200000,
+        "max_output_tokens": 200000,
+        "max_tokens": 200000,
+        "mode": "chat",
+        "provider_specific_entry": {
+            "cursor_agent": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "priced",
+                    "kind": "provider_catalog_reference_tariff",
+                    "billing_mode": "cursor_agent_subscription_reference",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "cursor_agent",
+                        "model": "cursor_agent/cursor-grok-4.6-high"
+                    },
+                    "rates": {
+                        "input_usd_per_million_tokens": 2.0,
+                        "cache_read_usd_per_million_tokens": 0.5,
+                        "output_usd_per_million_tokens": 6.0
+                    },
+                    "cache_mode": "cache_read",
+                    "equivalence_status": "direct_reference",
+                    "equivalence_evidence": "Public Cursor Grok 4.6 list rates from cursor.com/docs/models-and-pricing; not Cursor Models pool or subscription invoice economics. Distinct from xai/grok-4.6 and oa_xai/grok-4.6. Temporary 50% launch discount starting 2026-08-12 is not represented.",
+                    "source": {
+                        "kind": "official_provider_direct_list_rate_catalog",
+                        "label": "Cursor Models and Pricing",
+                        "urls": [
+                            "https://cursor.com/docs/models-and-pricing",
+                            "https://cursor.com/docs/models/grok-4-6"
+                        ],
+                        "version": "2026-08-19",
+                        "verified_on": "2026-08-19"
+                    }
+                }
+            }
+        },
+        "source": "https://cursor.com/docs/models-and-pricing",
+        "supports_function_calling": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true
+    },
     "cohere.rerank-v3-5:0": {
         "input_cost_per_query": 0.002,
         "input_cost_per_token": 0.0,

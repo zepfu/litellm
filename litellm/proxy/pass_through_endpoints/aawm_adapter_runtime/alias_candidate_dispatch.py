@@ -318,6 +318,16 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(
             use_alias_candidate_probe=True,
         )
 
+    async def _cursor_agent() -> "Response":
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+            _raise_cursor_agent_alias_not_implemented,
+        )
+
+        _raise_cursor_agent_alias_not_implemented(
+            ingress="anthropic",
+            candidate=candidate,
+        )
+
     async def _native() -> "Response":
         native_candidate_body = dict(candidate_body)
         native_custom_headers = custom_headers
@@ -411,6 +421,7 @@ async def _perform_anthropic_auto_agent_alias_candidate_request(
             rt.provider_opencode: _opencode,
             rt.provider_kimi: _kimi_code,
             rt.provider_alibaba: _alibaba_token_plan,
+            "cursor_agent": _cursor_agent,
         },
         route_family_handlers={
             rt.provider_openrouter: {
