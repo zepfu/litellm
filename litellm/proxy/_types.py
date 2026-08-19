@@ -664,6 +664,8 @@ class LiteLLMRoutes(enum.Enum):
         "/invitation/delete",
         # Team guardrail submission - requires team-scoped key; endpoint enforces team_id
         "/guardrails/register",
+        # D1-617: endpoint enforces proxy-admin or aawm_session_transfer_status.
+        "/internal/aawm/session-transfer-status",
     ]  # routes that manage their own allowed/disallowed logic
 
     ## Org Admin Routes ##

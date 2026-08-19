@@ -4,6 +4,11 @@ import TabItem from '@theme/TabItem';
 
 # Logging
 
+Live AAWM session-transfer telemetry is documented in the repository maintainer
+guide `docs/aawm-session-transfer-status.md`. Use
+`GET /internal/aawm/session-transfer-status` for authenticated, content-free
+stream status. It is not a prompt or response log.
+
 Log Proxy input, output, and exceptions using:
 
 - Langfuse

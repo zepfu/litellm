@@ -109,6 +109,13 @@ smoke scripts that send only `x-litellm-session-id` still get session grouping;
 they receive an internally generated trace id rather than reusing the session
 id as the Langfuse/standard-logging trace id.
 
+Live in-flight transfer state is a separate contract from durable
+`session_history` rows. Query
+[`GET /internal/aawm/session-transfer-status`](aawm-session-transfer-status.md)
+for content-free stream phases, chunk/byte counters, and current-window token
+counts. That endpoint does not replace `session_history` and does not prove
+local agent work has finished.
+
 Related helpers:
 
 - `get_trace_id_from_headers()` / `get_session_id_from_headers()` extract each

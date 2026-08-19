@@ -25,6 +25,12 @@ from litellm.proxy.aawm_route_logging import (
     record_aawm_route_rollup,
     record_aawm_route_rollup_turn,
 )
+from litellm.proxy.aawm_session_transfer.identity import extract_transfer_identity
+from litellm.proxy.aawm_session_transfer.registry import (
+    safe_finalize,
+    safe_mark_phase,
+    safe_record_chunks,
+)
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 from litellm.types.passthrough_endpoints.pass_through_endpoints import (
     EndpointType,
@@ -742,6 +748,35 @@ class PassThroughStreamingHandler:
                 custom_llm_provider=custom_llm_provider,
             )
             metadata["aawm_stream_raw_bytes_buffered"] = buffer_raw_bytes
+            transfer_identity = extract_transfer_identity(
+                request_body=request_body if isinstance(request_body, dict) else None,
+                logging_obj=litellm_logging_obj,
+                kwargs=success_handler_kwargs,
+                url_route=url_route,
+                custom_llm_provider=custom_llm_provider,
+                stream_path="pass_through",
+            )
+            await safe_mark_phase(transfer_identity, "awaiting_upstream")
+            downstream_chunk_count = 0
+            downstream_byte_count = 0
+
+            async def _publish_transfer_chunks(
+                *,
+                first_upstream: bool = False,
+                first_downstream: bool = False,
+                force: bool = False,
+            ) -> None:
+                if not force and chunk_count > 1 and chunk_count % 8 != 0:
+                    return
+                await safe_record_chunks(
+                    transfer_identity,
+                    upstream_chunks=chunk_count,
+                    upstream_bytes=total_stream_bytes,
+                    downstream_chunks=downstream_chunk_count,
+                    downstream_bytes=downstream_byte_count,
+                    first_upstream=first_upstream,
+                    first_downstream=first_downstream,
+                )
 
             def _mark_first_emitted_chunk() -> None:
                 nonlocal first_emitted_at
@@ -763,10 +798,13 @@ class PassThroughStreamingHandler:
                     )
 
             def _record_responses_wire_chunk(chunk: bytes) -> None:
+                nonlocal downstream_chunk_count, downstream_byte_count
                 if buffer_raw_bytes:
                     raw_bytes.append(chunk)
                 if line_accumulator is not None:
                     line_accumulator.feed(chunk)
+                downstream_chunk_count += 1
+                downstream_byte_count += len(chunk)
                 _mark_first_emitted_chunk()
 
             def _consume_responses_lines(lines: List[str]) -> None:
@@ -838,6 +876,7 @@ class PassThroughStreamingHandler:
                             ),
                         },
                     )
+                    await _publish_transfer_chunks(first_upstream=True, force=True)
 
                 if responses_terminal_accumulator is not None:
                     chunk = PassThroughStreamingHandler._stamp_encrypted_reasoning_in_responses_sse_chunk(
@@ -857,6 +896,10 @@ class PassThroughStreamingHandler:
                             yield held_responses_done_suffix
                             held_responses_done_suffix = b""
                         _record_responses_wire_chunk(chunk)
+                        await _publish_transfer_chunks(
+                            first_downstream=first_emitted_at is not None
+                            and downstream_chunk_count == 1
+                        )
                         yield chunk
                         continue
 
@@ -868,6 +911,10 @@ class PassThroughStreamingHandler:
                     )
                     if chunk_without_done:
                         _record_responses_wire_chunk(chunk_without_done)
+                        await _publish_transfer_chunks(
+                            first_downstream=first_emitted_at is not None
+                            and downstream_chunk_count == 1
+                        )
                         yield chunk_without_done
                     continue
 
@@ -907,7 +954,13 @@ class PassThroughStreamingHandler:
                         request_body=request_body if isinstance(request_body, dict) else None,
                         custom_llm_provider=custom_llm_provider,
                     )
+                downstream_chunk_count += 1
+                downstream_byte_count += len(chunk)
                 _mark_first_emitted_chunk()
+                await _publish_transfer_chunks(
+                    first_downstream=first_emitted_at is not None
+                    and downstream_chunk_count == 1
+                )
                 yield chunk
 
             if responses_terminal_accumulator is not None:
@@ -979,6 +1032,26 @@ class PassThroughStreamingHandler:
                     ),
                 },
             )
+            await safe_mark_phase(
+                transfer_identity,
+                "finalizing",
+                extra={
+                    "upstream_chunk_count": chunk_count,
+                    "upstream_byte_count": total_stream_bytes,
+                    "downstream_chunk_count": downstream_chunk_count,
+                    "downstream_byte_count": downstream_byte_count,
+                },
+            )
+            await safe_finalize(
+                transfer_identity,
+                "completed",
+                extra={
+                    "upstream_chunk_count": chunk_count,
+                    "upstream_byte_count": total_stream_bytes,
+                    "downstream_chunk_count": downstream_chunk_count,
+                    "downstream_byte_count": downstream_byte_count,
+                },
+            )
 
             precomputed_lines: Optional[List[str]] = None
             if line_accumulator is not None:
@@ -1003,6 +1076,57 @@ class PassThroughStreamingHandler:
                     error_log_context=error_log_context,
                 )
             )
+        except asyncio.CancelledError:
+            local_identity = (
+                transfer_identity if "transfer_identity" in locals() else {}
+            )
+            await safe_finalize(
+                local_identity,
+                "cancelled",
+                extra={
+                    "error_code": "cancelled",
+                    "error_class": "CancelledError",
+                    "upstream_chunk_count": chunk_count
+                    if "chunk_count" in locals()
+                    else 0,
+                    "upstream_byte_count": total_stream_bytes
+                    if "total_stream_bytes" in locals()
+                    else 0,
+                    "downstream_chunk_count": downstream_chunk_count
+                    if "downstream_chunk_count" in locals()
+                    else 0,
+                    "downstream_byte_count": downstream_byte_count
+                    if "downstream_byte_count" in locals()
+                    else 0,
+                },
+            )
+            raise
+        except GeneratorExit:
+            local_identity = (
+                transfer_identity if "transfer_identity" in locals() else {}
+            )
+            await safe_finalize(
+                local_identity,
+                "disconnected",
+                extra={
+                    "error_code": "disconnect",
+                    "error_class": "GeneratorExit",
+                    "disconnect_reason": "client_disconnected",
+                    "upstream_chunk_count": chunk_count
+                    if "chunk_count" in locals()
+                    else 0,
+                    "upstream_byte_count": total_stream_bytes
+                    if "total_stream_bytes" in locals()
+                    else 0,
+                    "downstream_chunk_count": downstream_chunk_count
+                    if "downstream_chunk_count" in locals()
+                    else 0,
+                    "downstream_byte_count": downstream_byte_count
+                    if "downstream_byte_count" in locals()
+                    else 0,
+                },
+            )
+            raise
         except Exception as e:
             local_chunk_count = chunk_count if "chunk_count" in locals() else 0
             local_total_stream_bytes = (
@@ -1013,6 +1137,43 @@ class PassThroughStreamingHandler:
             )
             local_first_emitted_at = (
                 first_emitted_at if "first_emitted_at" in locals() else None
+            )
+            local_identity = (
+                transfer_identity if "transfer_identity" in locals() else {}
+            )
+            local_downstream_chunk_count = (
+                downstream_chunk_count if "downstream_chunk_count" in locals() else 0
+            )
+            local_downstream_byte_count = (
+                downstream_byte_count if "downstream_byte_count" in locals() else 0
+            )
+            timeout_kind = None
+            terminal_phase = "failed"
+            error_code = "upstream_error"
+            if isinstance(e, httpx.ReadTimeout):
+                terminal_phase = "timed_out"
+                error_code = "timeout"
+                timeout_kind = "upstream_read"
+            elif isinstance(e, (BrokenPipeError, ConnectionResetError)):
+                terminal_phase = "disconnected"
+                error_code = "disconnect"
+            await safe_finalize(
+                local_identity,
+                terminal_phase,
+                extra={
+                    "error_code": error_code,
+                    "error_class": type(e).__name__,
+                    "timeout_kind": timeout_kind,
+                    "disconnect_reason": (
+                        "client_disconnected"
+                        if terminal_phase == "disconnected"
+                        else None
+                    ),
+                    "upstream_chunk_count": local_chunk_count,
+                    "upstream_byte_count": local_total_stream_bytes,
+                    "downstream_chunk_count": local_downstream_chunk_count,
+                    "downstream_byte_count": local_downstream_byte_count,
+                },
             )
             exception_context = (
                 PassThroughStreamingHandler._build_streaming_exception_log_context(

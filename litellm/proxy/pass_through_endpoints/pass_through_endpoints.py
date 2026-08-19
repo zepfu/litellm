@@ -4141,6 +4141,30 @@ async def pass_through_request(  # noqa: PLR0915
         )
         logging_obj.model_call_details["litellm_call_id"] = litellm_call_id
 
+        try:
+            from litellm.proxy.aawm_session_transfer.hooks import (
+                build_transfer_identity,
+                publish_transfer_phase,
+            )
+
+            _transfer_identity = build_transfer_identity(
+                request=request,
+                request_body=_parsed_body if isinstance(_parsed_body, dict) else None,
+                logging_obj=logging_obj,
+                kwargs=kwargs,
+                litellm_call_id=litellm_call_id,
+                url_route=str(url) if url is not None else None,
+                custom_llm_provider=custom_llm_provider,
+                stream_path="pass_through",
+            )
+            await publish_transfer_phase(_transfer_identity, "request_received")
+            await publish_transfer_phase(_transfer_identity, "request_preparing")
+        except Exception:
+            verbose_proxy_logger.debug(
+                "Failed to publish session-transfer request phase",
+                exc_info=True,
+            )
+
         # combine url with query params for logging
         requested_query_params: Optional[dict]
         if query_params is not None:
@@ -4212,6 +4236,32 @@ async def pass_through_request(  # noqa: PLR0915
                 ),
             )
             upstream_wait_started_at = datetime.now()
+            try:
+                from litellm.proxy.aawm_session_transfer.hooks import (
+                    build_transfer_identity,
+                    publish_transfer_phase,
+                )
+
+                await publish_transfer_phase(
+                    build_transfer_identity(
+                        request=request,
+                        request_body=_parsed_body
+                        if isinstance(_parsed_body, dict)
+                        else None,
+                        logging_obj=logging_obj,
+                        kwargs=kwargs,
+                        litellm_call_id=litellm_call_id,
+                        url_route=str(url) if url is not None else None,
+                        custom_llm_provider=custom_llm_provider,
+                        stream_path="pass_through",
+                    ),
+                    "awaiting_upstream",
+                )
+            except Exception:
+                verbose_proxy_logger.debug(
+                    "Failed to publish session-transfer awaiting_upstream phase",
+                    exc_info=True,
+                )
 
             async def _send_stream_pre_first_byte() -> Tuple[
                 httpx.Response, httpx.Request
