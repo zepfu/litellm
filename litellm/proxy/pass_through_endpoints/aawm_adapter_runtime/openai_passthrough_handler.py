@@ -779,15 +779,27 @@ class BaseOpenAIPassThroughHandler:
                     guard.decision
                     is _sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
                 ):
+                    # OPENAI-020: same hosted_provider model/account switches
+                    # are COMPATIBLE_OWNER on the canonical identity and must
+                    # not activate aawm-session-owner-redispatch-v1:*. Keep
+                    # activate_session_owner_redispatch_effective_identity for
+                    # remaining replay-safe mismatches.
+                    same_hosted_provider = _sa._hosted_providers_match(
+                        requested_attributes,
+                        _sa._owner_attributes(guard.owner_record),
+                    )
                     can_retry_with_effective_identity = (
-                        _sa.is_exact_owned_session_owner_route_mismatch(
+                        not same_hosted_provider
+                        and _sa.is_exact_owned_session_owner_route_mismatch(
                             guard=guard,
                             requested_attributes=requested_attributes,
                         )
                         and _sa.is_replay_safe_session_owner_redispatch_body(
                             direct_body
                         )
-                        and not _sa.request_has_effective_session_identity(request)
+                        and not _sa.request_has_effective_session_identity(
+                            request
+                        )
                     )
                     if can_retry_with_effective_identity and _sa.clear_non_held_request_session_owner_lease(
                         request

@@ -928,6 +928,52 @@ def _find_codex_auto_agent_candidate(
     return None
 
 
+_MANAGED_DIRECT_OPENAI_AFFINITY_ROUTE_FAMILIES = frozenset(
+    {
+        "codex_responses",
+        "codex_oauth",
+        "openai_responses",
+    }
+)
+
+
+def _hosted_provider_from_candidate_or_affinity(payload: Mapping[str, Any]) -> str:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as _sa,
+    )
+
+    explicit = payload.get("hosted_provider")
+    if isinstance(explicit, str) and explicit.strip():
+        return explicit.strip().lower()
+    return _sa._hosted_provider_from_attributes(payload)
+
+
+def _route_families_compatible_for_affinity(
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+) -> bool:
+    left_rf = left.get("route_family")
+    right_rf = right.get("route_family")
+    if left_rf in (None, "") or right_rf in (None, ""):
+        return True
+    if left_rf == right_rf:
+        return True
+    left_norm = str(left_rf).strip().lower()
+    right_norm = str(right_rf).strip().lower()
+    if left_norm == right_norm:
+        return True
+    if (
+        left_norm in _MANAGED_DIRECT_OPENAI_AFFINITY_ROUTE_FAMILIES
+        and right_norm in _MANAGED_DIRECT_OPENAI_AFFINITY_ROUTE_FAMILIES
+    ):
+        return True
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as _sa,
+    )
+
+    return bool(_sa._managed_direct_openai_owner_shapes_are_equivalent(left, right))
+
+
 def _find_codex_auto_agent_affinity_candidate(
     affinity: dict[str, Any],
     *,
@@ -939,8 +985,12 @@ def _find_codex_auto_agent_affinity_candidate(
 
     Snapshot-established affinity is checked against the captured snapshot's
     full alias membership so schedule-only changes do not evict an in-flight
-    continuation.
+    continuation. OPENAI-020: same hosted_provider is enough; model and OpenAI
+    account are mutable last-used attributes.
     """
+    affinity_host = _hosted_provider_from_candidate_or_affinity(affinity)
+    same_host: list[dict[str, Any]] = []
+    same_host_compatible_route: list[dict[str, Any]] = []
     for candidate in _select_snapshot_candidates(
         alias_model,
         ingress="codex",
@@ -948,14 +998,20 @@ def _find_codex_auto_agent_affinity_candidate(
         request=request,
         include_out_of_schedule=True,
     ):
-        if (
-            candidate["provider"] == affinity.get("provider")
-            and candidate["model"] == affinity.get("model")
-            and candidate.get("route_family")
-            == affinity.get("route_family")
-        ):
+        if _hosted_provider_from_candidate_or_affinity(candidate) != affinity_host:
+            continue
+        copied = dict(candidate)
+        same_host.append(copied)
+        if _route_families_compatible_for_affinity(candidate, affinity):
+            same_host_compatible_route.append(copied)
+    pool = same_host_compatible_route or same_host
+    if not pool:
+        return None
+    affinity_model = affinity.get("model")
+    for candidate in pool:
+        if candidate.get("model") == affinity_model:
             return dict(candidate)
-    return None
+    return dict(pool[0])
 
 
 def _find_anthropic_auto_agent_candidate(
@@ -1076,41 +1132,15 @@ def _candidate_matches_affinity(
     candidate: dict[str, Any],
     affinity: dict[str, Any],
 ) -> bool:
-    if not (
-        candidate.get("provider") == affinity.get("provider")
-        and candidate.get("model") == affinity.get("model")
-        and candidate.get("route_family") == affinity.get("route_family")
-    ):
+    candidate_host = _hosted_provider_from_candidate_or_affinity(candidate)
+    affinity_host = _hosted_provider_from_candidate_or_affinity(affinity)
+    if not candidate_host or candidate_host != affinity_host:
         return False
-    if not _candidate_uses_codex_oauth(candidate):
-        return True
-    if (
-        affinity.get("codex_oauth_credential_affinity")
-        == "interchangeable"
-        and not _affinity_pins_account_identity(affinity)
-    ):
-        return True
-    if (
-        affinity.get("codex_oauth_credential_affinity")
-        == "interchangeable"
-    ):
-        return all(
-            affinity.get(field) is None
-            or candidate.get(field) == affinity.get(field)
-            for field in (
-                "codex_oauth_account_label",
-                "codex_oauth_account_hash",
-                "codex_oauth_lane_key",
-            )
-        )
-    return all(
-        candidate.get(field) == affinity.get(field)
-        for field in (
-            "codex_oauth_account_label",
-            "codex_oauth_account_hash",
-            "codex_oauth_lane_key",
-        )
-    )
+    if not _route_families_compatible_for_affinity(candidate, affinity):
+        return False
+    # OPENAI-020: model and OpenAI account are mutable on the same hosted
+    # provider. Do not require candidate.model or account_label/hash/lane.
+    return True
 
 
 def _apply_codex_oauth_inventory_affinity_policy(
@@ -4267,6 +4297,16 @@ def install(host_globals: dict) -> None:
         "_lookup_active_snapshot_canonical_alias": _lookup_active_snapshot_canonical_alias,
         "_resolve_aawm_alias_selection_enumeration": _resolve_aawm_alias_selection_enumeration,
         "_select_snapshot_candidates": _select_snapshot_candidates,
+        # OPENAI-020: rebound affinity matchers LOAD_GLOBAL these helpers.
+        "_hosted_provider_from_candidate_or_affinity": (
+            _hosted_provider_from_candidate_or_affinity
+        ),
+        "_route_families_compatible_for_affinity": (
+            _route_families_compatible_for_affinity
+        ),
+        "_MANAGED_DIRECT_OPENAI_AFFINITY_ROUTE_FAMILIES": (
+            _MANAGED_DIRECT_OPENAI_AFFINITY_ROUTE_FAMILIES
+        ),
         "_is_grok_account_quota_candidate": _is_grok_account_quota_candidate,
         "_get_grok_account_quota_lane_cooldown_key": _get_grok_account_quota_lane_cooldown_key,
         "_is_kimi_code_candidate": _is_kimi_code_candidate,

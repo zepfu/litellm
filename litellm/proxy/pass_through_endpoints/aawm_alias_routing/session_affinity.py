@@ -135,6 +135,7 @@ _RECORD_LAST_RENEWED_AT_FIELD = "last_renewed_at_epoch"
 
 _OWNER_ATTRIBUTE_FIELDS = (
     "provider",
+    "hosted_provider",
     "model",
     "route_family",
     "account_label",
@@ -150,6 +151,7 @@ _OWNER_ATTRIBUTE_FIELDS = (
 
 _CORE_OWNER_ATTRIBUTE_KEYS = (
     "provider",
+    "hosted_provider",
     "model",
     "route_family",
     "account_label",
@@ -159,6 +161,21 @@ _CORE_OWNER_ATTRIBUTE_KEYS = (
     "state_format",
     "credential_affinity",
 )
+
+# Same-hosted-provider fields stay mutable last-used attributes. They are
+# stored on the owner record but never part of hard owner identity.
+_MUTABLE_SAME_HOSTED_PROVIDER_ATTRIBUTE_KEYS = (
+    "model",
+    "requested_model",
+    "account_hash",
+    "account_label",
+    "account_lane",
+    "credential_affinity",
+)
+
+# Canonical endpoint/state for the two equivalent managed direct-OpenAI shapes.
+_MANAGED_DIRECT_OPENAI_OWNER_ID_ENDPOINT = "codex_responses"
+_MANAGED_DIRECT_OPENAI_OWNER_ID_STATE = "codex_responses"
 
 _REQUIRED_OWNER_ATTRIBUTE_KEYS = (
     "provider",
@@ -544,6 +561,55 @@ def build_aawm_alias_routing_session_owner_cache_key(
     )
 
 
+def _hosted_provider_from_attributes(attrs: Mapping[str, Any]) -> str:
+    """Hard owner identity: openai, xai, cursor, moonshot, or normalized provider."""
+
+    provider = (_clean_optional_str(attrs.get("provider")) or "").strip().lower()
+    if not provider:
+        provider = (
+            _clean_optional_str(attrs.get("hosted_provider")) or ""
+        ).strip().lower()
+    route_family = (_clean_optional_str(attrs.get("route_family")) or "").strip().lower()
+    if provider == "xai":
+        return "xai"
+    if provider in {"cursor_agent", "cursor"}:
+        return "cursor"
+    if provider in {"kimi_code", "moonshot"}:
+        return "moonshot"
+    if (
+        not provider
+        or provider in {"openai", "codex", "codex_oauth", "chatgpt"}
+        or "codex_oauth" in route_family
+        or "codex_responses" in route_family
+    ):
+        return "openai"
+    return provider
+
+
+def _hosted_providers_match(
+    left: Mapping[str, Any],
+    right: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    right = right or {}
+    left_host = _hosted_provider_from_attributes(left)
+    right_host = _hosted_provider_from_attributes(right)
+    return bool(left_host) and left_host == right_host
+
+
+def _normalized_owner_id_endpoint_state(attrs: Mapping[str, Any]) -> tuple[str, str]:
+    """Collapse equivalent managed direct-OpenAI shapes onto one owner id."""
+
+    if _managed_direct_openai_owner_shape(attrs) is not None:
+        return (
+            _MANAGED_DIRECT_OPENAI_OWNER_ID_ENDPOINT,
+            _MANAGED_DIRECT_OPENAI_OWNER_ID_STATE,
+        )
+    return (
+        str(attrs.get("endpoint_contract") or "default"),
+        str(attrs.get("state_format") or "default"),
+    )
+
+
 def build_session_owner_attributes(
     *,
     provider: Any = None,
@@ -630,15 +696,22 @@ def build_session_owner_attributes(
                 )
                 if cleaned_extra is not None:
                     attributes[str(key)] = cleaned_extra
+    hosted = _hosted_provider_from_attributes(attributes)
+    if hosted:
+        attributes["hosted_provider"] = hosted
     return attributes
 
 
 def _core_owner_attributes(attributes: Mapping[str, Any]) -> Payload:
-    return {
+    core: Payload = {
         key: attributes[key]
         for key in _CORE_OWNER_ATTRIBUTE_KEYS
         if key in attributes and attributes[key] is not None
     }
+    hosted = _hosted_provider_from_attributes(attributes)
+    if hosted:
+        core["hosted_provider"] = hosted
+    return core
 
 
 def _accounts_are_interchangeable(
@@ -661,8 +734,8 @@ def _accounts_are_interchangeable(
 
 
 def build_session_owner_id(
-    *,
     attributes: Optional[Mapping[str, Any]] = None,
+    *,
     provider: Any = None,
     model: Any = None,
     route_family: Any = None,
@@ -683,25 +756,12 @@ def build_session_owner_id(
             if value is not None and str(value).strip() != "":
                 merged[key] = value
         attrs = cast(Payload, merged)
-    interchangeable = _accounts_are_interchangeable(attrs)
-    parts = [
-        str(attrs.get("provider") or "unknown"),
-        str(attrs.get("model") or "unknown"),
-        str(attrs.get("route_family") or "unknown"),
-        str(
-            "interchangeable"
-            if interchangeable
-            else (
-                attrs.get("account_lane")
-                or attrs.get("account_hash")
-                or attrs.get("account_label")
-                or "default"
-            )
-        ),
-        str(attrs.get("endpoint_contract") or "default"),
-        str(attrs.get("state_format") or "default"),
-    ]
-    return "|".join(parts)
+        hosted = _hosted_provider_from_attributes(attrs)
+        if hosted:
+            attrs["hosted_provider"] = hosted
+    hosted = _hosted_provider_from_attributes(attrs) or "unknown"
+    endpoint, state = _normalized_owner_id_endpoint_state(attrs)
+    return "|".join((hosted, endpoint, state))
 
 
 def route_requires_account_identity(attributes: Mapping[str, Any]) -> bool:
@@ -943,8 +1003,9 @@ def _managed_direct_openai_owner_shapes_are_equivalent(
 ) -> bool:
     """Treat the two complete managed direct-OpenAI owner tuples as one contract.
 
-    Comparison-only. Stored attributes, owner ids, and public
-    openai_responses/openai_responses/openai_responses remain distinct.
+    Comparison-only for stored route_family/endpoint/state. Public
+    openai_responses/openai_responses/openai_responses remains distinct.
+    Owner ids collapse the two managed direct-OpenAI shapes onto one triple.
     """
 
     left_shape = _managed_direct_openai_owner_shape(left)
@@ -959,7 +1020,11 @@ def _attributes_exactly_equal(
 ) -> bool:
     left_core = _core_owner_attributes(left)
     right_core = _core_owner_attributes(right)
-    if _accounts_are_interchangeable(left_core, right_core):
+    if _hosted_providers_match(left_core, right_core):
+        for key in _MUTABLE_SAME_HOSTED_PROVIDER_ATTRIBUTE_KEYS:
+            left_core.pop(key, None)
+            right_core.pop(key, None)
+    elif _accounts_are_interchangeable(left_core, right_core):
         for key in (
             "account_hash",
             "account_label",
@@ -1000,10 +1065,7 @@ def _compatibility_mismatch_reason(
     if not requested_attributes:
         return None
     requested_core = _core_owner_attributes(requested_attributes)
-    interchangeable = _accounts_are_interchangeable(
-        owner_attrs,
-        requested_core,
-    )
+    hosted_match = _hosted_providers_match(owner_attrs, requested_core)
     if require_exact_attributes:
         if not _attributes_exactly_equal(left=owner_attrs, right=requested_core):
             return "session_owner: requested route does not exactly match owner"
@@ -1014,14 +1076,21 @@ def _compatibility_mismatch_reason(
             requested_core,
         )
     )
-    for key in ("provider", "model", "route_family"):
-        if key == "route_family" and equivalent_managed_direct_openai:
+    owner_hosted = _hosted_provider_from_attributes(owner_attrs)
+    requested_hosted = _hosted_provider_from_attributes(requested_core)
+    if owner_hosted and requested_hosted and owner_hosted != requested_hosted:
+        return (
+            "session_owner: hosted_provider mismatch "
+            f"owner={owner_hosted} requested={requested_hosted}"
+        )
+    for key in ("route_family",):
+        if equivalent_managed_direct_openai:
             continue
         req = _clean_optional_str(requested_core.get(key))
         own = _clean_optional_str(owner_attrs.get(key))
         if req is not None and own is not None and req != own:
             return f"session_owner: {key} mismatch owner={own} requested={req}"
-    if not interchangeable:
+    if not hosted_match:
         for key in ("account_hash", "account_lane", "account_label"):
             req = _clean_optional_str(requested_core.get(key))
             own = _clean_optional_str(owner_attrs.get(key))
@@ -1443,12 +1512,14 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
     cache_key = build_aawm_alias_routing_session_owner_cache_key(
         session_identity=cleaned
     )
-    # When the caller supplied known owner identity, pin exactly. Fuzzy
-    # partial matching must not authorize a different credential/account.
+    # When the caller supplied known owner identity, pin exactly on hard
+    # owner identity (hosted provider + endpoint/state). Model and OpenAI
+    # account remain mutable last-used attributes.
     if attrs and not require_exact_attributes:
-        if all(
+        hosted = _hosted_provider_from_attributes(attrs)
+        if hosted and all(
             _clean_optional_str(attrs.get(key))
-            for key in ("provider", "model", "route_family")
+            for key in ("endpoint_contract", "state_format")
         ):
             require_exact_attributes = True
     if attrs:
@@ -3014,6 +3085,8 @@ def is_exact_owned_session_owner_route_mismatch(
     if incomplete_owner_attribute_reason(owner_attributes, for_promotion=True):
         return False
     if incomplete_owner_attribute_reason(requested, for_promotion=True):
+        return False
+    if _attributes_exactly_equal(left=owner_attributes, right=requested):
         return False
     return dict(owner_attributes) != dict(requested)
 

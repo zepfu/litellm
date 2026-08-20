@@ -521,18 +521,18 @@ async def test_foreign_reservation_promotion_compatible_owner_proceeds() -> None
 
 
 @pytest.mark.asyncio
-async def test_foreign_reservation_incompatible_promotion_stays_409_before_egress() -> None:
+async def test_foreign_reservation_same_hosted_openai_model_hop_is_compatible_before_egress() -> None:
     redis = _FakeRedisCache()
     attrs = _full_attrs(model="model-a")
-    incompatible = _full_attrs(model="model-b")
+    hop = _full_attrs(model="model-b")
     request = type("Req", (), {})()
     request.state = type("State", (), {})()
     with _patch_dual(redis), patch.object(
         durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
     ):
         leader = await sa.guard_session_owner_before_egress(
-            session_identity="sess-wait-incompatible",
-            requested_attributes=incompatible,
+            session_identity="sess-wait-model-hop",
+            requested_attributes=hop,
         )
         promote_once = True
 
@@ -541,15 +541,15 @@ async def test_foreign_reservation_incompatible_promotion_stays_409_before_egres
             if promote_once:
                 promote_once = False
                 promoted = await sa.promote_session_owner_reservation(
-                    session_identity="sess-wait-incompatible",
+                    session_identity="sess-wait-model-hop",
                     reservation_token=leader.reservation_token,
-                    attributes=incompatible,
+                    attributes=hop,
                 )
                 assert promoted.outcome is sa.SessionOwnerMutationOutcome.PROMOTED
 
         with patch.object(sa.asyncio, "sleep", side_effect=promote_during_wait):
             record, _, error = await sa.get_session_owner_record(
-                session_identity="sess-wait-incompatible",
+                session_identity="sess-wait-model-hop",
                 request=request,
                 wait_for_foreign_reservation=True,
                 reservation_wait_timeout_seconds=0.25,
@@ -559,20 +559,15 @@ async def test_foreign_reservation_incompatible_promotion_stays_409_before_egres
         assert error is None
 
         guard = await sa.guard_session_owner_before_egress(
-            session_identity="sess-wait-incompatible",
+            session_identity="sess-wait-model-hop",
             request=request,
             requested_attributes=attrs,
         )
-        with pytest.raises(HTTPException) as exc_info:
-            sa.raise_session_owner_redispatch_required(
-                session_identity="sess-wait-incompatible",
-                guard=guard,
-            )
 
-    assert guard.decision is sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
-    assert "exactly match" in (guard.mismatch_reason or "")
-    assert exc_info.value.status_code == 409
-    assert exc_info.value.detail["attempted_provider_call"] is False
+    assert guard.decision is sa.SessionOwnerGuardDecision.COMPATIBLE_OWNER
+    assert guard.held_reservation is False
+    assert guard.owner_id == leader.owner_id
+    assert guard.mismatch_reason is None
 
 
 @pytest.mark.asyncio
@@ -719,7 +714,7 @@ async def test_route_family_reserve_promote_lifecycle(route_attrs: dict[str, Any
 
 
 @pytest.mark.asyncio
-async def test_account_mismatch_fails_before_egress() -> None:
+async def test_same_hosted_openai_account_hop_is_compatible_before_egress() -> None:
     redis = _FakeRedisCache()
     attrs = _full_attrs(account_hash="acct-1", account_lane="lane-a")
     with _patch_dual(redis), patch.object(
@@ -733,20 +728,15 @@ async def test_account_mismatch_fails_before_egress() -> None:
             reservation_token=g.reservation_token,
             attributes=attrs,
         )
-        bad = dict(attrs)
-        bad["account_hash"] = "acct-other"
+        hop = dict(attrs)
+        hop["account_hash"] = "acct-other"
         g2 = await sa.guard_session_owner_before_egress(
-            session_identity="sess-acct", requested_attributes=bad
+            session_identity="sess-acct", requested_attributes=hop
         )
-        assert g2.decision is sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
-        with pytest.raises(HTTPException) as ei:
-            sa.raise_session_owner_redispatch_required(
-                session_identity="sess-acct", guard=g2
-            )
-        assert ei.value.status_code == 409
-        detail = ei.value.detail
-        assert detail["redispatch_required"] is True
-        assert detail["attempted_provider_call"] is False
+        assert g2.decision is sa.SessionOwnerGuardDecision.COMPATIBLE_OWNER
+        assert g2.held_reservation is False
+        assert g2.owner_id == g.owner_id
+        assert g2.mismatch_reason is None
 
 
 @pytest.mark.asyncio
@@ -845,7 +835,7 @@ async def test_account_scoped_incomplete_fails_before_egress_not_after() -> None
 
 
 @pytest.mark.asyncio
-async def test_known_owner_attributes_pin_exactly_not_fuzzy() -> None:
+async def test_same_hosted_openai_model_hop_is_compatible_owner() -> None:
     redis = _FakeRedisCache()
     owned = _full_attrs(model="model-a", account_hash="acct-1", account_lane="lane-a")
     with _patch_dual(redis), patch.object(
@@ -859,16 +849,16 @@ async def test_known_owner_attributes_pin_exactly_not_fuzzy() -> None:
             reservation_token=g.reservation_token,
             attributes=owned,
         )
-        # Same provider family but different model must not pass as "compatible".
-        fuzzy = dict(owned)
-        fuzzy["model"] = "model-b"
+        # Same hosted OpenAI provider + different model remains compatible.
+        hop = dict(owned)
+        hop["model"] = "model-b"
         g2 = await sa.guard_session_owner_before_egress(
-            session_identity="sess-exact", requested_attributes=fuzzy
+            session_identity="sess-exact", requested_attributes=hop
         )
-    assert g2.decision is sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
-    assert "exactly match" in (g2.mismatch_reason or "") or "mismatch" in (
-        g2.mismatch_reason or ""
-    )
+    assert g2.decision is sa.SessionOwnerGuardDecision.COMPATIBLE_OWNER
+    assert g2.held_reservation is False
+    assert g2.owner_id == g.owner_id
+    assert g2.mismatch_reason is None
 
 
 @pytest.mark.asyncio
@@ -1531,11 +1521,20 @@ def _patch_codex_selector_basics(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, 
         selector_globals, "_resolve_codex_session_key", lambda *_args, **_kwargs: "key"
     )
     monkeypatch.setitem(selector_globals, "_has_continuation_state", lambda _body: True)
+    def _has_account_bound_state(_body: Any) -> bool:
+        return True
+
+    monkeypatch.setitem(
+        selector_globals, "_has_account_bound_state", _has_account_bound_state
+    )
+    monkeypatch.setattr(sel, "_has_account_bound_state", _has_account_bound_state)
     monkeypatch.setitem(
         selector_globals, "_get_codex_session_affinity", AsyncMock(return_value=None)
     )
     monkeypatch.setitem(
-        selector_globals, "_apply_codex_oauth_inventory_affinity_policy", lambda value: value
+        selector_globals,
+        "_apply_codex_oauth_inventory_affinity_policy",
+        lambda value, **_kwargs: value,
     )
     monkeypatch.setitem(
         selector_globals, "_build_auto_agent_skipped_candidates_from_states", lambda _states: []
@@ -1667,7 +1666,11 @@ async def test_codex_compatible_owned_redispatch_metadata_remains_pinned(
         "get_session_owner_record",
         AsyncMock(return_value=(owner_record, "owner-key", None)),
     )
-    monkeypatch.setattr(sa, "owner_record_as_affinity_hint", lambda _record: dict(candidate))
+    monkeypatch.setattr(
+        sa,
+        "owner_record_as_affinity_hint",
+        lambda _record, **_kwargs: dict(candidate),
+    )
     monkeypatch.setitem(
         selector_globals,
         "_find_codex_auto_agent_affinity_candidate",
@@ -1735,7 +1738,7 @@ async def test_codex_auto_review_replay_safe_owned_alias_mismatch_uses_effective
     monkeypatch.setattr(
         sa,
         "owner_record_as_affinity_hint",
-        lambda _record: dict(owner_record["attributes"]),
+        lambda _record, **_kwargs: dict(owner_record["attributes"]),
     )
     monkeypatch.setitem(
         selector_globals,
@@ -1787,7 +1790,7 @@ async def test_codex_owned_alias_mismatch_with_previous_response_id_stays_409(
     monkeypatch.setattr(
         sa,
         "owner_record_as_affinity_hint",
-        lambda _record: dict(owner_record["attributes"]),
+        lambda _record, **_kwargs: dict(owner_record["attributes"]),
     )
     monkeypatch.setitem(
         selector_globals,
@@ -1839,7 +1842,7 @@ async def test_codex_effective_identity_second_owned_conflict_stays_409(
     monkeypatch.setattr(
         sa,
         "owner_record_as_affinity_hint",
-        lambda _record: dict(owner_record["attributes"]),
+        lambda _record, **_kwargs: dict(owner_record["attributes"]),
     )
     monkeypatch.setitem(
         selector_globals,
@@ -2394,7 +2397,7 @@ def test_interchangeable_openai_owner_ignores_account_identity_only() -> None:
     assert hint is not None
     assert "codex_oauth_account_label" not in hint
 
-    assert not sa._attributes_exactly_equal(
+    assert sa._attributes_exactly_equal(
         left=account1,
         right=dict(account2, model="gpt-5.6-terra"),
     )
@@ -2547,7 +2550,7 @@ def test_managed_direct_openai_owner_shapes_are_equivalent() -> None:
         requested_attributes=historical,
         require_exact_attributes=False,
     ) is None
-    assert sa.build_session_owner_id(attributes=historical) != (
+    assert sa.build_session_owner_id(attributes=historical) == (
         sa.build_session_owner_id(attributes=current)
     )
     assert sa.owner_record_as_affinity_hint(_owned_record(historical))["route_family"] == (
@@ -2560,9 +2563,11 @@ def test_managed_direct_openai_owner_shapes_are_equivalent() -> None:
 
 def test_managed_direct_openai_owner_shapes_remain_strict_nearby() -> None:
     owner = _legacy_managed_direct_openai_owner_attrs()
-    cases = [
+    compatible = [
         _current_managed_direct_openai_owner_attrs(model="gpt-5.6-terra"),
         _current_managed_direct_openai_owner_attrs(account_lane="lane-b"),
+    ]
+    incompatible = [
         _current_managed_direct_openai_owner_attrs(provider="xai"),
         _managed_direct_openai_owner_attrs(
             route_family="openai_responses",
@@ -2585,7 +2590,19 @@ def test_managed_direct_openai_owner_shapes_remain_strict_nearby() -> None:
             state_format="codex_responses",
         ),
     ]
-    for requested in cases:
+    for requested in compatible:
+        assert sa._attributes_exactly_equal(left=owner, right=requested)
+        assert sa._compatibility_mismatch_reason(
+            owner_record=_owned_record(owner),
+            requested_attributes=requested,
+            require_exact_attributes=True,
+        ) is None
+        assert sa._compatibility_mismatch_reason(
+            owner_record=_owned_record(owner),
+            requested_attributes=requested,
+            require_exact_attributes=False,
+        ) is None
+    for requested in incompatible:
         assert not sa._attributes_exactly_equal(left=owner, right=requested)
         assert sa._compatibility_mismatch_reason(
             owner_record=_owned_record(owner),
