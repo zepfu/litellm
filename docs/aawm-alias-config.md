@@ -300,6 +300,13 @@ candidate is Alibaba Token Plan `glm-5.2` on
 Plan route belongs on this same alias as another candidate; do not invent a
 second public name.
 
+## Codex passthrough alias catalog (CFG-023)
+
+Non-Codex-native `GET /openai_passthrough/v1/models` lists compiled YAML
+aliases from the active routing snapshot. Usage is
+`POST /openai_passthrough/v1/responses`. Generic `/v1/chat/completions` is
+not an alias ingress. The public name is `sota-zai`.
+
 ## Provider-native credential boundary
 
 Anthropic/Claude model traffic must egress exclusively through

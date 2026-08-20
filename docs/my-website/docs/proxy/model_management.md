@@ -65,6 +65,10 @@ snapshot. Missing or failed config fails closed; there is no built-in candidate
 table and no startup or no-snapshot fallback. Every configured YAML alias is an
 ordinary exact-name route with no public/internal routing distinction.
 
+Non-Codex-native `GET /openai_passthrough/v1/models` lists compiled YAML
+aliases. Usage is `POST /openai_passthrough/v1/responses`. Generic
+`/v1/chat/completions` is not an alias ingress. The public name is `sota-zai`.
+
 ### Codex reasoning effort follows the resolved model
 
 For native OpenAI Codex Responses traffic, LiteLLM reconciles a recognized

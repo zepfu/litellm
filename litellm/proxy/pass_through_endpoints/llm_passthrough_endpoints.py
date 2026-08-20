@@ -5710,6 +5710,17 @@ async def openai_proxy_route(  # noqa: PLR0915
 
     [Docs](https://docs.litellm.ai/docs/pass_through/openai_passthrough)
     """
+    if request.method == "GET" and _is_openai_models_endpoint(endpoint):
+        if not _should_preserve_openai_client_auth(
+            request=request, endpoint=endpoint
+        ):
+            from starlette.responses import JSONResponse
+            from litellm.proxy.pass_through_endpoints.aawm_alias_routing.catalog import (
+                build_passthrough_model_list,
+            )
+
+            return JSONResponse(build_passthrough_model_list())
+
     request_body: dict[str, Any] = {}
     is_oa_xai_request = False
     is_grok_native_oauth_request = False
