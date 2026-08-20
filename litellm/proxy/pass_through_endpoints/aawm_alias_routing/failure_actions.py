@@ -63,6 +63,7 @@ _DEFAULT_ACTION_BY_CLASS: dict[str, FailureAction] = {
     "provider_4xx_other": "terminal",
     "serialization": "terminal",
     "client_cancelled": "terminal",
+    "repetitive_output_loop": "terminal",
     "unknown": "observe",
 }
 

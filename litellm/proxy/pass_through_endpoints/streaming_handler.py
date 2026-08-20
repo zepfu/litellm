@@ -1943,6 +1943,12 @@ class PassThroughStreamingHandler:
             "model_alias": failure_context.get("model_alias"),
             "route_family": failure_context.get("route_family"),
         }
+        extra_terminal_metadata = failure_context.get("terminal_metadata")
+        if isinstance(extra_terminal_metadata, dict):
+            legacy_terminal_metadata = {
+                **legacy_terminal_metadata,
+                **extra_terminal_metadata,
+            }
         if incomplete_reason is not None:
             terminal_metadata = {
                 **legacy_terminal_metadata,
@@ -1975,15 +1981,18 @@ class PassThroughStreamingHandler:
                 b"data: [DONE]\n\n",
             ]
 
-        if exc is None:
-            raise ValueError("exc is required for failed stream terminal chunks")
-        message = (
-            "Streaming response interrupted after first byte due to upstream read "
-            f"timeout: {exc}"
-        )
+        message = failure_context.get("error_message")
+        if not message:
+            if exc is None:
+                raise ValueError("exc is required for failed stream terminal chunks")
+            message = (
+                "Streaming response interrupted after first byte due to upstream read "
+                f"timeout: {exc}"
+            )
         error_payload = {
             "type": "proxy_stream_terminal_error",
-            "code": failure_context.get("failure_kind")
+            "code": failure_context.get("error_code")
+            or failure_context.get("failure_kind")
             or "streaming_upstream_read_failure",
             "message": message,
             "param": None,
@@ -2005,8 +2014,9 @@ class PassThroughStreamingHandler:
                 ).encode("utf-8")
             ]
 
-        if endpoint_type == EndpointType.OPENAI and (
-            OpenAIPassthroughLoggingHandler.is_openai_responses_route(url_route)
+        if failure_context.get("responses_api_terminal") or (
+            endpoint_type == EndpointType.OPENAI
+            and OpenAIPassthroughLoggingHandler.is_openai_responses_route(url_route)
         ):
             payload = {
                 "type": "response.failed",

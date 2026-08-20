@@ -96,6 +96,14 @@ from litellm.types.utils import (
     all_litellm_params,
 )
 
+from .aawm_adapter_runtime.repetitive_output import (
+    bind_output_guard_to_streaming_response,
+    maybe_reject_passthrough_responses_body,
+    maybe_wrap_passthrough_responses_stream,
+)
+from .aawm_alias_routing.output_guard_config import (
+    output_guard_context_from_passthrough,
+)
 from .streaming_handler import (
     RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS,
     RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
@@ -4129,6 +4137,18 @@ async def pass_through_request(  # noqa: PLR0915
             parsed_body=_parsed_body,
             provider_bound_body=provider_bound_body,
         )
+        output_guard_extra_metadata: Dict[str, Any] = {}
+        if isinstance(passthrough_logging_metadata, dict):
+            output_guard_extra_metadata.update(passthrough_logging_metadata)
+        output_guard_extra_metadata.update(passthrough_metadata)
+        output_guard_request_context = output_guard_context_from_passthrough(
+            ingress_path=str(getattr(getattr(request, "url", None), "path", "") or ""),
+            method=str(getattr(request, "method", None) or "POST"),
+            custom_llm_provider=custom_llm_provider,
+            egress_credential_family=egress_credential_family,
+            request_body=_parsed_body if isinstance(_parsed_body, dict) else None,
+            extra_metadata=output_guard_extra_metadata,
+        )
         error_log_context = _build_passthrough_error_log_context(
             request=request,
             url=url,
@@ -4424,13 +4444,22 @@ async def pass_through_request(  # noqa: PLR0915
                     processed_chunks,
                     responses_function_name_rewrite,
                 )
-            return StreamingResponse(
+            processed_chunks = maybe_wrap_passthrough_responses_stream(
+                processed_chunks,
+                request_context=output_guard_request_context,
+                upstream_response=response,
+            )
+            stream_response = StreamingResponse(
                 processed_chunks,
                 headers=HttpPassThroughEndpointHelpers.get_response_headers(
                     headers=response.headers,
                     litellm_call_id=litellm_call_id,
                 ),
                 status_code=response.status_code,
+            )
+            return bind_output_guard_to_streaming_response(
+                stream_response,
+                request_context=output_guard_request_context,
             )
 
         await _aawm_session_owner_pre_send_guard(
@@ -4587,13 +4616,22 @@ async def pass_through_request(  # noqa: PLR0915
                     processed_chunks,
                     responses_function_name_rewrite,
                 )
-            return StreamingResponse(
+            processed_chunks = maybe_wrap_passthrough_responses_stream(
+                processed_chunks,
+                request_context=output_guard_request_context,
+                upstream_response=response,
+            )
+            stream_response = StreamingResponse(
                 processed_chunks,
                 headers=HttpPassThroughEndpointHelpers.get_response_headers(
                     headers=response.headers,
                     litellm_call_id=litellm_call_id,
                 ),
                 status_code=response.status_code,
+            )
+            return bind_output_guard_to_streaming_response(
+                stream_response,
+                request_context=output_guard_request_context,
             )
 
         if response.status_code >= 300:
@@ -4666,6 +4704,11 @@ async def pass_through_request(  # noqa: PLR0915
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ).encode("utf-8")
+        if isinstance(response_body, dict):
+            maybe_reject_passthrough_responses_body(
+                response_body,
+                request_context=output_guard_request_context,
+            )
         passthrough_logging_payload["response_body"] = response_body
         capture_passthrough_shape(
             mode="nonstream",

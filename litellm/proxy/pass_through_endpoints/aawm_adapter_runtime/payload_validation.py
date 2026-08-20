@@ -545,6 +545,11 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
     intake_context: Optional[dict[str, Any]] = None,
     request_body: Optional[dict[str, Any]] = None,
 ) -> Response:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.repetitive_output import (
+        inherit_or_wrap_passthrough_streaming_response,
+        is_repetitive_output_loop_failure,
+    )
+
     if isinstance(response, StreamingResponse):
         event_summaries: list[dict[str, Any]] = []
         peek = await _aawm_alias_streaming.peek_streaming_response(  # noqa: F821
@@ -604,10 +609,14 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 request_body=request_body,
                 adapter_model=adapter_model,
             )
-            return _restore_adapted_namespace_tool_calls_in_streaming_response(  # noqa: F821
+            restored_response = _restore_adapted_namespace_tool_calls_in_streaming_response(  # noqa: F821
                 restored_response,
                 request_body=request_body,
                 adapter_model=adapter_model,
+            )
+            return inherit_or_wrap_passthrough_streaming_response(
+                restored_response,
+                source_response=response,
             )
         response_body = await _collect_responses_response_from_stream(  # noqa: F821
             peek.response,
@@ -620,7 +629,9 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             )
             identity_changed = preserved_body is not response_body
             response_body = preserved_body
-        if _is_failed_responses_body(response_body):  # noqa: F821
+        if _is_failed_responses_body(response_body) and not is_repetitive_output_loop_failure(  # noqa: F821
+            response_body
+        ):
             _raise_codex_auto_agent_failed_responses_payload(
                 response_body=response_body,
                 adapter_model=adapter_model,
@@ -682,22 +693,30 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
                 stream_event_summaries=event_summaries,
             )
         if response_changed:
-            return StreamingResponse(
+            reconstructed = StreamingResponse(
                 _responses_sse_from_repaired_response_body(response_body),  # noqa: F821
                 headers=dict(response.headers),
                 status_code=response.status_code,
                 media_type=response.media_type or "text/event-stream",
+            )
+            return inherit_or_wrap_passthrough_streaming_response(
+                reconstructed,
+                source_response=response,
             )
 
         async def _replay_iterator() -> Any:
             for raw_chunk in peek.buffered_chunks:
                 yield raw_chunk
 
-        return StreamingResponse(
+        reconstructed = StreamingResponse(
             _replay_iterator(),
             headers=dict(response.headers),
             status_code=response.status_code,
             media_type=response.media_type or "text/event-stream",
+        )
+        return inherit_or_wrap_passthrough_streaming_response(
+            reconstructed,
+            source_response=response,
         )
 
     if isinstance(response, Response) and not isinstance(response, StreamingResponse):
@@ -712,7 +731,11 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             )
             identity_changed = preserved_body is not response_body
             response_body = preserved_body
-        if isinstance(response_body, dict) and _is_failed_responses_body(response_body):  # noqa: F821
+        if (
+            isinstance(response_body, dict)
+            and _is_failed_responses_body(response_body)  # noqa: F821
+            and not is_repetitive_output_loop_failure(response_body)
+        ):
             _raise_codex_auto_agent_failed_responses_payload(
                 response_body=response_body,
                 adapter_model=adapter_model,

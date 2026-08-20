@@ -12,6 +12,14 @@ import aiohttp
 import httpx
 from fastapi.responses import StreamingResponse
 
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.repetitive_output import (
+    inherit_or_wrap_passthrough_streaming_response,
+    maybe_wrap_passthrough_responses_stream,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.output_guard_config import (
+    OutputGuardRequestContext,
+)
+
 StreamPeekStopReason = Literal[
     "stream_exhausted",
     "pending_stream",
@@ -52,6 +60,36 @@ def _bind_stream_timeout_terminalizer(
 ) -> StreamingResponse:
     setattr(response, _STREAM_TIMEOUT_TERMINALIZER_ATTR, terminalizer)
     return response
+
+
+def _guard_reconstructed_passthrough_streaming_response(
+    reconstructed: StreamingResponse,
+    *,
+    source_response: StreamingResponse,
+    request_context: Optional[OutputGuardRequestContext] = None,
+) -> StreamingResponse:
+    """Keep CFG-025 live-forward wrapping across peek/replay reconstructions."""
+    guarded = inherit_or_wrap_passthrough_streaming_response(
+        reconstructed,
+        source_response=source_response,
+        request_context=request_context,
+    )
+    if isinstance(guarded, StreamingResponse):
+        return guarded
+    if request_context is None:
+        return reconstructed
+    wrapped_iter = maybe_wrap_passthrough_responses_stream(
+        reconstructed.body_iterator,
+        request_context=request_context,
+    )
+    if wrapped_iter is reconstructed.body_iterator:
+        return reconstructed
+    return StreamingResponse(
+        wrapped_iter,
+        headers=dict(reconstructed.headers),
+        status_code=reconstructed.status_code,
+        media_type=reconstructed.media_type or "text/event-stream",
+    )
 
 
 def _get_stream_timeout_terminalizer(
@@ -193,11 +231,14 @@ async def peek_streaming_response(  # noqa: PLR0915
                     yield buffered
 
             return BoundedStreamPeek(
-                response=StreamingResponse(
-                    _replay_buffered(),
-                    headers=dict(response.headers),
-                    status_code=response.status_code,
-                    media_type=response.media_type or "text/event-stream",
+                response=_guard_reconstructed_passthrough_streaming_response(
+                    StreamingResponse(
+                        _replay_buffered(),
+                        headers=dict(response.headers),
+                        status_code=response.status_code,
+                        media_type=response.media_type or "text/event-stream",
+                    ),
+                    source_response=response,
                 ),
                 buffered_chunks=buffered_chunks,
                 buffered_bytes=buffered_bytes,
@@ -224,7 +265,10 @@ async def peek_streaming_response(  # noqa: PLR0915
                     terminalizer,
                 )
             return BoundedStreamPeek(
-                response=continuation_response,
+                response=_guard_reconstructed_passthrough_streaming_response(
+                    continuation_response,
+                    source_response=response,
+                ),
                 buffered_chunks=buffered_chunks,
                 buffered_bytes=buffered_bytes,
                 stop_reason=stop_reason,
@@ -255,7 +299,10 @@ async def peek_streaming_response(  # noqa: PLR0915
                     terminalizer,
                 )
             return BoundedStreamPeek(
-                response=continuation_response,
+                response=_guard_reconstructed_passthrough_streaming_response(
+                    continuation_response,
+                    source_response=response,
+                ),
                 buffered_chunks=buffered_chunks,
                 buffered_bytes=buffered_bytes,
                 stop_reason="pending_stream",
@@ -281,7 +328,10 @@ async def peek_streaming_response(  # noqa: PLR0915
                 terminalizer,
             )
             return BoundedStreamPeek(
-                response=continuation_response,
+                response=_guard_reconstructed_passthrough_streaming_response(
+                    continuation_response,
+                    source_response=response,
+                ),
                 buffered_chunks=buffered_chunks,
                 buffered_bytes=buffered_bytes,
                 stop_reason="stream_exhausted",

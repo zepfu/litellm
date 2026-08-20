@@ -135,6 +135,7 @@ _HOST_FUNCTION_NAMES = (
     "_perform_codex_auto_agent_native_openai_request",
     "_perform_codex_auto_agent_grok_native_responses_request",
     "_perform_codex_auto_agent_oa_xai_responses_request",
+    "_maybe_wrap_xai_passthrough_responses_stream",
     "_bind_responses_stream_timeout_terminalizer",
     "_validate_codex_auto_agent_openrouter_responses_stream",
     "_perform_codex_auto_agent_openrouter_responses_request",
@@ -241,6 +242,56 @@ def install(
 
 
 # ── Extracted functions ─────────────────────────────────────────────
+
+
+def _maybe_wrap_xai_passthrough_responses_stream(
+    response: Response,
+    *,
+    request: Request,
+    request_body: dict[str, Any],
+    route_family: str,
+    resolved_model: Any = None,
+) -> Response:
+    """Live-forward CFG-025 wrap for xAI alias Responses SSE."""
+    from fastapi.responses import StreamingResponse
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.repetitive_output import (
+        inherit_or_wrap_passthrough_streaming_response,
+        maybe_wrap_passthrough_responses_stream,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.output_guard_config import (
+        output_guard_context_from_passthrough,
+    )
+
+    if not isinstance(response, StreamingResponse):
+        return response
+    request_context = output_guard_context_from_passthrough(
+        ingress_path=str(getattr(getattr(request, "url", None), "path", "") or ""),
+        method=str(getattr(request, "method", None) or "POST"),
+        custom_llm_provider=litellm.LlmProviders.XAI.value,
+        egress_credential_family="xai",
+        route_family=route_family,
+        resolved_model=resolved_model,
+        request_body=request_body,
+    )
+    wrapped_iter = maybe_wrap_passthrough_responses_stream(
+        response.body_iterator,
+        request_context=request_context,
+    )
+    if wrapped_iter is response.body_iterator:
+        return inherit_or_wrap_passthrough_streaming_response(
+            response,
+            request_context=request_context,
+        )
+    reconstructed = StreamingResponse(
+        wrapped_iter,
+        headers=dict(response.headers),
+        status_code=response.status_code,
+        media_type=response.media_type or "text/event-stream",
+    )
+    return inherit_or_wrap_passthrough_streaming_response(
+        reconstructed,
+        request_context=request_context,
+    )
 
 
 # ── CFG-004: encrypted reasoning detection ─────────────────────────
@@ -932,6 +983,13 @@ async def _perform_codex_auto_agent_grok_native_responses_request(
         if _grok_native_candidate_unavailable_detail(exc) is not None:
             _raise_grok_native_auto_agent_candidate_unavailable(exc)
         raise
+    response = _maybe_wrap_xai_passthrough_responses_stream(
+        response,
+        request=request,
+        request_body=request_body,
+        route_family="codex_auto_agent_grok_native_responses",
+        resolved_model=grok_prepared_body.get("model") or request_body.get("model"),
+    )
     return await _validate_codex_auto_agent_responses_payload(
         response,
         adapter_model=str(grok_prepared_body.get("model") or request_body.get("model") or "unknown-model"),
@@ -1012,6 +1070,14 @@ async def _perform_codex_auto_agent_oa_xai_responses_request(
         if _xai_oauth_candidate_unavailable_detail(exc) is not None:
             _raise_xai_oauth_auto_agent_candidate_unavailable(exc)
         raise
+    response = _maybe_wrap_xai_passthrough_responses_stream(
+        response,
+        request=request,
+        request_body=canonical_request_body,
+        route_family="codex_auto_agent_xai_oauth_responses",
+        resolved_model=oa_xai_prepared_body.get("model")
+        or canonical_request_body.get("model"),
+    )
     return await _validate_codex_auto_agent_responses_payload(
         response,
         adapter_model=str(oa_xai_prepared_body.get("model") or canonical_request_body.get("model") or "unknown-model"),

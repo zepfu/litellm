@@ -1,0 +1,20 @@
+# CFG-025 named output-guard policies.
+# Selectors attach a policy to resolved provider / route metadata.
+# Do not add model-name allowlists here.
+output_guards:
+  policies:
+    xai_visible_text_v1:
+      inspect: visible_output_text
+      window_words: 400
+      min_words: 80
+      min_ngram: 8
+      min_repeats: 6
+      min_coverage: 0.72
+      growth_words: 120
+      max_novelty: 0.18
+      max_ngram_edit_distance: 2
+  selectors:
+    - match:
+        ingress: openai_passthrough_responses
+        provider: xai
+      policy: xai_visible_text_v1
