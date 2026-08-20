@@ -3222,6 +3222,7 @@ class LlmProviders(str, Enum):
     JINA_AI = "jina_ai"
     XAI = "xai"
     ZAI = "zai"
+    ZAI_CODING_PLAN = "zai_coding_plan"
     CUSTOM_OPENAI = "custom_openai"
     TEXT_COMPLETION_OPENAI = "text-completion-openai"
     COHERE = "cohere"

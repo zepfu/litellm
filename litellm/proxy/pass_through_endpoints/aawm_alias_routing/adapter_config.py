@@ -213,6 +213,18 @@ ANTHROPIC_ALIBABA_TOKEN_PLAN = AnthropicCompletionAdapterConfig(
     custom_llm_provider="alibaba_token_plan",
 )
 
+CODEX_ZAI_CODING_PLAN = AnthropicCompletionAdapterConfig(
+    adapter="codex_zai_coding_plan_chat_completions_adapter",
+    adapter_label="Z.AI Coding Plan",
+    route_family="codex_zai_coding_plan_chat_completions_adapter",
+    tag_prefix="codex-zai-coding-plan-chat-completions-adapter",
+    span_name="codex.zai_coding_plan_chat_completions_adapter",
+    target_endpoint_label="zai_coding_plan:/api/coding/paas/v4/chat/completions",
+    credential_family="zai_coding_plan",
+    expected_target_family="zai_coding_plan",
+    custom_llm_provider="zai_coding_plan",
+)
+
 CODEX_COHERE_CHAT_COMPLETIONS = AnthropicCompletionAdapterConfig(
     adapter="codex_cohere_chat_completions_adapter",
     adapter_label="Cohere",

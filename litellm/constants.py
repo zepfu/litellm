@@ -745,6 +745,7 @@ openai_compatible_providers: List = [
     "xinference",
     "xai",
     "zai",
+    "zai_coding_plan",
     "together_ai",
     "fireworks_ai",
     "empower",

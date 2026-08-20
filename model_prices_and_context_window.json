@@ -577,6 +577,171 @@
             "custom_tool_call_output"
         ]
     },
+    "zai_coding_plan/glm-5.3": {
+        "comment": "Z.AI Coding Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "litellm_provider": "zai_coding_plan",
+        "max_input_tokens": 200000,
+        "max_output_tokens": 128000,
+        "mode": "chat",
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "provider_specific_entry": {
+            "zai_coding_plan": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "provider_subscription_reference",
+                    "billing_mode": "zai_coding_plan_subscription",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "zai_coding_plan",
+                        "model": "zai_coding_plan/glm-5.3"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_applicable",
+                    "equivalence_evidence": "Coding Plan subscription credit package is not ordinary list-rate invoice pricing.",
+                    "source": {
+                        "kind": "official_provider_catalog",
+                        "label": "Z.AI Coding Plan",
+                        "urls": [
+                            "https://docs.z.ai/devpack/quick-start"
+                        ],
+                        "version": "2026-08-20",
+                        "verified_on": "2026-08-20"
+                    },
+                    "unpriced_reason": "public_per_token_rate_unavailable"
+                }
+            }
+        },
+        "source": "https://docs.z.ai/devpack/quick-start",
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true
+    },
+    "zai_coding_plan/glm-5-turbo": {
+        "comment": "Z.AI Coding Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "litellm_provider": "zai_coding_plan",
+        "max_input_tokens": 200000,
+        "max_output_tokens": 128000,
+        "mode": "chat",
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "provider_specific_entry": {
+            "zai_coding_plan": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "provider_subscription_reference",
+                    "billing_mode": "zai_coding_plan_subscription",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "zai_coding_plan",
+                        "model": "zai_coding_plan/glm-5-turbo"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_applicable",
+                    "equivalence_evidence": "Coding Plan subscription credit package is not ordinary list-rate invoice pricing.",
+                    "source": {
+                        "kind": "official_provider_catalog",
+                        "label": "Z.AI Coding Plan",
+                        "urls": [
+                            "https://docs.z.ai/devpack/quick-start"
+                        ],
+                        "version": "2026-08-20",
+                        "verified_on": "2026-08-20"
+                    },
+                    "unpriced_reason": "public_per_token_rate_unavailable"
+                }
+            }
+        },
+        "source": "https://docs.z.ai/devpack/quick-start",
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true
+    },
+    "zai_coding_plan/glm-4.7": {
+        "comment": "Z.AI Coding Plan subscription route; per-request invoice cost is not exposed as public per-token pricing.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "litellm_provider": "zai_coding_plan",
+        "max_input_tokens": 200000,
+        "max_output_tokens": 128000,
+        "mode": "chat",
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "provider_specific_entry": {
+            "zai_coding_plan": {
+                "aawm_reference_pricing": {
+                    "schema_version": 1,
+                    "status": "unpriced",
+                    "kind": "provider_subscription_reference",
+                    "billing_mode": "zai_coding_plan_subscription",
+                    "actual_invoice_cost_known": false,
+                    "currency": "USD",
+                    "basis": {
+                        "provider": "zai_coding_plan",
+                        "model": "zai_coding_plan/glm-4.7"
+                    },
+                    "cache_mode": "none",
+                    "equivalence_status": "not_applicable",
+                    "equivalence_evidence": "Coding Plan subscription credit package is not ordinary list-rate invoice pricing.",
+                    "source": {
+                        "kind": "official_provider_catalog",
+                        "label": "Z.AI Coding Plan",
+                        "urls": [
+                            "https://docs.z.ai/devpack/quick-start"
+                        ],
+                        "version": "2026-08-20",
+                        "verified_on": "2026-08-20"
+                    },
+                    "unpriced_reason": "public_per_token_rate_unavailable"
+                }
+            }
+        },
+        "source": "https://docs.z.ai/devpack/quick-start",
+        "supports_function_calling": true,
+        "supports_parallel_function_calling": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true
+    },
     "kimi_code/k3": {
         "cache_read_input_token_cost": 3e-07,
         "comment": "Public reference costs for the kimi_code subscription route, not known invoice billing.",

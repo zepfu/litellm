@@ -35,6 +35,7 @@ CODEX_AUTO_AGENT_OPENROUTER_PROVIDER = "openrouter"
 CODEX_AUTO_AGENT_XAI_PROVIDER = "xai"
 CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER = "kimi_code"
 CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER = "alibaba_token_plan"
+CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER = "zai_coding_plan"
 CODEX_AUTO_AGENT_COHERE_PROVIDER = "cohere"
 CODEX_AUTO_AGENT_CURSOR_AGENT_PROVIDER = "cursor_agent"
 OPENCODE_ZEN_PROVIDER = "opencode_zen"
@@ -46,6 +47,7 @@ CODEX_AUTO_AGENT_XAI_LANE_KEY = "xai_grok_native"
 CODEX_AUTO_AGENT_XAI_OAUTH_LANE_KEY = "xai_oauth_managed"
 CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY = "kimi_code_managed_account"
 CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY = "alibaba_token_plan"
+CODEX_AUTO_AGENT_ZAI_CODING_PLAN_LANE_KEY = "zai_coding_plan"
 CODEX_AUTO_AGENT_COHERE_LANE_KEY = "cohere_native"
 CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY = "cursor_agent_cli"
 CODEX_AUTO_AGENT_OPENCODE_LANE_KEY = OPENCODE_ZEN_PROVIDER
@@ -151,12 +153,42 @@ def normalize_alibaba_token_plan_adapter_model_name(model: Any) -> Optional[str]
         return None
     return candidate
 
+
+def normalize_zai_coding_plan_adapter_model_name(model: Any) -> Optional[str]:
+    """Return the canonical `zai_coding_plan/<model-id>` adapter key when admissible.
+
+    Admission is structural (`zai_coding_plan/<nonempty-id>` without nested `/`)
+    plus the documented Coding Plan supported set. Unknown ids fail closed.
+    """
+
+    if not isinstance(model, str):
+        return None
+    candidate = model.strip()
+    if not candidate:
+        return None
+    provider_prefix, separator, model_id = candidate.partition("/")
+    if not separator or provider_prefix != CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER:
+        return None
+    normalized_id = model_id.strip()
+    if not normalized_id or "/" in normalized_id:
+        return None
+    from litellm.llms.zai_coding_plan.chat.transformation import (
+        ZAI_CODING_PLAN_MODEL_IDS,
+    )
+
+    if normalized_id not in ZAI_CODING_PLAN_MODEL_IDS:
+        return None
+    return candidate
+
 # Generic compatibility publication for the pass-through integration module.
 COMPAT_ALIAS_MAP: dict[str, str] = {
     "_CODEX_AUTO_AGENT_NATIVE_PROVIDER": "CODEX_AUTO_AGENT_NATIVE_PROVIDER",
     "_CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER": "CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER",
     "_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER": (
         "CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER"
+    ),
+    "_CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER": (
+        "CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER"
     ),
     "_CODEX_AUTO_AGENT_OPENROUTER_PROVIDER": "CODEX_AUTO_AGENT_OPENROUTER_PROVIDER",
     "_CODEX_AUTO_AGENT_XAI_PROVIDER": "CODEX_AUTO_AGENT_XAI_PROVIDER",
@@ -173,6 +205,9 @@ COMPAT_ALIAS_MAP: dict[str, str] = {
     ),
     "_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY": (
         "CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY"
+    ),
+    "_CODEX_AUTO_AGENT_ZAI_CODING_PLAN_LANE_KEY": (
+        "CODEX_AUTO_AGENT_ZAI_CODING_PLAN_LANE_KEY"
     ),
     "_CODEX_AUTO_AGENT_COHERE_PROVIDER": "CODEX_AUTO_AGENT_COHERE_PROVIDER",
     "_CODEX_AUTO_AGENT_COHERE_LANE_KEY": (
@@ -222,6 +257,9 @@ COMPAT_ALIAS_MAP: dict[str, str] = {
     "_normalize_alibaba_token_plan_adapter_model_name": (
         "normalize_alibaba_token_plan_adapter_model_name"
     ),
+    "_normalize_zai_coding_plan_adapter_model_name": (
+        "normalize_zai_coding_plan_adapter_model_name"
+    ),
 }
 COMPAT_ALIAS_COUNT = len(COMPAT_ALIAS_MAP)
 
@@ -245,6 +283,8 @@ __all__ = [
     "ANTHROPIC_OPENROUTER_RESPONSES_ADAPTER_ALLOWED_MODELS",
     "CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY",
     "CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER",
+    "CODEX_AUTO_AGENT_ZAI_CODING_PLAN_LANE_KEY",
+    "CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER",
     "CODEX_AUTO_AGENT_COHERE_LANE_KEY",
     "CODEX_AUTO_AGENT_COHERE_PROVIDER",
     "CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY",
@@ -272,4 +312,5 @@ __all__ = [
     "install_policy_compat_aliases",
     "normalize_alibaba_token_plan_adapter_model_name",
     "normalize_kimi_code_chat_completions_adapter_model_name",
+    "normalize_zai_coding_plan_adapter_model_name",
 ]

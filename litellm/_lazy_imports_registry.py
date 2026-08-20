@@ -263,6 +263,7 @@ LLM_CONFIG_NAMES = (
     "JinaAIEmbeddingConfig",
     "XAIChatConfig",
     "ZAIChatConfig",
+    "ZAICodingPlanChatConfig",
     "AIMLChatConfig",
     "VolcEngineChatConfig",
     "CodestralTextCompletionConfig",
@@ -1027,6 +1028,10 @@ _LLM_CONFIGS_IMPORT_MAP = {
     ),
     "XAIChatConfig": (".llms.xai.chat.transformation", "XAIChatConfig"),
     "ZAIChatConfig": (".llms.zai.chat.transformation", "ZAIChatConfig"),
+    "ZAICodingPlanChatConfig": (
+        ".llms.zai_coding_plan.chat.transformation",
+        "ZAICodingPlanChatConfig",
+    ),
     "AIMLChatConfig": (".llms.aiml.chat.transformation", "AIMLChatConfig"),
     "VolcEngineChatConfig": (
         ".llms.volcengine.chat.transformation",

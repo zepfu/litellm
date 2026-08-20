@@ -33,6 +33,7 @@ REGISTERED_PROVIDERS: frozenset[str] = frozenset(
         policy.CODEX_AUTO_AGENT_XAI_PROVIDER,
         policy.CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
         policy.CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        policy.CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
         policy.CODEX_AUTO_AGENT_COHERE_PROVIDER,
         policy.CODEX_AUTO_AGENT_CURSOR_AGENT_PROVIDER,
         policy.OPENCODE_ZEN_PROVIDER,
@@ -49,6 +50,7 @@ REGISTERED_ROUTE_FAMILIES: frozenset[str] = frozenset(
         "codex_xai_oauth_responses_adapter",
         "codex_kimi_chat_completions_adapter",
         "codex_alibaba_token_plan_chat_completions_adapter",
+        "codex_zai_coding_plan_chat_completions_adapter",
         "codex_cohere_chat_completions_adapter",
         "codex_cursor_agent_aiserver_adapter",
         "codex_opencode_zen_adapter",
@@ -82,6 +84,7 @@ CODEX_TO_ANTHROPIC_ROUTE_FAMILY: dict[str, str] = {
 CODEX_ONLY_ROUTE_FAMILIES: frozenset[str] = frozenset(
     {
         "codex_cohere_chat_completions_adapter",
+        "codex_zai_coding_plan_chat_completions_adapter",
     }
 )
 

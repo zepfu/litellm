@@ -756,6 +756,13 @@ def _get_openai_compatible_provider_info(  # noqa: PLR0915
         ) = litellm.ZAIChatConfig()._get_openai_compatible_provider_info(
             api_base, api_key
         )
+    elif custom_llm_provider == "zai_coding_plan":
+        (
+            api_base,
+            dynamic_api_key,
+        ) = litellm.ZAICodingPlanChatConfig()._get_openai_compatible_provider_info(
+            api_base, api_key
+        )
     elif custom_llm_provider == "together_ai":
         api_base = (
             api_base

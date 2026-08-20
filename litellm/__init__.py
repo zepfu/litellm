@@ -538,6 +538,7 @@ watsonx_models: Set = set()
 gemini_models: Set = set()
 xai_models: Set = set()
 zai_models: Set = set()
+zai_coding_plan_models: Set = set()
 deepseek_models: Set = set()
 runwayml_models: Set = set()
 azure_ai_models: Set = set()
@@ -749,6 +750,8 @@ def add_known_models(model_cost_map: Optional[Dict] = None):
             xai_models.add(key)
         elif value.get("litellm_provider") == "zai":
             zai_models.add(key)
+        elif value.get("litellm_provider") == "zai_coding_plan":
+            zai_coding_plan_models.add(key)
         elif value.get("litellm_provider") == "fal_ai":
             fal_ai_models.add(key)
         elif value.get("litellm_provider") == "deepseek":
@@ -936,6 +939,7 @@ model_list = list(
     | text_completion_codestral_models
     | xai_models
     | zai_models
+    | zai_coding_plan_models
     | fal_ai_models
     | deepseek_models
     | azure_ai_models
@@ -1031,6 +1035,7 @@ models_by_provider: dict = {
     "text-completion-codestral": text_completion_codestral_models,
     "xai": xai_models,
     "zai": zai_models,
+    "zai_coding_plan": zai_coding_plan_models,
     "fal_ai": fal_ai_models,
     "deepseek": deepseek_models,
     "runwayml": runwayml_models,
@@ -1791,6 +1796,9 @@ if TYPE_CHECKING:
     )
     from .llms.xai.chat.transformation import XAIChatConfig as XAIChatConfig
     from .llms.zai.chat.transformation import ZAIChatConfig as ZAIChatConfig
+    from .llms.zai_coding_plan.chat.transformation import (
+        ZAICodingPlanChatConfig as ZAICodingPlanChatConfig,
+    )
     from .llms.aiml.chat.transformation import AIMLChatConfig as AIMLChatConfig
     from .llms.volcengine.chat.transformation import (
         VolcEngineChatConfig as VolcEngineChatConfig,
@@ -2007,6 +2015,12 @@ def __getattr__(name: str) -> Any:
         )
 
         return AlibabaTokenPlanChatConfig
+    if name == "ZAICodingPlanChatConfig":
+        from .llms.zai_coding_plan.chat.transformation import (
+            ZAICodingPlanChatConfig,
+        )
+
+        return ZAICodingPlanChatConfig
 
     # Register async client cleanup on first access (only once)
     if not _async_client_cleanup_registered:
