@@ -68,6 +68,71 @@ def test_priority_descending_with_zero_last_resort_in_snapshot() -> None:
     assert basic_alias.candidates[-1].priority == 0
 
 
+def test_canonical_sota_zai_compiles_coding_plan_ahead_of_alibaba() -> None:
+    """Public sota-zai prefers Coding Plan glm-5.3 (110) then Alibaba glm-5.2 (100)."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    alias = snapshot.aliases["sota-zai"]
+    identities = [
+        (
+            candidate.provider,
+            candidate.model,
+            candidate.route_family,
+            candidate.priority,
+        )
+        for candidate in alias.candidates
+    ]
+    assert identities == [
+        (
+            "zai_coding_plan",
+            "zai_coding_plan/glm-5.3",
+            "codex_zai_coding_plan_chat_completions_adapter",
+            110,
+        ),
+        (
+            "alibaba_token_plan",
+            "alibaba_token_plan/glm-5.2",
+            "codex_alibaba_token_plan_chat_completions_adapter",
+            100,
+        ),
+    ]
+    coding_plan, alibaba = alias.candidates
+    assert coding_plan.priority > alibaba.priority
+    assert coding_plan.anthropic_route_family is None
+    assert (
+        alibaba.anthropic_route_family
+        == "anthropic_alibaba_token_plan_chat_completions_adapter"
+    )
+    assert coding_plan.reasoning_effort == "max"
+    assert alibaba.reasoning_effort == "max"
+    assert "aawm-sota-zai" not in snapshot.aliases
+    assert "sota-zcode" not in snapshot.aliases
+    sota = snapshot.aliases["sota"]
+    assert sota.dispatch is not None
+    assert all(rule.target_alias != "sota-zai" for rule in sota.dispatch.by_tui)
+    assert sota.dispatch.default != "sota-zai"
+
+
+def test_sota_zai_coding_plan_candidate_rejects_anthropic_route_family() -> None:
+    raw = """
+defaults: {}
+aliases:
+  - name: sota-zai
+    candidates:
+      - provider: zai_coding_plan
+        model: zai_coding_plan/glm-5.3
+        route_family: codex_zai_coding_plan_chat_completions_adapter
+        anthropic_route_family: anthropic_alibaba_token_plan_chat_completions_adapter
+        priority: 110
+"""
+    with pytest.raises(compiler.ConfigCompileError, match="Codex-only"):
+        compiler.compile_yaml(raw)
+
+
 def test_proportional_weights_normalized_in_snapshot() -> None:
     """Compiler normalizes proportional weights into the snapshot."""
     raw = """

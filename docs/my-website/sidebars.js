@@ -975,6 +975,7 @@ const sidebars = {
         "providers/xiaomi_mimo",
         "providers/xinference",
         "providers/zai",
+        "providers/zai_coding_plan",
       ],
     },
     {

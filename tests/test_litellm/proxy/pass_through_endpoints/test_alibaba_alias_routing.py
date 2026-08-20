@@ -91,7 +91,7 @@ def _reset_alibaba_alias_state() -> None:
 
 
 def test_should_register_all_alibaba_aliases_for_both_ingresses() -> None:
-    for alias in ("sota-alibaba", "sota-deepseek", "sota-zai"):
+    for alias in ("sota-alibaba", "sota-deepseek"):
         assert (
             snapshot_select._lookup_active_snapshot_canonical_alias(alias)
             == alias
@@ -120,13 +120,43 @@ def test_should_register_all_alibaba_aliases_for_both_ingresses() -> None:
             candidate["provider"] == "alibaba_token_plan"
             for candidate in anthropic_candidates
         )
-    zai_candidates = snapshot_select._select_snapshot_candidates(
+
+
+def test_should_prefer_coding_plan_then_alibaba_on_public_sota_zai() -> None:
+    assert (
+        snapshot_select._lookup_active_snapshot_canonical_alias("sota-zai")
+        == "sota-zai"
+    )
+    codex_candidates = snapshot_select._select_snapshot_candidates(
         "sota-zai",
         ingress="codex",
     )
-    assert [candidate["model"] for candidate in zai_candidates] == [
+    anthropic_candidates = snapshot_select._select_snapshot_candidates(
+        "sota-zai",
+        ingress="anthropic",
+    )
+    assert [
+        (candidate["provider"], candidate["model"], candidate["route_family"])
+        for candidate in codex_candidates
+    ] == [
+        (
+            "zai_coding_plan",
+            "zai_coding_plan/glm-5.3",
+            "codex_zai_coding_plan_chat_completions_adapter",
+        ),
+        (
+            "alibaba_token_plan",
+            "alibaba_token_plan/glm-5.2",
+            "codex_alibaba_token_plan_chat_completions_adapter",
+        ),
+    ]
+    assert [candidate["model"] for candidate in anthropic_candidates] == [
         "alibaba_token_plan/glm-5.2"
     ]
+    assert all(
+        candidate["provider"] == "alibaba_token_plan"
+        for candidate in anthropic_candidates
+    )
 
 
 @pytest.mark.asyncio

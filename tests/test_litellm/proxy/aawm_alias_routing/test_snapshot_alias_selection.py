@@ -82,6 +82,52 @@ def test_priority_descending_selection(snapshot_fixture) -> None:
     assert ordered[-1].model == "gpt-5.4-mini"
 
 
+def test_canonical_sota_zai_prefers_coding_plan_on_codex_ingress() -> None:
+    """Codex ingress sees Coding Plan glm-5.3 first; Anthropic keeps Alibaba only."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    previous = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    try:
+        ordered = snapshot_select._order_snapshot_candidates_by_priority(
+            snapshot.aliases["sota-zai"].candidates
+        )
+        assert [candidate.model for candidate in ordered] == [
+            "zai_coding_plan/glm-5.3",
+            "alibaba_token_plan/glm-5.2",
+        ]
+        assert [candidate.priority for candidate in ordered] == [110, 100]
+        codex = snapshot_select._select_snapshot_candidates(
+            "sota-zai",
+            ingress="codex",
+        )
+        anthropic = snapshot_select._select_snapshot_candidates(
+            "sota-zai",
+            ingress="anthropic",
+        )
+        assert [candidate["model"] for candidate in codex] == [
+            "zai_coding_plan/glm-5.3",
+            "alibaba_token_plan/glm-5.2",
+        ]
+        assert [candidate["model"] for candidate in anthropic] == [
+            "alibaba_token_plan/glm-5.2"
+        ]
+        assert (
+            codex[0]["route_family"]
+            == "codex_zai_coding_plan_chat_completions_adapter"
+        )
+        assert (
+            anthropic[0]["route_family"]
+            == "anthropic_alibaba_token_plan_chat_completions_adapter"
+        )
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous)
+
+
 def test_proportional_tie_distribution() -> None:
     """Equal-priority candidates split by weight over many selections within tolerance."""
     raw = """

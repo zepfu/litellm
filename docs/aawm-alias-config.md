@@ -292,13 +292,17 @@ credentials; Terra uses `codex_responses` (projected to
 `anthropic_openai_responses_adapter` on Anthropic ingress) and keeps its
 OpenAI/Codex credential domain on both ingresses.
 
-## Maintained `sota-zai` alias behavior (CFG-021)
+## Maintained `sota-zai` alias behavior (CFG-021 + ZAI-009)
 
-The public `sota-zai` alias is compiled from `sota-zai.yaml`. Its first
-candidate is Alibaba Token Plan `glm-5.2` on
-`codex_alibaba_token_plan_chat_completions_adapter`. A later Z.AI Coding
-Plan route belongs on this same alias as another candidate; do not invent a
-second public name.
+The public `sota-zai` alias is compiled from `sota-zai.yaml`. Codex
+`POST /openai_passthrough/v1/responses` prefers Z.AI Coding Plan
+`zai_coding_plan/glm-5.3` on
+`codex_zai_coding_plan_chat_completions_adapter` (priority 110). Alibaba
+Token Plan `alibaba_token_plan/glm-5.2` stays as the last-resort leaf on
+the same alias (priority 100). Coding Plan is Codex-only: do not set
+`anthropic_route_family` on that candidate. Anthropic ingress therefore
+sees only the Alibaba leaf. Do not invent `aawm-sota-zai` or `sota-zcode`.
+Do not add this alias to `sota.yaml` TUI dispatch.
 
 ## Codex passthrough alias catalog (CFG-023)
 

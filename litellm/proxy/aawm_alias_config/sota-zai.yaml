@@ -1,12 +1,18 @@
-# Public sota-zai alias (CFG-021).
-# First candidate is Alibaba Token Plan GLM 5.2. A later Z.AI Coding Plan
-# route belongs on this same alias as another candidate; do not invent a
-# second public name.
+# Public sota-zai alias (CFG-021 + ZAI-009 Wave 3).
+# Prefer Z.AI Coding Plan GLM-5.3. Alibaba Token Plan GLM-5.2 is the
+# last-resort leaf on this same alias. Do not invent aawm-sota-zai.
+# Do not add this alias to sota.yaml TUI dispatch.
 defaults: {}
 
 aliases:
   - name: sota-zai
     candidates:
+      - provider: zai_coding_plan
+        model: zai_coding_plan/glm-5.3
+        route_family: codex_zai_coding_plan_chat_completions_adapter
+        priority: 110
+        reasoning_effort: max
+
       - provider: alibaba_token_plan
         model: alibaba_token_plan/glm-5.2
         route_family: codex_alibaba_token_plan_chat_completions_adapter

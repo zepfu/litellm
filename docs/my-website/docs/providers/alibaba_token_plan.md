@@ -82,8 +82,8 @@ The AAWM proxy configuration may expose:
 
 - `sota-alibaba`: Qwen 3.8 Max, then Qwen 3.7 Max.
 - `sota-deepseek`: DeepSeek V4 Pro.
-- `sota-zai`: GLM 5.2. A later Z.AI Coding Plan route is another candidate
-  on this same alias.
+- `sota-zai`: last-resort Alibaba Token Plan GLM 5.2 after Z.AI Coding
+  Plan `zai_coding_plan/glm-5.3`. Do not invent a second public name.
 
 Codex Responses ingress uses
 `codex_alibaba_token_plan_chat_completions_adapter`. Anthropic Messages ingress

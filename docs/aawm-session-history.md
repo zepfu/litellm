@@ -1539,9 +1539,9 @@ is request-local rather than a durable candidate cooldown.
 The logical `sota` alias selects the producer-family `sota-*` alias from TUI
 origin and defaults to `sota-openai`. `sota-alibaba` uses
 `alibaba_token_plan/qwen3.8-max`, then
-`alibaba_token_plan/qwen3.7-max`. Public `sota-zai` is Alibaba Token Plan
-`glm-5.2`; a later Z.AI Coding Plan route is another candidate on the same
-alias.
+`alibaba_token_plan/qwen3.7-max`. Public `sota-zai` prefers Z.AI Coding
+Plan `zai_coding_plan/glm-5.3` first; Alibaba Token Plan `glm-5.2` is the
+last-resort leaf on the same alias.
 
 `basic` is the config-driven low-cost alias. `work` uses
 `gpt-5.3-codex-spark`, then the nested `work-other` alias reference, then for
