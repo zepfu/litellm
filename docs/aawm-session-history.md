@@ -61,6 +61,21 @@ This fork stores AAWM-specific routing and observability details in
 maintainer diagnostics and downstream reporting surfaces. They should not be
 treated as public LiteLLM API guarantees.
 
+## OpenAI passthrough text-watermark audits
+
+When `general_settings.openai_passthrough_text_watermark.mode` is not `off`,
+LiteLLM may attach bounded audit objects to session-history metadata:
+
+- `watermark_input_audit` — harness-original / upstream-sent visible request text
+- `watermark_output_audit` — provider-received / client-delivered visible response text
+
+These keys are allowlisted in `_AAWM_SESSION_HISTORY_METADATA_KEYS`. Audits
+record detector names, hit kinds, counts, JSON paths, and sanitation results.
+They must not persist raw matching characters, surrounding text, full prompts,
+full responses, detector keys, or unkeyed content hashes. Unicode-carrier
+evidence never sets `confirmed_watermark_detected` and `vendor_attribution`
+stays `unknown`. Shipped config remains `mode: off` with `removal.enabled: false`.
+
 ## Inbound Alias Capture
 
 `public.session_history` includes a nullable `inbound_model_alias` text column.

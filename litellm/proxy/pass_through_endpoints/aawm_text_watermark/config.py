@@ -128,6 +128,8 @@ def load_text_watermark_config(
 ) -> OpenAIPassthroughTextWatermarkSettings:
     """Validate and freeze a watermark policy. ``None`` loads shipped defaults."""
 
+    if isinstance(payload, OpenAIPassthroughTextWatermarkSettings):
+        return payload
     return OpenAIPassthroughTextWatermarkSettings.model_validate(
         _payload_to_mapping(payload)
     )

@@ -12,8 +12,6 @@ ZWJ = "\u200d"
 WORD_JOINER = "\u2060"
 BOM = "\ufeff"
 MONGOLIAN_VOWEL_SEPARATOR = "\u180e"
-VS15 = "\ufe0e"
-VS16 = "\ufe0f"
 COMBINING_ENCLOSING_KEYCAP = "\u20e3"
 
 UNICODE_CARRIER_DETECTOR_NAME = "unicode_carrier"

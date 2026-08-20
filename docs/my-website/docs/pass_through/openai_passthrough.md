@@ -112,3 +112,32 @@ messages = client.beta.threads.messages.list(
 # Delete the assistant when done
 client.beta.assistants.delete(assistant.id)
 ```
+
+## Text watermark policy (optional)
+
+`/openai_passthrough` can inspect visible Responses and Chat Completions text
+for deterministic Unicode carriers (zero-width/format controls, noncharacters,
+and configured exotic spaces). This is not a vendor-watermark detector and
+does not rewrite prose with a second model.
+
+Shipped default is off:
+
+```yaml
+general_settings:
+  openai_passthrough_text_watermark:
+    mode: off
+    unicode:
+      enabled: true
+      policy: conservative
+    removal:
+      enabled: false
+      stream_policy: audit_only
+    statistical_detectors: []
+```
+
+Leave this disabled unless you explicitly opt in. `sanitize` / `enforce`
+require `removal.enabled: true`. `enforce` plus streamed output also requires
+`stream_policy: buffer_response`. Statistical detectors stay an empty disabled
+registry; they report `unsupported` / `inconclusive` and never load
+torch/transformers.
+

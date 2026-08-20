@@ -2396,14 +2396,11 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
         None,
         description="List of MCP server fields that must be filled in for a submission to pass standards checks (e.g. ['description', 'source_url', 'alias']).",
     )
-    openai_passthrough_text_watermark: Optional[
-        OpenAIPassthroughTextWatermarkSettings
-    ] = Field(
+    openai_passthrough_text_watermark: OpenAIPassthroughTextWatermarkSettings = Field(
         default_factory=OpenAIPassthroughTextWatermarkSettings,
         description=(
-            "OpenAI passthrough text-watermark policy. An empty or unset "
-            "value loads as mode=off with removal disabled. Extra keys are "
-            "forbidden."
+            "Optional Unicode-carrier watermark policy for OpenAI passthrough "
+            "visible text. Shipped default is mode=off and removal.enabled=false."
         ),
     )
 

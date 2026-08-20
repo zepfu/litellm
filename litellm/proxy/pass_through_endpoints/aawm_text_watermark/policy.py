@@ -221,7 +221,6 @@ def apply_watermark_policy(
     removed_total = 0
     replaced_total = 0
     post_hits = 0
-    post_kinds: list[list[str]] = []
     errors: list[str] = []
 
     for node in nodes:
@@ -264,11 +263,8 @@ def apply_watermark_policy(
             normalize_spaces=unicode_settings.normalize_spaces,
         )
         post_hits += post.hit_count
-        if post.hit_kinds:
-            post_kinds.append(list(post.hit_kinds))
 
     merged_pre_kinds = _merge_kinds(pre_kinds)
-    merged_post_kinds = _merge_kinds(post_kinds)
     max_paths = loaded.limits.max_reported_paths
     truncated = truncated_limits or len(path_rows) > max_paths
     reported_paths = path_rows[:max_paths]
