@@ -27058,6 +27058,20 @@
         "supports_tool_choice": true,
         "supports_vision": true
     },
+    "openrouter/qwen/qwen3.6-flash": {
+        "input_cost_per_token": 1.875e-07,
+        "litellm_provider": "openrouter",
+        "max_input_tokens": 1000000,
+        "max_output_tokens": 65536,
+        "max_tokens": 65536,
+        "mode": "chat",
+        "output_cost_per_token": 1.125e-06,
+        "source": "https://openrouter.ai/qwen/qwen3.6-flash",
+        "supports_function_calling": true,
+        "supports_reasoning": true,
+        "supports_tool_choice": true,
+        "supports_vision": true
+    },
     "openrouter/qwen/qwen3.5-plus-02-15": {
         "input_cost_per_token": 4e-07,
         "input_cost_per_token_above_256k_tokens": 5e-07,

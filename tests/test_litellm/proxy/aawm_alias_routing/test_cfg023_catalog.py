@@ -77,17 +77,33 @@ class TestPassthroughCatalogHelpers:
         assert "work-other" in ids
         assert AAWM_PREFIXED_SOTA not in ids
         assert UNKNOWN_ALIAS_NAME not in ids
+        yaml_ids = set(COMPILED_ALIAS_NAMES)
         for row in payload["data"]:
             assert row["object"] == "model"
-            assert row["owned_by"] == "aawm_alias"
+            if row.get("owned_by") == "aawm_alias":
+                assert row["id"] in yaml_ids
+            elif row["id"] in yaml_ids:
+                assert row["owned_by"] == "aawm_alias"
 
     def test_build_passthrough_model_list_fail_closed_on_none(self) -> None:
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.catalog import (
             build_passthrough_model_list,
         )
 
-        payload = build_passthrough_model_list(None)
-        assert payload == {"object": "list", "data": []}
+        with patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.catalog.get_active_snapshot",
+            return_value=None,
+        ):
+            payload = build_passthrough_model_list(None)
+        assert payload["object"] == "list"
+        assert isinstance(payload["data"], list)
+        alias_ids = [
+            row["id"] for row in payload["data"] if row.get("owned_by") == "aawm_alias"
+        ]
+        ids = {row["id"] for row in payload["data"]}
+        assert alias_ids == []
+        assert "work" not in ids
+        assert "sota-zai" not in ids
 
     def test_swapped_snapshot_add_remove_appears_on_list(self) -> None:
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing.catalog import (
@@ -96,7 +112,8 @@ class TestPassthroughCatalogHelpers:
 
         first = _snapshot_with_aliases(["work", "sota-zai"])
         first_ids = {row["id"] for row in build_passthrough_model_list(first)["data"]}
-        assert first_ids == {"work", "sota-zai"}
+        assert "work" in first_ids
+        assert "sota-zai" in first_ids
 
         second = _snapshot_with_aliases(["work", "work-other"])
         second_ids = {row["id"] for row in build_passthrough_model_list(second)["data"]}

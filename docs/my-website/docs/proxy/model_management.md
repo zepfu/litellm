@@ -68,6 +68,11 @@ ordinary exact-name route with no public/internal routing distinction.
 Non-Codex-native `GET /openai_passthrough/v1/models` lists compiled YAML
 aliases. Usage is `POST /openai_passthrough/v1/responses`. Generic
 `/v1/chat/completions` is not an alias ingress. The public name is `sota-zai`.
+Non-Codex-native GET also lists served concrete provider ids with
+mode/context/cost from the bundled cost map or `aawm_reference_pricing`.
+Provenance is explicit and is not invoice cost. Cursor Grok is distinct from
+`oa_xai/grok-4.6`. Usage remains `POST /openai_passthrough/v1/responses`.
+omp should point at this passthrough (sibling client config; not committed here).
 
 ### Codex reasoning effort follows the resolved model
 
