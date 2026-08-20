@@ -390,6 +390,9 @@ from litellm.llms.alibaba_token_plan.adapters import (
     adapter as _alibaba_token_plan_adapters,
 )
 from litellm.llms.kimi_code.adapters import adapter as _kimi_code_adapters
+from litellm.llms.zai_coding_plan.adapters import (
+    adapter as _zai_coding_plan_adapters,
+)
 from litellm.types.llms.openai import (
     RESPONSES_API_TERMINAL_STREAM_EVENTS,  # noqa: F401 - Wave 6A host binding
     ResponsesAPIOptionalRequestParams,  # noqa: F401 - Wave 6F facade host binding
@@ -1346,6 +1349,9 @@ _normalize_kimi_code_chat_completions_adapter_model_name = _aawm_adapter_model_r
 _normalize_alibaba_token_plan_adapter_model_name = _aawm_adapter_model_resolution._normalize_alibaba_token_plan_adapter_model_name
 
 
+_normalize_zai_coding_plan_adapter_model_name = _aawm_adapter_model_resolution._normalize_zai_coding_plan_adapter_model_name
+
+
 _resolve_codex_opencode_zen_adapter_model = _aawm_adapter_model_resolution._resolve_codex_opencode_zen_adapter_model
 
 
@@ -1353,6 +1359,9 @@ _resolve_codex_kimi_chat_completions_adapter_model = _aawm_adapter_model_resolut
 
 
 _resolve_codex_alibaba_token_plan_adapter_model = _aawm_adapter_model_resolution._resolve_codex_alibaba_token_plan_adapter_model
+
+
+_resolve_codex_zai_coding_plan_adapter_model = _aawm_adapter_model_resolution._resolve_codex_zai_coding_plan_adapter_model
 
 
 _resolve_anthropic_opencode_zen_adapter_model = _aawm_adapter_model_resolution._resolve_anthropic_opencode_zen_adapter_model

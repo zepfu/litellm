@@ -47,6 +47,37 @@ def _resolve_upstream_model(adapter_model: str) -> str:
     return normalized.removeprefix("zai_coding_plan/")
 
 
+def normalize_zai_coding_plan_custom_tool_outputs(
+    request_body: dict[str, Any],
+) -> dict[str, Any]:
+    """Convert Codex custom-tool results to the function-tool wire shape."""
+
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
+        return request_body
+
+    changed = False
+    updated_items: list[Any] = []
+    for item in input_items:
+        if (
+            isinstance(item, dict)
+            and item.get("type") == "custom_tool_call_output"
+            and isinstance(item.get("call_id"), str)
+            and item["call_id"].strip()
+        ):
+            updated_item = dict(item)
+            updated_item["type"] = "function_call_output"
+            updated_items.append(updated_item)
+            changed = True
+        else:
+            updated_items.append(item)
+    if not changed:
+        return request_body
+    updated_body = dict(request_body)
+    updated_body["input"] = updated_items
+    return updated_body
+
+
 def _add_adapter_metadata(
     *,
     request_body: dict[str, Any],

@@ -31,6 +31,7 @@ from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lp
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import candidate_loop
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+    CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
 )
 
 PACKAGE_DIR = Path(package.__file__).resolve().parent
@@ -245,3 +246,51 @@ def test_resolve_failure_plan_classifies_alibaba_model_not_found_as_candidate_un
 
     assert captured["error_class"] == "candidate_unavailable"
     assert plan.error_class == "candidate_unavailable"
+
+
+def test_resolve_failure_plan_classifies_coding_plan_1113_as_terminal_routing() -> None:
+    class _InsufficientBalance(Exception):
+        def __init__(self) -> None:
+            super().__init__("Insufficient balance")
+            self.status_code = 429
+            self.detail = {
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": 1113,
+                    "message": "Insufficient balance",
+                }
+            }
+
+    exc = _InsufficientBalance()
+    candidate = {
+        "provider": CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
+        "model": "zai_coding_plan/glm-5.3",
+        "route_family": "codex_zai_coding_plan_chat_completions_adapter",
+    }
+    captured: dict = {}
+
+    def _capture_publication(**kwargs) -> SimpleNamespace:
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    plan = candidate_loop._resolve_failure_plan(
+        resolve_cooldown_publication_fn=_capture_publication,
+        record_codex_failure_evidence_fn=lambda **kwargs: None,
+        request=SimpleNamespace(),
+        candidate=candidate,
+        selection={
+            "cooldown_key": f"{CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER}:default",
+            "lane_key": None,
+        },
+        attempt_record={},
+        exc=exc,
+        codex_failure_evidence_alias=None,
+        kimi_failure_metadata_fn=lambda exc, candidate=None: None,
+        classify_kimi_fn=lambda metadata: None,
+        classify_retryable_fn=package.error_signals._classify_codex_auto_agent_retryable_exhaustion,
+        grok_quota_fn=lambda exc, candidate=None: False,
+        cooldown_seconds_fn=lambda exc, candidate=None: 60,
+    )
+
+    assert captured["error_class"] == "provider_terminal_error"
+    assert plan.error_class == "provider_terminal_error"

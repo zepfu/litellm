@@ -43,6 +43,9 @@ EXPECTED_PUBLIC_SYMBOLS = frozenset(
         "_prepare_codex_alibaba_token_plan_adapter_route",
         "_perform_codex_alibaba_token_plan_adapter_call",
         "_handle_codex_alibaba_token_plan_adapter_route",
+        "_prepare_codex_zai_coding_plan_adapter_route",
+        "_perform_codex_zai_coding_plan_adapter_call",
+        "_handle_codex_zai_coding_plan_adapter_route",
         "_handle_codex_opencode_zen_adapter_route",
         "_consume_opencode_zen_tools_mode_header",
         "_build_opencode_zen_completion_call_kwargs",
@@ -83,7 +86,7 @@ class TestSymbolInventory:
                 callable(getattr(codex_candidate_calls, name))
                 for name in codex_candidate_calls._HOST_FUNCTION_NAMES
             )
-            == 26
+            == 29
         )
 
 
@@ -104,6 +107,9 @@ ASYNC_FUNCTIONS = frozenset(
         "_prepare_codex_alibaba_token_plan_adapter_route",
         "_perform_codex_alibaba_token_plan_adapter_call",
         "_handle_codex_alibaba_token_plan_adapter_route",
+        "_prepare_codex_zai_coding_plan_adapter_route",
+        "_perform_codex_zai_coding_plan_adapter_call",
+        "_handle_codex_zai_coding_plan_adapter_route",
         "_handle_codex_opencode_zen_adapter_route",
         "_perform_opencode_zen_completion_call",
     }
@@ -198,6 +204,7 @@ class TestDispatchBehavior:
         host["_CODEX_AUTO_AGENT_OPENCODE_PROVIDER"] = "opencode"
         host["_CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER"] = "kimi_code"
         host["_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER"] = "alibaba_token_plan"
+        host["_CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER"] = "zai_coding_plan"
         host["_CODEX_AUTO_AGENT_OPENROUTER_PROVIDER"] = "openrouter"
         host["_CODEX_AUTO_AGENT_XAI_PROVIDER"] = "xai"
         codex_candidate_calls.install(host)
@@ -367,6 +374,39 @@ class TestCallbackOrdering:
         assert emit_kwargs["request_body"]["model"] == "alibaba-alias"
         assert emit_kwargs["provider_bound_body"] is completion_kwargs
         assert emit_kwargs["provider_bound_body"]["reasoning_effort"] == "low"
+
+    @pytest.mark.asyncio
+    async def test_zai_coding_plan_route_logs_provider_bound_body(self):
+        """handle_codex_zai_coding_plan must log translated completion kwargs."""
+        host = self._completion_handle_host(
+            prepare_name="_prepare_codex_zai_coding_plan_adapter_route"
+        )
+        mock_plan, completion_kwargs = self._completion_plan(
+            alias="zai-coding-plan-alias",
+            upstream="glm-5.3",
+            effort="max",
+        )
+        host["_prepare_codex_zai_coding_plan_adapter_route"] = AsyncMock(
+            return_value=mock_plan
+        )
+
+        await host["_handle_codex_zai_coding_plan_adapter_route"](
+            endpoint="/v1/responses",
+            request=MagicMock(headers={}),
+            fastapi_response=MagicMock(),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body={"model": "zai-coding-plan-alias"},
+            adapter_model="zai-coding-plan-alias",
+            use_alias_candidate_probe=False,
+        )
+
+        host["_validate_codex_auto_agent_responses_payload"].assert_awaited_once()
+        host["_record_adapted_completed_route_rollup_turn"].assert_called_once()
+        emit_kwargs = host["_emit_adapted_route_access_log"].call_args.kwargs
+        assert emit_kwargs["request_body"] is mock_plan.prepared_request_body
+        assert emit_kwargs["request_body"]["model"] == "zai-coding-plan-alias"
+        assert emit_kwargs["provider_bound_body"] is completion_kwargs
+        assert emit_kwargs["provider_bound_body"]["reasoning_effort"] == "max"
 
 
 class TestSotaXaiCandidateToolAdaptation:

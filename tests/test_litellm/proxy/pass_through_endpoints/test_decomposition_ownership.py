@@ -89,9 +89,11 @@ MODEL_RESOLUTION_SYMBOLS: set[str] = {
     "_normalize_opencode_zen_adapter_model_name",
     "_normalize_kimi_code_chat_completions_adapter_model_name",
     "_normalize_alibaba_token_plan_adapter_model_name",
+    "_normalize_zai_coding_plan_adapter_model_name",
     "_resolve_codex_opencode_zen_adapter_model",
     "_resolve_codex_kimi_chat_completions_adapter_model",
     "_resolve_codex_alibaba_token_plan_adapter_model",
+    "_resolve_codex_zai_coding_plan_adapter_model",
     "_resolve_anthropic_opencode_zen_adapter_model",
     "_resolve_anthropic_kimi_chat_completions_adapter_model",
     "_resolve_anthropic_alibaba_token_plan_adapter_model",
@@ -1656,7 +1658,7 @@ WAVE6F_MODULE_IMPORT_PATHS: dict[str, str] = {
 }
 WAVE6F_EXPECTED_COUNTS: dict[str, int] = {
     "anthropic_adapter_calls": 46,
-    "codex_candidate_calls": 23,
+    "codex_candidate_calls": 26,
     "codex_dispatch": 2,
     "anthropic_dispatch": 1,
 }
@@ -1724,6 +1726,9 @@ WAVE6F_CODEX_CANDIDATE_CALL_SYMBOLS: set[str] = {
     "_prepare_codex_alibaba_token_plan_adapter_route",
     "_perform_codex_alibaba_token_plan_adapter_call",
     "_handle_codex_alibaba_token_plan_adapter_route",
+    "_prepare_codex_zai_coding_plan_adapter_route",
+    "_perform_codex_zai_coding_plan_adapter_call",
+    "_handle_codex_zai_coding_plan_adapter_route",
     "_handle_codex_opencode_zen_adapter_route",
     "_consume_opencode_zen_tools_mode_header",
     "_build_opencode_zen_completion_call_kwargs",
@@ -1760,11 +1765,13 @@ WAVE6F_ANTHROPIC_ALREADY_FACADE_SYMBOLS: set[str] = {
     "_add_route_family_logging_metadata",
 }
 
-# Nine Codex candidate-call helpers authored after Wave 6F extraction.
-# They are part of the current 72-callable owned surface but were never
-# god-module FunctionDefs, so they are excluded from the historical
-# extraction count.
+# Codex candidate-call helpers authored after Wave 6F extraction.
+# They are part of the current owned surface but were never god-module
+# FunctionDefs, so they are excluded from the historical extraction count.
 WAVE6F_POST_EXTRACTION_CODEX_HELPERS: set[str] = {
+    "_prepare_codex_zai_coding_plan_adapter_route",
+    "_perform_codex_zai_coding_plan_adapter_call",
+    "_handle_codex_zai_coding_plan_adapter_route",
     "_consume_opencode_zen_tools_mode_header",
     "_build_opencode_zen_completion_call_kwargs",
     "_perform_opencode_zen_completion_call",
@@ -1844,7 +1851,7 @@ class TestWave6FAdapterRuntimeOwnership:
             for name, import_path in WAVE6F_MODULE_IMPORT_PATHS.items()
         }
 
-    def test_exact_72_callable_inventory_without_duplicate_ownership(self):
+    def test_exact_callable_inventory_without_duplicate_ownership(self):
         seen: dict[str, str] = {}
         duplicates: list[str] = []
         for module_name in WAVE6F_MODULE_ORDER:
@@ -1857,7 +1864,7 @@ class TestWave6FAdapterRuntimeOwnership:
                     )
                 seen[symbol] = module_name
 
-        assert len(seen) == 72
+        assert len(seen) == 75
         assert not duplicates
 
     def test_authored_module_inventories_match_shared_inventory(self):
@@ -1912,7 +1919,7 @@ class TestWave6FAdapterRuntimeOwnership:
             "try_dispatch_anthropic_adapter",
         )
 
-    def test_all_72_facades_are_accessible(self):
+    def test_all_owned_facades_are_accessible(self):
         for symbol in ALL_WAVE6F_FACADES:
             assert callable(getattr(lpe, symbol, None)), symbol
 

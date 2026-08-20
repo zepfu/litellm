@@ -88,6 +88,16 @@ _COHERE_NATIVE_PROVIDERS: frozenset[str] = frozenset(
         "cohere",
     }
 )
+_ZAI_CODING_PLAN_CREDENTIAL_ROUTE_FAMILIES: frozenset[str] = frozenset(
+    {
+        "codex_zai_coding_plan_chat_completions_adapter",
+    }
+)
+_ZAI_CODING_PLAN_NATIVE_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "zai_coding_plan",
+    }
+)
 _CURSOR_AGENT_CREDENTIAL_ROUTE_FAMILIES: frozenset[str] = frozenset(
     {
         "codex_cursor_agent_aiserver_adapter",
@@ -129,6 +139,37 @@ def _validate_cohere_credential_domain(
         raise ConfigCompileError(
             f"candidate model {model!r}: provider {provider!r} requires "
             "Cohere-native route families"
+        )
+
+
+def _validate_zai_coding_plan_credential_domain(
+    *,
+    provider: str,
+    model: str,
+    route_family: Optional[str],
+    anthropic_route_family: Optional[str],
+) -> None:
+    route_families = tuple(
+        value
+        for value in (route_family, anthropic_route_family)
+        if value is not None
+    )
+    uses_coding_plan_credentials = any(
+        value in _ZAI_CODING_PLAN_CREDENTIAL_ROUTE_FAMILIES for value in route_families
+    )
+    is_coding_plan_provider = provider in _ZAI_CODING_PLAN_NATIVE_PROVIDERS
+
+    if uses_coding_plan_credentials and not is_coding_plan_provider:
+        raise ConfigCompileError(
+            f"candidate model {model!r}: provider {provider!r} is incompatible "
+            "with Z.AI Coding Plan credential route family"
+        )
+    if is_coding_plan_provider and any(
+        value not in _ZAI_CODING_PLAN_CREDENTIAL_ROUTE_FAMILIES for value in route_families
+    ):
+        raise ConfigCompileError(
+            f"candidate model {model!r}: provider {provider!r} requires "
+            "Z.AI Coding Plan-native route families"
         )
 
 
@@ -262,6 +303,12 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
             f"is incompatible with anthropic-credential route_family {anthropic_rf!r}"
         )
     _validate_cohere_credential_domain(
+        provider=candidate.provider,
+        model=candidate.model,
+        route_family=candidate.route_family,
+        anthropic_route_family=anthropic_rf,
+    )
+    _validate_zai_coding_plan_credential_domain(
         provider=candidate.provider,
         model=candidate.model,
         route_family=candidate.route_family,

@@ -396,6 +396,24 @@ class TestModelResolutionBindingSafety:
         assert normalizer("alibaba_token_plan/") is None
         assert normalizer("qwen3.8-max-preview") is None
 
+    def test_rebound_zai_coding_plan_normalizer_resolves_documented_routes(self):
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+            model_resolution,
+        )
+
+        host_globals: dict = {"__builtins__": builtins.__dict__}
+        model_resolution.install(host_globals)
+        normalizer = host_globals["_normalize_zai_coding_plan_adapter_model_name"]
+        assert normalizer("zai_coding_plan/glm-5.3") == "zai_coding_plan/glm-5.3"
+        assert normalizer("zai_coding_plan/glm-5-turbo") == "zai_coding_plan/glm-5-turbo"
+        assert normalizer("zai_coding_plan/glm-5.2") is None
+        assert normalizer("glm-5.3") is None
+        resolver = host_globals["_resolve_codex_zai_coding_plan_adapter_model"]
+        host_globals["_is_openai_responses_endpoint"] = lambda endpoint: True
+        assert resolver({"model": "zai_coding_plan/glm-5.3"}, "/v1/responses") == (
+            "zai_coding_plan/glm-5.3"
+        )
+
 
 class TestNonOverlap:
     """Wave 5B symbols must not duplicate Wave 4 or 5A module ownership."""

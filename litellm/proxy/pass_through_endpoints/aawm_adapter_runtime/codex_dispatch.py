@@ -86,6 +86,18 @@ if TYPE_CHECKING:
         prepared_request_body: dict[str, Any],
         adapter_model: str,
     ) -> Response: ...
+    def _resolve_codex_zai_coding_plan_adapter_model(
+        request_body: dict[str, Any], *, endpoint: str
+    ) -> Optional[str]: ...
+    async def _handle_codex_zai_coding_plan_adapter_route(
+        *,
+        endpoint: str,
+        request: Request,
+        fastapi_response: Response,
+        user_api_key_dict: UserAPIKeyAuth,
+        prepared_request_body: dict[str, Any],
+        adapter_model: str,
+    ) -> Response: ...
     def _normalize_codex_reasoning_effort_for_resolved_route(
         request_body: dict[str, Any], *, resolved_route: dict[str, Any]
     ) -> tuple[dict[str, Any], Any]: ...
@@ -568,6 +580,42 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
                 user_api_key_dict=user_api_key_dict,
                 prepared_request_body=prepared_request_body,
                 adapter_model=alibaba_token_plan_adapter_model,
+            )
+        except Exception as _exc:
+            await _finalize_nested_session_owner_lease(request, exc=_exc)
+            raise
+        await _finalize_nested_session_owner_lease(request, _resp)
+        return _resp
+
+    zai_coding_plan_adapter_model = _resolve_codex_zai_coding_plan_adapter_model(
+        prepared_request_body,
+        endpoint=endpoint,
+    )
+    if zai_coding_plan_adapter_model is not None:
+        prepared_request_body = _prepare_request_body_for_passthrough_observability(
+            request=request,
+            request_body=prepared_request_body,
+        )
+        if prepared_request_body is not request_body:
+            _safe_set_request_parsed_body(request, prepared_request_body)
+
+        # Concrete pre-egress reserve after coding-plan route resolution.
+        await _ensure_codex_nested_session_owner_pre_egress(
+            request=request,
+            request_body=prepared_request_body,
+            session_identity=_sid,
+            provider="zai_coding_plan",
+            model=zai_coding_plan_adapter_model,
+            route_family="codex_zai_coding_plan_chat_completions_adapter",
+        )
+        try:
+            _resp = await _handle_codex_zai_coding_plan_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=prepared_request_body,
+                adapter_model=zai_coding_plan_adapter_model,
             )
         except Exception as _exc:
             await _finalize_nested_session_owner_lease(request, exc=_exc)

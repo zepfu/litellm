@@ -10,6 +10,7 @@ import pytest
 from litellm.llms.zai_coding_plan.adapters.adapter import (
     ZAI_CODING_PLAN_CREDENTIAL_SENTINEL,
     normalize_zai_coding_plan_adapter_model_name,
+    normalize_zai_coding_plan_custom_tool_outputs,
     prepare_codex_zai_coding_plan_adapter_route,
 )
 from litellm.llms.zai_coding_plan.chat.transformation import (
@@ -109,3 +110,21 @@ async def test_should_prepare_codex_adapter_metadata_and_coding_url() -> None:
     )
     assert "sota-zai" not in json.dumps(completion_kwargs)
     assert "anthropic_zai_coding_plan" not in json.dumps(metadata)
+
+
+def test_should_normalize_codex_custom_tool_outputs_to_function_shape() -> None:
+    request_body = {
+        "input": [
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_coding_plan",
+                "output": "pwd",
+            }
+        ]
+    }
+
+    normalized = normalize_zai_coding_plan_custom_tool_outputs(request_body)
+
+    assert normalized["input"][0]["type"] == "function_call_output"
+    assert normalized["input"][0]["call_id"] == "call_coding_plan"
+    assert request_body["input"][0]["type"] == "custom_tool_call_output"

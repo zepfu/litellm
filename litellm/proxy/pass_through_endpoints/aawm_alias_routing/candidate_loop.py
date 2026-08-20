@@ -40,6 +40,10 @@ import httpx
 from litellm.proxy.aawm_route_logging import (
     register_aawm_route_rollup_access_log_replacement,
 )
+from litellm.llms.zai_coding_plan.failure_classification import (
+    ZAICodingPlanFailureKind,
+    classify_zai_coding_plan_failure,
+)
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.cohere import (
     classify_cohere_failure,
 )
@@ -156,6 +160,8 @@ def _active_lane_identity_hash(*, candidate: dict[str, Any]) -> str:
 _CODEX_COHERE_PROVIDER = "cohere"
 _CODEX_COHERE_ROUTE_FAMILY = "codex_cohere_chat_completions_adapter"
 _CODEX_COHERE_CHAT_V2_URL = httpx.URL("https://api.cohere.com/v2/chat")
+_CODEX_ZAI_CODING_PLAN_PROVIDER = "zai_coding_plan"
+_CODEX_ZAI_CODING_PLAN_ROUTE_FAMILY = "codex_zai_coding_plan_chat_completions_adapter"
 
 
 def _classify_codex_cohere_candidate_failure(
@@ -197,6 +203,50 @@ def _classify_codex_cohere_candidate_failure(
         "provider_5xx": "provider_terminal_error",
         "transient": "provider_terminal_error",
     }.get(classification.failure_class)
+
+
+_ZAI_CODING_PLAN_KIND_TO_ERROR_CLASS = {
+    ZAICodingPlanFailureKind.AUTH: "provider_terminal_error",
+    ZAICodingPlanFailureKind.QUOTA: "usage_limit_reached",
+    ZAICodingPlanFailureKind.RATE: "rate_limited",
+    ZAICodingPlanFailureKind.CAPACITY: "capacity_exhausted",
+    ZAICodingPlanFailureKind.VALIDATION: "candidate_unavailable",
+    ZAICodingPlanFailureKind.ROUTING: "provider_terminal_error",
+}
+
+
+def _classify_codex_zai_coding_plan_candidate_failure(
+    exc: Exception,
+    *,
+    candidate: Optional[dict[str, Any]],
+) -> Optional[str]:
+    """Map Coding Plan business codes onto the shared Codex retry vocabulary.
+
+    1113 on the coding base is a wrong-base / wrong-key routing defect, not
+    ordinary-balance recharge. Unknown codes return ``None`` so generic
+    classifiers can still inspect HTTP status.
+    """
+
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get("provider") != _CODEX_ZAI_CODING_PLAN_PROVIDER
+    ):
+        return None
+    route_family = candidate.get("route_family")
+    if route_family not in (None, _CODEX_ZAI_CODING_PLAN_ROUTE_FAMILY):
+        return None
+
+    _error_type, error_code = _error_signals._extract_codex_auto_agent_error_type_and_code(
+        exc
+    )
+    failure = classify_zai_coding_plan_failure(
+        status_code=_error_signals._extract_adapter_exception_status_code(exc),
+        error_code=error_code,
+        upstream_id=candidate.get("model"),
+    )
+    if failure.kind == ZAICodingPlanFailureKind.UNKNOWN:
+        return None
+    return _ZAI_CODING_PLAN_KIND_TO_ERROR_CLASS.get(failure.kind)
 
 
 async def handle_alias_route(  # noqa: PLR0915
@@ -769,6 +819,13 @@ async def handle_alias_route(  # noqa: PLR0915
                         )
                     if early_pre_commit_error_class is None:
                         early_pre_commit_error_class = (
+                            _classify_codex_zai_coding_plan_candidate_failure(
+                                probe_failure_exc,
+                                candidate=candidate,
+                            )
+                        )
+                    if early_pre_commit_error_class is None:
+                        early_pre_commit_error_class = (
                             _classify_codex_auto_agent_retryable_exhaustion(
                                 probe_failure_exc, candidate=candidate
                             )
@@ -826,6 +883,11 @@ async def handle_alias_route(  # noqa: PLR0915
                         failure_exc,
                         candidate=candidate,
                         is_codex_alias=codex_failure_evidence_alias is not None,
+                    )
+                if error_class is None:
+                    error_class = _classify_codex_zai_coding_plan_candidate_failure(
+                        failure_exc,
+                        candidate=candidate,
                     )
                 if error_class is None:
                     error_class = _classify_codex_auto_agent_retryable_exhaustion(
@@ -1171,6 +1233,11 @@ def _resolve_failure_plan(
             exc,
             candidate=candidate,
             is_codex_alias=codex_failure_evidence_alias is not None,
+        )
+    if error_class is None:
+        error_class = _classify_codex_zai_coding_plan_candidate_failure(
+            exc,
+            candidate=candidate,
         )
     if error_class is None:
         error_class = classify_retryable_fn(exc, candidate=candidate)
