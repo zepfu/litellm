@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 WatermarkMode = Literal["off", "detect", "sanitize", "enforce"]
 UnicodePolicyName = Literal["conservative", "aggressive"]
@@ -42,6 +42,13 @@ class TextWatermarkRemovalSettings(BaseModel):
     enabled: bool = False
     stream_policy: StreamPolicyName = "audit_only"
     on_unremovable: UnremovablePolicyName = "allow"
+
+    @field_validator("on_unremovable", mode="before")
+    @classmethod
+    def _coerce_block_alias(cls, value: Any) -> Any:
+        if value == "block":
+            return "reject"
+        return value
 
 
 class TextWatermarkLimitsSettings(BaseModel):
@@ -133,3 +140,24 @@ def load_text_watermark_config(
     return OpenAIPassthroughTextWatermarkSettings.model_validate(
         _payload_to_mapping(payload)
     )
+
+
+def get_runtime_text_watermark_config() -> OpenAIPassthroughTextWatermarkSettings:
+    """Read live proxy settings; missing or invalid config stays ``mode=off``."""
+
+    try:
+        from litellm.proxy.proxy_server import general_settings
+    except Exception:
+        return load_text_watermark_config(None)
+
+    payload: Any = None
+    try:
+        if isinstance(general_settings, Mapping):
+            payload = general_settings.get("openai_passthrough_text_watermark")
+        else:
+            payload = getattr(
+                general_settings, "openai_passthrough_text_watermark", None
+            )
+        return load_text_watermark_config(payload)
+    except Exception:
+        return load_text_watermark_config(None)

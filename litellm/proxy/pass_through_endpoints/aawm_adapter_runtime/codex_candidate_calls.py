@@ -12,6 +12,37 @@ import json
 from types import FunctionType
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
+from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
+    load_text_watermark_config,
+)
+from litellm.proxy.pass_through_endpoints.aawm_text_watermark.policy import (
+    apply_request_watermark_egress,
+)
+
+
+def _watermark_endpoint_from_path(*parts: Any) -> str:
+    combined = " ".join(
+        str(part or "") for part in parts if part is not None
+    ).lower()
+    if "chat/completions" in combined or "chat_completions" in combined:
+        return "chat_completions"
+    return "responses"
+
+
+def _get_runtime_text_watermark_config() -> Any:
+    payload = None
+    try:
+        from litellm.proxy.proxy_server import general_settings as _gs
+
+        if isinstance(_gs, dict):
+            payload = _gs.get("openai_passthrough_text_watermark")
+        else:
+            payload = getattr(_gs, "openai_passthrough_text_watermark", None)
+    except Exception:
+        payload = None
+    return load_text_watermark_config(payload)
+
+
 if TYPE_CHECKING:
     import httpx
     import litellm as litellm
@@ -239,6 +270,13 @@ def install(
         if publish_to_module:
             _mod[_name] = _rebound
         host_globals[_name] = _rebound
+    for _name, _value in (
+        ("apply_request_watermark_egress", apply_request_watermark_egress),
+        ("load_text_watermark_config", load_text_watermark_config),
+        ("_get_runtime_text_watermark_config", _get_runtime_text_watermark_config),
+        ("_watermark_endpoint_from_path", _watermark_endpoint_from_path),
+    ):
+        host_globals.setdefault(_name, _value)
 
 
 # ── Extracted functions ─────────────────────────────────────────────
@@ -761,6 +799,23 @@ async def _perform_codex_cohere_chat_completions_adapter_call(
 
     _ = config, adapter_model
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(str(target_url)))
+    _watermark_intake = None
+    try:
+        _watermark_intake = getattr(getattr(request, "state", None), "watermark_intake", None)
+    except Exception:
+        _watermark_intake = None
+    _watermark_metadata = litellm_metadata if isinstance(litellm_metadata, dict) else {}
+    _watermark_egress = apply_request_watermark_egress(
+        body=completion_kwargs,
+        intake=_watermark_intake,
+        config=_get_runtime_text_watermark_config(),
+        endpoint=_watermark_endpoint_from_path("chat/completions", target_url),
+        direction="request",
+        metadata=_watermark_metadata,
+        litellm_metadata=_watermark_metadata,
+    )
+    if isinstance(getattr(_watermark_egress, "body", None), dict):
+        completion_kwargs = _watermark_egress.body
     completion_response = await litellm.acompletion(
         **completion_kwargs,
         api_key=api_key,
@@ -1460,6 +1515,23 @@ async def _perform_codex_kimi_chat_completions_adapter_call(
 
     _ = config
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(str(target_url)))
+    _watermark_intake = None
+    try:
+        _watermark_intake = getattr(getattr(request, "state", None), "watermark_intake", None)
+    except Exception:
+        _watermark_intake = None
+    _watermark_metadata = litellm_metadata if isinstance(litellm_metadata, dict) else {}
+    _watermark_egress = apply_request_watermark_egress(
+        body=completion_kwargs,
+        intake=_watermark_intake,
+        config=_get_runtime_text_watermark_config(),
+        endpoint=_watermark_endpoint_from_path("chat/completions", target_url),
+        direction="request",
+        metadata=_watermark_metadata,
+        litellm_metadata=_watermark_metadata,
+    )
+    if isinstance(getattr(_watermark_egress, "body", None), dict):
+        completion_kwargs = _watermark_egress.body
     completion_response = await litellm.acompletion(
         **completion_kwargs,
         api_key=api_key,
@@ -1632,6 +1704,23 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
 
     _ = config, adapter_model
     _annotate_request_scope_for_adapted_access_log(request, httpx.URL(str(target_url)))
+    _watermark_intake = None
+    try:
+        _watermark_intake = getattr(getattr(request, "state", None), "watermark_intake", None)
+    except Exception:
+        _watermark_intake = None
+    _watermark_metadata = litellm_metadata if isinstance(litellm_metadata, dict) else {}
+    _watermark_egress = apply_request_watermark_egress(
+        body=completion_kwargs,
+        intake=_watermark_intake,
+        config=_get_runtime_text_watermark_config(),
+        endpoint=_watermark_endpoint_from_path("chat/completions", target_url),
+        direction="request",
+        metadata=_watermark_metadata,
+        litellm_metadata=_watermark_metadata,
+    )
+    if isinstance(getattr(_watermark_egress, "body", None), dict):
+        completion_kwargs = _watermark_egress.body
     _acompletion_kwargs = dict(
         completion_kwargs,
         api_key=api_key,
@@ -2282,6 +2371,17 @@ async def _perform_opencode_zen_completion_call(
         completion_call_kwargs=completion_call_kwargs,
         is_known_free_direct=is_known_free_direct,
     )
+    _watermark_metadata = litellm_metadata if isinstance(litellm_metadata, dict) else {}
+    _watermark_egress = apply_request_watermark_egress(
+        body=completion_call_kwargs,
+        config=_get_runtime_text_watermark_config(),
+        endpoint=_watermark_endpoint_from_path("chat/completions"),
+        direction="request",
+        metadata=_watermark_metadata,
+        litellm_metadata=_watermark_metadata,
+    )
+    if isinstance(getattr(_watermark_egress, "body", None), dict):
+        completion_call_kwargs = _watermark_egress.body
     return await litellm.acompletion(**completion_call_kwargs)
 
 
@@ -2620,6 +2720,23 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
         adapter_label="OpenRouter chat-completions",
         provider_bound_body=completion_kwargs,
     )
+    _watermark_intake = None
+    try:
+        _watermark_intake = getattr(getattr(request, "state", None), "watermark_intake", None)
+    except Exception:
+        _watermark_intake = None
+    _watermark_metadata = litellm_metadata if isinstance(litellm_metadata, dict) else {}
+    _watermark_egress = apply_request_watermark_egress(
+        body=completion_kwargs,
+        intake=_watermark_intake,
+        config=_get_runtime_text_watermark_config(),
+        endpoint=_watermark_endpoint_from_path("chat/completions", target_url),
+        direction="request",
+        metadata=_watermark_metadata,
+        litellm_metadata=_watermark_metadata,
+    )
+    if isinstance(getattr(_watermark_egress, "body", None), dict):
+        completion_kwargs = _watermark_egress.body
 
     completion_response = await _perform_openrouter_completion_adapter_operation(
         adapter_model=upstream_adapter_model,

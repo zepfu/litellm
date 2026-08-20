@@ -66,9 +66,13 @@ def _h(name: str):
 
 # Names installed onto this module and re-exported by aawm_agent_identity.
 # Keep in sync with the function/class definitions below.
+_HOST_FUNCTION_NAMES: Tuple[str, ...] = (
+    "_build_watermark_policy_failure_session_history_record",
+)
 _RECORD_API_NAMES: Tuple[str, ...] = (
     "_build_provider_error_observation_only_record",
     "_build_structured_output_failure_session_history_record",
+    *_HOST_FUNCTION_NAMES,
     "_build_failure_observation_only_record",
     "_derive_session_history_reasoning_fields",
     "_derive_session_history_tool_fields",
@@ -154,6 +158,71 @@ def _build_structured_output_failure_session_history_record(
     record.update(structured_output_state)
     return _normalize_session_history_record(record)
 
+def _invoke_installed_record_api(unbound: Any, *args: Any, **kwargs: Any) -> Any:
+    """Dispatch to the identity-rebound copy when tests import this module first."""
+
+    _ensure_installed()
+    installed = sys.modules[__name__].__dict__.get(unbound.__name__)
+    if installed is not None and installed is not unbound:
+        return installed(*args, **kwargs)
+    return None
+
+
+# --- _build_watermark_policy_failure_session_history_record ---
+def _build_watermark_policy_failure_session_history_record(
+    kwargs: Dict[str, Any],
+    result: Any,
+    start_time: Any,
+    end_time: Any,
+) -> Optional[Dict[str, Any]]:
+    if globals().get("_merged_rate_limit_metadata") is None:
+        dispatched = _invoke_installed_record_api(
+            _build_watermark_policy_failure_session_history_record,
+            kwargs,
+            result,
+            start_time,
+            end_time,
+        )
+        if dispatched is not None or globals().get("_merged_rate_limit_metadata") is None:
+            return dispatched
+    candidates: List[Any] = []
+    metadata = _merged_rate_limit_metadata(kwargs)
+    if isinstance(metadata, dict):
+        candidates.append(metadata.get("watermark_input_audit"))
+    litellm_params = kwargs.get("litellm_params") if isinstance(kwargs, dict) else None
+    if isinstance(litellm_params, dict):
+        nested = litellm_params.get("metadata")
+        if isinstance(nested, dict):
+            candidates.append(nested.get("watermark_input_audit"))
+    detail = getattr(result, "detail", None)
+    if isinstance(detail, dict):
+        candidates.append(detail.get("watermark_input_audit"))
+        candidates.append(detail)
+    if isinstance(result, dict):
+        candidates.append(result.get("watermark_input_audit"))
+
+    audit: Optional[Dict[str, Any]] = None
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate.get("status") == "blocked":
+            audit = candidate
+            break
+    if audit is None:
+        return None
+
+    mutable_metadata = _ensure_mutable_metadata(kwargs)
+    mutable_metadata["source_status"] = "failure"
+    mutable_metadata.setdefault("watermark_input_audit", audit)
+
+    record = _build_session_history_record(
+        kwargs=kwargs,
+        result={},
+        start_time=start_time,
+        end_time=end_time,
+    )
+    if record is None:
+        return None
+    return _normalize_session_history_record(record)
+
 # --- _build_failure_observation_only_record ---
 def _build_failure_observation_only_record(
     kwargs: Dict[str, Any],
@@ -183,15 +252,26 @@ def _build_failure_observation_only_record(
         start_time=start_time,
         end_time=end_time,
     )
+    watermark_policy_record = _build_watermark_policy_failure_session_history_record(
+        kwargs=kwargs,
+        result=failure_result,
+        start_time=start_time,
+        end_time=end_time,
+    )
     if (
         not rate_limit_observations
         and provider_error_observation is None
         and structured_output_record is None
+        and watermark_policy_record is None
     ):
         return None
 
     if structured_output_record is not None:
         record = structured_output_record
+        if rate_limit_observations:
+            record["rate_limit_observations"] = rate_limit_observations
+    elif watermark_policy_record is not None:
+        record = watermark_policy_record
         if rate_limit_observations:
             record["rate_limit_observations"] = rate_limit_observations
     elif rate_limit_observations:
@@ -905,6 +985,15 @@ def _build_session_history_metadata(
     request_tags: List[str],
     tenant_id: Optional[str],
 ) -> Dict[str, Any]:
+    if globals().get("_sanitize_worker_context_exhaustion_metadata") is None:
+        dispatched = _invoke_installed_record_api(
+            _build_session_history_metadata,
+            metadata=metadata,
+            request_tags=request_tags,
+            tenant_id=tenant_id,
+        )
+        if dispatched is not None:
+            return dispatched
     _sanitize_worker_context_exhaustion_metadata(metadata)
     history_metadata: Dict[str, Any] = {"request_tags": request_tags}
     if tenant_id:

@@ -57,6 +57,12 @@ from litellm.proxy.pass_through_endpoints.aawm_request_policy.observability_meta
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES,
 )
+from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
+    load_text_watermark_config,
+)
+from litellm.proxy.pass_through_endpoints.aawm_text_watermark.policy import (
+    apply_request_watermark_egress,
+)
 from litellm.types.llms.anthropic_messages.anthropic_response import (
     AnthropicMessagesResponse,
 )
@@ -119,6 +125,29 @@ Parallel tool calls are enabled. When the current user task asks for multiple in
 Follow the latest user task exactly. Use the provided tool schemas as the source of truth for arguments. Emit no assistant text before tool calls when the task asks for tool calls only. After tool results return, provide the requested final answer.
 
 Do NOT Write report/summary/findings/analysis .md files unless EXPLICITLY asked to do. Regardless of a file write-- you need to return findings directly as your final assistant message."""
+
+
+def _watermark_endpoint_from_path(*parts: Any) -> str:
+    combined = " ".join(
+        str(part or "") for part in parts if part is not None
+    ).lower()
+    if "chat/completions" in combined or "chat_completions" in combined:
+        return "chat_completions"
+    return "responses"
+
+
+def _get_runtime_text_watermark_config() -> Any:
+    payload = None
+    try:
+        from litellm.proxy.proxy_server import general_settings as _gs
+
+        if isinstance(_gs, dict):
+            payload = _gs.get("openai_passthrough_text_watermark")
+        else:
+            payload = getattr(_gs, "openai_passthrough_text_watermark", None)
+    except Exception:
+        payload = None
+    return load_text_watermark_config(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -1285,6 +1314,25 @@ async def _perform_normalized_anthropic_completion_adapter_stream(
             **handler_call_kwargs,
             extra_kwargs=handler_extra_kwargs,
         )
+    _watermark_metadata = None
+    if isinstance(completion_kwargs, dict):
+        _watermark_metadata = completion_kwargs.get("litellm_metadata") or completion_kwargs.get(
+            "metadata"
+        )
+    if not isinstance(_watermark_metadata, dict) and isinstance(handler_extra_kwargs, dict):
+        _watermark_metadata = handler_extra_kwargs.get("litellm_metadata")
+    if not isinstance(_watermark_metadata, dict):
+        _watermark_metadata = {}
+    _watermark_egress = apply_request_watermark_egress(
+        body=completion_kwargs,
+        config=_get_runtime_text_watermark_config(),
+        endpoint=_watermark_endpoint_from_path("chat/completions"),
+        direction="request",
+        metadata=_watermark_metadata,
+        litellm_metadata=_watermark_metadata,
+    )
+    if isinstance(getattr(_watermark_egress, "body", None), dict):
+        completion_kwargs = _watermark_egress.body
     raw_completion_stream = await litellm.acompletion(**completion_kwargs)
     normalized_completion_stream = completion_stream_normalizer(raw_completion_stream)
     return handler._transform_completion_response(
@@ -1464,6 +1512,27 @@ async def _perform_anthropic_completion_adapter_messages_call(
             extra_kwargs=handler_extra_kwargs,
         )
     )
+    _watermark_metadata = prepared_request_body.get("litellm_metadata")
+    if not isinstance(_watermark_metadata, dict):
+        _watermark_metadata = handler_extra_kwargs.get("litellm_metadata")
+    if not isinstance(_watermark_metadata, dict):
+        _watermark_metadata = {}
+    _watermark_intake = None
+    try:
+        _watermark_intake = getattr(getattr(request, "state", None), "watermark_intake", None)
+    except Exception:
+        _watermark_intake = None
+    _watermark_egress = apply_request_watermark_egress(
+        body=completion_kwargs,
+        intake=_watermark_intake,
+        config=_get_runtime_text_watermark_config(),
+        endpoint=_watermark_endpoint_from_path("chat/completions", target_url),
+        direction="request",
+        metadata=_watermark_metadata,
+        litellm_metadata=_watermark_metadata,
+    )
+    if isinstance(getattr(_watermark_egress, "body", None), dict):
+        completion_kwargs = _watermark_egress.body
 
     async def _operation() -> object:
         if upstream_stream and completion_stream_normalizer is not None:
@@ -1658,3 +1727,10 @@ def install(host_globals: dict[str, Any]) -> None:
         host_globals[_name] = rebound
     for _name in _EXTRACTED_CONSTANT_NAMES:
         host_globals[_name] = _mod[_name]
+    for _name, _value in (
+        ("apply_request_watermark_egress", apply_request_watermark_egress),
+        ("load_text_watermark_config", load_text_watermark_config),
+        ("_get_runtime_text_watermark_config", _get_runtime_text_watermark_config),
+        ("_watermark_endpoint_from_path", _watermark_endpoint_from_path),
+    ):
+        host_globals.setdefault(_name, _value)

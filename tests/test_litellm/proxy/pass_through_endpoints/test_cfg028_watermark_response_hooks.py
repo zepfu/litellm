@@ -93,7 +93,7 @@ def _optional_field(obj: Any, name: str, default: Any = None) -> Any:
 def _function_source(path: Path, name: str) -> str:
     source = path.read_text(encoding="utf-8")
     module = ast.parse(source)
-    for node in module.body:
+    for node in ast.walk(module):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
             return ast.get_source_segment(source, node) or ""
     raise AssertionError(f"{name} not found in {path}")
@@ -244,7 +244,7 @@ def _sse_event(event_type: str, payload: dict[str, Any]) -> bytes:
     body = {"type": event_type, **payload}
     return (
         f"event: {event_type}\ndata: "
-        + json.dumps(body, separators=(",", ":"))
+        + json.dumps(body, separators=(",", ":"), ensure_ascii=False)
         + "\n\n"
     ).encode("utf-8")
 

@@ -22,6 +22,9 @@ from typing import Any, Callable, Optional
 from fastapi.responses import Response, StreamingResponse
 
 from litellm._logging import verbose_proxy_logger
+from litellm.proxy.pass_through_endpoints.aawm_text_watermark.response_hooks import (
+    maybe_apply_passthrough_watermark_response,
+)
 
 from .sse import _serialize_responses_adapter_response
 
@@ -33,20 +36,69 @@ def _build_responses_response_from_adapter_response(
     response_obj: Any,
     *,
     serializer: Optional[Callable[[Any], str]] = None,
+    success_handler_kwargs: Optional[dict[str, Any]] = None,
+    config: Any = None,
 ) -> Response:
     """Build a JSON Response from an adapter response object.
 
     Serialization is delegated to *serializer* (default: the SSE module's
     ``_serialize_responses_adapter_response``) so that the exact wire format
-    is preserved without importing the god module.
+    is preserved without importing the god module. CFG-028 applies
+    ``maybe_apply_passthrough_watermark_response`` before building Response.
     """
+    import json
+
+    from litellm.proxy.pass_through_endpoints.aawm_text_watermark.response_hooks import (
+        maybe_apply_passthrough_watermark_response,
+    )
+
     serialize = (
         serializer
         if serializer is not None
         else _serialize_responses_adapter_response
     )
+    serialized = serialize(response_obj)
+    parsed_body: Any = {}
+    if isinstance(serialized, (bytes, bytearray, str)):
+        try:
+            loaded = json.loads(serialized)
+        except (TypeError, ValueError):
+            loaded = None
+        if isinstance(loaded, dict):
+            parsed_body = loaded
+    elif isinstance(response_obj, dict):
+        parsed_body = response_obj
+
+    hooked_kwargs = (
+        success_handler_kwargs
+        if isinstance(success_handler_kwargs, dict)
+        else {"litellm_params": {"metadata": {}}}
+    )
+    watermark_config = config
+    if watermark_config is None:
+        try:
+            from litellm.proxy.proxy_server import general_settings as _gs
+
+            if isinstance(_gs, dict):
+                watermark_config = _gs.get("openai_passthrough_text_watermark")
+            else:
+                watermark_config = getattr(
+                    _gs, "openai_passthrough_text_watermark", None
+                )
+        except Exception:
+            watermark_config = None
+
+    _hooked_body, hooked_content = maybe_apply_passthrough_watermark_response(
+        parsed_body,
+        content=serialized,
+        config=watermark_config,
+        success_handler_kwargs=hooked_kwargs,
+        endpoint="responses",
+    )
+    if hooked_content is None:
+        hooked_content = serialized
     return Response(
-        content=serialize(response_obj),
+        content=hooked_content,
         media_type="application/json",
     )
 

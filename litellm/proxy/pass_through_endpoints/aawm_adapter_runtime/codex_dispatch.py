@@ -14,6 +14,35 @@ from typing import TYPE_CHECKING, Any, Optional
 from fastapi import Request, Response
 
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
+    load_text_watermark_config,
+)
+from litellm.proxy.pass_through_endpoints.aawm_text_watermark.policy import (
+    apply_request_watermark_egress,
+)
+
+
+def _watermark_endpoint_from_path(*parts: Any) -> str:
+    combined = " ".join(
+        str(part or "") for part in parts if part is not None
+    ).lower()
+    if "chat/completions" in combined or "chat_completions" in combined:
+        return "chat_completions"
+    return "responses"
+
+
+def _get_runtime_text_watermark_config() -> Any:
+    payload = None
+    try:
+        from litellm.proxy.proxy_server import general_settings as _gs
+
+        if isinstance(_gs, dict):
+            payload = _gs.get("openai_passthrough_text_watermark")
+        else:
+            payload = getattr(_gs, "openai_passthrough_text_watermark", None)
+    except Exception:
+        payload = None
+    return load_text_watermark_config(payload)
 
 if TYPE_CHECKING:
 
@@ -152,6 +181,13 @@ def install(
         if publish_to_module:
             _mod[_name] = _rebound
         host_globals[_name] = _rebound
+    for _name, _value in (
+        ("apply_request_watermark_egress", apply_request_watermark_egress),
+        ("load_text_watermark_config", load_text_watermark_config),
+        ("_get_runtime_text_watermark_config", _get_runtime_text_watermark_config),
+        ("_watermark_endpoint_from_path", _watermark_endpoint_from_path),
+    ):
+        host_globals.setdefault(_name, _value)
 
 
 # ── Extracted function ──────────────────────────────────────────────
@@ -430,6 +466,36 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
         prepared_request_body=prepared_request_body,
     )
     _sid = _sa.resolve_canonical_session_identity(request, prepared_request_body)
+    _watermark_metadata = (
+        prepared_request_body.get("litellm_metadata")
+        if isinstance(prepared_request_body, dict)
+        else None
+    )
+    if not isinstance(_watermark_metadata, dict):
+        _watermark_metadata = {}
+        if isinstance(prepared_request_body, dict):
+            prepared_request_body["litellm_metadata"] = _watermark_metadata
+    _watermark_intake = None
+    try:
+        _watermark_intake = getattr(
+            getattr(request, "state", None), "watermark_intake", None
+        )
+    except Exception:
+        _watermark_intake = None
+    _watermark_egress = apply_request_watermark_egress(
+        body=prepared_request_body,
+        intake=_watermark_intake,
+        config=_get_runtime_text_watermark_config(),
+        endpoint=_watermark_endpoint_from_path(endpoint, target_url),
+        direction="request",
+        metadata=_watermark_metadata,
+        litellm_metadata=_watermark_metadata,
+    )
+    if isinstance(getattr(_watermark_egress, "body", None), dict):
+        prepared_request_body = _watermark_egress.body
+    watermark_input_audit = getattr(_watermark_egress, "audit", None)
+    if watermark_input_audit is not None:
+        _watermark_metadata["watermark_input_audit"] = watermark_input_audit
 
     opencode_zen_adapter_model = _resolve_codex_opencode_zen_adapter_model(
         prepared_request_body,

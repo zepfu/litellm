@@ -48,6 +48,8 @@ from litellm.integrations.custom_logger import CustomLogger
 from litellm.integrations.aawm_passthrough_shape_capture import (
     capture_passthrough_shape,
 )
+
+_capture_passthrough_error_shape = capture_passthrough_shape
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
@@ -100,6 +102,14 @@ from .aawm_adapter_runtime.repetitive_output import (
     bind_output_guard_to_streaming_response,
     maybe_reject_passthrough_responses_body,
     maybe_wrap_passthrough_responses_stream,
+)
+from .aawm_text_watermark.config import load_text_watermark_config
+from .aawm_text_watermark.response_hooks import (
+    maybe_apply_passthrough_watermark_response,
+    maybe_wrap_passthrough_watermark_responses_stream,
+)
+from .aawm_text_watermark.policy import (
+    apply_request_watermark_egress,
 )
 from .aawm_alias_routing.output_guard_config import (
     output_guard_context_from_passthrough,
@@ -1088,6 +1098,29 @@ def _ensure_passthrough_metadata(kwargs: Optional[dict]) -> Dict[str, Any]:
         litellm_params["metadata"] = metadata
 
     return metadata
+
+
+def _watermark_endpoint_from_path(*parts: Any) -> str:
+    combined = " ".join(
+        str(part or "") for part in parts if part is not None
+    ).lower()
+    if "chat/completions" in combined or "chat_completions" in combined:
+        return "chat_completions"
+    return "responses"
+
+
+def _get_runtime_text_watermark_config() -> Any:
+    payload = None
+    try:
+        from litellm.proxy.proxy_server import general_settings as _gs
+
+        if isinstance(_gs, dict):
+            payload = _gs.get("openai_passthrough_text_watermark")
+        else:
+            payload = getattr(_gs, "openai_passthrough_text_watermark", None)
+    except Exception:
+        payload = None
+    return load_text_watermark_config(payload)
 
 
 def _set_passthrough_stream_timeout_metadata(
@@ -4271,6 +4304,41 @@ async def pass_through_request(  # noqa: PLR0915
             raw_body=raw_body,
             provider_bound_body=provider_bound_body,
         )
+        if isinstance(provider_bound_body, dict):
+            _watermark_metadata = _ensure_passthrough_metadata(kwargs)
+            _litellm_metadata = provider_bound_body.get("litellm_metadata")
+            if not isinstance(_litellm_metadata, dict):
+                _litellm_metadata = None
+            _watermark_intake = None
+            try:
+                _watermark_intake = getattr(
+                    getattr(request, "state", None), "watermark_intake", None
+                )
+            except Exception:
+                _watermark_intake = None
+            _watermark_egress = apply_request_watermark_egress(
+                body=provider_bound_body,
+                intake=_watermark_intake,
+                config=_get_runtime_text_watermark_config(),
+                endpoint=_watermark_endpoint_from_path(
+                    url, getattr(getattr(request, "url", None), "path", None)
+                ),
+                direction="request",
+                metadata=_watermark_metadata,
+                litellm_metadata=_litellm_metadata,
+            )
+            if isinstance(getattr(_watermark_egress, "body", None), dict):
+                provider_bound_body = _watermark_egress.body
+                litellm_params = (
+                    kwargs.get("litellm_params") if isinstance(kwargs, dict) else None
+                )
+                if isinstance(litellm_params, dict):
+                    proxy_server_request = litellm_params.get("proxy_server_request")
+                    if isinstance(proxy_server_request, dict):
+                        proxy_server_request["body"] = provider_bound_body
+            watermark_input_audit = getattr(_watermark_egress, "audit", None)
+            if watermark_input_audit is not None:
+                _watermark_metadata["watermark_input_audit"] = watermark_input_audit
 
         if stream:
             await _aawm_session_owner_pre_send_guard(
@@ -4349,7 +4417,7 @@ async def pass_through_request(  # noqa: PLR0915
                     response.raise_for_status()
                 except httpx.HTTPStatusError as e:
                     error_content = await e.response.aread()
-                    capture_passthrough_shape(
+                    _capture_passthrough_error_shape(
                         mode="stream_error",
                         provider=custom_llm_provider or endpoint_type.value,
                         endpoint_type=endpoint_type,
@@ -4449,6 +4517,14 @@ async def pass_through_request(  # noqa: PLR0915
                 request_context=output_guard_request_context,
                 upstream_response=response,
             )
+            processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
+                processed_chunks,
+                config=_get_runtime_text_watermark_config(),
+                success_handler_kwargs=kwargs,
+                endpoint=_watermark_endpoint_from_path(
+                    url, getattr(getattr(request, "url", None), "path", None)
+                ),
+            )
             stream_response = StreamingResponse(
                 processed_chunks,
                 headers=HttpPassThroughEndpointHelpers.get_response_headers(
@@ -4518,7 +4594,7 @@ async def pass_through_request(  # noqa: PLR0915
                     response.raise_for_status()
                 except httpx.HTTPStatusError as e:
                     error_content = await e.response.aread()
-                    capture_passthrough_shape(
+                    _capture_passthrough_error_shape(
                         mode="stream_error",
                         provider=custom_llm_provider or endpoint_type.value,
                         endpoint_type=endpoint_type,
@@ -4546,7 +4622,7 @@ async def pass_through_request(  # noqa: PLR0915
                     error_text = error_content.decode("utf-8", errors="replace")
                 except Exception:
                     error_text = str(error_content)
-                capture_passthrough_shape(
+                _capture_passthrough_error_shape(
                     mode="nonstream_error",
                     provider=custom_llm_provider or endpoint_type.value,
                     endpoint_type=endpoint_type,
@@ -4620,6 +4696,14 @@ async def pass_through_request(  # noqa: PLR0915
                 processed_chunks,
                 request_context=output_guard_request_context,
                 upstream_response=response,
+            )
+            processed_chunks = maybe_wrap_passthrough_watermark_responses_stream(
+                processed_chunks,
+                config=_get_runtime_text_watermark_config(),
+                success_handler_kwargs=kwargs,
+                endpoint=_watermark_endpoint_from_path(
+                    url, getattr(getattr(request, "url", None), "path", None)
+                ),
             )
             stream_response = StreamingResponse(
                 processed_chunks,
@@ -4708,6 +4792,15 @@ async def pass_through_request(  # noqa: PLR0915
             maybe_reject_passthrough_responses_body(
                 response_body,
                 request_context=output_guard_request_context,
+            )
+            response_body, content = maybe_apply_passthrough_watermark_response(
+                response_body,
+                content=content,
+                config=_get_runtime_text_watermark_config(),
+                success_handler_kwargs=kwargs,
+                endpoint=_watermark_endpoint_from_path(
+                    url, getattr(getattr(request, "url", None), "path", None)
+                ),
             )
         passthrough_logging_payload["response_body"] = response_body
         capture_passthrough_shape(

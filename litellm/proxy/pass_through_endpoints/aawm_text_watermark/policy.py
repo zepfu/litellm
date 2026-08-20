@@ -7,6 +7,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from fastapi import HTTPException
+
 from .config import (
     OpenAIPassthroughTextWatermarkSettings,
     load_text_watermark_config,
@@ -357,3 +359,223 @@ def apply_watermark_policy(
         errors=errors,
     )
     return WatermarkPolicyResult(body=out_body, audit=audit)
+
+
+@dataclass
+class WatermarkRequestIntake:
+    body: dict[str, Any]
+    audit: Optional[dict[str, Any]] = None
+    noop: bool = False
+
+
+def _clone_detect_only_config(
+    config: OpenAIPassthroughTextWatermarkSettings,
+) -> OpenAIPassthroughTextWatermarkSettings:
+    """Scan-only clone: never sanitizes the caller's body or original settings."""
+
+    return config.model_copy(
+        update={
+            "mode": "detect",
+            "removal": config.removal.model_copy(update={"enabled": False}),
+        }
+    )
+
+
+def _copy_visible_text_into(
+    destination: dict[str, Any],
+    source: Mapping[str, Any],
+    *,
+    endpoint: str,
+    direction: str,
+) -> None:
+    """Copy sanitized visible-node text back onto the provider-bound dict."""
+
+    if destination is source:
+        return
+    for node in extract_visible_text_nodes(
+        source, endpoint=endpoint, direction=direction
+    ):
+        assign_text_node(destination, node, node.text)
+
+
+def _stage_signal_detected(audit: Optional[Mapping[str, Any]]) -> bool:
+    if not audit:
+        return False
+    return bool(audit.get("signal_detected"))
+
+
+def _compose_watermark_input_audit(
+    *,
+    mode: str,
+    direction: str,
+    harness_audit: Optional[dict[str, Any]],
+    upstream_audit: Optional[dict[str, Any]],
+    status: Optional[str] = None,
+) -> dict[str, Any]:
+    harness_detected = _stage_signal_detected(harness_audit)
+    upstream_detected = _stage_signal_detected(upstream_audit)
+    signal_detected = harness_detected or upstream_detected
+    if status is None:
+        if mode == "enforce" and signal_detected:
+            status = "blocked"
+        elif mode == "sanitize" and harness_detected and not upstream_detected:
+            status = "sanitized"
+        elif signal_detected:
+            status = "detected"
+        else:
+            status = "clean"
+    base = dict(upstream_audit or harness_audit or {})
+    composed = {
+        **base,
+        "schema_version": AUDIT_SCHEMA_VERSION,
+        "direction": direction,
+        "mode": mode,
+        "status": status,
+        "signal_detected": signal_detected,
+        "harness_original": harness_audit,
+        "upstream_sent": upstream_audit,
+        "stages": {
+            "harness_original": harness_audit,
+            "upstream_sent": upstream_audit,
+        },
+    }
+    return composed
+
+
+def _attach_watermark_input_audit(
+    audit: dict[str, Any],
+    metadata: Any,
+    litellm_metadata: Any,
+) -> None:
+    if isinstance(metadata, dict):
+        metadata["watermark_input_audit"] = audit
+    if isinstance(litellm_metadata, dict):
+        litellm_metadata["watermark_input_audit"] = audit
+
+
+def apply_request_watermark_intake(
+    body: dict[str, Any],
+    config: Any,
+    endpoint: str = "responses",
+    direction: str = "request",
+    **kwargs: Any,
+) -> WatermarkRequestIntake:
+    """Scan the harness-original body without mutating it."""
+
+    del kwargs
+    loaded = _coerce_config(config)
+    if not isinstance(body, dict):
+        return WatermarkRequestIntake(body=body, audit=None, noop=True)
+    if loaded.mode == "off" or not _direction_enabled(loaded, direction):
+        return WatermarkRequestIntake(body=body, audit=None, noop=True)
+
+    detect_config = _clone_detect_only_config(loaded)
+    result = apply_watermark_policy(
+        body,
+        detect_config,
+        direction=direction,
+        endpoint=endpoint,
+    )
+    return WatermarkRequestIntake(body=body, audit=result.audit, noop=False)
+
+
+def apply_request_watermark_egress(
+    body: dict[str, Any],
+    intake: Any = None,
+    config: Any = None,
+    endpoint: str = "responses",
+    direction: str = "request",
+    metadata: Any = None,
+    litellm_metadata: Any = None,
+    **kwargs: Any,
+) -> WatermarkPolicyResult:
+    """Scan (and optionally sanitize) the provider-bound body; attach input audit."""
+
+    del kwargs
+    loaded = _coerce_config(config)
+    if loaded.mode == "off" or not _direction_enabled(loaded, direction):
+        return WatermarkPolicyResult(body=body, audit=None)
+
+    harness_audit = None
+    if isinstance(intake, WatermarkRequestIntake):
+        harness_audit = intake.audit
+    elif isinstance(intake, Mapping):
+        harness_audit = intake.get("audit") or intake.get("harness_original")
+    elif intake is not None:
+        harness_audit = getattr(intake, "audit", None)
+
+    if loaded.mode == "enforce":
+        detect_config = _clone_detect_only_config(loaded)
+        scanned = apply_watermark_policy(
+            body,
+            detect_config,
+            direction=direction,
+            endpoint=endpoint,
+        )
+        blocked = _stage_signal_detected(scanned.audit) or _stage_signal_detected(
+            harness_audit
+        )
+        composed = _compose_watermark_input_audit(
+            mode=loaded.mode,
+            direction=direction,
+            harness_audit=harness_audit or scanned.audit,
+            upstream_audit=scanned.audit,
+            status="blocked" if blocked else None,
+        )
+        if composed["signal_detected"]:
+            composed["status"] = "blocked"
+            _attach_watermark_input_audit(composed, metadata, litellm_metadata)
+            raise HTTPException(
+                status_code=403,
+                detail={"watermark_input_audit": composed},
+            )
+        _attach_watermark_input_audit(composed, metadata, litellm_metadata)
+        return WatermarkPolicyResult(body=body, audit=composed)
+
+    if loaded.mode == "sanitize" and loaded.removal.enabled:
+        result = apply_watermark_policy(
+            body,
+            loaded,
+            direction=direction,
+            endpoint=endpoint,
+        )
+        if isinstance(body, dict) and isinstance(result.body, dict):
+            _copy_visible_text_into(
+                body,
+                result.body,
+                endpoint=endpoint,
+                direction=direction,
+            )
+            out_body = body
+        else:
+            out_body = result.body
+        detect_config = _clone_detect_only_config(loaded)
+        upstream = apply_watermark_policy(
+            out_body,
+            detect_config,
+            direction=direction,
+            endpoint=endpoint,
+        )
+        composed = _compose_watermark_input_audit(
+            mode=loaded.mode,
+            direction=direction,
+            harness_audit=harness_audit,
+            upstream_audit=upstream.audit,
+        )
+        _attach_watermark_input_audit(composed, metadata, litellm_metadata)
+        return WatermarkPolicyResult(body=out_body, audit=composed)
+
+    scanned = apply_watermark_policy(
+        body,
+        _clone_detect_only_config(loaded),
+        direction=direction,
+        endpoint=endpoint,
+    )
+    composed = _compose_watermark_input_audit(
+        mode=loaded.mode,
+        direction=direction,
+        harness_audit=harness_audit or scanned.audit,
+        upstream_audit=scanned.audit,
+    )
+    _attach_watermark_input_audit(composed, metadata, litellm_metadata)
+    return WatermarkPolicyResult(body=body, audit=composed)

@@ -33,11 +33,40 @@ from typing import (
 import httpx
 
 import litellm
+from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
+    load_text_watermark_config,
+)
+from litellm.proxy.pass_through_endpoints.aawm_text_watermark.policy import (
+    apply_request_watermark_intake,
+)
 
 if TYPE_CHECKING:
     from fastapi import Request, Response
 
     from litellm.proxy._types import UserAPIKeyAuth
+
+
+def _watermark_endpoint_from_path(*parts: Any) -> str:
+    combined = " ".join(
+        str(part or "") for part in parts if part is not None
+    ).lower()
+    if "chat/completions" in combined or "chat_completions" in combined:
+        return "chat_completions"
+    return "responses"
+
+
+def _get_runtime_text_watermark_config() -> Any:
+    payload = None
+    try:
+        from litellm.proxy.proxy_server import general_settings as _gs
+
+        if isinstance(_gs, dict):
+            payload = _gs.get("openai_passthrough_text_watermark")
+        else:
+            payload = getattr(_gs, "openai_passthrough_text_watermark", None)
+    except Exception:
+        payload = None
+    return load_text_watermark_config(payload)
 
 
 def _identity_codex_tool_adapter(
@@ -394,6 +423,19 @@ class BaseOpenAIPassThroughHandler:
 
         if request.method == "POST":
             request_body = await rt.get_request_body_fn(request)
+            watermark_intake = apply_request_watermark_intake(
+                body=request_body,
+                config=_get_runtime_text_watermark_config(),
+                endpoint=_watermark_endpoint_from_path(endpoint),
+                direction="request",
+            )
+            try:
+                request.state.watermark_intake = watermark_intake
+                request.state.watermark_input_audit = getattr(
+                    watermark_intake, "audit", None
+                )
+            except Exception:  # noqa: BLE001
+                pass
             prepared_request_body = request_body
             body_was_prepared = False
             is_codex_responses_request = (
