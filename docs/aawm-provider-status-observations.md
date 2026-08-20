@@ -234,6 +234,56 @@ IDs or secrets. Managed Codex OAuth dispatch never falls back to
 Enrollment, removal, label/hash handling, permissions, rotation, and rollback
 are defined in `docs/aawm-oauth-credential-maintenance.md`.
 
+## Grok banked usage-limit resets (XAI-005 / XAI-006 / XAI-007)
+
+The sidecar can poll grok.com `GetRemainingResets` for banked usage-limit reset
+tokens. This is independent of the hourly Grok CLI billing poll. Auth reuses
+the existing Grok OIDC file (`AAWM_GROK_OIDC_AUTH_FILE`); there is no separate
+cookie file, `AAWM_GROK_WEB_AUTH_*` variable, or grok-web cookie mount.
+
+The request is stdlib gRPC-Web: `POST` to
+`https://grok.com/prod_mc_billing.ConsumerUiSvc/GetRemainingResets` with Bearer
+OIDC only (never Cookie plus Bearer), an empty 5-byte gRPC-Web frame, and
+`User-Agent: aawm-provider-status-observations`. The poller never calls
+`RedeemReset` and never substitutes managed `oa_xai` OAuth on grpc-status 16.
+
+Parser outcomes:
+
+- empty data frame plus `grpc-status 0` is a known zero inventory
+- missing tokens, truncated frames, leftover bytes, or nonzero grpc-status
+  other than 16 are unknown and do not persist a synthetic empty inventory
+- grpc-status 16 / HTTP 401/403 is `reauthentication_required`; last good
+  credit state is retained and xAI OAuth is not invoked
+
+Successful inventories persist hashed rows into the existing
+`provider_credit_*` tables:
+
+- `provider=xai`
+- `credit_family=xai_usage_limit_reset`
+- `credit_type=usage_reset_token`
+- `source=xai_grok_web_remaining_resets`
+- `parser_version=xai_grok_web_remaining_resets_v1`
+
+Credit identity uses `derive_provider_credit_identity(..., hash_provider_credit_id=True)`.
+Account identity is `probes.account_identity_hash(user_id)` and never the raw
+user id. Persist only nonempty token ids with `validity_end` still in the
+future. Missing before expiry synthesizes `used`; at or after expiry
+synthesizes `expired`. Failed/unknown polls skip synthesis. A known zero
+inventory synthesizes used/expired for previously available rows.
+
+Relevant environment variables:
+
+- `AAWM_XAI_RESET_POLL_ENABLED`: defaults to disabled (`0` / `false`).
+- `AAWM_XAI_RESET_POLL_INTERVAL_SECONDS`: defaults to `3600`.
+- `AAWM_XAI_RESET_POLL_HTTP_TIMEOUT_SECONDS`: defaults to `30`.
+- `AAWM_XAI_RESET_POLL_URL`: defaults to the grok.com `GetRemainingResets`
+  endpoint. Attempts/backoff match Grok billing (`3` / `0.5s`).
+
+Each due attempt emits a sanitized `xai_reset_poll` event including
+`last_good_state_retained`. Events must not contain access tokens,
+Authorization headers, cookies, or raw token ids. A reset-poll failure does
+not fail `grok_billing_poll`.
+
 ## Grok OIDC Refresh Task
 
 The same sidecar can also own the scheduled Grok native OIDC credential refresh.

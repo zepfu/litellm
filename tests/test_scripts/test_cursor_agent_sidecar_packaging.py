@@ -155,3 +155,44 @@ assert build_dashboard_headers("token", request_id="req-1")["authorization"] == 
         check=False,
     )
     assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_gold_lock_imports_loop_with_xai_reset_poll_enabled_and_missing_auth(
+    tmp_path: Path,
+) -> None:
+    image_root = _build_sidecar_layout(tmp_path)
+    loop_path = image_root / "scripts" / _LOOP_SCRIPT
+    helper = """
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+loop_path = Path(sys.argv[1])
+os.environ["AAWM_XAI_RESET_POLL_ENABLED"] = "1"
+os.environ.pop("AAWM_GROK_OIDC_AUTH_FILE", None)
+spec = importlib.util.spec_from_file_location(
+    "run_provider_status_observations_loop",
+    loop_path,
+)
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+assert module.xai_reset_poll_enabled() is True
+assert "RedeemReset" not in Path(loop_path).read_text(encoding="utf-8")
+assert "httpx" not in sys.modules
+"""
+    env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+    env["PYTHONPATH"] = str(image_root)
+    env["AAWM_XAI_RESET_POLL_ENABLED"] = "1"
+    env.pop("AAWM_GROK_OIDC_AUTH_FILE", None)
+    result = subprocess.run(
+        [sys.executable, "-c", helper, str(loop_path)],
+        cwd=str(image_root),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout

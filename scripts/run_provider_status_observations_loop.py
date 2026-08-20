@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import hmac
 import http.client
@@ -18,6 +19,8 @@ import ssl
 import sys
 import time
 import traceback
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timedelta, timezone
@@ -311,6 +314,25 @@ DEFAULT_GROK_BILLING_MODEL = "grok-build"
 DEFAULT_GROK_BILLING_HTTP_METHOD = "GET"
 DEFAULT_GROK_BILLING_POLL_MAX_ATTEMPTS = 3
 DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS = 0.5
+GROK_BILLING_POLL_ATTEMPTS = DEFAULT_GROK_BILLING_POLL_MAX_ATTEMPTS
+GROK_BILLING_POLL_BACKOFF_SECONDS = DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS
+_GROK_BILLING_POLL_ATTEMPTS = GROK_BILLING_POLL_ATTEMPTS
+_GROK_BILLING_POLL_BACKOFF_SECONDS = GROK_BILLING_POLL_BACKOFF_SECONDS
+DEFAULT_XAI_RESET_POLL_ENABLED = False
+DEFAULT_XAI_RESET_POLL_INTERVAL_SECONDS = 3600.0
+DEFAULT_XAI_RESET_POLL_HTTP_TIMEOUT_SECONDS = 30.0
+DEFAULT_XAI_RESET_POLL_URL = (
+    "https://grok.com/prod_mc_billing.ConsumerUiSvc/GetRemainingResets"
+)
+XAI_RESET_POLL_ATTEMPTS = GROK_BILLING_POLL_ATTEMPTS
+XAI_RESET_POLL_BACKOFF_SECONDS = GROK_BILLING_POLL_BACKOFF_SECONDS
+XAI_RESET_POLL_EMPTY_FRAME = b"\x00\x00\x00\x00\x00"
+XAI_RESET_POLL_USER_AGENT = "aawm-provider-status-observations"
+XAI_RESET_CREDIT_PROVIDER = "xai"
+XAI_RESET_CREDIT_FAMILY = "xai_usage_limit_reset"
+XAI_RESET_CREDIT_TYPE = "usage_reset_token"
+XAI_RESET_CREDIT_SOURCE = "xai_grok_web_remaining_resets"
+XAI_RESET_CREDIT_PARSER_VERSION = "xai_grok_web_remaining_resets_v1"
 GROK_BILLING_CLIENT_VERSION_ENV_VARS = (
     "AAWM_GROK_BILLING_CLIENT_VERSION",
     "LITELLM_XAI_GROK_CLIENT_VERSION",
@@ -1380,6 +1402,14 @@ class ProviderStatusLoopConfig:
     grok_billing_poll_retry_backoff_seconds: float = (
         DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS
     )
+    xai_reset_poll_enabled: bool = DEFAULT_XAI_RESET_POLL_ENABLED
+    xai_reset_poll_interval_seconds: float = DEFAULT_XAI_RESET_POLL_INTERVAL_SECONDS
+    xai_reset_poll_http_timeout_seconds: float = (
+        DEFAULT_XAI_RESET_POLL_HTTP_TIMEOUT_SECONDS
+    )
+    xai_reset_poll_url: str = DEFAULT_XAI_RESET_POLL_URL
+    xai_reset_poll_max_attempts: int = XAI_RESET_POLL_ATTEMPTS
+    xai_reset_poll_retry_backoff_seconds: float = XAI_RESET_POLL_BACKOFF_SECONDS
     codex_reset_credit_poll_enabled: bool = DEFAULT_CODEX_RESET_CREDIT_POLL_ENABLED
     codex_reset_credit_poll_interval_seconds: float = (
         DEFAULT_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS
@@ -1409,6 +1439,12 @@ class ProviderStatusLoopConfig:
     observability_anomaly_scan_error_log_dir: str = (
         DEFAULT_OBSERVABILITY_ANOMALY_SCAN_ERROR_LOG_DIR
     )
+
+    @classmethod
+    def from_env(
+        cls, argv: Optional[Sequence[str]] = None
+    ) -> "ProviderStatusLoopConfig":
+        return parse_config([] if argv is None else list(argv))
 
 
 @dataclass
@@ -1447,6 +1483,7 @@ class SidecarTaskState:
     alibaba_access_token: Optional[str] = None
     alibaba_console_session: Optional[AlibabaConsoleSession] = None
     grok_billing_last_attempt_monotonic: Optional[float] = None
+    xai_reset_poll_last_attempt_monotonic: Optional[float] = None
     cursor_agent_usage_last_attempt_monotonic: Optional[float] = None
     codex_reset_credit_last_attempt_monotonic_by_label: Dict[str, float] = (
         dataclass_field(default_factory=dict)
@@ -2441,6 +2478,59 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "Defaults to AAWM_GROK_BILLING_POLL_RETRY_BACKOFF_SECONDS or 0.5."
         ),
     )
+    xai_reset_group = parser.add_mutually_exclusive_group()
+    xai_reset_group.add_argument(
+        "--xai-reset-poll-enabled",
+        dest="xai_reset_poll_enabled",
+        action="store_true",
+        default=_env_bool(
+            "AAWM_XAI_RESET_POLL_ENABLED",
+            DEFAULT_XAI_RESET_POLL_ENABLED,
+        ),
+        help=(
+            "Poll grok.com GetRemainingResets for banked usage-limit reset "
+            "tokens. Reuses AAWM_GROK_OIDC_AUTH_FILE. Defaults to "
+            "AAWM_XAI_RESET_POLL_ENABLED or false."
+        ),
+    )
+    xai_reset_group.add_argument(
+        "--no-xai-reset-poll",
+        dest="xai_reset_poll_enabled",
+        action="store_false",
+        help="Disable the Grok GetRemainingResets poll task.",
+    )
+    parser.add_argument(
+        "--xai-reset-poll-interval-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_XAI_RESET_POLL_INTERVAL_SECONDS",
+            DEFAULT_XAI_RESET_POLL_INTERVAL_SECONDS,
+        ),
+        help=(
+            "Minimum seconds between Grok GetRemainingResets poll attempts. "
+            "Defaults to AAWM_XAI_RESET_POLL_INTERVAL_SECONDS or 3600."
+        ),
+    )
+    parser.add_argument(
+        "--xai-reset-poll-http-timeout-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_XAI_RESET_POLL_HTTP_TIMEOUT_SECONDS",
+            DEFAULT_XAI_RESET_POLL_HTTP_TIMEOUT_SECONDS,
+        ),
+        help=(
+            "HTTP timeout for Grok GetRemainingResets poll calls. Defaults to "
+            "AAWM_XAI_RESET_POLL_HTTP_TIMEOUT_SECONDS or 30."
+        ),
+    )
+    parser.add_argument(
+        "--xai-reset-poll-url",
+        default=os.getenv("AAWM_XAI_RESET_POLL_URL", DEFAULT_XAI_RESET_POLL_URL),
+        help=(
+            "Grok GetRemainingResets gRPC-Web endpoint. Defaults to "
+            "AAWM_XAI_RESET_POLL_URL or the grok.com ConsumerUiSvc URL."
+        ),
+    )
     cursor_usage_group = parser.add_mutually_exclusive_group()
     cursor_usage_group.add_argument(
         "--cursor-agent-usage-poll-enabled",
@@ -2655,6 +2745,13 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
     return parser
 
 
+build_arg_parser = _build_parser
+
+
+def xai_reset_poll_enabled() -> bool:
+    return _env_bool("AAWM_XAI_RESET_POLL_ENABLED", DEFAULT_XAI_RESET_POLL_ENABLED)
+
+
 def _validate_config_args(args: argparse.Namespace) -> None:
     _validate_core_config_args(args)
     _validate_grok_oidc_config_args(args)
@@ -2665,6 +2762,7 @@ def _validate_config_args(args: argparse.Namespace) -> None:
     _validate_kimi_usage_config_args(args)
     _validate_alibaba_quota_config_args(args)
     _validate_grok_billing_config_args(args)
+    _validate_xai_reset_poll_config_args(args)
     _validate_cursor_agent_usage_config_args(args)
     _validate_observability_anomaly_scan_config_args(args)
     _validate_codex_reset_credit_poll_config_args(args)
@@ -2871,6 +2969,17 @@ def _validate_grok_billing_config_args(args: argparse.Namespace) -> None:
         )
 
 
+def _validate_xai_reset_poll_config_args(args: argparse.Namespace) -> None:
+    if args.xai_reset_poll_interval_seconds <= 0:
+        raise SystemExit("--xai-reset-poll-interval-seconds must be greater than 0")
+    if args.xai_reset_poll_http_timeout_seconds <= 0:
+        raise SystemExit(
+            "--xai-reset-poll-http-timeout-seconds must be greater than 0"
+        )
+    if not str(args.xai_reset_poll_url).strip():
+        raise SystemExit("--xai-reset-poll-url must not be empty")
+
+
 def _validate_observability_anomaly_scan_config_args(args: argparse.Namespace) -> None:
     if args.observability_anomaly_scan_interval_seconds <= 0:
         raise SystemExit(
@@ -3024,6 +3133,12 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         grok_billing_include_model_override=args.grok_billing_include_model_override,
         grok_billing_poll_max_attempts=args.grok_billing_poll_max_attempts,
         grok_billing_poll_retry_backoff_seconds=(args.grok_billing_poll_retry_backoff_seconds),
+        xai_reset_poll_enabled=args.xai_reset_poll_enabled,
+        xai_reset_poll_interval_seconds=args.xai_reset_poll_interval_seconds,
+        xai_reset_poll_http_timeout_seconds=args.xai_reset_poll_http_timeout_seconds,
+        xai_reset_poll_url=str(args.xai_reset_poll_url).strip(),
+        xai_reset_poll_max_attempts=XAI_RESET_POLL_ATTEMPTS,
+        xai_reset_poll_retry_backoff_seconds=XAI_RESET_POLL_BACKOFF_SECONDS,
         codex_reset_credit_poll_enabled=args.codex_reset_credit_poll_enabled,
         codex_reset_credit_poll_interval_seconds=(args.codex_reset_credit_poll_interval_seconds),
         codex_reset_credit_poll_http_timeout_seconds=(args.codex_reset_credit_poll_http_timeout_seconds),
@@ -8094,7 +8209,872 @@ def _alibaba_quota_request_contract_summary(
     }
 
 
-def _load_grok_billing_auth_context(auth_file: str) -> Dict[str, Any]:
+@dataclass(frozen=True)
+class XaiGrpcWebFrames:
+    data_payloads: List[bytes]
+    grpc_status: Optional[int] = None
+    grpc_message: str = ""
+    truncated: bool = False
+    leftover: bool = False
+
+
+@dataclass(frozen=True)
+class XaiResetToken:
+    token_id: str
+    validity_start: Optional[int] = None
+    validity_end: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class XaiRemainingResetsParseResult:
+    outcome: str
+    grpc_status: Optional[int] = None
+    tokens: tuple[XaiResetToken, ...] = ()
+    last_good_state_retained: bool = False
+    reason: Optional[str] = None
+    status: str = "unknown"
+    known_zero: bool = False
+    tokens_field_present: bool = False
+    unexpired_count: int = 0
+    unknown: bool = True
+    auth_error: Any = None
+
+
+def _decode_protobuf_varint(buffer: bytes, offset: int) -> tuple[int, int]:
+    shift = 0
+    value = 0
+    while offset < len(buffer):
+        octet = buffer[offset]
+        offset += 1
+        value |= (octet & 0x7F) << shift
+        if octet & 0x80 == 0:
+            return value, offset
+        shift += 7
+        if shift > 70:
+            break
+    raise ValueError("truncated protobuf varint")
+
+
+def walk_xai_protobuf_fields(buffer: bytes) -> List[tuple[int, int, Any]]:
+    fields: List[tuple[int, int, Any]] = []
+    offset = 0
+    length = len(buffer)
+    while offset < length:
+        key, offset = _decode_protobuf_varint(buffer, offset)
+        field_number = key >> 3
+        wire_type = key & 0x07
+        if wire_type == 0:
+            value, offset = _decode_protobuf_varint(buffer, offset)
+        elif wire_type == 1:
+            if offset + 8 > length:
+                raise ValueError("truncated protobuf 64-bit field")
+            value = buffer[offset : offset + 8]
+            offset += 8
+        elif wire_type == 2:
+            payload_length, offset = _decode_protobuf_varint(buffer, offset)
+            end = offset + payload_length
+            if end > length:
+                raise ValueError("truncated protobuf length-delimited field")
+            value = buffer[offset:end]
+            offset = end
+        elif wire_type == 5:
+            if offset + 4 > length:
+                raise ValueError("truncated protobuf 32-bit field")
+            value = buffer[offset : offset + 4]
+            offset += 4
+        else:
+            raise ValueError(f"unsupported protobuf wire type {wire_type}")
+        fields.append((field_number, wire_type, value))
+    return fields
+
+
+def _parse_grpc_web_header_block(payload: bytes) -> Dict[str, str]:
+    headers: Dict[str, str] = {}
+    text = payload.decode("utf-8", errors="replace").replace("\r\n", "\n")
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line or ":" not in line:
+            continue
+        name, value = line.split(":", 1)
+        headers[name.strip().lower()] = value.strip()
+    return headers
+
+
+def _grpc_status_from_mapping(headers: Optional[Mapping[str, Any]]) -> Optional[int]:
+    if not headers:
+        return None
+    for key, value in headers.items():
+        if str(key).lower() != "grpc-status":
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        try:
+            return int(text)
+        except ValueError:
+            return None
+    return None
+
+
+def split_xai_grpc_web_frames(body: bytes) -> XaiGrpcWebFrames:
+    offset = 0
+    data_payloads: List[bytes] = []
+    grpc_status: Optional[int] = None
+    grpc_message = ""
+    truncated = False
+    leftover = False
+    length = len(body)
+    while offset < length:
+        remaining = length - offset
+        if remaining < 5:
+            leftover = True
+            truncated = True
+            break
+        flags = body[offset]
+        frame_length = int.from_bytes(body[offset + 1 : offset + 5], "big")
+        start = offset + 5
+        end = start + frame_length
+        if end > length:
+            truncated = True
+            leftover = True
+            break
+        payload = body[start:end]
+        offset = end
+        if flags & 0x80:
+            trailer_headers = _parse_grpc_web_header_block(payload)
+            status = _grpc_status_from_mapping(trailer_headers)
+            if status is not None:
+                grpc_status = status
+            grpc_message = str(trailer_headers.get("grpc-message") or grpc_message)
+            continue
+        if flags & 0x01:
+            try:
+                payload = gzip.decompress(payload)
+            except OSError as exc:
+                raise ValueError("invalid gzip gRPC-Web frame") from exc
+        data_payloads.append(payload)
+    return XaiGrpcWebFrames(
+        data_payloads=data_payloads,
+        grpc_status=grpc_status,
+        grpc_message=grpc_message,
+        truncated=truncated,
+        leftover=leftover,
+    )
+
+
+def _timestamp_seconds(payload: bytes) -> Optional[int]:
+    try:
+        fields = walk_xai_protobuf_fields(payload)
+    except ValueError:
+        return None
+    for field_number, wire_type, value in fields:
+        if field_number == 1 and wire_type == 0 and isinstance(value, int):
+            return value
+    return None
+
+
+def _parse_xai_reset_token(payload: bytes) -> Optional[XaiResetToken]:
+    try:
+        fields = walk_xai_protobuf_fields(payload)
+    except ValueError as exc:
+        raise ValueError("truncated reset token") from exc
+    token_id = ""
+    validity_start: Optional[int] = None
+    validity_end: Optional[int] = None
+    for field_number, wire_type, value in fields:
+        if wire_type != 2 or not isinstance(value, (bytes, bytearray)):
+            continue
+        if field_number == 10:
+            token_id = bytes(value).decode("utf-8", errors="replace")
+        elif field_number == 20:
+            validity_start = _timestamp_seconds(bytes(value))
+        elif field_number == 30:
+            validity_end = _timestamp_seconds(bytes(value))
+    return XaiResetToken(
+        token_id=token_id,
+        validity_start=validity_start,
+        validity_end=validity_end,
+    )
+
+
+def _xai_parse_result(
+    *,
+    outcome: str,
+    grpc_status: Optional[int] = None,
+    tokens: Sequence[XaiResetToken] = (),
+    last_good_state_retained: bool = False,
+    reason: Optional[str] = None,
+    tokens_field_present: bool = False,
+) -> XaiRemainingResetsParseResult:
+    token_tuple = tuple(tokens)
+    now_ts = int(time.time())
+    unexpired_count = sum(
+        1
+        for token in token_tuple
+        if token.token_id.strip()
+        and token.validity_end is not None
+        and token.validity_end > now_ts
+    )
+    known_zero = outcome == "zero"
+    unknown = outcome == "unknown"
+    auth = outcome == "auth"
+    status = "ok" if outcome in {"ok", "zero"} else outcome
+    auth_error: Any = None
+    if auth:
+        auth_error = reason or "reauthentication_required"
+        last_good_state_retained = True
+    elif unknown:
+        last_good_state_retained = True
+    return XaiRemainingResetsParseResult(
+        outcome=outcome,
+        grpc_status=grpc_status,
+        tokens=token_tuple,
+        last_good_state_retained=last_good_state_retained,
+        reason=reason,
+        status=status,
+        known_zero=known_zero,
+        tokens_field_present=tokens_field_present,
+        unexpired_count=unexpired_count,
+        unknown=unknown,
+        auth_error=auth_error,
+    )
+
+
+def parse_xai_remaining_resets_grpc_web(
+    body: bytes,
+    headers: Optional[Mapping[str, Any]] = None,
+) -> XaiRemainingResetsParseResult:
+    header_status = _grpc_status_from_mapping(headers)
+    try:
+        frames = split_xai_grpc_web_frames(body)
+    except ValueError:
+        return _xai_parse_result(outcome="unknown", grpc_status=header_status)
+    grpc_status = frames.grpc_status if frames.grpc_status is not None else header_status
+    if frames.truncated or frames.leftover:
+        return _xai_parse_result(
+            outcome="unknown",
+            grpc_status=grpc_status,
+            reason="truncated" if frames.truncated else "leftover",
+        )
+    if grpc_status == 16:
+        return _xai_parse_result(
+            outcome="auth",
+            grpc_status=16,
+            reason="reauthentication_required",
+        )
+    if grpc_status not in (None, 0):
+        return _xai_parse_result(
+            outcome="unknown",
+            grpc_status=grpc_status,
+            reason=f"grpc_status_{grpc_status}",
+        )
+    payload = b"".join(frames.data_payloads)
+    if not payload:
+        return _xai_parse_result(
+            outcome="zero",
+            grpc_status=grpc_status if grpc_status is not None else 0,
+        )
+    try:
+        fields = walk_xai_protobuf_fields(payload)
+    except ValueError:
+        return _xai_parse_result(outcome="unknown", grpc_status=grpc_status)
+    tokens: List[XaiResetToken] = []
+    tokens_field_present = False
+    for field_number, wire_type, value in fields:
+        if field_number != 10 or wire_type != 2 or not isinstance(value, (bytes, bytearray)):
+            continue
+        tokens_field_present = True
+        try:
+            token = _parse_xai_reset_token(bytes(value))
+        except ValueError:
+            return _xai_parse_result(outcome="unknown", grpc_status=grpc_status)
+        if token is not None:
+            tokens.append(token)
+    if not tokens_field_present:
+        return _xai_parse_result(outcome="unknown", grpc_status=grpc_status)
+    return _xai_parse_result(
+        outcome="ok",
+        grpc_status=grpc_status if grpc_status is not None else 0,
+        tokens=tokens,
+        tokens_field_present=True,
+    )
+
+
+def classify_xai_remaining_resets_http_error(
+    status_code: int,
+    _body: bytes = b"",
+) -> XaiRemainingResetsParseResult:
+    if int(status_code) in {401, 403}:
+        return _xai_parse_result(
+            outcome="auth",
+            grpc_status=16,
+            reason="reauthentication_required",
+        )
+    return _xai_parse_result(
+        outcome="unknown",
+        reason=f"http_{status_code}",
+    )
+
+
+def classify_xai_remaining_resets_missing_auth(
+    _auth_file: Optional[str] = None,
+) -> XaiRemainingResetsParseResult:
+    return _xai_parse_result(
+        outcome="auth",
+        grpc_status=16,
+        reason="reauthentication_required",
+    )
+
+
+def should_persist_xai_reset_token_observations(
+    parsed: XaiRemainingResetsParseResult,
+) -> bool:
+    return parsed.outcome in {"ok", "zero"}
+
+
+def build_xai_reset_poll_request(
+    access_token: str,
+    *,
+    url: Optional[str] = None,
+) -> tuple[str, Dict[str, str], bytes]:
+    token = str(access_token or "").strip()
+    if not token:
+        raise ValueError("Grok OIDC access token is required for GetRemainingResets.")
+    headers = {
+        "Origin": "https://grok.com",
+        "Referer": "https://grok.com/?_s=usage",
+        "Accept": "*/*",
+        "Content-Type": "application/grpc-web+proto",
+        "x-grpc-web": "1",
+        "x-user-agent": "connect-es/2.1.1",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": XAI_RESET_POLL_USER_AGENT,
+    }
+    return (
+        str(url or DEFAULT_XAI_RESET_POLL_URL).strip() or DEFAULT_XAI_RESET_POLL_URL,
+        headers,
+        XAI_RESET_POLL_EMPTY_FRAME,
+    )
+
+
+def fetch_xai_remaining_resets(
+    *,
+    access_token: str,
+    url: str = DEFAULT_XAI_RESET_POLL_URL,
+    timeout: float = DEFAULT_XAI_RESET_POLL_HTTP_TIMEOUT_SECONDS,
+    max_attempts: int = XAI_RESET_POLL_ATTEMPTS,
+) -> tuple[int, Dict[str, str], bytes]:
+    request_url, headers, body = build_xai_reset_poll_request(access_token, url=url)
+    last_error: Optional[BaseException] = None
+    attempts = max(1, int(max_attempts))
+    for attempt in range(1, attempts + 1):
+        request = urllib.request.Request(
+            request_url,
+            data=body,
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                status_code = int(getattr(response, "status", None) or response.getcode() or 200)
+                response_headers = {
+                    str(key): str(value) for key, value in response.headers.items()
+                }
+                return status_code, response_headers, response.read()
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            error_body = b""
+            try:
+                error_body = exc.read() or b""
+            except Exception:
+                error_body = b""
+            if int(exc.code) in {401, 403}:
+                return int(exc.code), dict(getattr(exc, "headers", {}) or {}), error_body
+            if attempt >= attempts or int(exc.code) in GROK_BILLING_NON_RETRYABLE_HTTP_STATUS_CODES:
+                raise
+        except urllib.error.URLError as exc:
+            last_error = exc
+            if attempt >= attempts:
+                raise
+        time.sleep(float(XAI_RESET_POLL_BACKOFF_SECONDS))
+    if last_error is not None:
+        raise last_error
+    raise urllib.error.URLError("GetRemainingResets poll failed.")
+
+
+def derive_xai_reset_credit_identity(token_id: str) -> str:
+    return probes.derive_provider_credit_identity(
+        account_hash="",
+        credit_family=XAI_RESET_CREDIT_FAMILY,
+        granted_at=None,
+        expires_at=None,
+        reset_type=None,
+        provider_credit_id=token_id,
+        hash_provider_credit_id=True,
+    )
+
+
+def _xai_account_identity_hash(user_id: Any) -> Optional[str]:
+    return probes.account_identity_hash(user_id)
+
+
+def _xai_unix_timestamp(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return int(value.astimezone(timezone.utc).timestamp())
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str) and value.strip():
+        normalized = value.strip()
+        if normalized.endswith("Z"):
+            normalized = normalized[:-1] + "+00:00"
+        try:
+            return int(datetime.fromisoformat(normalized).timestamp())
+        except ValueError:
+            try:
+                return int(normalized)
+            except ValueError:
+                return None
+    return None
+
+
+def _xai_datetime_from_unix(value: Optional[int]) -> Optional[datetime]:
+    if value is None:
+        return None
+    try:
+        return datetime.fromtimestamp(int(value), timezone.utc)
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _xai_persistable_tokens(
+    parsed: XaiRemainingResetsParseResult,
+    *,
+    now: int,
+) -> List[XaiResetToken]:
+    persistable: List[XaiResetToken] = []
+    seen: set[str] = set()
+    for token in parsed.tokens:
+        token_id = str(token.token_id or "").strip()
+        if not token_id or token.validity_end is None or token.validity_end <= now:
+            continue
+        identity = derive_xai_reset_credit_identity(token_id)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        persistable.append(token)
+    return persistable
+
+
+def _xai_reset_credit_row(
+    *,
+    token: Optional[XaiResetToken] = None,
+    credit_identity: str,
+    account_hash: str,
+    status: str,
+    now: int,
+    granted_at: Any = None,
+    expires_at: Any = None,
+    environment: str = "dev",
+) -> Dict[str, Any]:
+    granted_ts = _xai_unix_timestamp(
+        token.validity_start if token is not None else granted_at
+    )
+    expires_ts = _xai_unix_timestamp(
+        token.validity_end if token is not None else expires_at
+    )
+    available = status == "available"
+    return {
+        "observed_at": _xai_datetime_from_unix(now) or datetime.now(timezone.utc),
+        "environment": environment,
+        "provider": XAI_RESET_CREDIT_PROVIDER,
+        "account_hash": account_hash,
+        "credit_family": XAI_RESET_CREDIT_FAMILY,
+        "credit_type": XAI_RESET_CREDIT_TYPE,
+        "credit_identity": credit_identity,
+        "available_count": 1 if available else 0,
+        "granted_at": _xai_datetime_from_unix(granted_ts),
+        "expires_at": _xai_datetime_from_unix(expires_ts) or expires_ts,
+        "status": status,
+        "redeem_started_at": None,
+        "redeemed_at": None,
+        "redeem_status": None,
+        "redeem_at": None,
+        "operator_annotation": None,
+        "source_url": None,
+        "parser_version": XAI_RESET_CREDIT_PARSER_VERSION,
+        "raw_provider_fields": {
+            "parser_version": XAI_RESET_CREDIT_PARSER_VERSION,
+        },
+        "evidence": {
+            "signals": ["xai_grok_web_remaining_resets"],
+            "parser_version": XAI_RESET_CREDIT_PARSER_VERSION,
+            "source_endpoint": "GetRemainingResets",
+            "source_endpoint_class": "read_only_inventory",
+        },
+        "source": XAI_RESET_CREDIT_SOURCE,
+    }
+
+
+def plan_xai_reset_credit_writes(
+    *,
+    parse_result: XaiRemainingResetsParseResult,
+    previous_rows: Sequence[Mapping[str, Any]],
+    now: int,
+    user_id: Optional[str] = None,
+    account_hasher: Optional[Callable[[str], str]] = None,
+    environment: str = "dev",
+) -> List[Dict[str, Any]]:
+    if parse_result.outcome not in {"ok", "zero"}:
+        return []
+    if account_hasher is not None and user_id:
+        account_hash = str(account_hasher(user_id))
+    else:
+        account_hash = _xai_account_identity_hash(user_id) or ""
+    writes: List[Dict[str, Any]] = []
+    visible: set[str] = set()
+    for token in _xai_persistable_tokens(parse_result, now=now):
+        identity = derive_xai_reset_credit_identity(token.token_id)
+        visible.add(identity)
+        writes.append(
+            _xai_reset_credit_row(
+                token=token,
+                credit_identity=identity,
+                account_hash=account_hash,
+                status="available",
+                now=now,
+                environment=environment,
+            )
+        )
+    for previous in previous_rows:
+        if str(previous.get("status") or "").lower() != "available":
+            continue
+        identity = str(previous.get("credit_identity") or "").strip()
+        if not identity or identity in visible:
+            continue
+        expires_at = _xai_unix_timestamp(previous.get("expires_at"))
+        next_status = "expired" if expires_at is not None and expires_at <= now else "used"
+        writes.append(
+            _xai_reset_credit_row(
+                credit_identity=identity,
+                account_hash=str(previous.get("account_hash") or account_hash),
+                status=next_status,
+                now=now,
+                granted_at=previous.get("granted_at"),
+                expires_at=previous.get("expires_at"),
+                environment=str(previous.get("environment") or environment),
+            )
+        )
+    return writes
+
+
+def synthesize_xai_reset_token_lifecycle_observations(
+    *,
+    previous_observations: Sequence[Mapping[str, Any]],
+    current_tokens: Sequence[Any],
+    now_ts: int,
+) -> List[Dict[str, Any]]:
+    parsed_tokens: List[XaiResetToken] = []
+    for token in current_tokens:
+        if isinstance(token, XaiResetToken):
+            parsed_tokens.append(token)
+            continue
+        if isinstance(token, Mapping):
+            parsed_tokens.append(
+                XaiResetToken(
+                    token_id=str(token.get("token_id") or ""),
+                    validity_start=_xai_unix_timestamp(token.get("validity_start")),
+                    validity_end=_xai_unix_timestamp(token.get("validity_end")),
+                )
+            )
+    parse_result = _xai_parse_result(
+        outcome="ok",
+        tokens=parsed_tokens,
+        tokens_field_present=True,
+    )
+    return plan_xai_reset_credit_writes(
+        parse_result=parse_result,
+        previous_rows=previous_observations,
+        now=now_ts,
+    )
+
+
+def build_xai_reset_token_observations(
+    parsed: XaiRemainingResetsParseResult,
+    *,
+    now: Optional[int] = None,
+    user_id: Optional[str] = None,
+    previous_rows: Sequence[Mapping[str, Any]] = (),
+    environment: str = "dev",
+) -> List[Dict[str, Any]]:
+    if not should_persist_xai_reset_token_observations(parsed):
+        return []
+    return plan_xai_reset_credit_writes(
+        parse_result=parsed,
+        previous_rows=previous_rows,
+        now=int(time.time() if now is None else now),
+        user_id=user_id,
+        environment=environment,
+    )
+
+
+def _commit_xai_reset_credit_writes(
+    writes: Sequence[Mapping[str, Any]],
+    *,
+    config: Optional[ProviderStatusLoopConfig] = None,
+) -> int:
+    rows = [dict(row) for row in writes]
+    if not rows or config is None or not config.apply:
+        return 0
+    dsn = _resolve_dsn(config)
+    return probes.insert_provider_credit_observations(
+        dsn,
+        rows,
+        lock_timeout_ms=config.db_lock_timeout_ms,
+        statement_timeout_ms=config.db_statement_timeout_ms,
+    )
+
+
+def _emit_xai_reset_poll_telemetry(
+    *,
+    outcome: str,
+    last_good_state_retained: bool,
+    grpc_status: Optional[int] = None,
+    persisted: bool = False,
+    observation_count: int = 0,
+    status_code: Optional[int] = None,
+    error_class: Optional[str] = None,
+    error_message: Optional[str] = None,
+    environment: str = "dev",
+) -> Dict[str, Any]:
+    payload = {
+        "event": "xai_reset_poll",
+        "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "environment": environment,
+        "outcome": outcome,
+        "last_good_state_retained": last_good_state_retained,
+        "grpc_status": grpc_status,
+        "persisted": persisted,
+        "observation_count": observation_count,
+        "status_code": status_code,
+        "error_class": error_class,
+        "error_message": _redacted_failure_message(error_message),
+    }
+    sys.stdout.write(json.dumps(payload, sort_keys=True) + "\n")
+    sys.stdout.flush()
+    return payload
+
+
+def _xai_auth_context_user_id(auth_context: Mapping[str, Any]) -> Optional[str]:
+    for key in ("user_id", "account_id"):
+        value = auth_context.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    identity_headers = auth_context.get("identity_headers")
+    if isinstance(identity_headers, Mapping):
+        for header_name in ("x-userid", "x-grok-user-id"):
+            value = identity_headers.get(header_name)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _run_xai_reset_poll_once(
+    config: Optional[ProviderStatusLoopConfig] = None,
+    state: Optional[SidecarTaskState] = None,
+) -> Optional[Dict[str, Any]]:
+    del state
+    enabled = (
+        bool(config.xai_reset_poll_enabled)
+        if config is not None
+        else xai_reset_poll_enabled()
+    )
+    if not enabled:
+        return None
+    environment = config.environment if config is not None else "dev"
+    auth_file = (
+        config.grok_oidc_auth_file
+        if config is not None
+        else os.getenv("AAWM_GROK_OIDC_AUTH_FILE")
+    )
+    try:
+        try:
+            auth_context = _load_grok_billing_auth_context(auth_file)  # type: ignore[arg-type]
+        except TypeError:
+            auth_context = _load_grok_billing_auth_context()  # type: ignore[misc]
+    except Exception:
+        parsed = classify_xai_remaining_resets_missing_auth(auth_file)
+        return _emit_xai_reset_poll_telemetry(
+            outcome=parsed.outcome,
+            last_good_state_retained=True,
+            environment=environment,
+            error_class="reauthentication_required",
+        )
+    access_token = str(auth_context.get("access_token") or "").strip()
+    if not access_token:
+        parsed = classify_xai_remaining_resets_missing_auth(auth_file)
+        return _emit_xai_reset_poll_telemetry(
+            outcome=parsed.outcome,
+            last_good_state_retained=True,
+            environment=environment,
+            error_class="reauthentication_required",
+        )
+    poll_url = (
+        config.xai_reset_poll_url if config is not None else DEFAULT_XAI_RESET_POLL_URL
+    )
+    timeout = (
+        config.xai_reset_poll_http_timeout_seconds
+        if config is not None
+        else DEFAULT_XAI_RESET_POLL_HTTP_TIMEOUT_SECONDS
+    )
+    status_code, response_headers, response_body = fetch_xai_remaining_resets(
+        access_token=access_token,
+        url=poll_url,
+        timeout=timeout,
+    )
+    if int(status_code) in {401, 403}:
+        parsed = classify_xai_remaining_resets_http_error(status_code, response_body)
+    else:
+        parsed = parse_xai_remaining_resets_grpc_web(
+            response_body,
+            headers=response_headers,
+        )
+    writes: List[Dict[str, Any]] = []
+    if should_persist_xai_reset_token_observations(parsed):
+        previous_rows: Sequence[Mapping[str, Any]] = []
+        if config is not None and config.apply:
+            try:
+                user_id = _xai_auth_context_user_id(auth_context)
+                account_hash = _xai_account_identity_hash(user_id)
+                if account_hash:
+                    previous_rows = probes.load_provider_credit_current_rows(
+                        _resolve_dsn(config),
+                        environment=config.environment,
+                        provider=XAI_RESET_CREDIT_PROVIDER,
+                        account_hash=account_hash,
+                        credit_family=XAI_RESET_CREDIT_FAMILY,
+                        source=XAI_RESET_CREDIT_SOURCE,
+                        lock_timeout_ms=config.db_lock_timeout_ms,
+                        statement_timeout_ms=config.db_statement_timeout_ms,
+                    )
+            except Exception:
+                previous_rows = []
+        writes = plan_xai_reset_credit_writes(
+            parse_result=parsed,
+            previous_rows=previous_rows,
+            now=int(time.time()),
+            user_id=_xai_auth_context_user_id(auth_context),
+            environment=environment,
+        )
+        if writes:
+            _commit_xai_reset_credit_writes(writes, config=config)
+    return _emit_xai_reset_poll_telemetry(
+        outcome=parsed.outcome,
+        last_good_state_retained=parsed.last_good_state_retained,
+        grpc_status=parsed.grpc_status,
+        persisted=bool(writes),
+        observation_count=len(writes),
+        status_code=status_code,
+        environment=environment,
+    )
+
+
+def _run_xai_reset_poll_task(
+    config: Optional[ProviderStatusLoopConfig] = None,
+    state: Optional[SidecarTaskState] = None,
+    *,
+    now_monotonic: Optional[float] = None,
+) -> Any:
+    async def _async_guard() -> None:
+        try:
+            _run_xai_reset_poll_once(config, state)
+        except Exception:
+            return None
+        return None
+
+    if config is None:
+        return _async_guard()
+    if not config.xai_reset_poll_enabled:
+        return None
+    if state is not None and now_monotonic is not None:
+        last_attempt = state.xai_reset_poll_last_attempt_monotonic
+        if (
+            last_attempt is not None
+            and now_monotonic - last_attempt < config.xai_reset_poll_interval_seconds
+        ):
+            return None
+        state.xai_reset_poll_last_attempt_monotonic = now_monotonic
+    try:
+        return _run_xai_reset_poll_once(config, state)
+    except Exception as exc:
+        return _emit_xai_reset_poll_telemetry(
+            outcome="unknown",
+            last_good_state_retained=True,
+            environment=config.environment,
+            error_class=exc.__class__.__name__,
+            error_message=str(exc),
+        )
+
+
+def poll_grok_billing(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+) -> Optional[Dict[str, Any]]:
+    return _run_grok_billing_poll_task(
+        config,
+        state,
+        now_monotonic=now_monotonic,
+    )
+
+
+def poll_xai_remaining_resets(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+) -> Any:
+    return _run_xai_reset_poll_task(
+        config,
+        state,
+        now_monotonic=now_monotonic,
+    )
+
+
+def iter_scheduled_provider_poll_tasks(
+    config: Any,
+) -> List[tuple[str, Callable[..., Any]]]:
+    tasks: List[tuple[str, Callable[..., Any]]] = []
+    if getattr(config, "grok_billing_poll_enabled", False):
+        tasks.append(("grok_billing_poll", poll_grok_billing))
+    if getattr(config, "xai_reset_poll_enabled", False):
+        tasks.append(("xai_reset_poll", poll_xai_remaining_resets))
+    return tasks
+
+
+def run_independent_grok_polls(
+    *,
+    poll_grok_billing: Callable[..., Any],
+    poll_xai_remaining_resets: Callable[..., Any],
+) -> Dict[str, Any]:
+    billing_ok = True
+    resets_ok = True
+    try:
+        poll_grok_billing()
+    except Exception:
+        billing_ok = False
+    try:
+        poll_xai_remaining_resets()
+    except Exception:
+        resets_ok = False
+    return {"billing_ok": billing_ok, "resets_ok": resets_ok}
+
+
+def _load_grok_billing_auth_context(auth_file: Optional[str] = None) -> Dict[str, Any]:
+    if not auth_file:
+        auth_file, _source = _resolve_grok_sidecar_auth_file(None)
     payload = grok_oidc_refresh._read_credential_payload(Path(auth_file).expanduser())
     scope = grok_oidc_refresh._resolve_scope(None)
     credential = grok_oidc_refresh._select_credential_record(payload, scope)
@@ -11043,6 +12023,7 @@ def run_due_sidecar_tasks(
         (_run_cursor_agent_usage_poll_task, "cursor_agent_usage_poll"),
         (_run_alibaba_quota_poll_task, "alibaba_quota_poll"),
         (_run_grok_billing_poll_task, "grok_billing_poll"),
+        (_run_xai_reset_poll_task, "xai_reset_poll"),
         (_run_codex_reset_credit_poll_task, "codex_reset_credit_poll"),
         (_run_observability_anomaly_scan_task, "observability_anomaly_scan"),
     ):
