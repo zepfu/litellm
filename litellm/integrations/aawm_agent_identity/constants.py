@@ -384,6 +384,8 @@ _AAWM_SESSION_HISTORY_METADATA_KEYS = (
     "worker_context_exhaustion_last_visible_message",
     "worker_context_exhaustion_success",
     "worker_context_exhaustion_completed",
+    "watermark_input_audit",
+    "watermark_output_audit",
 )
 
 _AAWM_TENANT_ID_METADATA_KEYS = (

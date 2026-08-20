@@ -2133,6 +2133,102 @@ class UserHeaderMapping(LiteLLMPydanticObjectBase):
     }
 
 
+class OpenAIPassthroughTextWatermarkDirections(LiteLLMPydanticObjectBase):
+    """Per-direction enablement for OpenAI passthrough text-watermark scans."""
+
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+    request: bool = True
+    response: bool = True
+
+
+class OpenAIPassthroughTextWatermarkUnicode(LiteLLMPydanticObjectBase):
+    """Deterministic Unicode-carrier detector settings."""
+
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+    enabled: bool = True
+    policy: str = "conservative"
+    normalize_spaces: bool = True
+    nfkc: bool = False
+    detect_confusables: bool = False
+
+
+class OpenAIPassthroughTextWatermarkRemoval(LiteLLMPydanticObjectBase):
+    """Explicit sanitation controls. Mutation is never implied by mode alone."""
+
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+    enabled: bool = False
+    stream_policy: str = "audit_only"
+    on_unremovable: str = "allow"
+
+
+class OpenAIPassthroughTextWatermarkLimits(LiteLLMPydanticObjectBase):
+    """Scan and audit caps independent of raw prompt or response size."""
+
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+    max_text_bytes_per_direction: int = 1048576
+    max_text_nodes_per_direction: int = 256
+    max_reported_paths: int = 32
+    max_reported_hits_per_path: int = 16
+
+
+class OpenAIPassthroughTextWatermarkStatisticalDetector(LiteLLMPydanticObjectBase):
+    """Same-key statistical detector slot. Disabled unless fully configured."""
+
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+    name: str
+    type: str
+    enabled: bool = False
+    tokenizer: Optional[str] = None
+    key_secret_ref: Optional[str] = None
+    threshold: Optional[float] = None
+    minimum_tokens: Optional[int] = None
+
+
+class OpenAIPassthroughTextWatermarkSettings(LiteLLMPydanticObjectBase):
+    """Typed OpenAI-passthrough text-watermark policy. Extra keys are forbidden."""
+
+    model_config = ConfigDict(extra="forbid", protected_namespaces=())
+
+    mode: str = "off"
+    directions: OpenAIPassthroughTextWatermarkDirections = Field(
+        default_factory=OpenAIPassthroughTextWatermarkDirections
+    )
+    endpoints: List[str] = Field(
+        default_factory=lambda: ["responses", "chat_completions"]
+    )
+    unicode: OpenAIPassthroughTextWatermarkUnicode = Field(
+        default_factory=OpenAIPassthroughTextWatermarkUnicode
+    )
+    removal: OpenAIPassthroughTextWatermarkRemoval = Field(
+        default_factory=OpenAIPassthroughTextWatermarkRemoval
+    )
+    statistical_detectors: List[OpenAIPassthroughTextWatermarkStatisticalDetector] = (
+        Field(default_factory=list)
+    )
+    limits: OpenAIPassthroughTextWatermarkLimits = Field(
+        default_factory=OpenAIPassthroughTextWatermarkLimits
+    )
+
+    @model_validator(mode="after")
+    def _validate_mode_and_removal(self) -> "OpenAIPassthroughTextWatermarkSettings":
+        if self.mode in {"sanitize", "enforce"} and not self.removal.enabled:
+            raise ValueError(
+                "removal.enabled must be true when text-watermark mode is "
+                f"{self.mode}; sanitation is not implied by mode alone"
+            )
+        if self.mode == "enforce" and self.removal.stream_policy != "buffer_response":
+            raise ValueError(
+                "enforce mode requires removal.stream_policy=buffer_response "
+                "so streamed output is not emitted before the final detection result"
+            )
+        return self
+
+
 UserMCPManagementMode = Literal["restricted", "view_all"]
 
 
@@ -2299,6 +2395,16 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
     mcp_required_fields: Optional[List[str]] = Field(
         None,
         description="List of MCP server fields that must be filled in for a submission to pass standards checks (e.g. ['description', 'source_url', 'alias']).",
+    )
+    openai_passthrough_text_watermark: Optional[
+        OpenAIPassthroughTextWatermarkSettings
+    ] = Field(
+        default_factory=OpenAIPassthroughTextWatermarkSettings,
+        description=(
+            "OpenAI passthrough text-watermark policy. An empty or unset "
+            "value loads as mode=off with removal disabled. Extra keys are "
+            "forbidden."
+        ),
     )
 
 
