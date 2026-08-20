@@ -573,6 +573,33 @@ This is an interpretation-only documentation update. It adds no
 `session_history` or observation schema, view, or API change, so no
 `dashboard-shell` handoff is needed.
 
+## Z.AI Coding Plan quota polling
+
+The optional Z.AI Coding Plan quota poll records account-scoped 5-hour and
+weekly remaining windows from `GET https://api.z.ai/api/monitor/usage/quota/limit`
+with `Authorization: Bearer <key>`. It does not scrape the z.ai SPA, does not
+call bare `/api/monitor/usage`, and does not send inference traffic as a health
+check. An optional `GET https://api.z.ai/api/biz/subscription/list` supplies a
+hashed `customerId`; subscription failure must not blank a valid quota payload.
+
+Persisted rows use `source=zai_coding_plan_quota_poll`,
+`provider=zai_coding_plan`, `client=zai-coding-plan`, and `model=zai-coding-plan`.
+The mapper accepts both live `CREDIT_LIMIT` absolute remaining windows and
+OpenQuota `TOKENS_LIMIT` percent / `TIME_LIMIT` count windows. Account identity
+is hashed; raw keys and customer ids are never persisted. Routing is not blocked
+when the poll is off or unknown.
+
+Relevant environment variables:
+
+- `AAWM_ZAI_CODING_PLAN_QUOTA_POLL_ENABLED`: enables the scheduled poll.
+  Defaults to disabled (`0`).
+- `AAWM_ZAI_CODING_PLAN_QUOTA_POLL_INTERVAL_SECONDS`: minimum seconds between
+  attempts; default `3600`.
+- `AAWM_ZAI_CODING_PLAN_QUOTA_POLL_HTTP_TIMEOUT_SECONDS`: quota HTTP timeout;
+  default `30`.
+- Credential order is `ZAI_KEY` then `ZAI_CODING_PLAN_API_KEY`. Ordinary
+  `ZAI_API_KEY` / `ZHIPU_API_KEY` are not used.
+
 ## Cursor Agent monthly usage observations
 
 The optional Cursor Agent usage poll records account-scoped monthly

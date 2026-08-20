@@ -147,6 +147,19 @@ DEFAULT_KIMI_USAGE_POLL_ENABLED = False
 DEFAULT_KIMI_USAGE_POLL_INTERVAL_SECONDS = 3600.0
 DEFAULT_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_KIMI_USAGE_URL = _kimi_resolve_endpoint_url(None, "usages")
+DEFAULT_ZAI_CODING_PLAN_QUOTA_POLL_ENABLED = False
+DEFAULT_ZAI_CODING_PLAN_QUOTA_POLL_INTERVAL_SECONDS = 3600.0
+DEFAULT_ZAI_CODING_PLAN_QUOTA_POLL_HTTP_TIMEOUT_SECONDS = 30.0
+DEFAULT_ZAI_CODING_PLAN_QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
+DEFAULT_ZAI_CODING_PLAN_SUBSCRIPTION_URL = "https://api.z.ai/api/biz/subscription/list"
+ZAI_CODING_PLAN_PROVIDER = "zai_coding_plan"
+ZAI_CODING_PLAN_SOURCE = "zai_coding_plan_quota_poll"
+ZAI_CODING_PLAN_CLIENT = "zai-coding-plan"
+ZAI_CODING_PLAN_MODEL = "zai-coding-plan"
+ZAI_CODING_PLAN_5H_QUOTA_KEY = "zai_coding_plan_5h:credits"
+ZAI_CODING_PLAN_7D_QUOTA_KEY = "zai_coding_plan_7d:credits"
+ZAI_CODING_PLAN_5H_PERCENT_KEY = "zai_coding_plan_5h:percent"
+ZAI_CODING_PLAN_7D_PERCENT_KEY = "zai_coding_plan_7d:percent"
 KIMI_CODE_USAGE_SOURCE = "kimi_code_usage"
 KIMI_CODE_USAGE_PARSER_VERSION = "kimi_code_usage_v2"
 KIMI_CODE_USAGE_SOURCE_VERSION_FALLBACK = "kimi_code_0.29.1_managed_usage_v1"
@@ -531,6 +544,14 @@ class CursorAgentUsagePollError(ValueError):
         self.telemetry_class = telemetry_class
         self.attempt_count = max(1, attempt_count)
         self.retry_count = max(0, retry_count)
+
+
+class ZaiCodingPlanQuotaPollError(Exception):
+    """Sanitized Z.AI Coding Plan quota-poll failure."""
+
+    def __init__(self, message: str, *, telemetry_class: str = "auth") -> None:
+        super().__init__(message)
+        self.telemetry_class = telemetry_class
 
 
 class KimiUsagePollError(ValueError):
@@ -1370,6 +1391,15 @@ class ProviderStatusLoopConfig:
     kimi_usage_poll_enabled: bool = DEFAULT_KIMI_USAGE_POLL_ENABLED
     kimi_usage_poll_interval_seconds: float = DEFAULT_KIMI_USAGE_POLL_INTERVAL_SECONDS
     kimi_usage_poll_http_timeout_seconds: float = DEFAULT_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS
+    zai_coding_plan_quota_poll_enabled: bool = False
+    zai_coding_plan_quota_poll_interval_seconds: float = (
+        DEFAULT_ZAI_CODING_PLAN_QUOTA_POLL_INTERVAL_SECONDS
+    )
+    zai_coding_plan_quota_poll_http_timeout_seconds: float = (
+        DEFAULT_ZAI_CODING_PLAN_QUOTA_POLL_HTTP_TIMEOUT_SECONDS
+    )
+    zai_coding_plan_quota_url: str = DEFAULT_ZAI_CODING_PLAN_QUOTA_URL
+    zai_coding_plan_subscription_url: str = DEFAULT_ZAI_CODING_PLAN_SUBSCRIPTION_URL
     alibaba_quota_poll_enabled: bool = DEFAULT_ALIBABA_QUOTA_POLL_ENABLED
     alibaba_quota_poll_interval_seconds: float = DEFAULT_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS
     alibaba_subscription_poll_interval_seconds: float = DEFAULT_ALIBABA_SUBSCRIPTION_POLL_INTERVAL_SECONDS
@@ -1476,6 +1506,7 @@ class SidecarTaskState:
     provider_auth_health_poll_last_attempt_monotonic: Optional[float] = None
     kimi_usage_last_attempt_monotonic: Optional[float] = None
     kimi_usage_refresh_pending: bool = False
+    zai_coding_plan_quota_last_attempt_monotonic: Optional[float] = None
     alibaba_quota_last_attempt_monotonic: Optional[float] = None
     alibaba_subscription_last_attempt_monotonic: Optional[float] = None
     alibaba_subscription_payload: Optional[Dict[str, Any]] = None
@@ -2234,6 +2265,72 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "HTTP timeout for Kimi Code usage polling. Defaults to " "AAWM_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS or 30."
         ),
     )
+    zai_coding_plan_quota_group = parser.add_mutually_exclusive_group()
+    zai_coding_plan_quota_group.add_argument(
+        "--zai-coding-plan-quota-poll-enabled",
+        dest="zai_coding_plan_quota_poll_enabled",
+        action="store_true",
+        default=_env_bool(
+            "AAWM_ZAI_CODING_PLAN_QUOTA_POLL_ENABLED",
+            DEFAULT_ZAI_CODING_PLAN_QUOTA_POLL_ENABLED,
+        ),
+        help=(
+            "Poll Z.AI Coding Plan quota telemetry with the coding-plan API "
+            "key. Defaults to AAWM_ZAI_CODING_PLAN_QUOTA_POLL_ENABLED or false."
+        ),
+    )
+    zai_coding_plan_quota_group.add_argument(
+        "--no-zai-coding-plan-quota-poll",
+        dest="zai_coding_plan_quota_poll_enabled",
+        action="store_false",
+        help="Disable Z.AI Coding Plan quota polling.",
+    )
+    parser.add_argument(
+        "--zai-coding-plan-quota-poll-interval-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_ZAI_CODING_PLAN_QUOTA_POLL_INTERVAL_SECONDS",
+            DEFAULT_ZAI_CODING_PLAN_QUOTA_POLL_INTERVAL_SECONDS,
+        ),
+        help=(
+            "Minimum seconds between Z.AI Coding Plan quota poll attempts. "
+            "Defaults to AAWM_ZAI_CODING_PLAN_QUOTA_POLL_INTERVAL_SECONDS or 3600."
+        ),
+    )
+    parser.add_argument(
+        "--zai-coding-plan-quota-poll-http-timeout-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_ZAI_CODING_PLAN_QUOTA_POLL_HTTP_TIMEOUT_SECONDS",
+            DEFAULT_ZAI_CODING_PLAN_QUOTA_POLL_HTTP_TIMEOUT_SECONDS,
+        ),
+        help=(
+            "HTTP timeout for Z.AI Coding Plan quota polling. Defaults to "
+            "AAWM_ZAI_CODING_PLAN_QUOTA_POLL_HTTP_TIMEOUT_SECONDS or 30."
+        ),
+    )
+    parser.add_argument(
+        "--zai-coding-plan-quota-url",
+        default=(
+            os.getenv("AAWM_ZAI_CODING_PLAN_QUOTA_URL")
+            or DEFAULT_ZAI_CODING_PLAN_QUOTA_URL
+        ),
+        help=(
+            "Z.AI Coding Plan quota endpoint. Defaults to "
+            "AAWM_ZAI_CODING_PLAN_QUOTA_URL or the OpenQuota quota/limit path."
+        ),
+    )
+    parser.add_argument(
+        "--zai-coding-plan-subscription-url",
+        default=(
+            os.getenv("AAWM_ZAI_CODING_PLAN_SUBSCRIPTION_URL")
+            or DEFAULT_ZAI_CODING_PLAN_SUBSCRIPTION_URL
+        ),
+        help=(
+            "Z.AI Coding Plan subscription endpoint. Defaults to "
+            "AAWM_ZAI_CODING_PLAN_SUBSCRIPTION_URL or the subscription list path."
+        ),
+    )
     alibaba_quota_group = parser.add_mutually_exclusive_group()
     alibaba_quota_group.add_argument(
         "--alibaba-quota-poll-enabled",
@@ -2760,6 +2857,7 @@ def _validate_config_args(args: argparse.Namespace) -> None:
     _validate_kimi_oauth_config_args(args)
     _validate_provider_auth_health_poll_config_args(args)
     _validate_kimi_usage_config_args(args)
+    _validate_zai_coding_plan_quota_config_args(args)
     _validate_alibaba_quota_config_args(args)
     _validate_grok_billing_config_args(args)
     _validate_xai_reset_poll_config_args(args)
@@ -2915,6 +3013,21 @@ def _validate_kimi_usage_config_args(args: argparse.Namespace) -> None:
         raise SystemExit("--kimi-usage-poll-interval-seconds must be greater than 0")
     if args.kimi_usage_poll_http_timeout_seconds <= 0:
         raise SystemExit("--kimi-usage-poll-http-timeout-seconds must be greater than 0")
+
+
+def _validate_zai_coding_plan_quota_config_args(args: argparse.Namespace) -> None:
+    if args.zai_coding_plan_quota_poll_interval_seconds <= 0:
+        raise SystemExit(
+            "--zai-coding-plan-quota-poll-interval-seconds must be greater than 0"
+        )
+    if args.zai_coding_plan_quota_poll_http_timeout_seconds <= 0:
+        raise SystemExit(
+            "--zai-coding-plan-quota-poll-http-timeout-seconds must be greater than 0"
+        )
+    if not str(args.zai_coding_plan_quota_url).strip():
+        raise SystemExit("--zai-coding-plan-quota-url must not be empty")
+    if not str(args.zai_coding_plan_subscription_url).strip():
+        raise SystemExit("--zai-coding-plan-subscription-url must not be empty")
 
 
 def _validate_alibaba_quota_config_args(args: argparse.Namespace) -> None:
@@ -3101,6 +3214,17 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         kimi_usage_poll_enabled=args.kimi_usage_poll_enabled,
         kimi_usage_poll_interval_seconds=args.kimi_usage_poll_interval_seconds,
         kimi_usage_poll_http_timeout_seconds=args.kimi_usage_poll_http_timeout_seconds,
+        zai_coding_plan_quota_poll_enabled=args.zai_coding_plan_quota_poll_enabled,
+        zai_coding_plan_quota_poll_interval_seconds=(
+            args.zai_coding_plan_quota_poll_interval_seconds
+        ),
+        zai_coding_plan_quota_poll_http_timeout_seconds=(
+            args.zai_coding_plan_quota_poll_http_timeout_seconds
+        ),
+        zai_coding_plan_quota_url=str(args.zai_coding_plan_quota_url).strip(),
+        zai_coding_plan_subscription_url=str(
+            args.zai_coding_plan_subscription_url
+        ).strip(),
         alibaba_quota_poll_enabled=args.alibaba_quota_poll_enabled,
         alibaba_quota_poll_interval_seconds=(args.alibaba_quota_poll_interval_seconds),
         alibaba_subscription_poll_interval_seconds=(args.alibaba_subscription_poll_interval_seconds),
@@ -6473,6 +6597,387 @@ def _persist_kimi_usage_observations(
     except probes.ProviderStatusDatabaseWriteSkipped:
         raise
     return inserted_count
+
+
+def _resolve_zai_coding_plan_quota_api_key() -> str:
+    for name in ("ZAI_KEY", "ZAI_CODING_PLAN_API_KEY"):
+        value = os.getenv(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    raise ZaiCodingPlanQuotaPollError(
+        "Z.AI Coding Plan quota poll has no usable coding-plan API key.",
+        telemetry_class="auth",
+    )
+
+
+def _hash_zai_coding_plan_account_identity(
+    subscription_payload: Optional[Mapping[str, Any]] = None,
+    api_key: Optional[str] = None,
+) -> Optional[str]:
+    customer_id = None
+    if isinstance(subscription_payload, Mapping):
+        data = subscription_payload.get("data")
+        if isinstance(data, list) and data:
+            first = data[0]
+            if isinstance(first, Mapping):
+                raw_customer_id = first.get("customerId")
+                if raw_customer_id is not None and str(raw_customer_id).strip():
+                    customer_id = str(raw_customer_id).strip()
+    if customer_id:
+        return hashlib.sha256(
+            f"zai_coding_plan|customerId={customer_id}".encode("utf-8")
+        ).hexdigest()
+    if isinstance(api_key, str) and api_key.strip():
+        fingerprint = hashlib.sha256(api_key.strip().encode("utf-8")).hexdigest()[:16]
+        return hashlib.sha256(
+            f"zai_coding_plan|api_key_fingerprint={fingerprint}".encode("utf-8")
+        ).hexdigest()
+    return None
+
+
+def _zai_coding_plan_quota_period(unit: Any, number: Any) -> Optional[str]:
+    try:
+        unit_value = int(unit)
+        number_value = int(number)
+    except (TypeError, ValueError):
+        return None
+    if unit_value == 3 and number_value == 5:
+        return "5h"
+    if unit_value == 6 and number_value == 1:
+        return "7d"
+    if unit_value == 5 and number_value == 1:
+        return "1d"
+    return f"unit{unit_value}x{number_value}"
+
+
+def _zai_coding_plan_quota_key(period: str, quota_type: str) -> str:
+    if period == "5h" and quota_type == "credits":
+        return ZAI_CODING_PLAN_5H_QUOTA_KEY
+    if period == "7d" and quota_type == "credits":
+        return ZAI_CODING_PLAN_7D_QUOTA_KEY
+    if period == "5h" and quota_type == "percent":
+        return ZAI_CODING_PLAN_5H_PERCENT_KEY
+    if period == "7d" and quota_type == "percent":
+        return ZAI_CODING_PLAN_7D_PERCENT_KEY
+    return f"zai_coding_plan_{period}:{quota_type}"
+
+
+def _zai_coding_plan_reset_at(value: Any) -> Optional[datetime]:
+    if value in (None, ""):
+        return None
+    try:
+        millis = float(value)
+    except (TypeError, ValueError):
+        return None
+    if millis <= 0:
+        return None
+    return datetime.fromtimestamp(millis / 1000.0, tz=timezone.utc)
+
+
+def _zai_coding_plan_optional_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_zai_coding_plan_quota_rate_limit_payloads(
+    config: ProviderStatusLoopConfig,
+    *,
+    observed_at: datetime,
+    usage_payload: Mapping[str, Any],
+    subscription_payload: Optional[Mapping[str, Any]] = None,
+    api_key: Optional[str] = None,
+    **_kwargs: Any,
+) -> list[tuple[Any, ...]]:
+    if not isinstance(usage_payload, Mapping):
+        return []
+    if usage_payload.get("success") is False:
+        return []
+    data = usage_payload.get("data")
+    if not isinstance(data, Mapping):
+        return []
+    limits = data.get("limits")
+    if not isinstance(limits, list):
+        return []
+
+    account_hash = _hash_zai_coding_plan_account_identity(
+        subscription_payload=subscription_payload,
+        api_key=api_key,
+    )
+    if not account_hash:
+        return []
+
+    payloads: list[tuple[Any, ...]] = []
+    for limit in limits:
+        if not isinstance(limit, Mapping):
+            continue
+        limit_type = str(limit.get("type") or "").strip().upper()
+        period = _zai_coding_plan_quota_period(limit.get("unit"), limit.get("number"))
+        if not period:
+            continue
+        percentage = _zai_coding_plan_optional_float(limit.get("percentage"))
+        usage = _zai_coding_plan_optional_float(limit.get("usage"))
+        remaining = _zai_coding_plan_optional_float(limit.get("remaining"))
+        current_value = _zai_coding_plan_optional_float(limit.get("currentValue"))
+        expected_reset_at = _zai_coding_plan_reset_at(limit.get("nextResetTime"))
+        quota_type: Optional[str] = None
+        quota_limit: Optional[float] = None
+        quota_used: Optional[float] = None
+        quota_remaining: Optional[float] = None
+        remaining_pct: Optional[float] = None
+        if limit_type == "CREDIT_LIMIT":
+            if usage is None or remaining is None:
+                continue
+            quota_type = "credits"
+            quota_limit = usage
+            quota_remaining = remaining
+            quota_used = usage - remaining
+            remaining_pct = (
+                100.0 - percentage if percentage is not None else (remaining / usage * 100.0)
+            )
+        elif limit_type == "TOKENS_LIMIT":
+            if percentage is None:
+                continue
+            quota_type = "percent"
+            remaining_pct = 100.0 - percentage
+        elif limit_type == "TIME_LIMIT":
+            if usage is None or remaining is None:
+                continue
+            quota_type = "count"
+            quota_limit = usage
+            quota_remaining = remaining
+            quota_used = (
+                current_value if current_value is not None else usage - remaining
+            )
+            remaining_pct = (
+                100.0 - percentage if percentage is not None else (remaining / usage * 100.0)
+            )
+        else:
+            continue
+        if remaining_pct is None:
+            continue
+        remaining_pct = round(remaining_pct, 0) if quota_type == "credits" else float(remaining_pct)
+        if quota_type == "credits":
+            remaining_pct = float(int(remaining_pct)) if remaining_pct == int(remaining_pct) else float(remaining_pct)
+        raw_provider_fields = {
+            "limit_type": limit_type,
+            "quota_period": period,
+            "quota_type": quota_type,
+            "level": data.get("level"),
+        }
+        evidence = {
+            "signals": ["zai_coding_plan_quota_limit"],
+            "limit_type": limit_type,
+            "quota_period": period,
+        }
+        payloads.append(
+            (
+                observed_at,
+                ZAI_CODING_PLAN_CLIENT,
+                None,
+                account_hash,
+                ZAI_CODING_PLAN_PROVIDER,
+                ZAI_CODING_PLAN_MODEL,
+                _zai_coding_plan_quota_key(period, quota_type),
+                period,
+                quota_type,
+                expected_reset_at,
+                float(remaining_pct),
+                quota_limit,
+                quota_used,
+                quota_remaining,
+                None,
+                None,
+                json.dumps(raw_provider_fields, sort_keys=True),
+                json.dumps(evidence, sort_keys=True),
+                ZAI_CODING_PLAN_SOURCE,
+                None,
+                None,
+                f"zai-coding-plan-quota-poll-{observed_at.strftime('%Y%m%d%H%M%S')}",
+            )
+        )
+    return payloads
+
+
+def _set_zai_coding_plan_quota_database_timeouts(
+    cur: Any,
+    *,
+    lock_timeout_ms: int,
+    statement_timeout_ms: int,
+) -> None:
+    cur.execute(
+        "SELECT set_config('application_name', %s, false)",
+        (f"{probes._provider_status_db_application_name()}-zai-coding-plan-quota",),
+    )
+    cur.execute("SELECT set_config('lock_timeout', %s, true)", (f"{lock_timeout_ms}ms",))
+    cur.execute(
+        "SELECT set_config('statement_timeout', %s, true)",
+        (f"{statement_timeout_ms}ms",),
+    )
+
+
+def _persist_zai_coding_plan_quota_observations(
+    config: ProviderStatusLoopConfig,
+    payloads: Sequence[tuple[Any, ...]],
+) -> int:
+    if not payloads:
+        return 0
+    dsn = _resolve_dsn(config)
+    inserted_count = 0
+    try:
+        with probes.psycopg.connect(dsn) as conn:
+            try:
+                with conn.cursor() as cur:
+                    _set_zai_coding_plan_quota_database_timeouts(
+                        cur,
+                        lock_timeout_ms=config.db_lock_timeout_ms,
+                        statement_timeout_ms=config.db_statement_timeout_ms,
+                    )
+                    for payload in payloads:
+                        cur.execute(GROK_BILLING_RATE_LIMIT_INSERT_SQL, payload)
+                        inserted_count += max(0, cur.rowcount)
+            except (
+                probes.psycopg.errors.LockNotAvailable,
+                probes.psycopg.errors.QueryCanceled,
+            ) as exc:
+                conn.rollback()
+                raise probes.ProviderStatusDatabaseWriteSkipped(
+                    error_class=exc.__class__.__name__,
+                    message=str(exc),
+                ) from exc
+    except probes.ProviderStatusDatabaseWriteSkipped:
+        raise
+    return inserted_count
+
+
+def _fetch_zai_coding_plan_json(
+    url: str,
+    *,
+    api_key: str,
+    timeout_seconds: float,
+) -> Dict[str, Any]:
+    request = urllib_request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=timeout_seconds) as response:
+            status_code = int(getattr(response, "status", None) or response.getcode())
+            body = response.read().decode("utf-8")
+    except urllib_error.HTTPError as exc:
+        raise ZaiCodingPlanQuotaPollError(
+            "Z.AI Coding Plan quota poll HTTP error.",
+            telemetry_class="auth" if exc.code in {401, 403} else "http_error",
+        ) from exc
+    except (urllib_error.URLError, TimeoutError, OSError) as exc:
+        raise ZaiCodingPlanQuotaPollError(
+            "Z.AI Coding Plan quota poll failed while contacting the API.",
+            telemetry_class="transport",
+        ) from exc
+    if status_code < 200 or status_code >= 300:
+        raise ZaiCodingPlanQuotaPollError(
+            "Z.AI Coding Plan quota poll returned a non-success status.",
+            telemetry_class="http_error",
+        )
+    try:
+        payload = json.loads(body) if body else {}
+    except json.JSONDecodeError as exc:
+        raise ZaiCodingPlanQuotaPollError(
+            "Z.AI Coding Plan quota poll returned malformed JSON.",
+            telemetry_class="malformed_telemetry",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ZaiCodingPlanQuotaPollError(
+            "Z.AI Coding Plan quota poll returned a non-object payload.",
+            telemetry_class="malformed_telemetry",
+        )
+    return {"status_code": status_code, "payload": payload}
+
+
+def _run_zai_coding_plan_quota_poll_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+) -> Optional[Dict[str, Any]]:
+    if not config.zai_coding_plan_quota_poll_enabled:
+        return None
+    last_attempt = state.zai_coding_plan_quota_last_attempt_monotonic
+    if (
+        last_attempt is not None
+        and now_monotonic - last_attempt
+        < config.zai_coding_plan_quota_poll_interval_seconds
+    ):
+        return None
+
+    state.zai_coding_plan_quota_last_attempt_monotonic = now_monotonic
+    observed_at = datetime.now(timezone.utc)
+    summary: Dict[str, Any] = {
+        "attempted": True,
+        "persisted": False,
+        "skipped": False,
+        "quota_url": config.zai_coding_plan_quota_url,
+        "subscription_url": config.zai_coding_plan_subscription_url,
+        "observation_count": 0,
+        "inserted_count": 0,
+        "status_code": None,
+        "telemetry_class": None,
+        "error_class": None,
+        "error_message": None,
+    }
+    try:
+        api_key = _resolve_zai_coding_plan_quota_api_key()
+        fetched = _fetch_zai_coding_plan_json(
+            config.zai_coding_plan_quota_url,
+            api_key=api_key,
+            timeout_seconds=config.zai_coding_plan_quota_poll_http_timeout_seconds,
+        )
+        summary["status_code"] = fetched["status_code"]
+        subscription_payload: Optional[Mapping[str, Any]] = None
+        try:
+            subscription_fetched = _fetch_zai_coding_plan_json(
+                config.zai_coding_plan_subscription_url,
+                api_key=api_key,
+                timeout_seconds=config.zai_coding_plan_quota_poll_http_timeout_seconds,
+            )
+            subscription_payload = subscription_fetched["payload"]
+        except Exception:
+            subscription_payload = None
+        payloads = _build_zai_coding_plan_quota_rate_limit_payloads(
+            config,
+            observed_at=observed_at,
+            usage_payload=fetched["payload"],
+            subscription_payload=subscription_payload,
+            api_key=api_key,
+        )
+        summary["observation_count"] = len(payloads)
+        if config.apply:
+            summary["inserted_count"] = _persist_zai_coding_plan_quota_observations(
+                config,
+                payloads,
+            )
+            summary["persisted"] = bool(payloads)
+    except Exception as exc:
+        summary["error_class"] = exc.__class__.__name__
+        summary["error_message"] = _redacted_failure_message(str(exc))
+        if isinstance(exc, ZaiCodingPlanQuotaPollError):
+            summary["telemetry_class"] = exc.telemetry_class
+        else:
+            summary["telemetry_class"] = "malformed_telemetry"
+
+    return {
+        "event": "zai_coding_plan_quota_poll",
+        "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+        "environment": config.environment,
+        **summary,
+    }
 
 
 def _cursor_agent_usage_http_telemetry_class(status_code: int) -> str:
@@ -12020,6 +12525,7 @@ def run_due_sidecar_tasks(
         (_run_xai_oauth_refresh_task, "xai_oauth_refresh"),
         (_run_kimi_oauth_refresh_task, "kimi_oauth_refresh"),
         (_run_kimi_usage_poll_task, "kimi_usage_poll"),
+        (_run_zai_coding_plan_quota_poll_task, "zai_coding_plan_quota_poll"),
         (_run_cursor_agent_usage_poll_task, "cursor_agent_usage_poll"),
         (_run_alibaba_quota_poll_task, "alibaba_quota_poll"),
         (_run_grok_billing_poll_task, "grok_billing_poll"),
