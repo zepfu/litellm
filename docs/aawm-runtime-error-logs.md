@@ -74,7 +74,10 @@ tool-call text or payload without scraping container logs. Enable it with
 `LITELLM_AAWM_MALFORMED_ERROR_LOG_ENABLED=1`, or by enabling the generic AAWM
 error sink or setting `LITELLM_AAWM_ERROR_LOG_DIR`. The malformed-specific
 enable flag is enough to default the path to the current working directory's
-`.analysis/malformed-error.jsonl`.
+`.analysis/malformed-error.jsonl`. Direct `/grok/v1/responses` uses the same
+intake (`adapter=direct_grok_responses`) after Composer repair rejects unknown,
+invalid, or schema-invalid `Tool label:` dumps. That path is not alias routing
+and does not write Redis cooldowns.
 
 Terminal agent-session errors use a dedicated structured writer that appends to
 the normal `<environment>-error.jsonl` file under the same local intake

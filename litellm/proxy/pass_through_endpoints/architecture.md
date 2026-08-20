@@ -262,6 +262,7 @@ sequencing, stream validation, and response finalization, are package-owned:
 | Shared Anthropic-to-Responses/completion shaping orchestration | `litellm/llms/anthropic/experimental_pass_through/providers/common.py` |
 | Provider request shaping, credential/target preparation order, and route-plan construction | `litellm/llms/anthropic/experimental_pass_through/providers/<provider>/adapter.py` |
 | Grok argument/input normalization and composer response repair | `providers/grok/normalization.py`, `providers/grok/composer_repair.py` |
+| Direct `/grok/v1/responses` literal tool-call repair/reject (JSON Responses only; no alias cooldown) | `litellm/proxy/pass_through_endpoints/providers/grok/direct_responses_validation.py` |
 | OpenCode Zen request and stream normalization | `providers/opencode_zen/normalization.py` |
 | OpenCode Zen constants (base URL, provider ID, auth paths, free models) | `providers/opencode_zen/constants.py` |
 | Model resolution and adapter model normalization | `aawm_adapter_runtime/model_resolution.py` |

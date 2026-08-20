@@ -446,6 +446,9 @@ from litellm.proxy.pass_through_endpoints.providers.openrouter import runtime as
 from litellm.proxy.pass_through_endpoints.providers.nvidia import runtime as _wave6b_nvidia_runtime
 from litellm.proxy.pass_through_endpoints.providers.opencode_zen import runtime as _wave6b_opencode_zen_runtime  # noqa: F401 - install(globals()) pending wiring
 from litellm.proxy.pass_through_endpoints.providers.xai import request_prep as _wave6b_xai_request_prep
+from litellm.proxy.pass_through_endpoints.providers.grok import (
+    direct_responses_validation as _grok_direct_responses_validation,
+)
 from .aawm_alias_routing.state import alias_routing_state as _alias_routing_state
 
 
@@ -3756,7 +3759,7 @@ async def grok_proxy_route(
     query_params = {key: value for key, value in dict(request.query_params).items() if str(key).lower() != "key"}
     grok_side_channel_retryable_status_codes = _get_grok_side_channel_retryable_status_codes(endpoint)
 
-    return await pass_through_request(
+    response = await pass_through_request(
         request=request,
         target=target_url,
         custom_headers=custom_headers,
@@ -3774,6 +3777,19 @@ async def grok_proxy_route(
         retryable_upstream_status_codes=grok_side_channel_retryable_status_codes,
         caller_managed_hidden_retry=bool(grok_side_channel_retryable_status_codes),
     )
+    if _grok_direct_responses_validation.should_validate_direct_grok_responses(
+        endpoint=endpoint,
+        request=request,
+        raw_body_passthrough=raw_body_passthrough,
+        request_body=custom_body,
+    ):
+        response = await _grok_direct_responses_validation.validate_direct_grok_responses_payload(
+            response,
+            request=request,
+            request_body=custom_body,
+            endpoint=endpoint,
+        )
+    return response
 
 
 @router.api_route(
