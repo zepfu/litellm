@@ -784,6 +784,9 @@
         "unsupported_input_item_types": [
             "custom_tool_call",
             "custom_tool_call_output"
+        ],
+        "unsupported_request_params": [
+            "max_output_tokens"
         ]
     },
     "kimi_code/k3-high": {
@@ -835,6 +838,9 @@
         "unsupported_input_item_types": [
             "custom_tool_call",
             "custom_tool_call_output"
+        ],
+        "unsupported_request_params": [
+            "max_output_tokens"
         ]
     },
     "kimi_code/k3-max": {
@@ -886,6 +892,9 @@
         "unsupported_input_item_types": [
             "custom_tool_call",
             "custom_tool_call_output"
+        ],
+        "unsupported_request_params": [
+            "max_output_tokens"
         ]
     },
     "kimi_code/kimi-for-coding": {

@@ -354,6 +354,38 @@ async def handle_alias_route(  # noqa: PLR0915
 
     def _raise_terminal_alias_failure(exc: Exception) -> Any:
         last_attempt = attempts[-1] if attempts else {}
+        kimi_failure_metadata = _get_safe_kimi_code_probe_failure_metadata(
+            exc,
+            candidate=candidate if isinstance(candidate, dict) else None,
+        )
+        if (
+            kimi_failure_metadata is not None
+            and kimi_failure_metadata.get("kind") == "malformed"
+            and kimi_failure_metadata.get("scope") == "none"
+        ):
+            detail = getattr(exc, "detail", None)
+            if (
+                isinstance(detail, dict)
+                and isinstance(detail.get("error"), dict)
+                and detail["error"].get("code") == "kimi_code_invalid_request"
+            ):
+                status_code = int(
+                    kimi_failure_metadata.get("status_code")
+                    or getattr(exc, "status_code", 400)
+                    or 400
+                )
+                if status_code not in {400, 422}:
+                    status_code = 400
+                last_attempt_record = attempts[-1] if attempts else None
+                if isinstance(last_attempt_record, dict):
+                    _mark_auto_agent_alias_request_terminal_failure(
+                        request,
+                        last_attempt_record,
+                    )
+                raise HTTPException(
+                    status_code=status_code,
+                    detail=detail,
+                ) from None
         error_class = str(
             last_attempt.get("error_class")
             or _classify_codex_auto_agent_retryable_exhaustion(

@@ -161,17 +161,31 @@ def _add_adapter_metadata(
     return updated_body
 
 
+_ABSENT_REASONING_EFFORT_VALUES = frozenset({"none", "off"})
+
+
+def _normalize_explicit_reasoning_effort_token(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    if cleaned.lower() in _ABSENT_REASONING_EFFORT_VALUES:
+        return None
+    return cleaned
+
+
 def _extract_explicit_responses_reasoning_effort(
     request_body: dict[str, Any],
 ) -> Optional[str]:
-    reasoning_effort = request_body.get("reasoning_effort")
-    if isinstance(reasoning_effort, str) and reasoning_effort:
+    reasoning_effort = _normalize_explicit_reasoning_effort_token(
+        request_body.get("reasoning_effort")
+    )
+    if reasoning_effort is not None:
         return reasoning_effort
     reasoning = request_body.get("reasoning")
     if isinstance(reasoning, dict):
-        effort = reasoning.get("effort")
-        if isinstance(effort, str) and effort:
-            return effort
+        return _normalize_explicit_reasoning_effort_token(reasoning.get("effort"))
     return None
 
 
@@ -191,6 +205,9 @@ def _apply_kimi_reasoning_effort(
         completion_kwargs["reasoning_effort"] = forced_effort
         return
     explicit_effort = _extract_explicit_responses_reasoning_effort(request_body)
+    leftover_effort = completion_kwargs.get("reasoning_effort")
+    if _normalize_explicit_reasoning_effort_token(leftover_effort) is None:
+        completion_kwargs.pop("reasoning_effort", None)
     if explicit_effort is None:
         return
     mapped_effort = _K3_REASONING_EFFORT_MAP.get(explicit_effort)
@@ -754,11 +771,13 @@ async def prepare_codex_kimi_chat_completions_adapter_route(
         task_payload_metadata["tags"] = tags
         task_payload_metadata.update(task_payload_changes)
         request_body["litellm_metadata"] = task_payload_metadata
+    request_body.pop("max_output_tokens", None)
     request_input = request_body.get("input", "")
     responses_api_request = cast(
         ResponsesAPIOptionalRequestParams,
         {key: value for key, value in request_body.items() if key not in {"input", "model", "litellm_metadata"}},
     )
+    responses_api_request.pop("max_output_tokens", None)
     litellm_metadata = dict(request_body.get("litellm_metadata") or {})
     completion_kwargs = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
         model=upstream_model,
@@ -771,12 +790,16 @@ async def prepare_codex_kimi_chat_completions_adapter_route(
     completion_kwargs["metadata"] = litellm_metadata
     completion_kwargs["custom_llm_provider"] = "kimi_code"
     completion_kwargs["num_retries"] = 0
+    completion_kwargs.pop("max_output_tokens", None)
+    completion_kwargs.pop("max_tokens", None)
     previous_response_id = responses_api_request.get("previous_response_id")
     if isinstance(previous_response_id, str) and previous_response_id:
         completion_kwargs = await LiteLLMCompletionResponsesConfig.async_responses_api_session_handler(
             previous_response_id=previous_response_id,
             litellm_completion_request=completion_kwargs,
         )
+        completion_kwargs.pop("max_output_tokens", None)
+        completion_kwargs.pop("max_tokens", None)
     messages = completion_kwargs.get("messages")
     if not isinstance(messages, list):
         raise ValueError("Kimi Code request history must contain a messages list.")
