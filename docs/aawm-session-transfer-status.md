@@ -17,13 +17,12 @@ The route is private and always runs `user_api_key_auth`.
 Authorized callers:
 
 - proxy admin / proxy admin viewer
-- a dedicated transcript service key whose `permissions` include
+- a dedicated transcript service key whose `permissions` dict includes
   `aawm_session_transfer_status`
-- a virtual key whose `allowed_routes` includes
-  `/internal/aawm/session-transfer-status`
 
-All other authenticated callers receive HTTP 403. Unauthenticated callers fail
-closed through the existing auth dependency.
+Route membership alone does not authorize this handler. All other authenticated
+callers receive HTTP 403. Unauthenticated callers fail closed through the
+existing auth dependency.
 
 The route is listed in `LiteLLMRoutes.self_managed_routes`. The handler
 enforces the permission check above.
@@ -193,5 +192,5 @@ fields are estimated counts, not prompt text.
 No extra container, SQL, or live Redis mutation is required to land the source.
 Production multi-worker freshness requires the existing AAWM alias-routing Redis
 sidecar. Create a dedicated transcript key with
-`permissions=["aawm_session_transfer_status"]` only under separate operator
+`permissions={"aawm_session_transfer_status": true}` only under separate operator
 authorization.

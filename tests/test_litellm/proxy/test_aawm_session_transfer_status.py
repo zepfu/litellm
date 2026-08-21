@@ -1,5 +1,7 @@
+import asyncio
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -8,6 +10,9 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from litellm.caching.dual_cache import DualCache
+from litellm.caching.in_memory_cache import InMemoryCache
+from litellm.proxy import aawm_alias_routing_redis as alias_routing_redis
 from litellm.proxy._types import LiteLLMRoutes, LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
@@ -20,10 +25,12 @@ from litellm.proxy.aawm_session_transfer.hooks import publish_adapter_transfer_e
 from litellm.proxy.aawm_session_transfer.identity import extract_transfer_identity
 from litellm.proxy.aawm_session_transfer.registry import (
     SessionTransferRegistry,
+    get_session_transfer_registry,
     reset_session_transfer_registry,
     set_session_transfer_registry_override,
 )
 from litellm.proxy.aawm_session_transfer.schema import (
+    MAX_INDEX_MEMBERS,
     MAX_QUERY_RESULTS,
     SCHEMA_VERSION,
     TRANSFER_PERMISSION,
@@ -436,3 +443,309 @@ def test_http_endpoint_auth_via_dependency(registry):
     app.dependency_overrides[user_api_key_auth] = _auth_ok
     missing = client.get(TRANSFER_ROUTE)
     assert missing.status_code == 400
+
+
+_SESSION_TRANSFER_DOCS = (
+    Path(__file__).resolve().parents[3] / "docs" / "aawm-session-transfer-status.md"
+)
+
+
+class ConcurrentRacingCache:
+    """Shared store whose whole-value SET last-write-wins across interleaved tasks.
+
+    This is not a process-local serial dict used under a lock. Concurrent
+    read/modify/write of the same key can lose members. Atomic set-add / rpush
+    helpers union instead of replacing the whole value.
+    """
+
+    def __init__(self) -> None:
+        self.values = {}
+        self.sets = {}
+        self.lists = {}
+
+    async def async_get_cache(self, key, **kwargs):
+        await asyncio.sleep(0.02)
+        if key in self.sets:
+            return list(self.sets[key])
+        if key in self.lists:
+            return list(self.lists[key])
+        return self.values.get(key)
+
+    async def async_set_cache(self, key, value, ttl=None, **kwargs):
+        await asyncio.sleep(0.02)
+        self.values[key] = value
+
+    async def async_set_cache_sadd(self, key, value, ttl=None, **kwargs):
+        members = value if isinstance(value, list) else [value]
+        self.sets.setdefault(key, set()).update(members)
+
+    async def async_rpush(self, key, values, **kwargs):
+        items = values if isinstance(values, list) else [values]
+        self.lists.setdefault(key, []).extend(items)
+
+    async def async_batch_get_cache(self, keys, **kwargs):
+        return [await self.async_get_cache(key) for key in keys]
+
+
+class _RaisingRedisCache:
+    async def async_set_cache(self, key, value, **kwargs):
+        raise ConnectionError("redis write failed")
+
+    async def async_get_cache(self, key, **kwargs):
+        return None
+
+
+def _routes_only_user() -> UserAPIKeyAuth:
+    return UserAPIKeyAuth(
+        user_id="transcript-routes",
+        user_role=LitellmUserRoles.INTERNAL_USER.value,
+        allowed_routes=[TRANSFER_ROUTE],
+    )
+
+
+def _permission_list_user() -> UserAPIKeyAuth:
+    return UserAPIKeyAuth.model_construct(
+        user_id="transcript-list",
+        user_role=LitellmUserRoles.INTERNAL_USER.value,
+        permissions=[TRANSFER_PERMISSION],
+    )
+
+
+@pytest.mark.asyncio
+async def test_rr101_late_chunks_and_phase_keep_completed_terminal(registry):
+    identity = _identity()
+    await registry.record_chunks(
+        identity,
+        upstream_chunks=4,
+        upstream_bytes=40,
+        downstream_chunks=3,
+        downstream_bytes=30,
+        first_upstream=True,
+        first_downstream=True,
+    )
+    await registry.finalize(identity, "completed")
+
+    await registry.record_chunks(
+        identity,
+        upstream_chunks=1,
+        upstream_bytes=8,
+        downstream_chunks=1,
+        downstream_bytes=4,
+    )
+    await registry.mark_phase(identity, "response_streaming")
+
+    late = await registry.get_by_call_id("call-1")
+    public = (await registry.query(litellm_call_id="call-1"))["transfers"][0]
+    assert late["phase"] == "completed"
+    assert late["terminal_state"] == "completed"
+    assert late["active"] is False
+    assert late["upstream_chunk_count"] >= 4
+    assert late["upstream_byte_count"] >= 40
+    assert late["downstream_chunk_count"] >= 3
+    assert late["downstream_byte_count"] >= 30
+    assert public["phase"] == "completed"
+    assert public["terminal_state"] == "completed"
+    assert public["active"] is False
+    assert public["upstream_chunk_count"] >= 4
+
+
+def test_rr102_extracts_child_canonical_and_parent_thread_identities():
+    identity = extract_transfer_identity(
+        request_body={
+            "model": "gpt-5.4",
+            "metadata": {
+                "session_id": "parent-thread",
+                "canonical_thread_id": "child-thread",
+                "parent_thread_id": "parent-thread",
+                "agent_id": "child-agent",
+            },
+        },
+        litellm_call_id="call-child",
+        custom_llm_provider="openai",
+        stream_path="pass_through",
+    )
+    assert identity["canonical_session_id"] == "child-thread"
+    assert identity["parent_session_id"] == "parent-thread"
+    assert identity["canonical_session_id"] != identity["parent_session_id"]
+
+
+@pytest.mark.asyncio
+async def test_rr102_canonical_lookup_returns_child_not_collapsed_parent(registry):
+    identity = extract_transfer_identity(
+        request_body={
+            "model": "gpt-5.4",
+            "metadata": {
+                "session_id": "parent-thread",
+                "canonical_thread_id": "child-thread",
+                "parent_thread_id": "parent-thread",
+                "agent_id": "child-agent",
+            },
+        },
+        litellm_call_id="call-child",
+        custom_llm_provider="openai",
+        stream_path="pass_through",
+    )
+    await registry.mark_phase(identity, "response_streaming")
+    result = await registry.query(canonical_session_id="child-thread")
+    assert result["result_count"] == 1
+    transfer = result["transfers"][0]
+    assert transfer["litellm_call_id"] == "call-child"
+    assert transfer["canonical_session_id"] == "child-thread"
+    assert transfer["parent_session_id"] == "parent-thread"
+
+
+@pytest.mark.asyncio
+async def test_rr103_concurrent_index_writes_retain_all_members():
+    store = ConcurrentRacingCache()
+    worker_a = SessionTransferRegistry(cache=store, source_instance="worker-a")
+    worker_b = SessionTransferRegistry(cache=store, source_instance="worker-b")
+    await asyncio.gather(
+        worker_a.upsert(
+            _identity(litellm_call_id="call-a", agent_id="agent-race")
+        ),
+        worker_b.upsert(
+            _identity(litellm_call_id="call-b", agent_id="agent-race")
+        ),
+    )
+    result = await worker_a.query(agent_id="agent-race")
+    call_ids = {item["litellm_call_id"] for item in result["transfers"]}
+    assert call_ids == {"call-a", "call-b"}
+
+
+@pytest.mark.asyncio
+async def test_rr103_failing_dualcache_write_does_not_report_registry_ok():
+    dual = DualCache(
+        in_memory_cache=InMemoryCache(),
+        redis_cache=_RaisingRedisCache(),
+    )
+    item = SessionTransferRegistry(cache=dual, source_instance="worker-a")
+    item._redis_status = lambda: {
+        "mode": "redis",
+        "state_source": "durable_cache",
+        "reachable": True,
+    }
+    await item.upsert(_identity())
+    result = await item.query(litellm_call_id="call-1")
+    assert result["registry"]["state"] != "ok"
+
+
+@pytest.mark.asyncio
+async def test_rr103_expired_index_ids_do_not_displace_live_members(registry):
+    live_id = "call-live"
+    await registry.upsert(
+        _identity(litellm_call_id=live_id, agent_id="agent-index"),
+        {"phase": "response_streaming"},
+    )
+    for index in range(MAX_INDEX_MEMBERS):
+        await registry.finalize(
+            _identity(
+                litellm_call_id=f"call-expired-{index}",
+                agent_id="agent-index",
+            ),
+            "completed",
+        )
+    live = await registry.get_by_call_id(live_id)
+    assert live is not None
+    assert live["phase"] == "response_streaming"
+    result = await registry.query(
+        agent_id="agent-index",
+        limit=MAX_QUERY_RESULTS,
+    )
+    call_ids = {item["litellm_call_id"] for item in result["transfers"]}
+    assert live_id in call_ids
+
+
+@pytest.mark.asyncio
+async def test_rr104_registry_uses_replacement_dualcache_after_manager_reset():
+    old_redis = object()
+    new_redis = object()
+    old_cache = FakeDualCache()
+    old_cache.redis_cache = old_redis
+    new_cache = FakeDualCache()
+    new_cache.redis_cache = new_redis
+    manager = alias_routing_redis.aawm_alias_routing_redis_manager
+    previous_cache = manager._cache
+    previous_dual = manager._managed_dual_cache
+    reset_session_transfer_registry()
+    try:
+        manager._cache = old_redis
+        manager._managed_dual_cache = old_cache
+        item = get_session_transfer_registry()
+        await item.upsert(_identity(litellm_call_id="call-old"))
+        assert any(
+            "call-old" in (value if isinstance(value, str) else json.dumps(value))
+            for value in old_cache.values.values()
+        )
+        alias_routing_redis.reset()
+        manager._cache = new_redis
+        manager._managed_dual_cache = new_cache
+        await item.upsert(_identity(litellm_call_id="call-new"))
+        assert any(
+            "call-new" in (value if isinstance(value, str) else json.dumps(value))
+            for value in new_cache.values.values()
+        )
+        assert not any(
+            "call-new" in (value if isinstance(value, str) else json.dumps(value))
+            for value in old_cache.values.values()
+        )
+    finally:
+        manager._cache = previous_cache
+        manager._managed_dual_cache = previous_dual
+        reset_session_transfer_registry()
+
+
+def test_rr108_docs_do_not_claim_allowed_routes_or_list_permissions_authorize():
+    text = _SESSION_TRANSFER_DOCS.read_text()
+    assert "`allowed_routes`" not in text
+    assert 'permissions=["aawm_session_transfer_status"]' not in text
+    assert TRANSFER_PERMISSION in text
+
+
+@pytest.mark.asyncio
+async def test_rr108_endpoint_denies_allowed_routes_only_and_allows_permission(
+    registry,
+):
+    await registry.mark_phase(_identity(), "response_streaming")
+    with pytest.raises(HTTPException) as denied:
+        await get_session_transfer_status(
+            session_id="sess-canon",
+            user_api_key_dict=_routes_only_user(),
+        )
+    assert denied.value.status_code == 403
+
+    payload = await get_session_transfer_status(
+        session_id="sess-canon",
+        user_api_key_dict=_service_user(),
+    )
+    assert payload["result_count"] == 1
+    assert payload["transfers"][0]["canonical_session_id"] == "sess-canon"
+
+    list_payload = await get_session_transfer_status(
+        session_id="sess-canon",
+        user_api_key_dict=_permission_list_user(),
+    )
+    assert list_payload["result_count"] == 1
+
+
+def test_rr108_handler_rejects_allowed_routes_only_key():
+    assert caller_may_read_session_transfer(_routes_only_user()) is False
+    assert caller_may_read_session_transfer(_service_user()) is True
+    assert caller_may_read_session_transfer(_admin_user()) is True
+
+
+@pytest.mark.asyncio
+async def test_rr117_finished_calls_prune_heartbeat_map_and_keep_active(registry):
+    for index in range(12):
+        identity = _identity(litellm_call_id=f"hb-{index}")
+        await registry.upsert(identity, {"phase": "response_streaming"}, force=True)
+        await registry.finalize(identity, "completed")
+    assert registry._last_heartbeat_mono == {}
+
+    live = _identity(litellm_call_id="hb-live")
+    await registry.upsert(live, {"phase": "response_streaming"}, force=True)
+    assert list(registry._last_heartbeat_mono) == ["hb-live"]
+    first = registry._last_heartbeat_mono["hb-live"]
+    registry._last_heartbeat_mono["hb-live"] = 0.0
+    await registry.upsert(live, {"phase": "response_streaming"}, force=True)
+    assert registry._last_heartbeat_mono["hb-live"] >= first
+    assert list(registry._last_heartbeat_mono) == ["hb-live"]

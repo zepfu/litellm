@@ -114,6 +114,19 @@ class InMemoryTransferStore:
         self._purge_expired()
         return [self._values.get(key) for key in keys]
 
+    async def async_set_cache_sadd(
+        self, key: str, value: Any, ttl: Optional[float] = None, **_: Any
+    ) -> None:
+        members = value if isinstance(value, list) else [value]
+        existing = await self.async_get_cache(key)
+        union: set[str] = set()
+        if isinstance(existing, (list, set, tuple)):
+            union.update(str(item) for item in existing if item is not None)
+        elif isinstance(existing, str) and existing:
+            union.add(existing)
+        union.update(str(item) for item in members if item is not None)
+        await self.async_set_cache(key, list(union), ttl=ttl)
+
 
 class SessionTransferRegistry:
     def __init__(
@@ -123,6 +136,7 @@ class SessionTransferRegistry:
         source_instance: Optional[str] = None,
         now_fn=None,
     ) -> None:
+        self._explicit_cache = cache
         self._cache = cache
         self._memory = InMemoryTransferStore()
         self._source_instance = source_instance or socket.gethostname()
@@ -132,11 +146,20 @@ class SessionTransferRegistry:
         self._degraded = False
 
     def bind_cache(self, cache: Any) -> None:
+        self._explicit_cache = cache
         self._cache = cache
 
+    def _mark_degraded(self, exc: BaseException) -> None:
+        self._degraded = True
+        self._last_error_class = type(exc).__name__
+
+    def _drop_heartbeat(self, call_id: Optional[str]) -> None:
+        if call_id:
+            self._last_heartbeat_mono.pop(call_id, None)
+
     def _store(self) -> Any:
-        if self._cache is not None:
-            return self._cache
+        if self._explicit_cache is not None:
+            return self._explicit_cache
         try:
             cache = get_dual_cache()
         except Exception:
@@ -144,6 +167,7 @@ class SessionTransferRegistry:
         if cache is not None:
             self._cache = cache
             return cache
+        self._cache = None
         return self._memory
 
     def _redis_status(self) -> Dict[str, Any]:
@@ -198,13 +222,34 @@ class SessionTransferRegistry:
                 return dict(parsed)
         return None
 
+    def _decode_index_members(self, raw: Any) -> List[str]:
+        if raw is None:
+            return []
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="ignore")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return [raw] if raw else []
+        if isinstance(raw, (list, set, tuple)):
+            members: List[str] = []
+            seen: set[str] = set()
+            for item in raw:
+                if isinstance(item, (bytes, bytearray)):
+                    item = item.decode("utf-8", errors="ignore")
+                if isinstance(item, str) and item and item not in seen:
+                    seen.add(item)
+                    members.append(item)
+            return members
+        return []
+
     async def _read_raw(self, key: str) -> Any:
         store = self._store()
         try:
             return await store.async_get_cache(key=key)
         except Exception as exc:
-            self._degraded = True
-            self._last_error_class = type(exc).__name__
+            self._mark_degraded(exc)
             logger.debug("session-transfer registry read failed", exc_info=True)
             if store is not self._memory:
                 try:
@@ -213,17 +258,71 @@ class SessionTransferRegistry:
                     return None
             return None
 
+    async def _batch_read_raw(self, keys: List[str]) -> List[Any]:
+        if not keys:
+            return []
+        store = self._store()
+        batch = getattr(store, "async_batch_get_cache", None)
+        if callable(batch):
+            try:
+                result = await batch(keys=keys)
+            except TypeError:
+                result = await batch(keys)
+            except Exception as exc:
+                self._mark_degraded(exc)
+                logger.debug(
+                    "session-transfer registry batch read failed", exc_info=True
+                )
+                result = None
+            if isinstance(result, list) and len(result) == len(keys):
+                return result
+        return [await self._read_raw(key) for key in keys]
+
+    async def _write_redis_cache(self, redis_cache: Any, key: str, value: Any, ttl: int) -> bool:
+        try:
+            await redis_cache.async_set_cache(
+                key=key, value=value, ttl=ttl, raise_on_error=True
+            )
+            return True
+        except TypeError:
+            await redis_cache.async_set_cache(key=key, value=value, ttl=ttl)
+            return True
+
     async def _write_raw(self, key: str, value: Any, ttl: int) -> bool:
         encoded = json.dumps(value, separators=(",", ":"), default=str)
         store = self._store()
         try:
-            await store.async_set_cache(key=key, value=encoded, ttl=ttl)
+            redis_cache = getattr(store, "redis_cache", None)
+            in_memory = getattr(store, "in_memory_cache", None)
+            redis_set = (
+                getattr(redis_cache, "async_set_cache", None)
+                if redis_cache is not None
+                else None
+            )
+            if callable(redis_set):
+                if in_memory is not None:
+                    await in_memory.async_set_cache(key=key, value=encoded, ttl=ttl)
+                try:
+                    await self._write_redis_cache(
+                        redis_cache, key=key, value=encoded, ttl=ttl
+                    )
+                except Exception as exc:
+                    self._mark_degraded(exc)
+                    logger.debug(
+                        "session-transfer durable write failed", exc_info=True
+                    )
+                    if store is not self._memory:
+                        await self._memory.async_set_cache(
+                            key=key, value=encoded, ttl=ttl
+                        )
+                    return False
+            else:
+                await store.async_set_cache(key=key, value=encoded, ttl=ttl)
             if store is not self._memory:
                 await self._memory.async_set_cache(key=key, value=encoded, ttl=ttl)
             return True
         except Exception as exc:
-            self._degraded = True
-            self._last_error_class = type(exc).__name__
+            self._mark_degraded(exc)
             logger.debug("session-transfer registry write failed", exc_info=True)
             try:
                 await self._memory.async_set_cache(key=key, value=encoded, ttl=ttl)
@@ -231,26 +330,79 @@ class SessionTransferRegistry:
                 pass
             return False
 
+    async def _prefer_live_index_members(self, members: List[str]) -> List[str]:
+        unique: List[str] = []
+        seen: set[str] = set()
+        for item in members:
+            if item and item not in seen:
+                seen.add(item)
+                unique.append(item)
+        if len(unique) <= MAX_INDEX_MEMBERS:
+            return unique
+        raw_records = await self._batch_read_raw(
+            [self._record_key(call_id) for call_id in unique]
+        )
+        live: List[str] = []
+        other: List[str] = []
+        for call_id, raw in zip(unique, raw_records):
+            record = self._decode_record(raw)
+            if record is None:
+                other.append(call_id)
+                continue
+            phase = normalize_phase(record.get("phase"))
+            if is_terminal_phase(phase):
+                other.append(call_id)
+            else:
+                live.append(call_id)
+        kept = live[:MAX_INDEX_MEMBERS]
+        remaining = MAX_INDEX_MEMBERS - len(kept)
+        if remaining > 0:
+            kept.extend(other[-remaining:])
+        return kept
+
     async def _read_index(self, field: str, value: str) -> List[str]:
         raw = await self._read_raw(self._index_key(field, value))
-        if raw is None:
-            return []
-        if isinstance(raw, list):
-            return [item for item in raw if isinstance(item, str)][:MAX_INDEX_MEMBERS]
-        if isinstance(raw, (bytes, bytearray)):
-            raw = raw.decode("utf-8", errors="ignore")
-        if isinstance(raw, str):
-            try:
-                parsed = json.loads(raw)
-            except json.JSONDecodeError:
-                return []
-            if isinstance(parsed, list):
-                return [item for item in parsed if isinstance(item, str)][:MAX_INDEX_MEMBERS]
-        return []
+        members = self._decode_index_members(raw)
+        if len(members) > MAX_INDEX_MEMBERS:
+            return await self._prefer_live_index_members(members)
+        return members
 
-    async def _write_index(self, field: str, value: str, call_ids: List[str], ttl: int) -> None:
-        bounded = call_ids[-MAX_INDEX_MEMBERS:]
-        await self._write_raw(self._index_key(field, value), bounded, ttl)
+    async def _write_index(
+        self, field: str, value: str, call_ids: List[str], ttl: int
+    ) -> bool:
+        bounded = await self._prefer_live_index_members(call_ids)
+        return await self._write_raw(self._index_key(field, value), bounded, ttl)
+
+    async def _add_index_member(self, field: str, value: str, call_id: str) -> bool:
+        store = self._store()
+        key = self._index_key(field, value)
+        sadd = getattr(store, "async_set_cache_sadd", None)
+        if callable(sadd):
+            try:
+                await sadd(key=key, value=[call_id], ttl=INDEX_TTL_SECONDS)
+                return True
+            except Exception as exc:
+                self._mark_degraded(exc)
+                logger.debug(
+                    "session-transfer atomic index sadd failed", exc_info=True
+                )
+        rpush = getattr(store, "async_rpush", None)
+        if callable(rpush):
+            try:
+                await rpush(key=key, values=[call_id])
+                return True
+            except TypeError:
+                await rpush(key, [call_id])
+                return True
+            except Exception as exc:
+                self._mark_degraded(exc)
+                logger.debug(
+                    "session-transfer atomic index rpush failed", exc_info=True
+                )
+        members = await self._read_index(field, value)
+        if call_id not in members:
+            members.append(call_id)
+        return await self._write_index(field, value, members, INDEX_TTL_SECONDS)
 
     def _annotate_freshness(self, record: Dict[str, Any]) -> Dict[str, Any]:
         phase = normalize_phase(record.get("phase"))
@@ -302,17 +454,17 @@ class SessionTransferRegistry:
             record["source_instance"] = sanitize_identity(self._source_instance)
             if not record.get("received_at"):
                 record["received_at"] = now_iso
-            last_mono = self._last_heartbeat_mono.get(call_id, 0.0)
-            now_mono = time.monotonic()
-            if force or now_mono - last_mono >= HEARTBEAT_MIN_INTERVAL_SECONDS:
-                record["last_heartbeat_at"] = now_iso
-                self._last_heartbeat_mono[call_id] = now_mono
+            terminal = is_terminal_phase(normalize_phase(record.get("phase")))
+            if terminal:
+                self._drop_heartbeat(call_id)
+            else:
+                last_mono = self._last_heartbeat_mono.get(call_id, 0.0)
+                now_mono = time.monotonic()
+                if force or now_mono - last_mono >= HEARTBEAT_MIN_INTERVAL_SECONDS:
+                    record["last_heartbeat_at"] = now_iso
+                    self._last_heartbeat_mono[call_id] = now_mono
             record = self._annotate_freshness(record)
-            ttl = (
-                TERMINAL_TTL_SECONDS
-                if is_terminal_phase(normalize_phase(record.get("phase")))
-                else ACTIVE_TTL_SECONDS
-            )
+            ttl = TERMINAL_TTL_SECONDS if terminal else ACTIVE_TTL_SECONDS
             wrote = await self._write_raw(self._record_key(call_id), record, ttl)
             if not wrote:
                 record["redis_degraded"] = True
@@ -324,10 +476,11 @@ class SessionTransferRegistry:
             for field, value in iter_identity_values(record):
                 if field == "litellm_call_id":
                     continue
-                members = await self._read_index(field, value)
-                if call_id not in members:
-                    members.append(call_id)
-                await self._write_index(field, value, members, INDEX_TTL_SECONDS)
+                indexed = await self._add_index_member(field, value, call_id)
+                if not indexed:
+                    record["redis_degraded"] = True
+            if terminal:
+                self._drop_heartbeat(call_id)
             return record
         except Exception:
             logger.debug("session-transfer upsert failed", exc_info=True)
@@ -412,8 +565,12 @@ class SessionTransferRegistry:
             return None
         record = self._decode_record(await self._read_raw(self._record_key(cleaned)))
         if record is None:
+            self._drop_heartbeat(cleaned)
             return None
-        return self._annotate_freshness(record)
+        annotated = self._annotate_freshness(record)
+        if is_terminal_phase(normalize_phase(annotated.get("phase"))):
+            self._drop_heartbeat(cleaned)
+        return annotated
 
     async def query(
         self,

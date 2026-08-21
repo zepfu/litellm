@@ -121,12 +121,22 @@ def extract_transfer_identity(
         "session_id",
         "aawm_session_id",
     )
-    canonical_session_id = _first_value(
+    canonical_thread_id = _first_value(
         sources,
-        "canonical_session_id",
-        "aawm_canonical_session_id",
-        "effective_session_identity",
-    ) or session_id or codex_session_id
+        "canonical_thread_id",
+        "aawm_canonical_thread_id",
+    )
+    canonical_session_id = (
+        canonical_thread_id
+        or _first_value(
+            sources,
+            "canonical_session_id",
+            "aawm_canonical_session_id",
+            "effective_session_identity",
+        )
+        or session_id
+        or codex_session_id
+    )
 
     prompt_categories = empty_prompt_category_tokens()
     overhead = metadata.get("prompt_overhead")
@@ -194,9 +204,11 @@ def extract_transfer_identity(
         ),
         "parent_session_id": _first_value(
             sources,
+            "parent_thread_id",
             "parent_session_id",
             "aawm_parent_session_id",
             "parent_session_identity",
+            "aawm_parent_thread_id",
         ),
         "provider": sanitize_label(
             custom_llm_provider

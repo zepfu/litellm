@@ -357,23 +357,34 @@ def assert_content_free(payload: Any) -> None:
     _walk(payload, "payload")
 
 
+_COUNTER_FIELDS = frozenset(
+    {
+        "upstream_chunk_count",
+        "upstream_byte_count",
+        "downstream_chunk_count",
+        "downstream_byte_count",
+    }
+)
+_LIFECYCLE_FIELDS = frozenset(
+    {"phase", "active", "stale", "freshness", "terminal_state"}
+)
+
+
 def merge_records(
     current: Mapping[str, Any], incoming: Mapping[str, Any]
 ) -> Dict[str, Any]:
     merged = dict(current)
+    current_phase = normalize_phase(current.get("phase"))
+    current_terminal = is_terminal_phase(current_phase)
     for key, value in incoming.items():
         if key == "prompt_category_tokens":
             merged[key] = sanitize_prompt_category_tokens(value)
             continue
-        if key in {
-            "upstream_chunk_count",
-            "upstream_byte_count",
-            "downstream_chunk_count",
-            "downstream_byte_count",
-        }:
+        if key in _COUNTER_FIELDS:
             parsed = coerce_non_negative_int(value)
             if parsed is not None:
-                merged[key] = parsed
+                existing = coerce_non_negative_int(merged.get(key)) or 0
+                merged[key] = max(existing, parsed)
             continue
         if value is None or value == "":
             continue
@@ -383,7 +394,17 @@ def merge_records(
             and merged.get(key)
         ):
             continue
+        if current_terminal and key in _LIFECYCLE_FIELDS:
+            continue
         merged[key] = value
+    if current_terminal:
+        merged["phase"] = current_phase
+        merged["active"] = False
+        merged["stale"] = False
+        merged["freshness"] = "terminal"
+        merged["terminal_state"] = (
+            sanitize_label(current.get("terminal_state")) or current_phase
+        )
     return merged
 
 
