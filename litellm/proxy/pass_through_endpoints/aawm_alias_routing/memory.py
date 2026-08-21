@@ -20,8 +20,9 @@ def bound_memory_map(
     *,
     max_size: int = DEFAULT_MEMORY_STATE_MAX_SIZE,
 ) -> None:
-    """FIFO-trim a process-local map to ``max_size`` entries."""
+    """Prune expired entries, then FIFO-trim to ``max_size``."""
     global fifo_eviction_count
+    prune_expired_memory_map(cache)
     while len(cache) > max_size:
         try:
             oldest = next(iter(cache))

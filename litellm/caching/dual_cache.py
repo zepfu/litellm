@@ -137,6 +137,7 @@ class DualCache(BaseCache):
         **kwargs,
     ):
         # Try to fetch from in-memory cache first
+        raise_on_error = bool(kwargs.pop("raise_on_error", False))
         try:
             result = None
             if self.in_memory_cache is not None:
@@ -147,8 +148,9 @@ class DualCache(BaseCache):
 
             if result is None and self.redis_cache is not None and local_only is False:
                 # If not found in in-memory cache, try fetching from Redis
+                redis_kwargs = {"raise_on_error": True} if raise_on_error else {}
                 redis_result = self.redis_cache.get_cache(
-                    key, parent_otel_span=parent_otel_span
+                    key, parent_otel_span=parent_otel_span, **redis_kwargs
                 )
 
                 if redis_result is not None:
@@ -161,6 +163,8 @@ class DualCache(BaseCache):
             return result
         except Exception:
             verbose_logger.error(traceback.format_exc())
+            if raise_on_error:
+                raise
 
     def batch_get_cache(
         self,
@@ -204,6 +208,8 @@ class DualCache(BaseCache):
         local_only: bool = False,
         **kwargs,
     ):
+        # Opt-in: default remains swallow-and-return-None for unrelated cache users.
+        raise_on_error = bool(kwargs.pop("raise_on_error", False))
         # Try to fetch from in-memory cache first
         try:
             print_verbose(
@@ -221,8 +227,9 @@ class DualCache(BaseCache):
 
             if result is None and self.redis_cache is not None and local_only is False:
                 # If not found in in-memory cache, try fetching from Redis
+                redis_kwargs = {"raise_on_error": True} if raise_on_error else {}
                 redis_result = await self.redis_cache.async_get_cache(
-                    key, parent_otel_span=parent_otel_span
+                    key, parent_otel_span=parent_otel_span, **redis_kwargs
                 )
 
                 if redis_result is not None:
@@ -237,6 +244,8 @@ class DualCache(BaseCache):
             return result
         except Exception:
             verbose_logger.error(traceback.format_exc())
+            if raise_on_error:
+                raise
 
     def _reserve_redis_batch_keys(
         self,

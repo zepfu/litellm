@@ -2945,7 +2945,7 @@ async def read_aawm_alias_routing_state(
         async_get_cache = getattr(dual_cache, "async_get_cache", None)
         if not callable(async_get_cache):
             raise RuntimeError("redis client missing async_get_cache")
-        payload = await async_get_cache(key=cache_key)
+        payload = await async_get_cache(key=cache_key, raise_on_error=True)
     except Exception:
         payload = _local_payload()
         source = "degraded_local" if last_good_local else "durable_error"
@@ -2971,10 +2971,11 @@ async def read_aawm_alias_routing_state(
         }
 
     local_payload = _local_payload() if last_good_local else None
+    miss_source = "local_lease" if last_good_local else "confirmed_miss"
     return {
         "payload": local_payload,
-        "source": "memory" if last_good_local else "memory",
-        "affinity_state_source": "memory" if last_good_local else "memory",
+        "source": miss_source,
+        "affinity_state_source": miss_source,
         "confirmed_miss": True,
         "durable_miss": True,
         "durable_error": False,

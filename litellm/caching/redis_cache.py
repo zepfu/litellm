@@ -803,6 +803,7 @@ class RedisCache(BaseCache):
         return cached_response
 
     def get_cache(self, key, parent_otel_span: Optional[Span] = None, **kwargs):
+        raise_on_error = bool(kwargs.pop("raise_on_error", False))
         try:
             key = self.check_and_fix_namespace(key=key)
             print_verbose(f"Get Redis Cache: key: {key}")
@@ -827,6 +828,8 @@ class RedisCache(BaseCache):
             verbose_logger.error(
                 "litellm.caching.caching: get() - Got exception from REDIS: ", e
             )
+            if raise_on_error:
+                raise
 
     def _run_redis_mget_operation(self, keys: List[str]) -> List[Any]:
         """
@@ -902,6 +905,7 @@ class RedisCache(BaseCache):
     ):
         from redis.asyncio import Redis
 
+        raise_on_error = bool(kwargs.pop("raise_on_error", False))
         _redis_client: Redis = self.init_async_client()  # type: ignore
         key = self.check_and_fix_namespace(key=key)
         start_time = time.time()
@@ -946,6 +950,8 @@ class RedisCache(BaseCache):
             print_verbose(
                 f"litellm.caching.caching: async get() - Got exception from REDIS: {str(e)}"
             )
+            if raise_on_error:
+                raise
 
     async def async_batch_get_cache(
         self,
