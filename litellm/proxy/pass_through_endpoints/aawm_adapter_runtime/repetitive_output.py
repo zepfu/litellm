@@ -13,7 +13,8 @@ import json
 import unicodedata
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Mapping, Optional
+from itertools import islice
+from typing import TYPE_CHECKING, Any, AsyncIterator, Mapping, Optional
 
 from fastapi import HTTPException
 
@@ -24,12 +25,13 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
     _mapping_or_attr_get,
     _responses_event_text_key,
 )
-from litellm.proxy.pass_through_endpoints.aawm_alias_routing.output_guard_config import (
-    OutputGuardPolicy,
-    OutputGuardRequestContext,
-    resolve_output_guard_policy,
-)
 from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
+
+if TYPE_CHECKING:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.output_guard_config import (
+        OutputGuardPolicy,
+        OutputGuardRequestContext,
+    )
 
 REPETITIVE_OUTPUT_FAILURE_KIND = "repetitive_output_loop"
 REPETITIVE_OUTPUT_ERROR_CODE = "aawm_repetitive_output_loop"
@@ -287,6 +289,8 @@ class VisibleTextRepetitionDetector:
         self._pending = ""
         self._match: Optional[VisibleTextRepetitionMatch] = None
         self._extractor = VisibleOutputTextExtractor()
+        self._ngram_counts: dict[tuple[str, ...], int] = {}
+        self._has_scored = False
 
     def normalized_words(self) -> list[str]:
         return list(self._window)
@@ -299,10 +303,22 @@ class VisibleTextRepetitionDetector:
         words, self._pending = _normalize_visible_text_with_remainder(
             text, pending=self._pending, flush=flush
         )
+        added_ngrams: list[tuple[str, ...]] = []
         for word in words:
+            evicted_ngram = self._ngram_at(0)
+            window_was_full = (
+                self._window.maxlen is not None
+                and len(self._window) == self._window.maxlen
+            )
             self._window.append(word)
             self._total_words += 1
-        self._match = self._score()
+            if window_was_full and evicted_ngram is not None:
+                self._adjust_ngram_count(evicted_ngram, -1)
+            added = self._newest_ngram()
+            if added is not None:
+                self._adjust_ngram_count(added, 1)
+                added_ngrams.append(added)
+        self._match = self._score(added_ngrams)
         return self._match
 
     def feed_event(self, event: Any) -> Optional[VisibleTextRepetitionMatch]:
@@ -313,13 +329,53 @@ class VisibleTextRepetitionDetector:
             return None
         return self.feed(text, flush=False)
 
-    def _score(self) -> Optional[VisibleTextRepetitionMatch]:
+    def _ngram_at(self, start: int) -> Optional[tuple[str, ...]]:
+        min_ngram = self.policy.min_ngram
+        if min_ngram <= 0 or len(self._window) < min_ngram:
+            return None
+        return tuple(islice(self._window, start, start + min_ngram))
+
+    def _newest_ngram(self) -> Optional[tuple[str, ...]]:
+        min_ngram = self.policy.min_ngram
+        if min_ngram <= 0 or len(self._window) < min_ngram:
+            return None
+        return tuple(islice(self._window, len(self._window) - min_ngram, None))
+
+    def _adjust_ngram_count(self, ngram: tuple[str, ...], delta: int) -> None:
+        count = self._ngram_counts.get(ngram, 0) + delta
+        if count <= 0:
+            self._ngram_counts.pop(ngram, None)
+        else:
+            self._ngram_counts[ngram] = count
+
+    def _ngram_rebuild_required(self, added_ngrams: list[tuple[str, ...]]) -> bool:
+        """Skip whole-window clustering when exact n-gram counts cannot match.
+
+        Unique one-word deltas only shift the window; consecutive unique
+        n-grams are within edit-distance 2 of each other, so clustering them
+        would still rebuild on every feed. Exact counts below ``min_repeats``
+        cannot satisfy the detector, and the first armed score already ran a
+        full rebuild. Near-duplicate clustering remains on that first armed
+        score and on later feeds that actually repeat an n-gram.
+        """
+        del added_ngrams
+        return max(self._ngram_counts.values(), default=0) >= self.policy.min_repeats
+
+    def _score(
+        self, added_ngrams: Optional[list[tuple[str, ...]]] = None
+    ) -> Optional[VisibleTextRepetitionMatch]:
         policy = self.policy
         if self._total_words < policy.min_words:
             return None
         words = list(self._window)
         if len(words) < policy.min_ngram:
             return None
+        first_armed_score = not self._has_scored
+        if not first_armed_score and not self._ngram_rebuild_required(
+            added_ngrams or []
+        ):
+            return None
+        self._has_scored = True
         best = _best_repeated_ngram(
             words,
             min_ngram=policy.min_ngram,
@@ -562,6 +618,21 @@ async def wrap_responses_sse_with_repetitive_output_guard(
             await _abort_upstream()
 
 
+def _resolve_output_guard_policy(request_context: OutputGuardRequestContext) -> Optional[OutputGuardPolicy]:
+    """Load named-policy resolution after this module has finished initializing.
+
+    ``output_guard_config`` lives under ``aawm_alias_routing``, whose package
+    ``__init__`` eagerly imports ``streaming`` which in turn imports this
+    module. Resolving the policy at call time avoids executing that package
+    while ``repetitive_output`` is still partial (RR-093).
+    """
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.output_guard_config import (
+        resolve_output_guard_policy,
+    )
+
+    return resolve_output_guard_policy(request_context)
+
+
 def maybe_wrap_passthrough_responses_stream(
     body_iterator: Any,
     *,
@@ -577,7 +648,7 @@ def maybe_wrap_passthrough_responses_stream(
     (direct ``/grok``, generic OpenAI, chat completions) keep their original
     stream object.
     """
-    selected = policy or resolve_output_guard_policy(request_context)
+    selected = policy or _resolve_output_guard_policy(request_context)
     if selected is None:
         return body_iterator
     if getattr(body_iterator, WRAPPED_STREAM_ATTR, False):
@@ -626,7 +697,12 @@ def inherit_or_wrap_passthrough_streaming_response(
     request_context: Optional[OutputGuardRequestContext] = None,
     upstream_response: Any = None,
 ) -> Any:
-    """Wrap a reconstructed StreamingResponse unless the source stream is already guarded."""
+    """Wrap a reconstructed StreamingResponse iterator when the guard still applies.
+
+    Marker copy onto a new StreamingResponse is not enough: collection replay,
+    identity restoration, and tool-call repair all build a fresh iterator that
+    must be wrapped when the source was guarded.
+    """
     from fastapi.responses import StreamingResponse
 
     if not isinstance(response, StreamingResponse):
@@ -636,33 +712,23 @@ def inherit_or_wrap_passthrough_streaming_response(
         context = getattr(source_response, OUTPUT_GUARD_CONTEXT_ATTR, None)
     if context is None:
         return response
-    source_wrapped = bool(
-        source_response is not None
-        and (
-            getattr(source_response, WRAPPED_STREAM_ATTR, False)
-            or getattr(
-                getattr(source_response, "body_iterator", None),
-                WRAPPED_STREAM_ATTR,
-                False,
-            )
-        )
-    )
-    if source_wrapped or getattr(response, WRAPPED_STREAM_ATTR, False):
+    iterator = getattr(response, "body_iterator", None)
+    if getattr(iterator, WRAPPED_STREAM_ATTR, False):
         return bind_output_guard_to_streaming_response(
             response,
             request_context=context,
             wrapped=True,
         )
     wrapped_iter = maybe_wrap_passthrough_responses_stream(
-        response.body_iterator,
+        iterator,
         request_context=context,
         upstream_response=upstream_response,
     )
-    if wrapped_iter is response.body_iterator:
+    if wrapped_iter is iterator:
         return bind_output_guard_to_streaming_response(
             response,
             request_context=context,
-            wrapped=False,
+            wrapped=bool(getattr(wrapped_iter, WRAPPED_STREAM_ATTR, False)),
         )
     guarded = StreamingResponse(
         wrapped_iter,
@@ -750,7 +816,7 @@ def maybe_reject_passthrough_responses_body(
     """No-op unless the selector matches and the JSON body is looped."""
     if not isinstance(body, Mapping):
         return body
-    selected = policy or resolve_output_guard_policy(request_context)
+    selected = policy or _resolve_output_guard_policy(request_context)
     if selected is None:
         return body
     return reject_nonstream_responses_body_if_repetitive(

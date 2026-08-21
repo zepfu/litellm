@@ -54,9 +54,6 @@ from litellm.proxy.pass_through_endpoints.aawm_request_policy.observability_meta
     _merge_litellm_metadata,
     _normalize_low_cardinality_tag_value,
 )
-from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
-    PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES,
-)
 from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
     load_text_watermark_config,
 )
@@ -106,8 +103,14 @@ _ANTHROPIC_ADAPTER_NVIDIA_API_KEY_ENV_VARS: tuple[str, ...] = (
     "NVIDIA_API_KEY",
 )
 
+# Keep in sync with pass_through_endpoints.PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES.
+# Do not import that parent-module constant at load time (RR-093 cycle).
+_PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES = frozenset(
+    {500, 502, 503, 504, 529}
+)
+
 _AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES = sorted(
-    PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES - {429}
+    _PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES - {429}
 )
 
 _AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES_DEFAULT = [

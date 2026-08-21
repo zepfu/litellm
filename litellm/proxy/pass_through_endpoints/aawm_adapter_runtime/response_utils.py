@@ -48,10 +48,6 @@ def _build_responses_response_from_adapter_response(
     """
     import json
 
-    from litellm.proxy.pass_through_endpoints.aawm_text_watermark.response_hooks import (
-        maybe_apply_passthrough_watermark_response,
-    )
-
     serialize = (
         serializer
         if serializer is not None

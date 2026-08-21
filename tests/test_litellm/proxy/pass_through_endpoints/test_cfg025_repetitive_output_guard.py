@@ -18,15 +18,22 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
+from fastapi.responses import StreamingResponse
 
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+    payload_validation as pv,
     repetitive_output as ro,
+    sse as sse_mod,
+    tool_call_restore as tcr,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     output_guard_config as ogc,
 )
 from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     grok_proxy_route,
+)
+from litellm.responses.litellm_completion_transformation.function_call_identity import (
+    resolve_responses_function_call_identity,
 )
 
 
@@ -695,3 +702,237 @@ def test_diagnostics_hash_is_stable_and_content_free() -> None:
     assert LOOP_CLAUSE not in dumped
     for word in LOOP_CLAUSE.split():
         assert word not in dumped
+
+
+# ---------------------------------------------------------------------------
+# RR-096: reconstructed streams must wrap the new iterator, not just the marker
+# RR-116: small deltas must not rebuild the whole scoring window every feed
+# ---------------------------------------------------------------------------
+
+_RR096_LEFTOVER = "SHOULD_NOT_BE_FORWARDED"
+
+
+def _marked_guarded_source() -> StreamingResponse:
+    """Source response with only the wrap marker copied, as inherit() does today."""
+
+    async def _empty():
+        if False:
+            yield b""
+
+    source = StreamingResponse(_empty(), media_type="text/event-stream")
+    return ro.bind_output_guard_to_streaming_response(
+        source,
+        request_context=_xai_passthrough_context(),
+        wrapped=True,
+    )
+
+
+async def _collect_response_bytes(response: Any) -> list[bytes]:
+    chunks: list[bytes] = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8"))
+    return chunks
+
+
+def _assert_guard_aborted_looping_stream(chunks: list[bytes]) -> list[dict[str, Any]]:
+    events = _decode_sse_events(chunks)
+    combined = b"".join(chunks)
+    assert any(event.get("type") == "response.failed" for event in events), (
+        "RR-096: reconstructed iterator was not guarded; emitted bytes never "
+        "included response.failed. Marker-only copy is not enough."
+    )
+    failed = next(event for event in events if event.get("type") == "response.failed")
+    error = failed["response"]["error"]
+    assert error["code"] == REPETITIVE_OUTPUT_CODE
+    assert _RR096_LEFTOVER.encode("utf-8") not in combined
+    return events
+
+
+@pytest.mark.asyncio
+async def test_rr096_collection_replay_reconstructed_stream_emits_guarded_bytes() -> None:
+    """Collection/replay rebuilds a new iterator; inherit() must wrap those bytes."""
+    looping = _looping_text(repeats=12)
+
+    async def _replay():
+        yield _output_text_delta(looping)
+        yield _output_text_delta(_RR096_LEFTOVER)
+        yield _sse_event(
+            "response.completed",
+            {"response": {"id": "resp_loop", "status": "completed", "output": []}},
+        )
+        yield b"data: [DONE]\n\n"
+
+    reconstructed = StreamingResponse(
+        _replay(),
+        media_type="text/event-stream",
+    )
+    inherited = ro.inherit_or_wrap_passthrough_streaming_response(
+        reconstructed,
+        source_response=_marked_guarded_source(),
+        request_context=_xai_passthrough_context(),
+    )
+    assert getattr(inherited, ro.WRAPPED_STREAM_ATTR, False)
+    chunks = await _collect_response_bytes(inherited)
+    _assert_guard_aborted_looping_stream(chunks)
+
+
+@pytest.mark.asyncio
+async def test_rr096_identity_restoration_reconstructed_stream_emits_guarded_bytes() -> None:
+    """Identity repair reconstructs SSE from a repaired body; inspect those bytes."""
+    looping = _looping_text(repeats=12)
+    call_id = "provider_call_1"
+    expected_item_id, _ = resolve_responses_function_call_identity(call_id)
+    body = {
+        "id": "resp_identity",
+        "status": "completed",
+        "output": [
+            {
+                "type": "function_call",
+                "id": "not-a-native-fc",
+                "call_id": call_id,
+                "name": "tool",
+                "arguments": "{}",
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": looping}],
+            },
+        ],
+    }
+    preserved = pv._preserve_distinct_function_call_identity_fields(body)
+    assert preserved is not body
+    assert preserved["output"][0]["call_id"] == call_id
+    assert preserved["output"][0]["id"] == expected_item_id
+
+    async def _reconstructed():
+        async for chunk in sse_mod._responses_sse_from_repaired_response_body(preserved):
+            encoded = chunk if isinstance(chunk, bytes) else str(chunk).encode("utf-8")
+            if b"response.completed" in encoded or b"[DONE]" in encoded:
+                continue
+            yield encoded
+        yield _output_text_delta(looping)
+        yield _output_text_delta(_RR096_LEFTOVER)
+        yield b"data: [DONE]\n\n"
+
+    reconstructed = StreamingResponse(
+        _reconstructed(),
+        media_type="text/event-stream",
+    )
+    inherited = ro.inherit_or_wrap_passthrough_streaming_response(
+        reconstructed,
+        source_response=_marked_guarded_source(),
+        request_context=_xai_passthrough_context(),
+    )
+    chunks = await _collect_response_bytes(inherited)
+    combined = b"".join(chunks)
+    assert expected_item_id.encode("utf-8") in combined
+    _assert_guard_aborted_looping_stream(chunks)
+
+
+@pytest.mark.asyncio
+async def test_rr096_tool_call_repair_reconstructed_stream_emits_guarded_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Custom-tool restore builds a new iterator; inherit() must guard its bytes."""
+    looping = _looping_text(repeats=12)
+    added = {
+        "type": "response.output_item.added",
+        "item": {"type": "function_call", "name": "my_tool", "call_id": "c1"},
+        "output_index": 0,
+    }
+
+    async def _gen():
+        yield (
+            "event: response.output_item.added\ndata: "
+            + json.dumps(added)
+            + "\n\n"
+        ).encode("utf-8")
+        yield _output_text_delta(looping)
+        yield _output_text_delta(_RR096_LEFTOVER)
+        yield b"data: [DONE]\n\n"
+
+    restore_fn = tcr._restore_adapted_custom_tool_calls_in_streaming_response
+    restore_globals = restore_fn.__globals__
+    monkeypatch.setitem(
+        restore_globals,
+        "_advertised_custom_tool_function_adapter_names",
+        lambda request_body, *, adapter_model: {"my_tool"},
+    )
+    monkeypatch.setitem(
+        restore_globals,
+        "_normalize_low_cardinality_tag_value",
+        lambda value: value.strip().lower() if isinstance(value, str) else None,
+    )
+    monkeypatch.setitem(
+        restore_globals,
+        "_parse_adapted_custom_tool_function_arguments",
+        lambda arguments: ("", None),
+    )
+    restored = restore_fn(
+        StreamingResponse(_gen(), media_type="text/event-stream"),
+        request_body={"tools": []},
+        adapter_model="m",
+    )
+    assert restored is not None
+    inherited = ro.inherit_or_wrap_passthrough_streaming_response(
+        restored,
+        source_response=_marked_guarded_source(),
+        request_context=_xai_passthrough_context(),
+    )
+    chunks = await _collect_response_bytes(inherited)
+    combined = b"".join(chunks)
+    assert b"custom_tool_call" in combined
+    _assert_guard_aborted_looping_stream(chunks)
+
+
+def test_rr116_small_deltas_reduce_whole_window_ngram_rebuilds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Small streaming deltas must not rebuild whole-window n-grams every feed.
+
+    Existing CFG-025 match fixtures above stay unchanged. This only asserts that
+    ``_best_repeated_ngram`` (the whole-window rebuild) is called sublinearly
+    in the number of one-word post-arming feeds.
+    """
+    original_best = ro._best_repeated_ngram
+    rebuilds = {"count": 0}
+
+    def _counting_best_repeated_ngram(*args: Any, **kwargs: Any):
+        rebuilds["count"] += 1
+        return original_best(*args, **kwargs)
+
+    monkeypatch.setattr(ro, "_best_repeated_ngram", _counting_best_repeated_ngram)
+
+    policy = _default_policy()
+    detector = ro.VisibleTextRepetitionDetector(policy)
+    unique_prefix = " ".join(
+        f"unique pantry item {index} spice rack {index} layout"
+        for index in range(1, 30)
+    )
+    assert detector.feed(unique_prefix) is None
+    assert rebuilds["count"] >= 1
+    rebuilds["count"] = 0
+
+    small_delta_count = 40
+    for index in range(small_delta_count):
+        assert detector.feed(f"extra{index} ", flush=False) is None
+    small_rebuilds = rebuilds["count"]
+
+    looping_detector = ro.VisibleTextRepetitionDetector(policy)
+    looping_match = looping_detector.feed(_looping_text(repeats=12))
+    assert looping_match is not None
+    assert looping_match.repeat_count >= 6
+    assert looping_match.coverage >= 0.72
+
+    assert small_rebuilds < small_delta_count, (
+        "RR-116: whole-window n-gram rebuild still runs on every small delta "
+        f"(rebuilds={small_rebuilds}, small_delta_count={small_delta_count})"
+    )
+    assert small_rebuilds <= max(2, small_delta_count // 4), (
+        "RR-116: expected at least a 4x reduction in whole-window n-gram "
+        f"rebuilds for one-word deltas (rebuilds={small_rebuilds}, "
+        f"small_delta_count={small_delta_count})"
+    )
+
+
