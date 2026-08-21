@@ -12,9 +12,11 @@ import time
 from typing import Any, Optional, Sequence
 
 from .durable import (
+    UNBOUNDED_EXPIRY,
     get_aawm_alias_routing_dual_cache,
     parse_aawm_alias_routing_durable_expiry,
     read_aawm_alias_routing_durable_payload,
+    read_aawm_alias_routing_state,
     write_aawm_alias_routing_durable_payload,
 )
 from .lane_keys import _CODEX_AUTO_AGENT_SESSION_AFFINITY_TTL_SECONDS
@@ -55,6 +57,126 @@ def _require_manager() -> AliasRoutingStateManager:
     return _manager
 
 
+def _live_cooldown_state_module():
+    """Return the live cooldown_state module, even if this function was rebound."""
+    import sys
+
+    return sys.modules.get(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_state"
+    ) or sys.modules.get(__name__)
+
+
+def _live_dual_cache():
+    """Resolve DualCache from the live cooldown_state / durable bindings.
+
+    Getters may be copied into another module's globals (pass-through install).
+    Looking up the live module attribute keeps ``patch.object`` working and
+    avoids NameError on helper names missing from the host globals.
+    """
+    live = _live_cooldown_state_module()
+    resolver = getattr(live, "get_aawm_alias_routing_dual_cache", None)
+    if callable(resolver):
+        return resolver()
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.durable import (
+        get_aawm_alias_routing_dual_cache as live_get,
+    )
+
+    return live_get()
+
+
+def _live_read_routing_state():
+    live = _live_cooldown_state_module()
+    reader = getattr(live, "read_aawm_alias_routing_state", None)
+    if callable(reader):
+        return reader
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.durable import (
+        read_aawm_alias_routing_state as live_read,
+    )
+
+    return live_read
+
+
+def _last_good_affinity(
+    last_good: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not isinstance(last_good, dict):
+        return None
+    hydrated = dict(last_good)
+    hydrated["affinity_state_source"] = last_good.get(
+        "affinity_state_source", "memory"
+    )
+    return hydrated
+
+
+def _affinity_from_routing_state_result(
+    *,
+    family: Any,
+    session_key: str,
+    last_good: Optional[dict[str, Any]],
+    result: dict[str, Any],
+) -> Optional[dict[str, Any]]:
+    """Map the D1-532 helper result onto an affinity payload.
+
+    Durable hits overwrite still-valid local pins. Confirmed misses and
+    degraded reads may keep last-good local without inventing a pin.
+    """
+    if not isinstance(result, dict):
+        return _last_good_affinity(last_good)
+    source = (
+        result.get("affinity_state_source")
+        or result.get("source")
+        or result.get("state_source")
+    )
+    payload = result.get("payload")
+    if source == "durable_cache" and isinstance(payload, dict):
+        expires_at_epoch = parse_aawm_alias_routing_durable_expiry(payload)
+        if expires_at_epoch is None:
+            return _last_good_affinity(last_good)
+        if expires_at_epoch is UNBOUNDED_EXPIRY:
+            remaining: float = float("inf")
+        else:
+            remaining = max(0.0, float(expires_at_epoch) - time.time())
+            if remaining <= 0:
+                return _last_good_affinity(last_good)
+        affinity: dict[str, Any] = {
+            "provider": payload.get("provider"),
+            "model": payload.get("model"),
+            "route_family": payload.get("route_family"),
+            "last_resort": bool(payload.get("last_resort")),
+            "expires_at_monotonic": (
+                float("inf")
+                if expires_at_epoch is UNBOUNDED_EXPIRY
+                else time.monotonic() + remaining
+            ),
+            "affinity_state_source": "durable_cache",
+        }
+        for field in (
+            "codex_oauth_account_label",
+            "codex_oauth_account_hash",
+            "codex_oauth_lane_key",
+            "config_hash",
+        ):
+            if field in payload:
+                affinity[field] = payload.get(field)
+        family.session_affinity_by_key[session_key] = dict(affinity)
+        bound_memory_map(
+            family.session_affinity_by_key, max_size=DEFAULT_MEMORY_STATE_MAX_SIZE
+        )
+        return dict(affinity)
+    if isinstance(payload, dict):
+        hydrated = dict(payload)
+        if source in {"degraded_local", "memory", "local_lease"}:
+            hydrated["affinity_state_source"] = (
+                "memory" if source == "local_lease" else source
+            )
+        else:
+            hydrated["affinity_state_source"] = hydrated.get(
+                "affinity_state_source", "memory"
+            )
+        return hydrated
+    return _last_good_affinity(last_good)
+
+
 # ---------------------------------------------------------------------------
 # Codex active cooldown
 # ---------------------------------------------------------------------------
@@ -62,22 +184,28 @@ def _require_manager() -> AliasRoutingStateManager:
 
 async def _get_codex_auto_agent_active_cooldown_state(
     cooldown_key: str,
+    *,
+    _dual_cache_fn=_live_dual_cache,
+    _read_state_fn=_live_read_routing_state,
 ) -> tuple[float, str]:
     mgr = _require_manager()
     family = mgr.codex
+    last_good_until = 0.0
     async with family.lock:
         now = time.monotonic()
         until = family.cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
         if until > now:
-            return max(0.0, until - now), "memory"
-        family.cooldown_until_monotonic_by_key.pop(cooldown_key, None)
-    # RR-054 #30: negative-cache durable misses so healthy keys do not Redis-hit every call.
-    async with family.lock:
+            last_good_until = until
+        else:
+            family.cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+        # RR-054 #30: negative-cache durable misses so healthy keys do not Redis-hit every call.
         neg_until = family.cooldown_negative_until_monotonic_by_key.get(cooldown_key, 0.0)
-        if neg_until > time.monotonic():
+        if neg_until > now and last_good_until <= now:
             return 0.0, "negative_cache"
-    dual_cache = get_aawm_alias_routing_dual_cache()
+    dual_cache = _dual_cache_fn()
     if dual_cache is None:
+        if last_good_until > time.monotonic():
+            return max(0.0, last_good_until - time.monotonic()), "memory"
         return 0.0, "local_fallback"
     # CFG-004 Defect 3: per-key read/clear barrier.  The barrier lock is
     # acquired BEFORE capturing the generation and held through the durable
@@ -86,19 +214,60 @@ async def _get_codex_auto_agent_active_cooldown_state(
     # deleting the durable key.  This guarantees that a read which started
     # before a clear cannot capture the new generation and hydrate the old
     # durable value, while unrelated keys remain fully concurrent.
+    # D1-532: durable-first helper is the shared read contract. A durable
+    # exception must not be treated as a confirmed miss / negative cache.
     _barrier = await mgr.key_barrier_lock(cooldown_key)
     async with _barrier:
         gen_before = family.get_generation(cooldown_key)
         async with mgr.lane_state_cache_lock:
-            durable_payload = await read_aawm_alias_routing_durable_payload(
-                alias_family="codex",
-                state_kind="cooldown",
-                state_key=cooldown_key,
-            )
+            durable_payload: Optional[dict[str, Any]] = None
+            if callable(getattr(dual_cache, "async_get_cache", None)):
+                read_aawm_alias_routing_state = _read_state_fn()
+                result = await read_aawm_alias_routing_state(
+                    alias_family="codex",
+                    state_kind="cooldown",
+                    state_key=cooldown_key,
+                    last_good_local=(
+                        {"expires_at_monotonic": last_good_until}
+                        if last_good_until > 0
+                        else None
+                    ),
+                    dual_cache=dual_cache,
+                )
+                source = result.get("source") if isinstance(result, dict) else None
+                if source == "durable_cache":
+                    payload = result.get("payload")
+                    if isinstance(payload, dict):
+                        durable_payload = payload
+                elif isinstance(result, dict) and result.get("durable_error"):
+                    if last_good_until > time.monotonic():
+                        return max(0.0, last_good_until - time.monotonic()), "memory"
+                    return 0.0, "local_fallback"
+                elif isinstance(result, dict) and result.get("confirmed_miss"):
+                    durable_payload = None
+                else:
+                    durable_payload = await read_aawm_alias_routing_durable_payload(
+                        alias_family="codex",
+                        state_kind="cooldown",
+                        state_key=cooldown_key,
+                    )
+            else:
+                # Compatibility: Wave5b patches a dummy DualCache plus the older
+                # payload reader. A cache without async_get_cache is not a Redis
+                # exception; keep the existing miss/negative-cache contract.
+                durable_payload = await read_aawm_alias_routing_durable_payload(
+                    alias_family="codex",
+                    state_kind="cooldown",
+                    state_key=cooldown_key,
+                )
             if durable_payload is None:
                 async with family.lock:
                     if family.get_generation(cooldown_key) != gen_before:
+                        if last_good_until > time.monotonic():
+                            return max(0.0, last_good_until - time.monotonic()), "memory"
                         return 0.0, "local_fallback"
+                    if last_good_until > time.monotonic():
+                        return max(0.0, last_good_until - time.monotonic()), "memory"
                     family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
                         time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
                     )
@@ -231,45 +400,47 @@ async def clear_alias_family_cooldown_state(
 
 async def _get_codex_auto_agent_session_affinity(
     session_key: Optional[str],
+    *,
+    _dual_cache_fn=_live_dual_cache,
+    _read_state_fn=_live_read_routing_state,
+    _map_fn=_affinity_from_routing_state_result,
 ) -> Optional[dict[str, Any]]:
     if session_key is None:
         return None
     mgr = _require_manager()
     family = mgr.codex
+    last_good: Optional[dict[str, Any]] = None
     async with family.lock:
         affinity = family.session_affinity_by_key.get(session_key)
         if isinstance(affinity, dict):
             expires_at = affinity.get("expires_at_monotonic", 0.0)
             if isinstance(expires_at, (int, float)) and expires_at > time.monotonic():
-                hydrated = dict(affinity)
-                hydrated["affinity_state_source"] = affinity.get("affinity_state_source", "memory")
-                return hydrated
-            family.session_affinity_by_key.pop(session_key, None)
-    dual_cache = get_aawm_alias_routing_dual_cache()
+                last_good = dict(affinity)
+            else:
+                family.session_affinity_by_key.pop(session_key, None)
+    dual_cache = _dual_cache_fn()
     if dual_cache is None:
-        return None
-    durable_payload = await read_aawm_alias_routing_durable_payload(
+        if last_good is None:
+            return None
+        hydrated = dict(last_good)
+        hydrated["affinity_state_source"] = last_good.get(
+            "affinity_state_source", "memory"
+        )
+        return hydrated
+    read_aawm_alias_routing_state = _read_state_fn()
+    result = await read_aawm_alias_routing_state(
         alias_family="codex",
         state_kind="affinity",
         state_key=session_key,
+        last_good_local=last_good,
+        dual_cache=dual_cache,
     )
-    if durable_payload is None:
-        return None
-    expires_at_epoch = parse_aawm_alias_routing_durable_expiry(durable_payload)
-    if expires_at_epoch is None:
-        return None
-    async with family.lock:
-        affinity = hydrate_affinity_memory(
-            memory_map=family.session_affinity_by_key,
-            session_key=session_key,
-            payload=durable_payload,
-            expires_at_epoch=expires_at_epoch,
-            max_size=DEFAULT_MEMORY_STATE_MAX_SIZE,
-        )
-        if not affinity:
-            return None
-        affinity["affinity_state_source"] = "durable_cache"
-        return dict(affinity)
+    return _map_fn(
+        family=family,
+        session_key=session_key,
+        last_good=last_good,
+        result=result,
+    )
 
 
 async def _set_codex_auto_agent_session_affinity(
@@ -333,35 +504,83 @@ async def _set_codex_auto_agent_session_affinity(
 
 async def _get_anthropic_auto_agent_active_cooldown_state(
     cooldown_key: str,
+    *,
+    _dual_cache_fn=_live_dual_cache,
+    _read_state_fn=_live_read_routing_state,
 ) -> tuple[float, str]:
     mgr = _require_manager()
     family = mgr.anthropic
+    last_good_until = 0.0
     async with family.lock:
         now = time.monotonic()
         until = family.cooldown_until_monotonic_by_key.get(cooldown_key, 0.0)
         if until > now:
-            return max(0.0, until - now), "memory"
-        family.cooldown_until_monotonic_by_key.pop(cooldown_key, None)
+            last_good_until = until
+        else:
+            family.cooldown_until_monotonic_by_key.pop(cooldown_key, None)
         neg_until = family.cooldown_negative_until_monotonic_by_key.get(cooldown_key, 0.0)
-        if neg_until > now:
+        if neg_until > now and last_good_until <= now:
             return 0.0, "negative_cache"
-    dual_cache = get_aawm_alias_routing_dual_cache()
+    dual_cache = _dual_cache_fn()
     if dual_cache is None:
+        if last_good_until > time.monotonic():
+            return max(0.0, last_good_until - time.monotonic()), "memory"
         return 0.0, "local_fallback"
     # CFG-004 Defect 3: per-key read/clear barrier (mirrors codex path).
+    # D1-532: durable-first helper is the shared read contract. A durable
+    # exception must not be treated as a confirmed miss / negative cache.
     _barrier = await mgr.key_barrier_lock(cooldown_key)
     async with _barrier:
         gen_before = family.get_generation(cooldown_key)
         async with mgr.lane_state_cache_lock:
-            durable_payload = await read_aawm_alias_routing_durable_payload(
-                alias_family="anthropic",
-                state_kind="cooldown",
-                state_key=cooldown_key,
-            )
+            durable_payload: Optional[dict[str, Any]] = None
+            if callable(getattr(dual_cache, "async_get_cache", None)):
+                read_aawm_alias_routing_state = _read_state_fn()
+                result = await read_aawm_alias_routing_state(
+                    alias_family="anthropic",
+                    state_kind="cooldown",
+                    state_key=cooldown_key,
+                    last_good_local=(
+                        {"expires_at_monotonic": last_good_until}
+                        if last_good_until > 0
+                        else None
+                    ),
+                    dual_cache=dual_cache,
+                )
+                source = result.get("source") if isinstance(result, dict) else None
+                if source == "durable_cache":
+                    payload = result.get("payload")
+                    if isinstance(payload, dict):
+                        durable_payload = payload
+                elif isinstance(result, dict) and result.get("durable_error"):
+                    if last_good_until > time.monotonic():
+                        return max(0.0, last_good_until - time.monotonic()), "memory"
+                    return 0.0, "local_fallback"
+                elif isinstance(result, dict) and result.get("confirmed_miss"):
+                    durable_payload = None
+                else:
+                    durable_payload = await read_aawm_alias_routing_durable_payload(
+                        alias_family="anthropic",
+                        state_kind="cooldown",
+                        state_key=cooldown_key,
+                    )
+            else:
+                # Compatibility: Wave5b patches a dummy DualCache plus the older
+                # payload reader. A cache without async_get_cache is not a Redis
+                # exception; keep the existing miss/negative-cache contract.
+                durable_payload = await read_aawm_alias_routing_durable_payload(
+                    alias_family="anthropic",
+                    state_kind="cooldown",
+                    state_key=cooldown_key,
+                )
             if durable_payload is None:
                 async with family.lock:
                     if family.get_generation(cooldown_key) != gen_before:
+                        if last_good_until > time.monotonic():
+                            return max(0.0, last_good_until - time.monotonic()), "memory"
                         return 0.0, "local_fallback"
+                    if last_good_until > time.monotonic():
+                        return max(0.0, last_good_until - time.monotonic()), "memory"
                     family.cooldown_negative_until_monotonic_by_key[cooldown_key] = (
                         time.monotonic() + _AAWM_COOLDOWN_NEGATIVE_CACHE_TTL_SECONDS
                     )
@@ -430,45 +649,47 @@ async def _set_anthropic_auto_agent_cooldown(
 
 async def _get_anthropic_auto_agent_session_affinity(
     session_key: Optional[str],
+    *,
+    _dual_cache_fn=_live_dual_cache,
+    _read_state_fn=_live_read_routing_state,
+    _map_fn=_affinity_from_routing_state_result,
 ) -> Optional[dict[str, Any]]:
     if session_key is None:
         return None
     mgr = _require_manager()
     family = mgr.anthropic
+    last_good: Optional[dict[str, Any]] = None
     async with family.lock:
         affinity = family.session_affinity_by_key.get(session_key)
         if isinstance(affinity, dict):
             expires_at = affinity.get("expires_at_monotonic", 0.0)
             if isinstance(expires_at, (int, float)) and expires_at > time.monotonic():
-                hydrated = dict(affinity)
-                hydrated["affinity_state_source"] = affinity.get("affinity_state_source", "memory")
-                return hydrated
-            family.session_affinity_by_key.pop(session_key, None)
-    dual_cache = get_aawm_alias_routing_dual_cache()
+                last_good = dict(affinity)
+            else:
+                family.session_affinity_by_key.pop(session_key, None)
+    dual_cache = _dual_cache_fn()
     if dual_cache is None:
-        return None
-    durable_payload = await read_aawm_alias_routing_durable_payload(
+        if last_good is None:
+            return None
+        hydrated = dict(last_good)
+        hydrated["affinity_state_source"] = last_good.get(
+            "affinity_state_source", "memory"
+        )
+        return hydrated
+    read_aawm_alias_routing_state = _read_state_fn()
+    result = await read_aawm_alias_routing_state(
         alias_family="anthropic",
         state_kind="affinity",
         state_key=session_key,
+        last_good_local=last_good,
+        dual_cache=dual_cache,
     )
-    if durable_payload is None:
-        return None
-    expires_at_epoch = parse_aawm_alias_routing_durable_expiry(durable_payload)
-    if expires_at_epoch is None:
-        return None
-    async with family.lock:
-        affinity = hydrate_affinity_memory(
-            memory_map=family.session_affinity_by_key,
-            session_key=session_key,
-            payload=durable_payload,
-            expires_at_epoch=expires_at_epoch,
-            max_size=DEFAULT_MEMORY_STATE_MAX_SIZE,
-        )
-        if not affinity:
-            return None
-        affinity["affinity_state_source"] = "durable_cache"
-        return dict(affinity)
+    return _map_fn(
+        family=family,
+        session_key=session_key,
+        last_good=last_good,
+        result=result,
+    )
 
 
 async def _set_anthropic_auto_agent_session_affinity(

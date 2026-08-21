@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import logging
 import os
 import time
-from typing import Callable, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 from litellm.proxy.aawm_alias_routing_redis import (
     get_dual_cache as _redis_get_dual_cache,
@@ -142,7 +142,7 @@ def _should_log_durable_failure(log_key: str) -> bool:
 
 def get_aawm_alias_routing_state_namespace() -> str:
     try:
-        return resolve_alias_routing_state_namespace()
+        return str(resolve_alias_routing_state_namespace())
     except Exception:
         raw = _clean(os.getenv("AAWM_ALIAS_ROUTING_STATE_NAMESPACE"))
         if raw is not None:
@@ -209,7 +209,10 @@ def get_aawm_alias_routing_dual_cache() -> Optional[object]:
             pass
     try:
         try:
-            dual_cache = _redis_get_dual_cache()
+            from litellm.proxy import aawm_alias_routing_redis as live_redis
+
+            redis_get_dual_cache = getattr(live_redis, "get_dual_cache", _redis_get_dual_cache)
+            dual_cache = redis_get_dual_cache() if callable(redis_get_dual_cache) else _redis_get_dual_cache()
             if (
                 dual_cache is not None
                 and getattr(dual_cache, "redis_cache", None) is not None
@@ -2885,3 +2888,95 @@ async def rollback_clear_transaction(
             key_count=num_cd,
             exception_classes=("LuaRollbackError",),
         )
+
+
+async def read_aawm_alias_routing_state(
+    *,
+    alias_family: str,
+    state_kind: str,
+    state_key: str,
+    last_good_local: Any = None,
+    dual_cache: Any = None,
+    **_kwargs: Any,
+) -> dict[str, Any]:
+    """Durable-first routing-state reader used by affinity and cooldown getters.
+
+    A successful Redis miss is ``confirmed_miss``. A Redis exception is
+    ``degraded_local`` / ``durable_error`` and must not be treated as empty.
+    Callers should pass the DualCache they already resolved so getter-level
+    patches and per-worker fakes are not lost to a second lookup.
+    """
+
+    def _local_payload() -> Any:
+        if isinstance(last_good_local, dict):
+            return dict(last_good_local)
+        return last_good_local
+
+    if dual_cache is None:
+        dual_cache = get_aawm_alias_routing_dual_cache()
+    if dual_cache is None:
+        if last_good_local:
+            payload = _local_payload()
+            return {
+                "payload": payload,
+                "source": "memory",
+                "affinity_state_source": "memory",
+                "confirmed_miss": False,
+                "durable_miss": False,
+                "durable_error": False,
+                "read_error": False,
+            }
+        return {
+            "payload": None,
+            "source": "unavailable",
+            "affinity_state_source": "unavailable",
+            "confirmed_miss": False,
+            "durable_miss": False,
+            "durable_error": False,
+            "read_error": False,
+        }
+
+    cache_key = build_aawm_alias_routing_durable_cache_key(
+        alias_family=alias_family,
+        state_kind=state_kind,
+        state_key=state_key,
+    )
+    try:
+        async_get_cache = getattr(dual_cache, "async_get_cache", None)
+        if not callable(async_get_cache):
+            raise RuntimeError("redis client missing async_get_cache")
+        payload = await async_get_cache(key=cache_key)
+    except Exception:
+        payload = _local_payload()
+        source = "degraded_local" if last_good_local else "durable_error"
+        return {
+            "payload": payload,
+            "source": source,
+            "affinity_state_source": source,
+            "confirmed_miss": False,
+            "durable_miss": False,
+            "durable_error": True,
+            "read_error": True,
+        }
+
+    if isinstance(payload, dict) and parse_aawm_alias_routing_durable_expiry(payload) is not None:
+        return {
+            "payload": dict(payload),
+            "source": "durable_cache",
+            "affinity_state_source": "durable_cache",
+            "confirmed_miss": False,
+            "durable_miss": False,
+            "durable_error": False,
+            "read_error": False,
+        }
+
+    local_payload = _local_payload() if last_good_local else None
+    return {
+        "payload": local_payload,
+        "source": "memory" if last_good_local else "memory",
+        "affinity_state_source": "memory" if last_good_local else "memory",
+        "confirmed_miss": True,
+        "durable_miss": True,
+        "durable_error": False,
+        "read_error": False,
+    }

@@ -610,6 +610,14 @@ class AlibabaAuthError(ValueError):
     """Invalid or unavailable Alibaba RAM / console-token configuration."""
 
 
+class SidecarAuthPathError(ValueError):
+    """Sanitized sidecar auth-path configuration failure."""
+
+    def __init__(self, message: str, *, telemetry_class: str = "auth") -> None:
+        super().__init__(message)
+        self.telemetry_class = telemetry_class
+
+
 AlibabaWebAuthError = AlibabaAuthError
 
 
@@ -1575,6 +1583,22 @@ def _first_non_empty_env(*names: str) -> Optional[str]:
     return None
 
 
+def _maybe_reject_default_auth_source(source: str) -> None:
+    """Refuse HOME/default sidecar paths when explicit auth paths are required.
+
+    The raised message is path-sanitized: it must not include HOME or the
+    default ``~/.grok`` / ``~/.kimi-code`` / ``~/.codex`` / ``~/.litellm/xai``
+    fragments.
+    """
+    if source != "default":
+        return
+    if not _env_bool("AAWM_REQUIRE_EXPLICIT_AUTH_PATHS", False):
+        return
+    raise SidecarAuthPathError(
+        "Explicit sidecar auth path required (telemetry_class=auth)"
+    )
+
+
 def _resolve_grok_sidecar_auth_file(
     explicit_auth_file: Optional[str],
 ) -> tuple[str, str]:
@@ -1582,6 +1606,7 @@ def _resolve_grok_sidecar_auth_file(
         explicit_auth_file,
         value_getter=os.getenv,
     )
+    _maybe_reject_default_auth_source(resolution.source)
     return str(resolution.path), resolution.source
 
 
@@ -1611,6 +1636,7 @@ def _resolve_codex_sidecar_auth_file(
         if token_dir:
             return str(Path(token_dir).expanduser() / "auth.json"), env_name
 
+    _maybe_reject_default_auth_source("default")
     return DEFAULT_CODEX_AUTH_FILE, "default"
 
 
@@ -1655,6 +1681,7 @@ def _resolve_xai_oauth_sidecar_auth_file(
         if env_value:
             return str(Path(env_value).expanduser()), env_name
 
+    _maybe_reject_default_auth_source("default")
     return DEFAULT_XAI_OAUTH_AUTH_FILE, "default"
 
 
@@ -1674,6 +1701,7 @@ def _resolve_kimi_oauth_sidecar_auth_file(
     if explicit_value and explicit_value != DEFAULT_KIMI_OAUTH_AUTH_FILE:
         return str(Path(explicit_value).expanduser()), "explicit"
 
+    _maybe_reject_default_auth_source("default")
     return DEFAULT_KIMI_OAUTH_AUTH_FILE, "default"
 
 

@@ -65,11 +65,52 @@ def _env_is_set(name: str) -> bool:
     return value is not None and bool(str(value).strip())
 
 
-def resolve_alias_routing_state_namespace() -> str:
+class AliasRoutingStateNamespace:
+    """String-comparable namespace that also reports how it was resolved.
+
+    Existing callers compare this value to a plain string. D1-552 requires the
+    source to be distinguishable: ``explicit``, ``observability_derived``, or
+    ``default``. This is intentionally not a ``str`` subclass so callers can
+    inspect ``namespace_source`` instead of treating the result as a bare label.
+    """
+
+    __slots__ = ("namespace", "namespace_source")
+
+    def __init__(
+        self, namespace: str, namespace_source: str = "default"
+    ) -> None:
+        self.namespace = str(namespace)
+        self.namespace_source = namespace_source
+
+    @property
+    def source(self) -> str:
+        return self.namespace_source
+
+    def __str__(self) -> str:
+        return self.namespace
+
+    def __repr__(self) -> str:
+        return (
+            f"AliasRoutingStateNamespace({self.namespace!r}, "
+            f"{self.namespace_source!r})"
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, AliasRoutingStateNamespace):
+            return self.namespace == other.namespace
+        if isinstance(other, str):
+            return self.namespace == other
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self.namespace)
+
+
+def resolve_alias_routing_state_namespace() -> AliasRoutingStateNamespace:
     """Resolve an explicit or environment-isolated routing-state namespace."""
     explicit_namespace = (os.getenv("AAWM_ALIAS_ROUTING_STATE_NAMESPACE") or "").strip()
     if explicit_namespace:
-        return explicit_namespace
+        return AliasRoutingStateNamespace(explicit_namespace, "explicit")
 
     runtime_environment = (
         (
@@ -81,10 +122,16 @@ def resolve_alias_routing_state_namespace() -> str:
         .lower()
     )
     if runtime_environment in {"dev", "development"}:
-        return "aawm-routing-dev-v1"
+        return AliasRoutingStateNamespace(
+            "aawm-routing-dev-v1", "observability_derived"
+        )
     if runtime_environment in {"prod", "production"}:
-        return "aawm-routing-prod-v1"
-    return AAWMAliasRoutingRedisManager.DEFAULT_NAMESPACE
+        return AliasRoutingStateNamespace(
+            "aawm-routing-prod-v1", "observability_derived"
+        )
+    return AliasRoutingStateNamespace(
+        AAWMAliasRoutingRedisManager.DEFAULT_NAMESPACE, "default"
+    )
 
 
 class AAWMAliasRoutingRedisManager:
@@ -128,6 +175,7 @@ class AAWMAliasRoutingRedisManager:
         # Set when initialize() has observed a configured Redis that fell back to
         # memory so status/tests can tell self-heal is armed without inspecting tasks.
         self._self_heal_armed: bool = False
+        self._local_state_reconciled: bool = False
 
     @staticmethod
     def _parse_bool(value: Optional[str]) -> bool:
@@ -177,7 +225,7 @@ class AAWMAliasRoutingRedisManager:
         )
 
     def _load_env_config(self) -> Dict[str, Any]:
-        namespace = resolve_alias_routing_state_namespace()
+        namespace = str(resolve_alias_routing_state_namespace())
         socket_timeout = self._resolve_alias_routing_redis_socket_timeout()
 
         redis_url = os.getenv("AAWM_ALIAS_ROUTING_REDIS_URL")
@@ -234,7 +282,7 @@ class AAWMAliasRoutingRedisManager:
         return tuple(sorted(config.items()))
 
     @staticmethod
-    def _build_key_prefix(namespace: str) -> str:
+    def _build_key_prefix(namespace: object) -> str:
         return f"aawm:alias-routing:{namespace}"
 
     @classmethod
@@ -497,6 +545,7 @@ class AAWMAliasRoutingRedisManager:
             return True, None, None
 
         if cache is not None and not self._is_client_closing_locked(cache):
+            was_degraded = self._self_heal_armed or self._reachable is False
             replaced_cache = None
             if self._cache is not None and self._cache is not cache:
                 replaced_cache = self._take_cached_client_locked()
@@ -508,6 +557,8 @@ class AAWMAliasRoutingRedisManager:
             self._error_type = None
             self._initialized = True
             self._self_heal_armed = False
+            if was_degraded:
+                self.reconcile_local_routing_state()
             return False, self._claim_self_heal_task_locked(), replaced_cache
 
         if cache is not None:
@@ -664,6 +715,8 @@ class AAWMAliasRoutingRedisManager:
                         "AAWM alias routing Redis self-heal restored durable cache."
                     )
                     self._self_heal_armed = False
+                    if not self._local_state_reconciled:
+                        self.reconcile_local_routing_state()
                     return
         except asyncio.CancelledError:
             raise
@@ -686,6 +739,7 @@ class AAWMAliasRoutingRedisManager:
             self._namespace = self.DEFAULT_NAMESPACE
             self._config_signature = None
             self._self_heal_armed = False
+            self._local_state_reconciled = False
 
         await self._finish_self_heal_task(task_to_stop)
         await self._disconnect_owned_client(
@@ -697,7 +751,12 @@ class AAWMAliasRoutingRedisManager:
         """Return sanitized runtime status for alias-routing state cache."""
         # Report the same live namespace/key prefix durable key construction uses.
         # Do not reuse the initialize-time snapshot; runtime env can drift.
-        namespace = resolve_alias_routing_state_namespace() or self.DEFAULT_NAMESPACE
+        resolution = resolve_alias_routing_state_namespace()
+        namespace = str(resolution) if resolution else self.DEFAULT_NAMESPACE
+        namespace_source = (
+            getattr(resolution, "namespace_source", None)
+            or getattr(resolution, "source", None)
+        )
         mode = "redis" if self._is_cache_attached() else "memory"
         self_heal_active = bool(
             self._self_heal_armed
@@ -711,9 +770,11 @@ class AAWMAliasRoutingRedisManager:
             "state_source": self._resolve_state_source(),
             "reachable": self._reachable,
             "namespace": namespace,
+            "namespace_source": namespace_source,
             "key_prefix": self._build_key_prefix(namespace),
             "error_type": self._error_type,
             "self_heal_active": self_heal_active,
+            "local_state_reconciled": self._local_state_reconciled,
         }
 
     def reset(self) -> None:
@@ -736,6 +797,50 @@ class AAWMAliasRoutingRedisManager:
         self._namespace = self.DEFAULT_NAMESPACE
         self._config_signature = None
         self._self_heal_armed = False
+        self._local_state_reconciled = False
+
+    def reconcile_local_routing_state(self) -> None:
+        """Invalidate process-local affinity/cooldown maps after Redis reattach.
+
+        Outage-window local pins must not remain authoritative once durable
+        cache is reachable again. Callers then rehydrate from Redis.
+        """
+        try:
+            from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
+                alias_routing_state,
+            )
+        except Exception:
+            alias_routing_state = None
+        managers = []
+        if alias_routing_state is not None:
+            managers.append(alias_routing_state)
+        try:
+            from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+                cooldown_state as cooldown_state_mod,
+            )
+
+            bound = getattr(cooldown_state_mod, "_manager", None)
+            if bound is not None and bound not in managers:
+                managers.append(bound)
+        except Exception:
+            pass
+        for manager in managers:
+            for family_name in ("codex", "anthropic"):
+                family = getattr(manager, family_name, None)
+                if family is None:
+                    continue
+                session_map = getattr(family, "session_affinity_by_key", None)
+                if session_map is not None:
+                    session_map.clear()
+                cooldown_map = getattr(family, "cooldown_until_monotonic_by_key", None)
+                if cooldown_map is not None:
+                    cooldown_map.clear()
+                negative_map = getattr(
+                    family, "cooldown_negative_until_monotonic_by_key", None
+                )
+                if negative_map is not None:
+                    negative_map.clear()
+        self._local_state_reconciled = True
 
 
 aawm_alias_routing_redis_manager = AAWMAliasRoutingRedisManager()

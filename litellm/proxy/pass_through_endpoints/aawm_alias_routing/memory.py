@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import time
-from typing import MutableMapping, Optional, TypeVar
+from typing import Any, MutableMapping, Optional, TypeVar
 
 from .types import Payload
 
 DEFAULT_MEMORY_STATE_MAX_SIZE = 4096
 MapKeyT = TypeVar("MapKeyT")
 MapValueT = TypeVar("MapValueT")
+
+expired_prune_count = 0
+fifo_eviction_count = 0
 
 
 def bound_memory_map(
@@ -18,12 +21,40 @@ def bound_memory_map(
     max_size: int = DEFAULT_MEMORY_STATE_MAX_SIZE,
 ) -> None:
     """FIFO-trim a process-local map to ``max_size`` entries."""
+    global fifo_eviction_count
     while len(cache) > max_size:
         try:
             oldest = next(iter(cache))
         except StopIteration:
             break
         cache.pop(oldest, None)
+        fifo_eviction_count += 1
+
+
+def prune_expired_memory_map(
+    cache: MutableMapping[Any, Any],
+    now: Optional[float] = None,
+) -> None:
+    """Drop unread expired monotonic entries without requiring a later get()."""
+    global expired_prune_count
+    now_mono = time.monotonic() if now is None else float(now)
+    expired_keys: list[Any] = []
+    for key, value in list(cache.items()):
+        until: Optional[float] = None
+        if isinstance(value, (int, float)):
+            until = float(value)
+        elif isinstance(value, dict):
+            raw = value.get("expires_at_monotonic")
+            if isinstance(raw, (int, float)):
+                until = float(raw)
+        if until is not None and until <= now_mono:
+            expired_keys.append(key)
+    for key in expired_keys:
+        cache.pop(key, None)
+        expired_prune_count += 1
+
+
+prune_expired_monotonic_entries = prune_expired_memory_map
 
 
 def hydrate_cooldown_memory(

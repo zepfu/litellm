@@ -450,9 +450,11 @@ async def test_aawm_alias_routing_redis_module_wrappers_share_health_status(
                 "state_source": "durable_cache",
                 "reachable": True,
                 "namespace": "wrapper-plane",
+                "namespace_source": "explicit",
                 "key_prefix": "aawm:alias-routing:wrapper-plane",
                 "error_type": None,
                 "self_heal_active": False,
+                "local_state_reconciled": False,
             }
 
             # Production health helper re-maps status fields and currently omits
