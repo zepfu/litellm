@@ -162,11 +162,14 @@ _CORE_OWNER_ATTRIBUTE_KEYS = (
     "credential_affinity",
 )
 
-# Same-hosted-provider fields stay mutable last-used attributes. They are
-# stored on the owner record but never part of hard owner identity.
+# Same-hosted-provider last-used fields stored on the owner record.
+# Model stays mutable for every hosted-provider match. Account identity is
+# mutable only for the OPENAI-020 OpenAI hosted-provider contract.
 _MUTABLE_SAME_HOSTED_PROVIDER_ATTRIBUTE_KEYS = (
     "model",
     "requested_model",
+)
+_MUTABLE_OPENAI_ACCOUNT_ATTRIBUTE_KEYS = (
     "account_hash",
     "account_label",
     "account_lane",
@@ -594,6 +597,20 @@ def _hosted_providers_match(
     left_host = _hosted_provider_from_attributes(left)
     right_host = _hosted_provider_from_attributes(right)
     return bool(left_host) and left_host == right_host
+
+
+def _same_hosted_provider_account_identity_is_mutable(
+    left: Mapping[str, Any],
+    right: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Account label/hash/lane are mutable only on the OpenAI OPENAI-020 contract."""
+
+    if _accounts_are_interchangeable(left, right):
+        return True
+    return (
+        _hosted_providers_match(left, right)
+        and _hosted_provider_from_attributes(left) == "openai"
+    )
 
 
 def _normalized_owner_id_endpoint_state(attrs: Mapping[str, Any]) -> tuple[str, str]:
@@ -1024,13 +1041,8 @@ def _attributes_exactly_equal(
         for key in _MUTABLE_SAME_HOSTED_PROVIDER_ATTRIBUTE_KEYS:
             left_core.pop(key, None)
             right_core.pop(key, None)
-    elif _accounts_are_interchangeable(left_core, right_core):
-        for key in (
-            "account_hash",
-            "account_label",
-            "account_lane",
-            "credential_affinity",
-        ):
+    if _same_hosted_provider_account_identity_is_mutable(left_core, right_core):
+        for key in _MUTABLE_OPENAI_ACCOUNT_ATTRIBUTE_KEYS:
             left_core.pop(key, None)
             right_core.pop(key, None)
     if _managed_direct_openai_owner_shapes_are_equivalent(left_core, right_core):
@@ -1065,7 +1077,6 @@ def _compatibility_mismatch_reason(
     if not requested_attributes:
         return None
     requested_core = _core_owner_attributes(requested_attributes)
-    hosted_match = _hosted_providers_match(owner_attrs, requested_core)
     if require_exact_attributes:
         if not _attributes_exactly_equal(left=owner_attrs, right=requested_core):
             return "session_owner: requested route does not exactly match owner"
@@ -1090,8 +1101,13 @@ def _compatibility_mismatch_reason(
         own = _clean_optional_str(owner_attrs.get(key))
         if req is not None and own is not None and req != own:
             return f"session_owner: {key} mismatch owner={own} requested={req}"
-    if not hosted_match:
-        for key in ("account_hash", "account_lane", "account_label"):
+    if not _same_hosted_provider_account_identity_is_mutable(
+        owner_attrs,
+        requested_core,
+    ):
+        for key in _MUTABLE_OPENAI_ACCOUNT_ATTRIBUTE_KEYS:
+            if key == "credential_affinity":
+                continue
             req = _clean_optional_str(requested_core.get(key))
             own = _clean_optional_str(owner_attrs.get(key))
             if req is not None and own is not None and req != own:
@@ -1513,8 +1529,9 @@ async def guard_session_owner_before_egress(  # noqa: PLR0915
         session_identity=cleaned
     )
     # When the caller supplied known owner identity, pin exactly on hard
-    # owner identity (hosted provider + endpoint/state). Model and OpenAI
-    # account remain mutable last-used attributes.
+    # owner identity (hosted provider + endpoint/state). Model stays
+    # mutable for every hosted-provider match; account identity stays
+    # mutable only for the OpenAI OPENAI-020 contract.
     if attrs and not require_exact_attributes:
         hosted = _hosted_provider_from_attributes(attrs)
         if hosted and all(
