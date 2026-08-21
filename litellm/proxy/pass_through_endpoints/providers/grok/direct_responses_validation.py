@@ -3,6 +3,10 @@
 Reuses Grok Composer repair. Direct Grok is not alias routing: malformed
 literal tool text is a retryable 502 with content-free intake and no Redis
 cooldown.
+
+Streaming repair is bounded best-effort: a marker inside the peek window
+repairs; a marker after the peek window is forwarded; the collection
+ceiling rejects a marked stream that never completes inside the bound.
 """
 
 from __future__ import annotations
@@ -294,6 +298,14 @@ def _repair_or_reject_response_body(
     return None
 
 
+def _copy_headers_without_content_length(headers: Any) -> dict[str, Any]:
+    copied = dict(headers or {})
+    for name in list(copied):
+        if str(name).lower() == "content-length":
+            copied.pop(name, None)
+    return copied
+
+
 def _streaming_response_from_chunks(
     chunks: list[Any],
     *,
@@ -305,7 +317,7 @@ def _streaming_response_from_chunks(
 
     return StreamingResponse(
         _replay(),
-        headers=dict(response.headers),
+        headers=_copy_headers_without_content_length(response.headers),
         status_code=response.status_code,
         media_type=response.media_type or "text/event-stream",
     )
@@ -340,6 +352,13 @@ async def _validate_direct_grok_streaming_response(
     request_body: Optional[dict[str, Any]],
     endpoint: Optional[str] = None,
 ) -> StreamingResponse:
+    """Bound-peek direct Grok SSE and repair literal tool-call text.
+
+    Marker inside the peek window: collect to the ceiling, repair, re-emit.
+    Marker after the peek window: forward remaining bytes unchanged
+    (bounded best-effort; the client retry owns the rest).
+    Collection ceiling: reject a marked stream that is still incomplete.
+    """
     host = _passthrough_host()
     max_chunks = host._AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_CHUNKS
     max_bytes = host._AAWM_VALIDATE_RESPONSES_STREAM_MAX_BUFFERED_BYTES
@@ -424,7 +443,7 @@ async def _validate_direct_grok_streaming_response(
         return _streaming_response_from_chunks(collected_chunks, response=response)
     return StreamingResponse(
         host._responses_sse_from_repaired_response_body(repaired_body),
-        headers=dict(response.headers),
+        headers=_copy_headers_without_content_length(response.headers),
         status_code=response.status_code,
         media_type=response.media_type or "text/event-stream",
     )
@@ -455,7 +474,7 @@ def _validate_direct_grok_json_response(
         content=json.dumps(repaired_body),
         media_type=response.media_type or "application/json",
         status_code=response.status_code,
-        headers=dict(response.headers),
+        headers=_copy_headers_without_content_length(response.headers),
     )
 
 

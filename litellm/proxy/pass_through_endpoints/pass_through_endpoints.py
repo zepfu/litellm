@@ -3910,9 +3910,11 @@ async def pass_through_request(  # noqa: PLR0915
     _parsed_body: Optional[dict] = None
     # kwargs for pass through endpoint, contains metadata, litellm_params, call_type, litellm_call_id, passthrough_logging_payload
     kwargs: Optional[dict] = None
+    logging_obj: Optional[Any] = None
     error_log_context: Optional[Dict[str, Any]] = None
     raw_body: Optional[bytes] = None
     responses_function_name_rewrite: Optional[ResponsesFunctionNameRewrite] = None
+    _transfer_identity: Optional[dict[str, Any]] = None
     route_custom_headers = dict(custom_headers or {})
     headers: Dict[str, Any] = dict(route_custom_headers)
     retryable_status_codes = {
@@ -4862,11 +4864,21 @@ async def pass_through_request(  # noqa: PLR0915
             headers=response.headers,
             custom_headers=custom_headers,
         )
-        if (
-            responses_function_name_rewrite is not None
-            and responses_function_name_rewrite.changed
-        ):
-            response_headers.pop("content-length", None)
+        # Reconstructed bodies (watermark, reasoning stamp, function-name rewrite)
+        # must not keep the upstream content-length.
+        response_headers.pop("content-length", None)
+        try:
+            from litellm.proxy.aawm_session_transfer.hooks import (
+                publish_transfer_terminal,
+            )
+
+            if not stream and _transfer_identity:
+                await publish_transfer_terminal(_transfer_identity, "completed")
+        except Exception:
+            verbose_proxy_logger.debug(
+                "Failed to publish session-transfer completed phase",
+                exc_info=True,
+            )
         return Response(
             content=content,
             status_code=response.status_code,
@@ -5203,6 +5215,35 @@ async def pass_through_request(  # noqa: PLR0915
                 )
 
         #########################################################
+
+        try:
+            from litellm.proxy.aawm_session_transfer.hooks import (
+                build_transfer_identity,
+                publish_transfer_terminal,
+            )
+
+            if not stream:
+                identity = _transfer_identity
+                if not identity:
+                    identity = build_transfer_identity(
+                        request=request,
+                        request_body=_parsed_body
+                        if isinstance(_parsed_body, dict)
+                        else None,
+                        logging_obj=logging_obj,
+                        kwargs=kwargs,
+                        litellm_call_id=litellm_call_id,
+                        url_route=str(url) if url is not None else None,
+                        custom_llm_provider=custom_llm_provider,
+                        stream_path="pass_through",
+                    )
+                if identity:
+                    await publish_transfer_terminal(identity, "failed")
+        except Exception:
+            verbose_proxy_logger.debug(
+                "Failed to publish session-transfer failed phase",
+                exc_info=True,
+            )
 
         if isinstance(e, HTTPException):
             proxy_exc = ProxyException(
