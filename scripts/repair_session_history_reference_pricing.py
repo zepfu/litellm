@@ -9,14 +9,20 @@ name matches the configured target. Token fields that are already ``None`` stay
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
-from typing import Any, Mapping, Optional
+from pathlib import Path
+from typing import Any, Mapping, Optional, Sequence
 
 import psycopg
+import psycopg.rows
 
 DEFAULT_TARGET_DB_NAME = "aawm_tristore"
 DEFAULT_SELECT_LIMIT = 500
+DEFAULT_BATCH_SIZE = 50
+REPO_ROOT = Path(__file__).resolve().parents[1]
+_COST_MAP_PATH = REPO_ROOT / "model_prices_and_context_window.json"
 
 _TOKEN_FIELDS = (
     "input_tokens",
@@ -26,6 +32,31 @@ _TOKEN_FIELDS = (
     "prompt_tokens",
     "completion_tokens",
 )
+
+_SELECT_CANDIDATE_SQL = """
+SELECT
+    id,
+    provider,
+    model,
+    inbound_model_alias,
+    input_tokens,
+    output_tokens,
+    cache_read_input_tokens,
+    cache_creation_input_tokens,
+    response_cost_usd,
+    metadata
+FROM public.session_history
+WHERE 1=1
+"""
+
+_UPDATE_SQL = """
+UPDATE public.session_history
+SET reference_cost_usd = %s,
+    actual_invoice_cost_known = FALSE
+WHERE id = %s
+"""
+
+_MODEL_COST_MAP: Optional[dict[str, Any]] = None
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -58,7 +89,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=50,
+        default=DEFAULT_BATCH_SIZE,
         help="Update batch size used only with --apply.",
     )
     parser.add_argument(
@@ -140,6 +171,86 @@ def _copy_token_fields(row: Mapping[str, Any], repaired: dict[str, Any]) -> None
         repaired[field] = row.get(field)
 
 
+def _load_model_cost_map() -> dict[str, Any]:
+    global _MODEL_COST_MAP
+    if _MODEL_COST_MAP is not None:
+        return _MODEL_COST_MAP
+    try:
+        payload = json.loads(_COST_MAP_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    _MODEL_COST_MAP = payload if isinstance(payload, dict) else {}
+    return _MODEL_COST_MAP
+
+
+def _lookup_model_info(row: Mapping[str, Any]) -> Optional[Mapping[str, Any]]:
+    model = str(row.get("model") or "").strip()
+    provider = str(row.get("provider") or "").strip()
+    if not model:
+        return None
+    cost_map = _load_model_cost_map()
+    if not cost_map:
+        return None
+
+    candidates: list[str] = []
+    if provider:
+        provider_prefix = f"{provider}/"
+        if model.startswith(provider_prefix):
+            candidates.append(model)
+            stripped = model[len(provider_prefix) :]
+            if stripped:
+                candidates.append(stripped)
+        else:
+            candidates.append(f"{provider_prefix}{model}")
+            candidates.append(model)
+    else:
+        candidates.append(model)
+
+    lookup = {key.lower(): key for key in cost_map if isinstance(key, str)}
+    for candidate in candidates:
+        info = cost_map.get(candidate)
+        if isinstance(info, dict):
+            return info
+        matched = lookup.get(candidate.lower())
+        matched_info = cost_map.get(matched) if matched is not None else None
+        if isinstance(matched_info, dict):
+            return matched_info
+    return None
+
+
+def _first_present_token_count(row: Mapping[str, Any], *fields: str) -> Optional[float]:
+    for field in fields:
+        if field not in row:
+            continue
+        value = _as_optional_number(row.get(field))
+        if value is not None:
+            return value
+    return None
+
+
+def _calculate_reference_cost_usd(row: Mapping[str, Any]) -> Optional[float]:
+    """Provider-equivalent reference cost from stored tokens and the cost map."""
+    model_info = _lookup_model_info(row)
+    if not model_info:
+        return None
+    if (
+        "input_cost_per_token" not in model_info
+        and "output_cost_per_token" not in model_info
+    ):
+        return None
+
+    prompt_tokens = _first_present_token_count(row, "input_tokens", "prompt_tokens")
+    completion_tokens = _first_present_token_count(
+        row, "output_tokens", "completion_tokens"
+    )
+    if prompt_tokens is None and completion_tokens is None:
+        return None
+
+    input_rate = _as_optional_number(model_info.get("input_cost_per_token")) or 0.0
+    output_rate = _as_optional_number(model_info.get("output_cost_per_token")) or 0.0
+    return (prompt_tokens or 0.0) * input_rate + (completion_tokens or 0.0) * output_rate
+
+
 def _build_repaired_row(row: dict) -> dict:
     """Return a repaired pricing dict. Never invent invoice cost or token guesses."""
     repaired: dict[str, Any] = {
@@ -160,8 +271,14 @@ def _build_repaired_row(row: dict) -> dict:
         repaired["reference_cost_usd"] = None
         return repaired
 
+    reference_cost = _calculate_reference_cost_usd(row)
+    if reference_cost is None:
+        repaired["skip_reason"] = "unpriced"
+        repaired["reference_cost_usd"] = None
+        return repaired
+
     repaired["skip_reason"] = None
-    repaired["reference_cost_usd"] = row.get("reference_cost_usd")
+    repaired["reference_cost_usd"] = reference_cost
     return repaired
 
 
@@ -178,10 +295,83 @@ def _current_database_name(cur: Any) -> str:
     return str(fetched)
 
 
+def _positive_int(value: Any, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed
+
+
+def _inspect_limit(args: argparse.Namespace) -> int:
+    limit = _positive_int(getattr(args, "limit", None), DEFAULT_SELECT_LIMIT)
+    return max(limit, 0)
+
+
+def _update_batch_size(args: argparse.Namespace) -> int:
+    batch_size = _positive_int(getattr(args, "batch_size", None), DEFAULT_BATCH_SIZE)
+    return batch_size if batch_size > 0 else DEFAULT_BATCH_SIZE
+
+
+def _select_candidate_rows(cur: Any, args: argparse.Namespace) -> list[dict[str, Any]]:
+    sql = _SELECT_CANDIDATE_SQL
+    params: list[Any] = []
+    if args.provider:
+        sql += " AND provider = %s"
+        params.append(args.provider)
+    if args.session_id:
+        sql += " AND session_id = %s"
+        params.append(args.session_id)
+    sql += " ORDER BY id ASC LIMIT %s"
+    params.append(_inspect_limit(args))
+    cur.execute(sql, tuple(params))
+    fetched = cur.fetchall() or []
+    rows: list[dict[str, Any]] = []
+    for item in fetched:
+        if isinstance(item, Mapping):
+            rows.append(dict(item))
+        elif isinstance(item, (tuple, list)):
+            rows.append({"id": item[0] if item else None})
+    return rows
+
+
+def _repair_update_params(row: Mapping[str, Any]) -> Optional[tuple[float, Any]]:
+    repaired = _build_repaired_row(dict(row))
+    if repaired.get("skip_reason"):
+        return None
+    reference_cost = _as_optional_number(repaired.get("reference_cost_usd"))
+    row_id = repaired.get("id", row.get("id"))
+    if reference_cost is None or row_id is None:
+        return None
+    return (float(reference_cost), row_id)
+
+
+def _batched(items: Sequence[tuple[float, Any]], batch_size: int) -> list[list[tuple[float, Any]]]:
+    size = batch_size if batch_size > 0 else DEFAULT_BATCH_SIZE
+    return [list(items[index : index + size]) for index in range(0, len(items), size)]
+
+
+def _persist_repairs(
+    cur: Any,
+    updates: Sequence[tuple[float, Any]],
+    *,
+    batch_size: int,
+) -> int:
+    written = 0
+    for batch in _batched(updates, batch_size):
+        if not batch:
+            continue
+        cur.executemany(_UPDATE_SQL, batch)
+        written += len(batch)
+    return written
+
+
 def _run_repair(args: argparse.Namespace) -> dict:
     """Connect, guard the target DB on --apply, and never write on dry-run."""
     dsn = _build_aawm_admin_dsn()
-    conn = psycopg.connect(dsn)
+    conn = psycopg.connect(dsn, row_factory=psycopg.rows.dict_row)
     try:
         cur = conn.cursor()
         try:
@@ -191,18 +381,29 @@ def _run_repair(args: argparse.Namespace) -> dict:
                     f"Refusing to apply session_history reference pricing repair "
                     f"on database {current_db!r}; expected {args.target_db_name!r}."
                 )
-            if not args.apply:
-                return {
-                    "mode": "dry_run",
-                    "current_database": current_db,
-                    "target_db_name": args.target_db_name,
-                    "written": 0,
-                }
+            rows = _select_candidate_rows(cur, args)
+            updates = [
+                params
+                for params in (_repair_update_params(row) for row in rows)
+                if params is not None
+            ]
+            written = 0
+            if args.apply:
+                written = _persist_repairs(
+                    cur,
+                    updates,
+                    batch_size=_update_batch_size(args),
+                )
+                commit = getattr(conn, "commit", None)
+                if callable(commit):
+                    commit()
             return {
-                "mode": "apply",
+                "mode": "apply" if args.apply else "dry_run",
                 "current_database": current_db,
                 "target_db_name": args.target_db_name,
-                "written": 0,
+                "scanned": len(rows),
+                "eligible": len(updates),
+                "written": written,
             }
         finally:
             close = getattr(cur, "close", None)
