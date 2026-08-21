@@ -54,6 +54,18 @@ def _direction_enabled(config: OpenAIPassthroughTextWatermarkSettings, direction
     return bool(directions.request)
 
 
+def _policy_applies(
+    config: OpenAIPassthroughTextWatermarkSettings,
+    direction: str,
+    endpoint: str,
+) -> bool:
+    if config.mode == "off":
+        return False
+    if not _direction_enabled(config, direction):
+        return False
+    return config.allows_endpoint(endpoint)
+
+
 def _collect_nodes(
     body: Mapping[str, Any],
     *,
@@ -202,7 +214,7 @@ def apply_watermark_policy(
     if not isinstance(body, dict):
         return WatermarkPolicyResult(body=body, audit=None)
     loaded = _coerce_config(config)
-    if loaded.mode == "off" or not _direction_enabled(loaded, direction):
+    if not _policy_applies(loaded, direction, endpoint):
         return WatermarkPolicyResult(body=body, audit=None)
 
     nodes, skipped, scanned_bytes, truncated_limits = _collect_nodes(
@@ -466,7 +478,7 @@ def apply_request_watermark_intake(
     loaded = _coerce_config(config)
     if not isinstance(body, dict):
         return WatermarkRequestIntake(body=body, audit=None, noop=True)
-    if loaded.mode == "off" or not _direction_enabled(loaded, direction):
+    if not _policy_applies(loaded, direction, endpoint):
         return WatermarkRequestIntake(body=body, audit=None, noop=True)
 
     detect_config = _clone_detect_only_config(loaded)
@@ -493,7 +505,7 @@ def apply_request_watermark_egress(
 
     del kwargs
     loaded = _coerce_config(config)
-    if loaded.mode == "off" or not _direction_enabled(loaded, direction):
+    if not _policy_applies(loaded, direction, endpoint):
         return WatermarkPolicyResult(body=body, audit=None)
 
     harness_audit = None

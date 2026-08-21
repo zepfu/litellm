@@ -7,6 +7,8 @@ from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .text_nodes import _normalize_endpoint
+
 WatermarkMode = Literal["off", "detect", "sanitize", "enforce"]
 UnicodePolicyName = Literal["conservative", "aggressive"]
 StreamPolicyName = Literal[
@@ -99,6 +101,11 @@ class OpenAIPassthroughTextWatermarkSettings(BaseModel):
     limits: TextWatermarkLimitsSettings = Field(
         default_factory=TextWatermarkLimitsSettings
     )
+
+    def allows_endpoint(self, endpoint: str) -> bool:
+        """True when the normalized endpoint is in ``endpoints``."""
+
+        return _normalize_endpoint(endpoint) in self.endpoints
 
     @model_validator(mode="after")
     def _require_explicit_removal_and_buffer_for_enforce(
