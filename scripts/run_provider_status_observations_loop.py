@@ -6764,7 +6764,9 @@ def _build_zai_coding_plan_quota_rate_limit_payloads(
             quota_remaining = remaining
             quota_used = usage - remaining
             remaining_pct = (
-                100.0 - percentage if percentage is not None else (remaining / usage * 100.0)
+                100.0 - percentage
+                if percentage is not None
+                else (remaining / usage * 100.0 if usage > 0 else None)
             )
         elif limit_type == "TOKENS_LIMIT":
             if percentage is None:
@@ -6781,7 +6783,9 @@ def _build_zai_coding_plan_quota_rate_limit_payloads(
                 current_value if current_value is not None else usage - remaining
             )
             remaining_pct = (
-                100.0 - percentage if percentage is not None else (remaining / usage * 100.0)
+                100.0 - percentage
+                if percentage is not None
+                else (remaining / usage * 100.0 if usage > 0 else None)
             )
         else:
             continue

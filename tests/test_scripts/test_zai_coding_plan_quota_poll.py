@@ -101,6 +101,42 @@ LIVE_CREDIT_LIMIT_FIXTURE = {
     "success": True,
 }
 
+ZERO_USAGE_NO_PERCENTAGE_MIXED_FIXTURE = {
+    "code": 200,
+    "msg": "Operation successful",
+    "data": {
+        "limits": [
+            {
+                "type": "CREDIT_LIMIT",
+                "unit": 3,
+                "number": 5,
+                "usage": 0,
+                "currentValue": 0,
+                "remaining": 0,
+            },
+            {
+                "type": "TIME_LIMIT",
+                "unit": 5,
+                "number": 1,
+                "usage": 0,
+                "currentValue": 0,
+                "remaining": 0,
+            },
+            {
+                "type": "CREDIT_LIMIT",
+                "unit": 6,
+                "number": 1,
+                "usage": 60000,
+                "currentValue": 0,
+                "remaining": 59999,
+                "percentage": 1,
+            },
+        ],
+        "level": "pro",
+    },
+    "success": True,
+}
+
 SUBSCRIPTION_FIXTURE = {
     "code": 200,
     "msg": "Operation successful",
@@ -473,6 +509,22 @@ def test_credit_limit_fixture_emits_absolute_5h_and_weekly_windows() -> None:
     assert weekly["remaining_pct"] == 99.0
     assert weekly["provider"] == "zai_coding_plan"
     assert weekly["source"] == "zai_coding_plan_quota_poll"
+
+
+def test_zero_usage_without_percentage_skips_unsafe_windows_and_keeps_valid_rows() -> None:
+    payloads = _build_quota_payloads(
+        ZERO_USAGE_NO_PERCENTAGE_MIXED_FIXTURE,
+        SUBSCRIPTION_FIXTURE,
+    )
+    rows = [_payload_fields(payload) for payload in payloads]
+
+    assert len(rows) == 1
+    assert rows[0]["quota_period"] == "7d"
+    assert rows[0]["quota_type"] == "credits"
+    assert rows[0]["quota_limit"] == 60000
+    assert rows[0]["quota_used"] == 1
+    assert rows[0]["quota_remaining"] == 59999
+    assert rows[0]["remaining_pct"] == 99.0
 
 
 def test_account_hash_uses_hashed_customer_id_not_plaintext() -> None:
