@@ -99,6 +99,7 @@ if TYPE_CHECKING:
     _CODEX_AUTO_AGENT_COHERE_PROVIDER: str
     _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER: str
     _CODEX_AUTO_AGENT_OPENCODE_PROVIDER: str
+    _CODEX_AUTO_AGENT_OPENCODE_GO_PROVIDER: str
     _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER: str
     _CODEX_AUTO_AGENT_XAI_PROVIDER: str
 
@@ -124,6 +125,7 @@ if TYPE_CHECKING:
     def _emit_adapted_route_access_log(**kwargs: Any) -> None: ...
     def _get_anthropic_opencode_zen_normalization_runtime() -> Any: ...
     def _get_opencode_zen_target_base() -> str: ...
+    def _get_opencode_go_target_base() -> str: ...
     def _get_openrouter_api_key() -> Optional[str]: ...
     def _get_openrouter_completion_adapter_upstream_model(model: str) -> Optional[str]: ...
     def _get_openrouter_target_base() -> str: ...
@@ -185,6 +187,7 @@ _HOST_FUNCTION_NAMES = (
     "_handle_codex_zai_coding_plan_adapter_route",
     # OpenCode
     "_handle_codex_opencode_zen_adapter_route",
+    "_handle_codex_opencode_go_adapter_route",
     "_consume_opencode_zen_tools_mode_header",
     "_build_opencode_zen_completion_call_kwargs",
     "_perform_opencode_zen_completion_call",
@@ -469,6 +472,26 @@ async def _perform_codex_auto_agent_alias_candidate_request(
             use_alias_candidate_probe=True,
         )
 
+    opencode_go_provider = globals().get(
+        "_CODEX_AUTO_AGENT_OPENCODE_GO_PROVIDER", "opencode_go"
+    )
+
+    async def _opencode_go() -> Response:
+        if candidate.get("route_family") != "codex_opencode_go_adapter":
+            raise ValueError(
+                "OpenCode Go alias candidates require "
+                "codex_opencode_go_adapter."
+            )
+        return await _handle_codex_opencode_go_adapter_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            prepared_request_body=candidate_body,
+            adapter_model=adapter_model,
+            use_alias_candidate_probe=True,
+        )
+
     async def _kimi_code() -> Response:
         return await _handle_codex_kimi_chat_completions_adapter_route(
             endpoint=endpoint,
@@ -553,6 +576,7 @@ async def _perform_codex_auto_agent_alias_candidate_request(
         candidate=candidate,
         provider_handlers={
             _CODEX_AUTO_AGENT_OPENCODE_PROVIDER: _opencode,
+            opencode_go_provider: _opencode_go,
             _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER: _kimi_code,
             _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER: _alibaba_token_plan,
             zai_coding_plan_provider: _zai_coding_plan,
@@ -2573,6 +2597,129 @@ async def _handle_codex_opencode_zen_adapter_route(
         adapter_label="OpenCode Zen",
     )
     return _build_responses_response_from_adapter_response(responses_api_response)
+
+
+async def _handle_codex_opencode_go_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: Any,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+    use_alias_candidate_probe: bool = False,
+) -> Response:
+    import litellm
+    from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
+        _OPENCODE_GO_FREE_MODELS,
+    )
+    from fastapi.responses import Response as _FastAPIResponse
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
+        _serialize_responses_adapter_response as _serialize_go_response,
+    )
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    _ = endpoint, fastapi_response, user_api_key_dict
+    _ = (
+        not use_alias_candidate_probe
+        and adapter_model in _OPENCODE_GO_FREE_MODELS
+    )
+    request_body = dict(prepared_request_body)
+    request_body["model"] = adapter_model
+    request_input = request_body.get("input", "")
+    responses_api_request = {
+        key: value
+        for key, value in request_body.items()
+        if key not in {"input", "model", "litellm_metadata"}
+    }
+    litellm_metadata = dict(request_body.get("litellm_metadata") or {})
+    completion_kwargs = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+        model=adapter_model,
+        input=request_input,
+        responses_api_request=responses_api_request,
+        custom_llm_provider="openai",
+        stream=bool(request_body.get("stream")),
+        metadata=litellm_metadata,
+    )
+    completion_kwargs["model"] = adapter_model
+    target_base_url = _get_opencode_go_target_base()
+    target_url = _join_opencode_zen_passthrough_url(
+        base_target_url=target_base_url,
+        endpoint="/v1/chat/completions",
+    )
+    api_key = await _load_opencode_zen_api_key_for_candidate(
+        use_alias_candidate_probe=use_alias_candidate_probe,
+    )
+    custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
+        api_key=api_key,
+        request=request,
+    )
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url=target_url,
+        headers=custom_headers,
+        credential_family="opencode",
+        expected_target_family="opencode",
+    )
+    _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
+    rollup_kwargs = _build_adapted_route_rollup_kwargs(litellm_metadata)
+    _emit_adapted_route_access_log(
+        request=request,
+        target_url=target_url,
+        request_body=request_body,
+        rollup_kwargs=rollup_kwargs,
+        adapter_label="OpenCode Go",
+        provider_bound_body=completion_kwargs,
+    )
+    completion_call_kwargs = {
+        **completion_kwargs,
+        "api_key": api_key,
+        "api_base": f"{target_base_url.rstrip('/')}/v1",
+        "litellm_metadata": litellm_metadata,
+    }
+    perform = globals().get("_perform_opencode_zen_completion_call")
+    if callable(perform):
+        completion_response = await perform(
+            completion_call_kwargs=completion_call_kwargs,
+            litellm_metadata=litellm_metadata,
+            accepted_trace_user_id=None,
+            is_known_free_direct=False,
+        )
+    else:
+        completion_response = await litellm.acompletion(**completion_call_kwargs)
+    if isinstance(completion_response, dict):
+        from litellm.types.utils import ModelResponse
+
+        completion_response = ModelResponse(**completion_response)
+    responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+        chat_completion_response=completion_response,
+        request_input=request_input,
+        responses_api_request=responses_api_request,
+    )
+    try:
+        responses_api_response.object = "response"
+    except Exception:
+        pass
+    serialized = _serialize_go_response(responses_api_response)
+    try:
+        response_body = json.loads(serialized)
+    except (TypeError, ValueError, NameError):
+        response_body = None
+    if not isinstance(response_body, dict):
+        import json as _json
+
+        try:
+            response_body = _json.loads(serialized)
+        except (TypeError, ValueError):
+            response_body = {"id": getattr(completion_response, "id", "resp_opencode_go")}
+    response_body["object"] = "response"
+    import json as _json
+
+    return _FastAPIResponse(
+        content=_json.dumps(response_body),
+        media_type="application/json",
+    )
 
 
 async def _perform_codex_auto_agent_openrouter_completion_request(

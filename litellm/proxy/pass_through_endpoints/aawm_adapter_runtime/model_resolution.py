@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     # Host-global constants
     _OPENCODE_ZEN_PROVIDER: str
     _OPENCODE_ZEN_FREE_MODELS: frozenset
+    _OPENCODE_GO_PROVIDER: str
+    _OPENCODE_GO_FREE_MODELS: frozenset
     _ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS: frozenset
     _ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS: frozenset
     _ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS: frozenset
@@ -43,10 +45,12 @@ _HOST_FUNCTION_NAMES = (
     "_normalize_anthropic_openrouter_adapter_model_name",
     "_get_openrouter_completion_adapter_upstream_model",
     "_normalize_opencode_zen_adapter_model_name",
+    "_normalize_opencode_go_adapter_model_name",
     "_normalize_kimi_code_chat_completions_adapter_model_name",
     "_normalize_alibaba_token_plan_adapter_model_name",
     "_normalize_zai_coding_plan_adapter_model_name",
     "_resolve_codex_opencode_zen_adapter_model",
+    "_resolve_codex_opencode_go_adapter_model",
     "_resolve_codex_kimi_chat_completions_adapter_model",
     "_resolve_codex_alibaba_token_plan_adapter_model",
     "_resolve_codex_zai_coding_plan_adapter_model",
@@ -115,6 +119,8 @@ def _split_anthropic_adapter_provider_prefix(
         "opencode": _OPENCODE_ZEN_PROVIDER,  # noqa: F821
         "opencode-zen": _OPENCODE_ZEN_PROVIDER,  # noqa: F821
         "zen": _OPENCODE_ZEN_PROVIDER,  # noqa: F821
+        "opencode-go": _OPENCODE_GO_PROVIDER,  # noqa: F821
+        "opencode_go": _OPENCODE_GO_PROVIDER,  # noqa: F821
     }.get(
         prefix,
         prefix
@@ -124,6 +130,7 @@ def _split_anthropic_adapter_provider_prefix(
             "openrouter",
             "nvidia",
             _OPENCODE_ZEN_PROVIDER,  # noqa: F821
+            _OPENCODE_GO_PROVIDER,  # noqa: F821
         )
         else None,
     )
@@ -219,6 +226,16 @@ def _normalize_opencode_zen_adapter_model_name(model: Any) -> Optional[str]:
         return normalized_candidate
     return None
 
+
+def _normalize_opencode_go_adapter_model_name(model: Any) -> Optional[str]:
+    explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
+    if explicit_provider != _OPENCODE_GO_PROVIDER or candidate is None:  # noqa: F821
+        return None
+    normalized_candidate = candidate.strip()
+    if normalized_candidate in _OPENCODE_GO_FREE_MODELS:  # noqa: F821
+        return normalized_candidate
+    return None
+
 def _normalize_kimi_code_chat_completions_adapter_model_name(
     model: Any,
 ) -> Optional[str]:
@@ -259,6 +276,15 @@ def _resolve_codex_opencode_zen_adapter_model(
     if not _is_openai_responses_endpoint(endpoint):
         return None
     return _normalize_opencode_zen_adapter_model_name(request_body.get("model"))
+
+
+def _resolve_codex_opencode_go_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _is_openai_responses_endpoint(endpoint):
+        return None
+    return _normalize_opencode_go_adapter_model_name(request_body.get("model"))
 
 def _resolve_codex_kimi_chat_completions_adapter_model(
     request_body: dict[str, Any],

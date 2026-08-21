@@ -37,6 +37,7 @@ REGISTERED_PROVIDERS: frozenset[str] = frozenset(
         policy.CODEX_AUTO_AGENT_COHERE_PROVIDER,
         policy.CODEX_AUTO_AGENT_CURSOR_AGENT_PROVIDER,
         policy.OPENCODE_ZEN_PROVIDER,
+        policy.OPENCODE_GO_PROVIDER,
         policy.ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
     }
 )
@@ -54,6 +55,7 @@ REGISTERED_ROUTE_FAMILIES: frozenset[str] = frozenset(
         "codex_cohere_chat_completions_adapter",
         "codex_cursor_agent_aiserver_adapter",
         "codex_opencode_zen_adapter",
+        "codex_opencode_go_adapter",
         "anthropic_messages",
         "anthropic_openai_responses_adapter",
         "anthropic_openrouter_completion_adapter",
@@ -85,6 +87,7 @@ CODEX_ONLY_ROUTE_FAMILIES: frozenset[str] = frozenset(
     {
         "codex_cohere_chat_completions_adapter",
         "codex_zai_coding_plan_chat_completions_adapter",
+        "codex_opencode_go_adapter",
     }
 )
 

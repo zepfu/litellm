@@ -165,6 +165,18 @@ OPENCODE_ZEN_COMPLETION = AnthropicCompletionAdapterConfig(
     custom_llm_provider="openai",  # OpenCode uses OpenAI-compatible base
 )
 
+CODEX_OPENCODE_GO = AnthropicCompletionAdapterConfig(
+    adapter="codex_opencode_go_adapter",
+    adapter_label="OpenCode Go",
+    route_family="codex_opencode_go_adapter",
+    tag_prefix="codex-opencode-go-adapter",
+    span_name="codex.opencode_go_adapter",
+    target_endpoint_label="opencode_go:/zen/go/v1/chat/completions",
+    credential_family="opencode",
+    expected_target_family="opencode",
+    custom_llm_provider="openai",
+)
+
 CODEX_KIMI_CHAT_COMPLETIONS = AnthropicCompletionAdapterConfig(
     adapter="codex_kimi_chat_completions_adapter",
     adapter_label="Kimi Code",

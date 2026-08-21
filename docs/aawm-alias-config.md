@@ -138,21 +138,24 @@ generated from every snapshot alias and do not invent a denylist.
 The maintained alias name is `basic`. Every request uses this common candidate
 order:
 
-1. Direct Cohere North Mini Code (`cohere/north-mini-code-1-0`,
+1. OpenCode Go `ox-alpha-free` (`provider: opencode_go`,
+   `codex_opencode_go_adapter`, Codex-only; no Anthropic Go adapter)
+2. OpenRouter `openrouter/stealth/ox-alpha`
+3. Direct Cohere North Mini Code (`cohere/north-mini-code-1-0`,
    `provider: cohere`, `codex_cohere_chat_completions_adapter`,
    `lane=cohere_native`)
-2. OpenRouter Cohere North Mini Code free
+4. OpenRouter Cohere North Mini Code free
    (`openrouter/cohere/north-mini-code:free`) as an independent fallback
-3. OpenRouter Owl Alpha
-4. OpenCode Zen deepseek-v4-flash
-5. OpenCode Zen big-pickle
-6. Alibaba Token Plan deepseek-v4-flash-0731
-7. Cursor Agent Composer 2.5 standard (`cursor_agent/composer-2.5`,
+5. OpenRouter Owl Alpha
+6. OpenCode Zen deepseek-v4-flash
+7. OpenCode Zen big-pickle
+8. Alibaba Token Plan deepseek-v4-flash-0731
+9. Cursor Agent Composer 2.5 standard (`cursor_agent/composer-2.5`,
    `provider: cursor_agent`, `codex_cursor_agent_aiserver_adapter`,
    priority 42). Distinct from `composer-2.5-fast` and from xAI
    `grok-composer-2.5-fast`. Alias YAML uses `cursor_agent`, not Cloud
    Agents `cursor`.
-8. Alibaba Token Plan qwen3.6-flash
+10. Alibaba Token Plan qwen3.6-flash
 
 The managed `sota-xai` candidate has no candidate-level reasoning override:
 caller `reasoning.effort=xhigh` is sent unchanged to `oa_xai/grok-4.6`, with
@@ -207,10 +210,13 @@ actual routed fallback.
 
 The `work` alias is compiled from `work.yaml`. Candidate order is:
 
-1. OpenAI `gpt-5.3-codex-spark`
-2. Nested `alias_reference: work-other`
-3. Claude-origin only: native Anthropic Sonnet tail
-4. OpenAI `gpt-5.6-luna` last resort
+1. OpenCode Go `ox-alpha-free` (`provider: opencode_go`,
+   `codex_opencode_go_adapter`, Codex-only; no Anthropic Go adapter)
+2. OpenRouter `openrouter/stealth/ox-alpha`
+3. OpenAI `gpt-5.3-codex-spark`
+4. Nested `alias_reference: work-other`
+5. Claude-origin only: native Anthropic Sonnet tail
+6. OpenAI `gpt-5.6-luna` last resort
 
 `work-other` is an ordinary configured alias compiled from `work-other.yaml`.
 It is a valid exact-name route and a valid `alias_reference` target. It remains

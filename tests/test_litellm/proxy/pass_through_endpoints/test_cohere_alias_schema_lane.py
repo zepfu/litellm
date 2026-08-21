@@ -273,10 +273,26 @@ aliases:
                 "codex_openrouter_completion_adapter",
             ),
         ]
-        assert basic_candidates[0].provider == "cohere"
-        assert basic_candidates[0].priority == 90
-        assert basic_candidates[1].provider == "openrouter"
-        assert basic_candidates[1].priority == 80
+        # Direct Cohere stays immediately after the ox-alpha pair and still
+        # ahead of OpenRouter North Mini Code free. Alias head is no longer
+        # Cohere once OpenCode Go / OpenRouter ox-alpha land first.
+        cohere_index = next(
+            index
+            for index, candidate in enumerate(basic_candidates)
+            if candidate.model == "cohere/north-mini-code-1-0"
+        )
+        assert basic_candidates[cohere_index].provider == "cohere"
+        assert basic_candidates[cohere_index].priority == 90
+        assert (
+            basic_candidates[cohere_index - 1].model
+            == "openrouter/stealth/ox-alpha"
+        )
+        assert basic_candidates[cohere_index + 1].provider == "openrouter"
+        assert (
+            basic_candidates[cohere_index + 1].model
+            == "openrouter/cohere/north-mini-code:free"
+        )
+        assert basic_candidates[cohere_index + 1].priority == 80
 
 
 # ---------------------------------------------------------------------------

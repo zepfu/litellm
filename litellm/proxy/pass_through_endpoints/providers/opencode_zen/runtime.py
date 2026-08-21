@@ -60,6 +60,7 @@ _runtime: Optional[Runtime] = None
 
 _HOST_FUNCTION_NAMES = (
     "_get_opencode_zen_target_base",
+    "_get_opencode_go_target_base",
     "_get_opencode_zen_auth_file_path",
     "_load_local_opencode_zen_api_key",
     "_load_opencode_zen_api_key_for_candidate",
@@ -234,6 +235,22 @@ def _get_opencode_zen_target_base() -> str:
     return cleaned
 
 
+def _get_opencode_go_target_base() -> str:
+    runtime = _require_runtime()
+    cleaned = (
+        _clean_secret_string(runtime.get_secret_str("OPENCODE_GO_API_BASE"))
+        or _clean_secret_string(
+            runtime.get_secret_str("AAWM_OPENCODE_GO_API_BASE")
+        )
+        or _clean_secret_string(os.getenv("OPENCODE_GO_API_BASE"))
+        or _clean_secret_string(os.getenv("AAWM_OPENCODE_GO_API_BASE"))
+        or _constants._OPENCODE_GO_DEFAULT_BASE_URL
+    ).rstrip("/")
+    if cleaned.endswith("/v1"):
+        return cleaned[: -len("/v1")]
+    return cleaned
+
+
 def _get_opencode_zen_auth_file_path() -> Optional[Path]:
     """Resolve the OpenCode Zen auth file path.
 
@@ -302,9 +319,9 @@ async def _load_local_opencode_zen_api_key() -> str:
             "does not contain valid JSON."
         ) from None
 
-    provider_auth = (
-        auth_data.get("opencode") if isinstance(auth_data, dict) else None
-    )
+    provider_auth = None
+    if isinstance(auth_data, dict):
+        provider_auth = auth_data.get("opencode-go") or auth_data.get("opencode")
     api_key = (
         _clean_secret_string(provider_auth.get("key"))
         if isinstance(provider_auth, dict)

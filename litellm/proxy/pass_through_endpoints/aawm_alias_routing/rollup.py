@@ -87,6 +87,7 @@ def _resolve_auto_agent_alias_route_rollup_outgoing_target(
             "agentn.global.api5.cursor.sh/agent.v1.AgentService/Run"
         ),
         "codex_opencode_zen_adapter": "opencode.ai/zen/v1/chat/completions",
+        "codex_opencode_go_adapter": "opencode.ai/zen/go/v1/chat/completions",
         "codex_openrouter_completion_adapter": "openrouter.ai/api/v1/chat/completions",
         "anthropic_opencode_zen_responses_adapter": "opencode.ai/zen/v1/responses",
         "anthropic_opencode_zen_completion_adapter": "opencode.ai/zen/v1/chat/completions",

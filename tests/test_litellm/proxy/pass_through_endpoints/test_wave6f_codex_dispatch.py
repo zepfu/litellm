@@ -168,6 +168,7 @@ class TestNoneFallThrough:
         host = {
             "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint, request: None,
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_opencode_go_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_zai_coding_plan_adapter_model": lambda body, *, endpoint: None,
@@ -183,6 +184,7 @@ class TestNoneFallThrough:
         host = {
             "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint, request: None,
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_opencode_go_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_zai_coding_plan_adapter_model": lambda body, *, endpoint: None,
@@ -198,6 +200,7 @@ class TestNoneFallThrough:
         host = {
             "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint, request: None,
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_opencode_go_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_zai_coding_plan_adapter_model": lambda body, *, endpoint: None,
@@ -219,6 +222,7 @@ class TestNoneFallThrough:
         host = {
             "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint, request: None,
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_opencode_go_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_zai_coding_plan_adapter_model": lambda body, *, endpoint: None,
@@ -253,6 +257,7 @@ def _make_dispatch_host(
     resolvers: dict[str, Any] = {
         "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint, request: None,
         "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
+        "_resolve_codex_opencode_go_adapter_model": lambda body, *, endpoint: None,
         "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
         "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
         "_resolve_codex_zai_coding_plan_adapter_model": lambda body, *, endpoint: None,
@@ -274,6 +279,7 @@ def _make_dispatch_host(
         "_safe_set_request_parsed_body": lambda request, body: None,
         "_handle_codex_auto_agent_alias_route": _fake_alias_route,
         "_handle_codex_opencode_zen_adapter_route": _fake_adapter_route,
+        "_handle_codex_opencode_go_adapter_route": _fake_adapter_route,
         "_handle_codex_kimi_chat_completions_adapter_route": _fake_adapter_route,
         "_handle_codex_alibaba_token_plan_adapter_route": _fake_adapter_route,
         "_handle_codex_zai_coding_plan_adapter_route": _fake_adapter_route,
@@ -299,6 +305,15 @@ class TestSupportedDispatch:
     async def test_opencode_zen_dispatch(self) -> None:
         host, sentinel = _make_dispatch_host(
             matching_adapter="_resolve_codex_opencode_zen_adapter_model",
+        )
+        codex_dispatch.install(host)
+        result = await host["try_dispatch_codex_request"](**_dispatch_kwargs())
+        assert result is sentinel
+
+    @pytest.mark.asyncio
+    async def test_opencode_go_dispatch(self) -> None:
+        host, sentinel = _make_dispatch_host(
+            matching_adapter="_resolve_codex_opencode_go_adapter_model",
         )
         codex_dispatch.install(host)
         result = await host["try_dispatch_codex_request"](**_dispatch_kwargs())
@@ -356,6 +371,7 @@ class TestDispatchOrdering:
                 lambda body, *, endpoint, request: "alias-model"
             ),
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: "zen-model",
+            "_resolve_codex_opencode_go_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_zai_coding_plan_adapter_model": lambda body, *, endpoint: None,
@@ -365,6 +381,7 @@ class TestDispatchOrdering:
             "_safe_set_request_parsed_body": lambda request, body: None,
             "_handle_codex_auto_agent_alias_route": _alias_route,
             "_handle_codex_opencode_zen_adapter_route": _zen_route,
+            "_handle_codex_opencode_go_adapter_route": _zen_route,
             "_handle_codex_kimi_chat_completions_adapter_route": _zen_route,
             "_handle_codex_alibaba_token_plan_adapter_route": _zen_route,
             "_handle_codex_zai_coding_plan_adapter_route": _zen_route,
@@ -393,6 +410,7 @@ class TestErrorPropagation:
                 lambda body, *, endpoint, request: "alias"
             ),
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_opencode_go_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_zai_coding_plan_adapter_model": lambda body, *, endpoint: None,
@@ -402,6 +420,7 @@ class TestErrorPropagation:
             "_safe_set_request_parsed_body": lambda request, body: None,
             "_handle_codex_auto_agent_alias_route": _exploding_route,
             "_handle_codex_opencode_zen_adapter_route": _exploding_route,
+            "_handle_codex_opencode_go_adapter_route": _exploding_route,
             "_handle_codex_kimi_chat_completions_adapter_route": _exploding_route,
             "_handle_codex_alibaba_token_plan_adapter_route": _exploding_route,
             "_handle_codex_zai_coding_plan_adapter_route": _exploding_route,
@@ -424,6 +443,7 @@ class TestErrorPropagation:
         host: dict[str, Any] = {
             "_resolve_codex_auto_agent_alias_model": _exploding_resolver,
             "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_opencode_go_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
             "_resolve_codex_zai_coding_plan_adapter_model": lambda body, *, endpoint: None,

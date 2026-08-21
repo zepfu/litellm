@@ -22,6 +22,16 @@ defaults: {}
 aliases:
   - name: basic
     candidates:
+      - provider: opencode_go
+        model: ox-alpha-free
+        route_family: codex_opencode_go_adapter
+        priority: 100
+
+      - provider: openrouter
+        model: openrouter/stealth/ox-alpha
+        route_family: codex_openrouter_completion_adapter
+        priority: 95
+
       - provider: cohere
         model: cohere/north-mini-code-1-0
         route_family: codex_cohere_chat_completions_adapter

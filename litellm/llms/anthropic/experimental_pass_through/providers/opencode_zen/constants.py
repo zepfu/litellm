@@ -35,3 +35,9 @@ _OPENCODE_ZEN_FREE_MODELS = frozenset(
 )
 
 _OPENCODE_ZEN_ANTHROPIC_COMPLETION_MODELS = frozenset({"big-pickle"})
+
+_OPENCODE_GO_DEFAULT_BASE_URL = "https://opencode.ai/zen/go/v1"
+
+_OPENCODE_GO_PROVIDER = "opencode_go"
+
+_OPENCODE_GO_FREE_MODELS = frozenset({"ox-alpha-free"})
