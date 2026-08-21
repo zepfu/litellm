@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Iterator, List, Optional, 
 
 import httpx
 
+from litellm.exceptions import UnsupportedParamsError
 from litellm.llms.base_llm.chat.transformation import BaseConfig, BaseLLMException
 from litellm.types.llms.openai import AllMessageValues
 from litellm.types.utils import Choices, Message, ModelResponse
@@ -83,11 +84,25 @@ class CursorAgentConfig(BaseConfig):
         drop_params: bool,
     ) -> dict:
         # temperature / max_tokens / tool_choice have no AgentRunRequest field.
-        # Do not advertise or copy them; get_optional_params rejects undeclared
-        # OpenAI params unless drop_params is set.
+        # Reject them unless drop_params is set; do not copy or invent proto keys.
+        unsupported: List[str] = []
         for param, value in non_default_params.items():
             if param in {"stream", "tools"}:
                 optional_params[param] = value
+            elif param in {"temperature", "max_tokens", "tool_choice"}:
+                if not drop_params:
+                    unsupported.append(param)
+        if unsupported:
+            raise UnsupportedParamsError(
+                message=(
+                    f"{CURSOR_AGENT_PROVIDER} does not support parameters: "
+                    f"{unsupported}, for model={model}. AgentRunRequest has "
+                    "mcp_tools / custom_system_prompt / conversation_state, "
+                    "not OpenAI temperature / max_tokens / tool_choice."
+                ),
+                llm_provider=CURSOR_AGENT_PROVIDER,
+                model=model,
+            )
         return optional_params
 
     def validate_environment(

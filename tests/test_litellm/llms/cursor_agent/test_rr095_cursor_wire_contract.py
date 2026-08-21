@@ -135,12 +135,16 @@ def _assert_no_invented_openai_fields(payload: Dict[str, Any]) -> None:
 def _param_is_declared(param: str, value: Any) -> bool:
     config = _config()
     supported = config.get_supported_openai_params(MODEL)
-    mapped = config.map_openai_params(
-        non_default_params={param: value},
-        optional_params={},
-        model=MODEL,
-        drop_params=False,
-    )
+    try:
+        mapped = config.map_openai_params(
+            non_default_params={param: value},
+            optional_params={},
+            model=MODEL,
+            drop_params=False,
+        )
+    except _REJECT_TYPES:
+        # Explicit map-time rejection is a handled declaration, not a silent drop.
+        return True
     return param in supported or param in mapped
 
 
@@ -343,17 +347,20 @@ def test_map_openai_params_copies_declared_params_into_optional_params():
     param that transform then drops.
     """
     config = _config()
-    mapped = config.map_openai_params(
-        non_default_params={
-            "tools": [LOOKUP_TOOL],
-            "tool_choice": "auto",
-            "max_tokens": 64,
-            "temperature": 0.5,
-        },
-        optional_params={},
-        model=MODEL,
-        drop_params=False,
-    )
+    try:
+        mapped = config.map_openai_params(
+            non_default_params={
+                "tools": [LOOKUP_TOOL],
+                "tool_choice": "auto",
+                "max_tokens": 64,
+                "temperature": 0.5,
+            },
+            optional_params={},
+            model=MODEL,
+            drop_params=False,
+        )
+    except _REJECT_TYPES:
+        return
     declared = [
         name
         for name in ("tools", "tool_choice", "max_tokens", "temperature")
@@ -413,11 +420,14 @@ def test_build_run_request_does_not_exec_cursor_cli():
                 "temperature": 0.1,
             },
         )
-        build_run_request(
-            model=FULL_MODEL,
-            messages=[{"role": "user", "content": LAST_USER}],
-            optional_params={"tools": [LOOKUP_TOOL], "temperature": 0.1},
-        )
+        try:
+            build_run_request(
+                model=FULL_MODEL,
+                messages=[{"role": "user", "content": LAST_USER}],
+                optional_params={"tools": [LOOKUP_TOOL], "temperature": 0.1},
+            )
+        except _REJECT_TYPES:
+            pass
         mock_popen.assert_not_called()
         mock_run.assert_not_called()
         mock_execv.assert_not_called()

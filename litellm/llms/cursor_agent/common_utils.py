@@ -480,6 +480,21 @@ def build_run_request(
     optional_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     optional_params = optional_params or {}
+    unsupported = [
+        name
+        for name in ("temperature", "max_tokens", "tool_choice")
+        if name in optional_params
+    ]
+    if unsupported:
+        raise CursorAgentError(
+            status_code=400,
+            message=(
+                "cursor_agent does not support parameters: "
+                f"{unsupported}. AgentRunRequest has mcp_tools / "
+                "custom_system_prompt / conversation_state, not OpenAI "
+                "temperature / max_tokens / tool_choice."
+            ),
+        )
     model_id = strip_provider_prefix(model)
     last_user_index = _last_user_index(messages)
     prompt = extract_user_text(messages)
