@@ -6,6 +6,7 @@ This package is `cursor_agent`. It must not reuse Cloud Agents `cursor`.
 
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -61,6 +62,8 @@ __all__ = [
     "exchange_api_key_for_access_token",
     "extract_text_from_agent_payload",
     "extract_user_text",
+    "message_role",
+    "message_text",
     "resolve_access_token",
     "resolve_dashboard_api_base",
     "resolve_provider_info",
@@ -194,21 +197,281 @@ def exchange_api_key_for_access_token(
     return str(access_token)
 
 
+_DEFAULT_MCP_PROVIDER_IDENTIFIER = "litellm"
+
+
+def _as_mapping(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "model_dump"):
+        dumped = value.model_dump()
+        if isinstance(dumped, dict):
+            return dumped
+    if hasattr(value, "__dict__"):
+        return dict(vars(value))
+    return {}
+
+
+def message_role(message: Any) -> str:
+    if isinstance(message, dict):
+        return str(message.get("role") or "")
+    return str(getattr(message, "role", "") or "")
+
+
+def message_text(message: Any) -> str:
+    if isinstance(message, dict):
+        return convert_content_list_to_str(message=message)
+    mapping = _as_mapping(message)
+    if mapping:
+        return convert_content_list_to_str(message=mapping)  # type: ignore[arg-type]
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    return ""
+
+
 def extract_user_text(messages: List[AllMessageValues]) -> str:
     for message in reversed(messages):
-        role = ""
-        if isinstance(message, dict):
-            role = str(message.get("role") or "")
-        else:
-            role = str(getattr(message, "role", "") or "")
-        if role != "user":
+        if message_role(message) != "user":
             continue
-        text = convert_content_list_to_str(message=message)
+        text = message_text(message)
         if text:
             return text
     if messages:
-        return convert_content_list_to_str(message=messages[-1])
+        return message_text(messages[-1])
     return ""
+
+
+def _extract_system_prompt(messages: List[AllMessageValues]) -> str:
+    parts: List[str] = []
+    for message in messages:
+        if message_role(message) != "system":
+            continue
+        text = message_text(message)
+        if text:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+def _history_text_content(text: str) -> Dict[str, Any]:
+    return {"text": {"text": text}}
+
+
+def _history_user_message(text: str) -> Dict[str, Any]:
+    return {"user": {"content": [_history_text_content(text)]}}
+
+
+def _history_assistant_message(
+    text: str, tool_calls: Optional[List[Dict[str, Any]]] = None
+) -> Dict[str, Any]:
+    content: List[Dict[str, Any]] = []
+    if text:
+        content.append(_history_text_content(text))
+    for tool_call in tool_calls or []:
+        content.append({"tool_call": tool_call})
+    return {"assistant": {"content": content}}
+
+
+def _history_tool_message(
+    *,
+    tool_call_id: str,
+    tool_name: str,
+    text: str,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "tool_call_id": tool_call_id,
+        "content": [_history_text_content(text)],
+    }
+    if tool_name:
+        payload["tool_name"] = tool_name
+    return {"tool": payload}
+
+
+def _openai_tool_call_to_history(tool_call: Any) -> Optional[Dict[str, Any]]:
+    mapping = _as_mapping(tool_call)
+    function = _as_mapping(mapping.get("function"))
+    name = str(function.get("name") or mapping.get("name") or "")
+    tool_call_id = str(mapping.get("id") or mapping.get("tool_call_id") or "")
+    arguments = function.get("arguments")
+    if arguments is None:
+        arguments = mapping.get("arguments")
+    if isinstance(arguments, (dict, list)):
+        args_json = json.dumps(arguments)
+    else:
+        args_json = str(arguments or "")
+    if not name and not tool_call_id and not args_json:
+        return None
+    history_call: Dict[str, Any] = {
+        "tool_call_id": tool_call_id,
+        "tool_name": name,
+        "args_json": args_json,
+    }
+    return history_call
+
+
+def _tool_calls_from_message(message: Any) -> List[Any]:
+    mapping = message if isinstance(message, dict) else _as_mapping(message)
+    tool_calls = mapping.get("tool_calls")
+    if isinstance(tool_calls, list):
+        return tool_calls
+    return []
+
+
+def _tool_name_for_call_id(
+    messages: List[AllMessageValues], tool_call_id: str
+) -> str:
+    if not tool_call_id:
+        return ""
+    for message in messages:
+        for tool_call in _tool_calls_from_message(message):
+            mapping = _as_mapping(tool_call)
+            function = _as_mapping(mapping.get("function"))
+            call_id = str(mapping.get("id") or mapping.get("tool_call_id") or "")
+            if call_id == tool_call_id:
+                return str(function.get("name") or mapping.get("name") or "")
+    return ""
+
+
+def _build_conversation_history(
+    messages: List[AllMessageValues],
+    *,
+    last_user_index: Optional[int],
+) -> Optional[Dict[str, Any]]:
+    history_messages: List[Dict[str, Any]] = []
+    for index, message in enumerate(messages):
+        role = message_role(message)
+        if role == "system":
+            continue
+        if index == last_user_index and role == "user":
+            continue
+        text = message_text(message)
+        mapping = message if isinstance(message, dict) else _as_mapping(message)
+        if role == "user":
+            if text:
+                history_messages.append(_history_user_message(text))
+            continue
+        if role == "assistant":
+            tool_calls = []
+            for tool_call in _tool_calls_from_message(message):
+                converted = _openai_tool_call_to_history(tool_call)
+                if converted is not None:
+                    tool_calls.append(converted)
+            if text or tool_calls:
+                history_messages.append(
+                    _history_assistant_message(text, tool_calls or None)
+                )
+            continue
+        if role == "tool":
+            tool_call_id = str(
+                mapping.get("tool_call_id") or mapping.get("id") or ""
+            )
+            tool_name = str(
+                mapping.get("name")
+                or mapping.get("tool_name")
+                or _tool_name_for_call_id(messages, tool_call_id)
+            )
+            history_messages.append(
+                _history_tool_message(
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    text=text,
+                )
+            )
+    if not history_messages:
+        return None
+    return {"messages": history_messages}
+
+
+def _last_user_index(messages: List[AllMessageValues]) -> Optional[int]:
+    last_index: Optional[int] = None
+    for index, message in enumerate(messages):
+        if message_role(message) == "user" and message_text(message):
+            last_index = index
+    return last_index
+
+
+def _openai_tool_name(tool: Any) -> str:
+    mapping = _as_mapping(tool)
+    function = _as_mapping(mapping.get("function"))
+    return str(function.get("name") or mapping.get("name") or "")
+
+
+def _openai_tool_description(tool: Any) -> str:
+    mapping = _as_mapping(tool)
+    function = _as_mapping(mapping.get("function"))
+    return str(function.get("description") or mapping.get("description") or "")
+
+
+def _openai_tool_parameters(tool: Any) -> Any:
+    mapping = _as_mapping(tool)
+    function = _as_mapping(mapping.get("function"))
+    if "parameters" in function:
+        return function.get("parameters")
+    return mapping.get("parameters") or mapping.get("input_schema")
+
+
+def _tool_provider_identifier(tool: Any) -> str:
+    mapping = _as_mapping(tool)
+    return str(
+        mapping.get("provider_identifier")
+        or mapping.get("server_identifier")
+        or mapping.get("mcp_server")
+        or _DEFAULT_MCP_PROVIDER_IDENTIFIER
+    )
+
+
+def _build_mcp_tool_definition(tool: Any) -> Optional[Dict[str, Any]]:
+    name = _openai_tool_name(tool)
+    if not name:
+        return None
+    provider_identifier = _tool_provider_identifier(tool)
+    definition: Dict[str, Any] = {
+        "name": name,
+        "provider_identifier": provider_identifier,
+        "tool_name": name,
+    }
+    description = _openai_tool_description(tool)
+    if description:
+        definition["description"] = description
+    parameters = _openai_tool_parameters(tool)
+    if parameters is not None:
+        if isinstance(parameters, str):
+            definition["input_schema_json"] = parameters
+        else:
+            definition["input_schema_json"] = json.dumps(parameters)
+    return definition
+
+
+def _build_mcp_tools(optional_params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    existing = optional_params.get("mcp_tools")
+    if isinstance(existing, dict) and existing:
+        return existing
+    tools = optional_params.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return None
+    definitions: List[Dict[str, Any]] = []
+    for tool in tools:
+        definition = _build_mcp_tool_definition(tool)
+        if definition is not None:
+            definitions.append(definition)
+    if not definitions:
+        return None
+    return {"mcp_tools": definitions}
+
+
+def _merge_conversation_state(
+    optional_params: Dict[str, Any],
+    history: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    existing = optional_params.get("conversation_state")
+    if isinstance(existing, dict) and existing:
+        return dict(existing)
+    if history is None:
+        return {}
+    # AgentRunRequest.conversation_state is ConversationState. History JSON is
+    # a verified ConversationState.root_prompt_messages_json scalar so earlier
+    # OpenAI turns are not reduced to the last user message.
+    return {"root_prompt_messages_json": [json.dumps(history)]}
 
 
 def build_run_request(
@@ -218,18 +481,32 @@ def build_run_request(
 ) -> Dict[str, Any]:
     optional_params = optional_params or {}
     model_id = strip_provider_prefix(model)
+    last_user_index = _last_user_index(messages)
     prompt = extract_user_text(messages)
+    history = _build_conversation_history(
+        messages, last_user_index=last_user_index
+    )
     conversation_id = optional_params.get("conversation_id")
     run_id = optional_params.get("run_id") or str(uuid.uuid4())
     agent_session_id = optional_params.get("agent_session_id")
+    custom_system_prompt = optional_params.get("custom_system_prompt")
+    if not custom_system_prompt:
+        custom_system_prompt = _extract_system_prompt(messages)
+
+    user_message_action: Dict[str, Any] = {
+        "user_message": {
+            "text": prompt,
+        }
+    }
+    if history is not None:
+        # UserMessageAction.conversation_history is the verified field for
+        # prior OpenAI turns / tool results on the same Run.
+        user_message_action["conversation_history"] = history
+
     request: Dict[str, Any] = {
-        "conversation_state": optional_params.get("conversation_state") or {},
+        "conversation_state": _merge_conversation_state(optional_params, history),
         "action": {
-            "user_message_action": {
-                "user_message": {
-                    "text": prompt,
-                }
-            }
+            "user_message_action": user_message_action
         },
         "model_details": {
             "model_id": model_id,
@@ -239,6 +516,11 @@ def build_run_request(
         },
         "run_id": run_id,
     }
+    if custom_system_prompt:
+        request["custom_system_prompt"] = custom_system_prompt
+    mcp_tools = _build_mcp_tools(optional_params)
+    if mcp_tools is not None:
+        request["mcp_tools"] = mcp_tools
     if conversation_id:
         request["conversation_id"] = conversation_id
     if agent_session_id:

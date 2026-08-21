@@ -68,12 +68,11 @@ class CursorAgentConfig(BaseConfig):
         return resolve_provider_info(api_base, api_key)
 
     def get_supported_openai_params(self, model: str) -> List[str]:
+        # AgentRunRequest has mcp_tools / custom_system_prompt /
+        # conversation_state, not OpenAI temperature / max_tokens / tool_choice.
         return [
             "stream",
             "tools",
-            "tool_choice",
-            "max_tokens",
-            "temperature",
         ]
 
     def map_openai_params(
@@ -83,8 +82,11 @@ class CursorAgentConfig(BaseConfig):
         model: str,
         drop_params: bool,
     ) -> dict:
+        # temperature / max_tokens / tool_choice have no AgentRunRequest field.
+        # Do not advertise or copy them; get_optional_params rejects undeclared
+        # OpenAI params unless drop_params is set.
         for param, value in non_default_params.items():
-            if param in {"stream", "tools", "tool_choice", "max_tokens", "temperature"}:
+            if param in {"stream", "tools"}:
                 optional_params[param] = value
         return optional_params
 
