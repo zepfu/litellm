@@ -22,10 +22,11 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Union
+from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -2656,6 +2657,19 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             "AAWM_XAI_RESET_POLL_URL or the grok.com ConsumerUiSvc URL."
         ),
     )
+    parser.add_argument(
+        "--xai-reset-poll-max-attempts",
+        type=int,
+        default=_env_int(
+            "AAWM_XAI_RESET_POLL_MAX_ATTEMPTS",
+            XAI_RESET_POLL_ATTEMPTS,
+        ),
+        help=(
+            "Maximum Grok GetRemainingResets poll attempts per scheduled run, "
+            "including retries. Defaults to AAWM_XAI_RESET_POLL_MAX_ATTEMPTS "
+            "or 3."
+        ),
+    )
     cursor_usage_group = parser.add_mutually_exclusive_group()
     cursor_usage_group.add_argument(
         "--cursor-agent-usage-poll-enabled",
@@ -3119,6 +3133,8 @@ def _validate_xai_reset_poll_config_args(args: argparse.Namespace) -> None:
         )
     if not str(args.xai_reset_poll_url).strip():
         raise SystemExit("--xai-reset-poll-url must not be empty")
+    if args.xai_reset_poll_max_attempts <= 0:
+        raise SystemExit("--xai-reset-poll-max-attempts must be greater than 0")
 
 
 def _validate_observability_anomaly_scan_config_args(args: argparse.Namespace) -> None:
@@ -3289,7 +3305,7 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         xai_reset_poll_interval_seconds=args.xai_reset_poll_interval_seconds,
         xai_reset_poll_http_timeout_seconds=args.xai_reset_poll_http_timeout_seconds,
         xai_reset_poll_url=str(args.xai_reset_poll_url).strip(),
-        xai_reset_poll_max_attempts=XAI_RESET_POLL_ATTEMPTS,
+        xai_reset_poll_max_attempts=args.xai_reset_poll_max_attempts,
         xai_reset_poll_retry_backoff_seconds=XAI_RESET_POLL_BACKOFF_SECONDS,
         codex_reset_credit_poll_enabled=args.codex_reset_credit_poll_enabled,
         codex_reset_credit_poll_interval_seconds=(args.codex_reset_credit_poll_interval_seconds),
@@ -6711,6 +6727,24 @@ def _zai_coding_plan_optional_float(value: Any) -> Optional[float]:
         return None
 
 
+def _zai_coding_plan_remaining_pct(
+    *,
+    percentage: Optional[float],
+    usage: Optional[float],
+    remaining: Optional[float],
+) -> Optional[float]:
+    remaining_pct: Optional[float]
+    if percentage is not None:
+        remaining_pct = 100.0 - percentage
+    elif usage is not None and remaining is not None and usage > 0:
+        remaining_pct = remaining / usage * 100.0
+    else:
+        return None
+    if not math.isfinite(remaining_pct):
+        return None
+    return max(0.0, min(100.0, remaining_pct))
+
+
 def _build_zai_coding_plan_quota_rate_limit_payloads(
     config: ProviderStatusLoopConfig,
     *,
@@ -6757,24 +6791,37 @@ def _build_zai_coding_plan_quota_rate_limit_payloads(
         quota_remaining: Optional[float] = None
         remaining_pct: Optional[float] = None
         if limit_type == "CREDIT_LIMIT":
-            if usage is None or remaining is None:
+            if usage is None or remaining is None or usage < 0 or remaining < 0:
+                continue
+            remaining_pct = _zai_coding_plan_remaining_pct(
+                percentage=percentage,
+                usage=usage,
+                remaining=remaining,
+            )
+            if remaining_pct is None:
                 continue
             quota_type = "credits"
             quota_limit = usage
             quota_remaining = remaining
-            quota_used = usage - remaining
-            remaining_pct = (
-                100.0 - percentage
-                if percentage is not None
-                else (remaining / usage * 100.0 if usage > 0 else None)
-            )
+            quota_used = max(0.0, usage - remaining)
         elif limit_type == "TOKENS_LIMIT":
-            if percentage is None:
+            remaining_pct = _zai_coding_plan_remaining_pct(
+                percentage=percentage,
+                usage=None,
+                remaining=None,
+            )
+            if remaining_pct is None:
                 continue
             quota_type = "percent"
-            remaining_pct = 100.0 - percentage
         elif limit_type == "TIME_LIMIT":
-            if usage is None or remaining is None:
+            if usage is None or remaining is None or usage < 0 or remaining < 0:
+                continue
+            remaining_pct = _zai_coding_plan_remaining_pct(
+                percentage=percentage,
+                usage=usage,
+                remaining=remaining,
+            )
+            if remaining_pct is None:
                 continue
             quota_type = "count"
             quota_limit = usage
@@ -6782,11 +6829,8 @@ def _build_zai_coding_plan_quota_rate_limit_payloads(
             quota_used = (
                 current_value if current_value is not None else usage - remaining
             )
-            remaining_pct = (
-                100.0 - percentage
-                if percentage is not None
-                else (remaining / usage * 100.0 if usage > 0 else None)
-            )
+            if quota_used is not None and quota_used < 0:
+                continue
         else:
             continue
         if remaining_pct is None:
@@ -9465,10 +9509,16 @@ def _run_xai_reset_poll_once(
         if config is not None
         else DEFAULT_XAI_RESET_POLL_HTTP_TIMEOUT_SECONDS
     )
+    max_attempts = (
+        config.xai_reset_poll_max_attempts
+        if config is not None
+        else XAI_RESET_POLL_ATTEMPTS
+    )
     status_code, response_headers, response_body = fetch_xai_remaining_resets(
         access_token=access_token,
         url=poll_url,
         timeout=timeout,
+        max_attempts=max_attempts,
     )
     if int(status_code) in {401, 403}:
         parsed = classify_xai_remaining_resets_http_error(status_code, response_body)
@@ -9478,6 +9528,7 @@ def _run_xai_reset_poll_once(
             headers=response_headers,
         )
     writes: List[Dict[str, Any]] = []
+    previous_state_load_failed = False
     if should_persist_xai_reset_token_observations(parsed):
         previous_rows: Sequence[Mapping[str, Any]] = []
         if config is not None and config.apply:
@@ -9496,24 +9547,30 @@ def _run_xai_reset_poll_once(
                         statement_timeout_ms=config.db_statement_timeout_ms,
                     )
             except Exception:
-                previous_rows = []
-        writes = plan_xai_reset_credit_writes(
-            parse_result=parsed,
-            previous_rows=previous_rows,
-            now=int(time.time()),
-            user_id=_xai_auth_context_user_id(auth_context),
-            environment=environment,
-        )
-        if writes:
-            _commit_xai_reset_credit_writes(writes, config=config)
+                previous_state_load_failed = True
+        if not previous_state_load_failed:
+            writes = plan_xai_reset_credit_writes(
+                parse_result=parsed,
+                previous_rows=previous_rows,
+                now=int(time.time()),
+                user_id=_xai_auth_context_user_id(auth_context),
+                environment=environment,
+            )
+            if writes:
+                _commit_xai_reset_credit_writes(writes, config=config)
     return _emit_xai_reset_poll_telemetry(
-        outcome=parsed.outcome,
-        last_good_state_retained=parsed.last_good_state_retained,
+        outcome="unknown" if previous_state_load_failed else parsed.outcome,
+        last_good_state_retained=(
+            True if previous_state_load_failed else parsed.last_good_state_retained
+        ),
         grpc_status=parsed.grpc_status,
-        persisted=bool(writes),
-        observation_count=len(writes),
+        persisted=bool(writes) and not previous_state_load_failed,
+        observation_count=0 if previous_state_load_failed else len(writes),
         status_code=status_code,
         environment=environment,
+        error_class=(
+            "previous_credit_state_load_failed" if previous_state_load_failed else None
+        ),
     )
 
 
@@ -12540,6 +12597,11 @@ def _run_observability_anomaly_scan_task(
     }
 
 
+SIDECAR_OPTIONAL_POLL_DEADLINE_SECONDS = 0.05
+SIDECAR_OPTIONAL_POLL_MAX_WORKERS = 1
+_SIDECAR_OPTIONAL_POLL_EXECUTOR: Optional[ThreadPoolExecutor] = None
+
+
 def run_due_sidecar_tasks(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
@@ -12550,6 +12612,14 @@ def run_due_sidecar_tasks(
     now = time.monotonic() if now_monotonic is None else now_monotonic
     wall_now = _normalize_scheduler_wall_now(now_wall)
     events: list[Dict[str, Any]] = []
+    required_runners = {
+        _run_grok_oidc_metadata_repair_task,
+        _run_grok_oidc_refresh_task,
+        _run_codex_oauth_refresh_task,
+        _run_xai_oauth_refresh_task,
+        _run_kimi_oauth_refresh_task,
+    }
+    optional_pending: list[tuple[str, Any]] = []
     for runner, event_name in (
         (_run_grok_oidc_metadata_repair_task, "grok_oidc_metadata_repair"),
         (_run_grok_oidc_refresh_task, "grok_oidc_refresh"),
@@ -12565,29 +12635,82 @@ def run_due_sidecar_tasks(
         (_run_codex_reset_credit_poll_task, "codex_reset_credit_poll"),
         (_run_observability_anomaly_scan_task, "observability_anomaly_scan"),
     ):
-        try:
-            runner_kwargs = {"now_monotonic": now}
-            if runner in {
-                _run_grok_oidc_refresh_task,
-                _run_codex_oauth_refresh_task,
-                _run_xai_oauth_refresh_task,
-                _run_kimi_oauth_refresh_task,
-            }:
-                runner_kwargs["now_wall"] = wall_now
-            result = runner(config, state, **runner_kwargs)
-        except Exception as exc:
-            result = {
-                "event": event_name,
-                "observed_at": _utc_timestamp(),
-                "environment": config.environment,
-                "attempted": True,
-                "error_class": exc.__class__.__name__,
-                "error_message": _redacted_failure_message(str(exc)),
-            }
-        if isinstance(result, list):
-            events.extend(result)
-        elif result is not None:
-            events.append(result)
+        if runner in required_runners:
+            try:
+                runner_kwargs = {"now_monotonic": now}
+                if runner in {
+                    _run_grok_oidc_refresh_task,
+                    _run_codex_oauth_refresh_task,
+                    _run_xai_oauth_refresh_task,
+                    _run_kimi_oauth_refresh_task,
+                }:
+                    runner_kwargs["now_wall"] = wall_now
+                result = runner(config, state, **runner_kwargs)
+            except Exception as exc:
+                result = {
+                    "event": event_name,
+                    "observed_at": _utc_timestamp(),
+                    "environment": config.environment,
+                    "attempted": True,
+                    "error_class": exc.__class__.__name__,
+                    "error_message": _redacted_failure_message(str(exc)),
+                }
+            if isinstance(result, list):
+                events.extend(result)
+            elif result is not None:
+                events.append(result)
+            continue
+        optional_pending.append((event_name, runner))
+
+    if optional_pending:
+        global _SIDECAR_OPTIONAL_POLL_EXECUTOR
+        executor = _SIDECAR_OPTIONAL_POLL_EXECUTOR
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=SIDECAR_OPTIONAL_POLL_MAX_WORKERS,
+                thread_name_prefix="sidecar-optional-poll",
+            )
+            _SIDECAR_OPTIONAL_POLL_EXECUTOR = executor
+
+        def _run_optional(event_name: str, runner: Callable[..., Any]) -> Any:
+            try:
+                return runner(config, state, now_monotonic=now)
+            except Exception as exc:
+                return {
+                    "event": event_name,
+                    "observed_at": _utc_timestamp(),
+                    "environment": config.environment,
+                    "attempted": True,
+                    "error_class": exc.__class__.__name__,
+                    "error_message": _redacted_failure_message(str(exc)),
+                }
+
+        submitted = [
+            (event_name, executor.submit(_run_optional, event_name, runner))
+            for event_name, runner in optional_pending
+        ]
+        done, _not_done = futures_wait(
+            [future for _event_name, future in submitted],
+            timeout=SIDECAR_OPTIONAL_POLL_DEADLINE_SECONDS,
+        )
+        for event_name, future in submitted:
+            if future not in done:
+                continue
+            try:
+                result = future.result()
+            except Exception as exc:
+                result = {
+                    "event": event_name,
+                    "observed_at": _utc_timestamp(),
+                    "environment": config.environment,
+                    "attempted": True,
+                    "error_class": exc.__class__.__name__,
+                    "error_message": _redacted_failure_message(str(exc)),
+                }
+            if isinstance(result, list):
+                events.extend(result)
+            elif result is not None:
+                events.append(result)
     events.extend(
         _run_provider_auth_health_poll_task(
             config,

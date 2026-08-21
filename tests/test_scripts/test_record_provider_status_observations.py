@@ -4742,6 +4742,8 @@ def test_compose_wires_alibaba_quota_poll_defaults() -> None:
         "AAWM_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS=${AAWM_ALIBABA_QUOTA_POLL_RETRY_BACKOFF_SECONDS:-0.5}"
         in sidecar
     )
+    assert "AAWM_ALIBABA_QUOTA_POLL_ENABLED=${AAWM_ALIBABA_QUOTA_POLL_ENABLED:-0}" in sidecar
+    assert "AAWM_ALIBABA_QUOTA_POLL_ENABLED=${AAWM_ALIBABA_QUOTA_POLL_ENABLED:-1}" not in sidecar
 
 
 def test_loop_config_reads_grok_billing_poll_env_defaults(monkeypatch) -> None:

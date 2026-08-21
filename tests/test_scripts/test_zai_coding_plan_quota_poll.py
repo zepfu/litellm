@@ -172,6 +172,87 @@ MALFORMED_LIMITS_FIXTURE = {
     "success": True,
 }
 
+ZERO_USAGE_WITHOUT_PERCENTAGE_FIXTURE = {
+    "code": 200,
+    "msg": "Operation successful",
+    "data": {
+        "limits": [
+            {
+                "type": "CREDIT_LIMIT",
+                "unit": 3,
+                "number": 5,
+                "usage": 0,
+                "currentValue": 0,
+                "remaining": 0,
+            },
+            {
+                "type": "TIME_LIMIT",
+                "unit": 5,
+                "number": 1,
+                "usage": 0,
+                "currentValue": 0,
+                "remaining": 1000,
+            },
+            {
+                "type": "CREDIT_LIMIT",
+                "unit": 6,
+                "number": 1,
+                "usage": 60000,
+                "currentValue": 0,
+                "remaining": 59999,
+                "percentage": 1,
+                "nextResetTime": 1787831598997,
+            },
+        ],
+        "level": "pro",
+    },
+    "success": True,
+}
+
+OUT_OF_RANGE_QUOTA_FIXTURE = {
+    "code": 200,
+    "msg": "Operation successful",
+    "data": {
+        "limits": [
+            {
+                "type": "CREDIT_LIMIT",
+                "unit": 3,
+                "number": 5,
+                "usage": 12000,
+                "currentValue": 0,
+                "remaining": 13000,
+            },
+            {
+                "type": "CREDIT_LIMIT",
+                "unit": 3,
+                "number": 5,
+                "usage": -50,
+                "remaining": 10,
+                "percentage": -25,
+            },
+            {
+                "type": "TIME_LIMIT",
+                "unit": 5,
+                "number": 1,
+                "usage": 1000,
+                "remaining": 1000,
+                "percentage": 250,
+            },
+            {
+                "type": "CREDIT_LIMIT",
+                "unit": 6,
+                "number": 1,
+                "usage": 60000,
+                "remaining": 59999,
+                "percentage": 1,
+                "nextResetTime": 1787831598997,
+            },
+        ],
+        "level": "pro",
+    },
+    "success": True,
+}
+
 
 class _FakeHttpResponse:
     def __init__(self, payload: dict, *, status: int = 200) -> None:
@@ -661,3 +742,49 @@ def test_run_due_sidecar_tasks_invokes_registered_zai_poll(monkeypatch) -> None:
     ]
     assert matching
     assert called["now_monotonic"] == 100.0
+
+
+def test_zero_usage_without_percentage_does_not_zero_divide_and_keeps_valid_siblings() -> None:
+    payloads = _build_quota_payloads(
+        ZERO_USAGE_WITHOUT_PERCENTAGE_FIXTURE,
+        SUBSCRIPTION_FIXTURE,
+    )
+    rows = [_payload_fields(payload) for payload in payloads]
+    weekly = next(
+        row
+        for row in rows
+        if row["quota_period"] == "7d" and row["quota_type"] == "credits"
+    )
+
+    assert weekly["quota_limit"] == 60000
+    assert weekly["quota_remaining"] == 59999
+    assert weekly["quota_used"] == 1
+    assert weekly["remaining_pct"] == 99.0
+    for row in rows:
+        assert 0.0 <= float(row["remaining_pct"]) <= 100.0
+        if row["quota_used"] is not None:
+            assert row["quota_used"] >= 0
+        if row["quota_limit"] not in {None, 0, 0.0}:
+            assert row["quota_remaining"] is None or row["quota_remaining"] >= 0
+
+
+def test_negative_and_out_of_range_percentages_are_rejected_or_bounded() -> None:
+    payloads = _build_quota_payloads(
+        OUT_OF_RANGE_QUOTA_FIXTURE,
+        SUBSCRIPTION_FIXTURE,
+    )
+    rows = [_payload_fields(payload) for payload in payloads]
+    weekly = next(
+        row
+        for row in rows
+        if row["quota_period"] == "7d" and row["quota_type"] == "credits"
+    )
+
+    assert weekly["remaining_pct"] == 99.0
+    assert weekly["quota_used"] == 1
+    for row in rows:
+        assert 0.0 <= float(row["remaining_pct"]) <= 100.0
+        if row["quota_used"] is not None:
+            assert row["quota_used"] >= 0
+        if row["quota_limit"] is not None:
+            assert row["quota_limit"] >= 0

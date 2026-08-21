@@ -625,3 +625,117 @@ def test_packaging_sidecar_test_still_covers_loop_module():
     text = packaging.read_text(encoding="utf-8")
     assert "run_provider_status_observations_loop.py" in text
     assert "AAWM_XAI_RESET_POLL_ENABLED" in text
+
+
+def _xai_reset_poll_config(loop_mod, **overrides):
+    kwargs = {
+        "apply": True,
+        "dsn": "postgresql://fake-local/aawm_tristore_rr109",
+        "environment": "dev",
+        "interval_seconds": 300.0,
+        "timeout": 2.0,
+        "ping_count": 1,
+        "ping_timeout": 2,
+        "skip_icmp": False,
+        "once": True,
+        "setup_schema": False,
+        "db_lock_timeout_ms": 1000,
+        "db_statement_timeout_ms": 5000,
+        "xai_reset_poll_enabled": True,
+        "xai_reset_poll_interval_seconds": 3600.0,
+        "xai_reset_poll_http_timeout_seconds": 1.0,
+        "xai_reset_poll_url": DEFAULT_RESETS_URL,
+        "xai_reset_poll_max_attempts": 5,
+        "grok_oidc_auth_file": "/tmp/rr109-grok-oidc-auth.json",
+    }
+    kwargs.update(overrides)
+    return loop_mod.ProviderStatusLoopConfig(**kwargs)
+
+
+def test_previous_credit_state_load_failure_does_not_commit_complete_lifecycle(
+    loop_mod,
+    monkeypatch,
+):
+    now = int(time.time())
+    commits: List[Any] = []
+
+    monkeypatch.setattr(
+        loop_mod,
+        "_load_grok_billing_auth_context",
+        lambda *_args, **_kwargs: {"access_token": "oidc", "user_id": "user-1"},
+    )
+    monkeypatch.setattr(
+        loop_mod,
+        "fetch_xai_remaining_resets",
+        lambda **_kwargs: (
+            200,
+            {},
+            grpc_web_body(
+                encode_remaining_resets_message(
+                    [encode_reset_token("keep", now - 1, now + 500)]
+                ),
+                status=0,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        loop_mod.probes,
+        "load_provider_credit_current_rows",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("forced previous-state load failure")
+        ),
+    )
+    monkeypatch.setattr(
+        loop_mod,
+        "_commit_xai_reset_credit_writes",
+        lambda writes, config=None, **_kwargs: commits.append(list(writes)) or len(writes),
+    )
+
+    result = loop_mod._run_xai_reset_poll_once(_xai_reset_poll_config(loop_mod))
+
+    assert commits == []
+    assert result is not None
+    assert result.get("persisted") is not True
+    assert result.get("observation_count", 0) == 0
+    assert result.get("last_good_state_retained") is True or result.get("outcome") != "ok"
+
+
+def test_non_default_xai_reset_poll_max_attempts_is_parsed_from_cli_and_env(
+    loop_mod,
+    monkeypatch,
+):
+    monkeypatch.delenv("AAWM_XAI_RESET_POLL_MAX_ATTEMPTS", raising=False)
+    help_text = loop_mod._build_parser().format_help()
+    assert "--xai-reset-poll-max-attempts" in help_text
+    assert "AAWM_XAI_RESET_POLL_MAX_ATTEMPTS" in help_text
+
+    cli_config = loop_mod.parse_config(["--xai-reset-poll-max-attempts", "5"])
+    assert cli_config.xai_reset_poll_max_attempts == 5
+
+    monkeypatch.setenv("AAWM_XAI_RESET_POLL_MAX_ATTEMPTS", "7")
+    env_config = loop_mod.parse_config([])
+    assert env_config.xai_reset_poll_max_attempts == 7
+
+
+def test_non_default_xai_reset_poll_max_attempts_observes_exactly_that_many_fetches(
+    loop_mod,
+    monkeypatch,
+):
+    calls = {"n": 0}
+
+    def boom(*_args, **_kwargs):
+        calls["n"] += 1
+        raise urllib.error.URLError("nope")
+
+    monkeypatch.setattr(loop_mod.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(loop_mod.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        loop_mod,
+        "_load_grok_billing_auth_context",
+        lambda *_args, **_kwargs: {"access_token": "oidc", "user_id": "user-1"},
+    )
+
+    config = _xai_reset_poll_config(loop_mod, apply=False, xai_reset_poll_max_attempts=5)
+    with pytest.raises(urllib.error.URLError):
+        loop_mod._run_xai_reset_poll_once(config)
+    assert calls["n"] == 5
