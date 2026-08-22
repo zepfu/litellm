@@ -1,0 +1,261 @@
+# Platform and post-TUI checks. Operators edit lists here, not Python.
+checks:
+  health:
+    path: /health/liveliness
+    expect_status:
+      - 200
+  http:
+    suite:
+      - name: passthrough_v1_models
+        method: GET
+        path: /openai_passthrough/v1/models
+        expect_status:
+          - 200
+        catalog: compiled_aliases
+      - name: passthrough_models
+        method: GET
+        path: /openai_passthrough/models
+        expect_status:
+          - 200
+        catalog: compiled_aliases
+      - name: session_transfer_status_no_identity
+        method: GET
+        path: /internal/aawm/session-transfer-status
+        identity: false
+        expect_status:
+          - 400
+          - 401
+          - 403
+          - 404
+        reject_status:
+          - 500
+      - name: kimi_models
+        method: GET
+        path: /kimi/v1/models
+        expect_status:
+          - 200
+          - 401
+      - name: grok_v1
+        method: GET
+        path: /grok/v1
+        expect_status:
+          - 200
+          - 401
+          - 403
+          - 404
+      - name: grok_v1_models
+        method: GET
+        path: /grok/v1/models
+        expect_status:
+          - 200
+          - 401
+          - 403
+      - name: generic_work_miss
+        method: POST
+        path: /v1/chat/completions
+        json:
+          model: work
+          messages:
+            - role: user
+              content: ping
+        expect_status:
+          - 400
+          - 401
+          - 404
+          - 422
+        reject_status:
+          - 200
+          - 500
+        miss_is_pass: true
+  logs:
+    forbidden_substrings:
+      - "Task exception was never retrieved"
+      - "Exception in ASGI application"
+      - "KeyError: 'choices'"
+      - "h11._util.LocalProtocolError"
+      - "Too little data for declared Content-Length"
+      - "Traceback (most recent call last)"
+      - "pass_through_endpoint(): Exception occured - 429:"
+      - "pass_through_endpoint(): Exception occured - 500:"
+      - "pass_through_endpoint(): Exception occured - 502:"
+      - "pass_through_endpoint(): Exception occured - 503:"
+      - "pass_through_endpoint(): Exception occured - 504:"
+    traceback_substrings:
+      - "Traceback (most recent call last)"
+    expected_signatures:
+      - substring: "Traceback (most recent call last)"
+        nearby:
+          - "You passed in model=work. There are no healthy deployments"
+        local_context_chars: 1600
+    leftover_uvicorn:
+      enabled: true
+      regex: 'INFO:\s+\S+\s+-\s+"(?:GET|POST|PUT|PATCH|DELETE|HEAD)\s+\S+'
+      # Paths that MAY still print native uvicorn. Everything else is a halt.
+      allow_paths:
+        - /health
+        - /health/
+        - /health/liveliness
+        - /health/readiness
+        - /health/services
+      # Documentation only: routes that MUST have AAWM access-log replacement.
+      # Scanning does not use this list; any leftover uvicorn not in
+      # allow_paths is a halt (including Ohmypi discovery probes).
+      replaced_route_paths:
+        - /openai_passthrough/v1/responses
+        - /openai_passthrough/v1/chat/completions
+        - /anthropic/v1/messages
+        - /openai_passthrough/v1/models
+        - /openai_passthrough/models
+        - /model_group/info
+        - /openai_passthrough/model_group/info
+        - /openai_passthrough/v1/model/info
+        - /openai_passthrough/model/info
+        - /openai_passthrough/v2/model/info
+        - /internal/aawm/session-transfer-status
+        - /grok/v1
+        - /grok/v1/models
+        - /v1/chat/completions
+    rollup:
+      header_regex: '^\d{8} \d{2}:\d{2}:\d{2}(?: \[EARLY\])? \S+ /\S+'
+      required_after_tui: true
+      required_on_platform: false
+    attribution_scoped_substrings:
+      - "Task exception was never retrieved"
+      - "Exception in ASGI application"
+      - "KeyError: 'choices'"
+      - "h11._util.LocalProtocolError"
+      - "Too little data for declared Content-Length"
+      - "pass_through_endpoint(): Exception occured - 429:"
+      - "pass_through_endpoint(): Exception occured - 500:"
+      - "pass_through_endpoint(): Exception occured - 502:"
+      - "pass_through_endpoint(): Exception occured - 503:"
+      - "pass_through_endpoint(): Exception occured - 504:"
+    unrelated:
+      error_signatures:
+        - "deepseek/deepseek-v4-flash:free"
+        - "reset reason: connection timeout"
+      auto_agent_markers:
+        - "_handle_codex_auto_agent_alias_route"
+        - "_perform_codex_auto_agent_openrouter_completion_request"
+        - "codex_auto_agent_alias"
+      passthrough_markers:
+        - "chatgpt.com/backend-api/codex/responses"
+      local_context_chars: 800
+    model_regressions:
+      - substring: "Unsupported parameter: max_output_tokens"
+        models:
+          - work
+          - expert
+          - sota
+  error_jsonl:
+    path: "{repo}/.analysis/alpha-error.jsonl"
+    traceback_null_is_warning: true
+  identity_headers:
+    x-litellm-end-user-id: "{harness_user_id}"
+    x-aawm-repository: litellm
+    x-aawm-client: harnessv2
+  session_history:
+    enabled: false
+    timeout_seconds: 20
+soft_fail:
+  signatures:
+    - name: openrouter_owl_alpha_404
+      models:
+        - openrouter/owl-alpha
+      match: "No endpoints found"
+      client_status: 404
+    - name: ms037_kimi_no_candidate
+      models:
+        - sota-moonshot
+      match: agent_alias_no_candidate
+      traceback_null: true
+child_env:
+  base_keys:
+    - PATH
+    - HOME
+    - USER
+    - LOGNAME
+    - SHELL
+    - TERM
+    - COLORTERM
+    - TMPDIR
+    - TEMP
+    - TMP
+    - LANG
+    - LC_ALL
+    - LC_CTYPE
+    - TZ
+    - DISPLAY
+    - WAYLAND_DISPLAY
+    - DBUS_SESSION_BUS_ADDRESS
+    - SSH_AUTH_SOCK
+    - XDG_RUNTIME_DIR
+    - XDG_CONFIG_HOME
+    - XDG_DATA_HOME
+    - XDG_CACHE_HOME
+    - XDG_STATE_HOME
+    - NO_COLOR
+    - FORCE_COLOR
+    - http_proxy
+    - https_proxy
+    - HTTP_PROXY
+    - HTTPS_PROXY
+    - NO_PROXY
+    - no_proxy
+    - ALL_PROXY
+    - all_proxy
+    - SSL_CERT_FILE
+    - SSL_CERT_DIR
+    - REQUESTS_CA_BUNDLE
+    - CURL_CA_BUNDLE
+    - NODE_EXTRA_CA_CERTS
+    - NODE_OPTIONS
+    - ELECTRON_RUN_AS_NODE
+    - TMUX
+    - TMUX_PANE
+  allow_keys:
+    - LITELLM_BASE_URL
+    - LITELLM_API_BASE
+    - LITELLM_LOG
+    - LITELLM_MODE
+    - LITELLM_LOCAL_MODEL_COST_MAP
+    - PI_CONFIG_FILES
+    - AAWM_HARNESS_USER_ID
+  # Ohmypi v1 must not inherit Claude Code / Anthropic env.
+  allow_prefixes:
+    - CODEX_
+    - OPENAI_
+    - XAI_
+    - PI_
+    - OMP_
+  deny_keys:
+    - LANGFUSE_PUBLIC_KEY
+    - LANGFUSE_SECRET_KEY
+    - LANGFUSE_QUERY_URL
+    - LANGFUSE_HOST
+    - LANGFUSE_BASE_URL
+    - DATABASE_URL
+    - DIRECT_URL
+    - PRISMA_DATABASE_URL
+    - POSTGRES_PASSWORD
+    - POSTGRES_USER
+    - POSTGRES_DB
+    - PGPASSWORD
+    - AWS_SECRET_ACCESS_KEY
+    - AWS_ACCESS_KEY_ID
+    - AWS_SESSION_TOKEN
+    - LITELLM_MASTER_KEY
+    - LITELLM_SALT_KEY
+    - LITELLM_SALT
+  deny_prefixes:
+    - LANGFUSE_
+    - AAWM_DB_
+    - DATABASE_
+    - POSTGRES_
+    - PG
+  deny_substrings:
+    - SECRET
+    - PASSWORD
+    - TOKEN
+    - CREDENTIAL
+    - PRIVATE_KEY

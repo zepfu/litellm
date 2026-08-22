@@ -1,0 +1,4 @@
+20260822 06:21:47 litellm#Ohmypi[17.3.8]@thoth /v1/chat/completions
+ - openrouter/qwen/qwen3.6-flash:none - Turns: 1
+20260822 06:22:48 litellm#Ohmypi[17.3.8]@thoth /openai_passthrough/v1/responses
+ - gpt-5.6-sol(sota-openai):max - Turns: 5

@@ -9,6 +9,7 @@ exclude = [
     ".wheel-build/**",
     ".control-plane-wheel-build/**",
     "scripts/local-ci/**",
+    "scripts/harnessv2/**",
     "litellm/integrations/aawm_payload_capture.py",
     "litellm/proxy/pass_through_endpoints/aawm_claude_control_plane.py",
 ]

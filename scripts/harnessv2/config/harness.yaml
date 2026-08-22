@@ -1,0 +1,26 @@
+# Harness v2 root config. Lists, prompts, TUIs, and checks live in the
+# included YAML files — not in Python.
+schema_version: 1
+include:
+  - targets.yaml
+  - tuis.yaml
+  - models.yaml
+  - kinds.yaml
+  - checks.yaml
+  - prompts.yaml
+timeouts:
+  docker_seconds: 30
+  http_seconds: 15
+  tui_seconds: 420
+harness_user_id_env:
+  - AAWM_HARNESS_USER_ID
+default_harness_user_id: harnessv2
+artifact:
+  schema: harnessv2.artifact.v1
+  durable_dir: "{repo}/.analysis/harnessv2"
+  warn_on_sha_drift: true
+  expected_branch: develop
+  redact_headers:
+    - Authorization
+    - x-api-key
+    - api-key

@@ -1,0 +1,140 @@
+# TUI drivers. V1 implements Ohmypi only. Claude is not a stub.
+tuis:
+  out_of_scope:
+    - claude
+  implemented:
+    - ohmypi
+  stubs:
+    - codex
+    - grok
+    - opencode
+  ohmypi:
+    enabled: true
+    binary: omp
+    wrapper: ompla
+    version_min: "17.3.8"
+    env:
+      PI_CONFIG_FILES: "{home}/.omp/agent/litellm-alpha.yml"
+    cwd: /tmp/omp-alpha-workspace
+    session_dir: /tmp/omp-alpha-sessions
+    overlay: "{home}/.omp/agent/litellm-alpha.yml"
+    # Ohmypi `task.agent` profiles for harness children (H-7). Staged into
+    # `{cwd}/.omp/agents` so spawn is `agent=basic`, not `model=basic`.
+    bundled_agents_dir: "{config_dir}/ohmypi-agents"
+    project_agents_dir: "{cwd}/.omp/agents"
+    orchestration_child_agents:
+      - basic
+      - work
+      - expert
+      - sota
+    tmux:
+      socket: tmux37
+      session: omp-alpha-test
+      harness_session_prefix: hv2-ohmypi
+      wait_ready_seconds: 25
+      wait_idle_seconds: 90
+      wait_reply_seconds: 420
+      wait_mcp_seconds: 30
+      poll_interval_seconds: 1
+    forbid_flags:
+      - "-p"
+      - "--print"
+    argv_interactive:
+      - omp
+      - --session-dir
+      - "{session_dir}"
+    argv_launch_model:
+      - omp
+      - --session-dir
+      - "{session_dir}"
+      - --model
+      - "{lane}/{model}"
+    argv_no_tools:
+      - --no-tools
+    catalog_json_argv:
+      - omp
+      - models
+      - --json
+    catalog_find_argv:
+      - omp
+      - models
+      - find
+      - "{pattern}"
+      - --json
+    lanes:
+      alias: litellm-alpha-passthrough
+      completions: litellm-alpha
+    model_id_template: "{lane}/{model}"
+    spawn_prefix: litellm-alpha-passthrough
+    # Dedicated tmux launch with --model. Never reuse leftover omp-alpha-test
+    # panes and never use -p/--print.
+    select_model:
+      strategy: launch_session
+      reuse_operator_session: false
+      tools_for_model: false
+      tools_for_orchestration: true
+      ready_needles:
+        - "π"
+      mcp_ready_needles:
+        - "Connected to MCP"
+        - "No MCP"
+      idle_needles:
+        - "╰─"
+        - "π  >"
+        - "Default model:"
+      busy_needles:
+        - Thinking
+        - Working
+        - Streaming
+        - "Welcome back"
+        - "Recent sessions"
+        - "Connecting to MCP"
+        - "Discovering available models"
+        - "Waiting For Remaining"
+        - "all running jobs"
+        - "Background job"
+      selected_needles:
+        - "{selector}"
+        - "Default model: {selector}"
+        - "AAWM alias {model}"
+        # Long alias ids can paint this truncated chrome. Not a bare {model}
+        # needle: "work" is a substring of "work-other".
+        - "AAWM alias / model {model}"
+      # Recent-session titles contain "the word PONG"; recap text after a
+      # completed turn is the completion marker (wording varies).
+      pass_needles:
+        - "※ recap:"
+      error_needles:
+        - "Error:"
+        - "No endpoints found"
+        - "not supported when using Codex"
+      # Must not be a substring of the pasted orchestration prompt
+      # (omp-alpha-fanout lives in orchestration.txt and would false-complete).
+      orchestration_pass_needles:
+        - "※ recap:"
+      reject_needles:
+        - no-model
+        - "Warning: Model"
+        - "Error: No model selected"
+      env_keys:
+        - PATH
+        - HOME
+        - USER
+        - LOGNAME
+        - TERM
+        - COLORTERM
+        - TMPDIR
+        - LANG
+        - LC_ALL
+        - LC_CTYPE
+        - PI_CONFIG_FILES
+        - AAWM_HARNESS_USER_ID
+  codex:
+    enabled: false
+    stub: true
+  grok:
+    enabled: false
+    stub: true
+  opencode:
+    enabled: false
+    stub: true

@@ -1,0 +1,5 @@
+INFO:     127.0.0.1:56155 - "POST /openai_passthrough/v1/responses HTTP/1.1" 200 OK
+INFO:     172.18.0.1:50324 - "GET /openai_passthrough/v1/models HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56156 - "POST /v1/chat/completions HTTP/1.1" 200 OK
+INFO:     172.18.0.1:50329 - "GET /openai_passthrough/v1/model/info HTTP/1.1" 404 Not Found
+INFO:     172.18.0.1:50330 - "GET /model_group/info HTTP/1.1" 200 OK

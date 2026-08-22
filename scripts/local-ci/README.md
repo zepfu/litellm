@@ -4,7 +4,9 @@ This bundle contains the standalone local acceptance harness used to validate
 LiteLLM routing, request rewrites, Langfuse traces, and provider-specific
 metadata across Claude, Codex, OpenRouter, NVIDIA, and Grok paths. See
 `TEST_HARNESS.md` in the main repo for the full validation policy and runtime
-split, and `PROD_RELEASE.md` for the production promotion runbook.
+split, and `PROD_RELEASE.md` for the production promotion runbook. The Ohmypi
+YAML-first runner is `scripts/harnessv2/` (see
+`scripts/harnessv2/TESTING.md`) and is not part of this bundle.
 
 ## Included Files
 

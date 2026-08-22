@@ -5,6 +5,11 @@ This repository has two distinct local validation paths:
 - the baseline local acceptance harness for the normal LiteLLM runtime
 - the Anthropic-route adapter harness for real Claude CLI validation on `:4001`
 
+A separate YAML/JSON-first harness lives in `scripts/harnessv2/` (Ohmypi on
+`litellm-alpha` only). It does not replace `scripts/local-ci/` and must never
+target `aawm-litellm` (`:4000`) or `litellm-dev` (`:4001`). Operator document
+for that runner and its testing process: `scripts/harnessv2/TESTING.md`.
+
 The adapter suite is the one that matters for the Anthropic -> OpenAI/Codex,
 Anthropic -> OpenRouter, and Anthropic -> NVIDIA work.
 

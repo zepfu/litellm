@@ -1,0 +1,23 @@
+You are the parent on alias {parent}.
+
+Spawn exactly four subagents now, in one turn, using the Ohmypi `task` tool.
+The spawn payload has no `model=` field. Set `agent` to these exact profile
+names. Do not substitute scout, designer, reviewer, security-reviewer,
+librarian, task, sonic, a provider prefix, or an aawm- prefixed name:
+
+1. agent=basic   task: run the single shell command `date` (or `date -u` if
+   date is unavailable). Return only the command stdout. Do not guess the time.
+2. agent=work    same task.
+3. agent=expert  same task.
+4. agent=sota    same task.
+
+Do not spawn any other agents. Do not do the date command yourself.
+
+After all four subagents have returned their date stdout, send each of the
+same four subagents a follow-up in one parent turn: in a single assistant
+response, run these three tools in parallel (not sequential turns):
+`pwd`, `uname -s`, and `echo omp-alpha-fanout`. Return the three stdout
+strings. No other tools.
+
+Then list, for each child: agent profile used, date stdout, and the three
+parallel stdout strings.

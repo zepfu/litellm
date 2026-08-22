@@ -1,0 +1,6 @@
+20260821 16:00:00 Oh@thoth /v1/chat/completions
+ - openrouter/owl-alpha:none - Turns: 0
+Exception in ASGI application
+Traceback (most recent call last):
+  File "/app/litellm/proxy/proxy_server.py", line 1, in <module>
+    raise RuntimeError("boom")

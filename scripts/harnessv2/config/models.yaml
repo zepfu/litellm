@@ -1,0 +1,58 @@
+# Compiled YAML alias ids and groups. --model all expands compiled_aliases only.
+models:
+  compiled_aliases:
+    - basic
+    - work
+    - work-other
+    - expert
+    - sota
+    - sota-openai
+    - sota-xai
+    - sota-alibaba
+    - sota-moonshot
+    - sota-deepseek
+    - sota-zai
+    - codex-auto-review
+  skip_prefixes:
+    - aawm-
+    - claude-
+  absent_catalog_ids:
+    - aawm-sota-zai
+    - aawm-sota-openai
+    - aawm-sota-moonshot
+  catalog_picker_sample:
+    - work
+    - sota-zai
+  served_concrete_ids:
+    - cursor_agent/composer-2.5
+    - cursor_agent/cursor-grok-4.6-high
+    - oa_xai/grok-4.6
+    - kimi_code/k3
+    - cohere/north-mini-code-1-0
+    - alibaba_token_plan/glm-5.2
+    - alibaba_token_plan/qwen3.8-max
+    - openrouter/qwen/qwen3.6-flash
+    - openrouter/qwen/qwen3.5-flash-02-23
+    - deepseek-v4-flash-free
+    - big-pickle
+  groups:
+    all: compiled_aliases
+    all-sota:
+      - sota-openai
+      - sota-xai
+      - sota-alibaba
+      - sota-moonshot
+      - sota-deepseek
+      - sota-zai
+    orchestration_children:
+      - basic
+      - work
+      - expert
+      - sota
+    catalog_picker: catalog_picker_sample
+  default_model_group: all
+  default_orchestration_parent: sota-openai
+  alias_lane: alias
+  completions_lane: completions
+  # Recorded after the first real Ohmypi spawn; not a Python constant.
+  ohmypi_spawn_prefix: litellm-alpha-passthrough

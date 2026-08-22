@@ -1,0 +1,5 @@
+prompts:
+  pong:
+    file: prompts/pong.txt
+  orchestration:
+    file: prompts/orchestration.txt

@@ -1,0 +1,54 @@
+# Instance aliases and the container firewall. V1 runnable profile is alpha.
+# --instance/--container/--target resolve to a Docker container name.
+# Host port comes from docker inspect, not a CLI flag.
+default_instance: litellm-alpha
+protected_containers:
+  - aawm-litellm
+  - litellm-dev
+protected_ports:
+  - 4000
+  - 4001
+aliases:
+  alpha:
+    container: litellm-alpha
+    enabled: true
+  litellm-alpha:
+    container: litellm-alpha
+    enabled: true
+  # Present so operators see the names. enabled:false plus the protected
+  # list means the harness cannot aim at :4001 / :4000.
+  dev:
+    container: litellm-dev
+    enabled: false
+  litellm-dev:
+    container: litellm-dev
+    enabled: false
+  prod:
+    container: aawm-litellm
+    enabled: false
+  aawm-litellm:
+    container: aawm-litellm
+    enabled: false
+instances:
+  litellm-alpha:
+    enabled: true
+    container_port: 4011
+    inspect_env_keys:
+      - AAWM_LITELLM_ENVIRONMENT
+      - LITELLM_AAWM_ERROR_LOG_ENV
+      - AAWM_ALIAS_ROUTING_STATE_NAMESPACE
+      - LITELLM_LANGFUSE_TRACE_ENVIRONMENT
+redis:
+  container: litellm-aawm-alias-routing-redis-1
+  namespace: aawm-routing-alpha-v1
+  never_flush: true
+  never_write: true
+  info_command:
+    - INFO
+    - memory
+  scan_count: 200
+  ceilings:
+    warn_used_memory_bytes: 268435456
+    fail_used_memory_bytes: 1073741824
+    warn_prefix_keys: 50000
+    fail_prefix_keys: 200000

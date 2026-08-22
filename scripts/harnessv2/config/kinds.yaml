@@ -1,0 +1,49 @@
+# Kind steps. Adding a model or prompt is a YAML edit. Adding a *type* of
+# step requires Python.
+kinds:
+  platform:
+    requires_tui: false
+    description: Health, logs, custom endpoints, Redis prefix scan, error JSONL
+    steps:
+      - type: health
+      - type: http_suite
+      - type: error_jsonl
+      - type: redis_scan
+      - type: docker_logs
+  catalog:
+    requires_tui: false
+    tui_optional: true
+    description: CFG-023/024 passthrough catalog plus optional Ohmypi picker
+    default_models: catalog_picker_sample
+    steps:
+      - type: health
+      - type: catalog_http
+      - type: tui_catalog
+        when: tui_selected
+      - type: docker_logs
+      - type: error_jsonl
+  model:
+    requires_tui: true
+    description: Interactive Ohmypi turn per compiled alias or group
+    default_models: all
+    require_explicit_model: false
+    steps:
+      - type: health
+      - type: tui_model
+      - type: docker_logs
+      - type: error_jsonl
+  orchestration:
+    requires_tui: true
+    description: Ohmypi parent fanout to basic/work/expert/sota
+    default_parent_group: all-sota
+    default_parent: sota-openai
+    default_children_group: orchestration_children
+    evidence_order:
+      - session_history_tool_activity
+      - aawm_child_routes
+      - tui_transcript
+    steps:
+      - type: health
+      - type: tui_orchestration
+      - type: docker_logs
+      - type: error_jsonl
