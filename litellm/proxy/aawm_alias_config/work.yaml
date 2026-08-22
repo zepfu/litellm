@@ -8,6 +8,11 @@ aliases:
         route_family: codex_opencode_go_adapter
         priority: 110
 
+      - provider: nous
+        model: stealth/ox-alpha
+        route_family: codex_nous_chat_completions_adapter
+        priority: 107
+
       - provider: openrouter
         model: openrouter/stealth/ox-alpha
         route_family: codex_openrouter_completion_adapter

@@ -140,28 +140,33 @@ order:
 
 1. OpenCode Go `ox-alpha-free` (`provider: opencode_go`,
    `codex_opencode_go_adapter`, Codex-only; no Anthropic Go adapter)
-2. OpenRouter `openrouter/stealth/ox-alpha`
-
-Direct `nous/<id>` is a Codex-only chat-completions adapter
-(`codex_nous_chat_completions_adapter`, `provider: nous`) at
-`https://inference-api.nousresearch.com/v1`. Anthropic `nous/*` fails
-closed and is not rewritten to OpenRouter. Wave B does not insert Nous
-into compiled `basic` / `work`; that insertion is NOUS-003.
-3. Direct Cohere North Mini Code (`cohere/north-mini-code-1-0`,
+2. Direct Nous `stealth/ox-alpha` (`provider: nous`,
+   `codex_nous_chat_completions_adapter`, Codex-only; independent
+   Hermes OAuth lane; Anthropic `nous/*` fails closed and is omitted
+   from Claude snapshots)
+3. OpenRouter `openrouter/stealth/ox-alpha`
+4. Direct Cohere North Mini Code (`cohere/north-mini-code-1-0`,
    `provider: cohere`, `codex_cohere_chat_completions_adapter`,
    `lane=cohere_native`)
-4. OpenRouter Cohere North Mini Code free
+5. OpenRouter Cohere North Mini Code free
    (`openrouter/cohere/north-mini-code:free`) as an independent fallback
-5. OpenRouter Owl Alpha
-6. OpenCode Zen deepseek-v4-flash
-7. OpenCode Zen big-pickle
-8. Alibaba Token Plan deepseek-v4-flash-0731
-9. Cursor Agent Composer 2.5 standard (`cursor_agent/composer-2.5`,
+6. OpenRouter Owl Alpha
+7. OpenCode Zen deepseek-v4-flash
+8. OpenCode Zen big-pickle
+9. Alibaba Token Plan deepseek-v4-flash-0731
+10. Cursor Agent Composer 2.5 standard (`cursor_agent/composer-2.5`,
    `provider: cursor_agent`, `codex_cursor_agent_aiserver_adapter`,
    priority 42). Distinct from `composer-2.5-fast` and from xAI
    `grok-composer-2.5-fast`. Alias YAML uses `cursor_agent`, not Cloud
    Agents `cursor`.
-10. Alibaba Token Plan qwen3.6-flash
+11. Alibaba Token Plan qwen3.6-flash
+
+Claude-origin snapshots omit OpenCode Go and Nous (both Codex-only) and
+keep OpenRouter `openrouter/stealth/ox-alpha` as the first OX-alpha
+candidate. Direct `nous/<id>` remains a Codex-only chat-completions
+adapter at `https://inference-api.nousresearch.com/v1`. Nous auth,
+cooldown, capacity, and usage stay independent of OpenRouter free-daily
+quota and OpenAI Codex OAuth.
 
 The managed `sota-xai` candidate has no candidate-level reasoning override:
 caller `reasoning.effort=xhigh` is sent unchanged to `oa_xai/grok-4.6`, with
@@ -218,11 +223,13 @@ The `work` alias is compiled from `work.yaml`. Candidate order is:
 
 1. OpenCode Go `ox-alpha-free` (`provider: opencode_go`,
    `codex_opencode_go_adapter`, Codex-only; no Anthropic Go adapter)
-2. OpenRouter `openrouter/stealth/ox-alpha`
-3. OpenAI `gpt-5.3-codex-spark`
-4. Nested `alias_reference: work-other`
-5. Claude-origin only: native Anthropic Sonnet tail
-6. OpenAI `gpt-5.6-luna` last resort
+2. Direct Nous `stealth/ox-alpha` (`provider: nous`,
+   `codex_nous_chat_completions_adapter`, Codex-only)
+3. OpenRouter `openrouter/stealth/ox-alpha`
+4. OpenAI `gpt-5.3-codex-spark`
+5. Nested `alias_reference: work-other`
+6. Claude-origin only: native Anthropic Sonnet tail
+7. OpenAI `gpt-5.6-luna` last resort
 
 `work-other` is an ordinary configured alias compiled from `work-other.yaml`.
 It is a valid exact-name route and a valid `alias_reference` target. It remains

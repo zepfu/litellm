@@ -206,6 +206,7 @@ aliases:
         basic_candidates = snapshot.aliases["basic"].candidates
         first = basic_candidates[0]
         second = basic_candidates[1]
+        third = basic_candidates[2]
         assert (
             first.provider,
             first.model,
@@ -222,11 +223,22 @@ aliases:
             second.model,
             second.route_family,
         ) == (
+            "nous",
+            "stealth/ox-alpha",
+            "codex_nous_chat_completions_adapter",
+        )
+        assert second.priority == 97
+        assert second.anthropic_route_family is None
+        assert (
+            third.provider,
+            third.model,
+            third.route_family,
+        ) == (
             "openrouter",
             _OPENROUTER_OX_ALPHA_MODEL,
             "codex_openrouter_completion_adapter",
         )
-        assert second.priority == 95
+        assert third.priority == 95
 
         north_pairs = [
             (candidate.provider, candidate.model, candidate.route_family)
@@ -254,7 +266,7 @@ aliases:
             for index, candidate in enumerate(basic_candidates)
             if candidate.model == "cohere/north-mini-code-1-0"
         )
-        assert cohere_index == 2
+        assert cohere_index == 3
         assert basic_candidates[cohere_index - 1].model == _OPENROUTER_OX_ALPHA_MODEL
 
     def test_work_yaml_places_go_then_openrouter_ox_alpha_first(self):
@@ -263,6 +275,7 @@ aliases:
         first = work_candidates[0]
         second = work_candidates[1]
         third = work_candidates[2]
+        fourth = work_candidates[3]
         assert (
             first.provider,
             first.model,
@@ -279,12 +292,23 @@ aliases:
             second.model,
             second.route_family,
         ) == (
+            "nous",
+            "stealth/ox-alpha",
+            "codex_nous_chat_completions_adapter",
+        )
+        assert second.priority == 107
+        assert second.anthropic_route_family is None
+        assert (
+            third.provider,
+            third.model,
+            third.route_family,
+        ) == (
             "openrouter",
             _OPENROUTER_OX_ALPHA_MODEL,
             "codex_openrouter_completion_adapter",
         )
-        assert second.priority == 105
-        assert third.model == "gpt-5.3-codex-spark"
+        assert third.priority == 105
+        assert fourth.model == "gpt-5.3-codex-spark"
 
 
 class TestOpenCodeGoLaneSelection:
