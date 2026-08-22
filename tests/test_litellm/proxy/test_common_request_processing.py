@@ -1045,14 +1045,14 @@ class TestProxyBaseLLMRequestProcessing:
 
     def test_health_access_log_filter_suppresses_platform_http_suite_probes(
         self,
+        monkeypatch,
     ):
+        monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-dev")
         access_filter = AawmHealthAccessLogFilter()
         probes = (
             ("GET", "/internal/aawm/session-transfer-status", 403),
             ("GET", "/grok/v1", 403),
             ("GET", "/grok/v1/models", 401),
-            ("POST", "/v1/chat/completions", 400),
-            ("POST", "/chat/completions", 400),
         )
         for method, path, status_code in probes:
             assert (
@@ -1076,6 +1076,45 @@ class TestProxyBaseLLMRequestProcessing:
             )
             is True
         )
+
+    def test_health_access_log_filter_suppresses_chat_completions_probes_in_alpha_only(
+        self,
+        monkeypatch,
+    ):
+        access_filter = AawmHealthAccessLogFilter()
+        chat_probe_records = (
+            _build_uvicorn_access_record(
+                method="POST",
+                full_path="/v1/chat/completions",
+                status_code=400,
+            ),
+            _build_uvicorn_access_record(
+                method="POST",
+                full_path="/chat/completions",
+                status_code=400,
+            ),
+            _build_uvicorn_access_record(
+                method="GET",
+                full_path="/v1/chat/completions",
+                status_code=200,
+            ),
+        )
+
+        monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", "litellm-alpha")
+        for record in chat_probe_records:
+            assert access_filter.filter(record) is False
+
+        for environment in ("litellm-dev", "production"):
+            monkeypatch.setenv("AAWM_LITELLM_ENVIRONMENT", environment)
+            for record in chat_probe_records:
+                assert access_filter.filter(record) is True, (
+                    f"expected preserved access log for {record.args[1]} "
+                    f"{record.args[2]} in {environment}"
+                )
+
+        monkeypatch.delenv("AAWM_LITELLM_ENVIRONMENT", raising=False)
+        for record in chat_probe_records:
+            assert access_filter.filter(record) is True
 
     def test_health_access_log_filter_suppresses_successful_anthropic_base_head_probe(
         self,

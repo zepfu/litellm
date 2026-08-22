@@ -274,18 +274,25 @@ def _exception_chain_contains_type(
 
 
 def _proxy_exception_for_unclassified_probe_failure(exc: Exception) -> Exception:
-    """Turn an unclassified alias-probe failure into a client HTTP error.
+    """Turn an unclassified alias-probe failure into a FastAPI-safe HTTP error.
 
     Raw OpenRouter/BadRequest/ZAI exceptions leak as uvicorn
     ``Exception in ASGI application`` plus a full traceback. HTTPException
-    and ProxyException are already FastAPI-safe.
+    and ProxyException are already FastAPI-safe. A recognized provider HTTP
+    status (4xx/5xx) is preserved; anything without a valid status is an
+    internal error (HTTP 500), never a client error.
     """
 
     if isinstance(exc, (HTTPException, ProxyException)):
         return exc
     status_code = _error_signals._extract_adapter_exception_status_code(exc)
     if status_code is None or not (400 <= int(status_code) <= 599):
-        status_code = 400
+        return ProxyException(
+            message=str(getattr(exc, "message", str(exc))),
+            type="internal_server_error",
+            param="model",
+            code=500,
+        )
     return ProxyException(
         message=str(getattr(exc, "message", str(exc))),
         type=str(getattr(exc, "type", "invalid_request_error") or "invalid_request_error"),

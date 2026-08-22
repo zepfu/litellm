@@ -1251,10 +1251,23 @@ _AAWM_PLATFORM_PROBE_ACCESS_LOG_PATHS = frozenset(
         "/internal/aawm/session-transfer-status",
         "/grok/v1",
         "/grok/v1/models",
+    }
+)
+# Alpha test-harness chat-completions probes. Suppress leftover uvicorn
+# ACCESS only in the alpha environment; dev and production must keep these
+# access logs.
+_AAWM_ALPHA_CHAT_COMPLETIONS_PROBE_ACCESS_LOG_PATHS = frozenset(
+    {
         "/v1/chat/completions",
         "/chat/completions",
     }
 )
+
+
+def _aawm_alpha_access_log_suppression_enabled() -> bool:
+    return os.getenv("AAWM_LITELLM_ENVIRONMENT", "").strip() == "litellm-alpha"
+
+
 _AAWM_HEALTH_ACCESS_LOG_STATUSES = frozenset({200, 204})
 _AAWM_ANTHROPIC_BASE_PROBE_PATHS = frozenset({"/anthropic", "/anthropic/"})
 
@@ -1282,6 +1295,12 @@ class AawmHealthAccessLogFilter(logging.Filter):
         if (
             path in _AAWM_PLATFORM_PROBE_ACCESS_LOG_PATHS
             and normalized_method in {"GET", "POST"}
+        ):
+            return False
+        if (
+            path in _AAWM_ALPHA_CHAT_COMPLETIONS_PROBE_ACCESS_LOG_PATHS
+            and normalized_method in {"GET", "POST"}
+            and _aawm_alpha_access_log_suppression_enabled()
         ):
             return False
         is_health_probe = (

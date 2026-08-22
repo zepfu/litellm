@@ -425,7 +425,8 @@ def test_should_wrap_unclassified_probe_failure_as_proxy_exception() -> None:
     assert isinstance(wrapped, ProxyException)
     assert wrapped is not raw
     assert "openrouter 422" in wrapped.message
-    assert wrapped.code in {"400", 400}
+    assert wrapped.code == "500"
+    assert wrapped.type == "internal_server_error"
 
     http_exc = HTTPException(status_code=422, detail="already http")
     assert (
@@ -442,3 +443,25 @@ def test_should_wrap_unclassified_probe_failure_as_proxy_exception() -> None:
         candidate_loop._proxy_exception_for_unclassified_probe_failure(proxy_exc)
         is proxy_exc
     )
+
+
+@pytest.mark.parametrize("provider_status", [400, 401, 422, 429, 500, 502, 529])
+def test_should_preserve_recognized_probe_failure_statuses(provider_status) -> None:
+    raw = RuntimeError("upstream probe failed")
+    raw.status_code = provider_status  # type: ignore[attr-defined]
+
+    wrapped = candidate_loop._proxy_exception_for_unclassified_probe_failure(raw)
+
+    assert isinstance(wrapped, ProxyException)
+    assert wrapped.code == str(provider_status)
+
+
+def test_should_map_statusless_probe_failure_to_internal_server_error() -> None:
+    raw = RuntimeError("adapter crashed without a provider status")
+
+    wrapped = candidate_loop._proxy_exception_for_unclassified_probe_failure(raw)
+
+    assert isinstance(wrapped, ProxyException)
+    assert wrapped.code == "500"
+    assert wrapped.type == "internal_server_error"
+    assert "adapter crashed without a provider status" in wrapped.message
