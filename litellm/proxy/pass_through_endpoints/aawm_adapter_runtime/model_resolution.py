@@ -51,6 +51,7 @@ _HOST_FUNCTION_NAMES = (
     "_normalize_zai_coding_plan_adapter_model_name",
     "_resolve_codex_opencode_zen_adapter_model",
     "_resolve_codex_opencode_go_adapter_model",
+    "_resolve_codex_nous_chat_completions_adapter_model",
     "_resolve_codex_kimi_chat_completions_adapter_model",
     "_resolve_codex_alibaba_token_plan_adapter_model",
     "_resolve_codex_zai_coding_plan_adapter_model",
@@ -121,6 +122,7 @@ def _split_anthropic_adapter_provider_prefix(
         "zen": _OPENCODE_ZEN_PROVIDER,  # noqa: F821
         "opencode-go": _OPENCODE_GO_PROVIDER,  # noqa: F821
         "opencode_go": _OPENCODE_GO_PROVIDER,  # noqa: F821
+        "nous": "nous",
     }.get(
         prefix,
         prefix
@@ -129,6 +131,7 @@ def _split_anthropic_adapter_provider_prefix(
             "openai",
             "openrouter",
             "nvidia",
+            "nous",
             _OPENCODE_ZEN_PROVIDER,  # noqa: F821
             _OPENCODE_GO_PROVIDER,  # noqa: F821
         )
@@ -194,6 +197,8 @@ def _normalize_anthropic_openrouter_adapter_model_name(
     model: Any,
 ) -> Optional[str]:
     explicit_provider, candidate = _split_anthropic_adapter_provider_prefix(model)
+    if explicit_provider == "nous":
+        return None
     normalized_candidate = (
         candidate if explicit_provider == "openrouter" else _normalize_anthropic_adapter_model_name(model)
     )
@@ -285,6 +290,24 @@ def _resolve_codex_opencode_go_adapter_model(
     if not _is_openai_responses_endpoint(endpoint):
         return None
     return _normalize_opencode_go_adapter_model_name(request_body.get("model"))
+
+
+def _resolve_codex_nous_chat_completions_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _is_openai_responses_endpoint(endpoint):
+        return None
+    model = request_body.get("model")
+    if not isinstance(model, str):
+        return None
+    normalized = model.strip()
+    nous_provider = globals().get("_NOUS_PROVIDER", "nous")
+    prefix = f"{nous_provider}/"
+    if not normalized.startswith(prefix):
+        return None
+    remainder = normalized[len(prefix) :].strip()
+    return remainder or None
 
 def _resolve_codex_kimi_chat_completions_adapter_model(
     request_body: dict[str, Any],

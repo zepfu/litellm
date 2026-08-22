@@ -3326,6 +3326,7 @@ class LlmProviders(str, Enum):
     S3_VECTORS = "s3_vectors"
     HELICONE = "helicone"
     HYPERBOLIC = "hyperbolic"
+    NOUS = "nous"
     RECRAFT = "recraft"
     FAL_AI = "fal_ai"
     STABILITY = "stability"

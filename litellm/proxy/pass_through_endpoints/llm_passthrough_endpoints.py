@@ -739,6 +739,7 @@ _OPENCODE_ZEN_ANTHROPIC_COMPLETION_MODELS = _opencode_zen_constants._OPENCODE_ZE
 _OPENCODE_GO_DEFAULT_BASE_URL = _opencode_zen_constants._OPENCODE_GO_DEFAULT_BASE_URL
 _OPENCODE_GO_PROVIDER = _opencode_zen_constants._OPENCODE_GO_PROVIDER
 _OPENCODE_GO_FREE_MODELS = _opencode_zen_constants._OPENCODE_GO_FREE_MODELS
+_NOUS_PROVIDER = "nous"
 
 _GROK_CLI_CHAT_PROXY_DEFAULT_BASE_URL = _grok_side_channel._GROK_CLI_CHAT_PROXY_DEFAULT_BASE_URL
 
@@ -1362,6 +1363,9 @@ _resolve_codex_opencode_zen_adapter_model = _aawm_adapter_model_resolution._reso
 
 
 _resolve_codex_opencode_go_adapter_model = _aawm_adapter_model_resolution._resolve_codex_opencode_go_adapter_model
+
+
+_resolve_codex_nous_chat_completions_adapter_model = _aawm_adapter_model_resolution._resolve_codex_nous_chat_completions_adapter_model
 
 
 _resolve_codex_kimi_chat_completions_adapter_model = _aawm_adapter_model_resolution._resolve_codex_kimi_chat_completions_adapter_model

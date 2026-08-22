@@ -77,6 +77,9 @@ def _resolve_auto_agent_alias_route_rollup_outgoing_target(
         return _get_anthropic_adapter_access_log_target_label(target_url)
     route_family_target_labels = {
         "codex_cohere_chat_completions_adapter": "api.cohere.com/v2/chat",
+        "codex_nous_chat_completions_adapter": (
+            "inference-api.nousresearch.com/v1/chat/completions"
+        ),
         "codex_zai_coding_plan_chat_completions_adapter": (
             "api.z.ai/api/coding/paas/v4/chat/completions"
         ),

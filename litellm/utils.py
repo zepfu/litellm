@@ -8294,6 +8294,7 @@ class ProviderConfigManager:
             LlmProviders.HEROKU: (lambda: litellm.HerokuChatConfig(), False),
             LlmProviders.OCI: (lambda: litellm.OCIChatConfig(), False),
             LlmProviders.HYPERBOLIC: (lambda: litellm.HyperbolicChatConfig(), False),
+            LlmProviders.NOUS: (lambda: litellm.NousChatConfig(), False),
             LlmProviders.OVHCLOUD: (lambda: litellm.OVHCloudChatConfig(), False),
             LlmProviders.AMAZON_NOVA: (lambda: litellm.AmazonNovaChatConfig(), False),
             LlmProviders.LANGGRAPH: (

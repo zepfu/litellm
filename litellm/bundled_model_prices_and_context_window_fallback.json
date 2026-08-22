@@ -25992,6 +25992,48 @@
         "supports_prompt_caching": false,
         "supports_tool_choice": true
     },
+    "nous/stealth/ox-alpha": {
+        "input_cost_per_token": 0,
+        "litellm_provider": "nous",
+        "mode": "chat",
+        "output_cost_per_token": 0
+    },
+    "nous/upstage/solar-pro4:free": {
+        "input_cost_per_token": 0,
+        "litellm_provider": "nous",
+        "mode": "chat",
+        "output_cost_per_token": 0
+    },
+    "nous/meituan/longcat-2.0:free": {
+        "input_cost_per_token": 0,
+        "litellm_provider": "nous",
+        "mode": "chat",
+        "output_cost_per_token": 0
+    },
+    "nous/tencent/hy3:free": {
+        "input_cost_per_token": 0,
+        "litellm_provider": "nous",
+        "mode": "chat",
+        "output_cost_per_token": 0
+    },
+    "nous/poolside/laguna-s-2.1:free": {
+        "input_cost_per_token": 0,
+        "litellm_provider": "nous",
+        "mode": "chat",
+        "output_cost_per_token": 0
+    },
+    "nous/stepfun/step-3.7-flash:free": {
+        "input_cost_per_token": 0,
+        "litellm_provider": "nous",
+        "mode": "chat",
+        "output_cost_per_token": 0
+    },
+    "nous/poolside/laguna-xs-2.1:free": {
+        "input_cost_per_token": 0,
+        "litellm_provider": "nous",
+        "mode": "chat",
+        "output_cost_per_token": 0
+    },
     "openrouter/deepseek/deepseek-chat-v3-0324": {
         "input_cost_per_token": 1.4e-07,
         "litellm_provider": "openrouter",

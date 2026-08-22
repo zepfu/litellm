@@ -69,7 +69,10 @@ Related deeper context:
 LiteLLM is a **read-only consumer** of these files during request handling. It
 selects a still-valid access token (or fails the candidate with a clear
 refresh-required message). It must not refresh, seed, or rewrite these
-credentials on the request path.
+credentials on the request path. Direct Nous inference reads
+`providers.nous` then `credential_pool.nous` from
+`LITELLM_HERMES_AUTH_FILE`, else `AAWM_HERMES_AUTH_FILE`, else
+`~/.hermes/auth.json`.
 
 Kimi Code uses the existing host Kimi CLI credential in place. It is not a
 LiteLLM-owned second grant. A configured managed `kimi_code` route consumes the

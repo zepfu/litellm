@@ -311,6 +311,7 @@ LLM_CONFIG_NAMES = (
     "RAGFlowConfig",
     "LambdaAIChatConfig",
     "HyperbolicChatConfig",
+    "NousChatConfig",
     "VercelAIGatewayConfig",
     "OVHCloudChatConfig",
     "OVHCloudEmbeddingConfig",
@@ -1158,6 +1159,10 @@ _LLM_CONFIGS_IMPORT_MAP = {
     "HyperbolicChatConfig": (
         ".llms.hyperbolic.chat.transformation",
         "HyperbolicChatConfig",
+    ),
+    "NousChatConfig": (
+        ".llms.nous.chat.transformation",
+        "NousChatConfig",
     ),
     "VercelAIGatewayConfig": (
         ".llms.vercel_ai_gateway.chat.transformation",

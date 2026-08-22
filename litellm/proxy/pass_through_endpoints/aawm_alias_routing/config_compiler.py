@@ -88,6 +88,16 @@ _COHERE_NATIVE_PROVIDERS: frozenset[str] = frozenset(
         "cohere",
     }
 )
+_NOUS_CREDENTIAL_ROUTE_FAMILIES: frozenset[str] = frozenset(
+    {
+        "codex_nous_chat_completions_adapter",
+    }
+)
+_NOUS_NATIVE_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "nous",
+    }
+)
 _ZAI_CODING_PLAN_CREDENTIAL_ROUTE_FAMILIES: frozenset[str] = frozenset(
     {
         "codex_zai_coding_plan_chat_completions_adapter",
@@ -139,6 +149,37 @@ def _validate_cohere_credential_domain(
         raise ConfigCompileError(
             f"candidate model {model!r}: provider {provider!r} requires "
             "Cohere-native route families"
+        )
+
+
+def _validate_nous_credential_domain(
+    *,
+    provider: str,
+    model: str,
+    route_family: Optional[str],
+    anthropic_route_family: Optional[str],
+) -> None:
+    route_families = tuple(
+        value
+        for value in (route_family, anthropic_route_family)
+        if value is not None
+    )
+    uses_nous_credentials = any(
+        value in _NOUS_CREDENTIAL_ROUTE_FAMILIES for value in route_families
+    )
+    is_nous_provider = provider in _NOUS_NATIVE_PROVIDERS
+
+    if uses_nous_credentials and not is_nous_provider:
+        raise ConfigCompileError(
+            f"candidate model {model!r}: provider {provider!r} is incompatible "
+            "with Nous-credential route family"
+        )
+    if is_nous_provider and any(
+        value not in _NOUS_CREDENTIAL_ROUTE_FAMILIES for value in route_families
+    ):
+        raise ConfigCompileError(
+            f"candidate model {model!r}: provider {provider!r} requires "
+            "Nous-native route families"
         )
 
 
@@ -303,6 +344,12 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
             f"is incompatible with anthropic-credential route_family {anthropic_rf!r}"
         )
     _validate_cohere_credential_domain(
+        provider=candidate.provider,
+        model=candidate.model,
+        route_family=candidate.route_family,
+        anthropic_route_family=anthropic_rf,
+    )
+    _validate_nous_credential_domain(
         provider=candidate.provider,
         model=candidate.model,
         route_family=candidate.route_family,

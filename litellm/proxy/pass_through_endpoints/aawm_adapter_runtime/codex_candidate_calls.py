@@ -97,6 +97,7 @@ if TYPE_CHECKING:
     _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER: str
     _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER: str
     _CODEX_AUTO_AGENT_COHERE_PROVIDER: str
+    _CODEX_AUTO_AGENT_NOUS_PROVIDER: str
     _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER: str
     _CODEX_AUTO_AGENT_OPENCODE_PROVIDER: str
     _CODEX_AUTO_AGENT_OPENCODE_GO_PROVIDER: str
@@ -189,6 +190,7 @@ _HOST_FUNCTION_NAMES = (
     # OpenCode
     "_handle_codex_opencode_zen_adapter_route",
     "_handle_codex_opencode_go_adapter_route",
+    "_handle_codex_nous_chat_completions_adapter_route",
     "_consume_opencode_zen_tools_mode_header",
     "_build_opencode_zen_completion_call_kwargs",
     "_perform_opencode_zen_completion_call",
@@ -493,6 +495,24 @@ async def _perform_codex_auto_agent_alias_candidate_request(
             use_alias_candidate_probe=True,
         )
 
+    nous_provider = globals().get("_CODEX_AUTO_AGENT_NOUS_PROVIDER", "nous")
+
+    async def _nous() -> Response:
+        if candidate.get("route_family") != "codex_nous_chat_completions_adapter":
+            raise ValueError(
+                "Nous alias candidates require "
+                "codex_nous_chat_completions_adapter."
+            )
+        return await _handle_codex_nous_chat_completions_adapter_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            prepared_request_body=candidate_body,
+            adapter_model=adapter_model,
+            use_alias_candidate_probe=True,
+        )
+
     async def _kimi_code() -> Response:
         return await _handle_codex_kimi_chat_completions_adapter_route(
             endpoint=endpoint,
@@ -578,6 +598,7 @@ async def _perform_codex_auto_agent_alias_candidate_request(
         provider_handlers={
             _CODEX_AUTO_AGENT_OPENCODE_PROVIDER: _opencode,
             opencode_go_provider: _opencode_go,
+            nous_provider: _nous,
             _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER: _kimi_code,
             _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER: _alibaba_token_plan,
             zai_coding_plan_provider: _zai_coding_plan,
@@ -2722,6 +2743,129 @@ async def _handle_codex_opencode_go_adapter_route(
     response_body["object"] = "response"
     import json as _json
 
+    return _FastAPIResponse(
+        content=_json.dumps(response_body),
+        media_type="application/json",
+    )
+
+
+async def _handle_codex_nous_chat_completions_adapter_route(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: Any,
+    prepared_request_body: dict[str, Any],
+    adapter_model: str,
+    use_alias_candidate_probe: bool = False,
+) -> Response:
+    import json as _json
+
+    import litellm
+    from fastapi.responses import Response as _FastAPIResponse
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
+        _serialize_responses_adapter_response as _serialize_nous_response,
+    )
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+    from litellm.secret_managers.credential_error_sanitizer import (
+        sanitize_credential_error_message,
+    )
+    from litellm.secret_managers.hermes_nous_auth import load_nous_invoke_jwt
+
+    _ = endpoint, fastapi_response, user_api_key_dict, use_alias_candidate_probe
+    request_body = dict(prepared_request_body)
+    request_body["model"] = adapter_model
+    request_input = request_body.get("input", "")
+    responses_api_request = {
+        key: value
+        for key, value in request_body.items()
+        if key not in {"input", "model", "litellm_metadata"}
+    }
+    litellm_metadata = dict(request_body.get("litellm_metadata") or {})
+    completion_kwargs = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
+        model=adapter_model,
+        input=request_input,
+        responses_api_request=responses_api_request,
+        custom_llm_provider="nous",
+        stream=False,
+        metadata=litellm_metadata,
+    )
+    completion_kwargs["model"] = adapter_model
+    target_url = "https://inference-api.nousresearch.com/v1/chat/completions"
+    api_key = load_nous_invoke_jwt()
+    custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
+        api_key=api_key,
+        request=request,
+    )
+    HttpPassThroughEndpointHelpers.validate_outgoing_egress(
+        url=target_url,
+        headers=custom_headers,
+        credential_family="nous",
+        expected_target_family="nous",
+    )
+    _annotate_request_scope_for_adapted_access_log(request, httpx.URL(target_url))
+    rollup_kwargs = _build_adapted_route_rollup_kwargs(litellm_metadata)
+    _emit_adapted_route_access_log(
+        request=request,
+        target_url=target_url,
+        request_body=request_body,
+        rollup_kwargs=rollup_kwargs,
+        adapter_label="Nous",
+        provider_bound_body=completion_kwargs,
+    )
+    completion_call_kwargs = {
+        **completion_kwargs,
+        "api_key": api_key,
+        "api_base": "https://inference-api.nousresearch.com/v1",
+        "litellm_metadata": litellm_metadata,
+    }
+    try:
+        completion_response = await litellm.acompletion(**completion_call_kwargs)
+    except Exception as exc:
+        status_code = int(getattr(exc, "status_code", 0) or 0)
+        if status_code == 0:
+            response = getattr(exc, "response", None)
+            status_code = int(getattr(response, "status_code", 0) or 0)
+        raw = str(getattr(exc, "detail", "") or exc)
+        if api_key:
+            raw = raw.replace(api_key, "[REDACTED]")
+        detail = sanitize_credential_error_message(raw)
+        if status_code == 0:
+            raise type(exc)(detail) from None
+        setattr(exc, "status_code", status_code)
+        setattr(exc, "detail", detail)
+        if hasattr(exc, "args"):
+            try:
+                exc.args = (detail, *exc.args[1:])
+            except Exception:
+                pass
+        raise
+    if isinstance(completion_response, dict):
+        from litellm.types.utils import ModelResponse
+
+        completion_response = ModelResponse(**completion_response)
+    responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+        chat_completion_response=completion_response,
+        request_input=request_input,
+        responses_api_request=responses_api_request,
+    )
+    try:
+        responses_api_response.object = "response"
+    except Exception:
+        pass
+    serialized = _serialize_nous_response(responses_api_response)
+    try:
+        response_body = json.loads(serialized)
+    except (TypeError, ValueError, NameError):
+        response_body = None
+    if not isinstance(response_body, dict):
+        try:
+            response_body = _json.loads(serialized)
+        except (TypeError, ValueError):
+            response_body = {"id": getattr(completion_response, "id", "resp_nous")}
+    response_body["object"] = "response"
     return _FastAPIResponse(
         content=_json.dumps(response_body),
         media_type="application/json",

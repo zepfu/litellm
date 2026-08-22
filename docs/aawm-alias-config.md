@@ -141,6 +141,12 @@ order:
 1. OpenCode Go `ox-alpha-free` (`provider: opencode_go`,
    `codex_opencode_go_adapter`, Codex-only; no Anthropic Go adapter)
 2. OpenRouter `openrouter/stealth/ox-alpha`
+
+Direct `nous/<id>` is a Codex-only chat-completions adapter
+(`codex_nous_chat_completions_adapter`, `provider: nous`) at
+`https://inference-api.nousresearch.com/v1`. Anthropic `nous/*` fails
+closed and is not rewritten to OpenRouter. Wave B does not insert Nous
+into compiled `basic` / `work`; that insertion is NOUS-003.
 3. Direct Cohere North Mini Code (`cohere/north-mini-code-1-0`,
    `provider: cohere`, `codex_cohere_chat_completions_adapter`,
    `lane=cohere_native`)

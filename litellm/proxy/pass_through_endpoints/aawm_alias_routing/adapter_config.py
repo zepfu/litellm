@@ -249,6 +249,18 @@ CODEX_COHERE_CHAT_COMPLETIONS = AnthropicCompletionAdapterConfig(
     custom_llm_provider="cohere",
 )
 
+CODEX_NOUS_CHAT_COMPLETIONS = AnthropicCompletionAdapterConfig(
+    adapter="codex_nous_chat_completions_adapter",
+    adapter_label="Nous",
+    route_family="codex_nous_chat_completions_adapter",
+    tag_prefix="codex-nous-chat-completions-adapter",
+    span_name="codex.nous_chat_completions_adapter",
+    target_endpoint_label="nous:/v1/chat/completions",
+    credential_family="nous",
+    expected_target_family="nous",
+    custom_llm_provider="nous",
+)
+
 CODEX_CURSOR_AGENT_AISERVER = AnthropicCompletionAdapterConfig(
     adapter="codex_cursor_agent_aiserver_adapter",
     adapter_label="Cursor Agent",

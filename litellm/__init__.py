@@ -1874,6 +1874,9 @@ if TYPE_CHECKING:
     from .llms.hyperbolic.chat.transformation import (
         HyperbolicChatConfig as HyperbolicChatConfig,
     )
+    from .llms.nous.chat.transformation import (
+        NousChatConfig as NousChatConfig,
+    )
     from .llms.vercel_ai_gateway.chat.transformation import (
         VercelAIGatewayConfig as VercelAIGatewayConfig,
     )
