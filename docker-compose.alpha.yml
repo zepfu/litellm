@@ -1,0 +1,229 @@
+# Dedicated Compose file for the testing-only litellm-alpha service.
+#
+# This file manages ONLY litellm-alpha. It never includes, starts, stops, or
+# recreates litellm-dev, provider-status-observations, or the alias-routing
+# Redis service; those remain owned by docker-compose.dev.yml.
+#
+# Connectivity is preserved by attaching to the two external networks the live
+# alpha container already uses:
+#   - litellm_default (dev Compose project default; reaches the dev
+#     alias-routing Redis container by name)
+#   - aawm-infrastructure_default (shared infrastructure: PgBouncer, etc.)
+# Both networks and all runtime dependencies must already exist.
+
+# Distinct Compose project identity; this file never shares or collides with
+# the dev project.
+name: litellm-alpha
+
+# Explicit Codex OAuth inventory labels (non-secret operator mapping only):
+# - account1: sourced from Seshat ~/.codex/auth.json; owner rdkick+openai@pm.me
+# - account2: sourced from Thoth ~/.codex/auth.json; owner rdkick+openai2@pm.me
+x-codex-oauth-inventory: &codex-oauth-inventory >-
+  LITELLM_CODEX_OAUTH_INVENTORY={"schema_version":1,"routing":{
+  "credential_affinity":"interchangeable","strategy":"dual_quota_balance",
+  "balance_band_percentage_points":10,
+  "within_band_strategy":"weighted_round_robin"},"accounts":[
+  {"label":"account1","auth_path":"/home/zepfu/.codex/oauth.account1.json",
+  "lock_path":"/home/zepfu/.codex/oauth.account1.json.lock","priority":10,
+  "weight":1.0,"enabled":${AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED:-true},
+  "models":["*"],"expected_account_hash":"${AAWM_CODEX_OAUTH_ACCOUNT1_EXPECTED_HASH:?AAWM_CODEX_OAUTH_ACCOUNT1_EXPECTED_HASH is required}"},
+  {"label":"account2","auth_path":"/home/zepfu/.codex/oauth.account2.json",
+  "lock_path":"/home/zepfu/.codex/oauth.account2.json.lock","priority":20,
+  "weight":1.0,"enabled":${AAWM_CODEX_OAUTH_ACCOUNT2_ENABLED:-true},
+  "models":["*"],"expected_account_hash":"${AAWM_CODEX_OAUTH_ACCOUNT2_EXPECTED_HASH:?AAWM_CODEX_OAUTH_ACCOUNT2_EXPECTED_HASH is required}"}
+  ]}
+
+services:
+  litellm-alpha:
+    build:
+      context: .
+      dockerfile: Dockerfile.alpha
+    image: litellm-alpha:local
+    container_name: litellm-alpha
+    restart: unless-stopped
+    command:
+      - /usr/bin/env
+      - AAWM_LITELLM_ENVIRONMENT=litellm-alpha
+      - LITELLM_AAWM_ERROR_LOG_ENV=alpha
+      - LITELLM_LANGFUSE_TRACE_ENVIRONMENT=alpha
+      - AAWM_ALIAS_ROUTING_STATE_NAMESPACE=aawm-routing-alpha-v1
+      - PGAPPNAME=aawm-litellm-alpha
+      - AAWM_SESSION_HISTORY_DB_APPLICATION_NAME=aawm-litellm-alpha-session-history
+      - AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME=aawm-litellm-alpha-dynamic-injection
+      - LITELLM_KIMI_NATIVE_CONTRACT_PATH=/run/aawm/kimi-descriptor/native-contract.json
+      - watchfiles
+      - litellm --config /app/litellm-dev-config.yaml --port 4011
+      - /app/litellm
+      - /app/enterprise
+      - /app/litellm-dev-config.yaml
+      - /app/model_prices_and_context_window.json
+      - /app/context-replacement
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+    ports:
+      - "127.0.0.1:4011:4011"
+      - "100.109.19.233:4011:4011"
+    volumes:
+      # The checkout is authoritative. Keep it read-only to prevent candidate
+      # runtime behavior from modifying source or configuration.
+      - .:/app:ro
+      # Keep the packaged fallback synchronized with the canonical live map.
+      - ./model_prices_and_context_window.json:/app/litellm/bundled_model_prices_and_context_window_fallback.json:ro
+      # Runtime output surfaces remain writable.
+      - ./.analysis:/app/.analysis
+      - ./captures:/tmp/captures
+      - /home/zepfu/.analysis:/home/zepfu/.analysis
+      - /mnt/e/litellm/session_history:/mnt/e/litellm/session_history
+      # Match the development proxy's read-only identity and credential inputs.
+      - /home/zepfu/.claude/projects:/home/zepfu/.claude/projects:ro
+      - /home/zepfu/projects/aawm/agents:/home/zepfu/.claude/agents:ro
+      - /home/zepfu/.codex:/home/zepfu/.codex:ro
+      - /home/zepfu/.local/share/opencode:/home/zepfu/.local/share/opencode:ro
+      - /home/zepfu/.grok:/home/zepfu/.grok:ro
+      - /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai:ro
+      - /home/zepfu/.kimi-code/credentials:/home/zepfu/.kimi-code/credentials:ro
+      - /home/zepfu/.hermes:/home/zepfu/.hermes:ro
+      - ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.kimi-code/native-contract}:/run/aawm/kimi-descriptor:ro
+      - ${AAWM_GROK_CLIENT_VERSION_CACHE_DIR:-/home/zepfu/.cache/aawm/grok}:/run/aawm/grok:ro
+      - /home/zepfu/.qwen/settings.json:/home/zepfu/.qwen/settings.json:ro
+      - /etc/hostname:/host/etc/hostname:ro
+      - ${AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_HOST_DIR:-/home/zepfu/.analysis/aawm-host-identity}:/host/aawm:ro
+    # Same variable surface as the development proxy; the alpha-specific
+    # labels above are applied by the /usr/bin/env command prefix and take
+    # precedence over these defaults at process level.
+    environment:
+      # Langfuse — read from host env or set defaults
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
+      - LITELLM_LANGFUSE_TRACE_ENVIRONMENT=${LITELLM_LANGFUSE_TRACE_ENVIRONMENT:-dev}
+      - LITELLM_AAWM_ERROR_LOG_ENABLED=${LITELLM_AAWM_ERROR_LOG_ENABLED:-1}
+      - LITELLM_AAWM_ERROR_LOG_ENV=${LITELLM_AAWM_ERROR_LOG_ENV:-dev}
+      - LITELLM_AAWM_ERROR_LOG_DIR=${LITELLM_AAWM_ERROR_LOG_DIR:-/app/.analysis}
+      - AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_PATH=${AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_PATH:-/host/aawm/tailscale-self.json}
+      - LITELLM_LOCAL_MODEL_COST_MAP=${LITELLM_LOCAL_MODEL_COST_MAP:-True}
+      - AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR=${AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR:-/home/zepfu/.analysis/full-payload-captures/runtime}
+      # AAWM runtime database access goes through shared PgBouncer. Keep
+      # AAWM_DIRECT_DATABASE_URL on direct Postgres for admin/backfill paths.
+      - AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-pgbouncer-aawm-dev}
+      - AAWM_DB_PORT=${LITELLM_AAWM_DB_PORT:-6432}
+      - AAWM_DB_NAME=${LITELLM_AAWM_DB_NAME:-aawm_tristore}
+      - AAWM_DB_USER=${LITELLM_AAWM_DB_USER:-aawm}
+      - AAWM_DB_PASSWORD=${LITELLM_AAWM_DB_PASSWORD:-aawm_dev}
+      - AAWM_DB_PWD=${LITELLM_AAWM_DB_PWD:-}
+      - AAWM_DB_SSLMODE=${LITELLM_AAWM_DB_SSLMODE:-disable}
+      - AAWM_DB_SSL=${LITELLM_AAWM_DB_SSL:-}
+      - AAWM_DB_URL=${LITELLM_AAWM_DB_URL:-}
+      - AAWM_DATABASE_URL=${LITELLM_AAWM_DATABASE_URL:-postgresql://aawm:aawm_dev@pgbouncer-aawm-dev:6432/aawm_tristore?application_name=aawm-litellm-session-history}
+      - AAWM_DIRECT_DATABASE_URL=${LITELLM_AAWM_DIRECT_DATABASE_URL:-postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore}
+      - AAWM_SESSION_HISTORY_DB_APPLICATION_NAME=${LITELLM_AAWM_SESSION_HISTORY_DB_APPLICATION_NAME:-aawm-litellm-session-history}
+      - AAWM_SESSION_HISTORY_SPOOL_DIR=${AAWM_SESSION_HISTORY_SPOOL_DIR:-/mnt/e/litellm/session_history}
+      - AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE=${LITELLM_AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE:-0}
+      - AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME=${LITELLM_AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME:-aawm-litellm-dynamic-injection}
+      # Dynamic-injection/tristore selectors. Empty defaults keep the runtime
+      # fallback to the AAWM_DB_* values above; set LITELLM_AAWM_DYNAMIC_* to
+      # split dynamic context queries onto a different database than the
+      # callback/session-history pool.
+      - AAWM_DYNAMIC_INJECTION_DB_HOST=${LITELLM_AAWM_DYNAMIC_INJECTION_DB_HOST:-}
+      - AAWM_DYNAMIC_INJECTION_DB_PORT=${LITELLM_AAWM_DYNAMIC_INJECTION_DB_PORT:-}
+      - AAWM_DYNAMIC_INJECTION_DB_NAME=${LITELLM_AAWM_DYNAMIC_INJECTION_DB_NAME:-}
+      - AAWM_DYNAMIC_INJECTION_DB_USER=${LITELLM_AAWM_DYNAMIC_INJECTION_DB_USER:-}
+      - AAWM_DYNAMIC_INJECTION_DB_PASSWORD=${LITELLM_AAWM_DYNAMIC_INJECTION_DB_PASSWORD:-}
+      - AAWM_DYNAMIC_INJECTION_DB_SSLMODE=${LITELLM_AAWM_DYNAMIC_INJECTION_DB_SSLMODE:-}
+      - AAWM_DYNAMIC_INJECTION_DB_URL=${LITELLM_AAWM_DYNAMIC_INJECTION_DB_URL:-}
+      - PGAPPNAME=${LITELLM_AAWM_DB_APPLICATION_NAME:-aawm-litellm-runtime}
+      - AAWM_POSTGRES_SERVER=${LITELLM_AAWM_POSTGRES_SERVER:-}
+      - AAWM_POSTGRES_PORT=${LITELLM_AAWM_POSTGRES_PORT:-}
+      - AAWM_POSTGRES_DATABASE=${LITELLM_AAWM_POSTGRES_DATABASE:-}
+      - AAWM_POSTGRES_USER=${LITELLM_AAWM_POSTGRES_USER:-}
+      - AAWM_POSTGRES_PASSWORD=${LITELLM_AAWM_POSTGRES_PASSWORD:-}
+      - AAWM_POSTGRES_PWD=${LITELLM_AAWM_POSTGRES_PWD:-}
+      - AAWM_POSTGRES_SSLMODE=${LITELLM_AAWM_POSTGRES_SSLMODE:-}
+      - AAWM_POSTGRES_SSL=${LITELLM_AAWM_POSTGRES_SSL:-}
+      - AAWM_POSTGRES_URL=${LITELLM_AAWM_POSTGRES_URL:-}
+      # No server-side ANTHROPIC_API_KEY — client provides via x-api-key header
+      # Payload capture stays off by default; enable explicitly for debug sessions
+      - AAWM_CAPTURE=${AAWM_CAPTURE:-0}
+      - AAWM_CAPTURE_PASSTHROUGH_SHAPES=${AAWM_CAPTURE_PASSTHROUGH_SHAPES:-0}
+      - LITELLM_LOG=${LITELLM_LOG:-INFO}
+      - LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT=${LITELLM_EXPAND_CLAUDE_PERSISTED_OUTPUT:-1}
+      - LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT=${LITELLM_CLAUDE_PERSISTED_OUTPUT_ROOT:-/home/zepfu/.claude/projects}
+      - *codex-oauth-inventory
+      - LITELLM_OPENCODE_AUTH_FILE=${LITELLM_OPENCODE_AUTH_FILE:-/home/zepfu/.local/share/opencode/auth.json}
+      - AAWM_NVIDIA_API_KEY=${AAWM_NVIDIA_API_KEY:-}
+      - NVIDIA_NIM_API_KEY=${NVIDIA_NIM_API_KEY:-${AAWM_NVIDIA_API_KEY:-}}
+      - NVIDIA_API_KEY=${NVIDIA_API_KEY:-${AAWM_NVIDIA_API_KEY:-}}
+      - NVIDIA_NIM_API_BASE=${NVIDIA_NIM_API_BASE:-https://integrate.api.nvidia.com/v1}
+      - NVIDIA_NIM_RERANK_API_BASE=${NVIDIA_NIM_RERANK_API_BASE:-https://ai.api.nvidia.com}
+      - AAWM_OPENROUTER_API_KEY=${AAWM_OPENROUTER_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_API_BASE=${OPENROUTER_API_BASE:-https://openrouter.ai/api/v1}
+      # COHERE-001: export only the canonical direct Cohere credential.
+      # COHERE_KEY is a Compose-level compatibility source (repository-local
+      # .env) and is mapped into COHERE_API_KEY without exposing the value.
+      - COHERE_API_KEY=${COHERE_API_KEY:-${COHERE_KEY:-}}
+      - LITELLM_XAI_OAUTH_AUTH_FILE=${LITELLM_XAI_OAUTH_AUTH_FILE:-/home/zepfu/.litellm/xai/oauth-auth.json}
+      - LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.grok/auth.json}
+      - LITELLM_KIMI_OAUTH_AUTH_FILE=${LITELLM_KIMI_OAUTH_AUTH_FILE:-/home/zepfu/.kimi-code/credentials/kimi-code.json}
+      - LITELLM_NOUS_OAUTH_AUTH_FILE=${LITELLM_NOUS_OAUTH_AUTH_FILE:-/home/zepfu/.hermes/auth.json}
+      - LITELLM_KIMI_NATIVE_CONTRACT_PATH=${LITELLM_KIMI_NATIVE_CONTRACT_PATH:-/app/kimi-descriptor/native-contract.json}
+      - LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=${LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED:-true}
+      - AAWM_GROK_CLIENT_VERSION_CACHE_PATH=${AAWM_GROK_CLIENT_VERSION_CACHE_PATH:-/run/aawm/grok/native-client-version.json}
+      - AAWM_GROK_CLIENT_VERSION_CACHE_MAX_AGE_SECONDS=${AAWM_GROK_CLIENT_VERSION_CACHE_MAX_AGE_SECONDS:-172800}
+      - LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE=${LITELLM_ALIBABA_TOKEN_PLAN_SETTINGS_FILE:-/home/zepfu/.qwen/settings.json}
+      - OPENAI_API_KEY=${AAWM_OPENAI_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - OR_SITE_URL=${OR_SITE_URL:-https://litellm.ai}
+      - OR_APP_NAME=${OR_APP_NAME:-liteLLM}
+      - AAWM_OPENROUTER_ADAPTER_BACKOFF_SECONDS=${AAWM_OPENROUTER_ADAPTER_BACKOFF_SECONDS:-2,4,8,12}
+      - AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS=${AAWM_OPENROUTER_ADAPTER_HIDDEN_RETRY_BUDGET_SECONDS:-12}
+      - AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS=${AAWM_OPENROUTER_ADAPTER_POST_FAILURE_COOLDOWN_SECONDS:-300}
+      # Dedicated alias-routing Redis state (dev)
+      - AAWM_ALIAS_ROUTING_REDIS_HOST=${AAWM_ALIAS_ROUTING_REDIS_HOST:-aawm-alias-routing-redis}
+      - AAWM_ALIAS_ROUTING_REDIS_PORT=${AAWM_ALIAS_ROUTING_REDIS_PORT:-6379}
+      - AAWM_ALIAS_ROUTING_REDIS_DB=${AAWM_ALIAS_ROUTING_REDIS_DB:-0}
+      - AAWM_ALIAS_ROUTING_REDIS_PASSWORD=${AAWM_ALIAS_ROUTING_REDIS_PASSWORD:-}
+      - AAWM_ALIAS_ROUTING_REDIS_SSL=${AAWM_ALIAS_ROUTING_REDIS_SSL:-0}
+      - AAWM_ALIAS_ROUTING_REDIS_URL=${AAWM_ALIAS_ROUTING_REDIS_URL:-}
+      - AAWM_ALIAS_ROUTING_REDIS_USERNAME=${AAWM_ALIAS_ROUTING_REDIS_USERNAME:-}
+      - AAWM_ALIAS_ROUTING_STATE_NAMESPACE=${AAWM_ALIAS_ROUTING_STATE_NAMESPACE:-aawm-routing-dev-v1}
+      # CFG-004 cooldown-clear topology gate (single-worker dev only).
+      - AAWM_ALIAS_ROUTING_COOLDOWN_CLEAR_SINGLE_WORKER=${AAWM_ALIAS_ROUTING_COOLDOWN_CLEAR_SINGLE_WORKER:-1}
+      - AAWM_ALIAS_ROUTE_LOG_HEALTHY=${AAWM_ALIAS_ROUTE_LOG_HEALTHY:-0}
+      # Environment label for the proxy process; the alpha-specific value is
+      # applied by the /usr/bin/env command prefix above.
+      - AAWM_LITELLM_ENVIRONMENT=litellm-dev
+      # OPENAI-017/018 and CFG-019 acceptance controls (fail-closed defaults).
+      - AAWM_OPENAI_FAULT_PLAN_ENABLED=${AAWM_OPENAI_FAULT_PLAN_ENABLED:-0}
+      - AAWM_CFG004_ACCEPTANCE_ENABLED=${AAWM_CFG004_ACCEPTANCE_ENABLED:-0}
+      - AAWM_CFG004_ACCEPTANCE_RUN_ID=${AAWM_CFG004_ACCEPTANCE_RUN_ID:-}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen(
+              "http://127.0.0.1:4011/health/liveliness",
+              timeout=5,
+          )
+      interval: 10s
+      timeout: 6s
+      retries: 12
+      start_period: 30s
+    networks:
+      - default
+      - aawm-infrastructure_default
+
+networks:
+  default:
+    external: true
+    name: litellm_default
+  aawm-infrastructure_default:
+    external: true
+    name: ${AAWM_INFRASTRUCTURE_NETWORK_NAME:-aawm-infrastructure_default}

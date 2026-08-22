@@ -8,10 +8,39 @@ development traffic to this service. Do not use alpha results as production
 deployment evidence. The container intentionally runs code that may be
 incomplete, unreviewed, or broken.
 
+## Compose Ownership
+
+Alpha is managed exclusively by `docker-compose.alpha.yml`, which defines only
+the `litellm-alpha` service. It manages only alpha: it never includes,
+extends, depends on, lists, starts, stops, or recreates `litellm-dev`,
+`provider-status-observations`, or the alias-routing Redis service. All
+`docker compose` commands for alpha use
+`docker compose -f docker-compose.alpha.yml ...`.
+
+The file declares its own Compose project, `name: litellm-alpha`, separate
+from the dev project, so its state and naming never collide with
+`docker-compose.dev.yml`.
+
+The file defines no Redis, database, or other helper services and declares no
+`depends_on`. It preserves alpha's existing connectivity by attaching to two
+networks that must already exist:
+
+- `litellm_default` — the dev Compose project's default network, providing
+  name resolution for the dev alias-routing Redis container
+  (`aawm-alias-routing-redis`).
+- `aawm-infrastructure_default` — the shared infrastructure network
+  (PgBouncer and friends).
+
+Before starting alpha, make sure those external networks and their dependency
+services are already up (normally via `docker-compose.dev.yml` / the
+infrastructure stack). Alpha uses its own alias-routing Redis namespace and
+does not share candidate cooldown or affinity keys with `litellm-dev`.
+
 ## Runtime Contract
 
 - Container: `litellm-alpha`
 - Image: `litellm-alpha:local`
+- Compose file: `docker-compose.alpha.yml` (alpha only)
 - Local endpoint: `http://127.0.0.1:4011`
 - Tailscale endpoint: `http://100.109.19.233:4011`
 - Config: `/app/litellm-dev-config.yaml`, bind-mounted from this repository
@@ -44,19 +73,15 @@ Use the same environment preparation required by `litellm-dev`, including the
 two expected Codex OAuth account hashes.
 
 ```bash
-docker compose -f docker-compose.dev.yml build litellm-alpha
-docker compose -f docker-compose.dev.yml up -d litellm-alpha
+docker compose -f docker-compose.alpha.yml build litellm-alpha
+docker compose -f docker-compose.alpha.yml up -d litellm-alpha
 ```
-
-Starting alpha may also start the shared development alias-routing Redis
-service when it is not already running. Alpha uses its own Redis namespace and
-does not share candidate cooldown or affinity keys with `litellm-dev`.
 
 ## Verify
 
 ```bash
-docker compose -f docker-compose.dev.yml ps litellm-alpha
-docker compose -f docker-compose.dev.yml logs --tail=100 litellm-alpha
+docker compose -f docker-compose.alpha.yml ps litellm-alpha
+docker compose -f docker-compose.alpha.yml logs --tail=100 litellm-alpha
 curl --fail http://127.0.0.1:4011/health/liveliness
 docker exec litellm-alpha python -c \
   'import litellm; print(litellm.__file__)'
@@ -71,8 +96,8 @@ next live test.
 ## Rebuild
 
 ```bash
-docker compose -f docker-compose.dev.yml build litellm-alpha
-docker compose -f docker-compose.dev.yml up -d --force-recreate litellm-alpha
+docker compose -f docker-compose.alpha.yml build litellm-alpha
+docker compose -f docker-compose.alpha.yml up -d --force-recreate litellm-alpha
 ```
 
 Rebuild only when the image dependency layer or Dockerfile changed. Ordinary
@@ -80,12 +105,12 @@ source and watched configuration edits do not require this.
 
 ## Stop
 
-Stop or remove only the alpha service. Do not use `docker compose down`, because
-the Compose project also owns shared development services.
+Only the alpha service can be affected by this file, so `stop` and `down` here
+never touch `litellm-dev` or any other service.
 
 ```bash
-docker compose -f docker-compose.dev.yml stop litellm-alpha
-docker compose -f docker-compose.dev.yml rm -f litellm-alpha
+docker compose -f docker-compose.alpha.yml stop litellm-alpha
+docker compose -f docker-compose.alpha.yml rm -f litellm-alpha
 ```
 
 ## Testing Boundary
