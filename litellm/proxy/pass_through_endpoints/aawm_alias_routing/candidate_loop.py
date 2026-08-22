@@ -36,13 +36,18 @@ import hashlib
 from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
+from fastapi import HTTPException
 
-from litellm.proxy.aawm_route_logging import (
-    register_aawm_route_rollup_access_log_replacement,
+from litellm.llms.zai_coding_plan.chat.transformation import (
+    ZAICodingPlanAuthenticationError,
 )
 from litellm.llms.zai_coding_plan.failure_classification import (
     ZAICodingPlanFailureKind,
     classify_zai_coding_plan_failure,
+)
+from litellm.proxy._types import ProxyException
+from litellm.proxy.aawm_route_logging import (
+    register_aawm_route_rollup_access_log_replacement,
 )
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.cohere import (
     classify_cohere_failure,
@@ -244,9 +249,49 @@ def _classify_codex_zai_coding_plan_candidate_failure(
         error_code=error_code,
         upstream_id=candidate.get("model"),
     )
-    if failure.kind == ZAICodingPlanFailureKind.UNKNOWN:
-        return None
-    return _ZAI_CODING_PLAN_KIND_TO_ERROR_CLASS.get(failure.kind)
+    if failure.kind != ZAICodingPlanFailureKind.UNKNOWN:
+        return _ZAI_CODING_PLAN_KIND_TO_ERROR_CLASS.get(failure.kind)
+    if _exception_chain_contains_type(exc, ZAICodingPlanAuthenticationError):
+        return "provider_terminal_error"
+    if _error_signals._extract_adapter_exception_status_code(exc) == 401:
+        return "provider_terminal_error"
+    return None
+
+
+def _exception_chain_contains_type(
+    exc: BaseException, expected: type[BaseException]
+) -> bool:
+    current: Optional[BaseException] = exc
+    seen: set[int] = set()
+    for _ in range(8):
+        if current is None or id(current) in seen:
+            return False
+        if isinstance(current, expected):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _proxy_exception_for_unclassified_probe_failure(exc: Exception) -> Exception:
+    """Turn an unclassified alias-probe failure into a client HTTP error.
+
+    Raw OpenRouter/BadRequest/ZAI exceptions leak as uvicorn
+    ``Exception in ASGI application`` plus a full traceback. HTTPException
+    and ProxyException are already FastAPI-safe.
+    """
+
+    if isinstance(exc, (HTTPException, ProxyException)):
+        return exc
+    status_code = _error_signals._extract_adapter_exception_status_code(exc)
+    if status_code is None or not (400 <= int(status_code) <= 599):
+        status_code = 400
+    return ProxyException(
+        message=str(getattr(exc, "message", str(exc))),
+        type=str(getattr(exc, "type", "invalid_request_error") or "invalid_request_error"),
+        param="model",
+        code=status_code,
+    )
 
 
 async def handle_alias_route(  # noqa: PLR0915
@@ -926,7 +971,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         failure_exc, candidate=candidate
                     )
                 if error_class is None:
-                    raise failure_exc
+                    raise _proxy_exception_for_unclassified_probe_failure(failure_exc)
                 last_retryable_exc = failure_exc
                 account_slot = _codex_oauth_candidate_slot(candidate)
                 same_account_transient_attempts_by_slot[account_slot] = (

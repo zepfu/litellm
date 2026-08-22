@@ -160,6 +160,9 @@ def _install_native_openai_host(pass_through: Any) -> dict[str, Any]:
         return_value=None
     )
     host["_raise_codex_native_openai_auto_agent_candidate_unavailable"] = MagicMock()
+    host["_drop_unsupported_codex_request_params_from_request_body"] = MagicMock(
+        side_effect=lambda body: (body, [])
+    )
     from fastapi import Request
     from fastapi.responses import Response
 
@@ -251,4 +254,57 @@ async def test_direct_native_openai_request_normalizes_before_pass_through():
     # Caller-supplied body input entries keep pre-normalization values.
     assert request_body["input"][0]["id"] == original_input[0]["id"] == call_id
     assert captured["custom_llm_provider"] == "openai"
+    assert captured["expected_target_family"] == "openai"
+
+
+@pytest.mark.asyncio
+async def test_direct_native_openai_request_drops_resolved_unsupported_params():
+    """Alias rewrite sets model to the Codex candidate; drop must run after that.
+
+    Ohmypi sends ``max_output_tokens`` on alias ids such as ``work``. The
+    ingress drop keys off the alias name and is a no-op. Native Codex
+    egress must drop the field using the rewritten model id.
+    """
+    captured: dict[str, Any] = {}
+    mock_response = MagicMock(name="pass_through_response")
+
+    async def _fake_pass_through_request(**kwargs: Any):
+        captured.update(kwargs)
+        return mock_response
+
+    def _drop_unsupported(body: dict[str, Any]):
+        if body.get("model") != "gpt-5.3-codex-spark":
+            return body, []
+        updated = {key: value for key, value in body.items() if key != "max_output_tokens"}
+        return updated, ["max_output_tokens"]
+
+    host = _install_native_openai_host(AsyncMock(side_effect=_fake_pass_through_request))
+    host["_drop_unsupported_codex_request_params_from_request_body"] = MagicMock(
+        side_effect=_drop_unsupported
+    )
+    fn = host["_perform_codex_auto_agent_native_openai_request"]
+
+    request_body = {
+        "model": "gpt-5.3-codex-spark",
+        "max_output_tokens": 64000,
+        "input": "Reply with PONG",
+        "litellm_metadata": {"requested_model_alias": "work"},
+    }
+    response = await fn(
+        request=MagicMock(),
+        fastapi_response=MagicMock(),
+        user_api_key_dict=MagicMock(),
+        target_url="https://chatgpt.com/backend-api/codex/responses",
+        api_key=None,
+        forward_headers=True,
+        request_body=request_body,
+        custom_headers={"Authorization": "Bearer test"},
+    )
+
+    assert response is mock_response
+    host["_drop_unsupported_codex_request_params_from_request_body"].assert_called_once()
+    custom_body = captured["custom_body"]
+    assert "max_output_tokens" not in custom_body
+    assert custom_body["model"] == "gpt-5.3-codex-spark"
+    assert request_body["max_output_tokens"] == 64000
     assert captured["expected_target_family"] == "openai"

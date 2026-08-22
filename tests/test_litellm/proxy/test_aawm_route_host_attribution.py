@@ -42,6 +42,15 @@ def test_build_aawm_route_rollup_group_header_label_includes_host():
     assert label == "litellm#Codex[0.141.0]@localhost"
 
 
+def test_build_aawm_route_repo_client_host_label_formats_ohmypi():
+    label = build_aawm_route_repo_client_host_label(
+        repository="litellm",
+        client_product_label="ohmypi/17.3.8",
+        host_name="thoth",
+    )
+    assert label == "litellm#Ohmypi[17.3.8]@thoth"
+
+
 def test_resolve_aawm_route_host_attribution_loopback_resolves_local_magicdns(
     monkeypatch,
 ):
@@ -575,6 +584,93 @@ def test_build_aawm_route_rollup_context_uses_metadata_without_request(
     }
     assert context["client_ip"] == "100.99.1.5"
     assert context["host_name"] == "metadata-host"
+
+
+def test_build_aawm_route_rollup_context_maps_ohmypi_display_name_and_omp_user_agent(
+    monkeypatch,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    monkeypatch.setattr(
+        route_logging,
+        "resolve_aawm_route_host_attribution",
+        lambda request, **kwargs: {
+            "client_ip": "127.0.0.1",
+            "client_ip_source": "request_client",
+            "host_name": "thoth",
+            "host_name_source": "magicdns_local",
+        },
+    )
+    request = Mock(spec=Request)
+    request.method = "POST"
+    request.url = "http://127.0.0.1:4011/openai_passthrough/v1/responses"
+    request.headers = {
+        "user-agent": "omp/17.3.8",
+        "x-aawm-client": "Oh My Pi",
+        "x-aawm-client-name": "omp",
+        "x-aawm-repository": "litellm",
+    }
+    request.client = SimpleNamespace(host="127.0.0.1", port=12345)
+    request.scope = {
+        "path": "/openai_passthrough/v1/responses",
+        "query_string": b"",
+        "client": ("127.0.0.1", 12345),
+    }
+    request.state = SimpleNamespace()
+
+    context = build_aawm_route_rollup_context(
+        request=request,
+        target="https://chatgpt.com/backend-api/codex/responses",
+        request_body={"model": "sota-openai"},
+    )
+
+    assert context is not None
+    assert context["group_header_label"] == "litellm#Ohmypi[17.3.8]@thoth"
+
+
+def test_build_aawm_route_rollup_context_does_not_use_bun_runtime_as_ohmypi_client(
+    monkeypatch,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    monkeypatch.setattr(
+        route_logging,
+        "resolve_aawm_route_host_attribution",
+        lambda request, **kwargs: {
+            "client_ip": "127.0.0.1",
+            "client_ip_source": "request_client",
+            "host_name": "thoth",
+            "host_name_source": "magicdns_local",
+        },
+    )
+    request = Mock(spec=Request)
+    request.method = "POST"
+    request.url = "http://127.0.0.1:4011/v1/chat/completions"
+    request.headers = {
+        "user-agent": "Bun/1.3.14",
+        "x-aawm-client": "Oh My Pi",
+        "x-aawm-client-name": "omp",
+        "x-aawm-client-version": "17.3.8",
+        "x-aawm-repository": "litellm",
+    }
+    request.client = SimpleNamespace(host="127.0.0.1", port=12345)
+    request.scope = {
+        "path": "/v1/chat/completions",
+        "query_string": b"",
+        "client": ("127.0.0.1", 12345),
+    }
+    request.state = SimpleNamespace()
+
+    context = build_aawm_route_rollup_context(
+        request=request,
+        target="https://openrouter.ai/api/v1/chat/completions",
+        request_body={"model": "openrouter/qwen/qwen3.6-flash"},
+    )
+
+    assert context is not None
+    assert context["group_header_label"] == "litellm#Ohmypi[17.3.8]@thoth"
+    assert "Bun" not in context["group_header_label"]
+    assert not context["group_header_label"].startswith("Oh@")
 
 
 def test_is_tailscale_cgnat_client_ip_detects_100_64_range():

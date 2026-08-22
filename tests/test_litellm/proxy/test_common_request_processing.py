@@ -33,6 +33,7 @@ from litellm.proxy.common_request_processing import (
     _has_attribute_error_in_chain,
     _is_azure_model_router_request,
     _is_expected_provider_auth_configuration_exception,
+    _is_expected_provider_not_found_exception,
     _override_openai_response_model,
     _parse_event_data_for_error,
     create_response,
@@ -471,6 +472,50 @@ class TestProxyBaseLLMRequestProcessing:
         assert "unexpected upstream failure" in payloads[0]["message"]
         assert payloads[0]["traceback"]
         assert "RuntimeError" in payloads[0]["traceback"]
+
+    @pytest.mark.asyncio
+    async def test_handle_llm_api_exception_openrouter_not_found_skips_error_intake_jsonl(
+        self, monkeypatch, tmp_path
+    ):
+        saved_handlers, saved_level, saved_propagate = (
+            self._install_verbose_proxy_aawm_error_log_handler(tmp_path, monkeypatch)
+        )
+        error_log_path = tmp_path / "dev-error.jsonl"
+
+        processing_obj = ProxyBaseLLMRequestProcessing(
+            data={"model": "openrouter/owl-alpha"}
+        )
+        mock_user_api_key_dict = self._build_user_api_key_auth_for_exception_tests()
+        mock_proxy_logging_obj = MagicMock(spec=ProxyLogging)
+        mock_proxy_logging_obj.post_call_failure_hook = AsyncMock(return_value=None)
+        mock_proxy_logging_obj.post_call_response_headers_hook = AsyncMock(
+            return_value=None
+        )
+
+        not_found_exc = litellm.NotFoundError(
+            message=(
+                'NotFoundError: OpenrouterException - {"error":{"message":'
+                '"No endpoints found for owl-alpha.","code":404}}'
+            ),
+            model="openrouter/owl-alpha",
+            llm_provider="openrouter",
+        )
+
+        try:
+            with pytest.raises(ProxyException) as raised:
+                await processing_obj._handle_llm_api_exception(
+                    e=not_found_exc,
+                    user_api_key_dict=mock_user_api_key_dict,
+                    proxy_logging_obj=mock_proxy_logging_obj,
+                )
+        finally:
+            self._restore_verbose_proxy_logger(
+                saved_handlers, saved_level, saved_propagate
+            )
+
+        assert raised.value.code == "404"
+        assert "No endpoints found for owl-alpha" in raised.value.message
+        assert not error_log_path.exists()
 
     @pytest.mark.asyncio
     async def test_post_call_failure_hook_routes_original_exception_to_failure_callbacks(
@@ -945,6 +990,92 @@ class TestProxyBaseLLMRequestProcessing:
             is True
         )
         assert access_filter.filter(_build_uvicorn_access_record()) is True
+
+    def test_health_access_log_filter_suppresses_successful_model_group_info_probe(
+        self,
+    ):
+        access_filter = AawmHealthAccessLogFilter()
+
+        assert (
+            access_filter.filter(
+                _build_uvicorn_access_record(
+                    method="GET",
+                    full_path="/model_group/info",
+                    status_code=200,
+                )
+            )
+            is False
+        )
+
+    def test_health_access_log_filter_suppresses_native_model_info_probes_for_all_statuses(
+        self,
+    ):
+        access_filter = AawmHealthAccessLogFilter()
+        native_model_info_paths = (
+            "/v2/model/info",
+            "/model_group/info",
+            "/model/info",
+            "/v1/model/info",
+        )
+
+        for path in native_model_info_paths:
+            for status_code in (500, 404, 200):
+                assert (
+                    access_filter.filter(
+                        _build_uvicorn_access_record(
+                            method="GET",
+                            full_path=path,
+                            status_code=status_code,
+                        )
+                    )
+                    is False
+                ), f"expected leftover uvicorn suppression for GET {path} {status_code}"
+
+        assert (
+            access_filter.filter(
+                _build_uvicorn_access_record(
+                    method="GET",
+                    full_path="/health/readiness",
+                    status_code=503,
+                )
+            )
+            is True
+        )
+        assert access_filter.filter(_build_uvicorn_access_record()) is True
+
+    def test_health_access_log_filter_suppresses_platform_http_suite_probes(
+        self,
+    ):
+        access_filter = AawmHealthAccessLogFilter()
+        probes = (
+            ("GET", "/internal/aawm/session-transfer-status", 403),
+            ("GET", "/grok/v1", 403),
+            ("GET", "/grok/v1/models", 401),
+            ("POST", "/v1/chat/completions", 400),
+            ("POST", "/chat/completions", 400),
+        )
+        for method, path, status_code in probes:
+            assert (
+                access_filter.filter(
+                    _build_uvicorn_access_record(
+                        method=method,
+                        full_path=path,
+                        status_code=status_code,
+                    )
+                )
+                is False
+            ), f"expected leftover uvicorn suppression for {method} {path} {status_code}"
+
+        assert (
+            access_filter.filter(
+                _build_uvicorn_access_record(
+                    method="POST",
+                    full_path="/openai_passthrough/v1/responses",
+                    status_code=200,
+                )
+            )
+            is True
+        )
 
     def test_health_access_log_filter_suppresses_successful_anthropic_base_head_probe(
         self,
@@ -2933,6 +3064,54 @@ class TestDDSpanTaggerTagRequest:
             )
 
         mock_set_tag.assert_called_once_with("litellm.requested_model", "claude-3-5-sonnet")
+
+
+class TestExpectedProviderNotFoundException:
+    def test_matches_openrouter_not_found_error(self):
+        exc = litellm.NotFoundError(
+            message=(
+                'NotFoundError: OpenrouterException - {"error":{"message":'
+                '"No endpoints found for owl-alpha.","code":404}}'
+            ),
+            model="openrouter/owl-alpha",
+            llm_provider="openrouter",
+        )
+        assert _is_expected_provider_not_found_exception(exc) is True
+
+    def test_matches_wrapped_openrouter_not_found_error(self):
+        inner = litellm.NotFoundError(
+            message='{"error":{"message":"No endpoints found for owl-alpha.","code":404}}',
+            model="openrouter/owl-alpha",
+            llm_provider="openrouter",
+        )
+        outer = RuntimeError("wrapper")
+        outer.__cause__ = inner
+        assert _is_expected_provider_not_found_exception(outer) is True
+
+    def test_matches_http_404_status_code(self):
+        class _Http404(Exception):
+            status_code = 404
+
+        assert _is_expected_provider_not_found_exception(_Http404()) is True
+
+    def test_rejects_generic_runtime_error(self):
+        assert (
+            _is_expected_provider_not_found_exception(
+                RuntimeError("unexpected upstream failure")
+            )
+            is False
+        )
+
+    def test_matches_no_healthy_deployments_bad_request(self):
+        exc = litellm.BadRequestError(
+            message=(
+                "You passed in model=work. There are no healthy deployments "
+                "for this model. Received Model Group=work"
+            ),
+            model="work",
+            llm_provider="openai",
+        )
+        assert _is_expected_provider_not_found_exception(exc) is True
 
 
 class TestExpectedProviderAuthConfigurationException:

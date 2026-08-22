@@ -21,6 +21,9 @@ def _parse_client_identity_from_user_agent(
         (re.compile(r"\bcodex-tui/(?P<version>[A-Za-z0-9.+_-]+)"), "codex-tui"),
         (re.compile(r"\bOpenAI/Python\s+(?P<version>[A-Za-z0-9.+_-]+)"), "openai-python"),
         (re.compile(r"\bAnthropic/Python\s+(?P<version>[A-Za-z0-9.+_-]+)"), "anthropic-python"),
+        (re.compile(r"\bomp/(?P<version>[A-Za-z0-9.+_-]+)", re.IGNORECASE), "ohmypi"),
+        (re.compile(r"\bOh My Pi/(?P<version>[A-Za-z0-9.+_-]+)", re.IGNORECASE), "ohmypi"),
+        (re.compile(r"\bBun/(?P<version>[A-Za-z0-9.+_-]+)", re.IGNORECASE), "bun"),
     )
     for pattern, client_name in known_patterns:
         match = pattern.search(user_agent)

@@ -16,6 +16,7 @@ from fastapi import Response
 
 from litellm.llms.zai_coding_plan.chat.transformation import (
     ZAI_CODING_PLAN_CHAT_COMPLETIONS_URL,
+    ZAICodingPlanAuthenticationError,
 )
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     codex_candidate_calls,
@@ -329,4 +330,45 @@ def test_should_map_coding_plan_business_codes_in_candidate_loop(
             },
         )
         == expected_class
+    )
+
+
+def test_should_map_coding_plan_missing_key_to_terminal_error() -> None:
+    from litellm.exceptions import BadRequestError
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        candidate_loop,
+    )
+
+    candidate = {
+        "provider": "zai_coding_plan",
+        "model": _ADAPTER_MODEL,
+        "route_family": _CODEX_ZAI_ROUTE_FAMILY,
+    }
+    missing_key = ZAICodingPlanAuthenticationError()
+    assert (
+        candidate_loop._classify_codex_zai_coding_plan_candidate_failure(
+            missing_key,
+            candidate=candidate,
+        )
+        == "provider_terminal_error"
+    )
+    wrapped = BadRequestError(
+        message="GetLLMProvider Exception - Z.AI Coding Plan authentication requires ZAI_KEY or ZAI_CODING_PLAN_API_KEY. Ordinary ZAI_API_KEY is not reused.",
+        model=_ADAPTER_MODEL,
+        llm_provider="zai_coding_plan",
+    )
+    wrapped.__cause__ = missing_key
+    assert (
+        candidate_loop._classify_codex_zai_coding_plan_candidate_failure(
+            wrapped,
+            candidate=candidate,
+        )
+        == "provider_terminal_error"
+    )
+    assert (
+        candidate_loop._classify_codex_zai_coding_plan_candidate_failure(
+            missing_key,
+            candidate={"provider": "openai", "model": "gpt-5"},
+        )
+        is None
     )

@@ -468,3 +468,86 @@ def test_reconcile_error_and_response_failed_without_duplicate_payload():
     assert error_class == "server_overloaded"
     assert classification == "transient_capacity"
     assert retryable is True
+
+
+def test_inspect_pre_commit_chunks_does_not_raise_on_truncated_utf8_tail():
+    """T-4: inspect/peek must treat mid-codepoint SSE tails as incomplete text,
+    not dump UnicodeDecodeError from _chunk_lines/finish()."""
+    complete = _sse(
+        "response.created",
+        {
+            "type": "response.created",
+            "response": {
+                "id": "resp_ok",
+                "status": "in_progress",
+                "model": "gpt-5.4",
+                "output": [],
+            },
+        },
+    )
+    chunks = [complete + b"\xe2\x82"]
+    decision, error_payload, event_type = (
+        PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(chunks)
+    )
+    assert decision == "lifecycle"
+    assert error_payload is None
+    assert event_type is None
+
+
+def test_inspect_pre_commit_chunks_still_classifies_valid_utf8_sse():
+    chunks = [
+        _sse(
+            "response.created",
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_ok",
+                    "status": "in_progress",
+                    "model": "gpt-5.4",
+                    "output": [],
+                },
+            },
+        ),
+        _sse(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "delta": "hello",
+            },
+        ),
+    ]
+    decision, error_payload, event_type = (
+        PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(chunks)
+    )
+    assert decision == "substantive"
+    assert error_payload is None
+    assert event_type == "response.output_text.delta"
+
+
+@pytest.mark.asyncio
+async def test_peek_does_not_raise_on_truncated_utf8_at_end_of_stream():
+    """T-4: a lone truncated multi-byte sequence as the last peeked chunk must
+    not raise UnicodeDecodeError from peek_responses_pre_commit_stream."""
+    chunks = [
+        _sse(
+            "response.created",
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_ok",
+                    "status": "in_progress",
+                    "model": "gpt-5.4",
+                    "output": [],
+                },
+            },
+        ),
+        b"\xc3",
+    ]
+    response = _FakeUpstreamStream(chunks)
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        response
+    )
+    assert failure is None
+    replayed = [chunk async for chunk in peeked.aiter_bytes()]
+    assert replayed == chunks

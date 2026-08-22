@@ -269,6 +269,34 @@ def _is_expected_provider_rate_limit_exception(exc: Exception) -> bool:
     return status_code == status.HTTP_429_TOO_MANY_REQUESTS
 
 
+_OPENROUTER_NO_ENDPOINTS_MARKER = "No endpoints found for"
+_NO_HEALTHY_DEPLOYMENTS_MARKER = "There are no healthy deployments for this model"
+
+
+def _is_expected_provider_not_found_exception(exc: Exception) -> bool:
+    """Upstream/provider HTTP 404 and litellm NotFoundError are expected misses.
+
+    OpenRouter returns 404 with ``No endpoints found for <model>`` when a
+    catalog id is currently unpublished. That is a clean client 404, not a
+    proxy crash, so the request path must not dump a traceback.
+    Generic ``/v1/chat/completions`` with an alias-only model such as
+    ``work`` raises ``BadRequestError`` (no healthy deployments). That is
+    also an expected client miss, not a proxy crash.
+    """
+    for chained_exc in _iter_exceptions_in_chain(exc):
+        if isinstance(chained_exc, litellm.NotFoundError):
+            return True
+        status_code = _extract_exception_status_code_for_proxy(chained_exc)
+        if status_code == status.HTTP_404_NOT_FOUND:
+            return True
+        message = getattr(chained_exc, "message", str(chained_exc))
+        if _OPENROUTER_NO_ENDPOINTS_MARKER in str(message):
+            return True
+        if _NO_HEALTHY_DEPLOYMENTS_MARKER in str(message):
+            return True
+    return False
+
+
 _DIRECT_ANTHROPIC_MISSING_SERVER_CREDENTIAL_MARKER = (
     "A direct Anthropic route requires a server-side credential"
 )
@@ -1335,9 +1363,11 @@ class ProxyBaseLLMRequestProcessing:
         version: Optional[str] = None,
     ):
         """Raises ProxyException (OpenAI API compatible) if an exception is raised"""
-        if _is_expected_provider_rate_limit_exception(
-            e
-        ) or _is_expected_provider_auth_configuration_exception(e):
+        if (
+            _is_expected_provider_rate_limit_exception(e)
+            or _is_expected_provider_auth_configuration_exception(e)
+            or _is_expected_provider_not_found_exception(e)
+        ):
             verbose_proxy_logger.warning(
                 "litellm.proxy.proxy_server._handle_llm_api_exception(): Exception occured - %s",
                 str(e),

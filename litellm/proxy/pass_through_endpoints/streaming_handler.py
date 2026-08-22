@@ -200,14 +200,24 @@ class _PassThroughStreamLineAccumulator:
     __slots__ = ("_decoder", "_pending", "lines")
 
     def __init__(self) -> None:
-        self._decoder = codecs.getincrementaldecoder("utf-8")()
+        # Incomplete UTF-8 at a stream boundary is a mid-codepoint split.
+        # Drop the leftover truncated sequence instead of raising on finish().
+        # ``errors="ignore"`` is not enough on every CPython incremental
+        # decoder: ``final=True`` can still raise UnicodeDecodeError for a
+        # truncated multi-byte sequence (T-4).
+        self._decoder = codecs.getincrementaldecoder("utf-8")("ignore")
         self._pending = ""
         self.lines: List[str] = []
 
     def feed(self, chunk: bytes) -> None:
         if not chunk:
             return
-        self._pending += self._decoder.decode(chunk)
+        try:
+            decoded = self._decoder.decode(chunk)
+        except UnicodeDecodeError:
+            decoded = chunk.decode("utf-8", errors="ignore")
+            self._decoder.reset()
+        self._pending += decoded
         while "\n" in self._pending:
             line, self._pending = self._pending.split("\n", 1)
             stripped = line.strip()
@@ -215,7 +225,13 @@ class _PassThroughStreamLineAccumulator:
                 self.lines.append(stripped)
 
     def finish(self) -> List[str]:
-        tail = self._decoder.decode(b"", final=True)
+        try:
+            tail = self._decoder.decode(b"", final=True)
+        except UnicodeDecodeError:
+            # T-4: peeked Responses SSE can end mid-codepoint. Treat the
+            # leftover truncated sequence as incomplete text, not a crash.
+            self._decoder.reset()
+            tail = ""
         if tail:
             self._pending += tail
         stripped = self._pending.strip()
@@ -2820,8 +2836,9 @@ class PassThroughStreamingHandler:
         Returns:
             List of string lines, with each line being a complete data: {} chunk
         """
-        # Combine all bytes and decode to string
-        combined_str = b"".join(raw_bytes).decode("utf-8")
+        # Combine all bytes and decode to string. Incomplete UTF-8 at a
+        # stream boundary is the same T-4 condition as finish().
+        combined_str = b"".join(raw_bytes).decode("utf-8", errors="ignore")
 
         # Split by newlines and filter out empty lines
         lines = [line.strip() for line in combined_str.split("\n") if line.strip()]

@@ -3140,6 +3140,9 @@ def test_build_session_history_record_tracks_runtime_and_client_identity() -> No
         ("OpenAI/Python 1.99.0", "openai-python", "1.99.0"),
         ("Anthropic/Python 0.67.0", "anthropic-python", "0.67.0"),
         ("example-client/2.3.4 extra", "example-client", "2.3.4"),
+        ("omp/17.3.8", "ohmypi", "17.3.8"),
+        ("Oh My Pi/17.4.2 extra", "ohmypi", "17.4.2"),
+        ("Bun/1.3.14", "bun", "1.3.14"),
     ],
 )
 def test_parse_client_identity_from_user_agent_known_native_clients(

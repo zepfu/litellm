@@ -507,6 +507,9 @@ def test_gpt_5_6_variant_reasoning_effort_flags():
             assert model_info["supports_none_reasoning_effort"] is True
             assert model_info["supports_xhigh_reasoning_effort"] is True
             assert model_info["supports_max_reasoning_effort"] is True
+            assert "max_output_tokens" in model_info["unsupported_request_params"]
+            assert "temperature" in model_info["unsupported_request_params"]
+            assert "top_p" in model_info["unsupported_request_params"]
 
 
 def test_gpt_5_6_reasoning_effort_flags_in_runtime_model_info(monkeypatch):
@@ -529,6 +532,29 @@ def test_gpt_5_6_reasoning_effort_flags_in_runtime_model_info(monkeypatch):
         assert model_info["supports_xhigh_reasoning_effort"] is True
         assert model_info["supports_max_reasoning_effort"] is True
         assert supports_max_reasoning_effort(model) is True
+
+
+def test_codex_chatgpt_unsupported_request_params_in_cost_map():
+    import json
+    from pathlib import Path
+
+    pricing_map_paths = [
+        Path("model_prices_and_context_window.json"),
+        Path("litellm/bundled_model_prices_and_context_window_fallback.json"),
+    ]
+    for pricing_map_path in pricing_map_paths:
+        model_cost = json.loads(pricing_map_path.read_text())
+        for model in (
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.3-codex-spark",
+            "codex-auto-review",
+        ):
+            params = model_cost[model]["unsupported_request_params"]
+            assert "max_output_tokens" in params
+            assert "temperature" in params
+            assert "top_p" in params
 
 
 def test_gpt_5_3_codex_spark_reasoning_effort_flags(monkeypatch):

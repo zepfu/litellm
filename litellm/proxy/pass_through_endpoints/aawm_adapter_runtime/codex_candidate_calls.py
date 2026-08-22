@@ -999,6 +999,13 @@ async def _perform_codex_auto_agent_native_openai_request(
     request_body = normalize_direct_openai_legacy_function_call_history_ids(
         request_body
     )
+    # Ingress drop keys off the caller/alias model id. Alias names such as
+    # ``work`` / ``expert`` / ``sota`` are not cost-map keys, so Ohmypi
+    # ``max_output_tokens`` survives until this resolved Codex candidate.
+    (
+        request_body,
+        _codex_unsupported_request_params,
+    ) = _drop_unsupported_codex_request_params_from_request_body(request_body)
     is_streaming_request = "stream" in str(target_url)
     resolved_headers = (
         dict(custom_headers)

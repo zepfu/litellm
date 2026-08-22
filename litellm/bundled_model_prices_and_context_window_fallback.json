@@ -20145,7 +20145,12 @@
         "supports_reasoning": true,
         "supports_none_reasoning_effort": true,
         "supports_xhigh_reasoning_effort": true,
-        "supports_max_reasoning_effort": true
+        "supports_max_reasoning_effort": true,
+        "unsupported_request_params": [
+            "max_output_tokens",
+            "temperature",
+            "top_p"
+        ]
     },
     "gpt-5.6-sol": {
         "litellm_provider": "openai",
@@ -20160,7 +20165,12 @@
         "supports_reasoning": true,
         "supports_none_reasoning_effort": true,
         "supports_xhigh_reasoning_effort": true,
-        "supports_max_reasoning_effort": true
+        "supports_max_reasoning_effort": true,
+        "unsupported_request_params": [
+            "max_output_tokens",
+            "temperature",
+            "top_p"
+        ]
     },
     "gpt-5.6-terra": {
         "litellm_provider": "openai",
@@ -20175,7 +20185,12 @@
         "supports_reasoning": true,
         "supports_none_reasoning_effort": true,
         "supports_xhigh_reasoning_effort": true,
-        "supports_max_reasoning_effort": true
+        "supports_max_reasoning_effort": true,
+        "unsupported_request_params": [
+            "max_output_tokens",
+            "temperature",
+            "top_p"
+        ]
     },
     "gpt-5.4-2026-03-05": {
         "cache_read_input_token_cost": 2.5e-07,
@@ -39901,6 +39916,11 @@
         "unsupported_hosted_tools": [
             "image_generation"
         ],
+        "unsupported_request_params": [
+            "max_output_tokens",
+            "temperature",
+            "top_p"
+        ],
         "supports_vision": true
     },
     "codex-auto-review": {
@@ -39926,6 +39946,11 @@
         "unsupported_hosted_tools": [
             "custom",
             "image_generation"
+        ],
+        "unsupported_request_params": [
+            "max_output_tokens",
+            "temperature",
+            "top_p"
         ],
         "supports_vision": true
     },

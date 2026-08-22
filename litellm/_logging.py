@@ -1232,6 +1232,29 @@ _AAWM_HEALTH_ACCESS_LOG_PATHS = frozenset(
         "/health/services",
     }
 )
+# Native Ohmypi catalog probes. Suppress leftover uvicorn ACCESS for every
+# status (including 500 when prisma_client is None). Do not add
+# /openai_passthrough/* here; those consume leftover uvicorn via route
+# replacement.
+_AAWM_NATIVE_MODEL_INFO_ACCESS_LOG_PATHS = frozenset(
+    {
+        "/model_group/info",
+        "/model/info",
+        "/v1/model/info",
+        "/v2/model/info",
+    }
+)
+# Platform HTTP-suite probes (auth/miss expected). Do not add these to
+# leftover_uvicorn.allow_paths; suppress leftover uvicorn ACCESS here.
+_AAWM_PLATFORM_PROBE_ACCESS_LOG_PATHS = frozenset(
+    {
+        "/internal/aawm/session-transfer-status",
+        "/grok/v1",
+        "/grok/v1/models",
+        "/v1/chat/completions",
+        "/chat/completions",
+    }
+)
 _AAWM_HEALTH_ACCESS_LOG_STATUSES = frozenset({200, 204})
 _AAWM_ANTHROPIC_BASE_PROBE_PATHS = frozenset({"/anthropic", "/anthropic/"})
 
@@ -1251,6 +1274,16 @@ class AawmHealthAccessLogFilter(logging.Filter):
             "?",
             1,
         )[0]
+        if (
+            normalized_method == "GET"
+            and path in _AAWM_NATIVE_MODEL_INFO_ACCESS_LOG_PATHS
+        ):
+            return False
+        if (
+            path in _AAWM_PLATFORM_PROBE_ACCESS_LOG_PATHS
+            and normalized_method in {"GET", "POST"}
+        ):
+            return False
         is_health_probe = (
             normalized_method == "GET" and path in _AAWM_HEALTH_ACCESS_LOG_PATHS
         )

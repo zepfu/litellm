@@ -813,6 +813,43 @@ class TestUnsupportedParamDrops:
         assert result is body
         assert removed == []
 
+    def test_alias_id_does_not_match_resolved_codex_unsupported_params(self):
+        """Lookup is keyed off request_body['model']. Alias names such as
+        ``work`` are not cost-map keys, so Ohmypi ``max_output_tokens`` stays
+        on the body until rewrite to the resolved Codex model.
+        """
+        cost = {
+            "gpt-5.3-codex-spark": {
+                "unsupported_request_params": [
+                    "max_output_tokens",
+                    "temperature",
+                    "top_p",
+                ]
+            }
+        }
+        cb = _make_callbacks(cost)
+        alias_body = {"model": "work", "max_output_tokens": 64000}
+        alias_result, alias_removed = (
+            drop_unsupported_codex_request_params_from_request_body(
+                alias_body, callbacks=cb
+            )
+        )
+        assert alias_removed == []
+        assert alias_result is alias_body
+        assert alias_result["max_output_tokens"] == 64000
+
+        resolved_body = {
+            "model": "gpt-5.3-codex-spark",
+            "max_output_tokens": 64000,
+        }
+        resolved_result, resolved_removed = (
+            drop_unsupported_codex_request_params_from_request_body(
+                resolved_body, callbacks=cb
+            )
+        )
+        assert "max_output_tokens" in resolved_removed
+        assert "max_output_tokens" not in resolved_result
+
     def test_depth_bound(self):
         cost = {"gpt-4o": {"unsupported_request_params": ["deep_param"]}}
         cb = CodexToolPolicyCallbacks(

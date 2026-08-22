@@ -3200,6 +3200,8 @@ def _normalize_aawm_route_log_known_client_name(name: str) -> str:
         return "OpenCode"
     if normalized_name in {"cursor", "cursor-cli"}:
         return "Cursor"
+    if normalized_name in {"omp", "ohmypi", "oh-my-pi", "oh my pi"}:
+        return "Ohmypi"
     return name
 
 
@@ -3356,8 +3358,6 @@ def _get_aawm_route_log_client_product_label(
         _AAWM_ROUTE_LOG_CLIENT_LABEL_HEADER_KEYS,
         normalizer=_normalize_aawm_route_log_client_product,
     )
-    if direct_label:
-        return direct_label
 
     client_name = _first_aawm_route_log_value(
         metadata,
@@ -3368,8 +3368,6 @@ def _get_aawm_route_log_client_product_label(
         _AAWM_ROUTE_LOG_CLIENT_NAME_HEADER_KEYS,
         normalizer=_normalize_aawm_route_log_client_product,
     )
-    if not client_name:
-        return None
 
     client_version = _first_aawm_route_log_value(
         metadata,
@@ -3380,8 +3378,20 @@ def _get_aawm_route_log_client_product_label(
         _AAWM_ROUTE_LOG_CLIENT_VERSION_HEADER_KEYS,
         normalizer=_normalize_aawm_route_log_client_product,
     )
-    if client_version:
+    if client_name and client_version:
         return f"{client_name}/{client_version}"
+    if client_name == "Ohmypi" and not client_version:
+        # A lossy direct label like "Oh" (from x-aawm-client="Oh My Pi") hides
+        # the version the user-agent still carries; prefer it only for Ohmypi.
+        user_agent_label = _get_case_insensitive_header_value(
+            headers,
+            ("user-agent",),
+            normalizer=_normalize_aawm_route_log_client_product,
+        )
+        if user_agent_label and user_agent_label.startswith("Ohmypi/"):
+            return user_agent_label
+    if direct_label:
+        return direct_label
     return client_name
 
 

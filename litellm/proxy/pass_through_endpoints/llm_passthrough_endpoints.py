@@ -148,6 +148,7 @@ from litellm.proxy.aawm_route_logging import (
     emit_aawm_route_status_event,  # noqa: F401 - rollup install host binding
     record_aawm_route_rollup,  # noqa: F401 - rollup install host binding
     record_aawm_route_rollup_turn,  # noqa: F401 - Wave 6F facade host binding
+    _register_aawm_route_access_log_replacement,
     resolve_aawm_route_host_attribution,  # noqa: F401 - rollup install host binding
 )
 from litellm.proxy.pass_through_endpoints import (
@@ -1154,6 +1155,19 @@ def _is_openai_models_endpoint(endpoint: str) -> bool:
     if not normalized_path.startswith("/"):
         normalized_path = "/" + normalized_path
     return normalized_path == "/models" or normalized_path == "/v1/models"
+
+
+def _is_openai_model_info_probe_endpoint(endpoint: str) -> bool:
+    """Ohmypi catalog discovery GETs under /openai_passthrough, not CFG-023 /models."""
+    normalized_path = httpx.URL(endpoint).path.rstrip("/")
+    if not normalized_path.startswith("/"):
+        normalized_path = "/" + normalized_path
+    return normalized_path in {
+        "/model_group/info",
+        "/model/info",
+        "/v1/model/info",
+        "/v2/model/info",
+    }
 
 
 def _get_openai_passthrough_route_family(endpoint: str) -> str:
@@ -5752,12 +5766,29 @@ async def openai_proxy_route(  # noqa: PLR0915
         if not _should_preserve_openai_client_auth(
             request=request, endpoint=endpoint
         ):
-            from starlette.responses import JSONResponse
             from litellm.proxy.pass_through_endpoints.aawm_alias_routing.catalog import (
-                build_passthrough_model_list,
+                passthrough_models_json_response,
             )
 
-            return JSONResponse(build_passthrough_model_list())
+            # CFG-023 returns a local catalog JSON body and never enters
+            # pass_through_request, so uvicorn would otherwise log the GET.
+            # Register the access-log replacement even when route rollups
+            # are disabled: leftover uvicorn on this path is still a halt.
+            _register_aawm_route_access_log_replacement(
+                request,
+                suppress_all_statuses=True,
+            )
+            return passthrough_models_json_response()
+
+    if request.method == "GET" and _is_openai_model_info_probe_endpoint(endpoint):
+        # Ohmypi probes these under /openai_passthrough; they are not
+        # CFG-023 /models. Register replacement so leftover uvicorn
+        # (including 404) is consumed, then return without forwarding.
+        _register_aawm_route_access_log_replacement(
+            request,
+            suppress_all_statuses=True,
+        )
+        return Response(status_code=404)
 
     request_body: dict[str, Any] = {}
     is_oa_xai_request = False

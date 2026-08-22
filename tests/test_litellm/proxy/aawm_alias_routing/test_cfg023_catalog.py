@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -123,13 +124,34 @@ class TestPassthroughCatalogHelpers:
 
 
 def _openai_models_request(*, endpoint: str = "v1/models") -> MagicMock:
+    path = f"/openai_passthrough/{endpoint}"
     request = MagicMock()
     request.method = "GET"
-    request.url.path = f"/openai_passthrough/{endpoint}"
+    request.url.path = path
     request.headers = {}
     request.query_params = {}
     request.state = SimpleNamespace()
+    request.scope = {
+        "type": "http",
+        "method": "GET",
+        "path": path,
+        "query_string": b"",
+        "client": ("172.18.0.1", 50324),
+        "http_version": "1.1",
+    }
     return request
+
+
+def _uvicorn_access_record(*, method: str, full_path: str, status_code: int = 200) -> logging.LogRecord:
+    return logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=("172.18.0.1:50324", method, full_path, "1.1", status_code),
+        exc_info=None,
+    )
 
 
 @pytest.mark.asyncio
@@ -233,6 +255,117 @@ async def test_swapped_snapshot_appears_on_non_codex_models_list() -> None:
     assert "work" in second_ids
     assert "work-other" in second_ids
     assert "sota-zai" not in second_ids
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint,path",
+    [
+        ("v1/models", "/openai_passthrough/v1/models"),
+        ("models", "/openai_passthrough/models"),
+    ],
+)
+async def test_non_codex_native_models_list_replaces_uvicorn_access_log(
+    endpoint: str,
+    path: str,
+) -> None:
+    """CFG-023 local catalog GET must consume the matching uvicorn access line."""
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        openai_proxy_route,
+    )
+    from litellm._logging import (
+        AawmRouteAccessLogReplacementFilter,
+        clear_aawm_route_access_log_replacements,
+    )
+
+    clear_aawm_route_access_log_replacements()
+    snapshot = _snapshot_with_aliases(COMPILED_ALIAS_NAMES)
+    request = _openai_models_request(endpoint=endpoint)
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_openai_models_endpoint",
+        return_value=True,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._should_preserve_openai_client_auth",
+        return_value=False,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._request_uses_codex_native_auth",
+        return_value=False,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.catalog.get_active_snapshot",
+        return_value=snapshot,
+    ):
+        response = await openai_proxy_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=MagicMock(),
+            user_api_key_dict=MagicMock(),
+        )
+
+    from starlette.responses import JSONResponse
+
+    assert isinstance(response, JSONResponse)
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    matching = _uvicorn_access_record(method="GET", full_path=path)
+    assert access_filter.filter(matching) is False
+    assert access_filter.filter(matching) is True
+    clear_aawm_route_access_log_replacements()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint,path,status_code",
+    [
+        ("model_group/info", "/openai_passthrough/model_group/info", 404),
+        ("model/info", "/openai_passthrough/model/info", 404),
+        ("v1/model/info", "/openai_passthrough/v1/model/info", 404),
+        ("v2/model/info", "/openai_passthrough/v2/model/info", 404),
+    ],
+)
+async def test_openai_passthrough_model_info_probes_replace_uvicorn_access_log(
+    endpoint: str,
+    path: str,
+    status_code: int,
+) -> None:
+    """Ohmypi catalog discovery GETs under /openai_passthrough must consume leftover uvicorn."""
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        openai_proxy_route,
+    )
+    from litellm._logging import (
+        AawmRouteAccessLogReplacementFilter,
+        clear_aawm_route_access_log_replacements,
+    )
+
+    clear_aawm_route_access_log_replacements()
+    request = _openai_models_request(endpoint=endpoint)
+    handler = AsyncMock(return_value={"object": "list", "data": []})
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._should_preserve_openai_client_auth",
+        return_value=False,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.passthrough_endpoint_router.get_credentials",
+        return_value="sk-test",
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.BaseOpenAIPassThroughHandler._base_openai_pass_through_handler",
+        handler,
+    ):
+        await openai_proxy_route(
+            endpoint=endpoint,
+            request=request,
+            fastapi_response=MagicMock(),
+            user_api_key_dict=MagicMock(),
+        )
+
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    matching = _uvicorn_access_record(
+        method="GET",
+        full_path=path,
+        status_code=status_code,
+    )
+    assert access_filter.filter(matching) is False
+    assert access_filter.filter(matching) is True
+    clear_aawm_route_access_log_replacements()
 
 
 @pytest.mark.asyncio

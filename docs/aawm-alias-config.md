@@ -326,7 +326,10 @@ Do not add this alias to `sota.yaml` TUI dispatch.
 ## Codex passthrough alias catalog (CFG-023)
 
 Non-Codex-native `GET /openai_passthrough/v1/models` lists compiled YAML
-aliases from the active routing snapshot. Usage is
+aliases from the active routing snapshot. That local catalog GET
+registers the AAWM access-log replacement so leftover uvicorn
+`INFO: … "GET /openai_passthrough/v1/models"` lines are suppressed
+the same way as alias Responses POSTs. Usage is
 `POST /openai_passthrough/v1/responses`. Generic `/v1/chat/completions` is
 not an alias ingress. The public name is `sota-zai`. Non-Codex-native GET
 also lists served concrete provider ids with mode/context/cost from the
@@ -334,6 +337,16 @@ bundled cost map or `aawm_reference_pricing`. Provenance is explicit and
 is not invoice cost. Cursor Grok is distinct from `oa_xai/grok-4.6`.
 Usage remains `POST /openai_passthrough/v1/responses`. omp should point at
 this passthrough (sibling client config; not committed here).
+
+Ohmypi catalog discovery GETs under `/openai_passthrough`
+(`model_group/info`, `model/info`, `v1/model/info`, `v2/model/info`)
+are not CFG-023 `/models`. `openai_proxy_route` registers the same
+access-log replacement with `suppress_all_statuses=True` and returns
+404 without forwarding. Native `GET /model_group/info` (and unprefixed
+`/model/info`, `/v1/model/info`, `/v2/model/info`) leftover uvicorn
+ACCESS is suppressed by `AawmHealthAccessLogFilter` for all statuses,
+including 500 when `prisma_client is None`. Do not add these paths to
+harness leftover_uvicorn `allow_paths`.
 
 ## Provider-native credential boundary
 

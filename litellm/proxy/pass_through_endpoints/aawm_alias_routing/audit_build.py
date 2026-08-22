@@ -507,7 +507,12 @@ def _aawm_auto_agent_audit_request_has_account_bound_state(
                 return True
         if value.get("encrypted_content"):
             return True
-        if item_type in {"reasoning", "function_call_output"}:
+        # Ohmypi/OpenAI item payloads can put a list in ``type``. Membership
+        # against a set of strings must not raise ``TypeError: unhashable``.
+        if isinstance(item_type, str) and item_type in {
+            "reasoning",
+            "function_call_output",
+        }:
             return True
         return any(
             _aawm_auto_agent_audit_request_has_account_bound_state(child, _seen)

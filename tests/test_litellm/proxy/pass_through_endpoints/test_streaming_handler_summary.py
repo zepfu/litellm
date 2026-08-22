@@ -36,6 +36,85 @@ def test_stream_line_accumulator_matches_raw_bytes_converter():
     assert incremental == rebuilt
 
 
+@pytest.mark.parametrize(
+    "truncated_tail",
+    [
+        b"\xc3",  # first byte of a 2-byte sequence (e.g. \xc3\xa9)
+        b"\xe2\x9c",  # first two bytes of a 3-byte sequence (e.g. \xe2\x9c\x93)
+        b"\xe2",  # first byte of a 3-byte sequence
+        b"\xe2\x82",  # halt T-4: 'bytes in position 0-1: unexpected end of data'
+    ],
+    ids=["two-byte-lead", "three-byte-prefix", "three-byte-lead", "three-byte-two-prefix"],
+)
+def test_stream_line_accumulator_finish_skips_truncated_utf8_tail(truncated_tail):
+    """T-4: incomplete UTF-8 leftover in the incremental decoder is a stream
+    boundary, not a UnicodeDecodeError from finish()."""
+    accumulator = _PassThroughStreamLineAccumulator()
+    accumulator.feed(truncated_tail)
+    lines = accumulator.finish()
+    assert lines == []
+
+
+def test_stream_line_accumulator_finish_swallows_decoder_unicode_error():
+    """T-4: finish() must not dump Traceback even if the incremental decoder
+    still raises UnicodeDecodeError on final=True (errors='ignore' is not
+    enough on every CPython)."""
+    accumulator = _PassThroughStreamLineAccumulator()
+    accumulator.feed(b'data: {"type":"response.created"}\n')
+
+    class _RaisingDecoder:
+        def __init__(self) -> None:
+            self.reset_called = False
+
+        def decode(self, data, final=False):
+            raise UnicodeDecodeError(
+                "utf-8",
+                b"\xe2\x82",
+                0,
+                2,
+                "unexpected end of data",
+            )
+
+        def reset(self) -> None:
+            self.reset_called = True
+
+    decoder = _RaisingDecoder()
+    accumulator._decoder = decoder
+    lines = accumulator.finish()
+    assert 'data: {"type":"response.created"}' in lines
+    assert decoder.reset_called is True
+
+
+def test_chunk_lines_skips_incomplete_utf8_at_end_of_peeked_sse():
+    """T-4: peeked Responses SSE may split mid-codepoint; _chunk_lines must
+    keep complete lines and drop the incomplete tail instead of raising."""
+    complete = b'data: {"type":"response.created","response":{"id":"resp_ok"}}\n\n'
+    truncated = complete + b"\xe2\x82"
+    lines = PassThroughStreamingHandler._chunk_lines([truncated])
+    assert 'data: {"type":"response.created","response":{"id":"resp_ok"}}' in lines
+
+
+def test_convert_raw_bytes_ignores_truncated_utf8_tail():
+    raw_bytes = [
+        b'data: {"type":"response.created"}\n\n',
+        b"\xe2\x82",
+    ]
+    lines = PassThroughStreamingHandler._convert_raw_bytes_to_str_lines(raw_bytes)
+    assert lines == ['data: {"type":"response.created"}']
+
+
+def test_chunk_lines_still_decodes_valid_utf8_sse():
+    chunks = [
+        b'data: {"type":"response.output_text.delta","delta":"caf\xc3\xa9"}\n\n',
+        b'data: {"type":"response.completed"}\n\n',
+    ]
+    lines = PassThroughStreamingHandler._chunk_lines(chunks)
+    assert lines == [
+        'data: {"type":"response.output_text.delta","delta":"café"}',
+        'data: {"type":"response.completed"}',
+    ]
+
+
 def test_stream_summary_finalize_eligible_openai_responses_only():
     env_key = PassThroughStreamingHandler._AAWM_STREAM_SUMMARY_FIRST_FINALIZE_ENV
     with patch.dict(os.environ, {env_key: "1"}, clear=False):

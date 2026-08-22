@@ -10,8 +10,11 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from fastapi.responses import Response
 from fastapi.responses import StreamingResponse
+
+from litellm.proxy._types import ProxyException
 
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     codex_candidate_calls,
@@ -414,3 +417,28 @@ def test_should_strictly_gate_codex_cohere_candidate_failure_classification(
         is None
     )
     classifier.assert_not_called()
+
+
+def test_should_wrap_unclassified_probe_failure_as_proxy_exception() -> None:
+    raw = RuntimeError("openrouter 422")
+    wrapped = candidate_loop._proxy_exception_for_unclassified_probe_failure(raw)
+    assert isinstance(wrapped, ProxyException)
+    assert wrapped is not raw
+    assert "openrouter 422" in wrapped.message
+    assert wrapped.code in {"400", 400}
+
+    http_exc = HTTPException(status_code=422, detail="already http")
+    assert (
+        candidate_loop._proxy_exception_for_unclassified_probe_failure(http_exc)
+        is http_exc
+    )
+    proxy_exc = ProxyException(
+        message="already proxy",
+        type="invalid_request_error",
+        param="model",
+        code=400,
+    )
+    assert (
+        candidate_loop._proxy_exception_for_unclassified_probe_failure(proxy_exc)
+        is proxy_exc
+    )

@@ -739,6 +739,11 @@ class TestContinuationState:
     def test_empty_dict(self):
         assert _codex_auto_agent_request_has_continuation_state({}) is False
 
+    def test_list_type_field_does_not_raise(self):
+        body = {"type": ["message"], "content": []}
+        assert _aawm_auto_agent_audit_request_has_account_bound_state(body) is False
+        assert _codex_auto_agent_request_has_continuation_state(body) is False
+
     def test_scalar(self):
         assert _codex_auto_agent_request_has_continuation_state("hello") is False
         assert _codex_auto_agent_request_has_continuation_state(42) is False

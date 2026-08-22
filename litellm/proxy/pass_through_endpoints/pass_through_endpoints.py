@@ -98,6 +98,30 @@ from litellm.types.utils import (
     all_litellm_params,
 )
 
+# Keep these names defined before aawm_adapter_runtime imports. Package
+# __init__ loads anthropic_adapter_calls, which imports the retryable-status
+# frozenset at module scope while this file is still initializing.
+PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS: Tuple[int, ...] = (
+    5,
+    15,
+    30,
+    60,
+    120,
+)
+PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES = frozenset(
+    {500, 502, 503, 504, 529}
+)
+# Wall-clock ceiling for shared pre-first-byte hidden retries (RR-056 / B2).
+# Bounds total elapsed time across attempts + backoff, independent of per-attempt
+# HTTP timeouts (which can be many minutes each and otherwise amplify outages).
+# Override via AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS.
+# Set to 0 to disable the wall-clock bound (attempt-count limit still applies).
+# Default equals the sum of the fixed backoff schedule so fast failures can still
+# exercise the full attempt budget, while slow timed-out attempts abort early.
+DEFAULT_PASSTHROUGH_PRE_FIRST_BYTE_HIDDEN_RETRY_BUDGET_SECONDS = float(
+    sum(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS)
+)
+
 from .aawm_adapter_runtime.repetitive_output import (
     bind_output_guard_to_streaming_response,
     maybe_reject_passthrough_responses_body,
@@ -154,24 +178,6 @@ router = APIRouter()
 
 pass_through_endpoint_logging = PassThroughEndpointLogging()
 
-PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS: Tuple[int, ...] = (
-    5,
-    15,
-    30,
-    60,
-    120,
-)
-PASSTHROUGH_PRE_FIRST_BYTE_RETRYABLE_STATUS_CODES = frozenset({500, 502, 503, 504, 529})
-# Wall-clock ceiling for shared pre-first-byte hidden retries (RR-056 / B2).
-# Bounds total elapsed time across attempts + backoff, independent of per-attempt
-# HTTP timeouts (which can be many minutes each and otherwise amplify outages).
-# Override via AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS.
-# Set to 0 to disable the wall-clock bound (attempt-count limit still applies).
-# Default equals the sum of the fixed backoff schedule so fast failures can still
-# exercise the full attempt budget, while slow timed-out attempts abort early.
-DEFAULT_PASSTHROUGH_PRE_FIRST_BYTE_HIDDEN_RETRY_BUDGET_SECONDS = float(
-    sum(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS)
-)
 _AAWM_AGENT_IDENTITY_CALLBACK_MARKERS = (
     "aawm_agent_identity",
     "aawm_litellm_callbacks.agent_identity",
