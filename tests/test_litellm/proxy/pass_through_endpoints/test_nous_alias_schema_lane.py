@@ -1,16 +1,14 @@
 """NOUS-002: Codex/direct-Nous schema and lane selection.
 
 Verifies the reusable ``nous`` provider identity, the Codex-only adapter
-route family, the static Nous lane key, and that Wave B does not insert
-Nous into production ``basic.yaml`` / ``work.yaml``.
+route family, and the static Nous lane key. Production ``basic.yaml`` /
+``work.yaml`` insert order is locked by ``test_nous_ox_alpha_alias_schema_lane.py``.
 
 No provider egress, no synthetic LLM calls, no live Hermes reads.
 """
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
@@ -26,9 +24,6 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler imp
     ConfigCompileError,
     compile_yaml,
 )
-from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
-    compile_directory,
-)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_schema import (
     CODEX_ONLY_ROUTE_FAMILIES,
     CODEX_TO_ANTHROPIC_ROUTE_FAMILY,
@@ -38,17 +33,6 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_schema impor
 
 _CODEX_NOUS_ROUTE_FAMILY = "codex_nous_chat_completions_adapter"
 _NOUS_MODEL = "stealth/ox-alpha"
-_REPO_ROOT = os.path.dirname(
-    os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    )
-)
-_BASIC_YAML_PATH = os.path.join(
-    _REPO_ROOT, "litellm", "proxy", "aawm_alias_config", "basic.yaml"
-)
-_WORK_YAML_PATH = os.path.join(
-    _REPO_ROOT, "litellm", "proxy", "aawm_alias_config", "work.yaml"
-)
 
 _NOUS_ALIAS_YAML = """\
 defaults: {}
@@ -201,26 +185,6 @@ aliases:
 """
         with pytest.raises(ConfigCompileError):
             compile_yaml(raw)
-
-    def test_wave_b_does_not_insert_nous_into_basic_or_work(self):
-        with open(_BASIC_YAML_PATH, "r", encoding="utf-8") as handle:
-            basic_snapshot = compile_yaml(handle.read())
-        work_snapshot = compile_directory(
-            Path(_REPO_ROOT) / "litellm" / "proxy" / "aawm_alias_config"
-        )
-
-        basic_providers = {
-            candidate.provider
-            for candidate in basic_snapshot.aliases["basic"].candidates
-            if getattr(candidate, "provider", None)
-        }
-        work_providers = {
-            candidate.provider
-            for candidate in work_snapshot.aliases["work"].candidates
-            if getattr(candidate, "provider", None)
-        }
-        assert "nous" not in basic_providers
-        assert "nous" not in work_providers
 
 
 class TestNousLaneSelection:
