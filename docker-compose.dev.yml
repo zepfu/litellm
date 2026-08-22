@@ -167,7 +167,7 @@ services:
       - /etc/hostname:/host/etc/hostname:ro
       # Sanitized Tailscale self identity for local host attribution (host-maintained).
       - ${AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_HOST_DIR:-/home/zepfu/.analysis/aawm-host-identity}:/host/aawm:ro
-    environment:
+    environment: &litellm-dev-environment
       # Langfuse — read from host env or set defaults
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
       - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
@@ -273,6 +273,87 @@ services:
       - AAWM_OPENAI_FAULT_PLAN_ENABLED=${AAWM_OPENAI_FAULT_PLAN_ENABLED:-0}
       - AAWM_CFG004_ACCEPTANCE_ENABLED=${AAWM_CFG004_ACCEPTANCE_ENABLED:-0}
       - AAWM_CFG004_ACCEPTANCE_RUN_ID=${AAWM_CFG004_ACCEPTANCE_RUN_ID:-}
+    networks:
+      - default
+      - aawm_default
+    depends_on:
+      aawm-alias-routing-redis:
+        condition: service_healthy
+
+  # Testing-only live checkout. Never route production or persistent client
+  # traffic here; candidate code and config restart automatically on change.
+  litellm-alpha:
+    build:
+      context: .
+      dockerfile: Dockerfile.alpha
+    image: litellm-alpha:local
+    container_name: litellm-alpha
+    restart: unless-stopped
+    command:
+      - /usr/bin/env
+      - AAWM_LITELLM_ENVIRONMENT=litellm-alpha
+      - LITELLM_AAWM_ERROR_LOG_ENV=alpha
+      - LITELLM_LANGFUSE_TRACE_ENVIRONMENT=alpha
+      - AAWM_ALIAS_ROUTING_STATE_NAMESPACE=aawm-routing-alpha-v1
+      - PGAPPNAME=aawm-litellm-alpha
+      - AAWM_SESSION_HISTORY_DB_APPLICATION_NAME=aawm-litellm-alpha-session-history
+      - AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME=aawm-litellm-alpha-dynamic-injection
+      - LITELLM_KIMI_NATIVE_CONTRACT_PATH=/run/aawm/kimi-descriptor/native-contract.json
+      - watchfiles
+      - litellm --config /app/litellm-dev-config.yaml --port 4011
+      - /app/litellm
+      - /app/enterprise
+      - /app/litellm-dev-config.yaml
+      - /app/model_prices_and_context_window.json
+      - /app/context-replacement
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "5"
+    ports:
+      - "127.0.0.1:4011:4011"
+      - "100.109.19.233:4011:4011"
+    volumes:
+      # The checkout is authoritative. Keep it read-only to prevent candidate
+      # runtime behavior from modifying source or configuration.
+      - .:/app:ro
+      # Keep the packaged fallback synchronized with the canonical live map.
+      - ./model_prices_and_context_window.json:/app/litellm/bundled_model_prices_and_context_window_fallback.json:ro
+      # Runtime output surfaces remain writable.
+      - ./.analysis:/app/.analysis
+      - ./captures:/tmp/captures
+      - /home/zepfu/.analysis:/home/zepfu/.analysis
+      - /mnt/e/litellm/session_history:/mnt/e/litellm/session_history
+      # Match the development proxy's read-only identity and credential inputs.
+      - /home/zepfu/.claude/projects:/home/zepfu/.claude/projects:ro
+      - /home/zepfu/projects/aawm/agents:/home/zepfu/.claude/agents:ro
+      - /home/zepfu/.codex:/home/zepfu/.codex:ro
+      - /home/zepfu/.local/share/opencode:/home/zepfu/.local/share/opencode:ro
+      - /home/zepfu/.grok:/home/zepfu/.grok:ro
+      - /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai:ro
+      - /home/zepfu/.kimi-code/credentials:/home/zepfu/.kimi-code/credentials:ro
+      - ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.kimi-code/native-contract}:/run/aawm/kimi-descriptor:ro
+      - ${AAWM_GROK_CLIENT_VERSION_CACHE_DIR:-/home/zepfu/.cache/aawm/grok}:/run/aawm/grok:ro
+      - /home/zepfu/.qwen/settings.json:/home/zepfu/.qwen/settings.json:ro
+      - /etc/hostname:/host/etc/hostname:ro
+      - ${AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_HOST_DIR:-/home/zepfu/.analysis/aawm-host-identity}:/host/aawm:ro
+    environment: *litellm-dev-environment
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen(
+              "http://127.0.0.1:4011/health/liveliness",
+              timeout=5,
+          )
+      interval: 10s
+      timeout: 6s
+      retries: 12
+      start_period: 30s
     networks:
       - default
       - aawm_default

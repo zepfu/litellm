@@ -1,0 +1,26 @@
+FROM python:3.13-slim
+
+# Build dependencies for C extensions.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc g++ make \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install dependencies before source so ordinary source edits do not invalidate
+# the dependency layer.
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install the project at the same path used by the runtime bind mount. The
+# editable install and PYTHONPATH then resolve imports from the live checkout.
+COPY . .
+RUN pip install --no-cache-dir -e . \
+    && pip install --no-cache-dir asyncpg langfuse watchfiles==1.2.0
+
+ENV PYTHONPATH=/app \
+    PYTHONDONTWRITEBYTECODE=1
+
+EXPOSE 4011
+
+CMD ["watchfiles", "litellm --config /app/litellm-dev-config.yaml --port 4011", "/app/litellm", "/app/enterprise", "/app/litellm-dev-config.yaml", "/app/model_prices_and_context_window.json", "/app/context-replacement"]
