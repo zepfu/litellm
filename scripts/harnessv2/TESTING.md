@@ -125,7 +125,8 @@ Durable run logs: `.analysis/harnessv2/*.jsonl`.
 
 Root: `config/harness.yaml` (`schema_version: 1`). It includes the YAML
 files above. `--overlay PATH` deep-merges extra YAML/JSON onto that
-tree.
+tree. Overlays may add protected containers/ports but cannot remove the
+immutable `aawm-litellm`, `litellm-dev`, `4000`, `4001`.
 
 Timeouts (defaults):
 
@@ -173,7 +174,7 @@ Walk kinds in this order. Do **not** skip the logging gate.
 |---|---|---|
 | `platform` | forbidden | Health, custom HTTP, error JSONL, Redis prefix SCAN, docker logs |
 | `catalog` | optional | CFG-023/024 HTTP catalog; Ohmypi picker if `--tui ohmypi` |
-| `model` | required | Interactive Ohmypi PONG (or clean provider 404) per alias |
+| `model` | required | Waits for idle; standalone exact PONG or explicit provider 404 per alias |
 | `orchestration` | required | Parent alias spawns children through Ohmypi `task` |
 
 `--dry-run` prints the resolved plan and exits 0. No TUI, no HTTP, no
@@ -229,9 +230,12 @@ For each selected alias the driver:
 3. Refuses argv containing `-p` / `--print`.
 4. Waits for ready needles (`π`), then pastes `prompts/pong.txt`
    (`Reply with exactly the word PONG.`).
-5. Waits until idle. Pass if the pane shows `※ recap:` **or** a clean
-   provider error needle (`Error:`, `No endpoints found`, …). Needles
-   that are substrings of the **sent prompt** are ignored (H-6).
+5. Waits until the pane returns idle. After idle, pass requires a
+   standalone exact `PONG` reply **or** an explicit provider 404
+   needle (`No endpoints found for`, `404 Not Found`, `status code
+   404`, `Error: 404`). `※ recap:` is only a wait signal; generic
+   `Error:`, recap-only, and non-idle panes fail. Needles that are
+   substrings of the **sent prompt** are ignored (H-6).
 6. Closes that session before the next model.
 
 `--model` is repeatable / comma-separated. Default is group `all`.
@@ -320,7 +324,9 @@ From `config/tuis.yaml`:
 | Forbid | `-p`, `--print` |
 | Model tools | off |
 | Orchestration tools | on |
-| Pass / orch pass needles | `※ recap:` |
+| Wait needle | `※ recap:` (wait signal only, never pass evidence) |
+| Model pass needles | standalone exact `PONG`; `No endpoints found for` / `404 Not Found` / `status code 404` / `Error: 404` |
+| Orchestration pass | `child_evidence.ok` (hub `<task-result>` / nested `yield`) |
 
 Child env allow-prefixes include `PI_` / `OMP_` / `CODEX_` / `OPENAI_` /
 `XAI_`. Deny Langfuse, DB, master key, Anthropic/Claude inheritance.

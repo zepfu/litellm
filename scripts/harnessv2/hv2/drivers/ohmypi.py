@@ -527,11 +527,14 @@ class OhmypiDriver:
                 timeout_seconds=self._tmux_float("wait_reply_seconds", 180),
                 prompt=sent_prompt,
             )
+        idle = False
+        if replied:
+            idle = self.wait_until_idle()
         pane = self.capture_pane()
         return {
-            "ok": bool(sent.get("ok") and replied),
+            "ok": bool(sent.get("ok") and replied and idle),
             "send": sent,
-            "idle": False,
+            "idle": idle,
             "replied": replied,
             "pane": pane,
         }

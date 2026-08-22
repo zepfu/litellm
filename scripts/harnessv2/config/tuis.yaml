@@ -102,12 +102,17 @@ tuis:
         - "AAWM alias / model {model}"
       # Recent-session titles contain "the word PONG"; recap text after a
       # completed turn is the completion marker (wording varies).
-      pass_needles:
+      reply_needles:
         - "※ recap:"
-      error_needles:
-        - "Error:"
-        - "No endpoints found"
-        - "not supported when using Codex"
+        - "No endpoints found for"
+        - "404 Not Found"
+        - "status code 404"
+        - "Error: 404"
+      provider_404_needles:
+        - "No endpoints found for"
+        - "404 Not Found"
+        - "status code 404"
+        - "Error: 404"
       # Must not be a substring of the pasted orchestration prompt
       # (omp-alpha-fanout lives in orchestration.txt and would false-complete).
       orchestration_pass_needles:

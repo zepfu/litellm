@@ -39,7 +39,9 @@ port is **not** a flag. The harness reads `NetworkSettings.Ports` from
 
 `--dry-run` prints the resolved plan and exits 0 (no TUI, no HTTP, no
 docker logs of protected containers). `--overlay PATH` deep-merges extra
-YAML/JSON onto the checked-in config.
+YAML/JSON onto the checked-in config. Overlays may add protected
+containers/ports but cannot remove the immutable `aawm-litellm`,
+`litellm-dev`, `4000`, `4001`.
 
 Lists of aliases, log forbiddens, endpoints, Redis ceilings, and Ohmypi
 argv live under `config/`. Python changes only when a new *kind of step*
@@ -51,13 +53,19 @@ is invented.
 |---|---|---|
 | `platform` | forbidden | Health, custom endpoints, error JSONL, Redis prefix SCAN, docker logs |
 | `catalog` | optional | CFG-023/024 HTTP catalog; Ohmypi picker if `--tui ohmypi` |
-| `model` | required | Interactive Ohmypi PONG (or clean provider 404) per model/group |
+| `model` | required | Waits for idle; standalone exact PONG or explicit provider 404 per model/group |
 | `orchestration` | required | Parent alias spawns `basic`/`work`/`expert`/`sota` |
 
 `--test model` and `--test orchestration` launch a dedicated interactive
 Ohmypi tmux session on socket `tmux37` (`hv2-ohmypi-<model>-<pid>`) with
 `--model litellm-alpha-passthrough/<alias>`. They never use `omp -p` /
 `--print` and they do not reuse leftover `omp-alpha-test` panes.
+
+For `--test model` the driver waits until the TUI returns idle, then
+passes only on a standalone exact `PONG` reply or an explicit provider
+404 needle (`No endpoints found for`, `404 Not Found`, `status code
+404`, `Error: 404`). `※ recap:` is only a wait signal; generic
+`Error:`, recap-only, and non-idle panes fail.
 
 Every non-dry-run also appends a durable JSONL log under
 `.analysis/harnessv2/` (`run_start`, one `step` line per check with

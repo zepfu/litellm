@@ -349,6 +349,15 @@ def _step_tui_catalog(plan: RunPlan, **_: Any) -> dict[str, Any]:
     )
 
 
+def _pane_exact_pong(pane: str, prompt: str) -> bool:
+    prompt_line = prompt.strip()
+    for raw_line in pane.splitlines():
+        line = raw_line.strip()
+        if line == "PONG" and line != prompt_line:
+            return True
+    return False
+
+
 def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
     if not plan.tui:
         raise PlanError("model kind requires --tui")
@@ -361,7 +370,12 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
     select = _ohmypi_select_spec(driver)
     tools = bool(select.get("tools_for_model", False))
     pass_needles = as_str_list(select.get("pass_needles")) or ["PONG"]
-    error_needles = as_str_list(select.get("error_needles"))
+    provider_404_needles = (
+        as_str_list(select.get("provider_404_needles")) or ["404"]
+    )
+    reply_needles = as_str_list(select.get("reply_needles")) or (
+        pass_needles + provider_404_needles
+    )
     send_text = ""
     try:
         for model in plan.models:
@@ -389,13 +403,15 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
                 rows.append(row)
                 continue
             if hasattr(driver, "send_prompt_and_wait"):
-                waited = driver.send_prompt_and_wait(prompt.strip())
+                waited = driver.send_prompt_and_wait(
+                    prompt.strip(), reply_needles=reply_needles
+                )
                 sent = waited.get("send") or {}
                 pane = str(waited.get("pane") or "")
                 row["idle"] = waited.get("idle")
             else:
                 sent = driver.send_keys(prompt.strip())
-                driver.wait_until_idle()
+                row["idle"] = driver.wait_until_idle()
                 pane = driver.capture_pane()
             row["send"] = sent
             if not sent.get("ok"):
@@ -407,14 +423,21 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
                 failures.append(
                     f"pane for {model} does not show selector {selector}"
                 )
-            completed = _pane_has_any(
-                pane, pass_needles, prompt=prompt.strip()
-            ) or _pane_has_any(pane, error_needles, prompt=prompt.strip())
+            exact_pong = _pane_exact_pong(pane, prompt)
+            provider_404 = bool(
+                provider_404_needles
+                and _pane_has_any(
+                    pane, provider_404_needles, prompt=prompt.strip()
+                )
+            )
+            row["exact_pong"] = exact_pong
+            row["provider_404"] = provider_404
+            completed = bool(row.get("idle")) and (exact_pong or provider_404)
             row["completed"] = completed
             if not completed:
                 failures.append(
-                    f"TUI turn for {model} produced neither "
-                    f"{pass_needles} nor a clean provider error"
+                    f"TUI turn for {model} did not reach an idle exact PONG "
+                    f"reply or provider 404 evidence"
                 )
             rows.append(row)
             driver.close_session()

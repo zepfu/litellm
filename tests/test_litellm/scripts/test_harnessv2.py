@@ -116,6 +116,16 @@ def test_should_load_yaml_includes_and_compiled_aliases(hv, config) -> None:
     assert config["redis"]["container"] == "litellm-aawm-alias-routing-redis-1"
     assert config["redis"]["namespace"] == "aawm-routing-alpha-v1"
     assert config["redis"]["never_flush"] is True
+    select_model = config["tuis"]["ohmypi"]["select_model"]
+    provider_404 = select_model["provider_404_needles"]
+    assert provider_404 == [
+        "No endpoints found for",
+        "404 Not Found",
+        "status code 404",
+        "Error: 404",
+    ]
+    assert select_model["reply_needles"] == ["※ recap:"] + provider_404
+    assert "PONG" not in select_model["reply_needles"]
 
 
 def test_should_deep_merge_overlay(hv, tmp_path: Path) -> None:
@@ -234,6 +244,23 @@ def test_should_refuse_protected_host_ports(hv, config) -> None:
         hv.assert_host_port_allowed(4000, config)
     with pytest.raises(hv.ProtectedTargetError, match="4001"):
         hv.assert_host_port_allowed(4001, config)
+
+
+def test_should_union_immutable_protected_targets_with_config_replacements() -> None:
+    from hv2.docker_guard import protected_containers, protected_ports
+
+    replacement = {
+        "protected_containers": ["litellm-alpha"],
+        "protected_ports": [4011],
+    }
+    containers = protected_containers(replacement)
+    ports = protected_ports(replacement)
+    assert isinstance(containers, frozenset)
+    assert isinstance(ports, frozenset)
+    assert containers == frozenset({"aawm-litellm", "litellm-dev", "litellm-alpha"})
+    assert ports == frozenset({4000, 4001, 4011})
+    assert protected_containers({}) == frozenset({"aawm-litellm", "litellm-dev"})
+    assert protected_ports({}) == frozenset({4000, 4001})
 
 
 def test_should_not_call_docker_for_protected_container(hv, config) -> None:
@@ -1330,6 +1357,30 @@ def test_should_count_recap_needle_not_in_prompt_as_pass_evidence() -> None:
     assert _pane_has_pass_evidence(pane, ["※ recap:"], prompt=prompt) is True
 
 
+def test_should_accept_standalone_exact_pong_line() -> None:
+    from hv2.kinds.runner import _pane_exact_pong
+
+    prompt = "Reply with exactly the word PONG."
+    pane = (
+        "Default model: litellm-alpha-passthrough/work\n"
+        f"{prompt}\n"
+        "PONG\n"
+        "π  > ⬢ AAWM alias / model work\n"
+    )
+    assert _pane_exact_pong(pane, prompt) is True
+
+
+def test_should_reject_prompt_echo_and_non_exact_pong() -> None:
+    from hv2.kinds.runner import _pane_exact_pong
+
+    prompt = "Reply with exactly the word PONG."
+    echo_only = f"Default model: litellm-alpha-passthrough/work\n{prompt}\n"
+    assert _pane_exact_pong(echo_only, prompt) is False
+    assert _pane_exact_pong("PONG\n", "PONG") is False
+    assert _pane_exact_pong("PONG!\n", prompt) is False
+    assert _pane_exact_pong("The word is PONG\n", prompt) is False
+
+
 def test_should_not_mark_tui_replied_when_needle_is_only_in_sent_prompt(
     hv, config, monkeypatch
 ) -> None:
@@ -1390,6 +1441,43 @@ def test_should_mark_tui_replied_when_recap_needle_is_absent_from_prompt(
     waited = driver.send_prompt_and_wait(prompt, reply_needles=["※ recap:"])
     assert waited["replied"] is True
     assert waited["ok"] is True
+
+
+def test_should_not_mark_tui_ok_when_reply_seen_but_not_idle(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    prompt = "Reply with exactly the word PONG."
+    pane = (
+        "Default model: litellm-alpha-passthrough/work\n"
+        f"{prompt}\n"
+        "※ recap:\n"
+        "PONG\n"
+    )
+    driver = OhmypiDriver(config)
+    monkeypatch.setattr(
+        driver,
+        "send_keys",
+        lambda text: {"ok": True, "method": "paste-buffer"},
+    )
+    monkeypatch.setattr(driver, "capture_pane", lambda: pane)
+    monkeypatch.setattr(
+        driver, "wait_until_idle", lambda timeout_seconds=None: False
+    )
+
+    def fake_tmux_float(key: str, default: float) -> float:
+        if key == "wait_reply_seconds":
+            return 0.2
+        if key == "poll_interval_seconds":
+            return 0.01
+        return default
+
+    monkeypatch.setattr(driver, "_tmux_float", fake_tmux_float)
+    waited = driver.send_prompt_and_wait(prompt, reply_needles=["※ recap:"])
+    assert waited["replied"] is True
+    assert waited["idle"] is False
+    assert waited["ok"] is False
 
 
 _ORCH_CHILDREN = ("basic", "work", "expert", "sota")

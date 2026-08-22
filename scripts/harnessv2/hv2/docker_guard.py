@@ -23,16 +23,21 @@ PROTECTED_PORT_MESSAGE = (
     "Use litellm-alpha (published 4011)."
 )
 
+IMMUTABLE_PROTECTED_CONTAINERS: frozenset[str] = frozenset(
+    {"aawm-litellm", "litellm-dev"}
+)
+IMMUTABLE_PROTECTED_PORTS: frozenset[int] = frozenset({4000, 4001})
+
 
 def protected_containers(config: Mapping[str, Any]) -> frozenset[str]:
-    raw = as_str_list(config.get("protected_containers"))
-    return frozenset(raw or ["aawm-litellm", "litellm-dev"])
+    additions = as_str_list(config.get("protected_containers"))
+    return IMMUTABLE_PROTECTED_CONTAINERS | frozenset(additions)
 
 
 def protected_ports(config: Mapping[str, Any]) -> frozenset[int]:
     raw = config.get("protected_ports") or []
-    ports = [int(item) for item in raw] if raw else [4000, 4001]
-    return frozenset(ports)
+    additions = frozenset(int(item) for item in raw)
+    return IMMUTABLE_PROTECTED_PORTS | additions
 
 
 def assert_container_allowed(name: str, config: Mapping[str, Any]) -> None:
