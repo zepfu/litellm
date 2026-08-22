@@ -1,0 +1,15 @@
+# AAWM alias-routing config for inbound ``auto-review``.
+# This is the OMP-facing replica of ``codex-auto-review``.
+
+defaults: {}
+
+aliases:
+  - name: auto-review
+    candidates:
+      - provider: openai
+        model: codex-auto-review
+        route_family: codex_responses
+        priority: 100
+
+      - alias_reference: sota
+        priority: 90

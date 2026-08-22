@@ -588,3 +588,18 @@ aliases:
 """
     with pytest.raises((ValidationError, compiler.ConfigCompileError)):
         compiler.compile_yaml(invalid)
+
+
+def test_auto_review_yaml_replicates_codex_auto_review_candidates() -> None:
+    """OMP ``auto-review`` keeps the canonical review routing contract."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    canonical = snapshot.aliases["codex-auto-review"]
+    replica = snapshot.aliases["auto-review"]
+
+    assert replica.dispatch == canonical.dispatch
+    assert replica.candidates == canonical.candidates
