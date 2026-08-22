@@ -91,8 +91,9 @@ normal logs stay compact.
 
 ## Passive OAuth Credential Health
 
-The sidecar can inspect the existing Grok OIDC, Codex OAuth, xAI OAuth, and
-Kimi OAuth credential files without refreshing or modifying them. This mode is
+The sidecar can inspect the existing Grok OIDC, Codex OAuth, xAI OAuth,
+Kimi OAuth, and Nous Portal OAuth credential files without refreshing or
+modifying them. This mode is
 intended for read-only consumers such as Thoth, where another host remains the
 single credential writer but `provider_auth_observations` and
 `provider_auth_current` still need fresh health state.
@@ -116,7 +117,8 @@ Relevant environment variables:
 
 ## Deadline-Aware OAuth Refresh Scheduling
 
-The scheduled Grok OIDC, managed xAI OAuth, Kimi OAuth, and Codex OAuth tasks
+The scheduled Grok OIDC, managed xAI OAuth, Kimi OAuth, Codex OAuth, and
+Nous Portal OAuth tasks
 have two separate timing controls:
 
 - The outer eligibility cadence is the provider-status loop cadence
@@ -188,6 +190,32 @@ The managed xAI dev Compose contract is exact:
 - `AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS=300`
 - `AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=900`
 - `AAWM_XAI_OAUTH_FORCE_REFRESH=0`
+
+The Hermes Nous Portal OAuth dev Compose contract is exact:
+
+- `AAWM_NOUS_OAUTH_REFRESH_ENABLED=1`
+- `AAWM_NOUS_OAUTH_AUTH_FILE=/home/zepfu/.hermes/auth.json`
+- `AAWM_NOUS_OAUTH_LOCK_FILE=/home/zepfu/.hermes/auth.lock`
+- `AAWM_NOUS_OAUTH_AUTH_FILE_UID=1000` / `GID=1000` / `MODE=0o600`
+- `AAWM_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS=300`
+- `AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS=900`
+- `AAWM_NOUS_OAUTH_FORCE_REFRESH=0`
+- `AAWM_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS=30`
+
+The sidecar is the sole automatic Hermes writer. Proxies mount
+`/home/zepfu/.hermes` read-only. Directory mounts, not file mounts, keep atomic
+credential replacement visible without restart. Hermes CLI auto-refresh must
+not run against the same file. Do not copy Hermes 120s native skew as the
+sidecar buffer. Refresh tokens are single-use: a token-endpoint success
+followed by a failed atomic replace is terminal for that refresh token; do not
+replay it. Operator recovery is a Hermes CLI break-glass re-login on Thoth:
+
+```text
+hermes auth add nous
+```
+
+Never copy the WSL Hermes file over the Thoth file. The 2026-08-21 WSL-to-Thoth
+scoped bootstrap import is not refresh acceptance.
 
 These are checked-in development configuration defaults. They are not
 deployment or runtime acceptance evidence.
@@ -1004,13 +1032,13 @@ The detail endpoint is undocumented and provider-owned; shape may change without
 ## One-Shot Exit Policy
 
 With `--once`, enabled `grok_oidc_refresh`, per-account
-`codex_oauth_refresh`, and `xai_oauth_refresh` events are required tasks.
-A successful refresh or successful no-op/skipped refresh satisfies the task.
-Any required failure returns a non-zero process status. Telemetry, metadata
-repair, passive health, Kimi work, and aggregate events are optional; their
-failures are reported as optional degradation without changing the required
-exit status. Native Grok OIDC and managed xAI OAuth remain separate credential
-families and tasks.
+`codex_oauth_refresh`, `xai_oauth_refresh`, and `nous_oauth_refresh` events
+are required tasks. A successful refresh or successful no-op/skipped refresh
+satisfies the task. Any required failure returns a non-zero process status.
+Telemetry, metadata repair, passive health, Kimi work, and aggregate events
+are optional; their failures are reported as optional degradation without
+changing the required exit status. Native Grok OIDC, managed xAI OAuth, and
+Nous Portal OAuth remain separate credential families and tasks.
 
 
 ## Observability Anomaly Scan Task

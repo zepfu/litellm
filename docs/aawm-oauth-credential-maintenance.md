@@ -64,6 +64,7 @@ Related deeper context:
 | Managed xAI OAuth (`oa_xai/*`) | `scripts/xai_oauth_refresh.py` (sidecar) | LiteLLM managed xAI OAuth routes | `~/.litellm/xai/oauth-auth.json` |
 | Grok native OIDC | `scripts/grok_oidc_refresh.py` (sidecar) | LiteLLM Grok native routes | Caller-supplied configured path |
 | Kimi Code CLI OAuth (`kimi_code`) | Existing Kimi Code CLI grant; sidecar refresh only when enabled | Configured LiteLLM Kimi Code consumers | `~/.kimi-code/credentials/kimi-code.json` |
+| Nous Portal OAuth (`nous`) | `scripts/nous_oauth_refresh.py` (sidecar); Hermes CLI is break-glass re-login only | LiteLLM read-only Hermes consumers | `~/.hermes/auth.json` |
 
 LiteLLM is a **read-only consumer** of these files during request handling. It
 selects a still-valid access token (or fails the candidate with a clear
@@ -88,12 +89,14 @@ credential path. Defaults must not hardcode a specific operator home directory.
 | Managed xAI OAuth | `~/.litellm/xai/oauth-auth.json` | `~/.litellm/xai/oauth-auth.json.lock` |
 | Grok OIDC | Caller-supplied configured path | same directory, `.lock` sibling when configured |
 | Kimi Code CLI OAuth | `~/.kimi-code/credentials/kimi-code.json` | `~/.kimi-code/oauth/kimi-code` (native `proper-lockfile` creates the transient `kimi-code.lock` directory) |
+| Nous Portal OAuth | `~/.hermes/auth.json` | `~/.hermes/auth.lock` (Hermes-native `Path.with_suffix(".lock")`; not `auth.json.lock`) |
 
 Override paths with the normal env vars for the family in use (for example
 `AAWM_CODEX_AUTH_FILE` / `AAWM_CODEX_LOCK_FILE` only for the standalone Codex
 one-file primitive, `AAWM_XAI_OAUTH_AUTH_FILE` /
 `LITELLM_XAI_OAUTH_AUTH_FILE`,
 `AAWM_KIMI_OAUTH_AUTH_FILE` / `LITELLM_KIMI_OAUTH_AUTH_FILE`,
+`AAWM_NOUS_OAUTH_AUTH_FILE` / `LITELLM_NOUS_OAUTH_AUTH_FILE`,
 `LITELLM_XAI_GROK_AUTH_FILE`,
 variants). Compose may bind the expanded host path into containers; the script
 defaults themselves remain `~`-relative so other operators and hosts work
@@ -292,11 +295,11 @@ sidecar and standalone callers retain the normal structured failure contract.
 Publication preserves existing file ownership and private mode unless optional
 env overrides are set. Each family uses the same shape:
 
-| Purpose | Codex | Managed xAI | Grok OIDC | Kimi Code CLI |
+| Purpose | Codex | Managed xAI | Grok OIDC | Kimi Code CLI | Nous Portal OAuth |
 | --- | --- | --- | --- | --- | --- |
-| UID | `AAWM_CODEX_AUTH_FILE_UID` | `AAWM_XAI_OAUTH_AUTH_FILE_UID` | `AAWM_GROK_OIDC_AUTH_FILE_UID` | `AAWM_KIMI_OAUTH_AUTH_FILE_UID` |
-| GID | `AAWM_CODEX_AUTH_FILE_GID` | `AAWM_XAI_OAUTH_AUTH_FILE_GID` | `AAWM_GROK_OIDC_AUTH_FILE_GID` | `AAWM_KIMI_OAUTH_AUTH_FILE_GID` |
-| Mode | `AAWM_CODEX_AUTH_FILE_MODE` | `AAWM_XAI_OAUTH_AUTH_FILE_MODE` | `AAWM_GROK_OIDC_AUTH_FILE_MODE` | `AAWM_KIMI_OAUTH_AUTH_FILE_MODE` |
+| UID | `AAWM_CODEX_AUTH_FILE_UID` | `AAWM_XAI_OAUTH_AUTH_FILE_UID` | `AAWM_GROK_OIDC_AUTH_FILE_UID` | `AAWM_KIMI_OAUTH_AUTH_FILE_UID` | `AAWM_NOUS_OAUTH_AUTH_FILE_UID` |
+| GID | `AAWM_CODEX_AUTH_FILE_GID` | `AAWM_XAI_OAUTH_AUTH_FILE_GID` | `AAWM_GROK_OIDC_AUTH_FILE_GID` | `AAWM_KIMI_OAUTH_AUTH_FILE_GID` | `AAWM_NOUS_OAUTH_AUTH_FILE_GID` |
+| Mode | `AAWM_CODEX_AUTH_FILE_MODE` | `AAWM_XAI_OAUTH_AUTH_FILE_MODE` | `AAWM_GROK_OIDC_AUTH_FILE_MODE` | `AAWM_KIMI_OAUTH_AUTH_FILE_MODE` | `AAWM_NOUS_OAUTH_AUTH_FILE_MODE` |
 
 Rules:
 
@@ -333,7 +336,8 @@ shared value redaction via `sanitize_credential_error_message()` with a default
 Behavior:
 
 - Redacts secret *values* for known fields (`access_token`, `refresh_token`,
-  `id_token`, `client_secret`, `key`), not merely the field-name labels.
+  `id_token`, `client_secret`, `key`, `agent_key`), not merely the field-name
+  labels. `agent_key_id` is not a secret field.
 - Handles bare `key=value` / `key: value`, quoted values, JSON forms, and
   query/form boundaries.
 - Optionally redacts scoped `Authorization: Bearer …` credentials.
@@ -388,6 +392,52 @@ Any production-equivalent deployment must preserve the same read-only worker
 and single-writer sidecar contract, but production mutation remains a separate
 operator-authorized rollout.
 
+## Nous Portal OAuth credential ownership
+
+The shared Hermes Nous Portal credential and Hermes-native lock are:
+
+```text
+~/.hermes/auth.json
+~/.hermes/auth.lock
+```
+
+Hermes derives the lock with `Path.with_suffix(".lock")` on `auth.json`, so the
+lock is `~/.hermes/auth.lock`, not `auth.json.lock`. Do not create a second lock
+file. Stay in the Hermes file; do not copy the credential into a LiteLLM-owned
+path.
+
+This file is a **shared multi-provider store**. Automatic refresh must mutate
+only `providers.nous` and the matching `credential_pool.nous` entry (prefer
+`source == "device_code"`, else the sole oauth object). Preserve every other
+`providers` / `credential_pool` entry, `active_provider`, and unrelated keys.
+Do not `sort_keys` the whole payload.
+
+The provider-status sidecar (`scripts/nous_oauth_refresh.py`) is the **sole
+automatic writer**. LiteLLM proxies are read-only consumers. Refresh tokens are
+**single-use**. Never run Hermes CLI auto-refresh against the same Thoth file
+while the sidecar owns refresh. Hermes CLI is break-glass re-login only:
+
+```text
+hermes auth add nous
+```
+
+Run that command on Thoth only. Never copy the WSL Hermes file over the Thoth
+file. The 2026-08-21 WSL-to-Thoth scoped bootstrap import is not refresh
+acceptance.
+
+Dev compose source (not a live apply):
+
+- `litellm-dev` bind-mounts `/home/zepfu/.hermes` read-only and sets
+  `LITELLM_NOUS_OAUTH_AUTH_FILE`.
+- `provider-status-observations` bind-mounts the same directory writable and
+  enables `AAWM_NOUS_OAUTH_REFRESH_ENABLED=1` with interval `300`, buffer `900`,
+  force `0`, timeout `30`, uid/gid `1000`, and mode `0o600`.
+- Directory mounts, not file mounts, so atomic `os.replace` is visible without
+  a proxy restart.
+
+Do not add Hermes to `docker-compose.wsl-grok-oidc.yml`. That unit is xAI/Grok
+only.
+
 ## Historical credential records
 
 Older deployment notes may mention Antigravity credential files or refresh
@@ -422,8 +472,9 @@ restart event.
    summary: `refreshed` / `skipped` / redacted `error_message` only.
 5. Verify LiteLLM continues serving without restart once the file is updated.
 6. For `--once`, require exit `0` for enabled Grok OIDC, every enabled Codex
-   record, and managed xAI OAuth refresh. Optional telemetry degradation is
-   reported separately and does not mask required refresh failures.
+   record, managed xAI OAuth refresh, and Nous Portal OAuth refresh. Optional
+   telemetry degradation is reported separately and does not mask required
+   refresh failures.
 
 ## Implementation map
 
@@ -438,4 +489,5 @@ restart event.
 | Managed xAI refresh | `scripts/xai_oauth_refresh.py` |
 | Grok OIDC refresh | `scripts/grok_oidc_refresh.py` |
 | Managed Kimi Code refresh | `scripts/kimi_oauth_refresh.py` |
+| Nous Portal OAuth refresh | `scripts/nous_oauth_refresh.py` |
 | Sidecar loop | `scripts/run_provider_status_observations_loop.py` |

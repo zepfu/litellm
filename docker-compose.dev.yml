@@ -141,6 +141,9 @@ services:
       # Kimi Code CLI credential directory. LiteLLM only reads the host CLI's
       # existing grant; the directory mount preserves atomic credential replacement.
       - /home/zepfu/.kimi-code/credentials:/home/zepfu/.kimi-code/credentials:ro
+      # Hermes Nous Portal OAuth. LiteLLM reads only; provider-status-observations
+      # owns scheduled refresh writes. Directory mount preserves atomic replace.
+      - /home/zepfu/.hermes:/home/zepfu/.hermes:ro
       # Sanitized Kimi native descriptor for canonical endpoint resolution (MS-030/MS-031).
       # CFG-018: mount ONLY the dedicated sanitized descriptor directory
       # read-only (canonical host file:
@@ -238,6 +241,7 @@ services:
       - LITELLM_XAI_OAUTH_AUTH_FILE=${LITELLM_XAI_OAUTH_AUTH_FILE:-/home/zepfu/.litellm/xai/oauth-auth.json}
       - LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.grok/auth.json}
       - LITELLM_KIMI_OAUTH_AUTH_FILE=${LITELLM_KIMI_OAUTH_AUTH_FILE:-/home/zepfu/.kimi-code/credentials/kimi-code.json}
+      - LITELLM_NOUS_OAUTH_AUTH_FILE=${LITELLM_NOUS_OAUTH_AUTH_FILE:-/home/zepfu/.hermes/auth.json}
       - LITELLM_KIMI_NATIVE_CONTRACT_PATH=${LITELLM_KIMI_NATIVE_CONTRACT_PATH:-/app/kimi-descriptor/native-contract.json}
       - LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=${LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED:-true}
       - AAWM_GROK_CLIENT_VERSION_CACHE_PATH=${AAWM_GROK_CLIENT_VERSION_CACHE_PATH:-/run/aawm/grok/native-client-version.json}
@@ -316,6 +320,8 @@ services:
       # native proper-lockfile parent for the oauth/kimi-code sentinel.
       - /home/zepfu/.kimi-code/credentials:/home/zepfu/.kimi-code/credentials
       - /home/zepfu/.kimi-code/oauth:/home/zepfu/.kimi-code/oauth
+      # Writable Hermes directory so atomic auth.json replacement is visible.
+      - /home/zepfu/.hermes:/home/zepfu/.hermes
       # Sanitized Kimi native descriptor for canonical endpoint resolution (MS-030/MS-031).
       # CFG-018: dedicated sanitized descriptor directory only; canonical host
       # file /home/zepfu/.kimi-code/native-contract/native-contract.json.
@@ -396,6 +402,16 @@ services:
       - AAWM_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS=${AAWM_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS:-300}
       - AAWM_KIMI_OAUTH_FORCE_REFRESH=${AAWM_KIMI_OAUTH_FORCE_REFRESH:-0}
       - AAWM_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS=${AAWM_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS:-30}
+      - AAWM_NOUS_OAUTH_REFRESH_ENABLED=${AAWM_NOUS_OAUTH_REFRESH_ENABLED:-1}
+      - AAWM_NOUS_OAUTH_AUTH_FILE=${AAWM_NOUS_OAUTH_AUTH_FILE:-/home/zepfu/.hermes/auth.json}
+      - AAWM_NOUS_OAUTH_LOCK_FILE=${AAWM_NOUS_OAUTH_LOCK_FILE:-/home/zepfu/.hermes/auth.lock}
+      - AAWM_NOUS_OAUTH_AUTH_FILE_UID=${AAWM_NOUS_OAUTH_AUTH_FILE_UID:-1000}
+      - AAWM_NOUS_OAUTH_AUTH_FILE_GID=${AAWM_NOUS_OAUTH_AUTH_FILE_GID:-1000}
+      - AAWM_NOUS_OAUTH_AUTH_FILE_MODE=${AAWM_NOUS_OAUTH_AUTH_FILE_MODE:-0o600}
+      - AAWM_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS=${AAWM_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS:-300}
+      - AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS=${AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS:-900}
+      - AAWM_NOUS_OAUTH_FORCE_REFRESH=${AAWM_NOUS_OAUTH_FORCE_REFRESH:-0}
+      - AAWM_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS=${AAWM_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS:-30}
       - AAWM_PROVIDER_AUTH_HEALTH_POLL_ENABLED=${AAWM_PROVIDER_AUTH_HEALTH_POLL_ENABLED:-0}
       - AAWM_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS=${AAWM_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS:-3600}
       - AAWM_KIMI_USAGE_POLL_ENABLED=${AAWM_KIMI_USAGE_POLL_ENABLED:-1}

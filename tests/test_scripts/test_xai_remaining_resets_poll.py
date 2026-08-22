@@ -250,6 +250,7 @@ def _build_dockerfile_shaped_tree(root: Path) -> Path:
         "codex_oauth_refresh.py",
         "xai_oauth_refresh.py",
         "kimi_oauth_refresh.py",
+        "nous_oauth_refresh.py",
         "run_provider_status_observations_loop.py",
     ):
         shutil.copy2(REPO_ROOT / "scripts" / name, scripts_dir / name)

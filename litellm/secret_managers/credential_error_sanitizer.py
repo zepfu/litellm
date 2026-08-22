@@ -20,6 +20,7 @@ from typing import Iterable, Optional
 DEFAULT_SECRET_FIELD_NAMES = frozenset(
     {
         "access_token",
+        "agent_key",
         "client_secret",
         "id_token",
         "key",

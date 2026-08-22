@@ -8,7 +8,7 @@ import json
 import os
 import sys
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 
@@ -732,6 +732,217 @@ def test_rr089_kimi_oauth_refresh_event_redacts_tokens(loop, tmp_path, monkeypat
     assert "access_token" not in event
     assert "refresh_token" not in event
     assert "REDACTED" in event["error_message"]
+
+
+def test_rr089_nous_oauth_refresh_is_disabled_by_default(loop, monkeypatch) -> None:
+    for name in (
+        "AAWM_NOUS_OAUTH_REFRESH_ENABLED",
+        "AAWM_NOUS_OAUTH_AUTH_FILE",
+        "AAWM_NOUS_OAUTH_LOCK_FILE",
+        "AAWM_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS",
+        "AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS",
+        "AAWM_NOUS_OAUTH_FORCE_REFRESH",
+        "AAWM_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS",
+        "LITELLM_NOUS_OAUTH_AUTH_FILE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    config = loop.parse_config([])
+
+    assert config.nous_oauth_refresh_enabled is False
+    assert config.nous_oauth_auth_file == "~/.hermes/auth.json"
+    assert config.nous_oauth_lock_file == "~/.hermes/auth.lock"
+    assert Path(config.nous_oauth_lock_file).name == "auth.lock"
+    assert config.nous_oauth_refresh_interval_seconds == 300.0
+    assert config.nous_oauth_refresh_buffer_seconds == 900
+    assert config.nous_oauth_force_refresh is False
+    assert config.nous_oauth_http_timeout_seconds == 30.0
+    assert loop.run_due_sidecar_tasks(config, loop.SidecarTaskState(), now_monotonic=1.0) == []
+
+
+def test_rr089_nous_oauth_auth_file_resolves_env_then_cli(loop, monkeypatch) -> None:
+    env_auth_file = "~/hermes-from-env/auth.json"
+    cli_auth_file = "~/hermes-from-cli/auth.json"
+    monkeypatch.setenv("AAWM_NOUS_OAUTH_AUTH_FILE", env_auth_file)
+
+    env_config = loop.parse_config([])
+
+    assert env_config.nous_oauth_auth_file == str(Path(env_auth_file).expanduser())
+    assert env_config.nous_oauth_auth_file_source == "AAWM_NOUS_OAUTH_AUTH_FILE"
+
+    monkeypatch.delenv("AAWM_NOUS_OAUTH_AUTH_FILE")
+    cli_config = loop.parse_config(["--nous-oauth-auth-file", cli_auth_file])
+
+    assert cli_config.nous_oauth_auth_file == str(Path(cli_auth_file).expanduser())
+    assert cli_config.nous_oauth_auth_file_source == "explicit"
+
+
+def test_rr089_nous_oauth_refresh_not_due_skips_helper_http(
+    loop, tmp_path, monkeypatch
+) -> None:
+    wall_now = datetime(2026, 8, 13, 22, 30, tzinfo=timezone.utc)
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text("{}", encoding="utf-8")
+    config = _config(
+        loop,
+        tmp_path,
+        nous_oauth_refresh_enabled=True,
+        nous_oauth_auth_file=str(auth_file),
+        nous_oauth_lock_file=str(tmp_path / "auth.lock"),
+        nous_oauth_refresh_interval_seconds=300.0,
+        nous_oauth_refresh_buffer_seconds=900,
+        nous_oauth_force_refresh=False,
+    )
+    refresh_calls: list[object] = []
+
+    def inspect(*_args, now, **_kwargs):
+        observed = now()
+        return {
+            "eligibility_checked_at": observed.isoformat().replace("+00:00", "Z"),
+            "expires_at": (observed + timedelta(hours=2)).isoformat().replace("+00:00", "Z"),
+            "refresh_due_at": (observed + timedelta(hours=1, minutes=45))
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "next_refresh_check_at": (observed + timedelta(hours=1, minutes=45))
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "eligible": False,
+            "credential_health": "fresh",
+            "usable": True,
+            "error_class": None,
+            "error_message": None,
+        }
+
+    def refresh(*_args, **kwargs):
+        refresh_calls.append(kwargs)
+        raise AssertionError("not-due eligibility must not call the Nous refresh helper")
+
+    monkeypatch.setattr(
+        loop.nous_oauth_refresh,
+        "inspect_nous_oauth_refresh_eligibility",
+        inspect,
+    )
+    monkeypatch.setattr(
+        loop.nous_oauth_refresh,
+        "refresh_nous_oauth_auth_file",
+        refresh,
+    )
+    monkeypatch.setattr(
+        loop.nous_oauth_refresh.urllib_request,
+        "urlopen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("not-due eligibility must not call the token endpoint")
+        ),
+    )
+
+    event = loop._run_nous_oauth_refresh_task(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+        now_wall=wall_now,
+    )
+
+    assert event is not None
+    assert event["event"] == "nous_oauth_refresh"
+    assert event["refresh_result_class"] == "refresh_not_due"
+    assert event["actual_attempted"] is False
+    assert event["attempted"] is False or event["skipped"] is True
+    assert refresh_calls == []
+
+
+def test_rr089_nous_oauth_refresh_due_respects_attempt_interval(
+    loop, tmp_path, monkeypatch
+) -> None:
+    wall_now = datetime(2026, 8, 13, 22, 30, tzinfo=timezone.utc)
+    auth_file = tmp_path / "auth.json"
+    auth_file.write_text("{}", encoding="utf-8")
+    config = _config(
+        loop,
+        tmp_path,
+        nous_oauth_refresh_enabled=True,
+        nous_oauth_auth_file=str(auth_file),
+        nous_oauth_lock_file=str(tmp_path / "auth.lock"),
+        nous_oauth_refresh_interval_seconds=300.0,
+        nous_oauth_refresh_buffer_seconds=900,
+        nous_oauth_force_refresh=False,
+        nous_oauth_http_timeout_seconds=17.0,
+    )
+    refresh_calls: list[float] = []
+
+    def inspect(*_args, now, **_kwargs):
+        observed = now()
+        return {
+            "eligibility_checked_at": observed.isoformat().replace("+00:00", "Z"),
+            "expires_at": "2026-08-13T22:40:00Z",
+            "refresh_due_at": "2026-08-13T22:25:00Z",
+            "next_refresh_check_at": "2026-08-13T22:35:00Z",
+            "eligible": True,
+            "credential_health": "fresh",
+            "usable": True,
+            "error_class": None,
+            "error_message": None,
+        }
+
+    def refresh(auth_path, **kwargs):
+        refresh_calls.append(kwargs)
+        assert auth_path == config.nous_oauth_auth_file
+        assert kwargs["lock_file"] == config.nous_oauth_lock_file
+        assert kwargs["force"] is False
+        assert kwargs["buffer_seconds"] == 900
+        assert kwargs["http_timeout_seconds"] == 17.0
+        kwargs["on_token_endpoint_attempt"]()
+        return {
+            "attempted": True,
+            "refreshed": True,
+            "skipped": False,
+            "auth_file": config.nous_oauth_auth_file,
+            "scope": "inference:invoke",
+            "expires_at": "2026-08-13T23:30:00Z",
+            "error_class": None,
+            "error_message": None,
+        }
+
+    monkeypatch.setattr(
+        loop.nous_oauth_refresh,
+        "inspect_nous_oauth_refresh_eligibility",
+        inspect,
+    )
+    monkeypatch.setattr(
+        loop.nous_oauth_refresh,
+        "refresh_nous_oauth_auth_file",
+        refresh,
+    )
+
+    state = loop.SidecarTaskState()
+    first = loop._run_nous_oauth_refresh_task(
+        config,
+        state,
+        now_monotonic=100.0,
+        now_wall=wall_now,
+    )
+    throttled = loop._run_nous_oauth_refresh_task(
+        config,
+        state,
+        now_monotonic=399.0,
+        now_wall=wall_now + timedelta(seconds=299),
+    )
+    due_again = loop._run_nous_oauth_refresh_task(
+        config,
+        state,
+        now_monotonic=400.0,
+        now_wall=wall_now + timedelta(seconds=300),
+    )
+
+    assert first is not None
+    assert first["event"] == "nous_oauth_refresh"
+    assert first["actual_attempted"] is True
+    assert first["refreshed"] is True
+    assert throttled is not None
+    assert throttled["actual_attempted"] is False
+    assert due_again is not None
+    assert due_again["actual_attempted"] is True
+    assert len(refresh_calls) == 2
+    assert state.nous_oauth_last_attempt_monotonic == 400.0
 
 
 @pytest.fixture

@@ -33,6 +33,7 @@ COPY scripts/grok_oidc_refresh.py /app/scripts/grok_oidc_refresh.py
 COPY scripts/codex_oauth_refresh.py /app/scripts/codex_oauth_refresh.py
 COPY scripts/xai_oauth_refresh.py /app/scripts/xai_oauth_refresh.py
 COPY scripts/kimi_oauth_refresh.py /app/scripts/kimi_oauth_refresh.py
+COPY scripts/nous_oauth_refresh.py /app/scripts/nous_oauth_refresh.py
 COPY scripts/run_provider_status_observations_loop.py /app/scripts/run_provider_status_observations_loop.py
 COPY litellm/secret_managers/credential_error_sanitizer.py /app/litellm/secret_managers/credential_error_sanitizer.py
 COPY litellm/secret_managers/credential_file_lock.py /app/litellm/secret_managers/credential_file_lock.py

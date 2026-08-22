@@ -61,6 +61,12 @@ except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     kimi_oauth_refresh = importlib.import_module("kimi_oauth_refresh")
 
+try:
+    from scripts import nous_oauth_refresh
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    nous_oauth_refresh = importlib.import_module("nous_oauth_refresh")
+
 # The canonical module is a required image dependency. Missing it must fail at
 # import time instead of silently creating a divergent local contract.
 from litellm.secret_managers.kimi_native_contract import (
@@ -81,6 +87,9 @@ from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthInventory,
     load_codex_oauth_credential,
     load_codex_oauth_inventory,
+)
+from litellm.secret_managers.credential_error_sanitizer import (
+    sanitize_credential_error_message,
 )
 from litellm.llms.cursor_agent.constants import CURSOR_AGENT_DASHBOARD_HOST
 from litellm.llms.cursor_agent.dashboard import (
@@ -142,6 +151,16 @@ DEFAULT_KIMI_OAUTH_AUTH_FILE = "~/.kimi-code/credentials/kimi-code.json"
 DEFAULT_KIMI_OAUTH_LOCK_FILE = "~/.kimi-code/oauth/kimi-code"
 DEFAULT_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS = 3600.0
 DEFAULT_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS = kimi_oauth_refresh.DEFAULT_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS
+DEFAULT_NOUS_OAUTH_AUTH_FILE = nous_oauth_refresh.DEFAULT_NOUS_OAUTH_AUTH_FILE
+DEFAULT_NOUS_OAUTH_LOCK_FILE = nous_oauth_refresh.DEFAULT_NOUS_OAUTH_LOCK_FILE
+DEFAULT_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS = 300.0
+DEFAULT_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS = (
+    nous_oauth_refresh.DEFAULT_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS
+)
+NOUS_OAUTH_SIDECAR_AUTH_FILE_ENV_VARS = (
+    "LITELLM_NOUS_OAUTH_AUTH_FILE",
+    "AAWM_HERMES_AUTH_FILE",
+)
 DEFAULT_PROVIDER_AUTH_HEALTH_POLL_ENABLED = False
 DEFAULT_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS = 3600.0
 DEFAULT_KIMI_USAGE_POLL_ENABLED = False
@@ -434,7 +453,7 @@ PROVIDER_FAILURE_SECRET_RE = re.compile(
             r"Bearer\s+[A-Za-z0-9\-._~+/]{10,}=*",
             r"Basic\s+[A-Za-z0-9+/]{10,}={0,2}",
             r"sk-[A-Za-z0-9\-_]{20,}",
-            r"(?:api[_-]?key|x-api-key|api-key|token|password|passwd|mfa|secret|"
+            r"(?:api[_-]?key|x-api-key|api-key|agent[_-]?key|token|password|passwd|mfa|secret|"
             r"login[_-]?aliyunid[_-]?ticket|"
             r"x[_-]?xai[_-]?token[_-]?auth|x[_-]?userid|x[_-]?grok[_-]?user[_-]?id|"
             r"x[_-]?teamid|x[_-]?email)"
@@ -1393,6 +1412,18 @@ class ProviderStatusLoopConfig:
     kimi_oauth_refresh_interval_seconds: float = DEFAULT_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS
     kimi_oauth_force_refresh: bool = False
     kimi_oauth_http_timeout_seconds: float = DEFAULT_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS
+    nous_oauth_refresh_enabled: bool = False
+    nous_oauth_auth_file: str = DEFAULT_NOUS_OAUTH_AUTH_FILE
+    nous_oauth_auth_file_source: str = "default"
+    nous_oauth_lock_file: str = DEFAULT_NOUS_OAUTH_LOCK_FILE
+    nous_oauth_refresh_interval_seconds: float = (
+        DEFAULT_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS
+    )
+    nous_oauth_refresh_buffer_seconds: int = (
+        nous_oauth_refresh.DEFAULT_NOUS_OAUTH_REFRESH_BUFFER_SECONDS
+    )
+    nous_oauth_force_refresh: bool = False
+    nous_oauth_http_timeout_seconds: float = DEFAULT_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS
     provider_auth_health_poll_enabled: bool = DEFAULT_PROVIDER_AUTH_HEALTH_POLL_ENABLED
     provider_auth_health_poll_interval_seconds: float = (
         DEFAULT_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS
@@ -1500,6 +1531,9 @@ class SidecarTaskState:
     kimi_oauth_refresh_schedule: "OAuthRefreshScheduleState" = dataclass_field(
         default_factory=lambda: OAuthRefreshScheduleState()
     )
+    nous_oauth_refresh_schedule: "OAuthRefreshScheduleState" = dataclass_field(
+        default_factory=lambda: OAuthRefreshScheduleState()
+    )
     grok_oidc_last_attempt_monotonic: Optional[float] = None
     codex_oauth_last_attempt_monotonic_by_label: Dict[str, float] = dataclass_field(
         default_factory=dict
@@ -1512,6 +1546,7 @@ class SidecarTaskState:
     )
     xai_oauth_last_attempt_monotonic: Optional[float] = None
     kimi_oauth_last_attempt_monotonic: Optional[float] = None
+    nous_oauth_last_attempt_monotonic: Optional[float] = None
     provider_auth_health_poll_last_attempt_monotonic: Optional[float] = None
     kimi_usage_last_attempt_monotonic: Optional[float] = None
     kimi_usage_refresh_pending: bool = False
@@ -1704,6 +1739,31 @@ def _resolve_kimi_oauth_sidecar_auth_file(
 
     _maybe_reject_default_auth_source("default")
     return DEFAULT_KIMI_OAUTH_AUTH_FILE, "default"
+
+
+def _resolve_nous_oauth_sidecar_auth_file(
+    explicit_auth_file: Optional[str],
+) -> tuple[str, str]:
+    explicit_value = (
+        explicit_auth_file.strip()
+        if isinstance(explicit_auth_file, str) and explicit_auth_file.strip()
+        else None
+    )
+
+    aawm_auth_file = os.getenv("AAWM_NOUS_OAUTH_AUTH_FILE", "").strip()
+    if aawm_auth_file:
+        return str(Path(aawm_auth_file).expanduser()), "AAWM_NOUS_OAUTH_AUTH_FILE"
+
+    if explicit_value and explicit_value != DEFAULT_NOUS_OAUTH_AUTH_FILE:
+        return str(Path(explicit_value).expanduser()), "explicit"
+
+    for env_name in NOUS_OAUTH_SIDECAR_AUTH_FILE_ENV_VARS:
+        env_value = os.getenv(env_name, "").strip()
+        if env_value:
+            return str(Path(env_value).expanduser()), env_name
+
+    _maybe_reject_default_auth_source("default")
+    return DEFAULT_NOUS_OAUTH_AUTH_FILE, "default"
 
 
 def _grok_billing_cache_path_class() -> str:
@@ -2170,6 +2230,86 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         dest="kimi_oauth_refresh_enabled",
         action="store_false",
         help="Disable the Kimi OAuth auth-file refresh task.",
+    )
+    nous_oauth_group = parser.add_mutually_exclusive_group()
+    nous_oauth_group.add_argument(
+        "--nous-oauth-refresh-enabled",
+        dest="nous_oauth_refresh_enabled",
+        action="store_true",
+        default=_env_bool("AAWM_NOUS_OAUTH_REFRESH_ENABLED", False),
+        help=(
+            "Run the Hermes Nous Portal OAuth auth-file refresh task from this "
+            "sidecar loop. Defaults to AAWM_NOUS_OAUTH_REFRESH_ENABLED or false."
+        ),
+    )
+    nous_oauth_group.add_argument(
+        "--no-nous-oauth-refresh",
+        dest="nous_oauth_refresh_enabled",
+        action="store_false",
+        help="Disable the Hermes Nous Portal OAuth auth-file refresh task.",
+    )
+    parser.add_argument(
+        "--nous-oauth-auth-file",
+        dest="nous_oauth_auth_file",
+        default=os.getenv("AAWM_NOUS_OAUTH_AUTH_FILE", DEFAULT_NOUS_OAUTH_AUTH_FILE),
+        help=(
+            "Hermes Nous Portal OAuth auth JSON file maintained by this sidecar. "
+            "Defaults to AAWM_NOUS_OAUTH_AUTH_FILE or ~/.hermes/auth.json."
+        ),
+    )
+    parser.add_argument(
+        "--nous-oauth-lock-file",
+        dest="nous_oauth_lock_file",
+        default=os.getenv("AAWM_NOUS_OAUTH_LOCK_FILE", DEFAULT_NOUS_OAUTH_LOCK_FILE),
+        help=(
+            "Lock file for sidecar Hermes Nous Portal OAuth refresh writes. "
+            "Defaults to AAWM_NOUS_OAUTH_LOCK_FILE or ~/.hermes/auth.lock."
+        ),
+    )
+    parser.add_argument(
+        "--nous-oauth-refresh-interval-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS",
+            DEFAULT_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS,
+        ),
+        help=(
+            "Minimum seconds between Hermes Nous Portal OAuth refresh attempts. "
+            "Defaults to AAWM_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS or 300."
+        ),
+    )
+    parser.add_argument(
+        "--nous-oauth-refresh-buffer-seconds",
+        type=int,
+        default=_env_int(
+            "AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS",
+            nous_oauth_refresh.DEFAULT_NOUS_OAUTH_REFRESH_BUFFER_SECONDS,
+        ),
+        help=(
+            "Refresh buffer for non-forced Hermes Nous Portal OAuth refreshes. "
+            "Defaults to AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS or 900."
+        ),
+    )
+    parser.add_argument(
+        "--nous-oauth-force-refresh",
+        action="store_true",
+        default=_env_bool("AAWM_NOUS_OAUTH_FORCE_REFRESH", False),
+        help=(
+            "Refresh the Hermes Nous Portal OAuth credential on every scheduled "
+            "attempt even when the current access token is still valid."
+        ),
+    )
+    parser.add_argument(
+        "--nous-oauth-http-timeout-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS",
+            DEFAULT_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS,
+        ),
+        help=(
+            "HTTP timeout for Hermes Nous Portal OAuth token endpoint calls. "
+            "Defaults to AAWM_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS or 30."
+        ),
     )
     provider_auth_health_group = parser.add_mutually_exclusive_group()
     provider_auth_health_group.add_argument(
@@ -2897,6 +3037,7 @@ def _validate_config_args(args: argparse.Namespace) -> None:
     _validate_codex_config_args(args)
     _validate_xai_oauth_config_args(args)
     _validate_kimi_oauth_config_args(args)
+    _validate_nous_oauth_config_args(args)
     _validate_provider_auth_health_poll_config_args(args)
     _validate_kimi_usage_config_args(args)
     _validate_zai_coding_plan_quota_config_args(args)
@@ -2987,6 +3128,29 @@ def _validate_xai_oauth_config_args(args: argparse.Namespace) -> None:
         buffer_seconds=args.xai_oauth_refresh_buffer_seconds,
         buffer_option="--xai-oauth-refresh-buffer-seconds",
         provider_name="xAI OAuth",
+        outer_cadence=args.interval_seconds,
+    )
+
+
+def _validate_nous_oauth_config_args(args: argparse.Namespace) -> None:
+    _require_positive_finite(
+        args.nous_oauth_refresh_interval_seconds,
+        "--nous-oauth-refresh-interval-seconds",
+    )
+    _require_nonnegative_finite(
+        args.nous_oauth_refresh_buffer_seconds,
+        "--nous-oauth-refresh-buffer-seconds",
+    )
+    _require_positive_finite(
+        args.nous_oauth_http_timeout_seconds,
+        "--nous-oauth-http-timeout-seconds",
+    )
+    _validate_fixed_buffer_eligibility_cadence(
+        enabled=args.nous_oauth_refresh_enabled,
+        force=args.nous_oauth_force_refresh,
+        buffer_seconds=args.nous_oauth_refresh_buffer_seconds,
+        buffer_option="--nous-oauth-refresh-buffer-seconds",
+        provider_name="Nous OAuth",
         outer_cadence=args.interval_seconds,
     )
 
@@ -3201,6 +3365,10 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         resolved_kimi_oauth_auth_file,
         resolved_kimi_oauth_auth_file_source,
     ) = _resolve_kimi_oauth_sidecar_auth_file(args.kimi_oauth_auth_file)
+    (
+        resolved_nous_oauth_auth_file,
+        resolved_nous_oauth_auth_file_source,
+    ) = _resolve_nous_oauth_sidecar_auth_file(args.nous_oauth_auth_file)
 
     return ProviderStatusLoopConfig(
         apply=args.apply,
@@ -3251,6 +3419,14 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         kimi_oauth_refresh_interval_seconds=args.kimi_oauth_refresh_interval_seconds,
         kimi_oauth_force_refresh=args.kimi_oauth_force_refresh,
         kimi_oauth_http_timeout_seconds=args.kimi_oauth_http_timeout_seconds,
+        nous_oauth_refresh_enabled=args.nous_oauth_refresh_enabled,
+        nous_oauth_auth_file=resolved_nous_oauth_auth_file,
+        nous_oauth_auth_file_source=resolved_nous_oauth_auth_file_source,
+        nous_oauth_lock_file=args.nous_oauth_lock_file,
+        nous_oauth_refresh_interval_seconds=args.nous_oauth_refresh_interval_seconds,
+        nous_oauth_refresh_buffer_seconds=args.nous_oauth_refresh_buffer_seconds,
+        nous_oauth_force_refresh=args.nous_oauth_force_refresh,
+        nous_oauth_http_timeout_seconds=args.nous_oauth_http_timeout_seconds,
         provider_auth_health_poll_enabled=args.provider_auth_health_poll_enabled,
         provider_auth_health_poll_interval_seconds=(
             args.provider_auth_health_poll_interval_seconds
@@ -3435,6 +3611,7 @@ def _redacted_failure_message(value: Any) -> Optional[str]:
     text = _bounded_summary_field(value, limit=4096)
     if text is None:
         return None
+    text = sanitize_credential_error_message(text, limit=4096)
     text = PROVIDER_FAILURE_SECRET_RE.sub("REDACTED", text)
     return _bounded_summary_field(text, limit=PROVIDER_FAILURE_MESSAGE_LIMIT)
 
@@ -3445,6 +3622,7 @@ def _redacted_summary_field(
     text = _bounded_summary_field(value, limit=limit)
     if text is None:
         return None
+    text = sanitize_credential_error_message(text, limit=limit)
     return PROVIDER_FAILURE_SECRET_RE.sub("REDACTED", text)
 
 
@@ -3818,6 +3996,76 @@ def _persist_xai_oauth_auth_observation(
         return False, 0, None, "apply_disabled"
 
     observation = _build_xai_oauth_auth_observation(config, event)
+    dsn = _resolve_dsn(config)
+    try:
+        inserted_count = probes.insert_provider_auth_observations(
+            dsn,
+            [observation],
+            lock_timeout_ms=config.db_lock_timeout_ms,
+            statement_timeout_ms=config.db_statement_timeout_ms,
+        )
+    except probes.ProviderStatusDatabaseWriteSkipped as exc:
+        return False, 0, exc.error_class, _redacted_failure_message(str(exc))
+    except Exception as exc:
+        return False, 0, exc.__class__.__name__, _redacted_failure_message(str(exc))
+    return True, inserted_count, None, None
+
+
+def _build_nous_oauth_auth_observation(
+    config: ProviderStatusLoopConfig,
+    event: Mapping[str, Any],
+) -> Dict[str, Any]:
+    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(
+        timezone.utc
+    )
+    expires_at = _parse_sidecar_timestamp(event.get("expires_at"))
+    status = _provider_auth_status_from_event(event)
+    successful_validation = _oauth_refresh_successful_validation(event, status)
+    auth_file = event.get("auth_file") or config.nous_oauth_auth_file
+    metadata = {
+        "auth_file_hash_algorithm": "sha256",
+        "auth_file_source": config.nous_oauth_auth_file_source,
+        "refresh_buffer_seconds": config.nous_oauth_refresh_buffer_seconds,
+        "refresh_interval_seconds": config.nous_oauth_refresh_interval_seconds,
+        "force_refresh": config.nous_oauth_force_refresh,
+        "raw_status_flags": {
+            "attempted": bool(event.get("attempted")),
+            "refreshed": bool(event.get("refreshed")),
+            "skipped": bool(event.get("skipped")),
+        },
+    }
+    metadata.update(_oauth_refresh_observation_metadata(event))
+    return {
+        "observed_at": observed_at,
+        "environment": event.get("environment") or config.environment,
+        "provider": "nous",
+        "auth_family": "nous_oauth",
+        "credential_scope": _redacted_summary_field(
+            event.get("scope") or nous_oauth_refresh.DEFAULT_NOUS_OAUTH_SCOPE,
+            limit=512,
+        ),
+        "auth_file_hash": probes.auth_file_identity_hash(auth_file),
+        "status": status,
+        "attempted": bool(event.get("attempted")),
+        "refreshed": bool(event.get("refreshed")),
+        "skipped": bool(event.get("skipped")),
+        "expires_at": expires_at,
+        "last_success_at": observed_at if successful_validation else None,
+        "source_task": "nous_oauth_refresh",
+        "error_class": _redacted_summary_field(event.get("error_class")),
+        "error_message": _redacted_failure_message(event.get("error_message")),
+        "metadata": metadata,
+    }
+
+
+def _persist_nous_oauth_auth_observation(
+    config: ProviderStatusLoopConfig,
+    event: Mapping[str, Any],
+) -> tuple[bool, int, Optional[str], Optional[str]]:
+    if not config.apply:
+        return False, 0, None, "apply_disabled"
+
+    observation = _build_nous_oauth_auth_observation(config, event)
     dsn = _resolve_dsn(config)
     try:
         inserted_count = probes.insert_provider_auth_observations(
@@ -11639,6 +11887,76 @@ def _run_xai_oauth_refresh_task(
     return event
 
 
+def _run_nous_oauth_refresh_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+    now_wall: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    if not config.nous_oauth_refresh_enabled:
+        return None
+    wall_now = _normalize_scheduler_wall_now(now_wall)
+    final, summary, _post, evidence, helper_called = _run_oauth_refresh_schedule(
+        schedule=state.nous_oauth_refresh_schedule,
+        last_attempt_monotonic=state.nous_oauth_last_attempt_monotonic,
+        set_last_attempt_monotonic=lambda value: setattr(
+            state, "nous_oauth_last_attempt_monotonic", value
+        ),
+        now_monotonic=now_monotonic,
+        wall_now=wall_now,
+        eligibility_inspector=lambda *, now: (
+            nous_oauth_refresh.inspect_nous_oauth_refresh_eligibility(
+                config.nous_oauth_auth_file,
+                buffer_seconds=config.nous_oauth_refresh_buffer_seconds,
+                now=now,
+                poll_interval_seconds=config.interval_seconds,
+            )
+        ),
+        refresh_call=lambda callback: nous_oauth_refresh.refresh_nous_oauth_auth_file(
+            config.nous_oauth_auth_file,
+            buffer_seconds=config.nous_oauth_refresh_buffer_seconds,
+            force=config.nous_oauth_force_refresh,
+            lock_file=config.nous_oauth_lock_file,
+            http_timeout_seconds=config.nous_oauth_http_timeout_seconds,
+            on_token_endpoint_attempt=callback,
+        ),
+        force=config.nous_oauth_force_refresh,
+        attempt_interval_seconds=config.nous_oauth_refresh_interval_seconds,
+        eligibility_cadence_seconds=config.interval_seconds,
+        buffer_seconds=config.nous_oauth_refresh_buffer_seconds,
+    )
+
+    event = {
+        "event": "nous_oauth_refresh",
+        "observed_at": _scheduler_timestamp(wall_now),
+        "environment": config.environment,
+        "attempted": bool(summary.get("attempted")),
+        "refreshed": bool(summary.get("refreshed")),
+        "skipped": bool(summary.get("skipped")) or (
+            not helper_called and not summary.get("error_class")
+        ),
+        "auth_file": config.nous_oauth_auth_file,
+        "scope": summary.get("scope") or nous_oauth_refresh.DEFAULT_NOUS_OAUTH_SCOPE,
+        "expires_at": final.get("expires_at") or summary.get("expires_at"),
+        "error_class": _redacted_summary_field(summary.get("error_class")),
+        "error_message": _redacted_failure_message(summary.get("error_message")),
+        **evidence,
+    }
+    (
+        persisted,
+        inserted_count,
+        skip_error_class,
+        skip_reason,
+    ) = _persist_nous_oauth_auth_observation(config, event)
+    event["auth_observation_status"] = _provider_auth_status_from_event(event)
+    event["auth_observation_persisted"] = persisted
+    event["auth_observation_inserted_count"] = inserted_count
+    event["auth_observation_skip_error_class"] = skip_error_class
+    event["auth_observation_skip_reason"] = skip_reason
+    return event
+
+
 def _run_kimi_oauth_refresh_task(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
@@ -11839,6 +12157,17 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
             "kimi_oauth",
             config.kimi_oauth_auth_file,
             config.kimi_oauth_auth_file_source,
+            "scope",
+        ),
+        (
+            "nous_oauth_passive_health_inspection",
+            nous_oauth_refresh.inspect_nous_oauth_credential_health,
+            (config.nous_oauth_auth_file,),
+            {},
+            "nous",
+            "nous_oauth",
+            config.nous_oauth_auth_file,
+            config.nous_oauth_auth_file_source,
             "scope",
         ),
     )
@@ -12618,6 +12947,7 @@ def run_due_sidecar_tasks(
         _run_codex_oauth_refresh_task,
         _run_xai_oauth_refresh_task,
         _run_kimi_oauth_refresh_task,
+        _run_nous_oauth_refresh_task,
     }
     optional_pending: list[tuple[str, Any]] = []
     for runner, event_name in (
@@ -12626,6 +12956,7 @@ def run_due_sidecar_tasks(
         (_run_codex_oauth_refresh_task, "codex_oauth_refresh"),
         (_run_xai_oauth_refresh_task, "xai_oauth_refresh"),
         (_run_kimi_oauth_refresh_task, "kimi_oauth_refresh"),
+        (_run_nous_oauth_refresh_task, "nous_oauth_refresh"),
         (_run_kimi_usage_poll_task, "kimi_usage_poll"),
         (_run_zai_coding_plan_quota_poll_task, "zai_coding_plan_quota_poll"),
         (_run_cursor_agent_usage_poll_task, "cursor_agent_usage_poll"),
@@ -12643,6 +12974,7 @@ def run_due_sidecar_tasks(
                     _run_codex_oauth_refresh_task,
                     _run_xai_oauth_refresh_task,
                     _run_kimi_oauth_refresh_task,
+                    _run_nous_oauth_refresh_task,
                 }:
                     runner_kwargs["now_wall"] = wall_now
                 result = runner(config, state, **runner_kwargs)

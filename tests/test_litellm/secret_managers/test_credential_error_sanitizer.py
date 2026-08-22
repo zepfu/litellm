@@ -13,11 +13,27 @@ def test_default_secret_field_names_cover_oauth_tokens() -> None:
     assert SECRET_FIELD_NAMES is DEFAULT_SECRET_FIELD_NAMES
     assert {
         "access_token",
+        "agent_key",
         "client_secret",
         "id_token",
         "key",
         "refresh_token",
     } <= set(DEFAULT_SECRET_FIELD_NAMES)
+    assert "agent_key_id" not in DEFAULT_SECRET_FIELD_NAMES
+
+
+def test_sanitize_redacts_agent_key_without_touching_agent_key_id() -> None:
+    raw = (
+        "agent_key=ak-secret-value "
+        "agent_key_id=routing-id-keep "
+        '"agent_key": "quoted-agent-secret"'
+    )
+    sanitized = sanitize_credential_error_message(raw)
+    assert "ak-secret-value" not in sanitized
+    assert "quoted-agent-secret" not in sanitized
+    assert "agent_key=[REDACTED]" in sanitized
+    assert "routing-id-keep" in sanitized
+    assert "agent_key_id=routing-id-keep" in sanitized
 
 
 def test_sanitize_redacts_secret_values_not_only_labels() -> None:

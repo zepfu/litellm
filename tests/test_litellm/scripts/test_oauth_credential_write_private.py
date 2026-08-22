@@ -29,6 +29,7 @@ def _load(rel: str):
     [
         ("scripts/xai_oauth_refresh.py", "_write_credential_payload", "auth_path"),
         ("scripts/kimi_oauth_refresh.py", "_write_credential_payload", "auth_path"),
+        ("scripts/nous_oauth_refresh.py", "_write_credential_payload", "auth_path"),
         ("scripts/codex_oauth_refresh.py", None, None),
         ("litellm/llms/xai/oauth.py", "_write_credential_payload", "credential_path"),
         (

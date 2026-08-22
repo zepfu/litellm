@@ -20,6 +20,7 @@ _SCRIPT_FILES = (
     "codex_oauth_refresh.py",
     "xai_oauth_refresh.py",
     "kimi_oauth_refresh.py",
+    "nous_oauth_refresh.py",
     _LOOP_SCRIPT,
 )
 
@@ -76,6 +77,17 @@ def _build_sidecar_layout(tmp_path: Path) -> Path:
     ):
         init_path.write_text("", encoding="utf-8")
     return image_root
+
+
+def test_dockerfile_copies_nous_oauth_refresh_script() -> None:
+    dockerfile = _dockerfile()
+
+    assert (
+        "COPY scripts/nous_oauth_refresh.py "
+        "/app/scripts/nous_oauth_refresh.py"
+    ) in dockerfile
+    for name in _SCRIPT_FILES:
+        assert f"COPY scripts/{name} /app/scripts/{name}" in dockerfile
 
 
 def test_dockerfile_copies_stdlib_cursor_usage_helpers() -> None:
