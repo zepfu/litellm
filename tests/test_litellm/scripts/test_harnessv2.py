@@ -560,6 +560,34 @@ def test_should_accept_ohmypi_tui_rollup_when_concurrent_aawm_infrastructure_hea
     assert any("aawm-infrastructure@" in item for item in scan["rollup_hits"])
 
 
+def test_should_accept_ohmypi_tui_rollup_when_concurrent_codex_auto_review_litellm_at_host_headers_are_present(
+    hv, config
+) -> None:
+    text = (
+        _FIXTURES / "ohmypi_identity_ok_with_concurrent_codex_auto_review.txt"
+    ).read_text(encoding="utf-8")
+    scan = hv.scan_log_text(
+        text,
+        config,
+        require_rollup=True,
+        tui="ohmypi",
+    )
+    assert scan["ok"] is True
+    assert scan["failures"] == []
+    assert any(
+        "litellm#Ohmypi[" in item and "@" in item for item in scan["rollup_hits"]
+    )
+    assert any(
+        item.startswith("20260823 19:46:35 litellm@thoth /openai_passthrough/responses")
+        for item in scan["rollup_hits"]
+    )
+    assert any(
+        item.startswith("20260823 19:47:35 litellm@thoth /openai_passthrough/responses")
+        for item in scan["rollup_hits"]
+    )
+    assert "codex-auto-review" in text
+
+
 def test_should_still_fail_ohmypi_tui_rollup_when_unlabeled_ohmypi_mixes_with_labeled_ohmypi(
     hv, config
 ) -> None:

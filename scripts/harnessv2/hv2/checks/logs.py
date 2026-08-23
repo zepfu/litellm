@@ -22,6 +22,13 @@ _OHMYPI_ROLLUP_IDENTITY = re.compile(
 _ROLLUP_REPO_BEFORE_AT = re.compile(
     r"^\d{8} \d{2}:\d{2}:\d{2}(?: \[EARLY\])? (\S+)@"
 )
+# Codex clients share the instance as unlabeled litellm@host on these paths.
+_CODEX_RESPONSES_PASSTHROUGH_PATHS = frozenset(
+    {
+        "/openai_passthrough/responses",
+        "/openai_passthrough/v1/responses",
+    }
+)
 
 
 def _logs_spec(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -67,6 +74,44 @@ def _is_concurrent_workspace_rollup(hit: str, repos: set[str]) -> bool:
         return False
     repo = match.group(1)
     return repo != "litellm" and repo in repos
+
+
+def _rollup_request_path(hit: str) -> str:
+    idx = hit.rfind(" /")
+    if idx < 0:
+        return ""
+    return hit[idx + 1 :].split("?", 1)[0]
+
+
+def _model_detail_text_after_header(text: str, header: str) -> str:
+    """Return indented ` - ` model lines immediately after header, until the next header."""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line != header:
+            continue
+        details: list[str] = []
+        for following in lines[index + 1 :]:
+            if following.startswith(" - "):
+                details.append(following)
+                continue
+            break
+        return "\n".join(details)
+    return ""
+
+
+def _is_concurrent_codex_client_rollup(
+    hit: str, text: str, markers: Sequence[str]
+) -> bool:
+    """True for unlabeled litellm@host Responses headers followed by a Codex client model."""
+    if not markers:
+        return False
+    match = _ROLLUP_REPO_BEFORE_AT.search(hit)
+    if match is None or match.group(1) != "litellm":
+        return False
+    if _rollup_request_path(hit) not in _CODEX_RESPONSES_PASSTHROUGH_PATHS:
+        return False
+    detail = _model_detail_text_after_header(text, hit)
+    return any(marker in detail for marker in markers if marker)
 
 
 def _line_at(text: str, start: int, end: int) -> str:
@@ -149,6 +194,9 @@ def scan_log_text(
             for repo in as_str_list(rollup.get("concurrent_workspace_repos"))
             if repo and repo != "litellm"
         }
+        concurrent_codex_markers = as_str_list(
+            rollup.get("concurrent_codex_client_markers")
+        )
         has_ohmypi_identity = any(
             _OHMYPI_ROLLUP_IDENTITY.search(hit) for hit in rollup_hits
         )
@@ -157,6 +205,9 @@ def scan_log_text(
             for hit in rollup_hits
             if not _OHMYPI_ROLLUP_IDENTITY.search(hit)
             and not _is_concurrent_workspace_rollup(hit, concurrent_repos)
+            and not _is_concurrent_codex_client_rollup(
+                hit, text, concurrent_codex_markers
+            )
         ]
         if not has_ohmypi_identity or unidentified:
             suffix = f": {'; '.join(unidentified)}" if unidentified else ""
