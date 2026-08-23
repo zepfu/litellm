@@ -2,6 +2,7 @@
 Handles transforming from Responses API -> LiteLLM completion  (Chat Completion API)
 """
 
+import time
 from collections.abc import Sequence
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union, cast
 
@@ -1453,7 +1454,7 @@ class LiteLLMCompletionResponsesConfig:
         Transform a Chat Completion tools into a Responses API tools
         """
         all_chat_completion_tools: List[ChatCompletionMessageToolCall] = []
-        for choice in chat_completion_response.choices:
+        for choice in getattr(chat_completion_response, "choices", None) or []:
             if isinstance(choice, Choices):
                 if choice.message.tool_calls:
                     all_chat_completion_tools.extend(choice.message.tool_calls)
@@ -1630,6 +1631,61 @@ class LiteLLMCompletionResponsesConfig:
         return tool_call_dict
 
     @staticmethod
+    def _coerce_chat_completion_response(chat_completion_response):
+        """If acompletion returned a stream wrapper, assemble a ModelResponse."""
+        if isinstance(chat_completion_response, dict):
+            return ModelResponse(**chat_completion_response)
+        if isinstance(chat_completion_response, ModelResponse):
+            return chat_completion_response
+        if not hasattr(chat_completion_response, "completion_stream") and not hasattr(
+            chat_completion_response, "chunks"
+        ):
+            return chat_completion_response
+        if getattr(chat_completion_response, "choices", None):
+            return chat_completion_response
+        iterator = chat_completion_response
+        existing_chunks = list(getattr(iterator, "chunks", None) or [])
+        # Empty acompletion wrappers use completion_stream=None. Iterating them
+        # raises MidStreamFallbackError (TypeError wrapped by CustomStreamWrapper).
+        if getattr(iterator, "completion_stream", None) is None and not existing_chunks:
+            return chat_completion_response
+        try:
+            if hasattr(iterator, "__iter__") and not isinstance(
+                iterator, (str, bytes, dict, list)
+            ):
+                for _ in iterator:
+                    pass
+        except Exception:
+            # Also covers MidStreamFallbackError / APIConnectionError from
+            # CustomStreamWrapper.__next__. Do not wrap stream_chunk_builder.
+            pass
+        chunks = list(getattr(chat_completion_response, "chunks", None) or [])
+        if not chunks:
+            return chat_completion_response
+        from litellm.main import stream_chunk_builder
+
+        assembled = stream_chunk_builder(
+            chunks=chunks,
+            logging_obj=getattr(chat_completion_response, "logging_obj", None),
+        )
+        if assembled is None:
+            return chat_completion_response
+        wrapper_id = getattr(chat_completion_response, "id", None) or getattr(
+            chat_completion_response, "response_id", None
+        )
+        if wrapper_id and not getattr(assembled, "id", None):
+            assembled.id = wrapper_id
+        assembled_created = getattr(assembled, "created", None)
+        if not isinstance(assembled_created, int):
+            wrapper_created = getattr(chat_completion_response, "created", None)
+            assembled.created = (
+                wrapper_created
+                if isinstance(wrapper_created, int)
+                else int(time.time())
+            )
+        return assembled
+
+    @staticmethod
     def transform_chat_completion_response_to_responses_api_response(
         request_input: Union[str, ResponseInputParam],
         responses_api_request: ResponsesAPIOptionalRequestParams,
@@ -1640,6 +1696,9 @@ class LiteLLMCompletionResponsesConfig:
         """
         if isinstance(chat_completion_response, dict):
             chat_completion_response = ModelResponse(**chat_completion_response)
+        chat_completion_response = LiteLLMCompletionResponsesConfig._coerce_chat_completion_response(
+            chat_completion_response
+        )
         # Get finish_reason from the first choice to determine overall status
         finish_reason: Optional[str] = None
         choices: List[Choices] = getattr(chat_completion_response, "choices", [])
@@ -1647,10 +1706,16 @@ class LiteLLMCompletionResponsesConfig:
             finish_reason = choices[0].finish_reason
 
         responses_api_response: ResponsesAPIResponse = ResponsesAPIResponse(
-            id=chat_completion_response.id,
-            created_at=chat_completion_response.created,
+            id=getattr(chat_completion_response, "id", None)
+            or getattr(chat_completion_response, "response_id", None),
+            created_at=getattr(chat_completion_response, "created", None)
+            or int(time.time()),
             model=chat_completion_response.model,
-            object=chat_completion_response.object,
+            object=(
+                getattr(chat_completion_response, "object", None)
+                if getattr(chat_completion_response, "object", None) == "response"
+                else "response"
+            ),
             error=getattr(chat_completion_response, "error", None),
             incomplete_details=getattr(
                 chat_completion_response, "incomplete_details", None
@@ -2204,11 +2269,11 @@ class LiteLLMCompletionResponsesConfig:
     def _transform_chat_completion_usage_to_responses_usage(
         chat_completion_response: Union[ModelResponse, Usage],
     ) -> ResponseAPIUsage:
-        if isinstance(chat_completion_response, ModelResponse):
-            usage: Optional[Usage] = getattr(chat_completion_response, "usage", None)
+        if isinstance(chat_completion_response, Usage):
+            usage: Optional[Usage] = chat_completion_response
         else:
-            usage = chat_completion_response
-        if usage is None:
+            usage = getattr(chat_completion_response, "usage", None)
+        if usage is None or not hasattr(usage, "prompt_tokens"):
             return ResponseAPIUsage(
                 input_tokens=0,
                 output_tokens=0,

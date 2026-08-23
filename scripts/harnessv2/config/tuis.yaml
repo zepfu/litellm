@@ -82,14 +82,13 @@ tuis:
         - "╰─"
         - "π  >"
         - "Default model:"
+      # In-flight chrome only. Launch splash (Welcome back / Recent
+      # sessions / Connecting to MCP / Discovering available models)
+      # stays in tmux scrollback after the prompt footer returns.
       busy_needles:
         - Thinking
         - Working
         - Streaming
-        - "Welcome back"
-        - "Recent sessions"
-        - "Connecting to MCP"
-        - "Discovering available models"
         - "Waiting For Remaining"
         - "all running jobs"
         - "Background job"
@@ -100,10 +99,12 @@ tuis:
         # Long alias ids can paint this truncated chrome. Not a bare {model}
         # needle: "work" is a substring of "work-other".
         - "AAWM alias / model {model}"
-      # Recent-session titles contain "the word PONG"; recap text after a
-      # completed turn is the completion marker (wording varies).
+      # Recap is wait-only. A standalone exact PONG line (not the prompt
+      # echo) still completes the wait via the H-6 exact-line exception;
+      # "the word PONG" in recent-session titles is not a hit.
       reply_needles:
         - "※ recap:"
+        - "PONG"
         - "No endpoints found for"
         - "404 Not Found"
         - "status code 404"

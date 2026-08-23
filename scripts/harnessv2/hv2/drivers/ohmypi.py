@@ -12,7 +12,12 @@ from typing import Any, Mapping, Sequence
 from hv2.envscrub import scrubbed_child_env
 from hv2.errors import HarnessError, PlanError
 from hv2.load_config import as_str_list, config_timeouts, expand_string
-from hv2.pane import _pane_has_any
+from hv2.pane import _latest_prompt_echo_index, _pane_exact_pong, _pane_has_any
+
+try:
+    import yaml
+except ImportError as exc:  # pragma: no cover
+    raise PlanError("PyYAML is required to stage Ohmypi identity overlays") from exc
 
 _MODEL_ID_CONTINUE = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:+/")
 
@@ -93,6 +98,74 @@ class OhmypiDriver:
         template = str(self.spec.get("model_id_template") or "{lane}/{model}")
         return expand_string(template, self._context({"lane": chosen, "model": model}))
 
+    def detect_ohmypi_version(self) -> str:
+        configured = str(self.spec.get("version_min") or "17.3.8").strip() or "17.3.8"
+        binary = shutil.which(str(self.spec.get("binary") or "omp"))
+        if binary is None:
+            return configured
+        try:
+            proc = subprocess.run(
+                [binary, "--version"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return configured
+        text = " ".join(
+            part.strip()
+            for part in ((proc.stdout or ""), (proc.stderr or ""))
+            if part and part.strip()
+        )
+        for token in text.replace(",", " ").split():
+            token = token.strip()
+            if token.lower().startswith("omp/"):
+                version = token.split("/", 1)[1].strip()
+                if version:
+                    return version
+            if token[:1].isdigit() and all(
+                char.isalnum() or char in "._-+" for char in token
+            ):
+                return token
+        return configured
+
+    def identity_overlay_payload(self, version: str | None = None) -> dict[str, Any]:
+        resolved = str(version or self.detect_ohmypi_version()).strip() or "17.3.8"
+        headers = {
+            "x-aawm-client": "Oh My Pi",
+            "x-aawm-client-name": "omp",
+            "x-aawm-client-version": resolved,
+            "x-aawm-repository": "litellm",
+            "langfuse_trace_name": "omp",
+        }
+        return {
+            "providers": {
+                "litellm-alpha": {"headers": dict(headers)},
+                "litellm-alpha-passthrough": {"headers": dict(headers)},
+            }
+        }
+
+    def identity_overlay_path(self) -> Path:
+        session_dir = Path(str(self.spec.get("session_dir") or "/tmp/omp-alpha-sessions"))
+        session_dir.mkdir(parents=True, exist_ok=True)
+        return session_dir / "hv2-ohmypi-identity.yml"
+
+    def alias_session_dir(self, model: str) -> Path:
+        parent = Path(str(self.spec.get("session_dir") or "/tmp/omp-alpha-sessions"))
+        safe_model = model.replace("/", "-").replace(" ", "-")
+        path = parent / f"hv2-{safe_model}"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def write_identity_overlay(self, version: str | None = None) -> Path:
+        path = self.identity_overlay_path()
+        path.write_text(
+            yaml.safe_dump(self.identity_overlay_payload(version=version), sort_keys=False),
+            encoding="utf-8",
+        )
+        return path
+
     def launch_argv(self, model: str, *, lane: str | None = None) -> list[str]:
         selector = self.model_selector(model, lane=lane)
         lane_s, _, model_s = selector.partition("/")
@@ -101,10 +174,20 @@ class OhmypiDriver:
                 (self.spec.get("lanes") or {}).get("alias") or "litellm-alpha-passthrough"
             )
             model_s = model
-        return self.expand_argv(
+        argv = self.expand_argv(
             "argv_launch_model",
-            {"lane": lane_s, "model": model_s, "selector": selector},
+            {
+                "lane": lane_s,
+                "model": model_s,
+                "selector": selector,
+                "session_dir": str(self.alias_session_dir(model)),
+            },
         )
+        overlay = self.write_identity_overlay()
+        if "--config" not in argv:
+            argv.extend(["--config", str(overlay)])
+        self.assert_no_print_flags(argv)
+        return argv
 
     def describe_session(self) -> dict[str, Any]:
         tmux = self.spec.get("tmux") if isinstance(self.spec.get("tmux"), dict) else {}
@@ -326,6 +409,7 @@ class OhmypiDriver:
         timeout_seconds: float | None = None,
         *,
         prompt: str | None = None,
+        after_echo_index: int | None = None,
     ) -> bool:
         needles = [needle] if isinstance(needle, str) else [str(item) for item in needle]
         timeout = float(
@@ -335,9 +419,19 @@ class OhmypiDriver:
         )
         interval = self._tmux_float("poll_interval_seconds", 1)
         deadline = time.time() + timeout
+        sent_prompt = prompt or ""
         while time.time() < deadline:
             pane = self.capture_pane()
-            if _pane_has_any(pane, needles, prompt=prompt):
+            if _pane_has_any(
+                pane, needles, prompt=prompt, after_echo_index=after_echo_index
+            ):
+                return True
+            # Recap is wait-only. Exact PONG after a prompt echo newer than
+            # the pre-send watermark still completes the wait when recap
+            # never paints.
+            if sent_prompt and _pane_exact_pong(
+                pane, sent_prompt, after_echo_index=after_echo_index
+            ):
                 return True
             time.sleep(interval)
         return False
@@ -359,7 +453,13 @@ class OhmypiDriver:
             "Thinking",
             "Working",
             "Streaming",
+            "Waiting For Remaining",
+            "all running jobs",
+            "Background job",
         ]
+        # True in-flight tokens keep the pane busy even when the idle
+        # footer is already painted. Launch splash leftover is not a
+        # busy needle (see tuis.yaml) and must not block idle.
         deadline = time.time() + timeout
         while time.time() < deadline:
             pane = self.capture_pane()
@@ -519,6 +619,8 @@ class OhmypiDriver:
                 select.get("error_needles")
             )
         sent_prompt = prompt.strip()
+        pre_pane = self.capture_pane()
+        pre_echo = _latest_prompt_echo_index(pre_pane, sent_prompt)
         sent = self.send_keys(sent_prompt)
         replied = False
         if needles:
@@ -526,7 +628,16 @@ class OhmypiDriver:
                 needles,
                 timeout_seconds=self._tmux_float("wait_reply_seconds", 180),
                 prompt=sent_prompt,
+                after_echo_index=pre_echo,
             )
+        pane = self.capture_pane()
+        # Recap is wait-only. Exact PONG after a prompt echo newer than the
+        # pre-send watermark still completes the model wait when recap never
+        # paints. A restored complete echo+PONG turn is not this send.
+        if not replied and _pane_exact_pong(
+            pane, sent_prompt, after_echo_index=pre_echo
+        ):
+            replied = True
         idle = False
         if replied:
             idle = self.wait_until_idle()

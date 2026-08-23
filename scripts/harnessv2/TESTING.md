@@ -234,8 +234,21 @@ For each selected alias the driver:
    standalone exact `PONG` reply **or** an explicit provider 404
    needle (`No endpoints found for`, `404 Not Found`, `status code
    404`, `Error: 404`). `※ recap:` is only a wait signal; generic
-   `Error:`, recap-only, and non-idle panes fail. Needles that are
-   substrings of the **sent prompt** are ignored (H-6).
+   `Error:`, recap-only, and non-idle panes fail. Recap is wait-only;
+   a standalone exact `PONG` line **after the latest prompt echo**
+   (not the prompt echo itself) completes the model wait even when
+   recap never paints. A leftover session-dir `PONG` restored by
+   `capture-pane -S -200` before that echo is not this alias's live
+   reply. A restored complete echo+PONG turn already on the pane
+   before send is also not this alias's live reply: require a new
+   prompt echo after send, then `PONG` after that echo. Each alias
+   uses a fresh `--session-dir` under
+   `/tmp/omp-alpha-sessions/hv2-<alias>` so Ohmypi cannot restore the
+   prior PONG conversation. Launch splash (`Welcome back` /
+   `Recent sessions`) remaining in scrollback is not non-idle. Needles that are substrings of the
+   **sent prompt** are ignored (H-6), except a standalone pane line
+   equal to the needle (for `PONG`, that line must follow the latest
+   prompt echo).
 6. Closes that session before the next model.
 
 `--model` is repeatable / comma-separated. Default is group `all`.
@@ -317,7 +330,7 @@ From `config/tuis.yaml`:
 | Min version | 17.3.8 |
 | Overlay | `PI_CONFIG_FILES=$HOME/.omp/agent/litellm-alpha.yml` |
 | CWD | `/tmp/omp-alpha-workspace` |
-| Session dir | `/tmp/omp-alpha-sessions` |
+| Session dir | `/tmp/omp-alpha-sessions/hv2-<alias>` (identity overlay stays in `/tmp/omp-alpha-sessions`) |
 | tmux socket | `tmux37` |
 | Alias lane | `litellm-alpha-passthrough` |
 | Completions lane | `litellm-alpha` |
@@ -325,7 +338,7 @@ From `config/tuis.yaml`:
 | Model tools | off |
 | Orchestration tools | on |
 | Wait needle | `※ recap:` (wait signal only, never pass evidence) |
-| Model pass needles | standalone exact `PONG`; `No endpoints found for` / `404 Not Found` / `status code 404` / `Error: 404` |
+| Model pass needles | standalone exact `PONG` after latest prompt echo; `No endpoints found for` / `404 Not Found` / `status code 404` / `Error: 404` |
 | Orchestration pass | `child_evidence.ok` (hub `<task-result>` / nested `yield`) |
 
 Child env allow-prefixes include `PI_` / `OMP_` / `CODEX_` / `OPENAI_` /

@@ -2647,9 +2647,16 @@ async def _handle_codex_opencode_go_adapter_route(
     from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
         _OPENCODE_GO_FREE_MODELS,
     )
-    from fastapi.responses import Response as _FastAPIResponse
+    from fastapi.responses import Response as _FastAPIResponse, StreamingResponse
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.request_build import (
+        _is_empty_success_responses_body as _go_is_empty_success_responses_body,
+    )
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
+        _responses_sse_from_repaired_response_body,
         _serialize_responses_adapter_response as _serialize_go_response,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.stream_collect import (
+        _build_empty_success_responses_diagnostic as _go_build_empty_success_diagnostic,
     )
     from litellm.responses.litellm_completion_transformation.transformation import (
         LiteLLMCompletionResponsesConfig,
@@ -2748,6 +2755,26 @@ async def _handle_codex_opencode_go_adapter_route(
         except (TypeError, ValueError):
             response_body = {"id": getattr(completion_response, "id", "resp_opencode_go")}
     response_body["object"] = "response"
+    if bool(request_body.get("stream")):
+        _is_codex_auto_agent_empty_success_responses_body.__globals__.setdefault(
+            "_is_empty_success_responses_body",
+            _go_is_empty_success_responses_body,
+        )
+        _raise_codex_auto_agent_empty_success_response.__globals__.setdefault(
+            "_build_empty_success_responses_diagnostic",
+            _go_build_empty_success_diagnostic,
+        )
+        if _is_codex_auto_agent_empty_success_responses_body(response_body):
+            _raise_codex_auto_agent_empty_success_response(
+                response_body=response_body,
+                adapter_model=adapter_model,
+                adapter="codex_opencode_go_adapter",
+                adapter_label="OpenCode Go",
+            )
+        return StreamingResponse(
+            _responses_sse_from_repaired_response_body(response_body),
+            media_type="text/event-stream",
+        )
     import json as _json
 
     return _FastAPIResponse(
@@ -2801,7 +2828,32 @@ async def _handle_codex_nous_chat_completions_adapter_route(
     )
     completion_kwargs["model"] = adapter_model
     target_url = "https://inference-api.nousresearch.com/v1/chat/completions"
-    api_key = load_nous_invoke_jwt()
+    try:
+        api_key = load_nous_invoke_jwt()
+    except Exception:
+        from litellm.proxy._types import ProxyException
+
+        message = (
+            "Nous Codex auto-agent candidate is unavailable: "
+            "Hermes Nous Portal invoke JWT could not be loaded."
+        )
+        exc = ProxyException(
+            message=message,
+            type="rate_limit_error",
+            param="model",
+            code=429,
+        )
+        setattr(
+            exc,
+            "detail",
+            {
+                "error": {
+                    "message": message,
+                    "code": "aawm_codex_auto_agent_candidate_unavailable",
+                }
+            },
+        )
+        raise exc from None
     custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
         api_key=api_key,
         request=request,

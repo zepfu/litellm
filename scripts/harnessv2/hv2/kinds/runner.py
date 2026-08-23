@@ -28,8 +28,12 @@ from hv2.drivers import driver_for
 from hv2.errors import PlanError
 from hv2.instance import inspect_instance
 from hv2.load_config import as_str_list
-from hv2.pane import _pane_has_any
+from hv2.pane import _pane_exact_pong, _pane_has_any
 from hv2.plan import RunPlan
+
+# Tests import these from hv2.kinds.runner.
+_pane_exact_pong = _pane_exact_pong
+_pane_has_any = _pane_has_any
 
 
 def _record(
@@ -347,15 +351,6 @@ def _step_tui_catalog(plan: RunPlan, **_: Any) -> dict[str, Any]:
             "ok": not failures,
         },
     )
-
-
-def _pane_exact_pong(pane: str, prompt: str) -> bool:
-    prompt_line = prompt.strip()
-    for raw_line in pane.splitlines():
-        line = raw_line.strip()
-        if line == "PONG" and line != prompt_line:
-            return True
-    return False
 
 
 def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915

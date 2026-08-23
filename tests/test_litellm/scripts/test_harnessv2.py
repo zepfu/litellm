@@ -567,6 +567,24 @@ def test_should_scrub_langfuse_and_db_secrets_from_child_env(hv, config, monkeyp
         assert denied not in env
 
 
+def test_should_stage_ohmypi_identity_overlay_with_repo_and_version(hv, config) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    driver = OhmypiDriver(config)
+    overlay = driver.identity_overlay_payload(version="17.4.2")
+    providers = overlay["providers"]
+    for name in ("litellm-alpha", "litellm-alpha-passthrough"):
+        headers = providers[name]["headers"]
+        assert headers["x-aawm-client"] == "Oh My Pi"
+        assert headers["x-aawm-client-name"] == "omp"
+        assert headers["x-aawm-client-version"] == "17.4.2"
+        assert headers["x-aawm-repository"] == "litellm"
+    argv = driver.launch_argv("work")
+    assert "--config" in argv
+    config_path = argv[argv.index("--config") + 1]
+    assert "ohmypi-identity" in config_path or config_path.endswith(".yml")
+
+
 def test_should_refuse_ohmypi_print_flags(hv, config) -> None:
     from hv2.drivers.ohmypi import OhmypiDriver
 
@@ -653,6 +671,36 @@ def test_should_plan_orchestration_parents_and_children(hv, config) -> None:
 def test_should_refuse_redis_flush(hv) -> None:
     with pytest.raises(hv.ProtectedTargetError, match="FLUSHALL"):
         hv.assert_safe_redis(["FLUSHALL"])
+
+
+def test_error_jsonl_scanner_reads_existing_file_and_does_not_write(tmp_path: Path) -> None:
+    from hv2.checks.error_jsonl import scan_new_rows
+
+    path = tmp_path / "alpha-error.jsonl"
+    path.write_text(
+        '{"message":"prior","traceback":null}\n',
+        encoding="utf-8",
+    )
+    before = path.stat().st_size
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + '{"message":"boom","traceback":"Traceback (most recent call last):\\nValueError"}\n',
+        encoding="utf-8",
+    )
+    config = {
+        "checks": {
+            "error_jsonl": {
+                "path": str(path),
+                "traceback_null_is_warning": True,
+            }
+        }
+    }
+    result = scan_new_rows(config, before_size=before)
+    assert result["ok"] is False
+    assert any("traceback" in item for item in result["failures"])
+    assert result["rows"][0]["message"] == "boom"
+    # The harness scanner is a reader. It must not create or rewrite the sink.
+    assert path.is_file()
 
 
 def test_should_treat_jsonl_null_traceback_as_warning() -> None:
@@ -1260,6 +1308,7 @@ def test_should_launch_ohmypi_session_with_tmux_env_and_selected_alias(
     ]
     assert any(item.startswith("PI_CONFIG_FILES=") for item in env_values)
     assert "litellm-alpha-passthrough/work" in new_session
+    assert "--config" in new_session
 
 
 def test_should_refuse_ohmypi_operator_session_reuse(hv, config) -> None:
@@ -1325,6 +1374,225 @@ def _prompt_only_working_pane(prompt: str) -> str:
         f"{prompt}\n"
         "Working…\n"
     )
+
+
+def _ohmypi_idle_pong_pane_with_launch_splash() -> str:
+    """Ohmypi 17.4 pane after exact PONG: launch splash stays in scrollback."""
+
+    return (
+        "╭─── omp v17.4.2 ────────────────────────────────────────────────────────────╮\n"
+        "│                          │ Tips                                            │\n"
+        "│      Welcome back!       │ # for prompt actions                            │\n"
+        "│                          │ / for commands                                  │\n"
+        "│   AAWM alias sota-zai    │                                                 │\n"
+        "│litellm-alpha-passthrough │                                                 │\n"
+        "│                          │ ─────────────────────────────────────────────── │\n"
+        "│                          │ Recent sessions                                 │\n"
+        "│                          │ • Reply with exactly the word PONG. (just now)  │\n"
+        "╰──────────────────────────┴─────────────────────────────────────────────────╯\n"
+        " Connecting to MCP servers: aawm-transcript…\n"
+        "\n"
+        " Connected to MCP server: aawm-transcript.\n"
+        "\n"
+        " Reply with exactly the word PONG.\n"
+        "\n"
+        " PONG\n"
+        "\n"
+        " ※ recap: Session held only a connectivity check: you asked for the exact reply\n"
+        " PONG and I answered PONG.\n"
+        "\n"
+        "╭── π  > ⬢ AAWM alias sota-zai > 🗑 omp-alpha-workspace > ◫ 6.4%/128K ⟲ ▶───────╮\n"
+        "╰─                                                                            ─╯\n"
+        "interactive\n"
+    )
+
+
+def _ohmypi_welcome_back_basic_chrome() -> str:
+    """Welcome-back / Recent sessions chrome shared by Ohmypi basic panes."""
+
+    return (
+        "╭─── omp v17.4.2 ────────────────────────────────────────────────────────────╮\n"
+        "│                          │ Tips                                            │\n"
+        "│      Welcome back!       │ # for prompt actions                            │\n"
+        "│                          │ / for commands                                  │\n"
+        "│       ▀██████████▀       │ ! to run bash                                   │\n"
+        "│        ╘██    ██         │ $ to run python                                 │\n"
+        "│         ██    ██         │ ─────────────────────────────────────────────── │\n"
+        "│         ██    ██         │ LSP Servers                                     │\n"
+        "│        ▄██▄  ▄██▄        │ No LSP servers                                  │\n"
+        "│                          │                                                 │\n"
+        "│     AAWM alias basic     │                                                 │\n"
+        "│litellm-alpha-passthrough │                                                 │\n"
+        "│                          │ ─────────────────────────────────────────────── │\n"
+        "│                          │ Recent sessions                                 │\n"
+        "│                          │ • Reply with exactly the word PONG. (40m ago)   │\n"
+        "│                          │ • Reply with exactly the word PONG. (46m ago)   │\n"
+        "│                          │ • Reply with exactly the word PONG. (52m ago)   │\n"
+        "│                          │ • Reply with exactly the word PONG. (57m ago)   │\n"
+        "│                          │                                                 │\n"
+        "╰──────────────────────────┴─────────────────────────────────────────────────╯\n"
+        " Tip: Press shift+tab to cycle through reasoning effort levels\n"
+        "\n"
+        " Connecting to MCP servers: aawm-transcript…\n"
+        "\n"
+        "────────────────────────────────────────────────────────────────────────────────\n"
+        " Update Available\n"
+        " New version 18.0.3 is available. Run: omp update\n"
+        "────────────────────────────────────────────────────────────────────────────────\n"
+        "\n"
+        " Connected to MCP server: aawm-transcript.\n"
+    )
+
+
+def _ohmypi_idle_footer_basic() -> str:
+    return (
+        "╭── π  > ⬢ AAWM alias basic > 🗑 omp-alpha-workspace > ◫ 6.4%/128K ⟲ ▶──────────╮\n"
+        "╰─                                                                            ─╯\n"
+        "interactive\n"
+    )
+
+
+def _ohmypi_idle_pong_pane_without_recap() -> str:
+    """Live basic/work retry pane: exact PONG + idle footer, no recap."""
+
+    return (
+        f"{_ohmypi_welcome_back_basic_chrome()}\n"
+        "\n"
+        " Reply with exactly the word PONG.\n"
+        "\n"
+        "\n"
+        " The user wants exactly the word PONG.\n"
+        "\n"
+        " PONG\n"
+        "\n"
+        f"{_ohmypi_idle_footer_basic()}"
+    )
+
+
+def _ohmypi_pre_send_splash_idle_pane() -> str:
+    """Splash + idle footer before this send paints a standalone prompt echo."""
+
+    return f"{_ohmypi_welcome_back_basic_chrome()}\n\n{_ohmypi_idle_footer_basic()}"
+
+
+def _ohmypi_prompt_echo_idle_without_pong() -> str:
+    """This turn's prompt echo is painted, but no standalone PONG follows it yet."""
+
+    return (
+        f"{_ohmypi_welcome_back_basic_chrome()}\n"
+        "\n"
+        " Reply with exactly the word PONG.\n"
+        "\n"
+        f"{_ohmypi_idle_footer_basic()}"
+    )
+
+
+def _ohmypi_restored_complete_pong_turn_pane() -> str:
+    """Retry3 restore: one complete echo+PONG turn, no second prompt echo."""
+
+    return (
+        f"{_ohmypi_welcome_back_basic_chrome()}\n"
+        "\n"
+        " Reply with exactly the word PONG.\n"
+        "\n"
+        "\n"
+        " The user asked me to reply with exactly the word PONG.\n"
+        "\n"
+        " PONG\n"
+        "\n"
+        f"{_ohmypi_idle_footer_basic()}"
+    )
+
+
+def _ohmypi_session_dir_leftover_pong_before_latest_prompt() -> str:
+    """Restored capture-pane -S -200: leftover PONG sits before this turn's echo."""
+
+    recent = "".join(
+        f"│                          │ • Reply with exactly the word PONG. ({n}m ago)   │\n"
+        for n in range(40, 72)
+    )
+    restored_scrollback = "\n".join(
+        f" restored session-dir scrollback {index}" for index in range(140)
+    )
+    return (
+        "╭─── omp v17.4.2 ────────────────────────────────────────────────────────────╮\n"
+        "│                          │ Tips                                            │\n"
+        "│      Welcome back!       │ # for prompt actions                            │\n"
+        "│                          │ / for commands                                  │\n"
+        "│       ▀██████████▀       │ ! to run bash                                   │\n"
+        "│        ╘██    ██         │ $ to run python                                 │\n"
+        "│         ██    ██         │ ─────────────────────────────────────────────── │\n"
+        "│         ██    ██         │ LSP Servers                                     │\n"
+        "│        ▄██▄  ▄██▄        │ No LSP servers                                  │\n"
+        "│                          │                                                 │\n"
+        "│     AAWM alias basic     │                                                 │\n"
+        "│litellm-alpha-passthrough │                                                 │\n"
+        "│                          │ ─────────────────────────────────────────────── │\n"
+        "│                          │ Recent sessions                                 │\n"
+        f"{recent}"
+        "│                          │                                                 │\n"
+        "╰──────────────────────────┴─────────────────────────────────────────────────╯\n"
+        " Tip: Press shift+tab to cycle through reasoning effort levels\n"
+        "\n"
+        " Connecting to MCP servers: aawm-transcript…\n"
+        "\n"
+        " Connected to MCP server: aawm-transcript.\n"
+        "\n"
+        f"{restored_scrollback}\n"
+        "\n"
+        " Reply with exactly the word PONG.\n"
+        "\n"
+        " PONG\n"
+        "\n"
+        " Reply with exactly the word PONG.\n"
+        "\n"
+        "╭── π  > ⬢ AAWM alias basic > 🗑 omp-alpha-workspace > ◫ 6.4%/128K ⟲ ▶──────────╮\n"
+        "╰─                                                                            ─╯\n"
+        "interactive\n"
+    )
+
+
+def _ohmypi_session_dir_leftover_pong_plus_live_pong() -> str:
+    """Same restore, but a new standalone PONG follows the latest prompt echo."""
+
+    return _ohmypi_session_dir_leftover_pong_before_latest_prompt().replace(
+        "\n╭── π  >",
+        "\n PONG\n\n╭── π  >",
+        1,
+    )
+
+
+_OHMYPI_MODEL_REPLY_NEEDLES = [
+    "※ recap:",
+    "No endpoints found for",
+    "404 Not Found",
+    "status code 404",
+    "Error: 404",
+]
+
+
+def _ohmypi_busy_working_pane(*, idle_footer: bool) -> str:
+    footer = ""
+    if idle_footer:
+        footer = (
+            "╭── π  > ⬢ AAWM alias work > 🗑 omp-alpha-workspace > ◫ 6.4%/128K ⟲ ▶───────╮\n"
+            "╰─                                                                            ─╯\n"
+            "interactive\n"
+        )
+    return (
+        " Reply with exactly the word PONG.\n"
+        " Working…\n"
+        " Thinking\n"
+        f"{footer}"
+    )
+
+
+def _fast_ohmypi_tmux_float(key: str, default: float) -> float:
+    if key in {"wait_idle_seconds", "wait_reply_seconds"}:
+        return 0.2
+    if key == "poll_interval_seconds":
+        return 0.01
+    return default
 
 
 def _pane_has_pass_evidence(pane: str, needles: list[str], *, prompt: str) -> bool:
@@ -1478,6 +1746,280 @@ def test_should_not_mark_tui_ok_when_reply_seen_but_not_idle(
     assert waited["replied"] is True
     assert waited["idle"] is False
     assert waited["ok"] is False
+
+
+def test_should_treat_ohmypi_welcome_back_splash_as_idle_after_exact_pong(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    pane = _ohmypi_idle_pong_pane_with_launch_splash()
+    assert "Welcome back!" in pane
+    assert "Recent sessions" in pane
+    assert "Connecting to MCP servers:" in pane
+    assert "Connected to MCP server: aawm-transcript." in pane
+    assert "Reply with exactly the word PONG." in pane
+    assert "\n PONG\n" in pane
+    assert "※ recap:" in pane
+    assert "π  >" in pane
+    assert "╰─" in pane
+    assert "interactive" in pane
+
+    driver = OhmypiDriver(config)
+    monkeypatch.setattr(driver, "capture_pane", lambda: pane)
+    monkeypatch.setattr(driver, "_tmux_float", _fast_ohmypi_tmux_float)
+    monkeypatch.setattr(
+        driver,
+        "send_keys",
+        lambda text: {"ok": True, "method": "send-keys"},
+    )
+
+    assert driver.wait_until_idle() is True
+
+    waited = driver.send_prompt_and_wait(
+        "Reply with exactly the word PONG.",
+        reply_needles=["※ recap:"],
+    )
+    assert waited["idle"] is True
+    assert waited["ok"] is True
+
+
+def test_should_not_treat_ohmypi_working_or_thinking_pane_as_idle(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    driver = OhmypiDriver(config)
+    monkeypatch.setattr(driver, "_tmux_float", _fast_ohmypi_tmux_float)
+
+    busy = _ohmypi_busy_working_pane(idle_footer=False)
+    assert "Working…" in busy
+    assert "Thinking" in busy
+    assert "π  >" not in busy
+    assert "╰─" not in busy
+    monkeypatch.setattr(driver, "capture_pane", lambda: busy)
+    assert driver.wait_until_idle() is False
+
+    busy_with_footer = _ohmypi_busy_working_pane(idle_footer=True)
+    assert "Working…" in busy_with_footer
+    assert "π  >" in busy_with_footer
+    assert "╰─" in busy_with_footer
+    monkeypatch.setattr(driver, "capture_pane", lambda: busy_with_footer)
+    assert driver.wait_until_idle() is False
+
+
+def test_should_treat_ohmypi_exact_pong_without_recap_as_idle_model_turn(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+    from hv2.kinds.runner import _pane_exact_pong
+
+    prompt = "Reply with exactly the word PONG."
+    pre_send = _ohmypi_pre_send_splash_idle_pane()
+    echo_only = _ohmypi_prompt_echo_idle_without_pong()
+    live = _ohmypi_idle_pong_pane_without_recap()
+    assert "Welcome back!" in pre_send
+    assert "Recent sessions" in pre_send
+    assert "Connecting to MCP servers:" in pre_send
+    assert "π  >" in pre_send
+    assert "╰─" in pre_send
+    assert "interactive" in pre_send
+    assert _pane_exact_pong(pre_send, prompt) is False
+    assert _last_stripped_line_index(echo_only, prompt) >= 0
+    assert _pane_exact_pong(echo_only, prompt) is False
+    assert "Welcome back!" in live
+    assert "Recent sessions" in live
+    assert "Connecting to MCP servers:" in live
+    assert "Reply with exactly the word PONG." in live
+    assert "\n PONG\n" in live
+    assert "※ recap:" not in live
+    assert "π  >" in live
+    assert "╰─" in live
+    assert "interactive" in live
+    assert _pane_exact_pong(live, prompt) is True
+
+    sent = {"done": False}
+    post_send_panes = iter([echo_only, live])
+
+    def fake_send_keys(text: str) -> dict[str, Any]:
+        sent["done"] = True
+        return {"ok": True, "method": "send-keys"}
+
+    def fake_capture_pane() -> str:
+        if not sent["done"]:
+            return pre_send
+        try:
+            return next(post_send_panes)
+        except StopIteration:
+            return live
+
+    driver = OhmypiDriver(config)
+    monkeypatch.setattr(driver, "capture_pane", fake_capture_pane)
+    monkeypatch.setattr(driver, "_tmux_float", _fast_ohmypi_tmux_float)
+    monkeypatch.setattr(driver, "send_keys", fake_send_keys)
+
+    waited = driver.send_prompt_and_wait(
+        prompt, reply_needles=_OHMYPI_MODEL_REPLY_NEEDLES
+    )
+    assert sent["done"] is True
+    assert waited["replied"] is True
+    assert waited["idle"] is True
+    assert waited["ok"] is True
+    assert _pane_exact_pong(str(waited.get("pane") or ""), prompt) is True
+
+
+def test_should_not_treat_restored_complete_pong_turn_as_this_sends_live_reply(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+    from hv2.kinds.runner import _pane_exact_pong
+
+    prompt = "Reply with exactly the word PONG."
+    pane = _ohmypi_restored_complete_pong_turn_pane()
+    echo_indexes = [
+        index
+        for index, raw in enumerate(pane.splitlines())
+        if raw.strip() == prompt
+    ]
+    leftover_pong = _last_stripped_line_index(pane, "PONG")
+
+    assert "Welcome back!" in pane
+    assert "Recent sessions" in pane
+    assert "Connecting to MCP servers:" in pane
+    assert "The user asked me to reply with exactly the word PONG." in pane
+    assert "Reply with exactly the word PONG." in pane
+    assert "\n PONG\n" in pane
+    assert "※ recap:" not in pane
+    assert "π  >" in pane
+    assert "╰─" in pane
+    assert "interactive" in pane
+    assert echo_indexes == [echo_indexes[0]]
+    assert leftover_pong > echo_indexes[0]
+    assert prompt not in [raw.strip() for raw in pane.splitlines()[leftover_pong + 1 :]]
+    # Scanner still matches: the hole is send_prompt_and_wait without a watermark.
+    assert _pane_exact_pong(pane, prompt) is True
+
+    driver = OhmypiDriver(config)
+    monkeypatch.setattr(driver, "capture_pane", lambda: pane)
+    monkeypatch.setattr(driver, "_tmux_float", _fast_ohmypi_tmux_float)
+    monkeypatch.setattr(
+        driver,
+        "send_keys",
+        lambda text: {"ok": True, "method": "send-keys"},
+    )
+
+    waited = driver.send_prompt_and_wait(
+        prompt, reply_needles=_OHMYPI_MODEL_REPLY_NEEDLES
+    )
+    assert waited["replied"] is False
+    assert waited["idle"] is False
+    assert waited["ok"] is False
+
+
+def _last_stripped_line_index(pane: str, expected: str) -> int:
+    last = -1
+    for index, raw_line in enumerate(pane.splitlines()):
+        if raw_line.strip() == expected:
+            last = index
+    return last
+
+
+def test_should_not_treat_leftover_session_dir_pong_before_latest_prompt_as_live_reply(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+    from hv2.kinds.runner import _pane_exact_pong, _pane_has_any
+
+    prompt = "Reply with exactly the word PONG."
+    pane = _ohmypi_session_dir_leftover_pong_before_latest_prompt()
+    lines = [raw.strip() for raw in pane.splitlines()]
+    latest_echo = _last_stripped_line_index(pane, prompt)
+    leftover_pong = _last_stripped_line_index(pane, "PONG")
+
+    assert "Welcome back!" in pane
+    assert "Recent sessions" in pane
+    assert "Reply with exactly the word PONG." in pane
+    assert "\n PONG\n" in pane
+    assert "※ recap:" not in pane
+    assert "π  >" in pane
+    assert "╰─" in pane
+    assert "interactive" in pane
+    assert len(pane.splitlines()) >= 200
+    assert leftover_pong >= 0
+    assert latest_echo > leftover_pong
+    assert "PONG" not in lines[latest_echo + 1 :]
+    assert _pane_exact_pong(pane, prompt) is False
+    assert _pane_has_any(pane, ["PONG"], prompt=prompt) is False
+
+    driver = OhmypiDriver(config)
+    monkeypatch.setattr(driver, "capture_pane", lambda: pane)
+    monkeypatch.setattr(driver, "_tmux_float", _fast_ohmypi_tmux_float)
+    monkeypatch.setattr(
+        driver,
+        "send_keys",
+        lambda text: {"ok": True, "method": "send-keys"},
+    )
+
+    waited = driver.send_prompt_and_wait(
+        prompt, reply_needles=_OHMYPI_MODEL_REPLY_NEEDLES
+    )
+    assert waited["replied"] is False
+    assert waited["idle"] is False
+    assert waited["ok"] is False
+
+
+def test_should_treat_leftover_session_dir_pong_plus_new_pong_after_latest_prompt_as_live_reply(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+    from hv2.kinds.runner import _pane_exact_pong, _pane_has_any
+
+    prompt = "Reply with exactly the word PONG."
+    leftover = _ohmypi_session_dir_leftover_pong_before_latest_prompt()
+    live = leftover.replace(
+        "\n╭── π  >",
+        "\n Reply with exactly the word PONG.\n\n PONG\n\n╭── π  >",
+        1,
+    )
+    leftover_echo = _last_stripped_line_index(leftover, prompt)
+    live_echo = _last_stripped_line_index(live, prompt)
+    live_pong = _last_stripped_line_index(live, "PONG")
+
+    assert leftover_echo >= 0
+    assert live_echo > leftover_echo
+    assert live_pong > live_echo
+    assert _pane_exact_pong(leftover, prompt) is False
+    assert _pane_exact_pong(live, prompt) is True
+    assert _pane_has_any(live, ["PONG"], prompt=prompt) is True
+
+    sent = {"done": False}
+    post_send_panes = iter([live])
+
+    def fake_send_keys(text: str) -> dict[str, Any]:
+        sent["done"] = True
+        return {"ok": True, "method": "send-keys"}
+
+    def fake_capture_pane() -> str:
+        if not sent["done"]:
+            return leftover
+        try:
+            return next(post_send_panes)
+        except StopIteration:
+            return live
+
+    driver = OhmypiDriver(config)
+    monkeypatch.setattr(driver, "capture_pane", fake_capture_pane)
+    monkeypatch.setattr(driver, "_tmux_float", _fast_ohmypi_tmux_float)
+    monkeypatch.setattr(driver, "send_keys", fake_send_keys)
+
+    waited = driver.send_prompt_and_wait(
+        prompt, reply_needles=_OHMYPI_MODEL_REPLY_NEEDLES
+    )
+    assert sent["done"] is True
+    assert waited["replied"] is True
+    assert waited["idle"] is True
+    assert waited["ok"] is True
+    assert _pane_exact_pong(str(waited.get("pane") or ""), prompt) is True
 
 
 _ORCH_CHILDREN = ("basic", "work", "expert", "sota")

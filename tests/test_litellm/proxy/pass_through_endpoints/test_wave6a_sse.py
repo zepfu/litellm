@@ -36,6 +36,7 @@ from types import SimpleNamespace
 # ---------------------------------------------------------------------------
 # Target module
 # ---------------------------------------------------------------------------
+from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import sse as sse_mod
 
 SSE_MODULE_PATH = Path(sse_mod.__file__).resolve()
@@ -93,6 +94,99 @@ async def _collect_agen(agen):
     async for item in agen:
         items.append(item)
     return items
+
+
+def _collect_responses_sse_or_exception(iterator):
+    """Drain `_responses_sse_from_iterator` and capture a post-created failure.
+
+    Returns ``(chunks, None)`` when the helper yields a stream, or
+    ``(None, exc)`` when it re-raises / raises 502 instead of injecting
+    empty ``response.completed``.
+    """
+
+    async def collect():
+        return await _collect_agen(sse_mod._responses_sse_from_iterator(iterator))
+
+    try:
+        return _run(collect()), None
+    except BaseException as exc:
+        return None, exc
+
+
+def _sse_chunk_status(chunk: str) -> str | None:
+    if "data: " not in chunk:
+        return None
+    try:
+        payload = json.loads(chunk.split("data: ", 1)[1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    response = payload.get("response")
+    if isinstance(response, dict):
+        status = response.get("status")
+        if isinstance(status, str):
+            return status
+    status = payload.get("status")
+    return status if isinstance(status, str) else None
+
+
+def _assert_exception_sse_is_not_empty_completed_success(chunks: list[str]) -> None:
+    rendered = "".join(chunks)
+    completed_indexes = [
+        index
+        for index, chunk in enumerate(chunks)
+        if chunk.startswith("event: response.completed\n")
+    ]
+    assert not completed_indexes, (
+        "post-event iterator exception without on_stream_error must not inject "
+        f"empty event: response.completed; got {chunks}"
+    )
+    for chunk in chunks:
+        if chunk.startswith("event: response.completed\n"):
+            raise AssertionError(rendered)
+        if _sse_chunk_status(chunk) == "completed" and (
+            chunk.startswith("event: response.completed\n")
+            or '"status": "completed"' in chunk.replace(
+                '"status":"completed"', '"status": "completed"'
+            )
+        ):
+            raise AssertionError(
+                "exception path must not emit status=completed success; "
+                f"got {chunks}"
+            )
+
+
+def _assert_post_created_iterator_exception_is_real_failure(
+    *,
+    chunks: list[str] | None,
+    stream_exc: BaseException | None,
+    expected_runtime_error: BaseException | None = None,
+) -> None:
+    if stream_exc is not None:
+        if expected_runtime_error is not None and stream_exc is expected_runtime_error:
+            return
+        if isinstance(stream_exc, ProxyException):
+            assert str(stream_exc.code) == "502"
+            return
+        if isinstance(stream_exc, RuntimeError):
+            return
+        raise AssertionError(
+            "post-event iterator exception without on_stream_error must "
+            f"re-raise, emit response.failed, or raise 502; got {stream_exc!r}"
+        )
+    assert chunks is not None
+    _assert_exception_sse_is_not_empty_completed_success(chunks)
+    failed_indexes = [
+        index
+        for index, chunk in enumerate(chunks)
+        if chunk.startswith("event: response.failed\n")
+        or _sse_chunk_status(chunk) == "failed"
+    ]
+    assert failed_indexes, (
+        "post-event iterator exception without on_stream_error must re-raise, "
+        f"emit response.failed, or raise 502; empty completed is the defect; got {chunks}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +515,13 @@ class TestResponsesSSEFromIterator:
 
         chunks = _run(_collect_agen(sse_mod._responses_sse_from_iterator(events())))
         assert chunks[-1] == "data: [DONE]\n\n"
-        assert len(chunks) == 3
+        assert any(
+            chunk.startswith("event: response.completed\n")
+            or chunk.startswith("event: response.failed\n")
+            or chunk.startswith("event: response.incomplete\n")
+            for chunk in chunks[:-1]
+        )
+        assert len(chunks) == 4
 
     def test_closes_iterator_with_aclose(self):
         closed = []
@@ -523,6 +623,13 @@ class TestResponsesSSEFromIterator:
         assert iterator.close_calls == 1
 
     def test_post_event_error_without_callback_retains_prior_behavior(self):
+        """After response.created, a later iterator exception is a real failure.
+
+        OpenRouter wraps LiteLLMCompletionStreamingIterator without on_stream_error.
+        Empty ``response.completed`` + ``[DONE]`` papers over that failure.
+        Accept re-raise, ``response.failed``, or 502 — not empty success completed.
+        """
+
         provider_error = RuntimeError("unrelated provider failure")
 
         class FakeIter:
@@ -543,21 +650,158 @@ class TestResponsesSSEFromIterator:
                 self.close_calls += 1
 
         iterator = FakeIter()
-
-        async def exercise():
-            stream = sse_mod._responses_sse_from_iterator(iterator)
-            first = await stream.__anext__()
-            try:
-                await stream.__anext__()
-            except RuntimeError as exc:
-                assert exc is provider_error
-            else:
-                raise AssertionError("unrelated provider error did not propagate")
-            return first
-
-        first = _run(exercise())
-        assert first.startswith("event: response.created")
+        chunks, stream_exc = _collect_responses_sse_or_exception(iterator)
+        _assert_post_created_iterator_exception_is_real_failure(
+            chunks=chunks,
+            stream_exc=stream_exc,
+            expected_runtime_error=provider_error,
+        )
         assert iterator.close_calls == 1
+
+    def test_post_event_transform_error_without_callback_preserves_created_response_id(self):
+        """Transform failure after response.created must not look like empty success."""
+
+        class FakeIter:
+            def __init__(self):
+                self.step = 0
+                self.close_calls = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.step == 0:
+                    self.step += 1
+                    return {
+                        "type": "response.created",
+                        "response": {"id": "resp_ohmypi"},
+                    }
+                raise RuntimeError("transform failed")
+
+            async def aclose(self):
+                self.close_calls += 1
+
+        iterator = FakeIter()
+        chunks, stream_exc = _collect_responses_sse_or_exception(iterator)
+        if stream_exc is None:
+            assert chunks is not None
+            _assert_exception_sse_is_not_empty_completed_success(chunks)
+            failed_indexes = [
+                index
+                for index, chunk in enumerate(chunks)
+                if chunk.startswith("event: response.failed\n")
+            ]
+            assert failed_indexes, chunks
+            terminal_payload = json.loads(
+                chunks[failed_indexes[-1]].split("data: ", 1)[1]
+            )
+            response = terminal_payload.get("response")
+            if not isinstance(response, dict):
+                response = {}
+            assert response.get("id") == "resp_ohmypi", terminal_payload
+        else:
+            _assert_post_created_iterator_exception_is_real_failure(
+                chunks=None,
+                stream_exc=stream_exc,
+            )
+        assert iterator.close_calls == 1
+
+    def test_post_event_error_without_callback_emits_ohmypi_completed_terminal(self):
+        """After response.created, iterator exception without on_stream_error is a failure.
+
+        Must not inject empty ``event: response.completed`` with ``status: completed``.
+        Real failure/failover: re-raise, emit ``response.failed``, or raise 502.
+        """
+
+        class FakeIter:
+            def __init__(self):
+                self.step = 0
+                self.close_calls = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.step == 0:
+                    self.step += 1
+                    return {
+                        "type": "response.created",
+                        "response": {
+                            "id": "resp_ohmypi",
+                            "object": "response",
+                            "created_at": 1741290958,
+                            "status": "in_progress",
+                            "output": [],
+                        },
+                    }
+                raise RuntimeError("openrouter chunk failed")
+
+            async def aclose(self):
+                self.close_calls += 1
+
+        iterator = FakeIter()
+        chunks, stream_exc = _collect_responses_sse_or_exception(iterator)
+        if stream_exc is None:
+            assert chunks is not None
+            _assert_exception_sse_is_not_empty_completed_success(chunks)
+            failed_indexes = [
+                index
+                for index, chunk in enumerate(chunks)
+                if chunk.startswith("event: response.failed\n")
+            ]
+            assert failed_indexes, (
+                "post-event iterator exception without on_stream_error must "
+                "re-raise, emit response.failed, or raise 502; empty "
+                f"response.completed is the defect; got {chunks}"
+            )
+            failed_payload = json.loads(
+                chunks[failed_indexes[-1]].split("data: ", 1)[1]
+            )
+            response = failed_payload.get("response")
+            assert isinstance(response, dict), failed_payload
+            assert failed_payload.get("type") == "response.failed"
+            assert response.get("id") == "resp_ohmypi", failed_payload
+            assert response.get("status") == "failed"
+        else:
+            _assert_post_created_iterator_exception_is_real_failure(
+                chunks=None,
+                stream_exc=stream_exc,
+            )
+        assert iterator.close_calls == 1
+
+    def test_responses_sse_from_iterator_injects_terminal_before_done(self):
+        """Ohmypi requires a terminal Responses event before data: [DONE].
+
+        OpenRouter wraps LiteLLMCompletionStreamingIterator in
+        `_responses_sse_from_iterator`. If that iterator ends after only
+        `response.created` / `response.in_progress`, the helper currently
+        still yields `[DONE]`. Ohmypi then retries with:
+        "OpenAI responses stream closed before a terminal response event
+        was received".
+        """
+
+        async def events():
+            yield {"type": "response.created", "response": {"id": "resp_ohmypi"}}
+
+        chunks = _run(_collect_agen(sse_mod._responses_sse_from_iterator(events())))
+        rendered = "".join(chunks)
+        assert chunks[-1] == "data: [DONE]\n\n", chunks
+        terminal_prefixes = (
+            "event: response.completed\n",
+            "event: response.failed\n",
+            "event: response.incomplete\n",
+        )
+        terminal_indexes = [
+            index
+            for index, chunk in enumerate(chunks)
+            if any(chunk.startswith(prefix) for prefix in terminal_prefixes)
+        ]
+        assert terminal_indexes, (
+            "SSE helper must inject a terminal Responses event before "
+            f"[DONE]; got {chunks}"
+        )
+        assert terminal_indexes[-1] < len(chunks) - 1, rendered
+        assert "event: response.created" in rendered
 
 
 # ===========================================================================

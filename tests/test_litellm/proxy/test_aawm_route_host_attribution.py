@@ -8,7 +8,9 @@ from unittest.mock import Mock
 from fastapi import Request
 
 from litellm.proxy.aawm_route_logging import (
+    _get_aawm_route_log_client_product_label,
     _normalize_aawm_route_client_ip,
+    _normalize_aawm_route_log_client_product,
     attach_aawm_route_rollup_context,
     build_aawm_route_repo_client_host_label,
     build_aawm_route_rollup_context,
@@ -49,6 +51,28 @@ def test_build_aawm_route_repo_client_host_label_formats_ohmypi():
         host_name="thoth",
     )
     assert label == "litellm#Ohmypi[17.3.8]@thoth"
+
+
+def test_normalize_ohmypi_display_name_and_rejects_bun_runtime_ua():
+    assert _normalize_aawm_route_log_client_product("Oh My Pi") == "Ohmypi"
+    assert _normalize_aawm_route_log_client_product("Oh My Pi/17.4.2") == "Ohmypi/17.4.2"
+    assert _normalize_aawm_route_log_client_product("omp") == "Ohmypi"
+    assert _normalize_aawm_route_log_client_product("omp/17.4.2") == "Ohmypi/17.4.2"
+    assert _normalize_aawm_route_log_client_product("Bun/1.3.14") is None
+    assert _normalize_aawm_route_log_client_product("17.4.2") == "17.4.2"
+
+
+def test_ohmypi_product_label_uses_overlay_headers_not_bun_user_agent():
+    label = _get_aawm_route_log_client_product_label(
+        {},
+        {
+            "user-agent": "Bun/1.3.14",
+            "x-aawm-client": "Oh My Pi",
+            "x-aawm-client-name": "omp",
+            "x-aawm-client-version": "17.4.2",
+        },
+    )
+    assert label == "Ohmypi/17.4.2"
 
 
 def test_resolve_aawm_route_host_attribution_loopback_resolves_local_magicdns(
@@ -671,6 +695,50 @@ def test_build_aawm_route_rollup_context_does_not_use_bun_runtime_as_ohmypi_clie
     assert context["group_header_label"] == "litellm#Ohmypi[17.3.8]@thoth"
     assert "Bun" not in context["group_header_label"]
     assert not context["group_header_label"].startswith("Oh@")
+
+
+def test_build_aawm_route_rollup_context_maps_live_ohmypi_overlay_headers(
+    monkeypatch,
+):
+    from litellm.proxy import aawm_route_logging as route_logging
+
+    monkeypatch.setattr(
+        route_logging,
+        "resolve_aawm_route_host_attribution",
+        lambda request, **kwargs: {
+            "client_ip": "127.0.0.1",
+            "client_ip_source": "request_client",
+            "host_name": "thoth",
+            "host_name_source": "magicdns_local",
+        },
+    )
+    request = Mock(spec=Request)
+    request.method = "POST"
+    request.url = "http://127.0.0.1:4011/v1/chat/completions"
+    request.headers = {
+        "user-agent": "Bun/1.3.14",
+        "x-aawm-client": "Oh My Pi",
+        "x-aawm-client-name": "omp",
+        "x-aawm-client-version": "17.4.2",
+        "x-aawm-repository": "litellm",
+        "langfuse_trace_name": "omp",
+    }
+    request.client = SimpleNamespace(host="127.0.0.1", port=12345)
+    request.scope = {
+        "path": "/v1/chat/completions",
+        "query_string": b"",
+        "client": ("127.0.0.1", 12345),
+    }
+    request.state = SimpleNamespace()
+
+    context = build_aawm_route_rollup_context(
+        request=request,
+        target="https://openrouter.ai/api/v1/chat/completions",
+        request_body={"model": "openrouter/qwen/qwen3.6-flash"},
+    )
+
+    assert context is not None
+    assert context["group_header_label"] == "litellm#Ohmypi[17.4.2]@thoth"
 
 
 def test_is_tailscale_cgnat_client_ip_detects_100_64_range():

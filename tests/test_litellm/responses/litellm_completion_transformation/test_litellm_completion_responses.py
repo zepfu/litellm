@@ -1,10 +1,12 @@
 import os
 import sys
+from unittest.mock import MagicMock
 
 sys.path.insert(
     0, os.path.abspath("../../..")
 )  # Adds the parent directory to the system path
 
+from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
 from litellm.responses.litellm_completion_transformation.transformation import (
     LiteLLMCompletionResponsesConfig,
     TOOL_CALLS_CACHE,
@@ -16,13 +18,134 @@ from litellm.types.llms.openai import (
 from litellm.types.utils import (
     Choices,
     CompletionTokensDetailsWrapper,
+    Delta,
     Message,
     ModelResponse,
+    ModelResponseStream,
     Function,
     ChatCompletionMessageToolCall,
     PromptTokensDetailsWrapper,
+    StreamingChoices,
     Usage,
 )
+from litellm.utils import ModelResponseListIterator
+
+
+def _pong_model_response_stream_chunks(
+    *,
+    response_id: str,
+    model: str,
+) -> list[ModelResponseStream]:
+    """Real chat.completion.chunk objects that assemble to assistant content PONG."""
+    return [
+        ModelResponseStream(
+            id=response_id,
+            created=1234567890,
+            model=model,
+            object="chat.completion.chunk",
+            system_fingerprint=None,
+            choices=[
+                StreamingChoices(
+                    finish_reason=None,
+                    index=0,
+                    delta=Delta(
+                        provider_specific_fields=None,
+                        content="PO",
+                        role="assistant",
+                        function_call=None,
+                        tool_calls=None,
+                        audio=None,
+                    ),
+                    logprobs=None,
+                )
+            ],
+            provider_specific_fields={},
+            usage=None,
+        ),
+        ModelResponseStream(
+            id=response_id,
+            created=1234567890,
+            model=model,
+            object="chat.completion.chunk",
+            system_fingerprint=None,
+            choices=[
+                StreamingChoices(
+                    finish_reason=None,
+                    index=0,
+                    delta=Delta(
+                        provider_specific_fields=None,
+                        content="NG",
+                        role="assistant",
+                        function_call=None,
+                        tool_calls=None,
+                        audio=None,
+                    ),
+                    logprobs=None,
+                )
+            ],
+            provider_specific_fields={},
+            usage=None,
+        ),
+        ModelResponseStream(
+            id=response_id,
+            created=1234567890,
+            model=model,
+            object="chat.completion.chunk",
+            system_fingerprint=None,
+            choices=[
+                StreamingChoices(
+                    finish_reason="stop",
+                    index=0,
+                    delta=Delta(
+                        provider_specific_fields=None,
+                        content="",
+                        role="assistant",
+                        function_call=None,
+                        tool_calls=None,
+                        audio=None,
+                    ),
+                    logprobs=None,
+                )
+            ],
+            provider_specific_fields={},
+            usage=None,
+        ),
+    ]
+
+
+def _custom_stream_wrapper_for_responses_finalize(
+    *,
+    response_id: str | None,
+    model: str = "openrouter/qwen/qwen3.6-flash:none",
+    set_object: bool = True,
+    set_choices: bool = True,
+    set_created: bool = True,
+    completion_stream=None,
+) -> CustomStreamWrapper:
+    """Build a real CustomStreamWrapper as OpenRouter non-stream acompletion can return."""
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {"litellm_params": {}}
+    wrapper = CustomStreamWrapper(
+        completion_stream=completion_stream,
+        model=model,
+        logging_obj=logging_obj,
+        custom_llm_provider="openrouter",
+    )
+    wrapper.response_id = response_id
+    if set_created:
+        wrapper.created = 1234567890
+    if set_object:
+        wrapper.object = "chat.completion"
+    if set_choices:
+        wrapper.choices = [
+            Choices(
+                finish_reason="stop",
+                index=0,
+                message=Message(content="PONG", role="assistant"),
+            )
+        ]
+    return wrapper
+
 
 
 class TestLiteLLMCompletionResponsesConfig:
@@ -542,6 +665,181 @@ class TestLiteLLMCompletionResponsesConfig:
         # Assert - should default to empty dict
         assert hasattr(responses_api_response, "_hidden_params")
         assert responses_api_response._hidden_params == {}
+
+    def test_transform_custom_stream_wrapper_uses_response_id(self):
+        """Non-stream Responses finalize must accept a real CustomStreamWrapper.
+
+        Ohmypi 17.4.2 against litellm-alpha returned
+        500 `'CustomStreamWrapper' object has no attribute 'id'` after OpenRouter
+        chat completed. The adapter passes the acompletion object into
+        transform_chat_completion_response_to_responses_api_response.
+        """
+        wrapper = _custom_stream_wrapper_for_responses_finalize(
+            response_id="chatcmpl-ohmypi-basic",
+        )
+
+        responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+            request_input="Reply with exactly the word PONG.",
+            responses_api_request={},
+            chat_completion_response=wrapper,
+        )
+
+        assert isinstance(responses_api_response.id, str)
+        assert responses_api_response.id != ""
+        assert responses_api_response.id == wrapper.response_id
+
+        message_items = [
+            item for item in responses_api_response.output if item.type == "message"
+        ]
+        assert len(message_items) == 1
+        assert message_items[0].id == wrapper.response_id
+        assert message_items[0].content[0].text == "PONG"
+
+    def test_transform_custom_stream_wrapper_generates_id_when_response_id_missing(self):
+        """Responses finalize must still produce a non-empty id if response_id is unset."""
+        wrapper = _custom_stream_wrapper_for_responses_finalize(response_id=None)
+
+        responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+            request_input="Reply with exactly the word PONG.",
+            responses_api_request={},
+            chat_completion_response=wrapper,
+        )
+
+        assert isinstance(responses_api_response.id, str)
+        assert responses_api_response.id != ""
+        assert responses_api_response.id == wrapper.id
+
+    def test_transform_custom_stream_wrapper_without_object_attr(self):
+        """Ohmypi `--test model` 500s if CustomStreamWrapper has no `.object`.
+
+        transform_chat_completion_response_to_responses_api_response reads
+        `chat_completion_response.object` directly. Do not assign `.object`
+        here — the live wrapper never had that attribute set.
+        """
+        wrapper = _custom_stream_wrapper_for_responses_finalize(
+            response_id="chatcmpl-ohmypi-basic",
+            set_object=False,
+        )
+
+        responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+            request_input="Reply with exactly the word PONG.",
+            responses_api_request={},
+            chat_completion_response=wrapper,
+        )
+
+        assert isinstance(responses_api_response.id, str)
+        assert responses_api_response.id != ""
+
+    def test_transform_custom_stream_wrapper_without_choices_attr_does_not_raise(self):
+        """Live acompletion CustomStreamWrapper has no `.choices` attribute.
+
+        Ohmypi `--test model` on litellm-alpha alias `basic` 500s with
+        `'CustomStreamWrapper' object has no attribute 'choices'` after OpenRouter
+        chat completed. Assigning empty `.choices` is the wrong contract: the
+        transform must coerce a stream wrapper into a ModelResponse (or adapters
+        must not pass the wrapper into this non-stream transform).
+        """
+        wrapper = _custom_stream_wrapper_for_responses_finalize(
+            response_id="chatcmpl-ohmypi-basic",
+            set_choices=False,
+        )
+        assert not hasattr(wrapper, "choices")
+
+        responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+            request_input="Reply with exactly the word PONG.",
+            responses_api_request={},
+            chat_completion_response=wrapper,
+        )
+
+        assert isinstance(responses_api_response.id, str)
+        assert responses_api_response.id != ""
+
+    def test_transform_custom_stream_wrapper_consumes_stream_chunks_into_pong(self):
+        """If a CustomStreamWrapper is given to the non-stream transform, consume it.
+
+        Stream chunks together yield assistant content PONG. Do not assign
+        `.choices` on the wrapper — live wrappers never have that attribute.
+        """
+        model = "openrouter/qwen/qwen3.6-flash:none"
+        response_id = "chatcmpl-ohmypi-basic"
+        completion_stream = ModelResponseListIterator(
+            model_responses=_pong_model_response_stream_chunks(
+                response_id=response_id,
+                model=model,
+            )
+        )
+        wrapper = _custom_stream_wrapper_for_responses_finalize(
+            response_id=response_id,
+            model=model,
+            set_choices=False,
+            completion_stream=completion_stream,
+        )
+        assert not hasattr(wrapper, "choices")
+
+        responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+            request_input="Reply with exactly the word PONG.",
+            responses_api_request={},
+            chat_completion_response=wrapper,
+        )
+
+        message_items = [
+            item for item in responses_api_response.output if item.type == "message"
+        ]
+        assembled = "".join(
+            getattr(part, "text", "") or ""
+            for item in message_items
+            for part in (getattr(item, "content", None) or [])
+        )
+        assert "PONG" in assembled, assembled
+        assert isinstance(responses_api_response.id, str)
+        assert responses_api_response.id != ""
+
+    def test_transform_custom_stream_wrapper_without_created_attr(self):
+        """Live CustomStreamWrapper.created stays None until chunks are consumed.
+
+        Ohmypi `--test model` on litellm-alpha alias `basic` 500s with
+        `created_at Input should be a valid integer [type=int_type, input_value=None]`
+        after OpenRouter chat completed. The helper must not assign `.created`
+        here — that hides the live wrapper contract (`self.created = None`).
+        """
+        model = "openrouter/qwen/qwen3.6-flash:none"
+        response_id = "chatcmpl-ohmypi-basic"
+        completion_stream = ModelResponseListIterator(
+            model_responses=_pong_model_response_stream_chunks(
+                response_id=response_id,
+                model=model,
+            )
+        )
+        wrapper = _custom_stream_wrapper_for_responses_finalize(
+            response_id=response_id,
+            model=model,
+            set_choices=False,
+            set_created=False,
+            completion_stream=completion_stream,
+        )
+        assert wrapper.created is None
+
+        responses_api_response = LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
+            request_input="Reply with exactly the word PONG.",
+            responses_api_request={},
+            chat_completion_response=wrapper,
+        )
+
+        assert isinstance(responses_api_response.created_at, int)
+        assert responses_api_response.created_at is not None
+
+        message_items = [
+            item for item in responses_api_response.output if item.type == "message"
+        ]
+        assembled = "".join(
+            getattr(part, "text", "") or ""
+            for item in message_items
+            for part in (getattr(item, "content", None) or [])
+        )
+        assert "PONG" in assembled, assembled
+        assert isinstance(responses_api_response.id, str)
+        assert responses_api_response.id != ""
+
 
 class TestFunctionCallTransformation:
     """Test cases for function_call input transformation"""

@@ -605,7 +605,12 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             response_created_event_data["metadata"] = self.responses_api_request[
                 "metadata"
             ]
-        return response_created_event_data
+        # Encode the same way as response.completed so Ohmypi sees one identity.
+        return ResponsesAPIRequestUtils._update_responses_api_response_id_with_model_id(
+            responses_api_response=response_created_event_data,
+            custom_llm_provider=self.custom_llm_provider,
+            litellm_metadata=self.litellm_metadata,
+        )
 
     def create_response_created_event(self) -> ResponseCreatedEvent:
         """
@@ -1123,40 +1128,75 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
             return True
         return False
 
+    def _minimal_terminal_model_response(self) -> ModelResponse:
+        response_id = self._cached_response_id
+        if not response_id:
+            wrapper = self.litellm_custom_stream_wrapper
+            response_id = getattr(wrapper, "id", None) or getattr(
+                wrapper, "response_id", None
+            )
+        if not isinstance(response_id, str) or not response_id:
+            response_id = f"resp_{uuid.uuid4()}"
+        if self._cached_response_id is None:
+            self._cached_response_id = response_id
+        return ModelResponse(
+            id=response_id,
+            created=int(time.time()),
+            model=self.model,
+            choices=[],
+        )
+
+    def _fallback_terminal_response_event(self) -> ResponseCompletedEvent:
+        response_data = self._default_response_created_event_data()
+        response_data["status"] = "completed"
+        self.finished = True
+        return ResponseCompletedEvent(
+            type=ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
+            response=ResponsesAPIResponse(**response_data),
+        )
+
+    def _ensure_terminal_done_event(
+        self, sync_mode: bool = True
+    ) -> BaseLiteLLMOpenAIResponseObject:
+        try:
+            return self.common_done_event_logic(sync_mode=sync_mode)
+        except Exception:
+            return self._fallback_terminal_response_event()
+
     def common_done_event_logic(
         self, sync_mode: bool = True
     ) -> BaseLiteLLMOpenAIResponseObject:
+        # Ohmypi requires a terminal Responses event before the iterator ends.
+        # Never raise StopIteration/StopAsyncIteration from this path.
         if not self.litellm_model_response or isinstance(
             self.litellm_model_response, TextCompletionResponse
         ):
-            self.litellm_model_response = self.create_litellm_model_response()
-        if self.litellm_model_response:
+            assembled = self.create_litellm_model_response()
+            if assembled is not None:
+                self.litellm_model_response = assembled
+            elif not isinstance(self.litellm_model_response, ModelResponse):
+                self.litellm_model_response = self._minimal_terminal_model_response()
+        if isinstance(self.litellm_model_response, ModelResponse):
             # If tool calls exist, emit tool events before finishing/response.completed.
-            if isinstance(self.litellm_model_response, ModelResponse):
-                self._queue_final_tool_call_done_events(self.litellm_model_response)
+            self._queue_final_tool_call_done_events(self.litellm_model_response)
             if self._pending_tool_events:
                 return self._pending_tool_events.pop(0)
 
             done_event = self.return_default_done_events(self.litellm_model_response)
             if done_event:
                 return done_event
-        else:
-            if sync_mode:
-                raise StopIteration
-            else:
-                raise StopAsyncIteration
 
-        self.finished = self.is_stream_finished()
-        response_completed_event = self._emit_response_completed_event(
-            self.litellm_model_response
-        )
-        if response_completed_event:
-            return response_completed_event
-        else:
-            if sync_mode:
-                raise StopIteration
-            else:
-                raise StopAsyncIteration
+            self.finished = self.is_stream_finished()
+            response_completed_event = self._emit_response_completed_event(
+                self.litellm_model_response
+            )
+            if response_completed_event is not None:
+                self.finished = True
+                return response_completed_event
+
+        fallback = self._fallback_terminal_response_event()
+        self.finished = True
+        return fallback
 
     def _queue_reasoning_done_events(self) -> None:
         if not self._reasoning_active or self._reasoning_done_emitted:
@@ -1318,13 +1358,24 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
 
                 except StopAsyncIteration:
                     return self._record_response_stream_event(
-                        self.common_done_event_logic(sync_mode=False)
+                        self._ensure_terminal_done_event(sync_mode=False)
                     )
 
+        except StopAsyncIteration:
+            if self.finished:
+                raise
+            return self._record_response_stream_event(
+                self._ensure_terminal_done_event(sync_mode=False)
+            )
         except Exception as e:
-            # Handle HTTP errors
-            self.finished = True
-            raise e
+            # After response.created, wrapper/transform errors must still
+            # close Ohmypi with a terminal Responses event. Only re-raise
+            # once finished so the next pull becomes StopAsyncIteration.
+            if self.finished:
+                raise e
+            return self._record_response_stream_event(
+                self._ensure_terminal_done_event(sync_mode=False)
+            )
 
     def __iter__(self):
         return self
@@ -1392,12 +1443,20 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                     # Otherwise, loop to next chunk
                 except StopIteration:
                     return self._record_response_stream_event(
-                        self.common_done_event_logic(sync_mode=True)
+                        self._ensure_terminal_done_event(sync_mode=True)
                     )
+        except StopIteration:
+            if self.finished:
+                raise
+            return self._record_response_stream_event(
+                self._ensure_terminal_done_event(sync_mode=True)
+            )
         except Exception as e:
-            # Handle HTTP errors
-            self.finished = True
-            raise e
+            if self.finished:
+                raise e
+            return self._record_response_stream_event(
+                self._ensure_terminal_done_event(sync_mode=True)
+            )
 
     def _transform_chat_completion_chunk_to_response_api_chunk(
         self, chunk: ModelResponseStream
@@ -1517,7 +1576,9 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
     def _emit_response_completed_event(
         self, litellm_model_response: ModelResponse
     ) -> Optional[ResponseCompletedEvent]:
-        if litellm_model_response:
+        try:
+            if not litellm_model_response:
+                return None
             # Add cost to usage object if include_cost_in_streaming_usage is True
             if (
                 litellm.include_cost_in_streaming_usage
@@ -1555,5 +1616,5 @@ class LiteLLMCompletionStreamingIterator(ResponsesAPIStreamingIterator):
                 type=ResponsesAPIStreamEvents.RESPONSE_COMPLETED,
                 response=encoded_response,
             )
-        else:
+        except Exception:
             return None

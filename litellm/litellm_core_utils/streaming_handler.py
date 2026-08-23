@@ -162,7 +162,34 @@ class CustomStreamWrapper:
         )  # keep track of the returned chunks - used for calculating the input/output tokens for stream options
         self.is_function_call = self.check_is_function_call(logging_obj=logging_obj)
         self.created: Optional[int] = None
+        self._object: Optional[str] = None
         self._last_returned_hidden_params: Optional[dict] = None
+
+    @property
+    def id(self) -> str:
+        """OpenAI-compatible completion id. Mirrors `response_id`, generating one if needed."""
+        response_id = self.response_id
+        if isinstance(response_id, str) and response_id.strip():
+            return response_id
+        generated_id = f"chatcmpl-{uuid.uuid4()}"
+        self.response_id = generated_id
+        return generated_id
+
+    @id.setter
+    def id(self, value: Optional[str]) -> None:
+        self.response_id = value
+
+    @property
+    def object(self) -> str:
+        """OpenAI chat completion object tag. Defaults when acompletion wrappers omit it."""
+        stored = self._object
+        if isinstance(stored, str) and stored.strip():
+            return stored
+        return "chat.completion"
+
+    @object.setter
+    def object(self, value: Optional[str]) -> None:
+        self._object = value
 
     def _check_max_streaming_duration(self) -> None:
         """Raise litellm.Timeout if the stream has exceeded LITELLM_MAX_STREAMING_DURATION_SECONDS."""

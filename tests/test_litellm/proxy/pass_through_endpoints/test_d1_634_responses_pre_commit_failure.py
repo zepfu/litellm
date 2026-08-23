@@ -12,8 +12,13 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
+from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals import (
+    _RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES,
     plan_responses_pre_commit_retry,
+)
+from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+    _classify_codex_auto_agent_retryable_exhaustion,
 )
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     _execute_passthrough_pre_first_byte_with_hidden_retries,
@@ -317,6 +322,59 @@ def test_plan_returns_pre_stream_503_after_two_transient_failures():
     assert plan["http_status"] == 503
     assert plan["retryable"] is True
     assert plan["wait_seconds"] == 10.0
+
+
+def _opencode_go_empty_success_proxy_exception() -> ProxyException:
+    """Match production `_raise_codex_auto_agent_empty_success_response`."""
+    exc = ProxyException(
+        message=(
+            "Codex auto-agent OpenCode Go candidate returned an empty successful "
+            "Responses payload."
+        ),
+        type="upstream_error",
+        param="model",
+        code=502,
+    )
+    setattr(
+        exc,
+        "detail",
+        {
+            "error": {
+                "message": exc.message,
+                "code": "aawm_codex_auto_agent_empty_success",
+                "status": "EMPTY_SUCCESS_RESPONSE",
+                "type": "upstream_error",
+            }
+        },
+    )
+    return exc
+
+
+def test_empty_success_502_is_not_pre_commit_transient():
+    """Live Ohmypi stream=true `basic` 503s empty OpenCode Go success.
+
+    `_raise_codex_auto_agent_empty_success_response` fail-closes with HTTP 502
+    `aawm_codex_auto_agent_empty_success`. Mapping that 502 through
+    `_CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES` makes
+    `plan_responses_pre_commit_retry` treat emptiness as same-account
+    pre-commit capacity and 503 the whole alias after two attempts.
+    Empty success must leave the candidate loop instead.
+    """
+    exc = _opencode_go_empty_success_proxy_exception()
+
+    classified = _classify_codex_auto_agent_retryable_exhaustion(exc)
+    assert classified != "upstream_transient_internal"
+    assert classified is not None
+    assert classified not in _RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES
+
+    plan = plan_responses_pre_commit_retry(
+        error_class=classified,
+        same_account_transient_attempts=2,
+    )
+    assert plan["action"] not in {
+        "pre_stream_unavailable",
+        "retry_same_account",
+    }
 
 
 def test_pre_commit_failure_http_exception_is_503_with_retry_after():

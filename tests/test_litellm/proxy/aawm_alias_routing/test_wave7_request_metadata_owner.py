@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from litellm.proxy.aawm_route_logging import build_aawm_route_repo_client_host_label
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     request_metadata,
 )
@@ -317,6 +318,17 @@ class TestNormalizeClientProduct:
             == "Codex/1.0"
         )
 
+    def test_ohmypi_display_name_is_not_truncated_to_oh(self):
+        result = _normalize_auto_agent_alias_client_product("Oh My Pi")
+        assert result != "Oh"
+        assert result == "Ohmypi"
+
+    def test_ohmypi_display_name_with_version(self):
+        assert (
+            _normalize_auto_agent_alias_client_product("Oh My Pi/17.4.2")
+            == "Ohmypi/17.4.2"
+        )
+
 
 # ---------------------------------------------------------------------------
 # _extract_auto_agent_alias_client_product_label
@@ -382,6 +394,44 @@ class TestExtractClientProductLabel:
             _extract_auto_agent_alias_client_product_label(request, body)
             == "Grok/0.5"
         )
+
+    def test_ohmypi_overlay_headers_include_version_not_bun_or_oh(self):
+        request = _FakeRequest(
+            headers={
+                "user-agent": "Bun/1.3.14",
+                "x-aawm-client": "Oh My Pi",
+                "x-aawm-client-name": "omp",
+                "x-aawm-client-version": "17.4.2",
+                "x-aawm-repository": "litellm",
+            }
+        )
+        body: dict[str, Any] = {}
+        label = _extract_auto_agent_alias_client_product_label(request, body)
+        assert label != "Oh"
+        assert label is not None
+        assert "Ohmypi" in label
+        assert "17.4.2" in label
+        assert "Bun" not in label
+        assert label == "Ohmypi/17.4.2"
+
+    def test_ohmypi_overlay_headers_rollup_identity(self):
+        request = _FakeRequest(
+            headers={
+                "user-agent": "Bun/1.3.14",
+                "x-aawm-client": "Oh My Pi",
+                "x-aawm-client-name": "omp",
+                "x-aawm-client-version": "17.4.2",
+                "x-aawm-repository": "litellm",
+            }
+        )
+        label = _extract_auto_agent_alias_client_product_label(request, {})
+        rollup = build_aawm_route_repo_client_host_label(
+            repository="litellm",
+            client_product_label=label,
+            host_name="thoth",
+        )
+        assert rollup != "litellm#Oh@thoth"
+        assert rollup == "litellm#Ohmypi[17.4.2]@thoth"
 
     def test_header_fallback_user_agent(self):
         request = _FakeRequest(headers={"user-agent": "codex-cli/7.7"})

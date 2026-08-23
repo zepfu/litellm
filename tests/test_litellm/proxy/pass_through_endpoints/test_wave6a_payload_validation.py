@@ -673,3 +673,146 @@ class TestSignatureContracts:
             assert inspect.iscoroutinefunction(getattr(pv, name)) is (
                 name in async_symbols
             ), f"{name} async-ness diverged"
+
+
+# ---------------------------------------------------------------------------
+# Ohmypi OpenAI: successful completed SSE stays SSE; failed SSE must fail
+# ---------------------------------------------------------------------------
+_OHMYPI_OPENAI_SUCCESS_TERMINAL_EVENTS = (
+    "response.completed",
+    "response.done",
+    "response.incomplete",
+)
+
+
+async def _collect_streaming_body(response: StreamingResponse) -> str:
+    parts: list[str] = []
+    async for chunk in response.body_iterator:
+        if isinstance(chunk, (bytes, bytearray)):
+            parts.append(bytes(chunk).decode("utf-8"))
+        else:
+            parts.append(str(chunk))
+    return "".join(parts)
+
+
+def _assert_ohmypi_openai_terminal_sse_before_done(rendered: str) -> None:
+    """Successful streams still need a completed/done/incomplete event before [DONE].
+
+    Do not use this helper for exhausted failed SSE. Rewriting
+    ``response.failed`` into empty ``response.completed`` papers over adapter
+    failures and blocks alias failover.
+    """
+    done_idx = rendered.rfind("data: [DONE]")
+    assert done_idx != -1, rendered
+    terminal_indexes = [
+        rendered.find(f"event: {event_name}")
+        for event_name in _OHMYPI_OPENAI_SUCCESS_TERMINAL_EVENTS
+        if f"event: {event_name}" in rendered
+    ]
+    assert terminal_indexes, (
+        "successful Ohmypi OpenAI SSE requires event: response.completed "
+        "(or response.done / response.incomplete) before [DONE]; "
+        f"got {rendered!r}"
+    )
+    assert min(terminal_indexes) < done_idx, rendered
+    assert "event:" in rendered
+    stripped = rendered.lstrip()
+    assert stripped.startswith("event:") or stripped.startswith("data:"), rendered
+
+
+def _rendered_sse_has_empty_completed_success(rendered: str) -> bool:
+    return (
+        "event: response.completed" in rendered
+        and '"status": "completed"' in rendered.replace('"status":"completed"', '"status": "completed"')
+    )
+
+
+def _assert_failed_responses_proxy_exception(exc: ProxyException) -> None:
+    assert exc.type == "upstream_error"
+    assert str(exc.code) == "502"
+    detail = exc.detail
+    assert isinstance(detail, dict), detail
+    error = detail.get("error")
+    assert isinstance(error, dict), detail
+    assert error.get("code") == "aawm_auto_agent_failed_responses_payload"
+    assert error.get("status") == "RESPONSES_STATUS_FAILED"
+
+
+def _assert_remaining_failed_sse_is_not_empty_success(rendered: str) -> None:
+    assert "event: response.completed" not in rendered, (
+        "exhausted failed SSE must not be rewritten to event: response.completed; "
+        f"got {rendered!r}"
+    )
+    assert '"status": "completed"' not in rendered.replace(
+        '"status":"completed"', '"status": "completed"'
+    ), rendered
+    assert (
+        "event: response.failed" in rendered
+        or '"status": "failed"' in rendered.replace('"status":"failed"', '"status": "failed"')
+    ), (
+        "if failed SSE remains a stream, the terminal must stay a failure "
+        f"(response.failed / status failed); got {rendered!r}"
+    )
+
+
+class TestValidateOhmypiStreamingTerminal:
+    """Successful completed SSE stays SSE; exhausted failed SSE must not look like success."""
+
+    _CREATED = (
+        "event: response.created\n"
+        'data: {"type":"response.created","response":{"id":"resp_ohmypi","object":"response","created_at":1,"status":"in_progress","output":[]}}\n\n'
+    )
+    _COMPLETED = (
+        "event: response.completed\n"
+        'data: {"type":"response.completed","response":{"id":"resp_ohmypi","object":"response","created_at":1,"status":"completed","output":[]}}\n\n'
+    )
+    _FAILED = (
+        "event: response.failed\n"
+        'data: {"type":"response.failed","response":{"id":"resp_ohmypi","object":"response","created_at":1,"status":"failed","error":{"message":"upstream failed"},"output":[]}}\n\n'
+    )
+    _DONE = "data: [DONE]\n\n"
+
+    async def _validate(self, *chunks: str) -> StreamingResponse:
+        async def _agen():
+            for chunk in chunks:
+                yield chunk
+
+        upstream = StreamingResponse(_agen(), media_type="text/event-stream")
+        return await lpe._validate_codex_auto_agent_responses_payload(
+            upstream,
+            adapter_model="openrouter/qwen/qwen3.6-flash:none",
+            adapter="codex_auto_agent_openrouter_completion_adapter",
+            adapter_label="OpenRouter chat-completions",
+        )
+
+    @pytest.mark.asyncio
+    async def test_completed_sse_is_not_replaced_with_502_json(self):
+        validated = await self._validate(self._CREATED, self._COMPLETED, self._DONE)
+        assert isinstance(validated, StreamingResponse)
+        rendered = await _collect_streaming_body(validated)
+        _assert_ohmypi_openai_terminal_sse_before_done(rendered)
+        assert "event: response.completed" in rendered
+
+    @pytest.mark.asyncio
+    async def test_failed_sse_is_not_replaced_with_502_json(self):
+        """Exhausted response.created + response.failed must remain a real failure.
+
+        Prefer the same ProxyException 502 path as non-stream failed JSON
+        (``_raise_codex_auto_agent_failed_responses_payload``) so alias failover
+        can run. If the response remains SSE, the terminal must stay
+        ``response.failed`` / ``status: failed`` and must not look like empty
+        ``response.completed`` success.
+        """
+        try:
+            validated = await self._validate(self._CREATED, self._FAILED, self._DONE)
+        except ProxyException as exc:
+            _assert_failed_responses_proxy_exception(exc)
+            return
+
+        assert isinstance(validated, StreamingResponse), validated
+        rendered = await _collect_streaming_body(validated)
+        assert not _rendered_sse_has_empty_completed_success(rendered), (
+            "exhausted failed SSE must not be rewritten to empty "
+            f"event: response.completed; got {rendered!r}"
+        )
+        _assert_remaining_failed_sse_is_not_empty_success(rendered)

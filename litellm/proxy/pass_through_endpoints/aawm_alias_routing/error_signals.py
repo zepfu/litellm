@@ -1163,6 +1163,11 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "rate_limited"
     if "aawm_codex_auto_agent_candidate_unavailable" in tokens:
         return "candidate_unavailable"
+    if (
+        "aawm_codex_auto_agent_empty_success" in tokens
+        or "EMPTY_SUCCESS_RESPONSE" in tokens
+    ):
+        return "candidate_unavailable"
     if "DEEPSEEK_TOOL_MESSAGE_MISMATCH" in tokens:
         return "provider_format_rejected"
     if "OPENROUTER_INVALID_CHAT_MESSAGE" in tokens:

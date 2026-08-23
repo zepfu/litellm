@@ -65,7 +65,14 @@ For `--test model` the driver waits until the TUI returns idle, then
 passes only on a standalone exact `PONG` reply or an explicit provider
 404 needle (`No endpoints found for`, `404 Not Found`, `status code
 404`, `Error: 404`). `※ recap:` is only a wait signal; generic
-`Error:`, recap-only, and non-idle panes fail.
+`Error:`, recap-only, and non-idle panes fail. Recap is wait-only; a
+standalone exact `PONG` line after a prompt echo newer than the
+pre-send pane (not the prompt echo, not a leftover session-dir
+`PONG`, and not a restored complete echo+PONG turn already on the
+pane before send) completes the model wait even when recap never
+paints. Each alias uses a fresh `--session-dir` under
+`/tmp/omp-alpha-sessions/hv2-<alias>`. Launch splash (`Welcome
+back` / `Recent sessions`) remaining in scrollback is not non-idle.
 
 Every non-dry-run also appends a durable JSONL log under
 `.analysis/harnessv2/` (`run_start`, one `step` line per check with

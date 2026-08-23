@@ -632,6 +632,8 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
         if _is_failed_responses_body(response_body) and not is_repetitive_output_loop_failure(  # noqa: F821
             response_body
         ):
+            # Exhausted failed SSE is the same failover signal as non-stream
+            # failed JSON. Do not rewrite it to empty response.completed.
             _raise_codex_auto_agent_failed_responses_payload(
                 response_body=response_body,
                 adapter_model=adapter_model,

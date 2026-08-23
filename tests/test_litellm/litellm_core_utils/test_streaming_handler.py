@@ -1491,3 +1491,37 @@ def test_tool_use_not_dropped_when_finish_reason_already_set(
     )
     assert tool_calls[0].id == "call_1"
     assert tool_calls[0].function.name == "get_weather"
+
+
+def test_custom_stream_wrapper_id_matches_response_id(
+    initialized_custom_stream_wrapper: CustomStreamWrapper,
+):
+    """Responses finalize and logging read `.id`; map it to `response_id`."""
+    initialized_custom_stream_wrapper.response_id = "chatcmpl-ohmypi-basic"
+
+    assert initialized_custom_stream_wrapper.id == (
+        initialized_custom_stream_wrapper.response_id
+    )
+
+
+def test_custom_stream_wrapper_id_generated_when_response_id_missing(
+    initialized_custom_stream_wrapper: CustomStreamWrapper,
+):
+    """If response_id was never set, `.id` must still be a stable non-empty string."""
+    initialized_custom_stream_wrapper.response_id = None
+
+    wrapper_id = initialized_custom_stream_wrapper.id
+
+    assert isinstance(wrapper_id, str)
+    assert wrapper_id != ""
+    assert initialized_custom_stream_wrapper.id == wrapper_id
+
+
+def test_custom_stream_wrapper_object_defaults_to_chat_completion(
+    initialized_custom_stream_wrapper: CustomStreamWrapper,
+):
+    """Responses finalize reads `.object` directly; default to chat.completion."""
+    assert initialized_custom_stream_wrapper.object == "chat.completion"
+
+    initialized_custom_stream_wrapper.object = "response"
+    assert initialized_custom_stream_wrapper.object == "response"

@@ -39,6 +39,7 @@ from typing import Any, Callable, Optional
 from fastapi.responses import StreamingResponse
 
 from litellm._logging import verbose_proxy_logger
+from litellm.types.llms.openai import RESPONSES_API_TERMINAL_STREAM_EVENTS
 
 from typing import TYPE_CHECKING
 
@@ -67,6 +68,7 @@ _HOST_FUNCTION_NAMES = (
 
 _HOST_GLOBAL_DEFAULTS = (
     ("SimpleNamespace", SimpleNamespace),
+    ("RESPONSES_API_TERMINAL_STREAM_EVENTS", RESPONSES_API_TERMINAL_STREAM_EVENTS),
 )
 
 
@@ -213,15 +215,80 @@ async def _responses_sse_from_iterator(
     on_stream_error: Optional[Callable[[Exception], Optional[str]]] = None,
 ) -> Any:
     has_emitted = False
+    has_terminal = False
+    last_event: Any = None
+
+    def _injected_terminal_sse(*, event_type: str, status: str) -> str:
+        last_response = (
+            _mapping_or_attr_get(last_event, "response")
+            if last_event is not None
+            else None
+        )
+        response_payload: dict[str, Any] = {
+            "object": "response",
+            "status": status,
+            "output": [],
+        }
+        last_id = (
+            _mapping_or_attr_get(last_response, "id")
+            if last_response is not None
+            else None
+        )
+        if last_id is None and last_event is not None:
+            last_id = _mapping_or_attr_get(last_event, "id")
+        if isinstance(last_id, str) and last_id:
+            response_payload["id"] = last_id
+        created_at = None
+        if last_response is not None:
+            created_at = _mapping_or_attr_get(last_response, "created_at")
+            if created_at is None:
+                created_at = _mapping_or_attr_get(last_response, "created")
+        if created_at is None and last_event is not None:
+            created_at = _mapping_or_attr_get(last_event, "created_at")
+            if created_at is None:
+                created_at = _mapping_or_attr_get(last_event, "created")
+        try:
+            response_payload["created_at"] = int(created_at)
+        except (TypeError, ValueError):
+            response_payload["created_at"] = int(__import__("time").time())
+        last_model = (
+            _mapping_or_attr_get(last_response, "model")
+            if last_response is not None
+            else None
+        )
+        if last_model is None and last_event is not None:
+            last_model = _mapping_or_attr_get(last_event, "model")
+        if isinstance(last_model, str) and last_model:
+            response_payload["model"] = last_model
+        injected = {
+            "type": event_type,
+            "response": response_payload,
+        }
+        serialized = _serialize_responses_adapter_response(injected)
+        return f"event: {event_type}\ndata: {serialized}\n\n"
+
     try:
         async for event in responses_iterator:
             has_emitted = True
+            last_event = event
             event_type = _mapping_or_attr_get(event, "type")
+            if hasattr(event_type, "value"):
+                event_type = event_type.value
+            if (
+                isinstance(event_type, str)
+                and event_type in RESPONSES_API_TERMINAL_STREAM_EVENTS
+            ):
+                has_terminal = True
             serialized = _serialize_responses_adapter_response(event)
             if isinstance(event_type, str) and event_type:
                 yield f"event: {event_type}\ndata: {serialized}\n\n"
                 continue
             yield f"data: {serialized}\n\n"
+        if not has_terminal:
+            yield _injected_terminal_sse(
+                event_type="response.completed",
+                status="completed",
+            )
         if on_complete is not None:
             on_complete()
         yield "data: [DONE]\n\n"
@@ -233,6 +300,8 @@ async def _responses_sse_from_iterator(
             if terminal_event is not None:
                 yield terminal_event
                 return
+        # Post-created iterator errors are real adapter failures. Do not
+        # paper them over as empty Ohmypi response.completed success.
         raise
     finally:
         close_targets = (

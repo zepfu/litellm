@@ -3205,20 +3205,46 @@ def _normalize_aawm_route_log_known_client_name(name: str) -> str:
     return name
 
 
+def _ohmypi_display_client_product(cleaned: str) -> Optional[str]:
+    """Map Ohmypi display names. First-token parsing would turn 'Oh My Pi' into 'Oh'."""
+    lowered = " ".join(cleaned.replace("_", " ").replace("-", " ").split()).lower()
+    prefix = "oh my pi"
+    if lowered == prefix:
+        return "Ohmypi"
+    if lowered.startswith(prefix + "/"):
+        version = cleaned.split("/", 1)[1].strip().split()[0]
+        if version and _is_aawm_route_log_slug(version):
+            return f"Ohmypi/{version}"
+        return None
+    return None
+
+
+def _is_aawm_route_log_runtime_user_agent_client(name: str) -> bool:
+    return name.lower().replace("_", "-") in {"bun"}
+
+
 def _normalize_aawm_route_log_client_product(value: Any) -> Optional[str]:
     cleaned = _clean_aawm_route_log_field(value)
     if not cleaned or len(cleaned) > _AAWM_ROUTE_LOG_MAX_IDENTITY_CHARS:
         return None
+
+    ohmypi_label = _ohmypi_display_client_product(cleaned)
+    if ohmypi_label:
+        return ohmypi_label
 
     product = cleaned.split()[0].strip("()")
     if not product or any(char in product for char in " @;,=:{}`[]<>|\\"):
         return None
     if "/" in product:
         name, version = product.split("/", 1)
-        if _is_aawm_route_log_slug(name) and _is_aawm_route_log_slug(version):
-            return f"{_normalize_aawm_route_log_known_client_name(name)}/{version}"
-        return None
+        if not (_is_aawm_route_log_slug(name) and _is_aawm_route_log_slug(version)):
+            return None
+        if _is_aawm_route_log_runtime_user_agent_client(name):
+            return None
+        return f"{_normalize_aawm_route_log_known_client_name(name)}/{version}"
     if _is_aawm_route_log_slug(product):
+        if _is_aawm_route_log_runtime_user_agent_client(product):
+            return None
         return _normalize_aawm_route_log_known_client_name(product)
     return None
 
@@ -3381,8 +3407,8 @@ def _get_aawm_route_log_client_product_label(
     if client_name and client_version:
         return f"{client_name}/{client_version}"
     if client_name == "Ohmypi" and not client_version:
-        # A lossy direct label like "Oh" (from x-aawm-client="Oh My Pi") hides
-        # the version the user-agent still carries; prefer it only for Ohmypi.
+        # Prefer omp / Oh My Pi user-agents. Bun/... is the Ohmypi runtime,
+        # not the TUI product; the product normalizer drops it.
         user_agent_label = _get_case_insensitive_header_value(
             headers,
             ("user-agent",),

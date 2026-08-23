@@ -18,6 +18,9 @@ from urllib.parse import parse_qsl, urlencode, urlparse
 from fastapi import Request
 
 from litellm.proxy.aawm_route_logging import (
+    _is_aawm_route_log_runtime_user_agent_client,
+    _normalize_aawm_route_log_known_client_name,
+    _ohmypi_display_client_product,
     _select_aawm_route_host_attribution_for_request,
     aresolve_aawm_route_host_attribution,
     resolve_aawm_route_host_attribution,
@@ -253,19 +256,27 @@ def _normalize_auto_agent_alias_client_product(value: Any) -> Optional[str]:
     cleaned = _clean_codex_auth_value(value)
     if cleaned is None:
         return None
+    # Map "Oh My Pi" before first-token split; otherwise it becomes "Oh".
+    ohmypi_label = _ohmypi_display_client_product(cleaned)
+    if ohmypi_label:
+        return ohmypi_label
     product = cleaned.split()[0].strip("()")
     if not product:
         return None
     if "/" not in product:
+        if _is_aawm_route_log_runtime_user_agent_client(product):
+            return None
+        mapped_name = _normalize_aawm_route_log_known_client_name(product)
+        if mapped_name == "Ohmypi":
+            return mapped_name
         return product
     name, version = product.split("/", 1)
+    if _is_aawm_route_log_runtime_user_agent_client(name):
+        return None
     normalized_name = name.lower().replace("_", "-")
-    if normalized_name in {"codex", "codex-cli", "codex-tui", "codex-cli-rs"}:
-        name = "Codex"
-    elif normalized_name in {"claude", "claude-cli", "claude-code"}:
-        name = "Claude"
-    elif normalized_name in {"grok", "grok-build", "grok-pager"}:
-        name = "Grok"
+    mapped_name = _normalize_aawm_route_log_known_client_name(name)
+    if mapped_name != name:
+        name = mapped_name
     elif normalized_name in {"qwen", "qwen-code", "qwen-code-cli"}:
         name = "Qwen"
     elif normalized_name in {"kimi", "kimi-code", "kimi-code-cli"}:
@@ -303,20 +314,49 @@ def _extract_auto_agent_alias_client_product_label(
             "request_metadata runtime not configured: "
             "missing get_codex_auto_agent_header"
         )
+    name = None
+    for header_name in (
+        "x-aawm-client-name",
+        "x-litellm-client-name",
+        "x-client-name",
+    ):
+        name = _normalize_auto_agent_alias_client_product(
+            _get_codex_auto_agent_header(headers, header_name)
+        )
+        if name:
+            break
+    version = None
+    for header_name in (
+        "x-aawm-client-version",
+        "x-litellm-client-version",
+        "x-client-version",
+    ):
+        version = _clean_codex_auth_value(
+            _get_codex_auto_agent_header(headers, header_name)
+        )
+        if version:
+            break
+    if name and version and "/" not in name:
+        return f"{name}/{version}"
+    if name and "/" in name:
+        return name
     for header_name in (
         "x-aawm-client",
         "x-litellm-client",
         "x-client-name-version",
-        "user-agent",
     ):
         value = _normalize_auto_agent_alias_client_product(
             _get_codex_auto_agent_header(headers, header_name)
         )
-        if value and not (
-            header_name == "user-agent"
-            and _normalize_tui_family(value) == "qwen"
-        ):
+        if value:
             return value
+    if name:
+        return name
+    value = _normalize_auto_agent_alias_client_product(
+        _get_codex_auto_agent_header(headers, "user-agent")
+    )
+    if value and _normalize_tui_family(value) != "qwen":
+        return value
     return None
 
 
@@ -478,6 +518,18 @@ def install(host_globals: dict) -> None:
         (
             "_set_aawm_route_host_attribution_request_state",
             _set_aawm_route_host_attribution_request_state,
+        ),
+        (
+            "_ohmypi_display_client_product",
+            _ohmypi_display_client_product,
+        ),
+        (
+            "_normalize_aawm_route_log_known_client_name",
+            _normalize_aawm_route_log_known_client_name,
+        ),
+        (
+            "_is_aawm_route_log_runtime_user_agent_client",
+            _is_aawm_route_log_runtime_user_agent_client,
         ),
         ("_normalize_tui_family", _normalize_tui_family),
     ):

@@ -527,3 +527,180 @@ async def test_capacity_and_upstream_errors_keep_status_and_redact_secrets(
         status, text = await _run_status(expected_status)
         assert status == expected_status
         assert _FIXTURE_JWT not in text
+
+
+def _nous_missing_auth_text(exc: BaseException) -> str:
+    parts = [str(exc), str(getattr(exc, "message", "") or "")]
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict):
+        parts.append(json.dumps(detail))
+        error = detail.get("error")
+        if isinstance(error, dict):
+            parts.append(str(error.get("message") or ""))
+            parts.append(str(error.get("code") or ""))
+    elif detail is not None:
+        parts.append(str(detail))
+    return "\n".join(parts)
+
+
+def _assert_nous_jwt_failure_is_candidate_unavailable(exc: BaseException) -> None:
+    from litellm.proxy._types import ProxyException
+
+    assert isinstance(exc, ProxyException)
+    assert str(getattr(exc, "code", "") or "") == "429"
+    assert getattr(exc, "type", None) == "rate_limit_error"
+    detail = getattr(exc, "detail", None)
+    assert isinstance(detail, dict), f"expected detail dict, got {detail!r}"
+    error = detail.get("error")
+    assert isinstance(error, dict)
+    assert error.get("code") == "aawm_codex_auto_agent_candidate_unavailable"
+    text = _nous_missing_auth_text(exc)
+    assert "/root/.hermes" not in text
+    assert "/root/" not in text
+    assert ".hermes/auth.json" not in text
+    assert "No such file or directory" not in text
+
+
+async def _run_nous_jwt_load_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    jwt_error: BaseException,
+) -> None:
+    import litellm
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from litellm.proxy._types import ProxyException
+    from litellm.secret_managers import hermes_nous_auth
+
+    handler = getattr(
+        codex_candidate_calls,
+        "_handle_codex_nous_chat_completions_adapter_route",
+        None,
+    )
+    assert handler is not None, "missing _handle_codex_nous_chat_completions_adapter_route"
+
+    def _close_logging_coroutine(async_coroutine, metadata=None):
+        _ = metadata
+        close = getattr(async_coroutine, "close", None)
+        if callable(close):
+            close()
+
+    def _raise_jwt_error(**kwargs: Any) -> str:
+        _ = kwargs
+        raise jwt_error
+
+    acompletion_calls: list[dict[str, Any]] = []
+
+    async def _fake_acompletion(**kwargs: Any) -> dict[str, Any]:
+        acompletion_calls.append(kwargs)
+        raise AssertionError("litellm.acompletion must not run when Nous JWT is missing")
+
+    monkeypatch.setattr(
+        GLOBAL_LOGGING_WORKER,
+        "ensure_initialized_and_enqueue",
+        _close_logging_coroutine,
+    )
+    monkeypatch.setattr(hermes_nous_auth, "load_nous_invoke_jwt", _raise_jwt_error)
+    monkeypatch.setattr(
+        "litellm.secret_managers.hermes_nous_auth.load_nous_invoke_jwt",
+        _raise_jwt_error,
+    )
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setattr(litellm, "acompletion", _fake_acompletion)
+
+    def _validate_outgoing_egress(**kwargs: Any) -> None:
+        raise AssertionError(
+            "validate_outgoing_egress must not run when Nous JWT is missing"
+        )
+
+    host: dict[str, Any] = {
+        "__builtins__": __builtins__,
+        "litellm": litellm,
+        "httpx": httpx,
+        "Response": Response,
+        "HttpPassThroughEndpointHelpers": MagicMock(
+            validate_outgoing_egress=_validate_outgoing_egress
+        ),
+        "_annotate_request_scope_for_adapted_access_log": MagicMock(),
+        "_build_adapted_route_rollup_kwargs": MagicMock(return_value={}),
+        "_emit_adapted_route_access_log": MagicMock(),
+        "_add_route_family_logging_metadata": lambda body, family: body,
+        "_get_proxy_shared_aiohttp_session": lambda: None,
+        "BaseOpenAIPassThroughHandler": MagicMock(
+            _assemble_headers=MagicMock(
+                return_value={"Authorization": f"Bearer {_FIXTURE_JWT}"}
+            )
+        ),
+    }
+    codex_candidate_calls.install(host)
+    host["HttpPassThroughEndpointHelpers"] = MagicMock(
+        validate_outgoing_egress=_validate_outgoing_egress
+    )
+    bound_handler = host.get(
+        "_handle_codex_nous_chat_completions_adapter_route",
+        handler,
+    )
+    try:
+        try:
+            result = await bound_handler(
+                endpoint="/v1/responses",
+                request=_request(),
+                fastapi_response=MagicMock(spec=Response),
+                user_api_key_dict=MagicMock(),
+                prepared_request_body={
+                    "model": "nous/stealth/ox-alpha",
+                    "input": "Reply with exactly the word PONG.",
+                    "stream": True,
+                },
+                adapter_model=_ADAPTER_MODEL,
+                use_alias_candidate_probe=True,
+            )
+        except ProxyException as exc:
+            _assert_nous_jwt_failure_is_candidate_unavailable(exc)
+        except FileNotFoundError as exc:
+            raise AssertionError(
+                "FileNotFoundError escaped unwrapped from "
+                "_handle_codex_nous_chat_completions_adapter_route"
+            ) from exc
+        except RuntimeError as exc:
+            raise AssertionError(
+                "RuntimeError escaped unwrapped from "
+                "_handle_codex_nous_chat_completions_adapter_route"
+            ) from exc
+        else:
+            status_code = getattr(result, "status_code", None)
+            assert status_code != 500, (
+                "missing Nous Hermes JWT must not return HTTP 500; "
+                f"got {result!r}"
+            )
+            raise AssertionError(
+                "missing Nous Hermes JWT must raise ProxyException "
+                f"(candidate unavailable), got {result!r}"
+            )
+        assert acompletion_calls == []
+    finally:
+        await GLOBAL_LOGGING_WORKER.stop()
+        await litellm.close_litellm_async_clients()
+
+
+@pytest.mark.asyncio
+async def test_nous_missing_hermes_auth_is_candidate_unavailable_not_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _run_nous_jwt_load_failure(
+        monkeypatch,
+        jwt_error=FileNotFoundError(
+            "[Errno 2] No such file or directory: '/root/.hermes/auth.json'"
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_nous_missing_jwt_runtimeerror_is_candidate_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _run_nous_jwt_load_failure(
+        monkeypatch,
+        jwt_error=RuntimeError(
+            "Nous Portal invoke JWT is missing from Hermes auth"
+        ),
+    )
