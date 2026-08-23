@@ -136,7 +136,9 @@ def test_should_load_yaml_includes_and_compiled_aliases(hv, config) -> None:
         "Error: 404",
     ]
     assert select_model["reply_needles"] == ["※ recap:"] + provider_404
+    assert select_model["reply_needles"] == _OHMYPI_MODEL_REPLY_NEEDLES
     assert "PONG" not in select_model["reply_needles"]
+    assert "PONG" not in _OHMYPI_MODEL_REPLY_NEEDLES
 
 
 def test_should_deep_merge_overlay(hv, tmp_path: Path) -> None:

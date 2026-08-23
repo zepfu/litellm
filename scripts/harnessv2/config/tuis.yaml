@@ -104,12 +104,12 @@ tuis:
         # Long alias ids can paint this truncated chrome. Not a bare {model}
         # needle: "work" is a substring of "work-other".
         - "AAWM alias / model {model}"
-      # Recap is wait-only. A standalone exact PONG line (not the prompt
-      # echo) still completes the wait via the H-6 exact-line exception;
-      # "the word PONG" in recent-session titles is not a hit.
+      # Recap is wait-only. Exact PONG is NOT a substring wait needle:
+      # recent-session titles can contain the word PONG. Live PONG is a
+      # standalone exact pane line after a prompt echo newer than the
+      # pre-send watermark (H-6 / `_pane_exact_pong`).
       reply_needles:
         - "※ recap:"
-        - "PONG"
         - "No endpoints found for"
         - "404 Not Found"
         - "status code 404"
