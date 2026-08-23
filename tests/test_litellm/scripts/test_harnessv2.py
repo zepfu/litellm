@@ -540,6 +540,57 @@ def test_should_accept_ohmypi_tui_rollup_with_name_version_and_repo(
     assert any("Ohmypi[" in item and "#" in item for item in scan["rollup_hits"])
 
 
+def test_should_accept_ohmypi_tui_rollup_when_concurrent_aawm_infrastructure_headers_are_present(
+    hv, config
+) -> None:
+    text = (
+        _FIXTURES / "ohmypi_identity_ok_with_concurrent_aawm_infrastructure.txt"
+    ).read_text(encoding="utf-8")
+    scan = hv.scan_log_text(
+        text,
+        config,
+        require_rollup=True,
+        tui="ohmypi",
+    )
+    assert scan["ok"] is True
+    assert scan["failures"] == []
+    assert any(
+        "litellm#Ohmypi[" in item and "@" in item for item in scan["rollup_hits"]
+    )
+    assert any("aawm-infrastructure@" in item for item in scan["rollup_hits"])
+
+
+def test_should_still_fail_ohmypi_tui_rollup_when_unlabeled_ohmypi_mixes_with_labeled_ohmypi(
+    hv, config
+) -> None:
+    text = (
+        "20260823 17:35:57 litellm#Ohmypi[17.4.2]@thoth /v1/chat/completions\n"
+        " - gpt-5.6-sol(sota-openai):max - Turns: 5\n"
+        "20260823 17:36:00 Oh@thoth /openai_passthrough/v1/responses\n"
+        " - gpt-5.6-sol(sota-openai):max - Turns: 1\n"
+        "20260823 17:36:01 Bun[1.3.14]@thoth /v1/chat/completions\n"
+        " - openrouter/qwen/qwen3.6-flash:none - Turns: 4\n"
+        "20260823 17:36:02 litellm@thoth /v1/chat/completions\n"
+        " - gpt-5.6-sol:xhigh - Turns: 3\n"
+    )
+    scan = hv.scan_log_text(
+        text,
+        config,
+        require_rollup=True,
+        tui="ohmypi",
+    )
+    assert scan["ok"] is False
+    joined = " ".join(scan["failures"])
+    assert "Ohmypi" in joined or "ohmypi" in joined.lower()
+    assert any("Oh@" in item for item in scan["rollup_hits"])
+    assert any("Bun[" in item for item in scan["rollup_hits"])
+    assert any(
+        item.startswith("20260823 17:36:02 litellm@thoth")
+        for item in scan["rollup_hits"]
+    )
+    assert any("litellm#Ohmypi[" in item for item in scan["rollup_hits"])
+
+
 def test_should_warn_not_fail_on_expected_work_miss_traceback(hv, config) -> None:
     text = (
         "LiteLLM Proxy:ERROR: You passed in model=work. There are no healthy "

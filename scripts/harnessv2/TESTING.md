@@ -1,6 +1,6 @@
 # Harness v2 — as built and testing process
 
-Date: 2026-08-22
+Date: 2026-08-23
 
 This is the operator document for the YAML/JSON-first LiteLLM acceptance
 harness in `scripts/harnessv2/`. It describes what is built, what it is
@@ -97,7 +97,7 @@ scripts/harnessv2/
     tuis.yaml             # Ohmypi driver contract; stubs; Claude out
     models.yaml           # compiled aliases, groups, skip prefixes
     kinds.yaml            # platform / catalog / model / orchestration
-    checks.yaml           # health, HTTP suite, leftover uvicorn, JSONL
+    checks.yaml           # health, HTTP suite, leftover uvicorn, JSONL, Ohmypi rollup identity
     prompts.yaml
     prompts/pong.txt
     prompts/orchestration.txt
@@ -113,7 +113,7 @@ scripts/harnessv2/
     artifact.py           # JSON artifact + durable JSONL + SHA stamp
     pane.py               # pane needles; ignore needles in sent prompt
     envscrub.py           # child env allow/deny
-  fixtures/logs/          # leftover uvicorn / ASGI / clean rollup
+  fixtures/logs/          # leftover uvicorn / ASGI / clean rollup / Ohmypi identity
 tests/test_litellm/scripts/test_harnessv2.py
 ```
 
@@ -275,12 +275,15 @@ For each selected alias the driver:
 baseline `platform` → `catalog` → `orchestration` walk.
 
 Post-TUI `docker_logs` **requires** an AAWM route-rollup header
-(`YYYYMMDD HH:MM:SS … /path`). A recap without a real Responses POST +
-rollup is not pass evidence.
+(`YYYYMMDD HH:MM:SS … /path`) plus the Ohmypi identity gate in §7.
+A recap without a real Responses POST + rollup is not pass evidence.
 
 ### 5.4 `orchestration` (interactive Ohmypi)
 
 Steps: `health` → `tui_orchestration` → `docker_logs` → `error_jsonl`.
+
+Post-TUI `docker_logs` uses the same `require_rollup` + Ohmypi identity
+gate as model kind (§7). `child_evidence.ok` is not docker_logs pass.
 
 Default parent: `sota-openai` (group `all-sota`). Default children are
 the nine `orchestration_children`: `basic`, `work`, `expert`, `sota`,
@@ -368,7 +371,7 @@ From `config/tuis.yaml`:
 |---|---|
 | Binary | `omp` (wrapper `ompla`) |
 | Min version | 17.3.8 |
-| Overlay | Identity first, then operator: `PI_CONFIG_FILES=<session_dir>/hv2-ohmypi-identity.yml:$HOME/.omp/agent/litellm-alpha.yml`. Ohmypi `task` children inherit tmux env, not parent `--config`. Identity first so those children inherit `x-aawm-client*` headers; parent still gets `--config`. Do not revert this to operator-only `PI_CONFIG_FILES`. |
+| Overlay | Identity first, then operator: `PI_CONFIG_FILES=<session_dir>/hv2-ohmypi-identity.yml:$HOME/.omp/agent/litellm-alpha.yml`. Ohmypi `task` children inherit tmux env, not parent `--config`. Identity first so those children inherit `x-aawm-client*` headers; parent still gets `--config`. Do not revert this to operator-only `PI_CONFIG_FILES`. That overlay is what stamps rollup as `litellm#Ohmypi[<version>]@<host>`. |
 | CWD | `/tmp/omp-alpha-workspace` |
 | Session dir | `/tmp/omp-alpha-sessions/hv2-<alias>` (identity overlay stays in `/tmp/omp-alpha-sessions`) |
 | tmux socket | `tmux37` |
@@ -450,6 +453,34 @@ Everything else is a halt, including Ohmypi discovery probes:
 Startup lines (`Started server process`, `Application startup complete`,
 `Uvicorn running on`) are not ACCESS lines and are ignored.
 
+Ohmypi TUI kinds (`model`, `orchestration`) set `require_rollup` and
+`tui=ohmypi`. Pass then also requires at least one rollup header
+matching `litellm#Ohmypi[<version>]@<host>` (example:
+`20260823 17:36:58 litellm#Ohmypi[17.4.2]@thoth /openai_passthrough/v1/responses`).
+That stamp comes from the identity overlay in §6. Platform does not
+require rollup.
+
+Unlabeled Ohmypi still fails even when a labeled Ohmypi row is in the
+same window. Concurrent labeled Ohmypi does not excuse these:
+
+- `Oh@host` (`Oh@thoth`)
+- `Bun[...]@host` (`Bun[1.3.14]@thoth`)
+- `litellm@host` (`litellm@thoth` — this repo missing `#Ohmypi[ver]`)
+
+Concurrent other-workspace headers on the shared alpha instance are
+**not** unlabeled Ohmypi. Example:
+`aawm-infrastructure@thoth /openai_passthrough/responses`. When Ohmypi
+identity is present, those known-repo `@host` rows are ignored. The
+allowlist is `checks.yaml` `logs.rollup.concurrent_workspace_repos`
+and must **not** include `litellm`. If the window has only
+other-workspace rows and no `litellm#Ohmypi[...]@...`, still fail.
+
+Identity miss fails `docker_logs` (`ok: false`). It is not
+leftover-uvicorn halt (`halted_on_logging_regression`).
+
+Fixtures: `ohmypi_identity_ok.txt`, `ohmypi_identity_miss.txt`,
+`ohmypi_identity_ok_with_concurrent_aawm_infrastructure.txt`.
+
 Expected traceback signature (warning, not fail): `model=work` with
 `There are no healthy deployments` on the generic `/v1/chat/completions`
 miss probe.
@@ -510,8 +541,10 @@ is plain Python 3.
 ```
 
 Covers argparse, YAML load, docker_guard refuse of `:4000`/`:4001`,
-leftover-uvicorn invert, Ohmypi forbid `-p`, dry-run plans, H-6 prompt
-substring needles.
+leftover-uvicorn invert, Ohmypi forbid `-p`, Ohmypi rollup identity
+(`require_rollup` + `tui=ohmypi`, including concurrent
+`aawm-infrastructure@thoth`), dry-run plans, H-6 prompt substring
+needles.
 
 ### Dry-run a kind
 
@@ -575,14 +608,16 @@ Repeat `--model` / comma-separated ids, or omit it to expand `all`
 
 ### Live orchestration
 
-Same leftover-uvicorn gate. Recap is wait-only, never pass evidence:
-`tui_orchestration` fails unless `child_evidence.ok` is true for the
-nine orchestration children (`basic`, `work`, `expert`, `sota`,
-`sota-xai`, `sota-alibaba`, `sota-moonshot`, `sota-zai`, `auto-review`).
-Spawn name is `auto-review`, not `codex-auto-review`. Historical
-recap-only `ok: true` artifacts are stale relative to the current gate.
-Leave the dedicated parent session open after `_step_tui_orchestration`.
-Baseline leftover is that one orch parent session.
+Same leftover-uvicorn gate **and** the Ohmypi identity rollup gate
+(§7). Recap is wait-only, never pass evidence: `tui_orchestration`
+fails unless `child_evidence.ok` is true for the nine orchestration
+children (`basic`, `work`, `expert`, `sota`, `sota-xai`,
+`sota-alibaba`, `sota-moonshot`, `sota-zai`, `auto-review`). Spawn
+name is `auto-review`, not `codex-auto-review`. Historical recap-only
+`ok: true` artifacts are stale relative to the current gate. Leave
+the dedicated parent session open after `_step_tui_orchestration`.
+Baseline leftover is that one orch parent session. `child_evidence.ok`
+without green post-TUI `docker_logs` is not a full orch pass.
 
 ```text
 python scripts/harnessv2/run.py \
@@ -639,9 +674,13 @@ python scripts/harnessv2/run.py \
    `work`, `expert`, `sota`, `sota-xai`, `sota-alibaba`,
    `sota-moonshot`, `sota-zai`, `auto-review`; spawn name
    `auto-review`, not `codex-auto-review`). Recap is wait-only, never
-   pass evidence. Leave the dedicated parent session open; inspect
-   with `tmux -L tmux37 ls` / `attach -t <hv2-ohmypi-…>`. Baseline
-   leftover is that one orch parent session, not 4–5 and not 12.
+   pass evidence. Post-TUI `docker_logs` still needs
+   `litellm#Ohmypi[<version>]@<host>` (concurrent
+   `aawm-infrastructure@thoth` on the shared alpha instance is not
+   unlabeled Ohmypi; see §7). Leave the dedicated parent session
+   open; inspect with `tmux -L tmux37 ls` / `attach -t <hv2-ohmypi-…>`.
+   Baseline leftover is that one orch parent session, not 4–5 and not
+   12.
 9. Keep `TEST_HARNESS.md` / this document / the plan file in sync when
    halt signatures or spawn contract change.
 
@@ -650,7 +689,7 @@ are visible to the bind-mount immediately after watchfiles reload.
 
 ---
 
-## 11. Current status (2026-08-22)
+## 11. Current status (2026-08-23)
 
 Proven on `litellm-alpha` (do not re-claim without a new artifact):
 
@@ -660,7 +699,7 @@ Proven on `litellm-alpha` (do not re-claim without a new artifact):
 | CFG-023 catalog GET leftover uvicorn | 0 leftover ACCESS |
 | T-5 leftover uvicorn (discovery probes) | closed: post-cursor leftover ACCESS except `/health*` is **0**, including native `GET /v2/model/info` **500**. Worker reloaded via watchfiles after `_logging.py` mtime `2026-08-22T02:36:57Z`. Cursor `2026-08-22T02:44:06Z`. Ohmypi TUI was not used for this proof. |
 | `--test model` `work` / `basic` / `expert` / `sota` / `work-other` | passed: real Responses POST + rollup, `halted: false` |
-| `--test orchestration --orchestration-parent sota-openai` | four-child artifact (`/tmp/grok-goal-4ce5b5ad827f/implementer/hv2-orch.json`) is historical, not the current nine-child gate. Recap-only `ok: true` and the 2026-08-22T06:17 premature-close (`hv2-orch-premature-close.json`, nested `date` without `yield`) are not spawn proof. Current gate is `child_evidence.ok` for the nine orchestration children; recap is wait-only. |
+| `--test orchestration --orchestration-parent sota-openai` | Live 2026-08-23 nine-child orch on `cceab88cd3`: TUI `child_evidence.ok` for all nine children; leftover session `hv2-ohmypi-sota-openai-3839403` left open. `docker_logs` failed on concurrent `aawm-infrastructure@thoth` until the §7 concurrent-workspace filter. Do **not** treat that live artifact as a full orch pass until `docker_logs` is green. Four-child artifact (`/tmp/grok-goal-4ce5b5ad827f/implementer/hv2-orch.json`) is historical. Recap-only `ok: true` and the 2026-08-22T06:17 premature-close (`hv2-orch-premature-close.json`, nested `date` without `yield`) are not spawn proof. Current TUI gate is `child_evidence.ok` for the nine orchestration children; recap is wait-only. |
 | T-1 unhashable `type` list / ASGI | closed |
 | T-4 `UnicodeDecodeError` truncated UTF-8 peek | closed (incremental decoder `errors="ignore"`) |
 | H-6 wait needle | closed (`※ recap:`; ignore needles contained in the sent prompt) |
@@ -672,6 +711,7 @@ Proven on `litellm-alpha` (do not re-claim without a new artifact):
 | Gap | Notes |
 |---|---|
 | Remaining `--test model` | optional, not baseline. Compiled aliases through `sota-zai` completed on a halted `all` row; `codex-auto-review` resumed after truncated-chrome + ASGI wrap (`hv2-model.json`). `--model all` now also expands OMP-facing `auto-review`. Sequential `--model` rows that together cover `all` are valid. Do not treat the halted `all` JSONL as a full pass. |
+| Nine-child orch `docker_logs` | Live 2026-08-23 on `cceab88cd3` had TUI `child_evidence.ok` for all nine children and leftover `hv2-ohmypi-sota-openai-3839403`. `docker_logs` failed on concurrent `aawm-infrastructure@thoth` until the §7 filter. Do **not** treat that artifact as a full orch pass until `docker_logs` is green. Identity miss is a `docker_logs` fail, not leftover-uvicorn halt. |
 | Native `/v2/model/info` HTTP 500 body | `DB not connected` when `prisma_client is None`. Separate from leftover ACCESS. T-5 logging-halt does **not** require this body to become 200. |
 | Anthropic/Claude TUI | deferred (account canceled); still out of scope for v2 |
 

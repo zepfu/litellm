@@ -18,6 +18,10 @@ _UVICORN_ACCESS_PATH = re.compile(
 _OHMYPI_ROLLUP_IDENTITY = re.compile(
     r"\S+#Ohmypi\[[^\]\s]+\]@\S+",
 )
+# Repo token is the \S+ immediately before @ after the rollup timestamp.
+_ROLLUP_REPO_BEFORE_AT = re.compile(
+    r"^\d{8} \d{2}:\d{2}:\d{2}(?: \[EARLY\])? (\S+)@"
+)
 
 
 def _logs_spec(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -52,6 +56,17 @@ def leftover_uvicorn_regex(config: Mapping[str, Any]) -> re.Pattern[str] | None:
 def leftover_uvicorn_allow_paths(config: Mapping[str, Any]) -> set[str]:
     leftover = _leftover_spec(config)
     return {item for item in as_str_list(leftover.get("allow_paths")) if item}
+
+
+def _is_concurrent_workspace_rollup(hit: str, repos: set[str]) -> bool:
+    """True for <repo>@host /path headers from other AAWM workspaces, not litellm."""
+    if not repos:
+        return False
+    match = _ROLLUP_REPO_BEFORE_AT.search(hit)
+    if match is None:
+        return False
+    repo = match.group(1)
+    return repo != "litellm" and repo in repos
 
 
 def _line_at(text: str, start: int, end: int) -> str:
@@ -129,13 +144,25 @@ def scan_log_text(
     if require_rollup and header_regex and not rollup_hits:
         failures.append("expected AAWM route-rollup header was not found in docker logs")
     if require_rollup and rollup_hits and tui == "ohmypi":
+        concurrent_repos = {
+            repo
+            for repo in as_str_list(rollup.get("concurrent_workspace_repos"))
+            if repo and repo != "litellm"
+        }
+        has_ohmypi_identity = any(
+            _OHMYPI_ROLLUP_IDENTITY.search(hit) for hit in rollup_hits
+        )
         unidentified = [
-            hit for hit in rollup_hits if not _OHMYPI_ROLLUP_IDENTITY.search(hit)
+            hit
+            for hit in rollup_hits
+            if not _OHMYPI_ROLLUP_IDENTITY.search(hit)
+            and not _is_concurrent_workspace_rollup(hit, concurrent_repos)
         ]
-        if unidentified:
+        if not has_ohmypi_identity or unidentified:
+            suffix = f": {'; '.join(unidentified)}" if unidentified else ""
             failures.append(
                 "Ohmypi rollup headers lacked a client identity "
-                "(repository#Ohmypi[version]@host): " + "; ".join(unidentified)
+                "(repository#Ohmypi[version]@host)" + suffix
             )
 
     traceback_hits = [needle for needle in traceback_needles if needle and needle in text]

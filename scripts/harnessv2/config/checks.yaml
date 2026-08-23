@@ -119,6 +119,21 @@ checks:
       header_regex: '^\d{8} \d{2}:\d{2}:\d{2}(?: \[EARLY\])? \S+ /\S+'
       required_after_tui: true
       required_on_platform: false
+      concurrent_workspace_repos:
+        - aawm-infrastructure
+        - aawm
+        - aawm-tap
+        - aawm-devtools
+        - dashboard-shell
+        - aegis
+        - pytest-testable
+        - pytest-classifier
+        - aawm-transcript
+        - aawm-hook
+        - aawm-tap-dashboard
+        - aawm-observe
+        - mcp-pg
+        - sluice
     attribution_scoped_substrings:
       - "Task exception was never retrieved"
       - "Exception in ASGI application"

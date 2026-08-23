@@ -1,0 +1,6 @@
+20260823 17:35:57 aawm-infrastructure@thoth /openai_passthrough/responses
+ - gpt-5.6-sol:xhigh - Turns: 3
+ - codex-auto-review:low - Turns: 5
+20260823 17:35:57 litellm#Ohmypi[17.4.2]@thoth /v1/chat/completions
+20260823 17:36:58 aawm-infrastructure@thoth /openai_passthrough/responses
+20260823 17:36:58 litellm#Ohmypi[17.4.2]@thoth /openai_passthrough/v1/responses
