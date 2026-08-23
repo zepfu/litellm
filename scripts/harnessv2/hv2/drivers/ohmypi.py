@@ -90,6 +90,13 @@ class OhmypiDriver:
         }
         if extra:
             overlay.update({str(k): str(v) for k, v in extra.items()})
+        # Ohmypi `task` children inherit tmux env, not parent `--config`.
+        identity = str(self.write_identity_overlay())
+        operator = str(overlay.get("PI_CONFIG_FILES") or "")
+        if not operator or operator == identity:
+            overlay["PI_CONFIG_FILES"] = identity
+        else:
+            overlay["PI_CONFIG_FILES"] = f"{identity}:{operator}"
         return scrubbed_child_env(self.config, overlay)
 
     def model_selector(self, model: str, *, lane: str | None = None) -> str:
@@ -239,6 +246,11 @@ class OhmypiDriver:
             "work",
             "expert",
             "sota",
+            "sota-xai",
+            "sota-alibaba",
+            "sota-moonshot",
+            "sota-zai",
+            "auto-review",
         ]
         written: list[str] = []
         missing: list[str] = []

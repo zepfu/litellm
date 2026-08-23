@@ -27,6 +27,11 @@ tuis:
       - work
       - expert
       - sota
+      - sota-xai
+      - sota-alibaba
+      - sota-moonshot
+      - sota-zai
+      - auto-review
     tmux:
       socket: tmux37
       session: omp-alpha-test

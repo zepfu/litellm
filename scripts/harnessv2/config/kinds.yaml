@@ -1,5 +1,8 @@
 # Kind steps. Adding a model or prompt is a YAML edit. Adding a *type* of
 # step requires Python.
+# Baseline walk is platform → catalog → orchestration.
+# `--test model` remains available (`--model` / `--model all`) but is not
+# the default full-suite step.
 kinds:
   platform:
     requires_tui: false
@@ -24,7 +27,7 @@ kinds:
       - type: error_jsonl
   model:
     requires_tui: true
-    description: Interactive Ohmypi turn per compiled alias or group
+    description: Optional interactive Ohmypi turn per compiled alias or group; not a baseline full-suite step
     default_models: all
     require_explicit_model: false
     steps:
@@ -34,7 +37,7 @@ kinds:
       - type: error_jsonl
   orchestration:
     requires_tui: true
-    description: Ohmypi parent fanout to basic/work/expert/sota
+    description: Ohmypi sota parent fanout to baseline children including extra aliases
     default_parent_group: all-sota
     default_parent: sota-openai
     default_children_group: orchestration_children

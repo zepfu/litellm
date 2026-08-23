@@ -15,6 +15,17 @@ import pytest
 _REPO = Path(__file__).resolve().parents[3]
 _HV2 = _REPO / "scripts" / "harnessv2"
 _FIXTURES = _HV2 / "fixtures" / "logs"
+_ORCH_BASELINE_CHILDREN = (
+    "basic",
+    "work",
+    "expert",
+    "sota",
+    "sota-xai",
+    "sota-alibaba",
+    "sota-moonshot",
+    "sota-zai",
+    "auto-review",
+)
 
 if str(_HV2) not in sys.path:
     sys.path.insert(0, str(_HV2))
@@ -143,10 +154,26 @@ def test_should_expand_model_groups_from_yaml(hv, config) -> None:
     all_models = hv.expand_group("all", config)
     assert all_models == hv.compiled_aliases(config)
     assert "claude-opus-5" not in all_models
+    assert "auto-review" in all_models
+    assert "auto-review" in hv.compiled_aliases(config)
+    assert "codex-auto-review" in hv.compiled_aliases(config)
     picker = hv.expand_group("catalog_picker_sample", config)
     assert picker == ["work", "sota-zai"]
     children = hv.expand_group("orchestration_children", config)
-    assert children == ["basic", "work", "expert", "sota"]
+    assert children == list(_ORCH_BASELINE_CHILDREN)
+    assert "auto-review" in children
+    assert "codex-auto-review" not in children
+    assert "work-other" not in children
+    assert "sota-deepseek" not in children
+    assert config["tuis"]["ohmypi"]["orchestration_child_agents"] == list(
+        _ORCH_BASELINE_CHILDREN
+    )
+    kinds_src = (_HV2 / "config" / "kinds.yaml").read_text(encoding="utf-8")
+    assert "platform → catalog → orchestration" in kinds_src
+    model_desc = str(config["kinds"]["model"].get("description") or "").lower()
+    assert "optional" in model_desc or "not a baseline" in model_desc
+    orch_desc = str(config["kinds"]["orchestration"].get("description") or "").lower()
+    assert "extra" in orch_desc or "baseline children" in orch_desc
 
 
 def test_should_refuse_claude_tui(hv, config) -> None:
@@ -585,6 +612,28 @@ def test_should_stage_ohmypi_identity_overlay_with_repo_and_version(hv, config) 
     assert "ohmypi-identity" in config_path or config_path.endswith(".yml")
 
 
+def test_should_export_ohmypi_identity_overlay_on_pi_config_files_for_child_sessions(
+    hv, config, tmp_path: Path
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    cfg = _clone_config(config)
+    session_dir = tmp_path / "omp-sessions"
+    cfg["tuis"]["ohmypi"]["session_dir"] = str(session_dir)
+    driver = OhmypiDriver(cfg)
+    identity = str(driver.write_identity_overlay())
+    env = driver.child_env()
+    pi_config = env["PI_CONFIG_FILES"]
+    components = pi_config.split(":")
+    assert components[0] == identity
+    operator = str(Path.home() / ".omp" / "agent" / "litellm-alpha.yml")
+    if operator and operator != identity:
+        assert operator in components[1:]
+        assert pi_config == f"{identity}:{operator}"
+    else:
+        assert pi_config == identity
+
+
 def test_should_refuse_ohmypi_print_flags(hv, config) -> None:
     from hv2.drivers.ohmypi import OhmypiDriver
 
@@ -647,7 +696,29 @@ def test_should_plan_ohmypi_model_all_from_yaml(hv, config) -> None:
     )
     assert plan.tui == "ohmypi"
     assert list(plan.models) == hv.compiled_aliases(config)
+    assert "auto-review" in plan.models
+    assert "codex-auto-review" in plan.models
     assert "PONG" in plan.extra["pong_prompt"]
+
+
+def test_should_plan_model_kind_including_auto_review_compiled_alias(hv, config) -> None:
+    aliases = hv.compiled_aliases(config)
+    assert "auto-review" in aliases
+    assert "codex-auto-review" in aliases
+    plan = hv.build_plan(
+        config=config,
+        kind="model",
+        instance_token="alpha",
+        tui="ohmypi",
+        models=["auto-review"],
+        orchestration_parent=None,
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    assert plan.kind == "model"
+    assert plan.models == ("auto-review",)
+    assert "auto-review" in hv.expand_group("all", config)
 
 
 def test_should_plan_orchestration_parents_and_children(hv, config) -> None:
@@ -664,8 +735,17 @@ def test_should_plan_orchestration_parents_and_children(hv, config) -> None:
     )
     assert "sota-openai" in plan.orchestration_parents
     assert "sota-moonshot" in plan.orchestration_parents
-    assert list(plan.orchestration_children) == ["basic", "work", "expert", "sota"]
-    assert "Spawn exactly four subagents" in plan.extra["orchestration_prompt_template"]
+    assert list(plan.orchestration_children) == list(_ORCH_BASELINE_CHILDREN)
+    assert "work-other" not in plan.orchestration_children
+    assert "sota-deepseek" not in plan.orchestration_children
+    assert "codex-auto-review" not in plan.orchestration_children
+    prompt = plan.extra["orchestration_prompt_template"]
+    assert "agent=sota-xai" in prompt
+    assert "agent=auto-review" in prompt
+    assert "agent=codex-auto-review" not in prompt
+    assert "model=basic" not in prompt
+    assert "Spawn exactly four" not in prompt
+    assert "PONG" in prompt
 
 
 def test_should_refuse_redis_flush(hv) -> None:
@@ -2042,7 +2122,7 @@ def _task_tool_result_line(agents: Sequence[str], *, status: str = "ok") -> str:
 
 
 def test_should_fail_child_spawn_evidence_on_recap_only_pane() -> None:
-    from hv2.checks.orch_evidence import child_spawn_evidence
+    from hv2.checks.orch_evidence import _HUB_IDLE_PEER, _PANE_CHILD_DATE, child_spawn_evidence
     from hv2.kinds.runner import _pane_has_any
 
     prompt = _orchestration_sent_prompt()
@@ -2061,6 +2141,61 @@ def test_should_fail_child_spawn_evidence_on_recap_only_pane() -> None:
         assert name in joined
     assert evidence["successful_agents"] == []
     assert evidence["saw_task_result"] is False
+    # Recap remains non-evidence; pane/hub regexes must still see hyphenated
+    # baseline children when those names later appear as real spawn rows.
+    assert _PANE_CHILD_DATE.search(" - sota-xai\n   - date: Sat 22 Aug 2026\n")
+    assert _HUB_IDLE_PEER.search("AutoReviewDate [auto-review · sub · idle]")
+
+
+def test_should_fail_child_spawn_evidence_on_recap_only_pane_for_baseline_children() -> None:
+    from hv2.checks.orch_evidence import _HUB_IDLE_PEER, _PANE_CHILD_DATE, child_spawn_evidence
+    from hv2.kinds.runner import _pane_has_any
+
+    prompt = _orchestration_sent_prompt()
+    pane = (
+        _prompt_only_working_pane(prompt).replace("Working…\n", "")
+        + "※ recap:\n"
+        + "/".join(_ORCH_BASELINE_CHILDREN)
+        + " returned PONG, date stdout and omp-alpha-fanout\n"
+    )
+    assert _pane_has_any(pane, ["※ recap:"], prompt=prompt) is True
+    evidence = child_spawn_evidence(children=_ORCH_BASELINE_CHILDREN, pane=pane)
+    assert evidence["ok"] is False
+    joined = " ".join(evidence["failures"])
+    assert "recap-only" in joined
+    assert "missing successful Ohmypi task results" in joined
+    for name in _ORCH_BASELINE_CHILDREN:
+        assert name in joined
+    assert evidence["successful_agents"] == []
+    assert evidence["saw_task_result"] is False
+    assert evidence["children"] == list(_ORCH_BASELINE_CHILDREN)
+    assert _PANE_CHILD_DATE.search(" - auto-review\n   - date: Sat 22 Aug 2026\n")
+    assert _HUB_IDLE_PEER.search("SotaXaiDate [sota-xai · sub · idle]")
+
+
+def test_should_pass_child_spawn_evidence_on_hyphenated_pane_date_and_hub_idle_peers() -> None:
+    from hv2.checks.orch_evidence import child_spawn_evidence
+
+    date_lines = "".join(
+        f" - {name}\n   - date: Sat 22 Aug 2026 01:31:{index:02d} AM EDT\n"
+        for index, name in enumerate(_ORCH_BASELINE_CHILDREN)
+    )
+    hub_lines = "".join(
+        f"{name.title().replace('-', '')}Date [{name} · sub · idle] — parent Main\n"
+        for name in _ORCH_BASELINE_CHILDREN
+    )
+    pane = (
+        "Default model: litellm-alpha-passthrough/sota-openai\n"
+        f"{date_lines}"
+        f"{hub_lines}"
+        "π  > ⬢ AAWM alias sota-openai\n"
+    )
+    evidence = child_spawn_evidence(children=_ORCH_BASELINE_CHILDREN, pane=pane)
+    assert "sota-xai" in evidence["successful_agents"]
+    assert "auto-review" in evidence["successful_agents"]
+    assert evidence["successful_agents"] == sorted(_ORCH_BASELINE_CHILDREN)
+    assert evidence["ok"] is True
+    assert evidence["failures"] == []
 
 
 def test_should_fail_child_spawn_evidence_on_unknown_agent() -> None:
@@ -2491,10 +2626,21 @@ def test_should_ignore_stale_unknown_agent_when_current_hub_jobs_succeed(
 
 def test_should_use_agent_equals_not_model_equals_in_orchestration_prompt() -> None:
     prompt = _orchestration_sent_prompt()
-    for name in _ORCH_CHILDREN:
+    for name in _ORCH_BASELINE_CHILDREN:
         assert f"agent={name}" in prompt
+        assert f"model={name}" not in prompt
+    assert "agent=codex-auto-review" not in prompt
     assert "model=basic" not in prompt
     assert "model=work" not in prompt
+    assert "Spawn exactly four" not in prompt
+    lowered = prompt.lower()
+    assert "pong" in lowered
+    first_pong = lowered.index("pong")
+    first_date = lowered.index("date")
+    assert first_pong < first_date
+    assert "pwd" in prompt
+    assert "uname -s" in prompt
+    assert "echo omp-alpha-fanout" in prompt
 
 
 def test_should_stage_orchestration_child_agent_profiles(
@@ -2507,18 +2653,28 @@ def test_should_stage_orchestration_child_agent_profiles(
     dest = cwd / ".omp" / "agents"
     cfg["tuis"]["ohmypi"]["cwd"] = str(cwd)
     cfg["tuis"]["ohmypi"]["project_agents_dir"] = str(dest)
+    cfg["tuis"]["ohmypi"]["orchestration_child_agents"] = list(_ORCH_BASELINE_CHILDREN)
     driver = OhmypiDriver(cfg)
     staged = driver.stage_orchestration_agents()
     assert staged["ok"] is True
     assert staged["missing"] == []
     written_names = {Path(path).name for path in staged["written"]}
-    assert written_names == {f"{name}.md" for name in _ORCH_CHILDREN}
-    for name in _ORCH_CHILDREN:
+    assert written_names == {f"{name}.md" for name in _ORCH_BASELINE_CHILDREN}
+    for name in _ORCH_BASELINE_CHILDREN:
         target = dest / f"{name}.md"
         assert target.is_file()
         source = Path(staged["src"]) / f"{name}.md"
         assert source.is_file()
         assert target.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
+
+    cfg_fallback = _clone_config(config)
+    cfg_fallback["tuis"]["ohmypi"]["cwd"] = str(cwd)
+    cfg_fallback["tuis"]["ohmypi"]["project_agents_dir"] = str(dest)
+    cfg_fallback["tuis"]["ohmypi"].pop("orchestration_child_agents", None)
+    fallback = OhmypiDriver(cfg_fallback).stage_orchestration_agents()
+    assert {Path(path).name for path in fallback["written"]} == {
+        f"{name}.md" for name in _ORCH_BASELINE_CHILDREN
+    }
 
 
 def test_should_expand_cwd_placeholder_when_staging_ohmypi_agents(
@@ -2611,6 +2767,123 @@ def test_should_require_passthrough_selector_on_ohmypi_catalog_find_for_work(
     assert found["failures"] == []
     assert found["finds"][0]["selector"] == "litellm-alpha-passthrough/work"
     assert found["finds"][0]["found"] is True
+
+
+def test_should_leave_ohmypi_model_tmux_session_open_after_tui_model_step(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+    from hv2.kinds.runner import _step_tui_model
+
+    plan = hv.build_plan(
+        config=config,
+        kind="model",
+        instance_token="alpha",
+        tui="ohmypi",
+        models=["work"],
+        orchestration_parent=None,
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    driver = OhmypiDriver(config)
+    closes: list[str] = []
+    pane = _ohmypi_idle_pong_pane_without_recap()
+    monkeypatch.setattr("hv2.kinds.runner.driver_for", lambda tui, _config: driver)
+    monkeypatch.setattr(
+        driver,
+        "launch_argv",
+        lambda model, **k: ["omp", "--model", f"litellm-alpha-passthrough/{model}"],
+    )
+    monkeypatch.setattr(driver, "assert_no_print_flags", lambda argv: None)
+    monkeypatch.setattr(
+        driver,
+        "ensure_session",
+        lambda model, tools=False: {
+            "ok": True,
+            "session": "hv2-ohmypi-work",
+            "selector": driver.model_selector(model),
+            "selected": True,
+        },
+    )
+    monkeypatch.setattr(
+        driver,
+        "send_prompt_and_wait",
+        lambda prompt, reply_needles=None: {
+            "ok": True,
+            "send": {"ok": True, "method": "send-keys"},
+            "idle": True,
+            "replied": True,
+            "pane": pane,
+        },
+    )
+    monkeypatch.setattr(driver, "pane_has_selector", lambda model, pane=None: True)
+    monkeypatch.setattr(driver, "close_session", lambda: closes.append("close_session"))
+    payload = _step_tui_model(plan)
+    assert closes == []
+    assert payload.get("ok") is True
+
+
+def test_should_leave_ohmypi_orchestration_tmux_session_open_after_tui_orchestration_step(
+    hv, config, tmp_path: Path, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+    from hv2.kinds.runner import _step_tui_orchestration
+
+    session_dir = tmp_path / "omp-sessions"
+    session_dir.mkdir()
+    (session_dir / "parent.jsonl").write_text(
+        _task_tool_result_line(_ORCH_BASELINE_CHILDREN) + "\n",
+        encoding="utf-8",
+    )
+    cfg = _clone_config(config)
+    cfg["tuis"]["ohmypi"]["session_dir"] = str(session_dir)
+    plan = hv.build_plan(
+        config=cfg,
+        kind="orchestration",
+        instance_token="alpha",
+        tui="ohmypi",
+        models=None,
+        orchestration_parent="sota-openai",
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    driver = OhmypiDriver(cfg)
+    closes: list[str] = []
+    pane = (
+        "Default model: litellm-alpha-passthrough/sota-openai\n"
+        "π  > ⬢ AAWM alias sota-openai\n"
+    )
+    monkeypatch.setattr("hv2.kinds.runner.driver_for", lambda tui, _config: driver)
+    monkeypatch.setattr(
+        driver,
+        "launch_argv",
+        lambda model, **k: ["omp", "--model", f"litellm-alpha-passthrough/{model}"],
+    )
+    monkeypatch.setattr(driver, "assert_no_print_flags", lambda argv: None)
+    monkeypatch.setattr(
+        driver,
+        "ensure_session",
+        lambda model, tools=True: {
+            "ok": True,
+            "session": "hv2-ohmypi-sota-openai",
+            "selector": driver.model_selector(model),
+            "selected": True,
+            "staged_agents": {"ok": True, "missing": []},
+        },
+    )
+    monkeypatch.setattr(
+        driver, "send_keys", lambda text: {"ok": True, "method": "paste-buffer"}
+    )
+    monkeypatch.setattr(driver, "capture_pane", lambda: pane)
+    monkeypatch.setattr(driver, "pane_has_selector", lambda model, pane=None: True)
+    monkeypatch.setattr(driver, "tmux_has_session", lambda name=None: False)
+    monkeypatch.setattr(driver, "_tmux_float", _fast_ohmypi_tmux_float)
+    monkeypatch.setattr(driver, "close_session", lambda: closes.append("close_session"))
+    payload = _step_tui_orchestration(plan)
+    assert closes == []
+    assert payload.get("ok") is True
 
 
 def test_should_treat_truncated_ohmypi_alias_chrome_as_selected(hv, config) -> None:

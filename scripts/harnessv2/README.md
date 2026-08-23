@@ -49,17 +49,38 @@ is invented.
 
 ## Kinds (`--test`)
 
+Baseline walk is `platform` → `catalog` → `orchestration`. Independent
+`--test model` stays available (`--model` / `--model all`) but is **not**
+a baseline full-suite step.
+
 | Kind | TUI | What it does |
 |---|---|---|
 | `platform` | forbidden | Health, custom endpoints, error JSONL, Redis prefix SCAN, docker logs |
 | `catalog` | optional | CFG-023/024 HTTP catalog; Ohmypi picker if `--tui ohmypi` |
-| `model` | required | Waits for idle; standalone exact PONG or explicit provider 404 per model/group |
-| `orchestration` | required | Parent alias spawns `basic`/`work`/`expert`/`sota` |
+| `model` | required | Independent per-alias Ohmypi turn (not baseline). Waits for idle; standalone exact PONG or explicit provider 404 |
+| `orchestration` | required | Parent alias spawns the nine orchestration children |
 
 `--test model` and `--test orchestration` launch a dedicated interactive
 Ohmypi tmux session on socket `tmux37` (`hv2-ohmypi-<model>-<pid>`) with
 `--model litellm-alpha-passthrough/<alias>`. They never use `omp -p` /
-`--print` and they do not reuse leftover `omp-alpha-test` panes.
+`--print` and they do not reuse leftover `omp-alpha-test` panes. Leave
+those dedicated `hv2-ohmypi-*` sessions open after `_step_tui_model`
+and `_step_tui_orchestration`. Do not close them at the end of those
+kinds. Operator inspects leftovers after a claimed pass:
+
+```text
+tmux -L tmux37 ls
+tmux -L tmux37 attach -t <hv2-ohmypi-…>
+```
+
+Leftover count: platform 0, catalog 0 (HTTP; optional picker does not
+leave a dedicated inspect session as a baseline leftover), optional
+`--test model` / `--model all` = one dedicated session per alias (12
+if all compiled aliases), orchestration = 1 parent session. Baseline
+walk leftover is the orch parent session, not 4–5 and not 12.
+
+`--model all` expands compiled aliases, including OMP-facing
+`auto-review` and Codex-client compatibility `codex-auto-review`.
 
 For `--test model` the driver waits until the TUI returns idle, then
 passes only on a standalone exact `PONG` reply or an explicit provider
@@ -73,6 +94,17 @@ pane before send) completes the model wait even when recap never
 paints. Each alias uses a fresh `--session-dir` under
 `/tmp/omp-alpha-sessions/hv2-<alias>`. Launch splash (`Welcome
 back` / `Recent sessions`) remaining in scrollback is not non-idle.
+
+Ohmypi `task` children inherit tmux env, not parent `--config`. Overlay
+row is identity first:
+
+```text
+PI_CONFIG_FILES=<session_dir>/hv2-ohmypi-identity.yml:$HOME/.omp/agent/litellm-alpha.yml
+```
+
+Identity first so task children inherit `x-aawm-client*` headers; parent
+still gets `--config`. Do not revert this to operator-only
+`PI_CONFIG_FILES`.
 
 Every non-dry-run also appends a durable JSONL log under
 `.analysis/harnessv2/` (`run_start`, one `step` line per check with
@@ -97,19 +129,21 @@ lines and are ignored. The run fails and remaining steps are skipped.
 `--test catalog --tui ohmypi` requires the picker selector
 `litellm-alpha-passthrough/<alias>` (a bare alias substring is not
 enough). `--test orchestration` pastes `agent=basic` / `work` /
-`expert` / `sota` (no `model=` spawn field), stages those profiles
-into `{cwd}/.omp/agents`, and fails unless Ohmypi `task` / `hub`
-completions exist for all four children (`hub` jobs, `async-result`
+`expert` / `sota` / `sota-xai` / `sota-alibaba` / `sota-moonshot` /
+`sota-zai` / `auto-review` (no `model=` spawn field; spawn name is
+`auto-review`, not `codex-auto-review`). Not orch children:
+`work-other`, `sota-deepseek`, `codex-auto-review`. Each child's first
+directive is exact `PONG`, then `date`, then a follow-up parallel
+`pwd` / `uname -s` / `echo omp-alpha-fanout`. Profiles are staged into
+`{cwd}/.omp/agents`. The run fails unless Ohmypi `task` / `hub`
+completions exist for all nine children (`hub` jobs, `async-result`
 `<task-result>`, idle hub peers, or nested child `yield`). Nested
 `bash` `date` while the parent is still waiting is not a pass. A spawn
 announcement is not a pass. `※ recap:` is wait-complete only;
-recap-only is not a pass. Live `--test orchestration` on
-`litellm-alpha` with parent `sota-openai` now has a green artifact
-with hub/`yield` child evidence for `basic`/`work`/`expert`/`sota`
-(not recap-only). Leftover
-uvicorn ACCESS except `/health*` is 0 on alpha as of 2026-08-22
-(including native `GET /v2/model/info` 500). Empty `docker logs
---since` windows are not leftover-uvicorn pass.
+recap-only is not a pass. Leftover uvicorn ACCESS except `/health*` is
+0 on alpha as of 2026-08-22 (including native `GET /v2/model/info`
+500). Empty `docker logs --since` windows are not leftover-uvicorn
+pass.
 
 ## Unit tests
 

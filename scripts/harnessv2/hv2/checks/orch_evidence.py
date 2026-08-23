@@ -18,10 +18,10 @@ _TASK_RESULT_AGENT = re.compile(
     re.IGNORECASE,
 )
 _PANE_CHILD_DATE = re.compile(
-    r"(?m)^[ \t]*-[ \t]+(basic|work|expert|sota)\n[ \t]+-[ \t]+date:",
+    r"(?m)^[ \t]*-[ \t]+([\w-]+)\n[ \t]+-[ \t]+date:",
 )
 _HUB_IDLE_PEER = re.compile(
-    r"(\w+)Date \[(\w+) · sub · idle\]",
+    r"([\w-]+)Date \[([\w-]+) · sub · idle\]",
 )
 _COMPLETION_TOOLS = {"task", "hub", "bash", "yield"}
 _JSONL_SCAN_CAP = 64
@@ -199,6 +199,7 @@ def child_spawn_evidence(
     """
 
     wanted = [str(item) for item in children if str(item).strip()]
+    wanted_set = set(wanted)
     failures: list[str] = []
     pane_text = pane or ""
     combined = pane_text
@@ -209,7 +210,9 @@ def child_spawn_evidence(
     project_agents_dir: str | None = None
 
     successful_agents.update(_agents_from_text(pane_text, wanted))
-    successful_agents.update(_PANE_CHILD_DATE.findall(pane_text))
+    successful_agents.update(
+        name for name in _PANE_CHILD_DATE.findall(pane_text) if name in wanted_set
+    )
 
     root = Path(session_dir) if session_dir else None
     jsonl_files = _session_jsonl_paths(root, since_mtime=since_mtime) if root else []

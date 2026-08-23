@@ -143,12 +143,14 @@ DB / `LITELLM_MASTER_KEY` secrets (`checks.yaml` `child_env`).
 
 ### Compiled aliases (`config/models.yaml`)
 
-`--model all` expands `compiled_aliases` only:
+`--model all` expands `compiled_aliases` only, including both
+OMP-facing `auto-review` and Codex-client compatibility
+`codex-auto-review`:
 
 - `basic`, `work`, `work-other`, `expert`, `sota`
 - `sota-openai`, `sota-xai`, `sota-alibaba`, `sota-moonshot`,
   `sota-deepseek`, `sota-zai`
-- `codex-auto-review`
+- `auto-review`, `codex-auto-review`
 
 Skip prefixes: `aawm-`, `claude-`. Absent catalog ids
 (`aawm-sota-zai`, …) are recorded so a picker must not treat them as
@@ -158,7 +160,10 @@ Groups:
 
 - `all` → compiled aliases
 - `all-sota` → the six `sota-*` parents
-- `orchestration_children` → `basic`, `work`, `expert`, `sota`
+- `orchestration_children` (nine) → `basic`, `work`, `expert`, `sota`,
+  `sota-xai`, `sota-alibaba`, `sota-moonshot`, `sota-zai`, `auto-review`.
+  Spawn name is `auto-review`, not `codex-auto-review`. Not orchestration
+  children: `work-other`, `sota-deepseek`, `codex-auto-review`.
 - `catalog_picker` → `work`, `sota-zai`
 
 Ohmypi session `--model` is `litellm-alpha-passthrough/<alias>`, not a
@@ -168,14 +173,16 @@ bare alias and not `litellm-alpha/<alias>` (that lane is completions).
 
 ## 5. Kinds (`--test`) and intended process
 
-Walk kinds in this order. Do **not** skip the logging gate.
+Baseline walk is `platform` → `catalog` → `orchestration`. Do **not**
+skip the logging gate. Independent `--test model` stays available
+(`--model` / `--model all`) but is **not** a baseline full-suite step.
 
 | Kind | TUI | What it proves |
 |---|---|---|
 | `platform` | forbidden | Health, custom HTTP, error JSONL, Redis prefix SCAN, docker logs |
 | `catalog` | optional | CFG-023/024 HTTP catalog; Ohmypi picker if `--tui ohmypi` |
-| `model` | required | Waits for idle; standalone exact PONG or explicit provider 404 per alias |
-| `orchestration` | required | Parent alias spawns children through Ohmypi `task` |
+| `model` | required | Independent per-alias Ohmypi turn (not baseline). Waits for idle; standalone exact PONG or explicit provider 404 |
+| `orchestration` | required | Parent alias spawns the nine orchestration children through Ohmypi `task` |
 
 `--dry-run` prints the resolved plan and exits 0. No TUI, no HTTP, no
 docker logs of protected containers. Use it to confirm instance/kind/
@@ -249,9 +256,23 @@ For each selected alias the driver:
    **sent prompt** are ignored (H-6), except a standalone pane line
    equal to the needle (for `PONG`, that line must follow the latest
    prompt echo).
-6. Closes that session before the next model.
+6. Leaves the dedicated `hv2-ohmypi-<alias>-<pid>` session open after
+   `_step_tui_model`. Do not close it before the next alias or at the
+   end of the kind. Operator inspects leftovers after a claimed pass:
+
+   ```text
+   tmux -L tmux37 ls
+   tmux -L tmux37 attach -t <hv2-ohmypi-…>
+   ```
+
+   Optional `--test model` / `--model all` leftover count is one
+   dedicated session per alias (12 if all compiled aliases). This kind
+   is not a baseline full-suite step; baseline leftover is the orch
+   parent session, not 12.
 
 `--model` is repeatable / comma-separated. Default is group `all`.
+`--test model` stays available independently; it is not part of the
+baseline `platform` → `catalog` → `orchestration` walk.
 
 Post-TUI `docker_logs` **requires** an AAWM route-rollup header
 (`YYYYMMDD HH:MM:SS … /path`). A recap without a real Responses POST +
@@ -261,31 +282,38 @@ rollup is not pass evidence.
 
 Steps: `health` → `tui_orchestration` → `docker_logs` → `error_jsonl`.
 
-Default parent: `sota-openai` (group `all-sota`). Default children:
-`basic`, `work`, `expert`, `sota`.
+Default parent: `sota-openai` (group `all-sota`). Default children are
+the nine `orchestration_children`: `basic`, `work`, `expert`, `sota`,
+`sota-xai`, `sota-alibaba`, `sota-moonshot`, `sota-zai`, `auto-review`.
+Spawn name is `auto-review`, not `codex-auto-review`. Not orch children:
+`work-other`, `sota-deepseek`, `codex-auto-review`.
 
 Launches the parent with tools enabled. Pastes
-`prompts/orchestration.txt` with `{parent}` substituted. Wait needle is
+`prompts/orchestration.txt` with `{parent}` substituted. Each child's
+**first** directive is exact `PONG`, then `date`, then a follow-up
+parallel `pwd` / `uname -s` / `echo omp-alpha-fanout`. Wait needle is
 `※ recap:` — **not** `omp-alpha-fanout`, which is inside the prompt and
-would false-complete (H-6).
+would false-complete (H-6). Recap is wait-only, never pass evidence.
 
 Spawn contract (H-7, **closed in code**): Ohmypi `task` has no
 `model=` field. The parent must spawn `agent=basic`, `agent=work`,
-`agent=expert`, and `agent=sota`. Those names are harness profiles
-staged from `config/ohmypi-agents/` into `{cwd}/.omp/agents`
-(`/tmp/omp-alpha-workspace/.omp/agents` by default). They are **not**
-the built-in Ohmypi names (`scout`, `designer`, `reviewer`, …) and
-**not** LiteLLM catalog ids. Session `--model` stays
-`litellm-alpha-passthrough/<parent>`.
+`agent=expert`, `agent=sota`, `agent=sota-xai`, `agent=sota-alibaba`,
+`agent=sota-moonshot`, `agent=sota-zai`, and `agent=auto-review`. Those
+names are harness profiles staged from `config/ohmypi-agents/` into
+`{cwd}/.omp/agents` (`/tmp/omp-alpha-workspace/.omp/agents` by
+default). They are **not** the built-in Ohmypi names (`scout`,
+`designer`, `reviewer`, …) and **not** LiteLLM catalog ids. Session
+`--model` stays `litellm-alpha-passthrough/<parent>`.
 
 `※ recap:` is wait-complete only. Ohmypi 17.4 often finishes the parent
-turn with the four-child date list and idle `hub` peers, without a recap
-glyph. Missing recap is **not** a fail when `child_evidence.ok` is true.
+turn with the nine-child PONG / date list and idle `hub` peers, without
+a recap glyph. Missing recap is **not** a fail when `child_evidence.ok`
+is true.
 
 The runner then calls `child_spawn_evidence()` against Ohmypi session
 JSONL, including nested `session_dir/<parent-id>/*.jsonl` child
-transcripts. Pass requires successful child completions for `basic` /
-`work` / `expert` / `sota`. Ohmypi 17.4 delivers those as:
+transcripts. Pass requires successful child completions for all nine
+orchestration children. Ohmypi 17.4 delivers those as:
 
 - `hub` job rows (`details.jobs[].resolvedModel` /
   `<task-result agent="…" status="completed">`)
@@ -296,12 +324,24 @@ transcripts. Pass requires successful child completions for `basic` /
   `yield` (nested `bash` `date` while the parent is still waiting is
   not enough)
 
-A `Spawned N background agents using basic, work, expert, sota` line is
-spawn intent, not a completed child result. Recap-only, `Unknown agent`,
-failed preflight, or empty hub/task completions is fail. The wait loop
-does not stop on recap while any of the four children is still missing.
-Do not close the dedicated tmux session until those completions exist;
-SIGHUP during `hub wait` is not a pass.
+A `Spawned N background agents using basic, work, expert, sota, …` line
+is spawn intent, not a completed child result. Recap-only, `Unknown
+agent`, failed preflight, or empty hub/task completions is fail. The
+wait loop does not stop on recap while any of the nine children is still
+missing. Leave the dedicated tmux session open after
+`_step_tui_orchestration`; do not close it at the end of the kind.
+SIGHUP during `hub wait` is not a pass. Operator inspects leftovers
+after a claimed pass:
+
+```text
+tmux -L tmux37 ls
+tmux -L tmux37 attach -t <hv2-ohmypi-…>
+```
+
+Baseline leftover count: platform 0, catalog 0 (HTTP; optional picker
+does not leave a dedicated inspect session as a baseline leftover),
+orchestration = 1 parent session. Baseline walk leftover is that orch
+parent session, not 4–5 and not 12.
 
 Stage child profiles into the Ohmypi **workspace** `.omp/agents`
 (`{cwd}` expanded by the driver, default `/tmp/omp-alpha-workspace/.omp/agents`).
@@ -328,7 +368,7 @@ From `config/tuis.yaml`:
 |---|---|
 | Binary | `omp` (wrapper `ompla`) |
 | Min version | 17.3.8 |
-| Overlay | `PI_CONFIG_FILES=$HOME/.omp/agent/litellm-alpha.yml` |
+| Overlay | Identity first, then operator: `PI_CONFIG_FILES=<session_dir>/hv2-ohmypi-identity.yml:$HOME/.omp/agent/litellm-alpha.yml`. Ohmypi `task` children inherit tmux env, not parent `--config`. Identity first so those children inherit `x-aawm-client*` headers; parent still gets `--config`. Do not revert this to operator-only `PI_CONFIG_FILES`. |
 | CWD | `/tmp/omp-alpha-workspace` |
 | Session dir | `/tmp/omp-alpha-sessions/hv2-<alias>` (identity overlay stays in `/tmp/omp-alpha-sessions`) |
 | tmux socket | `tmux37` |
@@ -349,10 +389,15 @@ call that a harness pass.
 
 **Smoother path (dedicated session):** every `--test model` /
 `--test orchestration` row creates `hv2-ohmypi-<alias>-<pid>` on
-socket `tmux37`, with `PI_CONFIG_FILES=$HOME/.omp/agent/litellm-alpha.yml`
+socket `tmux37`, with identity-first
+`PI_CONFIG_FILES=<session_dir>/hv2-ohmypi-identity.yml:$HOME/.omp/agent/litellm-alpha.yml`
 and alias lane `litellm-alpha-passthrough/<alias>`. Never `omp -p` /
-`--print`. Never reuse leftover `omp-alpha-test`. Close the dedicated
-session before the next alias.
+`--print`. Never reuse leftover `omp-alpha-test`. Leave dedicated
+`hv2-ohmypi-*` sessions open after `_step_tui_model` and
+`_step_tui_orchestration`. Do not close them at the end of those kinds.
+Operator inspects leftovers after a claimed pass (`tmux -L tmux37 ls`,
+then `attach -t <hv2-ohmypi-…>`). Baseline leftover is the orch parent
+session; optional `--model all` would leave 12.
 
 Long alias ids can render as `AAWM alias / model <id>` instead of the
 full selector or `AAWM alias <id>`. That truncated chrome is selected
@@ -508,9 +553,13 @@ Add `--tui ohmypi` only when you also want the picker.
 
 ### Live model (interactive Ohmypi)
 
-Leftover uvicorn ACCESS except `/health*` is **0** on a harness-owned
-alpha window as of 2026-08-22 (see §11). Remaining compiled aliases
-still need live Ohmypi `--test model`.
+Independent of the baseline walk (`platform` → `catalog` →
+`orchestration`). Leftover uvicorn ACCESS except `/health*` is **0**
+on a harness-owned alpha window as of 2026-08-22 (see §11). Remaining
+compiled aliases still need live Ohmypi `--test model`. Leave dedicated
+`hv2-ohmypi-*` sessions open after `_step_tui_model` for inspect
+(`tmux -L tmux37 ls`). `--model all` leftover is one session per
+compiled alias (12), not a baseline leftover.
 
 ```text
 python scripts/harnessv2/run.py \
@@ -521,14 +570,19 @@ python scripts/harnessv2/run.py \
   --write-artifact /tmp/hv2-model-work.json
 ```
 
-Repeat `--model` / comma-separated ids, or omit it to expand `all`.
+Repeat `--model` / comma-separated ids, or omit it to expand `all`
+(includes `auto-review` and `codex-auto-review`).
 
 ### Live orchestration
 
-Same leftover-uvicorn gate. Recap is not enough: `tui_orchestration`
-fails unless `child_evidence.ok` is true for `basic` / `work` /
-`expert` / `sota`. Historical recap-only `ok: true` artifacts are
-stale relative to the current gate.
+Same leftover-uvicorn gate. Recap is wait-only, never pass evidence:
+`tui_orchestration` fails unless `child_evidence.ok` is true for the
+nine orchestration children (`basic`, `work`, `expert`, `sota`,
+`sota-xai`, `sota-alibaba`, `sota-moonshot`, `sota-zai`, `auto-review`).
+Spawn name is `auto-review`, not `codex-auto-review`. Historical
+recap-only `ok: true` artifacts are stale relative to the current gate.
+Leave the dedicated parent session open after `_step_tui_orchestration`.
+Baseline leftover is that one orch parent session.
 
 ```text
 python scripts/harnessv2/run.py \
@@ -558,10 +612,11 @@ python scripts/harnessv2/run.py \
 4. `--test platform`. If leftover uvicorn / Traceback / ASGI: **halt**.
    Empty `docker logs --since` is **not** leftover-uvicorn pass: send
    the real HTTP probes, then scan that window.
-5. `--test catalog --tui ohmypi`. HTTP CFG-023 is required **and**
-   `tui_catalog` must find selector `litellm-alpha-passthrough/work`
-   (and the other catalog sample). HTTP-only is not enough. Same halt
-   rule.
+5. `--test catalog`. HTTP CFG-023 is required for the baseline walk.
+   Add `--tui ohmypi` only when you also want the picker
+   (`litellm-alpha-passthrough/work` and the other catalog sample).
+   HTTP-only catalog leftover is 0; optional picker does not leave a
+   dedicated inspect session as a baseline leftover. Same halt rule.
 6. HTTP leftover-uvicorn proof for Ohmypi discovery probes (no TUI
    required for this gate). This gate **passed** on 2026-08-22
    (`CURSOR=2026-08-22T02:44:06Z`; leftover ACCESS except `/health*`
@@ -572,14 +627,21 @@ python scripts/harnessv2/run.py \
    - native `GET /model_group/info`, `/model/info`, `/v1/model/info`,
      `/v2/model/info`: leftover ACCESS = 0 even if the HTTP status is
      not 200
-7. Only then `--test model` per compiled alias through Ohmypi TUI
-   (default expands `all`). On traceback / leftover uvicorn: halt,
-   source-fix on the shared checkout, `docker restart litellm-alpha`
-   only if watchfiles did not reload, resume the **same** row.
-8. `--test orchestration --orchestration-parent sota-openai` only
-   after leftover uvicorn is gone. Gate spawn on `child_evidence.ok`
-   (successful Ohmypi `task` results for `basic`/`work`/`expert`/`sota`),
-   not recap-only.
+7. Optional independent `--test model` / `--model all` is **not** a
+   baseline full-suite step. If you run it, leave dedicated
+   `hv2-ohmypi-*` sessions open (12 if all compiled aliases). On
+   traceback / leftover uvicorn: halt, source-fix on the shared
+   checkout, `docker restart litellm-alpha` only if watchfiles did not
+   reload, resume the **same** row.
+8. Baseline next: `--test orchestration --orchestration-parent
+   sota-openai` after leftover uvicorn is gone. Gate spawn on
+   `child_evidence.ok` for the nine orchestration children (`basic`,
+   `work`, `expert`, `sota`, `sota-xai`, `sota-alibaba`,
+   `sota-moonshot`, `sota-zai`, `auto-review`; spawn name
+   `auto-review`, not `codex-auto-review`). Recap is wait-only, never
+   pass evidence. Leave the dedicated parent session open; inspect
+   with `tmux -L tmux37 ls` / `attach -t <hv2-ohmypi-…>`. Baseline
+   leftover is that one orch parent session, not 4–5 and not 12.
 9. Keep `TEST_HARNESS.md` / this document / the plan file in sync when
    halt signatures or spawn contract change.
 
@@ -598,7 +660,7 @@ Proven on `litellm-alpha` (do not re-claim without a new artifact):
 | CFG-023 catalog GET leftover uvicorn | 0 leftover ACCESS |
 | T-5 leftover uvicorn (discovery probes) | closed: post-cursor leftover ACCESS except `/health*` is **0**, including native `GET /v2/model/info` **500**. Worker reloaded via watchfiles after `_logging.py` mtime `2026-08-22T02:36:57Z`. Cursor `2026-08-22T02:44:06Z`. Ohmypi TUI was not used for this proof. |
 | `--test model` `work` / `basic` / `expert` / `sota` / `work-other` | passed: real Responses POST + rollup, `halted: false` |
-| `--test orchestration --orchestration-parent sota-openai` | passed (`/tmp/grok-goal-4ce5b5ad827f/implementer/hv2-orch.json`, `ok: true`, `halted: false`). Child evidence: hub `<task-result>` for `work`/`expert`/`sota` plus nested `yield` for `basic` (session `2026-08-22T06-21-45-763Z_01a02821-e7a3-7000-871c-04f719688caf`). Historical recap-only `ok: true` and the 2026-08-22T06:17 premature-close (`hv2-orch-premature-close.json`, nested `date` without `yield`) are not spawn proof. |
+| `--test orchestration --orchestration-parent sota-openai` | four-child artifact (`/tmp/grok-goal-4ce5b5ad827f/implementer/hv2-orch.json`) is historical, not the current nine-child gate. Recap-only `ok: true` and the 2026-08-22T06:17 premature-close (`hv2-orch-premature-close.json`, nested `date` without `yield`) are not spawn proof. Current gate is `child_evidence.ok` for the nine orchestration children; recap is wait-only. |
 | T-1 unhashable `type` list / ASGI | closed |
 | T-4 `UnicodeDecodeError` truncated UTF-8 peek | closed (incremental decoder `errors="ignore"`) |
 | H-6 wait needle | closed (`※ recap:`; ignore needles contained in the sent prompt) |
@@ -609,7 +671,7 @@ Proven on `litellm-alpha` (do not re-claim without a new artifact):
 
 | Gap | Notes |
 |---|---|
-| Remaining `--test model` | compiled aliases through `sota-zai` completed on a halted `all` row; `codex-auto-review` resumed after truncated-chrome + ASGI wrap (`hv2-model.json`). Sequential `--model` rows that together cover `all` are valid. Do not treat the halted `all` JSONL as a full pass. |
+| Remaining `--test model` | optional, not baseline. Compiled aliases through `sota-zai` completed on a halted `all` row; `codex-auto-review` resumed after truncated-chrome + ASGI wrap (`hv2-model.json`). `--model all` now also expands OMP-facing `auto-review`. Sequential `--model` rows that together cover `all` are valid. Do not treat the halted `all` JSONL as a full pass. |
 | Native `/v2/model/info` HTTP 500 body | `DB not connected` when `prisma_client is None`. Separate from leftover ACCESS. T-5 logging-halt does **not** require this body to become 200. |
 | Anthropic/Claude TUI | deferred (account canceled); still out of scope for v2 |
 

@@ -372,73 +372,68 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
         pass_needles + provider_404_needles
     )
     send_text = ""
-    try:
-        for model in plan.models:
-            argv = driver.launch_argv(model)
-            driver.assert_no_print_flags(argv)
-            if "-p" in argv or "--print" in argv:
-                failures.append(f"refusing print-mode argv for {model}")
-                continue
-            launched = driver.ensure_session(model, tools=tools)
-            row = {
-                "model": model,
-                "selector": driver.model_selector(model),
-                "argv": argv,
-                "prompt": prompt.strip(),
-                "session": launched.get("session"),
-                "launch_ok": launched.get("ok"),
-                "selected": launched.get("selected"),
-            }
-            if not launched.get("ok"):
-                failures.append(
-                    f"Ohmypi session for {model} did not become ready on "
-                    f"{launched.get('selector')}: "
-                    f"{(launched.get('pane_preview') or '')[-200:]}"
-                )
-                rows.append(row)
-                continue
-            if hasattr(driver, "send_prompt_and_wait"):
-                waited = driver.send_prompt_and_wait(
-                    prompt.strip(), reply_needles=reply_needles
-                )
-                sent = waited.get("send") or {}
-                pane = str(waited.get("pane") or "")
-                row["idle"] = waited.get("idle")
-            else:
-                sent = driver.send_keys(prompt.strip())
-                row["idle"] = driver.wait_until_idle()
-                pane = driver.capture_pane()
-            row["send"] = sent
-            if not sent.get("ok"):
-                failures.append(f"tmux send-keys failed for {model}")
-            row["pane_preview"] = pane[-1200:]
-            send_text = f"{send_text}\n{pane}"
-            selector = str(row["selector"])
-            if not driver.pane_has_selector(model, pane) and selector not in pane:
-                failures.append(
-                    f"pane for {model} does not show selector {selector}"
-                )
-            exact_pong = _pane_exact_pong(pane, prompt)
-            provider_404 = bool(
-                provider_404_needles
-                and _pane_has_any(
-                    pane, provider_404_needles, prompt=prompt.strip()
-                )
+    for model in plan.models:
+        argv = driver.launch_argv(model)
+        driver.assert_no_print_flags(argv)
+        if "-p" in argv or "--print" in argv:
+            failures.append(f"refusing print-mode argv for {model}")
+            continue
+        launched = driver.ensure_session(model, tools=tools)
+        row = {
+            "model": model,
+            "selector": driver.model_selector(model),
+            "argv": argv,
+            "prompt": prompt.strip(),
+            "session": launched.get("session"),
+            "launch_ok": launched.get("ok"),
+            "selected": launched.get("selected"),
+        }
+        if not launched.get("ok"):
+            failures.append(
+                f"Ohmypi session for {model} did not become ready on "
+                f"{launched.get('selector')}: "
+                f"{(launched.get('pane_preview') or '')[-200:]}"
             )
-            row["exact_pong"] = exact_pong
-            row["provider_404"] = provider_404
-            completed = bool(row.get("idle")) and (exact_pong or provider_404)
-            row["completed"] = completed
-            if not completed:
-                failures.append(
-                    f"TUI turn for {model} did not reach an idle exact PONG "
-                    f"reply or provider 404 evidence"
-                )
             rows.append(row)
-            driver.close_session()
-    finally:
-        if hasattr(driver, "close_session"):
-            driver.close_session()
+            continue
+        if hasattr(driver, "send_prompt_and_wait"):
+            waited = driver.send_prompt_and_wait(
+                prompt.strip(), reply_needles=reply_needles
+            )
+            sent = waited.get("send") or {}
+            pane = str(waited.get("pane") or "")
+            row["idle"] = waited.get("idle")
+        else:
+            sent = driver.send_keys(prompt.strip())
+            row["idle"] = driver.wait_until_idle()
+            pane = driver.capture_pane()
+        row["send"] = sent
+        if not sent.get("ok"):
+            failures.append(f"tmux send-keys failed for {model}")
+        row["pane_preview"] = pane[-1200:]
+        send_text = f"{send_text}\n{pane}"
+        selector = str(row["selector"])
+        if not driver.pane_has_selector(model, pane) and selector not in pane:
+            failures.append(
+                f"pane for {model} does not show selector {selector}"
+            )
+        exact_pong = _pane_exact_pong(pane, prompt)
+        provider_404 = bool(
+            provider_404_needles
+            and _pane_has_any(
+                pane, provider_404_needles, prompt=prompt.strip()
+            )
+        )
+        row["exact_pong"] = exact_pong
+        row["provider_404"] = provider_404
+        completed = bool(row.get("idle")) and (exact_pong or provider_404)
+        row["completed"] = completed
+        if not completed:
+            failures.append(
+                f"TUI turn for {model} did not reach an idle exact PONG "
+                f"reply or provider 404 evidence"
+            )
+        rows.append(row)
     soft_fail_matches = matching_signatures(
         plan.config, text=send_text, model=list(plan.models)
     )
@@ -483,41 +478,55 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
     select = _ohmypi_select_spec(driver)
     tools = bool(select.get("tools_for_orchestration", True))
     session_started = time.time()
-    try:
-        first = plan.orchestration_parents[0]
-        launched = driver.ensure_session(first, tools=tools)
-        rows[0]["session"] = launched.get("session")
-        rows[0]["launch_ok"] = launched.get("ok")
-        rows[0]["selected"] = launched.get("selected")
-        rows[0]["staged_agents"] = launched.get("staged_agents")
-        staged = launched.get("staged_agents") or {}
-        if tools and staged.get("missing"):
-            failures.append(
-                "Ohmypi child agent profiles missing: "
-                + ", ".join(str(item) for item in staged.get("missing") or [])
-            )
-        if not launched.get("ok"):
-            failures.append(
-                f"Ohmypi session for {first} did not become ready on "
-                f"{launched.get('selector')}: "
-                f"{(launched.get('pane_preview') or '')[-200:]}"
-            )
-        else:
-            orch_needles = as_str_list(select.get("orchestration_pass_needles"))
-            sent = driver.send_keys(rows[0]["prompt"])
-            rows[0]["send"] = sent
-            if not sent.get("ok"):
-                failures.append("tmux send-keys failed")
-            session_dir = None
-            if hasattr(driver, "spec"):
-                session_dir = str((driver.spec or {}).get("session_dir") or "") or None
-            wait_seconds = 420.0
-            poll_seconds = 1.0
-            if hasattr(driver, "_tmux_float"):
-                wait_seconds = driver._tmux_float("wait_reply_seconds", 420)
-                poll_seconds = driver._tmux_float("poll_interval_seconds", 1)
-            deadline = time.time() + wait_seconds
-            pane = driver.capture_pane() if hasattr(driver, "capture_pane") else ""
+    first = plan.orchestration_parents[0]
+    launched = driver.ensure_session(first, tools=tools)
+    rows[0]["session"] = launched.get("session")
+    rows[0]["launch_ok"] = launched.get("ok")
+    rows[0]["selected"] = launched.get("selected")
+    rows[0]["staged_agents"] = launched.get("staged_agents")
+    staged = launched.get("staged_agents") or {}
+    if tools and staged.get("missing"):
+        failures.append(
+            "Ohmypi child agent profiles missing: "
+            + ", ".join(str(item) for item in staged.get("missing") or [])
+        )
+    if not launched.get("ok"):
+        failures.append(
+            f"Ohmypi session for {first} did not become ready on "
+            f"{launched.get('selector')}: "
+            f"{(launched.get('pane_preview') or '')[-200:]}"
+        )
+    else:
+        orch_needles = as_str_list(select.get("orchestration_pass_needles"))
+        sent = driver.send_keys(rows[0]["prompt"])
+        rows[0]["send"] = sent
+        if not sent.get("ok"):
+            failures.append("tmux send-keys failed")
+        session_dir = None
+        if hasattr(driver, "spec"):
+            session_dir = str((driver.spec or {}).get("session_dir") or "") or None
+        wait_seconds = 420.0
+        poll_seconds = 1.0
+        if hasattr(driver, "_tmux_float"):
+            wait_seconds = driver._tmux_float("wait_reply_seconds", 420)
+            poll_seconds = driver._tmux_float("poll_interval_seconds", 1)
+        deadline = time.time() + wait_seconds
+        pane = driver.capture_pane() if hasattr(driver, "capture_pane") else ""
+        evidence = child_spawn_evidence(
+            children=list(plan.orchestration_children),
+            pane=pane,
+            session_dir=session_dir,
+            since_mtime=session_started,
+        )
+        recap_present = bool(
+            orch_needles
+            and _pane_has_any(pane, orch_needles, prompt=rows[0]["prompt"])
+        )
+        # Recap is wait-complete only. Keep polling until child hub/task
+        # evidence is complete even if the pane already shows recap.
+        while time.time() < deadline and not evidence.get("ok"):
+            time.sleep(max(poll_seconds, 0.2))
+            pane = driver.capture_pane() if hasattr(driver, "capture_pane") else pane
             evidence = child_spawn_evidence(
                 children=list(plan.orchestration_children),
                 pane=pane,
@@ -528,37 +537,19 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
                 orch_needles
                 and _pane_has_any(pane, orch_needles, prompt=rows[0]["prompt"])
             )
-            # Recap is wait-complete only. Keep polling until child hub/task
-            # evidence is complete even if the pane already shows recap.
-            while time.time() < deadline and not evidence.get("ok"):
-                time.sleep(max(poll_seconds, 0.2))
-                pane = driver.capture_pane() if hasattr(driver, "capture_pane") else pane
-                evidence = child_spawn_evidence(
-                    children=list(plan.orchestration_children),
-                    pane=pane,
-                    session_dir=session_dir,
-                    since_mtime=session_started,
-                )
-                recap_present = bool(
-                    orch_needles
-                    and _pane_has_any(pane, orch_needles, prompt=rows[0]["prompt"])
-                )
-            rows[0]["idle"] = False
-            rows[0]["replied"] = bool(evidence.get("ok") or recap_present)
-            rows[0]["pane_preview"] = pane[-2000:]
-            send_text = pane
-            selector = str(rows[0]["selector"])
-            if not driver.pane_has_selector(first, pane) and selector not in pane:
-                failures.append(
-                    f"orchestration pane does not show selector {selector}"
-                )
-            rows[0]["child_evidence"] = evidence
-            rows[0]["recap_present"] = recap_present
-            # Recap is wait-complete only. Child hub/task evidence is the gate.
-            failures.extend(list(evidence.get("failures") or []))
-    finally:
-        if hasattr(driver, "close_session"):
-            driver.close_session()
+        rows[0]["idle"] = False
+        rows[0]["replied"] = bool(evidence.get("ok") or recap_present)
+        rows[0]["pane_preview"] = pane[-2000:]
+        send_text = pane
+        selector = str(rows[0]["selector"])
+        if not driver.pane_has_selector(first, pane) and selector not in pane:
+            failures.append(
+                f"orchestration pane does not show selector {selector}"
+            )
+        rows[0]["child_evidence"] = evidence
+        rows[0]["recap_present"] = recap_present
+        # Recap is wait-complete only. Child hub/task evidence is the gate.
+        failures.extend(list(evidence.get("failures") or []))
     soft_fail_matches = _soft_fail_from_driver(
         plan,
         driver,

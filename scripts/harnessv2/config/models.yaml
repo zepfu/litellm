@@ -12,6 +12,7 @@ models:
     - sota-moonshot
     - sota-deepseek
     - sota-zai
+    - auto-review
     - codex-auto-review
   skip_prefixes:
     - aawm-
@@ -49,6 +50,11 @@ models:
       - work
       - expert
       - sota
+      - sota-xai
+      - sota-alibaba
+      - sota-moonshot
+      - sota-zai
+      - auto-review
     catalog_picker: catalog_picker_sample
   default_model_group: all
   default_orchestration_parent: sota-openai
