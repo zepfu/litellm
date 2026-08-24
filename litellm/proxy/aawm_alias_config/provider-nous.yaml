@@ -1,0 +1,13 @@
+# Provider-pinned acceptance alias (CFG-029). Closed Nous native set.
+# One-model limitation: OpenRouter stealth/ox-alpha is a different provider.
+# Codex-only route family; do not set anthropic_route_family.
+
+defaults: {}
+
+aliases:
+  - name: provider-nous
+    candidates:
+      - provider: nous
+        model: stealth/ox-alpha
+        route_family: codex_nous_chat_completions_adapter
+        priority: 100

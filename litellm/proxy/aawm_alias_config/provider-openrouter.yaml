@@ -1,0 +1,21 @@
+# Provider-pinned acceptance alias (CFG-029). Closed OpenRouter candidate set.
+
+defaults: {}
+
+aliases:
+  - name: provider-openrouter
+    candidates:
+      - provider: openrouter
+        model: openrouter/stealth/ox-alpha
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+
+      - provider: openrouter
+        model: openrouter/cohere/north-mini-code:free
+        route_family: codex_openrouter_completion_adapter
+        priority: 90
+
+      - provider: openrouter
+        model: openrouter/owl-alpha
+        route_family: codex_openrouter_completion_adapter
+        priority: 80

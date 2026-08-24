@@ -1,0 +1,18 @@
+# Provider-pinned acceptance alias (CFG-029). Closed Cursor Agent set.
+# Distinct from Cloud Agents ``cursor``. Composer 2.5 and Cursor Grok stay
+# on this provider; xAI managed/native Grok stay on provider-xai.
+
+defaults: {}
+
+aliases:
+  - name: provider-cursor_agent
+    candidates:
+      - provider: cursor_agent
+        model: cursor_agent/composer-2.5
+        route_family: codex_cursor_agent_aiserver_adapter
+        priority: 100
+
+      - provider: cursor_agent
+        model: cursor_agent/cursor-grok-4.6-high
+        route_family: codex_cursor_agent_aiserver_adapter
+        priority: 90

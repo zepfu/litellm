@@ -20,6 +20,7 @@ import hashlib
 import itertools
 import json
 import threading
+from collections.abc import Mapping
 from datetime import timedelta
 from typing import Optional
 
@@ -40,6 +41,175 @@ from .config_snapshot import (
 
 class ConfigCompileError(Exception):
     """Raised when the routing config YAML cannot be parsed/compiled."""
+
+
+PROVIDER_ALIAS_PREFIX = "provider-"
+
+# Closed route-family vocabulary per registered provider. Provider-pinned
+# aliases may only use families from this map; a newly registered provider
+# stays uncovered until both an alias and an allowed-family entry exist.
+_PROVIDER_ALLOWED_ROUTE_FAMILIES: dict[str, frozenset[str]] = {
+    "openai": frozenset(
+        {
+            "codex_responses",
+            "anthropic_openai_responses_adapter",
+        }
+    ),
+    "anthropic": frozenset({"anthropic_messages"}),
+    "openrouter": frozenset(
+        {
+            "codex_openrouter_completion_adapter",
+            "anthropic_openrouter_completion_adapter",
+        }
+    ),
+    "xai": frozenset(
+        {
+            "codex_xai_oauth_responses_adapter",
+            "anthropic_xai_oauth_responses_adapter",
+            "codex_grok_native_responses_adapter",
+            "anthropic_grok_native_responses_adapter",
+        }
+    ),
+    "kimi_code": frozenset(
+        {
+            "codex_kimi_chat_completions_adapter",
+            "anthropic_kimi_chat_completions_adapter",
+        }
+    ),
+    "alibaba_token_plan": frozenset(
+        {
+            "codex_alibaba_token_plan_chat_completions_adapter",
+            "anthropic_alibaba_token_plan_chat_completions_adapter",
+        }
+    ),
+    "zai_coding_plan": frozenset(
+        {
+            "codex_zai_coding_plan_chat_completions_adapter",
+        }
+    ),
+    "cohere": frozenset({"codex_cohere_chat_completions_adapter"}),
+    "nous": frozenset({"codex_nous_chat_completions_adapter"}),
+    "cursor_agent": frozenset(
+        {
+            "codex_cursor_agent_aiserver_adapter",
+            "anthropic_cursor_agent_aiserver_adapter",
+        }
+    ),
+    "opencode_zen": frozenset(
+        {
+            "codex_opencode_zen_adapter",
+            "anthropic_opencode_zen_responses_adapter",
+            "anthropic_opencode_zen_completion_adapter",
+        }
+    ),
+    "opencode_go": frozenset({"codex_opencode_go_adapter"}),
+}
+
+
+def provider_alias_name(provider_id: str) -> str:
+    """Return the canonical ``provider-<id>`` alias spelling."""
+
+    return f"{PROVIDER_ALIAS_PREFIX}{provider_id}"
+
+
+def iter_provider_alias_names(aliases: Mapping[str, object]) -> tuple[str, ...]:
+    """Return sorted ``provider-<id>`` alias names present in *aliases*."""
+
+    return tuple(sorted(name for name in aliases if name.startswith(PROVIDER_ALIAS_PREFIX)))
+
+
+def uncovered_registered_providers(aliases: Mapping[str, object]) -> tuple[str, ...]:
+    """Return registered providers that still lack a ``provider-<id>`` alias."""
+
+    present = {
+        name[len(PROVIDER_ALIAS_PREFIX) :]
+        for name in iter_provider_alias_names(aliases)
+    }
+    return tuple(sorted(schema.REGISTERED_PROVIDERS - present))
+
+
+def _assert_provider_alias_coverage(aliases: dict[str, RoutingAlias]) -> None:
+    """Reject a compile that introduces an incomplete provider-alias inventory.
+
+    Documents without any ``provider-*`` alias skip this check so focused
+    unit YAML stays valid. Once any provider alias is present, every
+    registered provider must have exactly one closed same-provider alias.
+    """
+
+    provider_names = iter_provider_alias_names(aliases)
+    if not provider_names:
+        return
+
+    errors: list[str] = []
+    seen_providers: dict[str, str] = {}
+    for name in provider_names:
+        provider_id = name[len(PROVIDER_ALIAS_PREFIX) :]
+        if provider_id not in schema.REGISTERED_PROVIDERS:
+            errors.append(
+                f"alias {name!r} does not name a registered provider"
+            )
+            continue
+        if provider_id in seen_providers:
+            errors.append(
+                f"duplicate provider alias {name!r} (already {seen_providers[provider_id]!r})"
+            )
+            continue
+        seen_providers[provider_id] = name
+        alias = aliases[name]
+        if alias.dispatch is not None:
+            errors.append(
+                f"{name} uses TUI dispatch; provider aliases must be closed candidate sets"
+            )
+        concrete = 0
+        for entry in alias.candidates:
+            if isinstance(entry, AliasReference):
+                errors.append(
+                    f"{name} uses alias_reference {entry.alias_name!r}; "
+                    "provider aliases must not escape via alias_reference"
+                )
+                continue
+            concrete += 1
+            if entry.provider != provider_id:
+                errors.append(
+                    f"{name} candidate {entry.model!r} has provider "
+                    f"{entry.provider!r}, expected {provider_id!r}"
+                )
+            allowed = _PROVIDER_ALLOWED_ROUTE_FAMILIES.get(provider_id)
+            if allowed is None:
+                errors.append(
+                    f"registered provider {provider_id!r} has no allowed "
+                    "route-family vocabulary for provider aliases"
+                )
+                continue
+            for route_family in (entry.route_family, entry.anthropic_route_family):
+                if route_family is not None and route_family not in allowed:
+                    errors.append(
+                        f"{name} candidate {entry.model!r} route family "
+                        f"{route_family!r} is not an allowed {provider_id} family"
+                    )
+        if concrete == 0:
+            errors.append(f"{name} has no concrete same-provider candidates")
+
+    missing = sorted(schema.REGISTERED_PROVIDERS - set(seen_providers))
+    if missing:
+        errors.append(
+            "uncovered registered providers (missing provider-<id> alias): "
+            + ", ".join(missing)
+        )
+    missing_vocab = sorted(
+        provider_id
+        for provider_id in schema.REGISTERED_PROVIDERS
+        if provider_id not in _PROVIDER_ALLOWED_ROUTE_FAMILIES
+    )
+    if missing_vocab:
+        errors.append(
+            "registered providers lack provider-alias route-family vocabulary: "
+            + ", ".join(missing_vocab)
+        )
+    if errors:
+        raise ConfigCompileError(
+            "provider-alias inventory incomplete: " + "; ".join(errors)
+        )
 
 
 _epoch_lock = threading.Lock()
@@ -584,6 +754,7 @@ def compile_yaml(raw_yaml: str) -> RoutingSnapshot:
         alias.name: _compile_alias(alias, available_aliases=available_aliases)
         for alias in resolved.aliases
     }
+    _assert_provider_alias_coverage(aliases)
     source_hash = hashlib.sha256(raw_yaml.encode("utf-8")).hexdigest()
     semantic_repr = _canonical_snapshot_repr(aliases)
     config_hash = hashlib.sha256(semantic_repr.encode("utf-8")).hexdigest()

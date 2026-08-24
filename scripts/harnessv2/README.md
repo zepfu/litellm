@@ -1,7 +1,7 @@
 # Harness v2
 
-YAML/JSON-first LiteLLM acceptance harness. Ohmypi is the only v1 TUI.
-Claude is out of scope. Codex, Grok, and OpenCode are stubs.
+YAML/JSON-first LiteLLM acceptance harness. Implemented TUIs are Ohmypi
+and Codex. Claude is out of scope. Grok and OpenCode are stubs.
 
 **Operator document (as-built runner + intended testing process):**
 [`TESTING.md`](TESTING.md). Legacy Claude/Codex harnesses stay in
@@ -31,6 +31,14 @@ python scripts/harnessv2/run.py \
   --dry-run
 ```
 
+```text
+python scripts/harnessv2/run.py \
+  --instance litellm-alpha \
+  --tui codex \
+  --test model \
+  --dry-run
+```
+
 `--instance`, `--container`, and `--target` are the same flag: a Docker
 container name, or a YAML alias (`alpha` → `litellm-alpha`). The host
 port is **not** a flag. The harness reads `NetworkSettings.Ports` from
@@ -56,15 +64,17 @@ a baseline full-suite step.
 | Kind | TUI | What it does |
 |---|---|---|
 | `platform` | forbidden | Health, custom endpoints, error JSONL, Redis prefix SCAN, docker logs |
-| `catalog` | optional | CFG-023/024 HTTP catalog; Ohmypi picker if `--tui ohmypi` |
-| `model` | required | Independent per-alias Ohmypi turn (not baseline). Waits for idle; standalone exact PONG or explicit provider 404 |
-| `orchestration` | required | Parent alias spawns the nine orchestration children |
+| `catalog` | optional | CFG-023/024 HTTP catalog; Ohmypi picker if `--tui ohmypi`; Codex skips live picker |
+| `model` | required | Independent per-alias TUI turn (not baseline). Ohmypi: idle exact PONG or provider 404. Codex: tool-bearing child command on `basic`/`read` |
+| `orchestration` | required | Parent alias spawns children. Ohmypi default is the nine mixed aliases; `--orchestration-children provider_coverage` spawns the provider-pinned aliases. Codex uses a smaller parent/child set |
 
 `--test model` and `--test orchestration` launch a dedicated interactive
-Ohmypi tmux session on socket `tmux37` (`hv2-ohmypi-<model>-<pid>`) with
-`--model litellm-alpha-passthrough/<alias>`. They never use `omp -p` /
-`--print` and they do not reuse leftover `omp-alpha-test` panes. Leave
-those dedicated `hv2-ohmypi-*` sessions open after `_step_tui_model`
+tmux session on socket `tmux37`. Ohmypi uses `hv2-ohmypi-<model>-<pid>`
+with `--model litellm-alpha-passthrough/<alias>`. Codex uses
+`hv2-codex-<model>-<pid>` and `codex --cd … --model <alias>` plus `-c`
+identity header overrides. They never use `-p` / `--print` / `codex exec`
+and they do not reuse leftover operator panes (`omp-alpha-test` or
+`codex`). Leave dedicated `hv2-*` sessions open after `_step_tui_model`
 and `_step_tui_orchestration`. Do not close them at the end of those
 kinds. Operator inspects leftovers after a claimed pass:
 
@@ -75,12 +85,37 @@ tmux -L tmux37 attach -t <hv2-ohmypi-…>
 
 Leftover count: platform 0, catalog 0 (HTTP; optional picker does not
 leave a dedicated inspect session as a baseline leftover), optional
-`--test model` / `--model all` = one dedicated session per alias (12
-if all compiled aliases), orchestration = 1 parent session. Baseline
-walk leftover is the orch parent session, not 4–5 and not 12.
+`--test model` / `--model all` = one dedicated session per compiled
+alias (including `provider-*`), orchestration = 1 parent session.
+Baseline walk leftover is the orch parent session, not the full
+`--model all` leftover set.
 
-`--model all` expands compiled aliases, including OMP-facing
-`auto-review` and Codex-client compatibility `codex-auto-review`.
+Ohmypi `--model all` expands compiled aliases, including OMP-facing
+`auto-review`, Codex-client compatibility `codex-auto-review`, and the
+`provider-<id>` aliases. Codex `--test model` defaults to `basic` and
+`read` only; `read` is not a compiled alias. Do not treat Ohmypi
+`--model all` as the Codex OC-003 surface. Codex model/orchestration is
+tool-bearing (child `date`/`pwd`); it is not Ohmypi `--no-tools` PONG.
+`--tui grok` and `--tui opencode` remain stubs. `--tui claude` stays out
+of scope.
+
+Provider-pinned orchestration is a separate group. It is not the
+baseline mixed-alias walk:
+
+```text
+python scripts/harnessv2/run.py \
+  --instance litellm-alpha \
+  --tui ohmypi \
+  --test orchestration \
+  --orchestration-parent sota-openai \
+  --orchestration-children provider_coverage \
+  --dry-run
+```
+
+That plan must stay tools-on. Each child is a `provider-<id>` Ohmypi
+`agent=` profile. Credential, quota, tool-contract, and provider errors
+fail that provider; they are not converted into a mixed-alias pass. Never
+target `aawm-litellm` or `litellm-dev`.
 
 For `--test model` the driver waits until the TUI returns idle, then
 passes only on a standalone exact `PONG` reply or an explicit provider
@@ -143,7 +178,10 @@ announcement is not a pass. `※ recap:` is wait-complete only;
 recap-only is not a pass. Leftover uvicorn ACCESS except `/health*` is
 0 on alpha as of 2026-08-22 (including native `GET /v2/model/info`
 500). Empty `docker logs --since` windows are not leftover-uvicorn
-pass.
+pass. Post-TUI `docker_logs` polls up to
+`checks.logs.rollup.settle_seconds` when the AAWM route-rollup header
+is the only miss (bind-mount alpha can emit it after the pane goes
+idle). Leftover uvicorn still fails immediately.
 
 ## Unit tests
 

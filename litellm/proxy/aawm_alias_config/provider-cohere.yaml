@@ -1,0 +1,13 @@
+# Provider-pinned acceptance alias (CFG-029). Closed Cohere native set.
+# One-model limitation: OpenRouter north-mini-code:free is a different provider.
+# Codex-only route family; do not set anthropic_route_family.
+
+defaults: {}
+
+aliases:
+  - name: provider-cohere
+    candidates:
+      - provider: cohere
+        model: cohere/north-mini-code-1-0
+        route_family: codex_cohere_chat_completions_adapter
+        priority: 100

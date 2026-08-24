@@ -25,6 +25,23 @@ _HUB_IDLE_PEER = re.compile(
 )
 _COMPLETION_TOOLS = {"task", "hub", "bash", "yield"}
 _JSONL_SCAN_CAP = 64
+_OPERATIONAL_FALLBACK_ALIASES = frozenset(
+    {
+        "basic",
+        "work",
+        "work-other",
+        "expert",
+        "sota",
+        "sota-openai",
+        "sota-xai",
+        "sota-alibaba",
+        "sota-moonshot",
+        "sota-deepseek",
+        "sota-zai",
+        "auto-review",
+        "codex-auto-review",
+    }
+)
 
 
 def _session_jsonl_paths(session_dir: Path, *, since_mtime: float | None) -> list[Path]:
@@ -105,6 +122,21 @@ def _agent_from_result(row: Mapping[str, Any]) -> str:
     return ""
 
 
+def _alias_tail(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        return ""
+    text = value.strip()
+    if "/" in text:
+        return text.rsplit("/", 1)[-1].strip()
+    return text
+
+
+def _provider_id_from_alias(alias: str) -> str:
+    if alias.startswith("provider-"):
+        return alias[len("provider-") :]
+    return ""
+
+
 def _wanted_from_model(value: Any, wanted: Sequence[str]) -> str:
     if not isinstance(value, str) or not value.strip():
         return ""
@@ -168,6 +200,123 @@ def _collect_successful_agents(
     return found
 
 
+def _nested_child_route_row(path: Path, wanted: Sequence[str]) -> dict[str, Any] | None:
+    """Classify one nested Ohmypi child transcript.
+
+    A completed PONG/date/fanout after Ohmypi auto-retried onto an
+    operational alias (``sota``, ``basic``, …) is a provider-specific
+    failure, not a pass. In-alias model fallback is allowed.
+    """
+
+    wanted_set = set(wanted)
+    requested = ""
+    selected_models: list[str] = []
+    producer_providers: list[str] = []
+    producer_models: list[str] = []
+    producer_routes: list[str] = []
+    tools: set[str] = set()
+    fallback = False
+    error = ""
+    completed = False
+    for obj in _iter_jsonl_objects(path):
+        payload = _message_payload(obj)
+        obj_type = str(obj.get("type") or "")
+        tool_name = str(payload.get("toolName") or obj.get("toolName") or "")
+        text = _content_text(payload)
+        if obj_type in {"session_init", "model_change"} or payload.get("agent"):
+            candidate = _wanted_from_model(
+                payload.get("agent") or obj.get("agent") or "",
+                wanted,
+            ) or _wanted_from_model(
+                payload.get("resolvedModel")
+                or obj.get("resolvedModel")
+                or obj.get("model")
+                or payload.get("model")
+                or "",
+                wanted,
+            )
+            if candidate and not requested:
+                requested = candidate
+            tail = _alias_tail(
+                obj.get("model") or payload.get("model") or obj.get("resolvedModel")
+            )
+            if tail:
+                selected_models.append(tail)
+            if obj.get("role") == "fallback" or obj.get("resolvedModelIsFallback") is True:
+                fallback = True
+        if tool_name:
+            tools.add(tool_name)
+        data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+        if data.get("toolName"):
+            tools.add(str(data.get("toolName")))
+        err = payload.get("errorMessage")
+        if isinstance(err, str) and err.strip() and not error:
+            error = err.strip()
+        blob = json.dumps(obj, default=str)
+        if "producer_provider" in blob:
+            match = re.search(r'"producer_provider"\s*:\s*"([^"]+)"', blob)
+            if match:
+                producer_providers.append(match.group(1))
+            match = re.search(r'"producer_model"\s*:\s*"([^"]+)"', blob)
+            if match:
+                producer_models.append(match.group(1))
+            match = re.search(r'"producer_route_family"\s*:\s*"([^"]+)"', blob)
+            if match:
+                producer_routes.append(match.group(1))
+        # Nested bash while the parent is still waiting is not a completed
+        # child. Count the nested transcript only after a successful yield
+        # or a completed task-result.
+        if (
+            tool_name == "yield"
+            and str(payload.get("role") or "") == "toolResult"
+            and payload.get("isError") is not True
+        ) or _TASK_RESULT_AGENT.search(text):
+            completed = True
+    if not requested and path.stem in wanted_set:
+        requested = path.stem
+    if not requested:
+        return None
+    unique_models = list(dict.fromkeys(selected_models))
+    escaped = [
+        name
+        for name in unique_models
+        if name in _OPERATIONAL_FALLBACK_ALIASES and name != requested
+    ]
+    expected_provider = _provider_id_from_alias(requested)
+    selected_provider = ""
+    unique_producers = list(dict.fromkeys(producer_providers))
+    if unique_producers:
+        selected_provider = unique_producers[-1]
+    elif expected_provider and not escaped:
+        selected_provider = expected_provider
+    cross_provider = bool(
+        expected_provider
+        and selected_provider
+        and selected_provider != expected_provider
+    )
+    disposition = "completed"
+    if escaped or (fallback and escaped) or cross_provider:
+        disposition = "fallback_operational"
+    elif error and not completed:
+        disposition = "unavailable"
+    elif not completed:
+        disposition = "incomplete"
+    ok = completed and not escaped and not cross_provider
+    return {
+        "requested_alias": requested,
+        "selected_provider": selected_provider,
+        "model": (producer_models[-1] if producer_models else (unique_models[-1] if unique_models else "")),
+        "route_family": producer_routes[-1] if producer_routes else "",
+        "endpoint_family": "openai_passthrough/v1/responses",
+        "terminal_disposition": disposition,
+        "fallback": fallback,
+        "escaped_aliases": escaped,
+        "tools": sorted(tools),
+        "error": error,
+        "ok": ok,
+    }
+
+
 def _record_looks_like_completion(payload: Mapping[str, Any], text: str) -> bool:
     tool_name = str(payload.get("toolName") or "")
     role = str(payload.get("role") or "")
@@ -205,6 +354,8 @@ def child_spawn_evidence(
     combined = pane_text
     session_paths: list[str] = []
     successful_agents: set[str] = set()
+    failed_agents: set[str] = set()
+    routes: dict[str, dict[str, Any]] = {}
     unknown_agents: set[str] = set()
     saw_task_result = False
     project_agents_dir: str | None = None
@@ -259,7 +410,19 @@ def child_spawn_evidence(
                 and payload.get("isError") is not True
             ):
                 file_completed = True
-        if file_agent and file_completed:
+        if root is not None and path.parent != root:
+            nested_route = _nested_child_route_row(path, wanted)
+            if nested_route:
+                alias = str(nested_route.get("requested_alias") or file_agent or "")
+                if alias in wanted_set:
+                    routes[alias] = nested_route
+                    if nested_route.get("ok") is True:
+                        successful_agents.add(alias)
+                    elif nested_route.get("terminal_disposition") == "fallback_operational":
+                        failed_agents.add(alias)
+                        successful_agents.discard(alias)
+                    continue
+        if file_agent and file_completed and file_agent not in failed_agents:
             successful_agents.add(file_agent)
 
     for child in wanted:
@@ -271,6 +434,23 @@ def child_spawn_evidence(
         failures.append(
             "orchestration spawn preflight rejected child agents "
             f"(unknown={sorted(unknown_agents) or 'see pane'})"
+        )
+    for alias, row in routes.items():
+        if row.get("ok") is True:
+            successful_agents.add(alias)
+            failed_agents.discard(alias)
+        elif row.get("terminal_disposition") == "fallback_operational":
+            failed_agents.add(alias)
+            successful_agents.discard(alias)
+    escaped = [
+        child
+        for child, row in routes.items()
+        if child in wanted_set and row.get("terminal_disposition") == "fallback_operational"
+    ]
+    if escaped:
+        failures.append(
+            "orchestration child fell back onto an operational alias or other "
+            f"provider (not in-alias fallback): {escaped}"
         )
     missing = [child for child in wanted if child not in successful_agents]
     if missing:
@@ -286,7 +466,9 @@ def child_spawn_evidence(
         "failures": failures,
         "children": wanted,
         "successful_agents": sorted(successful_agents),
+        "failed_agents": sorted(failed_agents),
         "unknown_agents": sorted(unknown_agents),
+        "routes": routes,
         "session_jsonl": session_paths[:4],
         "project_agents_dir": project_agents_dir,
         "saw_task_result": saw_task_result,

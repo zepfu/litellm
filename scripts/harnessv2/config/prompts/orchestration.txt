@@ -1,21 +1,12 @@
 You are the parent on alias {parent}.
 
-Spawn all nine subagents now, in one turn, using the Ohmypi `task` tool.
+Spawn all {child_count} subagents now, in one turn, using the Ohmypi `task` tool.
 The spawn payload has no `model=` field. Set `agent` to these exact profile
 names. Do not substitute scout, designer, reviewer, security-reviewer,
-librarian, task, sonic, a provider prefix, or an aawm- prefixed name:
+librarian, task, sonic, or an aawm- prefixed name. Use the listed names
+exactly, including any `provider-*` aliases:
 
-1. agent=basic   FIRST: reply with exactly the word PONG. Then run the
-   single shell command `date` (or `date -u` if date is unavailable).
-   Return only the command stdout. Do not guess the time.
-2. agent=work    same task.
-3. agent=expert  same task.
-4. agent=sota    same task.
-5. agent=sota-xai same task.
-6. agent=sota-alibaba same task.
-7. agent=sota-moonshot same task.
-8. agent=sota-zai same task.
-9. agent=auto-review same task.
+{children_block}
 
 Do not spawn any other agents. Do not do PONG or date yourself.
 

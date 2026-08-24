@@ -37,7 +37,7 @@ kinds:
       - type: error_jsonl
   orchestration:
     requires_tui: true
-    description: Ohmypi sota parent fanout to baseline children including extra aliases
+    description: Ohmypi parent fanout to baseline children or the provider_coverage group
     default_parent_group: all-sota
     default_parent: sota-openai
     default_children_group: orchestration_children

@@ -1,0 +1,36 @@
+# Provider-pinned acceptance alias (CFG-029). Closed Anthropic candidate set.
+# Anthropic-native credentials/egress on both ingress projections. Codex
+# ingress drops anthropic_messages (TOS). tui_attached is omitted so Ohmypi
+# / unknown origins remain eligible; Codex ingress still fail-closes.
+
+defaults: {}
+
+aliases:
+  - name: provider-anthropic
+    candidates:
+      - provider: anthropic
+        model: claude-opus-5
+        route_family: anthropic_messages
+        anthropic_route_family: anthropic_messages
+        priority: 100
+        reasoning_effort: max
+
+      - provider: anthropic
+        model: claude-sonnet-5[1m]
+        route_family: anthropic_messages
+        anthropic_route_family: anthropic_messages
+        priority: 90
+        reasoning_effort: max
+
+      - provider: anthropic
+        model: claude-sonnet-5
+        route_family: anthropic_messages
+        anthropic_route_family: anthropic_messages
+        priority: 80
+        reasoning_effort: max
+
+      - provider: anthropic
+        model: claude-haiku-4-5-20251001
+        route_family: anthropic_messages
+        anthropic_route_family: anthropic_messages
+        priority: 0

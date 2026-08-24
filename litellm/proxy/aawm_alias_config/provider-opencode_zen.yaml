@@ -1,0 +1,19 @@
+# Provider-pinned acceptance alias (CFG-029). Closed OpenCode Zen set.
+# Both adapter forms stay distinct: responses vs completion Anthropic projection.
+
+defaults: {}
+
+aliases:
+  - name: provider-opencode_zen
+    candidates:
+      - provider: opencode_zen
+        model: deepseek-v4-flash-free
+        route_family: codex_opencode_zen_adapter
+        anthropic_route_family: anthropic_opencode_zen_responses_adapter
+        priority: 100
+
+      - provider: opencode_zen
+        model: big-pickle
+        route_family: codex_opencode_zen_adapter
+        anthropic_route_family: anthropic_opencode_zen_completion_adapter
+        priority: 90

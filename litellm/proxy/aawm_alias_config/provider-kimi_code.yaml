@@ -1,0 +1,13 @@
+# Provider-pinned acceptance alias (CFG-029). Closed Moonshot/kimi_code set.
+# One-model limitation: only kimi_code/k3 is on the compiled active routes.
+
+defaults: {}
+
+aliases:
+  - name: provider-kimi_code
+    candidates:
+      - provider: kimi_code
+        model: kimi_code/k3
+        route_family: codex_kimi_chat_completions_adapter
+        priority: 100
+        reasoning_effort: max

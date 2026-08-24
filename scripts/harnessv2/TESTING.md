@@ -18,9 +18,9 @@ not run `scripts/local-ci/` as part of a v2 run.
 
 ## 1. What this harness is
 
-Harness v2 is an Ohmypi-only acceptance runner aimed at the live-repo
-bind-mount instance `litellm-alpha` (host port from `docker inspect`;
-today `127.0.0.1:4011`).
+Harness v2 is an Ohmypi and Codex acceptance runner aimed at the
+live-repo bind-mount instance `litellm-alpha` (host port from
+`docker inspect`; today `127.0.0.1:4011`).
 
 It exists because the legacy products in `scripts/local-ci/` are not
 TUI-agnostic:
@@ -34,8 +34,10 @@ v2 is a **new** tree. YAML/JSON is the source of truth. Python changes
 only when a new *kind of step* is invented. Adding a model, prompt,
 forbidden log string, HTTP probe, or Ohmypi argv token is a YAML edit.
 
-v1 TUI is Ohmypi (`omp` 17.3.8 via `ompla`). Claude is out of scope, not
-a stub. Codex, Grok, and OpenCode are stubs (`enabled: false`).
+Implemented TUIs are Ohmypi (`omp` 17.3.8 via `ompla`) and Codex
+(`codex` interactive TUI). Claude is out of scope, not a stub. Grok and
+OpenCode remain stubs (`enabled: false`). Codex never uses `codex exec`,
+`-p`, or `--print`.
 
 Entry point:
 
@@ -94,13 +96,15 @@ scripts/harnessv2/
   config/
     harness.yaml          # includes + timeouts + artifact schema
     targets.yaml          # instance firewall, Redis, inspect env keys
-    tuis.yaml             # Ohmypi driver contract; stubs; Claude out
+    tuis.yaml             # Ohmypi + Codex driver contract; grok/opencode stubs; Claude out
     models.yaml           # compiled aliases, groups, skip prefixes
     kinds.yaml            # platform / catalog / model / orchestration
     checks.yaml           # health, HTTP suite, leftover uvicorn, JSONL, Ohmypi rollup identity
     prompts.yaml
     prompts/pong.txt
     prompts/orchestration.txt
+    prompts/codex_model.txt
+    prompts/codex_orchestration.txt
   hv2/
     cli.py                # argparse only; no docker/HTTP
     plan.py               # fail-closed RunPlan before any inspect
@@ -108,12 +112,13 @@ scripts/harnessv2/
     docker_guard.py       # protected names/ports
     kinds/runner.py       # walk YAML steps; halt on logging regression
     drivers/ohmypi.py     # interactive tmux; never -p/--print
+    drivers/codex.py      # interactive tmux; never -p/--print/exec
     drivers/stub.py
     checks/               # health, HTTP, logs, redis, error JSONL
     artifact.py           # JSON artifact + durable JSONL + SHA stamp
     pane.py               # pane needles; ignore needles in sent prompt
     envscrub.py           # child env allow/deny
-  fixtures/logs/          # leftover uvicorn / ASGI / clean rollup / Ohmypi identity
+  fixtures/logs/          # leftover uvicorn / ASGI / clean rollup / Ohmypi + Codex identity
 tests/test_litellm/scripts/test_harnessv2.py
 ```
 
@@ -151,6 +156,13 @@ OMP-facing `auto-review` and Codex-client compatibility
 - `sota-openai`, `sota-xai`, `sota-alibaba`, `sota-moonshot`,
   `sota-deepseek`, `sota-zai`
 - `auto-review`, `codex-auto-review`
+- `provider-<id>` for every identity in `REGISTERED_PROVIDERS`
+  (`provider-openai`, `provider-anthropic`, `provider-openrouter`,
+  `provider-xai`, `provider-kimi_code`, `provider-alibaba_token_plan`,
+  `provider-zai_coding_plan`, `provider-cohere`, `provider-nous`,
+  `provider-cursor_agent`, `provider-opencode_zen`,
+  `provider-opencode_go`). NVIDIA is not registered and is not
+  invented.
 
 Skip prefixes: `aawm-`, `claude-`. Absent catalog ids
 (`aawm-sota-zai`, …) are recorded so a picker must not treat them as
@@ -164,6 +176,12 @@ Groups:
   `sota-xai`, `sota-alibaba`, `sota-moonshot`, `sota-zai`, `auto-review`.
   Spawn name is `auto-review`, not `codex-auto-review`. Not orchestration
   children: `work-other`, `sota-deepseek`, `codex-auto-review`.
+- `provider_coverage` → every `provider-<id>` alias. This is the
+  provider-pinned Ohmypi orchestration group. It is not mixed into
+  `orchestration_children`. A pass for provider P requires selected
+  provider P (in-alias fallback only). Missing credentials, quota,
+  unsupported tool contracts, Cursor fail-closed adapters, and provider
+  errors stay failed for that provider.
 - `catalog_picker` → `work`, `sota-zai`
 
 Ohmypi session `--model` is `litellm-alpha-passthrough/<alias>`, not a
@@ -180,9 +198,9 @@ skip the logging gate. Independent `--test model` stays available
 | Kind | TUI | What it proves |
 |---|---|---|
 | `platform` | forbidden | Health, custom HTTP, error JSONL, Redis prefix SCAN, docker logs |
-| `catalog` | optional | CFG-023/024 HTTP catalog; Ohmypi picker if `--tui ohmypi` |
-| `model` | required | Independent per-alias Ohmypi turn (not baseline). Waits for idle; standalone exact PONG or explicit provider 404 |
-| `orchestration` | required | Parent alias spawns the nine orchestration children through Ohmypi `task` |
+| `catalog` | optional | CFG-023/024 HTTP catalog; Ohmypi picker if `--tui ohmypi`; Codex skips live picker |
+| `model` | required | Independent per-alias TUI turn (not baseline). Ohmypi: idle exact PONG or provider 404. Codex: tool-bearing child command on `basic`/`read` |
+| `orchestration` | required | Ohmypi parent spawns the selected children group (default nine mixed aliases, or `provider_coverage`); Codex uses a smaller parent/child set |
 
 `--dry-run` prints the resolved plan and exits 0. No TUI, no HTTP, no
 docker logs of protected containers. Use it to confirm instance/kind/
@@ -266,9 +284,9 @@ For each selected alias the driver:
    ```
 
    Optional `--test model` / `--model all` leftover count is one
-   dedicated session per alias (12 if all compiled aliases). This kind
+   dedicated session per compiled alias (including `provider-*`). This kind
    is not a baseline full-suite step; baseline leftover is the orch
-   parent session, not 12.
+   parent session, not the full `--model all` leftover set.
 
 `--model` is repeatable / comma-separated. Default is group `all`.
 `--test model` stays available independently; it is not part of the
@@ -286,27 +304,39 @@ Post-TUI `docker_logs` uses the same `require_rollup` + Ohmypi identity
 gate as model kind (§7). `child_evidence.ok` is not docker_logs pass.
 
 Default parent: `sota-openai` (group `all-sota`). Default children are
-the nine `orchestration_children`: `basic`, `work`, `expert`, `sota`,
-`sota-xai`, `sota-alibaba`, `sota-moonshot`, `sota-zai`, `auto-review`.
-Spawn name is `auto-review`, not `codex-auto-review`. Not orch children:
-`work-other`, `sota-deepseek`, `codex-auto-review`.
+the nine mixed `orchestration_children`: `basic`, `work`, `expert`,
+`sota`, `sota-xai`, `sota-alibaba`, `sota-moonshot`, `sota-zai`,
+`auto-review`. Spawn name is `auto-review`, not `codex-auto-review`.
+Not mixed orch children: `work-other`, `sota-deepseek`,
+`codex-auto-review`, and the `provider-*` aliases.
+
+Provider-pinned coverage is a **separate** group. Select it with
+`--orchestration-children provider_coverage` (or an explicit
+`provider-*` list). That group must not depend on whichever provider
+happens to win `basic` / `work` / `expert` / `sota`. Mixed-alias
+success is not provider-coverage evidence.
 
 Launches the parent with tools enabled. Pastes
-`prompts/orchestration.txt` with `{parent}` substituted. Each child's
-**first** directive is exact `PONG`, then `date`, then a follow-up
-parallel `pwd` / `uname -s` / `echo omp-alpha-fanout`. Wait needle is
-`※ recap:` — **not** `omp-alpha-fanout`, which is inside the prompt and
-would false-complete (H-6). Recap is wait-only, never pass evidence.
+`prompts/orchestration.txt` with `{parent}` and the planned children
+list substituted. Each child's **first** directive is exact `PONG`,
+then `date`, then a follow-up parallel `pwd` / `uname -s` /
+`echo omp-alpha-fanout`. Wait needle is `※ recap:` — **not**
+`omp-alpha-fanout`, which is inside the prompt and would false-complete
+(H-6). Recap is wait-only, never pass evidence. `--no-tools`, a
+tool-free `PONG`, catalog visibility alone, or a direct completion
+outside orchestration is not acceptance.
 
 Spawn contract (H-7, **closed in code**): Ohmypi `task` has no
-`model=` field. The parent must spawn `agent=basic`, `agent=work`,
-`agent=expert`, `agent=sota`, `agent=sota-xai`, `agent=sota-alibaba`,
-`agent=sota-moonshot`, `agent=sota-zai`, and `agent=auto-review`. Those
-names are harness profiles staged from `config/ohmypi-agents/` into
-`{cwd}/.omp/agents` (`/tmp/omp-alpha-workspace/.omp/agents` by
-default). They are **not** the built-in Ohmypi names (`scout`,
-`designer`, `reviewer`, …) and **not** LiteLLM catalog ids. Session
-`--model` stays `litellm-alpha-passthrough/<parent>`.
+`model=` field. The parent must spawn `agent=<planned child>` for
+every selected child, including `provider-*` names when that group is
+selected. Those names are harness profiles staged from
+`config/ohmypi-agents/` into `{cwd}/.omp/agents`
+(`/tmp/omp-alpha-workspace/.omp/agents` by default). Staging follows
+the planned children list, not a hardcoded nine-name fallback, when
+`--orchestration-children` is set. They are **not** the built-in
+Ohmypi names (`scout`, `designer`, `reviewer`, …) and **not** LiteLLM
+catalog ids. Session `--model` stays
+`litellm-alpha-passthrough/<parent>`.
 
 `※ recap:` is wait-complete only. Ohmypi 17.4 often finishes the parent
 turn with the nine-child PONG / date list and idle `hub` peers, without
@@ -415,9 +445,58 @@ not add those strings to leftover-uvicorn `allow_paths`.
 
 ---
 
+## 6.1 Codex driver contract
+
+From `config/tuis.yaml`:
+
+| Item | Value |
+|---|---|
+| Binary | `codex` (interactive TUI; never `codex exec`) |
+| Min version | 0.142.5 |
+| Overlay | `-c model_provider="litellm-alpha"` plus `-c model_providers.litellm-alpha.http_headers.x-aawm-client*=…`. That overlay stamps rollup as `litellm#Codex[<version>]@<host>`. Extra `-c` from `tuis.codex.extra_c_overrides` keep unattended child `date`/`pwd` from blocking on guardian/`on-request` (`approval_policy="never"`, `sandbox_mode="workspace-write"`, `features.guardian_approval=false`). Still never `codex exec` / `-p`. |
+| CWD | `/tmp/hv2-codex-workspace` (`--cd`) |
+| Session dir | `/tmp/hv2-codex-sessions/hv2-<alias>` |
+| tmux socket | `tmux37` |
+| Default models | `basic`, `read` (`read` is not in `compiled_aliases`) |
+| Default orch | parent `basic`, child `read` |
+| Forbid | `-p`, `--print`, `--profile`, `exec` |
+| Model tools | on (not `--no-tools` PONG) |
+| Orchestration tools | on |
+| Model pass | standalone `hv2-codex-child` after a spawned child runs `date`/`pwd`; provider 404 needles |
+
+`--tui grok` and `--tui opencode` remain stubs. `--tui claude` stays out
+of scope. `--test platform --tui codex` is still forbidden. Protected
+containers `aawm-litellm` / `litellm-dev` and ports `4000` / `4001` still
+fail closed.
+
+Do not send-keys into an existing operator `codex` pane. Every
+`--test model` / `--test orchestration` row creates
+`hv2-codex-<alias>-<pid>` on socket `tmux37`. Never `codex exec -p`.
+Never reuse leftover operator sessions. A first launch into
+`/tmp/hv2-codex-workspace` may show Codex's directory-trust nux
+(`Do you trust the contents of this directory?`); the driver
+polls `wait_trust_seconds` (default 4s) and accepts
+`Yes, continue` with Enter in that dedicated session only.
+Prompt-free launches that already show the selected model skip
+that poll and do not send Enter. Composer submit is YAML
+`submit_keys` (default `C-m`); Codex 0.149 maps Enter to a
+newline, so `send-keys … Enter` leaves the prompt unsubmitted.
+Never send that submit chord into leftover operator panes.
+Codex `--model all` still
+expands compiled aliases if the operator asks, but the Codex default
+path (`--model` omitted) is `basic` + `read`, not the Ohmypi 13-alias
+matrix.
+
+---
+
 ## 7. Halt protocol (logging regression)
 
 After every kind, `docker_logs` scans alpha logs since run start.
+TUI kinds (`model`, `orchestration`) also poll that window for
+`checks.logs.rollup.settle_seconds` (default 90s, poll
+`settle_poll_seconds`) when the only miss is a delayed AAWM
+route-rollup header. Leftover uvicorn / Traceback / ASGI still fail
+on the first scan and do not wait out the settle budget.
 
 **Hard stop** (run `ok: false`, remaining steps skipped as
 `halted_on_logging_regression`):
@@ -474,6 +553,13 @@ Concurrent other-workspace headers on the shared alpha instance are
 identity is present, those known-repo `@host` rows are ignored. The
 allowlist is `checks.yaml` `logs.rollup.concurrent_workspace_repos`
 and must **not** include `litellm`.
+
+Labeled concurrent-other-TUI headers on the shared alpha instance are
+also **not** an identity miss: a Codex run may see leftover
+`litellm#Ohmypi[<version>]@<host>` rows from dedicated `hv2-ohmypi-*`
+sessions, and an Ohmypi run may see leftover
+`litellm#Codex[<version>]@<host>` rows. Pass still requires the selected
+TUI's own `repository#Client[version]@host` stamp.
 
 Concurrent Codex-client `litellm@thoth /openai_passthrough/responses`
 followed by `- codex-auto-review:low` is also **not** unlabeled Ohmypi.
@@ -555,8 +641,10 @@ Covers argparse, YAML load, docker_guard refuse of `:4000`/`:4001`,
 leftover-uvicorn invert, Ohmypi forbid `-p`, Ohmypi rollup identity
 (`require_rollup` + `tui=ohmypi`, including concurrent
 `aawm-infrastructure@thoth` and concurrent Codex-client
-`litellm@thoth` + `codex-auto-review`), dry-run plans, H-6 prompt
-substring needles.
+`litellm@thoth` + `codex-auto-review`), Codex interactive TUI plans
+(`basic`/`read`, identity overlay, dedicated tmux, no print/exec),
+Codex rollup identity (`tui=codex`), grok/opencode stubs, Claude out of
+scope, dry-run plans, H-6 prompt substring needles.
 
 ### Dry-run a kind
 
@@ -604,7 +692,7 @@ on a harness-owned alpha window as of 2026-08-22 (see §11). Remaining
 compiled aliases still need live Ohmypi `--test model`. Leave dedicated
 `hv2-ohmypi-*` sessions open after `_step_tui_model` for inspect
 (`tmux -L tmux37 ls`). `--model all` leftover is one session per
-compiled alias (12), not a baseline leftover.
+compiled alias, not a baseline leftover.
 
 ```text
 python scripts/harnessv2/run.py \
@@ -622,10 +710,11 @@ Repeat `--model` / comma-separated ids, or omit it to expand `all`
 
 Same leftover-uvicorn gate **and** the Ohmypi identity rollup gate
 (§7). Recap is wait-only, never pass evidence: `tui_orchestration`
-fails unless `child_evidence.ok` is true for the nine orchestration
-children (`basic`, `work`, `expert`, `sota`, `sota-xai`,
-`sota-alibaba`, `sota-moonshot`, `sota-zai`, `auto-review`). Spawn
-name is `auto-review`, not `codex-auto-review`. Historical recap-only
+fails unless `child_evidence.ok` is true for the selected children.
+Default mixed orch still requires the nine `orchestration_children`
+(`basic`, `work`, `expert`, `sota`, `sota-xai`, `sota-alibaba`,
+`sota-moonshot`, `sota-zai`, `auto-review`). Spawn name is
+`auto-review`, not `codex-auto-review`. Historical recap-only
 `ok: true` artifacts are stale relative to the current gate. Leave
 the dedicated parent session open after `_step_tui_orchestration`.
 Baseline leftover is that one orch parent session. `child_evidence.ok`
@@ -639,6 +728,23 @@ python scripts/harnessv2/run.py \
   --orchestration-parent sota-openai \
   --write-artifact /tmp/hv2-orch-sota-openai.json
 ```
+
+Provider-pinned live run (tools on, never prod/dev):
+
+```text
+python scripts/harnessv2/run.py \
+  --instance litellm-alpha \
+  --tui ohmypi \
+  --test orchestration \
+  --orchestration-parent sota-openai \
+  --orchestration-children provider_coverage \
+  --write-artifact /tmp/hv2-orch-provider-coverage.json
+```
+
+Interpret unavailable-provider failures as that provider's result.
+Do not reroute through `basic` / `work` / `sota`, OpenAI, OpenRouter,
+or Codex OAuth to make Anthropic coverage pass. In-alias fallback is
+allowed; cross-provider fallback is a fail.
 
 ### Overlay
 
@@ -676,7 +782,7 @@ python scripts/harnessv2/run.py \
      not 200
 7. Optional independent `--test model` / `--model all` is **not** a
    baseline full-suite step. If you run it, leave dedicated
-   `hv2-ohmypi-*` sessions open (12 if all compiled aliases). On
+   `hv2-ohmypi-*` sessions open (one per compiled alias). On
    traceback / leftover uvicorn: halt, source-fix on the shared
    checkout, `docker restart litellm-alpha` only if watchfiles did not
    reload, resume the **same** row.

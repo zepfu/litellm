@@ -1,4 +1,6 @@
-# Compiled YAML alias ids and groups. --model all expands compiled_aliases only.
+# Compiled YAML alias ids and groups. Ohmypi `--model all` expands
+# compiled_aliases only. Codex TUI default_models are `basic` and `read`;
+# `read` is intentionally not a compiled alias (do not add it here).
 models:
   compiled_aliases:
     - basic
@@ -14,6 +16,18 @@ models:
     - sota-zai
     - auto-review
     - codex-auto-review
+    - provider-alibaba_token_plan
+    - provider-anthropic
+    - provider-cohere
+    - provider-cursor_agent
+    - provider-kimi_code
+    - provider-nous
+    - provider-openai
+    - provider-opencode_go
+    - provider-opencode_zen
+    - provider-openrouter
+    - provider-xai
+    - provider-zai_coding_plan
   skip_prefixes:
     - aawm-
     - claude-
@@ -55,6 +69,19 @@ models:
       - sota-moonshot
       - sota-zai
       - auto-review
+    provider_coverage:
+      - provider-alibaba_token_plan
+      - provider-anthropic
+      - provider-cohere
+      - provider-cursor_agent
+      - provider-kimi_code
+      - provider-nous
+      - provider-openai
+      - provider-opencode_go
+      - provider-opencode_zen
+      - provider-openrouter
+      - provider-xai
+      - provider-zai_coding_plan
     catalog_picker: catalog_picker_sample
   default_model_group: all
   default_orchestration_parent: sota-openai

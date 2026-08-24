@@ -29,7 +29,7 @@ from hv2.errors import PlanError
 from hv2.instance import inspect_instance
 from hv2.load_config import as_str_list
 from hv2.pane import _pane_exact_pong, _pane_has_any
-from hv2.plan import RunPlan
+from hv2.plan import RunPlan, expand_orchestration_prompt
 
 # Tests import these from hv2.kinds.runner.
 _pane_exact_pong = _pane_exact_pong
@@ -289,16 +289,20 @@ def _with_session_history(plan: RunPlan, payload: dict[str, Any]) -> dict[str, A
     return payload
 
 
-def _step_docker_logs(plan: RunPlan, *, log_cursor: str, **_: Any) -> dict[str, Any]:
-    text = _read_logs_since(plan, log_cursor)
-    # Catalog listing does not generate route-rollup traffic, but any leftover
-    # native uvicorn access line (except health allow_paths) is still a
-    # logging-regression halt (scan_log_text leftover_uvicorn).
-    require_rollup = plan.kind in {"model", "orchestration"} and bool(plan.tui)
+def _rollup_cfg(plan: RunPlan) -> dict[str, Any]:
     logs_cfg = (plan.config.get("checks") or {}).get("logs") or {}
     rollup_cfg = logs_cfg.get("rollup") if isinstance(logs_cfg, dict) else {}
+    return rollup_cfg if isinstance(rollup_cfg, dict) else {}
+
+
+def _require_rollup(plan: RunPlan) -> bool:
+    require_rollup = plan.kind in {"model", "orchestration"} and bool(plan.tui)
     if plan.kind == "platform":
-        require_rollup = bool(rollup_cfg.get("required_on_platform"))
+        require_rollup = bool(_rollup_cfg(plan).get("required_on_platform"))
+    return require_rollup
+
+
+def _scan_docker_logs(plan: RunPlan, text: str, *, require_rollup: bool) -> dict[str, Any]:
     scan = scan_log_text(
         text,
         plan.config,
@@ -308,6 +312,43 @@ def _step_docker_logs(plan: RunPlan, *, log_cursor: str, **_: Any) -> dict[str, 
         tui=plan.tui,
     )
     scan["bytes"] = len(text)
+    return scan
+
+
+def _missing_rollup_only(scan: dict[str, Any]) -> bool:
+    failures = [str(item) for item in (scan.get("failures") or [])]
+    if not failures:
+        return False
+    return all("route-rollup header was not found" in item for item in failures)
+
+
+def _step_docker_logs(plan: RunPlan, *, log_cursor: str, **_: Any) -> dict[str, Any]:
+    # Catalog listing does not generate route-rollup traffic, but any leftover
+    # native uvicorn access line (except health allow_paths) is still a
+    # logging-regression halt (scan_log_text leftover_uvicorn).
+    require_rollup = _require_rollup(plan)
+    text = _read_logs_since(plan, log_cursor)
+    scan = _scan_docker_logs(plan, text, require_rollup=require_rollup)
+    rollup_cfg = _rollup_cfg(plan)
+    try:
+        settle_seconds = float(rollup_cfg.get("settle_seconds") or 0)
+    except (TypeError, ValueError):
+        settle_seconds = 0.0
+    try:
+        poll_seconds = float(rollup_cfg.get("settle_poll_seconds") or 2)
+    except (TypeError, ValueError):
+        poll_seconds = 2.0
+    if require_rollup and settle_seconds > 0 and _missing_rollup_only(scan):
+        deadline = time.time() + settle_seconds
+        waited = 0.0
+        started = time.time()
+        while time.time() < deadline and _missing_rollup_only(scan):
+            time.sleep(max(poll_seconds, 0.2))
+            text = _read_logs_since(plan, log_cursor)
+            scan = _scan_docker_logs(plan, text, require_rollup=require_rollup)
+        waited = time.time() - started
+        scan["settle_seconds"] = settle_seconds
+        scan["settle_waited_seconds"] = round(waited, 3)
     return scan
 
 
@@ -322,9 +363,17 @@ def _step_tui_catalog(plan: RunPlan, **_: Any) -> dict[str, Any]:
         return {"ok": True, "skipped": True, "failures": []}
     driver = driver_for(plan.tui, plan.config)
     if not hasattr(driver, "catalog_json"):
-        raise PlanError(f"TUI {plan.tui!r} cannot run catalog discovery")
+        return _with_session_history(
+            plan,
+            {
+                "ok": True,
+                "skipped": True,
+                "reason": "catalog_picker_unavailable",
+                "failures": [],
+            },
+        )
     outcome = driver.catalog_json()
-    failures = [] if outcome.get("ok") else ["Ohmypi `omp models --json` failed"]
+    failures = [] if outcome.get("ok") else [f"{plan.tui} catalog json listing failed"]
     finds: list[dict[str, Any]] = []
     samples = list(plan.models) or []
     if hasattr(driver, "catalog_find"):
@@ -364,12 +413,14 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
         raise PlanError("model kind has an empty model list")
     select = _ohmypi_select_spec(driver)
     tools = bool(select.get("tools_for_model", False))
+    pass_mode = str(select.get("pass_mode") or "exact_pong")
+    standalone_pass_tokens = as_str_list(select.get("standalone_pass_tokens"))
     pass_needles = as_str_list(select.get("pass_needles")) or ["PONG"]
     provider_404_needles = (
         as_str_list(select.get("provider_404_needles")) or ["404"]
     )
     reply_needles = as_str_list(select.get("reply_needles")) or (
-        pass_needles + provider_404_needles
+        pass_needles + provider_404_needles + standalone_pass_tokens
     )
     send_text = ""
     for model in plan.models:
@@ -390,7 +441,7 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
         }
         if not launched.get("ok"):
             failures.append(
-                f"Ohmypi session for {model} did not become ready on "
+                f"TUI session for {model} did not become ready on "
                 f"{launched.get('selector')}: "
                 f"{(launched.get('pane_preview') or '')[-200:]}"
             )
@@ -424,15 +475,31 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
                 pane, provider_404_needles, prompt=prompt.strip()
             )
         )
+        tool_tokens = standalone_pass_tokens or (
+            pass_needles if pass_mode == "tool_command" else []
+        )
+        tool_pass = bool(
+            tool_tokens
+            and _pane_has_any(pane, tool_tokens, prompt=prompt.strip())
+        )
         row["exact_pong"] = exact_pong
         row["provider_404"] = provider_404
-        completed = bool(row.get("idle")) and (exact_pong or provider_404)
+        row["tool_pass"] = tool_pass
+        if pass_mode == "tool_command":
+            completed = bool(row.get("idle")) and (tool_pass or provider_404)
+            miss = (
+                f"TUI turn for {model} did not reach an idle tool-bearing "
+                "child command reply or provider 404 evidence"
+            )
+        else:
+            completed = bool(row.get("idle")) and (exact_pong or provider_404)
+            miss = (
+                f"TUI turn for {model} did not reach an idle exact PONG "
+                "reply or provider 404 evidence"
+            )
         row["completed"] = completed
         if not completed:
-            failures.append(
-                f"TUI turn for {model} did not reach an idle exact PONG "
-                f"reply or provider 404 evidence"
-            )
+            failures.append(miss)
         rows.append(row)
     soft_fail_matches = matching_signatures(
         plan.config, text=send_text, model=list(plan.models)
@@ -462,7 +529,11 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
     rows: list[dict[str, Any]] = []
     failures: list[str] = []
     for parent in plan.orchestration_parents:
-        prompt = template.replace("{parent}", parent)
+        prompt = expand_orchestration_prompt(
+            template,
+            parent=parent,
+            children=plan.orchestration_children,
+        )
         argv = driver.launch_argv(parent)
         driver.assert_no_print_flags(argv)
         rows.append(
@@ -477,9 +548,14 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
     send_text = ""
     select = _ohmypi_select_spec(driver)
     tools = bool(select.get("tools_for_orchestration", True))
+    pass_mode = str(select.get("pass_mode") or "exact_pong")
     session_started = time.time()
     first = plan.orchestration_parents[0]
-    launched = driver.ensure_session(first, tools=tools)
+    launched = driver.ensure_session(
+        first,
+        tools=tools,
+        child_agents=list(plan.orchestration_children),
+    )
     rows[0]["session"] = launched.get("session")
     rows[0]["launch_ok"] = launched.get("ok")
     rows[0]["selected"] = launched.get("selected")
@@ -492,18 +568,22 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
         )
     if not launched.get("ok"):
         failures.append(
-            f"Ohmypi session for {first} did not become ready on "
+            f"TUI session for {first} did not become ready on "
             f"{launched.get('selector')}: "
             f"{(launched.get('pane_preview') or '')[-200:]}"
         )
     else:
         orch_needles = as_str_list(select.get("orchestration_pass_needles"))
+        if pass_mode == "tool_command" and not orch_needles:
+            orch_needles = as_str_list(select.get("standalone_pass_tokens"))
         sent = driver.send_keys(rows[0]["prompt"])
         rows[0]["send"] = sent
         if not sent.get("ok"):
             failures.append("tmux send-keys failed")
         session_dir = None
-        if hasattr(driver, "spec"):
+        if hasattr(driver, "alias_session_dir"):
+            session_dir = str(driver.alias_session_dir(first))
+        elif hasattr(driver, "spec"):
             session_dir = str((driver.spec or {}).get("session_dir") or "") or None
         wait_seconds = 420.0
         poll_seconds = 1.0
@@ -522,9 +602,10 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
             orch_needles
             and _pane_has_any(pane, orch_needles, prompt=rows[0]["prompt"])
         )
-        # Recap is wait-complete only. Keep polling until child hub/task
-        # evidence is complete even if the pane already shows recap.
-        while time.time() < deadline and not evidence.get("ok"):
+        wait_complete = recap_present if pass_mode == "tool_command" else evidence.get("ok")
+        # Recap/tool-token is wait-complete only. Keep polling until child
+        # hub/task evidence is complete even if the pane already shows recap.
+        while time.time() < deadline and not wait_complete:
             time.sleep(max(poll_seconds, 0.2))
             pane = driver.capture_pane() if hasattr(driver, "capture_pane") else pane
             evidence = child_spawn_evidence(
@@ -537,6 +618,9 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
                 orch_needles
                 and _pane_has_any(pane, orch_needles, prompt=rows[0]["prompt"])
             )
+            wait_complete = (
+                recap_present if pass_mode == "tool_command" else evidence.get("ok")
+            )
         rows[0]["idle"] = False
         rows[0]["replied"] = bool(evidence.get("ok") or recap_present)
         rows[0]["pane_preview"] = pane[-2000:]
@@ -548,8 +632,20 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
             )
         rows[0]["child_evidence"] = evidence
         rows[0]["recap_present"] = recap_present
-        # Recap is wait-complete only. Child hub/task evidence is the gate.
-        failures.extend(list(evidence.get("failures") or []))
+        if pass_mode == "tool_command":
+            tool_pass = bool(
+                orch_needles
+                and _pane_has_any(pane, orch_needles, prompt=rows[0]["prompt"])
+            )
+            rows[0]["tool_pass"] = tool_pass
+            if not tool_pass:
+                failures.append(
+                    f"Codex orchestration for {first} did not reach idle "
+                    "tool-bearing child evidence"
+                )
+        else:
+            # Recap is wait-complete only. Child hub/task evidence is the gate.
+            failures.extend(list(evidence.get("failures") or []))
     soft_fail_matches = _soft_fail_from_driver(
         plan,
         driver,

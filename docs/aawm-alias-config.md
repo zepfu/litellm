@@ -133,6 +133,40 @@ visibility routing distinction in YAML or Python. Codex and Claude TUI
 selection catalogs are separate client model-definition lists; they are not
 generated from every snapshot alias and do not invent a denylist.
 
+## Provider-pinned aliases (CFG-029)
+
+Each identity in `REGISTERED_PROVIDERS` has exactly one discoverable
+`provider-<id>` alias (`provider-openai`, `provider-anthropic`,
+`provider-openrouter`, `provider-xai`, `provider-kimi_code`,
+`provider-alibaba_token_plan`, `provider-zai_coding_plan`,
+`provider-cohere`, `provider-nous`, `provider-cursor_agent`,
+`provider-opencode_zen`, `provider-opencode_go`). These aliases are
+acceptance surfaces, not operational routing policy. They do not change
+`basic` / `work` / `expert` / `sota` candidate order.
+
+Each provider alias is a closed same-provider candidate set:
+
+- Candidates never cross provider boundaries.
+- Candidates never `alias_reference` an operational or other-provider
+  alias.
+- Fallback is allowed only among models inside that alias.
+- A registered provider with no alias is reported as uncovered at
+  compile time once any `provider-*` alias exists. NVIDIA is not
+  registered and is not invented.
+
+OpenCode Zen keeps both adapter forms (`anthropic_opencode_zen_responses_adapter`
+and `anthropic_opencode_zen_completion_adapter`). xAI keeps managed
+`oa_xai/grok-4.6` and native `xai/grok-4.6` lanes distinct. Cursor Grok
+stays on `provider-cursor_agent`. Anthropic coverage remains
+Anthropic-native (`anthropic_messages`); Codex ingress still drops that
+family.
+
+Harness v2 publishes these ids on `compiled_aliases` and in group
+`provider_coverage`. Operational Ohmypi orchestration still uses the
+nine mixed `orchestration_children`. Provider coverage is selected with
+`--orchestration-children provider_coverage`. Ohmypi auto-retry onto
+`sota` / OpenAI is a provider-specific failure, not a pass.
+
 ## Maintained `basic` alias behavior (CFG-008)
 
 The maintained alias name is `basic`. Every request uses this common candidate

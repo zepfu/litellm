@@ -44,6 +44,13 @@ class RunPlan:
             "write_artifact": str(self.write_artifact) if self.write_artifact else None,
             "steps": [dict(step) for step in self.steps],
         }
+        if "tools_for_orchestration" in self.extra:
+            payload["tools_for_orchestration"] = bool(
+                self.extra.get("tools_for_orchestration")
+            )
+        prompt = self.extra.get("orchestration_prompt_template")
+        if prompt:
+            payload["orchestration_prompt"] = str(prompt)
         if self.resolved is not None:
             payload["base_url"] = self.resolved.base_url
             payload["host_port"] = self.resolved.host_port
@@ -191,13 +198,29 @@ def _assert_tui(name: str, config: Mapping[str, Any]) -> None:
         "catalog_json_argv",
         "catalog_find_argv",
     )
+    forbid_tokens = as_str_list(spec.get("forbid_tokens"))
     for key in argv_keys:
         argv = as_str_list(spec.get(key))
-        for flag in forbid:
+        for flag in (*forbid, *forbid_tokens):
             if flag and flag in argv:
                 raise PlanError(
                     f"TUI {name!r} argv contains forbidden flag {flag!r} ({key})"
                 )
+
+
+def _tui_spec(tui: str | None, config: Mapping[str, Any]) -> dict[str, Any]:
+    if not tui:
+        return {}
+    spec = _tuis(config).get(tui)
+    return spec if isinstance(spec, dict) else {}
+
+
+def _expand_named_models(raw: Any, config: Mapping[str, Any]) -> list[str]:
+    if isinstance(raw, (list, tuple)):
+        return _expand_model_args([str(item) for item in raw], config)
+    if raw:
+        return expand_group(str(raw), config)
+    return []
 
 
 def _kind_spec(kind: str, config: Mapping[str, Any]) -> dict[str, Any]:
@@ -210,6 +233,44 @@ def _kind_spec(kind: str, config: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(spec, dict):
         raise PlanError(f"kind {kind!r} must be a mapping")
     return spec
+
+
+def render_orchestration_children_block(children: Sequence[str]) -> str:
+    """Render the Ohmypi `agent=` spawn list from the planned children.
+
+    The first child carries the PONG-then-date contract; later children
+    reuse that task. An empty children list yields an empty block.
+    """
+
+    if not children:
+        return ""
+    first = str(children[0])
+    lines = [
+        f"1. agent={first}   FIRST: reply with exactly the word PONG. Then run the",
+        "   single shell command `date` (or `date -u` if date is unavailable).",
+        "   Return only the command stdout. Do not guess the time.",
+    ]
+    for index, name in enumerate(children[1:], start=2):
+        lines.append(f"{index}. agent={name} same task.")
+    return "\n".join(lines)
+
+
+def expand_orchestration_prompt(
+    template: str,
+    *,
+    parent: str,
+    children: Sequence[str],
+) -> str:
+    """Substitute parent/children placeholders in an orchestration template."""
+
+    return expand_string(
+        template,
+        {
+            "parent": parent,
+            "child_count": str(len(children)),
+            "children_block": render_orchestration_children_block(children),
+        },
+    )
 
 
 def _prompt_text(config: Mapping[str, Any], name: str, context: Mapping[str, str]) -> str:
@@ -258,6 +319,7 @@ def build_plan(  # noqa: PLR0915
     parents: list[str] = []
     children: list[str] = []
     extra: dict[str, Any] = {}
+    tui_spec = _tui_spec(tui, config)
 
     if kind == "model":
         require_explicit_model = bool(spec.get("require_explicit_model"))
@@ -266,14 +328,17 @@ def build_plan(  # noqa: PLR0915
         if model_tokens:
             selected_models = _expand_model_args(model_tokens, config)
         else:
-            default_group = spec.get("default_models") or _models_block(config).get(
-                "default_model_group"
+            default_group = (
+                tui_spec.get("default_models")
+                or spec.get("default_models")
+                or _models_block(config).get("default_model_group")
             )
             if not default_group:
                 raise PlanError("--model is required when no default group is set")
-            selected_models = expand_group(str(default_group), config)
+            selected_models = _expand_named_models(default_group, config)
+        prompt_name = str(tui_spec.get("model_prompt") or "pong")
         extra["pong_prompt"] = _prompt_text(
-            config, "pong", {"home": str(Path.home()), "repo": ""}
+            config, prompt_name, {"home": str(Path.home()), "repo": ""}
         )
     elif kind == "catalog":
         default_group = spec.get("default_models") or "catalog_picker_sample"
@@ -289,21 +354,34 @@ def build_plan(  # noqa: PLR0915
         )
         parent_token = (
             orchestration_parent
+            or tui_spec.get("default_orchestration_parent")
             or default_parent
             or default_parent_group
             or default_orchestration_parent
         )
         if not parent_token:
             raise PlanError("--orchestration-parent is required")
-        parents = expand_group(str(parent_token), config)
+        parents = _expand_named_models(parent_token, config)
         child_token = (
             orchestration_children
+            or tui_spec.get("default_orchestration_children")
             or spec.get("default_children_group")
             or "orchestration_children"
         )
-        children = expand_group(str(child_token), config)
-        extra["orchestration_prompt_template"] = _prompt_text(
-            config, "orchestration", {"parent": "{parent}", "home": str(Path.home())}
+        children = _expand_named_models(child_token, config)
+        prompt_name = str(tui_spec.get("orchestration_prompt") or "orchestration")
+        raw_template = _prompt_text(
+            config, prompt_name, {"parent": "{parent}", "home": str(Path.home())}
+        )
+        extra["orchestration_prompt_template"] = expand_orchestration_prompt(
+            raw_template,
+            parent="{parent}",
+            children=children,
+        )
+        extra["tools_for_orchestration"] = bool(
+            (tui_spec.get("select_model") or {}).get("tools_for_orchestration", True)
+            if isinstance(tui_spec.get("select_model"), dict)
+            else True
         )
     elif kind == "platform":
         selected_models = []

@@ -1,0 +1,18 @@
+# Provider-pinned acceptance alias (CFG-029). Closed xAI candidate set.
+# Keeps managed OAuth (oa_xai) and native Grok lanes distinct. Cursor Grok
+# belongs to provider-cursor_agent, not this alias.
+
+defaults: {}
+
+aliases:
+  - name: provider-xai
+    candidates:
+      - provider: xai
+        model: oa_xai/grok-4.6
+        route_family: codex_xai_oauth_responses_adapter
+        priority: 100
+
+      - provider: xai
+        model: xai/grok-4.6
+        route_family: codex_grok_native_responses_adapter
+        priority: 90

@@ -161,7 +161,7 @@ class OhmypiDriver:
     def alias_session_dir(self, model: str) -> Path:
         parent = Path(str(self.spec.get("session_dir") or "/tmp/omp-alpha-sessions"))
         safe_model = model.replace("/", "-").replace(" ", "-")
-        path = parent / f"hv2-{safe_model}"
+        path = parent / f"hv2-{safe_model}-{os.getpid()}"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
@@ -220,12 +220,16 @@ class OhmypiDriver:
             parents=True, exist_ok=True
         )
 
-    def stage_orchestration_agents(self) -> dict[str, Any]:
+    def stage_orchestration_agents(
+        self, names: Sequence[str] | None = None
+    ) -> dict[str, Any]:
         """Copy harness child profiles into the Ohmypi project agents dir.
 
         Ohmypi `task` spawn accepts `agent=` profile names from
         `{cwd}/.omp/agents`, not LiteLLM catalog ids. Staging here keeps
-        operator `~/.omp/agent/agents` untouched.
+        operator `~/.omp/agent/agents` untouched. When *names* is provided
+        (planned orchestration children), those profiles are staged instead
+        of the YAML default mixed-alias list.
         """
 
         ctx = self._context()
@@ -241,17 +245,19 @@ class OhmypiDriver:
             expand_string(raw_dest, ctx) if raw_dest else (cwd / ".omp" / "agents")
         )
         dest.mkdir(parents=True, exist_ok=True)
-        names = as_str_list(self.spec.get("orchestration_child_agents")) or [
-            "basic",
-            "work",
-            "expert",
-            "sota",
-            "sota-xai",
-            "sota-alibaba",
-            "sota-moonshot",
-            "sota-zai",
-            "auto-review",
-        ]
+        names = [str(item) for item in names if str(item).strip()] if names else []
+        if not names:
+            names = as_str_list(self.spec.get("orchestration_child_agents")) or [
+                "basic",
+                "work",
+                "expert",
+                "sota",
+                "sota-xai",
+                "sota-alibaba",
+                "sota-moonshot",
+                "sota-zai",
+                "auto-review",
+            ]
         written: list[str] = []
         missing: list[str] = []
         for name in names:
@@ -525,7 +531,13 @@ class OhmypiDriver:
             needles = [selector, f"Default model: {selector}"]
         return any(_selected_needle_in_pane(token, text) for token in needles)
 
-    def ensure_session(self, model: str, *, tools: bool = True) -> dict[str, Any]:
+    def ensure_session(
+        self,
+        model: str,
+        *,
+        tools: bool = True,
+        child_agents: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
         """Launch a dedicated interactive Ohmypi tmux session for *model*.
 
         Does not reuse ``omp-alpha-test`` so leftover Claude aliases cannot
@@ -541,7 +553,7 @@ class OhmypiDriver:
         self.ensure_workspace()
         staged_agents: dict[str, Any] | None = None
         if tools:
-            staged_agents = self.stage_orchestration_agents()
+            staged_agents = self.stage_orchestration_agents(child_agents)
         argv = self.launch_argv(model)
         if not tools:
             argv.extend(as_str_list(self.spec.get("argv_no_tools")))
