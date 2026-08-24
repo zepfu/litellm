@@ -20,12 +20,16 @@ write_and_publish_private_text = None
 
 
 def resolve_hermes_nous_auth_path() -> str:
-    litellm_path = os.environ.get("LITELLM_HERMES_AUTH_FILE")
-    if litellm_path:
-        return litellm_path
-    aawm_path = os.environ.get("AAWM_HERMES_AUTH_FILE")
-    if aawm_path:
-        return aawm_path
+    for name in (
+        "LITELLM_NOUS_OAUTH_AUTH_FILE",
+        "LITELLM_HERMES_AUTH_FILE",
+        "AAWM_HERMES_AUTH_FILE",
+    ):
+        value = os.environ.get(name)
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned:
+                return cleaned
     return os.path.expanduser(_DEFAULT_HERMES_AUTH_PATH)
 
 

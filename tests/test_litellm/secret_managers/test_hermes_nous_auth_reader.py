@@ -29,6 +29,16 @@ _SECRET_FIXTURES = (
     _XAI_TOKEN,
     _COPILOT_TOKEN,
 )
+_AUTH_PATH_ENV_VARS = (
+    "LITELLM_NOUS_OAUTH_AUTH_FILE",
+    "LITELLM_HERMES_AUTH_FILE",
+    "AAWM_HERMES_AUTH_FILE",
+)
+
+
+def _clear_auth_path_env(monkeypatch) -> None:
+    for name in _AUTH_PATH_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 
 def _write_auth(path: Path, payload: dict[str, Any]) -> Path:
@@ -63,8 +73,8 @@ def _full_document() -> dict[str, Any]:
 
 def test_prefers_providers_nous_over_credential_pool(tmp_path, monkeypatch):
     auth_path = _write_auth(tmp_path / "auth.json", _full_document())
+    _clear_auth_path_env(monkeypatch)
     monkeypatch.setenv("LITELLM_HERMES_AUTH_FILE", str(auth_path))
-    monkeypatch.delenv("AAWM_HERMES_AUTH_FILE", raising=False)
 
     token = hermes_nous_auth.load_nous_invoke_jwt()
     assert token == _PROVIDERS_TOKEN
@@ -81,8 +91,8 @@ def test_falls_back_to_credential_pool_nous_when_providers_missing(
         "copilot": {"access_token": _COPILOT_TOKEN},
     }
     auth_path = _write_auth(tmp_path / "auth.json", payload)
+    _clear_auth_path_env(monkeypatch)
     monkeypatch.setenv("LITELLM_HERMES_AUTH_FILE", str(auth_path))
-    monkeypatch.delenv("AAWM_HERMES_AUTH_FILE", raising=False)
 
     token = hermes_nous_auth.load_nous_invoke_jwt()
     assert token == _POOL_TOKEN
@@ -96,8 +106,8 @@ def test_fail_closed_when_neither_slot_usable(tmp_path, monkeypatch):
         "copilot": {"access_token": _COPILOT_TOKEN},
     }
     auth_path = _write_auth(tmp_path / "auth.json", payload)
+    _clear_auth_path_env(monkeypatch)
     monkeypatch.setenv("LITELLM_HERMES_AUTH_FILE", str(auth_path))
-    monkeypatch.delenv("AAWM_HERMES_AUTH_FILE", raising=False)
 
     with pytest.raises(Exception):
         hermes_nous_auth.load_nous_invoke_jwt()
@@ -111,8 +121,8 @@ def test_does_not_read_xai_oauth_or_copilot_as_nous(tmp_path, monkeypatch):
         "copilot": {"access_token": _COPILOT_TOKEN},
     }
     auth_path = _write_auth(tmp_path / "auth.json", payload)
+    _clear_auth_path_env(monkeypatch)
     monkeypatch.setenv("LITELLM_HERMES_AUTH_FILE", str(auth_path))
-    monkeypatch.delenv("AAWM_HERMES_AUTH_FILE", raising=False)
 
     with pytest.raises(Exception) as exc_info:
         hermes_nous_auth.load_nous_invoke_jwt()
@@ -121,7 +131,36 @@ def test_does_not_read_xai_oauth_or_copilot_as_nous(tmp_path, monkeypatch):
     assert _COPILOT_TOKEN not in message
 
 
-def test_env_LITELLM_HERMES_AUTH_FILE_and_AAWM_HERMES_AUTH_FILE(
+def test_canonical_LITELLM_NOUS_OAUTH_AUTH_FILE_wins(tmp_path, monkeypatch):
+    canonical_path = _write_auth(
+        tmp_path / "canonical-auth.json",
+        {"providers": {"nous": _providers_slot()}},
+    )
+    litellm_path = _write_auth(
+        tmp_path / "litellm-auth.json",
+        {"credential_pool": {"nous": _pool_slot()}},
+    )
+    aawm_path = _write_auth(
+        tmp_path / "aawm-auth.json",
+        {
+            "providers": {
+                "nous": {
+                    "access_token": "fixture-aawm-nous-access-token",
+                    "agent_key": "fixture-aawm-nous-agent-key",
+                }
+            }
+        },
+    )
+    _clear_auth_path_env(monkeypatch)
+    monkeypatch.setenv("LITELLM_NOUS_OAUTH_AUTH_FILE", str(canonical_path))
+    monkeypatch.setenv("LITELLM_HERMES_AUTH_FILE", str(litellm_path))
+    monkeypatch.setenv("AAWM_HERMES_AUTH_FILE", str(aawm_path))
+
+    assert hermes_nous_auth.resolve_hermes_nous_auth_path() == str(canonical_path)
+    assert hermes_nous_auth.load_nous_invoke_jwt() == _PROVIDERS_TOKEN
+
+
+def test_compatibility_LITELLM_HERMES_AUTH_FILE_when_canonical_unset(
     tmp_path, monkeypatch
 ):
     litellm_path = _write_auth(
@@ -132,28 +171,60 @@ def test_env_LITELLM_HERMES_AUTH_FILE_and_AAWM_HERMES_AUTH_FILE(
         tmp_path / "aawm-auth.json",
         {"credential_pool": {"nous": _pool_slot()}},
     )
-
+    _clear_auth_path_env(monkeypatch)
     monkeypatch.setenv("LITELLM_HERMES_AUTH_FILE", str(litellm_path))
     monkeypatch.setenv("AAWM_HERMES_AUTH_FILE", str(aawm_path))
+
     assert hermes_nous_auth.resolve_hermes_nous_auth_path() == str(litellm_path)
     assert hermes_nous_auth.load_nous_invoke_jwt() == _PROVIDERS_TOKEN
 
-    monkeypatch.delenv("LITELLM_HERMES_AUTH_FILE", raising=False)
+
+def test_compatibility_AAWM_HERMES_AUTH_FILE_when_canonical_and_litellm_unset(
+    tmp_path, monkeypatch
+):
+    aawm_path = _write_auth(
+        tmp_path / "aawm-auth.json",
+        {"credential_pool": {"nous": _pool_slot()}},
+    )
+    _clear_auth_path_env(monkeypatch)
     monkeypatch.setenv("AAWM_HERMES_AUTH_FILE", str(aawm_path))
+
     assert hermes_nous_auth.resolve_hermes_nous_auth_path() == str(aawm_path)
     assert hermes_nous_auth.load_nous_invoke_jwt() == _POOL_TOKEN
 
-    monkeypatch.delenv("AAWM_HERMES_AUTH_FILE", raising=False)
+
+def test_blank_auth_path_env_vars_fall_through_to_next_nonempty(tmp_path, monkeypatch):
+    auth_path = _write_auth(tmp_path / "auth.json", _full_document())
+    _clear_auth_path_env(monkeypatch)
+    monkeypatch.setenv("LITELLM_NOUS_OAUTH_AUTH_FILE", "  ")
+    monkeypatch.setenv("LITELLM_HERMES_AUTH_FILE", "")
+    monkeypatch.setenv("AAWM_HERMES_AUTH_FILE", str(auth_path))
+
+    assert hermes_nous_auth.resolve_hermes_nous_auth_path() == str(auth_path)
+    assert hermes_nous_auth.load_nous_invoke_jwt() == _PROVIDERS_TOKEN
+
+
+def test_all_blank_auth_path_env_vars_expand_to_default(monkeypatch):
+    _clear_auth_path_env(monkeypatch)
+    monkeypatch.setenv("LITELLM_NOUS_OAUTH_AUTH_FILE", " ")
+    monkeypatch.setenv("LITELLM_HERMES_AUTH_FILE", "")
+    monkeypatch.setenv("AAWM_HERMES_AUTH_FILE", "\t")
+
     resolved = hermes_nous_auth.resolve_hermes_nous_auth_path()
-    assert resolved == os.path.expanduser("~/.hermes/auth.json") or resolved.endswith(
-        os.path.join(".hermes", "auth.json")
-    )
+    assert resolved == os.path.expanduser("~/.hermes/auth.json")
+
+
+def test_default_expands_user_hermes_auth_json_without_opening(monkeypatch):
+    _clear_auth_path_env(monkeypatch)
+
+    resolved = hermes_nous_auth.resolve_hermes_nous_auth_path()
+    assert resolved == os.path.expanduser("~/.hermes/auth.json")
 
 
 def test_reader_never_calls_write_helpers(tmp_path, monkeypatch):
     auth_path = _write_auth(tmp_path / "auth.json", _full_document())
-    monkeypatch.setenv("LITELLM_HERMES_AUTH_FILE", str(auth_path))
-    monkeypatch.delenv("AAWM_HERMES_AUTH_FILE", raising=False)
+    _clear_auth_path_env(monkeypatch)
+    monkeypatch.setenv("LITELLM_NOUS_OAUTH_AUTH_FILE", str(auth_path))
 
     def _fail_write(*_args: Any, **_kwargs: Any) -> None:
         pytest.fail("write_and_publish_private_text must not be called")
@@ -191,8 +262,8 @@ def test_errors_are_sanitized(tmp_path, monkeypatch):
         }
     }
     auth_path = _write_auth(tmp_path / "auth.json", payload)
+    _clear_auth_path_env(monkeypatch)
     monkeypatch.setenv("LITELLM_HERMES_AUTH_FILE", str(auth_path))
-    monkeypatch.delenv("AAWM_HERMES_AUTH_FILE", raising=False)
 
     original_json_load = json.load
 

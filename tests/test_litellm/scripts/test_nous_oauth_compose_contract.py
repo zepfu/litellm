@@ -5,8 +5,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from litellm.secret_managers.hermes_nous_auth import resolve_hermes_nous_auth_path
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _COMPOSE_PATH = _REPO_ROOT / "docker-compose.dev.yml"
+_ALPHA_COMPOSE_PATH = _REPO_ROOT / "docker-compose.alpha.yml"
 _PROD_COMPOSE_PATH = _REPO_ROOT / "docker-compose.yml"
 _PROVIDER_STATUS_DOCKERFILE_PATH = (
     _REPO_ROOT / "docker" / "Dockerfile.provider_status_observations"
@@ -14,6 +17,15 @@ _PROVIDER_STATUS_DOCKERFILE_PATH = (
 _HERMES_DIR = "/home/zepfu/.hermes"
 _HERMES_AUTH_FILE = "/home/zepfu/.hermes/auth.json"
 _HERMES_LOCK_FILE = "/home/zepfu/.hermes/auth.lock"
+_CANONICAL_AUTH_FILE_EXPORT = (
+    "- LITELLM_NOUS_OAUTH_AUTH_FILE="
+    "${LITELLM_NOUS_OAUTH_AUTH_FILE:-"
+    "/home/zepfu/.hermes/auth.json}"
+)
+_CANONICAL_AUTH_FILE_DEFAULT_RE = re.compile(
+    r"LITELLM_NOUS_OAUTH_AUTH_FILE="
+    r"\$\{LITELLM_NOUS_OAUTH_AUTH_FILE:-([^}]+)\}"
+)
 
 
 def _service_block(compose: str, service_name: str) -> str:
@@ -22,6 +34,20 @@ def _service_block(compose: str, service_name: str) -> str:
     remainder = compose[start + len(marker) :]
     next_service = re.search(r"(?m)^  [a-zA-Z0-9_-]+:\n", remainder)
     return remainder[: next_service.start()] if next_service else remainder
+
+
+def _exported_nous_oauth_auth_file_default(service_block: str) -> str:
+    match = _CANONICAL_AUTH_FILE_DEFAULT_RE.search(service_block)
+    assert match is not None
+    return match.group(1)
+
+
+def _assert_read_only_hermes_consumer(service_block: str) -> None:
+    assert f"- {_HERMES_DIR}:{_HERMES_DIR}:ro" in service_block
+    assert f"- {_HERMES_AUTH_FILE}:{_HERMES_AUTH_FILE}" not in service_block
+    assert f"- {_HERMES_AUTH_FILE}:{_HERMES_AUTH_FILE}:ro" not in service_block
+    assert f"- {_HERMES_DIR}:{_HERMES_DIR}\n" not in service_block
+    assert _CANONICAL_AUTH_FILE_EXPORT in service_block
 
 
 def _sibling_oauth_families_wired(compose: str) -> bool:
@@ -34,17 +60,33 @@ def _sibling_oauth_families_wired(compose: str) -> bool:
 
 def test_litellm_dev_hermes_directory_mount_is_read_only() -> None:
     compose = _COMPOSE_PATH.read_text(encoding="utf-8")
-    litellm_dev = _service_block(compose, "litellm-dev")
+    _assert_read_only_hermes_consumer(_service_block(compose, "litellm-dev"))
 
-    assert f"- {_HERMES_DIR}:{_HERMES_DIR}:ro" in litellm_dev
-    assert f"- {_HERMES_AUTH_FILE}:{_HERMES_AUTH_FILE}" not in litellm_dev
-    assert f"- {_HERMES_AUTH_FILE}:{_HERMES_AUTH_FILE}:ro" not in litellm_dev
-    assert f"- {_HERMES_DIR}:{_HERMES_DIR}\n" not in litellm_dev
-    assert (
-        "- LITELLM_NOUS_OAUTH_AUTH_FILE="
-        "${LITELLM_NOUS_OAUTH_AUTH_FILE:-"
-        "/home/zepfu/.hermes/auth.json}"
-    ) in litellm_dev
+
+def test_litellm_alpha_hermes_directory_mount_is_read_only() -> None:
+    compose = _ALPHA_COMPOSE_PATH.read_text(encoding="utf-8")
+    _assert_read_only_hermes_consumer(_service_block(compose, "litellm-alpha"))
+
+
+def test_compose_canonical_export_is_accepted_by_shipped_reader(monkeypatch) -> None:
+    defaults = []
+    for compose_path, service_name in (
+        (_COMPOSE_PATH, "litellm-dev"),
+        (_ALPHA_COMPOSE_PATH, "litellm-alpha"),
+    ):
+        service_block = _service_block(
+            compose_path.read_text(encoding="utf-8"), service_name
+        )
+        defaults.append(_exported_nous_oauth_auth_file_default(service_block))
+
+    assert defaults[0] == defaults[1]
+    exported_default = defaults[0]
+    assert exported_default == _HERMES_AUTH_FILE
+
+    monkeypatch.setenv("LITELLM_NOUS_OAUTH_AUTH_FILE", exported_default)
+    monkeypatch.delenv("LITELLM_HERMES_AUTH_FILE", raising=False)
+    monkeypatch.delenv("AAWM_HERMES_AUTH_FILE", raising=False)
+    assert resolve_hermes_nous_auth_path() == exported_default
 
 
 def test_provider_status_has_writable_hermes_directory_and_nous_env() -> None:
