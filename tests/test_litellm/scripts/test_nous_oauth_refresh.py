@@ -352,6 +352,42 @@ def test_inspect_eligibility_not_due_is_read_only(nous, tmp_path: Path) -> None:
     assert auth_path.stat().st_mtime_ns == before_stat.st_mtime_ns
 
 
+def test_inspect_eligibility_includes_non_secret_credential_identity(
+    nous, tmp_path: Path
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    original = _hermes_document(
+        nous_record=_nous_record(
+            expires_at="2020-01-01T00:00:00Z",
+            agent_key_expires_at="2020-01-01T00:00:00Z",
+            obtained_at="2026-01-01T00:00:00Z",
+        )
+    )
+    _write_hermes(auth_path, original)
+    first = nous.inspect_nous_oauth_refresh_eligibility(auth_path, buffer_seconds=900)
+    identity = first["credential_identity"]
+    assert identity
+    assert "mtime_ns=" in identity
+    assert "obtained_at=2026-01-01T00:00:00Z" in identity
+    assert "old-access" not in identity
+    assert "old-refresh" not in identity
+    assert "old-agent-key" not in identity
+
+    replaced = _hermes_document(
+        nous_record=_nous_record(
+            expires_at="2099-01-01T00:00:00Z",
+            agent_key_expires_at="2099-01-01T00:00:00Z",
+            obtained_at="2026-08-24T20:00:00Z",
+        )
+    )
+    _write_hermes(auth_path, replaced)
+    second = nous.inspect_nous_oauth_refresh_eligibility(auth_path, buffer_seconds=900)
+    assert second["credential_identity"] != identity
+    assert "obtained_at=2026-08-24T20:00:00Z" in second["credential_identity"]
+    assert "old-access" not in second["credential_identity"]
+    assert "old-refresh" not in second["credential_identity"]
+
+
 def test_missing_expires_at_is_eligible_and_degraded(nous, tmp_path: Path) -> None:
     auth_path = tmp_path / "auth.json"
     _write_hermes(

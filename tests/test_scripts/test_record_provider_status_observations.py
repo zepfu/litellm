@@ -1790,6 +1790,80 @@ def test_oauth_schedule_throttles_only_actual_token_endpoint_attempts(
         assert second[3]["actual_attempted"] is False
 
 
+def test_oauth_schedule_skips_spent_refresh_token_until_credential_identity_changes() -> None:
+    schedule = loop.OAuthRefreshScheduleState()
+    actual_attempt = {"value": None}
+    helper_calls = []
+    identity = {"value": "mtime_ns=1;size=10;obtained_at=old;expires_at=old"}
+
+    def inspect(*, now):
+        return {
+            "eligibility_checked_at": now().isoformat().replace("+00:00", "Z"),
+            "expires_at": "2026-08-13T21:00:00Z",
+            "refresh_due_at": "2026-08-13T20:00:00Z",
+            "next_refresh_check_at": "2026-08-13T22:35:00Z",
+            "eligible": True,
+            "credential_health": "expired",
+            "usable": False,
+            "error_class": None,
+            "error_message": None,
+            "credential_identity": identity["value"],
+        }
+
+    def refresh(callback):
+        helper_calls.append(True)
+        callback()
+        return {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "error_class": "invalid_grant",
+            "error_message": "Nous OAuth refresh failed with HTTP 400",
+        }
+
+    def run_schedule(now_monotonic, wall_now):
+        return loop._run_oauth_refresh_schedule(
+            schedule=schedule,
+            last_attempt_monotonic=actual_attempt["value"],
+            set_last_attempt_monotonic=lambda value: actual_attempt.__setitem__(
+                "value", value
+            ),
+            now_monotonic=now_monotonic,
+            wall_now=wall_now,
+            eligibility_inspector=inspect,
+            refresh_call=refresh,
+            force=True,
+            attempt_interval_seconds=300.0,
+            eligibility_cadence_seconds=300.0,
+            buffer_seconds=900.0,
+        )
+
+    first = run_schedule(100.0, datetime(2026, 8, 13, 22, 30, tzinfo=timezone.utc))
+    after_throttle = run_schedule(
+        500.0,
+        datetime(2026, 8, 13, 22, 35, tzinfo=timezone.utc),
+    )
+    identity["value"] = "mtime_ns=2;size=11;obtained_at=new;expires_at=new"
+    after_relogin = run_schedule(
+        501.0,
+        datetime(2026, 8, 13, 22, 35, 1, tzinfo=timezone.utc),
+    )
+
+    assert first[4] is True
+    assert first[3]["actual_attempted"] is True
+    assert first[3]["terminal_refresh_blocked"] is False
+    assert first[3]["terminal_refresh_error_class"] == "invalid_grant"
+    assert after_throttle[4] is False
+    assert after_throttle[3]["actual_attempted"] is False
+    assert after_throttle[3]["helper_called"] is False
+    assert after_throttle[3]["terminal_refresh_blocked"] is True
+    assert after_throttle[3]["terminal_refresh_error_class"] == "invalid_grant"
+    assert after_relogin[4] is True
+    assert after_relogin[3]["actual_attempted"] is True
+    assert after_relogin[3]["terminal_refresh_blocked"] is False
+    assert helper_calls == [True, True]
+
+
 def test_oauth_schedule_retries_pre_network_failure_next_outer_cycle() -> None:
     schedule = loop.OAuthRefreshScheduleState()
     actual_attempt = {"value": None}

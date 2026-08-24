@@ -1581,6 +1581,11 @@ class SidecarTaskState:
     observability_anomaly_scan_last_attempt_monotonic: Optional[float] = None
 
 
+_OAUTH_TERMINAL_REFRESH_ERROR_CLASSES = frozenset(
+    {"invalid_grant", "refresh_token_reused"}
+)
+
+
 @dataclass
 class OAuthRefreshScheduleState:
     """Sanitized scheduler evidence for one refreshable credential."""
@@ -1596,6 +1601,8 @@ class OAuthRefreshScheduleState:
     credential_health: Optional[str] = None
     usable: Optional[bool] = None
     actual_attempt_count: int = 0
+    terminal_refresh_error_class: Optional[str] = None
+    terminal_refresh_identity: Optional[str] = None
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -3694,6 +3701,8 @@ def _oauth_refresh_observation_metadata(event: Mapping[str, Any]) -> Dict[str, A
         "scheduler_error_class",
         "scheduler_error_message",
         "last_result_class",
+        "terminal_refresh_blocked",
+        "terminal_refresh_error_class",
     )
     metadata: Dict[str, Any] = {}
     for key in keys:
@@ -11249,6 +11258,10 @@ def _merge_oauth_refresh_eligibility(
     threshold_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     merged = dict(post)
+    if merged.get("credential_identity") in {None, ""} and pre.get(
+        "credential_identity"
+    ) not in {None, ""}:
+        merged["credential_identity"] = pre.get("credential_identity")
     effective_threshold_seconds = post.get("refresh_threshold_seconds")
     if effective_threshold_seconds is None:
         effective_threshold_seconds = pre.get("refresh_threshold_seconds")
@@ -11287,6 +11300,7 @@ def _merge_oauth_refresh_eligibility(
             "usable",
             "credential_health",
             "refresh_threshold_seconds",
+            "credential_identity",
         ):
             if pre.get(key) is not None:
                 merged[key] = pre[key]
@@ -11350,6 +11364,7 @@ def _oauth_refresh_schedule_evidence(
     buffer_seconds: Optional[float] = None,
     threshold_seconds: Optional[float] = None,
     credential_health: Optional[str] = None,
+    terminal_refresh_blocked: bool = False,
 ) -> Dict[str, Any]:
     effective_threshold_seconds = final.get("refresh_threshold_seconds")
     if effective_threshold_seconds is None:
@@ -11381,6 +11396,8 @@ def _oauth_refresh_schedule_evidence(
         "scheduler_error_class": schedule.last_error_class,
         "scheduler_error_message": schedule.last_error_message,
         "last_result_class": schedule.last_result_class,
+        "terminal_refresh_blocked": terminal_refresh_blocked,
+        "terminal_refresh_error_class": schedule.terminal_refresh_error_class,
     }
 
 
@@ -11395,6 +11412,105 @@ def _oauth_refresh_retry_throttled(
         and now_monotonic >= last_attempt_monotonic
         and now_monotonic - last_attempt_monotonic < attempt_interval_seconds
     )
+
+
+def _oauth_terminal_refresh_error_class(error_class: Optional[str]) -> Optional[str]:
+    cleaned = _redacted_summary_field(error_class)
+    if cleaned in _OAUTH_TERMINAL_REFRESH_ERROR_CLASSES:
+        return cleaned
+    return None
+
+
+def _oauth_refresh_identity(eligibility: Mapping[str, Any]) -> Optional[str]:
+    identity = eligibility.get("credential_identity")
+    if isinstance(identity, str) and identity.strip():
+        return identity.strip()
+    return None
+
+
+def _oauth_refresh_terminal_blocked(
+    schedule: OAuthRefreshScheduleState,
+    eligibility: Mapping[str, Any],
+) -> bool:
+    if (
+        schedule.terminal_refresh_error_class is None
+        or schedule.terminal_refresh_identity is None
+    ):
+        return False
+    current_identity = _oauth_refresh_identity(eligibility)
+    return current_identity == schedule.terminal_refresh_identity
+
+
+def _record_oauth_refresh_schedule_outcome(
+    *,
+    schedule: OAuthRefreshScheduleState,
+    pre: Mapping[str, Any],
+    final: Mapping[str, Any],
+    operation_summary: Mapping[str, Any],
+    should_call: bool,
+    terminal_blocked: bool,
+    current_identity: Optional[str],
+    actual_attempt_count: int,
+    wall_now: datetime,
+    pre_result_class: str,
+    eligibility_cadence_seconds: float,
+    attempt_interval_seconds: float,
+    buffer_seconds: Optional[float],
+    threshold_seconds: Optional[float],
+) -> tuple[str, Dict[str, Any]]:
+    operation_error_class = _redacted_summary_field(
+        operation_summary.get("error_class")
+    )
+    result_class = _oauth_refresh_result_class(
+        final,
+        wall_now=wall_now,
+        actual_attempt_count=actual_attempt_count,
+        operation_error_class=operation_error_class,
+        prior_result_class=schedule.last_result_class if not should_call else None,
+    )
+    effective_health = _effective_oauth_credential_health(
+        final,
+        result_class=result_class,
+    )
+    schedule.eligibility_checked_at = final.get("eligibility_checked_at")
+    schedule.refresh_due_at = final.get("refresh_due_at")
+    schedule.next_refresh_check_at = final.get("next_refresh_check_at")
+    schedule.expires_at = final.get("expires_at")
+    schedule.last_result_class = result_class
+    if operation_error_class:
+        schedule.last_error_class = operation_error_class
+        schedule.last_error_message = _redacted_failure_message(
+            operation_summary.get("error_message")
+        )
+        terminal_error = _oauth_terminal_refresh_error_class(operation_error_class)
+        stored_identity = current_identity or _oauth_refresh_identity(final)
+        if terminal_error and stored_identity is not None:
+            schedule.terminal_refresh_error_class = terminal_error
+            schedule.terminal_refresh_identity = stored_identity
+    elif result_class != "refresh_failed" and not terminal_blocked:
+        schedule.last_error_class = None
+        schedule.last_error_message = None
+    if should_call and operation_summary.get("refreshed"):
+        schedule.terminal_refresh_error_class = None
+        schedule.terminal_refresh_identity = None
+    schedule.credential_health = effective_health
+    schedule.usable = final.get("usable")
+    evidence = _oauth_refresh_schedule_evidence(
+        schedule=schedule,
+        pre=pre,
+        final=final,
+        pre_result_class=pre_result_class,
+        result_class=result_class,
+        actual_attempt_count=actual_attempt_count,
+        eligibility_cadence_seconds=eligibility_cadence_seconds,
+        attempt_interval_seconds=attempt_interval_seconds,
+        buffer_seconds=buffer_seconds,
+        threshold_seconds=threshold_seconds,
+        credential_health=effective_health,
+        terminal_refresh_blocked=terminal_blocked,
+    )
+    evidence["helper_called"] = should_call
+    return result_class, evidence
 
 
 def _run_oauth_refresh_schedule(
@@ -11439,6 +11555,15 @@ def _run_oauth_refresh_schedule(
         now_monotonic=now_monotonic,
         attempt_interval_seconds=attempt_interval_seconds,
     )
+    current_identity = _oauth_refresh_identity(pre)
+    if (
+        current_identity is not None
+        and schedule.terminal_refresh_identity is not None
+        and current_identity != schedule.terminal_refresh_identity
+    ):
+        schedule.terminal_refresh_error_class = None
+        schedule.terminal_refresh_identity = None
+    terminal_blocked = _oauth_refresh_terminal_blocked(schedule, pre)
 
     def on_token_endpoint_attempt() -> None:
         nonlocal actual_attempt_count
@@ -11447,7 +11572,11 @@ def _run_oauth_refresh_schedule(
         schedule.last_actual_attempt_at = _scheduler_timestamp(wall_now)
         schedule.actual_attempt_count += 1
 
-    should_call = (force or bool(pre.get("eligible"))) and not actual_throttled
+    should_call = (
+        (force or bool(pre.get("eligible")))
+        and not actual_throttled
+        and not terminal_blocked
+    )
     if should_call:
         try:
             operation_summary = refresh_call(on_token_endpoint_attempt)
@@ -11478,49 +11607,22 @@ def _run_oauth_refresh_schedule(
         post = None
         final = dict(pre)
 
-    operation_error_class = _redacted_summary_field(
-        operation_summary.get("error_class")
-    )
-    result_class = _oauth_refresh_result_class(
-        final,
-        wall_now=wall_now,
-        actual_attempt_count=actual_attempt_count,
-        operation_error_class=operation_error_class,
-        prior_result_class=schedule.last_result_class if not should_call else None,
-    )
-    effective_health = _effective_oauth_credential_health(
-        final,
-        result_class=result_class,
-    )
-    schedule.eligibility_checked_at = final.get("eligibility_checked_at")
-    schedule.refresh_due_at = final.get("refresh_due_at")
-    schedule.next_refresh_check_at = final.get("next_refresh_check_at")
-    schedule.expires_at = final.get("expires_at")
-    schedule.last_result_class = result_class
-    if operation_error_class:
-        schedule.last_error_class = operation_error_class
-        schedule.last_error_message = _redacted_failure_message(
-            operation_summary.get("error_message")
-        )
-    elif result_class != "refresh_failed":
-        schedule.last_error_class = None
-        schedule.last_error_message = None
-    schedule.credential_health = effective_health
-    schedule.usable = final.get("usable")
-    evidence = _oauth_refresh_schedule_evidence(
+    _result_class, evidence = _record_oauth_refresh_schedule_outcome(
         schedule=schedule,
         pre=pre,
         final=final,
-        pre_result_class=pre_result_class,
-        result_class=result_class,
+        operation_summary=operation_summary,
+        should_call=should_call,
+        terminal_blocked=terminal_blocked,
+        current_identity=current_identity,
         actual_attempt_count=actual_attempt_count,
+        wall_now=wall_now,
+        pre_result_class=pre_result_class,
         eligibility_cadence_seconds=eligibility_cadence_seconds,
         attempt_interval_seconds=attempt_interval_seconds,
         buffer_seconds=buffer_seconds,
         threshold_seconds=threshold_seconds,
-        credential_health=effective_health,
     )
-    evidence["helper_called"] = should_call
     return dict(final), dict(operation_summary), post, evidence, should_call
 
 

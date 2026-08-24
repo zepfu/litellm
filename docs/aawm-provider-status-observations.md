@@ -1034,7 +1034,10 @@ The detail endpoint is undocumented and provider-owned; shape may change without
 With `--once`, enabled `grok_oidc_refresh`, per-account
 `codex_oauth_refresh`, `xai_oauth_refresh`, and `nous_oauth_refresh` events
 are required tasks. A successful refresh or successful no-op/skipped refresh
-satisfies the task. Any required failure returns a non-zero process status.
+satisfies the task. For Nous Portal OAuth, a later cycle that skips because
+the previous attempt returned `invalid_grant` / `refresh_token_reused` on the
+same credential identity is a successful skip, not a second token-endpoint
+call. Any required failure returns a non-zero process status.
 Telemetry, metadata repair, passive health, Kimi work, and aggregate events
 are optional; their failures are reported as optional degradation without
 changing the required exit status. Native Grok OIDC, managed xAI OAuth, and

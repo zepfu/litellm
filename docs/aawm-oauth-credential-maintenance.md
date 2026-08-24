@@ -71,8 +71,8 @@ selects a still-valid access token (or fails the candidate with a clear
 refresh-required message). It must not refresh, seed, or rewrite these
 credentials on the request path. Direct Nous inference reads
 `providers.nous` then `credential_pool.nous` from
-`LITELLM_HERMES_AUTH_FILE`, else `AAWM_HERMES_AUTH_FILE`, else
-`~/.hermes/auth.json`.
+`LITELLM_NOUS_OAUTH_AUTH_FILE`, else `LITELLM_HERMES_AUTH_FILE`, else
+`AAWM_HERMES_AUTH_FILE`, else `~/.hermes/auth.json`.
 
 Kimi Code uses the existing host Kimi CLI credential in place. It is not a
 LiteLLM-owned second grant. A configured managed `kimi_code` route consumes the
@@ -417,8 +417,12 @@ Do not `sort_keys` the whole payload.
 
 The provider-status sidecar (`scripts/nous_oauth_refresh.py`) is the **sole
 automatic writer**. LiteLLM proxies are read-only consumers. Refresh tokens are
-**single-use**. Never run Hermes CLI auto-refresh against the same Thoth file
-while the sidecar owns refresh. Hermes CLI is break-glass re-login only:
+**single-use**. After a token-endpoint `invalid_grant` or `refresh_token_reused`
+response, the sidecar must not POST the same spent refresh token again. Later
+cycles skip the helper until Hermes re-login atomically replaces the credential
+(mtime/size/`obtained_at` identity changes). Never run Hermes CLI auto-refresh
+against the same Thoth file while the sidecar owns refresh. Hermes CLI is
+break-glass re-login only:
 
 ```text
 hermes auth add nous

@@ -133,6 +133,7 @@ def inspect_nous_oauth_refresh_eligibility(
         record = _select_nous_record(payload)
         usable = _record_usable(record)
         expires_at, expiry_unavailable = _earliest_expiry_with_status(record)
+        identity = _credential_identity(resolved_auth_file, record)
         if expiry_unavailable:
             return _eligibility_summary(
                 observed_at=observed_at,
@@ -145,6 +146,7 @@ def inspect_nous_oauth_refresh_eligibility(
                 usable=usable,
                 error_class="CredentialExpiryUnavailable",
                 error_message="Nous OAuth credential expires_at is missing or invalid.",
+                credential_identity=identity,
             )
         assert expires_at is not None
         refresh_due_at = expires_at - timedelta(seconds=max(0, int(buffer_seconds)))
@@ -160,6 +162,7 @@ def inspect_nous_oauth_refresh_eligibility(
             eligible=observed_at >= refresh_due_at,
             credential_health="expired" if expires_at <= observed_at else "fresh",
             usable=usable and expires_at > observed_at,
+            credential_identity=identity,
         )
     except Exception as exc:
         return _eligibility_summary(
@@ -173,6 +176,7 @@ def inspect_nous_oauth_refresh_eligibility(
             usable=False,
             error_class=exc.__class__.__name__,
             error_message=_sanitize_error_message(str(exc)),
+            credential_identity=_credential_identity(resolved_auth_file),
         )
 
 
@@ -295,6 +299,7 @@ def _eligibility_summary(
     usable: bool,
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
+    credential_identity: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "eligibility_checked_at": _format_expires_at(observed_at),
@@ -306,7 +311,38 @@ def _eligibility_summary(
         "usable": usable,
         "error_class": error_class,
         "error_message": error_message,
+        "credential_identity": credential_identity,
     }
+
+
+def _credential_identity(
+    auth_path: Path,
+    record: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """Stable non-secret identity for a Hermes Nous slot.
+
+    Used by the sidecar scheduler to skip spent-refresh-token replay until
+    Hermes re-login replaces the file. Never includes access, refresh, or
+    agent-key secret values.
+    """
+    try:
+        stat_result = auth_path.lstat()
+    except OSError:
+        return None
+    obtained_at = ""
+    expires_at = ""
+    agent_key_id = ""
+    agent_key_expires_at = ""
+    if isinstance(record, Mapping):
+        obtained_at = str(record.get("obtained_at") or "")
+        expires_at = str(record.get("expires_at") or "")
+        agent_key_id = str(record.get("agent_key_id") or "")
+        agent_key_expires_at = str(record.get("agent_key_expires_at") or "")
+    return (
+        f"mtime_ns={stat_result.st_mtime_ns};size={stat_result.st_size};"
+        f"obtained_at={obtained_at};expires_at={expires_at};"
+        f"agent_key_id={agent_key_id};agent_key_expires_at={agent_key_expires_at}"
+    )
 
 
 def _default_lock_path(auth_path: Path) -> Path:

@@ -213,6 +213,111 @@ def test_run_due_sidecar_tasks_persists_nous_oauth_auth_observation_when_apply_e
     assert captured["event"]["scope"] == "inference:invoke"
 
 
+def test_run_due_sidecar_tasks_skips_nous_invalid_grant_replay_until_identity_changes(
+    monkeypatch,
+) -> None:
+    config = _nous_oauth_auth_persist_config(
+        nous_oauth_force_refresh=False,
+        nous_oauth_refresh_interval_seconds=300.0,
+    )
+    identity = {"value": "mtime_ns=1;size=10;obtained_at=old;expires_at=old"}
+    helper_calls = []
+
+    def fake_inspect(*_args, now, **_kwargs):
+        observed = now()
+        return {
+            "eligibility_checked_at": observed.isoformat().replace("+00:00", "Z"),
+            "expires_at": "2026-08-21T23:17:38Z",
+            "refresh_due_at": "2026-08-21T23:02:38Z",
+            "next_refresh_check_at": observed.isoformat().replace("+00:00", "Z"),
+            "eligible": True,
+            "credential_health": "expired",
+            "usable": False,
+            "error_class": None,
+            "error_message": None,
+            "credential_identity": identity["value"],
+        }
+
+    def fake_refresh(*_args, on_token_endpoint_attempt, **_kwargs):
+        helper_calls.append(True)
+        on_token_endpoint_attempt()
+        return {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "auth_file": config.nous_oauth_auth_file,
+            "scope": "inference:invoke",
+            "expires_at": "2026-08-21T23:17:38Z",
+            "error_class": "invalid_grant",
+            "error_message": "Nous OAuth refresh failed with HTTP 400",
+        }
+
+    monkeypatch.setattr(
+        loop.nous_oauth_refresh,
+        "inspect_nous_oauth_refresh_eligibility",
+        fake_inspect,
+    )
+    monkeypatch.setattr(
+        loop.nous_oauth_refresh,
+        "refresh_nous_oauth_auth_file",
+        fake_refresh,
+    )
+    monkeypatch.setattr(
+        loop,
+        "_persist_nous_oauth_auth_observation",
+        lambda *_args, **_kwargs: (True, 1, None, None),
+    )
+
+    state = loop.SidecarTaskState()
+    first_events = loop.run_due_sidecar_tasks(
+        config,
+        state,
+        now_monotonic=100.0,
+        now_wall=datetime(2026, 8, 24, 20, 0, tzinfo=timezone.utc),
+    )
+    later_events = loop.run_due_sidecar_tasks(
+        config,
+        state,
+        now_monotonic=500.0,
+        now_wall=datetime(2026, 8, 24, 20, 5, tzinfo=timezone.utc),
+    )
+    identity["value"] = "mtime_ns=2;size=11;obtained_at=new;expires_at=new"
+    relogin_events = loop.run_due_sidecar_tasks(
+        config,
+        state,
+        now_monotonic=501.0,
+        now_wall=datetime(2026, 8, 24, 20, 5, 1, tzinfo=timezone.utc),
+    )
+
+    def _refresh_event(events):
+        matches = [
+            event for event in events if event.get("event") == "nous_oauth_refresh"
+        ]
+        assert len(matches) == 1
+        return matches[0]
+
+    first = _refresh_event(first_events)
+    later = _refresh_event(later_events)
+    relogin = _refresh_event(relogin_events)
+    rendered = json.dumps([first, later, relogin])
+
+    assert first["helper_called"] is True
+    assert first["actual_attempted"] is True
+    assert first["error_class"] == "invalid_grant"
+    assert first["terminal_refresh_error_class"] == "invalid_grant"
+    assert later["helper_called"] is False
+    assert later["actual_attempted"] is False
+    assert later["skipped"] is True
+    assert later["terminal_refresh_blocked"] is True
+    assert later["terminal_refresh_error_class"] == "invalid_grant"
+    assert relogin["helper_called"] is True
+    assert relogin["actual_attempted"] is True
+    assert relogin["terminal_refresh_blocked"] is False
+    assert helper_calls == [True, True]
+    assert "old-refresh" not in rendered
+    assert "access_token" not in rendered
+
+
 def test_passive_auth_health_poll_maps_sanitized_nous_oauth_row(monkeypatch) -> None:
     config = _nous_oauth_auth_persist_config(
         apply=True,
