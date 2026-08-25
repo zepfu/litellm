@@ -21620,6 +21620,7 @@ def test_auto_agent_alias_route_event_records_cooldown_rollup_with_host(monkeypa
             "incoming_endpoint": "/openai_passthrough/responses",
             "outgoing_target": "openrouter.ai/api/v1/chat/completions",
             "model_label": "openrouter/cohere/north-mini-code:free(basic)",
+            "effort": "none",
             "turns": 0,
             "status": "Cooling Down",
             "message": None,
