@@ -63,6 +63,8 @@ from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     _is_known_grok_build_usage_balance_exhausted_response,
     _get_passthrough_grok_build_usage_balance_exhausted_failure_kind,
     _is_known_chatgpt_codex_model_not_supported_for_account_response,
+    _is_known_openai_invalid_encrypted_content_response,
+    _is_passthrough_pre_first_byte_hidden_retryable,
     _set_passthrough_stream_timeout_metadata,
     _resolve_aawm_passthrough_stream_read_timeout_policy,
     _restore_responses_function_names_in_sse_chunks,
@@ -5416,6 +5418,323 @@ class TestPassThroughTerminalFailureLogging:
             mock_logging_obj.post_call_failure_hook.await_args.kwargs["traceback_str"]
             is None
         )
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_openai_encrypted_function_output_502_warns_without_retry(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4011/openai_passthrough/responses"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.openai.com/v1/responses"
+        upstream_detail = (
+            b'{"error":{"message":"Encrypted function output content could not '
+            b'be decrypted or decoded.","type":"provider_terminal_error",'
+            b'"code":"invalid_encrypted_content","retryable":false}}'
+        )
+        upstream_response = httpx.Response(
+            status_code=502,
+            content=upstream_detail,
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "gpt-5.6-sol"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=handler,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch.object(
+            verbose_proxy_logger,
+            "warning",
+        ) as mock_warning, patch.object(
+            verbose_proxy_logger,
+            "exception",
+        ) as mock_exception, patch.object(
+            verbose_proxy_logger,
+            "error",
+        ) as mock_error:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "gpt-5.6-sol"}
+            )
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException) as exc_info:
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={"authorization": "Bearer test"},
+                    user_api_key_dict=MagicMock(),
+                    custom_llm_provider="openai",
+                    stream=False,
+                )
+
+        assert exc_info.value.code == "502"
+        assert "Encrypted function output" in str(exc_info.value.detail)
+        assert handler.await_count == 1
+        mock_exception.assert_not_called()
+        assert not any(
+            "exhausted hidden retries" in str(call.args[0])
+            for call in mock_error.call_args_list
+            if call.args
+        )
+        invalid_warning = next(
+            call
+            for call in mock_warning.call_args_list
+            if "invalid encrypted content" in str(call.args[0])
+        )
+        assert (
+            invalid_warning.kwargs["extra"]["failure_kind"]
+            == "openai_invalid_encrypted_content"
+        )
+        mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+        assert (
+            mock_logging_obj.post_call_failure_hook.await_args.kwargs["traceback_str"]
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_openai_encrypted_function_output_400_warns_without_retry(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4011/openai_passthrough/responses"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+
+        target_url = "https://api.openai.com/v1/responses"
+        upstream_detail = (
+            b'{"error":{"message":"Encrypted function output content could not '
+            b'be decrypted or decoded.","type":"invalid_request_error",'
+            b'"code":"invalid_encrypted_content"}}'
+        )
+        upstream_response = httpx.Response(
+            status_code=400,
+            content=upstream_detail,
+            request=httpx.Request("POST", target_url),
+        )
+        handler = AsyncMock(return_value=upstream_response)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._read_request_body",
+            return_value={"model": "gpt-5.6-sol"},
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=handler,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch.object(
+            verbose_proxy_logger,
+            "warning",
+        ) as mock_warning, patch.object(
+            verbose_proxy_logger,
+            "exception",
+        ) as mock_exception, patch.object(
+            verbose_proxy_logger,
+            "error",
+        ) as mock_error:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(
+                return_value={"model": "gpt-5.6-sol"}
+            )
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException) as trans_exc:
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={"authorization": "Bearer test"},
+                    user_api_key_dict=MagicMock(),
+                    custom_llm_provider="openai",
+                    stream=False,
+                )
+
+        assert trans_exc.value.code == "400"
+        assert "Encrypted function output" in str(trans_exc.value.detail)
+        assert handler.await_count == 1
+        mock_exception.assert_not_called()
+        assert not any(
+            "exhausted hidden retries" in str(call.args[0])
+            for call in mock_error.call_args_list
+            if call.args
+        )
+        invalid_warning = next(
+            call
+            for call in mock_warning.call_args_list
+            if "invalid encrypted content" in str(call.args[0])
+        )
+        assert (
+            invalid_warning.kwargs["extra"]["failure_kind"]
+            == "openai_invalid_encrypted_content"
+        )
+        mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+        assert (
+            mock_logging_obj.post_call_failure_hook.await_args.kwargs["traceback_str"]
+            is None
+        )
+
+    def test_classifier_matches_openai_encrypted_function_output_400_and_502(self):
+        from litellm.proxy.pass_through_endpoints.streaming_handler import (
+            ResponsesStreamPreCommitFailure,
+        )
+
+        target_url = "https://api.openai.com/v1/responses"
+        message = (
+            "Encrypted function output content could not be decrypted or decoded."
+        )
+        detail = {
+            "error": {
+                "message": message,
+                "type": "provider_terminal_error",
+                "code": "invalid_encrypted_content",
+                "retryable": False,
+            }
+        }
+        exc_400 = HTTPException(status_code=400, detail=detail)
+        exc_502 = HTTPException(status_code=502, detail=detail)
+        url = httpx.URL(target_url)
+        assert _is_known_openai_invalid_encrypted_content_response(
+            url=url,
+            custom_llm_provider="openai",
+            status_code=400,
+            exc=exc_400,
+        )
+        assert _is_known_openai_invalid_encrypted_content_response(
+            url=url,
+            custom_llm_provider="openai",
+            status_code=502,
+            exc=exc_502,
+        )
+        stream_exc = ResponsesStreamPreCommitFailure(
+            error_class="provider_terminal_error",
+            classification="provider_terminal_error",
+            retryable=False,
+            error_code="invalid_encrypted_content",
+            error_type="provider_terminal_error",
+            message=message,
+            error_payload={
+                "code": "invalid_encrypted_content",
+                "type": "provider_terminal_error",
+                "message": message,
+            },
+        )
+        retry_kwargs = {
+            "url": url,
+            "custom_llm_provider": "openai",
+        }
+        assert _is_passthrough_pre_first_byte_hidden_retryable(
+            stream_exc,
+            status_code=None,
+            failure_class="provider_terminal_error",
+            **retry_kwargs,
+        ) is False
+        assert _is_passthrough_pre_first_byte_hidden_retryable(
+            exc_502,
+            status_code=502,
+            failure_class="http_status_502",
+            **retry_kwargs,
+        ) is False
+
+    def test_classifier_rejects_non_openai_responses_invalid_encrypted_content(self):
+        message = (
+            "Encrypted function output content could not be decrypted or decoded."
+        )
+        detail = {
+            "error": {
+                "message": message,
+                "type": "provider_terminal_error",
+                "code": "invalid_encrypted_content",
+                "retryable": False,
+            }
+        }
+        exc = HTTPException(status_code=502, detail=detail)
+        message_only = HTTPException(
+            status_code=502,
+            detail={
+                "error": {
+                    "message": message,
+                    "type": "provider_terminal_error",
+                    "retryable": False,
+                }
+            },
+        )
+        openai_chat_url = httpx.URL("https://api.openai.com/v1/chat/completions")
+        chatgpt_url = httpx.URL("https://chatgpt.com/backend-api/codex/responses")
+        grok_url = httpx.URL("https://api.x.ai/v1/responses")
+        responses_url = httpx.URL("https://api.openai.com/v1/responses")
+        assert not _is_known_openai_invalid_encrypted_content_response(
+            url=openai_chat_url,
+            custom_llm_provider="openai",
+            status_code=502,
+            exc=exc,
+        )
+        assert not _is_known_openai_invalid_encrypted_content_response(
+            url=chatgpt_url,
+            custom_llm_provider="openai",
+            status_code=400,
+            exc=HTTPException(status_code=400, detail=detail),
+        )
+        assert not _is_known_openai_invalid_encrypted_content_response(
+            url=grok_url,
+            custom_llm_provider="xai",
+            status_code=502,
+            exc=exc,
+        )
+        assert not _is_known_openai_invalid_encrypted_content_response(
+            url=responses_url,
+            custom_llm_provider="openai",
+            status_code=502,
+            exc=message_only,
+        )
+        assert _is_passthrough_pre_first_byte_hidden_retryable(
+            exc,
+            status_code=502,
+            failure_class="http_status_502",
+            url=openai_chat_url,
+            custom_llm_provider="openai",
+        ) is True
+        assert _is_passthrough_pre_first_byte_hidden_retryable(
+            exc,
+            status_code=502,
+            failure_class="http_status_502",
+            url=chatgpt_url,
+            custom_llm_provider="openai",
+        ) is True
+        assert _is_passthrough_pre_first_byte_hidden_retryable(
+            exc,
+            status_code=502,
+            failure_class="http_status_502",
+            url=grok_url,
+            custom_llm_provider="xai",
+        ) is True
+        assert _is_passthrough_pre_first_byte_hidden_retryable(
+            message_only,
+            status_code=502,
+            failure_class="http_status_502",
+            url=responses_url,
+            custom_llm_provider="openai",
+        ) is True
+        assert _is_passthrough_pre_first_byte_hidden_retryable(
+            exc,
+            status_code=502,
+            failure_class="http_status_502",
+        ) is True
 
     def test_classifier_matches_chatgpt_codex_unsupported_model_for_account_body(self):
         target_url = "https://chatgpt.com/backend-api/codex/responses"

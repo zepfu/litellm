@@ -21,8 +21,11 @@ from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.cohere im
     classify_cohere_failure,
 )
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.openai import (
+    _get_openai_invalid_encrypted_content_error_summary,
+    _get_openai_invalid_encrypted_content_failure_kind,
     _get_openai_model_not_found_error_summary,
     _get_openai_model_not_found_failure_kind,
+    _is_known_openai_invalid_encrypted_content_response,
     _is_known_openai_model_not_found_response,
 )
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.grok import (
@@ -265,6 +268,33 @@ def _classify_chatgpt_codex_model_not_supported(
 
 
 
+def _classify_openai_invalid_encrypted_content(
+    *,
+    request: Request,
+    url: Optional[httpx.URL],
+    custom_llm_provider: Optional[str],
+    status_code: Optional[int],
+    exc: Exception,
+) -> Optional[PassthroughProviderFailureClassification]:
+    del request
+    if not _is_known_openai_invalid_encrypted_content_response(
+        url=url,
+        custom_llm_provider=custom_llm_provider,
+        status_code=status_code,
+        exc=exc,
+    ):
+        return None
+    return PassthroughProviderFailureClassification(
+        name="openai_invalid_encrypted_content",
+        failure_kind=_get_openai_invalid_encrypted_content_failure_kind(),
+        log_message=(
+            "Pass through endpoint surfaced OpenAI invalid encrypted "
+            "content status=%s error=%s"
+        ),
+        log_error_summary=_get_openai_invalid_encrypted_content_error_summary(exc),
+    )
+
+
 def _classify_openai_model_not_found(
     *,
     request: Request,
@@ -356,6 +386,7 @@ PASSTHROUGH_PROVIDER_FAILURE_CLASSIFIERS: Sequence[ProviderFailureClassifier] = 
     _classify_chatgpt_codex_block_page,
     _classify_chatgpt_codex_invalid_encrypted_content,
     _classify_chatgpt_codex_model_not_supported,
+    _classify_openai_invalid_encrypted_content,
     _classify_openai_model_not_found,
     _classify_cohere_known_failure,
     _classify_anthropic_known_failure,

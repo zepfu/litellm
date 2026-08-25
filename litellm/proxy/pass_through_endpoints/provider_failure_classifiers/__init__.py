@@ -25,9 +25,13 @@ from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.common im
     _is_xai_passthrough_target,
 )
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.openai import (
+    _get_openai_invalid_encrypted_content_error_summary,
+    _get_openai_invalid_encrypted_content_failure_kind,
     _get_openai_model_not_found_error_summary,
     _get_openai_model_not_found_failure_kind,
+    _is_known_openai_invalid_encrypted_content_response,
     _is_known_openai_model_not_found_response,
+    _openai_error_is_invalid_encrypted_content,
 )
 from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.grok import (
     _get_passthrough_grok_billing_timeout_failure_kind,
@@ -76,5 +80,9 @@ __all__ = [
     "_is_known_openai_model_not_found_response",
     "_get_openai_model_not_found_error_summary",
     "_get_openai_model_not_found_failure_kind",
+    "_is_known_openai_invalid_encrypted_content_response",
+    "_get_openai_invalid_encrypted_content_error_summary",
+    "_get_openai_invalid_encrypted_content_failure_kind",
+    "_openai_error_is_invalid_encrypted_content",
     "_get_known_anthropic_passthrough_failure_kind",
 ]

@@ -1017,3 +1017,43 @@ client. It logs a compact warning with
 entry to the runtime error JSONL file for this known provider/client condition.
 Unrelated ChatGPT Codex 400 responses still use the normal exception and error
 intake path.
+
+## OpenAI encrypted function-output continuations
+
+When a Codex continuation includes ``function_call_output.encrypted_content``
+and later lands on an OpenAI API-key Responses candidate such as
+``gpt-5.6-sol``, the upstream may reject the request with HTTP 400 or a
+pre-commit 502 whose body is ``error.code = invalid_encrypted_content`` and
+``Encrypted function output content could not be decrypted or decoded``.
+That ciphertext is ChatGPT/session-bound; it is not portable onto a
+different OpenAI credential.
+
+LiteLLM strips ``encrypted_content`` from ``function_call_output`` items that
+already carry plaintext ``output`` before OpenAI Responses egress, including
+nested ``output`` parts with ``type=encrypted_content``. Nested ciphertext
+is stripped only when plaintext is present or the route is designated for
+stripping. On ``api.openai.com`` API-key egress, ciphertext-only
+``function_call_output`` items (no plaintext ``output``) are also stripped
+instead of unwrapped; an empty ``output`` placeholder keeps the ``call_id``
+valid. Ciphertext-only retention requires a confirmed ``chatgpt.com`` host
+from actual egress URL/host arguments. No URL or an unrecognized host
+strips. Explicit ``strip_ciphertext_without_plaintext=False`` cannot bypass
+that host check. ChatGPT-host retention also requires an OpenAI/Codex
+selected route from those same actual egress arguments plus an existing
+genuinely trusted server-side prior-owner source. Request-supplied/generic
+``litellm_metadata`` and unsigned encrypted provenance wrappers are not
+trusted prior-owner or current-route proof. Synthetic
+``session_owner_account_lane`` request metadata must not retain. If this
+layer has no authenticated/trusted prior-owner source, fail closed and
+strip. Alias text, ``codex_auto_agent_alias`` / ``model_alias_label`` /
+``requested_model_alias``, route-family plus selected-model labels, and a
+``gpt-5.6-sol(sota-openai)`` suffix are not same-account proof. The original
+item is mutated in place so a shallow pass-through copy cannot reserialize
+leftover ciphertext onto ``gpt-5.6-sol``. Remaining decrypt failures on
+OpenAI API-key Responses (``api.openai.com`` ``/v1/responses``,
+``custom_llm_provider=openai``) with exact structured
+``error.code = invalid_encrypted_content`` are classified as
+``failure_kind=openai_invalid_encrypted_content``. ChatGPT Codex HTTP 400
+with the same code remains ``openai_chatgpt_codex_invalid_encrypted_content``.
+The OpenAI API-key class is not hidden-retried as a capacity 502, it warns
+without a generic traceback, and it stays visible to the client.

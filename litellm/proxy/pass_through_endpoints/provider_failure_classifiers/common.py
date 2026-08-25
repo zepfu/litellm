@@ -35,6 +35,7 @@ _CHATGPT_CODEX_BLOCK_PAGE_MARKERS = (
     "cdn-cgi/challenge-platform",
 )
 _CHATGPT_CODEX_INVALID_ENCRYPTED_CONTENT_ERROR_CODE = "invalid_encrypted_content"
+_OPENAI_INVALID_ENCRYPTED_CONTENT_ERROR_CODE = "invalid_encrypted_content"
 _CHATGPT_CODEX_MODEL_NOT_SUPPORTED_FOR_ACCOUNT_MARKERS = (
     "not supported when using codex with a chatgpt account",
     "model is not supported",

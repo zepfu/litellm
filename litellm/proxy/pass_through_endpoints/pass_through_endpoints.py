@@ -161,6 +161,7 @@ from .provider_failure_classifiers import (  # noqa: F401
     _is_known_chatgpt_codex_block_page_response,
     _is_known_chatgpt_codex_invalid_encrypted_content_response,
     _is_known_chatgpt_codex_model_not_supported_for_account_response,
+    _is_known_openai_invalid_encrypted_content_response,
     _is_known_grok_billing_passthrough_timeout_cancel_response,
     _is_known_grok_build_usage_balance_exhausted_response,
     _is_known_grok_personal_team_spending_limit_response,
@@ -1329,7 +1330,23 @@ def _is_passthrough_pre_first_byte_hidden_retryable(
     *,
     status_code: Optional[int],
     failure_class: str,
+    url: Optional[httpx.URL] = None,
+    custom_llm_provider: Optional[str] = None,
 ) -> bool:
+    classified_status_code = status_code
+    if (
+        classified_status_code is None
+        and isinstance(exc, ResponsesStreamPreCommitFailure)
+        and not exc.retryable
+    ):
+        classified_status_code = status.HTTP_502_BAD_GATEWAY
+    if _is_known_openai_invalid_encrypted_content_response(
+        url=url,
+        custom_llm_provider=custom_llm_provider,
+        status_code=classified_status_code,
+        exc=exc,
+    ):
+        return False
     if isinstance(exc, ResponsesStreamPreCommitFailure):
         return bool(
             exc.retryable
@@ -1537,6 +1554,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
     operation_name: str,
     operation: Any,
     caller_managed_hidden_retry: bool,
+    url: Optional[httpx.URL] = None,
+    custom_llm_provider: Optional[str] = None,
 ) -> Any:
     if caller_managed_hidden_retry:
         return await operation()
@@ -1571,6 +1590,8 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
                 exc,
                 status_code=status_code,
                 failure_class=failure_class,
+                url=url,
+                custom_llm_provider=custom_llm_provider,
             )
             if (
                 isinstance(exc, ResponsesStreamPreCommitFailure)
@@ -4465,6 +4486,8 @@ async def pass_through_request(  # noqa: PLR0915
                     operation_name="stream_pre_first_byte",
                     operation=_send_stream_pre_first_byte,
                     caller_managed_hidden_retry=caller_managed_hidden_retry,
+                    url=url,
+                    custom_llm_provider=custom_llm_provider,
                 )
             except ResponsesStreamPreCommitFailure as pre_commit_exc:
                 await _aawm_session_owner_on_upstream_result(
@@ -4654,6 +4677,8 @@ async def pass_through_request(  # noqa: PLR0915
                 operation_name="non_stream_pre_first_byte",
                 operation=_send_non_stream_pre_first_byte,
                 caller_managed_hidden_retry=caller_managed_hidden_retry,
+                url=url,
+                custom_llm_provider=custom_llm_provider,
             )
         except Exception:
             await _aawm_session_owner_on_upstream_result(
