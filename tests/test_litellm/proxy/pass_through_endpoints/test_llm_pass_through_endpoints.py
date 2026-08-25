@@ -85,6 +85,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _extract_auto_agent_alias_agent_dispatch_fields,
     _extract_auto_agent_alias_role_from_text,
     _summarize_auto_agent_alias_actual_prior_tool_activity,
+    _codex_auto_agent_candidate_key,
     _codex_auto_agent_cooldown_until_monotonic_by_key,
     _codex_auto_agent_session_affinity_by_key,
     _anthropic_auto_agent_cooldown_until_monotonic_by_key,
@@ -132,6 +133,7 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
     _resolve_anthropic_openrouter_completion_adapter_model,
     _select_anthropic_auto_agent_candidate,
     _select_codex_auto_agent_candidate,
+    _select_snapshot_candidates,
     _set_anthropic_auto_agent_cooldown,
     _set_anthropic_auto_agent_session_affinity,
     _set_codex_auto_agent_cooldown,
@@ -29294,7 +29296,7 @@ class _FakeAawmAliasRoutingDualCache:
     async def async_get_cache(self, key: str, **_: Any) -> Any:
         return self.store.get(key)
 
-    async def async_set_cache(self, key: str, value: Any, **kwargs: Any) -> None:
+    async def async_set_cache(self, key: str, value: Any, **kwargs: Any) -> Any:
         local_only = kwargs.get("local_only") is True
         if self.fail_writes and not local_only:
             raise RuntimeError("redis unavailable")
@@ -29303,7 +29305,96 @@ class _FakeAawmAliasRoutingDualCache:
             self.local_set_calls.append(call)
         else:
             self.set_calls.append(call)
+        nx = kwargs.get("nx") is True
+        if nx and key in self.store:
+            return False
         self.store[key] = value
+        if nx:
+            return True
+        return None
+
+    def init_async_client(self) -> "_FakeAawmAliasRoutingDualCache":
+        # Session-owner lookup uses redis_cache.init_async_client().get(key).
+        return self
+
+    async def get(self, name: str) -> Any:
+        value = self.store.get(name)
+        if value is None:
+            return None
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value)
+        if isinstance(value, str):
+            return value
+        return json.dumps(value)
+
+    async def eval(self, script: str, numkeys: int, *args: Any) -> Any:
+        # Durable cooldown publish-txn Lua: store JSON payload and return success.
+        if "local cd_value_json = ARGV[7]" in script:
+            num_cd = int(args[numkeys])
+            cd_value_json = args[numkeys + 6]
+            payload = json.loads(cd_value_json)
+            for i in range(num_cd):
+                self.store[args[1 + i]] = payload
+            receipt_json = args[numkeys + 5]
+            try:
+                self.store[args[0]] = json.loads(receipt_json)
+            except Exception:
+                self.store[args[0]] = receipt_json
+            return 1
+        # Provider-lane admission reserve Lua: claim a lease and return success.
+        if "return {1, current_weighted + weighted_units}" in script:
+            lease_key = args[1]
+            payload = args[6]
+            units = int(args[3])
+            try:
+                self.store[lease_key] = json.loads(payload)
+            except Exception:
+                self.store[lease_key] = payload
+            return [1, units]
+        # Minimal Lua semantics used by session-owner renew/promote/release.
+        key = args[0]
+        raw = self.store.get(key)
+        if isinstance(raw, (bytes, bytearray)):
+            current = json.loads(raw.decode("utf-8"))
+        elif isinstance(raw, str):
+            current = json.loads(raw)
+        else:
+            current = raw
+        if "PERSIST" in script and "reservation_token" in script and "owned" in script:
+            token = args[1]
+            payload_json = args[2]
+            if current is None:
+                return [0, "missing"]
+            if current.get("state") == "owned":
+                return [2, json.dumps(current)]
+            if current.get("state") != "reserved" or current.get("reservation_token") != token:
+                return [0, json.dumps(current)]
+            payload = json.loads(payload_json)
+            if current.get("reserved_at_epoch") is not None:
+                payload["reserved_at_epoch"] = current["reserved_at_epoch"]
+            self.store[key] = payload
+            return [1, json.dumps(payload)]
+        if "DEL" in script and "reserved" in script:
+            token = args[1]
+            if current is None:
+                return 0
+            if current.get("state") == "owned":
+                return 2
+            if current.get("state") == "reserved" and current.get("reservation_token") == token:
+                self.store.pop(key, None)
+                return 1
+            return 0
+        if "last_renewed_at_epoch" in script or ("EX" in script and "reserved" in script):
+            token = args[1]
+            payload_json = args[2]
+            if current is None:
+                return 0
+            if current.get("state") != "reserved" or current.get("reservation_token") != token:
+                return 0
+            payload = json.loads(payload_json)
+            self.store[key] = payload
+            return 1
+        raise AssertionError(f"unexpected eval script: {script[:80]}")
 
 
 @pytest.mark.asyncio
@@ -29501,47 +29592,58 @@ async def test_anthropic_auto_agent_alias_low_openrouter_adapter_cooldown_does_n
 
 
 @pytest.mark.asyncio
-async def test_aawm_low_alias_skips_openrouter_candidate_with_adapter_local_cooldown():
+async def test_aawm_provider_openrouter_skips_first_candidate_with_adapter_local_cooldown():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "basic",
+        "model": "provider-openrouter",
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    exhausted_model = "openrouter/cohere/north-mini-code:free"
-    upstream_model = "cohere/north-mini-code:free"
+    first_model = "openrouter/stealth/ox-alpha"
+    selected_model = "openrouter/cohere/north-mini-code:free"
+    upstream_model = "stealth/ox-alpha"
     _openrouter_adapter_rate_limit_until_monotonic_by_key[upstream_model] = time.monotonic() + 120.0
     try:
-        selection = await _select_codex_auto_agent_candidate(
-            request=request,
-            request_body=body,
-        )
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+            return_value=dual_cache,
+        ):
+            selection = await _select_codex_auto_agent_candidate(
+                request=request,
+                request_body=body,
+            )
     finally:
         _openrouter_adapter_rate_limit_until_monotonic_by_key.pop(upstream_model, None)
 
     assert selection["candidate"]["provider"] == "openrouter"
-    assert selection["candidate"]["model"] == "openrouter/owl-alpha"
-    assert selection["selection_reason"] == "first_available"
-    assert selection["skipped"][0]["provider"] == "openrouter"
-    assert selection["skipped"][0]["model"] == exhausted_model
-    assert selection["skipped"][0]["reason"] == "adapter_cooldown"
-    assert selection["skipped"][0]["cooldown_seconds"] > 0
+    assert selection["candidate"]["model"] == selected_model
+    skipped = next(
+        item for item in selection["skipped"] if item.get("model") == first_model
+    )
+    assert skipped["reason"] == "adapter_cooldown"
+    assert skipped["cooldown_seconds"] > 0
 
 
 @pytest.mark.asyncio
-async def test_aawm_low_alias_durable_cooldown_blocks_after_memory_clear():
+async def test_aawm_provider_openrouter_durable_cooldown_blocks_after_memory_clear():
     dual_cache = _FakeAawmAliasRoutingDualCache()
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "basic",
+        "model": "provider-openrouter",
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    candidate = {
-        "provider": "openrouter",
-        "model": "openrouter/cohere/north-mini-code:free",
-        "route_family": "codex_openrouter_completion_adapter",
-        "last_resort": False,
-    }
-    cooldown_key = "openrouter:openrouter/cohere/north-mini-code:free:openrouter"
+    compiled = _select_snapshot_candidates(
+        "provider-openrouter",
+        ingress="codex",
+        request=request,
+    )
+    first_candidate = compiled[0]
+    second_candidate = compiled[1]
+    cooldown_key = _codex_auto_agent_candidate_key(
+        first_candidate,
+        "openrouter",
+        cooldown_identity_tag=first_candidate.get("cooldown_identity_tag"),
+    )
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
         return_value=dual_cache,
@@ -29553,15 +29655,18 @@ async def test_aawm_low_alias_durable_cooldown_blocks_after_memory_clear():
             request_body=body,
         )
 
-    assert selection["candidate"]["provider"] == "openrouter"
-    assert selection["candidate"]["model"] == "openrouter/owl-alpha"
-    assert selection["skipped"][0]["model"] == candidate["model"]
-    assert selection["skipped"][0]["cooldown_seconds"] > 0
-    assert selection["skipped"][0]["reason"] == "cooldown"
+    assert selection["candidate"]["provider"] == second_candidate["provider"]
+    assert selection["candidate"]["model"] == second_candidate["model"]
+    skipped = next(
+        item for item in selection["skipped"] if item.get("model") == first_candidate["model"]
+    )
+    assert skipped["reason"] == "cooldown"
+    assert skipped["cooldown_seconds"] > 0
 
 
 @pytest.mark.asyncio
 async def test_aawm_low_alias_skips_openrouter_candidates_with_durable_quota_exhaustion():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
     _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
     _codex_auto_agent_session_affinity_by_key.clear()
     request = _build_codex_auto_agent_request()
@@ -29571,6 +29676,9 @@ async def test_aawm_low_alias_skips_openrouter_candidates_with_durable_quota_exh
     }
 
     with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_openrouter_free_daily_quota_exhausted_cooldown_seconds",
         new=AsyncMock(return_value=600.0),
     ):
@@ -29579,8 +29687,8 @@ async def test_aawm_low_alias_skips_openrouter_candidates_with_durable_quota_exh
             request_body=body,
         )
 
-    assert selection["candidate"]["provider"] == "opencode_zen"
-    assert selection["candidate"]["model"] == "deepseek-v4-flash-free"
+    assert selection["candidate"]["provider"] == "opencode_go"
+    assert selection["candidate"]["model"] == "ox-alpha-free"
     skipped = selection["skipped"]
     skipped_models = {candidate["model"] for candidate in skipped}
     assert {
@@ -29632,15 +29740,19 @@ async def test_aawm_low_anthropic_alias_skips_openrouter_candidates_with_durable
 
 @pytest.mark.asyncio
 async def test_aawm_low_alias_keeps_openrouter_first_without_durable_quota_exhaustion():
+    dual_cache = _FakeAawmAliasRoutingDualCache()
     _codex_auto_agent_cooldown_until_monotonic_by_key.clear()
     _codex_auto_agent_session_affinity_by_key.clear()
     request = _build_codex_auto_agent_request()
     body = {
-        "model": "basic",
+        "model": "provider-openrouter",
         "litellm_metadata": {"session_id": "codex-session"},
     }
 
     with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_openrouter_free_daily_quota_exhausted_cooldown_seconds",
         new=AsyncMock(return_value=0.0),
     ):
@@ -29650,7 +29762,7 @@ async def test_aawm_low_alias_keeps_openrouter_first_without_durable_quota_exhau
         )
 
     assert selection["candidate"]["provider"] == "openrouter"
-    assert selection["candidate"]["model"] == "openrouter/cohere/north-mini-code:free"
+    assert selection["candidate"]["model"] == "openrouter/stealth/ox-alpha"
     assert selection["skipped"] == []
 
 
@@ -29915,9 +30027,7 @@ async def test_aawm_alias_routing_namespace_controls_cooldown_recovery(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_aawm_alias_routing_selector_reports_local_fallback_without_durable_cache(
-    monkeypatch,
-):
+async def test_aawm_alias_routing_selector_fails_closed_without_durable_cache():
     request = _build_codex_auto_agent_request()
     body = {
         "model": "basic",
@@ -29927,12 +30037,21 @@ async def test_aawm_alias_routing_selector_reports_local_fallback_without_durabl
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
         return_value=None,
     ):
-        selection = await _select_codex_auto_agent_candidate(
-            request=request,
-            request_body=body,
-        )
+        with pytest.raises(HTTPException) as exc_info:
+            await _select_codex_auto_agent_candidate(
+                request=request,
+                request_body=body,
+            )
 
-    assert selection["cooldown_state_source"] == "local_fallback"
+    assert exc_info.value.status_code == 409
+    detail = exc_info.value.detail
+    assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert detail["redispatch_required"] is True
+    assert detail["failure_phase"] == "session_owner_redis_unavailable"
+    assert detail["attempted_provider_call"] is False
+    assert detail["canonical_session_identity"] == "codex-session"
+    assert detail["alias_model"] == "basic"
+    assert detail["redispatch_model"] == "basic"
 
 
 @pytest.mark.asyncio
