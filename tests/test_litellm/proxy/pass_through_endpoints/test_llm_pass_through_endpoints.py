@@ -30979,16 +30979,32 @@ async def test_codex_auto_agent_alias_capacity_failure_still_sets_durable_cooldo
     body = {'model': 'work', 'input': 'hello', 'stream': False, 'litellm_metadata': {'session_id': 'codex-session'}}
     spark_error = RuntimeError('Selected model is at capacity. Please try a different model.')
     grok_success = Response(content='{"ok": true}', media_type='application/json')
-    with patch.dict(os.environ, {'GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL': 'https://api.x.ai/v1'}), patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock(side_effect=[spark_error, grok_success])), patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token', new=AsyncMock(return_value='grok-oidc-token')):
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    with patch.dict(os.environ, {'GROK_CLI_CHAT_PROXY_UPSTREAM_BASE_URL': 'https://api.x.ai/v1'}), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.durable.get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_state.get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ), patch(
+        'litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request',
+        new=AsyncMock(side_effect=[spark_error, grok_success]),
+    ), patch(
+        'litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_grok_native_oauth_access_token',
+        new=AsyncMock(return_value='grok-oidc-token'),
+    ):
         response = await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
+        durable_seconds, _ = await _get_codex_auto_agent_active_cooldown_state('openai:gpt-5.3-codex-spark:__default__')
+        assert durable_seconds > 0.0
     assert response is grok_success
     metadata = request.scope['parsed_body'][1]['litellm_metadata']
     spark_attempt = metadata['codex_auto_agent_attempts'][0]
     assert spark_attempt['cooldown_scope'] == 'candidate'
     assert spark_attempt['error_class'] == 'capacity_exhausted'
     assert spark_attempt['cooldown_seconds'] == 300.0
-    durable_seconds, _ = await _get_codex_auto_agent_active_cooldown_state('openai:gpt-5.3-codex-spark:__default__')
-    assert durable_seconds > 0.0
 
 
 
