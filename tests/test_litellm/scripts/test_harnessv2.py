@@ -812,6 +812,20 @@ def test_should_stage_ohmypi_identity_overlay_with_repo_and_version(hv, config) 
     assert "ohmypi-identity" in config_path or config_path.endswith(".yml")
 
 
+def test_should_stage_empty_fallback_chain_for_provider_nvidia_without_changing_default(
+    hv, config
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    driver = OhmypiDriver(config)
+    overlay = driver.identity_overlay_payload(version="17.4.2")
+    chains = overlay["retry"]["fallbackChains"]
+    selector = driver.model_selector("provider-nvidia")
+    assert selector == "litellm-alpha-passthrough/provider-nvidia"
+    assert chains[selector] == []
+    assert "default" not in chains
+
+
 def test_should_export_ohmypi_identity_overlay_on_pi_config_files_for_child_sessions(
     hv, config, tmp_path: Path
 ) -> None:

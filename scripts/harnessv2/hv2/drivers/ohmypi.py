@@ -146,11 +146,21 @@ class OhmypiDriver:
             "x-aawm-repository": "litellm",
             "langfuse_trace_name": "omp",
         }
+        # Identity is merged first, operator litellm-alpha.yml second.
+        # Exact selector wins over operator retry.fallbackChains.default, so a
+        # provider-pinned nvidia child fails closed instead of escaping to sota.
+        # Do not set default here; non-pinned runs keep the operator chain.
+        nvidia_selector = self.model_selector("provider-nvidia")
         return {
             "providers": {
                 "litellm-alpha": {"headers": dict(headers)},
                 "litellm-alpha-passthrough": {"headers": dict(headers)},
-            }
+            },
+            "retry": {
+                "fallbackChains": {
+                    nvidia_selector: [],
+                }
+            },
         }
 
     def identity_overlay_path(self) -> Path:
