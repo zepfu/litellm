@@ -67,9 +67,9 @@ WAVE6A_MODULE_IMPORT_PATHS: dict[str, str] = {
 WAVE6A_EXPECTED_COUNTS: dict[str, int] = {
     "request_build": 22,
     "sse": 11,
-    "tool_call_restore": 14,
+    "tool_call_restore": 20,
     "stream_collect": 9,
-    "payload_validation": 13,
+    "payload_validation": 14,
 }
 
 # ---------------------------------------------------------------------------
@@ -90,10 +90,12 @@ MODEL_RESOLUTION_SYMBOLS: set[str] = {
     "_normalize_kimi_code_chat_completions_adapter_model_name",
     "_normalize_alibaba_token_plan_adapter_model_name",
     "_normalize_zai_coding_plan_adapter_model_name",
+    "_normalize_nvidia_completion_adapter_model_name",
     "_resolve_codex_opencode_zen_adapter_model",
     "_resolve_codex_kimi_chat_completions_adapter_model",
     "_resolve_codex_alibaba_token_plan_adapter_model",
     "_resolve_codex_zai_coding_plan_adapter_model",
+    "_resolve_codex_nvidia_completion_adapter_model",
     "_resolve_anthropic_opencode_zen_adapter_model",
     "_resolve_anthropic_kimi_chat_completions_adapter_model",
     "_resolve_anthropic_alibaba_token_plan_adapter_model",
@@ -848,7 +850,7 @@ class TestWave6AAdapterRuntimeOwnership:
             for name, import_path in WAVE6A_MODULE_IMPORT_PATHS.items()
         }
 
-    def test_exact_69_symbol_union_without_duplicate_ownership(self):
+    def test_exact_76_symbol_union_without_duplicate_ownership(self):
         seen: dict[str, str] = {}
         duplicates: list[str] = []
         modules = self._modules()
@@ -863,7 +865,7 @@ class TestWave6AAdapterRuntimeOwnership:
                     )
                 seen[symbol] = module_name
 
-        assert len(seen) == 69
+        assert len(seen) == 76
         assert not duplicates
 
     def test_no_wave6a_symbol_remains_a_god_module_function_def(self):
@@ -876,7 +878,7 @@ class TestWave6AAdapterRuntimeOwnership:
         remaining = owned & _top_level_function_defs(_parse_god_module())
         assert not remaining
 
-    def test_all_69_facades_share_identity_and_host_globals(self):
+    def test_all_76_facades_share_identity_and_host_globals(self):
         checked = 0
         for module in self._modules().values():
             for symbol in getattr(module, "_HOST_FUNCTION_NAMES"):
@@ -885,7 +887,7 @@ class TestWave6AAdapterRuntimeOwnership:
                 function = getattr(facade, "__wrapped__", facade)
                 assert function.__globals__ is vars(lpe)
                 checked += 1
-        assert checked == 69
+        assert checked == 76
 
     def test_sse_retains_canonical_shared_helper_ownership(self):
         modules = self._modules()
