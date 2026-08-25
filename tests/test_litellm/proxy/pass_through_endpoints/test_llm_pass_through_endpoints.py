@@ -21538,6 +21538,7 @@ def test_auto_agent_alias_route_event_records_zero_turn_rollup(monkeypatch):
             "incoming_endpoint": "/openai_passthrough/responses",
             "outgoing_target": "grok_cli_chat_proxy",
             "model_label": "grok-composer-2.5-fast(basic)",
+            "effort": "none",
             "turns": 0,
             "status": "Cooling Down",
             "message": None,
