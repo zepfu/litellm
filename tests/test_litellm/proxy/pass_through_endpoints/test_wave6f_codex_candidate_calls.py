@@ -697,13 +697,24 @@ class TestSotaXaiCandidateToolAdaptation:
         assert "reasoning_effort" not in provider_body
         assert provider_body["model"] == "grok-4.6"
         assert provider_body["input"][0] == {
-            "type": "function_call",
-            "id": "fc_continuation_input",
-            "call_id": "call_continuation_input",
-            "name": "send_message",
-            "arguments": '{"send_message_value":"continue"}',
+            "type": "message",
+            "role": "assistant",
+            "content": (
+                "[Context note - prior assistant step; not an executable tool invocation]\n"
+                "Tool label: send_message\n"
+                "Correlation ref: call_continuation_input\n"
+                'Input payload: {"send_message_value":"continue"}'
+            ),
         }
-        assert provider_body["input"][1] == canonical_snapshot["input"][2]
+        assert provider_body["input"][1] == {
+            "type": "message",
+            "role": "user",
+            "content": (
+                "[Context note - prior tool outcome; not an executable tool invocation]\n"
+                "Correlation ref: call_continuation_input\n"
+                "Outcome text: continued"
+            ),
+        }
         assert request_body == canonical_snapshot
         assert validator_request_bodies == [canonical_snapshot]
         assert intake_request_bodies == [canonical_snapshot]
