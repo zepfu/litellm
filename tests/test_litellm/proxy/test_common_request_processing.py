@@ -18,6 +18,7 @@ from litellm._logging import (
     AawmHealthAccessLogFilter,
     AawmRouteAccessLogReplacementFilter,
     clear_aawm_route_access_log_replacements,
+    escalate_aawm_route_access_log_replacement_all_statuses,
     register_aawm_route_access_log_replacement,
     verbose_proxy_logger,
 )
@@ -1017,6 +1018,10 @@ class TestProxyBaseLLMRequestProcessing:
             "/model/info",
             "/v1/model/info",
         )
+        visible_catalog_paths = (
+            "/v1/models",
+            "/models",
+        )
 
         for path in native_model_info_paths:
             for status_code in (500, 404, 200):
@@ -1030,6 +1035,19 @@ class TestProxyBaseLLMRequestProcessing:
                     )
                     is False
                 ), f"expected leftover uvicorn suppression for GET {path} {status_code}"
+
+        for path in visible_catalog_paths:
+            for status_code in (500, 404, 200):
+                assert (
+                    access_filter.filter(
+                        _build_uvicorn_access_record(
+                            method="GET",
+                            full_path=path,
+                            status_code=status_code,
+                        )
+                    )
+                    is True
+                ), f"expected leftover uvicorn visibility for GET {path} {status_code}"
 
         assert (
             access_filter.filter(
@@ -1269,6 +1287,44 @@ class TestProxyBaseLLMRequestProcessing:
         register_aawm_route_access_log_replacement(**replacement)
         matching_record.name = "gunicorn.access"
         assert access_filter.filter(matching_record) is False
+
+    def test_aawm_route_access_log_same_key_escalate_does_not_increment_pending_count(
+        self,
+    ):
+        clear_aawm_route_access_log_replacements()
+        access_filter = AawmRouteAccessLogReplacementFilter()
+        replacement = {
+            "client_addr": "172.19.0.1:52834",
+            "method": "POST",
+            "full_path": "/openai_passthrough/responses",
+            "http_version": "1.1",
+        }
+
+        register_aawm_route_access_log_replacement(**replacement)
+        escalate_aawm_route_access_log_replacement_all_statuses(**replacement)
+
+        matching_record = _build_uvicorn_access_record(
+            client_addr=replacement["client_addr"],
+            method=replacement["method"],
+            full_path=replacement["full_path"],
+            http_version=replacement["http_version"],
+            status_code=429,
+        )
+        assert access_filter.filter(matching_record) is False
+        assert access_filter.filter(matching_record) is True
+
+        register_aawm_route_access_log_replacement(**replacement)
+        register_aawm_route_access_log_replacement(**replacement)
+        matching_record = _build_uvicorn_access_record(
+            client_addr=replacement["client_addr"],
+            method=replacement["method"],
+            full_path=replacement["full_path"],
+            http_version=replacement["http_version"],
+            status_code=409,
+        )
+        assert access_filter.filter(matching_record) is True
+        assert access_filter.filter(matching_record) is True
+        assert access_filter.filter(matching_record) is True
 
     def test_aawm_route_access_log_filter_bounds_pending_registrations(self):
         clear_aawm_route_access_log_replacements()

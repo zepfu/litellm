@@ -1001,9 +1001,9 @@ _aawm_route_access_log_replacement_lock = threading.Lock()
 _aawm_route_access_log_replacements: Dict[
     _AawmRouteAccessLogReplacementKey, int
 ] = {}
-_aawm_route_access_log_all_status_replacements: set[
-    _AawmRouteAccessLogReplacementKey
-] = set()
+_aawm_route_access_log_replacement_modes: Dict[
+    _AawmRouteAccessLogReplacementKey, Deque[bool]
+] = {}
 _aawm_route_access_log_replacement_order: Deque[
     _AawmRouteAccessLogReplacementKey
 ] = deque()
@@ -1013,10 +1013,37 @@ def _normalize_aawm_route_access_log_replacement_path(full_path: object) -> str:
     return unquote(str(full_path))
 
 
+def _drop_earliest_aawm_route_access_log_replacement(
+    key: _AawmRouteAccessLogReplacementKey,
+    *,
+    remove_from_order: bool,
+) -> Optional[bool]:
+    replacement_count = _aawm_route_access_log_replacements.get(key)
+    if replacement_count is None:
+        return None
+    modes = _aawm_route_access_log_replacement_modes.get(key)
+    suppress_all_statuses = False
+    if modes:
+        suppress_all_statuses = modes.popleft()
+        if not modes:
+            del _aawm_route_access_log_replacement_modes[key]
+    if replacement_count > 1:
+        _aawm_route_access_log_replacements[key] = replacement_count - 1
+    else:
+        del _aawm_route_access_log_replacements[key]
+        _aawm_route_access_log_replacement_modes.pop(key, None)
+    if remove_from_order:
+        try:
+            _aawm_route_access_log_replacement_order.remove(key)
+        except ValueError:
+            pass
+    return suppress_all_statuses
+
+
 def clear_aawm_route_access_log_replacements() -> None:
     with _aawm_route_access_log_replacement_lock:
         _aawm_route_access_log_replacements.clear()
-        _aawm_route_access_log_all_status_replacements.clear()
+        _aawm_route_access_log_replacement_modes.clear()
         _aawm_route_access_log_replacement_order.clear()
 
 
@@ -1041,23 +1068,48 @@ def register_aawm_route_access_log_replacement(
         _aawm_route_access_log_replacements[key] = (
             _aawm_route_access_log_replacements.get(key, 0) + 1
         )
+        _aawm_route_access_log_replacement_modes.setdefault(key, deque()).append(
+            bool(suppress_all_statuses)
+        )
         _aawm_route_access_log_replacement_order.append(key)
-        if suppress_all_statuses:
-            _aawm_route_access_log_all_status_replacements.add(key)
 
         while (
             len(_aawm_route_access_log_replacement_order)
             > _AAWM_ROUTE_ACCESS_LOG_REPLACEMENT_LIMIT
         ):
             stale_key = _aawm_route_access_log_replacement_order.popleft()
-            stale_count = _aawm_route_access_log_replacements.get(stale_key)
-            if stale_count is None:
-                continue
-            if stale_count > 1:
-                _aawm_route_access_log_replacements[stale_key] = stale_count - 1
-            else:
-                del _aawm_route_access_log_replacements[stale_key]
-                _aawm_route_access_log_all_status_replacements.discard(stale_key)
+            _drop_earliest_aawm_route_access_log_replacement(
+                stale_key,
+                remove_from_order=False,
+            )
+
+
+def escalate_aawm_route_access_log_replacement_all_statuses(
+    *,
+    client_addr: Optional[str],
+    method: Optional[str],
+    full_path: Optional[str],
+    http_version: Optional[str],
+) -> None:
+    """Set all-status suppression on an already-pending same key.
+
+    Same-request escalation must not increment the pending replacement
+    count. Independent ``register_aawm_route_access_log_replacement``
+    calls still increment so concurrent requests keep their own consume.
+    """
+    if not client_addr or not method or not full_path or not http_version:
+        return
+
+    key = (
+        str(client_addr),
+        str(method),
+        _normalize_aawm_route_access_log_replacement_path(full_path),
+        str(http_version),
+    )
+    with _aawm_route_access_log_replacement_lock:
+        modes = _aawm_route_access_log_replacement_modes.get(key)
+        if modes:
+            modes[-1] = True
 
 
 def discard_aawm_route_access_log_replacement(
@@ -1077,18 +1129,10 @@ def discard_aawm_route_access_log_replacement(
         str(http_version),
     )
     with _aawm_route_access_log_replacement_lock:
-        replacement_count = _aawm_route_access_log_replacements.get(key)
-        if replacement_count is None:
-            return
-        if replacement_count > 1:
-            _aawm_route_access_log_replacements[key] = replacement_count - 1
-        else:
-            del _aawm_route_access_log_replacements[key]
-            _aawm_route_access_log_all_status_replacements.discard(key)
-        try:
-            _aawm_route_access_log_replacement_order.remove(key)
-        except ValueError:
-            pass
+        _drop_earliest_aawm_route_access_log_replacement(
+            key,
+            remove_from_order=True,
+        )
 
 
 def _aawm_route_access_log_key_from_record(
@@ -1122,19 +1166,12 @@ def _consume_aawm_route_access_log_replacement(
         return False, False
 
     with _aawm_route_access_log_replacement_lock:
-        replacement_count = _aawm_route_access_log_replacements.get(key)
-        if replacement_count is None:
+        suppress_all_statuses = _drop_earliest_aawm_route_access_log_replacement(
+            key,
+            remove_from_order=True,
+        )
+        if suppress_all_statuses is None:
             return False, False
-        suppress_all_statuses = key in _aawm_route_access_log_all_status_replacements
-        if replacement_count > 1:
-            _aawm_route_access_log_replacements[key] = replacement_count - 1
-        else:
-            del _aawm_route_access_log_replacements[key]
-            _aawm_route_access_log_all_status_replacements.discard(key)
-        try:
-            _aawm_route_access_log_replacement_order.remove(key)
-        except ValueError:
-            pass
         return True, suppress_all_statuses
 
 
