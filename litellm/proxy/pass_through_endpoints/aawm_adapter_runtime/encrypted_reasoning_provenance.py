@@ -10,6 +10,27 @@ Provider-neutral helpers that:
 4. Treat OpenAI account lane as non-cryptographic: account1-to-account2 alone
    must not reject stateless encrypted content.
 
+5. On OpenAI Responses egress, drop ``function_call_output.encrypted_content``
+   when the item already has plaintext ``output``. ChatGPT-bound encrypted
+   function-output blobs are not portable onto API-key ``gpt-5.6-sol`` (or a
+   rotated account) and otherwise fail as ``invalid_encrypted_content``.
+   On ``api.openai.com`` API-key egress, and on ChatGPT-host sends that lack
+   same-account lane proof, also drop ciphertext-only
+   ``function_call_output`` blobs (no plaintext ``output``) instead of
+   unwrapping them for a host that cannot decrypt ChatGPT-bound state.
+   Nested ciphertext is stripped only when plaintext is present or the
+   route is designated for stripping. ChatGPT-host retention requires a
+   confirmed ``chatgpt.com`` host from actual egress URL/host arguments,
+   an OpenAI/Codex selected route from those same actual egress arguments,
+   plus an existing genuinely trusted server-side prior-owner source.
+   Explicit ``strip_ciphertext_without_plaintext=False`` cannot bypass a
+   missing/unrecognized host. Request-supplied/generic ``litellm_metadata``
+   and unsigned encrypted provenance wrappers are not trusted prior-owner
+   or current-route proof. Synthetic ``session_owner_account_lane`` request
+   metadata must not retain. If this layer has no authenticated/trusted
+   prior-owner source, fail closed and strip. Alias text and model suffixes
+   are not proof.
+
 D1-612 remains sole session/provider/model/route/account owner.
 OPENAI-007 remains sole function_call id/call_id owner.
 """
@@ -260,6 +281,11 @@ def wrap_encrypted_content_with_provenance(
     return f"{_WRAP_PREFIX}{_encode_wrap_metadata(safe)};{encrypted_content}"
 
 
+_LITELLM_ENC_PREFIX = "litellm_enc:"
+_FUNCTION_CALL_OUTPUT_ITEM_TYPE = "function_call_output"
+_NESTED_ENCRYPTED_CONTENT_PART_TYPE = "encrypted_content"
+
+
 def unwrap_encrypted_content_with_provenance(
     wrapped_content: str,
 ) -> tuple[Optional[dict[str, Any]], str]:
@@ -279,6 +305,144 @@ def unwrap_encrypted_content_with_provenance(
         return sanitize_encrypted_reasoning_provenance(parsed), original
     except Exception:
         return None, wrapped_content
+
+
+def unwrap_litellm_encrypted_content_affinity_wrap(wrapped_content: str) -> str:
+    """Restore original ciphertext from a ``litellm_enc:`` affinity wrap."""
+    if not isinstance(wrapped_content, str) or not wrapped_content.startswith(
+        _LITELLM_ENC_PREFIX
+    ):
+        return wrapped_content
+    try:
+        from litellm.responses.utils import ResponsesAPIRequestUtils
+
+        _model_id, original = (
+            ResponsesAPIRequestUtils._unwrap_encrypted_content_with_model_id(
+                wrapped_content
+            )
+        )
+    except Exception:
+        return wrapped_content
+    return original if isinstance(original, str) and original else wrapped_content
+
+
+def unwrap_encrypted_content_wrappers(encrypted_content: str) -> str:
+    """Strip aawm_erp / litellm_enc prefixes without logging ciphertext."""
+    if not isinstance(encrypted_content, str) or not encrypted_content:
+        return encrypted_content
+    current = encrypted_content
+    for _ in range(4):
+        if current.startswith(_WRAP_PREFIX):
+            _prov, current = unwrap_encrypted_content_with_provenance(current)
+            continue
+        if current.startswith(_LITELLM_ENC_PREFIX):
+            unwrapped = unwrap_litellm_encrypted_content_affinity_wrap(current)
+            if unwrapped == current:
+                return current
+            current = unwrapped
+            continue
+        return current
+    return current
+
+
+def _encrypted_function_output_blob_present(value: Any) -> bool:
+    """True when *value* is ChatGPT-bound function-output ciphertext."""
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, Mapping):
+        if str(value.get("type") or "").strip() == _NESTED_ENCRYPTED_CONTENT_PART_TYPE:
+            return True
+        nested = value.get("encrypted_content")
+        if nested is not None and nested is not value:
+            return _encrypted_function_output_blob_present(nested)
+        return False
+    if isinstance(value, list):
+        return any(_encrypted_function_output_blob_present(entry) for entry in value)
+    return False
+
+
+def _item_has_encrypted_function_output(item: Any) -> bool:
+    if isinstance(item, MutableMapping) or isinstance(item, Mapping):
+        if item.get("type") != _FUNCTION_CALL_OUTPUT_ITEM_TYPE:
+            return False
+        if _encrypted_function_output_blob_present(item.get("encrypted_content")):
+            return True
+        output = item.get("output")
+        # Plaintext string/list output is not itself a ciphertext blob.
+        if isinstance(output, str):
+            return False
+        return _encrypted_function_output_blob_present(output)
+    if getattr(item, "type", None) != _FUNCTION_CALL_OUTPUT_ITEM_TYPE:
+        return False
+    if _encrypted_function_output_blob_present(
+        getattr(item, "encrypted_content", None)
+    ):
+        return True
+    output = getattr(item, "output", None)
+    if isinstance(output, str):
+        return False
+    return _encrypted_function_output_blob_present(output)
+
+
+def _function_call_output_part_is_plaintext(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, Mapping):
+        if str(value.get("type") or "").strip() == _NESTED_ENCRYPTED_CONTENT_PART_TYPE:
+            return False
+        if _encrypted_function_output_blob_present(value.get("encrypted_content")):
+            return False
+        for key in ("text", "output", "content"):
+            nested = value.get(key)
+            if nested is value:
+                continue
+            if _function_call_output_part_is_plaintext(nested):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(_function_call_output_part_is_plaintext(entry) for entry in value)
+    return False
+
+
+def _function_call_output_has_plaintext(item: Mapping[str, Any]) -> bool:
+    return _function_call_output_part_is_plaintext(item.get("output"))
+
+
+def _strip_nested_encrypted_function_output(value: Any) -> tuple[Any, bool]:
+    """Drop nested encrypted_content parts; keep plaintext tool results."""
+    if isinstance(value, Mapping):
+        if str(value.get("type") or "").strip() == _NESTED_ENCRYPTED_CONTENT_PART_TYPE:
+            return None, True
+        if not isinstance(value, dict):
+            value = dict(value)
+        changed = False
+        if "encrypted_content" in value and _encrypted_function_output_blob_present(
+            value.get("encrypted_content")
+        ):
+            value = dict(value)
+            value.pop("encrypted_content", None)
+            changed = True
+        out: dict[str, Any] = {}
+        for key, nested in value.items():
+            stripped, nested_changed = _strip_nested_encrypted_function_output(nested)
+            if nested_changed:
+                changed = True
+            if stripped is None and key in {"output", "content"}:
+                continue
+            out[key] = stripped
+        return (out if changed else value), changed
+    if isinstance(value, list):
+        changed = False
+        out_list: list[Any] = []
+        for nested in value:
+            stripped, nested_changed = _strip_nested_encrypted_function_output(nested)
+            if nested_changed:
+                changed = True
+            if stripped is None:
+                continue
+            out_list.append(stripped)
+        return (out_list if changed else value), changed
+    return value, False
 
 
 def _item_has_encrypted_reasoning(item: Any) -> bool:
@@ -524,6 +688,434 @@ def prepare_encrypted_reasoning_items_for_openai_egress(
     return updated, disposition
 
 
+def _request_selected_route_metadata(
+    request_body: Mapping[str, Any] | dict[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    """Return surviving selected-route / continuation metadata from a body."""
+    if not isinstance(request_body, Mapping):
+        return None
+    metadata = request_body.get("litellm_metadata")
+    if isinstance(metadata, Mapping):
+        return metadata
+    fallback = request_body.get("metadata")
+    return fallback if isinstance(fallback, Mapping) else None
+
+
+def _first_nonempty_text(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _extract_encrypted_content_provenance(value: Any) -> Optional[dict[str, Any]]:
+    """Read wrap/sidecar provenance from a function-output ciphertext blob."""
+    if isinstance(value, str):
+        provenance, _original = unwrap_encrypted_content_with_provenance(value)
+        return provenance
+    if isinstance(value, Mapping):
+        sidecar = sanitize_encrypted_reasoning_provenance(value.get(PROVENANCE_ITEM_FIELD))
+        nested = _extract_encrypted_content_provenance(value.get("encrypted_content"))
+        if sidecar and nested:
+            merged = dict(nested)
+            merged.update(sidecar)
+            return sanitize_encrypted_reasoning_provenance(merged)
+        if sidecar or nested:
+            return sidecar or nested
+        for key in ("output", "content"):
+            nested_part = value.get(key)
+            if nested_part is value:
+                continue
+            found = _extract_encrypted_content_provenance(nested_part)
+            if found:
+                return found
+        return None
+    if isinstance(value, list):
+        for entry in value:
+            found = _extract_encrypted_content_provenance(entry)
+            if found:
+                return found
+    return None
+
+
+def _extract_item_producer_account_lane(item: Any) -> str:
+    """Prior producer account lane from item sidecar or ciphertext wrap."""
+    if isinstance(item, Mapping):
+        sidecar = sanitize_encrypted_reasoning_provenance(item.get(PROVENANCE_ITEM_FIELD))
+        if sidecar:
+            lane = _first_nonempty_text(sidecar.get("account_lane"))
+            if lane:
+                return lane
+        for key in ("encrypted_content", "output"):
+            provenance = _extract_encrypted_content_provenance(item.get(key))
+            if provenance:
+                lane = _first_nonempty_text(provenance.get("account_lane"))
+                if lane:
+                    return lane
+        return ""
+    sidecar = sanitize_encrypted_reasoning_provenance(
+        getattr(item, PROVENANCE_ITEM_FIELD, None)
+    )
+    if sidecar:
+        lane = _first_nonempty_text(sidecar.get("account_lane"))
+        if lane:
+            return lane
+    for attr in ("encrypted_content", "output"):
+        provenance = _extract_encrypted_content_provenance(getattr(item, attr, None))
+        if provenance:
+            lane = _first_nonempty_text(provenance.get("account_lane"))
+            if lane:
+                return lane
+    return ""
+
+
+def _prior_producer_account_lane(
+    request_body: Mapping[str, Any] | dict[str, Any] | None,
+    metadata: Mapping[str, Any] | None,
+) -> str:
+    """Trusted server-side prior-owner lane for ciphertext-only retention.
+
+    Unsigned wrap/sidecar ``account_lane`` and request-supplied/generic
+    ``litellm_metadata`` — including synthetic ``session_owner_account_lane``,
+    nested ``session_owner_provenance.session_owner_account_lane``, and
+    ``account_bound_owner_lane`` — are not trusted prior-owner proof. This
+    layer has no authenticated/trusted prior-owner source.
+    """
+    _ = (request_body, metadata)
+    return ""
+
+
+def _current_selected_account_lane(
+    metadata: Mapping[str, Any] | None,
+) -> str:
+    """Trusted current-route account lane from actual server-side state.
+
+    Request-supplied ``codex_auto_agent_selected_account_lane`` is not
+    trusted current-route proof.
+    """
+    _ = metadata
+    return ""
+
+
+_OPENAI_CODEX_ROUTE_FAMILIES = frozenset(
+    {
+        "codex_responses",
+        "codex_oauth",
+        "chatgpt",
+        "openai",
+        "openai_responses",
+    }
+)
+
+
+def _provider_or_route_is_foreign(value: Any) -> bool:
+    """True when a provider/route signal is present and not OpenAI/Codex."""
+    text = _first_nonempty_text(value)
+    if not text:
+        return False
+    if text.lower() in _OPENAI_CODEX_ROUTE_FAMILIES:
+        return False
+    return normalize_producer_provider_family(text) != "openai"
+
+
+def _selected_openai_codex_route(
+    *,
+    request_body: Mapping[str, Any] | dict[str, Any] | None = None,
+    egress_credential_family: Any = None,
+    custom_llm_provider: Any = None,
+    selected_route_family: Any = None,
+) -> bool:
+    """True when actual egress arguments agree on OpenAI/Codex.
+
+    Request-supplied/generic ``litellm_metadata`` is not current-route proof.
+    Any foreign actual egress argument fail-closes.
+    """
+    _ = request_body
+    actual_signals = (
+        custom_llm_provider,
+        selected_route_family,
+        egress_credential_family,
+    )
+    if any(_provider_or_route_is_foreign(value) for value in actual_signals):
+        return False
+    provider = _first_nonempty_text(
+        custom_llm_provider,
+        egress_credential_family,
+    )
+    route_family = _first_nonempty_text(
+        selected_route_family,
+        egress_credential_family,
+    ).lower()
+    if provider:
+        if normalize_producer_provider_family(provider) == "openai":
+            return (
+                not route_family
+                or route_family in _OPENAI_CODEX_ROUTE_FAMILIES
+            )
+        return route_family in _OPENAI_CODEX_ROUTE_FAMILIES
+    return route_family in _OPENAI_CODEX_ROUTE_FAMILIES
+
+
+def _has_matching_same_account_chatgpt_lane_proof(
+    *,
+    request_body: Mapping[str, Any] | dict[str, Any] | None = None,
+    egress_credential_family: Any = None,
+    custom_llm_provider: Any = None,
+    selected_route_family: Any = None,
+) -> bool:
+    """True only with actual-egress OpenAI/Codex route plus trusted owner proof.
+
+    Retention requires actual egress arguments plus an existing genuinely
+    trusted server-side prior-owner source. Request-supplied/generic
+    ``litellm_metadata`` and unsigned encrypted provenance wrappers cannot
+    establish that proof. Alias labels, requested-model suffixes, and
+    route-family+model identity are not same-account proof. This layer has
+    no authenticated/trusted prior-owner source, so it fail-closes.
+    """
+    if not _selected_openai_codex_route(
+        request_body=None,
+        egress_credential_family=egress_credential_family,
+        custom_llm_provider=custom_llm_provider,
+        selected_route_family=selected_route_family,
+    ):
+        return False
+    _ = request_body
+    prior_lane = _prior_producer_account_lane(None, None)
+    selected_lane = _current_selected_account_lane(None)
+    return bool(prior_lane) and bool(selected_lane) and prior_lane == selected_lane
+
+
+def _unwrap_nested_encrypted_function_output(value: Any) -> tuple[Any, bool]:
+    """Unwrap aawm_erp / litellm_enc wrappers on retained nested ciphertext."""
+    if isinstance(value, str):
+        unwrapped = unwrap_encrypted_content_wrappers(value)
+        if unwrapped != value:
+            return unwrapped, True
+        return value, False
+    if isinstance(value, Mapping):
+        if not isinstance(value, dict):
+            value = dict(value)
+        changed = False
+        out: dict[str, Any] = {}
+        for key, nested in value.items():
+            unwrapped, nested_changed = _unwrap_nested_encrypted_function_output(nested)
+            if nested_changed:
+                changed = True
+            out[key] = unwrapped
+        return (out if changed else value), changed
+    if isinstance(value, list):
+        changed = False
+        out_list: list[Any] = []
+        for nested in value:
+            unwrapped, nested_changed = _unwrap_nested_encrypted_function_output(nested)
+            if nested_changed:
+                changed = True
+            out_list.append(unwrapped)
+        return (out_list if changed else value), changed
+    return value, False
+
+
+def should_strip_encrypted_function_output_without_plaintext(
+    *,
+    url: Any = None,
+    egress_credential_family: Any = None,
+    custom_llm_provider: Any = None,
+    model: Any = None,
+    request_body: Mapping[str, Any] | dict[str, Any] | None = None,
+    selected_route_family: Any = None,
+    selected_model: Any = None,
+    selected_alias: Any = None,
+) -> bool:
+    """True when ChatGPT-bound function-output ciphertext must not be forwarded.
+
+    Retention requires a confirmed ``chatgpt.com`` host from actual egress
+    URL/host arguments. ``api.openai.com``, an absent/unrecognized host,
+    and normalizer use without URL/egress context strip fail-closed even
+    when credential labels say ``codex_oauth``. Explicit
+    ``strip_ciphertext_without_plaintext=False`` cannot bypass that host
+    check. On ``chatgpt.com``, retention still requires an OpenAI/Codex
+    selected route from those same actual egress arguments plus an
+    existing genuinely trusted server-side prior-owner source. Request-
+    supplied/generic ``litellm_metadata`` and unsigned encrypted
+    provenance wrappers are not trusted prior-owner or current-route
+    proof. Synthetic ``session_owner_account_lane`` must not retain. If
+    this layer has no authenticated/trusted prior-owner source, fail
+    closed and strip. Alias text, ``model(alias)`` suffixes, and
+    route-family+model labels are not same-account proof.
+    """
+    _ = (selected_model, selected_alias, model)
+    hostname = ""
+    if url is not None:
+        hostname = str(getattr(url, "host", "") or "").strip().lower()
+        if not hostname:
+            hostname = str(url).strip().lower()
+            if "://" in hostname:
+                hostname = hostname.split("://", 1)[1]
+            hostname = hostname.split("/", 1)[0].split(":", 1)[0]
+    if hostname != "chatgpt.com":
+        return True
+    return not _has_matching_same_account_chatgpt_lane_proof(
+        request_body=request_body,
+        egress_credential_family=egress_credential_family,
+        custom_llm_provider=custom_llm_provider,
+        selected_route_family=selected_route_family,
+    )
+
+
+def prepare_encrypted_function_output_items_for_openai_egress(
+    request_body: Mapping[str, Any] | dict[str, Any],
+    *,
+    strip_ciphertext_without_plaintext: Optional[bool] = None,
+    url: Any = None,
+    egress_credential_family: Any = None,
+    custom_llm_provider: Any = None,
+    selected_route_family: Any = None,
+    model: Any = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Drop portable-unsafe encrypted function-output blobs when plaintext exists.
+
+    ChatGPT Codex may attach ``encrypted_content`` on ``function_call_output``
+    items, including nested ``output`` parts with
+    ``type=encrypted_content``. That ciphertext is account/session-bound.
+    Forwarding it onto a later OpenAI API-key candidate (or a rotated ChatGPT
+    account) fails with ``invalid_encrypted_content`` / "Encrypted function
+    output content could not be decrypted". When the item already carries
+    plaintext ``output``, strip the blob (top-level and nested) and keep the
+    tool result. On API-key ``api.openai.com`` egress, and on ChatGPT-host
+    sends that lack same-account lane proof, also strip ciphertext-only
+    items (no plaintext ``output``) and leave an empty ``output``
+    placeholder so the call_id remains valid. Nested ciphertext is stripped
+    only when plaintext is present or the route is designated for
+    stripping. Default normalizer use without URL/egress context strips
+    ciphertext-only blobs fail-closed. Explicit
+    ``strip_ciphertext_without_plaintext=False`` cannot bypass a missing
+    or unrecognized host: retention still requires confirmed
+    ``chatgpt.com`` from actual egress URL/host arguments plus an
+    existing genuinely trusted server-side prior-owner source. Request-
+    supplied/generic ``litellm_metadata`` and unsigned wrappers are not
+    that proof. If this layer has no authenticated/trusted prior-owner
+    source, fail closed and strip. Mutate the original item as well so
+    shallow pass-through copies cannot reserialize leftover ciphertext.
+    Never logs ciphertext.
+    """
+    if not isinstance(request_body, dict):
+        return dict(request_body) if isinstance(request_body, Mapping) else {}, {
+            "encrypted_function_output_item_count": 0,
+            "encrypted_function_output_stripped_count": 0,
+            "encrypted_function_output_unwrapped_count": 0,
+        }
+
+    policy_strip = should_strip_encrypted_function_output_without_plaintext(
+        url=url,
+        egress_credential_family=egress_credential_family,
+        custom_llm_provider=custom_llm_provider,
+        model=model,
+        request_body=request_body,
+        selected_route_family=selected_route_family,
+    )
+    if strip_ciphertext_without_plaintext is True:
+        strip_ciphertext_without_plaintext = True
+    else:
+        # Explicit False is not a retain override. No URL / unrecognized
+        # host still strips; chatgpt.com still needs trusted prior-owner.
+        strip_ciphertext_without_plaintext = policy_strip
+
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
+        return request_body, {
+            "encrypted_function_output_item_count": 0,
+            "encrypted_function_output_stripped_count": 0,
+            "encrypted_function_output_unwrapped_count": 0,
+        }
+
+    changed = False
+    item_count = 0
+    stripped_count = 0
+    unwrapped_count = 0
+    normalized_input: list[Any] = []
+
+    for item in input_items:
+        if not isinstance(item, dict) or not _item_has_encrypted_function_output(item):
+            normalized_input.append(item)
+            continue
+
+        item_count += 1
+        encrypted = item.get("encrypted_content")
+        original = (
+            unwrap_encrypted_content_wrappers(encrypted)
+            if isinstance(encrypted, str)
+            else encrypted
+        )
+        clean_item = dict(item)
+        if PROVENANCE_ITEM_FIELD in clean_item:
+            clean_item.pop(PROVENANCE_ITEM_FIELD, None)
+            item.pop(PROVENANCE_ITEM_FIELD, None)
+            changed = True
+
+        has_plaintext = _function_call_output_has_plaintext(clean_item)
+        should_strip_nested = has_plaintext or strip_ciphertext_without_plaintext
+        if should_strip_nested:
+            nested_output, nested_changed = _strip_nested_encrypted_function_output(
+                clean_item.get("output")
+            )
+            if nested_changed:
+                clean_item["output"] = nested_output
+                item["output"] = nested_output
+                changed = True
+                stripped_count += 1
+        else:
+            nested_output, nested_changed = _unwrap_nested_encrypted_function_output(
+                clean_item.get("output")
+            )
+            if nested_changed:
+                clean_item["output"] = nested_output
+                item["output"] = nested_output
+                unwrapped_count += 1
+                changed = True
+
+        if has_plaintext:
+            if "encrypted_content" in clean_item or "encrypted_content" in item:
+                clean_item.pop("encrypted_content", None)
+                item.pop("encrypted_content", None)
+                stripped_count += 1
+                changed = True
+            normalized_input.append(clean_item)
+            continue
+
+        if strip_ciphertext_without_plaintext:
+            if "encrypted_content" in clean_item or "encrypted_content" in item:
+                clean_item.pop("encrypted_content", None)
+                item.pop("encrypted_content", None)
+                stripped_count += 1
+                changed = True
+            if not _function_call_output_has_plaintext(clean_item):
+                if "output" not in clean_item or clean_item.get("output") is None:
+                    clean_item["output"] = ""
+                    item["output"] = ""
+                    changed = True
+            normalized_input.append(clean_item)
+            continue
+
+        if isinstance(original, str) and original != encrypted:
+            clean_item["encrypted_content"] = original
+            item["encrypted_content"] = original
+            unwrapped_count += 1
+            changed = True
+        normalized_input.append(clean_item)
+
+    disposition = {
+        "encrypted_function_output_item_count": item_count,
+        "encrypted_function_output_stripped_count": stripped_count,
+        "encrypted_function_output_unwrapped_count": unwrapped_count,
+    }
+    if not changed:
+        return request_body, disposition
+    updated = dict(request_body)
+    updated["input"] = normalized_input
+    return updated, disposition
+
+
 def is_openai_encrypted_reasoning_compatible(
     provenance: Optional[Mapping[str, Any]],
 ) -> bool:
@@ -643,14 +1235,37 @@ def guard_openai_encrypted_reasoning_egress(
     target_provider: str = "openai",
     target_route_family: Any = None,
     failure_phase: str = "encrypted_reasoning_openai_pre_egress",
+    strip_function_output_ciphertext_without_plaintext: Optional[bool] = None,
+    url: Any = None,
+    egress_credential_family: Any = None,
+    custom_llm_provider: Any = None,
+    selected_route_family: Any = None,
+    model: Any = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Prepare body and fail closed on known-incompatible encrypted reasoning.
 
     Returns ``(prepared_body, disposition_metadata)`` when compatible.
+    Explicit ``strip_function_output_ciphertext_without_plaintext=False``
+    still requires confirmed ``chatgpt.com`` actual egress plus a trusted
+    prior-owner source; this layer fail-closes without one.
     """
     prepared, disposition = prepare_encrypted_reasoning_items_for_openai_egress(
         request_body if isinstance(request_body, dict) else dict(request_body or {})
     )
+    prepared, function_output_disposition = (
+        prepare_encrypted_function_output_items_for_openai_egress(
+            prepared,
+            strip_ciphertext_without_plaintext=(
+                strip_function_output_ciphertext_without_plaintext
+            ),
+            url=url,
+            egress_credential_family=egress_credential_family,
+            custom_llm_provider=custom_llm_provider,
+            selected_route_family=selected_route_family,
+            model=model,
+        )
+    )
+    disposition.update(function_output_disposition)
     items_meta = disposition.get("encrypted_reasoning_items") or []
     if not items_meta:
         disposition = build_encrypted_reasoning_disposition_metadata(
@@ -658,6 +1273,7 @@ def guard_openai_encrypted_reasoning_egress(
             items=[],
             compatibility_ok=True,
         )
+        disposition.update(function_output_disposition)
         return prepared, disposition
 
     incompatible: list[dict[str, Any]] = []
@@ -699,6 +1315,7 @@ def guard_openai_encrypted_reasoning_egress(
         items=[dict(item) for item in items_meta if isinstance(item, Mapping)],
         compatibility_ok=True,
     )
+    disposition.update(function_output_disposition)
     # target route is audit-only
     if target_route_family is not None and str(target_route_family).strip():
         disposition["encrypted_reasoning_target_route_family"] = str(

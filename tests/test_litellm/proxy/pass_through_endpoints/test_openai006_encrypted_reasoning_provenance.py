@@ -591,3 +591,45 @@ async def test_pass_through_stream_sends_unwrapped_ciphertext_byte_for_byte():
     sent = await _run_pass_through_and_capture_json(stream=True, custom_body=custom_body)
     _assert_clean_upstream_encrypted_item(sent, CIPHERTEXT)
     assert "litellm_metadata" not in sent
+
+
+@pytest.mark.asyncio
+async def test_native_openai_owner_strips_ciphertext_only_function_output_before_pass_through():
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _perform_codex_auto_agent_native_openai_request,
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _capture_pass_through(**kwargs):
+        captured["body"] = kwargs.get("custom_body")
+        return MagicMock()
+
+    request_body = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_native_owner_child",
+                "encrypted_content": "ciphertext",
+            },
+        ],
+    }
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=_capture_pass_through),
+    ):
+        await _perform_codex_auto_agent_native_openai_request(
+            request=MagicMock(spec=Request),
+            fastapi_response=MagicMock(),
+            user_api_key_dict=MagicMock(),
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+            request_body=request_body,
+            custom_headers={},
+        )
+    sent = captured["body"]
+    item = sent["input"][0]
+    assert item["call_id"] == "call_native_owner_child"
+    assert "encrypted_content" not in item

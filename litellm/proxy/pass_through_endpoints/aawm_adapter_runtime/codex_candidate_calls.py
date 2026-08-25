@@ -1006,6 +1006,16 @@ async def _perform_codex_auto_agent_native_openai_request(
         request_body,
         _codex_unsupported_request_params,
     ) = _drop_unsupported_codex_request_params_from_request_body(request_body)
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+        guard_openai_encrypted_reasoning_egress,
+    )
+
+    request_body, _encrypted_reasoning_disposition = (
+        guard_openai_encrypted_reasoning_egress(
+            request_body,
+            url=target_url,
+        )
+    )
     is_streaming_request = "stream" in str(target_url)
     resolved_headers = (
         dict(custom_headers)
