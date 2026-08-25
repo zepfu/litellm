@@ -1,9 +1,12 @@
-"""TUI drivers. V1 implements Ohmypi only. No Claude module."""
+"""TUI drivers. Ohmypi and Codex are implemented. No Claude module."""
 
 from __future__ import annotations
 
 from typing import Any, Mapping
 
+from hv2.drivers.codex import CodexDriver
+from hv2.drivers.ohmypi import OhmypiDriver
+from hv2.drivers.stub import StubDriver
 from hv2.errors import PlanError
 from hv2.load_config import as_str_list
 
@@ -18,11 +21,9 @@ def driver_for(tui: str, config: Mapping[str, Any]):
     implemented = set(as_str_list(tuis.get("implemented")))
     stubs = set(as_str_list(tuis.get("stubs")))
     if tui in stubs and tui not in implemented:
-        from hv2.drivers.stub import StubDriver
-
         return StubDriver(tui)
     if tui == "ohmypi":
-        from hv2.drivers.ohmypi import OhmypiDriver
-
         return OhmypiDriver(config)
+    if tui == "codex":
+        return CodexDriver(config)
     raise PlanError(f"unknown TUI driver {tui!r}")

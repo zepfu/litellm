@@ -119,10 +119,18 @@ checks:
       header_regex: '^\d{8} \d{2}:\d{2}:\d{2}(?: \[EARLY\])? \S+ /\S+'
       required_after_tui: true
       required_on_platform: false
+      # Bind-mount alpha can emit the AAWM route-rollup after the TUI pane
+      # already went idle. ACCESS replacement means a successful TUI turn
+      # can leave a 0-byte docker-logs window until the 60s rollup flush
+      # (plus leftover-session grouping). Poll until the header appears
+      # or this budget expires. Halt leftovers still fail immediately.
+      settle_seconds: 180
+      settle_poll_seconds: 2
       concurrent_codex_client_markers:
         - codex-auto-review
       concurrent_workspace_repos:
         - aawm-infrastructure
+        - zepfu
         - aawm
         - aawm-tap
         - aawm-devtools

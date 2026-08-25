@@ -1,0 +1,6 @@
+20260824 12:00:00 litellm@thoth /openai_passthrough/v1/responses
+ - gpt-5.4(basic):medium - Turns: 1
+20260824 12:00:01 Bun[1.3.14]@thoth /v1/chat/completions
+ - openrouter/qwen/qwen3.6-flash:none - Turns: 4
+20260824 12:00:02 Oh@thoth /openai_passthrough/v1/responses
+ - gpt-5.4(read):low - Turns: 2

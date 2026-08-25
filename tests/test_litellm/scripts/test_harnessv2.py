@@ -16,6 +16,8 @@ import pytest
 _REPO = Path(__file__).resolve().parents[3]
 _HV2 = _REPO / "scripts" / "harnessv2"
 _FIXTURES = _HV2 / "fixtures" / "logs"
+_ORCH_FIXTURES = _HV2 / "fixtures" / "orch"
+_CODEX_DRIVER = _HV2 / "hv2" / "drivers" / "codex.py"
 _ORCH_BASELINE_CHILDREN = (
     "basic",
     "work",
@@ -82,6 +84,34 @@ def config(hv):
     return hv.load_config()
 
 
+def _codex_driver_shipped() -> bool:
+    return _CODEX_DRIVER.is_file()
+
+
+def _codex_tui_implemented(config: dict[str, Any]) -> bool:
+    tuis = config.get("tuis") if isinstance(config.get("tuis"), dict) else {}
+    implemented = set(tuis.get("implemented") or [])
+    stubs = set(tuis.get("stubs") or [])
+    spec = tuis.get("codex") if isinstance(tuis.get("codex"), dict) else {}
+    return (
+        _codex_driver_shipped()
+        and "codex" in implemented
+        and "codex" not in stubs
+        and spec.get("enabled") is True
+        and spec.get("stub") is not True
+    )
+
+
+def _skip_unless_codex_tui_shipped(config: dict[str, Any]) -> None:
+    if not _codex_tui_implemented(config):
+        pytest.skip("Codex TUI driver is not shipped")
+
+
+def _skip_unless_codex_identity_fixtures() -> None:
+    if not (_FIXTURES / "codex_identity_ok.txt").is_file():
+        pytest.skip("Codex identity fixtures are not shipped")
+
+
 def test_should_require_test_flag(hv) -> None:
     parser = hv.build_parser()
     with pytest.raises(SystemExit):
@@ -122,8 +152,6 @@ def test_should_load_yaml_includes_and_compiled_aliases(hv, config) -> None:
     assert 4001 in config["protected_ports"]
     assert config["tuis"]["out_of_scope"] == ["claude"]
     assert "ohmypi" in config["tuis"]["implemented"]
-    assert "codex" in config["tuis"]["implemented"]
-    assert "codex" not in config["tuis"]["stubs"]
     assert "grok" in config["tuis"]["stubs"]
     assert "opencode" in config["tuis"]["stubs"]
     assert "read" not in aliases
@@ -131,12 +159,18 @@ def test_should_load_yaml_includes_and_compiled_aliases(hv, config) -> None:
     assert "--print" in config["tuis"]["ohmypi"]["forbid_flags"]
     assert "-p" not in config["tuis"]["ohmypi"]["argv_launch_model"]
     assert config["tuis"]["ohmypi"]["select_model"]["tools_for_model"] is False
-    assert config["tuis"]["codex"]["select_model"]["tools_for_model"] is True
-    assert config["tuis"]["codex"]["select_model"]["tools_for_orchestration"] is True
-    assert config["tuis"]["codex"]["default_models"] == ["basic", "read"]
-    assert "-p" not in config["tuis"]["codex"]["argv_launch_model"]
-    assert "--print" not in config["tuis"]["codex"]["argv_launch_model"]
-    assert "exec" not in config["tuis"]["codex"]["argv_launch_model"]
+    if _codex_tui_implemented(config):
+        assert "codex" in config["tuis"]["implemented"]
+        assert "codex" not in config["tuis"]["stubs"]
+        assert config["tuis"]["codex"]["select_model"]["tools_for_model"] is True
+        assert config["tuis"]["codex"]["select_model"]["tools_for_orchestration"] is True
+        assert config["tuis"]["codex"]["default_models"] == ["basic", "read"]
+        assert "-p" not in config["tuis"]["codex"]["argv_launch_model"]
+        assert "--print" not in config["tuis"]["codex"]["argv_launch_model"]
+        assert "exec" not in config["tuis"]["codex"]["argv_launch_model"]
+    else:
+        assert "codex" in config["tuis"]["stubs"]
+        assert "codex" not in config["tuis"]["implemented"]
     assert config["redis"]["container"] == "litellm-aawm-alias-routing-redis-1"
     assert config["redis"]["namespace"] == "aawm-routing-alpha-v1"
     assert config["redis"]["never_flush"] is True
@@ -207,7 +241,10 @@ def test_should_refuse_claude_tui(hv, config) -> None:
 
 
 def test_should_refuse_stub_tui(hv, config) -> None:
-    for stub in ("grok", "opencode"):
+    stubs = ["grok", "opencode"]
+    if not _codex_tui_implemented(config):
+        stubs.append("codex")
+    for stub in stubs:
         with pytest.raises(hv.PlanError, match="not implemented"):
             hv.build_plan(
                 config=config,
@@ -556,6 +593,49 @@ def test_should_accept_ohmypi_tui_rollup_with_name_version_and_repo(
     assert any("Ohmypi[" in item and "#" in item for item in scan["rollup_hits"])
 
 
+def test_should_accept_codex_tui_rollup_when_concurrent_owner_prefixed_aawm_infrastructure_headers_are_present(
+    hv, config
+) -> None:
+    _skip_unless_codex_identity_fixtures()
+    text = (
+        (_FIXTURES / "codex_identity_ok.txt").read_text(encoding="utf-8")
+        + "\n"
+        + "20260824 20:34:14 zepfu/aawm-infrastructure@thoth /openai_passthrough/responses\n"
+    )
+    scan = hv.scan_log_text(
+        text,
+        config,
+        require_rollup=True,
+        tui="codex",
+    )
+    assert scan["ok"] is True
+    assert scan["failures"] == []
+    assert any("litellm#Codex[" in item for item in scan["rollup_hits"])
+    assert any("zepfu/aawm-infrastructure@" in item for item in scan["rollup_hits"])
+
+
+def test_should_accept_codex_tui_rollup_when_concurrent_zepfu_at_thoth_responses_headers_are_present(
+    hv, config
+) -> None:
+    _skip_unless_codex_identity_fixtures()
+    text = (
+        (_FIXTURES / "codex_identity_ok.txt").read_text(encoding="utf-8")
+        + "\n"
+        + "20260824 20:34:14 zepfu@thoth /openai_passthrough/responses\n"
+        + " - gpt-5.6-sol:xhigh - Turns: 1\n"
+    )
+    scan = hv.scan_log_text(
+        text,
+        config,
+        require_rollup=True,
+        tui="codex",
+    )
+    assert scan["ok"] is True
+    assert scan["failures"] == []
+    assert any("litellm#Codex[" in item for item in scan["rollup_hits"])
+    assert any("zepfu@thoth /openai_passthrough/responses" in item for item in scan["rollup_hits"])
+
+
 def test_should_accept_ohmypi_tui_rollup_when_concurrent_aawm_infrastructure_headers_are_present(
     hv, config
 ) -> None:
@@ -683,6 +763,59 @@ def test_should_poll_docker_logs_until_delayed_rollup_header_appears(
     scan = _step_docker_logs(plan, log_cursor="2026-08-24T14:30:39+00:00")
     assert scan["ok"] is True
     assert scan["failures"] == []
+    assert any("litellm#Ohmypi[" in item for item in scan["rollup_hits"])
+    assert calls["n"] >= 3
+    assert float(scan.get("settle_waited_seconds") or 0) > 0
+
+
+def test_should_poll_empty_docker_logs_window_until_delayed_rollup_header_appears(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.instance import ResolvedInstance
+    from hv2.kinds.runner import _step_docker_logs
+
+    cfg = _clone_config(config)
+    cfg["checks"]["logs"]["rollup"]["settle_seconds"] = 2
+    cfg["checks"]["logs"]["rollup"]["settle_poll_seconds"] = 0.01
+    plan = hv.build_plan(
+        config=cfg,
+        kind="model",
+        instance_token="alpha",
+        tui="ohmypi",
+        models=["work"],
+        orchestration_parent=None,
+        orchestration_children=None,
+        dry_run=False,
+        write_artifact=None,
+    )
+    object.__setattr__(
+        plan,
+        "resolved",
+        ResolvedInstance(
+            alias="alpha",
+            container="litellm-alpha",
+            host="127.0.0.1",
+            host_port=4011,
+            container_port=4011,
+            base_url="http://127.0.0.1:4011",
+            inspect_env={},
+            running=True,
+        ),
+    )
+    rollup = (_FIXTURES / "ohmypi_identity_ok.txt").read_text(encoding="utf-8")
+    calls = {"n": 0}
+
+    def fake_read(_plan: Any, _started_at: str) -> str:
+        calls["n"] += 1
+        if calls["n"] < 3:
+            return ""
+        return rollup
+
+    monkeypatch.setattr("hv2.kinds.runner._read_logs_since", fake_read)
+    scan = _step_docker_logs(plan, log_cursor="2026-08-24T17:02:36+00:00")
+    assert scan["ok"] is True
+    assert scan["failures"] == []
+    assert scan.get("bytes") == len(rollup)
     assert any("litellm#Ohmypi[" in item for item in scan["rollup_hits"])
     assert calls["n"] >= 3
     assert float(scan.get("settle_waited_seconds") or 0) > 0
@@ -875,6 +1008,7 @@ def test_should_refuse_ohmypi_print_flags(hv, config) -> None:
 
 
 def test_should_plan_codex_catalog_model_and_orchestration_as_non_stub(hv, config) -> None:
+    _skip_unless_codex_tui_shipped(config)
     catalog = hv.build_plan(
         config=config,
         kind="catalog",
@@ -916,14 +1050,39 @@ def test_should_plan_codex_catalog_model_and_orchestration_as_non_stub(hv, confi
     assert list(model.models) != hv.compiled_aliases(config)
     assert "hv2-codex-child" in model.extra["pong_prompt"]
     assert "PONG" not in model.extra["pong_prompt"]
+    assert "model=basic" in model.extra["pong_prompt"]
+    assert "ChatGPT-unsupported" in model.extra["pong_prompt"]
+    assert "Do not run the command yourself" in model.extra["pong_prompt"]
+    assert "print that exact stdout" in model.extra["pong_prompt"]
+    assert "Call spawn_agent" in model.extra["pong_prompt"]
+    assert "non-empty message" in model.extra["pong_prompt"]
+    assert "/root/hv2_child_read" not in model.extra["pong_prompt"]
     assert orch.tui == "codex"
     assert list(orch.orchestration_parents) == ["basic"]
     assert list(orch.orchestration_children) == ["read"]
     assert "hv2-codex-child" in orch.extra["orchestration_prompt_template"]
+    assert "model=read" in orch.extra["orchestration_prompt_template"]
+    assert "model=basic" not in orch.extra["orchestration_prompt_template"]
     assert "agent=sota-xai" not in orch.extra["orchestration_prompt_template"]
+    work = hv.build_plan(
+        config=config,
+        kind="orchestration",
+        instance_token="alpha",
+        tui="codex",
+        models=None,
+        orchestration_parent=None,
+        orchestration_children="work",
+        dry_run=True,
+        write_artifact=None,
+    )
+    assert list(work.orchestration_children) == ["work"]
+    assert "model=work" in work.extra["orchestration_prompt_template"]
+    assert "hv2-codex-child" in work.extra["orchestration_prompt_template"]
+    assert "agent=sota-xai" not in work.extra["orchestration_prompt_template"]
 
 
 def test_should_plan_explicit_codex_basic_and_read_without_compiled_all(hv, config) -> None:
+    _skip_unless_codex_tui_shipped(config)
     plan = hv.build_plan(
         config=config,
         kind="model",
@@ -967,6 +1126,7 @@ def test_should_forbid_tui_codex_on_platform(hv, config) -> None:
 
 
 def test_should_stage_codex_identity_overlay_with_repo_and_version(hv, config) -> None:
+    _skip_unless_codex_tui_shipped(config)
     from hv2.drivers.codex import CodexDriver
 
     driver = CodexDriver(config)
@@ -995,6 +1155,7 @@ def test_should_stage_codex_identity_overlay_with_repo_and_version(hv, config) -
 
 
 def test_should_refuse_codex_print_and_exec_flags(hv, config) -> None:
+    _skip_unless_codex_tui_shipped(config)
     from hv2.drivers.codex import CodexDriver
 
     driver = CodexDriver(config)
@@ -1013,6 +1174,7 @@ def test_should_refuse_codex_print_and_exec_flags(hv, config) -> None:
 def test_should_launch_codex_session_on_dedicated_tmux_prefix(
     hv, config, monkeypatch
 ) -> None:
+    _skip_unless_codex_tui_shipped(config)
     from hv2.drivers.codex import CodexDriver
 
     driver = CodexDriver(config)
@@ -1042,23 +1204,34 @@ def test_should_launch_codex_session_on_dedicated_tmux_prefix(
     assert "--print" not in new_session
     assert "exec" not in new_session
     assert "--no-tools" not in new_session
+    dedicated_cwd = next(
+        token
+        for token in launched["argv"]
+        if str(token).startswith("/tmp/hv2-codex-workspace-hv2-codex-basic-")
+    )
+    assert dedicated_cwd != "/tmp/hv2-codex-workspace"
+    assert dedicated_cwd in new_session
+    assert f'projects."{dedicated_cwd}".trust_level="trusted"' in launched["argv"]
     assert not any(row[:1] == ["send-keys"] and "Enter" in row for row in calls)
 
 
 def test_should_submit_codex_prompt_with_ctrl_m_not_enter(
     hv, config, monkeypatch
 ) -> None:
+    _skip_unless_codex_tui_shipped(config)
     from hv2.drivers.codex import CodexDriver
 
     driver = CodexDriver(config)
     driver._active_session = "hv2-codex-basic-1"
     calls: list[tuple[list[str], str | None]] = []
+    sleeps: list[float] = []
 
     def fake_run(args: Any, *, timeout: int = 10, stdin_text: str | None = None) -> Any:
         calls.append(([str(item) for item in args], stdin_text))
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(driver, "_run_tmux", fake_run)
+    monkeypatch.setattr("hv2.drivers.codex.time.sleep", sleeps.append)
     prompt = (
         "Spawn one child agent now. The child must execute a harmless local "
         "shell command (`date` or `pwd`)."
@@ -1067,6 +1240,8 @@ def test_should_submit_codex_prompt_with_ctrl_m_not_enter(
     assert sent["ok"] is True
     assert sent["method"] == "paste-buffer"
     assert sent["submit_keys"] == ["C-m"]
+    assert sent["submit_delay_seconds"] == 1.0
+    assert sleeps == [1.0]
     assert any(row[0][:1] == ["load-buffer"] for row in calls)
     assert any(row[0][:1] == ["paste-buffer"] for row in calls)
     assert any(
@@ -1080,9 +1255,70 @@ def test_should_submit_codex_prompt_with_ctrl_m_not_enter(
     assert "-p" not in joined
 
 
+def test_should_delay_codex_submit_after_paste_before_ctrl_m(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["codex"]["submit_delay_seconds"] = 0.25
+    driver = CodexDriver(cfg)
+    driver._active_session = "hv2-codex-basic-1"
+    events: list[tuple[str, Any]] = []
+
+    def fake_run(args: Any, *, timeout: int = 10, stdin_text: str | None = None) -> Any:
+        events.append(("tmux", [str(item) for item in args]))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_sleep(seconds: float) -> None:
+        events.append(("sleep", float(seconds)))
+
+    monkeypatch.setattr(driver, "_run_tmux", fake_run)
+    monkeypatch.setattr("hv2.drivers.codex.time.sleep", fake_sleep)
+    sent = driver.send_keys("Spawn one child agent now and run date.")
+    assert sent["ok"] is True
+    assert sent["submit_keys"] == ["C-m"]
+    assert sent["submit_delay_seconds"] == 0.25
+    kinds = [row[0] for row in events]
+    assert kinds == ["tmux", "tmux", "sleep", "tmux"]
+    assert events[0][1][:1] == ["load-buffer"]
+    assert events[1][1][:1] == ["paste-buffer"]
+    assert events[2] == ("sleep", 0.25)
+    assert events[3][1] == ["send-keys", "-t", "hv2-codex-basic-1", "C-m"]
+    assert not any("Enter" in (row[1] or []) for row in events if row[0] == "tmux")
+    assert "codex" not in driver._active_session or driver._active_session.startswith(
+        "hv2-codex-"
+    )
+
+
+def test_should_skip_codex_submit_delay_when_yaml_sets_zero(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["codex"]["submit_delay_seconds"] = 0
+    driver = CodexDriver(cfg)
+    driver._active_session = "hv2-codex-basic-1"
+    sleeps: list[float] = []
+
+    def fake_run(args: Any, *, timeout: int = 10, stdin_text: str | None = None) -> Any:
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(driver, "_run_tmux", fake_run)
+    monkeypatch.setattr("hv2.drivers.codex.time.sleep", sleeps.append)
+    sent = driver.send_keys("Spawn one child agent now.")
+    assert sent["ok"] is True
+    assert sent["submit_delay_seconds"] == 0.0
+    assert sleeps == []
+
+
 def test_should_accept_codex_directory_trust_prompt_on_dedicated_session(
     hv, config, monkeypatch
 ) -> None:
+    _skip_unless_codex_tui_shipped(config)
     from hv2.drivers.codex import CodexDriver
 
     cfg = _clone_config(config)
@@ -1125,6 +1361,7 @@ def test_should_accept_codex_directory_trust_prompt_on_dedicated_session(
 def test_should_accept_delayed_codex_directory_trust_prompt_without_blocking_prompt_free(
     hv, config, monkeypatch
 ) -> None:
+    _skip_unless_codex_tui_shipped(config)
     from hv2.drivers.codex import CodexDriver
 
     cfg = _clone_config(config)
@@ -1189,7 +1426,180 @@ def test_should_accept_delayed_codex_directory_trust_prompt_without_blocking_pro
     assert not any(row[:1] == ["send-keys"] and "Enter" in row for row in free_calls)
 
 
+def test_should_accept_codex_directory_trust_prompt_after_loading_chrome_outlasts_wait_trust(
+    hv, config, monkeypatch
+) -> None:
+    """Codex 0.149 paints model: loading, then the trust nux after wait_trust_seconds."""
+
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["codex"]["tmux"]["wait_ready_seconds"] = 1
+    cfg["tuis"]["codex"]["tmux"]["wait_trust_seconds"] = 0.05
+    cfg["tuis"]["codex"]["tmux"]["poll_interval_seconds"] = 0.01
+    driver = CodexDriver(cfg)
+    calls: list[list[str]] = []
+    captures = {"n": 0}
+    trusted = {"ok": False}
+    splash = (
+        "OpenAI Codex (v0.149.1)\n"
+        "model: loading   /model to change\n"
+        "> Ask Codex to do anything\n"
+    )
+    nux = (
+        "OpenAI Codex (v0.149.1)\n"
+        "model: loading\n"
+        "Do you trust the contents of this directory?\n"
+        "› 1. Yes, continue\n"
+        "2. No, quit\n"
+        "Press enter to continue\n"
+    )
+    ready = "OpenAI Codex (v0.149.1)\nmodel: basic\n>"
+
+    def fake_run(args: Any, *, timeout: int = 10, stdin_text: str | None = None) -> Any:
+        row = [str(item) for item in args]
+        calls.append(row)
+        if row[:1] == ["send-keys"] and "Enter" in row:
+            trusted["ok"] = True
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_capture() -> str:
+        captures["n"] += 1
+        if trusted["ok"]:
+            return ready
+        # Longer than wait_trust_seconds (0.05s at 0.01s poll).
+        if captures["n"] < 12:
+            return splash
+        return nux
+
+    monkeypatch.setattr(driver, "_run_tmux", fake_run)
+    monkeypatch.setattr(driver, "tmux_has_session", lambda name=None: False)
+    monkeypatch.setattr(driver, "capture_pane", fake_capture)
+    monkeypatch.setattr(driver, "ensure_workspace", lambda: None)
+    launched = driver.ensure_session("basic", tools=True)
+    assert launched["ok"] is True
+    assert launched["selected"] is True
+    assert any(row[:1] == ["send-keys"] and "Enter" in row for row in calls)
+    assert "Do you trust" not in launched["pane_preview"]
+    assert "basic" in launched["pane_preview"]
+
+
+def test_should_not_treat_codex_loading_header_with_footer_alias_as_selected(
+    hv, config
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+
+    driver = CodexDriver(config)
+    loading = (
+        "╭───────────────────────────────────────╮\n"
+        "│ >_ OpenAI Codex (v0.149.1)            │\n"
+        "│                                       │\n"
+        "│ model:     loading   /model to change │\n"
+        "│ directory: /tmp/hv2-codex-workspace   │\n"
+        "╰───────────────────────────────────────╯\n"
+        "\n"
+        "› Ask Codex to do anything\n"
+        "\n"
+        "  basic default · Context 100% left · /tmp/hv2-codex-workspace\n"
+    )
+    ready = (
+        "╭───────────────────────────────────────────╮\n"
+        "│ >_ OpenAI Codex (v0.149.1)                │\n"
+        "│                                           │\n"
+        "│ model:     basic xhigh   /model to change │\n"
+        "│ directory: /tmp/hv2-codex-workspace       │\n"
+        "╰───────────────────────────────────────────╯\n"
+        "\n"
+        "› Ask Codex to do anything\n"
+        "\n"
+        "  basic xhigh · Context 100% left · /tmp/hv2-codex-workspace\n"
+    )
+    assert driver.pane_has_selector("basic", loading) is False
+    assert driver.pane_has_selector("basic", ready) is True
+
+
+def test_should_wait_for_codex_model_chrome_before_paste(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["codex"]["tmux"]["wait_ready_seconds"] = 0.2
+    cfg["tuis"]["codex"]["tmux"]["poll_interval_seconds"] = 0.01
+    cfg["tuis"]["codex"]["submit_delay_seconds"] = 0
+    driver = CodexDriver(cfg)
+    driver._active_session = "hv2-codex-basic-1"
+    driver._active_model = "basic"
+    calls: list[list[str]] = []
+    captures = {"n": 0}
+    loading = (
+        "OpenAI Codex (v0.149.1)\n"
+        "model:     loading   /model to change\n"
+        "basic default · Context 100% left\n"
+    )
+    ready = (
+        "OpenAI Codex (v0.149.1)\n"
+        "model:     basic xhigh   /model to change\n"
+        "basic xhigh · Context 100% left\n"
+    )
+
+    def fake_run(args: Any, *, timeout: int = 10, stdin_text: str | None = None) -> Any:
+        calls.append([str(item) for item in args])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_capture() -> str:
+        captures["n"] += 1
+        if captures["n"] < 4:
+            return loading
+        return ready
+
+    monkeypatch.setattr(driver, "_run_tmux", fake_run)
+    monkeypatch.setattr(driver, "capture_pane", fake_capture)
+    sent = driver.send_keys("Spawn one child agent now.")
+    assert sent["ok"] is True
+    assert captures["n"] >= 4
+    assert any(row[:1] == ["paste-buffer"] for row in calls)
+    assert any(row[:1] == ["send-keys"] and "C-m" in row for row in calls)
+
+
+def test_should_refuse_codex_paste_while_model_chrome_stays_loading(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["codex"]["tmux"]["wait_ready_seconds"] = 0.05
+    cfg["tuis"]["codex"]["tmux"]["poll_interval_seconds"] = 0.01
+    cfg["tuis"]["codex"]["submit_delay_seconds"] = 0
+    driver = CodexDriver(cfg)
+    driver._active_session = "hv2-codex-basic-1"
+    driver._active_model = "basic"
+    calls: list[list[str]] = []
+    loading = (
+        "OpenAI Codex (v0.149.1)\n"
+        "model:     loading   /model to change\n"
+        "basic default · Context 100% left\n"
+    )
+
+    def fake_run(args: Any, *, timeout: int = 10, stdin_text: str | None = None) -> Any:
+        calls.append([str(item) for item in args])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(driver, "_run_tmux", fake_run)
+    monkeypatch.setattr(driver, "capture_pane", lambda: loading)
+    sent = driver.send_keys("Spawn one child agent now.")
+    assert sent["ok"] is False
+    assert "still loading" in str(sent.get("stderr") or "")
+    assert not any(row[:1] == ["paste-buffer"] for row in calls)
+    assert not any(row[:1] == ["send-keys"] for row in calls)
+
+
 def test_should_refuse_codex_operator_session_reuse(hv, config) -> None:
+    _skip_unless_codex_tui_shipped(config)
     from hv2.drivers.codex import CodexDriver
 
     cfg = _clone_config(config)
@@ -1200,6 +1610,7 @@ def test_should_refuse_codex_operator_session_reuse(hv, config) -> None:
 
 
 def test_should_skip_codex_catalog_picker_without_catalog_json(hv, config) -> None:
+    _skip_unless_codex_tui_shipped(config)
     from hv2.drivers.codex import CodexDriver
     from hv2.kinds.runner import _step_tui_catalog
 
@@ -1224,6 +1635,7 @@ def test_should_skip_codex_catalog_picker_without_catalog_json(hv, config) -> No
 
 
 def test_should_accept_codex_tui_rollup_with_name_version_and_repo(hv, config) -> None:
+    _skip_unless_codex_identity_fixtures()
     text = (_FIXTURES / "codex_identity_ok.txt").read_text(encoding="utf-8")
     scan = hv.scan_log_text(
         text,
@@ -1239,6 +1651,7 @@ def test_should_accept_codex_tui_rollup_with_name_version_and_repo(hv, config) -
 def test_should_fail_codex_tui_rollup_without_client_name_version_and_repo(
     hv, config
 ) -> None:
+    _skip_unless_codex_identity_fixtures()
     text = (_FIXTURES / "codex_identity_miss.txt").read_text(encoding="utf-8")
     scan = hv.scan_log_text(
         text,
@@ -1269,6 +1682,7 @@ def test_should_keep_ohmypi_identity_gate_when_codex_identity_is_present(
 def test_should_accept_codex_tui_rollup_when_concurrent_ohmypi_headers_are_present(
     hv, config
 ) -> None:
+    _skip_unless_codex_identity_fixtures()
     text = (
         (_FIXTURES / "codex_identity_ok.txt").read_text(encoding="utf-8")
         + "\n"
@@ -1289,6 +1703,7 @@ def test_should_accept_codex_tui_rollup_when_concurrent_ohmypi_headers_are_prese
 def test_should_accept_ohmypi_tui_rollup_when_concurrent_codex_headers_are_present(
     hv, config
 ) -> None:
+    _skip_unless_codex_identity_fixtures()
     text = (
         (_FIXTURES / "ohmypi_identity_ok.txt").read_text(encoding="utf-8")
         + "\n"
@@ -1423,8 +1838,13 @@ def test_should_publish_provider_aliases_in_compiled_catalog_and_provider_covera
         assert name in aliases
         assert name in snapshot.aliases
     assert uncovered_registered_providers(snapshot.aliases) == ()
+    assert "nvidia" in REGISTERED_PROVIDERS
+    assert "provider-nvidia" in expected
+    assert "provider-nvidia" in aliases
+    assert "provider-nvidia" in snapshot.aliases
     coverage = hv.expand_group("provider_coverage", config)
     assert coverage == expected
+    assert "provider-nvidia" in coverage
     mixed = hv.expand_group("orchestration_children", config)
     assert mixed == list(_ORCH_BASELINE_CHILDREN)
     assert not set(expected) & set(mixed)
@@ -1444,6 +1864,8 @@ def test_should_plan_provider_coverage_orchestration_children_and_prompt(
         provider_alias_name(provider_id)
         for provider_id in sorted(REGISTERED_PROVIDERS)
     ]
+    assert "nvidia" in REGISTERED_PROVIDERS
+    assert "provider-nvidia" in expected
     plan = hv.build_plan(
         config=config,
         kind="orchestration",
@@ -1458,6 +1880,7 @@ def test_should_plan_provider_coverage_orchestration_children_and_prompt(
     assert plan.container == "litellm-alpha"
     assert list(plan.orchestration_parents) == ["sota-openai"]
     assert list(plan.orchestration_children) == expected
+    assert "provider-nvidia" in plan.orchestration_children
     assert plan.extra["tools_for_orchestration"] is True
     prompt = plan.extra["orchestration_prompt_template"]
     payload = plan.as_dict()
@@ -1476,6 +1899,36 @@ def test_should_plan_provider_coverage_orchestration_children_and_prompt(
     assert "pwd" in prompt
     assert "uname -s" in prompt
     assert "echo omp-alpha-fanout" in prompt
+
+
+def test_should_plan_comma_separated_provider_alias_orchestration_children(
+    hv, config
+) -> None:
+    children = (
+        "provider-kimi_code",
+        "provider-openrouter",
+        "provider-alibaba_token_plan",
+        "provider-xai",
+    )
+    plan = hv.build_plan(
+        config=config,
+        kind="orchestration",
+        instance_token="alpha",
+        tui="ohmypi",
+        models=None,
+        orchestration_parent="sota-openai",
+        orchestration_children=",".join(children),
+        dry_run=True,
+        write_artifact=None,
+    )
+    assert list(plan.orchestration_children) == list(children)
+    prompt = plan.extra["orchestration_prompt_template"]
+    assert "Spawn all 4 subagents" in prompt
+    for name in children:
+        assert f"agent={name}" in prompt
+    assert "agent=provider-kimi_code,provider-openrouter" not in prompt
+    for name in _ORCH_BASELINE_CHILDREN:
+        assert f"agent={name}" not in prompt
 
 
 def test_should_refuse_redis_flush(hv) -> None:
@@ -2441,6 +2894,488 @@ def test_should_count_recap_needle_not_in_prompt_as_pass_evidence() -> None:
     assert _pane_has_pass_evidence(pane, ["※ recap:"], prompt=prompt) is True
 
 
+def test_should_accept_codex_bullet_prefixed_standalone_pass_token() -> None:
+    from hv2.kinds.runner import _pane_has_any
+    from hv2.load_config import load_config
+    from pathlib import Path
+
+    if not (_HV2 / "config" / "prompts" / "codex_model.txt").is_file():
+        pytest.skip("Codex model prompt is not shipped")
+
+    prompt = (
+        Path(_HV2 / "config" / "prompts" / "codex_model.txt")
+        .read_text(encoding="utf-8")
+        .strip()
+    )
+    assert "hv2-codex-child" in prompt
+    wrapped_prompt_only = (
+        "› Call spawn_agent now with model=basic and a non-empty message that tells the\n"
+        "  child to execute a harmless local shell command (`date` or `pwd`) in this\n"
+        "  workspace and return only that command's stdout. Do not guess the result. Do\n"
+        "  not skip the child spawn. Do not run the command yourself. Do not spawn qwen,\n"
+        "  kimi, deepseek, grok, moonshot, or any ChatGPT-unsupported model. After the\n"
+        "  child returns stdout, print that exact stdout on its own line, then reply with\n"
+        "  the exact token hv2-codex-child on its own line. Do not print the token until\n"
+        "  the child's stdout is visible.\n"
+        "› Ask Codex to do anything\n"
+    )
+    assert (
+        _pane_has_any(wrapped_prompt_only, ["hv2-codex-child"], prompt=prompt) is False
+    )
+    pane = (
+        wrapped_prompt_only
+        + "• Started `/root/child_date_command`\n"
+        + "• Ran date\n"
+        + "  └ Mon Aug 24 11:24:30 EDT 2026\n"
+        + "• hv2-codex-child\n"
+        + "› Ask Codex to do anything\n"
+        + "  basic xhigh · Context 99% left · /tmp/hv2-codex-workspace\n"
+    )
+    assert _pane_has_any(pane, ["hv2-codex-child"], prompt=prompt) is True
+    from hv2.kinds.runner import _pane_tool_command_pass
+
+    assert _pane_tool_command_pass(pane, prompt, ["hv2-codex-child"]) is True
+    token_only = (
+        wrapped_prompt_only
+        + "• Started `/root/hv2_child_basic`\n"
+        + "• Waiting for agents\n"
+        + "• Finished waiting\n"
+        + "  └ No agents completed yet\n"
+        + "• Started `/root/hv2_child_basic_retry`\n"
+        + "• Finished waiting\n"
+        + "  └ No agents completed yet\n"
+        + "• hv2-codex-child\n"
+        + "› Ask Codex to do anything\n"
+        + "  basic xhigh · Context 98% left · /tmp/hv2-codex-workspace-hv2-codex-basic-413…\n"
+    )
+    assert _pane_has_any(token_only, ["hv2-codex-child"], prompt=prompt) is True
+    assert (
+        _pane_tool_command_pass(token_only, prompt, ["hv2-codex-child"]) is False
+    )
+    pwd_pane = (
+        wrapped_prompt_only
+        + "• Spawned 01a03552-e10b-7f90-a7c4-ed0f30b6fdce (basic low)\n"
+        + "  └ /tmp/hv2-codex-workspace-hv2-codex-basic-4131913\n"
+        + "• hv2-codex-child\n"
+        + "› Ask Codex to do anything\n"
+    )
+    assert _pane_tool_command_pass(pwd_pane, prompt, ["hv2-codex-child"]) is False
+    pwd_ok_pane = (
+        wrapped_prompt_only
+        + "• Spawned 01a03552-e10b-7f90-a7c4-ed0f30b6fdce (basic low)\n"
+        + "• Ran pwd\n"
+        + "  └ /tmp/hv2-codex-workspace-hv2-codex-basic-4131913\n"
+        + "• hv2-codex-child\n"
+        + "› Ask Codex to do anything\n"
+    )
+    assert _pane_tool_command_pass(pwd_ok_pane, prompt, ["hv2-codex-child"]) is True
+    prior_turn = (
+        "• Started `/root/child_date_command`\n"
+        + "• Ran date\n"
+        + "  └ Mon Aug 24 11:24:30 EDT 2026\n"
+        + "• hv2-codex-child\n"
+        + prompt
+        + "\n"
+        + "› Ask Codex to do anything\n"
+        + "  basic xhigh · Context 99% left · /tmp/hv2-codex-workspace\n"
+    )
+    assert _pane_tool_command_pass(prior_turn, prompt, ["hv2-codex-child"]) is False
+    current_turn = (
+        prior_turn
+        + "• Started `/root/child_date_command`\n"
+        + "• Ran date\n"
+        + "  └ Mon Aug 24 11:24:30 EDT 2026\n"
+        + "• hv2-codex-child\n"
+    )
+    assert _pane_tool_command_pass(current_turn, prompt, ["hv2-codex-child"]) is True
+    config = load_config()
+    busy = (
+        config.get("tuis", {})
+        .get("codex", {})
+        .get("select_model", {})
+        .get("busy_needles")
+        or []
+    )
+    trust_nux = (
+        "Do you trust the contents of this directory? Working with untrusted contents\n"
+        + pane
+    )
+    assert any("Working (" in str(item) for item in busy)
+    assert not any(str(item) == "Working" for item in busy)
+    assert "Working with untrusted contents" in trust_nux
+    assert "Working (" not in "Do you trust the contents of this directory? Working with untrusted contents"
+
+
+def _codex_model_prompt() -> str:
+    prompt_path = _HV2 / "config" / "prompts" / "codex_model.txt"
+    if not prompt_path.is_file():
+        pytest.skip("Codex model prompt is not shipped")
+    return prompt_path.read_text(encoding="utf-8").strip()
+
+
+def _wrapped_codex_model_prompt_echo() -> str:
+    return (
+        "› Call spawn_agent now with model=basic and a non-empty message that tells the\n"
+        "  child to execute a harmless local shell command (`date` or `pwd`) in this\n"
+        "  workspace and return only that command's stdout. Do not guess the result. Do\n"
+        "  not skip the child spawn. Do not run the command yourself. Do not spawn qwen,\n"
+        "  kimi, deepseek, grok, moonshot, or any ChatGPT-unsupported model. After the\n"
+        "  child returns stdout, print that exact stdout on its own line, then reply with\n"
+        "  the exact token hv2-codex-child on its own line. Do not print the token until\n"
+        "  the child's stdout is visible.\n"
+        "› Ask Codex to do anything\n"
+    )
+
+
+def _prior_wrapped_codex_echo_proof() -> str:
+    return (
+        _wrapped_codex_model_prompt_echo()
+        + "• Started `/root/child_date_command`\n"
+        + "• Ran date\n"
+        + "  └ Mon Aug 24 11:24:30 EDT 2026\n"
+        + "• hv2-codex-child\n"
+    )
+
+
+def test_should_reject_stale_pre_prompt_proof_when_current_prompt_is_wrapped() -> None:
+    from hv2.kinds.runner import _pane_tool_command_pass
+    from hv2.pane import _latest_prompt_echo_index, _pane_scan_start
+
+    prompt = _codex_model_prompt()
+    pre_pane = _prior_wrapped_codex_echo_proof()
+    pre_echo = _latest_prompt_echo_index(pre_pane, prompt)
+    pane = pre_pane + _wrapped_codex_model_prompt_echo()
+    echo = _latest_prompt_echo_index(pane, prompt)
+    wait_start = _pane_scan_start(pane, prompt, after_echo_index=pre_echo)
+    final_start = _pane_scan_start(pane, prompt, after_echo_index=pre_echo)
+    assert pre_echo >= 0
+    assert echo > pre_echo
+    assert final_start == echo + 1
+    assert wait_start == final_start
+    assert _pane_tool_command_pass(
+        pane, prompt, ["hv2-codex-child"], after_echo_index=pre_echo
+    ) is False
+
+
+def test_should_accept_wrapped_prompt_current_turn_tool_command_pass() -> None:
+    from hv2.kinds.runner import _pane_tool_command_pass
+    from hv2.pane import _latest_prompt_echo_index, _pane_scan_start
+
+    prompt = _codex_model_prompt()
+    pre_pane = _prior_wrapped_codex_echo_proof()
+    pre_echo = _latest_prompt_echo_index(pre_pane, prompt)
+    pane = (
+        pre_pane
+        + _wrapped_codex_model_prompt_echo()
+        + "• Started `/root/child_date_command`\n"
+        + "• Ran date\n"
+        + "  └ Mon Aug 24 11:24:30 EDT 2026\n"
+        + "• Ran pwd\n"
+        + "  └ /tmp/hv2-codex-workspace-hv2-codex-basic-4131913\n"
+        + "• hv2-codex-child\n"
+        + "› Ask Codex to do anything\n"
+    )
+    echo = _latest_prompt_echo_index(pane, prompt)
+    wait_start = _pane_scan_start(pane, prompt, after_echo_index=pre_echo)
+    final_start = _pane_scan_start(pane, prompt, after_echo_index=pre_echo)
+    assert pre_echo >= 0
+    assert echo > pre_echo
+    assert final_start == echo + 1
+    assert wait_start == final_start
+    assert _pane_tool_command_pass(
+        pane, prompt, ["hv2-codex-child"], after_echo_index=pre_echo
+    ) is True
+
+
+def test_should_accept_captured_codex_idle_tool_pass_and_reject_false_proof(
+    config, monkeypatch
+) -> None:
+    from hv2.kinds.runner import _pane_tool_command_pass
+    from hv2.pane import _latest_prompt_echo_index, _pane_has_codex_idle_prompt
+    from hv2.drivers.codex import CodexDriver
+
+    prompt = _codex_model_prompt()
+    old_turn = _wrapped_codex_model_prompt_echo()
+    pre_echo = _latest_prompt_echo_index(old_turn, prompt)
+    current_prompt = _wrapped_codex_model_prompt_echo().removesuffix(
+        "› Ask Codex to do anything\n"
+    )
+    current = old_turn + current_prompt
+    current_echo = _latest_prompt_echo_index(current, prompt)
+    assert pre_echo >= 0
+    assert current_echo > pre_echo
+    assert _pane_has_codex_idle_prompt(
+        current, prompt, after_echo_index=pre_echo
+    ) is False
+
+    current_with_tool = (
+        current
+        + "/tmp/hv2-codex-workspace-hv2-codex-basic-11657\n"
+        + "hv2-codex-child\n"
+    )
+    assert _pane_tool_command_pass(
+        current_with_tool,
+        prompt,
+        ["hv2-codex-child"],
+        after_echo_index=pre_echo,
+    ) is True
+    assert _pane_has_codex_idle_prompt(
+        current_with_tool, prompt, after_echo_index=pre_echo
+    ) is False
+
+    cfg = _clone_config(config)
+    cfg["tuis"]["codex"]["tmux"]["poll_interval_seconds"] = 0.001
+    driver = CodexDriver(cfg)
+    monkeypatch.setattr(
+        driver,
+        "capture_pane",
+        lambda: current_with_tool + "comparison: left > right\n",
+    )
+    assert (
+        driver.wait_until_idle(
+            timeout_seconds=0.01, prompt=prompt, after_echo_index=pre_echo
+        )
+        is False
+    )
+
+    successful = current_with_tool + "› Ask Codex to do anything\n"
+    assert _pane_has_codex_idle_prompt(
+        successful, prompt, after_echo_index=pre_echo
+    ) is True
+    monkeypatch.setattr(driver, "capture_pane", lambda: successful)
+    assert (
+        driver.wait_until_idle(
+            timeout_seconds=0.01, prompt=prompt, after_echo_index=pre_echo
+        )
+        is True
+    )
+
+    tree_chrome = (
+        current
+        + "  └ /tmp/hv2-codex-workspace-hv2-codex-basic-11657\n"
+        + "hv2-codex-child\n"
+        + "› Ask Codex to do anything\n"
+    )
+    root_chrome = (
+        current
+        + "/root/hv2_child_basic\n"
+        + "hv2-codex-child\n"
+        + "› Ask Codex to do anything\n"
+    )
+    assert _pane_tool_command_pass(
+        tree_chrome,
+        prompt,
+        ["hv2-codex-child"],
+        after_echo_index=pre_echo,
+    ) is False
+    assert _pane_tool_command_pass(
+        root_chrome,
+        prompt,
+        ["hv2-codex-child"],
+        after_echo_index=pre_echo,
+    ) is False
+
+    stale = successful + current_prompt
+    assert _pane_has_codex_idle_prompt(
+        stale, prompt, after_echo_index=current_echo
+    ) is False
+    assert _pane_tool_command_pass(
+        stale,
+        prompt,
+        ["hv2-codex-child"],
+        after_echo_index=current_echo,
+    ) is False
+
+
+def test_should_reject_hv2_codex_child_path_as_pwd_stdout() -> None:
+    from hv2.kinds.runner import _pane_tool_command_pass
+    from hv2.pane import _latest_prompt_echo_index, _pane_is_rejected_child_text
+
+    prompt = _codex_model_prompt()
+    pre_pane = _prior_wrapped_codex_echo_proof()
+    pre_echo = _latest_prompt_echo_index(pre_pane, prompt)
+    pane = (
+        pre_pane
+        + _wrapped_codex_model_prompt_echo()
+        + "• Spawned 01a03552-e10b-7f90-a7c4-ed0f30b6fdce (basic low)\n"
+        + "• Ran pwd\n"
+        + "  └ /root/hv2_codex_child_basic\n"
+        + "• hv2-codex-child\n"
+        + "› Ask Codex to do anything\n"
+    )
+    assert pre_echo >= 0
+    assert _pane_is_rejected_child_text("/root/hv2_codex_child_basic") is True
+    assert _pane_is_rejected_child_text("/root/hv2_child_basic") is True
+    assert _pane_tool_command_pass(
+        pane, prompt, ["hv2-codex-child"], after_echo_index=pre_echo
+    ) is False
+
+
+def test_should_reject_unchanged_old_prompt_evidence_on_wait_and_final() -> None:
+    from hv2.kinds.runner import _pane_tool_command_pass
+    from hv2.pane import _latest_prompt_echo_index, _pane_scan_start
+
+    prompt = _codex_model_prompt()
+    pre_pane = _prior_wrapped_codex_echo_proof()
+    pre_echo = _latest_prompt_echo_index(pre_pane, prompt)
+    pane = pre_pane
+    wait_start = _pane_scan_start(pane, prompt, after_echo_index=pre_echo)
+    final_start = _pane_scan_start(pane, prompt, after_echo_index=pre_echo)
+    unmarked_start = _pane_scan_start(pane, prompt)
+    assert pre_echo >= 0
+    assert wait_start == final_start
+    assert wait_start == len(pane.splitlines())
+    assert unmarked_start == pre_echo + 1
+    assert _pane_tool_command_pass(pane, prompt, ["hv2-codex-child"]) is True
+    assert _pane_tool_command_pass(
+        pane, prompt, ["hv2-codex-child"], after_echo_index=pre_echo
+    ) is False
+
+
+def test_should_fail_closed_when_supplied_watermark_has_no_matching_echo() -> None:
+    from hv2.kinds.runner import _pane_tool_command_pass
+    from hv2.pane import _latest_prompt_echo_index, _pane_scan_start
+
+    prompt = _codex_model_prompt()
+    pane = (
+        "• Started `/root/child_date_command`\n"
+        + "• Ran date\n"
+        + "  └ Mon Aug 24 11:24:30 EDT 2026\n"
+        + "• hv2-codex-child\n"
+        + "› Ask Codex to do anything\n"
+    )
+    assert _latest_prompt_echo_index(pane, prompt) == -1
+    wait_start = _pane_scan_start(pane, prompt, after_echo_index=-1)
+    final_start = _pane_scan_start(pane, prompt, after_echo_index=-1)
+    unmarked_start = _pane_scan_start(pane, prompt)
+    assert wait_start == final_start == len(pane.splitlines())
+    assert unmarked_start == 0
+    assert _pane_tool_command_pass(pane, prompt, ["hv2-codex-child"]) is True
+    assert (
+        _pane_tool_command_pass(
+            pane, prompt, ["hv2-codex-child"], after_echo_index=-1
+        )
+        is False
+    )
+    current = (
+        pane
+        + _wrapped_codex_model_prompt_echo()
+        + "• Started `/root/child_date_command`\n"
+        + "• Ran date\n"
+        + "  └ Mon Aug 24 11:24:30 EDT 2026\n"
+        + "• hv2-codex-child\n"
+    )
+    echo = _latest_prompt_echo_index(current, prompt)
+    assert echo >= 0
+    assert _pane_scan_start(current, prompt, after_echo_index=-1) == echo + 1
+    assert (
+        _pane_tool_command_pass(
+            current, prompt, ["hv2-codex-child"], after_echo_index=-1
+        )
+        is True
+    )
+
+
+
+def test_should_reject_stale_non_pong_404_before_supplied_watermark() -> None:
+    from hv2.kinds.runner import _pane_has_any
+    from hv2.pane import _latest_prompt_echo_index, _pane_scan_start
+
+    prompt = _codex_model_prompt()
+    pre_pane = (
+        _prior_wrapped_codex_echo_proof()
+        + "Error: 404\n"
+        + "404 Not Found\n"
+        + "No endpoints found for basic\n"
+    )
+    pre_echo = _latest_prompt_echo_index(pre_pane, prompt)
+    pane = pre_pane + _wrapped_codex_model_prompt_echo()
+    echo = _latest_prompt_echo_index(pane, prompt)
+    wait_start = _pane_scan_start(pane, prompt, after_echo_index=pre_echo)
+    needles = ["Error: 404", "404 Not Found", "hv2-codex-child"]
+    assert pre_echo >= 0
+    assert echo > pre_echo
+    assert wait_start == echo + 1
+    assert _pane_has_any(pane, needles, prompt=prompt) is True
+    assert (
+        _pane_has_any(
+            pane, needles, prompt=prompt, after_echo_index=pre_echo
+        )
+        is False
+    )
+    live = pane + "Error: 404\n404 Not Found\n"
+    assert (
+        _pane_has_any(
+            live, ["Error: 404", "404 Not Found"], prompt=prompt, after_echo_index=pre_echo
+        )
+        is True
+    )
+
+
+def test_should_reject_unchanged_old_orchestration_evidence_on_wait_and_final(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+    from hv2.kinds.runner import _pane_tool_command_pass, _step_tui_orchestration
+    from hv2.plan import expand_orchestration_prompt
+
+    plan = hv.build_plan(
+        config=config,
+        kind="orchestration",
+        instance_token="alpha",
+        tui="codex",
+        models=None,
+        orchestration_parent="basic",
+        orchestration_children="read",
+        dry_run=True,
+        write_artifact=None,
+    )
+    driver = CodexDriver(config)
+    prompt = expand_orchestration_prompt(
+        str(plan.extra["orchestration_prompt_template"]),
+        parent=plan.orchestration_parents[0],
+        children=list(plan.orchestration_children),
+    )
+    echo = "\n".join(line.strip() for line in prompt.splitlines() if line.strip())
+    pane = (
+        echo
+        + "\n"
+        + "• Started `/root/child_date_command`\n"
+        + "• Ran date\n"
+        + "  └ Mon Aug 24 11:24:30 EDT 2026\n"
+        + "• hv2-codex-child\n"
+    )
+    monkeypatch.setattr("hv2.kinds.runner.driver_for", lambda tui, _config: driver)
+    monkeypatch.setattr(
+        driver, "launch_argv", lambda model, **k: ["codex", "--model", model]
+    )
+    monkeypatch.setattr(driver, "assert_no_print_flags", lambda argv: None)
+    monkeypatch.setattr(
+        driver,
+        "ensure_session",
+        lambda model, tools=True, **_kwargs: {
+            "ok": True,
+            "session": "hv2-codex-basic",
+            "selector": driver.model_selector(model),
+            "selected": True,
+            "staged_agents": {"ok": True, "missing": []},
+        },
+    )
+    monkeypatch.setattr(
+        driver, "send_keys", lambda text: {"ok": True, "method": "paste-buffer"}
+    )
+    monkeypatch.setattr(driver, "capture_pane", lambda: pane)
+    monkeypatch.setattr(driver, "pane_has_selector", lambda model, pane=None: True)
+    monkeypatch.setattr(driver, "_tmux_float", _fast_ohmypi_tmux_float)
+    assert _pane_tool_command_pass(pane, prompt, ["hv2-codex-child"]) is True
+    payload = _step_tui_orchestration(plan)
+    row = payload["parents"][0]
+    assert row.get("after_echo_index") >= 0
+    assert payload.get("ok") is False
+    assert row.get("tool_pass") is False
+
+
 def test_should_accept_standalone_exact_pong_line() -> None:
     from hv2.kinds.runner import _pane_exact_pong
 
@@ -2727,6 +3662,7 @@ def test_should_not_treat_restored_complete_pong_turn_as_this_sends_live_reply(
     waited = driver.send_prompt_and_wait(
         prompt, reply_needles=_OHMYPI_MODEL_REPLY_NEEDLES
     )
+    assert waited["after_echo_index"] == echo_indexes[0]
     assert waited["replied"] is False
     assert waited["idle"] is False
     assert waited["ok"] is False
@@ -2992,6 +3928,570 @@ def test_should_fail_provider_child_that_falls_back_to_operational_sota(
     assert "sota" in route["escaped_aliases"]
     joined = " ".join(evidence["failures"])
     assert "operational alias" in joined
+
+
+def test_should_not_infer_provider_route_identity_from_alias_prefix(
+    tmp_path: Path,
+) -> None:
+    from hv2.checks.orch_evidence import child_spawn_evidence
+
+    session_dir = tmp_path / "omp-sessions"
+    nested = session_dir / "parent-id"
+    nested.mkdir(parents=True)
+    (session_dir / "parent.jsonl").write_text(
+        _task_tool_result_line(("provider-kimi_code",)) + "\n",
+        encoding="utf-8",
+    )
+    (nested / "KimiCode.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "session_init",
+                        "agent": "provider-kimi_code",
+                        "resolvedModel": (
+                            "litellm-alpha-passthrough/provider-kimi_code"
+                        ),
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "model_change",
+                        "model": "litellm-alpha-passthrough/provider-kimi_code",
+                        "resolvedModelIsFallback": False,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "api": "openai-responses",
+                            "provider": "litellm-alpha-passthrough",
+                            "model": "provider-kimi_code",
+                            "content": [
+                                {
+                                    "type": "toolCall",
+                                    "name": "bash",
+                                    "arguments": {"command": "date"},
+                                }
+                            ],
+                        }
+                    }
+                ),
+                json.dumps(
+                    {
+                        "message": {
+                            "role": "toolResult",
+                            "toolName": "yield",
+                            "isError": False,
+                            "content": "PONG",
+                        }
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    evidence = child_spawn_evidence(
+        children=("provider-kimi_code",),
+        pane="π  > ⬢ AAWM alias sota-openai\n",
+        session_dir=str(session_dir),
+    )
+    assert evidence["ok"] is False
+    assert "provider-kimi_code" not in evidence["successful_agents"]
+    assert "provider-kimi_code" in evidence["failed_agents"]
+    route = evidence["routes"]["provider-kimi_code"]
+    assert route["ok"] is False
+    assert route["selected_provider"] != "kimi_code"
+    assert route["selected_provider"] == ""
+    assert route["model"] != "provider-kimi_code"
+    assert route["model"] == ""
+    assert route["route_family"] == ""
+    assert route["terminal_disposition"] == "identity_unobserved"
+    joined = " ".join(evidence["failures"])
+    assert "observed" in joined.lower() or "identity" in joined.lower()
+
+
+def test_should_pass_provider_child_with_observed_producer_identity(
+    tmp_path: Path,
+) -> None:
+    from hv2.checks.orch_evidence import child_spawn_evidence
+
+    session_dir = tmp_path / "omp-sessions"
+    nested = session_dir / "parent-id"
+    nested.mkdir(parents=True)
+    (session_dir / "parent.jsonl").write_text(
+        _task_tool_result_line(("provider-openai",)) + "\n",
+        encoding="utf-8",
+    )
+    (nested / "OpenAI.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "session_init",
+                        "agent": "provider-openai",
+                        "resolvedModel": "litellm-alpha-passthrough/provider-openai",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "api": "openai-responses",
+                            "provider": "litellm-alpha-passthrough",
+                            "model": "provider-openai",
+                            "content": [
+                                {
+                                    "type": "toolCall",
+                                    "name": "bash",
+                                    "arguments": {"command": "date"},
+                                }
+                            ],
+                            "providerPayload": {
+                                "type": "openaiResponsesHistory",
+                                "aawm_encrypted_reasoning_provenance": {
+                                    "producer_provider": "openai",
+                                    "producer_model": "gpt-5.6-sol",
+                                    "producer_route_family": "codex_responses",
+                                },
+                            },
+                        }
+                    }
+                ),
+                json.dumps(
+                    {
+                        "message": {
+                            "role": "toolResult",
+                            "toolName": "yield",
+                            "isError": False,
+                            "content": "PONG",
+                        }
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    evidence = child_spawn_evidence(
+        children=("provider-openai",),
+        pane="π  > ⬢ AAWM alias sota-openai\n",
+        session_dir=str(session_dir),
+    )
+    assert evidence["ok"] is True
+    assert evidence["successful_agents"] == ["provider-openai"]
+    route = evidence["routes"]["provider-openai"]
+    assert route["ok"] is True
+    assert route["selected_provider"] == "openai"
+    assert route["model"] == "gpt-5.6-sol"
+    assert route["route_family"] == "codex_responses"
+    assert route["terminal_disposition"] == "completed"
+    assert route["model"] != "provider-openai"
+
+
+def _provider_snapshot_identity(alias: str) -> tuple[str, str, str]:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    alias_cfg = snapshot.aliases[alias]
+    entry = alias_cfg.candidates[0]
+    return (str(entry.provider), str(entry.model), str(entry.route_family))
+
+
+def _write_nested_orch_fixture(
+    tmp_path: Path, *, alias: str, fixture_name: str, nested_stem: str
+) -> Path:
+    session_dir = tmp_path / "omp-sessions"
+    nested = session_dir / "parent-id"
+    nested.mkdir(parents=True)
+    (session_dir / "parent.jsonl").write_text(
+        _task_tool_result_line((alias,)) + "\n",
+        encoding="utf-8",
+    )
+    source = _ORCH_FIXTURES / fixture_name
+    (nested / f"{nested_stem}.jsonl").write_text(
+        source.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    return session_dir
+
+
+def test_should_mark_live_shape_provider_jsonl_without_stamp_as_unobserved(
+    tmp_path: Path,
+) -> None:
+    from hv2.checks.orch_evidence import child_spawn_evidence, extract_child_route_identity
+
+    cases = (
+        ("provider-kimi_code", "kimi_code.unobserved.jsonl", "KimiCode"),
+        ("provider-openrouter", "openrouter.unobserved.jsonl", "OpenRouter"),
+        (
+            "provider-alibaba_token_plan",
+            "alibaba_token_plan.unobserved.jsonl",
+            "AlibabaTokenPlan",
+        ),
+        ("provider-xai", "xai.unobserved.jsonl", "XAI"),
+    )
+    for alias, fixture_name, stem in cases:
+        session_dir = _write_nested_orch_fixture(
+            tmp_path / alias, alias=alias, fixture_name=fixture_name, nested_stem=stem
+        )
+        evidence = child_spawn_evidence(
+            children=(alias,),
+            pane="π  > ⬢ AAWM alias sota-openai\n",
+            session_dir=str(session_dir),
+        )
+        nested = next(Path(session_dir).glob("*/*.jsonl"))
+        records = [
+            json.loads(line)
+            for line in nested.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert extract_child_route_identity(records) is None
+        assert evidence["ok"] is False
+        route = evidence["routes"][alias]
+        assert route["terminal_disposition"] == "identity_unobserved"
+        assert route["ok"] is False
+        assert route["selected_provider"] == ""
+        assert route["model"] == ""
+        assert route["route_family"] == ""
+
+
+def test_should_accept_stamped_live_shape_provider_jsonl_as_in_alias_pass(
+    tmp_path: Path,
+) -> None:
+    from hv2.checks.orch_evidence import child_spawn_evidence, extract_child_route_identity
+
+    cases = (
+        ("provider-kimi_code", "kimi_code.stamped.jsonl", "KimiCode"),
+        ("provider-openrouter", "openrouter.stamped.jsonl", "OpenRouter"),
+        (
+            "provider-alibaba_token_plan",
+            "alibaba_token_plan.stamped.jsonl",
+            "AlibabaTokenPlan",
+        ),
+        ("provider-xai", "xai.stamped.jsonl", "XAI"),
+    )
+    for alias, fixture_name, stem in cases:
+        expected = _provider_snapshot_identity(alias)
+        session_dir = _write_nested_orch_fixture(
+            tmp_path / alias, alias=alias, fixture_name=fixture_name, nested_stem=stem
+        )
+        evidence = child_spawn_evidence(
+            children=(alias,),
+            pane="π  > ⬢ AAWM alias sota-openai\n",
+            session_dir=str(session_dir),
+        )
+        nested = next(Path(session_dir).glob("*/*.jsonl"))
+        records = [
+            json.loads(line)
+            for line in nested.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        identity = extract_child_route_identity(records)
+        assert identity is not None
+        assert (
+            identity["producer_provider"],
+            identity["producer_model"],
+            identity["producer_route_family"],
+        ) == expected
+        assert evidence["ok"] is True
+        route = evidence["routes"][alias]
+        assert route["ok"] is True
+        assert route["selected_provider"] == expected[0]
+        assert route["model"] == expected[1]
+        assert route["route_family"] == expected[2]
+        assert route["terminal_disposition"] == "completed"
+        assert route["model"] != alias
+
+
+def test_should_fail_stamped_provider_child_with_in_alias_provider_error(
+    tmp_path: Path,
+) -> None:
+    from hv2.checks.orch_evidence import child_spawn_evidence, extract_child_route_identity
+
+    alias = "provider-openrouter"
+    expected = _provider_snapshot_identity(alias)
+    session_dir = tmp_path / "omp-sessions"
+    nested = session_dir / "parent-id"
+    nested.mkdir(parents=True)
+    (session_dir / "parent.jsonl").write_text(
+        _task_tool_result_line((alias,)) + "\n",
+        encoding="utf-8",
+    )
+    (nested / "OpenRouter.jsonl").write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "session_init",
+                        "agent": alias,
+                        "resolvedModel": f"litellm-alpha-passthrough/{alias}",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "api": "openai-responses",
+                            "provider": "litellm-alpha-passthrough",
+                            "model": alias,
+                            "content": [
+                                {
+                                    "type": "toolCall",
+                                    "name": "bash",
+                                    "arguments": {"command": "date"},
+                                }
+                            ],
+                            "providerPayload": {
+                                "type": "openaiResponsesHistory",
+                                "aawm_route_identity": {
+                                    "producer_provider": expected[0],
+                                    "producer_model": expected[1],
+                                    "producer_route_family": expected[2],
+                                },
+                            },
+                        }
+                    }
+                ),
+                json.dumps(
+                    {
+                        "message": {
+                            "role": "toolResult",
+                            "toolName": "yield",
+                            "isError": False,
+                            "content": "PONG",
+                        }
+                    }
+                ),
+                json.dumps(
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "errorMessage": (
+                                '429 {"detail":{"error":{"code":'
+                                '"aawm_codex_auto_agent_redispatch_required"},'
+                                f'"selected_provider":"{expected[0]}",'
+                                f'"selected_model":"{expected[1]}",'
+                                f'"selected_route_family":"{expected[2]}"}}'
+                            ),
+                        }
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    evidence = child_spawn_evidence(
+        children=(alias,),
+        pane="π  > ⬢ AAWM alias sota-openai\n",
+        session_dir=str(session_dir),
+    )
+    nested_path = next(Path(session_dir).glob("*/*.jsonl"))
+    records = [
+        json.loads(line)
+        for line in nested_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    identity = extract_child_route_identity(records)
+    assert identity is not None
+    assert (
+        identity["producer_provider"],
+        identity["producer_model"],
+        identity["producer_route_family"],
+    ) == expected
+    assert evidence["ok"] is False
+    assert alias in evidence["failed_agents"]
+    assert alias not in evidence["successful_agents"]
+    route = evidence["routes"][alias]
+    assert route["ok"] is False
+    assert route["selected_provider"] == expected[0]
+    assert route["model"] == expected[1]
+    assert route["route_family"] == expected[2]
+    assert route["terminal_disposition"] == "unavailable"
+    joined = " ".join(evidence["failures"])
+    assert "provider error" in joined
+
+
+def test_should_prefer_aawm_route_identity_stamp_over_encrypted_provenance() -> None:
+    from hv2.checks.orch_evidence import extract_child_route_identity
+
+    records = [
+        {
+            "message": {
+                "providerPayload": {
+                    "aawm_encrypted_reasoning_provenance": {
+                        "producer_provider": "openai",
+                        "producer_model": "gpt-5.6-sol",
+                        "producer_route_family": "codex_responses",
+                    },
+                    "aawm_route_identity": {
+                        "producer_provider": "kimi_code",
+                        "producer_model": "kimi_code/k3",
+                        "producer_route_family": "codex_kimi_chat_completions_adapter",
+                    },
+                }
+            }
+        }
+    ]
+    identity = extract_child_route_identity(records)
+    assert identity is not None
+    assert identity["producer_provider"] == "kimi_code"
+    assert identity["producer_model"] == "kimi_code/k3"
+    assert identity["producer_route_family"] == "codex_kimi_chat_completions_adapter"
+
+
+def test_should_reject_model_id_none_as_unobserved_route_identity() -> None:
+    from hv2.checks.orch_evidence import extract_child_route_identity
+
+    for model in ("None", "model_id:None", "litellm_enc:model_id:None"):
+        records = [
+            {
+                "message": {
+                    "providerPayload": {
+                        "aawm_route_identity": {
+                            "producer_provider": "kimi_code",
+                            "producer_model": model,
+                            "producer_route_family": (
+                                "codex_kimi_chat_completions_adapter"
+                            ),
+                        }
+                    }
+                }
+            }
+        ]
+        assert extract_child_route_identity(records) is None
+
+
+def test_should_prefer_latest_valid_route_identity_record() -> None:
+    from hv2.checks.orch_evidence import extract_child_route_identity
+
+    records = [
+        {
+            "message": {
+                "providerPayload": {
+                    "aawm_route_identity": {
+                        "producer_provider": "kimi_code",
+                        "producer_model": "kimi_code/k3",
+                        "producer_route_family": (
+                            "codex_kimi_chat_completions_adapter"
+                        ),
+                    }
+                }
+            }
+        },
+        {
+            "message": {
+                "providerPayload": {
+                    "aawm_route_identity": {
+                        "producer_provider": "openrouter",
+                        "producer_model": "openrouter/auto",
+                        "producer_route_family": (
+                            "codex_openrouter_completion_adapter"
+                        ),
+                    }
+                }
+            }
+        },
+    ]
+    identity = extract_child_route_identity(records)
+    assert identity is not None
+    assert identity["producer_provider"] == "openrouter"
+    assert identity["producer_model"] == "openrouter/auto"
+    assert identity["producer_route_family"] == "codex_openrouter_completion_adapter"
+
+
+def test_should_not_let_invalid_later_record_clobber_valid_identity() -> None:
+    from hv2.checks.orch_evidence import extract_child_route_identity
+
+    records = [
+        {
+            "message": {
+                "providerPayload": {
+                    "aawm_route_identity": {
+                        "producer_provider": "kimi_code",
+                        "producer_model": "kimi_code/k3",
+                        "producer_route_family": (
+                            "codex_kimi_chat_completions_adapter"
+                        ),
+                    }
+                }
+            }
+        },
+        {
+            "message": {
+                "providerPayload": {
+                    "aawm_route_identity": {
+                        "producer_provider": "openrouter",
+                        "producer_model": "model_id:None",
+                        "producer_route_family": (
+                            "codex_openrouter_completion_adapter"
+                        ),
+                    }
+                }
+            }
+        },
+        {
+            "message": {
+                "providerPayload": {
+                    "aawm_encrypted_reasoning_provenance": {
+                        "producer_provider": "openrouter",
+                        "producer_model": "provider-openrouter",
+                        "producer_route_family": (
+                            "codex_openrouter_completion_adapter"
+                        ),
+                    }
+                }
+            }
+        },
+    ]
+    identity = extract_child_route_identity(records)
+    assert identity is not None
+    assert identity["producer_provider"] == "kimi_code"
+    assert identity["producer_model"] == "kimi_code/k3"
+
+
+def test_should_let_later_valid_provenance_replace_earlier_stamp() -> None:
+    from hv2.checks.orch_evidence import extract_child_route_identity
+
+    records = [
+        {
+            "message": {
+                "providerPayload": {
+                    "aawm_route_identity": {
+                        "producer_provider": "kimi_code",
+                        "producer_model": "kimi_code/k3",
+                        "producer_route_family": (
+                            "codex_kimi_chat_completions_adapter"
+                        ),
+                    }
+                }
+            }
+        },
+        {
+            "message": {
+                "providerPayload": {
+                    "aawm_encrypted_reasoning_provenance": {
+                        "producer_provider": "openrouter",
+                        "producer_model": "openrouter/auto",
+                        "producer_route_family": (
+                            "codex_openrouter_completion_adapter"
+                        ),
+                    }
+                }
+            }
+        },
+    ]
+    identity = extract_child_route_identity(records)
+    assert identity is not None
+    assert identity["producer_provider"] == "openrouter"
+    assert identity["producer_model"] == "openrouter/auto"
+    assert identity["producer_route_family"] == "codex_openrouter_completion_adapter"
 
 
 def test_should_fail_child_spawn_evidence_on_unknown_agent() -> None:
@@ -3488,6 +4988,8 @@ def test_should_stage_provider_coverage_child_agent_profiles(
         provider_alias_name(provider_id)
         for provider_id in sorted(REGISTERED_PROVIDERS)
     ]
+    assert "nvidia" in REGISTERED_PROVIDERS
+    assert "provider-nvidia" in expected
     cfg = _clone_config(config)
     cwd = tmp_path / "omp-alpha-workspace"
     dest = cwd / ".omp" / "agents"
@@ -3499,6 +5001,7 @@ def test_should_stage_provider_coverage_child_agent_profiles(
     assert staged["missing"] == []
     written_names = {Path(path).name for path in staged["written"]}
     assert written_names == {f"{name}.md" for name in expected}
+    assert "provider-nvidia.md" in written_names
     for name in _ORCH_BASELINE_CHILDREN:
         assert not (dest / f"{name}.md").is_file()
     for name in expected:
@@ -3599,6 +5102,301 @@ def test_should_require_passthrough_selector_on_ohmypi_catalog_find_for_work(
     assert found["failures"] == []
     assert found["finds"][0]["selector"] == "litellm-alpha-passthrough/work"
     assert found["finds"][0]["found"] is True
+
+
+
+def test_should_reject_stale_pong_and_404_on_ohmypi_model_final_scans(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+    from hv2.kinds.runner import _step_tui_model
+    from hv2.pane import _latest_prompt_echo_index
+
+    plan = hv.build_plan(
+        config=config,
+        kind="model",
+        instance_token="alpha",
+        tui="ohmypi",
+        models=["work"],
+        orchestration_parent=None,
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    driver = OhmypiDriver(config)
+    prompt = str(plan.extra["pong_prompt"]).strip()
+    stale = (
+        "Default model: litellm-alpha-passthrough/work\n"
+        f"{prompt}\n"
+        "PONG\n"
+        "Error: 404\n"
+        "404 Not Found\n"
+    )
+    pre_echo = _latest_prompt_echo_index(stale, prompt)
+    pane = (
+        stale
+        + f"{prompt}\n"
+        + "╭── π  > ⬢ AAWM alias / model work\n"
+        + "╰─                                                                            ─╯\n"
+        + "interactive\n"
+    )
+    echo = _latest_prompt_echo_index(pane, prompt)
+    monkeypatch.setattr("hv2.kinds.runner.driver_for", lambda tui, _config: driver)
+    monkeypatch.setattr(
+        driver,
+        "launch_argv",
+        lambda model, **k: ["omp", "--model", f"litellm-alpha-passthrough/{model}"],
+    )
+    monkeypatch.setattr(driver, "assert_no_print_flags", lambda argv: None)
+    monkeypatch.setattr(
+        driver,
+        "ensure_session",
+        lambda model, tools=False, **_kwargs: {
+            "ok": True,
+            "session": "hv2-ohmypi-work",
+            "selector": driver.model_selector(model),
+            "selected": True,
+        },
+    )
+    monkeypatch.setattr(
+        driver,
+        "send_prompt_and_wait",
+        lambda prompt, reply_needles=None: {
+            "ok": True,
+            "send": {"ok": True, "method": "send-keys"},
+            "idle": True,
+            "replied": True,
+            "pane": pane,
+            "after_echo_index": pre_echo,
+        },
+    )
+    monkeypatch.setattr(driver, "pane_has_selector", lambda model, pane=None: True)
+    payload = _step_tui_model(plan)
+    row = payload["models"][0]
+    assert pre_echo >= 0
+    assert echo > pre_echo
+    assert payload.get("ok") is False
+    assert row.get("exact_pong") is False
+    assert row.get("provider_404") is False
+    assert row.get("completed") is False
+
+
+def test_should_reject_stale_404_on_codex_model_final_scans(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+    from hv2.kinds.runner import _step_tui_model
+    from hv2.pane import _latest_prompt_echo_index
+
+    plan = hv.build_plan(
+        config=config,
+        kind="model",
+        instance_token="alpha",
+        tui="codex",
+        models=["basic"],
+        orchestration_parent=None,
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    driver = CodexDriver(config)
+    prompt = str(plan.extra["pong_prompt"]).strip()
+    pre_pane = (
+        _prior_wrapped_codex_echo_proof()
+        + "Error: 404\n"
+        + "404 Not Found\n"
+        + "PONG\n"
+    )
+    pre_echo = _latest_prompt_echo_index(pre_pane, prompt)
+    pane = (
+        pre_pane
+        + _wrapped_codex_model_prompt_echo()
+        + "model: basic\n"
+        + ">\n"
+    )
+    echo = _latest_prompt_echo_index(pane, prompt)
+    monkeypatch.setattr("hv2.kinds.runner.driver_for", lambda tui, _config: driver)
+    monkeypatch.setattr(driver, "launch_argv", lambda model, **k: ["codex", "--model", model])
+    monkeypatch.setattr(driver, "assert_no_print_flags", lambda argv: None)
+    monkeypatch.setattr(
+        driver,
+        "ensure_session",
+        lambda model, tools=False, **_kwargs: {
+            "ok": True,
+            "session": "hv2-codex-basic",
+            "selector": driver.model_selector(model),
+            "selected": True,
+        },
+    )
+    monkeypatch.setattr(
+        driver,
+        "send_prompt_and_wait",
+        lambda prompt, reply_needles=None: {
+            "ok": True,
+            "send": {"ok": True, "method": "paste-buffer"},
+            "idle": True,
+            "replied": True,
+            "pane": pane,
+            "after_echo_index": pre_echo,
+        },
+    )
+    monkeypatch.setattr(driver, "pane_has_selector", lambda model, pane=None: True)
+    payload = _step_tui_model(plan)
+    row = payload["models"][0]
+    assert pre_echo >= 0
+    assert echo > pre_echo
+    assert payload.get("ok") is False
+    assert row.get("exact_pong") is False
+    assert row.get("provider_404") is False
+    assert row.get("completed") is False
+    assert row.get("tool_pass") is False
+
+
+def test_should_fail_codex_model_step_on_idle_provider_404(
+    hv, config, monkeypatch
+) -> None:
+    _skip_unless_codex_tui_shipped(config)
+    from hv2.drivers.codex import CodexDriver
+    from hv2.kinds.runner import _step_tui_model
+
+    plan = hv.build_plan(
+        config=config,
+        kind="model",
+        instance_token="alpha",
+        tui="codex",
+        models=["basic"],
+        orchestration_parent=None,
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    driver = CodexDriver(config)
+    pane = (
+        "Error: 404\n"
+        "404 Not Found\n"
+        "model: basic\n"
+        ">\n"
+    )
+    monkeypatch.setattr("hv2.kinds.runner.driver_for", lambda tui, _config: driver)
+    monkeypatch.setattr(driver, "launch_argv", lambda model, **k: ["codex", "--model", model])
+    monkeypatch.setattr(driver, "assert_no_print_flags", lambda argv: None)
+    monkeypatch.setattr(
+        driver,
+        "ensure_session",
+        lambda model, tools=False, **_kwargs: {
+            "ok": True,
+            "session": "hv2-codex-basic",
+            "selector": driver.model_selector(model),
+            "selected": True,
+        },
+    )
+    monkeypatch.setattr(
+        driver,
+        "send_prompt_and_wait",
+        lambda prompt, reply_needles=None: {
+            "ok": True,
+            "send": {"ok": True, "method": "paste-buffer"},
+            "idle": True,
+            "replied": True,
+            "pane": pane,
+        },
+    )
+    monkeypatch.setattr(driver, "pane_has_selector", lambda model, pane=None: True)
+    payload = _step_tui_model(plan)
+    row = payload["models"][0]
+    assert payload.get("ok") is False
+    assert row.get("provider_404") is False
+    assert row.get("completed") is False
+    assert row.get("tool_pass") is False
+
+
+def test_should_pass_ohmypi_model_step_on_idle_provider_404(
+    hv, config, monkeypatch
+) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+    from hv2.kinds.runner import _step_tui_model
+
+    plan = hv.build_plan(
+        config=config,
+        kind="model",
+        instance_token="alpha",
+        tui="ohmypi",
+        models=["work"],
+        orchestration_parent=None,
+        orchestration_children=None,
+        dry_run=True,
+        write_artifact=None,
+    )
+    driver = OhmypiDriver(config)
+    pane = (
+        "Default model: litellm-alpha-passthrough/work\n"
+        "Reply with exactly the word PONG.\n"
+        "Error: 404\n"
+        "404 Not Found\n"
+        "╭── π  > ⬢ AAWM alias / model work\n"
+        "╰─                                                                            ─╯\n"
+        "interactive\n"
+    )
+    monkeypatch.setattr("hv2.kinds.runner.driver_for", lambda tui, _config: driver)
+    monkeypatch.setattr(
+        driver,
+        "launch_argv",
+        lambda model, **k: ["omp", "--model", f"litellm-alpha-passthrough/{model}"],
+    )
+    monkeypatch.setattr(driver, "assert_no_print_flags", lambda argv: None)
+    monkeypatch.setattr(
+        driver,
+        "ensure_session",
+        lambda model, tools=False, **_kwargs: {
+            "ok": True,
+            "session": "hv2-ohmypi-work",
+            "selector": driver.model_selector(model),
+            "selected": True,
+        },
+    )
+    monkeypatch.setattr(
+        driver,
+        "send_prompt_and_wait",
+        lambda prompt, reply_needles=None: {
+            "ok": True,
+            "send": {"ok": True, "method": "send-keys"},
+            "idle": True,
+            "replied": True,
+            "pane": pane,
+        },
+    )
+    monkeypatch.setattr(driver, "pane_has_selector", lambda model, pane=None: True)
+    payload = _step_tui_model(plan)
+    row = payload["models"][0]
+    assert payload.get("ok") is True
+    assert row.get("provider_404") is True
+    assert row.get("exact_pong") is False
+    assert row.get("completed") is True
+
+
+def test_should_filter_stale_pre_echo_pane_child_evidence() -> None:
+    from hv2.checks.orch_evidence import child_spawn_evidence
+
+    prompt = "Reply with exactly the word PONG."
+    pane = (
+        "- basic\n"
+        "  - date:\n"
+        f"{prompt}\n"
+        "- work\n"
+        "  - date:\n"
+    )
+
+    result = child_spawn_evidence(
+        children=["basic", "work"],
+        pane=pane,
+        prompt=prompt,
+        after_echo_index=-1,
+    )
+
+    assert "basic" not in result["successful_agents"]
+    assert "work" in result["successful_agents"]
+    assert result["ok"] is False
 
 
 def test_should_leave_ohmypi_model_tmux_session_open_after_tui_model_step(

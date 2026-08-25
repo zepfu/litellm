@@ -28,12 +28,18 @@ from hv2.drivers import driver_for
 from hv2.errors import PlanError
 from hv2.instance import inspect_instance
 from hv2.load_config import as_str_list
-from hv2.pane import _pane_exact_pong, _pane_has_any
+from hv2.pane import (
+    _latest_prompt_echo_index,
+    _pane_exact_pong,
+    _pane_has_any,
+    _pane_tool_command_pass,
+)
 from hv2.plan import RunPlan, expand_orchestration_prompt
 
 # Tests import these from hv2.kinds.runner.
 _pane_exact_pong = _pane_exact_pong
 _pane_has_any = _pane_has_any
+_pane_tool_command_pass = _pane_tool_command_pass
 
 
 def _record(
@@ -433,7 +439,7 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
         row = {
             "model": model,
             "selector": driver.model_selector(model),
-            "argv": argv,
+            "argv": launched.get("argv") or argv,
             "prompt": prompt.strip(),
             "session": launched.get("session"),
             "launch_ok": launched.get("ok"),
@@ -447,6 +453,7 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
             )
             rows.append(row)
             continue
+        after_echo_index = None
         if hasattr(driver, "send_prompt_and_wait"):
             waited = driver.send_prompt_and_wait(
                 prompt.strip(), reply_needles=reply_needles
@@ -454,6 +461,9 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
             sent = waited.get("send") or {}
             pane = str(waited.get("pane") or "")
             row["idle"] = waited.get("idle")
+            after_echo_index = waited.get("after_echo_index")
+            if plan.tui == 'codex' and after_echo_index is None:
+                after_echo_index = -1
         else:
             sent = driver.send_keys(prompt.strip())
             row["idle"] = driver.wait_until_idle()
@@ -468,11 +478,16 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
             failures.append(
                 f"pane for {model} does not show selector {selector}"
             )
-        exact_pong = _pane_exact_pong(pane, prompt)
+        exact_pong = _pane_exact_pong(
+            pane, prompt, after_echo_index=after_echo_index
+        )
         provider_404 = bool(
             provider_404_needles
             and _pane_has_any(
-                pane, provider_404_needles, prompt=prompt.strip()
+                pane,
+                provider_404_needles,
+                prompt=prompt.strip(),
+                after_echo_index=after_echo_index,
             )
         )
         tool_tokens = standalone_pass_tokens or (
@@ -480,16 +495,21 @@ def _step_tui_model(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa: PLR0915
         )
         tool_pass = bool(
             tool_tokens
-            and _pane_has_any(pane, tool_tokens, prompt=prompt.strip())
+            and _pane_tool_command_pass(
+                pane,
+                prompt.strip(),
+                tool_tokens,
+                after_echo_index=after_echo_index,
+            )
         )
         row["exact_pong"] = exact_pong
         row["provider_404"] = provider_404
         row["tool_pass"] = tool_pass
         if pass_mode == "tool_command":
-            completed = bool(row.get("idle")) and (tool_pass or provider_404)
+            completed = bool(row.get("idle")) and tool_pass
             miss = (
                 f"TUI turn for {model} did not reach an idle tool-bearing "
-                "child command reply or provider 404 evidence"
+                "child command reply"
             )
         else:
             completed = bool(row.get("idle")) and (exact_pong or provider_404)
@@ -560,6 +580,8 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
     rows[0]["launch_ok"] = launched.get("ok")
     rows[0]["selected"] = launched.get("selected")
     rows[0]["staged_agents"] = launched.get("staged_agents")
+    if launched.get("argv"):
+        rows[0]["argv"] = launched.get("argv")
     staged = launched.get("staged_agents") or {}
     if tools and staged.get("missing"):
         failures.append(
@@ -576,8 +598,12 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
         orch_needles = as_str_list(select.get("orchestration_pass_needles"))
         if pass_mode == "tool_command" and not orch_needles:
             orch_needles = as_str_list(select.get("standalone_pass_tokens"))
-        sent = driver.send_keys(rows[0]["prompt"])
+        sent_prompt = str(rows[0]["prompt"])
+        pre_pane = driver.capture_pane() if hasattr(driver, "capture_pane") else ""
+        pre_echo = _latest_prompt_echo_index(pre_pane, sent_prompt)
+        sent = driver.send_keys(sent_prompt)
         rows[0]["send"] = sent
+        rows[0]["after_echo_index"] = pre_echo
         if not sent.get("ok"):
             failures.append("tmux send-keys failed")
         session_dir = None
@@ -597,10 +623,17 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
             pane=pane,
             session_dir=session_dir,
             since_mtime=session_started,
+            prompt=sent_prompt,
+            after_echo_index=pre_echo,
         )
         recap_present = bool(
             orch_needles
-            and _pane_has_any(pane, orch_needles, prompt=rows[0]["prompt"])
+            and _pane_tool_command_pass(
+                pane,
+                sent_prompt,
+                orch_needles,
+                after_echo_index=pre_echo,
+            )
         )
         wait_complete = recap_present if pass_mode == "tool_command" else evidence.get("ok")
         # Recap/tool-token is wait-complete only. Keep polling until child
@@ -613,10 +646,17 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
                 pane=pane,
                 session_dir=session_dir,
                 since_mtime=session_started,
+                prompt=sent_prompt,
+                after_echo_index=pre_echo,
             )
             recap_present = bool(
                 orch_needles
-                and _pane_has_any(pane, orch_needles, prompt=rows[0]["prompt"])
+                and _pane_tool_command_pass(
+                    pane,
+                    sent_prompt,
+                    orch_needles,
+                    after_echo_index=pre_echo,
+                )
             )
             wait_complete = (
                 recap_present if pass_mode == "tool_command" else evidence.get("ok")
@@ -635,7 +675,12 @@ def _step_tui_orchestration(plan: RunPlan, **_: Any) -> dict[str, Any]:  # noqa:
         if pass_mode == "tool_command":
             tool_pass = bool(
                 orch_needles
-                and _pane_has_any(pane, orch_needles, prompt=rows[0]["prompt"])
+                and _pane_tool_command_pass(
+                    pane,
+                    sent_prompt,
+                    orch_needles,
+                    after_echo_index=pre_echo,
+                )
             )
             rows[0]["tool_pass"] = tool_pass
             if not tool_pass:

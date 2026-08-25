@@ -1,4 +1,4 @@
-"""Stub TUI drivers (codex/grok/opencode). Not launch code."""
+"""Stub TUI drivers (grok/opencode). Not launch code."""
 
 from __future__ import annotations
 

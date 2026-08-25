@@ -7,6 +7,8 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from hv2.pane import _pane_scan_start
+
 
 _UNKNOWN_AGENT_MARKERS = (
     "Unknown agent",
@@ -150,6 +152,78 @@ def _wanted_from_model(value: Any, wanted: Sequence[str]) -> str:
     return ""
 
 
+def _is_alias_identity_value(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return True
+    lowered = text.lower()
+    if lowered in {"none", "null"}:
+        return True
+    if "model_id:none" in lowered.replace(" ", ""):
+        return True
+    return text.startswith("provider-")
+
+
+def _coerce_route_identity(value: Any) -> dict[str, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    provider = str(value.get("producer_provider") or "").strip()
+    model = str(value.get("producer_model") or "").strip()
+    route = str(value.get("producer_route_family") or "").strip()
+    if not provider or not model or not route:
+        return None
+    if _is_alias_identity_value(provider) or _is_alias_identity_value(model):
+        return None
+    return {
+        "producer_provider": provider,
+        "producer_model": model,
+        "producer_route_family": route,
+    }
+
+
+def _walk_named_identity(obj: Any, field: str) -> dict[str, str] | None:
+    if isinstance(obj, Mapping):
+        if field in obj:
+            found = _coerce_route_identity(obj.get(field))
+            if found:
+                return found
+        for nested in obj.values():
+            found = _walk_named_identity(nested, field)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for nested in obj:
+            found = _walk_named_identity(nested, field)
+            if found:
+                return found
+    return None
+
+
+def extract_child_route_identity(
+    records: Iterable[Mapping[str, Any]],
+) -> dict[str, str] | None:
+    """Read observed producer identity from nested Ohmypi records.
+
+    Last valid record wins across the append-only transcript. Within one
+    record, ``aawm_route_identity`` is preferred over
+    ``aawm_encrypted_reasoning_provenance``. Alias prefix, ``model_id:None``,
+    and ``provider-*`` as model are never a pass.
+    """
+
+    latest: dict[str, str] | None = None
+    for obj in records:
+        if not isinstance(obj, Mapping):
+            continue
+        stamp = _walk_named_identity(obj, "aawm_route_identity")
+        provenance = _walk_named_identity(
+            obj, "aawm_encrypted_reasoning_provenance"
+        )
+        found = stamp or provenance
+        if found:
+            latest = found
+    return latest
+
+
 def _result_looks_successful(row: Mapping[str, Any]) -> bool:
     status = str(row.get("status") or "").lower()
     if status in {"error", "failed", "fail", "preflight", "blocked", "running"}:
@@ -205,20 +279,21 @@ def _nested_child_route_row(path: Path, wanted: Sequence[str]) -> dict[str, Any]
 
     A completed PONG/date/fanout after Ohmypi auto-retried onto an
     operational alias (``sota``, ``basic``, …) is a provider-specific
-    failure, not a pass. In-alias model fallback is allowed.
+    failure, not a pass. In-alias model fallback is allowed. Provider
+    aliases require observed ``producer_provider`` / ``producer_model`` /
+    ``producer_route_family`` fields; the alias prefix is not a route.
     """
 
     wanted_set = set(wanted)
     requested = ""
     selected_models: list[str] = []
-    producer_providers: list[str] = []
-    producer_models: list[str] = []
-    producer_routes: list[str] = []
+    records: list[Mapping[str, Any]] = []
     tools: set[str] = set()
     fallback = False
     error = ""
     completed = False
     for obj in _iter_jsonl_objects(path):
+        records.append(obj)
         payload = _message_payload(obj)
         obj_type = str(obj.get("type") or "")
         tool_name = str(payload.get("toolName") or obj.get("toolName") or "")
@@ -252,17 +327,6 @@ def _nested_child_route_row(path: Path, wanted: Sequence[str]) -> dict[str, Any]
         err = payload.get("errorMessage")
         if isinstance(err, str) and err.strip() and not error:
             error = err.strip()
-        blob = json.dumps(obj, default=str)
-        if "producer_provider" in blob:
-            match = re.search(r'"producer_provider"\s*:\s*"([^"]+)"', blob)
-            if match:
-                producer_providers.append(match.group(1))
-            match = re.search(r'"producer_model"\s*:\s*"([^"]+)"', blob)
-            if match:
-                producer_models.append(match.group(1))
-            match = re.search(r'"producer_route_family"\s*:\s*"([^"]+)"', blob)
-            if match:
-                producer_routes.append(match.group(1))
         # Nested bash while the parent is still waiting is not a completed
         # child. Count the nested transcript only after a successful yield
         # or a completed task-result.
@@ -283,12 +347,12 @@ def _nested_child_route_row(path: Path, wanted: Sequence[str]) -> dict[str, Any]
         if name in _OPERATIONAL_FALLBACK_ALIASES and name != requested
     ]
     expected_provider = _provider_id_from_alias(requested)
-    selected_provider = ""
-    unique_producers = list(dict.fromkeys(producer_providers))
-    if unique_producers:
-        selected_provider = unique_producers[-1]
-    elif expected_provider and not escaped:
-        selected_provider = expected_provider
+    identity = extract_child_route_identity(records)
+    selected_provider = identity["producer_provider"] if identity else ""
+    observed_model = identity["producer_model"] if identity else ""
+    observed_route = identity["producer_route_family"] if identity else ""
+    observed_identity = identity is not None
+    requires_observed_identity = bool(expected_provider)
     cross_provider = bool(
         expected_provider
         and selected_provider
@@ -297,16 +361,24 @@ def _nested_child_route_row(path: Path, wanted: Sequence[str]) -> dict[str, Any]
     disposition = "completed"
     if escaped or (fallback and escaped) or cross_provider:
         disposition = "fallback_operational"
-    elif error and not completed:
+    elif error:
         disposition = "unavailable"
     elif not completed:
         disposition = "incomplete"
-    ok = completed and not escaped and not cross_provider
+    elif requires_observed_identity and not observed_identity:
+        disposition = "identity_unobserved"
+    ok = (
+        completed
+        and not escaped
+        and not cross_provider
+        and not error
+        and (observed_identity if requires_observed_identity else True)
+    )
     return {
         "requested_alias": requested,
         "selected_provider": selected_provider,
-        "model": (producer_models[-1] if producer_models else (unique_models[-1] if unique_models else "")),
-        "route_family": producer_routes[-1] if producer_routes else "",
+        "model": observed_model,
+        "route_family": observed_route,
         "endpoint_family": "openai_passthrough/v1/responses",
         "terminal_disposition": disposition,
         "fallback": fallback,
@@ -338,6 +410,8 @@ def child_spawn_evidence(
     pane: str = "",
     session_dir: str | None = None,
     since_mtime: float | None = None,
+    prompt: str | None = None,
+    after_echo_index: int | None = None,
 ) -> dict[str, Any]:
     """Return whether Ohmypi actually spawned the requested child profiles.
 
@@ -351,6 +425,10 @@ def child_spawn_evidence(
     wanted_set = set(wanted)
     failures: list[str] = []
     pane_text = pane or ""
+    if prompt is not None and after_echo_index is not None:
+        scan_start = _pane_scan_start(pane_text, prompt, after_echo_index=after_echo_index)
+        pane_lines = pane_text.splitlines()[scan_start:]
+        pane_text = "\n".join(pane_lines)
     combined = pane_text
     session_paths: list[str] = []
     successful_agents: set[str] = set()
@@ -418,7 +496,11 @@ def child_spawn_evidence(
                     routes[alias] = nested_route
                     if nested_route.get("ok") is True:
                         successful_agents.add(alias)
-                    elif nested_route.get("terminal_disposition") == "fallback_operational":
+                    elif nested_route.get("terminal_disposition") in {
+                        "fallback_operational",
+                        "identity_unobserved",
+                        "unavailable",
+                    }:
                         failed_agents.add(alias)
                         successful_agents.discard(alias)
                     continue
@@ -439,7 +521,11 @@ def child_spawn_evidence(
         if row.get("ok") is True:
             successful_agents.add(alias)
             failed_agents.discard(alias)
-        elif row.get("terminal_disposition") == "fallback_operational":
+        elif row.get("terminal_disposition") in {
+            "fallback_operational",
+            "identity_unobserved",
+            "unavailable",
+        }:
             failed_agents.add(alias)
             successful_agents.discard(alias)
     escaped = [
@@ -451,6 +537,27 @@ def child_spawn_evidence(
         failures.append(
             "orchestration child fell back onto an operational alias or other "
             f"provider (not in-alias fallback): {escaped}"
+        )
+    unobserved = [
+        child
+        for child, row in routes.items()
+        if child in wanted_set and row.get("terminal_disposition") == "identity_unobserved"
+    ]
+    if unobserved:
+        failures.append(
+            "orchestration child completed without observed producer identity "
+            "(selected_provider, model, and route_family must come from "
+            f"transcript producer fields, not the alias prefix): {unobserved}"
+        )
+    unavailable = [
+        child
+        for child, row in routes.items()
+        if child in wanted_set and row.get("terminal_disposition") == "unavailable"
+    ]
+    if unavailable:
+        failures.append(
+            "orchestration child failed with an in-alias provider error "
+            f"(not a pass): {unavailable}"
         )
     missing = [child for child in wanted if child not in successful_agents]
     if missing:

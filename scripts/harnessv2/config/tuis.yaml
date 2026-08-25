@@ -1,11 +1,11 @@
-# TUI drivers. V1 implements Ohmypi only. Claude is not a stub.
+# TUI drivers. Ohmypi and Codex are implemented. Claude is not a stub.
 tuis:
   out_of_scope:
     - claude
   implemented:
     - ohmypi
-  stubs:
     - codex
+  stubs:
     - grok
     - opencode
   ohmypi:
@@ -140,9 +140,146 @@ tuis:
         - LC_CTYPE
         - PI_CONFIG_FILES
         - AAWM_HARNESS_USER_ID
+  # Interactive Codex TUI. Never `codex exec`, never `-p`/`--print` (Codex
+  # `-p` is `--profile`; harness uses `-c model_provider=` instead).
+  # Default live surface is native `basic` and `read` only. Do not add `read`
+  # to models.compiled_aliases.
   codex:
-    enabled: false
-    stub: true
+    enabled: true
+    binary: codex
+    version_min: "0.142.5"
+    cwd: /tmp/hv2-codex-workspace
+    session_dir: /tmp/hv2-codex-sessions
+    default_models:
+      - basic
+      - read
+    default_orchestration_parent: basic
+    default_orchestration_children:
+      - read
+    model_prompt: codex_model
+    orchestration_prompt: codex_orchestration
+    identity:
+      client: Codex
+      client_name: Codex
+      repository: litellm
+      providers:
+        - litellm-alpha
+      headers:
+        x-aawm-client: Codex
+        x-aawm-client-name: Codex
+        x-aawm-repository: litellm
+        langfuse_trace_name: codex
+      header_override: 'model_providers.{provider}.http_headers.{header}="{value}"'
+      model_provider_override: 'model_provider="{lane}"'
+    # Unattended interactive TUI: never `codex exec` / `-p`. These `-c`
+    # overrides keep guardian/on-request from blocking the child `date`/`pwd`.
+    extra_c_overrides:
+      - 'approval_policy="never"'
+      - 'sandbox_mode="workspace-write"'
+      - 'features.guardian_approval=false'
+      - 'projects."{cwd}".trust_level="trusted"'
+    tmux:
+      socket: tmux37
+      session: codex
+      harness_session_prefix: hv2-codex
+      wait_ready_seconds: 25
+      wait_idle_seconds: 180
+      wait_reply_seconds: 600
+      wait_mcp_seconds: 30
+      # Extra floor for a nux that appears after selected chrome. Loading
+      # chrome keeps polling until wait_ready_seconds; prompt-free panes
+      # that already show the selected model skip Enter immediately.
+      wait_trust_seconds: 4
+      poll_interval_seconds: 1
+    forbid_flags:
+      - "-p"
+      - "--print"
+      - "--profile"
+    forbid_tokens:
+      - exec
+    # Codex 0.149 maps Enter to composer newline. Submit is Ctrl-M
+    # (`C-m`). Immediate C-m after paste-buffer is ignored until the
+    # composer finishes ingesting the paste, so wait this many seconds
+    # first. Never send this into the leftover operator `codex` pane.
+    submit_keys:
+      - C-m
+    submit_delay_seconds: 1.0
+    argv_interactive:
+      - codex
+      - --cd
+      - "{cwd}"
+    argv_launch_model:
+      - codex
+      - --cd
+      - "{cwd}"
+      - --model
+      - "{model}"
+    argv_no_tools: []
+    lanes:
+      alias: litellm-alpha
+    model_id_template: "{model}"
+    select_model:
+      strategy: launch_session
+      reuse_operator_session: false
+      tools_for_model: true
+      tools_for_orchestration: true
+      pass_mode: tool_command
+      standalone_pass_tokens:
+        - hv2-codex-child
+      ready_needles:
+        - Codex
+        - codex
+      mcp_ready_needles: []
+      idle_needles:
+        - ">"
+      busy_needles:
+        - Thinking
+        # Match `• Working (18s • esc to interrupt)`, not leftover trust-nux
+        # `Working with untrusted contents` still in capture-pane scrollback.
+        - "Working ("
+        - Streaming
+        - "Waiting For Remaining"
+        - "all running jobs"
+        - "Background job"
+      # Footer `{alias} default` is not selected. Wait for the latest
+      # `model:` header to leave `loading` and show `{alias}` / `{alias} xhigh`.
+      selected_needles:
+        - "{selector}"
+        - "{model}"
+      reply_needles:
+        - hv2-codex-child
+        - "No endpoints found for"
+        - "404 Not Found"
+        - "status code 404"
+        - "Error: 404"
+      provider_404_needles:
+        - "No endpoints found for"
+        - "404 Not Found"
+        - "status code 404"
+        - "Error: 404"
+      orchestration_pass_needles:
+        - hv2-codex-child
+      reject_needles:
+        - "Error: No model selected"
+        - "Unknown model"
+      # First launch into a fresh cwd shows the directory-trust nux.
+      # Dedicated harness sessions auto-accept it (Enter on "Yes, continue").
+      # Never send this into the leftover operator `codex` pane.
+      trust_prompt_needles:
+        - "Do you trust the contents of this directory?"
+        - "Yes, continue"
+      env_keys:
+        - PATH
+        - HOME
+        - USER
+        - LOGNAME
+        - TERM
+        - COLORTERM
+        - TMPDIR
+        - LANG
+        - LC_ALL
+        - LC_CTYPE
+        - AAWM_HARNESS_USER_ID
   grok:
     enabled: false
     stub: true

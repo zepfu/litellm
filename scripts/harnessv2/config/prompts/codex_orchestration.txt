@@ -1,0 +1,10 @@
+You are the parent on alias {parent}.
+
+Call spawn_agent now with model={child} and a non-empty message that tells
+the child to execute a harmless local shell command (`date` or `pwd`) in
+this workspace and return only stdout. Do not run the command yourself.
+Do not spawn any other children.
+
+After the child returns, print that exact stdout on its own line, list the
+child alias, then reply with the exact token hv2-codex-child on its own
+line. Do not print the token until the child's stdout is visible.

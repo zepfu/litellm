@@ -217,8 +217,12 @@ def _tui_spec(tui: str | None, config: Mapping[str, Any]) -> dict[str, Any]:
 
 def _expand_named_models(raw: Any, config: Mapping[str, Any]) -> list[str]:
     if isinstance(raw, (list, tuple)):
-        return _expand_model_args([str(item) for item in raw], config)
+        tokens = split_csv([str(item) for item in raw])
+        return _expand_model_args(tokens, config) if tokens else []
     if raw:
+        tokens = split_csv([str(raw)])
+        if len(tokens) > 1:
+            return _expand_model_args(tokens, config)
         return expand_group(str(raw), config)
     return []
 
@@ -263,10 +267,12 @@ def expand_orchestration_prompt(
 ) -> str:
     """Substitute parent/children placeholders in an orchestration template."""
 
+    first_child = str(children[0]) if children else ""
     return expand_string(
         template,
         {
             "parent": parent,
+            "child": first_child,
             "child_count": str(len(children)),
             "children_block": render_orchestration_children_block(children),
         },

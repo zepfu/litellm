@@ -682,6 +682,7 @@ class OhmypiDriver:
             "idle": idle,
             "replied": replied,
             "pane": pane,
+            "after_echo_index": pre_echo,
         }
 
     def close_session(self) -> None:

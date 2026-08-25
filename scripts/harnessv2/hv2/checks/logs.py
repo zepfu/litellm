@@ -18,6 +18,15 @@ _UVICORN_ACCESS_PATH = re.compile(
 _OHMYPI_ROLLUP_IDENTITY = re.compile(
     r"\S+#Ohmypi\[[^\]\s]+\]@\S+",
 )
+# Codex rollup identity: <repository>#Codex[<version>]@<host>, e.g.
+# litellm#Codex[0.142.5]@thoth / aawm-infrastructure#Codex[0.142.5]@thoth.
+_CODEX_ROLLUP_IDENTITY = re.compile(
+    r"\S+#Codex\[[^\]\s]+\]@\S+",
+)
+_TUI_ROLLUP_IDENTITY = {
+    "ohmypi": (_OHMYPI_ROLLUP_IDENTITY, "Ohmypi"),
+    "codex": (_CODEX_ROLLUP_IDENTITY, "Codex"),
+}
 # Repo token is the \S+ immediately before @ after the rollup timestamp.
 _ROLLUP_REPO_BEFORE_AT = re.compile(
     r"^\d{8} \d{2}:\d{2}:\d{2}(?: \[EARLY\])? (\S+)@"
@@ -66,14 +75,22 @@ def leftover_uvicorn_allow_paths(config: Mapping[str, Any]) -> set[str]:
 
 
 def _is_concurrent_workspace_rollup(hit: str, repos: set[str]) -> bool:
-    """True for <repo>@host /path headers from other AAWM workspaces, not litellm."""
+    """True for <repo>@host /path headers from other AAWM workspaces, not litellm.
+
+    Live operator headers may stamp ``zepfu/aawm-infrastructure@host``; match
+    that against YAML ``aawm-infrastructure`` as well as the full token.
+    Bare ``zepfu@host`` Responses rollups are the same other-workspace class.
+    """
     if not repos:
         return False
     match = _ROLLUP_REPO_BEFORE_AT.search(hit)
     if match is None:
         return False
     repo = match.group(1)
-    return repo != "litellm" and repo in repos
+    if repo == "litellm":
+        return False
+    short = repo.rsplit("/", 1)[-1]
+    return repo in repos or short in repos
 
 
 def _rollup_request_path(hit: str) -> str:
@@ -188,7 +205,9 @@ def scan_log_text(
             failures.append("invalid rollup.header_regex in checks.yaml")
     if require_rollup and header_regex and not rollup_hits:
         failures.append("expected AAWM route-rollup header was not found in docker logs")
-    if require_rollup and rollup_hits and tui == "ohmypi":
+    identity_spec = _TUI_ROLLUP_IDENTITY.get(str(tui or ""))
+    if require_rollup and rollup_hits and identity_spec is not None:
+        identity_re, client_label = identity_spec
         concurrent_repos = {
             repo
             for repo in as_str_list(rollup.get("concurrent_workspace_repos"))
@@ -197,23 +216,27 @@ def scan_log_text(
         concurrent_codex_markers = as_str_list(
             rollup.get("concurrent_codex_client_markers")
         )
-        has_ohmypi_identity = any(
-            _OHMYPI_ROLLUP_IDENTITY.search(hit) for hit in rollup_hits
-        )
+        has_identity = any(identity_re.search(hit) for hit in rollup_hits)
+        other_tui_re = None
+        if str(tui or "") == "codex":
+            other_tui_re = _OHMYPI_ROLLUP_IDENTITY
+        elif str(tui or "") == "ohmypi":
+            other_tui_re = _CODEX_ROLLUP_IDENTITY
         unidentified = [
             hit
             for hit in rollup_hits
-            if not _OHMYPI_ROLLUP_IDENTITY.search(hit)
+            if not identity_re.search(hit)
             and not _is_concurrent_workspace_rollup(hit, concurrent_repos)
             and not _is_concurrent_codex_client_rollup(
                 hit, text, concurrent_codex_markers
             )
+            and not (other_tui_re is not None and other_tui_re.search(hit))
         ]
-        if not has_ohmypi_identity or unidentified:
+        if not has_identity or unidentified:
             suffix = f": {'; '.join(unidentified)}" if unidentified else ""
             failures.append(
-                "Ohmypi rollup headers lacked a client identity "
-                "(repository#Ohmypi[version]@host)" + suffix
+                f"{client_label} rollup headers lacked a client identity "
+                f"(repository#{client_label}[version]@host)" + suffix
             )
 
     traceback_hits = [needle for needle in traceback_needles if needle and needle in text]

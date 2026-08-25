@@ -3,3 +3,7 @@ prompts:
     file: prompts/pong.txt
   orchestration:
     file: prompts/orchestration.txt
+  codex_model:
+    file: prompts/codex_model.txt
+  codex_orchestration:
+    file: prompts/codex_orchestration.txt
