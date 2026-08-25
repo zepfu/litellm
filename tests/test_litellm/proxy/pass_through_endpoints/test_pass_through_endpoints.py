@@ -8329,6 +8329,11 @@ class _FakeStreamingResponse:
     def __init__(self, chunks: list[bytes]):
         self._chunks = chunks
         self.headers = {}
+        self.status_code = 200
+        self.request = httpx.Request(
+            "POST",
+            "https://chatgpt.com/backend-api/codex/responses",
+        )
 
     async def aiter_bytes(self):
         for chunk in self._chunks:
@@ -8337,8 +8342,17 @@ class _FakeStreamingResponse:
 
 @pytest.mark.asyncio
 async def test_chunk_processor_records_segmented_streaming_metrics():
-    response = _FakeStreamingResponse([b'data: {"delta":1}\n\n', b"data: [DONE]\n\n"])
+    delta_chunk = (
+        b'data: {"type":"response.output_text.delta","delta":"1"}\n\n'
+    )
+    completed_chunk = (
+        b'data: {"type":"response.completed","response":{"id":"resp_test","created_at":1,"model":"gpt-5.4","object":"response","output":[],"status":"completed"}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    response = _FakeStreamingResponse([delta_chunk, completed_chunk])
     logging_obj = MagicMock()
+    logging_obj.async_success_handler = AsyncMock()
+    logging_obj._should_run_sync_callbacks_for_async_calls.return_value = False
     success_handler_kwargs = {
         "litellm_params": {"metadata": {}},
         "standard_logging_object": {"metadata": {}, "request_tags": []},
@@ -8363,7 +8377,21 @@ async def test_chunk_processor_records_segmented_streaming_metrics():
 
     await asyncio.sleep(0)
 
-    assert chunks == [b'data: {"delta":1}\n\n', b"data: [DONE]\n\n"]
+    assert chunks[0] == delta_chunk
+    assert len(chunks) == 2
+    completed_wire = chunks[1]
+    assert completed_wire.endswith(b"data: [DONE]\n\n")
+    completed_payload_line = next(
+        line
+        for line in completed_wire.decode("utf-8").splitlines()
+        if line.startswith("data:") and "[DONE]" not in line
+    )
+    completed_event = json.loads(completed_payload_line.removeprefix("data:").strip())
+    assert completed_event["type"] == "response.completed"
+    completed_response = completed_event["response"]
+    assert completed_response["id"] == "resp_test"
+    assert completed_response["status"] == "completed"
+    assert completed_response["model"] == "gpt-5.4"
     metadata = success_handler_kwargs["litellm_params"]["metadata"]
     assert metadata["aawm_stream_chunk_count"] == 2
     assert metadata["aawm_stream_total_bytes"] > 0
