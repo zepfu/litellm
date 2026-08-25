@@ -3,6 +3,10 @@
 YAML/JSON-first LiteLLM acceptance harness. Implemented TUIs are Ohmypi
 and Codex. Claude is out of scope. Grok and OpenCode are stubs.
 
+Current Harness v2 closeout excludes Anthropic/Claude provider, model,
+alias, TUI, test, and acceptance work. Do not select or run it.
+Historical Anthropic/Claude mentions are legacy/non-goal.
+
 **Operator document (as-built runner + intended testing process):**
 [`TESTING.md`](TESTING.md). Legacy Claude/Codex harnesses stay in
 `TEST_HARNESS.md` and `scripts/local-ci/`.
@@ -65,7 +69,7 @@ a baseline full-suite step.
 |---|---|---|
 | `platform` | forbidden | Health, custom endpoints, error JSONL, Redis prefix SCAN, docker logs |
 | `catalog` | optional | CFG-023/024 HTTP catalog; Ohmypi picker if `--tui ohmypi`; Codex skips live picker |
-| `model` | required | Independent per-alias TUI turn (not baseline). Ohmypi: idle exact PONG or provider 404. Codex: tool-bearing child command on `basic`/`read` |
+| `model` | required | Independent per-alias TUI turn (not baseline). Ohmypi: idle exact PONG or provider 404. Codex: tool-bearing child `date`/`pwd` stdout plus `hv2-codex-child` on `basic`/`read`; local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome is not a pass |
 | `orchestration` | required | Parent alias spawns children. Ohmypi default is the nine mixed aliases; `--orchestration-children provider_coverage` spawns the provider-pinned aliases. Codex uses a smaller parent/child set |
 
 `--test model` and `--test orchestration` launch a dedicated interactive
@@ -74,8 +78,12 @@ with `--model litellm-alpha-passthrough/<alias>`. Codex uses
 `hv2-codex-<model>-<pid>` and `codex --cd … --model <alias>` plus `-c`
 identity header overrides. They never use `-p` / `--print` / `codex exec`
 and they do not reuse leftover operator panes (`omp-alpha-test` or
-`codex`). Leave dedicated `hv2-*` sessions open after `_step_tui_model`
-and `_step_tui_orchestration`. Do not close them at the end of those
+`codex`). Codex 0.149 submit waits until the latest `model:` header
+leaves `loading` (footer `{alias} default` is not selected), then uses
+YAML `submit_keys` (`C-m`) after `submit_delay_seconds` (default `1.0`);
+Enter is a composer newline.
+Leave dedicated `hv2-*` sessions open after `_step_tui_model` and
+`_step_tui_orchestration`. Do not close them at the end of those
 kinds. Operator inspects leftovers after a claimed pass:
 
 ```text
@@ -86,18 +94,23 @@ tmux -L tmux37 attach -t <hv2-ohmypi-…>
 Leftover count: platform 0, catalog 0 (HTTP; optional picker does not
 leave a dedicated inspect session as a baseline leftover), optional
 `--test model` / `--model all` = one dedicated session per compiled
-alias (including `provider-*`), orchestration = 1 parent session.
+alias (including `provider-*` except `provider-anthropic` and all
+`claude-*` aliases, which current closeout must not select or run),
+orchestration = 1 parent session.
 Baseline walk leftover is the orch parent session, not the full
 `--model all` leftover set.
 
 Ohmypi `--model all` expands compiled aliases, including OMP-facing
 `auto-review`, Codex-client compatibility `codex-auto-review`, and the
-`provider-<id>` aliases. Codex `--test model` defaults to `basic` and
+`provider-<id>` aliases except `provider-anthropic` and all `claude-*`
+aliases. Those remain catalog/history facts, not current closeout
+selection/run targets. Codex `--test model` defaults to `basic` and
 `read` only; `read` is not a compiled alias. Do not treat Ohmypi
 `--model all` as the Codex OC-003 surface. Codex model/orchestration is
 tool-bearing (child `date`/`pwd`); it is not Ohmypi `--no-tools` PONG.
 `--tui grok` and `--tui opencode` remain stubs. `--tui claude` stays out
-of scope.
+of scope and is excluded from current closeout (do not select or run;
+historical mentions are legacy/non-goal).
 
 Provider-pinned orchestration is a separate group. It is not the
 baseline mixed-alias walk:
@@ -113,8 +126,10 @@ python scripts/harnessv2/run.py \
 ```
 
 That plan must stay tools-on. Each child is a `provider-<id>` Ohmypi
-`agent=` profile. Credential, quota, tool-contract, and provider errors
-fail that provider; they are not converted into a mixed-alias pass. Never
+`agent=` profile except `provider-anthropic` and all `claude-*` aliases,
+which current closeout `provider_coverage` must not select or run.
+Credential, quota, tool-contract, and provider errors fail that
+provider; they are not converted into a mixed-alias pass. Never
 target `aawm-litellm` or `litellm-dev`.
 
 For `--test model` the driver waits until the TUI returns idle, then
@@ -179,9 +194,21 @@ recap-only is not a pass. Leftover uvicorn ACCESS except `/health*` is
 0 on alpha as of 2026-08-22 (including native `GET /v2/model/info`
 500). Empty `docker logs --since` windows are not leftover-uvicorn
 pass. Post-TUI `docker_logs` polls up to
-`checks.logs.rollup.settle_seconds` when the AAWM route-rollup header
-is the only miss (bind-mount alpha can emit it after the pane goes
-idle). Leftover uvicorn still fails immediately.
+`checks.logs.rollup.settle_seconds` (default 180s) when the AAWM
+route-rollup header is the only miss, including a 0-byte window
+after ACCESS replacement. Bind-mount alpha can emit the header after
+the pane goes idle (60s rollup flush plus leftover-session grouping).
+Leftover uvicorn still fails immediately.
+
+## Closeout checkpoint
+
+Fail-fast continuation for the current closeout: record the last passed
+node and the exact failed node. After a fix, rely on existing focused
+evidence for the corrected node, then run only the first unverified
+successor and later nodes/files. Never rerun a passed prefix or the
+full gate unless that evidence is invalidated or the operator
+explicitly requests it. At the next failure: stop, preserve the
+checkpoint, fix, and continue there.
 
 ## Unit tests
 

@@ -7,6 +7,10 @@ harness in `scripts/harnessv2/`. It describes what is built, what it is
 allowed to touch, how a live run is supposed to proceed, and what still
 blocks a full wrap-up.
 
+Current Harness v2 closeout excludes Anthropic/Claude provider, model,
+alias, TUI, test, and acceptance work. Do not select or run it.
+Historical Anthropic/Claude mentions are legacy/non-goal.
+
 Quick CLI cheat sheet: `scripts/harnessv2/README.md`.
 Policy split vs the legacy Claude/Codex harnesses: `TEST_HARNESS.md`.
 Implementation plan / traceback ids: `.analysis/202608/harnessv2-tui-agnostic-plan.md`.
@@ -35,7 +39,10 @@ only when a new *kind of step* is invented. Adding a model, prompt,
 forbidden log string, HTTP probe, or Ohmypi argv token is a YAML edit.
 
 Implemented TUIs are Ohmypi (`omp` 17.3.8 via `ompla`) and Codex
-(`codex` interactive TUI). Claude is out of scope, not a stub. Grok and
+(`codex` interactive TUI). Claude is out of scope, not a stub, and is
+excluded from current closeout: do not select or run Anthropic/Claude
+provider, model, alias, TUI, test, or acceptance work. Historical
+mentions are legacy/non-goal. Grok and
 OpenCode remain stubs (`enabled: false`). Codex never uses `codex exec`,
 `-p`, or `--print`.
 
@@ -150,7 +157,9 @@ DB / `LITELLM_MASTER_KEY` secrets (`checks.yaml` `child_env`).
 
 `--model all` expands `compiled_aliases` only, including both
 OMP-facing `auto-review` and Codex-client compatibility
-`codex-auto-review`:
+`codex-auto-review`. Current closeout selection/run omits
+`provider-anthropic` and all `claude-*` aliases from that expansion;
+they remain catalog/history facts:
 
 - `basic`, `work`, `work-other`, `expert`, `sota`
 - `sota-openai`, `sota-xai`, `sota-alibaba`, `sota-moonshot`,
@@ -161,22 +170,29 @@ OMP-facing `auto-review` and Codex-client compatibility
   `provider-xai`, `provider-kimi_code`, `provider-alibaba_token_plan`,
   `provider-zai_coding_plan`, `provider-cohere`, `provider-nous`,
   `provider-cursor_agent`, `provider-opencode_zen`,
-  `provider-opencode_go`). NVIDIA is not registered and is not
-  invented.
+  `provider-opencode_go`, `provider-nvidia`). `provider-nvidia` is a
+  closed same-provider NVIDIA NIM alias: NVIDIA NIM credentials only,
+  no `alias_reference`, no OpenRouter free Nemotron substitution.
+  Validate only `provider-nvidia`; mixed-alias success is not NVIDIA
+  evidence.
 
 Skip prefixes: `aawm-`, `claude-`. Absent catalog ids
 (`aawm-sota-zai`, …) are recorded so a picker must not treat them as
-present.
+present. `provider-anthropic` and `claude-*` are catalog/history facts,
+not current closeout selection/run targets.
 
 Groups:
 
-- `all` → compiled aliases
+- `all` → compiled aliases except `provider-anthropic` and all
+  `claude-*` aliases (catalog/history only; do not select or run)
 - `all-sota` → the six `sota-*` parents
 - `orchestration_children` (nine) → `basic`, `work`, `expert`, `sota`,
   `sota-xai`, `sota-alibaba`, `sota-moonshot`, `sota-zai`, `auto-review`.
   Spawn name is `auto-review`, not `codex-auto-review`. Not orchestration
   children: `work-other`, `sota-deepseek`, `codex-auto-review`.
-- `provider_coverage` → every `provider-<id>` alias. This is the
+- `provider_coverage` → every `provider-<id>` alias except
+  `provider-anthropic`. All `claude-*` aliases stay omitted from current
+  closeout selection/run. This is the
   provider-pinned Ohmypi orchestration group. It is not mixed into
   `orchestration_children`. A pass for provider P requires selected
   provider P (in-alias fallback only). Missing credentials, quota,
@@ -312,9 +328,11 @@ Not mixed orch children: `work-other`, `sota-deepseek`,
 
 Provider-pinned coverage is a **separate** group. Select it with
 `--orchestration-children provider_coverage` (or an explicit
-`provider-*` list). That group must not depend on whichever provider
-happens to win `basic` / `work` / `expert` / `sota`. Mixed-alias
-success is not provider-coverage evidence.
+`provider-*` list). Current closeout must omit `provider-anthropic` and
+all `claude-*` aliases from that group and from any explicit `provider-*`
+list (catalog/history only; do not select or run). That group must not
+depend on whichever provider happens to win `basic` / `work` / `expert`
+/ `sota`. Mixed-alias success is not provider-coverage evidence.
 
 Launches the parent with tools enabled. Pastes
 `prompts/orchestration.txt` with `{parent}` and the planned children
@@ -454,34 +472,41 @@ From `config/tuis.yaml`:
 | Binary | `codex` (interactive TUI; never `codex exec`) |
 | Min version | 0.142.5 |
 | Overlay | `-c model_provider="litellm-alpha"` plus `-c model_providers.litellm-alpha.http_headers.x-aawm-client*=…`. That overlay stamps rollup as `litellm#Codex[<version>]@<host>`. Extra `-c` from `tuis.codex.extra_c_overrides` keep unattended child `date`/`pwd` from blocking on guardian/`on-request` (`approval_policy="never"`, `sandbox_mode="workspace-write"`, `features.guardian_approval=false`). Still never `codex exec` / `-p`. |
-| CWD | `/tmp/hv2-codex-workspace` (`--cd`) |
+| CWD | dedicated `/tmp/hv2-codex-workspace-<session>` (`--cd`); leftover sessions do not share one workspace |
 | Session dir | `/tmp/hv2-codex-sessions/hv2-<alias>` |
-| tmux socket | `tmux37` |
+| tmux socket | `tmux37` (`wait_reply_seconds` 600, `wait_idle_seconds` 180) |
 | Default models | `basic`, `read` (`read` is not in `compiled_aliases`) |
 | Default orch | parent `basic`, child `read` |
 | Forbid | `-p`, `--print`, `--profile`, `exec` |
 | Model tools | on (not `--no-tools` PONG) |
 | Orchestration tools | on |
-| Model pass | standalone `hv2-codex-child` after a spawned child runs `date`/`pwd`; provider 404 needles |
+| Model pass | standalone `hv2-codex-child` **and** a current-turn child spawn plus `Ran date` / `Ran pwd` context with compatible stdout after `spawn_agent` with `model=basic` and a non-empty message (Codex may prefix the token with `• `). Local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome, a workspace path alone, or a token with no stdout, is not a pass. Provider 404 needles do not pass Codex `tool_command`. Do not spawn ChatGPT-unsupported child models (`qwen`/`kimi`/`deepseek`/`grok`/`moonshot`). Leftover trust-nux `Working with untrusted contents` is not a busy needle; in-flight work is `Working (`. |
 
 `--tui grok` and `--tui opencode` remain stubs. `--tui claude` stays out
-of scope. `--test platform --tui codex` is still forbidden. Protected
+of scope and is excluded from current closeout (do not select or run;
+historical mentions are legacy/non-goal). `--test platform --tui codex`
+is still forbidden. Protected
 containers `aawm-litellm` / `litellm-dev` and ports `4000` / `4001` still
 fail closed.
 
 Do not send-keys into an existing operator `codex` pane. Every
 `--test model` / `--test orchestration` row creates
 `hv2-codex-<alias>-<pid>` on socket `tmux37`. Never `codex exec -p`.
-Never reuse leftover operator sessions. A first launch into
-`/tmp/hv2-codex-workspace` may show Codex's directory-trust nux
-(`Do you trust the contents of this directory?`); the driver
-polls `wait_trust_seconds` (default 4s) and accepts
-`Yes, continue` with Enter in that dedicated session only.
-Prompt-free launches that already show the selected model skip
-that poll and do not send Enter. Composer submit is YAML
-`submit_keys` (default `C-m`); Codex 0.149 maps Enter to a
-newline, so `send-keys … Enter` leaves the prompt unsubmitted.
-Never send that submit chord into leftover operator panes.
+Never reuse leftover operator sessions. A first launch into a dedicated
+`/tmp/hv2-codex-workspace-<session>` may show Codex's directory-trust nux
+(`Do you trust the contents of this directory?`); the driver accepts
+`Yes, continue` with Enter in that dedicated session only. Codex 0.149
+paints `model: loading` before the nux, so the driver keeps polling
+until the selected model is visible or `wait_ready_seconds` elapses
+rather than stopping at `wait_trust_seconds`. Prompt-free launches that
+already show the selected model skip that poll and do not send Enter.
+The latest `model:` header must leave `loading` before paste, otherwise
+the prompt queues as a follow-up. Composer
+submit is YAML `submit_keys` (default `C-m`) after YAML
+`submit_delay_seconds` (default `1.0`); Codex 0.149 maps Enter to a
+newline, and immediate `C-m` after `paste-buffer` is ignored until
+the composer finishes ingesting the paste. Never send that submit
+chord into leftover operator panes.
 Codex `--model all` still
 expands compiled aliases if the operator asks, but the Codex default
 path (`--model` omitted) is `basic` + `read`, not the Ohmypi 13-alias
@@ -493,10 +518,13 @@ matrix.
 
 After every kind, `docker_logs` scans alpha logs since run start.
 TUI kinds (`model`, `orchestration`) also poll that window for
-`checks.logs.rollup.settle_seconds` (default 90s, poll
+`checks.logs.rollup.settle_seconds` (default 180s, poll
 `settle_poll_seconds`) when the only miss is a delayed AAWM
-route-rollup header. Leftover uvicorn / Traceback / ASGI still fail
-on the first scan and do not wait out the settle budget.
+route-rollup header. ACCESS replacement can leave a successful TUI
+turn as a 0-byte docker-logs window until the 60s rollup flush
+(plus leftover-session grouping). Leftover uvicorn / Traceback /
+ASGI still fail on the first scan and do not wait out the settle
+budget.
 
 **Hard stop** (run `ok: false`, remaining steps skipped as
 `halted_on_logging_regression`):
@@ -644,7 +672,8 @@ leftover-uvicorn invert, Ohmypi forbid `-p`, Ohmypi rollup identity
 `litellm@thoth` + `codex-auto-review`), Codex interactive TUI plans
 (`basic`/`read`, identity overlay, dedicated tmux, no print/exec),
 Codex rollup identity (`tui=codex`), grok/opencode stubs, Claude out of
-scope, dry-run plans, H-6 prompt substring needles.
+scope and excluded from current closeout (historical mentions
+legacy/non-goal), dry-run plans, H-6 prompt substring needles.
 
 ### Dry-run a kind
 
@@ -729,7 +758,9 @@ python scripts/harnessv2/run.py \
   --write-artifact /tmp/hv2-orch-sota-openai.json
 ```
 
-Provider-pinned live run (tools on, never prod/dev):
+Provider-pinned live run (tools on, never prod/dev). Current closeout
+`provider_coverage` omits `provider-anthropic` and all `claude-*`
+aliases; do not select or run them:
 
 ```text
 python scripts/harnessv2/run.py \
@@ -803,6 +834,15 @@ python scripts/harnessv2/run.py \
 9. Keep `TEST_HARNESS.md` / this document / the plan file in sync when
    halt signatures or spawn contract change.
 
+### Closeout checkpoint (fail-fast continuation)
+
+Record the last passed node and the exact failed node. After a fix,
+rely on existing focused evidence for the corrected node, then run
+only the first unverified successor and later nodes/files. Never
+rerun a passed prefix or the full gate unless that evidence is
+invalidated or the operator explicitly requests it. At the next
+failure: stop, preserve the checkpoint, fix, and continue there.
+
 Alpha is testing-only. Uncommitted halt-fixes in the shared checkout
 are visible to the bind-mount immediately after watchfiles reload.
 
@@ -833,7 +873,7 @@ Proven on `litellm-alpha` (do not re-claim without a new artifact):
 | Nine-child orch `docker_logs` | Live 2026-08-23 on `cceab88cd3` had TUI `child_evidence.ok` for all nine children and leftover `hv2-ohmypi-sota-openai-3839403`. `docker_logs` failed on concurrent `aawm-infrastructure@thoth` until the §7 workspace filter. Live 2026-08-23 retry3 on `e397f7b12e` failed `docker_logs` on concurrent `litellm@thoth /openai_passthrough/responses` + `codex-auto-review` until the §7 Codex-client filter. Do **not** treat those artifacts as a full orch pass until TUI and `docker_logs` are both green. Identity miss is a `docker_logs` fail, not leftover-uvicorn halt. |
 | Nine-child orch TUI spawn | Live 2026-08-23 retry3 on `e397f7b12e` missed `basic` / `work` / `expert` / `sota` (Ohmypi no-yield / null yield). Separate from the §7 identity gate. |
 | Native `/v2/model/info` HTTP 500 body | `DB not connected` when `prisma_client is None`. Separate from leftover ACCESS. T-5 logging-halt does **not** require this body to become 200. |
-| Anthropic/Claude TUI | deferred (account canceled); still out of scope for v2 |
+| Anthropic/Claude TUI | excluded from current closeout; do not select or run. Historical/deferred mentions are legacy/non-goal |
 
 ---
 
