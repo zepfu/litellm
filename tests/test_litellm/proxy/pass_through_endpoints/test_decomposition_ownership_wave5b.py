@@ -340,6 +340,8 @@ class TestModelResolutionBindingSafety:
             "_alibaba_token_plan_adapters": object(),
             "_OPENCODE_ZEN_PROVIDER": "opencode_zen",
             "_OPENCODE_ZEN_FREE_MODELS": frozenset(),
+            "_OPENCODE_GO_PROVIDER": "opencode_go",
+            "_OPENCODE_GO_FREE_MODELS": frozenset(),
             "_ANTHROPIC_RESPONSES_ADAPTER_ENDPOINTS": frozenset(),
             "_ANTHROPIC_OPENAI_RESPONSES_ADAPTER_ALLOWED_MODELS": frozenset(),
             "_ANTHROPIC_NVIDIA_RESPONSES_ADAPTER_ALLOWED_MODELS": frozenset(),
