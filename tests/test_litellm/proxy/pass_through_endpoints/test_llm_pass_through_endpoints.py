@@ -21775,6 +21775,7 @@ def test_auto_agent_alias_route_event_prefers_real_opencode_zen_target(monkeypat
             "incoming_endpoint": "/openai_passthrough/responses",
             "outgoing_target": "opencode.ai/zen/v1/chat/completions",
             "model_label": "deepseek-v4-flash-free(basic)",
+            "effort": "none",
             "turns": 0,
             "status": "Cooling Down",
             "message": None,
