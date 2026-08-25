@@ -819,6 +819,177 @@ def test_rr006_shutdown_remainder_spool_failure_tracks_abandoned(
     }
 
 
+def _reset_session_history_recovery_state() -> None:
+    aawm_agent_identity._aawm_session_history_shutdown_in_progress = False
+    aawm_agent_identity._aawm_session_history_shutdown_deadline_monotonic = 0.0
+    aawm_agent_identity._aawm_session_history_worker_inflight_records = []
+    writer._set_state("_aawm_session_history_recovery_inflight_spooled", 0)
+    writer._set_state("_aawm_session_history_recovery_queued", 0)
+    writer._set_state("_aawm_session_history_recovery_inflight_ids", set())
+
+
+def test_rr006_normal_worker_flush_times_out_spools_resets_pool_and_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hung_records = [{"litellm_call_id": "hung-1"}]
+    later_records = [{"litellm_call_id": "later-1"}]
+    persist_ids: list[str] = []
+    spooled: list[list[dict[str, Any]]] = []
+    pool_resets: list[Any] = []
+
+    async def persist_records(records: list[dict[str, Any]]) -> None:
+        persist_ids.append(str(records[0]["litellm_call_id"]))
+        if records[0]["litellm_call_id"] == "hung-1":
+            await asyncio.Event().wait()
+
+    def spool_records(batch: list[dict[str, Any]], **_kwargs: Any) -> str:
+        spooled.append(list(batch))
+        return "/tmp/grok-goal-703298f7d7bd/implementer/session-history-timeout.jsonl"
+
+    original_reset = writer._reset_session_history_pool_after_retryable_failure
+
+    def reset_pool(loop: Any) -> int:
+        pool_resets.append(loop)
+        return original_reset(loop)
+
+    _reset_session_history_recovery_state()
+    monkeypatch.setattr(
+        aawm_agent_identity, "_persist_session_history_records", persist_records
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity, "_spool_session_history_records", spool_records
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_get_session_history_command_timeout_seconds",
+        lambda: 0.05,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_get_session_history_failed_flush_max_retries",
+        lambda: 1,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_get_session_history_failed_flush_retry_seconds",
+        lambda: 0.0,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_reset_session_history_pool_after_retryable_failure",
+        reset_pool,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_ensure_session_history_spool_drainer_started",
+        lambda: None,
+    )
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", lambda *a, **k: None)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "exception", lambda *a, **k: None)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "error", lambda *a, **k: None)
+    monkeypatch.setattr(aawm_agent_identity.time, "sleep", lambda _seconds: None)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        writer._flush_session_history_worker_batch(hung_records, loop)
+        assert persist_ids.count("hung-1") >= 1
+        assert spooled == [hung_records]
+        assert pool_resets
+        assert writer._session_history_recovery_disposition()["inflight_spooled"] == 1
+        writer._flush_session_history_worker_batch(later_records, loop)
+        assert persist_ids[-1] == "later-1"
+        assert writer._session_history_recovery_disposition()["inflight_spooled"] == 1
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
+def test_rr006_saturated_queue_drains_to_zero_without_overflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capacity = 4
+    q: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=capacity)
+    for index in range(capacity):
+        q.put({"litellm_call_id": f"queued-{index}"})
+    assert q.full()
+    overflow_drains: list[int] = []
+
+    async def persist_records(_records: list[dict[str, Any]]) -> None:
+        return None
+
+    def drain_for_spool(max_records: int) -> list[dict[str, Any]]:
+        overflow_drains.append(max_records)
+        raise AssertionError("overflow dequeue must not drain the saturated queue")
+
+    _reset_session_history_recovery_state()
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", q)
+    monkeypatch.setattr(
+        aawm_agent_identity, "_persist_session_history_records", persist_records
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity, "_drain_session_history_queue_for_spool", drain_for_spool
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_get_session_history_command_timeout_seconds",
+        lambda: 5.0,
+    )
+    monkeypatch.setattr(
+        aawm_agent_identity,
+        "_ensure_session_history_spool_drainer_started",
+        lambda: None,
+    )
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "warning", lambda *a, **k: None)
+    monkeypatch.setattr(aawm_agent_identity.verbose_logger, "debug", lambda *a, **k: None)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        saw_below_capacity = False
+        while True:
+            try:
+                item = q.get_nowait()
+            except queue.Empty:
+                break
+            writer._flush_session_history_worker_batch([item], loop)
+            if q.qsize() < capacity:
+                saw_below_capacity = True
+        assert saw_below_capacity is True
+        assert q.qsize() == 0
+        assert overflow_drains == []
+        assert writer._session_history_recovery_disposition()["queued"] == 0
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
+def test_rr006_controlled_recovery_disposition_is_idempotent_for_inflight(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inflight = [{"litellm_call_id": "inflight-1"}]
+    queued = queue.Queue()
+    queued.put({"litellm_call_id": "queued-1"})
+    queued.put({"litellm_call_id": "queued-2"})
+
+    _reset_session_history_recovery_state()
+    monkeypatch.setattr(aawm_agent_identity, "_aawm_session_history_queue", queued)
+    writer._session_history_track_worker_batch(inflight)
+
+    first = writer._session_history_mark_recovery_inflight_spooled(inflight)
+    second = writer._session_history_mark_recovery_inflight_spooled(inflight)
+    claimed = writer._session_history_claim_worker_batch(inflight)
+    claimed_again = writer._session_history_claim_worker_batch(inflight)
+    disposition = writer._session_history_recovery_disposition()
+
+    assert first == 1
+    assert second == 0
+    assert claimed == inflight
+    assert claimed_again == []
+    assert disposition["inflight_spooled"] == 1
+    assert disposition["queued"] == 2
+
+
 def test_rr006_shutdown_session_history_worker_lock_not_reentered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

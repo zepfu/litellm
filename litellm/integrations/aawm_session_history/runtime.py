@@ -24,6 +24,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Set,
     Tuple,
 )
 
@@ -181,6 +182,9 @@ _aawm_session_history_shutdown_deadline_monotonic = 0.0
 _aawm_session_history_shutdown_records_drained = 0
 _aawm_session_history_shutdown_records_spooled = 0
 _aawm_session_history_shutdown_records_abandoned = 0
+_aawm_session_history_recovery_inflight_spooled = 0
+_aawm_session_history_recovery_queued = 0
+_aawm_session_history_recovery_inflight_ids: Set[str] = set()
 _aawm_session_history_worker_inflight_records: List[Dict[str, Any]] = []
 _aawm_session_history_degraded_lock = threading.Lock()
 _aawm_session_history_degraded_until_monotonic = 0.0

@@ -59,6 +59,9 @@ from litellm.integrations.aawm_session_history.runtime import (  # noqa: F401
     _aawm_session_history_schema_lock,
     _aawm_session_history_schema_ready,
     _aawm_session_history_shutdown_records_abandoned,
+    _aawm_session_history_recovery_inflight_spooled,
+    _aawm_session_history_recovery_queued,
+    _aawm_session_history_recovery_inflight_ids,
     _aawm_session_history_worker_inflight_records,
     _aawm_session_history_spool_drain_lock,
     _aawm_session_history_spool_drainer,
@@ -165,6 +168,51 @@ def _session_history_shutdown_disposition() -> Dict[str, int]:
             "spooled": int(_state("_aawm_session_history_shutdown_records_spooled")),
             "abandoned": int(_state("_aawm_session_history_shutdown_records_abandoned")),
         }
+
+
+def _session_history_record_identity(record: Dict[str, Any]) -> str:
+    for key in ("litellm_call_id", "id", "session_id"):
+        value = record.get(key)
+        if isinstance(value, str) and value:
+            return f"{key}:{value}"
+    return f"id:{id(record)}"
+
+
+def _session_history_recovery_disposition() -> Dict[str, int]:
+    with _state("_aawm_session_history_shutdown_lock"):
+        try:
+            queued = int(_state("_aawm_session_history_queue").qsize())
+        except Exception:
+            queued = int(_state("_aawm_session_history_recovery_queued"))
+        return {
+            "inflight_spooled": int(
+                _state("_aawm_session_history_recovery_inflight_spooled")
+            ),
+            "queued": queued,
+        }
+
+
+def _session_history_mark_recovery_inflight_spooled(
+    records: List[Dict[str, Any]],
+) -> int:
+    if not records:
+        return 0
+    newly_marked = 0
+    with _state("_aawm_session_history_shutdown_lock"):
+        known_ids = _state("_aawm_session_history_recovery_inflight_ids")
+        for record in records:
+            identity = _session_history_record_identity(record)
+            if identity in known_ids:
+                continue
+            known_ids.add(identity)
+            newly_marked += 1
+        if newly_marked:
+            _set_state(
+                "_aawm_session_history_recovery_inflight_spooled",
+                int(_state("_aawm_session_history_recovery_inflight_spooled"))
+                + newly_marked,
+            )
+    return newly_marked
 
 
 def _session_history_mark_shutdown_disposition(
@@ -536,7 +584,12 @@ def _flush_session_history_worker_batch(
                 )
                 return
             return
-        _call("_flush_session_history_batch_with_retry", records, loop=loop)
+        _call(
+            "_flush_session_history_batch_with_retry",
+            records,
+            loop=loop,
+            timeout_seconds=_call("_get_session_history_command_timeout_seconds"),
+        )
     finally:
         _session_history_finish_worker_batch(records)
 

@@ -341,6 +341,7 @@ def _prepare_session_history_retry_after_failure(
                 failure=last_failure,
                 start_drainer=False,
             )
+            _call("_session_history_mark_recovery_inflight_spooled", batch)
         except Exception as spool_exc:
             verbose_logger.exception(
                 "AawmAgentIdentity: failed to write retry-protection "
@@ -439,6 +440,7 @@ def _flush_session_history_batch_with_retry(
     *,
     loop: Optional[asyncio.AbstractEventLoop] = None,
     retry_message: str = "session_history batch flush",
+    timeout_seconds: Optional[float] = None,
 ) -> None:
     retry_seconds = _call("_get_session_history_failed_flush_retry_seconds", )
     max_retries = _call("_get_session_history_failed_flush_max_retries", )
@@ -456,6 +458,7 @@ def _flush_session_history_batch_with_retry(
     while not _call("_flush_session_history_batch",
         batch,
         loop=loop,
+        timeout_seconds=timeout_seconds,
         log_exception=retry_count == 0,
         failure_callback=_capture_failure,
         ensure_spool_drainer=retry_write_ahead_spool_path is None,
