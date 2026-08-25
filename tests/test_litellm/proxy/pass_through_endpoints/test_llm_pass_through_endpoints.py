@@ -21578,6 +21578,7 @@ def test_auto_agent_alias_route_event_records_source_error_on_rollup(monkeypatch
             "incoming_endpoint": "/openai_passthrough/responses",
             "outgoing_target": "codex_xai_oauth_responses_adapter",
             "model_label": "oa_xai/grok-4.5(sota-xai)",
+            "effort": "none",
             "turns": 0,
             "status": "Cooling Down",
             "message": "Grok Build usage balance exhausted",
