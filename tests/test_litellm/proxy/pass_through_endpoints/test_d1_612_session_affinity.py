@@ -2211,6 +2211,270 @@ def test_d614_rollup_failure_still_raises_identical_409() -> None:
     assert failed.detail == baseline.detail
 
 
+def _d614_uvicorn_access_record(
+    *,
+    client: str,
+    method: str,
+    path: str,
+    status: int,
+    http_version: str = "1.1",
+) -> logging.LogRecord:
+    return logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=(client, method, path, http_version, status),
+        exc_info=None,
+    )
+
+
+def test_d614_owner_409_consumes_leftover_uvicorn_access() -> None:
+    """Direct/nested session-owner 409 still consumes leftover uvicorn ACCESS.
+
+    Live 2026-08-24: concurrent reservation raised HTTP 409 from the
+    OpenAI passthrough handler before ``pass_through_request`` registered
+    ACCESS replacement, so uvicorn printed
+    ``INFO: … "POST /openai_passthrough/responses HTTP/1.1" 409 Conflict``.
+    Distinct leftover source ports were separate requests; each exact POST
+    responses 409 registers once. A second identical ACCESS record stays
+    visible.
+    """
+
+    from fastapi import Request
+    from starlette.datastructures import Headers
+
+    from litellm._logging import (
+        AawmRouteAccessLogReplacementFilter,
+        clear_aawm_route_access_log_replacements,
+    )
+    from litellm.proxy.aawm_route_logging import clear_aawm_route_rollups
+
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    request = MagicMock(spec=Request)
+    request.method = "POST"
+    request.url = "http://127.0.0.1:4011/openai_passthrough/responses"
+    request.headers = Headers({"user-agent": "codex-cli/0.149.1"})
+    request.scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/openai_passthrough/responses",
+        "query_string": b"",
+        "client": ("172.18.0.1", 35106),
+        "http_version": "1.1",
+    }
+    with pytest.raises(HTTPException) as exc_info:
+        sa.raise_session_owner_redispatch_required(
+            session_identity=_D614_SESSION_ID,
+            guard=_d614_guard_result(),
+            alias_model="gpt-5.6-luna",
+            failure_phase="session_owner_mismatch",
+            request=request,
+        )
+    assert exc_info.value.status_code == 409
+    leftover_409 = _d614_uvicorn_access_record(
+        client="172.18.0.1:35106",
+        method="POST",
+        path="/openai_passthrough/responses",
+        status=409,
+    )
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    assert access_filter.filter(leftover_409) is False
+    assert access_filter.filter(leftover_409) is True
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+
+
+def test_d614_owner_409_on_non_post_responses_keeps_leftover_uvicorn_access() -> None:
+    """Non-POST /openai_passthrough/responses 409 must not consume ACCESS."""
+
+    from fastapi import Request
+    from starlette.datastructures import Headers
+
+    from litellm._logging import (
+        AawmRouteAccessLogReplacementFilter,
+        clear_aawm_route_access_log_replacements,
+    )
+    from litellm.proxy.aawm_route_logging import clear_aawm_route_rollups
+
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    request = MagicMock(spec=Request)
+    request.method = "GET"
+    request.url = "http://127.0.0.1:4011/openai_passthrough/responses"
+    request.headers = Headers({"user-agent": "codex-cli/0.149.1"})
+    request.scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/openai_passthrough/responses",
+        "query_string": b"",
+        "client": ("172.18.0.1", 35109),
+        "http_version": "1.1",
+    }
+    with pytest.raises(HTTPException) as exc_info:
+        sa.raise_session_owner_redispatch_required(
+            session_identity=_D614_SESSION_ID,
+            guard=_d614_guard_result(),
+            alias_model="gpt-5.6-luna",
+            failure_phase="session_owner_mismatch",
+            request=request,
+        )
+    assert exc_info.value.status_code == 409
+    leftover = _d614_uvicorn_access_record(
+        client="172.18.0.1:35109",
+        method="GET",
+        path="/openai_passthrough/responses",
+        status=409,
+    )
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    assert access_filter.filter(leftover) is True
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+
+
+def test_d614_owner_409_missing_scope_method_keeps_leftover_uvicorn_access() -> None:
+    """Missing/falsy scope method must not consume ACCESS even if request.method is POST."""
+
+    from fastapi import Request
+    from starlette.datastructures import Headers
+
+    from litellm._logging import (
+        AawmRouteAccessLogReplacementFilter,
+        clear_aawm_route_access_log_replacements,
+    )
+    from litellm.proxy.aawm_route_logging import clear_aawm_route_rollups
+
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    request = MagicMock(spec=Request)
+    request.method = "POST"
+    request.url = "http://127.0.0.1:4011/openai_passthrough/responses"
+    request.headers = Headers({"user-agent": "codex-cli/0.149.1"})
+    request.scope = {
+        "type": "http",
+        "method": "",
+        "path": "/openai_passthrough/responses",
+        "query_string": b"",
+        "client": ("172.18.0.1", 35110),
+        "http_version": "1.1",
+    }
+    with pytest.raises(HTTPException) as exc_info:
+        sa.raise_session_owner_redispatch_required(
+            session_identity=_D614_SESSION_ID,
+            guard=_d614_guard_result(),
+            alias_model="gpt-5.6-luna",
+            failure_phase="session_owner_mismatch",
+            request=request,
+        )
+    assert exc_info.value.status_code == 409
+    leftover = _d614_uvicorn_access_record(
+        client="172.18.0.1:35110",
+        method="POST",
+        path="/openai_passthrough/responses",
+        status=409,
+    )
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    assert access_filter.filter(leftover) is True
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+
+
+def test_d614_owner_409_on_non_responses_path_keeps_leftover_uvicorn_access() -> None:
+    """Non-responses session-owner 409 must not consume leftover uvicorn ACCESS."""
+
+    from fastapi import Request
+    from starlette.datastructures import Headers
+
+    from litellm._logging import (
+        AawmRouteAccessLogReplacementFilter,
+        clear_aawm_route_access_log_replacements,
+    )
+    from litellm.proxy.aawm_route_logging import clear_aawm_route_rollups
+
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    request = MagicMock(spec=Request)
+    request.method = "POST"
+    request.url = "http://127.0.0.1:4011/grok/v1/responses"
+    request.headers = Headers({"user-agent": "grok-cli/0.1.0"})
+    request.scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/grok/v1/responses",
+        "query_string": b"",
+        "client": ("172.18.0.1", 35107),
+        "http_version": "1.1",
+    }
+    with pytest.raises(HTTPException) as exc_info:
+        sa.raise_session_owner_redispatch_required(
+            session_identity=_D614_SESSION_ID,
+            guard=_d614_guard_result(),
+            alias_model="grok-4",
+            failure_phase="session_owner_mismatch",
+            request=request,
+        )
+    assert exc_info.value.status_code == 409
+    leftover = _d614_uvicorn_access_record(
+        client="172.18.0.1:35107",
+        method="POST",
+        path="/grok/v1/responses",
+        status=409,
+    )
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    assert access_filter.filter(leftover) is True
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+
+
+def test_d614_owner_409_on_lookalike_responses_path_keeps_leftover_uvicorn_access() -> None:
+    """Look-alike responses paths must not consume leftover uvicorn ACCESS."""
+
+    from fastapi import Request
+    from starlette.datastructures import Headers
+
+    from litellm._logging import (
+        AawmRouteAccessLogReplacementFilter,
+        clear_aawm_route_access_log_replacements,
+    )
+    from litellm.proxy.aawm_route_logging import clear_aawm_route_rollups
+
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    request = MagicMock(spec=Request)
+    request.method = "POST"
+    request.url = "http://127.0.0.1:4011/openai_passthrough/responses2"
+    request.headers = Headers({"user-agent": "codex-cli/0.149.1"})
+    request.scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/openai_passthrough/responses2",
+        "query_string": b"",
+        "client": ("172.18.0.1", 35108),
+        "http_version": "1.1",
+    }
+    with pytest.raises(HTTPException) as exc_info:
+        sa.raise_session_owner_redispatch_required(
+            session_identity=_D614_SESSION_ID,
+            guard=_d614_guard_result(),
+            alias_model="gpt-5.6-luna",
+            failure_phase="session_owner_mismatch",
+            request=request,
+        )
+    assert exc_info.value.status_code == 409
+    leftover = _d614_uvicorn_access_record(
+        client="172.18.0.1:35108",
+        method="POST",
+        path="/openai_passthrough/responses2",
+        status=409,
+    )
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    assert access_filter.filter(leftover) is True
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+
+
 @pytest.mark.asyncio
 async def test_d614_full_wrapper_records_owner_409_once_before_egress() -> None:
     from types import SimpleNamespace

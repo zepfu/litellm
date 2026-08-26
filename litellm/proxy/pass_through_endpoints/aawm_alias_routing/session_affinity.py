@@ -2886,6 +2886,30 @@ def _emit_session_owner_redispatch_observability(
         pass
 
 
+def _register_session_owner_inbound_access_log_replacement(request: Any) -> None:
+    """Consume leftover uvicorn ACCESS for exact POST responses 409."""
+    try:
+        from litellm.proxy.aawm_route_logging import (
+            _register_aawm_route_access_log_replacement,
+        )
+
+        if request is None:
+            return
+        scope = getattr(request, "scope", None)
+        if not isinstance(scope, dict):
+            return
+        if scope.get("method") != "POST":
+            return
+        if scope.get("path") != "/openai_passthrough/responses":
+            return
+        _register_aawm_route_access_log_replacement(
+            request,
+            suppress_all_statuses=True,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def raise_session_owner_redispatch_required(
     *,
     session_identity: Optional[str],
@@ -3003,6 +3027,11 @@ def raise_session_owner_redispatch_required(
         owner_attrs=owner_attrs,
         request=request,
     )
+    # Direct OpenAI / nested Codex guards raise 409 before
+    # pass_through_request registers ACCESS replacement. Register once so
+    # the leftover uvicorn ACCESS for this exact POST
+    # /openai_passthrough/responses 409 is consumed.
+    _register_session_owner_inbound_access_log_replacement(request)
 
     raise HTTPException(status_code=409, detail=detail)
 
