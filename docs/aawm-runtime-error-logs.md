@@ -1057,3 +1057,28 @@ OpenAI API-key Responses (``api.openai.com`` ``/v1/responses``,
 with the same code remains ``openai_chatgpt_codex_invalid_encrypted_content``.
 The OpenAI API-key class is not hidden-retried as a capacity 502, it warns
 without a generic traceback, and it stays visible to the client.
+
+## Inbound uvicorn ACCESS replacement on Codex 429
+
+Early `register_aawm_route_rollup_access_log_replacement` keys native
+uvicorn ACCESS on the inbound `/openai_passthrough/responses` path with
+`suppress_all_statuses`. That early all-status registration is scoped to
+AAWM `/openai_passthrough/responses` ingress; leftover uvicorn ACCESS on
+unrelated generic or Grok pass-through failures remains visible. A later
+emit that rebuilds the replacement key from a mutated query string must
+not discard that inbound key. ChatGPT Codex usage-limit HTTP 429 still
+has to consume leftover uvicorn ACCESS instead of printing
+`INFO: … "POST /openai_passthrough/responses HTTP/1.1" 429 Too Many Requests`.
+
+Session-owner HTTP 409 from `raise_session_owner_redispatch_required`
+registers the same inbound ACCESS replacement with
+`suppress_all_statuses=True` only on that AAWM responses ingress. Direct
+OpenAI / nested Codex guards can raise that 409 before
+`pass_through_request` runs, so leftover uvicorn
+`INFO: … "POST /openai_passthrough/responses HTTP/1.1" 409 Conflict`
+must still be consumed.
+
+Native catalog `GET /models` and `GET /v1/models` leftover uvicorn ACCESS
+is not globally suppressed by `AawmHealthAccessLogFilter`. Existing
+request-scoped probe registration consumes leftover ACCESS for those
+catalog probes; do not add a global health-filter path for them.

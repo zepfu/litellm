@@ -1465,6 +1465,294 @@ async def test_pass_through_request_emits_aawm_route_access_log(
 
 
 @pytest.mark.asyncio
+async def test_pass_through_request_session_owner_409_suppresses_leftover_uvicorn(
+    monkeypatch,
+) -> None:
+    """Session-owner 409 still consumes native uvicorn ACCESS on responses."""
+
+    from fastapi import status as http_status
+
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    # Unique client so this one-shot replacement cannot collide with sibling
+    # access-log tests. Rollups must be on so the early
+    # register_aawm_route_rollup_access_log_replacement uses
+    # suppress_all_statuses and a 409 still consumes leftover uvicorn ACCESS.
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "1")
+    request = _build_aawm_route_log_request(
+        url="http://127.0.0.1:4011/openai_passthrough/responses",
+        client=("172.18.0.1", 40586),
+        headers={"user-agent": "codex-cli/0.149.1"},
+    )
+    request_body = {
+        "model": "basic",
+        "input": "redacted",
+        "litellm_metadata": {"session_id": "sess-409"},
+    }
+    mock_user_api_key_dict = _build_aawm_route_log_user_api_key_dict()
+    conflict = HTTPException(
+        status_code=http_status.HTTP_409_CONFLICT,
+        detail={
+            "redispatch_required": True,
+            "attempted_provider_call": False,
+            "error": {
+                "code": "aawm_session_owner_redispatch_required",
+                "message": (
+                    "session_owner: concurrent reservation held by another request"
+                ),
+            },
+        },
+    )
+
+    async def _raise_409(*_args: object, **_kwargs: object):
+        raise conflict
+
+    with patch("litellm.proxy.proxy_server.proxy_logging_obj") as mock_proxy_logging:
+        mock_proxy_logging.pre_call_hook = AsyncMock(return_value=request_body)
+        mock_proxy_logging.post_call_failure_hook = AsyncMock()
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+            "_aawm_session_owner_pre_send_guard",
+            new=_raise_409,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+            "emit_aawm_route_access_log",
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+            "HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=AsyncMock(),
+        ), pytest.raises(ProxyException) as exc_info:
+            await pass_through_request(
+                request=request,
+                target="https://api.openai.com/v1/responses",
+                custom_headers={},
+                user_api_key_dict=mock_user_api_key_dict,
+                custom_body=request_body,
+                custom_llm_provider="openai",
+                stream=False,
+            )
+
+    assert str(exc_info.value.code) == str(http_status.HTTP_409_CONFLICT)
+    assert getattr(exc_info.value, "detail", None) == conflict.detail
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    leftover = _build_uvicorn_access_record(
+        client_addr="172.18.0.1:40586",
+        method="POST",
+        full_path="/openai_passthrough/responses",
+        http_version="1.1",
+        status_code=409,
+    )
+    assert access_filter.filter(leftover) is False
+    assert access_filter.filter(leftover) is True
+    clear_aawm_route_rollups()
+    clear_aawm_route_access_log_replacements()
+
+
+@pytest.mark.asyncio
+async def test_pass_through_request_generic_grok_failure_keeps_leftover_uvicorn(
+    monkeypatch,
+) -> None:
+    """Generic/Grok leftover uvicorn ACCESS stays visible after pass_through_request."""
+
+    from fastapi import status as http_status
+
+    clear_aawm_route_access_log_replacements()
+    clear_aawm_route_rollups()
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "1")
+    request = _build_aawm_route_log_request(
+        url="http://127.0.0.1:4011/grok/v1/responses",
+        client=("172.18.0.1", 40587),
+        headers={"user-agent": "grok-cli/0.1.0"},
+    )
+    request_body = {
+        "model": "grok-4",
+        "input": "redacted",
+    }
+    mock_user_api_key_dict = _build_aawm_route_log_user_api_key_dict(
+        request_route="/grok/v1/responses",
+    )
+    forbidden = HTTPException(
+        status_code=http_status.HTTP_403_FORBIDDEN,
+        detail={"error": {"message": "generic grok leftover uvicorn must stay visible"}},
+    )
+
+    async def _raise_403(*_args: object, **_kwargs: object):
+        raise forbidden
+
+    with patch("litellm.proxy.proxy_server.proxy_logging_obj") as mock_proxy_logging:
+        mock_proxy_logging.pre_call_hook = AsyncMock(return_value=request_body)
+        mock_proxy_logging.post_call_failure_hook = AsyncMock()
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+            "_aawm_session_owner_pre_send_guard",
+            new=_raise_403,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+            "emit_aawm_route_access_log",
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+            "HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=AsyncMock(),
+        ), pytest.raises(ProxyException) as exc_info:
+            await pass_through_request(
+                request=request,
+                target="https://api.openai.com/v1/responses",
+                custom_headers={},
+                user_api_key_dict=mock_user_api_key_dict,
+                custom_body=request_body,
+                custom_llm_provider="openai",
+                stream=False,
+            )
+
+    assert str(exc_info.value.code) == str(http_status.HTTP_403_FORBIDDEN)
+    leftover = _build_uvicorn_access_record(
+        client_addr="172.18.0.1:40587",
+        method="POST",
+        full_path="/grok/v1/responses",
+        http_version="1.1",
+        status_code=403,
+    )
+    access_filter = AawmRouteAccessLogReplacementFilter()
+    assert access_filter.filter(leftover) is True
+    clear_aawm_route_rollups()
+    clear_aawm_route_access_log_replacements()
+
+
+def test_aawm_route_access_log_filter_keeps_inbound_429_after_adapted_reregister() -> None:
+    """Live 2026-08-24: ChatGPT Codex usage-limit 429 leaked native uvicorn ACCESS.
+
+    Early rollup replacement is keyed on the inbound
+    ``/openai_passthrough/responses`` path with suppress_all_statuses.
+    A later emit that re-keys onto an adapted display path (or
+    suppress_all_statuses=False) must not drop that inbound 429
+    replacement.
+    """
+
+    from litellm.proxy.aawm_route_logging import (
+        _AAWM_ROUTE_ACCESS_LOG_REPLACEMENT_SCOPE_KEY,
+        _register_aawm_route_access_log_replacement,
+        register_aawm_route_rollup_access_log_replacement,
+    )
+
+    clear_aawm_route_access_log_replacements()
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "1")
+    try:
+        request = _build_aawm_route_log_request(
+            url="http://127.0.0.1:4011/openai_passthrough/responses",
+            client=("172.18.0.1", 38424),
+            headers={"user-agent": "codex-cli/0.149.1"},
+        )
+        register_aawm_route_rollup_access_log_replacement(request)
+        inbound_key = request.scope.get(_AAWM_ROUTE_ACCESS_LOG_REPLACEMENT_SCOPE_KEY)
+        assert inbound_key == (
+            "172.18.0.1:38424",
+            "POST",
+            "/openai_passthrough/responses",
+            "1.1",
+        )
+
+        # A later emit/re-register can rebuild the replacement key from a
+        # mutated query_string (adapted display). That must not discard the
+        # inbound uvicorn ACCESS key used for the native 429 line.
+        request.scope["query_string"] = (
+            b"adapted_to=chatgpt.com/backend-api/codex/responses"
+        )
+        _register_aawm_route_access_log_replacement(
+            request,
+            suppress_all_statuses=False,
+        )
+
+        leftover = _build_uvicorn_access_record(
+            client_addr="172.18.0.1:38424",
+            method="POST",
+            full_path="/openai_passthrough/responses",
+            http_version="1.1",
+            status_code=429,
+        )
+        access_filter = AawmRouteAccessLogReplacementFilter()
+        assert access_filter.filter(leftover) is False
+        assert access_filter.filter(leftover) is True
+    finally:
+        monkeypatch.undo()
+        clear_aawm_route_access_log_replacements()
+        clear_aawm_route_rollups()
+
+
+def test_is_aawm_openai_passthrough_responses_ingress_matches_exact_path_only() -> None:
+    """Exact /openai_passthrough/responses ingress only; descendants and lookalikes stay out."""
+
+    from litellm.proxy.aawm_route_logging import (
+        is_aawm_openai_passthrough_responses_ingress,
+    )
+
+    accepted = (
+        "http://127.0.0.1:4011/openai_passthrough/responses",
+        "http://127.0.0.1:4011/openai_passthrough/responses/",
+        "http://127.0.0.1:4011/openai_passthrough/responses?stream=false",
+    )
+    rejected = (
+        "http://127.0.0.1:4011/openai_passthrough/responses/other",
+        "http://127.0.0.1:4011/openai_passthrough/responses-extra",
+        "http://127.0.0.1:4011/openai_passthrough/v1/responses",
+        "http://127.0.0.1:4011/grok/v1/responses",
+        "http://127.0.0.1:4011/openai_passthrough/response",
+    )
+    for url in accepted:
+        request = _build_aawm_route_log_request(url=url)
+        assert is_aawm_openai_passthrough_responses_ingress(request) is True
+    for url in rejected:
+        request = _build_aawm_route_log_request(url=url)
+        assert is_aawm_openai_passthrough_responses_ingress(request) is False
+    lookalike_route = _build_aawm_route_log_request(
+        url="http://127.0.0.1:4011/grok/v1/responses",
+    )
+    assert (
+        is_aawm_openai_passthrough_responses_ingress(
+            lookalike_route,
+            request_route="/openai_passthrough/responses/other",
+        )
+        is False
+    )
+    query_widening = _build_aawm_route_log_request(
+        url="http://127.0.0.1:4011/grok/v1/responses?next=/openai_passthrough/responses",
+    )
+    assert is_aawm_openai_passthrough_responses_ingress(query_widening) is False
+    exact_url = "http://127.0.0.1:4011/openai_passthrough/responses"
+    descendant_route = "/openai_passthrough/responses/other"
+    for path in ("", None):
+        request = _build_aawm_route_log_request(url=exact_url)
+        if path is None:
+            del request.scope["path"]
+        else:
+            request.scope["path"] = path
+        assert (
+            is_aawm_openai_passthrough_responses_ingress(
+                request,
+                request_route=descendant_route,
+            )
+            is True
+        )
+    no_path_or_url = _build_aawm_route_log_request(url=exact_url)
+    no_path_or_url.scope["path"] = ""
+    no_path_or_url.url = None
+    for route in ("/openai_passthrough/responses", "/openai_passthrough/responses/"):
+        assert (
+            is_aawm_openai_passthrough_responses_ingress(
+                no_path_or_url, request_route=route
+            )
+            is True
+        )
+    for route in (descendant_route, "/openai_passthrough/responses-extra"):
+        assert (
+            is_aawm_openai_passthrough_responses_ingress(
+                no_path_or_url, request_route=route
+            )
+            is False
+        )
+
+
+@pytest.mark.asyncio
 async def test_pass_through_request_emits_aawm_route_access_log_with_provider_bound_body(
     monkeypatch,
 ) -> None:

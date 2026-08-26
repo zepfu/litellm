@@ -18,7 +18,7 @@ import httpx
 from fastapi import Request
 
 from litellm._logging import (
-    discard_aawm_route_access_log_replacement,
+    escalate_aawm_route_access_log_replacement_all_statuses,
     json_logs,
     register_aawm_route_access_log_replacement,
     verbose_aawm_route_logger,
@@ -3490,6 +3490,47 @@ def _get_aawm_route_native_access_log_path(request: Request) -> Optional[str]:
     return f"{full_path}?{query_label}"
 
 
+_AAWM_OPENAI_PASSTHROUGH_RESPONSES_INGRESS_PATH = (
+    "/openai_passthrough/responses"
+)
+
+
+def is_aawm_openai_passthrough_responses_ingress(
+    request: Any,
+    *,
+    request_route: Optional[str] = None,
+) -> bool:
+    """True for AAWM /openai_passthrough/responses ingress only."""
+    path = ""
+    if request is not None:
+        scope = getattr(request, "scope", None)
+        if isinstance(scope, dict):
+            scope_path = scope.get("path")
+            if isinstance(scope_path, str) and scope_path:
+                path = scope_path
+        if not path:
+            request_url = getattr(request, "url", None)
+            url_path = getattr(request_url, "path", None)
+            if isinstance(url_path, str) and url_path:
+                path = url_path
+            else:
+                parsed_path = urlparse(str(request_url or "")).path
+                if isinstance(parsed_path, str) and parsed_path:
+                    path = parsed_path
+    if not path and request_route:
+        path = str(request_route)
+    if not path:
+        return False
+    candidate = path.split("?", 1)[0]
+    parsed_path = urlparse(candidate).path
+    if parsed_path:
+        candidate = parsed_path
+    if not candidate:
+        return False
+    canonical = _AAWM_OPENAI_PASSTHROUGH_RESPONSES_INGRESS_PATH
+    return candidate == canonical or candidate == f"{canonical}/"
+
+
 def _register_aawm_route_access_log_replacement(
     request: Request,
     *,
@@ -3513,15 +3554,16 @@ def _register_aawm_route_access_log_replacement(
     replacement_key = (client_addr, method, full_path, http_version)
     previous_key = scope.get(_AAWM_ROUTE_ACCESS_LOG_REPLACEMENT_SCOPE_KEY)
     if previous_key == replacement_key:
+        if suppress_all_statuses:
+            escalate_aawm_route_access_log_replacement_all_statuses(
+                client_addr=client_addr,
+                method=method,
+                full_path=full_path,
+                http_version=http_version,
+            )
         return
-    if isinstance(previous_key, tuple) and len(previous_key) == 4:
-        discard_aawm_route_access_log_replacement(
-            client_addr=previous_key[0],
-            method=previous_key[1],
-            full_path=previous_key[2],
-            http_version=previous_key[3],
-        )
-
+    # Keep the inbound uvicorn ACCESS key. Re-keying onto an adapted
+    # display path used to discard it, so a later native 429 leaked.
     register_aawm_route_access_log_replacement(
         client_addr=client_addr,
         method=method,

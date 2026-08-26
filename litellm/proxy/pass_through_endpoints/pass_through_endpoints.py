@@ -68,7 +68,9 @@ from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.aawm_route_logging import (
     build_aawm_route_access_log_line,  # noqa: F401 - re-exported for existing tests/callers
     emit_aawm_route_access_log,
+    is_aawm_openai_passthrough_responses_ingress,
     record_aawm_route_rollup_failure,
+    register_aawm_route_rollup_access_log_replacement,
 )
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 from litellm.proxy.common_utils.http_parsing_utils import (
@@ -3953,6 +3955,14 @@ async def pass_through_request(  # noqa: PLR0915
     #########################################################
     try:
         start_time = datetime.now()
+        # Register before session-owner 409 / candidate selection so native
+        # uvicorn ACCESS on /openai_passthrough/responses is replaced even
+        # when the request never reaches emit_aawm_route_access_log.
+        if is_aawm_openai_passthrough_responses_ingress(
+            request,
+            request_route=getattr(user_api_key_dict, "request_route", None),
+        ):
+            register_aawm_route_rollup_access_log_replacement(request)
         url = httpx.URL(target)
         headers = HttpPassThroughEndpointHelpers.forward_headers_from_request(
             request_headers=_safe_get_request_headers(request).copy(),
