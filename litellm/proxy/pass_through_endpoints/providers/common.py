@@ -60,6 +60,58 @@ def _raise_opencode_zen_auto_agent_candidate_unavailable(
     )
 
 
+def _opencode_go_candidate_unavailable_detail(
+    exc: Exception,
+) -> Optional[str]:
+    status_code = getattr(exc, "status_code", None)
+    if status_code is None:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        normalized_status_code = int(status_code)
+    except (TypeError, ValueError):
+        return None
+    if normalized_status_code != 401:
+        return None
+
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, bytes):
+        detail_text = detail.decode("utf-8", errors="ignore")
+    elif isinstance(detail, (dict, list)):
+        detail_text = json.dumps(detail, sort_keys=True, default=str)
+    elif detail is not None:
+        detail_text = str(detail)
+    else:
+        detail_text = str(exc)
+    exception_text = " ".join(
+        str(part)
+        for part in (
+            getattr(exc, "message", None),
+            detail_text,
+            str(exc),
+        )
+        if part is not None
+    )
+    normalized = " ".join(exception_text.lower().split())
+    if "model ox-alpha-free is not supported" not in normalized:
+        return None
+    return exception_text
+
+
+def _raise_opencode_go_auto_agent_candidate_unavailable(
+    exc: Exception,
+) -> Never:
+    detail = _opencode_go_candidate_unavailable_detail(exc) or str(exc)
+    _raise_candidate_unavailable(
+        exc,
+        message=(
+            "OpenCode Go auto-agent candidate does not support ox-alpha-free: "
+            f"{detail}"
+        ),
+        error_type="rate_limit_error",
+        status_code=429,
+    )
+
+
 def _opencode_zen_candidate_unavailable_detail(
     exc: Exception,
     *,
@@ -303,9 +355,11 @@ __all__ = [
     "_codex_native_openai_candidate_unavailable_detail",
     "_grok_native_candidate_unavailable_detail",
     "_is_grok_unsupported_reasoning_parameter_detail",
+    "_opencode_go_candidate_unavailable_detail",
     "_opencode_zen_candidate_unavailable_detail",
     "_raise_codex_native_openai_auto_agent_candidate_unavailable",
     "_raise_grok_native_auto_agent_candidate_unavailable",
+    "_raise_opencode_go_auto_agent_candidate_unavailable",
     "_raise_opencode_zen_auto_agent_candidate_unavailable",
     "_raise_xai_oauth_auto_agent_candidate_unavailable",
     "_xai_oauth_candidate_unavailable_detail",

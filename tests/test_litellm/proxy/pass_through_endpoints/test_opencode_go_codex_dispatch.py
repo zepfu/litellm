@@ -7,6 +7,7 @@ HTTP is stubbed; this is not live OpenCode or OpenRouter fanout.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -465,6 +466,9 @@ async def _invoke_codex_opencode_go_adapter_route(
     completion: dict[str, Any],
     completion_error: BaseException | None = None,
     captured_out: dict[str, Any] | None = None,
+    use_alias_candidate_probe: bool = True,
+    completion_delay_seconds: float = 0.0,
+    alias_candidate_timeout_seconds: float | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     import litellm
     from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
@@ -494,6 +498,8 @@ async def _invoke_codex_opencode_go_adapter_route(
 
     async def _fake_acompletion(**kwargs: Any) -> dict[str, Any]:
         captured["completion"] = kwargs
+        if completion_delay_seconds > 0:
+            await asyncio.sleep(completion_delay_seconds)
         if completion_error is not None:
             raise completion_error
         return completion
@@ -523,6 +529,12 @@ async def _invoke_codex_opencode_go_adapter_route(
     host["_load_opencode_zen_api_key_for_candidate"] = AsyncMock(
         return_value="opencode-go-test-key"
     )
+    if alias_candidate_timeout_seconds is not None:
+        monkeypatch.setattr(
+            codex_candidate_calls,
+            "_OPENCODE_GO_ALIAS_CANDIDATE_TIMEOUT_SECONDS",
+            alias_candidate_timeout_seconds,
+        )
 
     async def _fake_perform(
         *,
@@ -539,6 +551,8 @@ async def _invoke_codex_opencode_go_adapter_route(
             "is_known_free_direct": is_known_free_direct,
             **kwargs,
         }
+        if completion_delay_seconds > 0:
+            await asyncio.sleep(completion_delay_seconds)
         if completion_error is not None:
             raise completion_error
         return completion
@@ -558,7 +572,7 @@ async def _invoke_codex_opencode_go_adapter_route(
             user_api_key_dict=MagicMock(),
             prepared_request_body=prepared_request_body,
             adapter_model=_ADAPTER_MODEL,
-            use_alias_candidate_probe=True,
+            use_alias_candidate_probe=use_alias_candidate_probe,
         )
     finally:
         await GLOBAL_LOGGING_WORKER.stop()
@@ -1250,3 +1264,176 @@ async def test_should_record_sanitized_opencode_go_provider_rejection_evidence(
     assert "opencode-go-test-key" not in dumped
     assert _REJECTION_SCHEMA_TOKEN not in dumped
     assert "parameters" not in dumped
+
+
+@pytest.mark.asyncio
+async def test_should_translate_opencode_go_unsupported_model_401_after_recording_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_go_runtime,
+) -> None:
+    captured: dict[str, Any] = {}
+    error = RuntimeError("Model ox-alpha-free is not supported for this account")
+    setattr(error, "status_code", 401)
+
+    with pytest.raises(ProxyException) as exc_info:
+        await _invoke_codex_opencode_go_adapter_route(
+            monkeypatch,
+            prepared_request_body={
+                "model": f"opencode-go/{_ADAPTER_MODEL}",
+                "input": "run date",
+                "stream": False,
+            },
+            completion=_chat_completion_payload(content="unused"),
+            completion_error=error,
+            captured_out=captured,
+        )
+
+    raised = exc_info.value
+    assert raised.code == "429"
+    assert raised.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_candidate_unavailable"
+    )
+    evidence = captured["request"].state.opencode_go_provider_rejection_evidence
+    assert evidence["error"]["status"] == 401
+    assert "model ox-alpha-free is not supported" in evidence["error"][
+        "message"
+    ].lower()
+
+
+@pytest.mark.asyncio
+async def test_should_preserve_arbitrary_opencode_go_401_as_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_go_runtime,
+) -> None:
+    captured: dict[str, Any] = {}
+    error = RuntimeError("invalid API key")
+    setattr(error, "status_code", 401)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await _invoke_codex_opencode_go_adapter_route(
+            monkeypatch,
+            prepared_request_body={
+                "model": f"opencode-go/{_ADAPTER_MODEL}",
+                "input": "run date",
+                "stream": False,
+            },
+            completion=_chat_completion_payload(content="unused"),
+            completion_error=error,
+            captured_out=captured,
+        )
+
+    assert exc_info.value is error
+    evidence = captured["request"].state.opencode_go_provider_rejection_evidence
+    assert evidence["error"]["status"] == 401
+
+
+@pytest.mark.asyncio
+async def test_should_preserve_arbitrary_opencode_go_403_as_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_go_runtime,
+) -> None:
+    captured: dict[str, Any] = {}
+    error = RuntimeError("forbidden")
+    setattr(error, "status_code", 403)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await _invoke_codex_opencode_go_adapter_route(
+            monkeypatch,
+            prepared_request_body={
+                "model": f"opencode-go/{_ADAPTER_MODEL}",
+                "input": "run date",
+                "stream": False,
+            },
+            completion=_chat_completion_payload(content="unused"),
+            completion_error=error,
+            captured_out=captured,
+        )
+
+    assert exc_info.value is error
+    evidence = captured["request"].state.opencode_go_provider_rejection_evidence
+    assert evidence["error"]["status"] == 403
+
+
+@pytest.mark.asyncio
+async def test_should_normalize_opencode_go_probe_local_timeout_to_504(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_go_runtime,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    with pytest.raises(ProxyException) as exc_info:
+        await _invoke_codex_opencode_go_adapter_route(
+            monkeypatch,
+            prepared_request_body={
+                "model": f"opencode-go/{_ADAPTER_MODEL}",
+                "input": "run date",
+                "stream": False,
+            },
+            completion=_chat_completion_payload(content="late"),
+            captured_out=captured,
+            completion_delay_seconds=0.02,
+            alias_candidate_timeout_seconds=0.001,
+        )
+
+    raised = exc_info.value
+    assert raised.code == "504"
+    assert raised.status_code == 504
+    assert raised.detail["error"]["type"] == "upstream_timeout"
+    assert raised.detail["error"]["code"] == "upstream_timeout"
+    evidence = captured["request"].state.opencode_go_provider_rejection_evidence
+    assert evidence["error"]["type"] == "TimeoutError"
+
+
+@pytest.mark.asyncio
+async def test_should_normalize_opencode_go_probe_408_to_504(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_go_runtime,
+) -> None:
+    error = RuntimeError("upstream request timeout")
+    setattr(error, "status_code", 408)
+
+    with pytest.raises(ProxyException) as exc_info:
+        await _invoke_codex_opencode_go_adapter_route(
+            monkeypatch,
+            prepared_request_body={
+                "model": f"opencode-go/{_ADAPTER_MODEL}",
+                "input": "run date",
+                "stream": False,
+            },
+            completion=_chat_completion_payload(content="unused"),
+            completion_error=error,
+        )
+
+    raised = exc_info.value
+    assert raised.code == "504"
+    assert raised.status_code == 504
+    assert raised.detail["error"] == {
+        "message": "OpenCode Go alias candidate timed out upstream.",
+        "type": "upstream_timeout",
+        "code": "upstream_timeout",
+    }
+
+
+@pytest.mark.asyncio
+async def test_should_leave_direct_opencode_go_calls_unbounded_and_raw(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_go_runtime,
+) -> None:
+    error = RuntimeError("upstream request timeout")
+    setattr(error, "status_code", 408)
+    with pytest.raises(RuntimeError) as exc_info:
+        await _invoke_codex_opencode_go_adapter_route(
+            monkeypatch,
+            prepared_request_body={
+                "model": f"opencode-go/{_ADAPTER_MODEL}",
+                "input": "run date",
+                "stream": False,
+            },
+            completion=_chat_completion_payload(content="unused"),
+            completion_error=error,
+            use_alias_candidate_probe=False,
+            completion_delay_seconds=0.02,
+            alias_candidate_timeout_seconds=0.001,
+        )
+
+    assert exc_info.value is error

@@ -30342,6 +30342,77 @@ def test_raise_codex_native_openai_auto_agent_candidate_unavailable_sets_proxy_d
 
 
 @pytest.mark.asyncio
+async def test_codex_work_advances_from_opencode_go_unavailable_to_nous_ox_alpha():
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "work",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    opencode_go_unavailable = ProxyException(
+        message="OpenCode Go does not support ox-alpha-free",
+        type="rate_limit_error",
+        param="model",
+        code=429,
+    )
+    opencode_go_unavailable.detail = {
+        "error": {
+            "message": opencode_go_unavailable.message,
+            "code": "aawm_codex_auto_agent_candidate_unavailable",
+        }
+    }
+    nous_success = Response(
+        content='{"ok": true}',
+        media_type="application/json",
+    )
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_opencode_go_adapter_route",
+        new=AsyncMock(side_effect=opencode_go_unavailable),
+    ) as mock_opencode_go, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_nous_chat_completions_adapter_route",
+        new=AsyncMock(return_value=nous_success),
+    ) as mock_nous:
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            canonical_alias=body["model"],
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is nous_success
+    mock_opencode_go.assert_awaited_once()
+    mock_nous.assert_awaited_once()
+    assert mock_opencode_go.await_args.kwargs["adapter_model"] == "ox-alpha-free"
+    assert mock_opencode_go.await_args.kwargs["use_alias_candidate_probe"] is True
+    assert mock_nous.await_args.kwargs["adapter_model"] == "stealth/ox-alpha"
+    assert mock_nous.await_args.kwargs["use_alias_candidate_probe"] is True
+    metadata = mock_nous.await_args.kwargs["prepared_request_body"][
+        "litellm_metadata"
+    ]
+    assert [
+        (attempt["provider"], attempt["model"])
+        for attempt in metadata["codex_auto_agent_attempts"]
+    ] == [
+        ("opencode_go", "ox-alpha-free"),
+        ("nous", "stealth/ox-alpha"),
+    ]
+    assert metadata["codex_auto_agent_attempts"][0]["error_class"] == (
+        "candidate_unavailable"
+    )
+
+
+@pytest.mark.asyncio
 async def test_codex_auto_agent_alias_code_falls_back_after_gpt_5_6_terra_unsupported():
     request = _build_codex_auto_agent_request()
     body = {

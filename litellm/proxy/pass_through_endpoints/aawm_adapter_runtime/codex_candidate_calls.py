@@ -23,6 +23,8 @@ from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
 
+_OPENCODE_GO_ALIAS_CANDIDATE_TIMEOUT_SECONDS = 30.0
+
 
 def _watermark_endpoint_from_path(*parts: Any) -> str:
     combined = " ".join(
@@ -221,6 +223,7 @@ _HOST_FUNCTION_NAMES = (
     "_handle_codex_opencode_go_adapter_route",
     "_build_opencode_go_provider_rejection_evidence",
     "_record_opencode_go_provider_rejection_evidence",
+    "_raise_opencode_go_alias_candidate_upstream_timeout",
     "_handle_codex_nous_chat_completions_adapter_route",
     "_consume_opencode_zen_tools_mode_header",
     "_build_opencode_zen_completion_call_kwargs",
@@ -3291,6 +3294,32 @@ def _record_opencode_go_provider_rejection_evidence(
     return recorded
 
 
+def _raise_opencode_go_alias_candidate_upstream_timeout(
+    exc: Exception,
+) -> None:
+    from litellm.proxy._types import ProxyException
+
+    proxy_exc = ProxyException(
+        message="OpenCode Go alias candidate timed out upstream.",
+        type="upstream_timeout",
+        param="model",
+        code=504,
+    )
+    setattr(proxy_exc, "status_code", 504)
+    setattr(
+        proxy_exc,
+        "detail",
+        {
+            "error": {
+                "message": proxy_exc.message,
+                "type": "upstream_timeout",
+                "code": "upstream_timeout",
+            }
+        },
+    )
+    raise proxy_exc from exc
+
+
 async def _handle_codex_opencode_go_adapter_route(
     *,
     endpoint: str,
@@ -3301,6 +3330,8 @@ async def _handle_codex_opencode_go_adapter_route(
     adapter_model: str,
     use_alias_candidate_probe: bool = False,
 ) -> Response:
+    import asyncio
+
     import litellm
     from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
         _OPENCODE_GO_FREE_MODELS,
@@ -3315,6 +3346,9 @@ async def _handle_codex_opencode_go_adapter_route(
     )
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.stream_collect import (
         _build_empty_success_responses_diagnostic as _go_build_empty_success_diagnostic,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
+        _OPENCODE_GO_ALIAS_CANDIDATE_TIMEOUT_SECONDS as _go_probe_timeout_seconds,
     )
     from litellm.responses.litellm_completion_transformation.transformation import (
         LiteLLMCompletionResponsesConfig,
@@ -3424,14 +3458,21 @@ async def _handle_codex_opencode_go_adapter_route(
     perform = globals().get("_perform_opencode_zen_completion_call")
     try:
         if callable(perform):
-            completion_response = await perform(
+            completion_awaitable = perform(
                 completion_call_kwargs=completion_call_kwargs,
                 litellm_metadata=litellm_metadata,
                 accepted_trace_user_id=None,
                 is_known_free_direct=False,
             )
         else:
-            completion_response = await litellm.acompletion(**completion_call_kwargs)
+            completion_awaitable = litellm.acompletion(**completion_call_kwargs)
+        if use_alias_candidate_probe:
+            completion_response = await asyncio.wait_for(
+                completion_awaitable,
+                timeout=_go_probe_timeout_seconds,
+            )
+        else:
+            completion_response = await completion_awaitable
     except Exception as exc:
         evidence = _build_opencode_go_provider_rejection_evidence(
             target_url=target_url,
@@ -3441,6 +3482,19 @@ async def _handle_codex_opencode_go_adapter_route(
             api_key=api_key,
         )
         _record_opencode_go_provider_rejection_evidence(request, evidence)
+        if use_alias_candidate_probe:
+            if (
+                isinstance(exc, asyncio.TimeoutError)
+                or evidence["error"]["status"] == 408
+            ):
+                _raise_opencode_go_alias_candidate_upstream_timeout(exc)
+            from litellm.proxy.pass_through_endpoints.providers.common import (
+                _opencode_go_candidate_unavailable_detail,
+                _raise_opencode_go_auto_agent_candidate_unavailable,
+            )
+
+            if _opencode_go_candidate_unavailable_detail(exc) is not None:
+                _raise_opencode_go_auto_agent_candidate_unavailable(exc)
         raise
     if isinstance(completion_response, dict):
         from litellm.types.utils import ModelResponse
