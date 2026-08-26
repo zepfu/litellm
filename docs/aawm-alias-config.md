@@ -13,6 +13,12 @@ candidate tables and no startup or no-snapshot fallback.
 litellm/proxy/aawm_alias_config/
 ```
 
+Codex TUI OC-003 requires native ``read`` even though Ohmypi
+``compiled_aliases`` omits it. ``read.yaml`` publishes that alias as an
+``alias_reference`` to ``basic`` so OpenCode Go ``ox-alpha-free`` stays
+first and Codex does not send ``model=read`` to ChatGPT as a native
+model.
+
 Relative to the repository root (and `/app/litellm/proxy/aawm_alias_config/`
 inside the container). The path is resolved from
 `litellm/proxy/pass_through_endpoints/aawm_alias_routing/config_startup.py`

@@ -353,6 +353,40 @@ def test_canonical_work_other_compiles_scheduled_deepseek_without_alibaba() -> N
     assert owner.schedule is None
 
 
+def test_canonical_read_alias_references_basic_go_first() -> None:
+    """Live ``read`` must compile as an AAWM alias, not a ChatGPT-native model.
+
+    Codex TUI OC-003 uses ``--model read`` even though Ohmypi
+    ``compiled_aliases`` omits it. Without this YAML the passthrough
+    catalog does not list ``read``, and Codex sends it to ChatGPT as
+    ``The 'read' model is not supported``.
+    """
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+        AliasReference,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.catalog import (
+        iter_compiled_alias_names,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    assert "read" in snapshot.aliases
+    alias = snapshot.aliases["read"]
+    assert alias.candidates
+    assert all(isinstance(entry, AliasReference) for entry in alias.candidates)
+    assert alias.candidates[0].alias_name == "basic"
+    basic = snapshot.aliases["basic"].candidates[0]
+    assert basic.provider == "opencode_go"
+    assert basic.model == "ox-alpha-free"
+    assert basic.route_family == "codex_opencode_go_adapter"
+    names = iter_compiled_alias_names(snapshot)
+    assert "read" in names
+    assert "basic" in names
+
+
 def test_inheritance_resolves_at_compile() -> None:
     """Typed inheritance (defaults -> alias -> candidate) compiles without ambiguity."""
     snapshot = compiler.compile_yaml(_RAW_YAML)

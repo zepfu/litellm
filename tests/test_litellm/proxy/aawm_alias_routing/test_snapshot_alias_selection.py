@@ -611,3 +611,35 @@ def test_canonical_work_other_promotes_deepseek_only_inside_daily_window() -> No
         ]
     finally:
         snapshot_select.set_active_routing_snapshot(previous)
+
+
+def test_canonical_read_alias_selects_basic_opencode_go_first() -> None:
+    """Codex ``read`` must resolve through the live YAML snapshot, not ChatGPT native."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    previous = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    try:
+        assert snapshot_select._lookup_active_snapshot_canonical_alias("read") == "read"
+        codex = snapshot_select._select_snapshot_candidates(
+            "read",
+            ingress="codex",
+        )
+        assert codex
+        assert codex[0]["provider"] == "opencode_go"
+        assert codex[0]["model"] == "ox-alpha-free"
+        assert codex[0]["route_family"] == "codex_opencode_go_adapter"
+        assert codex[0]["alias_reference"] == "basic"
+        basic = snapshot_select._select_snapshot_candidates(
+            "basic",
+            ingress="codex",
+        )
+        assert [candidate["model"] for candidate in codex] == [
+            candidate["model"] for candidate in basic
+        ]
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous)
