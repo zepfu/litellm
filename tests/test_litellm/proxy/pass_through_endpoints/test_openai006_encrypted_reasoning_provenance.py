@@ -766,6 +766,63 @@ def test_pre_send_strips_ciphertext_only_function_output_on_chatgpt_unlabeled():
     assert CIPHERTEXT not in str(sent)
 
 
+def test_pre_send_strips_ciphertext_only_function_output_on_chatgpt_unlabeled_gpt56_sol_child():
+    """Live unlabeled gpt-5.6-sol ChatGPT-host child must still enter sanitation."""
+    body = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_chatgpt_unlabeled_gpt56_sol_child",
+                "encrypted_content": _wrapped_openai_function_output_ciphertext(),
+            }
+        ],
+    }
+    sent = _apply_openai_encrypted_reasoning_pre_send(
+        body=body,
+        url=SimpleNamespace(
+            host="chatgpt.com",
+            path="/backend-api/codex/responses",
+        ),
+        custom_llm_provider=None,
+        egress_credential_family=None,
+        expected_target_family=None,
+    )
+    item = sent["input"][0]
+    assert item["call_id"] == "call_chatgpt_unlabeled_gpt56_sol_child"
+    assert "encrypted_content" not in item
+    assert item.get("output") == ""
+    assert CIPHERTEXT not in str(sent)
+
+
+def test_pre_send_skips_unlabeled_chatgpt_lookalike_responses_path():
+    """Unlabeled confirmed-host lookalike paths must not enter sanitation."""
+    ciphertext = _wrapped_openai_function_output_ciphertext()
+    body = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_chatgpt_unlabeled_lookalike",
+                "encrypted_content": ciphertext,
+            }
+        ],
+    }
+    sent = _apply_openai_encrypted_reasoning_pre_send(
+        body=body,
+        url=SimpleNamespace(
+            host="chatgpt.com",
+            path="/backend-api/codex/responses-invalid",
+        ),
+        custom_llm_provider=None,
+        egress_credential_family=None,
+        expected_target_family=None,
+    )
+    item = sent["input"][0]
+    assert item["call_id"] == "call_chatgpt_unlabeled_lookalike"
+    assert item["encrypted_content"] == ciphertext
+
+
 def test_pre_send_preserves_plaintext_function_output():
     """Valid plaintext function output must survive OpenAI Responses egress sanitation."""
     body = {

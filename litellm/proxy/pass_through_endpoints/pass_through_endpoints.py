@@ -3667,6 +3667,7 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
         egress_credential_family=egress_credential_family,
         expected_target_family=expected_target_family,
         url_path=path,
+        url=url,
     ):
         return
 

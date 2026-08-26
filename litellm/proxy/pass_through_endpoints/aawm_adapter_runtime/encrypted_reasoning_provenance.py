@@ -1579,17 +1579,61 @@ def build_producer_provenance_from_egress_context(
     )
 
 
+def _is_actual_openai_responses_path(path: Any) -> bool:
+    """True for actual Responses endpoints, not lookalike substrings."""
+    text = str(path or "").strip().lower()
+    if not text:
+        return False
+    text = text.split("?", 1)[0].split("#", 1)[0]
+    return (
+        text == "responses"
+        or text.endswith("/responses")
+        or "/responses/" in text
+    )
+
+
 def is_openai_responses_egress(
     *,
     custom_llm_provider: Any = None,
     egress_credential_family: Any = None,
     expected_target_family: Any = None,
     url_path: Any = None,
+    url: Any = None,
 ) -> bool:
-    """True when the outbound call is OpenAI/Codex Responses shaped."""
+    """True when the outbound call is OpenAI/Codex Responses shaped.
+
+    Confirmed ``chatgpt.com`` / ``api.openai.com`` actual Responses URLs are
+    OpenAI Responses egress even when provider/credential labels are missing.
+    That unlabeled host fallback requires a real Responses endpoint such as
+    ``/backend-api/codex/responses`` or ``/v1/responses``, not a lookalike
+    substring. Labeled OpenAI/Codex behavior is unchanged. xAI/Grok and other
+    foreign hosts stay fail-closed unless those labels themselves prove an
+    OpenAI/Codex family.
+    """
     path = str(url_path or "").lower()
+    if not path and url is not None:
+        path = str(getattr(url, "path", "") or "").lower()
+        if not path:
+            text = str(url).strip().lower()
+            if "://" in text:
+                text = text.split("://", 1)[1]
+            slash = text.find("/")
+            if slash >= 0:
+                path = text[slash:]
     if "responses" not in path:
         return False
+    hostname = ""
+    if url is not None:
+        hostname = str(getattr(url, "host", "") or "").strip().lower()
+        if not hostname:
+            hostname = str(url).strip().lower()
+            if "://" in hostname:
+                hostname = hostname.split("://", 1)[1]
+            hostname = hostname.split("/", 1)[0].split(":", 1)[0]
+    if hostname in {"chatgpt.com", "api.openai.com"} and _is_actual_openai_responses_path(
+        path
+    ):
+        return True
     provider = normalize_producer_provider_family(
         custom_llm_provider or expected_target_family or egress_credential_family
     )
