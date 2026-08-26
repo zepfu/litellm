@@ -244,6 +244,75 @@ class TestNoneFallThrough:
         assert result is None
         assert body["reasoning"] == {"effort": "high"}
 
+    @pytest.mark.asyncio
+    async def test_reserved_openrouter_nemotron_free_second_wildcard_uses_openrouter_not_openai(
+        self,
+    ) -> None:
+        from litellm.proxy._types import ProxyException
+
+        body = {"model": "nvidia/nemotron-super-49b:free"}
+        kwargs = _dispatch_kwargs(prepared_request_body=body, request_body=body)
+        sentinel = Response(content=b"openrouter", status_code=200)
+        seen: dict[str, Any] = {}
+
+        async def _openrouter_handler(**handler_kwargs: Any) -> Response:
+            seen.update(handler_kwargs)
+            return sentinel
+
+        def _openai_normalize(request_body: Any, *, resolved_route: dict[str, Any]) -> tuple[Any, Any]:
+            seen["openai_normalize_route"] = resolved_route
+            return request_body, None
+
+        host = {
+            "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint, request: None,
+            "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_opencode_go_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_nous_chat_completions_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_zai_coding_plan_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_nvidia_completion_adapter_model": lambda body, *, endpoint: None,
+            "_prepare_request_body_for_passthrough_observability": (
+                lambda *, request, request_body: request_body
+            ),
+            "_safe_set_request_parsed_body": lambda request, body: None,
+            "_perform_codex_auto_agent_openrouter_responses_request": _openrouter_handler,
+            "_normalize_codex_reasoning_effort_for_resolved_route": _openai_normalize,
+        }
+        codex_dispatch.install(host)
+        result = await host["try_dispatch_codex_request"](**kwargs)
+        assert result is sentinel
+        assert seen["adapter_model"] == "nvidia/nemotron-super-49b:free"
+        assert "openai_normalize_route" not in seen
+
+        fail_closed_host = {
+            "_resolve_codex_auto_agent_alias_model": lambda body, *, endpoint, request: None,
+            "_resolve_codex_opencode_zen_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_opencode_go_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_nous_chat_completions_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_kimi_chat_completions_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_alibaba_token_plan_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_zai_coding_plan_adapter_model": lambda body, *, endpoint: None,
+            "_resolve_codex_nvidia_completion_adapter_model": lambda body, *, endpoint: None,
+            "_normalize_codex_reasoning_effort_for_resolved_route": _openai_normalize,
+        }
+        seen.pop("openai_normalize_route", None)
+        fail_closed_body = {"model": "nvidia/nemotron-super-49b:free"}
+        fail_closed_kwargs = _dispatch_kwargs(
+            prepared_request_body=fail_closed_body,
+            request_body=fail_closed_body,
+        )
+        codex_dispatch.install(fail_closed_host)
+        with pytest.raises(ProxyException) as exc_info:
+            await fail_closed_host["try_dispatch_codex_request"](**fail_closed_kwargs)
+        exc = exc_info.value
+        assert result is not None
+        assert exc.type == "rate_limit_error"
+        assert str(exc.code) == "429"
+        assert exc.detail["error"]["code"] == "aawm_codex_auto_agent_candidate_unavailable"
+        assert "native OpenAI/Codex OAuth" in exc.message
+        assert "openai_normalize_route" not in seen
+
 
 # ===================================================================
 # 3. Supported dispatch tests (one per adapter lane)

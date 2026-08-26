@@ -95,6 +95,7 @@ _PROVIDER_ALLOWED_ROUTE_FAMILIES: dict[str, frozenset[str]] = {
             "anthropic_cursor_agent_aiserver_adapter",
         }
     ),
+    "nvidia": frozenset({"codex_nvidia_completion_adapter"}),
     "opencode_zen": frozenset(
         {
             "codex_opencode_zen_adapter",
@@ -289,6 +290,16 @@ _CURSOR_AGENT_NATIVE_PROVIDERS: frozenset[str] = frozenset(
         "cursor_agent",
     }
 )
+_NVIDIA_CREDENTIAL_ROUTE_FAMILIES: frozenset[str] = frozenset(
+    {
+        "codex_nvidia_completion_adapter",
+    }
+)
+_NVIDIA_NATIVE_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "nvidia",
+    }
+)
 
 
 def _validate_cohere_credential_domain(
@@ -415,6 +426,37 @@ def _validate_cursor_agent_credential_domain(
         )
 
 
+def _validate_nvidia_credential_domain(
+    *,
+    provider: str,
+    model: str,
+    route_family: Optional[str],
+    anthropic_route_family: Optional[str],
+) -> None:
+    route_families = tuple(
+        value
+        for value in (route_family, anthropic_route_family)
+        if value is not None
+    )
+    uses_nvidia_credentials = any(
+        value in _NVIDIA_CREDENTIAL_ROUTE_FAMILIES for value in route_families
+    )
+    is_nvidia_provider = provider in _NVIDIA_NATIVE_PROVIDERS
+
+    if uses_nvidia_credentials and not is_nvidia_provider:
+        raise ConfigCompileError(
+            f"candidate model {model!r}: provider {provider!r} is incompatible "
+            "with NVIDIA-credential route family"
+        )
+    if is_nvidia_provider and any(
+        value not in _NVIDIA_CREDENTIAL_ROUTE_FAMILIES for value in route_families
+    ):
+        raise ConfigCompileError(
+            f"candidate model {model!r}: provider {provider!r} requires "
+            "NVIDIA-native route families"
+        )
+
+
 def _format_fixed_utc_offset(offset: timedelta) -> str:
     total_minutes = int(offset.total_seconds() // 60)
     sign = "-" if total_minutes < 0 else "+"
@@ -532,6 +574,12 @@ def _compile_candidate(candidate: schema.CandidateConfig, weight: float) -> Rout
         anthropic_route_family=anthropic_rf,
     )
     _validate_cursor_agent_credential_domain(
+        provider=candidate.provider,
+        model=candidate.model,
+        route_family=candidate.route_family,
+        anthropic_route_family=anthropic_rf,
+    )
+    _validate_nvidia_credential_domain(
         provider=candidate.provider,
         model=candidate.model,
         route_family=candidate.route_family,

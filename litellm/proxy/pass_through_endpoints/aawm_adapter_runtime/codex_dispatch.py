@@ -151,6 +151,18 @@ if TYPE_CHECKING:
         prepared_request_body: dict[str, Any],
         adapter_model: str,
     ) -> Response: ...
+    def _resolve_codex_nvidia_completion_adapter_model(
+        request_body: dict[str, Any], *, endpoint: str
+    ) -> Optional[str]: ...
+    async def _handle_codex_nvidia_completion_adapter_route(
+        *,
+        endpoint: str,
+        request: Request,
+        fastapi_response: Response,
+        user_api_key_dict: UserAPIKeyAuth,
+        prepared_request_body: dict[str, Any],
+        adapter_model: str,
+    ) -> Response: ...
     def _normalize_codex_reasoning_effort_for_resolved_route(
         request_body: dict[str, Any], *, resolved_route: dict[str, Any]
     ) -> tuple[dict[str, Any], Any]: ...
@@ -776,6 +788,122 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
                 user_api_key_dict=user_api_key_dict,
                 prepared_request_body=prepared_request_body,
                 adapter_model=zai_coding_plan_adapter_model,
+            )
+        except Exception as _exc:
+            await _finalize_nested_session_owner_lease(request, exc=_exc)
+            raise
+        await _finalize_nested_session_owner_lease(request, _resp)
+        return _resp
+
+    resolve_nvidia = globals().get("_resolve_codex_nvidia_completion_adapter_model")
+    nvidia_adapter_model = (
+        resolve_nvidia(prepared_request_body, endpoint=endpoint)
+        if callable(resolve_nvidia)
+        else None
+    )
+    if nvidia_adapter_model is not None:
+        prepared_request_body = _prepare_request_body_for_passthrough_observability(
+            request=request,
+            request_body=prepared_request_body,
+        )
+        if prepared_request_body is not request_body:
+            _safe_set_request_parsed_body(request, prepared_request_body)
+
+        await _ensure_codex_nested_session_owner_pre_egress(
+            request=request,
+            request_body=prepared_request_body,
+            session_identity=_sid,
+            provider="nvidia",
+            model=nvidia_adapter_model,
+            route_family="codex_nvidia_completion_adapter",
+        )
+        try:
+            _resp = await _handle_codex_nvidia_completion_adapter_route(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                prepared_request_body=prepared_request_body,
+                adapter_model=nvidia_adapter_model,
+            )
+        except Exception as _exc:
+            await _finalize_nested_session_owner_lease(request, exc=_exc)
+            raise
+        await _finalize_nested_session_owner_lease(request, _resp)
+        return _resp
+
+    reserved_openrouter_model = None
+    requested_model = (
+        prepared_request_body.get("model")
+        if isinstance(prepared_request_body, dict)
+        else None
+    )
+    if isinstance(requested_model, str) and requested_model.strip():
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+            is_reserved_openrouter_nvidia_nemotron_free_model,
+        )
+
+        if is_reserved_openrouter_nvidia_nemotron_free_model(requested_model):
+            reserved_openrouter_model = requested_model.strip()
+            if reserved_openrouter_model.casefold().startswith("openrouter/"):
+                reserved_openrouter_model = reserved_openrouter_model.split("/", 1)[1]
+    if reserved_openrouter_model:
+        from litellm.proxy._types import ProxyException
+
+        openrouter_handler = globals().get(
+            "_perform_codex_auto_agent_openrouter_responses_request"
+        )
+        if not callable(openrouter_handler):
+            message = (
+                "aawm_codex_auto_agent_candidate_unavailable: "
+                "reserved OpenRouter nvidia/nemotron-*:free namespace cannot "
+                "use native OpenAI/Codex OAuth; OpenRouter responses adapter "
+                f"is unavailable. ingress_model={requested_model}."
+            )
+            exc = ProxyException(
+                message=message,
+                type="rate_limit_error",
+                param="model",
+                code=429,
+            )
+            setattr(
+                exc,
+                "detail",
+                {
+                    "error": {
+                        "message": message,
+                        "code": "aawm_codex_auto_agent_candidate_unavailable",
+                    }
+                },
+            )
+            raise exc
+
+        if prepared_request_body.get("model") != reserved_openrouter_model:
+            prepared_request_body = dict(prepared_request_body)
+            prepared_request_body["model"] = reserved_openrouter_model
+
+        prepared_request_body = _prepare_request_body_for_passthrough_observability(
+            request=request,
+            request_body=prepared_request_body,
+        )
+        if prepared_request_body is not request_body:
+            _safe_set_request_parsed_body(request, prepared_request_body)
+
+        await _ensure_codex_nested_session_owner_pre_egress(
+            request=request,
+            request_body=prepared_request_body,
+            session_identity=_sid,
+            provider="openrouter",
+            model=reserved_openrouter_model,
+            route_family="codex_auto_agent_openrouter_responses",
+        )
+        try:
+            _resp = await openrouter_handler(
+                endpoint=endpoint,
+                request=request,
+                user_api_key_dict=user_api_key_dict,
+                adapter_model=reserved_openrouter_model,
+                request_body=prepared_request_body,
             )
         except Exception as _exc:
             await _finalize_nested_session_owner_lease(request, exc=_exc)

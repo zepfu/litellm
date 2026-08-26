@@ -141,6 +141,18 @@ NVIDIA_COMPLETION = AnthropicCompletionAdapterConfig(
     custom_llm_provider="nvidia_nim",
 )
 
+CODEX_NVIDIA_COMPLETION = AnthropicCompletionAdapterConfig(
+    adapter="codex_nvidia_completion_adapter",
+    adapter_label="NVIDIA",
+    route_family="codex_nvidia_completion_adapter",
+    tag_prefix="codex-nvidia-completion-adapter",
+    span_name="codex.nvidia_completion_adapter",
+    target_endpoint_label="nvidia:/v1/chat/completions",
+    credential_family="nvidia",
+    expected_target_family="nvidia",
+    custom_llm_provider="nvidia_nim",
+)
+
 OPENROUTER_COMPLETION = AnthropicCompletionAdapterConfig(
     adapter="anthropic_openrouter_completion_adapter",
     adapter_label="OpenRouter",

@@ -89,6 +89,9 @@ def _resolve_auto_agent_alias_route_rollup_outgoing_target(
         "anthropic_cursor_agent_aiserver_adapter": (
             "agentn.global.api5.cursor.sh/agent.v1.AgentService/Run"
         ),
+        "codex_nvidia_completion_adapter": (
+            "integrate.api.nvidia.com/v1/chat/completions"
+        ),
         "codex_opencode_zen_adapter": "opencode.ai/zen/v1/chat/completions",
         "codex_opencode_go_adapter": "opencode.ai/zen/go/v1/chat/completions",
         "codex_openrouter_completion_adapter": "openrouter.ai/api/v1/chat/completions",

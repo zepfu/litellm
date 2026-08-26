@@ -49,12 +49,14 @@ _HOST_FUNCTION_NAMES = (
     "_normalize_kimi_code_chat_completions_adapter_model_name",
     "_normalize_alibaba_token_plan_adapter_model_name",
     "_normalize_zai_coding_plan_adapter_model_name",
+    "_normalize_nvidia_completion_adapter_model_name",
     "_resolve_codex_opencode_zen_adapter_model",
     "_resolve_codex_opencode_go_adapter_model",
     "_resolve_codex_nous_chat_completions_adapter_model",
     "_resolve_codex_kimi_chat_completions_adapter_model",
     "_resolve_codex_alibaba_token_plan_adapter_model",
     "_resolve_codex_zai_coding_plan_adapter_model",
+    "_resolve_codex_nvidia_completion_adapter_model",
     "_resolve_anthropic_opencode_zen_adapter_model",
     "_resolve_anthropic_kimi_chat_completions_adapter_model",
     "_resolve_anthropic_alibaba_token_plan_adapter_model",
@@ -274,6 +276,20 @@ def _normalize_zai_coding_plan_adapter_model_name(
     return _normalize_zai_coding_plan_model_name(model)
 
 
+def _normalize_nvidia_completion_adapter_model_name(
+    model: Any,
+) -> Optional[str]:
+    # Binding-safe: install() rebinds this function into host_globals, so a
+    # module-imported helper name would disappear from the visible namespace.
+    # Resolve the policy helper at call time instead (host-owned dependencies
+    # stay late-bound through host_globals).
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        normalize_nvidia_completion_adapter_model_name as _normalize_nvidia_adapter_model_name,
+    )
+
+    return _normalize_nvidia_adapter_model_name(model)
+
+
 def _resolve_codex_opencode_zen_adapter_model(
     request_body: dict[str, Any],
     endpoint: str,
@@ -333,6 +349,22 @@ def _resolve_codex_zai_coding_plan_adapter_model(
     if not _is_openai_responses_endpoint(endpoint):
         return None
     return _normalize_zai_coding_plan_adapter_model_name(request_body.get("model"))
+
+
+def _resolve_codex_nvidia_completion_adapter_model(
+    request_body: dict[str, Any],
+    endpoint: str,
+) -> Optional[str]:
+    if not _is_openai_responses_endpoint(endpoint):
+        return None
+    requested_model = request_body.get("model")
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+        is_reserved_openrouter_nvidia_nemotron_free_model,
+    )
+
+    if is_reserved_openrouter_nvidia_nemotron_free_model(requested_model):
+        return None
+    return _normalize_nvidia_completion_adapter_model_name(requested_model)
 
 def _resolve_anthropic_opencode_zen_adapter_model(
     request_body: dict[str, Any],

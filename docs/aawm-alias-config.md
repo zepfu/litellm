@@ -146,8 +146,9 @@ Each identity in `REGISTERED_PROVIDERS` has exactly one discoverable
 `provider-openrouter`, `provider-xai`, `provider-kimi_code`,
 `provider-alibaba_token_plan`, `provider-zai_coding_plan`,
 `provider-cohere`, `provider-nous`, `provider-cursor_agent`,
-`provider-opencode_zen`, `provider-opencode_go`). These aliases are
-acceptance surfaces, not operational routing policy. They do not change
+`provider-opencode_zen`, `provider-opencode_go`, `provider-nvidia`).
+These aliases are acceptance surfaces, not operational routing policy.
+They do not change
 `basic` / `work` / `expert` / `sota` candidate order.
 
 Each provider alias is a closed same-provider candidate set:
@@ -157,8 +158,13 @@ Each provider alias is a closed same-provider candidate set:
   alias.
 - Fallback is allowed only among models inside that alias.
 - A registered provider with no alias is reported as uncovered at
-  compile time once any `provider-*` alias exists. NVIDIA is not
-  registered and is not invented.
+  compile time once any `provider-*` alias exists.
+
+`provider-nvidia` is a registered closed same-provider alias. It uses
+NVIDIA NIM credentials only, carries no `alias_reference`, and does not
+substitute OpenRouter free Nemotron (`nvidia/nemotron-*:free` stays on
+`provider-openrouter`). Validation is provider-specific: only
+`provider-nvidia` is NVIDIA evidence.
 
 OpenCode Zen keeps both adapter forms (`anthropic_opencode_zen_responses_adapter`
 and `anthropic_opencode_zen_completion_adapter`). xAI keeps managed

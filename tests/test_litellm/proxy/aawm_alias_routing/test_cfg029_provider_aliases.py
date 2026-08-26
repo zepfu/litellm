@@ -187,8 +187,8 @@ def test_compile_directory_exposes_one_closed_provider_alias_per_registered_prov
     actual = iter_provider_alias_names(snapshot.aliases)
     assert actual == expected
     assert uncovered_registered_providers(snapshot.aliases) == ()
-    assert "nvidia" not in REGISTERED_PROVIDERS
-    assert "provider-nvidia" not in snapshot.aliases
+    assert "nvidia" in REGISTERED_PROVIDERS
+    assert "provider-nvidia" in snapshot.aliases
 
     for provider_id in REGISTERED_PROVIDERS:
         name = provider_alias_name(provider_id)
@@ -202,6 +202,100 @@ def test_compile_directory_exposes_one_closed_provider_alias_per_registered_prov
             assert entry.provider == provider_id
             assert entry.model
             assert entry.route_family
+
+
+_NVIDIA_CLOSED_SET = (
+    (
+        "nvidia",
+        "nvidia/deepseek-ai/deepseek-v3.2",
+        "codex_nvidia_completion_adapter",
+        100,
+    ),
+    (
+        "nvidia",
+        "nvidia/deepseek-ai/deepseek-v3.1-terminus",
+        "codex_nvidia_completion_adapter",
+        90,
+    ),
+    (
+        "nvidia",
+        "nvidia/mistralai/devstral-2-123b-instruct-2512",
+        "codex_nvidia_completion_adapter",
+        80,
+    ),
+    (
+        "nvidia",
+        "nvidia/z-ai/glm4.7",
+        "codex_nvidia_completion_adapter",
+        70,
+    ),
+    (
+        "nvidia",
+        "nvidia/minimaxai/minimax-m2.7",
+        "codex_nvidia_completion_adapter",
+        60,
+    ),
+)
+
+
+def test_provider_nvidia_keeps_closed_five_model_nim_set() -> None:
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    alias = snapshot.aliases["provider-nvidia"]
+    assert alias.dispatch is None
+    assert len(alias.candidates) == 5
+    identities = [
+        (
+            entry.provider,
+            entry.model,
+            entry.route_family,
+            entry.priority,
+        )
+        for entry in alias.candidates
+    ]
+    assert identities == list(_NVIDIA_CLOSED_SET)
+    for entry in alias.candidates:
+        assert isinstance(entry, RoutingCandidate)
+        assert entry.provider == "nvidia"
+        assert "nemotron" not in entry.model
+        assert not entry.model.endswith(":free")
+        assert entry.route_family == "codex_nvidia_completion_adapter"
+        assert entry.anthropic_route_family is None
+    assert all(not isinstance(entry, AliasReference) for entry in alias.candidates)
+
+
+def test_provider_nvidia_rejects_alias_reference_and_openrouter_escape() -> None:
+    escaped = """
+defaults: {}
+aliases:
+  - name: provider-openrouter
+    candidates:
+      - provider: openrouter
+        model: openrouter/nvidia/nemotron-super-49b:free
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+  - name: provider-nvidia
+    candidates:
+      - alias_reference: provider-openrouter
+        priority: 100
+"""
+    with pytest.raises(ConfigCompileError, match="alias_reference"):
+        compiler.compile_yaml(escaped)
+
+    crossed = """
+defaults: {}
+aliases:
+  - name: provider-nvidia
+    candidates:
+      - provider: openrouter
+        model: openrouter/nvidia/nemotron-super-49b:free
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+"""
+    with pytest.raises(
+        (ValidationError, ConfigCompileError),
+        match="provider-nvidia|expected 'nvidia'|NVIDIA|uncovered",
+    ):
+        compiler.compile_yaml(crossed)
 
 
 def test_provider_opencode_zen_keeps_both_adapter_forms_distinct() -> None:

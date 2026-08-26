@@ -40,6 +40,7 @@ CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER = "zai_coding_plan"
 CODEX_AUTO_AGENT_COHERE_PROVIDER = "cohere"
 CODEX_AUTO_AGENT_NOUS_PROVIDER = "nous"
 CODEX_AUTO_AGENT_CURSOR_AGENT_PROVIDER = "cursor_agent"
+CODEX_AUTO_AGENT_NVIDIA_PROVIDER = "nvidia"
 OPENCODE_ZEN_PROVIDER = "opencode_zen"
 OPENCODE_GO_PROVIDER = "opencode_go"
 CODEX_AUTO_AGENT_OPENCODE_PROVIDER = OPENCODE_ZEN_PROVIDER
@@ -55,6 +56,7 @@ CODEX_AUTO_AGENT_ZAI_CODING_PLAN_LANE_KEY = "zai_coding_plan"
 CODEX_AUTO_AGENT_COHERE_LANE_KEY = "cohere_native"
 CODEX_AUTO_AGENT_NOUS_LANE_KEY = "nous"
 CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY = "cursor_agent_cli"
+CODEX_AUTO_AGENT_NVIDIA_LANE_KEY = "nvidia_nim"
 CODEX_AUTO_AGENT_OPENCODE_LANE_KEY = OPENCODE_ZEN_PROVIDER
 CODEX_AUTO_AGENT_OPENCODE_GO_LANE_KEY = OPENCODE_GO_PROVIDER
 
@@ -187,6 +189,84 @@ def normalize_zai_coding_plan_adapter_model_name(model: Any) -> Optional[str]:
         return None
     return candidate
 
+
+NVIDIA_COMPLETION_ADAPTER_ALLOWED_MODELS = frozenset(
+    {
+        "deepseek-ai/deepseek-v3.1-terminus",
+        "deepseek-ai/deepseek-v3.2",
+        "minimaxai/minimax-m2.7",
+        "mistralai/devstral-2-123b-instruct-2512",
+        "z-ai/glm4.7",
+    }
+)
+NVIDIA_COMPLETION_ADAPTER_MODEL_ALIASES = {
+    "minimax/minimax-m2.7": "minimaxai/minimax-m2.7",
+}
+
+
+def is_reserved_openrouter_nvidia_nemotron_free_model(model: Any) -> bool:
+    """Return True for reserved OpenRouter ``nvidia/nemotron-*:free`` names.
+
+    Accepts ``nvidia/nemotron-<nonempty>:free`` and
+    ``openrouter/nvidia/nemotron-<nonempty>:free``. Non-free NVIDIA NIM names
+    such as ``nvidia/nemotron-3-ultra`` are not reserved.
+    """
+
+    if not isinstance(model, str):
+        return False
+    candidate = model.strip().casefold()
+    if not candidate:
+        return False
+    if candidate.startswith("openrouter/"):
+        candidate = candidate[len("openrouter/") :]
+    prefix = "nvidia/nemotron-"
+    suffix = ":free"
+    if not candidate.startswith(prefix) or not candidate.endswith(suffix):
+        return False
+    wildcard = candidate[len(prefix) : -len(suffix)]
+    return bool(wildcard)
+
+
+def normalize_nvidia_completion_adapter_model_name(model: Any) -> Optional[str]:
+    """Return the canonical `nvidia/<model-id>` adapter key when admissible.
+
+    Explicit `nvidia/<nonempty-id>` routes are admitted except OpenRouter-namespace
+    names such as `nvidia/nemotron-3-super-120b-a12b:free`. Unprefixed names are
+    admitted only when they match the closed NVIDIA completion allowlist.
+    """
+
+    if not isinstance(model, str):
+        return None
+    candidate = model.strip()
+    if not candidate:
+        return None
+    if is_reserved_openrouter_nvidia_nemotron_free_model(candidate):
+        return None
+    provider_prefix, separator, model_id = candidate.partition("/")
+    if separator and provider_prefix == CODEX_AUTO_AGENT_NVIDIA_PROVIDER:
+        normalized_id = NVIDIA_COMPLETION_ADAPTER_MODEL_ALIASES.get(
+            model_id, model_id
+        ).strip()
+        if not normalized_id:
+            return None
+        return f"{CODEX_AUTO_AGENT_NVIDIA_PROVIDER}/{normalized_id}"
+    normalized_id = NVIDIA_COMPLETION_ADAPTER_MODEL_ALIASES.get(
+        candidate, candidate
+    ).strip()
+    if normalized_id in NVIDIA_COMPLETION_ADAPTER_ALLOWED_MODELS:
+        return f"{CODEX_AUTO_AGENT_NVIDIA_PROVIDER}/{normalized_id}"
+    return None
+
+
+def nvidia_completion_adapter_upstream_model(model: Any) -> Optional[str]:
+    """Return the NVIDIA NIM upstream model id without the `nvidia/` prefix."""
+
+    canonical = normalize_nvidia_completion_adapter_model_name(model)
+    if canonical is None:
+        return None
+    _prefix, _separator, model_id = canonical.partition("/")
+    return model_id or None
+
 # Generic compatibility publication for the pass-through integration module.
 COMPAT_ALIAS_MAP: dict[str, str] = {
     "_CODEX_AUTO_AGENT_NATIVE_PROVIDER": "CODEX_AUTO_AGENT_NATIVE_PROVIDER",
@@ -231,6 +311,8 @@ COMPAT_ALIAS_MAP: dict[str, str] = {
     "_CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY": (
         "CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY"
     ),
+    "_CODEX_AUTO_AGENT_NVIDIA_PROVIDER": "CODEX_AUTO_AGENT_NVIDIA_PROVIDER",
+    "_CODEX_AUTO_AGENT_NVIDIA_LANE_KEY": "CODEX_AUTO_AGENT_NVIDIA_LANE_KEY",
     "_CODEX_AUTO_AGENT_OPENCODE_LANE_KEY": "CODEX_AUTO_AGENT_OPENCODE_LANE_KEY",
     "_CODEX_AUTO_AGENT_OPENCODE_GO_LANE_KEY": (
         "CODEX_AUTO_AGENT_OPENCODE_GO_LANE_KEY"
@@ -275,6 +357,9 @@ COMPAT_ALIAS_MAP: dict[str, str] = {
     "_normalize_zai_coding_plan_adapter_model_name": (
         "normalize_zai_coding_plan_adapter_model_name"
     ),
+    "_normalize_nvidia_completion_adapter_model_name": (
+        "normalize_nvidia_completion_adapter_model_name"
+    ),
 }
 COMPAT_ALIAS_COUNT = len(COMPAT_ALIAS_MAP)
 
@@ -306,6 +391,8 @@ __all__ = [
     "CODEX_AUTO_AGENT_NOUS_PROVIDER",
     "CODEX_AUTO_AGENT_CURSOR_AGENT_LANE_KEY",
     "CODEX_AUTO_AGENT_CURSOR_AGENT_PROVIDER",
+    "CODEX_AUTO_AGENT_NVIDIA_LANE_KEY",
+    "CODEX_AUTO_AGENT_NVIDIA_PROVIDER",
     "CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS",
     "CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS",
     "CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS",
@@ -326,11 +413,16 @@ __all__ = [
     "COMPAT_ALIAS_COUNT",
     "COMPAT_ALIAS_MAP",
     "KIMI_CODE_CHAT_COMPLETIONS_ADAPTER_COMPATIBILITY_MAPPINGS",
+    "NVIDIA_COMPLETION_ADAPTER_ALLOWED_MODELS",
+    "NVIDIA_COMPLETION_ADAPTER_MODEL_ALIASES",
     "OPENCODE_GO_PROVIDER",
     "OPENCODE_ZEN_PROVIDER",
     "OPENROUTER_FREE_DAILY_QUOTA_MODELS",
     "install_policy_compat_aliases",
+    "is_reserved_openrouter_nvidia_nemotron_free_model",
     "normalize_alibaba_token_plan_adapter_model_name",
     "normalize_kimi_code_chat_completions_adapter_model_name",
+    "normalize_nvidia_completion_adapter_model_name",
     "normalize_zai_coding_plan_adapter_model_name",
+    "nvidia_completion_adapter_upstream_model",
 ]

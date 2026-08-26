@@ -207,6 +207,7 @@ class TestDispatchBehavior:
         host["_CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER"] = "zai_coding_plan"
         host["_CODEX_AUTO_AGENT_OPENROUTER_PROVIDER"] = "openrouter"
         host["_CODEX_AUTO_AGENT_XAI_PROVIDER"] = "xai"
+        host["_CODEX_AUTO_AGENT_NVIDIA_PROVIDER"] = "nvidia"
         codex_candidate_calls.install(host)
         return host
 
@@ -407,6 +408,41 @@ class TestCallbackOrdering:
         assert emit_kwargs["request_body"]["model"] == "zai-coding-plan-alias"
         assert emit_kwargs["provider_bound_body"] is completion_kwargs
         assert emit_kwargs["provider_bound_body"]["reasoning_effort"] == "max"
+
+    @pytest.mark.asyncio
+    async def test_nvidia_route_logs_provider_bound_body(self):
+        """handle_codex_nvidia must log translated completion kwargs."""
+        host = self._completion_handle_host(
+            prepare_name="_prepare_codex_nvidia_completion_adapter_route"
+        )
+        host["_CODEX_AUTO_AGENT_NVIDIA_PROVIDER"] = "nvidia"
+        mock_plan, completion_kwargs = self._completion_plan(
+            alias="nvidia/deepseek-ai/deepseek-v3.2",
+            upstream="deepseek-ai/deepseek-v3.2",
+            effort="high",
+        )
+        host["_prepare_codex_nvidia_completion_adapter_route"] = AsyncMock(
+            return_value=mock_plan
+        )
+
+        await host["_handle_codex_nvidia_completion_adapter_route"](
+            endpoint="/v1/responses",
+            request=MagicMock(headers={}),
+            fastapi_response=MagicMock(),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body={"model": "nvidia/deepseek-ai/deepseek-v3.2"},
+            adapter_model="nvidia/deepseek-ai/deepseek-v3.2",
+            use_alias_candidate_probe=False,
+        )
+
+        host["_validate_codex_auto_agent_responses_payload"].assert_awaited_once()
+        host["_record_adapted_completed_route_rollup_turn"].assert_called_once()
+        emit_kwargs = host["_emit_adapted_route_access_log"].call_args.kwargs
+        assert emit_kwargs["request_body"] is mock_plan.prepared_request_body
+        assert emit_kwargs["request_body"]["model"] == "nvidia/deepseek-ai/deepseek-v3.2"
+        assert emit_kwargs["provider_bound_body"] is completion_kwargs
+        assert emit_kwargs["provider_bound_body"]["reasoning_effort"] == "high"
+        assert emit_kwargs["adapter_label"] == "NVIDIA"
 
 
 class TestSotaXaiCandidateToolAdaptation:
@@ -1913,3 +1949,198 @@ class TestD1521OpenCodeProviderBoundBody:
         assert emit_kwargs["provider_bound_body"]["reasoning_effort"] == "medium"
         assert emit_kwargs["request_body"] is request_body
         assert emit_kwargs["request_body"]["model"] == "opencode-alias"
+# ── CFG-030 Codex NVIDIA completion adapter ─────────────────────────
+
+
+NVIDIA_FUNCTION_NAMES = (
+    "_build_codex_nvidia_adapter_request_body",
+    "_prepare_codex_nvidia_completion_adapter_route",
+    "_perform_codex_nvidia_completion_adapter_call",
+    "_handle_codex_nvidia_completion_adapter_route",
+)
+
+
+def _identity_adapter(body):
+    return body, []
+
+
+def _identity_drop(body):
+    return body, []
+
+
+class TestCFG030CodexNvidiaCompletionAdapter:
+    """Focused CFG-030 contract: nested NIM ids, OpenRouter reject, fail-closed."""
+
+    def _nvidia_host(self, monkeypatch, *, api_key="nvidia-test-key"):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        import httpx
+        from fastapi.responses import Response, StreamingResponse
+
+        from litellm.proxy._types import ProxyException
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            adapter_config,
+            adapter_driver,
+        )
+        from litellm.proxy.pass_through_endpoints.providers.nvidia import (
+            runtime as nvidia_runtime,
+        )
+
+        transform = MagicMock()
+        transform.transform_responses_api_request_to_chat_completion_request.return_value = {
+            "model": "deepseek-ai/deepseek-v3.2",
+            "messages": [{"role": "user", "content": "translated"}],
+            "custom_llm_provider": "nvidia_nim",
+        }
+        responses_transformation = __import__(
+            "litellm.responses.litellm_completion_transformation.transformation",
+            fromlist=["LiteLLMCompletionResponsesConfig"],
+        )
+        monkeypatch.setattr(
+            responses_transformation,
+            "LiteLLMCompletionResponsesConfig",
+            transform,
+        )
+        monkeypatch.setattr(
+            nvidia_runtime,
+            "_get_anthropic_adapter_nvidia_api_key",
+            lambda: api_key,
+        )
+        monkeypatch.setattr(
+            nvidia_runtime,
+            "_get_anthropic_adapter_nvidia_target_base",
+            lambda: "https://integrate.api.nvidia.com",
+        )
+        completion = AsyncMock(return_value=SimpleNamespace(id="chatcmpl_nvidia_1"))
+        egress = MagicMock()
+        host = {
+            "__builtins__": __builtins__,
+            "httpx": httpx,
+            "cast": lambda typ, val: val,
+            "ResponsesAPIOptionalRequestParams": dict,
+            "ProxyException": ProxyException,
+            "_aawm_adapter_driver": adapter_driver,
+            "_aawm_adapter_config": adapter_config,
+            "Response": Response,
+            "StreamingResponse": StreamingResponse,
+            "litellm": SimpleNamespace(acompletion=completion),
+            "_CODEX_AUTO_AGENT_NVIDIA_PROVIDER": "nvidia",
+            "_adapt_codex_custom_tools_to_functions_from_request_body": _identity_adapter,
+            "_adapt_codex_namespace_tools_to_functions_from_request_body": _identity_adapter,
+            "_apply_codex_tool_description_patches_to_request_body": _identity_adapter,
+            "_drop_unsupported_codex_hosted_tools_from_request_body": _identity_drop,
+            "_drop_unsupported_codex_input_items_from_request_body": _identity_drop,
+            "_drop_tool_choice_without_tools_from_request_body": _identity_drop,
+            "HttpPassThroughEndpointHelpers": SimpleNamespace(
+                validate_outgoing_egress=egress
+            ),
+            "_annotate_request_scope_for_adapted_access_log": MagicMock(),
+            "_get_proxy_shared_aiohttp_session": MagicMock(return_value="shared-session"),
+            "_build_responses_response_from_adapter_response": MagicMock(),
+            "apply_request_watermark_egress": MagicMock(
+                side_effect=lambda **kwargs: SimpleNamespace(body=kwargs["body"])
+            ),
+            "_get_runtime_text_watermark_config": MagicMock(return_value=None),
+            "_watermark_endpoint_from_path": MagicMock(return_value="chat_completions"),
+        }
+        codex_candidate_calls.install(host)
+        return SimpleNamespace(
+            host=host,
+            completion=completion,
+            egress=egress,
+            transform=transform,
+        )
+
+    def test_install_publishes_nvidia_names_outside_host_function_inventory(self):
+        host: dict[str, Any] = {"__builtins__": __builtins__}
+        codex_candidate_calls.install(host)
+        for name in NVIDIA_FUNCTION_NAMES:
+            assert name not in codex_candidate_calls._HOST_FUNCTION_NAMES
+            assert name not in EXPECTED_PUBLIC_SYMBOLS
+            assert name in host
+            assert callable(host[name])
+
+    @pytest.mark.asyncio
+    async def test_nested_slash_model_is_admitted_as_nvidia_nim(self, monkeypatch):
+        nvidia = self._nvidia_host(monkeypatch)
+        adapter_model = "nvidia/deepseek-ai/deepseek-v3.2"
+        plan = await nvidia.host["_prepare_codex_nvidia_completion_adapter_route"](
+            request=MagicMock(),
+            prepared_request_body={
+                "model": adapter_model,
+                "input": "hello",
+                "stream": False,
+            },
+            adapter_model=adapter_model,
+            use_alias_candidate_probe=False,
+        )
+        assert plan.perform_kwargs["upstream_model"] == "deepseek-ai/deepseek-v3.2"
+        assert plan.perform_kwargs["completion_kwargs"]["custom_llm_provider"] == "nvidia_nim"
+        assert plan.api_base == "https://integrate.api.nvidia.com/v1"
+        assert plan.target_url == "https://integrate.api.nvidia.com/v1/chat/completions"
+        transform_call = (
+            nvidia.transform.transform_responses_api_request_to_chat_completion_request.call_args
+        )
+        assert transform_call.kwargs["custom_llm_provider"] == "nvidia_nim"
+        assert transform_call.kwargs["model"] == "deepseek-ai/deepseek-v3.2"
+        metadata = plan.prepared_request_body["litellm_metadata"]
+        assert metadata["codex_nvidia_adapter_model"] == adapter_model
+        assert metadata["codex_nvidia_upstream_model"] == "deepseek-ai/deepseek-v3.2"
+        egress_kwargs = nvidia.egress.call_args.kwargs
+        assert egress_kwargs["credential_family"] == "nvidia"
+        assert egress_kwargs["expected_target_family"] == "nvidia"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "adapter_model",
+        [
+            "nvidia/nemotron-3-super-120b-a12b:free",
+            "nvidia/nemotron-super-49b:free",
+        ],
+    )
+    async def test_openrouter_nvidia_namespace_is_rejected(self, monkeypatch, adapter_model):
+        nvidia = self._nvidia_host(monkeypatch)
+        with pytest.raises(
+            ValueError,
+            match="Codex NVIDIA adapter requires a nvidia/<model> candidate.",
+        ):
+            await nvidia.host["_prepare_codex_nvidia_completion_adapter_route"](
+                request=MagicMock(),
+                prepared_request_body={
+                    "model": adapter_model,
+                    "input": "hello",
+                },
+                adapter_model=adapter_model,
+                use_alias_candidate_probe=False,
+            )
+        assert nvidia.completion.await_count == 0
+        nvidia.egress.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_credentials_fail_closed_without_acompletion(self, monkeypatch):
+        from litellm.proxy._types import ProxyException
+
+        nvidia = self._nvidia_host(monkeypatch, api_key=None)
+        with pytest.raises(ProxyException) as exc_info:
+            await nvidia.host["_prepare_codex_nvidia_completion_adapter_route"](
+                request=MagicMock(),
+                prepared_request_body={
+                    "model": "nvidia/deepseek-ai/deepseek-v3.2",
+                    "input": "hello",
+                },
+                adapter_model="nvidia/deepseek-ai/deepseek-v3.2",
+                use_alias_candidate_probe=False,
+            )
+        exc = exc_info.value
+        assert exc.type == "rate_limit_error"
+        assert str(exc.code) == "429"
+        assert "AAWM_NVIDIA_API_KEY" in exc.message
+        assert "NVIDIA_NIM_API_KEY" in exc.message
+        assert "NVIDIA_API_KEY" in exc.message
+        assert (
+            exc.detail["error"]["code"]
+            == "aawm_codex_auto_agent_candidate_unavailable"
+        )
+        assert nvidia.completion.await_count == 0
+        nvidia.egress.assert_not_called()

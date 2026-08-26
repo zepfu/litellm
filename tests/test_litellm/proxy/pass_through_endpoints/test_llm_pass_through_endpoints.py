@@ -7340,6 +7340,46 @@ class TestClaudePersistedOutputExpansion:
             == "nvidia/nemotron-3-super-120b-a12b:free"
         )
 
+    def test_normalize_nvidia_completion_rejects_reserved_openrouter_namespace(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+            is_reserved_openrouter_nvidia_nemotron_free_model,
+            normalize_nvidia_completion_adapter_model_name,
+        )
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            _resolve_codex_nvidia_completion_adapter_model,
+        )
+
+        reserved = (
+            "nvidia/nemotron-3-super-120b-a12b:free",
+            "nvidia/nemotron-super-49b:free",
+            "openrouter/nvidia/nemotron-super-49b:free",
+        )
+        for requested_model in reserved:
+            assert is_reserved_openrouter_nvidia_nemotron_free_model(requested_model) is True
+            assert normalize_nvidia_completion_adapter_model_name(requested_model) is None
+            assert (
+                _resolve_codex_nvidia_completion_adapter_model(
+                    {"model": requested_model},
+                    endpoint="/v1/responses",
+                )
+                is None
+            )
+
+        assert (
+            normalize_nvidia_completion_adapter_model_name("nvidia/deepseek-ai/deepseek-v3.2")
+            == "nvidia/deepseek-ai/deepseek-v3.2"
+        )
+        assert (
+            _resolve_codex_nvidia_completion_adapter_model(
+                {"model": "nvidia/deepseek-ai/deepseek-v3.2"},
+                endpoint="/v1/responses",
+            )
+            == "nvidia/deepseek-ai/deepseek-v3.2"
+        )
+        assert is_reserved_openrouter_nvidia_nemotron_free_model("nvidia/deepseek-ai/deepseek-v3.2") is False
+
     def test_resolve_anthropic_openrouter_responses_adapter_model_supports_google_namespace(
         self,
     ):

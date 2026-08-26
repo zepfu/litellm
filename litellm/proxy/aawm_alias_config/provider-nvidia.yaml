@@ -1,0 +1,32 @@
+# Provider-pinned acceptance alias (CFG-030). Closed NVIDIA NIM set.
+# OpenRouter-namespace nvidia/nemotron-*:free stays on provider-openrouter.
+
+defaults: {}
+
+aliases:
+  - name: provider-nvidia
+    candidates:
+      - provider: nvidia
+        model: nvidia/deepseek-ai/deepseek-v3.2
+        route_family: codex_nvidia_completion_adapter
+        priority: 100
+
+      - provider: nvidia
+        model: nvidia/deepseek-ai/deepseek-v3.1-terminus
+        route_family: codex_nvidia_completion_adapter
+        priority: 90
+
+      - provider: nvidia
+        model: nvidia/mistralai/devstral-2-123b-instruct-2512
+        route_family: codex_nvidia_completion_adapter
+        priority: 80
+
+      - provider: nvidia
+        model: nvidia/z-ai/glm4.7
+        route_family: codex_nvidia_completion_adapter
+        priority: 70
+
+      - provider: nvidia
+        model: nvidia/minimaxai/minimax-m2.7
+        route_family: codex_nvidia_completion_adapter
+        priority: 60

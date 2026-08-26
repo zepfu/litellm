@@ -353,6 +353,105 @@ def test_canonical_work_other_compiles_scheduled_deepseek_without_alibaba() -> N
     assert owner.schedule is None
 
 
+def test_canonical_provider_nvidia_compiles_closed_nim_set_without_alias_reference() -> None:
+    """Live provider-nvidia is five NVIDIA NIM models on NVIDIA-credential families."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+        AliasReference,
+        RoutingCandidate,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    alias = snapshot.aliases["provider-nvidia"]
+    assert alias.dispatch is None
+    assert all(isinstance(entry, RoutingCandidate) for entry in alias.candidates)
+    assert all(not isinstance(entry, AliasReference) for entry in alias.candidates)
+    identities = [
+        (entry.provider, entry.model, entry.route_family, entry.priority)
+        for entry in alias.candidates
+    ]
+    assert identities == [
+        (
+            "nvidia",
+            "nvidia/deepseek-ai/deepseek-v3.2",
+            "codex_nvidia_completion_adapter",
+            100,
+        ),
+        (
+            "nvidia",
+            "nvidia/deepseek-ai/deepseek-v3.1-terminus",
+            "codex_nvidia_completion_adapter",
+            90,
+        ),
+        (
+            "nvidia",
+            "nvidia/mistralai/devstral-2-123b-instruct-2512",
+            "codex_nvidia_completion_adapter",
+            80,
+        ),
+        (
+            "nvidia",
+            "nvidia/z-ai/glm4.7",
+            "codex_nvidia_completion_adapter",
+            70,
+        ),
+        (
+            "nvidia",
+            "nvidia/minimaxai/minimax-m2.7",
+            "codex_nvidia_completion_adapter",
+            60,
+        ),
+    ]
+    for entry in alias.candidates:
+        assert entry.anthropic_route_family is None
+        assert "nemotron" not in entry.model
+
+
+def test_nvidia_credential_domain_rejects_foreign_provider_and_non_nim_family() -> None:
+    """NVIDIA-credential families stay NVIDIA-native; NVIDIA models stay on NIM families."""
+    foreign_provider = """
+defaults: {}
+aliases:
+  - name: mixed
+    candidates:
+      - provider: openrouter
+        model: nvidia/deepseek-ai/deepseek-v3.2
+        route_family: codex_nvidia_completion_adapter
+        priority: 100
+"""
+    with pytest.raises(compiler.ConfigCompileError, match="NVIDIA-credential"):
+        compiler.compile_yaml(foreign_provider)
+
+    nvidia_on_codex = """
+defaults: {}
+aliases:
+  - name: mixed
+    candidates:
+      - provider: nvidia
+        model: nvidia/deepseek-ai/deepseek-v3.2
+        route_family: codex_responses
+        priority: 100
+"""
+    with pytest.raises(compiler.ConfigCompileError, match="NVIDIA-native"):
+        compiler.compile_yaml(nvidia_on_codex)
+
+    nvidia_on_openrouter = """
+defaults: {}
+aliases:
+  - name: mixed
+    candidates:
+      - provider: nvidia
+        model: nvidia/deepseek-ai/deepseek-v3.2
+        route_family: codex_openrouter_completion_adapter
+        priority: 100
+"""
+    with pytest.raises(compiler.ConfigCompileError, match="NVIDIA-native"):
+        compiler.compile_yaml(nvidia_on_openrouter)
+
+
 def test_canonical_read_alias_references_basic_go_first() -> None:
     """Live ``read`` must compile as an AAWM alias, not a ChatGPT-native model.
 
