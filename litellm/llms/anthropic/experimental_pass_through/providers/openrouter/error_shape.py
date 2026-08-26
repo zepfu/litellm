@@ -201,6 +201,41 @@ def is_no_endpoint_candidate_error(
     return "no endpoints found" in " ".join(haystacks).lower()
 
 
+def is_retired_ox_alpha_candidate_error(
+    runtime: ErrorShapeRuntime,
+    exc: object,
+    *,
+    model: Optional[str],
+    status_code: Optional[int] = None,
+    raw_message: Optional[str] = None,
+) -> bool:
+    """Return whether OpenRouter reports the retired ox-alpha test model."""
+    if status_code is None:
+        status_code = extract_exception_status_code(runtime, exc)
+    if status_code != 404:
+        return False
+    if model not in {"stealth/ox-alpha", "openrouter/stealth/ox-alpha"}:
+        return False
+    if raw_message is None:
+        raw_message = extract_raw_message(runtime, exc)
+    combined_text = " ".join(
+        str(part)
+        for part in (
+            raw_message,
+            getattr(exc, "message", None),
+            getattr(exc, "detail", None),
+            str(exc),
+        )
+        if part is not None
+    ).casefold()
+    normalized_text = " ".join(combined_text.split())
+    observed_withdrawal_message = (
+        "thank you for participating in the stealth ox alpha testing period. "
+        "this model was zai's glm-5.3 flash."
+    )
+    return observed_withdrawal_message in normalized_text
+
+
 def is_provider_raw_error(runtime: ErrorShapeRuntime, exc: object) -> bool:
     payload = extract_error_payload(runtime, exc)
     if payload is None:

@@ -247,6 +247,126 @@ def test_rr054_openrouter_no_endpoint_error_is_alias_probe_only() -> None:
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "adapter_model",
+        "use_alias_candidate_probe",
+        "status_code",
+        "detail",
+        "expect_candidate_unavailable",
+    ),
+    [
+        pytest.param(
+            "stealth/ox-alpha",
+            True,
+            404,
+            {
+                "error": {
+                    "message": (
+                        "Thank you for participating in the Stealth Ox Alpha "
+                        "testing period. This model was ZAI's GLM-5.3 Flash."
+                    )
+                }
+            },
+            True,
+            id="probe-upstream-model-detail",
+        ),
+        pytest.param(
+            "openrouter/stealth/ox-alpha",
+            False,
+            404,
+            {
+                "error": {
+                    "message": (
+                        "Thank you for participating in the Stealth Ox Alpha "
+                        "testing period. This model was ZAI's GLM-5.3 Flash."
+                    )
+                }
+            },
+            False,
+            id="direct-retired-original",
+        ),
+        pytest.param(
+            "openrouter/stealth/ox-alpha",
+            True,
+            404,
+            {"error": {"message": "Model not found"}},
+            False,
+            id="probe-arbitrary-404-original",
+        ),
+        pytest.param(
+            "openrouter/stealth/ox-alpha",
+            True,
+            404,
+            {
+                "error": {
+                    "message": (
+                        "The Stealth Ox Alpha testing period has ended. "
+                        "Please migrate to GLM-5.3 Flash."
+                    )
+                }
+            },
+            False,
+            id="probe-alternate-with-loose-fragments-original",
+        ),
+        pytest.param(
+            "openrouter/example",
+            True,
+            404,
+            {
+                "error": {
+                    "message": (
+                        "Thank you for participating in the Stealth Ox Alpha "
+                        "testing period. This model was ZAI's GLM-5.3 Flash."
+                    )
+                }
+            },
+            False,
+            id="probe-wrong-model-original",
+        ),
+    ],
+)
+async def test_rr054_openrouter_retired_ox_alpha_error_matrix(
+    adapter_model: str,
+    use_alias_candidate_probe: bool,
+    status_code: int,
+    detail: object,
+    expect_candidate_unavailable: bool,
+) -> None:
+    runtime = _runtime()
+    exc = ProviderError(
+        "OpenRouter request failed",
+        status_code=status_code,
+        detail=detail,
+    )
+
+    async def _operation() -> object:
+        raise exc
+
+    if expect_candidate_unavailable:
+        with pytest.raises(
+            CandidateUnavailable,
+            match="is retired after its testing period",
+        ):
+            await retry_transport.perform_completion_operation(
+                runtime,
+                adapter_model=adapter_model,
+                operation=_operation,
+                use_alias_candidate_probe=use_alias_candidate_probe,
+            )
+        return
+
+    with pytest.raises(ProviderError) as raised:
+        await retry_transport.perform_completion_operation(
+            runtime,
+            adapter_model=adapter_model,
+            operation=_operation,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+        )
+    assert raised.value is exc
+
+
 def test_rr054_openrouter_retry_wait_prefers_provider_reset_metadata() -> None:
     runtime = _runtime(env={"AAWM_OPENROUTER_ADAPTER_BACKOFF_SECONDS": "2,10"})
     metadata_retry = ProviderError(

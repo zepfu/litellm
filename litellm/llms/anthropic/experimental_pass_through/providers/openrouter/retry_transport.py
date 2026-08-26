@@ -33,6 +33,7 @@ from .error_shape import (
     is_long_window_rate_limit,
     is_no_endpoint_candidate_error,
     is_provider_raw_error,
+    is_retired_ox_alpha_candidate_error,
 )
 
 RetryResultT = TypeVar("RetryResultT")
@@ -118,6 +119,37 @@ def maybe_raise_alias_probe_no_endpoint_unavailable(
     runtime.raise_candidate_unavailable(
         f"OpenRouter auto-agent candidate {model_label} has no available "
         f"endpoints: {detail_text}"
+    )
+
+
+def maybe_raise_alias_probe_retired_ox_alpha_unavailable(
+    runtime: Runtime,
+    exc: object,
+    *,
+    adapter_model: Optional[str],
+    use_alias_candidate_probe: bool,
+    status_code: Optional[int] = None,
+    raw_message: Optional[str] = None,
+) -> None:
+    if not use_alias_candidate_probe:
+        return
+    upstream_model = runtime.get_completion_model(adapter_model)
+    if not any(
+        is_retired_ox_alpha_candidate_error(
+            runtime,
+            exc,
+            model=model,
+            status_code=status_code,
+            raw_message=raw_message,
+        )
+        for model in (adapter_model, upstream_model)
+    ):
+        return
+    model_label = get_rate_limit_key(runtime, adapter_model)
+    detail_text = raw_message or str(exc)
+    runtime.raise_candidate_unavailable(
+        f"OpenRouter auto-agent candidate {model_label} is retired after its "
+        f"testing period: {detail_text}"
     )
 
 
@@ -410,6 +442,14 @@ async def run_retry_loop(
             )
             await runtime.open_failure_circuit_callback(adapter_model, exc=exc)
             return False
+        maybe_raise_alias_probe_retired_ox_alpha_unavailable(
+            runtime,
+            exc,
+            adapter_model=adapter_model,
+            use_alias_candidate_probe=use_alias_candidate_probe,
+            status_code=status_code,
+            raw_message=raw_message,
+        )
         maybe_raise_alias_probe_no_endpoint_unavailable(
             runtime,
             exc,

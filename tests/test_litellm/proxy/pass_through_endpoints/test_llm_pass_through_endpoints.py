@@ -30342,7 +30342,7 @@ def test_raise_codex_native_openai_auto_agent_candidate_unavailable_sets_proxy_d
 
 
 @pytest.mark.asyncio
-async def test_codex_work_advances_from_go_and_nous_to_openrouter_ox_alpha():
+async def test_codex_work_advances_from_go_nous_and_retired_openrouter_to_alibaba():
     request = _build_codex_auto_agent_request()
     body = {
         "model": "work",
@@ -30364,7 +30364,14 @@ async def test_codex_work_advances_from_go_and_nous_to_openrouter_ox_alpha():
             "code": "aawm_codex_auto_agent_candidate_unavailable",
         }
     }
-    openrouter_success = Response(
+    with pytest.raises(ProxyException) as openrouter_retired_info:
+        llm_passthrough_endpoints._raise_openrouter_auto_agent_candidate_unavailable(
+            "OpenRouter auto-agent candidate openrouter/stealth/ox-alpha is "
+            "retired: Thank you for participating in the Stealth Ox Alpha "
+            "testing period. This model was ZAI's GLM-5.3 Flash."
+        )
+    openrouter_retired = openrouter_retired_info.value
+    alibaba_success = Response(
         content='{"ok": true}',
         media_type="application/json",
     )
@@ -30398,8 +30405,11 @@ async def test_codex_work_advances_from_go_and_nous_to_openrouter_ox_alpha():
         ),
     ) as mock_nous_completion, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
-        new=AsyncMock(return_value=openrouter_success),
-    ) as mock_openrouter:
+        new=AsyncMock(side_effect=openrouter_retired),
+    ) as mock_openrouter, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_alibaba_token_plan_adapter_route",
+        new=AsyncMock(return_value=alibaba_success),
+    ) as mock_alibaba:
         response = await _handle_codex_auto_agent_alias_route(
             endpoint="/v1/responses",
             request=request,
@@ -30412,10 +30422,11 @@ async def test_codex_work_advances_from_go_and_nous_to_openrouter_ox_alpha():
             forward_headers=True,
         )
 
-    assert response is openrouter_success
+    assert response is alibaba_success
     mock_opencode_go.assert_awaited_once()
     mock_nous.assert_awaited_once()
     mock_openrouter.assert_awaited_once()
+    mock_alibaba.assert_awaited_once()
     mock_nous_jwt.assert_not_called()
     mock_nous_completion.assert_not_awaited()
     assert mock_opencode_go.await_args.kwargs["adapter_model"] == "ox-alpha-free"
@@ -30426,7 +30437,16 @@ async def test_codex_work_advances_from_go_and_nous_to_openrouter_ox_alpha():
         "openrouter/stealth/ox-alpha"
     )
     assert mock_openrouter.await_args.kwargs["use_alias_candidate_probe"] is True
-    metadata = mock_openrouter.await_args.kwargs["request_body"]["litellm_metadata"]
+    assert mock_alibaba.await_args.kwargs["adapter_model"] == (
+        "alibaba_token_plan/deepseek-v4-pro"
+    )
+    assert mock_alibaba.await_args.kwargs["use_alias_candidate_probe"] is True
+    alibaba_body = mock_alibaba.await_args.kwargs["prepared_request_body"]
+    metadata = alibaba_body["litellm_metadata"]
+    assert metadata["codex_auto_agent_selected_provider"] == "alibaba_token_plan"
+    assert metadata["codex_auto_agent_selected_model"] == (
+        "alibaba_token_plan/deepseek-v4-pro"
+    )
     assert [
         (attempt["provider"], attempt["model"])
         for attempt in metadata["codex_auto_agent_attempts"]
@@ -30434,6 +30454,7 @@ async def test_codex_work_advances_from_go_and_nous_to_openrouter_ox_alpha():
         ("opencode_go", "ox-alpha-free"),
         ("nous", "stealth/ox-alpha"),
         ("openrouter", "openrouter/stealth/ox-alpha"),
+        ("alibaba_token_plan", "alibaba_token_plan/deepseek-v4-pro"),
     ]
     assert metadata["codex_auto_agent_attempts"][0]["error_class"] == (
         "candidate_unavailable"
@@ -30447,6 +30468,12 @@ async def test_codex_work_advances_from_go_and_nous_to_openrouter_ox_alpha():
     assert metadata["codex_auto_agent_attempts"][1][
         "attempted_provider_call"
     ] is False
+    assert metadata["codex_auto_agent_attempts"][2]["error_class"] == (
+        "candidate_unavailable"
+    )
+    assert "aawm_codex_auto_agent_candidate_unavailable" in metadata[
+        "codex_auto_agent_attempts"
+    ][2]["error_tokens"]
 
 
 @pytest.mark.asyncio
