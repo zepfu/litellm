@@ -103,6 +103,120 @@ def test_should_resolve_prefixed_direct_nous_models_on_responses() -> None:
 
 
 @pytest.mark.asyncio
+async def test_should_reject_nous_alias_probe_stock_codex_contract_before_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import litellm
+    from litellm.proxy._types import ProxyException
+    from litellm.proxy.pass_through_endpoints import (
+        llm_passthrough_endpoints as lpe,
+    )
+    from litellm.secret_managers import hermes_nous_auth
+
+    jwt_loader = MagicMock(
+        side_effect=AssertionError("Nous JWT must not load for incompatible probe")
+    )
+    completion = AsyncMock(
+        side_effect=AssertionError(
+            "Nous provider must not run for incompatible probe"
+        )
+    )
+    monkeypatch.setattr(hermes_nous_auth, "load_nous_invoke_jwt", jwt_loader)
+    monkeypatch.setattr(litellm, "acompletion", completion)
+
+    with pytest.raises(ProxyException) as exc_info:
+        await lpe._handle_codex_nous_chat_completions_adapter_route(
+            endpoint="/v1/responses",
+            request=_request(),
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body={
+                "model": f"nous/{_ADAPTER_MODEL}",
+                "input": "run date",
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "exec_command",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+                "tool_choice": {
+                    "type": "function",
+                    "name": "exec_command",
+                },
+            },
+            adapter_model=_ADAPTER_MODEL,
+            use_alias_candidate_probe=True,
+        )
+
+    raised = exc_info.value
+    assert raised.code == "429"
+    assert raised.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_candidate_unavailable"
+    )
+    assert raised.failure_phase == "candidate_preflight"
+    assert raised.attempted_provider_call is False
+    jwt_loader.assert_not_called()
+    completion.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_should_preserve_direct_nous_stream_request_provider_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import litellm
+    from litellm.proxy.pass_through_endpoints import (
+        llm_passthrough_endpoints as lpe,
+    )
+    from litellm.secret_managers import hermes_nous_auth
+
+    provider_error = RuntimeError("Nous provider rejected the request")
+    jwt_loader = MagicMock(return_value=_FIXTURE_JWT)
+    completion = AsyncMock(side_effect=provider_error)
+    monkeypatch.setattr(hermes_nous_auth, "load_nous_invoke_jwt", jwt_loader)
+    monkeypatch.setattr(litellm, "acompletion", completion)
+    monkeypatch.setattr(
+        lpe.BaseOpenAIPassThroughHandler,
+        "_assemble_headers",
+        MagicMock(
+            return_value={"Authorization": f"Bearer {_FIXTURE_JWT}"}
+        ),
+    )
+    monkeypatch.setattr(
+        lpe.HttpPassThroughEndpointHelpers,
+        "validate_outgoing_egress",
+        MagicMock(),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_annotate_request_scope_for_adapted_access_log",
+        MagicMock(),
+    )
+    monkeypatch.setattr(lpe, "_emit_adapted_route_access_log", MagicMock())
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await lpe._handle_codex_nous_chat_completions_adapter_route(
+            endpoint="/v1/responses",
+            request=_request(),
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body={
+                "model": f"nous/{_ADAPTER_MODEL}",
+                "input": "run date",
+                "stream": True,
+            },
+            adapter_model=_ADAPTER_MODEL,
+            use_alias_candidate_probe=False,
+        )
+
+    assert type(exc_info.value) is RuntimeError
+    assert str(exc_info.value) == str(provider_error)
+    jwt_loader.assert_called_once_with()
+    completion.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_should_post_to_nous_inference_chat_completions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -649,7 +763,7 @@ async def _run_nous_jwt_load_failure(
                 prepared_request_body={
                     "model": "nous/stealth/ox-alpha",
                     "input": "Reply with exactly the word PONG.",
-                    "stream": True,
+                    "stream": False,
                 },
                 adapter_model=_ADAPTER_MODEL,
                 use_alias_candidate_probe=True,

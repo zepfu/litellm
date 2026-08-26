@@ -3620,7 +3620,35 @@ async def _handle_codex_nous_chat_completions_adapter_route(
     )
     from litellm.secret_managers.hermes_nous_auth import load_nous_invoke_jwt
 
-    _ = endpoint, fastapi_response, user_api_key_dict, use_alias_candidate_probe
+    _ = endpoint, fastapi_response, user_api_key_dict
+    if use_alias_candidate_probe and (
+        bool(prepared_request_body.get("stream"))
+        or bool(prepared_request_body.get("tools"))
+        or bool(prepared_request_body.get("tool_choice"))
+    ):
+        from litellm.proxy.pass_through_endpoints.providers.common import (
+            _raise_candidate_unavailable,
+        )
+        from litellm.proxy._types import ProxyException
+
+        incompatibility = ValueError(
+            "Nous stealth/ox-alpha cannot accept the stock Codex "
+            "streaming and tool request contract."
+        )
+        try:
+            _raise_candidate_unavailable(
+                incompatibility,
+                message=(
+                    "Nous auto-agent candidate is incompatible with the "
+                    "requested Codex streaming or tool contract."
+                ),
+                error_type="rate_limit_error",
+                status_code=429,
+            )
+        except ProxyException as exc:
+            setattr(exc, "failure_phase", "candidate_preflight")
+            setattr(exc, "attempted_provider_call", False)
+            raise
     request_body = dict(prepared_request_body)
     request_body["model"] = adapter_model
     request_input = request_body.get("input", "")

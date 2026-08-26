@@ -30342,12 +30342,14 @@ def test_raise_codex_native_openai_auto_agent_candidate_unavailable_sets_proxy_d
 
 
 @pytest.mark.asyncio
-async def test_codex_work_advances_from_opencode_go_unavailable_to_nous_ox_alpha():
+async def test_codex_work_advances_from_go_and_nous_to_openrouter_ox_alpha():
     request = _build_codex_auto_agent_request()
     body = {
         "model": "work",
         "input": "hello",
-        "stream": False,
+        "stream": True,
+        "tools": [_codex_apply_patch_custom_tool_definition()],
+        "tool_choice": {"type": "custom", "name": "apply_patch"},
         "litellm_metadata": {"session_id": "codex-session"},
     }
     opencode_go_unavailable = ProxyException(
@@ -30362,11 +30364,14 @@ async def test_codex_work_advances_from_opencode_go_unavailable_to_nous_ox_alpha
             "code": "aawm_codex_auto_agent_candidate_unavailable",
         }
     }
-    nous_success = Response(
+    openrouter_success = Response(
         content='{"ok": true}',
         media_type="application/json",
     )
     dual_cache = _FakeAawmAliasRoutingDualCache()
+    nous_handler = (
+        llm_passthrough_endpoints._handle_codex_nous_chat_completions_adapter_route
+    )
 
     with patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
@@ -30376,8 +30381,25 @@ async def test_codex_work_advances_from_opencode_go_unavailable_to_nous_ox_alpha
         new=AsyncMock(side_effect=opencode_go_unavailable),
     ) as mock_opencode_go, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_nous_chat_completions_adapter_route",
-        new=AsyncMock(return_value=nous_success),
-    ) as mock_nous:
+        new=AsyncMock(wraps=nous_handler),
+    ) as mock_nous, patch(
+        "litellm.secret_managers.hermes_nous_auth.load_nous_invoke_jwt",
+        new=MagicMock(
+            side_effect=AssertionError(
+                "Nous JWT must not load for incompatible alias preflight"
+            )
+        ),
+    ) as mock_nous_jwt, patch(
+        "litellm.acompletion",
+        new=AsyncMock(
+            side_effect=AssertionError(
+                "Nous provider must not run for incompatible alias preflight"
+            )
+        ),
+    ) as mock_nous_completion, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
+        new=AsyncMock(return_value=openrouter_success),
+    ) as mock_openrouter:
         response = await _handle_codex_auto_agent_alias_route(
             endpoint="/v1/responses",
             request=request,
@@ -30390,26 +30412,41 @@ async def test_codex_work_advances_from_opencode_go_unavailable_to_nous_ox_alpha
             forward_headers=True,
         )
 
-    assert response is nous_success
+    assert response is openrouter_success
     mock_opencode_go.assert_awaited_once()
     mock_nous.assert_awaited_once()
+    mock_openrouter.assert_awaited_once()
+    mock_nous_jwt.assert_not_called()
+    mock_nous_completion.assert_not_awaited()
     assert mock_opencode_go.await_args.kwargs["adapter_model"] == "ox-alpha-free"
     assert mock_opencode_go.await_args.kwargs["use_alias_candidate_probe"] is True
     assert mock_nous.await_args.kwargs["adapter_model"] == "stealth/ox-alpha"
     assert mock_nous.await_args.kwargs["use_alias_candidate_probe"] is True
-    metadata = mock_nous.await_args.kwargs["prepared_request_body"][
-        "litellm_metadata"
-    ]
+    assert mock_openrouter.await_args.kwargs["adapter_model"] == (
+        "openrouter/stealth/ox-alpha"
+    )
+    assert mock_openrouter.await_args.kwargs["use_alias_candidate_probe"] is True
+    metadata = mock_openrouter.await_args.kwargs["request_body"]["litellm_metadata"]
     assert [
         (attempt["provider"], attempt["model"])
         for attempt in metadata["codex_auto_agent_attempts"]
     ] == [
         ("opencode_go", "ox-alpha-free"),
         ("nous", "stealth/ox-alpha"),
+        ("openrouter", "openrouter/stealth/ox-alpha"),
     ]
     assert metadata["codex_auto_agent_attempts"][0]["error_class"] == (
         "candidate_unavailable"
     )
+    assert metadata["codex_auto_agent_attempts"][1]["error_class"] == (
+        "candidate_unavailable"
+    )
+    assert metadata["codex_auto_agent_attempts"][1]["failure_phase"] == (
+        "candidate_preflight"
+    )
+    assert metadata["codex_auto_agent_attempts"][1][
+        "attempted_provider_call"
+    ] is False
 
 
 @pytest.mark.asyncio

@@ -428,8 +428,8 @@ def _update_codex_auto_agent_retryable_attempt_record(
         "status": ("retryable_no_cooldown" if cooldown_scope == "none" else "cooldown_set"),
         "error_class": error_class,
         "error_tokens": sorted(error_tokens),
-        "failure_phase": "provider_attempt",
-        "attempted_provider_call": True,
+        "failure_phase": getattr(exc, "failure_phase", "provider_attempt"),
+        "attempted_provider_call": getattr(exc, "attempted_provider_call", True),
         "source_error": source_error,
     }
     if cooldown_scope != "none":
