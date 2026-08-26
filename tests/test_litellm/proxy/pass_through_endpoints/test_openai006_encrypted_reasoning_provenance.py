@@ -915,6 +915,157 @@ async def test_native_openai_owner_strips_ciphertext_only_function_output_before
     assert "encrypted_content" not in item
 
 
+_CODEX_EMPTY_SPAWN_ENVELOPE = (
+    "Message Type: NEW_TASK\n"
+    "Task name: /root/hv2_child_shell_retry\n"
+    "Sender: /root\n"
+    "Payload:\n"
+)
+_CODEX_MESSAGE_SPAWN_ENVELOPE = (
+    "Message Type: MESSAGE\n"
+    "Task name: /root/hv2_child_shell_retry\n"
+    "Sender: /root\n"
+    "Payload:\n"
+)
+_CODEX_SPAWN_TASK_TEXT = (
+    "gAAAA ordinary spawn task text; execute a harmless local shell command."
+)
+
+
+def test_guard_restores_codex_spawn_agent_plaintext_into_visible_input_text():
+    """Native OpenAI egress must surface stranded spawn_agent task text."""
+    body = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "agent_message",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": _CODEX_EMPTY_SPAWN_ENVELOPE,
+                    },
+                    {
+                        "type": "encrypted_content",
+                        "encrypted_content": _CODEX_SPAWN_TASK_TEXT,
+                    },
+                ],
+            }
+        ],
+    }
+    prepared, _disposition = erp.guard_openai_encrypted_reasoning_egress(
+        body,
+        url="https://chatgpt.com/backend-api/codex/responses",
+    )
+    item = prepared["input"][0]
+    assert item["type"] == "agent_message"
+    assert item["content"] == [
+        {
+            "type": "input_text",
+            "text": f"{_CODEX_EMPTY_SPAWN_ENVELOPE}{_CODEX_SPAWN_TASK_TEXT}",
+        }
+    ]
+
+
+def test_guard_leaves_nonmatching_agent_message_shape_unmodified():
+    """Only the exact NEW_TASK/input_text two-part wire shape is restored."""
+    original_item = {
+        "type": "agent_message",
+        "content": [
+            {
+                "type": "input_text",
+                "text": _CODEX_MESSAGE_SPAWN_ENVELOPE,
+            },
+            {
+                "type": "encrypted_content",
+                "encrypted_content": _CODEX_SPAWN_TASK_TEXT,
+            },
+        ],
+    }
+    body = {
+        "model": "gpt-5.6-sol",
+        "input": [original_item],
+    }
+    prepared, _disposition = erp.guard_openai_encrypted_reasoning_egress(
+        body,
+        url="https://chatgpt.com/backend-api/codex/responses",
+    )
+    item = prepared["input"][0]
+    assert item == original_item
+    assert item["content"] == [
+        {
+            "type": "input_text",
+            "text": _CODEX_MESSAGE_SPAWN_ENVELOPE,
+        },
+        {
+            "type": "encrypted_content",
+            "encrypted_content": _CODEX_SPAWN_TASK_TEXT,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_openai_owner_restores_spawn_agent_plaintext_and_strips_function_output():
+    from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+        _perform_codex_auto_agent_native_openai_request,
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _capture_pass_through(**kwargs):
+        captured["body"] = kwargs.get("custom_body")
+        return MagicMock()
+
+    request_body = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "agent_message",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": _CODEX_EMPTY_SPAWN_ENVELOPE,
+                    },
+                    {
+                        "type": "encrypted_content",
+                        "encrypted_content": _CODEX_SPAWN_TASK_TEXT,
+                    },
+                ],
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_native_owner_child",
+                "encrypted_content": "ciphertext",
+            },
+        ],
+    }
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+        new=AsyncMock(side_effect=_capture_pass_through),
+    ):
+        await _perform_codex_auto_agent_native_openai_request(
+            request=MagicMock(spec=Request),
+            fastapi_response=MagicMock(),
+            user_api_key_dict=MagicMock(),
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+            request_body=request_body,
+            custom_headers={},
+        )
+    sent = captured["body"]
+    agent_item = sent["input"][0]
+    function_item = sent["input"][1]
+    assert agent_item["type"] == "agent_message"
+    assert agent_item["content"] == [
+        {
+            "type": "input_text",
+            "text": f"{_CODEX_EMPTY_SPAWN_ENVELOPE}{_CODEX_SPAWN_TASK_TEXT}",
+        }
+    ]
+    assert function_item["call_id"] == "call_native_owner_child"
+    assert "encrypted_content" not in function_item
+
+
 def test_build_route_identity_from_valid_provenance_triple():
     identity = erp.build_route_identity_from_provenance(
         {

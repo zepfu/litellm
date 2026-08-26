@@ -31,6 +31,15 @@ Provider-neutral helpers that:
    prior-owner source, fail closed and strip. Alias text and model suffixes
    are not proof.
 
+6. On OpenAI Responses egress, restore ordinary Codex ``spawn_agent`` task
+   text that arrives as an ``agent_message`` with exactly two content parts:
+   first ``input_text`` whose text is the empty ``NEW_TASK`` envelope
+   ``Message Type: NEW_TASK\nTask name: <line>\nSender: <line>\nPayload:\n``,
+   and second ``encrypted_content`` whose nonempty string is the task text.
+   Append that sibling string onto the visible ``input_text`` and drop the
+   sibling. Do not classify the payload value, and do not treat this as
+   encrypted reasoning.
+
 D1-612 remains sole session/provider/model/route/account owner.
 OPENAI-007 remains sole function_call id/call_id owner.
 """
@@ -290,6 +299,92 @@ def wrap_encrypted_content_with_provenance(
 _LITELLM_ENC_PREFIX = "litellm_enc:"
 _FUNCTION_CALL_OUTPUT_ITEM_TYPE = "function_call_output"
 _NESTED_ENCRYPTED_CONTENT_PART_TYPE = "encrypted_content"
+_AGENT_MESSAGE_ITEM_TYPE = "agent_message"
+
+
+def _is_exact_new_task_empty_payload_envelope(text: str) -> bool:
+    """True for the exact empty Codex ``NEW_TASK`` spawn envelope."""
+    if not text.endswith("\n"):
+        return False
+    message_type, *rest = text[:-1].split("\n")
+    if len(rest) != 3:
+        return False
+    task_name_line, sender_line, payload_line = rest
+    return (
+        message_type == "Message Type: NEW_TASK"
+        and task_name_line.startswith("Task name: ")
+        and task_name_line[len("Task name: ") :] != ""
+        and sender_line.startswith("Sender: ")
+        and sender_line[len("Sender: ") :] != ""
+        and payload_line == "Payload:"
+    )
+
+
+def restore_codex_agent_message_payloads_for_openai_egress(
+    request_body: Mapping[str, Any] | dict[str, Any],
+) -> dict[str, Any]:
+    """Promote exact Codex empty ``NEW_TASK`` spawn text into visible ``input_text``.
+
+    Codex parent agents dispatch ``spawn_agent`` assignments as
+    ``agent_message`` items with exactly two content parts: visible
+    ``input_text`` whose text is the empty ``NEW_TASK`` envelope ending
+    ``Payload:``, and a sibling ``type=encrypted_content`` part whose
+    nonempty string is the ordinary task text. The selected child model
+    cannot see that sibling, so append the sibling string onto the
+    visible ``input_text`` and drop the sibling before OpenAI Responses
+    egress. Payload bytes are not classified. Non-matching items stay
+    unchanged. Never logs payload bytes.
+    """
+    if not isinstance(request_body, dict):
+        return dict(request_body) if isinstance(request_body, Mapping) else {}
+
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
+        return request_body
+
+    changed = False
+    updated_items: list[Any] = []
+    for item in input_items:
+        if not isinstance(item, dict) or item.get("type") != _AGENT_MESSAGE_ITEM_TYPE:
+            updated_items.append(item)
+            continue
+        content = item.get("content")
+        if not isinstance(content, list) or len(content) != 2:
+            updated_items.append(item)
+            continue
+        visible_part, payload_part = content
+        if not isinstance(visible_part, dict) or not isinstance(payload_part, dict):
+            updated_items.append(item)
+            continue
+        visible_text = visible_part.get("text")
+        payload = payload_part.get("encrypted_content")
+        if (
+            visible_part.get("type") != "input_text"
+            or not isinstance(visible_text, str)
+            or not _is_exact_new_task_empty_payload_envelope(visible_text)
+            or payload_part.get("type") != _NESTED_ENCRYPTED_CONTENT_PART_TYPE
+            or not isinstance(payload, str)
+            or not payload
+        ):
+            updated_items.append(item)
+            continue
+
+        updated_item = dict(item)
+        updated_item["content"] = [
+            {
+                "type": "input_text",
+                "text": f"{visible_text}{payload}",
+            }
+        ]
+        updated_items.append(updated_item)
+        changed = True
+
+    if not changed:
+        return request_body
+    updated = dict(request_body)
+    updated["input"] = updated_items
+    return updated
+
 
 
 def unwrap_encrypted_content_with_provenance(
@@ -1403,6 +1498,7 @@ def guard_openai_encrypted_reasoning_egress(
     prepared, disposition = prepare_encrypted_reasoning_items_for_openai_egress(
         request_body if isinstance(request_body, dict) else dict(request_body or {})
     )
+    prepared = restore_codex_agent_message_payloads_for_openai_egress(prepared)
     prepared, function_output_disposition = (
         prepare_encrypted_function_output_items_for_openai_egress(
             prepared,
@@ -1875,6 +1971,7 @@ __all__ = [
     "prepare_encrypted_reasoning_items_for_openai_egress",
     "should_strip_encrypted_function_output_without_plaintext",
     "prepare_encrypted_function_output_items_for_openai_egress",
+    "restore_codex_agent_message_payloads_for_openai_egress",
     "is_openai_encrypted_reasoning_compatible",
     "build_encrypted_reasoning_disposition_metadata",
     "raise_openai_encrypted_reasoning_redispatch_required",
