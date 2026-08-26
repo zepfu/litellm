@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from types import FunctionType
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
@@ -17,6 +18,9 @@ from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
 )
 from litellm.proxy.pass_through_endpoints.aawm_text_watermark.policy import (
     apply_request_watermark_egress,
+)
+from litellm.secret_managers.credential_error_sanitizer import (
+    sanitize_credential_error_message,
 )
 
 
@@ -154,11 +158,27 @@ if TYPE_CHECKING:
     def _raise_xai_oauth_auto_agent_candidate_unavailable(exc: Exception) -> Any: ...
     def _record_adapted_completed_route_rollup_after_stream(response: Any, rollup: Any, **kwargs: Any) -> Any: ...
     def _record_adapted_completed_route_rollup_turn(rollup: Any, **kwargs: Any) -> None: ...
+    def _record_opencode_go_provider_rejection_evidence(
+        request: Any, evidence: dict[str, Any]
+    ) -> dict[str, Any]: ...
+    def _restore_adapted_custom_tool_calls_in_response_body(
+        response_body: dict[str, Any],
+        *,
+        request_body: Any = None,
+        adapter_model: str = "",
+    ) -> tuple: ...
+    def _restore_adapted_namespace_tool_calls_in_response_body(
+        response_body: dict[str, Any],
+        *,
+        request_body: Any = None,
+        adapter_model: str = "",
+    ) -> tuple: ...
     def _responses_sse_from_iterator(iterator: Any, **kwargs: Any) -> Any: ...
     def _responses_sse_from_repaired_response_body(response_body: dict[str, Any]) -> Any: ...
     def _serialize_responses_adapter_response(response_obj: Any) -> str: ...
     async def _validate_codex_auto_agent_responses_payload(response: Any, **kwargs: Any) -> Any: ...
     def _xai_oauth_candidate_unavailable_detail(exc: Exception) -> Optional[str]: ...
+    def _build_opencode_go_provider_rejection_evidence(**kwargs: Any) -> dict[str, Any]: ...
 
 
 # ── Host-global function names (bound via install()) ────────────────
@@ -190,6 +210,8 @@ _HOST_FUNCTION_NAMES = (
     # OpenCode
     "_handle_codex_opencode_zen_adapter_route",
     "_handle_codex_opencode_go_adapter_route",
+    "_build_opencode_go_provider_rejection_evidence",
+    "_record_opencode_go_provider_rejection_evidence",
     "_handle_codex_nous_chat_completions_adapter_route",
     "_consume_opencode_zen_tools_mode_header",
     "_build_opencode_zen_completion_call_kwargs",
@@ -281,6 +303,12 @@ def install(
         ("load_text_watermark_config", load_text_watermark_config),
         ("_get_runtime_text_watermark_config", _get_runtime_text_watermark_config),
         ("_watermark_endpoint_from_path", _watermark_endpoint_from_path),
+        ("_opencode_go_tool_type", _opencode_go_tool_type),
+        ("_opencode_go_tool_types", _opencode_go_tool_types),
+        ("_extract_opencode_go_offending_tool_index", _extract_opencode_go_offending_tool_index),
+        ("_sanitize_opencode_go_error_text", _sanitize_opencode_go_error_text),
+        ("_OPENCODE_GO_CHAT_COMPLETIONS_ROUTE", _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE),
+        ("_OPENCODE_GO_TOOLS_INDEX_RE", _OPENCODE_GO_TOOLS_INDEX_RE),
     ):
         host_globals.setdefault(_name, _value)
 
@@ -2643,6 +2671,122 @@ async def _handle_codex_opencode_zen_adapter_route(
     return _build_responses_response_from_adapter_response(responses_api_response)
 
 
+_OPENCODE_GO_CHAT_COMPLETIONS_ROUTE = "/zen/go/v1/chat/completions"
+_OPENCODE_GO_TOOLS_INDEX_RE = re.compile(r"tools\[(\d+)\]")
+
+
+def _opencode_go_tool_type(tool: Any) -> Optional[str]:
+    if not isinstance(tool, dict):
+        return None
+    tool_type = tool.get("type")
+    if isinstance(tool_type, str) and tool_type.strip():
+        return tool_type.strip()
+    function = tool.get("function")
+    if isinstance(function, dict):
+        return "function"
+    return None
+
+
+def _opencode_go_tool_types(tools: Any) -> list[str]:
+    if not isinstance(tools, list):
+        return []
+    summarized: list[str] = []
+    for tool in tools:
+        tool_type = _opencode_go_tool_type(tool)
+        summarized.append(tool_type or "unknown")
+    return summarized
+
+
+def _extract_opencode_go_offending_tool_index(message: str) -> Optional[int]:
+    match = _OPENCODE_GO_TOOLS_INDEX_RE.search(message)
+    if match is None:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _sanitize_opencode_go_error_text(message: Any, *, api_key: Any = None) -> str:
+    text = str(message or "")
+    if isinstance(api_key, str) and api_key:
+        text = text.replace(api_key, "[REDACTED]")
+    return sanitize_credential_error_message(text, limit=512)
+
+
+def _build_opencode_go_provider_rejection_evidence(
+    *,
+    target_url: Any,
+    exc: BaseException,
+    advertised_tools: Any = None,
+    completion_tools: Any = None,
+    api_key: Any = None,
+) -> dict[str, Any]:
+    advertised_types = _opencode_go_tool_types(advertised_tools)
+    completion_types = _opencode_go_tool_types(completion_tools)
+    status_code = getattr(exc, "status_code", None)
+    if not isinstance(status_code, int) or status_code <= 0:
+        response = getattr(exc, "response", None)
+        status_code = getattr(response, "status_code", None)
+    raw_message = getattr(exc, "message", None)
+    if not raw_message:
+        raw_message = getattr(exc, "detail", None) or str(exc)
+    sanitized_message = _sanitize_opencode_go_error_text(
+        raw_message,
+        api_key=api_key,
+    )
+    offending_index = _extract_opencode_go_offending_tool_index(sanitized_message)
+    offending_type = None
+    if offending_index is not None:
+        if 0 <= offending_index < len(advertised_types):
+            offending_type = advertised_types[offending_index]
+        elif 0 <= offending_index < len(completion_types):
+            offending_type = completion_types[offending_index]
+    target = str(target_url or "")
+    return {
+        "route": "codex_opencode_go_adapter",
+        "target_url_family": _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE,
+        "target_url": (
+            target
+            if _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE in target
+            else _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE
+        ),
+        "error": {
+            "status": status_code if isinstance(status_code, int) else None,
+            "type": type(exc).__name__,
+            "message": sanitized_message,
+        },
+        "tool_count": len(advertised_types),
+        "tool_types": advertised_types,
+        "completion_tool_count": len(completion_types),
+        "completion_tool_types": completion_types,
+        "offending_index": offending_index,
+        "offending_type": offending_type,
+    }
+
+
+def _record_opencode_go_provider_rejection_evidence(
+    request: Any,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    recorded = dict(evidence)
+    state = getattr(request, "state", None)
+    if state is not None:
+        try:
+            setattr(state, "opencode_go_provider_rejection_evidence", recorded)
+        except Exception:
+            pass
+        extra = getattr(state, "opencode_go_logger_extra", None)
+        if not isinstance(extra, dict):
+            extra = {}
+            try:
+                setattr(state, "opencode_go_logger_extra", extra)
+            except Exception:
+                extra = {}
+        extra["opencode_go_provider_rejection"] = recorded
+    return recorded
+
+
 async def _handle_codex_opencode_go_adapter_route(
     *,
     endpoint: str,
@@ -2679,6 +2823,43 @@ async def _handle_codex_opencode_go_adapter_route(
     )
     request_body = dict(prepared_request_body)
     request_body["model"] = adapter_model
+    advertised_tools = (
+        list(request_body.get("tools") or [])
+        if isinstance(request_body.get("tools"), list)
+        else []
+    )
+    # Restore dispatchable tool identities before the chat-completion
+    # transformation. Match the Cohere/OpenRouter Responses prep order:
+    # adapt custom tools, flatten namespace tools, apply description
+    # patches, drop unsupported hosted tools and input items, then clean
+    # incompatible tool_choice. Console Go chat-completions accept only
+    # function tools. Retain the canonical (namespaced/custom) body so
+    # tool_call_restore can reconstruct Codex custom_tool_call items.
+    canonical_request_body = request_body
+    (
+        request_body,
+        _adapted_custom_tools,
+    ) = _adapt_codex_custom_tools_to_functions_from_request_body(request_body)
+    (
+        request_body,
+        _adapted_namespace_tools,
+    ) = _adapt_codex_namespace_tools_to_functions_from_request_body(request_body)
+    (
+        request_body,
+        _tool_description_patch_events,
+    ) = _apply_codex_tool_description_patches_to_request_body(request_body)
+    (
+        request_body,
+        _unsupported_hosted_tools,
+    ) = _drop_unsupported_codex_hosted_tools_from_request_body(request_body)
+    (
+        request_body,
+        _unsupported_input_items,
+    ) = _drop_unsupported_codex_input_items_from_request_body(request_body)
+    (
+        request_body,
+        _removed_tool_choice,
+    ) = _drop_tool_choice_without_tools_from_request_body(request_body)
     request_input = request_body.get("input", "")
     responses_api_request = {
         key: value
@@ -2686,15 +2867,22 @@ async def _handle_codex_opencode_go_adapter_route(
         if key not in {"input", "model", "litellm_metadata"}
     }
     litellm_metadata = dict(request_body.get("litellm_metadata") or {})
+    # Console Go chat-completions must be complete-upstream. Forwarding
+    # client stream=True into acompletion returns a stream wrapper; the
+    # Responses transform then emits output:[] / output_tokens=0 and the
+    # adapter cools ox-alpha-free as empty success. Client stream is
+    # reconstructed from the completed body below.
+    client_requested_stream = bool(request_body.get("stream"))
     completion_kwargs = LiteLLMCompletionResponsesConfig.transform_responses_api_request_to_chat_completion_request(
         model=adapter_model,
         input=request_input,
         responses_api_request=responses_api_request,
         custom_llm_provider="openai",
-        stream=bool(request_body.get("stream")),
+        stream=False,
         metadata=litellm_metadata,
     )
     completion_kwargs["model"] = adapter_model
+    completion_kwargs["stream"] = False
     target_base_url = _get_opencode_go_target_base()
     target_url = _join_opencode_zen_passthrough_url(
         base_target_url=target_base_url,
@@ -2730,15 +2918,26 @@ async def _handle_codex_opencode_go_adapter_route(
         "litellm_metadata": litellm_metadata,
     }
     perform = globals().get("_perform_opencode_zen_completion_call")
-    if callable(perform):
-        completion_response = await perform(
-            completion_call_kwargs=completion_call_kwargs,
-            litellm_metadata=litellm_metadata,
-            accepted_trace_user_id=None,
-            is_known_free_direct=False,
+    try:
+        if callable(perform):
+            completion_response = await perform(
+                completion_call_kwargs=completion_call_kwargs,
+                litellm_metadata=litellm_metadata,
+                accepted_trace_user_id=None,
+                is_known_free_direct=False,
+            )
+        else:
+            completion_response = await litellm.acompletion(**completion_call_kwargs)
+    except Exception as exc:
+        evidence = _build_opencode_go_provider_rejection_evidence(
+            target_url=target_url,
+            exc=exc,
+            advertised_tools=advertised_tools,
+            completion_tools=completion_kwargs.get("tools"),
+            api_key=api_key,
         )
-    else:
-        completion_response = await litellm.acompletion(**completion_call_kwargs)
+        _record_opencode_go_provider_rejection_evidence(request, evidence)
+        raise
     if isinstance(completion_response, dict):
         from litellm.types.utils import ModelResponse
 
@@ -2765,26 +2964,58 @@ async def _handle_codex_opencode_go_adapter_route(
         except (TypeError, ValueError):
             response_body = {"id": getattr(completion_response, "id", "resp_opencode_go")}
     response_body["object"] = "response"
-    if bool(request_body.get("stream")):
-        _is_codex_auto_agent_empty_success_responses_body.__globals__.setdefault(
-            "_is_empty_success_responses_body",
-            _go_is_empty_success_responses_body,
+    restore_custom = globals().get("_restore_adapted_custom_tool_calls_in_response_body")
+    if callable(restore_custom):
+        restored_body, restored_custom_count, _custom_tool_adapter_error = restore_custom(
+            response_body,
+            request_body=canonical_request_body,
+            adapter_model=adapter_model,
         )
-        _raise_codex_auto_agent_empty_success_response.__globals__.setdefault(
-            "_build_empty_success_responses_diagnostic",
-            _go_build_empty_success_diagnostic,
+        if restored_custom_count:
+            response_body = restored_body
+    restore_namespace = globals().get(
+        "_restore_adapted_namespace_tool_calls_in_response_body"
+    )
+    if callable(restore_namespace):
+        restored_body, restored_namespace_count = restore_namespace(
+            response_body,
+            request_body=canonical_request_body,
+            adapter_model=adapter_model,
         )
-        if _is_codex_auto_agent_empty_success_responses_body(response_body):
-            _raise_codex_auto_agent_empty_success_response(
-                response_body=response_body,
-                adapter_model=adapter_model,
-                adapter="codex_opencode_go_adapter",
-                adapter_label="OpenCode Go",
-            )
-        return StreamingResponse(
-            _responses_sse_from_repaired_response_body(response_body),
-            media_type="text/event-stream",
+        if restored_namespace_count:
+            response_body = restored_body
+    _is_codex_auto_agent_empty_success_responses_body.__globals__.setdefault(
+        "_is_empty_success_responses_body",
+        _go_is_empty_success_responses_body,
+    )
+    _raise_codex_auto_agent_empty_success_response.__globals__.setdefault(
+        "_build_empty_success_responses_diagnostic",
+        _go_build_empty_success_diagnostic,
+    )
+    if _is_codex_auto_agent_empty_success_responses_body(response_body):
+        _raise_codex_auto_agent_empty_success_response(
+            response_body=response_body,
+            adapter_model=adapter_model,
+            adapter="codex_opencode_go_adapter",
+            adapter_label="OpenCode Go",
         )
+    # ACCESS replacement is registered at emit time. A completed Go
+    # turn still has to record the rollup so the 60s flush emits
+    # litellm#Ohmypi / litellm#Codex headers. Without this, a
+    # successful PONG / child-spawn leaves a 0-byte docker-logs window.
+    if client_requested_stream:
+        return _record_adapted_completed_route_rollup_after_stream(
+            StreamingResponse(
+                _responses_sse_from_repaired_response_body(response_body),
+                media_type="text/event-stream",
+            ),
+            rollup_kwargs,
+            adapter_label="OpenCode Go",
+        )
+    _record_adapted_completed_route_rollup_turn(
+        rollup_kwargs,
+        adapter_label="OpenCode Go",
+    )
     import json as _json
 
     return _FastAPIResponse(

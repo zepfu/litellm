@@ -39,6 +39,7 @@ from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy 
     get_codex_core_tool_guidance,
     get_codex_tool_policy_model_cost_candidates,
     get_custom_tool_function_adapter_names_for_model,
+    load_bundled_model_cost_map_for_codex_policy,
     get_namespace_tool_function_adapter_names_for_model,
     get_openai_tool_name,
     get_openai_tool_type,
@@ -186,6 +187,9 @@ class TestSpawnAgentDescriptionPatch:
             "Apply defaults only when the current task did not provide an explicit "
             "value for that field."
         ) in updated
+        assert "`basic` and `read` are valid spawn_agent model values" in updated
+        assert "Do not start a local exec" in updated
+        assert "non-empty spawn_agent message" in updated
 
     def test_non_restrictive_description_is_preserved_with_policy(self):
         desc = "A normal description."
@@ -214,6 +218,8 @@ class TestSpawnAgentPayloadParameters:
         assert set(added) == set(CODEX_SPAWN_AGENT_PAYLOAD_FIELD_ORDER)
         assert removed == []
         assert params["type"] == "object"
+        assert params["required"] == ["message"]
+        assert params["properties"]["message"]["minLength"] == 1
 
     def test_removes_fork_context(self):
         params_in = {
@@ -231,6 +237,8 @@ class TestSpawnAgentPayloadParameters:
         assert "fork_context" in removed
         assert "fork_context" not in params["properties"]
         assert "fork_context" not in params.get("required", [])
+        assert params.get("required") == ["message"]
+        assert params["properties"]["message"]["minLength"] == 1
         assert added == []
 
     def test_non_dict_passthrough(self):
@@ -239,7 +247,47 @@ class TestSpawnAgentPayloadParameters:
         assert added == []
         assert removed == []
 
+    def test_existing_message_gains_min_length(self):
+        params_in = {
+            "type": "object",
+            "properties": {
+                "agent_type": {"type": "string"},
+                "model": {"type": "string"},
+                "fork_turns": {"type": "string"},
+                "message": {"type": "string", "description": "child task"},
+            },
+            "required": ["message"],
+        }
+        params, added, removed = patch_codex_spawn_agent_payload_parameters(params_in)
+        assert added == []
+        assert removed == []
+        assert params is not params_in
+        assert params["properties"]["message"]["minLength"] == 1
+        assert params["properties"]["message"]["type"] == "string"
+        assert params["properties"]["message"]["description"] == "child task"
+        assert "minLength" not in params_in["properties"]["message"]
+
     def test_no_change_returns_original_identity(self):
+        params_in = {
+            "type": "object",
+            "properties": {
+                "agent_type": {"type": "string"},
+                "model": {"type": "string"},
+                "fork_turns": {"type": "string"},
+                "message": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "child task",
+                },
+            },
+            "required": ["message"],
+        }
+        params, added, removed = patch_codex_spawn_agent_payload_parameters(params_in)
+        assert added == []
+        assert removed == []
+        assert params is params_in
+
+    def test_requires_non_empty_message_when_required_missing(self):
         params_in = {
             "type": "object",
             "properties": {
@@ -252,7 +300,9 @@ class TestSpawnAgentPayloadParameters:
         params, added, removed = patch_codex_spawn_agent_payload_parameters(params_in)
         assert added == []
         assert removed == []
-        assert params is params_in
+        assert params is not params_in
+        assert params["required"] == ["message"]
+        assert params["properties"]["message"]["minLength"] == 1
 
 
 class TestPatchSpawnAgentToolDescription:
@@ -487,6 +537,68 @@ class TestModelCapabilityLookups:
         assert get_unsupported_input_item_types_for_model("unknown", callbacks=cb) == set()
         assert get_custom_tool_function_adapter_names_for_model("unknown", callbacks=cb) == set()
         assert get_namespace_tool_function_adapter_names_for_model("unknown", callbacks=cb) == {}
+
+    def test_opencode_go_ox_alpha_policy_lookup_from_canonical_and_bundled(self):
+        from pathlib import Path
+
+        repo = Path(__file__).resolve().parents[4]
+        canonical = json.loads(
+            (repo / "model_prices_and_context_window.json").read_text(encoding="utf-8")
+        )
+        go_row = canonical["opencode/ox-alpha-free"]
+        load_bundled_model_cost_map_for_codex_policy.cache_clear()
+        bundled = load_bundled_model_cost_map_for_codex_policy()
+        bundled_row = bundled["opencode/ox-alpha-free"]
+        assert bundled_row["custom_tool_function_adapters"] == go_row[
+            "custom_tool_function_adapters"
+        ]
+        assert bundled_row["unsupported_hosted_tools"] == go_row[
+            "unsupported_hosted_tools"
+        ]
+        assert bundled_row["namespace_tool_function_adapters"] == go_row[
+            "namespace_tool_function_adapters"
+        ]
+        expected_adapters = {
+            str(item).strip().lower()
+            for item in go_row["custom_tool_function_adapters"]
+        }
+        expected_hosted = {
+            str(item).strip().lower() for item in go_row["unsupported_hosted_tools"]
+        }
+        expected_namespaces = {
+            str(namespace).strip().lower(): {
+                str(name).strip().lower() for name in names
+            }
+            for namespace, names in go_row["namespace_tool_function_adapters"].items()
+        }
+        live_cb = _make_callbacks(canonical)
+        bundled_cb = _make_callbacks({})
+        for model in ("ox-alpha-free", "opencode/ox-alpha-free"):
+            assert get_codex_tool_policy_model_cost_candidates(
+                model, callbacks=live_cb
+            )
+            assert "opencode/ox-alpha-free" in get_codex_tool_policy_model_cost_candidates(
+                model, callbacks=live_cb
+            )
+            for callbacks in (live_cb, bundled_cb):
+                assert (
+                    get_custom_tool_function_adapter_names_for_model(
+                        model, callbacks=callbacks
+                    )
+                    == expected_adapters
+                )
+                assert (
+                    get_unsupported_hosted_tool_types_for_model(
+                        model, callbacks=callbacks
+                    )
+                    == expected_hosted
+                )
+                assert (
+                    get_namespace_tool_function_adapter_names_for_model(
+                        model, callbacks=callbacks
+                    )
+                    == expected_namespaces
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +842,92 @@ class TestNamespaceToolAdaptation:
         )
         assert result is body
         assert adapted == []
+
+    def test_functions_collaboration_and_wait_flatten_from_catalog_aliases(self):
+        """Codex 0.149 advertises functions.collaboration / wait, not catalog keys."""
+        tools = [
+            {
+                "type": "namespace",
+                "name": "functions.collaboration",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"message": {"type": "string"}},
+                        },
+                    },
+                    {
+                        "type": "function",
+                        "name": "wait",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"timeout_ms": {"type": "integer"}},
+                        },
+                    },
+                ],
+            }
+        ]
+        adapter_names = {"collaboration": {"spawn_agent", "wait_agent"}}
+        updated, adapted, skipped = adapt_codex_namespace_tool_definitions(
+            tools, adapter_names=adapter_names, normalize_tag_value=_normalize_tag_value
+        )
+        assert skipped == []
+        assert updated is not None
+        names = [tool["name"] for tool in updated]
+        assert names == ["spawn_agent", "wait"]
+        assert all(tool["type"] == "function" for tool in updated)
+        assert {item["namespace"] for item in adapted} == {"functions.collaboration"}
+        assert {item["name"] for item in adapted} == {"spawn_agent", "wait"}
+
+    def test_functions_collaboration_survives_go_hosted_namespace_drop(self):
+        from pathlib import Path
+
+        canonical = json.loads(
+            Path(__file__)
+            .resolve()
+            .parents[4]
+            .joinpath("model_prices_and_context_window.json")
+            .read_text(encoding="utf-8")
+        )
+        cb = _make_callbacks(canonical)
+        body = {
+            "model": "ox-alpha-free",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "functions.collaboration",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "spawn_agent",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                        {
+                            "type": "function",
+                            "name": "wait",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    ],
+                },
+                {"type": "web_search"},
+            ],
+        }
+        adapted_body, adapted = adapt_codex_namespace_tools_to_functions_from_request_body(
+            body, callbacks=cb
+        )
+        assert {item["name"] for item in adapted} == {"spawn_agent", "wait"}
+        dropped, removed = drop_unsupported_codex_hosted_tools_from_request_body(
+            adapted_body, callbacks=cb
+        )
+        names = [get_openai_tool_name(tool) for tool in dropped["tools"]]
+        types = [get_openai_tool_type(tool) for tool in dropped["tools"]]
+        assert "spawn_agent" in names
+        assert "wait" in names
+        assert "namespace" not in types
+        assert "web_search" not in types
+        assert any(item.get("type") == "web_search" for item in removed)
 
 
 # ---------------------------------------------------------------------------

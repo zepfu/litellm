@@ -1058,6 +1058,27 @@ with the same code remains ``openai_chatgpt_codex_invalid_encrypted_content``.
 The OpenAI API-key class is not hidden-retried as a capacity 502, it warns
 without a generic traceback, and it stays visible to the client.
 
+A Codex TUI parent that prints local ``/root/hv2_codex_child`` chrome with
+``No agents completed yet`` is Codex client job chrome, not OpenCode Go
+child-spawn evidence. Go selection for that window still comes from
+Codex-owned AAWM rollup headers such as ``ox-alpha-free(basic)`` targeting
+``/zen/go/v1/chat/completions``. If Codex advertised
+``functions.collaboration`` / ``wait`` and LiteLLM dropped that namespace
+instead of flattening it, the parent has no restored ``spawn_agent`` /
+``wait`` function tools and synthesizes those local jobs even while Go
+completes parent/child chat turns.
+
+## OpenCode Go completed-turn route-rollup
+
+`_handle_codex_opencode_go_adapter_route` replaces native uvicorn ACCESS
+before the Console Go call. A completed JSON or fake-SSE Responses body
+must still record an AAWM route-rollup turn (same helper OpenCode Zen and
+Cohere already use). Without that record, a successful Ohmypi `PONG` or
+Codex child-spawn leaves a 0-byte or spool-only docker-logs window and
+harness v2 `docker_logs` fails for a missing `litellm#Ohmypi` /
+`litellm#Codex` header. Empty-success fail-closed still raises before the
+turn is recorded.
+
 ## Inbound uvicorn ACCESS replacement on Codex 429
 
 Early `register_aawm_route_rollup_access_log_replacement` keys native

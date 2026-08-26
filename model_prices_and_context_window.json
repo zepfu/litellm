@@ -40749,6 +40749,37 @@
         "supports_vision": false,
         "supports_audio_input": false,
         "supports_pdf_input": false,
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
+        "namespace_tool_function_adapters": {
+            "collaboration": [
+                "followup_task",
+                "interrupt_agent",
+                "list_agents",
+                "send_message",
+                "spawn_agent",
+                "wait_agent"
+            ],
+            "multi_agent_v1": [
+                "close_agent",
+                "resume_agent",
+                "send_input",
+                "spawn_agent",
+                "wait_agent"
+            ]
+        },
+        "unsupported_hosted_tools": [
+            "custom",
+            "image_generation",
+            "namespace",
+            "tool_search",
+            "web_search"
+        ],
+        "unsupported_input_item_types": [
+            "custom_tool_call",
+            "custom_tool_call_output"
+        ],
         "source": "https://opencode.ai/zen/go/v1"
     },
     "claude-sonnet-5": {

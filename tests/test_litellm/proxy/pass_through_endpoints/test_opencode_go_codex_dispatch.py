@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -25,10 +27,42 @@ from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen imp
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     codex_candidate_calls,
     model_resolution,
+    request_build,
+    tool_call_restore,
+)
+from litellm.proxy.pass_through_endpoints.aawm_request_policy.codex_tool_policy import (
+    CodexToolPolicyCallbacks,
+    adapt_codex_custom_tools_to_functions_from_request_body,
+    adapt_codex_namespace_tools_to_functions_from_request_body,
+    apply_codex_tool_description_patches_to_request_body,
+    drop_tool_choice_without_tools_from_request_body,
+    drop_unsupported_codex_hosted_tools_from_request_body,
+    drop_unsupported_codex_input_items_from_request_body,
+    get_custom_tool_function_adapter_names_for_model,
+    get_openai_tool_name,
+    get_openai_tool_type,
 )
 from litellm.proxy.pass_through_endpoints.providers.opencode_zen import (
     runtime as zen_runtime,
 )
+
+_CODEX_0149_FUNCTION_NAMES_BEFORE = (
+    "shell",
+    "grep_files",
+    "read_file",
+    "list_dir",
+    "update_plan",
+    "view_image",
+    "exec_command",
+)
+_CODEX_0149_FUNCTION_NAMES_AFTER = (
+    "write_stdin",
+    "grep_files",
+    "read_file",
+    "list_dir",
+)
+_APPLY_PATCH_INPUT = "*** Begin Patch\n*** Update File: README.md\n@@\n-hello\n+hello world\n*** End Patch"
+_REJECTION_SCHEMA_TOKEN = "do-not-persist-this-tool-schema"
 
 
 _ADAPTER_MODEL = "ox-alpha-free"
@@ -41,7 +75,7 @@ def _request() -> MagicMock:
     request = MagicMock()
     request.headers = {}
     request.scope = {}
-    request.state = MagicMock()
+    request.state = SimpleNamespace()
     return request
 
 
@@ -136,13 +170,246 @@ def _validate_outgoing_egress_capturing(captured: dict[str, Any]):
     return _validate_outgoing_egress
 
 
+def _function_tool(name: str, *, schema_token: str | None = None) -> dict[str, Any]:
+    parameters: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": schema_token or f"{name} argument",
+            }
+        },
+    }
+    return {
+        "type": "function",
+        "name": name,
+        "description": f"{name} tool",
+        "parameters": parameters,
+    }
+
+
+def _codex_0149_mixed_tools(
+    *,
+    schema_token: str | None = None,
+    collaboration_namespace: str = "collaboration",
+    wait_child_name: str = "wait_agent",
+) -> list[dict[str, Any]]:
+    return [
+        *(_function_tool(name, schema_token=schema_token) for name in _CODEX_0149_FUNCTION_NAMES_BEFORE),
+        {
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "Apply a patch to a file.",
+        },
+        *(_function_tool(name, schema_token=schema_token) for name in _CODEX_0149_FUNCTION_NAMES_AFTER),
+        {
+            "type": "namespace",
+            "name": collaboration_namespace,
+            "description": "Spawn and manage sub-agents.",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "spawn_agent",
+                    "description": "Spawn a child agent.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"message": {"type": "string"}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "name": wait_child_name,
+                    "description": "Wait for a spawned child.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"timeout_ms": {"type": "integer"}},
+                    },
+                },
+            ],
+        },
+        {"type": "tool_search", "name": "tool_search"},
+        {"type": "web_search"},
+    ]
+
+
+def _chat_tool_type(tool: Any) -> str | None:
+    if not isinstance(tool, dict):
+        return None
+    tool_type = tool.get("type")
+    if isinstance(tool_type, str) and tool_type.strip():
+        return tool_type.strip()
+    if isinstance(tool.get("function"), dict):
+        return "function"
+    return None
+
+
+def _chat_tool_name(tool: Any) -> str | None:
+    if not isinstance(tool, dict):
+        return None
+    function = tool.get("function")
+    if isinstance(function, dict):
+        name = function.get("name")
+        if isinstance(name, str) and name.strip():
+            return name
+    name = tool.get("name")
+    if isinstance(name, str) and name.strip():
+        return name
+    return None
+
+
+def _chat_completion_tool_call_payload(
+    *,
+    name: str,
+    arguments: str,
+    completion_id: str = "chatcmpl-opencode-go-tool",
+) -> dict[str, Any]:
+    return {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": 1,
+        "model": _ADAPTER_MODEL,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_apply_patch",
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": arguments,
+                            },
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 8,
+            "completion_tokens": 4,
+            "total_tokens": 12,
+            "output_tokens": 4,
+        },
+    }
+
+
+def _normalize_tag_value(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        return cleaned or None
+    return None
+
+
+def _canonical_model_cost() -> dict[str, Any]:
+    repo = Path(__file__).resolve().parents[4]
+    return json.loads(
+        (repo / "model_prices_and_context_window.json").read_text(encoding="utf-8")
+    )
+
+
+def _make_go_policy_callbacks() -> CodexToolPolicyCallbacks:
+    canonical = _canonical_model_cost()
+    return CodexToolPolicyCallbacks(
+        normalize_tag_value=_normalize_tag_value,
+        dedupe_sorted=lambda values: sorted(
+            {item for item in values if isinstance(item, str) and item}
+        ),
+        merge_metadata=lambda request_body, *, tags_to_add, extra_fields: request_body,
+        build_span=lambda *, name, metadata: {"name": name, "metadata": metadata},
+        get_model_cost_map=lambda: canonical,
+        normalize_grok_native_oauth_model=lambda model: None,
+        is_oa_xai_model=lambda model: False,
+        resolve_oa_xai_upstream_model=lambda model: model,
+        normalize_kimi_model_name=lambda model: None,
+        normalize_kimi_custom_tool_outputs=lambda body: body,
+    )
+
+
+def _advertised_custom_tool_function_adapter_names(
+    request_body: dict[str, Any] | None,
+    *,
+    adapter_model: str,
+) -> set[str]:
+    configured = get_custom_tool_function_adapter_names_for_model(
+        adapter_model, callbacks=_make_go_policy_callbacks()
+    )
+    if not configured or not isinstance(request_body, dict):
+        return set()
+    tools = request_body.get("tools")
+    if not isinstance(tools, list):
+        return set()
+    advertised: set[str] = set()
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = _normalize_tag_value(get_openai_tool_type(tool))
+        tool_name = _normalize_tag_value(get_openai_tool_name(tool))
+        if tool_type == "custom" and tool_name in configured:
+            advertised.add(tool_name)
+    return advertised
+
+
+def _bind_go_policy_helpers(host: dict[str, Any]) -> None:
+    callbacks = _make_go_policy_callbacks()
+    host["_adapt_codex_custom_tools_to_functions_from_request_body"] = (
+        lambda body: adapt_codex_custom_tools_to_functions_from_request_body(
+            body, callbacks=callbacks
+        )
+    )
+    host["_adapt_codex_namespace_tools_to_functions_from_request_body"] = (
+        lambda body: adapt_codex_namespace_tools_to_functions_from_request_body(
+            body, callbacks=callbacks
+        )
+    )
+    host["_apply_codex_tool_description_patches_to_request_body"] = (
+        lambda body: apply_codex_tool_description_patches_to_request_body(
+            body, callbacks=callbacks
+        )
+    )
+    host["_drop_unsupported_codex_hosted_tools_from_request_body"] = (
+        lambda body: drop_unsupported_codex_hosted_tools_from_request_body(
+            body, callbacks=callbacks
+        )
+    )
+    host["_drop_unsupported_codex_input_items_from_request_body"] = (
+        lambda body: drop_unsupported_codex_input_items_from_request_body(
+            body, callbacks=callbacks
+        )
+    )
+    host["_drop_tool_choice_without_tools_from_request_body"] = (
+        lambda body: drop_tool_choice_without_tools_from_request_body(
+            body, callbacks=callbacks
+        )
+    )
+    host["_advertised_custom_tool_function_adapter_names"] = (
+        _advertised_custom_tool_function_adapter_names
+    )
+    host["_normalize_low_cardinality_tag_value"] = _normalize_tag_value
+    host["_parse_adapted_custom_tool_function_arguments"] = (
+        request_build._parse_adapted_custom_tool_function_arguments
+    )
+    tool_call_restore.install(host)
+    host["_restore_adapted_namespace_tool_calls_in_response_body"] = (
+        lambda response_body, *, request_body=None, adapter_model="": (
+            response_body,
+            0,
+        )
+    )
+
+
 def _go_adapter_host(
     *,
     litellm_module: Any,
     captured: dict[str, Any],
 ) -> dict[str, Any]:
     validate_outgoing_egress = _validate_outgoing_egress_capturing(captured)
-    return {
+    host: dict[str, Any] = {
         "__builtins__": __builtins__,
         "litellm": litellm_module,
         "httpx": httpx,
@@ -164,14 +431,31 @@ def _go_adapter_host(
             validate_outgoing_egress=validate_outgoing_egress
         ),
         "_annotate_request_scope_for_adapted_access_log": MagicMock(),
-        "_build_adapted_route_rollup_kwargs": MagicMock(return_value={}),
+        "_build_adapted_route_rollup_kwargs": MagicMock(
+            return_value={"litellm_params": {"metadata": {}}}
+        ),
         "_emit_adapted_route_access_log": MagicMock(),
+        "_record_adapted_completed_route_rollup_turn": MagicMock(
+            side_effect=lambda rollup, **kwargs: captured.setdefault(
+                "rollup_turns", []
+            ).append({"rollup": rollup, **kwargs})
+        ),
+        "_record_adapted_completed_route_rollup_after_stream": MagicMock(
+            side_effect=lambda response, rollup, **kwargs: (
+                captured.setdefault("rollup_after_stream", []).append(
+                    {"rollup": rollup, **kwargs}
+                )
+                or response
+            )
+        ),
         "_add_route_family_logging_metadata": lambda body, family: body,
         "_get_proxy_shared_aiohttp_session": lambda: None,
         "_opencode_zen_candidate_unavailable_detail": lambda exc: None,
         "_maybe_raise_opencode_zen_direct_rate_limit": lambda exc: None,
         "_OPENCODE_GO_FREE_MODELS": frozenset({"ox-alpha-free"}),
     }
+    _bind_go_policy_helpers(host)
+    return host
 
 
 async def _invoke_codex_opencode_go_adapter_route(
@@ -179,6 +463,8 @@ async def _invoke_codex_opencode_go_adapter_route(
     *,
     prepared_request_body: dict[str, Any],
     completion: dict[str, Any],
+    completion_error: BaseException | None = None,
+    captured_out: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     import litellm
     from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
@@ -196,7 +482,7 @@ async def _invoke_codex_opencode_go_adapter_route(
     )
     assert handler is not None, "missing _handle_codex_opencode_go_adapter_route"
 
-    captured: dict[str, Any] = {}
+    captured: dict[str, Any] = captured_out if captured_out is not None else {}
     monkeypatch.setattr(
         GLOBAL_LOGGING_WORKER,
         "ensure_initialized_and_enqueue",
@@ -208,6 +494,8 @@ async def _invoke_codex_opencode_go_adapter_route(
 
     async def _fake_acompletion(**kwargs: Any) -> dict[str, Any]:
         captured["completion"] = kwargs
+        if completion_error is not None:
+            raise completion_error
         return completion
 
     monkeypatch.setattr(litellm, "acompletion", _fake_acompletion)
@@ -224,6 +512,7 @@ async def _invoke_codex_opencode_go_adapter_route(
         _is_codex_auto_agent_empty_success_responses_body
     )
     codex_candidate_calls.install(host)
+    _bind_go_policy_helpers(host)
     host["HttpPassThroughEndpointHelpers"] = MagicMock(
         validate_outgoing_egress=_validate_outgoing_egress_capturing(captured)
     )
@@ -250,6 +539,8 @@ async def _invoke_codex_opencode_go_adapter_route(
             "is_known_free_direct": is_known_free_direct,
             **kwargs,
         }
+        if completion_error is not None:
+            raise completion_error
         return completion
 
     host["_perform_opencode_zen_completion_call"] = _fake_perform
@@ -257,10 +548,12 @@ async def _invoke_codex_opencode_go_adapter_route(
         "_handle_codex_opencode_go_adapter_route",
         handler,
     )
+    request = _request()
+    captured["request"] = request
     try:
         response = await bound_handler(
             endpoint="/v1/responses",
-            request=_request(),
+            request=request,
             fastapi_response=MagicMock(spec=Response),
             user_api_key_dict=MagicMock(),
             prepared_request_body=prepared_request_body,
@@ -512,6 +805,13 @@ async def test_should_prepare_or_handle_codex_go_route_to_zen_go_chat_url(
     assert str(getattr(response, "media_type", "")).startswith("application/json")
     response_body = json.loads(response.body)
     assert response_body["object"] == "response"
+    rollup_turns = captured.get("rollup_turns") or []
+    assert rollup_turns, (
+        "completed Go JSON success must record a route-rollup turn so "
+        "ACCESS replacement still emits an AAWM header"
+    )
+    assert rollup_turns[0].get("adapter_label") == "OpenCode Go"
+    assert not captured.get("rollup_after_stream")
 
 
 @pytest.mark.asyncio
@@ -537,7 +837,10 @@ async def test_opencode_go_stream_true_returns_sse_not_json(
     )
 
     completion_kwargs = captured.get("completion") or {}
-    assert completion_kwargs.get("stream") is True
+    # Client stream=true still gets SSE, but Console Go is complete-upstream
+    # plus fake SSE. Forwarding stream=True into acompletion yields a stream
+    # wrapper that transform_chat_completion_response treats as output:[].
+    assert completion_kwargs.get("stream") in (False, None)
     assert not isinstance(response, Response) or isinstance(response, StreamingResponse)
     assert isinstance(response, StreamingResponse), (
         "stream=true must wrap `_responses_sse_from_iterator` / "
@@ -573,6 +876,13 @@ async def test_opencode_go_stream_true_returns_sse_not_json(
         )
         for item in output
     ), f"completed output must include a message/output_text item: {output!r}"
+    after_stream = captured.get("rollup_after_stream") or []
+    assert after_stream, (
+        "completed Go fake-SSE success must record a route-rollup turn "
+        "after the stream so ACCESS replacement still emits an AAWM header"
+    )
+    assert after_stream[0].get("adapter_label") == "OpenCode Go"
+    assert not captured.get("rollup_turns")
 
 
 @pytest.mark.asyncio
@@ -588,6 +898,7 @@ async def test_opencode_go_stream_true_empty_success_must_not_return_empty_json(
     returning that empty JSON 200 (or, if SSE is used, it still must not be
     empty JSON success).
     """
+    captured: dict[str, Any] = {}
     try:
         response = (
             await _invoke_codex_opencode_go_adapter_route(
@@ -604,10 +915,13 @@ async def test_opencode_go_stream_true_empty_success_must_not_return_empty_json(
                     prompt_tokens=0,
                     completion_tokens=0,
                 ),
+                captured_out=captured,
             )
         )[0]
     except ProxyException as exc:
         assert _empty_success_error_code(exc) == "aawm_codex_auto_agent_empty_success"
+        assert not captured.get("rollup_turns")
+        assert not captured.get("rollup_after_stream")
         return
     except Exception as exc:
         code = _empty_success_error_code(exc)
@@ -643,6 +957,53 @@ async def test_opencode_go_stream_true_empty_success_must_not_return_empty_json(
         f"Got {type(response).__name__} media_type={media_type!r} "
         f"body={body_text!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_opencode_go_stream_true_complete_upstream_does_not_empty_success(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_go_runtime,
+) -> None:
+    """Codex stream=true must not send stream=True to /zen/go chat completions.
+
+    Live 2026-08-24: `_handle_codex_opencode_go_adapter_route` forwarded
+    `stream=True` into acompletion, then ran
+    `transform_chat_completion_response_to_responses_api_response` on the
+    stream wrapper. That wrapper has empty choices, so the adapter raised
+    `aawm_codex_auto_agent_empty_success` and cooled `ox-alpha-free` even
+    though Go never produced a completed empty payload. Codex then fell
+    through to Nous (`stream is not supported`). Complete-upstream plus
+    fake SSE keeps Go selected.
+    """
+    response, captured = await _invoke_codex_opencode_go_adapter_route(
+        monkeypatch,
+        prepared_request_body={
+            "model": f"opencode-go/{_ADAPTER_MODEL}",
+            "input": "Spawn one child agent now.",
+            "stream": True,
+            "tools": _codex_0149_mixed_tools(),
+        },
+        completion=_chat_completion_payload(content="hv2-codex-child"),
+    )
+
+    completion_kwargs = captured.get("completion") or {}
+    assert completion_kwargs.get("stream") in (False, None)
+    tools = _bound_completion_tools(captured)
+    assert all(_chat_tool_type(tool) == "function" for tool in tools)
+    assert isinstance(response, StreamingResponse)
+    sse_text = await _collect_response_text(response)
+    assert "event: response.completed" in sse_text
+    payload = _parse_sse_terminal_event(sse_text)
+    completed = payload.get("response")
+    assert isinstance(completed, dict)
+    output = completed.get("output")
+    assert isinstance(output, list) and output
+    assert "hv2-codex-child" in json.dumps(output)
+    after_stream = captured.get("rollup_after_stream") or []
+    assert after_stream, (
+        "complete-upstream fake SSE must still record a route-rollup turn"
+    )
+    assert after_stream[0].get("adapter_label") == "OpenCode Go"
 
 
 @pytest.mark.asyncio
@@ -738,3 +1099,154 @@ def test_go_target_base_strips_v1_and_joins_chat_completions(
     assert joined == _GO_CHAT_COMPLETIONS_URL
     assert "/zen/go/v1/" in joined
     assert joined != _ZEN_CHAT_COMPLETIONS_URL
+
+
+def _bound_completion_tools(captured: dict[str, Any]) -> list[dict[str, Any]]:
+    completion_kwargs = captured.get("completion") or {}
+    tools = completion_kwargs.get("tools")
+    assert isinstance(tools, list), f"missing bound tools: {completion_kwargs!r}"
+    return tools
+
+
+@pytest.mark.asyncio
+async def test_should_adapt_codex_mixed_tools_to_go_function_tools(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_go_runtime,
+) -> None:
+    response, captured = await _invoke_codex_opencode_go_adapter_route(
+        monkeypatch,
+        prepared_request_body={
+            "model": f"opencode-go/{_ADAPTER_MODEL}",
+            "input": "run date",
+            "stream": False,
+            "tools": _codex_0149_mixed_tools(),
+        },
+        completion=_chat_completion_payload(content="ok"),
+    )
+
+    target_url = str(captured.get("url") or "")
+    completion_kwargs = captured.get("completion") or {}
+    joined = target_url or str(completion_kwargs.get("api_base") or "")
+    assert "/zen/go/v1/chat/completions" in joined or joined.endswith(
+        "/zen/go/v1/chat/completions"
+    )
+    assert "/v1/responses" not in joined
+    tools = _bound_completion_tools(captured)
+    types = [_chat_tool_type(tool) for tool in tools]
+    names = [_chat_tool_name(tool) for tool in tools]
+    assert tools, "mixed tools must still advertise apply_patch as a function"
+    assert all(tool_type == "function" for tool_type in types)
+    assert "apply_patch" in names
+    assert "spawn_agent" in names
+    assert "wait_agent" in names
+    assert "custom" not in types
+    assert "namespace" not in types
+    assert "tool_search" not in types
+    assert "web_search" not in types
+    assert not isinstance(response, StreamingResponse)
+
+
+@pytest.mark.asyncio
+async def test_should_flatten_functions_collaboration_wait_on_go_bound_tools(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_go_runtime,
+) -> None:
+    _response, captured = await _invoke_codex_opencode_go_adapter_route(
+        monkeypatch,
+        prepared_request_body={
+            "model": f"opencode-go/{_ADAPTER_MODEL}",
+            "input": "spawn a child",
+            "stream": False,
+            "tools": _codex_0149_mixed_tools(
+                collaboration_namespace="functions.collaboration",
+                wait_child_name="wait",
+            ),
+        },
+        completion=_chat_completion_payload(content="ok"),
+    )
+
+    tools = _bound_completion_tools(captured)
+    types = [_chat_tool_type(tool) for tool in tools]
+    names = [_chat_tool_name(tool) for tool in tools]
+    assert all(tool_type == "function" for tool_type in types)
+    assert "spawn_agent" in names
+    assert "wait" in names
+    assert "namespace" not in types
+    assert "tool_search" not in types
+    assert "web_search" not in types
+
+
+@pytest.mark.asyncio
+async def test_should_restore_go_apply_patch_function_call_as_codex_custom_tool(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_go_runtime,
+) -> None:
+    response, _captured = await _invoke_codex_opencode_go_adapter_route(
+        monkeypatch,
+        prepared_request_body={
+            "model": f"opencode-go/{_ADAPTER_MODEL}",
+            "input": "apply the patch",
+            "stream": False,
+            "tools": _codex_0149_mixed_tools(),
+        },
+        completion=_chat_completion_tool_call_payload(
+            name="apply_patch",
+            arguments=json.dumps({"input": _APPLY_PATCH_INPUT}),
+        ),
+    )
+
+    body = json.loads(response.body)
+    output = body.get("output")
+    assert isinstance(output, list)
+    restored = [
+        item
+        for item in output
+        if isinstance(item, dict) and item.get("name") == "apply_patch"
+    ]
+    assert restored, f"missing apply_patch output item: {output!r}"
+    item = restored[0]
+    assert item["type"] == "custom_tool_call"
+    assert item["input"] == _APPLY_PATCH_INPUT
+    assert "arguments" not in item
+
+
+@pytest.mark.asyncio
+async def test_should_record_sanitized_opencode_go_provider_rejection_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_go_runtime,
+) -> None:
+    captured: dict[str, Any] = {}
+    error = RuntimeError(
+        "[1214] tools[8].type:type is illegal Authorization: Bearer opencode-go-test-key"
+    )
+    setattr(error, "status_code", 400)
+
+    with pytest.raises(RuntimeError, match="tools\\[8\\]"):
+        await _invoke_codex_opencode_go_adapter_route(
+            monkeypatch,
+            prepared_request_body={
+                "model": f"opencode-go/{_ADAPTER_MODEL}",
+                "input": "run date",
+                "stream": False,
+                "tools": _codex_0149_mixed_tools(schema_token=_REJECTION_SCHEMA_TOKEN),
+            },
+            completion=_chat_completion_payload(content="ok"),
+            completion_error=error,
+            captured_out=captured,
+        )
+
+    request = captured["request"]
+    evidence = getattr(request.state, "opencode_go_provider_rejection_evidence", None)
+    assert isinstance(evidence, dict)
+    assert evidence["route"] == "codex_opencode_go_adapter"
+    assert evidence["target_url_family"] == "/zen/go/v1/chat/completions"
+    assert evidence["tool_count"] == 15
+    assert evidence["tool_types"][7] == "custom"
+    assert "namespace" in evidence["tool_types"]
+    assert "tool_search" in evidence["tool_types"]
+    assert "web_search" in evidence["tool_types"]
+    assert evidence["offending_index"] == 8
+    dumped = json.dumps(evidence)
+    assert "opencode-go-test-key" not in dumped
+    assert _REJECTION_SCHEMA_TOKEN not in dumped
+    assert "parameters" not in dumped

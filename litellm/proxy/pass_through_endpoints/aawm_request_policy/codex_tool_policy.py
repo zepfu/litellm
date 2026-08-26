@@ -159,6 +159,13 @@ CODEX_CUSTOM_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD = "custom_tool_function_ada
 CODEX_NAMESPACE_TOOL_FUNCTION_ADAPTERS_MODEL_INFO_FIELD = (
     "namespace_tool_function_adapters"
 )
+# Codex 0.149 advertises ``functions.collaboration`` / child ``wait`` while
+# the cost-map keys remain ``collaboration`` / ``wait_agent``. Flatten must
+# match the advertised names so hosted-tool drop cannot remove spawn_agent.
+_CODEX_NAMESPACE_FUNCTION_PREFIX = "functions."
+_CODEX_NAMESPACE_TOOL_NAME_ALIASES = {
+    "wait": "wait_agent",
+}
 
 CODEX_SPAWN_AGENT_FANOUT_POLICY = (
     "Use subagents to parallelize independent work while keeping one local owner "
@@ -175,7 +182,12 @@ CODEX_SPAWN_AGENT_FANOUT_POLICY = (
     "lower-case payload fields. If the current task did not explicitly provide "
     'a model, require an explicit supported alias or model name. If the current task '
     "did provide a model, keep that provided value unchanged and do not "
-    "substitute any default, including on retries. Use "
+    "substitute any default, including on retries. AAWM public aliases such as "
+    "`basic` and `read` are valid spawn_agent model values on this LiteLLM "
+    "route; they are not ChatGPT-native model ids. Always include a non-empty "
+    "spawn_agent message that states the child's exact task, including any "
+    "required command; an empty or omitted message is invalid. Do not start a "
+    "local exec or background job as a substitute for spawn_agent. Use "
     'fork_turns="none" unless context sharing is explicitly needed, and message '
     "containing the read-only boundary plus the audit task. If a fix is needed, "
     "the worker should describe the patch only.\n\n"
@@ -206,9 +218,10 @@ CODEX_SPAWN_AGENT_PAYLOAD_FIELD_SCHEMAS: dict[str, dict[str, Any]] = {
         "description": (
             "Optional lower-case model override accepted by the orchestrator. "
             "If the current task provided a model, keep that value unchanged, "
-            "including on retries. Otherwise use an explicit supported alias "
-            "or model name for read-only/exploration workers, or the selected "
-            "coding model for coding workers."
+            "including on retries. AAWM public aliases such as basic and read "
+            "are valid values on this LiteLLM route. Otherwise use an explicit "
+            "supported alias or model name for read-only/exploration workers, "
+            "or the selected coding model for coding workers."
         ),
     },
     "fork_turns": {
@@ -221,9 +234,11 @@ CODEX_SPAWN_AGENT_PAYLOAD_FIELD_SCHEMAS: dict[str, dict[str, Any]] = {
     },
     "message": {
         "type": "string",
+        "minLength": 1,
         "description": (
-            "Plain-text task prompt for the worker, including read-only or "
-            "coding scope, file boundaries, and final-answer requirements."
+            "Required non-empty plain-text task prompt for the worker, "
+            "including the exact command or audit task, read-only or coding "
+            "scope, file boundaries, and final-answer requirements."
         ),
     },
 }
@@ -314,6 +329,39 @@ def get_openai_tool_type(tool: dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _catalog_namespace_adapter_key(namespace: str) -> str:
+    if namespace.startswith(_CODEX_NAMESPACE_FUNCTION_PREFIX):
+        return namespace[len(_CODEX_NAMESPACE_FUNCTION_PREFIX) :]
+    return namespace
+
+
+def _allowed_names_for_namespace(
+    adapter_names: dict[str, set[str]],
+    namespace: Optional[str],
+) -> Optional[set[str]]:
+    if not namespace:
+        return None
+    allowed = adapter_names.get(namespace)
+    if allowed is not None:
+        return allowed
+    catalog_key = _catalog_namespace_adapter_key(namespace)
+    if catalog_key != namespace:
+        return adapter_names.get(catalog_key)
+    return None
+
+
+def _namespace_child_name_allowed(
+    child_name: Optional[str],
+    allowed_names: set[str],
+) -> bool:
+    if not child_name:
+        return False
+    if child_name in allowed_names:
+        return True
+    canonical = _CODEX_NAMESPACE_TOOL_NAME_ALIASES.get(child_name)
+    return canonical is not None and canonical in allowed_names
+
+
 def extract_openai_passthrough_tool_choice(
     value: Any,
     *,
@@ -397,13 +445,40 @@ def patch_codex_spawn_agent_payload_parameters(
         )
         added_fields.append(field_name)
 
-    required = updated_parameters.get("required")
-    if isinstance(required, list) and "fork_context" in required:
-        updated_parameters["required"] = [
-            field_name for field_name in required if field_name != "fork_context"
-        ]
+    message_schema_updated = False
+    existing_message = properties.get("message")
+    if isinstance(existing_message, dict) and (
+        not isinstance(existing_message.get("minLength"), int)
+        or isinstance(existing_message.get("minLength"), bool)
+        or existing_message["minLength"] < 1
+    ):
+        updated_message = dict(existing_message)
+        updated_message["minLength"] = 1
+        properties["message"] = updated_message
+        message_schema_updated = True
 
-    if not added_fields and not removed_fields:
+    original_required = updated_parameters.get("required")
+    required: list[Any]
+    if isinstance(original_required, list):
+        required = list(original_required)
+    else:
+        required = []
+    if "fork_context" in required:
+        required = [field_name for field_name in required if field_name != "fork_context"]
+    if "message" not in required:
+        required.append("message")
+    required_changed = required != (
+        list(original_required) if isinstance(original_required, list) else []
+    )
+    if required_changed:
+        updated_parameters["required"] = required
+
+    if (
+        not added_fields
+        and not removed_fields
+        and not required_changed
+        and not message_schema_updated
+    ):
         return parameters, [], []
 
     updated_parameters["properties"] = properties
@@ -439,7 +514,7 @@ def _apply_spawn_agent_parameter_patches(
             added_fields,
             removed_fields,
         ) = patch_codex_spawn_agent_payload_parameters(parameters)
-        if (not added_fields and not removed_fields) or updated_parameters is parameters:
+        if updated_parameters is parameters:
             continue
 
         if updated_tool is original_tool:
@@ -705,6 +780,8 @@ def get_codex_tool_policy_model_cost_candidates(
         f"chatgpt/{split_model_name.lower()}",
         f"openai/{split_model_name}",
         f"openai/{split_model_name.lower()}",
+        f"opencode/{split_model_name}",
+        f"opencode/{split_model_name.lower()}",
     ]
     grok_native_model = callbacks.normalize_grok_native_oauth_model(model_name)
     if grok_native_model is not None:
@@ -1212,7 +1289,7 @@ def adapt_codex_namespace_tool_definitions(
 
         tool_type = normalize_tag_value(get_openai_tool_type(tool))
         namespace = normalize_tag_value(get_openai_tool_name(tool))
-        allowed_names = adapter_names.get(namespace or "")
+        allowed_names = _allowed_names_for_namespace(adapter_names, namespace)
         if tool_type != "namespace" or allowed_names is None:
             updated_tools.append(tool)
             continue
@@ -1250,7 +1327,7 @@ def adapt_codex_namespace_tool_definitions(
                     }
                 )
                 continue
-            if child_name not in allowed_names:
+            if not _namespace_child_name_allowed(child_name, allowed_names):
                 skipped_tools.append(
                     {
                         **skip_detail,
@@ -1323,9 +1400,11 @@ def adapt_codex_namespace_input_items(
 
         namespace = normalize_tag_value(item.get("namespace"))
         item_name = normalize_tag_value(item.get("name"))
+        allowed_names = _allowed_names_for_namespace(adapter_names, namespace)
         if (
             namespace is None
-            or item_name not in adapter_names.get(namespace, set())
+            or allowed_names is None
+            or not _namespace_child_name_allowed(item_name, allowed_names)
             or item.get("type") not in {"function_call", "custom_tool_call"}
         ):
             updated_items.append(item)
@@ -1368,7 +1447,12 @@ def adapt_codex_namespace_tool_choice(
 
     namespace = normalize_tag_value(tool_choice.get("namespace"))
     tool_name = normalize_tag_value(tool_choice.get("name"))
-    if namespace is None or tool_name not in adapter_names.get(namespace, set()):
+    allowed_names = _allowed_names_for_namespace(adapter_names, namespace)
+    if (
+        namespace is None
+        or allowed_names is None
+        or not _namespace_child_name_allowed(tool_name, allowed_names)
+    ):
         return tool_choice, None
 
     tool_choice_type = normalize_tag_value(tool_choice.get("type"))

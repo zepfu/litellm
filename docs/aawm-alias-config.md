@@ -225,6 +225,12 @@ function calls and results are restored to stock Codex collaboration and
 `multi_agent_v1` tool calls and results with continuation IDs preserved. Native
 Grok remains a separate, unchanged flow.
 
+Codex 0.149 may advertise the same collaboration children as
+`functions.collaboration` with child `wait` instead of the catalog keys
+`collaboration` / `wait_agent`. OpenCode Go flatten treats those advertised
+names as aliases of the catalog adapters so `spawn_agent` / `wait` stay
+function tools and are not dropped as an unsupported hosted `namespace`.
+
 Managed `oa_xai` Responses preparation applies the existing catalog/model-
 metadata-driven `rewrite_input_item_types` continuation rewrite before xAI
 request sanitization. The rewrite runs only when model metadata requests those
