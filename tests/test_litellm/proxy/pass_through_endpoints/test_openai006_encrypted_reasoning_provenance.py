@@ -690,6 +690,132 @@ async def test_pass_through_stream_sends_unwrapped_ciphertext_byte_for_byte():
     assert "litellm_metadata" not in sent
 
 
+def _apply_openai_encrypted_reasoning_pre_send(
+    *,
+    body: dict[str, Any],
+    url: Any,
+    custom_llm_provider: str = "openai",
+    egress_credential_family: str = "codex_oauth",
+    expected_target_family: str = "openai",
+) -> dict[str, Any]:
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+
+    class _SA:
+        @staticmethod
+        def resolve_canonical_session_identity(request, body):
+            return "session-test"
+
+        @staticmethod
+        def request_session_owner_already_guarded(request):
+            return True
+
+        @staticmethod
+        def get_request_session_owner_lease(request):
+            return None
+
+    request = MagicMock()
+    request.state = SimpleNamespace()
+    with patch.object(pte, "_session_affinity_mod", lambda: _SA):
+        pte._aawm_apply_openai_encrypted_reasoning_pre_send(
+            request=request,
+            parsed_body=body,
+            custom_llm_provider=custom_llm_provider,
+            egress_credential_family=egress_credential_family,
+            expected_target_family=expected_target_family,
+            url=url,
+            provider_bound_body=body,
+        )
+    return body
+
+
+def _wrapped_openai_function_output_ciphertext() -> str:
+    return erp.wrap_encrypted_content_with_provenance(
+        CIPHERTEXT,
+        erp.build_encrypted_reasoning_provenance(
+            producer_provider="openai",
+            producer_model="gpt-5.6-sol",
+            producer_route_family="codex_oauth",
+        ),
+    )
+
+
+def test_pre_send_strips_ciphertext_only_function_output_on_chatgpt_unlabeled():
+    """ChatGPT-host unlabeled Responses egress must drop ciphertext-only function output."""
+    body = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_chatgpt_unlabeled_child",
+                "encrypted_content": _wrapped_openai_function_output_ciphertext(),
+            }
+        ],
+    }
+    sent = _apply_openai_encrypted_reasoning_pre_send(
+        body=body,
+        url=SimpleNamespace(
+            host="chatgpt.com",
+            path="/backend-api/codex/responses",
+        ),
+        egress_credential_family="codex_oauth",
+    )
+    item = sent["input"][0]
+    assert item["call_id"] == "call_chatgpt_unlabeled_child"
+    assert "encrypted_content" not in item
+    assert item.get("output") == ""
+    assert CIPHERTEXT not in str(sent)
+
+
+def test_pre_send_preserves_plaintext_function_output():
+    """Valid plaintext function output must survive OpenAI Responses egress sanitation."""
+    body = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_child_plaintext",
+                "output": "Mon Aug 24 11:44:41 EDT 2026",
+                "encrypted_content": _wrapped_openai_function_output_ciphertext(),
+            }
+        ],
+    }
+    sent = _apply_openai_encrypted_reasoning_pre_send(
+        body=body,
+        url=SimpleNamespace(
+            host="chatgpt.com",
+            path="/backend-api/codex/responses",
+        ),
+    )
+    item = sent["input"][0]
+    assert item["output"] == "Mon Aug 24 11:44:41 EDT 2026"
+    assert "encrypted_content" not in item
+    assert CIPHERTEXT not in str(sent)
+
+
+def test_pre_send_strips_ciphertext_only_function_output_on_api_openai():
+    """Explicit api.openai.com API-key Responses egress still strips ciphertext-only blobs."""
+    body = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call_api_key_child",
+                "encrypted_content": _wrapped_openai_function_output_ciphertext(),
+            }
+        ],
+    }
+    sent = _apply_openai_encrypted_reasoning_pre_send(
+        body=body,
+        url=SimpleNamespace(host="api.openai.com", path="/v1/responses"),
+        egress_credential_family="openai",
+    )
+    item = sent["input"][0]
+    assert item["call_id"] == "call_api_key_child"
+    assert "encrypted_content" not in item
+    assert item.get("output") == ""
+    assert CIPHERTEXT not in str(sent)
+
+
 @pytest.mark.asyncio
 async def test_native_openai_owner_strips_ciphertext_only_function_output_before_pass_through():
     from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (

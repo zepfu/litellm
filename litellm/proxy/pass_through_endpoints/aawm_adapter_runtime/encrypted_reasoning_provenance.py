@@ -1829,6 +1829,8 @@ __all__ = [
     "strip_route_identity_from_request_body",
     "iter_encrypted_reasoning_items",
     "prepare_encrypted_reasoning_items_for_openai_egress",
+    "should_strip_encrypted_function_output_without_plaintext",
+    "prepare_encrypted_function_output_items_for_openai_egress",
     "is_openai_encrypted_reasoning_compatible",
     "build_encrypted_reasoning_disposition_metadata",
     "raise_openai_encrypted_reasoning_redispatch_required",

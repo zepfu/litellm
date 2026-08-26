@@ -3645,6 +3645,7 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
         guard_openai_encrypted_reasoning_egress,
         is_openai_responses_egress,
         merge_encrypted_reasoning_disposition_into_request_body,
+        should_strip_encrypted_function_output_without_plaintext,
         strip_route_identity_from_request_body,
     )
 
@@ -3689,22 +3690,33 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
         target_provider="openai",
         target_route_family=egress_credential_family or expected_target_family,
         failure_phase="encrypted_reasoning_openai_pre_send",
+        strip_function_output_ciphertext_without_plaintext=(
+            should_strip_encrypted_function_output_without_plaintext(
+                url=url,
+                egress_credential_family=egress_credential_family,
+                custom_llm_provider=custom_llm_provider,
+                request_body=identity_source,
+            )
+        ),
     )
 
-    # Synchronize normalized input into the live send body used by httpx.
-    # ``prepare`` returns a new dict when input items change; a top-level
-    # shallow provider_bound_body copy would otherwise keep the wrapped list.
-    if isinstance(prepared, dict):
-        prepared_input = prepared.get("input")
-        if isinstance(prepared_input, list):
-            send_body["input"] = prepared_input
-            if (
-                isinstance(parsed_body, dict)
-                and parsed_body is not send_body
-                and isinstance(parsed_body.get("input"), list)
-            ):
-                # Keep the observability body aligned with egress ciphertext.
-                parsed_body["input"] = prepared_input
+    # Synchronize the prepared body into the live send body used by httpx.
+    # ``prepare`` returns a new dict when items change; a top-level shallow
+    # provider_bound_body copy would otherwise keep the original input list
+    # (and shared item dicts) including function_call_output ciphertext.
+    if isinstance(prepared, dict) and isinstance(send_body, dict):
+        for key, value in prepared.items():
+            if key == "litellm_metadata":
+                continue
+            send_body[key] = value
+        if (
+            isinstance(parsed_body, dict)
+            and parsed_body is not send_body
+            and isinstance(prepared.get("input"), list)
+            and isinstance(parsed_body.get("input"), list)
+        ):
+            # Keep the observability body aligned with egress ciphertext.
+            parsed_body["input"] = prepared["input"]
 
     # Disposition/observability only — do not reintroduce litellm_metadata onto
     # the stripped provider-bound send body.
