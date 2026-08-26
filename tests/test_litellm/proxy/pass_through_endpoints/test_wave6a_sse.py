@@ -489,6 +489,44 @@ class TestResponsesSSEFromIterator:
         assert "data: " in chunks[0]
         assert chunks[-1] == "data: [DONE]\n\n"
 
+    def test_stamps_aawm_route_identity_from_iterator_metadata(self):
+        class MetaIter:
+            litellm_metadata = {
+                "codex_auto_agent_selected_provider": "kimi_code",
+                "codex_auto_agent_selected_model": "kimi_code/k3",
+                "codex_auto_agent_selected_route_family": (
+                    "codex_kimi_chat_completions_adapter"
+                ),
+            }
+
+            def __aiter__(self):
+                return self._gen()
+
+            async def _gen(self):
+                yield {
+                    "type": "response.output_item.added",
+                    "item": {"type": "message", "id": "msg_1"},
+                }
+                yield {
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "output": [{"type": "message", "id": "msg_1"}],
+                    },
+                }
+
+        chunks = _run(_collect_agen(sse_mod._responses_sse_from_iterator(MetaIter())))
+        completed = next(
+            json.loads(chunk.split("data: ", 1)[1])
+            for chunk in chunks
+            if "response.completed" in chunk
+        )
+        identity = completed["response"]["aawm_route_identity"]
+        assert identity["producer_provider"] == "kimi_code"
+        assert identity["producer_model"] == "kimi_code/k3"
+        assert identity["producer_route_family"] == "codex_kimi_chat_completions_adapter"
+
     def test_untyped_events_data_only(self):
         async def events():
             yield {"no_type": True}
@@ -958,6 +996,105 @@ class TestResponsesSSEFromRepairedResponseBody:
         body = {"output": [{"type": "message", "id": "m1"}]}
         gen = sse_mod._responses_sse_from_repaired_response_body(body)
         assert gen is not None
+
+    def test_stamps_aawm_route_identity_from_selected_metadata(self):
+        """Reconstructed adapter SSE carries producer identity without encrypted_content."""
+        body = {
+            "id": "chatcmpl-kimi-no-erp",
+            "object": "response",
+            "model": "provider-kimi_code",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_kimi_1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "PONG"}],
+                }
+            ],
+        }
+        request_body = {
+            "model": "provider-kimi_code",
+            "litellm_metadata": {
+                "codex_auto_agent_selected_provider": "kimi_code",
+                "codex_auto_agent_selected_model": "kimi_code/k3",
+                "codex_auto_agent_selected_route_family": (
+                    "codex_kimi_chat_completions_adapter"
+                ),
+            },
+        }
+        chunks = _run(
+            _collect_agen(
+                sse_mod._responses_sse_from_repaired_response_body(
+                    body,
+                    request_body=request_body,
+                )
+            )
+        )
+        completed = next(
+            json.loads(chunk.split("data: ", 1)[1])
+            for chunk in chunks
+            if "response.completed" in chunk
+        )
+        identity = completed["response"]["aawm_route_identity"]
+        assert identity["producer_provider"] == "kimi_code"
+        assert identity["producer_model"] == "kimi_code/k3"
+        assert identity["producer_route_family"] == "codex_kimi_chat_completions_adapter"
+        assert identity["producer_model"] != "provider-kimi_code"
+        added = next(
+            json.loads(chunk.split("data: ", 1)[1])
+            for chunk in chunks
+            if "response.output_item.added" in chunk
+        )
+        assert added["item"]["aawm_route_identity"] == identity
+        assert "encrypted_content" not in added["item"]
+
+    def test_stamps_alibaba_aawm_route_identity_from_selected_metadata(self):
+        """Alibaba repaired SSE stamps Alibaba identity, never default OpenAI."""
+        body = {
+            "id": "chatcmpl-alibaba-no-erp",
+            "object": "response",
+            "model": "provider-alibaba_token_plan",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_alibaba_1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "PONG"}],
+                }
+            ],
+        }
+        request_body = {
+            "model": "provider-alibaba_token_plan",
+            "litellm_metadata": {
+                "codex_auto_agent_selected_provider": "alibaba_token_plan",
+                "codex_auto_agent_selected_model": "alibaba_token_plan/qwen3.7-max",
+                "codex_auto_agent_selected_route_family": (
+                    "codex_alibaba_token_plan_chat_completions_adapter"
+                ),
+            },
+        }
+        chunks = _run(
+            _collect_agen(
+                sse_mod._responses_sse_from_repaired_response_body(
+                    body,
+                    request_body=request_body,
+                )
+            )
+        )
+        completed = next(
+            json.loads(chunk.split("data: ", 1)[1])
+            for chunk in chunks
+            if "response.completed" in chunk
+        )
+        identity = completed["response"]["aawm_route_identity"]
+        assert identity["producer_provider"] == "alibaba_token_plan"
+        assert identity["producer_model"] == "alibaba_token_plan/qwen3.7-max"
+        assert (
+            identity["producer_route_family"]
+            == "codex_alibaba_token_plan_chat_completions_adapter"
+        )
+        assert identity["producer_provider"] != "openai"
+        assert identity["producer_model"] != "provider-alibaba_token_plan"
 
 
 # ===========================================================================

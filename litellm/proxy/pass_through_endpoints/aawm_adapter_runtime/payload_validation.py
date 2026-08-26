@@ -51,6 +51,8 @@ if TYPE_CHECKING:
     def _raise_codex_auto_agent_malformed_adapted_custom_tool_call(*, response_body: dict, adapter_model: str, adapter: str, adapter_label: str, adapter_error: Any, stream_event_summaries: Any = None) -> None: ...
     def _responses_sse_from_repaired_response_body(
         response_body: dict,
+        *,
+        request_body: Any = None,
     ) -> AsyncIterator[str]: ...
     def _build_empty_success_responses_diagnostic(*, response_body: dict, diagnostic_context: Any) -> dict: ...
 
@@ -696,7 +698,10 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             )
         if response_changed:
             reconstructed = StreamingResponse(
-                _responses_sse_from_repaired_response_body(response_body),  # noqa: F821
+                _responses_sse_from_repaired_response_body(  # noqa: F821
+                    response_body,
+                    request_body=request_body if isinstance(request_body, dict) else None,
+                ),
                 headers=dict(response.headers),
                 status_code=response.status_code,
                 media_type=response.media_type or "text/event-stream",
@@ -707,8 +712,18 @@ async def _validate_codex_auto_agent_responses_payload(  # noqa: PLR0915
             )
 
         async def _replay_iterator() -> Any:
+            from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+                stamp_route_identity_in_sse_chunk,
+            )
+
+            identity_request_body = (
+                request_body if isinstance(request_body, dict) else None
+            )
             for raw_chunk in peek.buffered_chunks:
-                yield raw_chunk
+                yield stamp_route_identity_in_sse_chunk(
+                    raw_chunk,
+                    request_body=identity_request_body,
+                )
 
         reconstructed = StreamingResponse(
             _replay_iterator(),

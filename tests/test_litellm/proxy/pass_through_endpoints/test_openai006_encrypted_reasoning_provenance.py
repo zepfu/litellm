@@ -360,9 +360,104 @@ async def test_pre_send_guard_allows_cross_account_openai(monkeypatch):
     # Ciphertext restored for egress
     assert body["input"][0]["encrypted_content"] == CIPHERTEXT
     assert erp.PROVENANCE_ITEM_FIELD not in body["input"][0]
+    assert erp.ROUTE_IDENTITY_FIELD not in body["input"][0]
     meta = body["litellm_metadata"]
     assert meta["encrypted_reasoning_disposition"] == "allowed_compatible"
     assert getattr(request.state, "_aawm_encrypted_reasoning_disposition", None)
+
+
+def test_strip_route_identity_from_request_body_drops_unknown_item_field():
+    body = {
+        "model": "provider-kimi_code",
+        "input": [
+            {
+                "type": "message",
+                "id": "msg_kimi_1",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "PONG"}],
+                erp.ROUTE_IDENTITY_FIELD: {
+                    "producer_provider": "kimi_code",
+                    "producer_model": "kimi_code/k3",
+                    "producer_route_family": "codex_kimi_chat_completions_adapter",
+                },
+            }
+        ],
+        erp.ROUTE_IDENTITY_FIELD: {
+            "producer_provider": "kimi_code",
+            "producer_model": "kimi_code/k3",
+            "producer_route_family": "codex_kimi_chat_completions_adapter",
+        },
+    }
+    stripped = erp.strip_route_identity_from_request_body(body)
+    assert erp.ROUTE_IDENTITY_FIELD not in stripped
+    assert erp.ROUTE_IDENTITY_FIELD not in stripped["input"][0]
+    assert stripped["input"][0]["type"] == "message"
+    assert stripped["input"][0]["content"][0]["text"] == "PONG"
+    prepared, _disposition = erp.prepare_encrypted_reasoning_items_for_openai_egress(
+        body
+    )
+    assert erp.ROUTE_IDENTITY_FIELD not in prepared
+    assert erp.ROUTE_IDENTITY_FIELD not in prepared["input"][0]
+
+
+@pytest.mark.asyncio
+async def test_pre_send_guard_strips_route_identity_for_xai_responses(monkeypatch):
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+
+    class _SA:
+        @staticmethod
+        def resolve_canonical_session_identity(request, body):
+            return "session-test"
+
+        @staticmethod
+        def request_session_owner_already_guarded(request):
+            return True
+
+        @staticmethod
+        def get_request_session_owner_lease(request):
+            return None
+
+        @staticmethod
+        def should_skip_session_owner_for_openai_models_discovery(
+            request=None, *, endpoint=None, url=None
+        ):
+            return False
+
+    monkeypatch.setattr(pte, "_session_affinity_mod", lambda: _SA)
+
+    identity = {
+        "producer_provider": "xai",
+        "producer_model": "oa_xai/grok-4.6",
+        "producer_route_family": "codex_xai_oauth_responses_adapter",
+    }
+    body = {
+        "model": "provider-xai",
+        "input": [
+            {
+                "type": "message",
+                "id": "msg_xai_1",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "PONG"}],
+                erp.ROUTE_IDENTITY_FIELD: dict(identity),
+            }
+        ],
+        erp.ROUTE_IDENTITY_FIELD: dict(identity),
+    }
+    request = MagicMock()
+    request.state = SimpleNamespace()
+    url = SimpleNamespace(path="/v1/responses")
+
+    await pte._aawm_session_owner_pre_send_guard(
+        request=request,
+        parsed_body=body,
+        custom_llm_provider="xai",
+        egress_credential_family="xai",
+        expected_target_family="xai",
+        url=url,
+    )
+    assert erp.ROUTE_IDENTITY_FIELD not in body
+    assert erp.ROUTE_IDENTITY_FIELD not in body["input"][0]
+    assert body["input"][0]["content"][0]["text"] == "PONG"
 
 
 def test_streaming_sse_stamp_preserves_ciphertext():
@@ -418,6 +513,8 @@ def _assert_clean_upstream_encrypted_item(sent_json: dict[str, Any], ciphertext:
     assert "aawm_erp:" not in str(sent_json)
     assert erp.PROVENANCE_ITEM_FIELD not in reasoning
     assert erp.PROVENANCE_ITEM_FIELD not in str(sent_json)
+    assert erp.ROUTE_IDENTITY_FIELD not in reasoning
+    assert erp.ROUTE_IDENTITY_FIELD not in str(sent_json)
 
 
 async def _run_pass_through_and_capture_json(
@@ -633,3 +730,82 @@ async def test_native_openai_owner_strips_ciphertext_only_function_output_before
     item = sent["input"][0]
     assert item["call_id"] == "call_native_owner_child"
     assert "encrypted_content" not in item
+
+
+def test_build_route_identity_from_valid_provenance_triple():
+    identity = erp.build_route_identity_from_provenance(
+        {
+            "producer_provider": "kimi_code",
+            "producer_model": "kimi_code/k3",
+            "producer_route_family": "codex_kimi_chat_completions_adapter",
+        }
+    )
+    assert identity == {
+        "producer_provider": "kimi_code",
+        "producer_model": "kimi_code/k3",
+        "producer_route_family": "codex_kimi_chat_completions_adapter",
+    }
+
+
+def test_build_route_identity_rejects_provider_alias_model():
+    assert (
+        erp.build_route_identity_from_provenance(
+            {
+                "producer_provider": "kimi_code",
+                "producer_model": "provider-kimi_code",
+                "producer_route_family": "codex_kimi_chat_completions_adapter",
+            }
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "producer_model",
+    ("None", "null", "model_id:None", "litellm_enc:model_id:None"),
+)
+def test_build_route_identity_rejects_none_and_model_id_none(producer_model):
+    assert (
+        erp.build_route_identity_from_provenance(
+            {
+                "producer_provider": "kimi_code",
+                "producer_model": producer_model,
+                "producer_route_family": "codex_kimi_chat_completions_adapter",
+            }
+        )
+        is None
+    )
+
+
+def test_build_route_identity_rejects_missing_field():
+    assert (
+        erp.build_route_identity_from_provenance(
+            {
+                "producer_provider": "kimi_code",
+                "producer_model": "kimi_code/k3",
+            }
+        )
+        is None
+    )
+
+
+def test_build_producer_provenance_retains_actual_egress_over_conflicting_metadata():
+    provenance = erp.build_producer_provenance_from_egress_context(
+        custom_llm_provider="openai",
+        expected_target_family="openai",
+        egress_credential_family="codex_oauth",
+        route_family="codex_oauth",
+        request_body={
+            "model": "gpt-5.6-sol",
+            "litellm_metadata": {
+                "codex_auto_agent_selected_provider": "xai",
+                "codex_auto_agent_selected_model": "grok-4",
+                "codex_auto_agent_selected_route_family": (
+                    "codex_xai_oauth_responses_adapter"
+                ),
+            },
+        },
+    )
+    assert provenance["producer_provider"] == "openai"
+    assert provenance["producer_model"] == "gpt-5.6-sol"
+    assert provenance["producer_route_family"] == "codex_oauth"

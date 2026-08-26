@@ -3645,7 +3645,20 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
         guard_openai_encrypted_reasoning_egress,
         is_openai_responses_egress,
         merge_encrypted_reasoning_disposition_into_request_body,
+        strip_route_identity_from_request_body,
     )
+
+    def _strip_identity_in_place(body: Optional[dict]) -> None:
+        if not isinstance(body, dict):
+            return
+        stripped = strip_route_identity_from_request_body(body)
+        if stripped is body or not isinstance(stripped, dict):
+            return
+        body.clear()
+        body.update(stripped)
+
+    _strip_identity_in_place(parsed_body)
+    _strip_identity_in_place(provider_bound_body)
 
     path = str(getattr(url, "path", "") or "")
     if not is_openai_responses_egress(
@@ -4802,8 +4815,10 @@ async def pass_through_request(  # noqa: PLR0915
         # OPENAI-006: stamp producer provenance on outbound encrypted reasoning.
         if isinstance(response_body, dict):
             from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+                ROUTE_IDENTITY_FIELD,
                 build_producer_provenance_from_egress_context,
                 stamp_encrypted_reasoning_provenance_in_response,
+                stamp_route_identity_in_response,
             )
 
             producer_prov = build_producer_provenance_from_egress_context(
@@ -4817,15 +4832,21 @@ async def pass_through_request(  # noqa: PLR0915
             )
             if stamped_body is not response_body:
                 response_body = stamped_body
-            # Re-serialize when any encrypted reasoning item was stamped.
-            if any(
+            stamp_route_identity_in_response(response_body, producer_prov)
+            # Re-serialize when encrypted reasoning or route identity was stamped.
+            output_items = response_body.get("output") or []
+            erp_stamped = any(
                 isinstance(item, dict)
                 and item.get("type") == "reasoning"
                 and isinstance(item.get("encrypted_content"), str)
                 and item.get("aawm_encrypted_reasoning_provenance")
-                for item in (response_body.get("output") or [])
+                for item in output_items
                 if isinstance(item, dict)
-            ):
+            )
+            identity_stamped = isinstance(
+                response_body.get(ROUTE_IDENTITY_FIELD), dict
+            )
+            if erp_stamped or identity_stamped:
                 content = json.dumps(
                     response_body,
                     ensure_ascii=False,

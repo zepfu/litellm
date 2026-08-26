@@ -1565,7 +1565,7 @@ class TestCFG004AlibabaStreamingPath:
         async def _sse_gen(body):
             yield "data: " + json.dumps(body) + chr(10) + chr(10)
 
-        def mock_sse_from_body(body):
+        def mock_sse_from_body(body, *, request_body=None):
             # Capture at call time: StreamingResponse is mocked and never
             # iterates the generator, so record the body argument directly.
             sse_bodies.append(body)
@@ -1949,6 +1949,365 @@ class TestD1521OpenCodeProviderBoundBody:
         assert emit_kwargs["provider_bound_body"]["reasoning_effort"] == "medium"
         assert emit_kwargs["request_body"] is request_body
         assert emit_kwargs["request_body"]["model"] == "opencode-alias"
+
+
+# ── CFG-029 non-stream route-identity request metadata ──────────────
+
+
+class TestCFG029NonstreamRouteIdentityRequestBody:
+    """The three non-stream completion adapters pass selected route metadata
+    into the shared Responses serializer."""
+
+    @staticmethod
+    def _selected_metadata(*, provider: str, model: str, route_family: str) -> dict[str, str]:
+        return {
+            "codex_auto_agent_selected_provider": provider,
+            "codex_auto_agent_selected_model": model,
+            "codex_auto_agent_selected_route_family": route_family,
+        }
+
+    def _make_kimi_host(self) -> dict[str, Any]:
+        import httpx as _httpx
+
+        host: dict[str, Any] = {"__builtins__": __builtins__}
+        host["json"] = json
+        host["httpx"] = _httpx
+        host["StreamingResponse"] = MagicMock()
+        host["_responses_sse_from_iterator"] = MagicMock()
+        host["_annotate_request_scope_for_adapted_access_log"] = MagicMock()
+        host["_get_proxy_shared_aiohttp_session"] = MagicMock(return_value=None)
+        host["_build_responses_response_from_adapter_response"] = MagicMock(
+            return_value="BUILT_RESPONSE"
+        )
+        return host
+
+    def _kimi_call_kwargs(self, prepared_request_body: dict[str, Any]) -> dict[str, Any]:
+        return dict(
+            config=MagicMock(),
+            request=MagicMock(headers={}),
+            prepared_request_body=prepared_request_body,
+            adapter_model="kimi_code/k3",
+            target_url="https://kimi.example/v1/chat/completions",
+            api_key="sk-test",
+            api_base="https://kimi.example/v1",
+            client_requested_stream=False,
+            completion_kwargs={"model": "kimi_code/k3", "messages": []},
+            request_input="test input",
+            responses_api_request={},
+            litellm_metadata=dict(prepared_request_body.get("litellm_metadata") or {}),
+            upstream_model="kimi_code/k3",
+        )
+
+    @pytest.mark.asyncio
+    async def test_kimi_passes_prepared_request_body_to_shared_serializer(self):
+        host = self._make_kimi_host()
+        mock_litellm = MagicMock()
+        mock_litellm.acompletion = AsyncMock(return_value=MagicMock())
+        mock_litellm.LlmProviders.KIMI_CODE.value = "kimi_code"
+        host["litellm"] = mock_litellm
+        codex_candidate_calls.install(host)
+
+        prepared_request_body = {
+            "model": "provider-kimi_code",
+            "litellm_metadata": self._selected_metadata(
+                provider="kimi_code",
+                model="kimi_code/k3",
+                route_family="codex_kimi_chat_completions_adapter",
+            ),
+        }
+        mock_config = MagicMock()
+        mock_config.transform_chat_completion_response_to_responses_api_response.return_value = (
+            MagicMock()
+        )
+        with unittest.mock.patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig",
+            mock_config,
+        ):
+            result = await host["_perform_codex_kimi_chat_completions_adapter_call"](
+                **self._kimi_call_kwargs(prepared_request_body)
+            )
+
+        assert result == "BUILT_RESPONSE"
+        builder = host["_build_responses_response_from_adapter_response"]
+        builder.assert_called_once()
+        assert builder.call_args.kwargs["request_body"] is prepared_request_body
+
+    @pytest.mark.asyncio
+    async def test_alibaba_passes_prepared_request_body_to_shared_serializer(self):
+        host = TestCFG004AlibabaRetryPath()._make_host()
+        mock_litellm = MagicMock()
+        mock_litellm.acompletion = AsyncMock(return_value=MagicMock())
+        mock_litellm.LlmProviders.ALIBABA_TOKEN_PLAN.value = "alibaba_token_plan"
+        host["litellm"] = mock_litellm
+        host["_raise_codex_auto_agent_malformed_tool_call_text_payload"] = MagicMock(
+            side_effect=AssertionError("should not raise")
+        )
+        codex_candidate_calls.install(host)
+
+        selected = self._selected_metadata(
+            provider="alibaba_token_plan",
+            model="qwen3.7-max",
+            route_family="codex_alibaba_token_plan_chat_completions_adapter",
+        )
+        call_kwargs = TestCFG004AlibabaRetryPath()._call_kwargs()
+        call_kwargs["prepared_request_body"] = {
+            "model": "provider-alibaba_token_plan",
+            "litellm_metadata": selected,
+        }
+        call_kwargs["litellm_metadata"] = selected
+        mock_config = MagicMock()
+        mock_config.transform_chat_completion_response_to_responses_api_response.return_value = (
+            TestCFG004AlibabaRetryPath()._make_plaintext_response()
+        )
+        with unittest.mock.patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig",
+            mock_config,
+        ):
+            result = await host["_perform_codex_alibaba_token_plan_adapter_call"](
+                **call_kwargs
+            )
+
+        assert result == "BUILT_RESPONSE"
+        builder = host["_build_responses_response_from_adapter_response"]
+        builder.assert_called_once()
+        assert builder.call_args.kwargs["request_body"] is call_kwargs["prepared_request_body"]
+
+    @pytest.mark.asyncio
+    async def test_kimi_streaming_passes_prepared_request_body_to_sse_iterator(self):
+        host = self._make_kimi_host()
+        mock_litellm = MagicMock()
+        mock_litellm.acompletion = AsyncMock(return_value=MagicMock())
+        mock_litellm.LlmProviders.KIMI_CODE.value = "kimi_code"
+        host["litellm"] = mock_litellm
+        host["StreamingResponse"] = MagicMock(return_value="STREAM_RESPONSE")
+        codex_candidate_calls.install(host)
+
+        prepared_request_body = {
+            "model": "provider-kimi_code",
+            "litellm_metadata": self._selected_metadata(
+                provider="kimi_code",
+                model="kimi_code/k3",
+                route_family="codex_kimi_chat_completions_adapter",
+            ),
+        }
+        call_kwargs = self._kimi_call_kwargs(prepared_request_body)
+        call_kwargs["client_requested_stream"] = True
+        with unittest.mock.patch(
+            "litellm.responses.litellm_completion_transformation.streaming_iterator.LiteLLMCompletionStreamingIterator",
+            return_value=MagicMock(name="kimi_iterator"),
+        ):
+            result = await host["_perform_codex_kimi_chat_completions_adapter_call"](
+                **call_kwargs
+            )
+
+        assert result == "STREAM_RESPONSE"
+        sse = host["_responses_sse_from_iterator"]
+        sse.assert_called_once()
+        assert sse.call_args.kwargs["request_body"] is prepared_request_body
+        metadata = sse.call_args.kwargs["request_body"]["litellm_metadata"]
+        assert metadata["codex_auto_agent_selected_provider"] == "kimi_code"
+        assert metadata["codex_auto_agent_selected_model"] == "kimi_code/k3"
+        assert (
+            metadata["codex_auto_agent_selected_route_family"]
+            == "codex_kimi_chat_completions_adapter"
+        )
+
+    @pytest.mark.asyncio
+    async def test_alibaba_streaming_passes_selected_metadata_to_repaired_sse(self):
+        stream_harness = TestCFG004AlibabaStreamingPath()
+        host = stream_harness._make_host()
+        captured: dict[str, Any] = {}
+        original_sse = host["_responses_sse_from_repaired_response_body"]
+
+        def capture_sse(body, *, request_body=None):
+            captured["request_body"] = request_body
+            return original_sse(body, request_body=request_body)
+
+        host["_responses_sse_from_repaired_response_body"] = capture_sse
+        host["_serialize_responses_adapter_response"] = MagicMock(
+            return_value=json.dumps(
+                {
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "name": "spawn_agent",
+                            "arguments": json.dumps({"message": "implement the fix"}),
+                        }
+                    ],
+                    "status": "completed",
+                }
+            )
+        )
+        host["_raise_codex_auto_agent_malformed_tool_call_text_payload"] = MagicMock(
+            side_effect=AssertionError("should not raise")
+        )
+        mock_litellm = MagicMock()
+        mock_litellm.acompletion = AsyncMock(return_value=MagicMock())
+        mock_litellm.LlmProviders.ALIBABA_TOKEN_PLAN.value = "alibaba_token_plan"
+        host["litellm"] = mock_litellm
+        host["StreamingResponse"] = MagicMock(return_value="STREAM_RESPONSE")
+        codex_candidate_calls.install(host)
+
+        selected = self._selected_metadata(
+            provider="alibaba_token_plan",
+            model="alibaba_token_plan/qwen3.7-max",
+            route_family="codex_alibaba_token_plan_chat_completions_adapter",
+        )
+        call_kwargs = stream_harness._call_kwargs(stream=True)
+        call_kwargs["prepared_request_body"] = {
+            "model": "provider-alibaba_token_plan",
+            "litellm_metadata": selected,
+        }
+        call_kwargs["litellm_metadata"] = selected
+        mock_config = MagicMock()
+        mock_config.transform_chat_completion_response_to_responses_api_response.return_value = (
+            stream_harness._make_plaintext_response()
+        )
+        with unittest.mock.patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig",
+            mock_config,
+        ):
+            result = await host["_perform_codex_alibaba_token_plan_adapter_call"](
+                **call_kwargs
+            )
+
+        assert result == "STREAM_RESPONSE"
+        request_body = captured["request_body"]
+        assert request_body is call_kwargs["prepared_request_body"]
+        metadata = request_body["litellm_metadata"]
+        assert metadata["codex_auto_agent_selected_provider"] == "alibaba_token_plan"
+        assert metadata["codex_auto_agent_selected_model"] == "alibaba_token_plan/qwen3.7-max"
+        assert (
+            metadata["codex_auto_agent_selected_route_family"]
+            == "codex_alibaba_token_plan_chat_completions_adapter"
+        )
+        assert metadata["codex_auto_agent_selected_provider"] != "openai"
+
+    @pytest.mark.asyncio
+    async def test_openrouter_passes_request_metadata_to_shared_serializer(self):
+        host: dict[str, Any] = {"__builtins__": __builtins__}
+        from fastapi.responses import Response, StreamingResponse
+
+        selected = self._selected_metadata(
+            provider="openrouter",
+            model="openrouter/auto",
+            route_family="codex_openrouter_completion_adapter",
+        )
+        request_body = {
+            "model": "provider-openrouter",
+            "input": "hello",
+            "litellm_metadata": selected,
+        }
+        host["Response"] = Response
+        host["StreamingResponse"] = StreamingResponse
+        host["_adapt_codex_namespace_tools_to_functions_from_request_body"] = (
+            TestOpenRouterCompletionNamespaceToolAdaptation._passthrough_request_policy
+        )
+        host["_adapt_codex_custom_tools_to_functions_from_request_body"] = (
+            TestOpenRouterCompletionNamespaceToolAdaptation._passthrough_request_policy
+        )
+        host["_apply_codex_tool_description_patches_to_request_body"] = (
+            TestOpenRouterCompletionNamespaceToolAdaptation._passthrough_request_policy
+        )
+        host["_drop_unsupported_codex_hosted_tools_from_request_body"] = (
+            TestOpenRouterCompletionNamespaceToolAdaptation._passthrough_request_policy
+        )
+        host["_drop_unsupported_codex_input_items_from_request_body"] = (
+            TestOpenRouterCompletionNamespaceToolAdaptation._passthrough_request_policy
+        )
+        host["_drop_tool_choice_without_tools_from_request_body"] = (
+            TestOpenRouterCompletionNamespaceToolAdaptation._passthrough_request_policy
+        )
+        host["_get_openrouter_api_key"] = MagicMock(return_value="sk-test")
+        host["_get_openrouter_completion_adapter_upstream_model"] = MagicMock(
+            return_value=None
+        )
+        host["_get_openrouter_target_base"] = MagicMock(
+            return_value="https://openrouter.ai"
+        )
+        host["_build_openrouter_default_headers"] = MagicMock(return_value={})
+        host["_get_proxy_shared_aiohttp_session"] = MagicMock(return_value=None)
+        host["_merge_litellm_metadata"] = MagicMock(side_effect=lambda body, **kw: body)
+        host["_add_route_family_logging_metadata"] = MagicMock(
+            side_effect=lambda body, family: body
+        )
+        host["_build_langfuse_span_descriptor"] = MagicMock(return_value={})
+        host["_build_adapted_route_rollup_kwargs"] = MagicMock(return_value={})
+        host["_emit_adapted_route_access_log"] = MagicMock()
+        host["_annotate_request_scope_for_adapted_access_log"] = MagicMock()
+        host["_record_adapted_completed_route_rollup_turn"] = MagicMock()
+        host["_apply_openrouter_completion_message_sanitization"] = MagicMock(
+            side_effect=lambda **kw: (
+                kw["request_body"],
+                {"model": "openrouter-upstream", "messages": []},
+                kw["litellm_metadata"],
+            )
+        )
+        host["_perform_openrouter_completion_adapter_operation"] = AsyncMock(
+            return_value=MagicMock()
+        )
+        host["_serialize_responses_adapter_response"] = MagicMock(
+            return_value='{"id":"resp-1","output":[],"status":"completed"}'
+        )
+        host["_is_codex_auto_agent_malformed_tool_call_text_output"] = MagicMock(
+            return_value=False
+        )
+        host["_is_codex_auto_agent_empty_success_responses_body"] = MagicMock(
+            return_value=False
+        )
+        builder = MagicMock(return_value=MagicMock())
+        host["_build_responses_response_from_adapter_response"] = builder
+        host["_build_malformed_tool_call_intake_context"] = MagicMock(return_value={})
+        host["_validate_codex_auto_agent_responses_payload"] = AsyncMock(
+            return_value=MagicMock()
+        )
+        import httpx as _httpx
+
+        host["httpx"] = _httpx
+
+        class _MockHelpers:
+            @staticmethod
+            def validate_outgoing_egress(**kwargs):
+                return None
+
+        host["HttpPassThroughEndpointHelpers"] = _MockHelpers
+        import litellm as _litellm
+
+        host["litellm"] = _litellm
+        from typing import cast as _cast
+
+        host["cast"] = _cast
+        host["ResponsesAPIOptionalRequestParams"] = dict
+        host["json"] = json
+        codex_candidate_calls.install(host)
+
+        mock_config = MagicMock()
+        mock_config.transform_responses_api_request_to_chat_completion_request.return_value = {
+            "model": "openrouter-upstream",
+            "messages": [],
+        }
+        mock_config.transform_chat_completion_response_to_responses_api_response.return_value = (
+            MagicMock()
+        )
+        mock_request = MagicMock()
+        mock_request.headers = {"x-test": "1"}
+        with unittest.mock.patch(
+            "litellm.responses.litellm_completion_transformation.transformation.LiteLLMCompletionResponsesConfig",
+            mock_config,
+        ):
+            await host["_perform_codex_auto_agent_openrouter_completion_request"](
+                request=mock_request,
+                adapter_model="provider-openrouter",
+                request_body=request_body,
+                use_alias_candidate_probe=False,
+            )
+
+        builder.assert_called_once()
+        passed = builder.call_args.kwargs["request_body"]
+        assert isinstance(passed, dict)
+        assert passed["litellm_metadata"] == selected
+
+
 # ── CFG-030 Codex NVIDIA completion adapter ─────────────────────────
 
 

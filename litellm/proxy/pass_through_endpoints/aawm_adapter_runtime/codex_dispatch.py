@@ -529,6 +529,14 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
     )
     if isinstance(getattr(_watermark_egress, "body", None), dict):
         prepared_request_body = _watermark_egress.body
+    if isinstance(prepared_request_body, dict):
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+            strip_route_identity_from_request_body,
+        )
+
+        prepared_request_body = strip_route_identity_from_request_body(
+            prepared_request_body
+        )
     watermark_input_audit = getattr(_watermark_egress, "audit", None)
     if watermark_input_audit is not None:
         _watermark_metadata["watermark_input_audit"] = watermark_input_audit
@@ -687,6 +695,25 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
         await _finalize_nested_session_owner_lease(request, _resp)
         return _resp
 
+    def _attach_direct_selected_route_metadata(
+        body: Any,
+        *,
+        provider: str,
+        model: str,
+        route_family: str,
+    ) -> Any:
+        """Attach concrete selected-route identity for direct Kimi/Alibaba dispatch."""
+        if not isinstance(body, dict):
+            return body
+        metadata = body.get("litellm_metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            body["litellm_metadata"] = metadata
+        metadata["codex_auto_agent_selected_provider"] = provider
+        metadata["codex_auto_agent_selected_model"] = model
+        metadata["codex_auto_agent_selected_route_family"] = route_family
+        return body
+
     kimi_code_adapter_model = _resolve_codex_kimi_chat_completions_adapter_model(
         prepared_request_body,
         endpoint=endpoint,
@@ -698,6 +725,12 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
         )
         if prepared_request_body is not request_body:
             _safe_set_request_parsed_body(request, prepared_request_body)
+        prepared_request_body = _attach_direct_selected_route_metadata(
+            prepared_request_body,
+            provider="kimi_code",
+            model=kimi_code_adapter_model,
+            route_family="codex_kimi_chat_completions_adapter",
+        )
 
         # Concrete pre-egress reserve after kimi route resolution.
         await _ensure_codex_nested_session_owner_pre_egress(
@@ -734,6 +767,12 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
         )
         if prepared_request_body is not request_body:
             _safe_set_request_parsed_body(request, prepared_request_body)
+        prepared_request_body = _attach_direct_selected_route_metadata(
+            prepared_request_body,
+            provider="alibaba_token_plan",
+            model=alibaba_token_plan_adapter_model,
+            route_family="codex_alibaba_token_plan_chat_completions_adapter",
+        )
 
         # Concrete pre-egress reserve after alibaba route resolution.
         await _ensure_codex_nested_session_owner_pre_egress(

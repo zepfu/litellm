@@ -413,6 +413,62 @@ class TestSupportedDispatch:
         assert result is sentinel
 
     @pytest.mark.asyncio
+    async def test_kimi_code_dispatch_attaches_selected_route_metadata(self) -> None:
+        seen: dict[str, Any] = {}
+
+        async def _capture_route(**kwargs: Any) -> Response:
+            seen["prepared_request_body"] = kwargs["prepared_request_body"]
+            return Response(content=b"dispatched", status_code=200)
+
+        host, _sentinel = _make_dispatch_host(
+            matching_adapter="_resolve_codex_kimi_chat_completions_adapter_model",
+            adapter_model="kimi_code/k3",
+        )
+        host["_handle_codex_kimi_chat_completions_adapter_route"] = _capture_route
+        codex_dispatch.install(host)
+        inbound = {"model": "provider-kimi_code"}
+        result = await host["try_dispatch_codex_request"](
+            **_dispatch_kwargs(prepared_request_body=inbound, request_body=dict(inbound))
+        )
+        assert result.status_code == 200
+        metadata = seen["prepared_request_body"]["litellm_metadata"]
+        assert metadata["codex_auto_agent_selected_provider"] == "kimi_code"
+        assert metadata["codex_auto_agent_selected_model"] == "kimi_code/k3"
+        assert (
+            metadata["codex_auto_agent_selected_route_family"]
+            == "codex_kimi_chat_completions_adapter"
+        )
+
+    @pytest.mark.asyncio
+    async def test_alibaba_token_plan_dispatch_attaches_selected_route_metadata(
+        self,
+    ) -> None:
+        seen: dict[str, Any] = {}
+
+        async def _capture_route(**kwargs: Any) -> Response:
+            seen["prepared_request_body"] = kwargs["prepared_request_body"]
+            return Response(content=b"dispatched", status_code=200)
+
+        host, _sentinel = _make_dispatch_host(
+            matching_adapter="_resolve_codex_alibaba_token_plan_adapter_model",
+            adapter_model="alibaba_token_plan/qwen3.7-max",
+        )
+        host["_handle_codex_alibaba_token_plan_adapter_route"] = _capture_route
+        codex_dispatch.install(host)
+        inbound = {"model": "provider-alibaba_token_plan"}
+        result = await host["try_dispatch_codex_request"](
+            **_dispatch_kwargs(prepared_request_body=inbound, request_body=dict(inbound))
+        )
+        assert result.status_code == 200
+        metadata = seen["prepared_request_body"]["litellm_metadata"]
+        assert metadata["codex_auto_agent_selected_provider"] == "alibaba_token_plan"
+        assert metadata["codex_auto_agent_selected_model"] == "alibaba_token_plan/qwen3.7-max"
+        assert (
+            metadata["codex_auto_agent_selected_route_family"]
+            == "codex_alibaba_token_plan_chat_completions_adapter"
+        )
+
+    @pytest.mark.asyncio
     async def test_zai_coding_plan_dispatch(self) -> None:
         host, sentinel = _make_dispatch_host(
             matching_adapter="_resolve_codex_zai_coding_plan_adapter_model",

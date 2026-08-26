@@ -16,6 +16,7 @@ Integration seams (injectable for testability):
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from types import FunctionType
 from typing import Any, Callable, Optional
 
@@ -38,6 +39,7 @@ def _build_responses_response_from_adapter_response(
     serializer: Optional[Callable[[Any], str]] = None,
     success_handler_kwargs: Optional[dict[str, Any]] = None,
     config: Any = None,
+    request_body: Optional[Mapping[str, Any]] = None,
 ) -> Response:
     """Build a JSON Response from an adapter response object.
 
@@ -45,6 +47,8 @@ def _build_responses_response_from_adapter_response(
     ``_serialize_responses_adapter_response``) so that the exact wire format
     is preserved without importing the god module. CFG-028 applies
     ``maybe_apply_passthrough_watermark_response`` before building Response.
+    When *request_body* carries selected route metadata, CFG-029 stamps
+    ``aawm_route_identity`` after serialize and before watermark.
     """
     import json
 
@@ -55,6 +59,7 @@ def _build_responses_response_from_adapter_response(
     )
     serialized = serialize(response_obj)
     parsed_body: Any = {}
+    has_parsed_body = False
     if isinstance(serialized, (bytes, bytearray, str)):
         try:
             loaded = json.loads(serialized)
@@ -62,8 +67,31 @@ def _build_responses_response_from_adapter_response(
             loaded = None
         if isinstance(loaded, dict):
             parsed_body = loaded
+            has_parsed_body = True
     elif isinstance(response_obj, dict):
         parsed_body = response_obj
+        has_parsed_body = True
+
+    if isinstance(request_body, Mapping):
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+            ROUTE_IDENTITY_FIELD,
+            build_producer_provenance_from_egress_context,
+            stamp_route_identity_in_response,
+        )
+
+        stamp_target = parsed_body if has_parsed_body and isinstance(parsed_body, dict) else (
+            response_obj if isinstance(response_obj, dict) else None
+        )
+        if isinstance(stamp_target, dict):
+            stamp_route_identity_in_response(
+                stamp_target,
+                build_producer_provenance_from_egress_context(
+                    request_body=request_body,
+                ),
+            )
+            if isinstance(stamp_target.get(ROUTE_IDENTITY_FIELD), dict):
+                parsed_body = stamp_target
+                serialized = json.dumps(stamp_target)
 
     hooked_kwargs = (
         success_handler_kwargs

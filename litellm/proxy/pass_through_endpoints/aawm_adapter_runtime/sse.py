@@ -213,10 +213,34 @@ async def _responses_sse_from_iterator(
     responses_iterator: Any,
     on_complete: Optional[Callable[[], None]] = None,
     on_stream_error: Optional[Callable[[Exception], Optional[str]]] = None,
+    *,
+    request_body: Optional[dict[str, Any]] = None,
 ) -> Any:
     has_emitted = False
     has_terminal = False
     last_event: Any = None
+
+    def _identity_request_body() -> Optional[dict[str, Any]]:
+        if isinstance(request_body, dict):
+            return request_body
+        metadata = getattr(responses_iterator, "litellm_metadata", None)
+        if isinstance(metadata, dict) and metadata:
+            return {"litellm_metadata": metadata}
+        return None
+
+    def _stamp_sse_text(sse_text: str) -> str:
+        identity_body = _identity_request_body()
+        if not sse_text or not identity_body:
+            return sse_text
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+            stamp_route_identity_in_sse_chunk,
+        )
+
+        stamped = stamp_route_identity_in_sse_chunk(
+            sse_text,
+            request_body=identity_body,
+        )
+        return stamped if isinstance(stamped, str) else sse_text
 
     def _injected_terminal_sse(*, event_type: str, status: str) -> str:
         last_response = (
@@ -281,13 +305,17 @@ async def _responses_sse_from_iterator(
                 has_terminal = True
             serialized = _serialize_responses_adapter_response(event)
             if isinstance(event_type, str) and event_type:
-                yield f"event: {event_type}\ndata: {serialized}\n\n"
+                yield _stamp_sse_text(
+                    f"event: {event_type}\ndata: {serialized}\n\n",
+                )
                 continue
-            yield f"data: {serialized}\n\n"
+            yield _stamp_sse_text(f"data: {serialized}\n\n")
         if not has_terminal:
-            yield _injected_terminal_sse(
-                event_type="response.completed",
-                status="completed",
+            yield _stamp_sse_text(
+                _injected_terminal_sse(
+                    event_type="response.completed",
+                    status="completed",
+                ),
             )
         if on_complete is not None:
             on_complete()
@@ -411,7 +439,21 @@ def _responses_repaired_output_item_id(item: dict[str, Any], index: int) -> str:
 
 async def _responses_sse_from_repaired_response_body(
     response_body: dict[str, Any],
+    *,
+    request_body: Optional[dict[str, Any]] = None,
 ) -> Any:
+    if isinstance(response_body, dict) and isinstance(request_body, dict):
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+            build_producer_provenance_from_egress_context,
+            stamp_route_identity_in_response,
+        )
+
+        stamp_route_identity_in_response(
+            response_body,
+            build_producer_provenance_from_egress_context(
+                request_body=request_body,
+            ),
+        )
     output = response_body.get("output")
     if not isinstance(output, list):
         output = []

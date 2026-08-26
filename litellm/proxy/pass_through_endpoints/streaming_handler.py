@@ -1400,13 +1400,17 @@ class PassThroughStreamingHandler:
                         if modified_chunk is not None:
                             chunk = modified_chunk
 
-                # OPENAI-006: stamp encrypted reasoning on non-OpenAI Responses
-                # streams too (e.g. xAI) so foreign provenance survives into
-                # later OpenAI continuations.
-                if (
-                    isinstance(chunk, (bytes, bytearray))
-                    and b"encrypted_content" in chunk
-                    and b"reasoning" in chunk
+                # OPENAI-006 / CFG-029: stamp encrypted reasoning and
+                # aawm_route_identity on non-OpenAI Responses streams too
+                # (e.g. xAI) so producer identity survives into Ohmypi JSONL.
+                if isinstance(chunk, (bytes, bytearray)) and (
+                    (
+                        b"encrypted_content" in chunk
+                        and b"reasoning" in chunk
+                    )
+                    or b"response.completed" in chunk
+                    or b"response.output_item.added" in chunk
+                    or b"response.output_item.done" in chunk
                 ):
                     chunk = PassThroughStreamingHandler._stamp_encrypted_reasoning_in_responses_sse_chunk(
                         bytes(chunk),

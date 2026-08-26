@@ -51,8 +51,14 @@ ENCRYPTED_REASONING_COMPATIBILITY_SOURCE = (
 )
 
 PROVENANCE_ITEM_FIELD = "aawm_encrypted_reasoning_provenance"
+ROUTE_IDENTITY_FIELD = "aawm_route_identity"
 _WRAP_PREFIX = "aawm_erp:"
 _PROVENANCE_VERSION = 1
+_ROUTE_IDENTITY_KEYS = (
+    "producer_provider",
+    "producer_model",
+    "producer_route_family",
+)
 
 # Wire/state families for encrypted reasoning blobs.
 STATE_FORMAT_OPENAI_ENCRYPTED_REASONING = "openai_encrypted_reasoning"
@@ -565,6 +571,141 @@ def stamp_encrypted_reasoning_provenance_in_response(
     return response
 
 
+def _is_provider_alias_model(value: Any) -> bool:
+    return str(value or "").strip().startswith("provider-")
+
+
+def _is_invalid_route_identity_value(value: Any) -> bool:
+    """True when a producer field is empty, alias-shaped, or ``model_id:None``."""
+
+    text = str(value or "").strip()
+    if not text:
+        return True
+    lowered = text.lower()
+    if lowered in {"none", "null"}:
+        return True
+    if "model_id:none" in lowered.replace(" ", ""):
+        return True
+    return _is_provider_alias_model(text)
+
+
+def build_route_identity_from_provenance(
+    provenance: Mapping[str, Any] | None,
+) -> Optional[dict[str, str]]:
+    """Return the three producer fields used by CFG-029 orch evidence.
+
+    Alias names (``provider-*``), missing fields, and ``model_id:None`` /
+    ``None`` / ``null`` are never a concrete model. Collectors stay
+    identity-unobserved when any of the three fields is invalid.
+    """
+
+    if not isinstance(provenance, Mapping):
+        return None
+    provider = str(provenance.get("producer_provider") or "").strip()
+    model = str(provenance.get("producer_model") or "").strip()
+    route = str(provenance.get("producer_route_family") or "").strip()
+    if not provider or not model or not route:
+        return None
+    if _is_invalid_route_identity_value(provider) or _is_invalid_route_identity_value(
+        model
+    ):
+        return None
+    return {
+        "producer_provider": provider,
+        "producer_model": model,
+        "producer_route_family": route,
+    }
+
+
+_ROUTE_IDENTITY_STRIP_MAX_DEPTH = 32
+
+
+def _strip_route_identity_node(value: Any, *, _depth: int) -> tuple[Any, bool]:
+    """Return ``(stripped, changed)`` without mutating *value*."""
+
+    if _depth > _ROUTE_IDENTITY_STRIP_MAX_DEPTH:
+        return value, False
+    if isinstance(value, dict):
+        changed = False
+        out: dict[str, Any] = {}
+        for key, nested in value.items():
+            if key == ROUTE_IDENTITY_FIELD:
+                changed = True
+                continue
+            stripped, nested_changed = _strip_route_identity_node(
+                nested, _depth=_depth + 1
+            )
+            if nested_changed:
+                changed = True
+            out[key] = stripped
+        return (out if changed else value), changed
+    if isinstance(value, list):
+        changed = False
+        out_list: list[Any] = []
+        for nested in value:
+            stripped, nested_changed = _strip_route_identity_node(
+                nested, _depth=_depth + 1
+            )
+            if nested_changed:
+                changed = True
+            out_list.append(stripped)
+        return (out_list if changed else value), changed
+    return value, False
+
+
+def strip_route_identity_from_request_body(
+    request_body: Mapping[str, Any] | dict[str, Any] | None,
+) -> Any:
+    """Drop outbound ``aawm_route_identity`` before provider send.
+
+    OpenAI and xAI reject unknown item fields such as
+    ``input[N].aawm_route_identity``. Identity is client-facing only.
+    """
+
+    if not isinstance(request_body, dict):
+        return dict(request_body) if isinstance(request_body, Mapping) else {}
+    stripped, changed = _strip_route_identity_node(request_body, _depth=0)
+    return stripped if changed else request_body
+
+
+def stamp_route_identity_in_response(
+    response: Any,
+    provenance: Mapping[str, Any],
+) -> Any:
+    """Attach ``aawm_route_identity`` on the Responses envelope and items.
+
+    Independent of ``encrypted_content``. Missing identity is a no-op.
+    """
+
+    identity = build_route_identity_from_provenance(provenance)
+    if identity is None:
+        return response
+    payload = dict(identity)
+    if isinstance(response, dict):
+        response[ROUTE_IDENTITY_FIELD] = payload
+        output = response.get("output")
+        if isinstance(output, list):
+            for item in output:
+                if isinstance(item, dict):
+                    item[ROUTE_IDENTITY_FIELD] = dict(payload)
+        return response
+    try:
+        setattr(response, ROUTE_IDENTITY_FIELD, payload)
+    except Exception:
+        return response
+    output = getattr(response, "output", None)
+    if isinstance(output, list):
+        for item in output:
+            if isinstance(item, dict):
+                item[ROUTE_IDENTITY_FIELD] = dict(payload)
+            else:
+                try:
+                    setattr(item, ROUTE_IDENTITY_FIELD, dict(payload))
+                except Exception:
+                    pass
+    return response
+
+
 def prepare_encrypted_reasoning_items_for_openai_egress(
     request_body: Mapping[str, Any] | dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -576,6 +717,16 @@ def prepare_encrypted_reasoning_items_for_openai_egress(
     """
     if not isinstance(request_body, dict):
         return dict(request_body) if isinstance(request_body, Mapping) else {}, {
+            "encrypted_reasoning_item_count": 0,
+            "encrypted_reasoning_disposition": "absent",
+            "encrypted_reasoning_compatibility_source": (
+                ENCRYPTED_REASONING_COMPATIBILITY_SOURCE
+            ),
+        }
+
+    request_body = strip_route_identity_from_request_body(request_body)
+    if not isinstance(request_body, dict):
+        return request_body, {
             "encrypted_reasoning_item_count": 0,
             "encrypted_reasoning_disposition": "absent",
             "encrypted_reasoning_compatibility_source": (
@@ -1370,21 +1521,27 @@ def build_producer_provenance_from_egress_context(
 ) -> dict[str, Any]:
     """Construct producer provenance for stamping outbound encrypted items."""
     body = request_body if isinstance(request_body, Mapping) else {}
-    model = body.get("model") if isinstance(body, Mapping) else None
-    provider = (
+    requested_model = body.get("model") if isinstance(body, Mapping) else None
+    model = requested_model
+    explicit_provider = (
         custom_llm_provider
         or expected_target_family
         or egress_credential_family
-        or "openai"
     )
-    resolved_route = (
+    provider = explicit_provider or "openai"
+    explicit_route = (
         route_family
         or egress_credential_family
         or expected_target_family
-        or provider
     )
-    # Prefer bound inventory identity from metadata when present.
+    resolved_route = explicit_route or provider
+    # Explicit/actual egress identity wins over selected request metadata.
+    # Metadata may still fill account fields, and may supply a concrete
+    # selected model only when the request model is absent or alias/invalid.
     metadata = body.get("litellm_metadata") if isinstance(body, Mapping) else None
+    if not isinstance(metadata, Mapping) and isinstance(body, Mapping):
+        fallback_meta = body.get("metadata")
+        metadata = fallback_meta if isinstance(fallback_meta, Mapping) else None
     if isinstance(metadata, Mapping):
         account_label = account_label or metadata.get(
             "codex_auto_agent_selected_account_label"
@@ -1395,18 +1552,23 @@ def build_producer_provenance_from_egress_context(
         account_hash = account_hash or metadata.get(
             "codex_auto_agent_selected_account_hash"
         ) or metadata.get("account_hash")
-        if model is None:
-            model = metadata.get("codex_auto_agent_selected_model") or model
-        if not route_family:
+        selected_model = metadata.get("codex_auto_agent_selected_model")
+        if selected_model and not _is_invalid_route_identity_value(selected_model):
+            if requested_model is None or _is_invalid_route_identity_value(
+                requested_model
+            ):
+                model = selected_model
+        if not explicit_route:
             resolved_route = (
                 metadata.get("codex_auto_agent_selected_route_family")
                 or metadata.get("passthrough_route_family")
                 or resolved_route
             )
-        provider = (
-            metadata.get("codex_auto_agent_selected_provider")
-            or provider
-        )
+        if not explicit_provider:
+            provider = (
+                metadata.get("codex_auto_agent_selected_provider")
+                or provider
+            )
     return build_encrypted_reasoning_provenance(
         producer_provider=provider,
         producer_model=model,
@@ -1475,7 +1637,15 @@ def stamp_encrypted_reasoning_in_responses_sse_chunk(
         decoded = chunk.decode("utf-8")
     except Exception:
         return chunk
-    if "encrypted_content" not in decoded or "reasoning" not in decoded:
+    has_encrypted_reasoning = (
+        "encrypted_content" in decoded and "reasoning" in decoded
+    )
+    has_identity_event = (
+        "response.completed" in decoded
+        or "response.output_item.added" in decoded
+        or "response.output_item.done" in decoded
+    )
+    if not has_encrypted_reasoning and not has_identity_event:
         return chunk
 
     provenance = build_producer_provenance_from_egress_context(
@@ -1505,8 +1675,11 @@ def stamp_encrypted_reasoning_in_responses_sse_chunk(
             out_lines.append(line)
             continue
 
-        line_changed = _stamp_encrypted_reasoning_in_sse_event(event, provenance)
-        if not line_changed:
+        line_changed = False
+        if has_encrypted_reasoning:
+            line_changed = _stamp_encrypted_reasoning_in_sse_event(event, provenance)
+        identity_changed = _stamp_route_identity_in_sse_event(event, provenance)
+        if not line_changed and not identity_changed:
             out_lines.append(line)
             continue
         any_changed = True
@@ -1528,6 +1701,43 @@ def stamp_encrypted_reasoning_in_responses_sse_chunk(
     if decoded.endswith('\n') and not rebuilt.endswith('\n'):
         rebuilt += '\n'
     return rebuilt.encode("utf-8")
+
+
+def stamp_route_identity_in_sse_chunk(
+    chunk: Any,
+    *,
+    request_body: Optional[Mapping[str, Any]] = None,
+    custom_llm_provider: Any = None,
+    egress_credential_family: Any = None,
+    expected_target_family: Any = None,
+) -> Any:
+    """Stamp ``aawm_route_identity`` onto one SSE chunk (bytes or str).
+
+    Missing identity is a no-op. Independent of ``encrypted_content``.
+    """
+
+    if not chunk:
+        return chunk
+    if isinstance(chunk, str):
+        stamped = stamp_encrypted_reasoning_in_responses_sse_chunk(
+            chunk.encode("utf-8"),
+            request_body=request_body,
+            custom_llm_provider=custom_llm_provider,
+            egress_credential_family=egress_credential_family,
+            expected_target_family=expected_target_family,
+        )
+        if isinstance(stamped, bytes):
+            return stamped.decode("utf-8")
+        return chunk
+    if isinstance(chunk, (bytes, bytearray)):
+        return stamp_encrypted_reasoning_in_responses_sse_chunk(
+            bytes(chunk),
+            request_body=request_body,
+            custom_llm_provider=custom_llm_provider,
+            egress_credential_family=egress_credential_family,
+            expected_target_family=expected_target_family,
+        )
+    return chunk
 
 
 def _stamp_encrypted_reasoning_in_sse_event(
@@ -1563,10 +1773,44 @@ def _stamp_encrypted_reasoning_in_sse_event(
     return changed
 
 
+def _stamp_route_identity_in_sse_event(
+    event: dict[str, Any],
+    provenance: Mapping[str, Any],
+) -> bool:
+    """Attach ``aawm_route_identity`` to Responses SSE items/envelopes."""
+
+    identity = build_route_identity_from_provenance(provenance)
+    if identity is None:
+        return False
+    changed = False
+    event_type = event.get("type")
+    if event_type in {"response.output_item.added", "response.output_item.done"}:
+        item = event.get("item")
+        if isinstance(item, dict) and item.get(ROUTE_IDENTITY_FIELD) != identity:
+            item[ROUTE_IDENTITY_FIELD] = dict(identity)
+            event["item"] = item
+            changed = True
+        return changed
+    if event_type == "response.completed":
+        response_obj = event.get("response")
+        if not isinstance(response_obj, dict):
+            return False
+        if response_obj.get(ROUTE_IDENTITY_FIELD) != identity:
+            response_obj[ROUTE_IDENTITY_FIELD] = dict(identity)
+            changed = True
+        output = response_obj.get("output")
+        if isinstance(output, list):
+            for item in output:
+                if isinstance(item, dict) and item.get(ROUTE_IDENTITY_FIELD) != identity:
+                    item[ROUTE_IDENTITY_FIELD] = dict(identity)
+                    changed = True
+    return changed
+
 
 __all__ = [
     "ENCRYPTED_REASONING_COMPATIBILITY_SOURCE",
     "PROVENANCE_ITEM_FIELD",
+    "ROUTE_IDENTITY_FIELD",
     "STATE_FORMAT_OPENAI_ENCRYPTED_REASONING",
     "STATE_FORMAT_XAI_ENCRYPTED_REASONING",
     "STATE_FORMAT_ANTHROPIC_ENCRYPTED_REASONING",
@@ -1580,6 +1824,9 @@ __all__ = [
     "extract_item_encrypted_reasoning_provenance",
     "stamp_encrypted_reasoning_provenance_on_item",
     "stamp_encrypted_reasoning_provenance_in_response",
+    "build_route_identity_from_provenance",
+    "stamp_route_identity_in_response",
+    "strip_route_identity_from_request_body",
     "iter_encrypted_reasoning_items",
     "prepare_encrypted_reasoning_items_for_openai_egress",
     "is_openai_encrypted_reasoning_compatible",
@@ -1590,4 +1837,5 @@ __all__ = [
     "build_producer_provenance_from_egress_context",
     "is_openai_responses_egress",
     "stamp_encrypted_reasoning_in_responses_sse_chunk",
+    "stamp_route_identity_in_sse_chunk",
 ]

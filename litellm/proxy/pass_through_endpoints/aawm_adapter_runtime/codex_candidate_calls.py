@@ -120,7 +120,11 @@ if TYPE_CHECKING:
     def _build_langfuse_span_descriptor(**kwargs: Any) -> Any: ...
     def _build_malformed_tool_call_intake_context(*args: Any, **kwargs: Any) -> Any: ...
     def _build_openrouter_default_headers() -> dict[str, str]: ...
-    def _build_responses_response_from_adapter_response(response_obj: Any) -> Response: ...
+    def _build_responses_response_from_adapter_response(
+        response_obj: Any,
+        *,
+        request_body: Any = None,
+    ) -> Response: ...
     def _codex_native_openai_candidate_unavailable_detail(exc: Any) -> Optional[str]: ...
     async def _collect_responses_response_from_stream(response: Any, **kwargs: Any) -> dict[str, Any]: ...
     def _decode_http_response_body(body: Any) -> str: ...
@@ -175,7 +179,11 @@ if TYPE_CHECKING:
         adapter_model: str = "",
     ) -> tuple: ...
     def _responses_sse_from_iterator(iterator: Any, **kwargs: Any) -> Any: ...
-    def _responses_sse_from_repaired_response_body(response_body: dict[str, Any]) -> Any: ...
+    def _responses_sse_from_repaired_response_body(
+        response_body: dict[str, Any],
+        *,
+        request_body: Any = None,
+    ) -> Any: ...
     def _serialize_responses_adapter_response(response_obj: Any) -> str: ...
     async def _validate_codex_auto_agent_responses_payload(response: Any, **kwargs: Any) -> Any: ...
     def _xai_oauth_candidate_unavailable_detail(exc: Exception) -> Optional[str]: ...
@@ -459,6 +467,20 @@ async def _perform_codex_auto_agent_alias_candidate_request(
     )
 
     _bind_codex_oauth_candidate_to_request(request, candidate)
+    if isinstance(candidate_body, dict):
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+            strip_route_identity_from_request_body,
+        )
+
+        stripped_candidate_body = strip_route_identity_from_request_body(
+            candidate_body
+        )
+        if (
+            stripped_candidate_body is not candidate_body
+            and isinstance(stripped_candidate_body, dict)
+        ):
+            candidate_body.clear()
+            candidate_body.update(stripped_candidate_body)
     adapter_model = candidate["model"]
     cohere_provider = globals().get("_CODEX_AUTO_AGENT_COHERE_PROVIDER", "cohere")
     zai_coding_plan_provider = globals().get(
@@ -949,7 +971,18 @@ async def _perform_codex_cohere_chat_completions_adapter_call(
         request_input=request_input,
         responses_api_request=responses_api_request,
     )
-    return _build_responses_response_from_adapter_response(responses_api_response)
+    return _build_responses_response_from_adapter_response(
+        responses_api_response,
+        request_body=(
+            prepared_request_body
+            if isinstance(prepared_request_body, dict)
+            else (
+                {"litellm_metadata": litellm_metadata}
+                if isinstance(litellm_metadata, dict)
+                else None
+            )
+        ),
+    )
 
 
 async def _handle_codex_cohere_chat_completions_adapter_route(
@@ -1295,7 +1328,18 @@ async def _perform_codex_nvidia_completion_adapter_call(
         request_input=request_input,
         responses_api_request=responses_api_request,
     )
-    return _build_responses_response_from_adapter_response(responses_api_response)
+    return _build_responses_response_from_adapter_response(
+        responses_api_response,
+        request_body=(
+            prepared_request_body
+            if isinstance(prepared_request_body, dict)
+            else (
+                {"litellm_metadata": litellm_metadata}
+                if isinstance(litellm_metadata, dict)
+                else None
+            )
+        ),
+    )
 
 
 async def _handle_codex_nvidia_completion_adapter_route(
@@ -1743,6 +1787,7 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(
     *,
     adapter_model: str,
     intake_context: Optional[dict[str, Any]] = None,
+    request_body: Optional[dict[str, Any]] = None,
 ) -> StreamingResponse:
     event_summaries: list[dict[str, Any]] = []
     peek = await _aawm_alias_streaming.peek_streaming_response(
@@ -1800,8 +1845,16 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(
         )
 
     async def _replay_iterator() -> Any:
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+            stamp_route_identity_in_sse_chunk,
+        )
+
+        identity_request_body = request_body if isinstance(request_body, dict) else None
         for raw_chunk in peek.buffered_chunks:
-            yield raw_chunk
+            yield stamp_route_identity_in_sse_chunk(
+                raw_chunk,
+                request_body=identity_request_body,
+            )
 
     return StreamingResponse(
         _replay_iterator(),
@@ -1887,6 +1940,7 @@ async def _perform_codex_auto_agent_openrouter_responses_request(
                 upstream_url=str(target_url),
                 provider="openrouter",
             ),
+            request_body=request_body if isinstance(request_body, dict) else None,
         )
     if isinstance(response, Response) and not isinstance(response, StreamingResponse):
         try:
@@ -2014,6 +2068,15 @@ async def _perform_codex_kimi_chat_completions_adapter_call(
         },
         shared_session=_get_proxy_shared_aiohttp_session(),
     )
+    _identity_request_body = (
+        prepared_request_body
+        if isinstance(prepared_request_body, dict)
+        else (
+            {"litellm_metadata": litellm_metadata}
+            if isinstance(litellm_metadata, dict)
+            else None
+        )
+    )
     if client_requested_stream:
         return StreamingResponse(
             _responses_sse_from_iterator(
@@ -2024,7 +2087,8 @@ async def _perform_codex_kimi_chat_completions_adapter_call(
                     responses_api_request=responses_api_request,
                     custom_llm_provider=litellm.LlmProviders.KIMI_CODE.value,
                     litellm_metadata=litellm_metadata,
-                )
+                ),
+                request_body=_identity_request_body,
             ),
             media_type="text/event-stream",
         )
@@ -2035,7 +2099,10 @@ async def _perform_codex_kimi_chat_completions_adapter_call(
             responses_api_request=responses_api_request,
         )
     )
-    return _build_responses_response_from_adapter_response(responses_api_response)
+    return _build_responses_response_from_adapter_response(
+        responses_api_response,
+        request_body=_identity_request_body,
+    )
 
 
 async def _handle_codex_kimi_chat_completions_adapter_route(
@@ -2237,7 +2304,16 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
                 )
                 return StreamingResponse(
                     _responses_sse_from_repaired_response_body(
-                        _stream_response_body
+                        _stream_response_body,
+                        request_body=(
+                            prepared_request_body
+                            if isinstance(prepared_request_body, dict)
+                            else (
+                                {"litellm_metadata": litellm_metadata}
+                                if isinstance(litellm_metadata, dict)
+                                else None
+                            )
+                        ),
                     ),
                     media_type="text/event-stream",
                 )
@@ -2262,7 +2338,18 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
         )
         # Unreachable: the raise helper always raises.
         return StreamingResponse(
-            _responses_sse_from_repaired_response_body(_stream_response_body),
+            _responses_sse_from_repaired_response_body(
+                _stream_response_body,
+                request_body=(
+                    prepared_request_body
+                    if isinstance(prepared_request_body, dict)
+                    else (
+                        {"litellm_metadata": litellm_metadata}
+                        if isinstance(litellm_metadata, dict)
+                        else None
+                    )
+                ),
+            ),
             media_type="text/event-stream",
         )
     completion_response = await litellm.acompletion(**_acompletion_kwargs)
@@ -2289,7 +2376,16 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
         )
         if not _encrypted_findings:
             return _build_responses_response_from_adapter_response(
-                responses_api_response
+                responses_api_response,
+                request_body=(
+                    prepared_request_body
+                    if isinstance(prepared_request_body, dict)
+                    else (
+                        {"litellm_metadata": litellm_metadata}
+                        if isinstance(litellm_metadata, dict)
+                        else None
+                    )
+                ),
             )
         _last_encrypted_findings = _encrypted_findings
         if _attempt < _ALIBABA_ENCRYPTED_REASONING_MAX_RETRIES:
@@ -2310,7 +2406,18 @@ async def _perform_codex_alibaba_token_plan_adapter_call(
             provider="alibaba_token_plan",
         ),
     )
-    return _build_responses_response_from_adapter_response(responses_api_response)
+    return _build_responses_response_from_adapter_response(
+        responses_api_response,
+        request_body=(
+            prepared_request_body
+            if isinstance(prepared_request_body, dict)
+            else (
+                {"litellm_metadata": litellm_metadata}
+                if isinstance(litellm_metadata, dict)
+                else None
+            )
+        ),
+    )
 
 
 async def _handle_codex_alibaba_token_plan_adapter_route(
@@ -2478,7 +2585,18 @@ async def _perform_codex_zai_coding_plan_adapter_call(
     # Codex /v1/responses contract: never forward the chat.completion object tag.
     if getattr(responses_api_response, "object", None) != "response":
         responses_api_response.object = "response"
-    return _build_responses_response_from_adapter_response(responses_api_response)
+    return _build_responses_response_from_adapter_response(
+        responses_api_response,
+        request_body=(
+            prepared_request_body
+            if isinstance(prepared_request_body, dict)
+            else (
+                {"litellm_metadata": litellm_metadata}
+                if isinstance(litellm_metadata, dict)
+                else None
+            )
+        ),
+    )
 
 
 async def _handle_codex_zai_coding_plan_adapter_route(
@@ -3043,7 +3161,18 @@ async def _handle_codex_opencode_zen_adapter_route(
         rollup_kwargs,
         adapter_label="OpenCode Zen",
     )
-    return _build_responses_response_from_adapter_response(responses_api_response)
+    return _build_responses_response_from_adapter_response(
+        responses_api_response,
+        request_body=(
+            request_body
+            if isinstance(request_body, dict)
+            else (
+                {"litellm_metadata": litellm_metadata}
+                if isinstance(litellm_metadata, dict)
+                else None
+            )
+        ),
+    )
 
 
 _OPENCODE_GO_CHAT_COMPLETIONS_ROUTE = "/zen/go/v1/chat/completions"
@@ -3176,7 +3305,7 @@ async def _handle_codex_opencode_go_adapter_route(
     from litellm.llms.anthropic.experimental_pass_through.providers.opencode_zen.constants import (
         _OPENCODE_GO_FREE_MODELS,
     )
-    from fastapi.responses import Response as _FastAPIResponse, StreamingResponse
+    from fastapi.responses import StreamingResponse
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.request_build import (
         _is_empty_success_responses_body as _go_is_empty_success_responses_body,
     )
@@ -3379,9 +3508,19 @@ async def _handle_codex_opencode_go_adapter_route(
     # litellm#Ohmypi / litellm#Codex headers. Without this, a
     # successful PONG / child-spawn leaves a 0-byte docker-logs window.
     if client_requested_stream:
+        identity_request_body = (
+            canonical_request_body
+            if isinstance(canonical_request_body, dict)
+            else request_body
+            if isinstance(request_body, dict)
+            else None
+        )
         return _record_adapted_completed_route_rollup_after_stream(
             StreamingResponse(
-                _responses_sse_from_repaired_response_body(response_body),
+                _responses_sse_from_repaired_response_body(
+                    response_body,
+                    request_body=identity_request_body,
+                ),
                 media_type="text/event-stream",
             ),
             rollup_kwargs,
@@ -3391,11 +3530,15 @@ async def _handle_codex_opencode_go_adapter_route(
         rollup_kwargs,
         adapter_label="OpenCode Go",
     )
-    import json as _json
-
-    return _FastAPIResponse(
-        content=_json.dumps(response_body),
-        media_type="application/json",
+    return _build_responses_response_from_adapter_response(
+        response_body,
+        request_body=(
+            canonical_request_body
+            if isinstance(canonical_request_body, dict)
+            else request_body
+            if isinstance(request_body, dict)
+            else None
+        ),
     )
 
 
@@ -3412,7 +3555,6 @@ async def _handle_codex_nous_chat_completions_adapter_route(
     import json as _json
 
     import litellm
-    from fastapi.responses import Response as _FastAPIResponse
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
         _serialize_responses_adapter_response as _serialize_nous_response,
     )
@@ -3541,9 +3683,17 @@ async def _handle_codex_nous_chat_completions_adapter_route(
         except (TypeError, ValueError):
             response_body = {"id": getattr(completion_response, "id", "resp_nous")}
     response_body["object"] = "response"
-    return _FastAPIResponse(
-        content=_json.dumps(response_body),
-        media_type="application/json",
+    return _build_responses_response_from_adapter_response(
+        response_body,
+        request_body=(
+            request_body
+            if isinstance(request_body, dict)
+            else (
+                {"litellm_metadata": litellm_metadata}
+                if isinstance(litellm_metadata, dict)
+                else None
+            )
+        ),
     )
 
 
@@ -3580,6 +3730,17 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
         )
         raise exc
 
+    if isinstance(request_body, dict):
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+            strip_route_identity_from_request_body,
+        )
+
+        stripped_request_body = strip_route_identity_from_request_body(request_body)
+        if stripped_request_body is not request_body and isinstance(
+            stripped_request_body, dict
+        ):
+            request_body.clear()
+            request_body.update(stripped_request_body)
     requested_model = request_body.get("model")
     upstream_adapter_model = _get_openrouter_completion_adapter_upstream_model(adapter_model) or adapter_model
     route_family = "codex_openrouter_completion_adapter"
@@ -3795,7 +3956,14 @@ async def _perform_codex_auto_agent_openrouter_completion_request(
             adapter="codex_auto_agent_openrouter_completion_adapter",
             adapter_label="OpenRouter chat-completions",
         )
-    built_response = _build_responses_response_from_adapter_response(responses_api_response)
+    built_response = _build_responses_response_from_adapter_response(
+        responses_api_response,
+        request_body=(
+            canonical_request_body
+            if isinstance(canonical_request_body, dict)
+            else request_body if isinstance(request_body, dict) else None
+        ),
+    )
     validated_response = await _validate_codex_auto_agent_responses_payload(
         built_response,
         adapter_model=adapter_model,

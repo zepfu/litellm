@@ -110,6 +110,89 @@ class TestBuildResponsesResponse:
         assert resp.body.decode() == sentinel
         assert resp.media_type == "application/json"
 
+    def test_stamps_route_identity_from_selected_request_metadata(self) -> None:
+        obj = {
+            "id": "resp_stamp",
+            "output": [{"type": "message", "content": "ok"}],
+        }
+        request_body = {
+            "model": "provider-kimi_code",
+            "litellm_metadata": {
+                "codex_auto_agent_selected_provider": "kimi_code",
+                "codex_auto_agent_selected_model": "kimi_code/k3",
+                "codex_auto_agent_selected_route_family": (
+                    "codex_kimi_chat_completions_adapter"
+                ),
+            },
+        }
+        resp = _build_responses_response_from_adapter_response(
+            obj,
+            request_body=request_body,
+        )
+        body = json.loads(resp.body)
+        expected = {
+            "producer_provider": "kimi_code",
+            "producer_model": "kimi_code/k3",
+            "producer_route_family": "codex_kimi_chat_completions_adapter",
+        }
+        assert body["aawm_route_identity"] == expected
+        assert body["output"][0]["aawm_route_identity"] == expected
+
+    def test_stamps_alibaba_route_identity_from_selected_request_metadata(self) -> None:
+        obj = {
+            "id": "resp_stamp_alibaba",
+            "output": [{"type": "message", "content": "ok"}],
+        }
+        request_body = {
+            "model": "provider-alibaba_token_plan",
+            "litellm_metadata": {
+                "codex_auto_agent_selected_provider": "alibaba_token_plan",
+                "codex_auto_agent_selected_model": "alibaba_token_plan/qwen3.7-max",
+                "codex_auto_agent_selected_route_family": (
+                    "codex_alibaba_token_plan_chat_completions_adapter"
+                ),
+            },
+        }
+        resp = _build_responses_response_from_adapter_response(
+            obj,
+            request_body=request_body,
+        )
+        body = json.loads(resp.body)
+        expected = {
+            "producer_provider": "alibaba_token_plan",
+            "producer_model": "alibaba_token_plan/qwen3.7-max",
+            "producer_route_family": "codex_alibaba_token_plan_chat_completions_adapter",
+        }
+        assert body["aawm_route_identity"] == expected
+        assert body["output"][0]["aawm_route_identity"] == expected
+        assert body["aawm_route_identity"]["producer_provider"] != "openai"
+        assert body["aawm_route_identity"]["producer_model"] != "provider-alibaba_token_plan"
+
+    def test_does_not_stamp_provider_alias_or_missing_selected_model(self) -> None:
+        obj = {"id": "resp_nostamp", "output": [{"type": "message"}]}
+        request_body = {
+            "model": "provider-kimi_code",
+            "litellm_metadata": {
+                "codex_auto_agent_selected_provider": "kimi_code",
+                "codex_auto_agent_selected_route_family": (
+                    "codex_kimi_chat_completions_adapter"
+                ),
+            },
+        }
+        resp = _build_responses_response_from_adapter_response(
+            obj,
+            request_body=request_body,
+        )
+        body = json.loads(resp.body)
+        assert "aawm_route_identity" not in body
+        assert "aawm_route_identity" not in body["output"][0]
+
+    def test_no_request_body_leaves_serialization_unchanged(self) -> None:
+        obj = {"id": "resp_plain", "output": []}
+        resp = _build_responses_response_from_adapter_response(obj)
+        assert json.loads(resp.body) == obj
+        assert b"aawm_route_identity" not in resp.body
+
 
 # _wrap_streaming_response_with_release_callback
 

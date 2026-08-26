@@ -55,6 +55,14 @@ async def run_responses_adapter_route(
     use_alias_candidate_probe: bool,
 ) -> RouteResult:
     """Prepare and execute one config-selected Responses adapter route."""
+    if isinstance(prepared_request_body, dict):
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+            strip_route_identity_from_request_body,
+        )
+
+        prepared_request_body = strip_route_identity_from_request_body(
+            prepared_request_body
+        )
     plan = await prepare(
         request=request,
         prepared_request_body=prepared_request_body,
@@ -90,6 +98,14 @@ async def run_completion_adapter_route(
     use_alias_candidate_probe: bool,
 ) -> RouteResult:
     """Prepare and execute one config-selected completion adapter route."""
+    if isinstance(prepared_request_body, dict):
+        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
+            strip_route_identity_from_request_body,
+        )
+
+        prepared_request_body = strip_route_identity_from_request_body(
+            prepared_request_body
+        )
     plan = await prepare(
         request=request,
         prepared_request_body=prepared_request_body,
