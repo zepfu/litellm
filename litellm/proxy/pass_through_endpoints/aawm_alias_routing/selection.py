@@ -492,9 +492,17 @@ def _build_auto_agent_terminal_candidate_inventory(
     normalized_attempts = [
         attempt for attempt in attempts or [] if isinstance(attempt, dict)
     ]
+    stored_skipped = getattr(
+        request.state,
+        "aawm_alias_terminal_skipped_candidates",
+        None,
+    )
     normalized_skipped = [
         candidate
-        for candidate in skipped_candidates or []
+        for candidate in (
+            *(stored_skipped if isinstance(stored_skipped, list) else []),
+            *(skipped_candidates or []),
+        )
         if isinstance(candidate, dict)
     ]
 
@@ -559,7 +567,7 @@ def _build_auto_agent_terminal_candidate_inventory(
             shaped["reason"] = skipped.get("reason") or "unavailable"
         else:
             shaped["terminal_disposition"] = "skipped"
-            shaped["reason"] = "not_reached_before_terminal"
+            shaped["reason"] = "traversal_budget_exhausted"
         inventory.append(shaped)
     return inventory
 
@@ -776,6 +784,7 @@ def _plan_codex_oauth_account_failover(
     if error_class not in {
         "capacity_exhausted",
         "rate_limited",
+        "token_invalidated",
         "usage_limit_reached",
         "candidate_unavailable",
     }:
@@ -3785,6 +3794,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         client_product_label=client_product_label,
     )
     skipped = _build_auto_agent_skipped_candidates_from_states(states)
+    request.state.aawm_alias_terminal_skipped_candidates = skipped
 
     state = _select_available_state(
         request,
@@ -4198,6 +4208,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
         client_product_label=client_product_label,
     )
     skipped = _build_auto_agent_skipped_candidates_from_states(states)
+    request.state.aawm_alias_terminal_skipped_candidates = skipped
 
     state = _select_available_state(
         request,

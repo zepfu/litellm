@@ -1090,6 +1090,42 @@ def _encode_request_context_exec_response(
     ]
 
 
+_UNSUPPORTED_LOCAL_EXEC_FIELDS = {
+    5: "grep_args",
+    14: "shell_stream_args",
+}
+
+
+def _encode_unsupported_local_exec_response(
+    exec_fields: List[tuple[int, int, Any]],
+    message_field: int,
+) -> List[bytes]:
+    operation_name = _UNSUPPORTED_LOCAL_EXEC_FIELDS[message_field]
+    request_id = _proto_last_field(exec_fields, 1, wire_type=0) or 0
+    error = (
+        "Cursor Agent local exec operation "
+        f"{operation_name} (field {message_field}) is unsupported by this adapter; "
+        "no local execution was performed."
+    )
+    exec_client_throw = b"".join(
+        (
+            _encode_proto_varint_field(1, request_id),
+            _encode_proto_string_field(2, error),
+        )
+    )
+    exec_client_stream_close = _encode_proto_varint_field(1, request_id)
+    return [
+        _encode_proto_message_field(
+            5,
+            _encode_proto_message_field(2, exec_client_throw),
+        ),
+        _encode_proto_message_field(
+            5,
+            _encode_proto_message_field(1, exec_client_stream_close),
+        ),
+    ]
+
+
 def _encode_kv_response(
     kv_fields: List[tuple[int, int, Any]],
     blobs: Dict[bytes, bytes],
@@ -1171,10 +1207,19 @@ def _process_agent_server_message(
         if not isinstance(request_context_args, bytes):
             message_field = next(
                 (number for number, wire_type, _value in exec_fields if wire_type == 2 and number != 15),
-                "unknown",
+                None,
             )
+            if message_field in _UNSUPPORTED_LOCAL_EXEC_FIELDS:
+                return (
+                    decode_agent_server_message(payload),
+                    _encode_unsupported_local_exec_response(
+                        exec_fields,
+                        message_field,
+                    ),
+                )
             raise CursorConnectProtocolError(
-                "Cursor Agent requested unsupported local exec operation " f"field {message_field}."
+                "Cursor Agent requested unsupported local exec operation "
+                f"field {message_field or 'unknown'}."
             )
         return (
             decode_agent_server_message(payload),

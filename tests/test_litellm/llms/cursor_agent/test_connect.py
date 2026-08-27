@@ -611,6 +611,53 @@ def test_proto_bidi_rejects_unsupported_local_exec_operation() -> None:
         cursor_connect._process_agent_server_message(server_message, {})
 
 
+@pytest.mark.parametrize(
+    ("message_field", "operation_name"),
+    [
+        (5, "grep_args"),
+        (14, "shell_stream_args"),
+    ],
+)
+def test_proto_bidi_rejects_known_unsupported_local_exec_without_execution(
+    message_field: int,
+    operation_name: str,
+) -> None:
+    exec_request = _varint(1, 17) + _string(15, "exec-local") + _message(message_field, b"")
+    server_message = _message(2, exec_request)
+
+    normalized, client_messages = cursor_connect._process_agent_server_message(
+        server_message,
+        {},
+    )
+
+    assert normalized == {
+        "execServerMessage": {
+            "id": 17,
+            "execId": "exec-local",
+            "messageField": message_field,
+        }
+    }
+    assert len(client_messages) == 2
+
+    throw_control = _last_field(client_messages[0], 5, wire_type=2)
+    assert isinstance(throw_control, bytes)
+    throw = _last_field(throw_control, 2, wire_type=2)
+    assert isinstance(throw, bytes)
+    assert _last_field(throw, 1, wire_type=0) == 17
+    error = cursor_connect._decode_proto_string(
+        _last_field(throw, 2, wire_type=2)
+    )
+    assert operation_name in error
+    assert f"field {message_field}" in error
+    assert "no local execution was performed" in error
+
+    stream_close_control = _last_field(client_messages[1], 5, wire_type=2)
+    assert isinstance(stream_close_control, bytes)
+    stream_close = _last_field(stream_close_control, 1, wire_type=2)
+    assert isinstance(stream_close, bytes)
+    assert _last_field(stream_close, 1, wire_type=0) == 17
+
+
 def test_proto_startup_responses_match_native_empty_id_frames() -> None:
     exec_fields = cursor_connect._decode_proto_fields(_message(10, b""))
     exec_response, stream_close = cursor_connect._encode_request_context_exec_response(exec_fields)

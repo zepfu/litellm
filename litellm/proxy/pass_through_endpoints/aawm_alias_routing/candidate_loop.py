@@ -419,6 +419,7 @@ async def handle_alias_route(  # noqa: PLR0915
         if error_class not in {
             "capacity_exhausted",
             "rate_limited",
+            "token_invalidated",
             "usage_limit_reached",
             "candidate_unavailable",
         }:

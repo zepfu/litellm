@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     attempt_records,
     candidate_loop,
     codex_oauth,
+    error_signals,
     selection,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import rollup
@@ -79,6 +81,19 @@ class _DirectCodexUsageLimitError(Exception):
     ) -> None:
         self.upstream_headers = upstream_headers or {}
         self.detail = detail or {}
+
+
+def _token_invalidated_error() -> HTTPException:
+    return HTTPException(
+        status_code=401,
+        detail={
+            "error": {
+                "message": "The access token has been invalidated.",
+                "type": "invalid_request_error",
+                "code": "token_invalidated",
+            }
+        },
+    )
 
 
 def _record(
@@ -701,7 +716,12 @@ async def test_candidate_loop_exhausts_all_accounts_before_error(
         )
     assert exc_info.value.status_code == 429
     assert selected_labels == ["account1", "account2", "account3"]
-    assert performed_labels == selected_labels
+    assert performed_labels == [
+        "account1",
+        "account1",
+        "account2",
+        "account3",
+    ]
     request_identity = attempt_records._resolve_auto_agent_alias_request_identity(
         request
     )
@@ -712,12 +732,16 @@ async def test_candidate_loop_exhausts_all_accounts_before_error(
     captured_attempts = list(request_outcome.get("attempts") or [])
     assert [item["account_label"] for item in captured_attempts] == [
         "account1",
+        "account1",
         "account2",
         "account3",
     ]
-    assert captured_attempts[0]["request_outcome"] == "pending_failover"
-    assert captured_attempts[1]["request_outcome"] == "pending_failover"
-    assert captured_attempts[2]["request_outcome"] == "failed"
+    assert "request_outcome" not in captured_attempts[0]
+    assert [item["request_outcome"] for item in captured_attempts[1:]] == [
+        "pending_failover",
+        "pending_failover",
+        "failed",
+    ]
     context = request.state.aawm_codex_oauth_request_local_failover_context
     assert context["attempted_account_hashes"] == [
         "hash-account1",
@@ -745,7 +769,6 @@ async def test_candidate_loop_tracks_account_failover_per_candidate_slot(
         ("codex-auto-review", "account1", "hash-account-1", 0),
         ("codex-auto-review", "account2", "hash-account-2", 1),
         ("gpt-5.6-sol", "account1", "hash-account-1", 0),
-        ("gpt-5.6-sol", "account2", "hash-account-2", 1),
     ]
     selected_attempts: list[tuple[str, str]] = []
     performed_attempts: list[tuple[str, str]] = []
@@ -776,7 +799,7 @@ async def test_candidate_loop_tracks_account_failover_per_candidate_slot(
             candidate["codex_oauth_account_label"],
         )
         performed_attempts.append(attempt)
-        if len(performed_attempts) < len(planned_attempts):
+        if len(performed_attempts) < len(planned_attempts) + 1:
             raise RuntimeError("account capacity exhausted")
         return Response(content=b"recovered", status_code=200)
 
@@ -807,9 +830,13 @@ async def test_candidate_loop_tracks_account_failover_per_candidate_slot(
         ("codex-auto-review", "account1"),
         ("codex-auto-review", "account2"),
         ("gpt-5.6-sol", "account1"),
-        ("gpt-5.6-sol", "account2"),
     ]
-    assert performed_attempts == selected_attempts
+    assert performed_attempts == [
+        ("codex-auto-review", "account1"),
+        ("codex-auto-review", "account1"),
+        ("codex-auto-review", "account2"),
+        ("gpt-5.6-sol", "account1"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -918,6 +945,263 @@ async def test_candidate_loop_continuation_usage_limit_fails_over_interchangeabl
     }
     assert rollup._auto_agent_alias_route_rollup_status(pending_event) is None
     assert rollup._auto_agent_alias_route_rollup_status(recovered_event) == "Recovered"
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_token_invalidated_fails_over_without_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        error_signals._classify_codex_auto_agent_retryable_exhaustion,
+    )
+    request = _request()
+    selected_labels: list[str] = []
+    resolved_plans: list[CooldownPublicationPlan] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        context = getattr(
+            request.state,
+            "aawm_codex_oauth_request_local_failover_context",
+            None,
+        )
+        account = "account2" if context is not None else "account1"
+        selected_labels.append(account)
+        return _account_selection(
+            account,
+            f"hash-{account}",
+            failover_ordinal=1 if context is not None else 0,
+        )
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        if candidate["codex_oauth_account_label"] == "account1":
+            raise _token_invalidated_error()
+        return Response(content=b"recovered", status_code=200)
+
+    def _resolve_publication(**kwargs: Any) -> CooldownPublicationPlan:
+        assert kwargs["error_class"] == "token_invalidated"
+        plan = lpe._resolve_auto_agent_cooldown_publication_plan(
+            **kwargs,
+        )
+        resolved_plans.append(plan)
+        return plan
+
+    services = _loop_services(
+        select_candidate=_select,
+        perform_candidate=_perform,
+    )
+    services = replace(
+        services,
+        resolve_cooldown_publication_fn=_resolve_publication,
+    )
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    response = await candidate_loop.handle_alias_route(
+        services,
+        alias_family="codex_auto_agent",
+        alias_model="basic",
+        request=request,
+        prepared_request_body={"model": "basic"},
+        max_candidate_attempts=1,
+        get_active_cooldown_state_fn=_zero,
+        attempts_metadata_key="codex_auto_agent_attempts",
+        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+        no_candidate_detail="no candidate",
+        log_label="Codex",
+    )
+
+    assert response.status_code == 200
+    assert selected_labels == ["account1", "account2"]
+    assert len(resolved_plans) == 1
+    assert resolved_plans[0].applied_scope == "request_local"
+    assert resolved_plans[0].memory_keys == ()
+    assert resolved_plans[0].durable_keys == ()
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_all_token_invalidated_accounts_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        error_signals._classify_codex_auto_agent_retryable_exhaustion,
+    )
+    request = _request()
+    selected_labels: list[str] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        context = getattr(
+            request.state,
+            "aawm_codex_oauth_request_local_failover_context",
+            None,
+        )
+        attempted = set(
+            (context or {}).get("attempted_account_hashes") or ()
+        )
+        for ordinal, account in enumerate(("account1", "account2")):
+            account_hash = f"hash-{account}"
+            if account_hash in attempted:
+                continue
+            selected_labels.append(account)
+            return _account_selection(
+                account,
+                account_hash,
+                failover_ordinal=ordinal,
+            )
+        raise HTTPException(status_code=429, detail="all accounts exhausted")
+
+    async def _perform(**kwargs: Any) -> Response:
+        raise _token_invalidated_error()
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    with pytest.raises(HTTPException):
+        await candidate_loop.handle_alias_route(
+            _loop_services(
+                select_candidate=_select,
+                perform_candidate=_perform,
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body={"model": "basic"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_zero,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidate",
+            log_label="Codex",
+        )
+
+    assert selected_labels == ["account1", "account2"]
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_generic_401_does_not_fail_over(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        error_signals._classify_codex_auto_agent_retryable_exhaustion,
+    )
+    request = _request()
+    selected_labels: list[str] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        selected_labels.append("account1")
+        return _account_selection(
+            "account1",
+            "hash-account1",
+            failover_ordinal=0,
+        )
+
+    async def _perform(**kwargs: Any) -> Response:
+        raise HTTPException(
+            status_code=401,
+            detail={"error": {"code": "invalid_api_key"}},
+        )
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    with pytest.raises(HTTPException) as exc_info:
+        await candidate_loop.handle_alias_route(
+            _loop_services(
+                select_candidate=_select,
+                perform_candidate=_perform,
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body={"model": "basic"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_zero,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidate",
+            log_label="Codex",
+        )
+
+    assert exc_info.value.status_code == 401
+    assert selected_labels == ["account1"]
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_unsafe_continuation_token_invalidated_stays_on_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        error_signals._classify_codex_auto_agent_retryable_exhaustion,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_codex_auto_agent_request_has_continuation_state",
+        lambda body: True,
+    )
+    request = _request()
+    selected_labels: list[str] = []
+    redispatch_calls: list[dict[str, Any]] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        selected_labels.append("account1")
+        return _account_selection(
+            "account1",
+            "hash-account1",
+            failover_ordinal=0,
+        )
+
+    async def _perform(**kwargs: Any) -> Response:
+        raise _token_invalidated_error()
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    def _raise_redispatch(**kwargs: Any) -> None:
+        redispatch_calls.append(kwargs)
+        raise HTTPException(status_code=409, detail="redispatch required")
+
+    with pytest.raises(HTTPException) as exc_info:
+        await candidate_loop.handle_alias_route(
+            _loop_services(
+                select_candidate=_select,
+                perform_candidate=_perform,
+                raise_redispatch=_raise_redispatch,
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body={
+                "model": "basic",
+                "previous_response_id": "resp_account1",
+            },
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_zero,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidate",
+            log_label="Codex",
+        )
+
+    assert exc_info.value.status_code == 409
+    assert selected_labels == ["account1"]
+    assert len(redispatch_calls) == 1
+    assert redispatch_calls[0]["error_class"] == "token_invalidated"
 
 
 def test_recovered_failover_does_not_override_unrelated_request_failure() -> None:
@@ -2998,6 +3282,82 @@ async def test_openai_proxy_route_direct_uses_inventory_not_client_or_api_key(
     assert "api.openai.com" not in target
     assert "account1" in loaded
     assert lpe._should_preserve_openai_client_auth(request, "v1/responses") is False
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_route_direct_token_invalidated_retries_next_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_direct_inventory_auth(monkeypatch)
+    request = _direct_request()
+    body = {"model": "gpt-5.6-sol", "input": "hello"}
+    provider_accounts: list[str] = []
+
+    async def _fake_get_body(req):
+        return dict(body)
+
+    async def _fake_base_handler(**kwargs):
+        authorization = (kwargs.get("extra_headers") or {}).get("Authorization")
+        provider_accounts.append(authorization)
+        if authorization == "Bearer server-token-account1":
+            raise _token_invalidated_error()
+        return Response(content=b"ok", status_code=200)
+
+    publish = AsyncMock()
+    persist = AsyncMock()
+    monkeypatch.setattr(lpe, "get_request_body", _fake_get_body)
+    monkeypatch.setattr(
+        lpe.BaseOpenAIPassThroughHandler,
+        "_base_openai_pass_through_handler",
+        _fake_base_handler,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_resolve_codex_auto_agent_alias_model",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(lpe, "_is_oa_xai_request_body", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        lpe, "_is_grok_native_oauth_request_body", lambda *_a, **_k: False
+    )
+    monkeypatch.setattr(lpe, "_publish_codex_cooldown_memory", publish)
+    monkeypatch.setattr(lpe, "_persist_codex_cooldown_durable", persist)
+
+    response = await lpe.openai_proxy_route(
+        endpoint="v1/responses",
+        request=request,
+        fastapi_response=Response(),
+        user_api_key_dict=object(),  # type: ignore[arg-type]
+    )
+
+    assert response.status_code == 200
+    assert provider_accounts == [
+        "Bearer server-token-account1",
+        "Bearer server-token-account2",
+    ]
+    publish.assert_not_awaited()
+    persist.assert_not_awaited()
+
+
+def test_direct_codex_token_invalidated_predicate_is_narrow() -> None:
+    assert codex_oauth.is_direct_codex_token_invalidated_error(
+        _token_invalidated_error()
+    )
+    assert not codex_oauth.is_direct_codex_token_invalidated_error(
+        HTTPException(
+            status_code=401,
+            detail={"error": {"code": "invalid_api_key"}},
+        )
+    )
+    assert not codex_oauth.is_direct_codex_token_invalidated_error(
+        HTTPException(
+            status_code=403,
+            detail={"error": {"code": "token_invalidated"}},
+        )
+    )
+    assert not codex_oauth.is_direct_codex_token_invalidated_error(
+        HTTPException(status_code=401, detail="token_invalidated")
+    )
 
 
 def test_should_bind_direct_inventory_for_concrete_codex_targets() -> None:

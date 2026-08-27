@@ -613,8 +613,8 @@ def test_canonical_work_other_promotes_deepseek_only_inside_daily_window() -> No
         snapshot_select.set_active_routing_snapshot(previous)
 
 
-def test_canonical_read_alias_selects_basic_opencode_go_first() -> None:
-    """Codex ``read`` must resolve through the live YAML snapshot, not ChatGPT native."""
+def test_canonical_read_alias_selects_basic_zai_coding_plan_first() -> None:
+    """Codex ``read`` resolves to the authorized mapping used by ``basic``."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
         DEFAULT_CONFIG_DIR,
         compile_directory,
@@ -630,10 +630,12 @@ def test_canonical_read_alias_selects_basic_opencode_go_first() -> None:
             ingress="codex",
         )
         assert codex
-        assert codex[0]["provider"] == "opencode_go"
-        assert codex[0]["model"] == "ox-alpha-free"
-        assert codex[0]["route_family"] == "codex_opencode_go_adapter"
-        assert codex[0]["alias_reference"] == "basic"
+        assert codex[0]["provider"] == "zai_coding_plan"
+        assert codex[0]["model"] == "zai_coding_plan/glm-5.3-flash"
+        assert (
+            codex[0]["route_family"]
+            == "codex_zai_coding_plan_chat_completions_adapter"
+        )
         basic = snapshot_select._select_snapshot_candidates(
             "basic",
             ingress="codex",

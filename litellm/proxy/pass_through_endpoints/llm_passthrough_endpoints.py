@@ -3448,22 +3448,28 @@ async def llm_passthrough_factory_proxy_route(
     return received_value
 
 
-async def _retry_direct_codex_oauth_after_usage_limit(
+async def _retry_direct_codex_oauth_after_account_failure(
     *,
     request: Request,
     request_body: dict[str, Any],
     selection: dict[str, Any],
     exc: Exception,
+    error_class: str,
 ) -> Optional[tuple[Any, dict[str, Any]]]:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         session_affinity as _sa,
     )
 
+    is_usage_limit = error_class == "usage_limit_reached"
     cooldown_seconds = (
         _aawm_codex_oauth.direct_codex_usage_limit_retry_after_seconds(exc)
+        if is_usage_limit
+        else 0.0
     )
-    retry_after_hint = _aawm_codex_oauth.direct_codex_usage_limit_raw_reset_hint(
-        exc
+    retry_after_hint = (
+        _aawm_codex_oauth.direct_codex_usage_limit_raw_reset_hint(exc)
+        if is_usage_limit
+        else {}
     )
     cooldown_key = str(selection.get("cooldown_key") or "").strip()
     if cooldown_key and cooldown_seconds > 0:
@@ -3510,7 +3516,7 @@ async def _retry_direct_codex_oauth_after_usage_limit(
             candidate=candidate,
             selection=selection,
             attempt_record=retry_attempt_record,
-            error_class="usage_limit_reached",
+            error_class=error_class,
             has_continuation_state=selection.get("request_mode") != "fresh",
             has_previous_response_id=bool(
                 request_body.get("previous_response_id")
@@ -5905,17 +5911,23 @@ async def openai_proxy_route(  # noqa: PLR0915
                 )
             return response
         except (HTTPException, ProxyException) as exc:
+            direct_account_error_class: Optional[str] = None
+            if _aawm_codex_oauth.is_direct_codex_usage_limit_error(exc):
+                direct_account_error_class = "usage_limit_reached"
+            elif _aawm_codex_oauth.is_direct_codex_token_invalidated_error(exc):
+                direct_account_error_class = "token_invalidated"
             if (
                 not use_direct_codex_oauth_inventory
                 or direct_codex_selection_state is None
-                or not _aawm_codex_oauth.is_direct_codex_usage_limit_error(exc)
+                or direct_account_error_class is None
             ):
                 raise
-            retry = await _retry_direct_codex_oauth_after_usage_limit(
+            retry = await _retry_direct_codex_oauth_after_account_failure(
                 request=request,
                 request_body=request_body,
                 selection=direct_codex_selection_state,
                 exc=exc,
+                error_class=direct_account_error_class,
             )
             if retry is None:
                 _aawm_dev_fault_plan.note_direct_openai_managed_terminal_exhaustion(

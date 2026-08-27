@@ -118,6 +118,159 @@ async def test_should_prepare_codex_coding_plan_route_to_coding_chat_url() -> No
 
 
 @pytest.mark.asyncio
+async def test_should_filter_zai_unsupported_tools_and_keep_function_tools() -> None:
+    plan = await _prepare_codex_zai_coding_plan_adapter_route(
+        request=_request(),
+        adapter_model=_ADAPTER_MODEL,
+        prepared_request_body={
+            "model": _ADAPTER_MODEL,
+            "input": "inspect",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "read_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                    },
+                },
+                {"type": "custom", "name": "exec_command"},
+                {"type": "mcp", "server_label": "external_mcp"},
+                {"type": "web_search_preview"},
+                {"type": "custom", "name": "apply_patch"},
+            ],
+            "tool_choice": {"type": "custom", "name": "exec_command"},
+        },
+    )
+
+    completion_kwargs = plan.perform_kwargs["completion_kwargs"]
+    completion_tools = completion_kwargs["tools"]
+    assert [tool["type"] for tool in completion_tools] == ["function", "function"]
+    assert [
+        tool["function"]["name"] for tool in completion_tools
+    ] == ["read_file", "apply_patch"]
+    assert "tool_choice" not in completion_kwargs
+
+    metadata = plan.prepared_request_body["litellm_metadata"]
+    assert metadata["zai_coding_plan_removed_unsupported_tool_count"] == 3
+    assert metadata["zai_coding_plan_removed_unsupported_tool_types"] == [
+        "custom",
+        "mcp",
+        "web_search_preview",
+    ]
+    assert metadata["zai_coding_plan_removed_unsupported_tool_names"] == [
+        "exec_command",
+        "external_mcp",
+    ]
+    assert metadata["zai_coding_plan_removed_unsupported_tools"] == [
+        {"index": 1, "type": "custom", "name": "exec_command"},
+        {"index": 2, "type": "mcp", "name": "external_mcp"},
+        {"index": 3, "type": "web_search_preview"},
+    ]
+    assert metadata["zai_coding_plan_removed_unsupported_tool_choice"] == {
+        "type": "custom",
+        "name": "exec_command",
+    }
+    assert metadata["langfuse_spans"][-1]["name"] == (
+        "zai_coding_plan.unsupported_tool_removed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_should_remove_zai_tool_choice_when_all_tools_are_filtered() -> None:
+    plan = await _prepare_codex_zai_coding_plan_adapter_route(
+        request=_request(),
+        adapter_model=_ADAPTER_MODEL,
+        prepared_request_body={
+            "model": _ADAPTER_MODEL,
+            "input": "inspect",
+            "tools": [{"type": "custom", "name": "exec_command"}],
+            "tool_choice": "required",
+        },
+    )
+
+    completion_kwargs = plan.perform_kwargs["completion_kwargs"]
+    assert not completion_kwargs.get("tools")
+    assert "tool_choice" not in completion_kwargs
+    assert "tools" not in plan.prepared_request_body
+    assert "tool_choice" not in plan.prepared_request_body
+    assert plan.prepared_request_body["litellm_metadata"][
+        "zai_coding_plan_removed_unsupported_tool_choice"
+    ] == "required"
+
+
+@pytest.mark.asyncio
+async def test_should_preserve_zai_function_tools_for_previous_response_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.responses.litellm_completion_transformation.transformation import (
+        LiteLLMCompletionResponsesConfig,
+    )
+
+    captured: dict[str, Any] = {}
+
+    async def _session_handler(
+        *,
+        previous_response_id: str,
+        litellm_completion_request: dict[str, Any],
+    ) -> dict[str, Any]:
+        captured["previous_response_id"] = previous_response_id
+        captured["litellm_completion_request"] = litellm_completion_request
+        return {
+            **litellm_completion_request,
+            "litellm_trace_id": "zai-continuation-trace",
+        }
+
+    monkeypatch.setattr(
+        LiteLLMCompletionResponsesConfig,
+        "async_responses_api_session_handler",
+        AsyncMock(side_effect=_session_handler),
+    )
+
+    plan = await _prepare_codex_zai_coding_plan_adapter_route(
+        request=_request(),
+        adapter_model=_ADAPTER_MODEL,
+        prepared_request_body={
+            "model": _ADAPTER_MODEL,
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "read_file:1",
+                    "output": "contents",
+                }
+            ],
+            "previous_response_id": "resp_zai_continuation",
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "read_file",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                {"type": "custom", "name": "exec_command"},
+            ],
+        },
+    )
+
+    continued_request = captured["litellm_completion_request"]
+    assert captured["previous_response_id"] == "resp_zai_continuation"
+    assert continued_request["tools"][0]["function"]["name"] == "read_file"
+    tool_message = continued_request["messages"][0]
+    assert tool_message["role"] == "tool"
+    assert tool_message["tool_call_id"] == "read_file:1"
+    assert tool_message["content"] == "contents"
+    assert plan.perform_kwargs["completion_kwargs"]["litellm_trace_id"] == (
+        "zai-continuation-trace"
+    )
+    assert plan.perform_kwargs["completion_kwargs"]["tools"][0]["function"][
+        "name"
+    ] == "read_file"
+    assert plan.prepared_request_body["litellm_metadata"][
+        "zai_coding_plan_removed_unsupported_tool_names"
+    ] == ["exec_command"]
+
+
+@pytest.mark.asyncio
 async def test_should_post_codex_responses_direct_model_to_coding_chat_url(
     monkeypatch: pytest.MonkeyPatch,
     respx_mock,
@@ -151,6 +304,7 @@ async def test_should_post_codex_responses_direct_model_to_coding_chat_url(
     monkeypatch.setenv("ZAI_KEY", "coding-plan-key")
     monkeypatch.delenv("ZAI_API_KEY", raising=False)
     monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    monkeypatch.setattr(litellm, "enable_preview_features", True)
     respx_mock.post(ZAI_CODING_PLAN_CHAT_COMPLETIONS_URL).respond(
         json={
             "id": "chatcmpl-coding-plan",
@@ -182,6 +336,8 @@ async def test_should_post_codex_responses_direct_model_to_coding_chat_url(
                 "model": _ADAPTER_MODEL,
                 "input": "hello from openai_passthrough",
                 "stream": False,
+                "tools": [{"type": "unsupported", "name": "blocked_tool"}],
+                "tool_choice": "required",
             },
             adapter_model=_ADAPTER_MODEL,
         )
@@ -196,6 +352,9 @@ async def test_should_post_codex_responses_direct_model_to_coding_chat_url(
     assert "open.bigmodel.cn" not in str(upstream_request.url)
     upstream_body = json.loads(upstream_request.content)
     assert upstream_body["model"] == "glm-5.3"
+    assert "metadata" not in upstream_body
+    assert "litellm_metadata" not in upstream_body
+    assert "zai_coding_plan_removed_unsupported_tool_choice" not in upstream_body
     assert "sota-zai" not in upstream_request.content.decode()
     assert "zai_coding_plan/" not in upstream_request.content.decode()
     assert upstream_request.headers["Authorization"] == "Bearer coding-plan-key"

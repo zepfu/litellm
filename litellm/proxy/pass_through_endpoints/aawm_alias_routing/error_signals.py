@@ -1172,6 +1172,15 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "capacity_exhausted"
     if _is_alibaba_token_plan_unsupported_model_response(exc, candidate=candidate):
         return "candidate_unavailable"
+    if (
+        isinstance(candidate, dict)
+        and candidate.get("route_family") == "codex_responses"
+        and candidate.get("codex_oauth_account_hash")
+    ):
+        from . import codex_oauth
+
+        if codex_oauth.is_direct_codex_token_invalidated_error(exc):
+            return "token_invalidated"
     if "usage_limit_reached" in tokens:
         return "usage_limit_reached"
     if "server_overloaded" in tokens or tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS:

@@ -27,6 +27,178 @@ _CODEX_AGENT_MESSAGE_EMPTY_PAYLOAD_PATTERN = re.compile(
     r"Sender: [^\n]+\n"
     r"Payload:\n?\Z"
 )
+_ZAI_CODING_PLAN_SUPPORTED_TOOL_TYPES = frozenset({"function"})
+
+
+def _zai_coding_plan_tool_type(tool: Any) -> str:
+    if isinstance(tool, dict):
+        tool_type = tool.get("type")
+        if isinstance(tool_type, str) and tool_type.strip():
+            return tool_type.strip()
+    return "unknown"
+
+
+def _zai_coding_plan_tool_name(tool: Any) -> Optional[str]:
+    if not isinstance(tool, dict):
+        return None
+    for key in ("name", "tool_name", "server_label"):
+        value = tool.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    function = tool.get("function")
+    if isinstance(function, dict):
+        value = function.get("name")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _zai_coding_plan_tool_choice_references_removed_tool(
+    tool_choice: Any,
+    removed_tools: list[dict[str, Any]],
+) -> bool:
+    removed_types = {
+        item["type"]
+        for item in removed_tools
+        if isinstance(item.get("type"), str)
+    }
+    removed_names = {
+        item["name"]
+        for item in removed_tools
+        if isinstance(item.get("name"), str)
+    }
+    candidates: list[Any] = []
+    if isinstance(tool_choice, str):
+        candidates.append(tool_choice)
+    elif isinstance(tool_choice, dict):
+        choice_type = tool_choice.get("type")
+        if isinstance(choice_type, str) and choice_type.strip() == "function":
+            return False
+        candidates.extend(
+            [
+                tool_choice.get("name"),
+                tool_choice.get("tool_name"),
+                choice_type,
+            ]
+        )
+        function = tool_choice.get("function")
+        if isinstance(function, dict):
+            candidates.append(function.get("name"))
+    return any(
+        isinstance(candidate, str)
+        and candidate.strip() in removed_types | removed_names
+        for candidate in candidates
+    )
+
+
+def _filter_zai_coding_plan_tools(
+    request_body: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]], Optional[Any]]:
+    """Keep only tool definitions accepted by Z.AI chat completions."""
+
+    tools = request_body.get("tools")
+    if not isinstance(tools, list):
+        return request_body, [], None
+
+    retained_tools: list[Any] = []
+    removed_tools: list[dict[str, Any]] = []
+    for index, tool in enumerate(tools):
+        tool_type = _zai_coding_plan_tool_type(tool)
+        if tool_type in _ZAI_CODING_PLAN_SUPPORTED_TOOL_TYPES:
+            retained_tools.append(tool)
+            continue
+
+        removed_tool: dict[str, Any] = {
+            "index": index,
+            "type": tool_type,
+        }
+        tool_name = _zai_coding_plan_tool_name(tool)
+        if tool_name is not None:
+            removed_tool["name"] = tool_name
+        removed_tools.append(removed_tool)
+
+    if not removed_tools:
+        return request_body, [], None
+
+    updated_body = dict(request_body)
+    if retained_tools:
+        updated_body["tools"] = retained_tools
+    else:
+        updated_body.pop("tools", None)
+
+    removed_tool_choice = None
+    if "tool_choice" in updated_body and (
+        not retained_tools
+        or _zai_coding_plan_tool_choice_references_removed_tool(
+            updated_body.get("tool_choice"),
+            removed_tools,
+        )
+    ):
+        removed_tool_choice = updated_body.pop("tool_choice", None)
+    return updated_body, removed_tools, removed_tool_choice
+
+
+def _add_zai_coding_plan_tool_filter_metadata(
+    request_body: dict[str, Any],
+    *,
+    removed_tools: list[dict[str, Any]],
+    removed_tool_choice: Optional[Any],
+) -> dict[str, Any]:
+    if not removed_tools:
+        return request_body
+
+    metadata = dict(request_body.get("litellm_metadata") or {})
+    tags = list(metadata.get("tags") or [])
+    if "zai-coding-plan-unsupported-tools-removed" not in tags:
+        tags.append("zai-coding-plan-unsupported-tools-removed")
+    spans = list(metadata.get("langfuse_spans") or [])
+    removed_types = sorted(
+        {
+            item["type"]
+            for item in removed_tools
+            if isinstance(item.get("type"), str)
+        }
+    )
+    removed_names = sorted(
+        {
+            item["name"]
+            for item in removed_tools
+            if isinstance(item.get("name"), str)
+        }
+    )
+    spans.append(
+        {
+            "name": "zai_coding_plan.unsupported_tool_removed",
+            "metadata": {
+                "removed_count": len(removed_tools),
+                "removed_tool_types": removed_types,
+                "removed_tool_names": removed_names,
+                "allowed_tool_types": sorted(
+                    _ZAI_CODING_PLAN_SUPPORTED_TOOL_TYPES
+                ),
+            },
+        }
+    )
+    metadata.update(
+        {
+            "tags": tags,
+            "langfuse_spans": spans,
+            "zai_coding_plan_removed_unsupported_tool_count": len(removed_tools),
+            "zai_coding_plan_removed_unsupported_tool_types": removed_types,
+            "zai_coding_plan_removed_unsupported_tool_names": removed_names,
+            "zai_coding_plan_removed_unsupported_tools": removed_tools,
+            "zai_coding_plan_supported_tool_types": sorted(
+                _ZAI_CODING_PLAN_SUPPORTED_TOOL_TYPES
+            ),
+        }
+    )
+    if removed_tool_choice is not None:
+        metadata["zai_coding_plan_removed_unsupported_tool_choice"] = (
+            removed_tool_choice
+        )
+    updated_body = dict(request_body)
+    updated_body["litellm_metadata"] = metadata
+    return updated_body
 
 
 def normalize_zai_coding_plan_adapter_model_name(
@@ -222,6 +394,11 @@ async def prepare_codex_zai_coding_plan_adapter_route(
     _ = request, use_alias_candidate_probe
     upstream_model = _resolve_upstream_model(adapter_model)
     config = adapter_config.CODEX_ZAI_CODING_PLAN
+    (
+        prepared_request_body,
+        removed_tools,
+        removed_tool_choice,
+    ) = _filter_zai_coding_plan_tools(prepared_request_body)
     prepared_request_body, task_payload_changes = _restore_codex_agent_message_payloads(
         prepared_request_body
     )
@@ -231,6 +408,11 @@ async def prepare_codex_zai_coding_plan_adapter_route(
         adapter_model=adapter_model,
         upstream_model=upstream_model,
         ingress="codex",
+    )
+    request_body = _add_zai_coding_plan_tool_filter_metadata(
+        request_body,
+        removed_tools=removed_tools,
+        removed_tool_choice=removed_tool_choice,
     )
     if task_payload_changes:
         metadata = dict(request_body.get("litellm_metadata") or {})
@@ -272,6 +454,7 @@ async def prepare_codex_zai_coding_plan_adapter_route(
             previous_response_id=previous_response_id,
             litellm_completion_request=completion_kwargs,
         )
+    completion_kwargs.pop("metadata", None)
 
     return adapter_driver.CompletionAdapterRoutePlan(
         config=config,

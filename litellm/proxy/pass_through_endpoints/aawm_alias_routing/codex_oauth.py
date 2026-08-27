@@ -1060,6 +1060,23 @@ def is_direct_codex_usage_limit_error(exc: Exception) -> bool:
     )
 
 
+def is_direct_codex_token_invalidated_error(exc: Exception) -> bool:
+    """Return whether trusted Codex upstream invalidated the selected token."""
+    status_code = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    try:
+        parsed_status_code = int(status_code)
+    except (TypeError, ValueError):
+        return False
+    detail = _direct_codex_error_detail(exc)
+    if parsed_status_code != 401 or not detail:
+        return False
+    error = detail.get("error")
+    return bool(
+        isinstance(error, dict)
+        and error.get("code") == "token_invalidated"
+    )
+
+
 def direct_codex_usage_limit_retry_after_seconds(
     exc: Exception,
     *,
