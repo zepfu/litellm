@@ -1172,6 +1172,167 @@ async def test_candidate_loop_transient_capacity_retries_same_account_before_fai
 
 
 @pytest.mark.asyncio
+async def test_cfg040_fresh_codex_traverses_to_luna_after_pre_stream_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc, *args, candidate=None, **kwargs: "upstream_transient_internal",
+    )
+    request = _request()
+    earlier = {
+        "provider": "openrouter",
+        "model": "openrouter/owl-alpha",
+        "route_family": "codex_openrouter_completion_adapter",
+        "last_resort": False,
+    }
+    luna = {
+        "provider": "openai",
+        "model": "gpt-5.6-luna",
+        "route_family": "codex_responses",
+        "last_resort": True,
+        "reasoning_effort": "low",
+    }
+    selections: list[str] = []
+    performed: list[str] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        excluded = selection._get_codex_auto_agent_request_local_excluded_keys(
+            request
+        )
+        candidate = (
+            luna
+            if selection._get_codex_auto_agent_request_local_cooldown_key(
+                candidate=earlier,
+                lane_key="openrouter",
+            )
+            in excluded
+            else earlier
+        )
+        selections.append(candidate["model"])
+        lane_key = "openai" if candidate is luna else "openrouter"
+        return {
+            "candidate": candidate,
+            "lane_key": lane_key,
+            "cooldown_key": f"{candidate['provider']}:{candidate['model']}:{lane_key}",
+            "selection_reason": (
+                "last_resort" if candidate is luna else "first_available"
+            ),
+            "session_key": None,
+            "skipped": [],
+        }
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        performed.append(candidate["model"])
+        if candidate is earlier:
+            raise RuntimeError("adapter failed before first byte")
+        assert candidate_body["model"] == "basic"
+        return Response(content=b"luna")
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    response = await candidate_loop.handle_alias_route(
+        _loop_services(
+            select_candidate=_select,
+            perform_candidate=_perform,
+        ),
+        alias_family="codex_auto_agent",
+        alias_model="basic",
+        request=request,
+        prepared_request_body={"model": "basic"},
+        max_candidate_attempts=2,
+        get_active_cooldown_state_fn=_zero,
+        attempts_metadata_key="codex_auto_agent_attempts",
+        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+        no_candidate_detail="no candidate",
+        log_label="Codex",
+    )
+
+    assert response.body == b"luna"
+    assert selections == [
+        "openrouter/owl-alpha",
+        "gpt-5.6-luna",
+    ]
+    assert performed == [
+        "openrouter/owl-alpha",
+        "openrouter/owl-alpha",
+        "gpt-5.6-luna",
+    ]
+    attempts = attempt_records._auto_agent_alias_request_outcome_state(request)[
+        "attempts"
+    ]
+    assert attempts[-1]["model"] == "gpt-5.6-luna"
+    assert attempts[-1]["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_cfg040_success_stops_before_luna(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    request = _request()
+    selections = 0
+    performed: list[str] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        nonlocal selections
+        selections += 1
+        candidate = {
+            "provider": "openrouter",
+            "model": "openrouter/owl-alpha",
+            "route_family": "codex_openrouter_completion_adapter",
+            "last_resort": False,
+        }
+        return {
+            "candidate": candidate,
+            "lane_key": "openrouter",
+            "cooldown_key": "openrouter:openrouter/owl-alpha:openrouter",
+            "selection_reason": "first_available",
+            "session_key": None,
+            "skipped": [],
+        }
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        performed.append(candidate["model"])
+        return Response(content=b"earlier-success")
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    response = await candidate_loop.handle_alias_route(
+        _loop_services(
+            select_candidate=_select,
+            perform_candidate=_perform,
+        ),
+        alias_family="codex_auto_agent",
+        alias_model="basic",
+        request=request,
+        prepared_request_body={"model": "basic"},
+        max_candidate_attempts=2,
+        get_active_cooldown_state_fn=_zero,
+        attempts_metadata_key="codex_auto_agent_attempts",
+        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+        no_candidate_detail="no candidate",
+        log_label="Codex",
+    )
+
+    assert response.body == b"earlier-success"
+    assert selections == 1
+    assert performed == ["openrouter/owl-alpha"]
+
+
+@pytest.mark.asyncio
 async def test_candidate_loop_stream_pre_first_byte_usage_limit_fails_over_before_downstream_bytes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

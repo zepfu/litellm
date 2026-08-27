@@ -1104,24 +1104,33 @@ async def handle_alias_route(  # noqa: PLR0915
                         "apply_account_exhaustion_cooldown": False,
                         "retryable": True,
                     }
-                    raise HTTPException(
-                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                        detail={
-                            "error": {
-                                "message": (
-                                    "Upstream Responses stream failed before "
-                                    "the first client byte."
-                                ),
-                                "type": error_class,
-                                "code": "responses_pre_commit_retry_exhausted",
-                                "retryable": True,
-                            }
-                        },
-                        headers={
-                            "Retry-After": str(
-                                int(pre_commit_retry_plan["wait_seconds"] or 10)
-                            )
-                        },
+                    if has_continuation_state:
+                        raise HTTPException(
+                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail={
+                                "error": {
+                                    "message": (
+                                        "Upstream Responses stream failed before "
+                                        "the first client byte."
+                                    ),
+                                    "type": error_class,
+                                    "code": "responses_pre_commit_retry_exhausted",
+                                    "retryable": True,
+                                }
+                            },
+                            headers={
+                                "Retry-After": str(
+                                    int(
+                                        pre_commit_retry_plan["wait_seconds"]
+                                        or 10
+                                    )
+                                )
+                            },
+                        )
+                    _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
+                        request,
+                        candidate=candidate,
+                        lane_key=selection.get("lane_key"),
                     )
                 cooldown_seconds = (
                     publication_requested_ttl_seconds

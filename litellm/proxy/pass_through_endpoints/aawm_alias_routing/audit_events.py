@@ -31,6 +31,7 @@ _attach_auto_agent_alias_terminal_context_fields: Optional[Callable[..., Any]] =
 from .audit_build import (
     _format_auto_agent_alias_timestamp as _default_format_timestamp,
 )
+from .selection import _build_auto_agent_terminal_candidate_inventory
 
 _format_auto_agent_alias_timestamp: Callable[[datetime], str] = _default_format_timestamp
 _extract_auto_agent_alias_metadata_value: Optional[Callable[..., Optional[str]]] = None
@@ -171,6 +172,24 @@ def _enrich_auto_agent_alias_terminal_event_from_attempts(
     return normalized_attempts
 
 
+def _resolve_auto_agent_alias_terminal_candidates(
+    *,
+    alias_family: str,
+    alias_model: str,
+    request: Request,
+    candidates: Any,
+    attempts: Optional[list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    ingress = "anthropic" if alias_family.startswith("anthropic") else "codex"
+    return _build_auto_agent_terminal_candidate_inventory(
+        request=request,
+        alias_model=alias_model,
+        ingress=ingress,
+        attempts=attempts,
+        skipped_candidates=candidates if isinstance(candidates, list) else None,
+    )
+
+
 def _emit_auto_agent_alias_no_candidate_event(
     *,
     alias_family: str,
@@ -192,6 +211,13 @@ def _emit_auto_agent_alias_no_candidate_event(
 
     detail: dict[str, Any] = exc.detail if isinstance(exc.detail, dict) else {}
     candidates = detail.get("candidates") if isinstance(detail, dict) else None
+    terminal_candidates = _resolve_auto_agent_alias_terminal_candidates(
+        alias_family=alias_family,
+        alias_model=alias_model,
+        request=request,
+        candidates=candidates,
+        attempts=attempts,
+    )
     context = _get_auto_agent_alias_request_context(
         request,
         request_body,
@@ -239,8 +265,8 @@ def _emit_auto_agent_alias_no_candidate_event(
         "failure_phase": "candidate_selection",
         "attempted_provider_call": False,
         "error_status_code": exc.status_code,
-        "candidate_count": len(candidates) if isinstance(candidates, list) else 0,
-        "candidates": candidates if isinstance(candidates, list) else None,
+        "candidate_count": len(terminal_candidates),
+        "candidates": terminal_candidates,
     }
     _attach_auto_agent_alias_terminal_context_fields(
         event,
@@ -308,6 +334,11 @@ def _emit_auto_agent_alias_no_candidate_event(
     audit_events: list[dict[str, Any]] = []
     if normalized_attempts:
         last_attempt = normalized_attempts[-1]
+        terminal_skipped = [
+            candidate
+            for candidate in terminal_candidates
+            if candidate.get("terminal_disposition") == "skipped"
+        ]
         audit_events.extend(
             _build_auto_agent_alias_audit_events(
                 alias_family=alias_family,
@@ -319,7 +350,7 @@ def _emit_auto_agent_alias_no_candidate_event(
                     "session_key": event.get("session_key"),
                     "lane_key": last_attempt.get("lane_key"),
                     "selection_reason": last_attempt.get("reason"),
-                    "skipped": [],
+                    "skipped": terminal_skipped,
                 },
                 attempts=normalized_attempts,
             )
@@ -339,6 +370,7 @@ from types import FunctionType as _FunctionType
 
 _HOST_FUNCTION_NAMES = (
     "_enrich_auto_agent_alias_terminal_event_from_attempts",
+    "_resolve_auto_agent_alias_terminal_candidates",
     "_emit_auto_agent_alias_no_candidate_event",
 )
 
@@ -432,6 +464,7 @@ def install(host_globals: dict) -> None:
         ("_emit_auto_agent_alias_route_event", _emit_auto_agent_alias_route_event),
         ("_build_auto_agent_alias_audit_events", _build_auto_agent_alias_audit_events),
         ("_persist_auto_agent_alias_audit_only_events_best_effort", _persist_auto_agent_alias_audit_only_events_best_effort),
+        ("_build_auto_agent_terminal_candidate_inventory", _build_auto_agent_terminal_candidate_inventory),
     ):
         host_globals.setdefault(_sk, _sv)
 

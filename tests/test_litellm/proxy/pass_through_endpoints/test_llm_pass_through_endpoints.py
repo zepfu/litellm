@@ -17513,6 +17513,20 @@ def test_auto_agent_alias_no_candidate_persists_complete_attempt_sequence(
             "attempted_provider_call": True,
         },
     ]
+    skipped_luna = {
+        "provider": "openai",
+        "model": "gpt-5.6-luna",
+        "route_family": "codex_responses",
+        "last_resort": True,
+        "reasoning_effort": "low",
+        "reason": "managed_account_cooldown",
+    }
+    request.state.aawm_alias_selection_context = {
+        ("codex", "work"): SimpleNamespace(
+            candidates=(*attempts, skipped_luna),
+            commit_token=None,
+        )
+    }
     persisted = []
     terminal_records = []
 
@@ -17536,7 +17550,10 @@ def test_auto_agent_alias_no_candidate_persists_complete_attempt_sequence(
         request_body=body,
         exc=HTTPException(
             status_code=429,
-            detail={"candidates": [], "error": {"code": "all_unavailable"}},
+            detail={
+                "candidates": [skipped_luna],
+                "error": {"code": "all_unavailable"},
+            },
         ),
         attempts=attempts,
     )
@@ -17544,6 +17561,7 @@ def test_auto_agent_alias_no_candidate_persists_complete_attempt_sequence(
     assert len(persisted) == 1
     events = persisted[0]
     assert [event["model"] for event in events[:-1]] == [
+        "gpt-5.6-luna",
         "gpt-5.3-codex-spark",
         "xai/grok-4.5",
     ]
@@ -17559,6 +17577,21 @@ def test_auto_agent_alias_no_candidate_persists_complete_attempt_sequence(
     assert terminal_context["source_error"] == "Content violates usage guidelines"
     assert terminal_context["attempted_provider_call"] is True
     assert terminal_context["failure_phase"] == "provider_attempt"
+    assert terminal_context["candidate_count"] == 3
+    assert [
+        candidate["terminal_disposition"]
+        for candidate in terminal_context["candidates"]
+    ] == ["attempted", "attempted", "skipped"]
+    assert [
+        candidate["outcome"]
+        for candidate in terminal_context["candidates"]
+        if candidate["terminal_disposition"] == "attempted"
+    ] == ["cooldown_set", "cooldown_set"]
+    assert terminal_context["candidates"][-1]["model"] == "gpt-5.6-luna"
+    assert terminal_context["candidates"][-1]["reason"] == (
+        "managed_account_cooldown"
+    )
+    assert terminal_context["candidates"][-1]["reasoning_effort"] == "low"
     assert terminal_context["agent_id"] == "agent-safety-terminal"
     assert terminal_context["agent_name"] == "worker"
     assert terminal_context["agent_role"] == "worker"

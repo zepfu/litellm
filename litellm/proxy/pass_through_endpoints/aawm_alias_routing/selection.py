@@ -479,6 +479,91 @@ def _build_auto_agent_skipped_candidates_from_states(
     return skipped
 
 
+def _build_auto_agent_terminal_candidate_inventory(
+    *,
+    request: Request,
+    alias_model: str,
+    ingress: str,
+    attempts: Optional[list[dict[str, Any]]] = None,
+    skipped_candidates: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    """Account for every compiled candidate in one terminal inventory."""
+
+    normalized_attempts = [
+        attempt for attempt in attempts or [] if isinstance(attempt, dict)
+    ]
+    normalized_skipped = [
+        candidate
+        for candidate in skipped_candidates or []
+        if isinstance(candidate, dict)
+    ]
+
+    def _identity(candidate: Mapping[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(candidate.get("provider") or ""),
+            str(candidate.get("model") or ""),
+            str(candidate.get("route_family") or ""),
+        )
+
+    compiled_candidates = list(
+        _resolve_aawm_alias_selection_enumeration(
+            request,
+            alias_model,
+            ingress=ingress,
+        ).candidates
+    )
+    if not compiled_candidates:
+        seen: set[tuple[str, str, str]] = set()
+        for candidate in (*normalized_attempts, *normalized_skipped):
+            identity = _identity(candidate)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            compiled_candidates.append(candidate)
+
+    attempts_by_identity: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for attempt in normalized_attempts:
+        attempts_by_identity.setdefault(_identity(attempt), []).append(attempt)
+    skipped_by_identity = {
+        _identity(candidate): candidate for candidate in normalized_skipped
+    }
+
+    inventory: list[dict[str, Any]] = []
+    for candidate in compiled_candidates:
+        identity = _identity(candidate)
+        candidate_attempts = attempts_by_identity.get(identity) or []
+        skipped = skipped_by_identity.get(identity)
+        shaped = _codex_auto_agent_candidate_public_shape(candidate)
+        if candidate.get("reasoning_effort") is not None:
+            shaped["reasoning_effort"] = candidate["reasoning_effort"]
+        if candidate_attempts:
+            last_attempt = candidate_attempts[-1]
+            outcome = (
+                last_attempt.get("status")
+                or last_attempt.get("error_class")
+                or "attempted"
+            )
+            shaped.update(
+                {
+                    "terminal_disposition": "attempted",
+                    "attempt_count": len(candidate_attempts),
+                    "outcome": outcome,
+                }
+            )
+            continue_reason = last_attempt.get("error_class")
+            if continue_reason is not None:
+                shaped["reason"] = continue_reason
+        elif skipped is not None:
+            shaped.update(skipped)
+            shaped["terminal_disposition"] = "skipped"
+            shaped["reason"] = skipped.get("reason") or "unavailable"
+        else:
+            shaped["terminal_disposition"] = "skipped"
+            shaped["reason"] = "not_reached_before_terminal"
+        inventory.append(shaped)
+    return inventory
+
+
 # ---------------------------------------------------------------------------
 # Request-local cooldown / exclusion helpers
 # ---------------------------------------------------------------------------
