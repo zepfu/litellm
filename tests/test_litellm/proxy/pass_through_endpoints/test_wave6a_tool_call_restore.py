@@ -19,6 +19,13 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     sse as sse_mod,
     tool_call_restore as mod,
 )
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.direct_openai_function_call_history import (
+    normalize_direct_openai_legacy_function_call_history_ids,
+)
+from litellm.responses.litellm_completion_transformation.function_call_identity import (
+    generate_responses_custom_tool_call_item_id,
+    is_native_responses_custom_tool_call_item_id,
+)
 
 MODULE_PATH = Path(mod.__file__).resolve()
 
@@ -251,9 +258,16 @@ class TestCustomToolResponseBody:
             "output": [
                 {
                     "type": "function_call",
+                    "id": "fc_legacy",
                     "name": "My_Tool",
                     "arguments": json.dumps({"input": "hello"}),
                     "call_id": "c1",
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "output_1",
+                    "call_id": "c1",
+                    "output": "ok",
                 },
             ],
         }
@@ -264,9 +278,58 @@ class TestCustomToolResponseBody:
         assert err is None
         item = result["output"][0]
         assert item["type"] == "custom_tool_call"
+        assert item["id"] == generate_responses_custom_tool_call_item_id("c1")
+        assert is_native_responses_custom_tool_call_item_id(item["id"])
+        assert item["call_id"] == "c1"
         assert item["input"] == "hello"
         assert item["status"] == "completed"
         assert "arguments" not in item
+        assert result["output"][1] == body["output"][1]
+
+    @pytest.mark.parametrize("raw_item_id", [None, "fc_legacy", "invalid-id", "ctc_"])
+    def test_repairs_malformed_custom_tool_item_ids(
+        self,
+        host_deps: None,
+        raw_item_id: Optional[str],
+    ) -> None:
+        call_id = " call_custom "
+        item = {
+            "type": "function_call",
+            "name": "my_tool",
+            "arguments": json.dumps({"input": "hello"}),
+            "call_id": call_id,
+        }
+        if raw_item_id is not None:
+            item["id"] = raw_item_id
+        result, count, err = mod._restore_adapted_custom_tool_calls_in_response_body(
+            {"output": [item]},
+            request_body={"tools": []},
+            adapter_model="m",
+        )
+        assert count == 1
+        assert err is None
+        restored = result["output"][0]
+        assert restored["id"] == generate_responses_custom_tool_call_item_id(call_id)
+        assert is_native_responses_custom_tool_call_item_id(restored["id"])
+        assert restored["call_id"] == call_id
+
+    def test_preserves_valid_custom_tool_item_id(self, host_deps: None) -> None:
+        item = {
+            "type": "function_call",
+            "id": "ctc_existing",
+            "name": "my_tool",
+            "arguments": json.dumps({"input": "hello"}),
+            "call_id": "call_existing",
+        }
+        result, count, err = mod._restore_adapted_custom_tool_calls_in_response_body(
+            {"output": [item]},
+            request_body={"tools": []},
+            adapter_model="m",
+        )
+        assert count == 1
+        assert err is None
+        assert result["output"][0]["id"] == "ctc_existing"
+        assert result["output"][0]["call_id"] == "call_existing"
 
     def test_malformed_arguments_returns_error(self, host_deps: None) -> None:
         body = {
@@ -696,6 +759,99 @@ class TestCustomStreamEventPayload:
         assert result["input"] == "hello"
         assert "arguments" not in result
 
+    def test_stream_reuses_one_ctc_id_across_restored_events(
+        self,
+        host_deps: None,
+    ) -> None:
+        state: dict[str, dict[str, Any]] = {}
+        call_id = " call_stream "
+        added, count = mod._restore_adapted_custom_tool_calls_in_stream_event_payload(
+            {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_legacy",
+                    "call_id": call_id,
+                    "name": "my_tool",
+                },
+            },
+            request_body={"tools": []},
+            adapter_model="m",
+            adapted_names={"my_tool"},
+            state_by_key=state,
+        )
+        assert count == 1
+        assert added is not None
+        stable_item_id = added["item"]["id"]
+        assert stable_item_id == generate_responses_custom_tool_call_item_id(call_id)
+        assert is_native_responses_custom_tool_call_item_id(stable_item_id)
+
+        input_done, count = mod._restore_adapted_custom_tool_calls_in_stream_event_payload(
+            {
+                "type": "response.function_call_arguments.done",
+                "item_id": "fc_legacy",
+                "output_index": 0,
+                "arguments": '{"input":"hello"}',
+            },
+            request_body={"tools": []},
+            adapter_model="m",
+            adapted_names={"my_tool"},
+            state_by_key=state,
+        )
+        assert count == 1
+        assert input_done is not None
+        assert input_done["item_id"] == stable_item_id
+
+        output_done, count = mod._restore_adapted_custom_tool_calls_in_stream_event_payload(
+            {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "ctc_other_valid",
+                    "call_id": call_id,
+                    "name": "my_tool",
+                    "arguments": '{"input":"done"}',
+                },
+            },
+            request_body={"tools": []},
+            adapter_model="m",
+            adapted_names={"my_tool"},
+            state_by_key=state,
+        )
+        assert count == 1
+        assert output_done is not None
+        assert output_done["item"]["id"] == stable_item_id
+        assert output_done["item"]["type"] == "custom_tool_call"
+        assert output_done["item"]["call_id"] == call_id
+
+        completed, count = mod._restore_adapted_custom_tool_calls_in_stream_event_payload(
+            {
+                "type": "response.completed",
+                "response": {
+                    "output": [
+                        {
+                            "type": "function_call",
+                            "id": "ctc_another_valid",
+                            "call_id": call_id,
+                            "name": "my_tool",
+                            "arguments": '{"input":"done"}',
+                        }
+                    ]
+                },
+            },
+            request_body={"tools": []},
+            adapter_model="m",
+            adapted_names={"my_tool"},
+            state_by_key=state,
+        )
+        assert count == 1
+        assert completed is not None
+        assert completed["response"]["output"][0]["id"] == stable_item_id
+        assert completed["response"]["output"][0]["type"] == "custom_tool_call"
+        assert completed["response"]["output"][0]["call_id"] == call_id
+
     def test_unrelated_event_passthrough(self, host_deps: None) -> None:
         state: dict[str, dict[str, Any]] = {}
         payload = {"type": "response.completed", "response": {"status": "completed"}}
@@ -1099,7 +1255,74 @@ class TestCustomStreamingResponse:
 
 
 # ===========================================================================
-# SECTION 13 - Namespace streaming response wrapper
+# SECTION 14 - Native OpenAI custom-tool history identity normalization
+# ===========================================================================
+
+
+class TestDirectOpenAICustomToolHistory:
+    """OPENAI-021 native egress repair for persisted custom-tool history."""
+
+    @pytest.mark.parametrize("raw_item_id", [None, "fc_legacy", "invalid-id", "ctc_"])
+    def test_repairs_malformed_custom_tool_history_ids(
+        self,
+        raw_item_id: Optional[str],
+    ) -> None:
+        call_id = " call_history "
+        item = {
+            "type": "custom_tool_call",
+            "call_id": call_id,
+            "name": "my_tool",
+            "input": "hello",
+        }
+        if raw_item_id is not None:
+            item["id"] = raw_item_id
+        output_item = {
+            "type": "custom_tool_call_output",
+            "call_id": call_id,
+            "output": "ok",
+        }
+        body = {"input": [item, output_item]}
+
+        normalized = normalize_direct_openai_legacy_function_call_history_ids(body)
+
+        assert normalized is not body
+        assert normalized["input"][0]["id"] == (
+            generate_responses_custom_tool_call_item_id(call_id)
+        )
+        assert is_native_responses_custom_tool_call_item_id(
+            normalized["input"][0]["id"]
+        )
+        assert normalized["input"][0]["call_id"] == call_id
+        assert normalized["input"][1] == output_item
+        assert normalized["input"][1]["call_id"] == call_id
+        if raw_item_id is None:
+            assert "id" not in body["input"][0]
+        else:
+            assert body["input"][0]["id"] == raw_item_id
+
+    def test_preserves_valid_custom_tool_history_id(self) -> None:
+        item = {
+            "type": "custom_tool_call",
+            "id": "ctc_native",
+            "call_id": "call_native",
+            "name": "my_tool",
+            "input": "hello",
+        }
+        output_item = {
+            "type": "custom_tool_call_output",
+            "call_id": "call_native",
+            "output": "ok",
+        }
+        body = {"input": [item, output_item]}
+
+        normalized = normalize_direct_openai_legacy_function_call_history_ids(body)
+
+        assert normalized is body
+        assert normalized["input"] == [item, output_item]
+
+
+# ===========================================================================
+# SECTION 15 - Namespace streaming response wrapper
 # ===========================================================================
 
 

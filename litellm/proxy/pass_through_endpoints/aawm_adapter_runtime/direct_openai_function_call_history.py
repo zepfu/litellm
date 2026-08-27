@@ -1,4 +1,4 @@
-"""OPENAI-007 direct OpenAI legacy-history function_call identity normalization."""
+"""OPENAI-021 direct OpenAI legacy-history custom-tool identity normalization."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from typing import Any
 
 from litellm.responses.litellm_completion_transformation.function_call_identity import (
     is_native_responses_function_call_item_id,
+    resolve_responses_custom_tool_call_item_id,
     resolve_responses_function_call_identity,
 )
 
@@ -13,14 +14,14 @@ from litellm.responses.litellm_completion_transformation.function_call_identity 
 def normalize_direct_openai_legacy_function_call_history_ids(
     request_body: dict[str, Any],
 ) -> dict[str, Any]:
-    """Normalize typed Responses input ``function_call`` item ids.
+    """Normalize typed Responses input function and custom-tool item ids.
 
     Immediately before direct OpenAI native pass-through, rewrite only
     malformed/non-native ``id`` values on top-level ``input`` items whose
-    ``type`` is exactly ``function_call``. Preserve ``call_id`` byte-for-byte,
-    leave valid native ``fc_*`` item ids (including UUID-shaped forms) alone,
-    and never rewrite ``function_call_output`` items, other types, or nested
-    ``id`` fields outside those typed items.
+    ``type`` is exactly ``function_call`` or ``custom_tool_call``. Preserve
+    ``call_id`` byte-for-byte, leave valid native ``fc_*`` and ``ctc_*`` item
+    ids alone, and never rewrite output items, other types, or nested ``id``
+    fields outside those typed items.
     """
     if not isinstance(request_body, dict):
         return request_body
@@ -30,8 +31,30 @@ def normalize_direct_openai_legacy_function_call_history_ids(
 
     normalized_input: list[Any] = []
     changed = False
-    for item in input_items:
-        if not isinstance(item, dict) or item.get("type") != "function_call":
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict):
+            normalized_input.append(item)
+            continue
+
+        item_type = item.get("type")
+        if item_type == "custom_tool_call":
+            resolved_item_id = resolve_responses_custom_tool_call_item_id(
+                item.get("id"),
+                item.get("call_id"),
+                fallback=f"input:{index}",
+            )
+            if not resolved_item_id or item.get("id") == resolved_item_id:
+                normalized_input.append(item)
+                continue
+
+            clean_item = dict(item)
+            clean_item["id"] = resolved_item_id
+            # call_id remains the original provider tool id byte-for-byte.
+            normalized_input.append(clean_item)
+            changed = True
+            continue
+
+        if item_type != "function_call":
             normalized_input.append(item)
             continue
 

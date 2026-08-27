@@ -1,9 +1,11 @@
 """
-Responses function_call identity helpers for Chat Completions adapters.
+Responses function-call identity helpers for Chat Completions adapters.
 
 OpenAI Responses function_call items carry two distinct identifiers:
 - ``id``: the Responses output-item id (``fc_...``)
 - ``call_id``: the upstream tool/call id used to correlate function_call_output
+
+Responses custom_tool_call items use the same split, with ``ctc_...`` item ids.
 
 Chat Completions providers typically expose a single tool-call id. Non-native
 providers (Kimi/Alibaba/OpenRouter/OpenCode, etc.) often reuse that value for
@@ -33,6 +35,8 @@ _NATIVE_RESPONSES_FUNCTION_CALL_ITEM_ID_RE = re.compile(
     r")$"
 )
 _GENERATED_FC_HEX_LEN = 48
+_NATIVE_RESPONSES_CUSTOM_TOOL_CALL_ITEM_ID_RE = re.compile(r"^ctc_[^\s]+$")
+_GENERATED_CTC_HEX_LEN = 48
 
 
 def is_native_responses_function_call_item_id(value: Optional[str]) -> bool:
@@ -52,6 +56,43 @@ def generate_responses_function_call_item_id(provider_tool_id: str) -> str:
     """
     digest = hashlib.sha256(provider_tool_id.encode("utf-8")).hexdigest()
     return f"fc_{digest[:_GENERATED_FC_HEX_LEN]}"
+
+
+def is_native_responses_custom_tool_call_item_id(value: Optional[str]) -> bool:
+    """Return True when ``value`` already has a valid Responses ``ctc_*`` id."""
+    if not isinstance(value, str) or not value:
+        return False
+    return (
+        _NATIVE_RESPONSES_CUSTOM_TOOL_CALL_ITEM_ID_RE.fullmatch(value) is not None
+    )
+
+
+def generate_responses_custom_tool_call_item_id(identity: str) -> str:
+    """Build one deterministic stable ``ctc_*`` item id from an exact identity."""
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return f"ctc_{digest[:_GENERATED_CTC_HEX_LEN]}"
+
+
+def resolve_responses_custom_tool_call_item_id(
+    item_id: Optional[str],
+    call_id: Optional[str],
+    *,
+    fallback: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Resolve a Responses custom-tool-call item id without changing ``call_id``.
+
+    Valid native ``ctc_*`` item ids pass through byte-for-byte. Otherwise the
+    exact non-blank ``call_id`` is the stable identity source, followed by the
+    existing item id and then an explicit stable fallback.
+    """
+    if is_native_responses_custom_tool_call_item_id(item_id):
+        return item_id
+
+    for candidate in (call_id, item_id, fallback):
+        if isinstance(candidate, str) and candidate.strip():
+            return generate_responses_custom_tool_call_item_id(candidate)
+    return None
 
 
 def resolve_responses_function_call_identity(

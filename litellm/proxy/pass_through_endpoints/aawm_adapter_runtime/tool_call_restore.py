@@ -115,6 +115,10 @@ def _restore_adapted_custom_tool_calls_in_response_body(
     request_body: Optional[dict[str, Any]],
     adapter_model: str,
 ) -> tuple[dict[str, Any], int, Optional[dict[str, Any]]]:
+    from litellm.responses.litellm_completion_transformation.function_call_identity import (
+        resolve_responses_custom_tool_call_item_id,
+    )
+
     adapted_names = _advertised_custom_tool_function_adapter_names(  # noqa: F821
         request_body,
         adapter_model=adapter_model,
@@ -152,6 +156,13 @@ def _restore_adapted_custom_tool_calls_in_response_body(
 
         restored_item = dict(item)
         restored_item["type"] = "custom_tool_call"
+        resolved_item_id = resolve_responses_custom_tool_call_item_id(
+            item.get("id"),
+            item.get("call_id"),
+            fallback=f"output:{index}",
+        )
+        if resolved_item_id is not None:
+            restored_item["id"] = resolved_item_id
         restored_item["input"] = raw_input
         restored_item.setdefault("status", "completed")
         restored_item.pop("arguments", None)
@@ -473,16 +484,18 @@ def _remember_adapted_custom_tool_stream_state(
     *,
     event_payload: dict[str, Any],
     item: dict[str, Any],
+    item_id: Optional[str] = None,
 ) -> dict[str, Any]:
     state = {
         "call_id": item.get("call_id") or item.get("id"),
         "name": item.get("name"),
         "arguments": "",
+        "item_id": item_id or item.get("id"),
     }
-    for key in _adapted_custom_tool_stream_state_keys(
-        event_payload,
-        item=item,
-    ):
+    keys = _adapted_custom_tool_stream_state_keys(event_payload, item=item)
+    if isinstance(item_id, str) and item_id.strip():
+        keys.append(f"id:{item_id.strip()}")
+    for key in dict.fromkeys(keys):
         state_by_key[key] = state
     return state
 
@@ -506,28 +519,52 @@ def _restore_adapted_custom_tool_calls_in_stream_event_payload(
     adapted_names: set[str],
     state_by_key: dict[str, dict[str, Any]],
 ) -> tuple[Optional[dict[str, Any]], int]:
+    from litellm.responses.litellm_completion_transformation.function_call_identity import (
+        resolve_responses_custom_tool_call_item_id,
+    )
+
     event_type = event_payload.get("type")
     item = event_payload.get("item")
 
     if event_type == "response.output_item.added" and isinstance(item, dict) and item.get("type") == "function_call":
         item_name = _normalize_low_cardinality_tag_value(item.get("name"))  # noqa: F821
         if item_name in adapted_names:
+            output_index = event_payload.get("output_index")
+            fallback = (
+                f"output:{output_index}"
+                if isinstance(output_index, int)
+                else f"custom_tool:{item_name or 'unknown'}"
+            )
+            resolved_item_id = resolve_responses_custom_tool_call_item_id(
+                item.get("id"),
+                item.get("call_id"),
+                fallback=fallback,
+            )
             _remember_adapted_custom_tool_stream_state(
                 state_by_key,
                 event_payload=event_payload,
                 item=item,
+                item_id=resolved_item_id,
             )
             restored_item = dict(item)
             restored_item["type"] = "custom_tool_call"
+            if resolved_item_id is not None:
+                restored_item["id"] = resolved_item_id
             restored_item["input"] = ""
             restored_item.pop("arguments", None)
             restored_payload = dict(event_payload)
             restored_payload["item"] = restored_item
             return restored_payload, 1
 
+    state_lookup_payload = event_payload
+    if isinstance(item, dict):
+        state_lookup_payload = dict(event_payload)
+        for field in ("call_id", "id", "item_id"):
+            if field not in state_lookup_payload:
+                state_lookup_payload[field] = item.get(field)
     state = _get_adapted_custom_tool_stream_state(
         state_by_key,
-        event_payload,
+        state_lookup_payload,
     )
     if event_type == "response.function_call_arguments.delta" and state is not None:
         delta = event_payload.get("delta")
@@ -544,12 +581,27 @@ def _restore_adapted_custom_tool_calls_in_stream_event_payload(
             restored_payload = dict(event_payload)
             restored_payload["type"] = "response.custom_tool_call_input.done"
             restored_payload["input"] = raw_input
+            item_id = state.get("item_id")
+            if isinstance(item_id, str) and item_id:
+                restored_payload["item_id"] = item_id
             restored_payload.pop("arguments", None)
             return restored_payload, 1
 
     if event_type == "response.output_item.done" and isinstance(item, dict):
+        state_item_id = state.get("item_id") if state is not None else None
+        normalized_item = item
+        item_id_changed = False
+        if (
+            isinstance(state_item_id, str)
+            and state_item_id
+            and item.get("type") in {"function_call", "custom_tool_call"}
+            and item.get("id") != state_item_id
+        ):
+            normalized_item = dict(item)
+            normalized_item["id"] = state_item_id
+            item_id_changed = True
         restored_body, restored_count, adapter_error = _restore_adapted_custom_tool_calls_in_response_body(
-            {"output": [item]},
+            {"output": [normalized_item]},
             request_body=request_body,
             adapter_model=adapter_model,
         )
@@ -557,11 +609,54 @@ def _restore_adapted_custom_tool_calls_in_stream_event_payload(
             restored_payload = dict(event_payload)
             restored_payload["item"] = restored_body["output"][0]
             return restored_payload, restored_count
+        if item_id_changed:
+            restored_payload = dict(event_payload)
+            restored_payload["item"] = normalized_item
+            return restored_payload, 1
 
     response_body = event_payload.get("response")
     if isinstance(response_body, dict):
+        normalized_response_body = response_body
+        output = response_body.get("output")
+        if isinstance(output, list):
+            normalized_output: list[Any] = []
+            response_item_id_changed = False
+            for output_index, output_item in enumerate(output):
+                if not isinstance(output_item, dict) or output_item.get("type") not in {
+                    "function_call",
+                    "custom_tool_call",
+                }:
+                    normalized_output.append(output_item)
+                    continue
+
+                output_state_lookup = {"output_index": output_index}
+                for field in ("call_id", "id", "item_id"):
+                    if field in output_item:
+                        output_state_lookup[field] = output_item[field]
+                output_state = _get_adapted_custom_tool_stream_state(
+                    state_by_key,
+                    output_state_lookup,
+                )
+                output_state_item_id = (
+                    output_state.get("item_id")
+                    if output_state is not None
+                    else None
+                )
+                if (
+                    isinstance(output_state_item_id, str)
+                    and output_state_item_id
+                    and output_item.get("id") != output_state_item_id
+                ):
+                    output_item = dict(output_item)
+                    output_item["id"] = output_state_item_id
+                    response_item_id_changed = True
+                normalized_output.append(output_item)
+
+            if response_item_id_changed:
+                normalized_response_body = dict(response_body)
+                normalized_response_body["output"] = normalized_output
         restored_body, restored_count, adapter_error = _restore_adapted_custom_tool_calls_in_response_body(
-            response_body,
+            normalized_response_body,
             request_body=request_body,
             adapter_model=adapter_model,
         )
@@ -569,6 +664,10 @@ def _restore_adapted_custom_tool_calls_in_stream_event_payload(
             restored_payload = dict(event_payload)
             restored_payload["response"] = restored_body
             return restored_payload, restored_count
+        if normalized_response_body is not response_body:
+            restored_payload = dict(event_payload)
+            restored_payload["response"] = normalized_response_body
+            return restored_payload, 1
 
     return event_payload, 0
 
