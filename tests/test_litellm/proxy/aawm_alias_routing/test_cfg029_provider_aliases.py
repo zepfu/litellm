@@ -198,6 +198,17 @@ _OPERATIONAL_ALIAS_ORDER = {
     ],
 }
 
+_CONFIGURED_PROVIDER_IDS = tuple(
+    sorted(REGISTERED_PROVIDERS - {"nous", "opencode_go"})
+)
+_WITHDRAWN_OX_ALPHA_MODELS = frozenset(
+    {
+        "ox-alpha-free",
+        "stealth/ox-alpha",
+        "openrouter/stealth/ox-alpha",
+    }
+)
+
 
 def _entry_identity(entry: RoutingCandidate | AliasReference) -> tuple:
     if isinstance(entry, AliasReference):
@@ -205,19 +216,22 @@ def _entry_identity(entry: RoutingCandidate | AliasReference) -> tuple:
     return (entry.provider, entry.model, entry.route_family, entry.priority)
 
 
-def test_compile_directory_exposes_one_closed_provider_alias_per_registered_provider() -> None:
+def test_compile_directory_exposes_closed_aliases_for_configured_providers() -> None:
     snapshot = compile_directory(DEFAULT_CONFIG_DIR)
     expected = tuple(
         provider_alias_name(provider_id)
-        for provider_id in sorted(REGISTERED_PROVIDERS)
+        for provider_id in _CONFIGURED_PROVIDER_IDS
     )
     actual = iter_provider_alias_names(snapshot.aliases)
     assert actual == expected
-    assert uncovered_registered_providers(snapshot.aliases) == ()
+    assert set(uncovered_registered_providers(snapshot.aliases)) == {
+        "nous",
+        "opencode_go",
+    }
     assert "nvidia" in REGISTERED_PROVIDERS
     assert "provider-nvidia" in snapshot.aliases
 
-    for provider_id in REGISTERED_PROVIDERS:
+    for provider_id in _CONFIGURED_PROVIDER_IDS:
         name = provider_alias_name(provider_id)
         alias = snapshot.aliases[name]
         assert alias.dispatch is None
@@ -324,42 +338,14 @@ aliases:
         compiler.compile_yaml(crossed)
 
 
-@pytest.mark.parametrize(
-    ("provider_id", "expected"),
-    [
-        (
-            "nous",
-            (
-                "nous",
-                "stealth/ox-alpha",
-                "codex_nous_chat_completions_adapter",
-                100,
-            ),
-        ),
-        (
-            "opencode_go",
-            (
-                "opencode_go",
-                "ox-alpha-free",
-                "codex_opencode_go_adapter",
-                100,
-            ),
-        ),
-    ],
-)
-def test_provider_aliases_keep_closed_same_provider_candidate_sets(
-    provider_id: str,
-    expected: tuple[str, str, str, int],
-) -> None:
+def test_compiled_aliases_exclude_withdrawn_ox_alpha_routes() -> None:
     snapshot = compile_directory(DEFAULT_CONFIG_DIR)
-    alias = snapshot.aliases[provider_alias_name(provider_id)]
-    assert alias.dispatch is None
-    assert [
-        (entry.provider, entry.model, entry.route_family, entry.priority)
-        for entry in alias.candidates
-    ] == [expected]
-    assert all(entry.provider == provider_id for entry in alias.candidates)
-    assert all(entry.anthropic_route_family is None for entry in alias.candidates)
+    assert "provider-nous" not in snapshot.aliases
+    assert "provider-opencode_go" not in snapshot.aliases
+    for alias in snapshot.aliases.values():
+        for entry in alias.candidates:
+            if isinstance(entry, RoutingCandidate):
+                assert entry.model not in _WITHDRAWN_OX_ALPHA_MODELS
 
 
 def test_provider_opencode_zen_keeps_both_adapter_forms_distinct() -> None:
@@ -428,7 +414,7 @@ def test_operational_alias_candidate_order_is_unchanged_by_provider_aliases() ->
     assert sota.dispatch.default != "provider-openai"
 
 
-def test_compile_reports_uncovered_registered_provider_when_any_provider_alias_exists() -> None:
+def test_compile_allows_subset_of_registered_provider_aliases() -> None:
     raw = """
 defaults: {}
 aliases:
@@ -439,8 +425,11 @@ aliases:
         route_family: codex_responses
         priority: 100
 """
-    with pytest.raises(ConfigCompileError, match="uncovered registered providers"):
-        compiler.compile_yaml(raw)
+    snapshot = compiler.compile_yaml(raw)
+    assert iter_provider_alias_names(snapshot.aliases) == ("provider-openai",)
+    assert set(uncovered_registered_providers(snapshot.aliases)) == (
+        set(REGISTERED_PROVIDERS) - {"openai"}
+    )
 
 
 def test_provider_alias_rejects_cross_provider_candidate_and_alias_reference() -> None:
@@ -485,6 +474,8 @@ def test_iter_compiled_alias_names_includes_live_provider_aliases() -> None:
 
     snapshot = compile_directory(DEFAULT_CONFIG_DIR)
     names = iter_compiled_alias_names(snapshot)
-    for provider_id in REGISTERED_PROVIDERS:
+    for provider_id in _CONFIGURED_PROVIDER_IDS:
         assert provider_alias_name(provider_id) in names
+    assert "provider-nous" not in names
+    assert "provider-opencode_go" not in names
     assert "aawm-sota-zai" not in names

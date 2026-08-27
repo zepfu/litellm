@@ -536,7 +536,7 @@ aliases:
         snapshot_select.set_active_routing_snapshot(previous)
 
 
-def test_canonical_work_other_promotes_deepseek_only_inside_daily_window() -> None:
+def test_canonical_work_other_inherits_sota_xai_order_after_daily_deepseek() -> None:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
         DEFAULT_CONFIG_DIR,
         compile_directory,
@@ -559,13 +559,15 @@ def test_canonical_work_other_promotes_deepseek_only_inside_daily_window() -> No
         assert [candidate["model"] for candidate in inside] == [
             "alibaba_token_plan/deepseek-v4-pro",
             "kimi_code/k3",
-            "oa_xai/grok-4.6",
             "cursor_agent/cursor-grok-4.6-high",
+            "xai/grok-4.6",
+            "oa_xai/grok-4.6",
         ]
         assert [candidate["model"] for candidate in outside] == [
             "kimi_code/k3",
-            "oa_xai/grok-4.6",
             "cursor_agent/cursor-grok-4.6-high",
+            "xai/grok-4.6",
+            "oa_xai/grok-4.6",
         ]
         assert all(
             "qwen" not in str(candidate["model"])
@@ -585,13 +587,15 @@ def test_canonical_work_other_promotes_deepseek_only_inside_daily_window() -> No
         assert [candidate["model"] for candidate in inside_anthropic] == [
             "alibaba_token_plan/deepseek-v4-pro",
             "kimi_code/k3",
-            "oa_xai/grok-4.6",
             "cursor_agent/cursor-grok-4.6-high",
+            "xai/grok-4.6",
+            "oa_xai/grok-4.6",
         ]
         assert [candidate["model"] for candidate in outside_anthropic] == [
             "kimi_code/k3",
-            "oa_xai/grok-4.6",
             "cursor_agent/cursor-grok-4.6-high",
+            "xai/grok-4.6",
+            "oa_xai/grok-4.6",
         ]
         assert (
             inside_anthropic[0]["route_family"]
@@ -606,14 +610,66 @@ def test_canonical_work_other_promotes_deepseek_only_inside_daily_window() -> No
         assert [candidate["model"] for candidate in preserved] == [
             "alibaba_token_plan/deepseek-v4-pro",
             "kimi_code/k3",
-            "oa_xai/grok-4.6",
             "cursor_agent/cursor-grok-4.6-high",
+            "xai/grok-4.6",
+            "oa_xai/grok-4.6",
         ]
     finally:
         snapshot_select.set_active_routing_snapshot(previous)
 
 
-def test_canonical_read_alias_selects_basic_zai_coding_plan_first() -> None:
+def test_canonical_work_selects_direct_grok_order() -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    previous = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    try:
+        selected = snapshot_select._select_snapshot_candidates(
+            "work",
+            ingress="codex",
+            now_utc=dt.datetime(2026, 8, 18, 15, 0, tzinfo=dt.timezone.utc),
+        )
+        assert [
+            (
+                candidate["provider"],
+                candidate["model"],
+                candidate["route_family"],
+                candidate["selection_priority"],
+            )
+            for candidate in selected
+        ] == [
+            (
+                "cursor_agent",
+                "cursor_agent/cursor-grok-4.6-high",
+                "codex_cursor_agent_aiserver_adapter",
+                110,
+            ),
+            (
+                "xai",
+                "xai/grok-4.6",
+                "codex_grok_native_responses_adapter",
+                100,
+            ),
+            (
+                "xai",
+                "oa_xai/grok-4.6",
+                "codex_xai_oauth_responses_adapter",
+                90,
+            ),
+        ]
+        assert all(
+            "alias_reference" not in candidate
+            for candidate in selected
+        )
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous)
+
+
+def test_canonical_read_alias_selects_direct_zai_coding_plan() -> None:
     """Codex ``read`` resolves to the authorized mapping used by ``basic``."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
         DEFAULT_CONFIG_DIR,
@@ -640,8 +696,7 @@ def test_canonical_read_alias_selects_basic_zai_coding_plan_first() -> None:
             "basic",
             ingress="codex",
         )
-        assert [candidate["model"] for candidate in codex] == [
-            candidate["model"] for candidate in basic
-        ]
+        assert len(codex) == 1
+        assert codex[0]["model"] == basic[0]["model"]
     finally:
         snapshot_select.set_active_routing_snapshot(previous)

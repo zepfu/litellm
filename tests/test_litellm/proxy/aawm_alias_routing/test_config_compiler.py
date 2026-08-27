@@ -353,6 +353,46 @@ def test_canonical_work_other_compiles_scheduled_deepseek_without_alibaba() -> N
     assert owner.schedule is None
 
 
+def test_canonical_work_compiles_direct_grok_order() -> None:
+    """The temporary work alias keeps the exact Cursor, native, OAuth order."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+        RoutingCandidate,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    entries = snapshot.aliases["work"].candidates
+
+    assert len(entries) == 3
+    assert all(isinstance(entry, RoutingCandidate) for entry in entries)
+    assert [
+        (entry.provider, entry.model, entry.route_family, entry.priority)
+        for entry in entries
+    ] == [
+        (
+            "cursor_agent",
+            "cursor_agent/cursor-grok-4.6-high",
+            "codex_cursor_agent_aiserver_adapter",
+            110,
+        ),
+        (
+            "xai",
+            "xai/grok-4.6",
+            "codex_grok_native_responses_adapter",
+            100,
+        ),
+        (
+            "xai",
+            "oa_xai/grok-4.6",
+            "codex_xai_oauth_responses_adapter",
+            90,
+        ),
+    ]
+
+
 def test_canonical_provider_nvidia_compiles_closed_nim_set_without_alias_reference() -> None:
     """Live provider-nvidia is five NVIDIA NIM models on NVIDIA-credential families."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
@@ -451,7 +491,7 @@ aliases:
         compiler.compile_yaml(nvidia_on_openrouter)
 
 
-def test_canonical_read_alias_references_basic_go_first() -> None:
+def test_canonical_read_alias_compiles_direct_zai_coding_plan_first() -> None:
     """Live ``read`` must compile as an AAWM alias, not a ChatGPT-native model.
 
     Codex TUI OC-003 uses ``--model read`` even though Ohmypi
@@ -459,9 +499,6 @@ def test_canonical_read_alias_references_basic_go_first() -> None:
     catalog does not list ``read``, and Codex sends it to ChatGPT as
     ``The 'read' model is not supported``.
     """
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
-        AliasReference,
-    )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
         DEFAULT_CONFIG_DIR,
         compile_directory,
@@ -473,13 +510,19 @@ def test_canonical_read_alias_references_basic_go_first() -> None:
     snapshot = compile_directory(DEFAULT_CONFIG_DIR)
     assert "read" in snapshot.aliases
     alias = snapshot.aliases["read"]
-    assert alias.candidates
-    assert all(isinstance(entry, AliasReference) for entry in alias.candidates)
-    assert alias.candidates[0].alias_name == "basic"
+    assert len(alias.candidates) == 1
+    assert getattr(alias.candidates[0], "alias_name", None) is None
     basic = snapshot.aliases["basic"].candidates[0]
-    assert basic.provider == "opencode_go"
-    assert basic.model == "ox-alpha-free"
-    assert basic.route_family == "codex_opencode_go_adapter"
+    assert basic.provider == "zai_coding_plan"
+    assert basic.model == "zai_coding_plan/glm-5.3-flash"
+    assert basic.route_family == "codex_zai_coding_plan_chat_completions_adapter"
+    read_candidate = alias.candidates[0]
+    assert read_candidate.provider == "zai_coding_plan"
+    assert read_candidate.model == "zai_coding_plan/glm-5.3-flash"
+    assert read_candidate.route_family == (
+        "codex_zai_coding_plan_chat_completions_adapter"
+    )
+    assert read_candidate.reasoning_effort == "low"
     names = iter_compiled_alias_names(snapshot)
     assert "read" in names
     assert "basic" in names

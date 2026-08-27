@@ -1,9 +1,8 @@
-"""NOUS-003: compiled basic/work order Go, Nous, then OpenRouter ox-alpha.
+"""CFG-035/038: operational alias replacement and retained Nous lane policy.
 
-Locks the numeric-gap insert of Codex-only Nous stealth/ox-alpha between
-OpenCode Go and OpenRouter. Anthropic snapshots omit Go and Nous and still
-include OpenRouter ox-alpha. Nous stays off the OpenRouter free-daily quota
-set.
+Operational ``basic`` and ``work`` aliases no longer contain the withdrawn
+OX-alpha block. The ``work`` alias keeps the canonical direct Cursor, native
+xAI, and OAuth xAI Grok order.
 
 No provider egress, no live Hermes reads.
 """
@@ -24,16 +23,19 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler imp
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
     compile_directory,
 )
-from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_schema import (
-    CODEX_ONLY_ROUTE_FAMILIES,
-)
 
 
-_CODEX_GO_ROUTE_FAMILY = "codex_opencode_go_adapter"
-_CODEX_NOUS_ROUTE_FAMILY = "codex_nous_chat_completions_adapter"
-_GO_MODEL = "ox-alpha-free"
+_CODEX_ZAI_ROUTE_FAMILY = "codex_zai_coding_plan_chat_completions_adapter"
+_ZAI_MODEL = "zai_coding_plan/glm-5.3-flash"
 _NOUS_MODEL = "stealth/ox-alpha"
 _OPENROUTER_OX_ALPHA_MODEL = "openrouter/stealth/ox-alpha"
+_LEGACY_OX_MODELS = frozenset(
+    {
+        "ox-alpha-free",
+        _NOUS_MODEL,
+        _OPENROUTER_OX_ALPHA_MODEL,
+    }
+)
 _REPO_ROOT = os.path.dirname(
     os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -49,33 +51,22 @@ def _candidate_identity(candidate: Any) -> tuple[str, str, str]:
     return (candidate.provider, candidate.model, candidate.route_family)
 
 
-def test_basic_yaml_places_go_nous_then_openrouter_ox_alpha():
+def test_basic_yaml_replaces_legacy_ox_alpha_block_with_zai_flash():
     with open(_BASIC_YAML_PATH, "r", encoding="utf-8") as handle:
         snapshot = compile_yaml(handle.read())
 
     basic_candidates = snapshot.aliases["basic"].candidates
-    first, second, third = basic_candidates[0], basic_candidates[1], basic_candidates[2]
+    first = basic_candidates[0]
     assert _candidate_identity(first) == (
-        "opencode_go",
-        _GO_MODEL,
-        _CODEX_GO_ROUTE_FAMILY,
+        "zai_coding_plan",
+        _ZAI_MODEL,
+        _CODEX_ZAI_ROUTE_FAMILY,
     )
     assert first.priority == 100
-    assert first.anthropic_route_family is None
-    assert _candidate_identity(second) == (
-        "nous",
-        _NOUS_MODEL,
-        _CODEX_NOUS_ROUTE_FAMILY,
+    assert first.reasoning_effort == "low"
+    assert not any(
+        candidate.model in _LEGACY_OX_MODELS for candidate in basic_candidates
     )
-    assert second.priority == 97
-    assert second.anthropic_route_family is None
-    assert _CODEX_NOUS_ROUTE_FAMILY in CODEX_ONLY_ROUTE_FAMILIES
-    assert _candidate_identity(third) == (
-        "openrouter",
-        _OPENROUTER_OX_ALPHA_MODEL,
-        "codex_openrouter_completion_adapter",
-    )
-    assert third.priority == 95
 
     north_pairs = [
         (candidate.provider, candidate.model, candidate.route_family)
@@ -103,43 +94,39 @@ def test_basic_yaml_places_go_nous_then_openrouter_ox_alpha():
         for index, candidate in enumerate(basic_candidates)
         if candidate.model == "cohere/north-mini-code-1-0"
     )
-    assert cohere_index == 3
-    assert basic_candidates[cohere_index - 1].model == _OPENROUTER_OX_ALPHA_MODEL
+    assert cohere_index == 1
+    assert basic_candidates[cohere_index - 1].model == _ZAI_MODEL
 
 
-def test_work_yaml_places_go_nous_then_openrouter_ox_alpha():
+def test_work_yaml_compiles_shared_cfg035_cfg038_graph():
     snapshot = compile_directory(_ALIAS_CONFIG_DIR)
     work_candidates = snapshot.aliases["work"].candidates
-    first, second, third, fourth = (
-        work_candidates[0],
-        work_candidates[1],
-        work_candidates[2],
-        work_candidates[3],
-    )
+    first, second, third = work_candidates
     assert _candidate_identity(first) == (
-        "opencode_go",
-        _GO_MODEL,
-        _CODEX_GO_ROUTE_FAMILY,
+        "cursor_agent",
+        "cursor_agent/cursor-grok-4.6-high",
+        "codex_cursor_agent_aiserver_adapter",
     )
     assert first.priority == 110
-    assert first.anthropic_route_family is None
     assert _candidate_identity(second) == (
-        "nous",
-        _NOUS_MODEL,
-        _CODEX_NOUS_ROUTE_FAMILY,
+        "xai",
+        "xai/grok-4.6",
+        "codex_grok_native_responses_adapter",
     )
-    assert second.priority == 107
-    assert second.anthropic_route_family is None
+    assert second.priority == 100
     assert _candidate_identity(third) == (
-        "openrouter",
-        _OPENROUTER_OX_ALPHA_MODEL,
-        "codex_openrouter_completion_adapter",
+        "xai",
+        "oa_xai/grok-4.6",
+        "codex_xai_oauth_responses_adapter",
     )
-    assert third.priority == 105
-    assert fourth.model == "gpt-5.3-codex-spark"
+    assert third.priority == 90
+    assert not any(
+        getattr(candidate, "model", None) in _LEGACY_OX_MODELS
+        for candidate in work_candidates
+    )
 
 
-def test_anthropic_basic_skips_go_and_nous_keeps_openrouter_ox_alpha():
+def test_anthropic_basic_excludes_legacy_ox_alpha_candidates():
     with open(_BASIC_YAML_PATH, "r", encoding="utf-8") as handle:
         snapshot = compile_yaml(handle.read())
     previous = snapshot_select.get_active_routing_snapshot()
@@ -157,14 +144,8 @@ def test_anthropic_basic_skips_go_and_nous_keeps_openrouter_ox_alpha():
     assert "opencode_go" not in providers
     assert "nous" not in providers
     assert "openrouter" in providers
-    assert _OPENROUTER_OX_ALPHA_MODEL in models
-    openrouter_ox = next(
-        candidate
-        for candidate in selected
-        if candidate["model"] == _OPENROUTER_OX_ALPHA_MODEL
-    )
-    assert openrouter_ox["provider"] == "openrouter"
-    assert openrouter_ox["route_family"] == "anthropic_openrouter_completion_adapter"
+    assert "zai_coding_plan" not in providers
+    assert not any(model in _LEGACY_OX_MODELS for model in models)
 
 
 def test_nous_lane_independent_of_openrouter_and_go():
@@ -176,24 +157,11 @@ def test_nous_lane_independent_of_openrouter_and_go():
     assert _OPENROUTER_OX_ALPHA_MODEL in policy.OPENROUTER_FREE_DAILY_QUOTA_MODELS
 
 
-def test_direct_vs_alias_attribution():
-    with open(_BASIC_YAML_PATH, "r", encoding="utf-8") as handle:
-        snapshot = compile_yaml(handle.read())
-    basic_candidates = snapshot.aliases["basic"].candidates
-    nous = next(
-        candidate
-        for candidate in basic_candidates
-        if getattr(candidate, "provider", None) == "nous"
-        and candidate.model == _NOUS_MODEL
-    )
-    openrouter = next(
-        candidate
-        for candidate in basic_candidates
-        if candidate.model == _OPENROUTER_OX_ALPHA_MODEL
-    )
-    assert nous.provider == "nous"
-    assert nous.route_family == _CODEX_NOUS_ROUTE_FAMILY
-    assert openrouter.provider == "openrouter"
-    assert openrouter.route_family == "codex_openrouter_completion_adapter"
-    assert nous.provider != openrouter.provider
-    assert nous.model != openrouter.model
+def test_operational_aliases_exclude_legacy_ox_alpha_models():
+    snapshot = compile_directory(_ALIAS_CONFIG_DIR)
+    for alias_name in ("basic", "work"):
+        alias = snapshot.aliases[alias_name]
+        assert not any(
+            getattr(candidate, "model", None) in _LEGACY_OX_MODELS
+            for candidate in alias.candidates
+        )

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
@@ -68,20 +69,13 @@ def test_basic_yaml_compiles() -> None:
     assert basic_candidate.reasoning_effort == "low"
 
 
-def test_alpha_stabilization_single_route_alias_mappings() -> None:
-    """Temporary alpha aliases expose only their explicitly assigned route."""
+def test_standalone_alias_mappings() -> None:
+    """Standalone aliases expose only their explicitly assigned route."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         config_compiler as compiler,
     )
 
     expected = {
-        "basic.yaml": (
-            "basic",
-            "zai_coding_plan",
-            "zai_coding_plan/glm-5.3-flash",
-            "codex_zai_coding_plan_chat_completions_adapter",
-            "low",
-        ),
         "read.yaml": (
             "read",
             "zai_coding_plan",
@@ -128,19 +122,27 @@ def test_alpha_stabilization_single_route_alias_mappings() -> None:
         assert candidate.reasoning_effort == reasoning_effort
 
 
-def test_work_yaml_orders_cursor_then_native_then_managed_xai() -> None:
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
-        config_compiler as compiler,
+def test_work_yaml_compiles_shared_cfg035_cfg038_graph() -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+        RoutingCandidate,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        compile_directory,
     )
 
-    with open(
-        os.path.join(_ALIAS_CONFIG_DIR, "work.yaml"), "r", encoding="utf-8"
-    ) as handle:
-        snapshot = compiler.compile_yaml(handle.read())
+    snapshot = compile_directory(Path(_ALIAS_CONFIG_DIR))
+    entries = snapshot.aliases["work"].candidates
 
+    assert len(entries) == 3
+    assert all(isinstance(entry, RoutingCandidate) for entry in entries)
     assert [
-        (candidate.provider, candidate.model, candidate.route_family, candidate.priority)
-        for candidate in snapshot.aliases["work"].candidates
+        (
+            entry.provider,
+            entry.model,
+            entry.route_family,
+            entry.priority,
+        )
+        for entry in entries
     ] == [
         (
             "cursor_agent",
@@ -148,8 +150,18 @@ def test_work_yaml_orders_cursor_then_native_then_managed_xai() -> None:
             "codex_cursor_agent_aiserver_adapter",
             110,
         ),
-        ("xai", "xai/grok-4.6", "codex_grok_native_responses_adapter", 100),
-        ("xai", "oa_xai/grok-4.6", "codex_xai_oauth_responses_adapter", 90),
+        (
+            "xai",
+            "xai/grok-4.6",
+            "codex_grok_native_responses_adapter",
+            100,
+        ),
+        (
+            "xai",
+            "oa_xai/grok-4.6",
+            "codex_xai_oauth_responses_adapter",
+            90,
+        ),
     ]
 
 

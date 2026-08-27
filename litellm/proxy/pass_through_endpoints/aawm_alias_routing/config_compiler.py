@@ -120,7 +120,10 @@ def iter_provider_alias_names(aliases: Mapping[str, object]) -> tuple[str, ...]:
 
 
 def uncovered_registered_providers(aliases: Mapping[str, object]) -> tuple[str, ...]:
-    """Return registered providers that still lack a ``provider-<id>`` alias."""
+    """Return registered providers without a configured ``provider-<id>`` alias.
+
+    Direct provider registration does not require a provider-pinned alias.
+    """
 
     present = {
         name[len(PROVIDER_ALIAS_PREFIX) :]
@@ -133,8 +136,8 @@ def _assert_provider_alias_coverage(aliases: dict[str, RoutingAlias]) -> None:
     """Reject a compile that introduces an incomplete provider-alias inventory.
 
     Documents without any ``provider-*`` alias skip this check so focused
-    unit YAML stays valid. Once any provider alias is present, every
-    registered provider must have exactly one closed same-provider alias.
+    unit YAML stays valid. Once any provider alias is present, each configured
+    provider alias must be a closed same-provider alias.
     """
 
     provider_names = iter_provider_alias_names(aliases)
@@ -191,20 +194,14 @@ def _assert_provider_alias_coverage(aliases: dict[str, RoutingAlias]) -> None:
         if concrete == 0:
             errors.append(f"{name} has no concrete same-provider candidates")
 
-    missing = sorted(schema.REGISTERED_PROVIDERS - set(seen_providers))
-    if missing:
-        errors.append(
-            "uncovered registered providers (missing provider-<id> alias): "
-            + ", ".join(missing)
-        )
     missing_vocab = sorted(
         provider_id
-        for provider_id in schema.REGISTERED_PROVIDERS
+        for provider_id in seen_providers
         if provider_id not in _PROVIDER_ALLOWED_ROUTE_FAMILIES
     )
     if missing_vocab:
         errors.append(
-            "registered providers lack provider-alias route-family vocabulary: "
+            "configured providers lack provider-alias route-family vocabulary: "
             + ", ".join(missing_vocab)
         )
     if errors:

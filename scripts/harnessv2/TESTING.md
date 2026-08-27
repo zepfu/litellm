@@ -165,14 +165,15 @@ they remain catalog/history facts:
 - `sota-openai`, `sota-xai`, `sota-alibaba`, `sota-moonshot`,
   `sota-deepseek`, `sota-zai`
 - `auto-review`, `codex-auto-review`
-- `provider-<id>` for every identity in `REGISTERED_PROVIDERS`
+- configured non-empty `provider-<id>` aliases
   (`provider-openai`, `provider-anthropic`, `provider-openrouter`,
   `provider-xai`, `provider-kimi_code`, `provider-alibaba_token_plan`,
-  `provider-zai_coding_plan`, `provider-cohere`, `provider-nous`,
-  `provider-cursor_agent`, `provider-opencode_zen`,
-  `provider-opencode_go`, `provider-nvidia`). `provider-nvidia` is a
-  closed same-provider NVIDIA NIM alias: NVIDIA NIM credentials only,
-  no `alias_reference`, no OpenRouter free Nemotron substitution.
+  `provider-zai_coding_plan`, `provider-cohere`, `provider-cursor_agent`,
+  `provider-opencode_zen`, `provider-nvidia`). This list is the configured
+  provider-pinned inventory, not every direct identity in
+  `REGISTERED_PROVIDERS`. `provider-nvidia` is a closed same-provider NVIDIA
+  NIM alias: NVIDIA NIM credentials only, no `alias_reference`, no OpenRouter
+  free Nemotron substitution.
   Validate only `provider-nvidia`; mixed-alias success is not NVIDIA
   evidence.
 
@@ -190,9 +191,10 @@ Groups:
   `sota-xai`, `sota-alibaba`, `sota-moonshot`, `sota-zai`, `auto-review`.
   Spawn name is `auto-review`, not `codex-auto-review`. Not orchestration
   children: `work-other`, `sota-deepseek`, `codex-auto-review`.
-- `provider_coverage` → every `provider-<id>` alias except
-  `provider-anthropic`. All `claude-*` aliases stay omitted from current
-  closeout selection/run. This is the
+- `provider_coverage` → the configured non-empty `provider-<id>` aliases
+  listed in `models.yaml`, except `provider-anthropic`. It is not derived
+  from every direct identity in `REGISTERED_PROVIDERS`. All `claude-*`
+  aliases stay omitted from current closeout selection/run. This is the
   provider-pinned Ohmypi orchestration group. It is not mixed into
   `orchestration_children`. A pass for provider P requires selected
   provider P (in-alias fallback only). Missing credentials, quota,
@@ -857,7 +859,7 @@ Proven on `litellm-alpha` (do not re-claim without a new artifact):
 | `--test platform` | passed (`/tmp/hv2-platform.json`, `ok: true`) |
 | CFG-023 catalog GET leftover uvicorn | 0 leftover ACCESS |
 | T-5 leftover uvicorn (discovery probes) | closed: post-cursor leftover ACCESS except `/health*` is **0**, including native `GET /v2/model/info` **500**. Worker reloaded via watchfiles after `_logging.py` mtime `2026-08-22T02:36:57Z`. Cursor `2026-08-22T02:44:06Z`. Ohmypi TUI was not used for this proof. |
-| `--test model` `work` / `basic` / `expert` / `sota` / `work-other` | passed: real Responses POST + rollup, `halted: false` |
+| `--test model` `work` / `basic` / `expert` / `sota` / `work-other` | `work` / `work-other` evidence is stale after the shared CFG-035/038 graph; rerun before current acceptance claims. |
 | `--test orchestration --orchestration-parent sota-openai` | Live 2026-08-23 nine-child orch on `cceab88cd3`: TUI `child_evidence.ok` for all nine children; leftover session `hv2-ohmypi-sota-openai-3839403` left open. `docker_logs` failed on concurrent `aawm-infrastructure@thoth` until the §7 concurrent-workspace filter. Live 2026-08-23 orch retry3 on `e397f7b12e`: `docker_logs` failed on concurrent `litellm@thoth /openai_passthrough/responses` + `codex-auto-review` until the §7 concurrent Codex-client filter. That retry3 TUI also missed `basic` / `work` / `expert` / `sota` (Ohmypi no-yield / null yield) — a separate spawn flake, not this identity gate. Do **not** treat those live artifacts as a full orch pass until TUI nine-child `child_evidence.ok` and `docker_logs` are both green. Four-child artifact (`/tmp/grok-goal-4ce5b5ad827f/implementer/hv2-orch.json`) is historical. Recap-only `ok: true` and the 2026-08-22T06:17 premature-close (`hv2-orch-premature-close.json`, nested `date` without `yield`) are not spawn proof. Current TUI gate is `child_evidence.ok` for the nine orchestration children; recap is wait-only. |
 | T-1 unhashable `type` list / ASGI | closed |
 | T-4 `UnicodeDecodeError` truncated UTF-8 peek | closed (incremental decoder `errors="ignore"`) |
