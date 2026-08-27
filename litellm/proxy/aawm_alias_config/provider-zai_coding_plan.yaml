@@ -8,7 +8,7 @@ aliases:
   - name: provider-zai_coding_plan
     candidates:
       - provider: zai_coding_plan
-        model: zai_coding_plan/glm-5.3
+        model: zai_coding_plan/glm-5.3-flash
         route_family: codex_zai_coding_plan_chat_completions_adapter
         priority: 100
         reasoning_effort: max
