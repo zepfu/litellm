@@ -330,6 +330,78 @@ def test_cursor_codex_path_returns_native_function_call_and_replays_tool_history
         assert run["conversationGroupId"] == run["conversationId"]
 
 
+def test_cursor_local_exec_function_call_replays_through_existing_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeCursorClient:
+        results = [
+            CursorAgentRunResult(
+                tool_calls=[
+                    {
+                        "id": "fc_exec-local",
+                        "call_id": "exec-local",
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
+                    }
+                ]
+            ),
+            CursorAgentRunResult(text="command completed", turn_ended=True),
+        ]
+
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self,
+            _payload: dict[str, Any],
+            **_kwargs: Any,
+        ) -> CursorAgentRunResult:
+            return self.results.pop(0)
+
+    monkeypatch.setattr(
+        "litellm.llms.cursor_agent.connect.CursorAgentConnectClient",
+        FakeCursorClient,
+    )
+
+    first = _call(
+        {
+            "model": "work",
+            "input": "run pwd",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "exec_command"},
+                }
+            ],
+        }
+    )
+    first_body = json.loads(first.body)
+    assert first_body["output"][0] == {
+        "id": "fc_exec-local",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": "exec-local",
+        "name": "exec_command",
+        "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
+    }
+
+    second = _call(
+        {
+            "model": "work",
+            "previous_response_id": first_body["id"],
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "exec-local",
+                    "output": "pwd output",
+                }
+            ],
+        }
+    )
+
+    assert json.loads(second.body)["output_text"] == "command completed"
+
+
 def test_cursor_continuation_requires_matching_function_call() -> None:
     with pytest.raises(ValueError, match="matching"):
         codex_candidate_calls._responses_input_to_cursor_messages(
