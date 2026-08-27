@@ -1724,6 +1724,9 @@ async def test_codex_auto_review_replay_safe_owned_alias_mismatch_uses_effective
             "provider": "other",
             "model": "removed-model",
             "route_family": "other_route",
+            "codex_oauth_account_label": "owner-account",
+            "codex_oauth_account_hash": "owner-hash",
+            "codex_oauth_lane_key": "owner-lane",
         },
     }
 
@@ -1749,6 +1752,7 @@ async def test_codex_auto_review_replay_safe_owned_alias_mismatch_uses_effective
         request=request,
         request_body={
             "model": "codex-auto-review",
+            "litellm_metadata": {"redispatch_ordinal": 1},
             "input": [
                 {"type": "reasoning", "summary": [{"type": "text", "text": "r"}]},
                 {"type": "function_call", "name": "inspect", "call_id": "call-1"},
@@ -1780,7 +1784,14 @@ async def test_codex_owned_alias_mismatch_with_previous_response_id_stays_409(
     owner_record = {
         "state": "owned",
         "owner": "owner-a",
-        "attributes": {"provider": "other", "model": "removed", "route_family": "other"},
+        "attributes": {
+            "provider": "other",
+            "model": "removed",
+            "route_family": "other",
+            "codex_oauth_account_label": "owner-account",
+            "codex_oauth_account_hash": "owner-hash",
+            "codex_oauth_lane_key": "owner-lane",
+        },
     }
     monkeypatch.setattr(
         sa,
@@ -1815,6 +1826,81 @@ async def test_codex_owned_alias_mismatch_with_previous_response_id_stays_409(
 
     assert exc_info.value.status_code == 409
     assert sa.get_request_effective_session_identity(request) is None
+
+
+@pytest.mark.asyncio
+async def test_codex_owned_owner_cooldown_reselects_with_effective_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sel, candidate = _patch_codex_selector_basics(monkeypatch)
+    selector_globals = sel._select_codex_auto_agent_candidate.__globals__
+    request = _codex_selector_request("base-thread")
+    owner_record = {
+        "state": "owned",
+        "owner": "owner-a",
+        "attributes": {
+            **candidate,
+            "codex_oauth_account_label": "owner-account",
+            "codex_oauth_account_hash": "owner-hash",
+            "codex_oauth_lane_key": "owner-lane",
+        },
+    }
+
+    async def _get_owner_record(
+        *, session_identity: str | None, **_kwargs: Any
+    ) -> tuple[Any, str, None]:
+        if session_identity == "base-thread":
+            return owner_record, "owner-key", None
+        assert session_identity is not None
+        assert session_identity.startswith("aawm-session-owner-redispatch-v1:")
+        return None, "effective-key", None
+
+    monkeypatch.setattr(sa, "get_session_owner_record", _get_owner_record)
+    monkeypatch.setattr(
+        sa,
+        "owner_record_as_affinity_hint",
+        lambda _record, **_kwargs: dict(owner_record["attributes"]),
+    )
+    monkeypatch.setitem(
+        selector_globals,
+        "_find_codex_auto_agent_affinity_candidate",
+        lambda *_args, **_kwargs: dict(candidate),
+    )
+    monkeypatch.setitem(
+        selector_globals,
+        "_build_codex_auto_agent_affinity_candidate_state",
+        AsyncMock(
+            return_value={
+                "candidate": dict(candidate),
+                "cooldown_seconds": 10.0,
+                "lane_key": "owner-lane",
+            }
+        ),
+    )
+    monkeypatch.setitem(
+        selector_globals, "_candidate_matches_affinity", lambda *_args: False
+    )
+    activate = MagicMock(wraps=sa.activate_session_owner_redispatch_effective_identity)
+    monkeypatch.setattr(sa, "activate_session_owner_redispatch_effective_identity", activate)
+
+    selected = await sel._select_codex_auto_agent_candidate(
+        request=request,
+        request_body={
+            "model": "alias",
+            "litellm_metadata": {"redispatch_ordinal": 1},
+            "input": [{"type": "function_call", "name": "inspect"}],
+        },
+    )
+
+    assert selected["selection_reason"] == "first_available"
+    assert selected["candidate"] == candidate
+    assert selected["session_owner_identity"].startswith(
+        "aawm-session-owner-redispatch-v1:"
+    )
+    assert sa.get_request_effective_session_identity(request) == selected[
+        "session_owner_identity"
+    ]
+    activate.assert_called_once()
 
 
 @pytest.mark.asyncio

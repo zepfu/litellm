@@ -3587,6 +3587,22 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             request=request,
         )
         if affinity_candidate is None:
+            if (
+                isinstance(session_owner_record, dict)
+                and sa._record_state(session_owner_record) == "owned"
+            ):
+                return await _reselect_owned_affinity_with_effective_identity(
+                    candidate={
+                        "provider": affinity.get("provider"),
+                        "model": affinity.get("model"),
+                        "route_family": affinity.get("route_family"),
+                        "last_resort": bool(affinity.get("last_resort")),
+                    },
+                    failure_phase="session_owner_owned_affinity_removed",
+                    mismatch_reason=(
+                        "session_owner: no compatible alias candidate for owned route"
+                    ),
+                )
             if account_identity_pinned and _affinity_pins_account_identity(affinity):
                 pinned_candidate_shape = {
                     "provider": affinity.get("provider"),
@@ -3611,22 +3627,6 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     cooldown_scope="account",
                     failure_phase="account_bound_owner_unavailable",
                     attempted_provider_call=False,
-                )
-            if (
-                isinstance(session_owner_record, dict)
-                and sa._record_state(session_owner_record) == "owned"
-            ):
-                return await _reselect_owned_affinity_with_effective_identity(
-                    candidate={
-                        "provider": affinity.get("provider"),
-                        "model": affinity.get("model"),
-                        "route_family": affinity.get("route_family"),
-                        "last_resort": bool(affinity.get("last_resort")),
-                    },
-                    failure_phase="session_owner_owned_affinity_removed",
-                    mismatch_reason=(
-                        "session_owner: no compatible alias candidate for owned route"
-                    ),
                 )
             pinned_candidate_shape = {
                 "provider": affinity.get("provider"),
@@ -3691,22 +3691,6 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             isinstance(session_owner_record, dict)
             and sa._record_state(session_owner_record) == "owned"
         ):
-            if account_identity_pinned:
-                _raise_codex_auto_agent_redispatch_required(
-                    candidate=dict(affinity_state.get("candidate") or {}),
-                    lane_key=affinity_state.get("lane_key")
-                    or affinity.get("codex_oauth_lane_key"),
-                    cooldown_seconds=0.0,
-                    error_tokens=set(),
-                    alias_model=alias_model,
-                    error_class="candidate_unavailable",
-                    cooldown_scope="account",
-                    failure_phase="account_bound_owner_unavailable",
-                    attempted_provider_call=False,
-                    skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
-                        [affinity_state]
-                    ),
-                )
             return await _reselect_owned_affinity_with_effective_identity(
                 candidate=affinity_state.get("candidate"),
                 failure_phase="session_owner_owned_affinity_unavailable",
@@ -3731,28 +3715,10 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         if affinity_state["cooldown_seconds"] > 0:
             # Owned/cooldown owner is unavailable: fail before free selection.
             if session_owner_record is not None and sa._record_state(session_owner_record) == "owned":
-                sa.raise_session_owner_redispatch_required(
-                    session_identity=session_owner_identity,
-                    alias_model=alias_model,
+                return await _reselect_owned_affinity_with_effective_identity(
                     candidate=affinity_state.get("candidate"),
                     failure_phase="session_owner_owner_cooldown",
-                    guard=sa.SessionOwnerGuardResult(
-                        decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
-                        session_identity=session_owner_identity,
-                        cache_key=_cache_key,
-                        owner_record=session_owner_record,
-                        owner_id=session_owner_record.get("owner"),
-                        mismatch_reason="session_owner: owner unavailable (cooldown)",
-                        provenance=sa.build_session_owner_provenance(
-                            session_identity=session_owner_identity,
-                            decision="redispatch_required",
-                            owner_record=session_owner_record,
-                            owner_id=session_owner_record.get("owner"),
-                            mismatch_reason="session_owner: owner unavailable (cooldown)",
-                            cache_key=_cache_key,
-                        ),
-                    ),
-                    request=request,
+                    mismatch_reason="session_owner: owner unavailable (cooldown)",
                 )
             _raise_codex_auto_agent_in_flight_cooldown(
                 candidate=affinity_state["candidate"],
