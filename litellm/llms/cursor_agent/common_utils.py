@@ -218,9 +218,7 @@ def extract_user_text(messages: List[AllMessageValues]) -> str:
     for message in reversed(messages):
         if message_role(message) != "user":
             continue
-        text = message_text(message)
-        if text:
-            return text
+        return message_text(message)
     if messages:
         return message_text(messages[-1])
     return ""
@@ -380,7 +378,7 @@ def _build_conversation_history(
 def _last_user_index(messages: List[AllMessageValues]) -> Optional[int]:
     last_index: Optional[int] = None
     for index, message in enumerate(messages):
-        if message_role(message) == "user" and message_text(message):
+        if message_role(message) == "user":
             last_index = index
     return last_index
 

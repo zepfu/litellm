@@ -239,6 +239,7 @@ def test_cursor_codex_path_returns_native_function_call_and_replays_tool_history
     history = second_run["action"]["userMessageAction"]["conversationHistory"]
     assert history == {
         "messages": [
+            {"user": {"content": [{"text": {"text": "run pwd"}}]}},
             {
                 "assistant": {
                     "content": [
@@ -266,12 +267,21 @@ def test_cursor_codex_path_returns_native_function_call_and_replays_tool_history
         ]
     }
     assert "rootPromptMessagesJson" not in json.dumps(second_run)
-    assert second_run["action"]["userMessageAction"]["userMessage"]["text"] == "run pwd"
+    assert second_run["action"]["userMessageAction"]["userMessage"]["text"] == ""
     assert second_run["mcpTools"]["mcpTools"][0]["name"] == "exec_command"
+    assert (
+        history["messages"][2]["tool"]["toolCallId"]
+        == first_body["output"][0]["call_id"]
+    )
+    assert (
+        history["messages"][2]["tool"]["toolCallId"]
+        != first_body["output"][0]["id"]
+    )
 
     third_run = FakeCursorClient.calls[2]["payload"]["runRequest"]
     assert third_run["action"]["userMessageAction"]["conversationHistory"] == {
         "messages": [
+            {"user": {"content": [{"text": {"text": "run pwd"}}]}},
             {
                 "assistant": {
                     "content": [
