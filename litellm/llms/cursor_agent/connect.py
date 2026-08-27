@@ -1092,10 +1092,12 @@ def _encode_request_context_exec_response(
 
 _UNSUPPORTED_LOCAL_EXEC_FIELDS = {
     5: "grep_args",
-    14: "shell_stream_args",
 }
+# Cursor's generated ExecServerMessage schema types both fields as ShellArgs.
+# Field 14 streams ShellStream responses only after client-side execution.
 _LOCAL_EXEC_BRIDGE_FIELDS = {
     2: "shell_args",
+    14: "shell_stream_args",
 }
 _LOCAL_EXEC_TOOL_NAMES = (
     "exec_command",

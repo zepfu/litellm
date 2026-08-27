@@ -383,8 +383,16 @@ class _H2StartupPeer:
 
 
 class _H2McpExecPeer:
-    def __init__(self, *, local_exec: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        local_exec: bool = False,
+        local_exec_field: int = 2,
+        fragment_local_exec: bool = False,
+    ) -> None:
         self.local_exec = local_exec
+        self.local_exec_field = local_exec_field
+        self.fragment_local_exec = fragment_local_exec
         self.server = H2Connection(
             config=H2Configuration(
                 client_side=False,
@@ -409,17 +417,31 @@ class _H2McpExecPeer:
 
     def _send_tool_call(self) -> None:
         if self.local_exec:
-            shell_args = _string(1, "pwd") + _string(2, "/workspace")
+            shell_args = (
+                _string(1, "pwd")
+                + _string(2, "/workspace")
+                + _varint(3, 30_000)
+                + _string(4, "cursor-tool-call")
+            )
             exec_request = (
                 _varint(1, 11)
-                + _message(2, shell_args)
+                + _message(self.local_exec_field, shell_args)
                 + _string(15, "exec-local")
             )
-            self.server.send_data(
-                self.stream_id,
-                encode_connect_proto_frame(_message(2, exec_request)),
-                end_stream=False,
-            )
+            frame = encode_connect_proto_frame(_message(2, exec_request))
+            if self.fragment_local_exec:
+                for chunk in (frame[:3], frame[3:8], frame[8:]):
+                    self.server.send_data(
+                        self.stream_id,
+                        chunk,
+                        end_stream=False,
+                    )
+            else:
+                self.server.send_data(
+                    self.stream_id,
+                    frame,
+                    end_stream=False,
+                )
             self.sent_tool_call = True
             return
 
@@ -653,8 +675,51 @@ def test_h2_bidi_surfaces_local_shell_as_advertised_external_tool_call(
     )
 
 
-def test_proto_bidi_bridges_advertised_local_shell_arguments() -> None:
-    message_field = 2
+def test_h2_bidi_surfaces_fragmented_shell_stream_as_external_tool_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer = _H2McpExecPeer(
+        local_exec=True,
+        local_exec_field=14,
+        fragment_local_exec=True,
+    )
+    monkeypatch.setattr(asyncio, "open_connection", peer.open_connection)
+    client = CursorAgentConnectClient(auth=CursorAgentAuth("access-token"))
+    request = _run_request()
+    request["runRequest"]["mcpTools"] = {
+        "mcpTools": [{"name": "exec_command"}],
+    }
+
+    result = asyncio.run(
+        client.run(
+            request,
+            url="https://cursor.test/agent.v1.AgentService/Run",
+            timeout=0.5,
+            stop_on_tool_call=True,
+        )
+    )
+
+    assert result.tool_calls == [
+        {
+            "call_id": "exec-local",
+            "name": "exec_command",
+            "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
+            "id": "fc_exec-local",
+        }
+    ]
+    assert peer.sent_tool_call is True
+    assert peer.request_stream_ended is False
+    assert all(
+        _last_field(payload, 2, wire_type=2) is None
+        and _last_field(payload, 5, wire_type=2) is None
+        for payload in peer.client_payloads
+    )
+
+
+@pytest.mark.parametrize("message_field", [2, 14])
+def test_proto_bidi_bridges_advertised_local_shell_arguments(
+    message_field: int,
+) -> None:
     shell_args = _string(1, "pwd") + _string(2, "/workspace")
     exec_request = (
         _varint(1, 17)
@@ -680,61 +745,41 @@ def test_proto_bidi_bridges_advertised_local_shell_arguments() -> None:
     assert client_messages == []
 
 
-def test_proto_bidi_rejects_shell_stream_with_advertised_command_tool() -> None:
-    exec_request = (
-        _varint(1, 17)
-        + _string(15, "exec-local")
-        + _message(14, _string(1, "pwd") + _string(2, "/workspace"))
-    )
-    server_message = _message(2, exec_request)
-
-    normalized, client_messages = cursor_connect._process_agent_server_message(
-        server_message,
-        {},
-        local_exec_tool_name="exec_command",
-    )
-
-    assert normalized == {
-        "execServerMessage": {
-            "id": 17,
-            "execId": "exec-local",
-            "messageField": 14,
-        }
-    }
-    assert len(client_messages) == 2
-    error_control = _last_field(client_messages[0], 5, wire_type=2)
-    assert isinstance(error_control, bytes)
-    throw = _last_field(error_control, 2, wire_type=2)
-    assert isinstance(throw, bytes)
-    error = cursor_connect._decode_proto_string(
-        _last_field(throw, 2, wire_type=2)
-    )
-    assert "shell_stream_args" in error
-    assert "no local execution was performed" in error
-
-
-def test_proto_bidi_rejects_unsupported_local_exec_operation() -> None:
-    shell_exec = _varint(1, 4) + _message(2, b"")
+@pytest.mark.parametrize("message_field", [2, 14])
+def test_proto_bidi_rejects_local_exec_without_advertised_command_tool(
+    message_field: int,
+) -> None:
+    shell_exec = _varint(1, 4) + _message(message_field, b"")
     server_message = _message(2, shell_exec)
 
     with pytest.raises(
         CursorConnectProtocolError,
-        match="unsupported local exec operation field 2",
+        match=f"unsupported local exec operation field {message_field}",
     ):
         cursor_connect._process_agent_server_message(server_message, {})
 
 
-@pytest.mark.parametrize(
-    ("message_field", "operation_name"),
-    [
-        (5, "grep_args"),
-        (14, "shell_stream_args"),
-    ],
-)
-def test_proto_bidi_rejects_known_unsupported_local_exec_without_execution(
+@pytest.mark.parametrize("message_field", [2, 14])
+def test_proto_bidi_rejects_advertised_local_exec_without_command(
     message_field: int,
-    operation_name: str,
 ) -> None:
+    shell_exec = _varint(1, 4) + _message(message_field, _string(2, "/workspace"))
+
+    with pytest.raises(
+        CursorConnectProtocolError,
+        match="does not contain a command",
+    ):
+        cursor_connect._process_agent_server_message(
+            _message(2, shell_exec),
+            {},
+            local_exec_tool_name="exec_command",
+        )
+
+
+def test_proto_bidi_rejects_known_unsupported_local_exec_without_execution(
+) -> None:
+    message_field = 5
+    operation_name = "grep_args"
     exec_request = _varint(1, 17) + _string(15, "exec-local") + _message(message_field, b"")
     server_message = _message(2, exec_request)
 
