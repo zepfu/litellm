@@ -1094,6 +1094,16 @@ _UNSUPPORTED_LOCAL_EXEC_FIELDS = {
     5: "grep_args",
     14: "shell_stream_args",
 }
+_LOCAL_EXEC_BRIDGE_FIELDS = {
+    2: "shell_args",
+    14: "shell_stream_args",
+}
+_LOCAL_EXEC_TOOL_NAMES = (
+    "exec_command",
+    "shell",
+    "bash",
+    "run_shell_command",
+)
 
 
 def _encode_unsupported_local_exec_response(
@@ -1124,6 +1134,99 @@ def _encode_unsupported_local_exec_response(
             _encode_proto_message_field(1, exec_client_stream_close),
         ),
     ]
+
+
+def _advertised_local_exec_tool_name(
+    request_payload: Mapping[str, Any],
+) -> Optional[str]:
+    run_request = _proto_mapping_value(
+        request_payload,
+        "runRequest",
+        "run_request",
+    )
+    if not isinstance(run_request, Mapping):
+        return None
+    mcp_tools = _proto_mapping_value(run_request, "mcpTools", "mcp_tools")
+    if not isinstance(mcp_tools, Mapping):
+        return None
+    definitions = _proto_mapping_value(mcp_tools, "mcpTools", "mcp_tools")
+    if not isinstance(definitions, list):
+        return None
+
+    for preferred_name in _LOCAL_EXEC_TOOL_NAMES:
+        for definition in definitions:
+            if not isinstance(definition, Mapping):
+                continue
+            name = _proto_mapping_value(
+                definition,
+                "name",
+                "toolName",
+                "tool_name",
+            )
+            if isinstance(name, str) and name.casefold() == preferred_name:
+                return name
+    return None
+
+
+def _decode_local_exec_tool_call(
+    exec_fields: List[tuple[int, int, Any]],
+    *,
+    message_field: int,
+    tool_name: str,
+) -> Dict[str, Any]:
+    args_payload = _proto_last_field(
+        exec_fields,
+        message_field,
+        wire_type=2,
+    )
+    if not isinstance(args_payload, bytes):
+        raise CursorConnectProtocolError(
+            "Cursor Agent local exec operation does not contain shell arguments."
+        )
+    args_fields = _decode_proto_fields(args_payload)
+    command = _decode_proto_string(
+        _proto_last_field(args_fields, 1, wire_type=2)
+    )
+    if not command:
+        raise CursorConnectProtocolError(
+            "Cursor Agent local exec operation does not contain a command."
+        )
+    working_directory = _decode_proto_string(
+        _proto_last_field(args_fields, 2, wire_type=2)
+    )
+    request_id = _proto_last_field(exec_fields, 1, wire_type=0) or 0
+    exec_id = _decode_proto_string(
+        _proto_last_field(exec_fields, 15, wire_type=2)
+    )
+    if not exec_id and not request_id:
+        raise CursorConnectProtocolError(
+            "Cursor Agent local exec operation does not contain a replayable "
+            "request identity."
+        )
+
+    argument_name = (
+        "command"
+        if tool_name.casefold() in {"bash", "shell", "run_shell_command"}
+        else "cmd"
+    )
+    arguments: Dict[str, Any] = {argument_name: command}
+    if working_directory:
+        arguments["workdir"] = working_directory
+    call_id = exec_id or f"cursor-exec-{request_id}"
+    return {
+        "interactionUpdate": {
+            "toolCallCompleted": {
+                "callId": call_id,
+                "toolName": tool_name,
+                "argsJson": json.dumps(
+                    arguments,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                "itemId": f"fc_{call_id}",
+            }
+        }
+    }
 
 
 def _encode_kv_response(
@@ -1165,6 +1268,8 @@ def _encode_kv_response(
 def _process_agent_server_message(
     payload: bytes,
     blobs: Dict[bytes, bytes],
+    *,
+    local_exec_tool_name: Optional[str] = None,
 ) -> tuple[Dict[str, Any], List[bytes]]:
     fields = _decode_proto_fields(payload)
     exec_server_message = _proto_last_field(fields, 2, wire_type=2)
@@ -1209,6 +1314,18 @@ def _process_agent_server_message(
                 (number for number, wire_type, _value in exec_fields if wire_type == 2 and number != 15),
                 None,
             )
+            if (
+                message_field in _LOCAL_EXEC_BRIDGE_FIELDS
+                and local_exec_tool_name
+            ):
+                return (
+                    _decode_local_exec_tool_call(
+                        exec_fields,
+                        message_field=message_field,
+                        tool_name=local_exec_tool_name,
+                    ),
+                    [],
+                )
             if message_field in _UNSUPPORTED_LOCAL_EXEC_FIELDS:
                 return (
                     decode_agent_server_message(payload),
@@ -2056,6 +2173,7 @@ class CursorAgentConnectClient:
         headers: Mapping[str, str],
         stop_on_tool_call: bool,
         timeout: Optional[float],
+        local_exec_tool_name: Optional[str],
     ) -> CursorAgentRunResult:
         """Run Cursor's true bidi RPC without half-closing the request."""
         from h2 import events as h2_events
@@ -2211,6 +2329,7 @@ class CursorAgentConnectClient:
                             normalized, client_messages = _process_agent_server_message(
                                 frame.payload,
                                 blobs,
+                                local_exec_tool_name=local_exec_tool_name,
                             )
                             for client_message in client_messages:
                                 pending.extend(encode_connect_proto_frame(client_message))
@@ -2280,6 +2399,7 @@ class CursorAgentConnectClient:
         response: Any,
         *,
         stop_on_tool_call: bool,
+        local_exec_tool_name: Optional[str],
     ) -> CursorAgentRunResult:
         self._require_http2(response)
         status_code = int(getattr(response, "status_code", 502))
@@ -2309,6 +2429,7 @@ class CursorAgentConnectClient:
             normalized, client_messages = _process_agent_server_message(
                 frame.payload,
                 blobs,
+                local_exec_tool_name=local_exec_tool_name,
             )
             if client_messages:
                 raise CursorConnectProtocolError(
@@ -2329,6 +2450,7 @@ class CursorAgentConnectClient:
         headers: Mapping[str, str],
         stop_on_tool_call: bool,
         timeout: Optional[float],
+        local_exec_tool_name: Optional[str],
     ) -> CursorAgentRunResult:
         if self.http_client is None and self.client_factory is None:
             self._ensure_http2_dependency()
@@ -2338,6 +2460,7 @@ class CursorAgentConnectClient:
                 headers=headers,
                 stop_on_tool_call=stop_on_tool_call,
                 timeout=timeout,
+                local_exec_tool_name=local_exec_tool_name,
             )
 
         owned_client = self.http_client is None
@@ -2376,12 +2499,14 @@ class CursorAgentConnectClient:
                         return await self._consume_response(
                             response,
                             stop_on_tool_call=stop_on_tool_call,
+                            local_exec_tool_name=local_exec_tool_name,
                         )
                 response = context
                 try:
                     return await self._consume_response(
                         response,
                         stop_on_tool_call=stop_on_tool_call,
+                        local_exec_tool_name=local_exec_tool_name,
                     )
                 finally:
                     aclose = getattr(response, "aclose", None)
@@ -2391,6 +2516,7 @@ class CursorAgentConnectClient:
             return await self._consume_response(
                 response,
                 stop_on_tool_call=stop_on_tool_call,
+                local_exec_tool_name=local_exec_tool_name,
             )
         except CursorConnectError:
             raise
@@ -2427,6 +2553,7 @@ class CursorAgentConnectClient:
         request_body = encode_cursor_run_request(request_payload)
         run_request = request_payload.get("runRequest")
         run_id = str(run_request.get("runId") or "").strip() if isinstance(run_request, Mapping) else ""
+        local_exec_tool_name = _advertised_local_exec_tool_name(request_payload)
         turn_extra_headers = {str(key).lower(): value for key, value in dict(extra_headers or {}).items()}
         if run_id:
             turn_extra_headers.setdefault("x-original-request-id", run_id)
@@ -2451,6 +2578,7 @@ class CursorAgentConnectClient:
                 headers=headers,
                 stop_on_tool_call=stop_on_tool_call,
                 timeout=timeout,
+                local_exec_tool_name=local_exec_tool_name,
             )
         except CursorConnectError as exc:
             if exc.status_code != 401:
@@ -2475,6 +2603,7 @@ class CursorAgentConnectClient:
                 headers=retry_headers,
                 stop_on_tool_call=stop_on_tool_call,
                 timeout=timeout,
+                local_exec_tool_name=local_exec_tool_name,
             )
 
 
