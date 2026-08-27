@@ -1096,7 +1096,6 @@ _UNSUPPORTED_LOCAL_EXEC_FIELDS = {
 }
 _LOCAL_EXEC_BRIDGE_FIELDS = {
     2: "shell_args",
-    14: "shell_stream_args",
 }
 _LOCAL_EXEC_TOOL_NAMES = (
     "exec_command",

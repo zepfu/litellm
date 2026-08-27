@@ -653,10 +653,8 @@ def test_h2_bidi_surfaces_local_shell_as_advertised_external_tool_call(
     )
 
 
-@pytest.mark.parametrize("message_field", [2, 14])
-def test_proto_bidi_bridges_advertised_local_shell_arguments(
-    message_field: int,
-) -> None:
+def test_proto_bidi_bridges_advertised_local_shell_arguments() -> None:
+    message_field = 2
     shell_args = _string(1, "pwd") + _string(2, "/workspace")
     exec_request = (
         _varint(1, 17)
@@ -680,6 +678,39 @@ def test_proto_bidi_bridges_advertised_local_shell_arguments(
         }
     }
     assert client_messages == []
+
+
+def test_proto_bidi_rejects_shell_stream_with_advertised_command_tool() -> None:
+    exec_request = (
+        _varint(1, 17)
+        + _string(15, "exec-local")
+        + _message(14, _string(1, "pwd") + _string(2, "/workspace"))
+    )
+    server_message = _message(2, exec_request)
+
+    normalized, client_messages = cursor_connect._process_agent_server_message(
+        server_message,
+        {},
+        local_exec_tool_name="exec_command",
+    )
+
+    assert normalized == {
+        "execServerMessage": {
+            "id": 17,
+            "execId": "exec-local",
+            "messageField": 14,
+        }
+    }
+    assert len(client_messages) == 2
+    error_control = _last_field(client_messages[0], 5, wire_type=2)
+    assert isinstance(error_control, bytes)
+    throw = _last_field(error_control, 2, wire_type=2)
+    assert isinstance(throw, bytes)
+    error = cursor_connect._decode_proto_string(
+        _last_field(throw, 2, wire_type=2)
+    )
+    assert "shell_stream_args" in error
+    assert "no local execution was performed" in error
 
 
 def test_proto_bidi_rejects_unsupported_local_exec_operation() -> None:
