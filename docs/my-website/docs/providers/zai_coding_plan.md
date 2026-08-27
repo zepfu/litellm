@@ -20,6 +20,7 @@ not a fallback.
 ## Supported models
 
 - `zai_coding_plan/glm-5.3`
+- `zai_coding_plan/glm-5.3-flash`
 - `zai_coding_plan/glm-5-turbo`
 - `zai_coding_plan/glm-4.7`
 

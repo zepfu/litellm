@@ -40,6 +40,7 @@ def _request() -> MagicMock:
     ("model", "expected"),
     (
         ("zai_coding_plan/glm-5.3", "zai_coding_plan/glm-5.3"),
+        ("zai_coding_plan/glm-5.3-flash", "zai_coding_plan/glm-5.3-flash"),
         ("zai_coding_plan/glm-5-turbo", "zai_coding_plan/glm-5-turbo"),
         ("zai_coding_plan/glm-4.7", "zai_coding_plan/glm-4.7"),
         ("glm-5.3", None),
@@ -110,6 +111,25 @@ async def test_should_prepare_codex_adapter_metadata_and_coding_url() -> None:
     )
     assert "sota-zai" not in json.dumps(completion_kwargs)
     assert "anthropic_zai_coding_plan" not in json.dumps(metadata)
+
+
+@pytest.mark.asyncio
+async def test_should_send_glm_5_3_flash_as_the_exact_upstream_model() -> None:
+    plan = await prepare_codex_zai_coding_plan_adapter_route(
+        request=_request(),
+        adapter_model="zai_coding_plan/glm-5.3-flash",
+        prepared_request_body={
+            "model": "zai_coding_plan/glm-5.3-flash",
+            "input": "hello",
+            "reasoning": {"effort": "low"},
+        },
+    )
+
+    completion_kwargs = plan.perform_kwargs["completion_kwargs"]
+    metadata = plan.prepared_request_body["litellm_metadata"]
+    assert completion_kwargs["model"] == "glm-5.3-flash"
+    assert metadata["zai_coding_plan_upstream_model"] == "glm-5.3-flash"
+    assert "glm-5.3\"" not in json.dumps(completion_kwargs)
 
 
 def test_should_normalize_codex_custom_tool_outputs_to_function_shape() -> None:

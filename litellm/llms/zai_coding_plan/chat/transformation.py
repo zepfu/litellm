@@ -17,7 +17,9 @@ ZAI_CODING_PLAN_CHAT_COMPLETIONS_URL = (
 )
 ZAI_CODING_PLAN_PROVIDER_NAME = "zai_coding_plan"
 ZAI_CODING_PLAN_USER_AGENT_PREFIX = "litellm-zai-coding-plan"
-ZAI_CODING_PLAN_MODEL_IDS = frozenset({"glm-5.3", "glm-5-turbo", "glm-4.7"})
+ZAI_CODING_PLAN_MODEL_IDS = frozenset(
+    {"glm-5.3", "glm-5.3-flash", "glm-5-turbo", "glm-4.7"}
+)
 ZAI_CODING_PLAN_REASONING_EFFORT_MAP = {
     "minimal": "low",
     "low": "low",
@@ -98,7 +100,8 @@ class ZAICodingPlanChatConfig(OpenAIGPTConfig):
         if normalized not in ZAI_CODING_PLAN_MODEL_IDS:
             raise ValueError(
                 f"Unsupported Z.AI Coding Plan model {model!r}. "
-                "Admitted models are glm-5.3, glm-5-turbo, and glm-4.7."
+                "Admitted models are glm-5.3, glm-5.3-flash, "
+                "glm-5-turbo, and glm-4.7."
             )
         return normalized
 
