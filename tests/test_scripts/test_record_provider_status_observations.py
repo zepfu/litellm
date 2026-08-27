@@ -47,8 +47,8 @@ def _codex_oauth_record(
     account_id = f"acct-{label}"
     return CodexOAuthCredentialRecord(
         label=label,
-        auth_path=root / f"oauth.{label}.json",
-        lock_path=root / f"oauth.{label}.json.lock",
+        auth_path=root / f"{label}.auth.json",
+        lock_path=root / f"{label}.auth.json.lock",
         priority=(declaration_order + 1) * 10,
         weight=1.0,
         enabled=enabled,
@@ -1416,9 +1416,18 @@ def test_loop_config_uses_dedicated_codex_quota_dsn(monkeypatch) -> None:
 def test_provider_status_compose_hardens_sidecar_db_path() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     compose_text = (repo_root / "docker-compose.dev.yml").read_text()
+    alpha_compose_text = (repo_root / "docker-compose.alpha.yml").read_text()
     dockerfile_text = (
         repo_root / "docker/Dockerfile.provider_status_observations"
     ).read_text()
+
+    for inventory_compose_text in (compose_text, alpha_compose_text):
+        assert "/home/zepfu/.codex/account1.auth.json" in inventory_compose_text
+        assert "/home/zepfu/.codex/account1.auth.json.lock" in inventory_compose_text
+        assert "/home/zepfu/.codex/account2.auth.json" in inventory_compose_text
+        assert "/home/zepfu/.codex/account2.auth.json.lock" in inventory_compose_text
+        assert "oauth.account1.json" not in inventory_compose_text
+        assert "oauth.account2.json" not in inventory_compose_text
 
     assert "container_name: aawm-provider-status-observations" in compose_text
     assert "AAWM_DB_HOST=${LITELLM_AAWM_DB_HOST:-pgbouncer-aawm-dev}" in compose_text
@@ -2507,8 +2516,8 @@ def test_provider_status_compose_aawm_network_rendered_default_name() -> None:
     ] == [
         (
             "account1",
-            "/home/zepfu/.codex/oauth.account1.json",
-            "/home/zepfu/.codex/oauth.account1.json.lock",
+            "/home/zepfu/.codex/account1.auth.json",
+            "/home/zepfu/.codex/account1.auth.json.lock",
             10,
             1.0,
             True,
@@ -2517,8 +2526,8 @@ def test_provider_status_compose_aawm_network_rendered_default_name() -> None:
         ),
         (
             "account2",
-            "/home/zepfu/.codex/oauth.account2.json",
-            "/home/zepfu/.codex/oauth.account2.json.lock",
+            "/home/zepfu/.codex/account2.auth.json",
+            "/home/zepfu/.codex/account2.auth.json.lock",
             20,
             1.0,
             True,
@@ -7646,6 +7655,69 @@ def test_codex_inventory_passive_health_isolates_records(monkeypatch) -> None:
     )
     assert aggregate["health"] == "degraded"
     assert aggregate["usable_count"] == 1
+
+
+def test_codex_inventory_env_prevents_passive_health_auth_json_fallback(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "LITELLM_CODEX_OAUTH_INVENTORY",
+        _codex_oauth_inventory_env_payload(),
+    )
+    config = _grok_oidc_auth_persist_config(
+        grok_oidc_refresh_enabled=False,
+        codex_oauth_inventory=None,
+        codex_auth_file="/home/zepfu/.codex/auth.json",
+        codex_auth_file_source="AAWM_CODEX_AUTH_FILE",
+        provider_auth_health_poll_enabled=True,
+        provider_auth_health_poll_interval_seconds=3600.0,
+    )
+    inspected = []
+
+    def fail_interactive_auth_json(*_args, **_kwargs):
+        raise AssertionError("managed Codex health must not inspect auth.json")
+
+    def inspect_inventory_record(record):
+        inspected.append((record.label, str(record.auth_path)))
+        return {
+            "attempted": True,
+            "health_status": "fresh",
+            "account_label": record.label,
+            "account_hash": record.expected_account_hash,
+            "expires_at": "2026-08-08T18:00:00Z",
+            "error_class": None,
+            "error_message": None,
+        }
+
+    monkeypatch.setattr(
+        loop.codex_oauth_refresh,
+        "inspect_codex_oauth_credential_health",
+        fail_interactive_auth_json,
+    )
+    monkeypatch.setattr(
+        loop,
+        "_inspect_codex_inventory_record_health",
+        inspect_inventory_record,
+    )
+    monkeypatch.setattr(
+        loop,
+        "_persist_codex_passive_auth_observation",
+        lambda *_args, **_kwargs: (False, 0, None, "apply_disabled"),
+    )
+
+    events = loop._run_provider_auth_health_poll_task(
+        config,
+        loop.SidecarTaskState(
+            provider_auth_health_poll_last_attempt_monotonic=100.0
+        ),
+        now_monotonic=200.0,
+    )
+
+    assert inspected == [
+        ("account1", "/home/zepfu/.codex/account1.auth.json"),
+        ("account2", "/home/zepfu/.codex/account2.auth.json"),
+    ]
+    assert any(event["event"] == "codex_oauth_health_aggregate" for event in events)
 
 
 def _xai_oauth_auth_persist_config(**overrides):

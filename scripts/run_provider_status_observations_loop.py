@@ -82,6 +82,7 @@ from litellm.secret_managers.grok_oidc_auth_path import (
     resolve_grok_oidc_auth_path,
 )
 from litellm.secret_managers.codex_oauth_inventory import (
+    CODEX_OAUTH_INVENTORY_ENV,
     CodexOAuthCredentialRecord,
     CodexOAuthCredentialSnapshot,
     CodexOAuthInventory,
@@ -1694,10 +1695,24 @@ def _load_codex_inventory_for_config(
     return load_codex_oauth_inventory()
 
 
+def _codex_oauth_inventory_is_configured() -> bool:
+    return bool(os.getenv(CODEX_OAUTH_INVENTORY_ENV, "").strip())
+
+
+def _resolve_codex_oauth_inventory(
+    config: ProviderStatusLoopConfig,
+) -> Optional[CodexOAuthInventory]:
+    if config.codex_oauth_inventory is not None:
+        return config.codex_oauth_inventory
+    if _codex_oauth_inventory_is_configured():
+        return load_codex_oauth_inventory()
+    return None
+
+
 def _require_codex_oauth_inventory(
     config: ProviderStatusLoopConfig,
 ) -> CodexOAuthInventory:
-    inventory = config.codex_oauth_inventory
+    inventory = _resolve_codex_oauth_inventory(config)
     if inventory is not None:
         return inventory
     return load_codex_oauth_inventory()
@@ -12325,7 +12340,7 @@ def _run_provider_auth_health_poll_task(  # noqa: PLR0915
             event["auth_observation_skip_reason"] = skip_reason
             events.append(event)
 
-    inventory = config.codex_oauth_inventory
+    inventory = _resolve_codex_oauth_inventory(config)
     if inventory is None:
         if not non_codex_due:
             return events

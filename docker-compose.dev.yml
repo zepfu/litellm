@@ -6,12 +6,12 @@ x-codex-oauth-inventory: &codex-oauth-inventory >-
   "credential_affinity":"interchangeable","strategy":"dual_quota_balance",
   "balance_band_percentage_points":10,
   "within_band_strategy":"weighted_round_robin"},"accounts":[
-  {"label":"account1","auth_path":"/home/zepfu/.codex/oauth.account1.json",
-  "lock_path":"/home/zepfu/.codex/oauth.account1.json.lock","priority":10,
+  {"label":"account1","auth_path":"/home/zepfu/.codex/account1.auth.json",
+  "lock_path":"/home/zepfu/.codex/account1.auth.json.lock","priority":10,
   "weight":1.0,"enabled":${AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED:-true},
   "models":["*"],"expected_account_hash":"${AAWM_CODEX_OAUTH_ACCOUNT1_EXPECTED_HASH:?AAWM_CODEX_OAUTH_ACCOUNT1_EXPECTED_HASH is required}"},
-  {"label":"account2","auth_path":"/home/zepfu/.codex/oauth.account2.json",
-  "lock_path":"/home/zepfu/.codex/oauth.account2.json.lock","priority":20,
+  {"label":"account2","auth_path":"/home/zepfu/.codex/account2.auth.json",
+  "lock_path":"/home/zepfu/.codex/account2.auth.json.lock","priority":20,
   "weight":1.0,"enabled":${AAWM_CODEX_OAUTH_ACCOUNT2_ENABLED:-true},
   "models":["*"],"expected_account_hash":"${AAWM_CODEX_OAUTH_ACCOUNT2_EXPECTED_HASH:?AAWM_CODEX_OAUTH_ACCOUNT2_EXPECTED_HASH is required}"}
   ]}

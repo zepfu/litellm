@@ -60,7 +60,7 @@ Related deeper context:
 
 | Family | Writer | Typical consumer | Default portable auth path |
 | --- | --- | --- | --- |
-| Codex / ChatGPT OAuth | Provider-status sidecar, using `scripts/codex_oauth_refresh.py` once per enabled inventory record | LiteLLM Codex adapter routes | Explicit `LITELLM_CODEX_OAUTH_INVENTORY`; managed dev enrolls `~/.codex/oauth.account1.json` and `~/.codex/oauth.account2.json` |
+| Codex / ChatGPT OAuth | Provider-status sidecar, using `scripts/codex_oauth_refresh.py` once per enabled inventory record | LiteLLM Codex adapter routes | Explicit `LITELLM_CODEX_OAUTH_INVENTORY`; managed dev enrolls `/home/zepfu/.codex/account1.auth.json` and `/home/zepfu/.codex/account2.auth.json` |
 | Managed xAI OAuth (`oa_xai/*`) | `scripts/xai_oauth_refresh.py` (sidecar) | LiteLLM managed xAI OAuth routes | `~/.litellm/xai/oauth-auth.json` |
 | Grok native OIDC | `scripts/grok_oidc_refresh.py` (sidecar) | LiteLLM Grok native routes | Caller-supplied configured path |
 | Kimi Code CLI OAuth (`kimi_code`) | Existing Kimi Code CLI grant; sidecar refresh only when enabled | Configured LiteLLM Kimi Code consumers | `~/.kimi-code/credentials/kimi-code.json` |
@@ -118,8 +118,8 @@ the same inventory to the proxy and provider-status sidecar:
 
 | Label | Auth path | Independent lock path | Priority | Weight | Enabled | Models |
 | --- | --- | --- | --- | --- | --- | --- |
-| `account1` | `/home/zepfu/.codex/oauth.account1.json` | `/home/zepfu/.codex/oauth.account1.json.lock` | `10` | `1.0` | `AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED` (default `true`) | `["*"]` |
-| `account2` | `/home/zepfu/.codex/oauth.account2.json` | `/home/zepfu/.codex/oauth.account2.json.lock` | `20` | `1.0` | `AAWM_CODEX_OAUTH_ACCOUNT2_ENABLED` (default `true`) | `["*"]` |
+| `account1` | `/home/zepfu/.codex/account1.auth.json` | `/home/zepfu/.codex/account1.auth.json.lock` | `10` | `1.0` | `AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED` (default `true`) | `["*"]` |
+| `account2` | `/home/zepfu/.codex/account2.auth.json` | `/home/zepfu/.codex/account2.auth.json.lock` | `20` | `1.0` | `AAWM_CODEX_OAUTH_ACCOUNT2_ENABLED` (default `true`) | `["*"]` |
 
 Operator mapping for those enrolled files (documentation only; not inventory
 schema fields):
@@ -197,6 +197,12 @@ usable. Aggregate health is degraded while at least one record remains usable
 and terminal when none do. Sidecar events and observations use only the
 configured label and expected safe hash; they do not emit raw paths, account
 IDs, or tokens.
+
+When `LITELLM_CODEX_OAUTH_INVENTORY` is configured, all provider-status Codex
+refresh, passive-health, and reset-credit/quota work uses only those inventory
+records. The standalone `~/.codex/auth.json` and its lock remain a generic
+single-file primitive for operation outside inventory mode; they are never a
+managed-inventory fallback.
 
 ## Codex multi-account request routing (OPENAI-004)
 

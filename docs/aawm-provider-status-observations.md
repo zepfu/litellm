@@ -224,8 +224,10 @@ deployment or runtime acceptance evidence.
 
 Managed Codex proxy consumers use only the explicit
 `LITELLM_CODEX_OAUTH_INVENTORY`. Development Compose enrolls ordered
-`account1` and `account2` records with separate auth files, separate lock
-files, stable non-secret labels, explicit model eligibility, and
+`account1` and `account2` records at
+`/home/zepfu/.codex/account1.auth.json` and
+`/home/zepfu/.codex/account2.auth.json`, each with a separate matching lock
+file, stable non-secret labels, explicit model eligibility, and
 operator-supplied expected account hashes. It supplies the same inventory to
 the provider-status sidecar so deployment configuration cannot silently drift.
 
@@ -243,6 +245,9 @@ suppress later records, including an otherwise idle `account2`. Refresh and
 health aggregates are `healthy` when every enabled record is usable,
 `degraded` when some are usable, and `terminal` when none are usable. Events
 emit only the configured label and pinned safe hash for account identity.
+When inventory mode is configured, those record paths are the only Codex paths
+used by provider-status refresh, health, and quota work; the generic
+`~/.codex/auth.json` primitive is available only outside inventory mode.
 Refresh scheduler evidence and actual-attempt throttles remain independent for
 each label; one account's due check, failure, or endpoint attempt does not
 consume the other account's timer.
