@@ -30,6 +30,11 @@ _OPENCODE_GO_ALIAS_CANDIDATE_TIMEOUT_SECONDS = 30.0
 _CURSOR_REPLAY_TTL_SECONDS = 600.0
 _CURSOR_REPLAY_MAX_SIZE = 256
 _CURSOR_REPLAY_REGISTRY: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_CURSOR_TOOL_CONTINUATION_CUE = (
+    "Finish the original user request using the completed tool result above. "
+    "Do not repeat completed tool calls."
+)
+_CURSOR_TOOL_CONTINUATION_CUE_MARKER = "_cursor_tool_continuation_cue"
 _CURSOR_REPLAY_PRESERVED_STATUS_CODES = frozenset(
     {408, 500, 502, 503, 504, 529}
 )
@@ -1033,11 +1038,15 @@ def _responses_input_to_cursor_messages(
                 function_calls,
             )
     saw_function_call_output = False
+    saw_new_user_message = False
     last_item_was_user = False
+    function_call_output_ends_input = False
+    input_items = _cursor_response_input_items(request_body)
 
-    for raw_item in _cursor_response_input_items(request_body):
+    for item_index, raw_item in enumerate(input_items):
         if isinstance(raw_item, str):
             messages.append({"role": "user", "content": raw_item})
+            saw_new_user_message = True
             last_item_was_user = bool(raw_item)
             continue
         item = _cursor_as_mapping(raw_item)
@@ -1054,6 +1063,10 @@ def _responses_input_to_cursor_messages(
         if item_type in {"function_call_output", "mcp_call_output"}:
             messages.append(_cursor_tool_result_message(item, function_calls))
             saw_function_call_output = True
+            function_call_output_ends_input = (
+                item_type == "function_call_output"
+                and item_index == len(input_items) - 1
+            )
             last_item_was_user = False
             continue
 
@@ -1070,6 +1083,8 @@ def _responses_input_to_cursor_messages(
         message = _cursor_message_input_item(item, function_calls)
         if message is not None:
             messages.append(message)
+            if message["role"] == "user":
+                saw_new_user_message = True
             last_item_was_user = message["role"] == "user" and bool(
                 message["content"]
             )
@@ -1079,11 +1094,16 @@ def _responses_input_to_cursor_messages(
             f"Cursor Agent received unsupported Responses input type: {item_type or role or 'unknown'}."
         )
 
-    # A tool result is a continuation of the interrupted Cursor turn.  An
-    # empty current user message keeps the replayed tool rows in history while
-    # avoiding a second copy of the original user prompt.
+    # A tool result is a continuation of the interrupted Cursor turn.
     if saw_function_call_output and not last_item_was_user:
-        messages.append({"role": "user", "content": ""})
+        continuation_message: dict[str, Any] = {"role": "user", "content": ""}
+        if function_call_output_ends_input and not saw_new_user_message:
+            continuation_message = {
+                "role": "user",
+                "content": _CURSOR_TOOL_CONTINUATION_CUE,
+                _CURSOR_TOOL_CONTINUATION_CUE_MARKER: True,
+            }
+        messages.append(continuation_message)
     if not messages:
         messages.append({"role": "user", "content": ""})
     return messages
@@ -1094,6 +1114,10 @@ def _cursor_messages_with_result_tool_calls(
     tool_calls: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     replay_messages = copy.deepcopy(messages)
+    if replay_messages and replay_messages[-1].get(
+        _CURSOR_TOOL_CONTINUATION_CUE_MARKER
+    ):
+        replay_messages.pop()
     function_calls: dict[str, str] = {}
     for message in replay_messages:
         if message.get("role") == "assistant":

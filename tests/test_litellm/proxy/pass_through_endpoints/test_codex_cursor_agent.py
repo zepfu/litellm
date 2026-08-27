@@ -115,6 +115,14 @@ def _replay_body(response_id: str = "resp-replay") -> dict[str, Any]:
 def test_cursor_codex_path_returns_native_function_call_and_replays_tool_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    continuation_cue = (
+        "Finish the original user request using the completed tool result above. "
+        "Do not repeat completed tool calls."
+    )
+    assert codex_candidate_calls._responses_input_to_cursor_messages(
+        {"input": "run pwd"}
+    ) == [{"role": "user", "content": "run pwd"}]
+
     class FakeCursorClient:
         calls: list[dict[str, Any]] = []
         init_kwargs: list[dict[str, Any]] = []
@@ -267,7 +275,10 @@ def test_cursor_codex_path_returns_native_function_call_and_replays_tool_history
         ]
     }
     assert "rootPromptMessagesJson" not in json.dumps(second_run)
-    assert second_run["action"]["userMessageAction"]["userMessage"]["text"] == ""
+    assert (
+        second_run["action"]["userMessageAction"]["userMessage"]["text"]
+        == continuation_cue
+    )
     assert second_run["mcpTools"]["mcpTools"][0]["name"] == "exec_command"
     assert (
         history["messages"][2]["tool"]["toolCallId"]
@@ -328,6 +339,10 @@ def test_cursor_codex_path_returns_native_function_call_and_replays_tool_history
             },
         ]
     }
+    assert (
+        third_run["action"]["userMessageAction"]["userMessage"]["text"]
+        == continuation_cue
+    )
     assert third_run["mcpTools"]["mcpTools"][0]["name"] == "exec_command"
     message_ids = [
         run["action"]["userMessageAction"]["userMessage"]["messageId"]
