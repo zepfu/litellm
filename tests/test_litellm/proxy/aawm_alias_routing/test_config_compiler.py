@@ -376,38 +376,37 @@ def test_canonical_provider_nvidia_compiles_closed_nim_set_without_alias_referen
     assert identities == [
         (
             "nvidia",
-            "nvidia/deepseek-ai/deepseek-v3.2",
+            "nvidia/openai/gpt-oss-20b",
             "codex_nvidia_completion_adapter",
             100,
         ),
         (
             "nvidia",
-            "nvidia/deepseek-ai/deepseek-v3.1-terminus",
+            "nvidia/deepseek-ai/deepseek-v4-flash-0731",
             "codex_nvidia_completion_adapter",
             90,
         ),
         (
             "nvidia",
-            "nvidia/mistralai/devstral-2-123b-instruct-2512",
+            "nvidia/nvidia/nemotron-3-super-120b-a12b",
             "codex_nvidia_completion_adapter",
             80,
         ),
         (
             "nvidia",
-            "nvidia/z-ai/glm4.7",
+            "nvidia/minimaxai/minimax-m3",
             "codex_nvidia_completion_adapter",
             70,
         ),
         (
             "nvidia",
-            "nvidia/minimaxai/minimax-m2.7",
+            "nvidia/openai/gpt-oss-120b",
             "codex_nvidia_completion_adapter",
             60,
         ),
     ]
     for entry in alias.candidates:
         assert entry.anthropic_route_family is None
-        assert "nemotron" not in entry.model
 
 
 def test_nvidia_credential_domain_rejects_foreign_provider_and_non_nim_family() -> None:

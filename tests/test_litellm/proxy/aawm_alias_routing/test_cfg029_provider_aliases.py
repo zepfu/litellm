@@ -207,31 +207,31 @@ def test_compile_directory_exposes_one_closed_provider_alias_per_registered_prov
 _NVIDIA_CLOSED_SET = (
     (
         "nvidia",
-        "nvidia/deepseek-ai/deepseek-v3.2",
+        "nvidia/openai/gpt-oss-20b",
         "codex_nvidia_completion_adapter",
         100,
     ),
     (
         "nvidia",
-        "nvidia/deepseek-ai/deepseek-v3.1-terminus",
+        "nvidia/deepseek-ai/deepseek-v4-flash-0731",
         "codex_nvidia_completion_adapter",
         90,
     ),
     (
         "nvidia",
-        "nvidia/mistralai/devstral-2-123b-instruct-2512",
+        "nvidia/nvidia/nemotron-3-super-120b-a12b",
         "codex_nvidia_completion_adapter",
         80,
     ),
     (
         "nvidia",
-        "nvidia/z-ai/glm4.7",
+        "nvidia/minimaxai/minimax-m3",
         "codex_nvidia_completion_adapter",
         70,
     ),
     (
         "nvidia",
-        "nvidia/minimaxai/minimax-m2.7",
+        "nvidia/openai/gpt-oss-120b",
         "codex_nvidia_completion_adapter",
         60,
     ),
@@ -256,7 +256,6 @@ def test_provider_nvidia_keeps_closed_five_model_nim_set() -> None:
     for entry in alias.candidates:
         assert isinstance(entry, RoutingCandidate)
         assert entry.provider == "nvidia"
-        assert "nemotron" not in entry.model
         assert not entry.model.endswith(":free")
         assert entry.route_family == "codex_nvidia_completion_adapter"
         assert entry.anthropic_route_family is None
