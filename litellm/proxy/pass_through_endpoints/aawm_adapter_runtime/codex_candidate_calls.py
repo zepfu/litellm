@@ -10,6 +10,9 @@ from __future__ import annotations
 import copy
 import json
 import re
+import time
+import uuid
+from collections import OrderedDict
 from types import FunctionType
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
@@ -24,6 +27,61 @@ from litellm.secret_managers.credential_error_sanitizer import (
 )
 
 _OPENCODE_GO_ALIAS_CANDIDATE_TIMEOUT_SECONDS = 30.0
+_CURSOR_REPLAY_TTL_SECONDS = 600.0
+_CURSOR_REPLAY_MAX_SIZE = 256
+_CURSOR_REPLAY_REGISTRY: OrderedDict[str, dict[str, Any]] = OrderedDict()
+
+
+def _prune_cursor_replay_registry(now: Optional[float] = None) -> None:
+    current = time.monotonic() if now is None else now
+    expired = [
+        response_id
+        for response_id, state in _CURSOR_REPLAY_REGISTRY.items()
+        if float(state["expires_at"]) <= current
+    ]
+    for response_id in expired:
+        _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
+
+
+def _store_cursor_replay_state(
+    response_id: str,
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[Any],
+) -> None:
+    now = time.monotonic()
+    _prune_cursor_replay_registry(now)
+    _CURSOR_REPLAY_REGISTRY[response_id] = {
+        "expires_at": now + _CURSOR_REPLAY_TTL_SECONDS,
+        "messages": copy.deepcopy(messages),
+        "tools": copy.deepcopy(tools),
+    }
+    _CURSOR_REPLAY_REGISTRY.move_to_end(response_id)
+    while len(_CURSOR_REPLAY_REGISTRY) > _CURSOR_REPLAY_MAX_SIZE:
+        _CURSOR_REPLAY_REGISTRY.popitem(last=False)
+
+
+def _take_cursor_replay_state(response_id: str) -> dict[str, Any]:
+    from litellm.llms.cursor_agent.connect import CursorConnectError
+
+    now = time.monotonic()
+    state = _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
+    _prune_cursor_replay_registry(now)
+    if state is None:
+        raise CursorConnectError(
+            "Cursor Agent continuation state is missing for previous_response_id.",
+            status_code=409,
+        )
+    if float(state["expires_at"]) <= now:
+        raise CursorConnectError(
+            "Cursor Agent continuation state expired for previous_response_id.",
+            status_code=409,
+        )
+    return state
+
+
+def _clear_cursor_replay_registry() -> None:
+    _CURSOR_REPLAY_REGISTRY.clear()
 
 
 def _watermark_endpoint_from_path(*parts: Any) -> str:
@@ -275,6 +333,12 @@ def install(
     production facade.
     """
     _mod = globals()
+    for _name in (
+        "_perform_codex_auto_agent_cursor_agent_request",
+        "_raise_cursor_agent_alias_error",
+    ):
+        host_globals.setdefault(_name, _mod[_name])
+
     for _name in _HOST_FUNCTION_NAMES:
         _obj = _mod[_name]
         if not isinstance(_obj, FunctionType):
@@ -630,14 +694,27 @@ async def _perform_codex_auto_agent_alias_candidate_request(
         )
 
     async def _cursor_agent() -> Response:
-        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.codex_candidate_calls import (
-            _raise_cursor_agent_alias_not_implemented,
-        )
+        try:
+            return await _perform_codex_auto_agent_cursor_agent_request(
+                endpoint=endpoint,
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                candidate=candidate,
+                candidate_body=candidate_body,
+                target_url=target_url,
+                api_key=api_key,
+                forward_headers=forward_headers,
+            )
+        except Exception as exc:
+            from litellm.proxy._types import ProxyException
 
-        _raise_cursor_agent_alias_not_implemented(
-            ingress="codex",
-            candidate=candidate,
-        )
+            if isinstance(exc, ProxyException):
+                raise
+            _raise_cursor_agent_alias_error(
+                exc=exc,
+                candidate=candidate,
+            )
 
     async def _nvidia() -> Response:
         if candidate.get("route_family") != "codex_nvidia_completion_adapter":
@@ -738,6 +815,494 @@ def _raise_cursor_agent_alias_not_implemented(
         },
     )
     raise exc
+
+
+def _cursor_as_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump()
+        if isinstance(dumped, dict):
+            return dumped
+    return {}
+
+
+def _cursor_response_content_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("text", "input_text", "output_text"):
+            nested = value.get(key)
+            if isinstance(nested, str):
+                return nested
+            if isinstance(nested, dict):
+                text = _cursor_response_content_text(nested)
+                if text:
+                    return text
+        return ""
+    if isinstance(value, list):
+        return "".join(_cursor_response_content_text(item) for item in value)
+    return ""
+
+
+def _cursor_function_call_arguments(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list, int, float, bool)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return "{}"
+
+
+def _cursor_call_id(item: dict[str, Any]) -> str:
+    return str(
+        item.get("call_id")
+        or item.get("callId")
+        or item.get("id")
+        or ""
+    )
+
+
+def _cursor_function_name(item: dict[str, Any]) -> str:
+    function = _cursor_as_mapping(item.get("function"))
+    return str(item.get("name") or function.get("name") or "")
+
+
+def _cursor_function_call_message(
+    item: dict[str, Any],
+    function_calls: dict[str, str],
+) -> dict[str, Any]:
+    call_id = _cursor_call_id(item)
+    name = _cursor_function_name(item)
+    function = _cursor_as_mapping(item.get("function"))
+    arguments = item.get("arguments")
+    if arguments is None:
+        arguments = function.get("arguments")
+    if not call_id or not name:
+        raise ValueError(
+            "Cursor Agent continuation requires function_call call_id and name."
+        )
+    function_calls[call_id] = name
+    return {
+        "role": "assistant",
+        "content": _cursor_response_content_text(item.get("content")),
+        "tool_calls": [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": _cursor_function_call_arguments(arguments),
+                },
+            }
+        ],
+    }
+
+
+def _cursor_tool_result_message(
+    item: dict[str, Any],
+    function_calls: dict[str, str],
+) -> dict[str, Any]:
+    call_id = _cursor_call_id(item)
+    if not call_id or call_id not in function_calls:
+        raise ValueError(
+            "Cursor Agent continuation requires a matching "
+            "function_call for every function_call_output."
+        )
+    output = item.get("output")
+    if output is None:
+        output = item.get("content")
+    return {
+        "role": "tool",
+        "tool_call_id": call_id,
+        "content": _cursor_response_content_text(output),
+    }
+
+
+def _remember_cursor_message_tool_calls(
+    tool_calls: Any,
+    function_calls: dict[str, str],
+) -> None:
+    if not isinstance(tool_calls, list):
+        return
+    for tool_call in tool_calls:
+        call_mapping = _cursor_as_mapping(tool_call)
+        call_id = _cursor_call_id(call_mapping)
+        name = _cursor_function_name(call_mapping)
+        if call_id and name:
+            function_calls[call_id] = name
+
+
+def _cursor_message_input_item(
+    item: dict[str, Any],
+    function_calls: dict[str, str],
+) -> Optional[dict[str, Any]]:
+    item_type = str(item.get("type") or "")
+    if item_type == "input_text":
+        return {
+            "role": "user",
+            "content": _cursor_response_content_text(item.get("text")),
+        }
+    role = str(item.get("role") or "")
+    if role not in {"user", "assistant", "system", "developer"} and item_type != "message":
+        return None
+    message_role = role or "user"
+    if message_role == "developer":
+        message_role = "system"
+    message: dict[str, Any] = {
+        "role": message_role,
+        "content": _cursor_response_content_text(item.get("content")),
+    }
+    if message_role == "assistant":
+        tool_calls = item.get("tool_calls") or item.get("toolCalls")
+        if isinstance(tool_calls, list):
+            message["tool_calls"] = tool_calls
+            _remember_cursor_message_tool_calls(tool_calls, function_calls)
+    return message
+
+
+def _cursor_response_input_items(request_body: dict[str, Any]) -> list[Any]:
+    raw_input = request_body.get("input", "")
+    if isinstance(raw_input, list):
+        return raw_input
+    if raw_input is None:
+        return []
+    return [raw_input]
+
+
+def _responses_input_to_cursor_messages(
+    request_body: dict[str, Any],
+    *,
+    prior_messages: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    """Translate one Responses request, including a tool continuation."""
+    messages = copy.deepcopy(prior_messages or [])
+    instructions = request_body.get("instructions")
+    if instructions and not prior_messages:
+        messages.append(
+            {
+                "role": "system",
+                "content": _cursor_response_content_text(instructions),
+            }
+        )
+
+    function_calls: dict[str, str] = {}
+    for message in messages:
+        if message.get("role") == "assistant":
+            _remember_cursor_message_tool_calls(
+                message.get("tool_calls") or message.get("toolCalls"),
+                function_calls,
+            )
+    saw_function_call_output = False
+    last_item_was_user = False
+
+    for raw_item in _cursor_response_input_items(request_body):
+        if isinstance(raw_item, str):
+            messages.append({"role": "user", "content": raw_item})
+            last_item_was_user = bool(raw_item)
+            continue
+        item = _cursor_as_mapping(raw_item)
+        if not item:
+            raise ValueError("Cursor Agent received an unsupported empty input item.")
+        item_type = str(item.get("type") or "")
+        role = str(item.get("role") or "")
+
+        if item_type in {"function_call", "mcp_call"}:
+            messages.append(_cursor_function_call_message(item, function_calls))
+            last_item_was_user = False
+            continue
+
+        if item_type in {"function_call_output", "mcp_call_output"}:
+            messages.append(_cursor_tool_result_message(item, function_calls))
+            saw_function_call_output = True
+            last_item_was_user = False
+            continue
+
+        if role == "tool":
+            messages.append(_cursor_tool_result_message(item, function_calls))
+            saw_function_call_output = True
+            last_item_was_user = False
+            continue
+
+        if item_type in {"reasoning", "computer_call", "computer_call_output"}:
+            last_item_was_user = False
+            continue
+
+        message = _cursor_message_input_item(item, function_calls)
+        if message is not None:
+            messages.append(message)
+            last_item_was_user = message["role"] == "user" and bool(
+                message["content"]
+            )
+            continue
+
+        raise ValueError(
+            f"Cursor Agent received unsupported Responses input type: {item_type or role or 'unknown'}."
+        )
+
+    # A tool result is a continuation of the interrupted Cursor turn.  An
+    # empty current user message keeps the replayed tool rows in history while
+    # avoiding a second copy of the original user prompt.
+    if saw_function_call_output and not last_item_was_user:
+        messages.append({"role": "user", "content": ""})
+    if not messages:
+        messages.append({"role": "user", "content": ""})
+    return messages
+
+
+def _cursor_messages_with_result_tool_calls(
+    messages: list[dict[str, Any]],
+    tool_calls: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    replay_messages = copy.deepcopy(messages)
+    function_calls: dict[str, str] = {}
+    for message in replay_messages:
+        if message.get("role") == "assistant":
+            _remember_cursor_message_tool_calls(
+                message.get("tool_calls") or message.get("toolCalls"),
+                function_calls,
+            )
+    for tool_call in tool_calls:
+        replay_messages.append(
+            _cursor_function_call_message(tool_call, function_calls)
+        )
+    return replay_messages
+
+
+def _cursor_responses_response_body(
+    *,
+    model: str,
+    result: Any,
+) -> dict[str, Any]:
+    response_id = f"resp_{uuid.uuid4().hex}"
+    output: list[dict[str, Any]] = []
+    if result.text:
+        output.append(
+            {
+                "id": f"msg_{response_id}",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": result.text,
+                        "annotations": [],
+                    }
+                ],
+            }
+        )
+    for tool_call in result.tool_calls:
+        output.append(
+            {
+                "id": str(tool_call.get("id") or f"fc_{tool_call['call_id']}"),
+                "type": "function_call",
+                "status": "completed",
+                "call_id": str(tool_call["call_id"]),
+                "name": str(tool_call["name"]),
+                "arguments": str(tool_call.get("arguments") or "{}"),
+            }
+        )
+    body: dict[str, Any] = {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": model,
+        "output": output,
+        "output_text": result.text,
+    }
+    if result.usage:
+        body["usage"] = dict(result.usage)
+    if result.provider_metadata:
+        body["provider_specific_fields"] = dict(result.provider_metadata)
+    return body
+
+
+async def _perform_codex_auto_agent_cursor_agent_request(
+    *,
+    endpoint: str,
+    request: Request,
+    fastapi_response: Response,
+    user_api_key_dict: Any,
+    candidate: dict[str, Any],
+    candidate_body: dict[str, Any],
+    target_url: str,
+    api_key: Optional[str],
+    forward_headers: bool,
+) -> Response:
+    """Execute a Codex Responses request through Cursor Agent Connect."""
+    _ = (
+        endpoint,
+        fastapi_response,
+        user_api_key_dict,
+        target_url,
+        api_key,
+        forward_headers,
+    )
+    from fastapi.responses import Response, StreamingResponse
+
+    from litellm.llms.cursor_agent.common_utils import (
+        build_run_request,
+        run_url,
+    )
+    from litellm.llms.cursor_agent.connect import (
+        CursorAgentConnectClient,
+        CursorConnectError,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
+        _responses_sse_from_repaired_response_body,
+    )
+
+    if candidate.get("route_family") != "codex_cursor_agent_aiserver_adapter":
+        raise ValueError(
+            "Cursor Agent Codex candidates require "
+            "codex_cursor_agent_aiserver_adapter."
+        )
+
+    request_body = dict(candidate_body)
+    replay_state: Optional[dict[str, Any]] = None
+    previous_response_id = request_body.get("previous_response_id")
+    if isinstance(previous_response_id, str) and previous_response_id:
+        replay_state = _take_cursor_replay_state(previous_response_id)
+    messages = _responses_input_to_cursor_messages(
+        request_body,
+        prior_messages=(
+            replay_state.get("messages")
+            if isinstance(replay_state, dict)
+            and isinstance(replay_state.get("messages"), list)
+            else None
+        ),
+    )
+    optional_params: dict[str, Any] = {}
+    request_tools = request_body.get("tools")
+    if not isinstance(request_tools, list) and isinstance(replay_state, dict):
+        request_tools = replay_state.get("tools")
+    if isinstance(request_tools, list):
+        optional_params["tools"] = request_tools
+    for source_names, cursor_name in (
+        (("message_id", "messageId"), "message_id"),
+        (("conversation_id", "conversationId"), "conversation_id"),
+        (("conversation_group_id", "conversationGroupId"), "conversation_group_id"),
+        (("run_id", "runId"), "run_id"),
+        (("agent_session_id", "agentSessionId"), "agent_session_id"),
+    ):
+        value = next(
+            (
+                request_body.get(source_name)
+                for source_name in source_names
+                if request_body.get(source_name)
+            ),
+            None,
+        )
+        if value:
+            optional_params[cursor_name] = value
+    cursor_request = build_run_request(
+        model=str(candidate.get("model") or request_body.get("model") or ""),
+        messages=messages,
+        optional_params=optional_params,
+    )
+
+    candidate_api_base = candidate.get("api_base")
+    cursor_url = run_url(
+        str(candidate_api_base)
+        if isinstance(candidate_api_base, str) and candidate_api_base.strip()
+        else None
+    )
+    extra_headers: dict[str, str] = {}
+    request_headers = getattr(request, "headers", None)
+    if request_headers is not None:
+        request_id = request_headers.get("x-request-id")
+        if request_id:
+            extra_headers["x-request-id"] = str(request_id)
+
+    client = CursorAgentConnectClient()
+    try:
+        result = await client.run(
+            cursor_request,
+            url=cursor_url,
+            extra_headers=extra_headers,
+            stop_on_tool_call=True,
+        )
+    except CursorConnectError:
+        raise
+
+    result.validate_terminal()
+    if result.exec_server_messages and not (
+        result.tool_calls or result.text or result.turn_ended
+    ):
+        raise CursorConnectError(
+            "Cursor Agent returned execServerMessage without a replayable "
+            "tool-call event; the bounded fresh-Run continuation bridge "
+            "cannot represent that server message.",
+            status_code=502,
+        )
+    if not result.tool_calls and not result.text and not result.turn_ended:
+        raise CursorConnectError(
+            "Cursor Agent Connect completed without text, a function call, or turnEnded.",
+            status_code=502,
+        )
+
+    model = str(candidate.get("model") or request_body.get("model") or "")
+    response_body = _cursor_responses_response_body(model=model, result=result)
+    if result.tool_calls:
+        _store_cursor_replay_state(
+            response_body["id"],
+            messages=_cursor_messages_with_result_tool_calls(
+                messages,
+                result.tool_calls,
+            ),
+            tools=request_tools if isinstance(request_tools, list) else [],
+        )
+    if bool(request_body.get("stream")):
+        return StreamingResponse(
+            _responses_sse_from_repaired_response_body(
+                response_body,
+                request_body=request_body,
+            ),
+            media_type="text/event-stream",
+        )
+    return Response(
+        content=json.dumps(response_body, ensure_ascii=False),
+        media_type="application/json",
+    )
+
+
+def _raise_cursor_agent_alias_error(
+    *,
+    exc: Exception,
+    candidate: dict[str, Any],
+) -> None:
+    from litellm.proxy._types import ProxyException
+
+    status_code = int(getattr(exc, "status_code", 502) or 502)
+    if status_code < 400 or status_code > 599:
+        status_code = 502
+    message = str(getattr(exc, "message", None) or exc)
+    model = str(candidate.get("model") or "")
+    route_family = str(candidate.get("route_family") or "")
+    detail = (
+        "aawm_codex_auto_agent_candidate_unavailable: "
+        f"cursor_agent request failed; model={model} "
+        f"route_family={route_family}; {message}"
+    )
+    proxy_exc = ProxyException(
+        message=detail,
+        type="authentication_error" if status_code == 401 else "upstream_error",
+        param="model",
+        code=status_code,
+    )
+    setattr(
+        proxy_exc,
+        "detail",
+        {
+            "error": {
+                "message": detail,
+                "code": "aawm_codex_auto_agent_candidate_unavailable",
+            }
+        },
+    )
+    raise proxy_exc from exc
 
 
 def _build_codex_cohere_adapter_request_body(

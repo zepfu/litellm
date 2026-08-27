@@ -43,13 +43,6 @@ services:
     restart: unless-stopped
     command:
       - /usr/bin/env
-      - AAWM_LITELLM_ENVIRONMENT=litellm-alpha
-      - LITELLM_AAWM_ERROR_LOG_ENV=alpha
-      - LITELLM_LANGFUSE_TRACE_ENVIRONMENT=alpha
-      - AAWM_ALIAS_ROUTING_STATE_NAMESPACE=aawm-routing-alpha-v1
-      - PGAPPNAME=aawm-litellm-alpha
-      - AAWM_SESSION_HISTORY_DB_APPLICATION_NAME=aawm-litellm-alpha-session-history
-      - AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME=aawm-litellm-alpha-dynamic-injection
       - LITELLM_KIMI_NATIVE_CONTRACT_PATH=/run/aawm/kimi-descriptor/native-contract.json
       - watchfiles
       - litellm --config /app/litellm-dev-config.yaml --port 4011
@@ -85,22 +78,22 @@ services:
       - /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai:ro
       - /home/zepfu/.kimi-code/credentials:/home/zepfu/.kimi-code/credentials:ro
       - /home/zepfu/.hermes:/home/zepfu/.hermes:ro
+      - /home/zepfu/.config/cursor/auth.json:/home/zepfu/.config/cursor/auth.json:ro
       - ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.kimi-code/native-contract}:/run/aawm/kimi-descriptor:ro
       - ${AAWM_GROK_CLIENT_VERSION_CACHE_DIR:-/home/zepfu/.cache/aawm/grok}:/run/aawm/grok:ro
       - /home/zepfu/.qwen/settings.json:/home/zepfu/.qwen/settings.json:ro
       - /etc/hostname:/host/etc/hostname:ro
       - ${AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_HOST_DIR:-/home/zepfu/.analysis/aawm-host-identity}:/host/aawm:ro
-    # Same variable surface as the development proxy; the alpha-specific
-    # labels above are applied by the /usr/bin/env command prefix and take
-    # precedence over these defaults at process level.
+    # Same variable surface as the development proxy; alpha identity and
+    # isolation values below are literal to prevent dev interpolation.
     environment:
       # Langfuse — read from host env or set defaults
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
       - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
       - LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com}
-      - LITELLM_LANGFUSE_TRACE_ENVIRONMENT=${LITELLM_LANGFUSE_TRACE_ENVIRONMENT:-dev}
+      - LITELLM_LANGFUSE_TRACE_ENVIRONMENT=alpha
       - LITELLM_AAWM_ERROR_LOG_ENABLED=${LITELLM_AAWM_ERROR_LOG_ENABLED:-1}
-      - LITELLM_AAWM_ERROR_LOG_ENV=${LITELLM_AAWM_ERROR_LOG_ENV:-alpha}
+      - LITELLM_AAWM_ERROR_LOG_ENV=alpha
       - LITELLM_AAWM_ERROR_LOG_DIR=${LITELLM_AAWM_ERROR_LOG_DIR:-/app/.analysis}
       - AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_PATH=${AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_PATH:-/host/aawm/tailscale-self.json}
       - LITELLM_LOCAL_MODEL_COST_MAP=${LITELLM_LOCAL_MODEL_COST_MAP:-True}
@@ -118,10 +111,10 @@ services:
       - AAWM_DB_URL=${LITELLM_AAWM_DB_URL:-}
       - AAWM_DATABASE_URL=${LITELLM_AAWM_DATABASE_URL:-postgresql://aawm:aawm_dev@pgbouncer-aawm-dev:6432/aawm_tristore?application_name=aawm-litellm-session-history}
       - AAWM_DIRECT_DATABASE_URL=${LITELLM_AAWM_DIRECT_DATABASE_URL:-postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore}
-      - AAWM_SESSION_HISTORY_DB_APPLICATION_NAME=${LITELLM_AAWM_SESSION_HISTORY_DB_APPLICATION_NAME:-aawm-litellm-session-history}
+      - AAWM_SESSION_HISTORY_DB_APPLICATION_NAME=aawm-litellm-alpha-session-history
       - AAWM_SESSION_HISTORY_SPOOL_DIR=/app/.analysis/runtime/litellm-alpha/session_history
       - AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE=${LITELLM_AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE:-0}
-      - AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME=${LITELLM_AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME:-aawm-litellm-dynamic-injection}
+      - AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME=aawm-litellm-alpha-dynamic-injection
       # Dynamic-injection/tristore selectors. Empty defaults keep the runtime
       # fallback to the AAWM_DB_* values above; set LITELLM_AAWM_DYNAMIC_* to
       # split dynamic context queries onto a different database than the
@@ -133,7 +126,7 @@ services:
       - AAWM_DYNAMIC_INJECTION_DB_PASSWORD=${LITELLM_AAWM_DYNAMIC_INJECTION_DB_PASSWORD:-}
       - AAWM_DYNAMIC_INJECTION_DB_SSLMODE=${LITELLM_AAWM_DYNAMIC_INJECTION_DB_SSLMODE:-}
       - AAWM_DYNAMIC_INJECTION_DB_URL=${LITELLM_AAWM_DYNAMIC_INJECTION_DB_URL:-}
-      - PGAPPNAME=${LITELLM_AAWM_DB_APPLICATION_NAME:-aawm-litellm-runtime}
+      - PGAPPNAME=aawm-litellm-alpha-runtime
       - AAWM_POSTGRES_SERVER=${LITELLM_AAWM_POSTGRES_SERVER:-}
       - AAWM_POSTGRES_PORT=${LITELLM_AAWM_POSTGRES_PORT:-}
       - AAWM_POSTGRES_DATABASE=${LITELLM_AAWM_POSTGRES_DATABASE:-}
@@ -169,6 +162,7 @@ services:
       - LITELLM_XAI_GROK_AUTH_FILE=${LITELLM_XAI_GROK_AUTH_FILE:-/home/zepfu/.grok/auth.json}
       - LITELLM_KIMI_OAUTH_AUTH_FILE=${LITELLM_KIMI_OAUTH_AUTH_FILE:-/home/zepfu/.kimi-code/credentials/kimi-code.json}
       - LITELLM_NOUS_OAUTH_AUTH_FILE=${LITELLM_NOUS_OAUTH_AUTH_FILE:-/home/zepfu/.hermes/auth.json}
+      - LITELLM_CURSOR_AGENT_AUTH_FILE=${LITELLM_CURSOR_AGENT_AUTH_FILE:-/home/zepfu/.config/cursor/auth.json}
       - LITELLM_KIMI_NATIVE_CONTRACT_PATH=${LITELLM_KIMI_NATIVE_CONTRACT_PATH:-/app/kimi-descriptor/native-contract.json}
       - LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED=${LITELLM_KIMI_NATIVE_CONTRACT_REQUIRED:-true}
       - AAWM_GROK_CLIENT_VERSION_CACHE_PATH=${AAWM_GROK_CLIENT_VERSION_CACHE_PATH:-/run/aawm/grok/native-client-version.json}
@@ -190,13 +184,12 @@ services:
       - AAWM_ALIAS_ROUTING_REDIS_SSL=${AAWM_ALIAS_ROUTING_REDIS_SSL:-0}
       - AAWM_ALIAS_ROUTING_REDIS_URL=${AAWM_ALIAS_ROUTING_REDIS_URL:-}
       - AAWM_ALIAS_ROUTING_REDIS_USERNAME=${AAWM_ALIAS_ROUTING_REDIS_USERNAME:-}
-      - AAWM_ALIAS_ROUTING_STATE_NAMESPACE=${AAWM_ALIAS_ROUTING_STATE_NAMESPACE:-aawm-routing-dev-v1}
+      - AAWM_ALIAS_ROUTING_STATE_NAMESPACE=aawm-routing-alpha-v1
       # CFG-004 cooldown-clear topology gate (single-worker dev only).
       - AAWM_ALIAS_ROUTING_COOLDOWN_CLEAR_SINGLE_WORKER=${AAWM_ALIAS_ROUTING_COOLDOWN_CLEAR_SINGLE_WORKER:-1}
       - AAWM_ALIAS_ROUTE_LOG_HEALTHY=${AAWM_ALIAS_ROUTE_LOG_HEALTHY:-0}
-      # Environment label for the proxy process; the alpha-specific value is
-      # applied by the /usr/bin/env command prefix above.
-      - AAWM_LITELLM_ENVIRONMENT=litellm-dev
+      # Environment label for the alpha proxy process.
+      - AAWM_LITELLM_ENVIRONMENT=litellm-alpha
       # OPENAI-017/018 and CFG-019 acceptance controls (fail-closed defaults).
       - AAWM_OPENAI_FAULT_PLAN_ENABLED=${AAWM_OPENAI_FAULT_PLAN_ENABLED:-0}
       - AAWM_CFG004_ACCEPTANCE_ENABLED=${AAWM_CFG004_ACCEPTANCE_ENABLED:-0}

@@ -15,7 +15,10 @@ REFRESH_PATH = "/aawm/alias-config/refresh"
 _REPO_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 )
-_BASIC_YAML_PATH = os.path.join(_REPO_ROOT, "litellm", "proxy", "aawm_alias_config", "basic.yaml")
+_ALIAS_CONFIG_DIR = os.path.join(
+    _REPO_ROOT, "litellm", "proxy", "aawm_alias_config"
+)
+_BASIC_YAML_PATH = os.path.join(_ALIAS_CONFIG_DIR, "basic.yaml")
 
 
 def test_module_imports() -> None:
@@ -55,43 +58,81 @@ def test_basic_yaml_compiles() -> None:
     assert first.config_version == second.config_version
     assert first.config_epoch != second.config_epoch
 
-    basic_candidates = first.aliases["basic"].candidates
-    north_pairs = [
-        (candidate.provider, candidate.model, candidate.route_family)
-        for candidate in basic_candidates
-        if candidate.model
-        in {
-            "cohere/north-mini-code-1-0",
-            "openrouter/cohere/north-mini-code:free",
-        }
-    ]
-    assert north_pairs == [
-        (
-            "cohere",
-            "cohere/north-mini-code-1-0",
-            "codex_cohere_chat_completions_adapter",
-        ),
-        (
-            "openrouter",
-            "openrouter/cohere/north-mini-code:free",
-            "codex_openrouter_completion_adapter",
-        ),
-    ]
-    direct_index = next(
-        index
-        for index, candidate in enumerate(basic_candidates)
-        if candidate.provider == "cohere"
-        and candidate.model == "cohere/north-mini-code-1-0"
+    basic_candidate = first.aliases["basic"].candidates[0]
+    assert basic_candidate.provider == "zai_coding_plan"
+    assert basic_candidate.model == "zai_coding_plan/glm-5.3-flash"
+    assert basic_candidate.route_family == (
+        "codex_zai_coding_plan_chat_completions_adapter"
     )
-    openrouter_index = next(
-        index
-        for index, candidate in enumerate(basic_candidates)
-        if candidate.provider == "openrouter"
-        and candidate.model == "openrouter/cohere/north-mini-code:free"
+    assert basic_candidate.priority == 100
+    assert basic_candidate.reasoning_effort == "low"
+
+
+def test_alpha_stabilization_alias_mappings_are_single_direct_candidates() -> None:
+    """Temporary alpha aliases expose only their explicitly assigned route."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        config_compiler as compiler,
     )
-    assert direct_index < openrouter_index
-    assert basic_candidates[direct_index].priority == 90
-    assert basic_candidates[openrouter_index].priority == 80
+
+    expected = {
+        "basic.yaml": (
+            "basic",
+            "zai_coding_plan",
+            "zai_coding_plan/glm-5.3-flash",
+            "codex_zai_coding_plan_chat_completions_adapter",
+            "low",
+        ),
+        "read.yaml": (
+            "read",
+            "zai_coding_plan",
+            "zai_coding_plan/glm-5.3-flash",
+            "codex_zai_coding_plan_chat_completions_adapter",
+            "low",
+        ),
+        "work.yaml": (
+            "work",
+            "cursor_agent",
+            "cursor_agent/cursor-grok-4.6-high",
+            "codex_cursor_agent_aiserver_adapter",
+            None,
+        ),
+        "expert.yaml": (
+            "expert",
+            "openai",
+            "gpt-5.6-terra",
+            "codex_responses",
+            "max",
+        ),
+        "sota-openai.yaml": (
+            "sota-openai",
+            "openai",
+            "gpt-5.6-sol",
+            "codex_responses",
+            "medium",
+        ),
+    }
+
+    for filename, (
+        alias_name,
+        provider,
+        model,
+        route_family,
+        reasoning_effort,
+    ) in expected.items():
+        with open(
+            os.path.join(_ALIAS_CONFIG_DIR, filename), "r", encoding="utf-8"
+        ) as handle:
+            snapshot = compiler.compile_yaml(handle.read())
+
+        candidates = snapshot.aliases[alias_name].candidates
+        assert len(candidates) == 1, alias_name
+        candidate = candidates[0]
+        assert getattr(candidate, "alias_name", None) is None
+        assert candidate.provider == provider
+        assert candidate.model == model
+        assert candidate.route_family == route_family
+        assert candidate.priority == 100
+        assert candidate.reasoning_effort == reasoning_effort
 
 
 def test_refresh_endpoint_registered() -> None:

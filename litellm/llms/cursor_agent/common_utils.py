@@ -6,11 +6,10 @@ This package is `cursor_agent`. It must not reuse Cloud Agents `cursor`.
 
 from __future__ import annotations
 
+import copy
 import json
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
-
-import httpx
 
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     convert_content_list_to_str,
@@ -25,6 +24,7 @@ from .constants import (
     CURSOR_AGENT_CLIENT_VERSION,
     CURSOR_AGENT_DASHBOARD_HOST,
     CURSOR_AGENT_PROVIDER,
+    CURSOR_AGENT_REQUESTED_MODEL_OVERRIDES,
     CURSOR_AGENT_RUN_PATH,
     CURSOR_AGENT_TURN_HOST,
     CURSOR_AGENT_USAGE_PATH,
@@ -38,6 +38,10 @@ from .dashboard import (
     cursor_agent_user_agent,
     current_period_usage_url,
     resolve_dashboard_api_base,
+)
+from .connect import (
+    CursorConnectError,
+    resolve_cursor_access_token_sync,
 )
 
 __all__ = [
@@ -145,56 +149,36 @@ def resolve_access_token(
     network call; callers that already have an access token must pass
     it as api_key or CURSOR_AUTH_TOKEN.
     """
-    explicit = (api_key or "").strip()
-    auth_token = (get_secret_str(CURSOR_AUTH_TOKEN_ENV) or "").strip()
-    raw_key = (get_secret_str(CURSOR_API_KEY_ENV) or "").strip()
-
-    if explicit:
-        return explicit
-    if auth_token:
-        return auth_token
-    if raw_key and allow_exchange:
-        return exchange_api_key_for_access_token(raw_key)
-    if raw_key:
-        return raw_key
-
-    raise CursorAgentError(
-        status_code=401,
-        message=(
-            "cursor_agent requires CURSOR_AUTH_TOKEN or CURSOR_API_KEY. "
-            "CURSOR_CLI_KEY is not used. Cloud Agents cursor credentials "
-            "are not a substitute."
-        ),
-    )
+    try:
+        return resolve_cursor_access_token_sync(
+            api_key,
+            allow_exchange=allow_exchange,
+        )
+    except CursorConnectError as exc:
+        raise CursorAgentError(
+            status_code=exc.status_code,
+            message=exc.message,
+            headers=exc.headers,
+        ) from exc
 
 
 def exchange_api_key_for_access_token(
     raw_api_key: str,
     dashboard_base: Optional[str] = None,
 ) -> str:
-    response = httpx.post(
-        auth_exchange_url(dashboard_base),
-        headers={
-            "Authorization": f"Bearer {raw_api_key}",
-            "Content-Type": "application/json",
-        },
-        json={},
-        timeout=30.0,
-    )
-    if response.status_code >= 400:
-        raise CursorAgentError(
-            status_code=response.status_code,
-            message="cursor_agent API key exchange failed",
-            headers=dict(response.headers),
+    from .connect import exchange_cursor_api_key_for_access_token_sync
+
+    try:
+        return exchange_cursor_api_key_for_access_token_sync(
+            raw_api_key,
+            dashboard_base=dashboard_base,
         )
-    payload = response.json()
-    access_token = payload.get("accessToken") if isinstance(payload, dict) else None
-    if not access_token:
+    except CursorConnectError as exc:
         raise CursorAgentError(
-            status_code=401,
-            message="cursor_agent API key exchange did not return accessToken",
-        )
-    return str(access_token)
+            status_code=exc.status_code,
+            message=exc.message,
+            headers=exc.headers,
+        ) from exc
 
 
 _DEFAULT_MCP_PROVIDER_IDENTIFIER = "litellm"
@@ -245,7 +229,7 @@ def extract_user_text(messages: List[AllMessageValues]) -> str:
 def _extract_system_prompt(messages: List[AllMessageValues]) -> str:
     parts: List[str] = []
     for message in messages:
-        if message_role(message) != "system":
+        if message_role(message) not in {"system", "developer"}:
             continue
         text = message_text(message)
         if text:
@@ -268,7 +252,7 @@ def _history_assistant_message(
     if text:
         content.append(_history_text_content(text))
     for tool_call in tool_calls or []:
-        content.append({"tool_call": tool_call})
+        content.append({"toolCall": tool_call})
     return {"assistant": {"content": content}}
 
 
@@ -279,11 +263,11 @@ def _history_tool_message(
     text: str,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
-        "tool_call_id": tool_call_id,
+        "toolCallId": tool_call_id,
         "content": [_history_text_content(text)],
     }
     if tool_name:
-        payload["tool_name"] = tool_name
+        payload["toolName"] = tool_name
     return {"tool": payload}
 
 
@@ -302,9 +286,9 @@ def _openai_tool_call_to_history(tool_call: Any) -> Optional[Dict[str, Any]]:
     if not name and not tool_call_id and not args_json:
         return None
     history_call: Dict[str, Any] = {
-        "tool_call_id": tool_call_id,
-        "tool_name": name,
-        "args_json": args_json,
+        "toolCallId": tool_call_id,
+        "toolName": name,
+        "argsJson": args_json,
     }
     return history_call
 
@@ -336,11 +320,22 @@ def _build_conversation_history(
     messages: List[AllMessageValues],
     *,
     last_user_index: Optional[int],
+    instruction_text: str = "",
 ) -> Optional[Dict[str, Any]]:
     history_messages: List[Dict[str, Any]] = []
+    if instruction_text:
+        # Cursor's public AgentService path rejects customSystemPrompt through
+        # its internal --system-prompt option. ConversationHistory has no
+        # system role, so preserve the guidance as a leading user-level entry.
+        history_messages.append(
+            _history_user_message(
+                "System and developer instructions for this run:\n\n"
+                f"{instruction_text}"
+            )
+        )
     for index, message in enumerate(messages):
         role = message_role(message)
-        if role == "system":
+        if role in {"system", "developer"}:
             continue
         if index == last_user_index and role == "user":
             continue
@@ -427,8 +422,8 @@ def _build_mcp_tool_definition(tool: Any) -> Optional[Dict[str, Any]]:
     provider_identifier = _tool_provider_identifier(tool)
     definition: Dict[str, Any] = {
         "name": name,
-        "provider_identifier": provider_identifier,
-        "tool_name": name,
+        "providerIdentifier": provider_identifier,
+        "toolName": name,
     }
     description = _openai_tool_description(tool)
     if description:
@@ -436,16 +431,16 @@ def _build_mcp_tool_definition(tool: Any) -> Optional[Dict[str, Any]]:
     parameters = _openai_tool_parameters(tool)
     if parameters is not None:
         if isinstance(parameters, str):
-            definition["input_schema_json"] = parameters
+            definition["inputSchemaJson"] = parameters
         else:
-            definition["input_schema_json"] = json.dumps(parameters)
+            definition["inputSchemaJson"] = json.dumps(parameters)
     return definition
 
 
 def _build_mcp_tools(optional_params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     existing = optional_params.get("mcp_tools")
     if isinstance(existing, dict) and existing:
-        return existing
+        return _camelize_proto_mapping(existing)
     tools = optional_params.get("tools")
     if not isinstance(tools, list) or not tools:
         return None
@@ -456,22 +451,68 @@ def _build_mcp_tools(optional_params: Dict[str, Any]) -> Optional[Dict[str, Any]
             definitions.append(definition)
     if not definitions:
         return None
-    return {"mcp_tools": definitions}
+    return {"mcpTools": definitions}
 
 
 def _merge_conversation_state(
     optional_params: Dict[str, Any],
-    history: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     existing = optional_params.get("conversation_state")
     if isinstance(existing, dict) and existing:
-        return dict(existing)
-    if history is None:
-        return {}
-    # AgentRunRequest.conversation_state is ConversationState. History JSON is
-    # a verified ConversationState.root_prompt_messages_json scalar so earlier
-    # OpenAI turns are not reduced to the last user message.
-    return {"root_prompt_messages_json": [json.dumps(history)]}
+        return _camelize_proto_mapping(existing)
+    return {}
+
+
+def _build_requested_model(model_id: str) -> Dict[str, Any]:
+    configured = CURSOR_AGENT_REQUESTED_MODEL_OVERRIDES.get(model_id)
+    if configured is not None:
+        return copy.deepcopy(configured)
+    return {"modelId": model_id}
+
+
+_PROTO_FIELD_NAMES = {
+    "conversation_state": "conversationState",
+    "root_prompt_messages_json": "rootPromptMessagesJson",
+    "user_message_action": "userMessageAction",
+    "user_message": "userMessage",
+    "conversation_history": "conversationHistory",
+    "model_details": "modelDetails",
+    "model_id": "modelId",
+    "requested_model": "requestedModel",
+    "mcp_tools": "mcpTools",
+    "provider_identifier": "providerIdentifier",
+    "tool_name": "toolName",
+    "input_schema_json": "inputSchemaJson",
+    "tool_call_id": "toolCallId",
+    "args_json": "argsJson",
+    "message_id": "messageId",
+    "conversation_id": "conversationId",
+    "conversation_group_id": "conversationGroupId",
+    "run_id": "runId",
+    "agent_session_id": "agentSessionId",
+}
+
+
+def _camelize_proto_key(key: Any) -> str:
+    text = str(key)
+    mapped = _PROTO_FIELD_NAMES.get(text)
+    if mapped is not None:
+        return mapped
+    parts = text.split("_")
+    if len(parts) == 1:
+        return text
+    return parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:])
+
+
+def _camelize_proto_mapping(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            _camelize_proto_key(key): _camelize_proto_mapping(nested)
+            for key, nested in value.items()
+        }
+    if isinstance(value, list):
+        return [_camelize_proto_mapping(item) for item in value]
+    return value
 
 
 def build_run_request(
@@ -491,74 +532,88 @@ def build_run_request(
             message=(
                 "cursor_agent does not support parameters: "
                 f"{unsupported}. AgentRunRequest has mcp_tools / "
-                "custom_system_prompt / conversation_state, not OpenAI "
+                "conversation_history / conversation_state, not OpenAI "
                 "temperature / max_tokens / tool_choice."
             ),
         )
     model_id = strip_provider_prefix(model)
     last_user_index = _last_user_index(messages)
     prompt = extract_user_text(messages)
-    history = _build_conversation_history(
-        messages, last_user_index=last_user_index
+    custom_system_prompt = (
+        optional_params.get("custom_system_prompt")
+        or optional_params.get("customSystemPrompt")
+        or _extract_system_prompt(messages)
     )
-    conversation_id = optional_params.get("conversation_id")
-    run_id = optional_params.get("run_id") or str(uuid.uuid4())
+    history = _build_conversation_history(
+        messages,
+        last_user_index=last_user_index,
+        instruction_text=str(custom_system_prompt or ""),
+    )
+    message_id = (
+        optional_params.get("message_id")
+        or optional_params.get("messageId")
+        or str(uuid.uuid4())
+    )
+    conversation_id = (
+        optional_params.get("conversation_id")
+        or optional_params.get("conversationId")
+        or str(uuid.uuid4())
+    )
+    conversation_group_id = (
+        optional_params.get("conversation_group_id")
+        or optional_params.get("conversationGroupId")
+        or conversation_id
+    )
+    run_id = (
+        optional_params.get("run_id")
+        or optional_params.get("runId")
+        or str(uuid.uuid4())
+    )
     agent_session_id = optional_params.get("agent_session_id")
-    custom_system_prompt = optional_params.get("custom_system_prompt")
-    if not custom_system_prompt:
-        custom_system_prompt = _extract_system_prompt(messages)
-
-    user_message_action: Dict[str, Any] = {
-        "user_message": {
-            "text": prompt,
-        }
-    }
-    if history is not None:
-        # UserMessageAction.conversation_history is the verified field for
-        # prior OpenAI turns / tool results on the same Run.
-        user_message_action["conversation_history"] = history
 
     request: Dict[str, Any] = {
-        "conversation_state": _merge_conversation_state(optional_params, history),
+        "conversationState": _merge_conversation_state(optional_params),
         "action": {
-            "user_message_action": user_message_action
+            "userMessageAction": {
+                "userMessage": {
+                    "text": prompt,
+                    "messageId": message_id,
+                    "selectedContext": {},
+                    "mode": "AGENT_MODE_AGENT",
+                },
+            }
         },
-        "model_details": {
-            "model_id": model_id,
-        },
-        "requested_model": {
-            "model_id": model_id,
-        },
-        "run_id": run_id,
+        "requestedModel": _build_requested_model(model_id),
+        "mcpTools": _build_mcp_tools(optional_params) or {},
+        "conversationId": conversation_id,
+        "conversationGroupId": conversation_group_id,
+        "runId": run_id,
     }
-    if custom_system_prompt:
-        request["custom_system_prompt"] = custom_system_prompt
-    mcp_tools = _build_mcp_tools(optional_params)
-    if mcp_tools is not None:
-        request["mcp_tools"] = mcp_tools
-    if conversation_id:
-        request["conversation_id"] = conversation_id
+    if history is not None:
+        request["action"]["userMessageAction"]["conversationHistory"] = history
     if agent_session_id:
-        request["agent_session_id"] = agent_session_id
+        request["agentSessionId"] = agent_session_id
     return {
-        "run_request": request,
+        "runRequest": request,
     }
 
 
 def _interaction_text(update: Dict[str, Any]) -> Tuple[str, bool]:
     if not isinstance(update, dict):
         return "", False
+    if "textDelta" in update and isinstance(update["textDelta"], dict):
+        return str(update["textDelta"].get("text") or ""), False
     if "text_delta" in update and isinstance(update["text_delta"], dict):
         return str(update["text_delta"].get("text") or ""), False
-    if "turn_ended" in update:
+    if "turnEnded" in update or "turn_ended" in update:
         return "", True
     message = update.get("message")
     if isinstance(message, dict):
         case = message.get("case")
         value = message.get("value") if isinstance(message.get("value"), dict) else {}
-        if case == "text_delta":
+        if case in {"textDelta", "text_delta"}:
             return str(value.get("text") or ""), False
-        if case == "turn_ended":
+        if case in {"turnEnded", "turn_ended"}:
             return "", True
     return "", False
 
@@ -575,6 +630,8 @@ def extract_text_from_agent_payload(payload: Any) -> Tuple[str, bool]:
     if not isinstance(payload, dict):
         return "", False
 
+    if "interactionUpdate" in payload:
+        return _interaction_text(payload["interactionUpdate"])
     if "interaction_update" in payload:
         return _interaction_text(payload["interaction_update"])
 
@@ -582,7 +639,7 @@ def extract_text_from_agent_payload(payload: Any) -> Tuple[str, bool]:
     if isinstance(message, dict):
         case = message.get("case")
         value = message.get("value") if isinstance(message.get("value"), dict) else {}
-        if case == "interaction_update":
+        if case in {"interactionUpdate", "interaction_update"}:
             return _interaction_text(value)
         text, ended = _interaction_text(message)
         if text or ended:

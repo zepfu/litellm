@@ -92,6 +92,17 @@ _KIMI_CODE_SAFE_FAILURE_KINDS = frozenset(
     }
 )
 _KIMI_CODE_SAFE_FAILURE_SCOPES = frozenset({"managed_account", "candidate", "telemetry", "none"})
+_KIMI_CODE_SAFE_FAILURE_SCOPES_BY_KIND = {
+    "refresh_required_auth": frozenset({"managed_account"}),
+    "quota": frozenset({"managed_account"}),
+    "provider_capacity": frozenset({"managed_account"}),
+    "transient": frozenset({"candidate"}),
+    "malformed": frozenset({"telemetry", "none"}),
+    "unsupported_model": frozenset({"candidate"}),
+    "unsupported_effort": frozenset({"candidate"}),
+    "unsupported_capability": frozenset({"candidate"}),
+    "unknown": frozenset({"none"}),
+}
 _KIMI_CODE_SAFE_METADATA_GATES = frozenset({"none", "model_id", "think_effort", "capability"})
 _KIMI_CODE_SAFE_RESET_REASONS = frozenset(
     {
@@ -713,6 +724,7 @@ def _get_safe_kimi_code_probe_failure_metadata(
     if (
         kind not in _KIMI_CODE_SAFE_FAILURE_KINDS
         or scope not in _KIMI_CODE_SAFE_FAILURE_SCOPES
+        or scope not in _KIMI_CODE_SAFE_FAILURE_SCOPES_BY_KIND.get(kind, ())
         or upstream_id not in _KIMI_CODE_SAFE_UPSTREAM_IDS
         or metadata_gate not in _KIMI_CODE_SAFE_METADATA_GATES
         or reset_reason not in _KIMI_CODE_SAFE_RESET_REASONS
@@ -745,7 +757,10 @@ def _classify_kimi_code_auto_agent_probe_failure(
 ) -> Optional[str]:
     if metadata is None:
         return None
-    scope = metadata["scope"]
+    kind = metadata.get("kind")
+    scope = metadata.get("scope")
+    if scope not in _KIMI_CODE_SAFE_FAILURE_SCOPES_BY_KIND.get(kind, ()):
+        return None
     if scope == "managed_account":
         return "kimi_code_managed_account"
     if scope == "candidate":
@@ -960,12 +975,16 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
             error_class == "kimi_code_managed_account"
             and kimi_failure_metadata is not None
             and kimi_failure_metadata.get("scope") == "managed_account"
+            and _classify_kimi_code_auto_agent_probe_failure(kimi_failure_metadata)
+            == "kimi_code_managed_account"
         ):
             return "managed_account"
         if (
             error_class == "kimi_code_candidate_failure"
             and kimi_failure_metadata is not None
             and kimi_failure_metadata.get("scope") == "candidate"
+            and _classify_kimi_code_auto_agent_probe_failure(kimi_failure_metadata)
+            == "kimi_code_candidate_failure"
         ):
             return "candidate"
         if error_class == "kimi_code_no_cooldown":

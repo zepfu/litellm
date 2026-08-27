@@ -1,15 +1,11 @@
-# AAWM alias-routing config for the ``read`` alias.
-#
-# Codex TUI OC-003 requires native ``read`` even though Ohmypi
-# ``compiled_aliases`` omits it. The live catalog must publish this
-# name so Codex does not send ``model=read`` to ChatGPT as a native
-# model. Candidate order matches ``basic`` via alias_reference so
-# OpenCode Go ``ox-alpha-free`` stays first.
-
+# Temporary litellm-alpha stabilization mapping for ``read``.
 defaults: {}
 
 aliases:
   - name: read
     candidates:
-      - alias_reference: basic
+      - provider: zai_coding_plan
+        model: zai_coding_plan/glm-5.3-flash
+        route_family: codex_zai_coding_plan_chat_completions_adapter
         priority: 100
+        reasoning_effort: low

@@ -1162,6 +1162,7 @@ class TestDevReadOnlyMount:
         assert source_path == expected_source
         assert mount.endswith(":ro")
 
+
     def test_compose_has_read_only_alias_routing_mount(self) -> None:
         """docker-compose.dev.yml mounts alias routing dependencies as :ro."""
         _, compose_data = self._load_dev_compose_yaml()
@@ -1193,3 +1194,118 @@ class TestDevReadOnlyMount:
             "pass_through_endpoints/aawm_request_policy/"
             "claude_prompt_replacement.py:ro"
         ) in content
+
+
+class TestAlphaComposeContract:
+    @staticmethod
+    def _load_alpha_compose_yaml() -> dict[str, object]:
+        compose_path = Path(__file__).resolve().parents[4] / "docker-compose.alpha.yml"
+        if not compose_path.exists():
+            pytest.skip("docker-compose.alpha.yml not found")
+        compose_data = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+        if not isinstance(compose_data, dict):
+            raise AssertionError("docker-compose.alpha.yml did not parse to a mapping")
+        return compose_data
+
+    def test_alpha_isolated_on_4011_with_path_only_cursor_auth(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        compose_data = self._load_alpha_compose_yaml()
+        assert compose_data["name"] == "litellm-alpha"
+
+        services = compose_data["services"]
+        assert isinstance(services, dict)
+        assert list(services) == ["litellm-alpha"]
+        alpha = services["litellm-alpha"]
+        assert isinstance(alpha, dict)
+        assert alpha["container_name"] == "litellm-alpha"
+        assert alpha["ports"] == [
+            "127.0.0.1:4011:4011",
+            "100.109.19.233:4011:4011",
+        ]
+
+        volumes = alpha["volumes"]
+        assert isinstance(volumes, list)
+        cursor_mount = (
+            "/home/zepfu/.config/cursor/auth.json:"
+            "/home/zepfu/.config/cursor/auth.json:ro"
+        )
+        assert cursor_mount in volumes
+
+        environment = alpha["environment"]
+        assert isinstance(environment, list)
+        cursor_environment = [
+            entry
+            for entry in environment
+            if isinstance(entry, str) and "CURSOR" in entry
+        ]
+        assert cursor_environment == [
+            "LITELLM_CURSOR_AGENT_AUTH_FILE=${LITELLM_CURSOR_AGENT_AUTH_FILE:-"
+            "/home/zepfu/.config/cursor/auth.json}"
+        ]
+
+        import json
+        import shutil
+        import subprocess
+
+        if shutil.which("docker") is None:
+            pytest.skip("docker CLI unavailable")
+
+        hostile_dev_values = {
+            "AAWM_LITELLM_ENVIRONMENT": "litellm-dev",
+            "AAWM_ALIAS_ROUTING_STATE_NAMESPACE": "aawm-routing-dev-v1",
+            "LITELLM_LANGFUSE_TRACE_ENVIRONMENT": "dev",
+            "LITELLM_AAWM_ERROR_LOG_ENV": "dev",
+            "LITELLM_AAWM_DB_APPLICATION_NAME": "aawm-litellm-dev-runtime",
+            "LITELLM_AAWM_SESSION_HISTORY_DB_APPLICATION_NAME": (
+                "aawm-litellm-dev-session-history"
+            ),
+            "LITELLM_AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME": (
+                "aawm-litellm-dev-dynamic-injection"
+            ),
+        }
+        for name, value in hostile_dev_values.items():
+            monkeypatch.setenv(name, value)
+
+        compose_path = Path(__file__).resolve().parents[4] / "docker-compose.alpha.yml"
+        proc = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "--env-file",
+                "/dev/null",
+                "-f",
+                str(compose_path),
+                "config",
+                "--format",
+                "json",
+            ],
+            cwd=compose_path.parent,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env={
+                **os.environ,
+                "AAWM_CODEX_OAUTH_ACCOUNT1_EXPECTED_HASH": "111111111111",
+                "AAWM_CODEX_OAUTH_ACCOUNT2_EXPECTED_HASH": "222222222222",
+            },
+        )
+        if proc.returncode != 0:
+            pytest.fail(f"docker compose config failed: {proc.stderr.strip()}")
+
+        rendered = json.loads(proc.stdout)
+        alpha_environment = rendered["services"]["litellm-alpha"]["environment"]
+        expected = {
+            "AAWM_LITELLM_ENVIRONMENT": "litellm-alpha",
+            "AAWM_ALIAS_ROUTING_STATE_NAMESPACE": "aawm-routing-alpha-v1",
+            "LITELLM_LANGFUSE_TRACE_ENVIRONMENT": "alpha",
+            "LITELLM_AAWM_ERROR_LOG_ENV": "alpha",
+            "PGAPPNAME": "aawm-litellm-alpha-runtime",
+            "AAWM_SESSION_HISTORY_DB_APPLICATION_NAME": (
+                "aawm-litellm-alpha-session-history"
+            ),
+            "AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME": (
+                "aawm-litellm-alpha-dynamic-injection"
+            ),
+        }
+        assert {name: alpha_environment[name] for name in expected} == expected

@@ -12,12 +12,14 @@ the symbols.
 from __future__ import annotations
 
 import copy
+import math
 from typing import Any, Callable, Mapping, Optional
 from uuid import uuid4
 
 from fastapi import Request
 
 from .lane_keys import _CODEX_REASONING_EFFORT_TIER_INDEX
+from .policy import CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER
 from .request_metadata import (
     _extract_auto_agent_alias_canonical_thread_id,
     _extract_auto_agent_alias_parent_thread_id,
@@ -396,6 +398,115 @@ def _mark_auto_agent_alias_request_recovered(
 # ---------------------------------------------------------------------------
 # Retryable attempt record mutation
 # ---------------------------------------------------------------------------
+
+
+def _safe_publication_seconds(value: Any) -> Optional[float]:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return round(seconds, 3)
+
+
+def _safe_publication_label(
+    value: Any,
+    *,
+    allowed: Optional[set[str]] = None,
+) -> Optional[str]:
+    if not isinstance(value, str) or not value or len(value) > 128:
+        return None
+    if allowed is not None:
+        return value if value in allowed else None
+    if any(not (character.isalnum() or character in "._-") for character in value):
+        return None
+    return value
+
+
+def _attach_kimi_managed_account_publication_telemetry(
+    *,
+    attempt_record: dict[str, Any],
+    candidate: Optional[dict[str, Any]],
+    error_class: Optional[str],
+    kimi_failure_metadata: Optional[dict[str, Any]],
+    plan: Any,
+    requested_ttl_seconds: Any,
+    transaction_result: Optional[object] = None,
+    publication_error: Optional[BaseException] = None,
+) -> None:
+    """Attach safe publication evidence for confirmed managed Kimi quota."""
+
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get("provider") != CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER
+        or error_class != "kimi_code_managed_account"
+        or not isinstance(kimi_failure_metadata, dict)
+        or kimi_failure_metadata.get("scope") != "managed_account"
+        or getattr(plan, "applied_scope", None) != "managed_account"
+    ):
+        return
+
+    durable_keys = getattr(plan, "durable_keys", ())
+    if (
+        not isinstance(durable_keys, tuple)
+        or len(durable_keys) != 1
+        or not isinstance(durable_keys[0], str)
+        or not durable_keys[0]
+    ):
+        return
+    requested_ttl = _safe_publication_seconds(requested_ttl_seconds)
+    effective_plan_ttl = _safe_publication_seconds(
+        getattr(plan, "duration_seconds", None)
+    )
+    if requested_ttl is None or effective_plan_ttl is None:
+        return
+
+    telemetry: dict[str, Any] = {
+        "classification": error_class,
+        "scope": "managed_account",
+        "logical_cooldown_key": durable_keys[0],
+        "requested_ttl_seconds": requested_ttl,
+        "effective_plan_ttl_seconds": effective_plan_ttl,
+    }
+    if publication_error is not None:
+        failure_phase = _safe_publication_label(
+            getattr(publication_error, "phase", None),
+            allowed={"PREPARED", "DURABLE_COMMITTED", "LOCAL_COMMITTED"},
+        )
+        telemetry["state_source"] = "durable_publication_failed"
+        telemetry["durable_publication_failure"] = {
+            "exception_class": type(publication_error).__name__,
+            "phase": failure_phase or "publication_transaction",
+        }
+    elif transaction_result is None:
+        telemetry["state_source"] = "local_fallback"
+    else:
+        transaction_id = _safe_publication_label(
+            getattr(transaction_result, "transaction_id", None)
+        )
+        phase = _safe_publication_label(
+            getattr(transaction_result, "phase", None),
+            allowed={"PREPARED", "DURABLE_COMMITTED", "LOCAL_COMMITTED"},
+        )
+        journal = getattr(transaction_result, "journal", None)
+        receipt_ttl = _safe_publication_seconds(
+            getattr(journal, "requested_ttl", None)
+        )
+        if transaction_id is None or phase is None or receipt_ttl is None:
+            telemetry["state_source"] = "durable_publication_failed"
+            telemetry["durable_publication_failure"] = {
+                "exception_class": "InvalidPublicationReceipt",
+                "phase": "publication_transaction",
+            }
+        else:
+            telemetry["state_source"] = "durable_cache"
+            telemetry["durable_transaction_receipt"] = {
+                "id": transaction_id,
+                "phase": phase,
+                "requested_ttl_seconds": receipt_ttl,
+            }
+    attempt_record["kimi_managed_account_publication"] = telemetry
 
 
 def _update_codex_auto_agent_retryable_attempt_record(

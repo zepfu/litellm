@@ -124,6 +124,13 @@ async def test_should_post_codex_responses_direct_model_to_coding_chat_url(
 ) -> None:
     import litellm
     from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
+
+    watermark_calls: list[dict[str, Any]] = []
+
+    def _watermark_response(body, **kwargs):
+        watermark_calls.append({"body": body, **kwargs})
+        return body, kwargs["content"]
 
     def _close_logging_coroutine(async_coroutine, metadata=None):
         _ = metadata
@@ -135,6 +142,11 @@ async def test_should_post_codex_responses_direct_model_to_coding_chat_url(
         GLOBAL_LOGGING_WORKER,
         "ensure_initialized_and_enqueue",
         _close_logging_coroutine,
+    )
+    monkeypatch.setattr(
+        llm_passthrough_endpoints,
+        "maybe_apply_passthrough_watermark_response",
+        _watermark_response,
     )
     monkeypatch.setenv("ZAI_KEY", "coding-plan-key")
     monkeypatch.delenv("ZAI_API_KEY", raising=False)
@@ -189,6 +201,8 @@ async def test_should_post_codex_responses_direct_model_to_coding_chat_url(
     assert upstream_request.headers["Authorization"] == "Bearer coding-plan-key"
     response_body = json.loads(response.body)
     assert response_body["object"] == "response"
+    assert watermark_calls
+    assert watermark_calls[0]["endpoint"] == "responses"
     assert any(
         item.get("type") == "message" for item in response_body.get("output", [])
     )

@@ -1175,6 +1175,7 @@ class TestKimiManagedAccount:
         )
         assert cd == 90.0
         assert src == "kimi_managed_account:memory"
+        assert skip == "managed_account_cooldown"
         assert scope == "managed_account"
 
     @pytest.mark.asyncio
@@ -1191,7 +1192,56 @@ class TestKimiManagedAccount:
         )
         assert cd == 5.0
         assert src == "memory"
+        assert skip is None
         assert scope is None
+
+    @pytest.mark.asyncio
+    async def test_managed_account_cooldown_excludes_last_resort_kimi(self):
+        candidates = (
+            _candidate("kimi_code", "kimi-k2"),
+            _candidate(
+                "kimi_code",
+                "kimi-for-coding",
+                last_resort=True,
+            ),
+        )
+        _set_selection_candidates(candidates)
+
+        async def _kimi_managed_cooldown(key: str) -> tuple[float, str]:
+            if "__managed_account__" in key:
+                return (90.0, "memory")
+            return (0.0, "local_fallback")
+
+        _set_selection_runtime(
+            "_get_codex_active_cooldown_state",
+            _kimi_managed_cooldown,
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={"model": "basic"},
+            )
+
+        detail = exc_info.value.detail
+        assert exc_info.value.status_code == 429
+        assert detail["error"]["code"] == (
+            "aawm_codex_auto_agent_all_candidates_cooling_down"
+        )
+        assert {
+            candidate["model"] for candidate in detail["candidates"]
+        } == {
+            "kimi-k2",
+            "kimi-for-coding",
+        }
+        assert all(
+            candidate["reason"] == "managed_account_cooldown"
+            for candidate in detail["candidates"]
+        )
+        assert all(
+            candidate["cooldown_scope"] == "managed_account"
+            for candidate in detail["candidates"]
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -267,6 +267,10 @@ def install(host_globals: dict[str, Any]) -> None:
     Follows the same FunctionType-rebinding pattern used by sibling modules
     so that the god module's namespace resolves to these implementations.
     """
+    host_globals.setdefault(
+        "maybe_apply_passthrough_watermark_response",
+        maybe_apply_passthrough_watermark_response,
+    )
     _mod = globals()
     for _name in _HOST_FUNCTION_NAMES:
         _obj = _mod[_name]

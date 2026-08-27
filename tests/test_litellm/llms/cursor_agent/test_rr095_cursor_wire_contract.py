@@ -1,9 +1,10 @@
 """RR-095: Cursor Agent advertised OpenAI params must reach the wire or reject.
 
-AgentRunRequest (CURSOR-001) has conversation_state, action.user_message_action,
-mcp_tools, and custom_system_prompt. It does not have OpenAI temperature,
-max_tokens, or tool_choice as top-level fields. LiteLLM must not spawn the
-Cursor CLI at request time.
+AgentRunRequest (CURSOR-001) has conversationState, action.userMessageAction,
+mcpTools, and conversationHistory. Although its schema includes
+customSystemPrompt, Cursor's public AgentService route maps that field to the
+unsupported internal --system-prompt option. LiteLLM must preserve system and
+developer guidance through supported conversation history instead.
 """
 
 from __future__ import annotations
@@ -24,22 +25,22 @@ FULL_MODEL = "cursor_agent/composer-2.5"
 # Verified AgentRunRequest field names from CURSOR-001. OpenAI sampling /
 # tool_choice keys are not among them and must not be invented on the wire.
 VERIFIED_AGENT_RUN_REQUEST_FIELDS = {
-    "conversation_state",
+    "conversationState",
     "action",
-    "model_details",
-    "mcp_tools",
-    "conversation_id",
+    "modelDetails",
+    "mcpTools",
+    "conversationId",
     "mcp_file_system_options",
     "skill_options",
-    "custom_system_prompt",
-    "requested_model",
+    "customSystemPrompt",
+    "requestedModel",
     "suggest_next_prompt",
     "subagent_type_name",
     "exclude_workspace_context",
     "harness",
     "selected_subagent_models",
     "selected_subagent_model_details",
-    "conversation_group_id",
+    "conversationGroupId",
     "pre_fetched_blobs",
     "dev_raw_model_slug",
     "client_supports_inline_images",
@@ -48,8 +49,8 @@ VERIFIED_AGENT_RUN_REQUEST_FIELDS = {
     "suppress_subagent_progress_update_tool",
     "client_supports_send_to_user",
     "computer_use_coordinate_mode",
-    "run_id",
-    "agent_session_id",
+    "runId",
+    "agentSessionId",
     "client_supports_prompt_context_usage_rpc",
     "client_supports_routed_model_update",
 }
@@ -73,6 +74,7 @@ EARLIER_USER = "remember the project marker is RR-095-EARLIER-TURN"
 ASSISTANT_PRIOR = "acknowledged RR-095 prior context ASSISTANT-PRIOR-TURN"
 LAST_USER = "LAST-USER-TURN what is the project marker?"
 SYSTEM_PROMPT = "SYSTEM-PROMPT-RR095 stay in the named worktree"
+DEVELOPER_PROMPT = "DEVELOPER-PROMPT-RR095 return exact evidence"
 
 _REJECT_TYPES = (CursorAgentError, UnsupportedParamsError, ValueError, TypeError)
 
@@ -101,8 +103,8 @@ def _transform_or_reject(
 
 
 def _run_request(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if "run_request" in payload and isinstance(payload["run_request"], dict):
-        return payload["run_request"]
+    if "runRequest" in payload and isinstance(payload["runRequest"], dict):
+        return payload["runRequest"]
     return payload
 
 
@@ -126,7 +128,7 @@ def _assert_no_invented_openai_fields(payload: Dict[str, Any]) -> None:
         f"{sorted(leaked)}; serialize to verified proto fields or reject"
     )
     unknown = _top_level_keys(run) - VERIFIED_AGENT_RUN_REQUEST_FIELDS
-    # Nested OpenAI leftovers under conversation_state/action are allowed
+    # Nested OpenAI leftovers under conversationState/action are allowed
     # only as serialized history, not as sibling proto fields.
     invented = unknown & OPENAI_ONLY_KEYS
     assert not invented
@@ -190,7 +192,7 @@ def test_declared_openai_sampling_and_tool_choice_reject_or_verified_field(
 
 
 def test_declared_tools_reach_mcp_tools_or_are_rejected():
-    """Ingress-advertised tools serialize to mcp_tools, or the call is rejected."""
+    """Ingress-advertised tools serialize to mcpTools, or the call is rejected."""
     messages = [{"role": "user", "content": LAST_USER}]
     optional_params = {"tools": [LOOKUP_TOOL], "tool_choice": "auto"}
     status, result = _transform_or_reject(
@@ -205,19 +207,20 @@ def test_declared_tools_reach_mcp_tools_or_are_rejected():
     assert isinstance(result, dict)
     _assert_no_invented_openai_fields(result)
     run = _run_request(result)
-    assert "mcp_tools" in run, (
-        "tools was advertised and the request was not rejected, but mcp_tools "
+    assert "mcpTools" in run, (
+        "tools was advertised and the request was not rejected, but mcpTools "
         "is missing from AgentRunRequest"
     )
-    assert "lookup_ticket" in _dump(run["mcp_tools"]), (
-        "mcp_tools must include the ingress-advertised tool name lookup_ticket"
+    assert "lookup_ticket" in _dump(run["mcpTools"]), (
+        "mcpTools must include the ingress-advertised tool name lookup_ticket"
     )
     assert "tools" not in run
 
 
-def test_system_prompt_reaches_custom_system_prompt_or_is_rejected():
+def test_system_and_developer_prompts_use_supported_history_projection():
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "developer", "content": DEVELOPER_PROMPT},
         {"role": "user", "content": LAST_USER},
     ]
     status, result = _transform_or_reject(messages=messages, optional_params={})
@@ -228,20 +231,53 @@ def test_system_prompt_reaches_custom_system_prompt_or_is_rejected():
     assert isinstance(result, dict)
     run = _run_request(result)
     dumped = _dump(run)
-    assert SYSTEM_PROMPT in dumped, (
-        "system content was dropped; serialize to custom_system_prompt "
-        "(or conversation_state) or reject the request"
+    assert "customSystemPrompt" not in run
+    history = run["action"]["userMessageAction"]["conversationHistory"]
+    instruction_entry = history["messages"][0]["user"]["content"][0]["text"]["text"]
+    assert instruction_entry.startswith(
+        "System and developer instructions for this run:"
     )
-    assert run.get("custom_system_prompt") == SYSTEM_PROMPT or SYSTEM_PROMPT in _dump(
-        run.get("conversation_state")
-    )
+    assert SYSTEM_PROMPT in instruction_entry
+    assert DEVELOPER_PROMPT in instruction_entry
     action_text = (
         run.get("action", {})
-        .get("user_message_action", {})
-        .get("user_message", {})
+        .get("userMessageAction", {})
+        .get("userMessage", {})
         .get("text")
     )
-    assert action_text != SYSTEM_PROMPT or LAST_USER in dumped
+    assert action_text == LAST_USER
+    assert "--system-prompt" not in dumped
+
+
+def test_user_message_uses_native_cursor_run_envelope():
+    status, result = _transform_or_reject(
+        messages=[{"role": "user", "content": LAST_USER}],
+        optional_params={"message_id": "message-native-envelope"},
+    )
+    assert status == "ok", f"expected request serialization, got {result!r}"
+    assert isinstance(result, dict)
+
+    run = _run_request(result)
+    assert set(run) == {
+        "conversationState",
+        "action",
+        "requestedModel",
+        "mcpTools",
+        "conversationId",
+        "conversationGroupId",
+        "runId",
+    }
+    assert "messageId" not in run
+    assert run["action"]["userMessageAction"]["userMessage"] == {
+        "text": LAST_USER,
+        "messageId": "message-native-envelope",
+        "selectedContext": {},
+        "mode": "AGENT_MODE_AGENT",
+    }
+    assert run["requestedModel"] == {"modelId": MODEL}
+    assert "modelDetails" not in run
+    assert run["mcpTools"] == {}
+    assert run["conversationGroupId"] == run["conversationId"]
 
 
 def test_multi_turn_history_is_not_silently_reduced_to_last_user_message():
@@ -272,8 +308,8 @@ def test_multi_turn_history_is_not_silently_reduced_to_last_user_message():
     dumped = _dump(run)
     action_text = (
         run.get("action", {})
-        .get("user_message_action", {})
-        .get("user_message", {})
+        .get("userMessageAction", {})
+        .get("userMessage", {})
         .get("text")
     )
     assert action_text == LAST_USER or LAST_USER in dumped
@@ -285,7 +321,7 @@ def test_multi_turn_history_is_not_silently_reduced_to_last_user_message():
         "prior assistant turn was silently dropped; put it in conversation_state "
         "or reject multi-turn requests"
     )
-    conversation_state = run.get("conversation_state")
+    conversation_state = run.get("conversationState")
     assert conversation_state not in ({}, None) or EARLIER_USER in dumped
 
 
@@ -332,8 +368,8 @@ def test_tool_result_continuation_is_not_reduced_to_last_user_message():
     run = _run_request(result)
     action_text = (
         run.get("action", {})
-        .get("user_message_action", {})
-        .get("user_message", {})
+        .get("userMessageAction", {})
+        .get("userMessage", {})
         .get("text")
     )
     assert action_text != "TOOL-RESULT-RR095 status=open" or LAST_USER in dumped
@@ -381,8 +417,8 @@ def test_map_openai_params_copies_declared_params_into_optional_params():
     dumped = _dump(run)
     missing = []
     if "tools" in declared and "lookup_ticket" not in dumped:
-        missing.append("tools->mcp_tools")
-    if "tool_choice" in declared and "tool_choice" not in dumped and "mcp_tools" not in run:
+        missing.append("tools->mcpTools")
+    if "tool_choice" in declared and "tool_choice" not in dumped and "mcpTools" not in run:
         missing.append("tool_choice")
     if "max_tokens" in declared and "max_tokens" not in dumped:
         missing.append("max_tokens")

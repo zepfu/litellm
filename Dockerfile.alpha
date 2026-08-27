@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # editable install and PYTHONPATH then resolve imports from the live checkout.
 COPY . .
 RUN pip install --no-cache-dir -e . \
-    && pip install --no-cache-dir asyncpg langfuse watchfiles==1.2.0
+    && pip install --no-cache-dir asyncpg h2==4.3.0 langfuse watchfiles==1.2.0
 
 ENV PYTHONPATH=/app \
     PYTHONDONTWRITEBYTECODE=1

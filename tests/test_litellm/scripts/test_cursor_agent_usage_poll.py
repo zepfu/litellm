@@ -193,6 +193,8 @@ def test_cursor_agent_usage_fetch_uses_mocked_connect_json(
     assert captured["method"] == "POST"
     assert captured["headers"]["authorization"] == "Bearer stored-access-token"
     assert captured["headers"]["connect-protocol-version"] == "1"
+    assert captured["headers"]["content-type"] == "application/json"
+    assert "accept" not in captured["headers"]
     assert captured["body"] == b"{}"
     assert "agentn" not in captured["url"]
     assert "/v0/me" not in captured["url"]

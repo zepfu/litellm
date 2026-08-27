@@ -901,6 +901,8 @@ async def _apply_kimi_code_managed_account_lane_cooldown(
     if managed_seconds >= cooldown_seconds:
         cooldown_seconds = managed_seconds
         cooldown_state_source = f"kimi_managed_account:{managed_source}"
+    if skip_reason is None:
+        skip_reason = "managed_account_cooldown"
     return cooldown_seconds, cooldown_state_source, skip_reason, "managed_account"
 
 

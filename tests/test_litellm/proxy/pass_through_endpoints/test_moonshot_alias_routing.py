@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -9,10 +10,14 @@ from fastapi import HTTPException
 from starlette.requests import Request
 from starlette.responses import Response
 
+from litellm.llms.kimi_code.failure_classification import (
+    classify_kimi_code_failure,
+)
 from litellm.proxy.pass_through_endpoints import (
     llm_passthrough_endpoints as lpe,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    candidate_loop,
     classification,
     cooldown_apply,
     cooldown_state,
@@ -110,6 +115,8 @@ def _reset_moonshot_alias_state() -> None:
     alias_routing_state.anthropic.cooldown_negative_until_monotonic_by_key.clear()
     alias_routing_state.codex.session_affinity_by_key.clear()
     alias_routing_state.anthropic.session_affinity_by_key.clear()
+    alias_routing_state.codex_failure_evidence_gate.clear_for_tests()
+    alias_routing_state.lane_identity_index.clear()
     yield
     alias_routing_state.codex.cooldown_until_monotonic_by_key.clear()
     alias_routing_state.anthropic.cooldown_until_monotonic_by_key.clear()
@@ -117,6 +124,8 @@ def _reset_moonshot_alias_state() -> None:
     alias_routing_state.anthropic.cooldown_negative_until_monotonic_by_key.clear()
     alias_routing_state.codex.session_affinity_by_key.clear()
     alias_routing_state.anthropic.session_affinity_by_key.clear()
+    alias_routing_state.codex_failure_evidence_gate.clear_for_tests()
+    alias_routing_state.lane_identity_index.clear()
     snapshot_select.set_active_routing_snapshot(previous_snapshot)
 
 
@@ -410,6 +419,161 @@ async def test_should_persist_one_kimi_managed_account_lane_and_continue_to_grok
     assert skipped_kimi["cooldown_seconds"] <= exact_reset_seconds
     assert skipped_kimi["cooldown_seconds"] > exact_reset_seconds - 2.0
     assert time.time() < next(iter(cache.payloads.values()))["expires_at_epoch"]
+
+
+@pytest.mark.asyncio
+async def test_should_converge_kimi_usage_limit_on_the_durable_managed_account_ttl() -> None:
+    fakeredis_aioredis = pytest.importorskip("fakeredis.aioredis")
+    pytest.importorskip("lupa")
+
+    retry_after_ttl = 37.0
+    requested_ttl = policy.CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS
+    canonical_alias = "sota-moonshot"
+    candidate = {
+        "provider": policy.CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
+        "model": "kimi_code/k3",
+        "route_family": "codex_kimi_chat_completions_adapter",
+        "last_resort": False,
+        "reasoning_effort": "max",
+    }
+    selected_cooldown_key = (
+        "kimi_code:kimi_code/k3:kimi_code_managed_account"
+    )
+    managed_key = error_signals._get_kimi_code_managed_account_cooldown_key()
+    failure_metadata = classify_kimi_code_failure(
+        status_code=429,
+        error_code="usage_limit",
+        message="usage limit",
+        upstream_id="k3",
+        headers={"X-Trace-Id": "kimi-trace-ms-038"},
+    ).to_safe_metadata()
+    exc = HTTPException(
+        status_code=429,
+        detail={"error": {"message": "usage limit", "code": "usage_limit"}},
+    )
+    exc.upstream_headers = {"Retry-After": str(retry_after_ttl)}
+    exc.kimi_code_probe_failure_metadata = failure_metadata
+    attempt_record: dict[str, Any] = {}
+
+    plan = candidate_loop._resolve_failure_plan(
+        resolve_cooldown_publication_fn=(
+            cooldown_apply._resolve_auto_agent_cooldown_publication_plan
+        ),
+        record_codex_failure_evidence_fn=(
+            attempt_records._record_codex_failure_evidence
+        ),
+        request=_request("/v1/responses"),
+        candidate=candidate,
+        selection={
+            "lane_key": policy.CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
+            "cooldown_key": selected_cooldown_key,
+        },
+        attempt_record=attempt_record,
+        exc=exc,
+        codex_failure_evidence_alias=canonical_alias,
+        kimi_failure_metadata_fn=(
+            error_signals._get_safe_kimi_code_probe_failure_metadata
+        ),
+        classify_kimi_fn=(
+            error_signals._classify_kimi_code_auto_agent_probe_failure
+        ),
+        classify_retryable_fn=(
+            error_signals._classify_codex_auto_agent_retryable_exhaustion
+        ),
+        grok_quota_fn=(
+            error_signals._is_codex_auto_agent_grok_account_quota_exhaustion
+        ),
+        cooldown_seconds_fn=error_signals._get_codex_auto_agent_cooldown_seconds,
+    )
+
+    assert failure_metadata == {
+        "kind": "quota",
+        "scope": "managed_account",
+        "upstream_id": "k3",
+        "metadata_gate": "none",
+        "status_code": 429,
+        "trace_id": "kimi-trace-ms-038",
+        "reset_reason": "quota_exhausted",
+    }
+    assert attempt_record["origin"] == "upstream"
+    assert alias_routing_state.codex_failure_evidence_gate.contains(
+        canonical_alias=canonical_alias,
+        cooldown_key=selected_cooldown_key,
+    )
+    assert plan.kimi_failure_metadata == failure_metadata
+    assert plan.memory_keys == plan.durable_keys == (managed_key,)
+    assert plan.duration_seconds == pytest.approx(requested_ttl, abs=0.1)
+
+    redis_client = fakeredis_aioredis.FakeRedis(decode_responses=False)
+    redis_cache = MagicMock()
+    redis_cache.init_async_client.return_value = redis_client
+    redis_cache.check_and_fix_namespace.side_effect = lambda *, key: key
+    dual_cache = MagicMock()
+    dual_cache.redis_cache = redis_cache
+    dual_cache.in_memory_cache = None
+    durable_key = durable.build_aawm_alias_routing_durable_cache_key(
+        alias_family="codex",
+        state_kind="cooldown",
+        state_key=managed_key,
+    )
+
+    try:
+        with patch.object(
+            durable,
+            "get_aawm_alias_routing_dual_cache",
+            return_value=dual_cache,
+        ):
+            result = await cooldown_apply.execute_cooldown_publication_transaction(
+                alias_family="codex",
+                candidate=candidate,
+                plan=plan,
+                publish_cooldown_memory_fn=(
+                    cooldown_state._publish_codex_cooldown_memory
+                ),
+                persist_cooldown_fn=cooldown_apply._persist_codex_cooldown_durable,
+            )
+
+        assert result is not None
+        attempt_records._attach_kimi_managed_account_publication_telemetry(
+            attempt_record=attempt_record,
+            candidate=candidate,
+            error_class="kimi_code_managed_account",
+            kimi_failure_metadata=failure_metadata,
+            plan=plan,
+            requested_ttl_seconds=requested_ttl,
+            transaction_result=result,
+        )
+        assert result.journal.cooldown_keys == [managed_key]
+        assert result.journal.requested_ttl == int(requested_ttl)
+        assert attempt_record["kimi_managed_account_publication"] == {
+            "classification": "kimi_code_managed_account",
+            "scope": "managed_account",
+            "logical_cooldown_key": managed_key,
+            "requested_ttl_seconds": requested_ttl,
+            "effective_plan_ttl_seconds": requested_ttl,
+            "state_source": "durable_cache",
+            "durable_transaction_receipt": {
+                "id": result.transaction_id,
+                "phase": "LOCAL_COMMITTED",
+                "requested_ttl_seconds": requested_ttl,
+            },
+        }
+
+        durable_ttl = await redis_client.ttl(durable_key)
+        durable_payload = json.loads(await redis_client.get(durable_key))
+        local_ttl = alias_routing_state.codex.get_memory_cooldown_remaining(
+            managed_key
+        )
+
+        assert durable_payload["cooldown_keys"] == [managed_key]
+        assert requested_ttl - 2.0 <= durable_ttl <= requested_ttl
+        assert local_ttl == pytest.approx(float(durable_ttl), abs=2.0)
+        assert durable_payload["expires_at_epoch"] - time.time() == pytest.approx(
+            local_ttl,
+            abs=2.0,
+        )
+    finally:
+        await redis_client.aclose()
 
 
 @pytest.mark.asyncio

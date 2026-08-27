@@ -204,7 +204,14 @@ def _resolve_auto_agent_cooldown_publication_plan(
                 grok_account_quota_exhausted=grok_account_quota_exhausted,
                 kimi_failure_metadata=kimi_failure_metadata,
             )
-        duration = max(0.0, float(decision.duration_seconds))
+        evidence_duration = max(0.0, float(decision.duration_seconds))
+        if (
+            error_class == "kimi_code_managed_account"
+            and cooldown_scope == "managed_account"
+        ):
+            duration = max(duration, evidence_duration)
+        else:
+            duration = evidence_duration
     if cooldown_scope == "none":
         return CooldownPublicationPlan(
             applied_scope="none",

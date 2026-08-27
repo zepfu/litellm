@@ -1,49 +1,10 @@
+# Temporary litellm-alpha stabilization mapping for ``work``.
 defaults: {}
 
 aliases:
   - name: work
     candidates:
-      - provider: opencode_go
-        model: ox-alpha-free
-        route_family: codex_opencode_go_adapter
-        priority: 110
-
-      - provider: nous
-        model: stealth/ox-alpha
-        route_family: codex_nous_chat_completions_adapter
-        priority: 107
-
-      - provider: openrouter
-        model: openrouter/stealth/ox-alpha
-        route_family: codex_openrouter_completion_adapter
-        priority: 105
-
-      - provider: openai
-        model: gpt-5.3-codex-spark
-        route_family: codex_responses
+      - provider: cursor_agent
+        model: cursor_agent/cursor-grok-4.6-high
+        route_family: codex_cursor_agent_aiserver_adapter
         priority: 100
-
-      - alias_reference: work-other
-        priority: 90
-
-      - provider: anthropic
-        model: claude-sonnet-5[1m]
-        route_family: anthropic_messages
-        anthropic_route_family: anthropic_messages
-        priority: 80
-        reasoning_effort: max
-        tui_attached: Claude
-
-      - provider: anthropic
-        model: claude-sonnet-5
-        route_family: anthropic_messages
-        anthropic_route_family: anthropic_messages
-        priority: 70
-        reasoning_effort: max
-        tui_attached: Claude
-
-      - provider: openai
-        model: gpt-5.6-luna
-        route_family: codex_responses
-        priority: 0
-        reasoning_effort: max

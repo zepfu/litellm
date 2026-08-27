@@ -13,6 +13,9 @@ import pytest
 from fastapi import Request
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import attempt_records
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
+    CooldownPublicationPlan,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +60,18 @@ def _make_request() -> Request:
 @dataclass
 class _FakeClassificationEvent:
     origin: str = "upstream"
+
+
+@dataclass
+class _FakePublicationJournal:
+    requested_ttl: int
+
+
+@dataclass
+class _FakePublicationResult:
+    transaction_id: str
+    phase: str
+    journal: _FakePublicationJournal
 
 
 class _StubState:
@@ -397,6 +412,133 @@ class TestRetryableAttemptRecord:
         )
 
         assert "kimi_code_failure" not in record
+
+
+# ---------------------------------------------------------------------------
+# Managed Kimi publication telemetry
+# ---------------------------------------------------------------------------
+
+
+class TestKimiManagedAccountPublicationTelemetry:
+    @staticmethod
+    def _plan(*, duration_seconds: float = 1800.0) -> CooldownPublicationPlan:
+        return CooldownPublicationPlan(
+            memory_keys=("kimi_code:__managed_account__:kimi-code",),
+            durable_keys=("kimi_code:__managed_account__:kimi-code",),
+            duration_seconds=duration_seconds,
+            applied_scope="managed_account",
+            kimi_failure_metadata={"scope": "managed_account"},
+        )
+
+    def test_attaches_safe_durable_transaction_receipt(self) -> None:
+        record: dict[str, Any] = {}
+
+        attempt_records._attach_kimi_managed_account_publication_telemetry(
+            attempt_record=record,
+            candidate={"provider": "kimi_code", "model": "kimi-k3"},
+            error_class="kimi_code_managed_account",
+            kimi_failure_metadata={"scope": "managed_account"},
+            plan=self._plan(),
+            requested_ttl_seconds=3600.1254,
+            transaction_result=_FakePublicationResult(
+                transaction_id="txn-123",
+                phase="LOCAL_COMMITTED",
+                journal=_FakePublicationJournal(requested_ttl=1800),
+            ),
+        )
+
+        assert record["kimi_managed_account_publication"] == {
+            "classification": "kimi_code_managed_account",
+            "scope": "managed_account",
+            "logical_cooldown_key": "kimi_code:__managed_account__:kimi-code",
+            "requested_ttl_seconds": 3600.125,
+            "effective_plan_ttl_seconds": 1800.0,
+            "state_source": "durable_cache",
+            "durable_transaction_receipt": {
+                "id": "txn-123",
+                "phase": "LOCAL_COMMITTED",
+                "requested_ttl_seconds": 1800.0,
+            },
+        }
+
+    def test_attaches_sanitized_publication_failure(self) -> None:
+        record: dict[str, Any] = {}
+        failure = RuntimeError("redis://user:secret@private-host/internal-key")
+
+        attempt_records._attach_kimi_managed_account_publication_telemetry(
+            attempt_record=record,
+            candidate={"provider": "kimi_code", "model": "kimi-k3"},
+            error_class="kimi_code_managed_account",
+            kimi_failure_metadata={"scope": "managed_account"},
+            plan=self._plan(),
+            requested_ttl_seconds=3600.0,
+            publication_error=failure,
+        )
+
+        publication = record["kimi_managed_account_publication"]
+        assert publication["state_source"] == "durable_publication_failed"
+        assert publication["durable_publication_failure"] == {
+            "exception_class": "RuntimeError",
+            "phase": "publication_transaction",
+        }
+        assert "secret" not in str(publication)
+        assert "private-host" not in str(publication)
+
+    def test_marks_memory_only_publication_as_local_fallback(self) -> None:
+        record: dict[str, Any] = {}
+
+        attempt_records._attach_kimi_managed_account_publication_telemetry(
+            attempt_record=record,
+            candidate={"provider": "kimi_code", "model": "kimi-k3"},
+            error_class="kimi_code_managed_account",
+            kimi_failure_metadata={"scope": "managed_account"},
+            plan=self._plan(),
+            requested_ttl_seconds=3600.0,
+        )
+
+        publication = record["kimi_managed_account_publication"]
+        assert publication["state_source"] == "local_fallback"
+        assert "durable_transaction_receipt" not in publication
+        assert "durable_publication_failure" not in publication
+
+    @pytest.mark.parametrize(
+        ("candidate", "error_class", "metadata"),
+        [
+            (
+                {"provider": "openai", "model": "gpt-5"},
+                "kimi_code_managed_account",
+                {"scope": "managed_account"},
+            ),
+            (
+                {"provider": "kimi_code", "model": "kimi-k3"},
+                "rate_limited",
+                {"scope": "managed_account"},
+            ),
+            (
+                {"provider": "kimi_code", "model": "kimi-k3"},
+                "kimi_code_managed_account",
+                {"scope": "candidate"},
+            ),
+        ],
+    )
+    def test_preserves_non_managed_kimi_attempts(
+        self,
+        candidate: dict[str, Any],
+        error_class: str,
+        metadata: dict[str, Any],
+    ) -> None:
+        record: dict[str, Any] = {"existing": "unchanged"}
+
+        attempt_records._attach_kimi_managed_account_publication_telemetry(
+            attempt_record=record,
+            candidate=candidate,
+            error_class=error_class,
+            kimi_failure_metadata=metadata,
+            plan=self._plan(),
+            requested_ttl_seconds=3600.0,
+        )
+
+        assert record == {"existing": "unchanged"}
 
 
 # ---------------------------------------------------------------------------

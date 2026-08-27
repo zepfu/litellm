@@ -1410,6 +1410,21 @@ authenticated managed candidate. Declaring `sota-moonshot` or inserting a
 Kimi candidate in an alias does not enable it without a configured route, the
 shared credential, and accepted authenticated `/models` capability evidence.
 
+For confirmed managed-account quota exhaustion, the untagged shared cooldown
+key is `kimi_code:__managed_account__:kimi_code_managed_account`; the effective
+TTL uses the provider wait/reset signal when available and remains bounded by
+`LITELLM_CODEX_OAUTH_USAGE_LIMIT_COOLDOWN_MAX_SECONDS` (default `10800`
+seconds). The same account gate excludes every Kimi candidate, including a
+`last_resort` candidate, so fallback cannot bypass confirmed exhaustion.
+Attempt and audit metadata expose only bounded failure classification, managed
+scope, reset reason, status/trace identifiers, cooldown key/scope/duration,
+retry-after, and state source; credentials and raw provider payloads are
+excluded. `kimi_managed_account_publication` records the bounded logical
+cooldown key, requested/effective TTLs, state source, and either a sanitized
+durable transaction receipt or publication failure. Durable publication is
+atomic; uncertain writes are accepted only after receipt and postcondition
+evidence, with failure reported as failure rather than inferred success.
+
 For retryable provider errors, the handler records a
 `candidate_retryable_failure` event, cools down that candidate, and selects the
 next configured usable candidate. Declared OpenRouter free daily candidates are

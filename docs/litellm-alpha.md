@@ -45,10 +45,29 @@ does not share candidate cooldown or affinity keys with `litellm-dev`.
 - Tailscale endpoint: `http://100.109.19.233:4011`
 - Config: `/app/litellm-dev-config.yaml`, bind-mounted from this repository
 - Source: `/app`, bind-mounted read-only from this repository
-- Environment label: `litellm-alpha`
-- Alias-routing namespace: `aawm-routing-alpha-v1`
+- Cursor GUI auth file: `/home/zepfu/.config/cursor/auth.json`, bind-mounted
+  read-only at the same path
+- Cursor auth path variable:
+  `LITELLM_CURSOR_AGENT_AUTH_FILE=/home/zepfu/.config/cursor/auth.json`
+- Proxy environment label:
+  `AAWM_LITELLM_ENVIRONMENT=litellm-alpha`
+- Alias-routing Redis namespace:
+  `AAWM_ALIAS_ROUTING_STATE_NAMESPACE=aawm-routing-alpha-v1`
+- Database application names:
+  `AAWM_SESSION_HISTORY_DB_APPLICATION_NAME=aawm-litellm-alpha-session-history`,
+  `AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME=aawm-litellm-alpha-dynamic-injection`,
+  and `PGAPPNAME=aawm-litellm-alpha-runtime`
+- Error-log label: `LITELLM_AAWM_ERROR_LOG_ENV=alpha`
+- Langfuse trace label: `LITELLM_LANGFUSE_TRACE_ENVIRONMENT=alpha`
 - Session-history spool:
   `/app/.analysis/runtime/litellm-alpha/session_history`
+
+The Cursor Agent provider reads the mounted GUI auth file. A fresh
+`accessToken` is used directly; an `apiKey`/`api_key` is exchanged with
+`https://api2.cursor.sh/auth/exchange_user_api_key`, and the returned
+`accessToken` is used as the Agent bearer credential. Only the auth-file path
+is supplied through Compose/environment; the auth JSON contents and raw API
+key are never placed there.
 
 The image contains the Python dependencies and an editable LiteLLM install.
 At runtime, the repository is mounted over `/app`, and `PYTHONPATH=/app`
@@ -134,3 +153,5 @@ development database connections for parity. Treat all calls as real provider
 and development-data operations. It is isolated by port, container name,
 environment label, process application names, and alias-routing Redis
 namespace, but it is not a sandbox for destructive database or provider tests.
+The Cursor auth-file wiring is testing-only; this document does not claim
+Cursor live acceptance.

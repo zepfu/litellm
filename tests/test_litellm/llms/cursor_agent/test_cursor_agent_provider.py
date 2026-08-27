@@ -24,6 +24,11 @@ from litellm.llms.cursor_agent.common_utils import (
     run_url,
     strip_provider_prefix,
 )
+from litellm.llms.cursor_agent import connect as cursor_connect
+from litellm.llms.cursor_agent.connect import (
+    decode_connect_proto_frames,
+    encode_connect_proto_frame,
+)
 from litellm.types.utils import LlmProviders, ModelResponse
 
 
@@ -141,6 +146,104 @@ def test_validate_environment_uses_http2_headers(monkeypatch):
     assert "x-cursor-streaming" not in {key.lower() for key in headers}
 
 
+def test_sign_request_uses_connect_proto_framing():
+    config = CursorAgentConfig()
+    request_data = build_run_request(
+        model="cursor_agent/cursor-grok-4.6-high",
+        messages=[{"role": "user", "content": "ping"}],
+        optional_params={
+            "message_id": "message-1",
+            "conversation_id": "conversation-1",
+            "conversation_group_id": "conversation-1",
+            "run_id": "run-1",
+        },
+    )
+    headers, body = config.sign_request(
+        headers={"content-type": "application/connect+proto"},
+        optional_params={},
+        request_data=request_data,
+        api_base=run_url(),
+        api_key="access-token",
+    )
+
+    assert headers["content-type"] == "application/connect+proto"
+    assert body is not None
+    frames = decode_connect_proto_frames(body)
+    client_fields = cursor_connect._decode_proto_fields(frames[0].payload)
+    run_payload = cursor_connect._proto_last_field(
+        client_fields,
+        1,
+        wire_type=2,
+    )
+    assert isinstance(run_payload, bytes)
+    run_fields = cursor_connect._decode_proto_fields(run_payload)
+    assert cursor_connect._proto_last_field(
+        run_fields,
+        12,
+        wire_type=0,
+    ) is None
+    action = cursor_connect._proto_last_field(
+        run_fields,
+        2,
+        wire_type=2,
+    )
+    assert isinstance(action, bytes)
+    action_fields = cursor_connect._decode_proto_fields(action)
+    assert cursor_connect._proto_last_field(
+        action_fields,
+        17,
+        wire_type=2,
+    ) is None
+    user_message_action = cursor_connect._proto_last_field(
+        action_fields,
+        1,
+        wire_type=2,
+    )
+    assert isinstance(user_message_action, bytes)
+    assert cursor_connect._proto_last_field(
+        cursor_connect._decode_proto_fields(user_message_action),
+        2,
+        wire_type=2,
+    ) is None
+    requested_model = cursor_connect._proto_last_field(
+        run_fields,
+        9,
+        wire_type=2,
+    )
+    assert isinstance(requested_model, bytes)
+    model_fields = cursor_connect._decode_proto_fields(requested_model)
+    assert cursor_connect._decode_proto_string(
+        cursor_connect._proto_last_field(model_fields, 1, wire_type=2)
+    ) == "grok-4.6"
+    parameters = cursor_connect._proto_field_values(
+        model_fields,
+        3,
+        wire_type=2,
+    )
+    assert [
+        {
+            "id": cursor_connect._decode_proto_string(
+                cursor_connect._proto_last_field(
+                    cursor_connect._decode_proto_fields(parameter),
+                    1,
+                    wire_type=2,
+                )
+            ),
+            "value": cursor_connect._decode_proto_string(
+                cursor_connect._proto_last_field(
+                    cursor_connect._decode_proto_fields(parameter),
+                    2,
+                    wire_type=2,
+                )
+            ),
+        }
+        for parameter in parameters
+    ] == [
+        {"id": "effort", "value": "high"},
+        {"id": "fast", "value": "false"},
+    ]
+
+
 def test_prompt_maps_to_user_message_text():
     request = build_run_request(
         model="cursor_agent/composer-2.5",
@@ -149,30 +252,81 @@ def test_prompt_maps_to_user_message_text():
             {"role": "user", "content": "hello from litellm"},
         ],
     )
-    action = request["run_request"]["action"]["user_message_action"]
-    assert action["user_message"]["text"] == "hello from litellm"
-    assert request["run_request"]["requested_model"]["model_id"] == "composer-2.5"
-    assert request["run_request"]["model_details"]["model_id"] == "composer-2.5"
+    action = request["runRequest"]["action"]["userMessageAction"]
+    user_message = action["userMessage"]
+    assert user_message["text"] == "hello from litellm"
+    assert user_message["messageId"]
+    assert user_message["selectedContext"] == {}
+    assert user_message["mode"] == "AGENT_MODE_AGENT"
+    assert request["runRequest"]["requestedModel"]["modelId"] == "composer-2.5"
+    assert "modelDetails" not in request["runRequest"]
+    assert request["runRequest"]["mcpTools"] == {}
+    assert "messageId" not in request["runRequest"]
+    assert request["runRequest"]["conversationId"]
+    assert (
+        request["runRequest"]["conversationGroupId"]
+        == request["runRequest"]["conversationId"]
+    )
+    assert request["runRequest"]["runId"]
 
 
-def test_model_slugs_are_preserved():
-    for slug in ("composer-2.5", "cursor-grok-4.6-high"):
-        request = build_run_request(
-            model=f"cursor_agent/{slug}",
-            messages=[{"role": "user", "content": "ping"}],
-        )
-        assert request["run_request"]["requested_model"]["model_id"] == slug
-        assert strip_provider_prefix(f"cursor_agent/{slug}") == slug
+def test_run_identifiers_preserve_caller_values():
+    request = build_run_request(
+        model="cursor_agent/composer-2.5",
+        messages=[{"role": "user", "content": "ping"}],
+        optional_params={
+            "message_id": "message-1",
+            "conversationId": "conversation-1",
+            "conversation_group_id": "group-1",
+            "runId": "run-1",
+        },
+    )
+
+    assert (
+        request["runRequest"]["action"]["userMessageAction"]["userMessage"][
+            "messageId"
+        ]
+        == "message-1"
+    )
+    assert request["runRequest"]["conversationId"] == "conversation-1"
+    assert request["runRequest"]["conversationGroupId"] == "group-1"
+    assert request["runRequest"]["runId"] == "run-1"
+
+
+def test_requested_model_preserves_unmapped_model_slug():
+    request = build_run_request(
+        model="cursor_agent/composer-2.5",
+        messages=[{"role": "user", "content": "ping"}],
+    )
+
+    assert request["runRequest"]["requestedModel"] == {"modelId": "composer-2.5"}
+
+
+def test_requested_model_translates_cursor_catalog_selector():
+    selector = "cursor-grok-4.6-high"
+    request = build_run_request(
+        model=f"cursor_agent/{selector}",
+        messages=[{"role": "user", "content": "ping"}],
+    )
+
+    assert strip_provider_prefix(f"cursor_agent/{selector}") == selector
+    assert request["runRequest"]["requestedModel"] == {
+        "modelId": "grok-4.6",
+        "parameters": [
+            {"id": "effort", "value": "high"},
+            {"id": "fast", "value": "false"},
+        ],
+    }
 
 
 def test_text_delta_and_turn_ended_parse():
     text, ended = extract_text_from_agent_payload(
-        {"interaction_update": {"text_delta": {"text": "Hello"}}}
+        {"interactionUpdate": {"textDelta": {"text": "Hello"}}}
     )
     assert text == "Hello"
     assert ended is False
     text, ended = extract_text_from_agent_payload(
-        {"interaction_update": {"turn_ended": {}}}
+        {"interactionUpdate": {"turnEnded": {}}}
     )
     assert text == ""
     assert ended is True
@@ -180,14 +334,40 @@ def test_text_delta_and_turn_ended_parse():
 
 def test_transform_response_joins_text_deltas():
     config = CursorAgentConfig()
+    text_hel = cursor_connect._encode_proto_string_field(1, "Hel")
+    text_lo = cursor_connect._encode_proto_string_field(1, "lo")
+    interaction_hel = cursor_connect._encode_proto_message_field(1, text_hel)
+    interaction_lo = cursor_connect._encode_proto_message_field(1, text_lo)
+    turn_ended = cursor_connect._encode_proto_message_field(14, b"")
+    body = b"".join(
+        (
+            encode_connect_proto_frame(
+                cursor_connect._encode_proto_message_field(
+                    1,
+                    interaction_hel,
+                )
+            ),
+            encode_connect_proto_frame(
+                cursor_connect._encode_proto_message_field(
+                    1,
+                    interaction_lo,
+                )
+            ),
+            encode_connect_proto_frame(
+                cursor_connect._encode_proto_message_field(
+                    1,
+                    turn_ended,
+                )
+            ),
+            bytes((2, 0, 0, 0, 2)) + b"{}",
+        )
+    )
     raw = httpx.Response(
         200,
-        json=[
-            {"interaction_update": {"text_delta": {"text": "Hel"}}},
-            {"interaction_update": {"text_delta": {"text": "lo"}}},
-            {"interaction_update": {"turn_ended": {}}},
-        ],
+        content=body,
+        headers={"content-type": "application/connect+proto"},
         request=httpx.Request("POST", run_url()),
+        extensions={"http_version": b"HTTP/2"},
     )
     response = config.transform_response(
         model="composer-2.5",
@@ -202,6 +382,45 @@ def test_transform_response_joins_text_deltas():
     )
     assert response.choices[0].message.content == "Hello"
     assert response.model == "cursor_agent/composer-2.5"
+
+
+def test_transform_response_rejects_incomplete_text():
+    config = CursorAgentConfig()
+    text_delta = cursor_connect._encode_proto_string_field(1, "partial")
+    interaction_update = cursor_connect._encode_proto_message_field(
+        1,
+        text_delta,
+    )
+    body = (
+        encode_connect_proto_frame(
+            cursor_connect._encode_proto_message_field(
+                1,
+                interaction_update,
+            )
+        )
+        + bytes((2, 0, 0, 0, 2))
+        + b"{}"
+    )
+    raw = httpx.Response(
+        200,
+        content=body,
+        headers={"content-type": "application/connect+proto"},
+        request=httpx.Request("POST", run_url()),
+        extensions={"http_version": b"HTTP/2"},
+    )
+
+    with pytest.raises(CursorAgentError, match="turnEnded"):
+        config.transform_response(
+            model="composer-2.5",
+            raw_response=raw,
+            model_response=ModelResponse(),
+            logging_obj=None,
+            request_data={},
+            messages=[{"role": "user", "content": "hi"}],
+            optional_params={},
+            litellm_params={},
+            encoding=None,
+        )
 
 
 def test_get_llm_provider_resolves_cursor_agent():

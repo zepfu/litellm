@@ -1,3 +1,4 @@
+# Temporary litellm-alpha stabilization mapping for ``sota-openai``.
 defaults: {}
 
 aliases:
@@ -7,4 +8,4 @@ aliases:
         model: gpt-5.6-sol
         route_family: codex_responses
         priority: 100
-        reasoning_effort: max
+        reasoning_effort: medium

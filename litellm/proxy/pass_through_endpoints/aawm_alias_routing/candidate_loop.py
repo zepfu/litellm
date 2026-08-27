@@ -949,18 +949,53 @@ async def handle_alias_route(  # noqa: PLR0915
                         early_pre_commit_retry_plan["action"]
                         in {"retry_same_account", "pre_stream_unavailable"}
                     )
+                    publication_transaction_result: Optional[object] = None
+                    publication_requested_ttl_seconds: Optional[float] = None
+                    if (
+                        probe_failure_plan is not None
+                        and probe_failure_plan.applied_scope == "managed_account"
+                    ):
+                        publication_requested_ttl_seconds = (
+                            _get_codex_auto_agent_cooldown_seconds(
+                                probe_failure_exc,
+                                candidate=candidate,
+                            )
+                        )
 
                     # --- Cooldown mutation: NO pre-held probe lock ------------
                     if (
                         probe_failure_plan is not None
                         and not skip_cooldown_for_same_account_retry
                     ):
-                        await _lpe.execute_cooldown_publication_transaction(
-                            alias_family=alias_family,
+                        try:
+                            publication_transaction_result = (
+                                await _lpe.execute_cooldown_publication_transaction(
+                                    alias_family=alias_family,
+                                    candidate=candidate,
+                                    plan=probe_failure_plan,
+                                    publish_cooldown_memory_fn=publish_cooldown_memory_fn,
+                                    persist_cooldown_fn=persist_cooldown_fn,
+                                )
+                            )
+                        except BaseException as publication_exc:
+                            _attempt_records._attach_kimi_managed_account_publication_telemetry(
+                                attempt_record=attempt_record,
+                                candidate=candidate,
+                                error_class=early_pre_commit_error_class,
+                                kimi_failure_metadata=probe_failure_plan.kimi_failure_metadata,
+                                plan=probe_failure_plan,
+                                requested_ttl_seconds=publication_requested_ttl_seconds,
+                                publication_error=publication_exc,
+                            )
+                            raise
+                        _attempt_records._attach_kimi_managed_account_publication_telemetry(
+                            attempt_record=attempt_record,
                             candidate=candidate,
+                            error_class=early_pre_commit_error_class,
+                            kimi_failure_metadata=probe_failure_plan.kimi_failure_metadata,
                             plan=probe_failure_plan,
-                            publish_cooldown_memory_fn=publish_cooldown_memory_fn,
-                            persist_cooldown_fn=persist_cooldown_fn,
+                            requested_ttl_seconds=publication_requested_ttl_seconds,
+                            transaction_result=publication_transaction_result,
                         )
                     # Mutation complete (or no plan): signal intent.
                     intent.complete(error=probe_failure_exc)
@@ -1088,9 +1123,13 @@ async def handle_alias_route(  # noqa: PLR0915
                             )
                         },
                     )
-                cooldown_seconds = _get_codex_auto_agent_cooldown_seconds(
-                    failure_exc,
-                    candidate=candidate,
+                cooldown_seconds = (
+                    publication_requested_ttl_seconds
+                    if publication_requested_ttl_seconds is not None
+                    else _get_codex_auto_agent_cooldown_seconds(
+                        failure_exc,
+                        candidate=candidate,
+                    )
                 )
                 # The plan was resolved inside the probe lock above.  After probe
                 # lock release, execute_cooldown_publication_transaction performed

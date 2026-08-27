@@ -479,14 +479,70 @@ class TestKimiMetadata:
         candidate = {"provider": "kimi_code", "model": "kimi-k3"}
         assert _get_safe_kimi_code_probe_failure_metadata(exc, candidate=candidate) is None
 
-    def test_classify_managed_account(self):
-        assert _classify_kimi_code_auto_agent_probe_failure({"scope": "managed_account"}) == "kimi_code_managed_account"
+    @pytest.mark.parametrize(
+        ("kind", "scope", "expected_error_class"),
+        (
+            ("unsupported_model", "candidate", "kimi_code_candidate_failure"),
+            ("malformed", "none", "kimi_code_no_cooldown"),
+            (
+                "refresh_required_auth",
+                "managed_account",
+                "kimi_code_managed_account",
+            ),
+            ("provider_capacity", "managed_account", "kimi_code_managed_account"),
+            ("transient", "candidate", "kimi_code_candidate_failure"),
+        ),
+    )
+    def test_classify_proven_failure_kind_dispositions(
+        self,
+        kind: str,
+        scope: str,
+        expected_error_class: str,
+    ):
+        assert (
+            _classify_kimi_code_auto_agent_probe_failure(
+                {"kind": kind, "scope": scope}
+            )
+            == expected_error_class
+        )
 
-    def test_classify_candidate(self):
-        assert _classify_kimi_code_auto_agent_probe_failure({"scope": "candidate"}) == "kimi_code_candidate_failure"
+    @pytest.mark.parametrize(
+        "kind",
+        ("unsupported_model", "malformed", "transient"),
+    )
+    def test_non_account_failure_kind_rejects_managed_account_scope(
+        self,
+        kind: str,
+    ):
+        meta = dict(self._VALID_METADATA, kind=kind)
+        exc = _FakeExc(kimi_code_probe_failure_metadata=meta)
+        candidate = {"provider": "kimi_code", "model": "kimi-k3"}
 
-    def test_classify_none_scope(self):
-        assert _classify_kimi_code_auto_agent_probe_failure({"scope": "none"}) == "kimi_code_no_cooldown"
+        assert _get_safe_kimi_code_probe_failure_metadata(
+            exc,
+            candidate=candidate,
+        ) is None
+        assert (
+            _classify_kimi_code_auto_agent_probe_failure(
+                {"kind": kind, "scope": "managed_account"}
+            )
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "kind",
+        ("refresh_required_auth", "provider_capacity"),
+    )
+    def test_proven_account_failure_kind_rejects_candidate_scope(
+        self,
+        kind: str,
+    ):
+        assert (
+            _classify_kimi_code_auto_agent_probe_failure(
+                {"kind": kind, "scope": "candidate"}
+            )
+            is None
+        )
 
     def test_classify_none_metadata(self):
         assert _classify_kimi_code_auto_agent_probe_failure(None) is None
@@ -527,7 +583,7 @@ class TestCooldownScope:
 
     def test_kimi_managed_account_scope(self):
         candidate = {"provider": "kimi_code", "model": "kimi-k3"}
-        meta = {"scope": "managed_account"}
+        meta = {"kind": "quota", "scope": "managed_account"}
         scope = _get_codex_auto_agent_candidate_cooldown_scope(
             "kimi_code_managed_account", candidate=candidate, kimi_failure_metadata=meta
         )
@@ -535,7 +591,7 @@ class TestCooldownScope:
 
     def test_kimi_candidate_scope(self):
         candidate = {"provider": "kimi_code", "model": "kimi-k3"}
-        meta = {"scope": "candidate"}
+        meta = {"kind": "unsupported_model", "scope": "candidate"}
         scope = _get_codex_auto_agent_candidate_cooldown_scope(
             "kimi_code_candidate_failure", candidate=candidate, kimi_failure_metadata=meta
         )
@@ -547,6 +603,23 @@ class TestCooldownScope:
             "kimi_code_no_cooldown", candidate=candidate
         )
         assert scope == "none"
+
+    @pytest.mark.parametrize(
+        "kind",
+        ("unsupported_model", "malformed", "transient"),
+    )
+    def test_non_account_kimi_failure_cannot_select_managed_account_scope(
+        self,
+        kind: str,
+    ):
+        candidate = {"provider": "kimi_code", "model": "kimi-k3"}
+        scope = _get_codex_auto_agent_candidate_cooldown_scope(
+            "kimi_code_managed_account",
+            candidate=candidate,
+            kimi_failure_metadata={"kind": kind, "scope": "managed_account"},
+        )
+
+        assert scope == "request_local"
 
     def test_native_grok_candidate_unavailable_gets_none(self):
         candidate = {

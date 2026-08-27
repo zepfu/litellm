@@ -773,6 +773,44 @@ class TestApplyCodexFailureEvidence:
         setter.assert_awaited_once_with("rp:key", 45.0)
 
     @pytest.mark.asyncio
+    async def test_kimi_managed_account_evidence_preserves_provider_ttl(
+        self, configured_runtime: dict
+    ) -> None:
+        configured_runtime["scope_fn"].return_value = "managed_account"
+        configured_runtime["gate"]._decision = _FakeDecision(
+            should_cool=True,
+            duration_seconds=30.0,
+            scope="managed_account",
+        )
+        mgr = configured_runtime["mgr"]
+        setter = AsyncMock()
+
+        result = await _apply_codex_failure_evidence_cooldown(
+            canonical_alias="kimi-alias",
+            request=_make_request(),
+            candidate={"provider": "kimi", "model": "kimi-code"},
+            lane_key="kimi-lane",
+            selected_cooldown_key="kimi:selected",
+            cooldown_seconds=10_800.0,
+            error_class="kimi_code_managed_account",
+            set_candidate_cooldown=setter,
+            kimi_failure_metadata={"scope": "managed_account"},
+        )
+
+        assert result == "managed_account"
+        remaining = mgr.codex.get_memory_cooldown_remaining(
+            "kimi:__managed__:default"
+        )
+        assert remaining > 10_799.0
+        setter.assert_awaited_once_with("kimi:__managed__:default", 10_800.0)
+        assert configured_runtime["gate"].current_calls == [
+            {
+                "canonical_alias": "kimi-alias",
+                "cooldown_key": "kimi:selected",
+            }
+        ]
+
+    @pytest.mark.asyncio
     async def test_evidence_not_cool_returns_none(
         self, configured_runtime: dict
     ) -> None:

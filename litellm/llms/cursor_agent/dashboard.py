@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 
 from .constants import (
     CURSOR_AGENT_CLIENT_VERSION,
+    CURSOR_AGENT_CONNECT_CONTENT_TYPE,
     CURSOR_AGENT_DASHBOARD_HOST,
     CURSOR_AGENT_USAGE_PATH,
     CURSOR_API_KEY_ENV,
@@ -103,7 +104,8 @@ def build_turn_headers(
         "x-ghost-mode": "true",
         "x-request-id": request_id or str(uuid.uuid4()),
         "connect-protocol-version": "1",
-        "content-type": "application/json",
+        "accept": CURSOR_AGENT_CONNECT_CONTENT_TYPE,
+        "content-type": CURSOR_AGENT_CONNECT_CONTENT_TYPE,
     }
     if extra_headers:
         for key, value in extra_headers.items():
@@ -112,6 +114,10 @@ def build_turn_headers(
             lowered = key.lower()
             if lowered in {
                 "authorization",
+                "accept",
+                "content-type",
+                "connect-protocol-version",
+                "accept-encoding",
                 "x-cursor-streaming",
                 "x-cursor-checksum",
             }:
@@ -127,9 +133,12 @@ def build_dashboard_headers(
     request_id: Optional[str] = None,
 ) -> Dict[str, str]:
     """Headers for DashboardService unary Connect JSON RPCs."""
-    return build_turn_headers(
+    headers = build_turn_headers(
         access_token,
         extra_headers=extra_headers,
         request_id=request_id,
         http2=True,
     )
+    headers["content-type"] = "application/json"
+    headers.pop("accept", None)
+    return headers

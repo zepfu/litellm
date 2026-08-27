@@ -24,11 +24,18 @@ from ..common_utils import (
     CursorAgentError,
     build_run_request,
     build_turn_headers,
-    extract_text_from_agent_payload,
     resolve_access_token,
     resolve_provider_info,
     run_url,
     strip_provider_prefix,
+)
+from ..connect import (
+    CursorConnectError,
+    decode_cursor_agent_response_payloads,
+    ensure_cursor_http2_available,
+    encode_cursor_run_request,
+    parse_cursor_agent_payloads,
+    require_http2_response,
 )
 from .streaming_iterator import CursorAgentModelResponseIterator
 
@@ -58,8 +65,8 @@ class CursorAgentConfig(BaseConfig):
         """
         HTTP/2 `Run` is a Connect bidi stream, not OpenAI SSE.
 
-        Collect the JSON frames through `transform_response` and fake-stream
-        them. Native Connect proto framing is deferred.
+        Collect the framed Connect messages through `transform_response` and
+        fake-stream them as OpenAI-compatible chunks.
         """
         return bool(stream)
 
@@ -69,7 +76,7 @@ class CursorAgentConfig(BaseConfig):
         return resolve_provider_info(api_base, api_key)
 
     def get_supported_openai_params(self, model: str) -> List[str]:
-        # AgentRunRequest has mcp_tools / custom_system_prompt /
+        # AgentRunRequest has mcp_tools / conversation_history /
         # conversation_state, not OpenAI temperature / max_tokens / tool_choice.
         return [
             "stream",
@@ -97,7 +104,7 @@ class CursorAgentConfig(BaseConfig):
                 message=(
                     f"{CURSOR_AGENT_PROVIDER} does not support parameters: "
                     f"{unsupported}, for model={model}. AgentRunRequest has "
-                    "mcp_tools / custom_system_prompt / conversation_state, "
+                    "mcp_tools / conversation_history / conversation_state, "
                     "not OpenAI temperature / max_tokens / tool_choice."
                 ),
                 llm_provider=CURSOR_AGENT_PROVIDER,
@@ -115,7 +122,15 @@ class CursorAgentConfig(BaseConfig):
         api_key: Optional[str] = None,
         api_base: Optional[str] = None,
     ) -> dict:
-        access_token = resolve_access_token(api_key, allow_exchange=False)
+        try:
+            ensure_cursor_http2_available()
+        except CursorConnectError as exc:
+            raise CursorAgentError(
+                status_code=exc.status_code,
+                message=exc.message,
+                headers=exc.headers,
+            ) from exc
+        access_token = resolve_access_token(api_key, allow_exchange=True)
         request_id = None
         if isinstance(headers, dict):
             request_id = headers.get("x-request-id") or headers.get("X-Request-Id")
@@ -156,6 +171,28 @@ class CursorAgentConfig(BaseConfig):
             optional_params=optional_params,
         )
 
+    def sign_request(
+        self,
+        headers: dict,
+        optional_params: dict,
+        request_data: dict,
+        api_base: str,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        stream: Optional[bool] = None,
+        fake_stream: Optional[bool] = None,
+    ) -> tuple[dict, Optional[bytes]]:
+        _ = optional_params, api_base, api_key, model, stream, fake_stream
+        try:
+            ensure_cursor_http2_available()
+            return headers, encode_cursor_run_request(request_data)
+        except CursorConnectError as exc:
+            raise CursorAgentError(
+                status_code=exc.status_code,
+                message=exc.message,
+                headers=exc.headers,
+            ) from exc
+
     def transform_response(
         self,
         model: str,
@@ -170,14 +207,30 @@ class CursorAgentConfig(BaseConfig):
         api_key: Optional[str] = None,
         json_mode: Optional[bool] = None,
     ) -> ModelResponse:
+        response_headers = dict(raw_response.headers)
+        content_type = response_headers.get("content-type", "").lower()
         try:
-            payload = raw_response.json()
+            require_http2_response(raw_response)
+            if "application/connect+proto" in content_type:
+                payload = decode_cursor_agent_response_payloads(
+                    raw_response.content
+                )
+            else:
+                payload = raw_response.json()
+        except CursorAgentError:
+            raise
+        except CursorConnectError as exc:
+            raise CursorAgentError(
+                status_code=exc.status_code,
+                message=exc.message,
+                headers=exc.headers,
+            ) from exc
         except Exception as exc:
             raise CursorAgentError(
                 status_code=raw_response.status_code,
                 message=f"Failed to parse cursor_agent response: {exc}",
-                headers=dict(raw_response.headers),
-            )
+                headers=response_headers,
+            ) from exc
 
         if isinstance(payload, dict) and payload.get("error"):
             error = payload["error"]
@@ -189,30 +242,33 @@ class CursorAgentConfig(BaseConfig):
             raise CursorAgentError(
                 status_code=raw_response.status_code,
                 message=message,
-                headers=dict(raw_response.headers),
+                headers=response_headers,
             )
 
-        text_parts: List[str] = []
-        turn_ended = False
         if isinstance(payload, list):
             frames = payload
         elif isinstance(payload, dict) and isinstance(payload.get("events"), list):
             frames = payload["events"]
         else:
             frames = [payload]
-        for frame in frames:
-            chunk_text, ended = extract_text_from_agent_payload(frame)
-            if chunk_text:
-                text_parts.append(chunk_text)
-            if ended:
-                turn_ended = True
+        result = parse_cursor_agent_payloads(
+            frame for frame in frames if isinstance(frame, dict)
+        )
+        try:
+            result.validate_terminal()
+        except CursorConnectError as exc:
+            raise CursorAgentError(
+                status_code=exc.status_code,
+                message=exc.message,
+                headers=response_headers,
+            ) from exc
 
         model_response.choices = [
             Choices(
-                finish_reason="stop" if turn_ended or text_parts else "stop",
+                finish_reason="stop",
                 index=0,
                 message=Message(
-                    content="".join(text_parts),
+                    content=result.text,
                     role="assistant",
                 ),
             )
