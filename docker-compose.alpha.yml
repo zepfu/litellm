@@ -76,7 +76,6 @@ services:
       - ./.analysis:/app/.analysis
       - ./captures:/tmp/captures
       - /home/zepfu/.analysis:/home/zepfu/.analysis
-      - /mnt/e/litellm/session_history:/mnt/e/litellm/session_history
       # Match the development proxy's read-only identity and credential inputs.
       - /home/zepfu/.claude/projects:/home/zepfu/.claude/projects:ro
       - /home/zepfu/projects/aawm/agents:/home/zepfu/.claude/agents:ro
@@ -120,7 +119,7 @@ services:
       - AAWM_DATABASE_URL=${LITELLM_AAWM_DATABASE_URL:-postgresql://aawm:aawm_dev@pgbouncer-aawm-dev:6432/aawm_tristore?application_name=aawm-litellm-session-history}
       - AAWM_DIRECT_DATABASE_URL=${LITELLM_AAWM_DIRECT_DATABASE_URL:-postgresql://aawm:aawm_dev@postgres18:5432/aawm_tristore}
       - AAWM_SESSION_HISTORY_DB_APPLICATION_NAME=${LITELLM_AAWM_SESSION_HISTORY_DB_APPLICATION_NAME:-aawm-litellm-session-history}
-      - AAWM_SESSION_HISTORY_SPOOL_DIR=${AAWM_SESSION_HISTORY_SPOOL_DIR:-/mnt/e/litellm/session_history}
+      - AAWM_SESSION_HISTORY_SPOOL_DIR=/app/.analysis/runtime/litellm-alpha/session_history
       - AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE=${LITELLM_AAWM_SESSION_HISTORY_STATEMENT_CACHE_SIZE:-0}
       - AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME=${LITELLM_AAWM_DYNAMIC_INJECTION_DB_APPLICATION_NAME:-aawm-litellm-dynamic-injection}
       # Dynamic-injection/tristore selectors. Empty defaults keep the runtime

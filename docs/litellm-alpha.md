@@ -47,10 +47,17 @@ does not share candidate cooldown or affinity keys with `litellm-dev`.
 - Source: `/app`, bind-mounted read-only from this repository
 - Environment label: `litellm-alpha`
 - Alias-routing namespace: `aawm-routing-alpha-v1`
+- Session-history spool:
+  `/app/.analysis/runtime/litellm-alpha/session_history`
 
 The image contains the Python dependencies and an editable LiteLLM install.
 At runtime, the repository is mounted over `/app`, and `PYTHONPATH=/app`
 ensures imports resolve from the live checkout.
+
+Alpha never mounts or scans the development session-history spool at
+`/mnt/e/litellm/session_history`. Its durable queue fallback lives under the
+repository's ignored `.analysis/runtime/litellm-alpha/` tree, so alpha cannot
+claim, replay, quarantine, or delete `litellm-dev` spool records.
 
 `watchfiles` restarts the LiteLLM process when files change under:
 
