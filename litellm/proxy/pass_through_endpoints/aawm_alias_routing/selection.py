@@ -3691,6 +3691,25 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             isinstance(session_owner_record, dict)
             and sa._record_state(session_owner_record) == "owned"
         ):
+            if account_identity_pinned and _candidate_matches_affinity(
+                affinity_state["candidate"],
+                affinity,
+            ):
+                _raise_codex_auto_agent_redispatch_required(
+                    candidate=dict(affinity_state.get("candidate") or {}),
+                    lane_key=affinity_state.get("lane_key")
+                    or affinity.get("codex_oauth_lane_key"),
+                    cooldown_seconds=0.0,
+                    error_tokens=set(),
+                    alias_model=alias_model,
+                    error_class="candidate_unavailable",
+                    cooldown_scope="account",
+                    failure_phase="account_bound_owner_unavailable",
+                    attempted_provider_call=False,
+                    skipped_candidates=_build_auto_agent_skipped_candidates_from_states(
+                        [affinity_state]
+                    ),
+                )
             return await _reselect_owned_affinity_with_effective_identity(
                 candidate=affinity_state.get("candidate"),
                 failure_phase="session_owner_owned_affinity_unavailable",
