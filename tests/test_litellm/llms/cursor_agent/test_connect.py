@@ -383,7 +383,8 @@ class _H2StartupPeer:
 
 
 class _H2McpExecPeer:
-    def __init__(self) -> None:
+    def __init__(self, *, local_exec: bool = False) -> None:
+        self.local_exec = local_exec
         self.server = H2Connection(
             config=H2Configuration(
                 client_side=False,
@@ -407,6 +408,21 @@ class _H2McpExecPeer:
         return await self.incoming.get()
 
     def _send_tool_call(self) -> None:
+        if self.local_exec:
+            shell_args = _string(1, "pwd") + _string(2, "/workspace")
+            exec_request = (
+                _varint(1, 11)
+                + _message(2, shell_args)
+                + _string(15, "exec-local")
+            )
+            self.server.send_data(
+                self.stream_id,
+                encode_connect_proto_frame(_message(2, exec_request)),
+                end_stream=False,
+            )
+            self.sent_tool_call = True
+            return
+
         mcp_args = (
             _string(1, "exec_command")
             + _message(
@@ -598,6 +614,72 @@ def test_h2_bidi_surfaces_mcp_exec_as_external_tool_call(
         and _last_field(payload, 5, wire_type=2) is None
         for payload in peer.client_payloads
     )
+
+
+def test_h2_bidi_surfaces_local_shell_as_advertised_external_tool_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer = _H2McpExecPeer(local_exec=True)
+    monkeypatch.setattr(asyncio, "open_connection", peer.open_connection)
+    client = CursorAgentConnectClient(auth=CursorAgentAuth("access-token"))
+    request = _run_request()
+    request["runRequest"]["mcpTools"] = {
+        "mcpTools": [{"name": "exec_command"}],
+    }
+
+    result = asyncio.run(
+        client.run(
+            request,
+            url="https://cursor.test/agent.v1.AgentService/Run",
+            timeout=0.5,
+            stop_on_tool_call=True,
+        )
+    )
+
+    assert result.tool_calls == [
+        {
+            "call_id": "exec-local",
+            "name": "exec_command",
+            "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
+            "id": "fc_exec-local",
+        }
+    ]
+    assert peer.sent_tool_call is True
+    assert peer.request_stream_ended is False
+    assert all(
+        _last_field(payload, 2, wire_type=2) is None
+        and _last_field(payload, 5, wire_type=2) is None
+        for payload in peer.client_payloads
+    )
+
+
+@pytest.mark.parametrize("message_field", [2, 14])
+def test_proto_bidi_bridges_advertised_local_shell_arguments(
+    message_field: int,
+) -> None:
+    shell_args = _string(1, "pwd") + _string(2, "/workspace")
+    exec_request = (
+        _varint(1, 17)
+        + _message(message_field, shell_args)
+        + _string(15, "exec-local")
+    )
+    normalized, client_messages = cursor_connect._process_agent_server_message(
+        _message(2, exec_request),
+        {},
+        local_exec_tool_name="exec_command",
+    )
+
+    assert normalized == {
+        "interactionUpdate": {
+            "toolCallCompleted": {
+                "callId": "exec-local",
+                "toolName": "exec_command",
+                "argsJson": '{"cmd":"pwd","workdir":"/workspace"}',
+                "itemId": "fc_exec-local",
+            }
+        }
+    }
+    assert client_messages == []
 
 
 def test_proto_bidi_rejects_unsupported_local_exec_operation() -> None:
