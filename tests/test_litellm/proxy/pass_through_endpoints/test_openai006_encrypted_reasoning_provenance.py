@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from starlette.requests import Request
@@ -13,6 +17,13 @@ from starlette.requests import Request
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     encrypted_reasoning_provenance as erp,
 )
+from litellm.proxy.pass_through_endpoints.streaming_handler import (
+    PassThroughStreamingHandler,
+)
+from litellm.proxy.pass_through_endpoints.success_handler import (
+    PassThroughEndpointLogging,
+)
+from litellm.types.passthrough_endpoints.pass_through_endpoints import EndpointType
 
 
 CIPHERTEXT = "gAAAAABpnW_yEYmSNEyOG_ORIGINAL_BYTES_do_not_mutate=="
@@ -324,6 +335,12 @@ async def test_pre_send_guard_allows_cross_account_openai(monkeypatch):
         def get_request_session_owner_lease(request):
             return None
 
+        @staticmethod
+        def should_skip_session_owner_for_openai_models_discovery(
+            request=None, *, endpoint=None, url=None
+        ):
+            return False
+
     monkeypatch.setattr(pte, "_session_affinity_mod", lambda: _SA)
 
     provenance = erp.build_encrypted_reasoning_provenance(
@@ -461,10 +478,6 @@ async def test_pre_send_guard_strips_route_identity_for_xai_responses(monkeypatc
 
 
 def test_streaming_sse_stamp_preserves_ciphertext():
-    from litellm.proxy.pass_through_endpoints.streaming_handler import (
-        PassThroughStreamingHandler,
-    )
-
     event = {
         "type": "response.output_item.done",
         "item": {
@@ -473,7 +486,6 @@ def test_streaming_sse_stamp_preserves_ciphertext():
             "encrypted_content": CIPHERTEXT,
         },
     }
-    import json
 
     chunk = f"data: {json.dumps(event)}\n\n".encode("utf-8")
     out = PassThroughStreamingHandler._stamp_encrypted_reasoning_in_responses_sse_chunk(
@@ -495,6 +507,120 @@ def test_streaming_sse_stamp_preserves_ciphertext():
     assert parsed["item"][erp.PROVENANCE_ITEM_FIELD]["producer_provider_family"] == (
         "openai"
     )
+
+
+@pytest.mark.asyncio
+async def test_fragmented_streaming_sse_stamp_happens_after_reassembly():
+    event = {
+        "type": "response.output_item.done",
+        "item": {
+            "type": "reasoning",
+            "id": "rs_stream_split",
+            "encrypted_content": CIPHERTEXT,
+        },
+    }
+    reasoning_chunk = (
+        "event: response.output_item.done\n"
+        "data: "
+        + json.dumps(event)
+        + "\n\n"
+    ).encode("utf-8")
+    split_at = reasoning_chunk.index(b'"encrypted_content"') + len(
+        b'"encrypted_content"'
+    )
+    terminal_chunk = (
+        "event: response.completed\n"
+        "data: "
+        + json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_stream_split",
+                    "status": "completed",
+                    "output": [],
+                },
+            }
+        )
+        + "\n\n"
+    ).encode("utf-8")
+    provider_chunks = [
+        reasoning_chunk[:split_at],
+        reasoning_chunk[split_at:],
+        terminal_chunk,
+        b"data: [DONE]\n\n",
+    ]
+
+    async def _aiter_bytes():
+        for provider_chunk in provider_chunks:
+            yield provider_chunk
+
+    response = MagicMock()
+    response.headers = httpx.Headers({})
+    response.aiter_bytes = _aiter_bytes
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {}
+    logging_obj._update_completion_start_time = MagicMock()
+    success_handler_kwargs = {
+        "litellm_params": {
+            "metadata": {
+                "codex_auto_agent_selected_provider": "openai",
+                "codex_auto_agent_selected_model": "gpt-5.6-sol",
+                "codex_auto_agent_selected_route_family": "codex_oauth",
+            }
+        }
+    }
+    route_handler = AsyncMock()
+
+    with patch.object(
+        PassThroughStreamingHandler,
+        "_route_streaming_logging_to_handler",
+        route_handler,
+    ):
+        emitted = [
+            chunk
+            async for chunk in PassThroughStreamingHandler.chunk_processor(
+                response=response,
+                request_body={
+                    "model": "gpt-5.6-sol",
+                    "litellm_metadata": {
+                        "codex_auto_agent_selected_route_family": "codex_oauth",
+                    },
+                },
+                litellm_logging_obj=logging_obj,
+                endpoint_type=EndpointType.OPENAI,
+                start_time=datetime.now(),
+                passthrough_success_handler_obj=MagicMock(
+                    spec=PassThroughEndpointLogging
+                ),
+                url_route="https://chatgpt.com/backend-api/codex/responses",
+                custom_llm_provider="openai",
+                success_handler_kwargs=success_handler_kwargs,
+            )
+        ]
+        await asyncio.sleep(0.05)
+
+    stamped_chunk = next(
+        chunk for chunk in emitted if b"response.output_item.done" in chunk
+    )
+    data_line = next(
+        line for line in stamped_chunk.splitlines() if line.startswith(b"data:")
+    )
+    parsed = json.loads(data_line.removeprefix(b"data:").strip())
+    stamped_item = parsed["item"]
+    assert stamped_item["encrypted_content"].startswith("aawm_erp:")
+    _provenance, original = erp.unwrap_encrypted_content_with_provenance(
+        stamped_item["encrypted_content"]
+    )
+    assert original == CIPHERTEXT
+    assert stamped_item[erp.PROVENANCE_ITEM_FIELD][
+        "producer_provider_family"
+    ] == "openai"
+    assert stamped_item[erp.ROUTE_IDENTITY_FIELD] == {
+        "producer_provider": "openai",
+        "producer_model": "gpt-5.6-sol",
+        "producer_route_family": "codex_oauth",
+    }
+    route_handler.assert_awaited_once()
 
 
 def _assert_clean_upstream_encrypted_item(sent_json: dict[str, Any], ciphertext: str) -> None:
@@ -542,9 +668,10 @@ async def _run_pass_through_and_capture_json(
     mock_httpx_response.headers = {"content-type": "application/json"}
     if stream:
         mock_httpx_response.headers = {"content-type": "text/event-stream"}
-    mock_httpx_response.aiter_bytes = AsyncMock(
-        return_value=iter([b'data: {"type":"response.completed"}\n\n'])
-    )
+    async def _aiter_bytes():
+        yield b'data: {"type":"response.completed"}\n\n'
+
+    mock_httpx_response.aiter_bytes = MagicMock(return_value=_aiter_bytes())
     mock_httpx_response.aread = AsyncMock(return_value=b'{"id":"resp_test","output":[]}')
     mock_httpx_response.raise_for_status = MagicMock()
 
@@ -561,6 +688,12 @@ async def _run_pass_through_and_capture_json(
         @staticmethod
         def get_request_session_owner_lease(request):
             return None
+
+        @staticmethod
+        def should_skip_session_owner_for_openai_models_discovery(
+            request=None, *, endpoint=None, url=None
+        ):
+            return False
 
         @staticmethod
         async def ensure_session_owner_guard_for_request(**kwargs):

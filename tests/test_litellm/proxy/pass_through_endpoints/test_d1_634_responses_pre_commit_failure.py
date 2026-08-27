@@ -214,6 +214,7 @@ async def test_peek_holds_lifecycle_until_failed_without_downstream_commit():
         "error_message",
         "expected_error_class",
         "expected_status_code",
+        "fragmented",
     ),
     [
         (
@@ -221,6 +222,14 @@ async def test_peek_holds_lifecycle_until_failed_without_downstream_commit():
             "The access token has been invalidated.",
             "token_invalidated",
             401,
+            False,
+        ),
+        (
+            "token_invalidated",
+            "The access token has been invalidated.",
+            "token_invalidated",
+            401,
+            True,
         ),
         (
             "invalid_request_error",
@@ -231,16 +240,57 @@ async def test_peek_holds_lifecycle_until_failed_without_downstream_commit():
             ),
             "openai_responses_unpersisted_item_not_found",
             400,
+            False,
+        ),
+        (
+            "invalid_request_error",
+            (
+                "Item with id 'rs_abc123' not found. "
+                "Items are not persisted when store is set to false. "
+                "Try again with store set to true."
+            ),
+            "openai_responses_unpersisted_item_not_found",
+            400,
+            True,
         ),
     ],
-    ids=["token-invalidated", "unpersisted-rs-item"],
+    ids=[
+        "token-invalidated",
+        "token-invalidated-fragmented",
+        "unpersisted-rs-item",
+        "unpersisted-rs-item-fragmented",
+    ],
 )
 async def test_peek_classifies_native_codex_recovery_errors_before_commit(
     error_code: str,
     error_message: str,
     expected_error_class: str,
     expected_status_code: int,
+    fragmented: bool,
 ) -> None:
+    error_chunk = _sse(
+        "error",
+        {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": error_code,
+                "message": error_message,
+            },
+        },
+    )
+    if fragmented:
+        split_at = error_chunk.index(b'"message"') + len(b'"message"')
+        error_chunks = [error_chunk[:split_at], error_chunk[split_at:]]
+        partial_decision, _, _ = (
+            PassThroughStreamingHandler._inspect_responses_pre_commit_chunks(
+                [error_chunks[0]]
+            )
+        )
+        assert partial_decision != "failed"
+    else:
+        error_chunks = [error_chunk]
+
     chunks = [
         _sse(
             "response.created",
@@ -254,17 +304,7 @@ async def test_peek_classifies_native_codex_recovery_errors_before_commit(
                 },
             },
         ),
-        _sse(
-            "error",
-            {
-                "type": "error",
-                "error": {
-                    "type": "invalid_request_error",
-                    "code": error_code,
-                    "message": error_message,
-                },
-            },
-        ),
+        *error_chunks,
     ]
 
     peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(

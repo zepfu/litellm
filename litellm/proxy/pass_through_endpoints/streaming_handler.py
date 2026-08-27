@@ -682,7 +682,11 @@ class PassThroughStreamingHandler:
     def _inspect_responses_pre_commit_chunks(
         chunks: List[bytes],
     ) -> tuple[str, Optional[Dict[str, Any]], Optional[str]]:
-        lines = PassThroughStreamingHandler._chunk_lines(chunks)
+        buffered = b"".join(chunks)
+        complete_chunk, _partial_chunk = (
+            PassThroughStreamingHandler._split_responses_sse_event_buffer(buffered)
+        )
+        lines = PassThroughStreamingHandler._chunk_lines([complete_chunk])
         events = PassThroughStreamingHandler._iter_responses_sse_events(lines)
         if not events:
             return "empty", None, None
@@ -1551,11 +1555,6 @@ class PassThroughStreamingHandler:
                     await _publish_transfer_chunks(first_upstream=True, force=True)
 
                 if responses_terminal_accumulator is not None:
-                    chunk = PassThroughStreamingHandler._stamp_encrypted_reasoning_in_responses_sse_chunk(
-                        chunk,
-                        request_body=request_body if isinstance(request_body, dict) else None,
-                        custom_llm_provider=custom_llm_provider,
-                    )
                     responses_sse_event_buffer += chunk
                     complete_chunk, responses_sse_event_buffer = (
                         PassThroughStreamingHandler._split_responses_sse_event_buffer(
@@ -1564,6 +1563,15 @@ class PassThroughStreamingHandler:
                     )
                     recovery_failure: Optional[ResponsesStreamPreCommitFailure] = None
                     if complete_chunk:
+                        complete_chunk = PassThroughStreamingHandler._stamp_encrypted_reasoning_in_responses_sse_chunk(
+                            complete_chunk,
+                            request_body=(
+                                request_body
+                                if isinstance(request_body, dict)
+                                else None
+                            ),
+                            custom_llm_provider=custom_llm_provider,
+                        )
                         responses_terminal_accumulator.feed(complete_chunk)
                         recovery_failure = _consume_responses_lines(
                             responses_terminal_accumulator.lines
