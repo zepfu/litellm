@@ -35,6 +35,66 @@ _OPERATIONAL_ALIAS_ORDER = {
             "codex_zai_coding_plan_chat_completions_adapter",
             100,
         ),
+        (
+            "cohere",
+            "cohere/north-mini-code-1-0",
+            "codex_cohere_chat_completions_adapter",
+            90,
+        ),
+        (
+            "openrouter",
+            "openrouter/cohere/north-mini-code:free",
+            "codex_openrouter_completion_adapter",
+            80,
+        ),
+        (
+            "openrouter",
+            "openrouter/owl-alpha",
+            "codex_openrouter_completion_adapter",
+            70,
+        ),
+        (
+            "opencode_zen",
+            "deepseek-v4-flash-free",
+            "codex_opencode_zen_adapter",
+            60,
+        ),
+        (
+            "opencode_zen",
+            "big-pickle",
+            "codex_opencode_zen_adapter",
+            50,
+        ),
+        (
+            "alibaba_token_plan",
+            "alibaba_token_plan/deepseek-v4-flash-0731",
+            "codex_alibaba_token_plan_chat_completions_adapter",
+            45,
+        ),
+        (
+            "cursor_agent",
+            "cursor_agent/composer-2.5",
+            "codex_cursor_agent_aiserver_adapter",
+            42,
+        ),
+        (
+            "alibaba_token_plan",
+            "alibaba_token_plan/qwen3.6-flash",
+            "codex_alibaba_token_plan_chat_completions_adapter",
+            40,
+        ),
+        (
+            "openai",
+            "gpt-5.6-luna",
+            "codex_responses",
+            0,
+        ),
+        (
+            "anthropic",
+            "claude-haiku-4-5-20251001",
+            "anthropic_messages",
+            0,
+        ),
     ],
     "work": [
         (
@@ -73,11 +133,22 @@ _OPERATIONAL_ALIAS_ORDER = {
         ("openai", "gpt-5.6-sol", "codex_responses", 100),
     ],
     "sota-xai": [
-        ("xai", "oa_xai/grok-4.6", "codex_xai_oauth_responses_adapter", 100),
         (
             "cursor_agent",
             "cursor_agent/cursor-grok-4.6-high",
             "codex_cursor_agent_aiserver_adapter",
+            110,
+        ),
+        (
+            "xai",
+            "xai/grok-4.6",
+            "codex_grok_native_responses_adapter",
+            100,
+        ),
+        (
+            "xai",
+            "oa_xai/grok-4.6",
+            "codex_xai_oauth_responses_adapter",
             90,
         ),
     ],
@@ -251,6 +322,44 @@ aliases:
         match="provider-nvidia|expected 'nvidia'|NVIDIA|uncovered",
     ):
         compiler.compile_yaml(crossed)
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "expected"),
+    [
+        (
+            "nous",
+            (
+                "nous",
+                "stealth/ox-alpha",
+                "codex_nous_chat_completions_adapter",
+                100,
+            ),
+        ),
+        (
+            "opencode_go",
+            (
+                "opencode_go",
+                "ox-alpha-free",
+                "codex_opencode_go_adapter",
+                100,
+            ),
+        ),
+    ],
+)
+def test_provider_aliases_keep_closed_same_provider_candidate_sets(
+    provider_id: str,
+    expected: tuple[str, str, str, int],
+) -> None:
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    alias = snapshot.aliases[provider_alias_name(provider_id)]
+    assert alias.dispatch is None
+    assert [
+        (entry.provider, entry.model, entry.route_family, entry.priority)
+        for entry in alias.candidates
+    ] == [expected]
+    assert all(entry.provider == provider_id for entry in alias.candidates)
+    assert all(entry.anthropic_route_family is None for entry in alias.candidates)
 
 
 def test_provider_opencode_zen_keeps_both_adapter_forms_distinct() -> None:
