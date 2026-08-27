@@ -1158,6 +1158,49 @@ def _cursor_responses_response_body(
     return body
 
 
+def _validate_cursor_result_and_consume_replay_state(
+    *,
+    result: Any,
+    previous_response_id: Any,
+    replay_state: Optional[dict[str, Any]],
+) -> None:
+    from litellm.llms.cursor_agent.connect import CursorConnectError
+
+    try:
+        result.validate_terminal()
+        if result.exec_server_messages and not (
+            result.tool_calls or result.text or result.turn_ended
+        ):
+            raise CursorConnectError(
+                "Cursor Agent returned execServerMessage without a replayable "
+                "tool-call event; the bounded fresh-Run continuation bridge "
+                "cannot represent that server message.",
+                status_code=502,
+            )
+        if not result.tool_calls and not result.text and not result.turn_ended:
+            raise CursorConnectError(
+                "Cursor Agent Connect completed without text, a function call, or turnEnded.",
+                status_code=502,
+            )
+    except Exception as exc:
+        if (
+            isinstance(previous_response_id, str)
+            and replay_state is not None
+            and not _cursor_replay_failure_is_transient(exc)
+        ):
+            _consume_cursor_replay_state(
+                previous_response_id,
+                expected_state=replay_state,
+            )
+        raise
+
+    if isinstance(previous_response_id, str) and replay_state is not None:
+        _consume_cursor_replay_state(
+            previous_response_id,
+            expected_state=replay_state,
+        )
+
+
 async def _perform_codex_auto_agent_cursor_agent_request(
     *,
     endpoint: str,
@@ -1278,39 +1321,11 @@ async def _perform_codex_auto_agent_cursor_agent_request(
             )
         raise
 
-    try:
-        result.validate_terminal()
-        if result.exec_server_messages and not (
-            result.tool_calls or result.text or result.turn_ended
-        ):
-            raise CursorConnectError(
-                "Cursor Agent returned execServerMessage without a replayable "
-                "tool-call event; the bounded fresh-Run continuation bridge "
-                "cannot represent that server message.",
-                status_code=502,
-            )
-        if not result.tool_calls and not result.text and not result.turn_ended:
-            raise CursorConnectError(
-                "Cursor Agent Connect completed without text, a function call, or turnEnded.",
-                status_code=502,
-            )
-    except Exception as exc:
-        if (
-            isinstance(previous_response_id, str)
-            and replay_state is not None
-            and not _cursor_replay_failure_is_transient(exc)
-        ):
-            _consume_cursor_replay_state(
-                previous_response_id,
-                expected_state=replay_state,
-            )
-        raise
-
-    if isinstance(previous_response_id, str) and replay_state is not None:
-        _consume_cursor_replay_state(
-            previous_response_id,
-            expected_state=replay_state,
-        )
+    _validate_cursor_result_and_consume_replay_state(
+        result=result,
+        previous_response_id=previous_response_id,
+        replay_state=replay_state,
+    )
 
     model = str(candidate.get("model") or request_body.get("model") or "")
     response_body = _cursor_responses_response_body(model=model, result=result)
