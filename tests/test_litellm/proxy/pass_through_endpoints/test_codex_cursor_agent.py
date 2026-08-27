@@ -112,6 +112,17 @@ def _replay_body(response_id: str = "resp-replay") -> dict[str, Any]:
     }
 
 
+class _CountingRetainedSession:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+    async def aclose(self) -> None:
+        self.close()
+
+
 def test_cursor_codex_path_returns_native_function_call_and_replays_tool_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -359,6 +370,7 @@ def test_cursor_local_exec_function_call_replays_through_existing_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class FakeCursorClient:
+        calls: list[dict[str, Any]] = []
         results = [
             CursorAgentRunResult(
                 tool_calls=[
@@ -378,9 +390,10 @@ def test_cursor_local_exec_function_call_replays_through_existing_state(
 
         async def run(
             self,
-            _payload: dict[str, Any],
-            **_kwargs: Any,
+            payload: dict[str, Any],
+            **kwargs: Any,
         ) -> CursorAgentRunResult:
+            self.calls.append({"payload": payload, "kwargs": kwargs})
             return self.results.pop(0)
 
     monkeypatch.setattr(
@@ -409,6 +422,9 @@ def test_cursor_local_exec_function_call_replays_through_existing_state(
         "name": "exec_command",
         "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
     }
+    assert codex_candidate_calls._peek_cursor_replay_state(
+        first_body["id"]
+    )["retained_session"] is None
 
     second = _call(
         {
@@ -425,6 +441,104 @@ def test_cursor_local_exec_function_call_replays_through_existing_state(
     )
 
     assert json.loads(second.body)["output_text"] == "command completed"
+    assert len(FakeCursorClient.calls) == 2
+
+
+def test_cursor_fresh_full_history_tool_output_emits_continuation_cue() -> None:
+    messages = codex_candidate_calls._responses_input_to_cursor_messages(
+        {
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "run the requested read",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "read-call",
+                    "name": "exec_command",
+                    "arguments": '{"cmd":"read"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "read-call",
+                    "output": "read result",
+                },
+            ]
+        }
+    )
+
+    assert messages[-1] == {
+        "role": "user",
+        "content": codex_candidate_calls._CURSOR_TOOL_CONTINUATION_CUE,
+        codex_candidate_calls._CURSOR_TOOL_CONTINUATION_CUE_MARKER: True,
+    }
+
+
+def test_cursor_retained_session_consumes_function_call_output_without_new_run() -> None:
+    class FakeRetainedSession:
+        def __init__(self) -> None:
+            self.outputs: list[list[tuple[str, Any]]] = []
+            self.closed = False
+
+        async def continue_with_tool_outputs(
+            self,
+            outputs: list[tuple[str, Any]],
+        ) -> CursorAgentRunResult:
+            self.outputs.append(outputs)
+            return CursorAgentRunResult(text="read complete", turn_ended=True)
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def aclose(self) -> None:
+            self.close()
+
+    session = FakeRetainedSession()
+    codex_candidate_calls._store_cursor_replay_state(
+        "resp-retained",
+        messages=[
+            {"role": "user", "content": "run the requested read"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "read-call",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"read"}',
+                        },
+                    }
+                ],
+            },
+        ],
+        tools=[],
+        retained_session=session,
+    )
+
+    response = _call(
+        {
+            "model": "work",
+            "previous_response_id": "resp-retained",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "read-call",
+                    "output": "LITELLM_CURSOR_READ_V1:envelope",
+                }
+            ],
+        }
+    )
+
+    assert json.loads(response.body)["output_text"] == "read complete"
+    assert session.outputs == [
+        [("read-call", "LITELLM_CURSOR_READ_V1:envelope")]
+    ]
+    assert session.closed is True
+    with pytest.raises(CursorConnectError, match="missing"):
+        codex_candidate_calls._peek_cursor_replay_state("resp-retained")
 
 
 def test_cursor_continuation_requires_matching_function_call() -> None:
@@ -496,6 +610,170 @@ def test_cursor_replay_registry_enforces_max_size(
     with pytest.raises(CursorConnectError, match="missing"):
         codex_candidate_calls._take_cursor_replay_state("resp-old")
     assert codex_candidate_calls._take_cursor_replay_state("resp-new")["messages"]
+
+
+def test_cursor_replay_registry_expires_idle_retained_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(codex_candidate_calls, "_CURSOR_REPLAY_TTL_SECONDS", 0.01)
+    session = _CountingRetainedSession()
+
+    async def run_scenario() -> None:
+        codex_candidate_calls._store_cursor_replay_state(
+            "resp-idle",
+            messages=[],
+            tools=[],
+            retained_session=session,
+        )
+        state = codex_candidate_calls._CURSOR_REPLAY_REGISTRY["resp-idle"]
+        assert state["expiry_handle"] is not None
+
+        await asyncio.sleep(0.03)
+
+        assert "resp-idle" not in codex_candidate_calls._CURSOR_REPLAY_REGISTRY
+
+    asyncio.run(run_scenario())
+    assert session.close_calls == 1
+
+
+def test_cursor_replay_registry_replacement_timer_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_session = _CountingRetainedSession()
+    new_session = _CountingRetainedSession()
+
+    async def run_scenario() -> None:
+        monkeypatch.setattr(
+            codex_candidate_calls,
+            "_CURSOR_REPLAY_TTL_SECONDS",
+            0.01,
+        )
+        codex_candidate_calls._store_cursor_replay_state(
+            "resp-replaced",
+            messages=[],
+            tools=[],
+            retained_session=old_session,
+        )
+        old_state = codex_candidate_calls._CURSOR_REPLAY_REGISTRY["resp-replaced"]
+
+        monkeypatch.setattr(
+            codex_candidate_calls,
+            "_CURSOR_REPLAY_TTL_SECONDS",
+            0.1,
+        )
+        codex_candidate_calls._store_cursor_replay_state(
+            "resp-replaced",
+            messages=[],
+            tools=[],
+            retained_session=new_session,
+        )
+        codex_candidate_calls._expire_cursor_replay_state(
+            "resp-replaced",
+            old_state,
+        )
+        await asyncio.sleep(0.03)
+
+        current = codex_candidate_calls._CURSOR_REPLAY_REGISTRY["resp-replaced"]
+        assert current["retained_session"] is new_session
+        assert new_session.close_calls == 0
+        codex_candidate_calls._clear_cursor_replay_registry()
+
+    asyncio.run(run_scenario())
+    assert old_session.close_calls == 1
+    assert new_session.close_calls == 1
+
+
+def test_cursor_replay_registry_consume_and_clear_cancel_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(codex_candidate_calls, "_CURSOR_REPLAY_TTL_SECONDS", 0.01)
+    consumed_session = _CountingRetainedSession()
+    cleared_session = _CountingRetainedSession()
+
+    async def run_scenario() -> None:
+        codex_candidate_calls._store_cursor_replay_state(
+            "resp-consumed",
+            messages=[],
+            tools=[],
+            retained_session=consumed_session,
+        )
+        consumed_state = codex_candidate_calls._CURSOR_REPLAY_REGISTRY[
+            "resp-consumed"
+        ]
+        consumed_handle = consumed_state["expiry_handle"]
+        codex_candidate_calls._consume_cursor_replay_state(
+            "resp-consumed",
+            expected_state=consumed_state,
+        )
+        assert consumed_handle.cancelled()
+
+        codex_candidate_calls._store_cursor_replay_state(
+            "resp-cleared",
+            messages=[],
+            tools=[],
+            retained_session=cleared_session,
+        )
+        cleared_handle = codex_candidate_calls._CURSOR_REPLAY_REGISTRY[
+            "resp-cleared"
+        ]["expiry_handle"]
+        codex_candidate_calls._clear_cursor_replay_registry()
+        assert cleared_handle.cancelled()
+
+        await asyncio.sleep(0.03)
+
+    asyncio.run(run_scenario())
+    assert consumed_session.close_calls == 1
+    assert cleared_session.close_calls == 1
+
+
+def test_cursor_retained_session_failure_closes_once() -> None:
+    class FailingRetainedSession(_CountingRetainedSession):
+        async def continue_with_tool_outputs(
+            self,
+            _outputs: list[tuple[str, Any]],
+        ) -> CursorAgentRunResult:
+            raise RuntimeError("continuation failed")
+
+    session = FailingRetainedSession()
+    codex_candidate_calls._store_cursor_replay_state(
+        "resp-failing-retained",
+        messages=[
+            {"role": "user", "content": "run the requested read"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "read-call",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"read"}',
+                        },
+                    }
+                ],
+            },
+        ],
+        tools=[],
+        retained_session=session,
+    )
+
+    with pytest.raises(RuntimeError, match="continuation failed"):
+        _call(
+            {
+                "model": "work",
+                "previous_response_id": "resp-failing-retained",
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "read-call",
+                        "output": "LITELLM_CURSOR_READ_V1:envelope",
+                    }
+                ],
+            }
+        )
+
+    assert session.close_calls == 1
 
 
 def test_cursor_stream_uses_responses_event_schema(

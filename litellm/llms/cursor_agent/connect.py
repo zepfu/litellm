@@ -13,7 +13,9 @@ import hashlib
 import inspect
 import json
 import os
+import re
 import secrets
+import shlex
 import ssl
 import struct
 import time
@@ -25,6 +27,7 @@ from typing import (
     AsyncIterator,
     Awaitable,
     Callable,
+    cast,
     Dict,
     Iterable,
     List,
@@ -1105,6 +1108,515 @@ _LOCAL_EXEC_TOOL_NAMES = (
     "bash",
     "run_shell_command",
 )
+_CURSOR_READ_ENVELOPE_PREFIX = "LITELLM_CURSOR_READ_V1:"
+_CURSOR_READ_MAX_OUTPUT_CHARS = 8 * 1024 * 1024
+_CURSOR_READ_ENVELOPE_MAX_BYTES = 16 * 1024 * 1024
+_CURSOR_EXEC_CHUNK_ID_RE = re.compile(r"Chunk ID: \S+")
+_CURSOR_EXEC_WALL_TIME_RE = re.compile(r"Wall time: \d+(?:\.\d+)? seconds")
+_CURSOR_EXEC_PROCESS_EXIT_RE = re.compile(r"Process exited with code (-?\d+)")
+_CURSOR_EXEC_TRUNCATION_WARNING_RE = re.compile(
+    r"Warning: truncated output \(original token count: \d+\)"
+)
+_CURSOR_EXEC_TOKEN_COUNT_RE = re.compile(r"(?:Token count|Tokens): \d+")
+_CURSOR_READ_COMMAND_SCRIPT = r"""import base64
+import codecs
+import json
+import os
+import stat
+import sys
+
+MAX_OUTPUT = 8388608
+PREFIX = "LITELLM_CURSOR_READ_V1:"
+BINARY_EXTENSIONS = {
+    ".7z", ".avi", ".bmp", ".class", ".dll", ".dmg", ".doc", ".docx",
+    ".eot", ".gif", ".gz", ".ico", ".jpeg", ".jpg", ".lock", ".mp3",
+    ".mp4", ".otf", ".pdf", ".png", ".pyc", ".so", ".sqlite", ".tar",
+    ".ttf", ".wav", ".webp", ".woff", ".woff2", ".xls", ".xlsx", ".zip",
+}
+
+def emit(status, **extra):
+    payload = {"version": 1, "status": status}
+    payload.update(extra)
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    print(PREFIX + encoded, flush=True)
+
+if len(sys.argv) != 2:
+    emit("invalid_file", path="", reason="Reader requires exactly one path argument.")
+    raise SystemExit(2)
+
+path = sys.argv[1]
+try:
+    info = os.stat(path)
+    if not stat.S_ISREG(info.st_mode):
+        emit("invalid_file", path=path, reason="Path is not a regular file.")
+        raise SystemExit(2)
+    if os.path.splitext(path)[1].lower() in BINARY_EXTENSIONS:
+        emit("invalid_file", path=path, reason="Binary files are not supported by the read bridge.")
+        raise SystemExit(2)
+
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    parts = []
+    captured = 0
+    total_lines = 0
+    saw_text = False
+    ends_with_newline = False
+    truncated = False
+    with open(path, "rb") as stream:
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            text = decoder.decode(chunk, final=False)
+            if "\x00" in text or any(
+                (ord(char) < 9 or 13 < ord(char) < 32 or ord(char) == 127)
+                for char in text
+            ):
+                raise ValueError("Binary or non-text content is not supported.")
+            total_lines += text.count("\n")
+            if text:
+                saw_text = True
+                ends_with_newline = text.endswith("\n")
+            if captured < MAX_OUTPUT:
+                part = text[: MAX_OUTPUT - captured]
+                parts.append(part)
+                captured += len(part)
+                if len(part) != len(text):
+                    truncated = True
+            elif text:
+                truncated = True
+        tail = decoder.decode(b"", final=True)
+        if "\x00" in tail or any(
+            (ord(char) < 9 or 13 < ord(char) < 32 or ord(char) == 127)
+            for char in tail
+        ):
+            raise ValueError("Binary or non-text content is not supported.")
+        total_lines += tail.count("\n")
+        if tail:
+            saw_text = True
+            ends_with_newline = tail.endswith("\n")
+        if captured < MAX_OUTPUT:
+            part = tail[: MAX_OUTPUT - captured]
+            parts.append(part)
+            captured += len(part)
+            if len(part) != len(tail):
+                truncated = True
+        elif tail:
+            truncated = True
+
+    content = "".join(parts)
+    if saw_text and not ends_with_newline:
+        total_lines += 1
+    if content.startswith("\ufeff"):
+        content = content[1:]
+    emit(
+        "ok",
+        path=path,
+        content_b64=base64.b64encode(content.encode("utf-8")).decode("ascii"),
+        total_lines=total_lines,
+        file_size=int(info.st_size),
+        truncated=truncated,
+        range_applied=False,
+    )
+except FileNotFoundError:
+    emit("file_not_found", path=path)
+except PermissionError:
+    emit("permission_denied", path=path)
+except (UnicodeDecodeError, ValueError) as exc:
+    emit("invalid_file", path=path, reason=str(exc))
+except OSError as exc:
+    emit("error", path=path, error=str(exc))
+except Exception as exc:
+    emit("error", path=path, error=str(exc))
+"""
+
+
+def _decode_proto_int32(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    normalized = int(value) & 0xFFFFFFFF
+    if normalized & 0x80000000:
+        normalized -= 1 << 32
+    return normalized
+
+
+def _exec_request_identity(
+    exec_fields: List[tuple[int, int, Any]],
+) -> tuple[int, str]:
+    return (
+        _proto_last_field(exec_fields, 1, wire_type=0) or 0,
+        _decode_proto_string(_proto_last_field(exec_fields, 15, wire_type=2)),
+    )
+
+
+def _encode_exec_client_message(
+    exec_fields: List[tuple[int, int, Any]],
+    *,
+    message_field: int,
+    message_payload: bytes,
+) -> bytes:
+    request_id, exec_id = _exec_request_identity(exec_fields)
+    exec_client_message = b"".join(
+        (
+            _encode_proto_varint_field(1, request_id),
+            _encode_proto_string_field(15, exec_id),
+            _encode_proto_message_field(message_field, message_payload),
+        )
+    )
+    return _encode_proto_message_field(2, exec_client_message)
+
+
+def _encode_exec_stream_close(
+    exec_fields: List[tuple[int, int, Any]],
+) -> bytes:
+    request_id, _exec_id = _exec_request_identity(exec_fields)
+    return _encode_proto_message_field(
+        5,
+        _encode_proto_message_field(1, _encode_proto_varint_field(1, request_id)),
+    )
+
+
+def _encode_read_result(
+    *,
+    path: str,
+    status: str,
+    content: str = "",
+    total_lines: int = 0,
+    file_size: int = 0,
+    truncated: bool = False,
+    range_applied: bool = False,
+    error: str = "",
+    reason: str = "",
+) -> bytes:
+    if status == "ok":
+        success = b"".join(
+            (
+                _encode_proto_string_field(1, path),
+                _encode_proto_string_field(2, content, include_empty=True),
+                _encode_proto_varint_field(3, total_lines),
+                _encode_proto_varint_field(4, file_size),
+                _encode_proto_varint_field(6, truncated),
+                _encode_proto_varint_field(8, range_applied),
+            )
+        )
+        return _encode_proto_message_field(1, success)
+    if status == "file_not_found":
+        return _encode_proto_message_field(
+            4,
+            _encode_proto_string_field(1, path),
+        )
+    if status == "permission_denied":
+        return _encode_proto_message_field(
+            5,
+            _encode_proto_string_field(1, path),
+        )
+    if status == "rejected":
+        rejected = _encode_proto_string_field(1, path) + _encode_proto_string_field(2, reason)
+        return _encode_proto_message_field(3, rejected)
+    if status == "invalid_file":
+        invalid = _encode_proto_string_field(1, path) + _encode_proto_string_field(2, reason)
+        return _encode_proto_message_field(6, invalid)
+    if status == "error":
+        read_error = _encode_proto_string_field(1, path) + _encode_proto_string_field(2, error)
+        return _encode_proto_message_field(2, read_error)
+    raise CursorConnectProtocolError(f"Unsupported Cursor read result status {status!r}.")
+
+
+def _decode_read_args(
+    exec_fields: List[tuple[int, int, Any]],
+) -> Dict[str, Any]:
+    args_payload = _proto_last_field(exec_fields, 7, wire_type=2)
+    if not isinstance(args_payload, bytes):
+        raise CursorConnectProtocolError(
+            "Cursor Agent read operation does not contain read arguments."
+        )
+    args_fields = _decode_proto_fields(args_payload)
+    path = _decode_proto_string(_proto_last_field(args_fields, 1, wire_type=2))
+    if not path:
+        raise CursorConnectProtocolError(
+            "Cursor Agent read operation does not contain a path."
+        )
+    limit_value = _proto_last_field(args_fields, 5, wire_type=0)
+    if limit_value is not None and int(limit_value) > 0xFFFFFFFF:
+        raise CursorConnectProtocolError(
+            "Cursor Agent read operation contains an invalid line limit."
+        )
+    offset = _decode_proto_int32(
+        _proto_last_field(args_fields, 4, wire_type=0)
+    ) or 0
+    limit = int(limit_value or 0)
+    encoding_hint = _decode_proto_string(
+        _proto_last_field(args_fields, 6, wire_type=2)
+    )
+    unsupported = []
+    if offset:
+        unsupported.append("nondefault line offset")
+    if limit:
+        unsupported.append("nondefault line limit")
+    if encoding_hint:
+        unsupported.append("nondefault encoding_hint")
+    if unsupported:
+        raise CursorConnectProtocolError(
+            "Cursor Agent read operation requests "
+            f"{', '.join(unsupported)}; the external read bridge supports "
+            "only full UTF-8 text reads."
+        )
+    request_id, exec_id = _exec_request_identity(exec_fields)
+    return {
+        "path": path,
+        "tool_call_id": _decode_proto_string(
+            _proto_last_field(args_fields, 2, wire_type=2)
+        ),
+        "offset": offset,
+        "limit": limit,
+        "encoding_hint": encoding_hint,
+        "request_id": request_id,
+        "exec_id": exec_id,
+    }
+
+
+def _read_command(path: str) -> str:
+    return shlex.join(
+        [
+            "python3",
+            "-c",
+            _CURSOR_READ_COMMAND_SCRIPT,
+            path,
+        ]
+    )
+
+
+def _decode_cursor_read_envelope(  # noqa: PLR0915
+    output: Any,
+    *,
+    expected_path: str,
+) -> Dict[str, Any]:
+    raw_output = output if isinstance(output, str) else str(output or "")
+    if len(raw_output.encode("utf-8", "replace")) > _CURSOR_READ_ENVELOPE_MAX_BYTES:
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read envelope exceeds the supported size.",
+        }
+    lines = raw_output.splitlines()
+    header_line_index = 0
+    if lines and _CURSOR_EXEC_TRUNCATION_WARNING_RE.fullmatch(lines[0]):
+        header_line_index = 1
+    if len(lines) < header_line_index + 5:
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read command returned invalid exec_command framing.",
+        }
+    if not _CURSOR_EXEC_CHUNK_ID_RE.fullmatch(lines[header_line_index]):
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read command returned invalid exec_command framing.",
+        }
+    if not _CURSOR_EXEC_WALL_TIME_RE.fullmatch(lines[header_line_index + 1]):
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read command returned invalid exec_command framing.",
+        }
+    process_line_index = header_line_index + 2
+    if _CURSOR_EXEC_TOKEN_COUNT_RE.fullmatch(lines[process_line_index]):
+        process_line_index += 1
+    process_match = _CURSOR_EXEC_PROCESS_EXIT_RE.fullmatch(
+        lines[process_line_index]
+    )
+    if process_match is None:
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read command returned invalid exec_command framing.",
+        }
+    exit_code = int(process_match.group(1))
+    if exit_code != 0:
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": f"The external read command exited with nonzero status {exit_code}.",
+        }
+    output_marker_index = process_line_index + 1
+    if output_marker_index >= len(lines) or lines[output_marker_index] not in {
+        "Final output:",
+        "Output:",
+    }:
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read command returned invalid exec_command framing.",
+        }
+    envelope_lines = lines[output_marker_index + 1 :]
+    envelope_occurrences = sum(
+        line.count(_CURSOR_READ_ENVELOPE_PREFIX) for line in envelope_lines
+    )
+    if envelope_occurrences == 0 and len(envelope_lines) == 1:
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read command returned an invalid envelope.",
+        }
+    if envelope_occurrences > 1:
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": (
+                "The external read command must return exactly one "
+                "LITELLM_CURSOR_READ_V1: envelope."
+            ),
+        }
+    if len(envelope_lines) != 1:
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read command returned ambiguous extra content.",
+        }
+    envelope_line = envelope_lines[0]
+    if not envelope_line.startswith(_CURSOR_READ_ENVELOPE_PREFIX):
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read command returned ambiguous extra content.",
+        }
+    encoded = envelope_line[len(_CURSOR_READ_ENVELOPE_PREFIX) :]
+    try:
+        padding = "=" * (-len(encoded) % 4)
+        payload = base64.b64decode(
+            encoded + padding,
+            altchars=b"-_",
+            validate=True,
+        )
+        decoded = json.loads(payload.decode("utf-8"))
+    except (ValueError, TypeError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError):
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read command returned an invalid envelope.",
+        }
+    if not isinstance(decoded, Mapping) or decoded.get("version") != 1:
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read command returned an unsupported envelope.",
+        }
+    if decoded.get("path") != expected_path:
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read envelope path did not match the request.",
+        }
+    status = decoded.get("status")
+    if status in {"file_not_found", "permission_denied"}:
+        return {"status": status, "path": expected_path}
+    if status == "error":
+        return {
+            "status": "error",
+            "path": expected_path,
+            "error": str(decoded.get("error") or "External read failed."),
+        }
+    if status == "invalid_file":
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": str(decoded.get("reason") or "External read returned invalid content."),
+        }
+    if status != "ok":
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read command returned an unsupported status.",
+        }
+    content_b64 = decoded.get("content_b64")
+    if not isinstance(content_b64, str):
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read envelope omitted content.",
+        }
+    try:
+        padding = "=" * (-len(content_b64) % 4)
+        content_bytes = base64.b64decode(
+            content_b64 + padding,
+            validate=True,
+        )
+        content = content_bytes.decode("utf-8")
+    except (ValueError, TypeError, UnicodeDecodeError, binascii.Error):
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read content was not valid UTF-8.",
+        }
+    if len(content) > _CURSOR_READ_MAX_OUTPUT_CHARS:
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read content exceeds the supported size.",
+        }
+    total_lines = decoded.get("total_lines")
+    file_size = decoded.get("file_size")
+    truncated = decoded.get("truncated")
+    range_applied = decoded.get("range_applied")
+    if (
+        isinstance(total_lines, bool)
+        or not isinstance(total_lines, int)
+        or total_lines < 0
+        or isinstance(file_size, bool)
+        or not isinstance(file_size, int)
+        or file_size < 0
+        or not isinstance(truncated, bool)
+        or not isinstance(range_applied, bool)
+    ):
+        return {
+            "status": "invalid_file",
+            "path": expected_path,
+            "reason": "The external read envelope contained invalid metadata.",
+        }
+    return {
+        "status": "ok",
+        "path": expected_path,
+        "content": content,
+        "total_lines": total_lines,
+        "file_size": file_size,
+        "truncated": truncated,
+        "range_applied": range_applied,
+    }
+
+
+def _encode_read_terminal_result(
+    exec_request: Mapping[str, Any],
+    output: Any,
+) -> List[bytes]:
+    expected_path = str(exec_request["path"])
+    envelope = _decode_cursor_read_envelope(
+        output,
+        expected_path=expected_path,
+    )
+    read_result = _encode_read_result(**envelope)
+    exec_fields = cast(List[tuple[int, int, Any]], exec_request["exec_fields"])
+    return [
+        _encode_exec_client_message(
+            exec_fields,
+            message_field=7,
+            message_payload=read_result,
+        ),
+        _encode_exec_stream_close(exec_fields),
+    ]
+
+
+def _encode_external_exec_terminal_result(
+    exec_request: Mapping[str, Any],
+    output: Any,
+) -> List[bytes]:
+    message_field = int(exec_request["message_field"])
+    if message_field == 7:
+        return _encode_read_terminal_result(exec_request, output)
+    raise CursorConnectProtocolError(
+        f"Cursor Agent requested unsupported external exec field {message_field}."
+    )
 
 
 def _encode_unsupported_local_exec_response(
@@ -1175,6 +1687,19 @@ def _decode_local_exec_tool_call(
     message_field: int,
     tool_name: str,
 ) -> Dict[str, Any]:
+    return _decode_local_exec_request(
+        exec_fields,
+        message_field=message_field,
+        tool_name=tool_name,
+    )["normalized"]
+
+
+def _decode_local_exec_request(
+    exec_fields: List[tuple[int, int, Any]],
+    *,
+    message_field: int,
+    tool_name: str,
+) -> Dict[str, Any]:
     args_payload = _proto_last_field(
         exec_fields,
         message_field,
@@ -1214,7 +1739,7 @@ def _decode_local_exec_tool_call(
     if working_directory:
         arguments["workdir"] = working_directory
     call_id = exec_id or f"cursor-exec-{request_id}"
-    return {
+    normalized = {
         "interactionUpdate": {
             "toolCallCompleted": {
                 "callId": call_id,
@@ -1227,6 +1752,55 @@ def _decode_local_exec_tool_call(
                 "itemId": f"fc_{call_id}",
             }
         }
+    }
+    return {
+        "normalized": normalized,
+        "exec_request": {
+            "call_id": call_id,
+            "message_field": message_field,
+            "exec_fields": exec_fields,
+            "command": command,
+            "working_directory": working_directory,
+        },
+    }
+
+
+def _decode_read_tool_call(
+    exec_fields: List[tuple[int, int, Any]],
+    *,
+    tool_name: str,
+) -> Dict[str, Any]:
+    read_args = _decode_read_args(exec_fields)
+    request_id = int(read_args["request_id"])
+    exec_id = str(read_args["exec_id"])
+    call_id = str(read_args["tool_call_id"] or exec_id or f"cursor-read-{request_id}")
+    if not call_id:
+        raise CursorConnectProtocolError(
+            "Cursor Agent read operation does not contain a replayable request identity."
+        )
+    command = _read_command(str(read_args["path"]))
+    normalized = {
+        "interactionUpdate": {
+            "toolCallCompleted": {
+                "callId": call_id,
+                "toolName": tool_name,
+                "argsJson": json.dumps(
+                    {"cmd": command},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                "itemId": f"fc_{call_id}",
+            }
+        }
+    }
+    return {
+        "normalized": normalized,
+        "exec_request": {
+            "call_id": call_id,
+            "message_field": 7,
+            "exec_fields": exec_fields,
+            "path": str(read_args["path"]),
+        },
     }
 
 
@@ -1271,6 +1845,7 @@ def _process_agent_server_message(
     blobs: Dict[bytes, bytes],
     *,
     local_exec_tool_name: Optional[str] = None,
+    external_exec_requests: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[Dict[str, Any], List[bytes]]:
     fields = _decode_proto_fields(payload)
     exec_server_message = _proto_last_field(fields, 2, wire_type=2)
@@ -1319,14 +1894,23 @@ def _process_agent_server_message(
                 message_field in _LOCAL_EXEC_BRIDGE_FIELDS
                 and local_exec_tool_name
             ):
+                local_exec_request = _decode_local_exec_request(
+                    exec_fields,
+                    message_field=message_field,
+                    tool_name=local_exec_tool_name,
+                )
                 return (
-                    _decode_local_exec_tool_call(
-                        exec_fields,
-                        message_field=message_field,
-                        tool_name=local_exec_tool_name,
-                    ),
+                    local_exec_request["normalized"],
                     [],
                 )
+            if message_field == 7 and local_exec_tool_name:
+                read_tool_call = _decode_read_tool_call(
+                    exec_fields,
+                    tool_name=local_exec_tool_name,
+                )
+                if external_exec_requests is not None:
+                    external_exec_requests.append(read_tool_call["exec_request"])
+                return read_tool_call["normalized"], []
             if message_field in _UNSUPPORTED_LOCAL_EXEC_FIELDS:
                 return (
                     decode_agent_server_message(payload),
@@ -1361,6 +1945,311 @@ def _process_agent_server_message(
         raise CursorConnectProtocolError("Cursor Agent requested an unsupported interactive client response.")
 
     return decode_agent_server_message(payload), []
+
+
+class CursorAgentRetainedSession:
+    """A live native Run retained while an external tool executes."""
+
+    def __init__(
+        self,
+        *,
+        reader: Any,
+        writer: Any,
+        connection: Any,
+        stream_id: int,
+        decoder: _ProtoConnectFrameDecoder,
+        blobs: Dict[bytes, bytes],
+        local_exec_tool_name: Optional[str],
+        saw_response_headers: bool,
+    ) -> None:
+        self.reader = reader
+        self.writer = writer
+        self.connection = connection
+        self.stream_id = stream_id
+        self.decoder = decoder
+        self.blobs = blobs
+        self.local_exec_tool_name = local_exec_tool_name
+        self.saw_response_headers = saw_response_headers
+        self.pending = bytearray()
+        self._buffered_frames: List[CursorConnectProtoFrame] = []
+        self._external_exec_requests: Dict[str, Dict[str, Any]] = {}
+        self._closed = False
+        self._wait_closed_started = False
+
+    @property
+    def can_continue(self) -> bool:
+        return bool(self._external_exec_requests) and all(
+            int(request.get("message_field") or 0) == 7
+            for request in self._external_exec_requests.values()
+        ) and not self._closed
+
+    def register_external_exec(self, exec_request: Mapping[str, Any]) -> None:
+        call_id = str(exec_request.get("call_id") or "")
+        if not call_id:
+            raise CursorConnectProtocolError(
+                "Cursor Agent external exec request does not contain a call id."
+            )
+        if int(exec_request.get("message_field") or 0) != 7:
+            raise CursorConnectProtocolError(
+                "Cursor Agent retained continuation supports only field-7 read requests."
+            )
+        self._external_exec_requests[call_id] = dict(exec_request)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close = getattr(self.writer, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
+    async def aclose(self) -> None:
+        self.close()
+        if self._wait_closed_started:
+            return
+        self._wait_closed_started = True
+        wait_closed = getattr(self.writer, "wait_closed", None)
+        if callable(wait_closed):
+            try:
+                await wait_closed()
+            except Exception:
+                pass
+
+    async def continue_with_tool_outputs(
+        self,
+        outputs: List[tuple[str, Any]],
+        *,
+        timeout: Optional[float] = None,
+    ) -> "CursorAgentRunResult":
+        if self._closed:
+            raise CursorConnectError(
+                "Cursor Agent retained continuation session is closed.",
+                status_code=409,
+            )
+        if not outputs:
+            raise CursorConnectError(
+                "Cursor Agent continuation requires a function_call_output.",
+                status_code=400,
+            )
+        requests: List[tuple[Dict[str, Any], Any]] = []
+        seen_call_ids: set[str] = set()
+        for call_id, output in outputs:
+            normalized_call_id = str(call_id)
+            if normalized_call_id in seen_call_ids:
+                raise CursorConnectError(
+                    "Cursor Agent continuation contains a duplicate function_call_output.",
+                    status_code=400,
+                )
+            seen_call_ids.add(normalized_call_id)
+            exec_request = self._external_exec_requests.get(normalized_call_id)
+            if exec_request is None:
+                raise CursorConnectError(
+                    "Cursor Agent continuation does not match a pending external tool call.",
+                    status_code=409,
+                )
+            requests.append((exec_request, output))
+
+        for call_id, _output in outputs:
+            self._external_exec_requests.pop(str(call_id), None)
+        for exec_request, output in requests:
+            for client_message in _encode_external_exec_terminal_result(
+                exec_request,
+                output,
+            ):
+                self.pending.extend(encode_connect_proto_frame(client_message))
+        result = await self._read_until_boundary(
+            stop_on_tool_call=True,
+            timeout=timeout,
+        )
+        if result.tool_calls and self.can_continue:
+            result.retained_session = self
+        return result
+
+    async def _flush_pending(self) -> None:
+        while self.pending:
+            outbound = CursorAgentConnectClient._flush_h2_request_data(
+                self.connection,
+                self.stream_id,
+                self.pending,
+            )
+            if not outbound:
+                return
+            self.writer.write(outbound)
+            await self.writer.drain()
+
+    def _handle_frame(
+        self,
+        frame: CursorConnectProtoFrame,
+        result: "CursorAgentRunResult",
+        *,
+        stop_on_tool_call: bool,
+    ) -> bool:
+        if frame.is_end_stream:
+            _raise_for_connect_end_stream(frame.payload)
+            result.end_stream = True
+            return True
+        external_exec_requests: List[Dict[str, Any]] = []
+        normalized, client_messages = _process_agent_server_message(
+            frame.payload,
+            self.blobs,
+            local_exec_tool_name=self.local_exec_tool_name,
+            external_exec_requests=external_exec_requests,
+        )
+        for exec_request in external_exec_requests:
+            self.register_external_exec(exec_request)
+        for client_message in client_messages:
+            self.pending.extend(encode_connect_proto_frame(client_message))
+        if normalized:
+            result.add_payload(normalized)
+        if result.turn_ended:
+            return True
+        return bool(
+            result.tool_calls
+            and (stop_on_tool_call or self._external_exec_requests)
+        )
+
+    async def _read_until_boundary(  # noqa: PLR0915
+        self,
+        *,
+        stop_on_tool_call: bool,
+        timeout: Optional[float],
+    ) -> "CursorAgentRunResult":
+        loop = asyncio.get_running_loop()
+        terminal_timeout = (
+            float(timeout)
+            if timeout is not None
+            else CURSOR_CONNECT_TERMINAL_TIMEOUT_SECONDS
+        )
+        if terminal_timeout <= 0:
+            raise CursorConnectError(
+                "Cursor Agent Connect timeout must be greater than zero.",
+                status_code=500,
+            )
+        deadline = loop.time() + terminal_timeout
+        next_heartbeat = loop.time() + CURSOR_CONNECT_HEARTBEAT_SECONDS
+        result = CursorAgentRunResult()
+
+        while True:
+            now = loop.time()
+            if now >= deadline:
+                raise CursorConnectError(
+                    "Cursor Agent Connect timed out after "
+                    f"{terminal_timeout:g}s without turnEnded or a "
+                    "completed tool call.",
+                    status_code=504,
+                )
+            if now >= next_heartbeat:
+                self.pending.extend(
+                    encode_connect_proto_frame(_encode_proto_message_field(7, b""))
+                )
+                next_heartbeat = now + CURSOR_CONNECT_HEARTBEAT_SECONDS
+            await self._flush_pending()
+
+            if self._buffered_frames:
+                frame = self._buffered_frames.pop(0)
+                if self._handle_frame(
+                    frame,
+                    result,
+                    stop_on_tool_call=stop_on_tool_call,
+                ):
+                    return result
+                continue
+
+            wait_seconds = min(
+                deadline - loop.time(),
+                max(0.0, next_heartbeat - loop.time()),
+            )
+            try:
+                incoming = await asyncio.wait_for(
+                    self.reader.read(64 * 1024),
+                    timeout=wait_seconds,
+                )
+            except TimeoutError:
+                continue
+            if not incoming:
+                self.decoder.finish()
+                if not self.saw_response_headers:
+                    raise CursorConnectError(
+                        "Cursor Agent HTTP/2 stream closed before response headers.",
+                        status_code=502,
+                    )
+                result.validate_terminal()
+                return result
+
+            from h2 import events as h2_events
+
+            for event in self.connection.receive_data(incoming):
+                if isinstance(event, h2_events.ResponseReceived):
+                    response_headers = CursorAgentConnectClient._h2_response_headers(
+                        event.headers
+                    )
+                    CursorAgentConnectClient._validate_h2_response_headers(
+                        response_headers
+                    )
+                    self.saw_response_headers = True
+                    continue
+                if isinstance(event, h2_events.DataReceived):
+                    self.connection.acknowledge_received_data(
+                        event.flow_controlled_length,
+                        event.stream_id,
+                    )
+                    frames = self.decoder.feed(event.data)
+                    for index, frame in enumerate(frames):
+                        if self._handle_frame(
+                            frame,
+                            result,
+                            stop_on_tool_call=stop_on_tool_call,
+                        ):
+                            self._buffered_frames.extend(frames[index + 1 :])
+                            return result
+                    continue
+                if isinstance(event, h2_events.TrailersReceived):
+                    trailer_headers = CursorAgentConnectClient._h2_response_headers(
+                        event.headers
+                    )
+                    error_code = trailer_headers.get("connect-error-code")
+                    if error_code and error_code != "0":
+                        raise CursorConnectError(
+                            trailer_headers.get(
+                                "connect-error-message",
+                                f"Cursor Agent Connect error {error_code}.",
+                            ),
+                            status_code=502,
+                            headers=trailer_headers,
+                        )
+                    continue
+                if isinstance(event, h2_events.StreamEnded):
+                    self.decoder.finish()
+                    result.validate_terminal()
+                    return result
+                if isinstance(event, h2_events.StreamReset):
+                    raise CursorConnectError(
+                        "Cursor Agent HTTP/2 stream was reset "
+                        f"(error_code={event.error_code}).",
+                        status_code=502,
+                    )
+                if isinstance(event, h2_events.ConnectionTerminated):
+                    raise CursorConnectError(
+                        "Cursor Agent HTTP/2 connection terminated "
+                        f"(error_code={event.error_code}).",
+                        status_code=502,
+                    )
+
+    async def start(
+        self,
+        request_body: bytes,
+        *,
+        timeout: Optional[float],
+        stop_on_tool_call: bool,
+    ) -> "CursorAgentRunResult":
+        self.pending.extend(request_body)
+        return await self._read_until_boundary(
+            stop_on_tool_call=stop_on_tool_call,
+            timeout=timeout,
+        )
 
 
 def _raise_for_connect_end_stream(payload: bytes) -> None:
@@ -1540,6 +2429,10 @@ class CursorAgentRunResult:
     usage: Dict[str, Any] = field(default_factory=dict)
     provider_metadata: Dict[str, Any] = field(default_factory=dict)
     exec_server_messages: List[Dict[str, Any]] = field(default_factory=list)
+    retained_session: Optional["CursorAgentRetainedSession"] = field(
+        default=None,
+        repr=False,
+    )
     _pending_tool_calls: Dict[str, Dict[str, Any]] = field(
         default_factory=dict,
         repr=False,
@@ -2175,9 +3068,9 @@ class CursorAgentConnectClient:
         stop_on_tool_call: bool,
         timeout: Optional[float],
         local_exec_tool_name: Optional[str],
+        retain_on_tool_call: bool,
     ) -> CursorAgentRunResult:
         """Run Cursor's true bidi RPC without half-closing the request."""
-        from h2 import events as h2_events
         from h2.config import H2Configuration
         from h2.connection import H2Connection
 
@@ -2205,9 +3098,8 @@ class CursorAgentConnectClient:
 
         ssl_context = ssl.create_default_context()
         ssl_context.set_alpn_protocols(["h2"])
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + terminal_timeout
         writer: Any = None
+        session: Optional[CursorAgentRetainedSession] = None
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(
@@ -2257,117 +3149,28 @@ class CursorAgentConnectClient:
                 request_headers,
                 end_stream=False,
             )
-
-            pending = bytearray(request_body)
+            session = CursorAgentRetainedSession(
+                reader=reader,
+                writer=writer,
+                connection=connection,
+                stream_id=stream_id,
+                decoder=_ProtoConnectFrameDecoder(),
+                blobs={},
+                local_exec_tool_name=local_exec_tool_name,
+                saw_response_headers=False,
+            )
             writer.write(connection.data_to_send())
             await writer.drain()
-            result = CursorAgentRunResult()
-            decoder = _ProtoConnectFrameDecoder()
-            blobs: Dict[bytes, bytes] = {}
-            next_heartbeat = loop.time() + CURSOR_CONNECT_HEARTBEAT_SECONDS
-            saw_response_headers = False
-
-            while True:
-                now = loop.time()
-                if now >= deadline:
-                    raise CursorConnectError(
-                        "Cursor Agent Connect timed out after "
-                        f"{terminal_timeout:g}s without turnEnded or a "
-                        "completed tool call.",
-                        status_code=504,
-                    )
-                if now >= next_heartbeat:
-                    pending.extend(encode_connect_proto_frame(_encode_proto_message_field(7, b"")))
-                    next_heartbeat = now + CURSOR_CONNECT_HEARTBEAT_SECONDS
-
-                outbound = self._flush_h2_request_data(
-                    connection,
-                    stream_id,
-                    pending,
-                )
-                if outbound:
-                    writer.write(outbound)
-                    await writer.drain()
-
-                wait_seconds = min(
-                    deadline - loop.time(),
-                    max(0.0, next_heartbeat - loop.time()),
-                )
-                try:
-                    incoming = await asyncio.wait_for(
-                        reader.read(64 * 1024),
-                        timeout=wait_seconds,
-                    )
-                except TimeoutError:
-                    continue
-                if not incoming:
-                    decoder.finish()
-                    if not saw_response_headers:
-                        raise CursorConnectError(
-                            "Cursor Agent HTTP/2 stream closed before response headers.",
-                            status_code=502,
-                        )
-                    result.validate_terminal()
-                    return result
-
-                for event in connection.receive_data(incoming):
-                    if isinstance(event, h2_events.ResponseReceived):
-                        response_headers = self._h2_response_headers(event.headers)
-                        self._validate_h2_response_headers(response_headers)
-                        saw_response_headers = True
-                        continue
-                    if isinstance(event, h2_events.DataReceived):
-                        connection.acknowledge_received_data(
-                            event.flow_controlled_length,
-                            event.stream_id,
-                        )
-                        for frame in decoder.feed(event.data):
-                            if frame.is_end_stream:
-                                _raise_for_connect_end_stream(frame.payload)
-                                result.end_stream = True
-                                result.validate_terminal()
-                                return result
-                            normalized, client_messages = _process_agent_server_message(
-                                frame.payload,
-                                blobs,
-                                local_exec_tool_name=local_exec_tool_name,
-                            )
-                            for client_message in client_messages:
-                                pending.extend(encode_connect_proto_frame(client_message))
-                            if normalized:
-                                result.add_payload(normalized)
-                            if stop_on_tool_call and result.tool_calls:
-                                return result
-                            if result.turn_ended:
-                                return result
-                        continue
-                    if isinstance(event, h2_events.TrailersReceived):
-                        trailer_headers = self._h2_response_headers(event.headers)
-                        error_code = trailer_headers.get("connect-error-code")
-                        if error_code and error_code != "0":
-                            raise CursorConnectError(
-                                trailer_headers.get(
-                                    "connect-error-message",
-                                    f"Cursor Agent Connect error {error_code}.",
-                                ),
-                                status_code=502,
-                                headers=trailer_headers,
-                            )
-                        continue
-                    if isinstance(event, h2_events.StreamEnded):
-                        decoder.finish()
-                        result.validate_terminal()
-                        return result
-                    if isinstance(event, h2_events.StreamReset):
-                        raise CursorConnectError(
-                            "Cursor Agent HTTP/2 stream was reset " f"(error_code={event.error_code}).",
-                            status_code=502,
-                        )
-                    if isinstance(event, h2_events.ConnectionTerminated):
-                        raise CursorConnectError(
-                            "Cursor Agent HTTP/2 connection terminated " f"(error_code={event.error_code}).",
-                            status_code=502,
-                        )
+            result = await session.start(
+                request_body,
+                timeout=terminal_timeout,
+                stop_on_tool_call=stop_on_tool_call,
+            )
+            if retain_on_tool_call and result.tool_calls and session.can_continue:
+                result.retained_session = session
+                session = None
+                writer = None
+            return result
         except CursorConnectError:
             raise
         except TimeoutError as exc:
@@ -2386,7 +3189,9 @@ class CursorAgentConnectClient:
                 status_code=502,
             ) from exc
         finally:
-            if writer is not None:
+            if session is not None:
+                await session.aclose()
+            elif writer is not None:
                 writer.close()
                 wait_closed = getattr(writer, "wait_closed", None)
                 if callable(wait_closed):
@@ -2452,6 +3257,7 @@ class CursorAgentConnectClient:
         stop_on_tool_call: bool,
         timeout: Optional[float],
         local_exec_tool_name: Optional[str],
+        retain_on_tool_call: bool,
     ) -> CursorAgentRunResult:
         if self.http_client is None and self.client_factory is None:
             self._ensure_http2_dependency()
@@ -2462,6 +3268,7 @@ class CursorAgentConnectClient:
                 stop_on_tool_call=stop_on_tool_call,
                 timeout=timeout,
                 local_exec_tool_name=local_exec_tool_name,
+                retain_on_tool_call=retain_on_tool_call,
             )
 
         owned_client = self.http_client is None
@@ -2545,6 +3352,7 @@ class CursorAgentConnectClient:
         extra_headers: Optional[Mapping[str, Any]] = None,
         stop_on_tool_call: bool = False,
         timeout: Optional[float] = None,
+        retain_on_tool_call: bool = False,
     ) -> CursorAgentRunResult:
         """Run one Connect request, retrying one 401 with refreshed auth."""
         self._ensure_http2_dependency()
@@ -2580,6 +3388,7 @@ class CursorAgentConnectClient:
                 stop_on_tool_call=stop_on_tool_call,
                 timeout=timeout,
                 local_exec_tool_name=local_exec_tool_name,
+                retain_on_tool_call=retain_on_tool_call,
             )
         except CursorConnectError as exc:
             if exc.status_code != 401:
@@ -2605,6 +3414,7 @@ class CursorAgentConnectClient:
                 stop_on_tool_call=stop_on_tool_call,
                 timeout=timeout,
                 local_exec_tool_name=local_exec_tool_name,
+                retain_on_tool_call=retain_on_tool_call,
             )
 
 

@@ -4,6 +4,8 @@ import asyncio
 import base64
 import json
 import re
+import shlex
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +90,61 @@ def _server_turn_ended_frame(
     turn_ended = _varint(1, input_tokens) + _varint(2, output_tokens)
     interaction_update = _message(14, turn_ended)
     return encode_connect_proto_frame(_message(1, interaction_update))
+
+
+def _read_envelope(
+    path: str,
+    *,
+    content: str = "",
+    status: str = "ok",
+    total_lines: int = 0,
+    file_size: int = 0,
+    truncated: bool = False,
+    range_applied: bool = False,
+) -> str:
+    payload: dict[str, Any] = {
+        "version": 1,
+        "status": status,
+        "path": path,
+    }
+    if status == "ok":
+        payload.update(
+            {
+                "content_b64": base64.b64encode(content.encode()).decode(),
+                "total_lines": total_lines,
+                "file_size": file_size,
+                "truncated": truncated,
+                "range_applied": range_applied,
+            }
+        )
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode()
+    ).decode().rstrip("=")
+    return f"LITELLM_CURSOR_READ_V1:{encoded}"
+
+
+def _codex_exec_output(
+    output: str,
+    *,
+    exit_code: int = 0,
+    marker: str = "Final output:",
+    token_count: int | None = None,
+) -> str:
+    lines = []
+    if token_count is not None:
+        lines.append(
+            f"Warning: truncated output (original token count: {token_count})"
+        )
+    lines.extend(
+        [
+            "Chunk ID: cursor-read-test",
+            "Wall time: 0.001 seconds",
+            f"Process exited with code {exit_code}",
+            marker,
+            output.rstrip("\r\n"),
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _proto_value(value: Any) -> bytes:
@@ -519,6 +576,125 @@ class _H2McpExecPeer:
         return None
 
 
+class _H2ReadContinuationPeer:
+    def __init__(self) -> None:
+        self.server = H2Connection(
+            config=H2Configuration(
+                client_side=False,
+                header_encoding="utf-8",
+            )
+        )
+        self.server.initiate_connection()
+        self.incoming: asyncio.Queue[bytes] = asyncio.Queue()
+        self.incoming.put_nowait(self.server.data_to_send())
+        self.decoder = cursor_connect._ProtoConnectFrameDecoder()
+        self.client_payloads: list[bytes] = []
+        self.stream_id = 0
+        self.connection_count = 0
+        self.path = "/workspace/file with spaces.txt"
+        self.sent_read_call = False
+        self.saw_read_result = False
+        self.saw_stream_close = False
+        self.read_result: bytes | None = None
+        self.response_sent = False
+        self.request_stream_ended = False
+        self.closed = False
+
+    async def open_connection(self, *_args: Any, **_kwargs: Any) -> tuple[Any, Any]:
+        self.connection_count += 1
+        return self, self
+
+    async def read(self, _size: int) -> bytes:
+        return await self.incoming.get()
+
+    def _send_read_call(self) -> None:
+        read_args = _string(1, self.path) + _string(2, "read-call")
+        exec_request = (
+            _varint(1, 17)
+            + _message(7, read_args)
+            + _string(15, "exec-read")
+        )
+        self.server.send_data(
+            self.stream_id,
+            encode_connect_proto_frame(_message(2, exec_request)),
+            end_stream=False,
+        )
+        self.sent_read_call = True
+
+    def _record_client_result(self, payload: bytes) -> None:
+        exec_message = _last_field(payload, 2, wire_type=2)
+        if isinstance(exec_message, bytes):
+            if _last_field(exec_message, 1, wire_type=0) == 17:
+                read_result = _last_field(exec_message, 7, wire_type=2)
+                if isinstance(read_result, bytes):
+                    self.saw_read_result = True
+                    self.read_result = read_result
+        exec_control = _last_field(payload, 5, wire_type=2)
+        if isinstance(exec_control, bytes):
+            stream_close = _last_field(exec_control, 1, wire_type=2)
+            if (
+                isinstance(stream_close, bytes)
+                and _last_field(stream_close, 1, wire_type=0) == 17
+            ):
+                self.saw_stream_close = True
+        if self.saw_read_result and self.saw_stream_close and not self.response_sent:
+            self.response_sent = True
+            self.server.send_data(
+                self.stream_id,
+                _server_text_frame("read complete")
+                + _server_turn_ended_frame()
+                + _end_stream_frame(),
+                end_stream=True,
+            )
+
+    def write(self, data: bytes) -> None:
+        if self.closed:
+            raise RuntimeError("write attempted after the retained stream closed")
+        for event in self.server.receive_data(data):
+            if isinstance(event, RequestReceived):
+                self.stream_id = event.stream_id
+                self.server.send_headers(
+                    event.stream_id,
+                    [
+                        (":status", "200"),
+                        ("content-type", "application/connect+proto"),
+                    ],
+                    end_stream=False,
+                )
+            elif isinstance(event, DataReceived):
+                self.server.acknowledge_received_data(
+                    event.flow_controlled_length,
+                    event.stream_id,
+                )
+                for frame in self.decoder.feed(event.data):
+                    assert frame.is_end_stream is False
+                    self.client_payloads.append(frame.payload)
+                    if (
+                        not self.sent_read_call
+                        and _last_field(frame.payload, 1, wire_type=2) is not None
+                    ):
+                        self._send_read_call()
+                    elif self.sent_read_call:
+                        self._record_client_result(frame.payload)
+            elif isinstance(event, StreamEnded):
+                self.request_stream_ended = True
+        outbound = self.server.data_to_send()
+        if outbound:
+            self.incoming.put_nowait(outbound)
+
+    async def drain(self) -> None:
+        return None
+
+    def get_extra_info(self, name: str) -> Any:
+        return _FakeTLS() if name == "ssl_object" else None
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
 def test_connect_proto_frames_round_trip_gzip_and_parse_end_stream() -> None:
     message = _message(7, b"")
     body = encode_connect_proto_frame(message, compress=True) + _end_stream_frame()
@@ -618,6 +794,7 @@ def test_h2_bidi_surfaces_mcp_exec_as_external_tool_call(
             url="https://cursor.test/agent.v1.AgentService/Run",
             timeout=0.5,
             stop_on_tool_call=True,
+            retain_on_tool_call=True,
         )
     )
 
@@ -631,6 +808,8 @@ def test_h2_bidi_surfaces_mcp_exec_as_external_tool_call(
     ]
     assert peer.sent_tool_call is True
     assert peer.request_stream_ended is False
+    assert peer.closed is True
+    assert result.retained_session is None
     assert all(
         _last_field(payload, 2, wire_type=2) is None
         and _last_field(payload, 5, wire_type=2) is None
@@ -655,6 +834,7 @@ def test_h2_bidi_surfaces_local_shell_as_advertised_external_tool_call(
             url="https://cursor.test/agent.v1.AgentService/Run",
             timeout=0.5,
             stop_on_tool_call=True,
+            retain_on_tool_call=True,
         )
     )
 
@@ -668,6 +848,8 @@ def test_h2_bidi_surfaces_local_shell_as_advertised_external_tool_call(
     ]
     assert peer.sent_tool_call is True
     assert peer.request_stream_ended is False
+    assert peer.closed is True
+    assert result.retained_session is None
     assert all(
         _last_field(payload, 2, wire_type=2) is None
         and _last_field(payload, 5, wire_type=2) is None
@@ -696,6 +878,7 @@ def test_h2_bidi_surfaces_fragmented_shell_stream_as_external_tool_call(
             url="https://cursor.test/agent.v1.AgentService/Run",
             timeout=0.5,
             stop_on_tool_call=True,
+            retain_on_tool_call=True,
         )
     )
 
@@ -709,11 +892,70 @@ def test_h2_bidi_surfaces_fragmented_shell_stream_as_external_tool_call(
     ]
     assert peer.sent_tool_call is True
     assert peer.request_stream_ended is False
+    assert peer.closed is True
+    assert result.retained_session is None
     assert all(
         _last_field(payload, 2, wire_type=2) is None
         and _last_field(payload, 5, wire_type=2) is None
         for payload in peer.client_payloads
     )
+
+
+def test_h2_bidi_retains_read_run_until_external_output_then_final_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer = _H2ReadContinuationPeer()
+    monkeypatch.setattr(asyncio, "open_connection", peer.open_connection)
+    request = _run_request()
+    request["runRequest"]["mcpTools"] = {
+        "mcpTools": [{"name": "exec_command"}],
+    }
+
+    async def exercise() -> tuple[Any, Any]:
+        client = CursorAgentConnectClient(
+            auth=CursorAgentAuth("access-token")
+        )
+        first = await client.run(
+            request,
+            url="https://cursor.test/agent.v1.AgentService/Run",
+            timeout=0.5,
+            stop_on_tool_call=True,
+            retain_on_tool_call=True,
+        )
+        session = first.retained_session
+        assert session is not None
+        assert peer.closed is False
+        second = await session.continue_with_tool_outputs(
+            [
+                (
+                    "read-call",
+                    _codex_exec_output(
+                        _read_envelope(
+                            peer.path,
+                            content="line one\nline two",
+                            total_lines=2,
+                            file_size=17,
+                        )
+                    ),
+                )
+            ],
+            timeout=0.5,
+        )
+        await session.aclose()
+        return first, second
+
+    first, second = asyncio.run(exercise())
+
+    assert peer.connection_count == 1
+    assert first.tool_calls[0]["call_id"] == "read-call"
+    command = json.loads(first.tool_calls[0]["arguments"])["cmd"]
+    assert command.endswith(f"'{peer.path}'")
+    assert peer.saw_read_result is True
+    assert peer.saw_stream_close is True
+    assert peer.request_stream_ended is False
+    assert peer.closed is True
+    assert second.text == "read complete"
+    assert second.turn_ended is True
 
 
 @pytest.mark.parametrize("message_field", [2, 14])
@@ -743,6 +985,187 @@ def test_proto_bidi_bridges_advertised_local_shell_arguments(
         }
     }
     assert client_messages == []
+
+
+def test_proto_bidi_bridges_read_args_through_external_exec_command() -> None:
+    path = "/workspace/file with spaces;$(touch should-not-run).txt"
+    read_args = _string(1, path) + _string(2, "read-call")
+    exec_request = (
+        _varint(1, 23)
+        + _message(7, read_args)
+        + _string(15, "exec-read")
+    )
+
+    normalized, client_messages = cursor_connect._process_agent_server_message(
+        _message(2, exec_request),
+        {},
+        local_exec_tool_name="exec_command",
+    )
+
+    tool_call = normalized["interactionUpdate"]["toolCallCompleted"]
+    command = json.loads(tool_call["argsJson"])["cmd"]
+    assert tool_call["callId"] == "read-call"
+    assert tool_call["toolName"] == "exec_command"
+    assert command.startswith("python3 -c ")
+    assert command.endswith(f"'{path}'")
+    assert client_messages == []
+
+
+@pytest.mark.parametrize(
+    ("marker", "token_count"),
+    [
+        ("Final output:", None),
+        ("Output:", 3),
+    ],
+)
+def test_read_command_executes_utf8_file_and_emits_valid_envelope(
+    tmp_path: Path,
+    marker: str,
+    token_count: int | None,
+) -> None:
+    path = tmp_path / "file with spaces.txt"
+    content = "alpha\nbeta\n"
+    path.write_text(content, encoding="utf-8")
+    command = cursor_connect._read_command(str(path))
+
+    completed = subprocess.run(
+        shlex.split(command),
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=5,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    decoded = cursor_connect._decode_cursor_read_envelope(
+        _codex_exec_output(
+            completed.stdout,
+            marker=marker,
+            token_count=token_count,
+        ),
+        expected_path=str(path),
+    )
+    assert decoded == {
+        "status": "ok",
+        "path": str(path),
+        "content": content,
+        "total_lines": 2,
+        "file_size": len(content.encode("utf-8")),
+        "truncated": False,
+        "range_applied": False,
+    }
+
+
+@pytest.mark.parametrize("rejection", ["nonzero", "multiple", "extra"])
+def test_decode_cursor_read_envelope_rejects_ambiguous_exec_output(
+    rejection: str,
+) -> None:
+    path = "/workspace/file.txt"
+    envelope = _read_envelope(path, content="alpha", total_lines=1, file_size=5)
+    if rejection == "nonzero":
+        output = _codex_exec_output(envelope, exit_code=7)
+        expected_reason = "nonzero status"
+    elif rejection == "multiple":
+        output = _codex_exec_output(f"{envelope}\n{envelope}")
+        expected_reason = "exactly one"
+    else:
+        output = _codex_exec_output(f"{envelope}\nunexpected trailing content")
+        expected_reason = "ambiguous extra content"
+
+    decoded = cursor_connect._decode_cursor_read_envelope(
+        output,
+        expected_path=path,
+    )
+
+    assert decoded["status"] == "invalid_file"
+    assert expected_reason in decoded["reason"]
+
+
+@pytest.mark.parametrize(
+    "unsupported_args",
+    [
+        _varint(4, 1),
+        _varint(5, 1),
+        _string(6, "latin1"),
+    ],
+)
+def test_proto_bidi_rejects_nondefault_read_range_or_encoding(
+    unsupported_args: bytes,
+) -> None:
+    read_args = _string(1, "/workspace/file.txt") + unsupported_args
+    exec_request = _varint(1, 23) + _message(7, read_args)
+
+    with pytest.raises(
+        CursorConnectProtocolError,
+        match="nondefault",
+    ):
+        cursor_connect._process_agent_server_message(
+            _message(2, exec_request),
+            {},
+            local_exec_tool_name="exec_command",
+        )
+
+
+def test_proto_bidi_encodes_read_result_success_and_invalid_envelope() -> None:
+    path = "/workspace/file.txt"
+    exec_fields = _top_level_fields(
+        _varint(1, 23) + _string(15, "exec-read")
+    )
+    request = {
+        "exec_fields": exec_fields,
+        "message_field": 7,
+        "path": path,
+    }
+
+    messages = cursor_connect._encode_read_terminal_result(
+        request,
+        _codex_exec_output(
+            _read_envelope(
+                path,
+                content="alpha\nbeta",
+                total_lines=2,
+                file_size=10,
+                truncated=True,
+            )
+        ),
+    )
+    exec_message = _last_field(messages[0], 2, wire_type=2)
+    assert isinstance(exec_message, bytes)
+    assert _last_field(exec_message, 1, wire_type=0) == 23
+    assert _last_field(exec_message, 15, wire_type=2) == b"exec-read"
+    read_result = _last_field(exec_message, 7, wire_type=2)
+    assert isinstance(read_result, bytes)
+    success = _last_field(read_result, 1, wire_type=2)
+    assert isinstance(success, bytes)
+    assert _last_field(success, 1, wire_type=2) == path.encode()
+    assert _last_field(success, 2, wire_type=2) == b"alpha\nbeta"
+    assert _last_field(success, 3, wire_type=0) == 2
+    assert _last_field(success, 4, wire_type=0) == 10
+    assert _last_field(success, 6, wire_type=0) == 1
+    assert _last_field(messages[1], 5, wire_type=2) is not None
+
+    invalid_messages = cursor_connect._encode_read_terminal_result(
+        request,
+        _codex_exec_output("not-a-read-envelope"),
+    )
+    invalid_exec_message = _last_field(
+        invalid_messages[0],
+        2,
+        wire_type=2,
+    )
+    assert isinstance(invalid_exec_message, bytes)
+    invalid_result = _last_field(
+        invalid_exec_message,
+        7,
+        wire_type=2,
+    )
+    assert isinstance(invalid_result, bytes)
+    invalid_file = _last_field(invalid_result, 6, wire_type=2)
+    assert isinstance(invalid_file, bytes)
+    assert _last_field(invalid_file, 1, wire_type=2) == path.encode()
+    assert b"invalid envelope" in (
+        _last_field(invalid_file, 2, wire_type=2) or b""
+    )
 
 
 @pytest.mark.parametrize("message_field", [2, 14])

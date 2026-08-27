@@ -7,6 +7,7 @@ Do not import llm_passthrough_endpoints at module scope.
 from __future__ import annotations
 # ruff: noqa: F821 - free names resolve via host globals after install() rebind
 
+import asyncio
 import copy
 import json
 import re
@@ -40,6 +41,64 @@ _CURSOR_REPLAY_PRESERVED_STATUS_CODES = frozenset(
 )
 
 
+def _close_cursor_retained_session(state: Optional[dict[str, Any]]) -> None:
+    if not isinstance(state, dict):
+        return
+    session = state.get("retained_session")
+    close = getattr(session, "close", None)
+    if callable(close):
+        close()
+
+
+def _cancel_cursor_replay_expiry(state: Optional[dict[str, Any]]) -> None:
+    if not isinstance(state, dict):
+        return
+    handle = state.get("expiry_handle")
+    state["expiry_handle"] = None
+    cancel = getattr(handle, "cancel", None)
+    if callable(cancel):
+        cancel()
+
+
+def _dispose_cursor_replay_state(
+    state: Optional[dict[str, Any]],
+    *,
+    close_retained_session: bool = True,
+) -> None:
+    _cancel_cursor_replay_expiry(state)
+    if close_retained_session:
+        _close_cursor_retained_session(state)
+
+
+def _expire_cursor_replay_state(
+    response_id: str,
+    expected_state: dict[str, Any],
+) -> None:
+    current = _CURSOR_REPLAY_REGISTRY.get(response_id)
+    if current is not expected_state:
+        return
+    _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
+    expected_state["expiry_handle"] = None
+    _close_cursor_retained_session(expected_state)
+
+
+def _schedule_cursor_replay_expiry(
+    response_id: str,
+    state: dict[str, Any],
+) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    delay = max(0.0, float(state["expires_at"]) - time.monotonic())
+    state["expiry_handle"] = loop.call_later(
+        delay,
+        _expire_cursor_replay_state,
+        response_id,
+        state,
+    )
+
+
 def _prune_cursor_replay_registry(now: Optional[float] = None) -> None:
     current = time.monotonic() if now is None else now
     expired = [
@@ -48,7 +107,8 @@ def _prune_cursor_replay_registry(now: Optional[float] = None) -> None:
         if float(state["expires_at"]) <= current
     ]
     for response_id in expired:
-        _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
+        state = _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
+        _dispose_cursor_replay_state(state)
 
 
 def _store_cursor_replay_state(
@@ -56,17 +116,25 @@ def _store_cursor_replay_state(
     *,
     messages: list[dict[str, Any]],
     tools: list[Any],
+    retained_session: Any = None,
 ) -> None:
     now = time.monotonic()
     _prune_cursor_replay_registry(now)
-    _CURSOR_REPLAY_REGISTRY[response_id] = {
+    previous = _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
+    _dispose_cursor_replay_state(previous)
+    state = {
         "expires_at": now + _CURSOR_REPLAY_TTL_SECONDS,
+        "expiry_handle": None,
         "messages": copy.deepcopy(messages),
         "tools": copy.deepcopy(tools),
+        "retained_session": retained_session,
     }
+    _CURSOR_REPLAY_REGISTRY[response_id] = state
+    _schedule_cursor_replay_expiry(response_id, state)
     _CURSOR_REPLAY_REGISTRY.move_to_end(response_id)
     while len(_CURSOR_REPLAY_REGISTRY) > _CURSOR_REPLAY_MAX_SIZE:
-        _CURSOR_REPLAY_REGISTRY.popitem(last=False)
+        _evicted_id, evicted_state = _CURSOR_REPLAY_REGISTRY.popitem(last=False)
+        _dispose_cursor_replay_state(evicted_state)
 
 
 def _peek_cursor_replay_state(response_id: str) -> dict[str, Any]:
@@ -82,6 +150,7 @@ def _peek_cursor_replay_state(response_id: str) -> dict[str, Any]:
         )
     if float(state["expires_at"]) <= now:
         _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
+        _dispose_cursor_replay_state(state)
         _prune_cursor_replay_registry(now)
         raise CursorConnectError(
             "Cursor Agent continuation state expired for previous_response_id.",
@@ -96,11 +165,16 @@ def _consume_cursor_replay_state(
     response_id: str,
     *,
     expected_state: Optional[dict[str, Any]] = None,
+    close_retained_session: bool = True,
 ) -> None:
     current = _CURSOR_REPLAY_REGISTRY.get(response_id)
     if expected_state is not None and current is not expected_state:
         return
-    _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
+    state = _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
+    _dispose_cursor_replay_state(
+        state,
+        close_retained_session=close_retained_session,
+    )
 
 
 def _take_cursor_replay_state(response_id: str) -> dict[str, Any]:
@@ -125,7 +199,10 @@ def _cursor_replay_failure_is_transient(
 
 
 def _clear_cursor_replay_registry() -> None:
+    states = list(_CURSOR_REPLAY_REGISTRY.values())
     _CURSOR_REPLAY_REGISTRY.clear()
+    for state in states:
+        _dispose_cursor_replay_state(state)
 
 
 def _watermark_endpoint_from_path(*parts: Any) -> str:
@@ -1014,6 +1091,27 @@ def _cursor_response_input_items(request_body: dict[str, Any]) -> list[Any]:
     return [raw_input]
 
 
+def _cursor_function_call_outputs(
+    request_body: dict[str, Any],
+) -> list[tuple[str, str]]:
+    outputs: list[tuple[str, str]] = []
+    for raw_item in _cursor_response_input_items(request_body):
+        item = _cursor_as_mapping(raw_item)
+        if not item:
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type not in {"function_call_output", "mcp_call_output"} and (
+            item.get("role") != "tool"
+        ):
+            continue
+        call_id = _cursor_call_id(item)
+        output = item.get("output")
+        if output is None:
+            output = item.get("content")
+        outputs.append((call_id, _cursor_response_content_text(output)))
+    return outputs
+
+
 def _responses_input_to_cursor_messages(  # noqa: PLR0915
     request_body: dict[str, Any],
     *,
@@ -1038,7 +1136,6 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
                 function_calls,
             )
     saw_function_call_output = False
-    saw_new_user_message = False
     last_item_was_user = False
     function_call_output_ends_input = False
     input_items = _cursor_response_input_items(request_body)
@@ -1046,7 +1143,6 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
     for item_index, raw_item in enumerate(input_items):
         if isinstance(raw_item, str):
             messages.append({"role": "user", "content": raw_item})
-            saw_new_user_message = True
             last_item_was_user = bool(raw_item)
             continue
         item = _cursor_as_mapping(raw_item)
@@ -1083,8 +1179,6 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
         message = _cursor_message_input_item(item, function_calls)
         if message is not None:
             messages.append(message)
-            if message["role"] == "user":
-                saw_new_user_message = True
             last_item_was_user = message["role"] == "user" and bool(
                 message["content"]
             )
@@ -1097,7 +1191,7 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
     # A tool result is a continuation of the interrupted Cursor turn.
     if saw_function_call_output and not last_item_was_user:
         continuation_message: dict[str, Any] = {"role": "user", "content": ""}
-        if function_call_output_ends_input and not saw_new_user_message:
+        if function_call_output_ends_input:
             continuation_message = {
                 "role": "user",
                 "content": _CURSOR_TOOL_CONTINUATION_CUE,
@@ -1225,7 +1319,7 @@ def _validate_cursor_result_and_consume_replay_state(
         )
 
 
-async def _perform_codex_auto_agent_cursor_agent_request(
+async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     *,
     endpoint: str,
     request: Request,
@@ -1284,6 +1378,64 @@ async def _perform_codex_auto_agent_cursor_agent_request(
     request_tools = request_body.get("tools")
     if not isinstance(request_tools, list) and isinstance(replay_state, dict):
         request_tools = replay_state.get("tools")
+
+    retained_session = (
+        replay_state.get("retained_session")
+        if isinstance(replay_state, dict)
+        else None
+    )
+    if retained_session is not None:
+        _consume_cursor_replay_state(
+            previous_response_id,
+            expected_state=replay_state,
+            close_retained_session=False,
+        )
+        try:
+            result = await retained_session.continue_with_tool_outputs(
+                _cursor_function_call_outputs(request_body)
+            )
+            _validate_cursor_result_and_consume_replay_state(
+                result=result,
+                previous_response_id=None,
+                replay_state=None,
+            )
+        except Exception:
+            await retained_session.aclose()
+            raise
+
+        model = str(candidate.get("model") or request_body.get("model") or "")
+        response_body = _cursor_responses_response_body(
+            model=model,
+            result=result,
+        )
+        if result.tool_calls:
+            next_session = result.retained_session
+            _store_cursor_replay_state(
+                response_body["id"],
+                messages=_cursor_messages_with_result_tool_calls(
+                    messages,
+                    result.tool_calls,
+                ),
+                tools=request_tools if isinstance(request_tools, list) else [],
+                retained_session=next_session,
+            )
+            if next_session is None:
+                await retained_session.aclose()
+        else:
+            await retained_session.aclose()
+        if bool(request_body.get("stream")):
+            return StreamingResponse(
+                _responses_sse_from_repaired_response_body(
+                    response_body,
+                    request_body=request_body,
+                ),
+                media_type="text/event-stream",
+            )
+        return Response(
+            content=json.dumps(response_body, ensure_ascii=False),
+            media_type="application/json",
+        )
+
     if isinstance(request_tools, list):
         optional_params["tools"] = request_tools
     for source_names, cursor_name in (
@@ -1329,6 +1481,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(
             url=cursor_url,
             extra_headers=extra_headers,
             stop_on_tool_call=True,
+            retain_on_tool_call=True,
         )
     except Exception as exc:
         if (
@@ -1361,6 +1514,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(
                 result.tool_calls,
             ),
             tools=request_tools if isinstance(request_tools, list) else [],
+            retained_session=result.retained_session,
         )
     if bool(request_body.get("stream")):
         return StreamingResponse(
@@ -4013,7 +4167,7 @@ def _raise_opencode_go_alias_candidate_upstream_timeout(
     raise proxy_exc from exc
 
 
-async def _handle_codex_opencode_go_adapter_route(
+async def _handle_codex_opencode_go_adapter_route(  # noqa: PLR0915
     *,
     endpoint: str,
     request: Request,
@@ -4289,7 +4443,7 @@ async def _handle_codex_opencode_go_adapter_route(
     )
 
 
-async def _handle_codex_nous_chat_completions_adapter_route(
+async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
     *,
     endpoint: str,
     request: Request,
@@ -4472,7 +4626,7 @@ async def _handle_codex_nous_chat_completions_adapter_route(
     )
 
 
-async def _perform_codex_auto_agent_openrouter_completion_request(
+async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0915
     *,
     request: Request,
     adapter_model: str,
