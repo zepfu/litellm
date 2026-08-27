@@ -104,6 +104,9 @@ tuis:
         # Long alias ids can paint this truncated chrome. Not a bare {model}
         # needle: "work" is a substring of "work-other".
         - "AAWM alias / model {model}"
+        # OhMyPi 17.4.2 header chrome. The following " >" keeps "work"
+        # from matching "work-other".
+        - "╭── π  > ⬢ {model} >"
       # Recap is wait-only. Exact PONG is NOT a substring wait needle:
       # recent-session titles can contain the word PONG. Live PONG is a
       # standalone exact pane line after a prompt echo newer than the

@@ -5539,6 +5539,21 @@ def test_should_not_treat_work_other_alias_chrome_as_selected_work(
     assert driver.pane_has_selector("work", pane) is False
 
 
+def test_should_treat_ohmypi_header_model_chrome_as_selected(hv, config) -> None:
+    from hv2.drivers.ohmypi import OhmypiDriver
+
+    driver = OhmypiDriver(config)
+    pane = (
+        "╭── π  > ⬢ provider-nvidia > 🗑 omp-alpha-workspace > ◫ 6.4%/128K ⟲ ▶──────────╮\n"
+        "╰─                                                                            ╯\n"
+        "interactive\n"
+    )
+    suffix = pane.replace("provider-nvidia", "provider-nvidia-other")
+    assert "litellm-alpha-passthrough/provider-nvidia" not in pane
+    assert driver.pane_has_selector("provider-nvidia", pane) is True
+    assert driver.pane_has_selector("provider-nvidia", suffix) is False
+
+
 def test_should_wait_again_for_ohmypi_selected_needles_after_mcp(
     hv, config, monkeypatch
 ) -> None:
