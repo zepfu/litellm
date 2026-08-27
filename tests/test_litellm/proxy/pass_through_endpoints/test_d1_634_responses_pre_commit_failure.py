@@ -288,6 +288,7 @@ async def test_peek_classifies_native_codex_recovery_errors_before_commit(
         "error_message",
         "expected_error_class",
         "raw_error_marker",
+        "fragmented",
     ),
     [
         (
@@ -295,6 +296,14 @@ async def test_peek_classifies_native_codex_recovery_errors_before_commit(
             "The access token has been invalidated.",
             "token_invalidated",
             "The access token has been invalidated.",
+            False,
+        ),
+        (
+            "token_invalidated",
+            "The access token has been invalidated.",
+            "token_invalidated",
+            "The access token has been invalidated.",
+            True,
         ),
         (
             "invalid_request_error",
@@ -305,16 +314,58 @@ async def test_peek_classifies_native_codex_recovery_errors_before_commit(
             ),
             "openai_responses_unpersisted_item_not_found",
             "Items are not persisted when store is set to false.",
+            False,
+        ),
+        (
+            "invalid_request_error",
+            (
+                "Item with id 'rs_abc123' not found. "
+                "Items are not persisted when store is set to false. "
+                "Try again with store set to true."
+            ),
+            "openai_responses_unpersisted_item_not_found",
+            "Items are not persisted when store is set to false.",
+            True,
         ),
     ],
-    ids=["token-invalidated", "unpersisted-rs-item"],
+    ids=[
+        "token-invalidated",
+        "token-invalidated-fragmented",
+        "unpersisted-rs-item",
+        "unpersisted-rs-item-fragmented",
+    ],
 )
 async def test_chunk_processor_terminalizes_native_recovery_once_after_commit(
     error_code: str,
     error_message: str,
     expected_error_class: str,
     raw_error_marker: str,
+    fragmented: bool,
 ) -> None:
+    error_chunk = _sse(
+        "error",
+        {
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "code": error_code,
+                "message": error_message,
+            },
+        },
+    )
+    if fragmented:
+        marker_end = error_chunk.index(raw_error_marker.encode()) + len(
+            raw_error_marker
+        )
+        second_split = marker_end + max(1, (len(error_chunk) - marker_end) // 2)
+        error_chunks = [
+            error_chunk[:marker_end],
+            error_chunk[marker_end:second_split],
+            error_chunk[second_split:],
+        ]
+    else:
+        error_chunks = [error_chunk]
+
     response_chunks = [
         _sse(
             "response.created",
@@ -336,18 +387,8 @@ async def test_chunk_processor_terminalizes_native_recovery_once_after_commit(
                 "delta": "hello",
             },
         ),
-        _sse(
-            "error",
-            {
-                "type": "error",
-                "error": {
-                    "type": "invalid_request_error",
-                    "code": error_code,
-                    "message": error_message,
-                },
-            },
-        ),
     ]
+    response_chunks.extend(error_chunks)
     response = _FakeUpstreamStream(response_chunks)
     logging_obj = MagicMock()
     logging_obj.model_call_details = {}
@@ -403,6 +444,7 @@ async def test_chunk_processor_terminalizes_native_recovery_once_after_commit(
     assert rendered.count("data: [DONE]") == 1
     assert rendered.count('"delta":"hello"') == 1
     assert raw_error_marker not in rendered
+    assert error_message not in rendered
     metadata = success_handler_kwargs["litellm_params"]["metadata"]
     assert metadata["error_class"] == expected_error_class
     assert metadata["stream_hidden_retry_safe"] is False

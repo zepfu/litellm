@@ -380,6 +380,25 @@ class PassThroughStreamingHandler:
         return chunk, b""
 
     @staticmethod
+    def _split_responses_sse_event_buffer(
+        chunk: bytes,
+    ) -> tuple[bytes, bytes]:
+        """Return complete SSE events and retain the trailing partial event."""
+        if not chunk:
+            return b"", b""
+
+        lf_boundary = chunk.rfind(b"\n\n")
+        crlf_boundary = chunk.rfind(b"\r\n\r\n")
+        if crlf_boundary >= lf_boundary:
+            boundary_start, boundary_length = crlf_boundary, 4
+        else:
+            boundary_start, boundary_length = lf_boundary, 2
+        if boundary_start < 0:
+            return b"", chunk
+        boundary_end = boundary_start + boundary_length
+        return chunk[:boundary_end], chunk[boundary_end:]
+
+    @staticmethod
     def _chunk_lines(chunks: List[bytes]) -> List[str]:
         accumulator = _PassThroughStreamLineAccumulator()
         for chunk in chunks:
@@ -1350,6 +1369,7 @@ class PassThroughStreamingHandler:
             responses_terminal_seen = False
             responses_substantive_seen = False
             held_responses_done_suffix = b""
+            responses_sse_event_buffer = b""
             buffer_raw_bytes = True
             if PassThroughStreamingHandler._stream_summary_first_finalize_eligible(
                 endpoint_type=endpoint_type,
@@ -1536,11 +1556,19 @@ class PassThroughStreamingHandler:
                         request_body=request_body if isinstance(request_body, dict) else None,
                         custom_llm_provider=custom_llm_provider,
                     )
-                    responses_terminal_accumulator.feed(chunk)
-                    recovery_failure = _consume_responses_lines(
-                        responses_terminal_accumulator.lines
+                    responses_sse_event_buffer += chunk
+                    complete_chunk, responses_sse_event_buffer = (
+                        PassThroughStreamingHandler._split_responses_sse_event_buffer(
+                            responses_sse_event_buffer
+                        )
                     )
-                    responses_terminal_accumulator.lines.clear()
+                    recovery_failure: Optional[ResponsesStreamPreCommitFailure] = None
+                    if complete_chunk:
+                        responses_terminal_accumulator.feed(complete_chunk)
+                        recovery_failure = _consume_responses_lines(
+                            responses_terminal_accumulator.lines
+                        )
+                        responses_terminal_accumulator.lines.clear()
 
                     if (
                         recovery_failure is not None
@@ -1551,7 +1579,7 @@ class PassThroughStreamingHandler:
                     ):
                         filtered_chunk, removed_failure = (
                             PassThroughStreamingHandler._remove_responses_stream_recovery_failure_events(
-                                chunk
+                                complete_chunk
                             )
                         )
                         if filtered_chunk and (
@@ -1582,6 +1610,7 @@ class PassThroughStreamingHandler:
                         metadata["aawm_stream_interrupted"] = True
                         metadata["aawm_route_rollup_turn_suppressed"] = True
                         held_responses_done_suffix = b""
+                        responses_sse_event_buffer = b""
                         responses_terminal_seen = True
                         terminal_chunks = (
                             PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
@@ -1597,6 +1626,9 @@ class PassThroughStreamingHandler:
                             yield terminal_chunk
                         break
 
+                    if not complete_chunk:
+                        continue
+
                     if responses_terminal_seen:
                         if held_responses_done_suffix:
                             _record_responses_wire_chunk(
@@ -1604,19 +1636,19 @@ class PassThroughStreamingHandler:
                             )
                             yield held_responses_done_suffix
                             held_responses_done_suffix = b""
-                        _record_responses_wire_chunk(chunk)
+                        _record_responses_wire_chunk(complete_chunk)
                         await _publish_transfer_chunks(
                             first_downstream=first_emitted_at is not None
                             and downstream_chunk_count == 1
                         )
-                        yield chunk
+                        yield complete_chunk
                         continue
 
                     (
                         chunk_without_done,
                         held_responses_done_suffix,
                     ) = PassThroughStreamingHandler._split_trailing_done_chunk(
-                        held_responses_done_suffix + chunk
+                        held_responses_done_suffix + complete_chunk
                     )
                     if chunk_without_done:
                         _record_responses_wire_chunk(chunk_without_done)
@@ -1677,12 +1709,26 @@ class PassThroughStreamingHandler:
                 yield chunk
 
             if responses_terminal_accumulator is not None:
-                if responses_terminal_accumulator.has_pending_frame():
+                if responses_sse_event_buffer or (
+                    responses_terminal_accumulator.has_pending_frame()
+                ):
                     OpenAIPassthroughLoggingHandler._mark_responses_sse_partial_frame(
                         responses_sse_tracker
                     )
                 else:
                     _consume_responses_lines(responses_terminal_accumulator.finish())
+
+                if responses_sse_event_buffer:
+                    (
+                        chunk_without_done,
+                        held_responses_done_suffix,
+                    ) = PassThroughStreamingHandler._split_trailing_done_chunk(
+                        held_responses_done_suffix + responses_sse_event_buffer
+                    )
+                    responses_sse_event_buffer = b""
+                    if chunk_without_done:
+                        _record_responses_wire_chunk(chunk_without_done)
+                        yield chunk_without_done
 
                 terminal_chunks: List[bytes] = []
                 if first_emitted_at is not None and not responses_terminal_seen:
