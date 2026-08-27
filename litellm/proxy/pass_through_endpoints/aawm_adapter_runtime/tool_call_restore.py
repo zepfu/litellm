@@ -511,7 +511,7 @@ def _get_adapted_custom_tool_stream_state(
     return None
 
 
-def _restore_adapted_custom_tool_calls_in_stream_event_payload(
+def _restore_adapted_custom_tool_calls_in_stream_event_payload(  # noqa: PLR0915
     event_payload: dict[str, Any],
     *,
     request_body: Optional[dict[str, Any]],
