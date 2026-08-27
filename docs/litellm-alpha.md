@@ -77,7 +77,10 @@ metadata require an image rebuild.
 ## Start
 
 Use the same environment preparation required by `litellm-dev`, including the
-two expected Codex OAuth account hashes.
+two expected Codex OAuth account hashes. Live `auto-review` /
+`codex-auto-review` testing also requires `ZAI_KEY` and
+`AAWM_OPENROUTER_API_KEY`; alpha receives only the provider credentials present
+when its container is created.
 
 ```bash
 docker compose -f docker-compose.alpha.yml build litellm-alpha

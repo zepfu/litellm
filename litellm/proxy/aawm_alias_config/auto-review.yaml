@@ -6,10 +6,26 @@ defaults: {}
 aliases:
   - name: auto-review
     candidates:
-      - provider: openai
-        model: codex-auto-review
-        route_family: codex_responses
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/deepseek-v4-flash-0731
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
         priority: 100
+        reasoning_effort: low
 
-      - alias_reference: sota
+      - provider: zai_coding_plan
+        model: zai_coding_plan/glm-5.3-flash
+        route_family: codex_zai_coding_plan_chat_completions_adapter
         priority: 90
+        reasoning_effort: low
+
+      - provider: openai
+        model: gpt-5.6-luna
+        route_family: codex_responses
+        priority: 80
+        reasoning_effort: low
+
+      - provider: openrouter
+        model: openrouter/~deepseek/deepseek-v4-flash-latest
+        route_family: codex_openrouter_completion_adapter
+        priority: 0
+        reasoning_effort: low

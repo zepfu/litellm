@@ -160,6 +160,7 @@ services:
       - AAWM_OPENROUTER_API_KEY=${AAWM_OPENROUTER_API_KEY:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - OPENROUTER_API_BASE=${OPENROUTER_API_BASE:-https://openrouter.ai/api/v1}
+      - ZAI_KEY=${ZAI_KEY:-}
       # COHERE-001: export only the canonical direct Cohere credential.
       # COHERE_KEY is a Compose-level compatibility source (repository-local
       # .env) and is mapped into COHERE_API_KEY without exposing the value.

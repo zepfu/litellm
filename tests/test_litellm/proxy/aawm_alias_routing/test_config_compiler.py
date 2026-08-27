@@ -678,10 +678,9 @@ aliases:
     )
 
 
-def test_codex_auto_review_yaml_compiles_native_openai_then_sota_reference() -> None:
-    """Dedicated auto-review YAML is native OpenAI first, then ``sota``."""
+def test_codex_auto_review_yaml_compiles_requested_cross_provider_chain() -> None:
+    """Dedicated auto-review YAML keeps the exact low-reasoning fallback order."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
-        AliasReference,
         RoutingCandidate,
     )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
@@ -692,31 +691,56 @@ def test_codex_auto_review_yaml_compiles_native_openai_then_sota_reference() -> 
     snapshot = compile_directory(DEFAULT_CONFIG_DIR)
     alias = snapshot.aliases["codex-auto-review"]
     assert alias.dispatch is None
-    assert len(alias.candidates) == 2
-
-    native, fallback = alias.candidates
-    assert isinstance(native, RoutingCandidate)
-    assert (native.provider, native.model, native.route_family) == (
-        "openai",
-        "codex-auto-review",
-        "codex_responses",
-    )
-    assert native.priority > fallback.priority
-    assert isinstance(fallback, AliasReference)
-    assert fallback.alias_name == "sota"
-    assert "sota" in snapshot.aliases
+    assert all(isinstance(candidate, RoutingCandidate) for candidate in alias.candidates)
+    assert [
+        (
+            candidate.provider,
+            candidate.model,
+            candidate.route_family,
+            candidate.priority,
+            candidate.reasoning_effort,
+        )
+        for candidate in alias.candidates
+    ] == [
+        (
+            "alibaba_token_plan",
+            "alibaba_token_plan/deepseek-v4-flash-0731",
+            "codex_alibaba_token_plan_chat_completions_adapter",
+            100,
+            "low",
+        ),
+        (
+            "zai_coding_plan",
+            "zai_coding_plan/glm-5.3-flash",
+            "codex_zai_coding_plan_chat_completions_adapter",
+            90,
+            "low",
+        ),
+        (
+            "openai",
+            "gpt-5.6-luna",
+            "codex_responses",
+            80,
+            "low",
+        ),
+        (
+            "openrouter",
+            "openrouter/~deepseek/deepseek-v4-flash-latest",
+            "codex_openrouter_completion_adapter",
+            0,
+            "low",
+        ),
+    ]
 
     invalid = """
 defaults: {}
 aliases:
   - name: codex-auto-review
     candidates:
-      - provider: openai
-        model: codex-auto-review
-        route_family: codex_responses
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/deepseek-v4-flash-0731
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
         priority: 100
-      - alias_reference: sota
-        priority: 90
         unknown_key: true
 """
     with pytest.raises((ValidationError, compiler.ConfigCompileError)):
