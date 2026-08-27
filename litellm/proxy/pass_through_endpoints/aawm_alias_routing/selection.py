@@ -608,11 +608,17 @@ def _get_codex_oauth_request_local_failover_context(
     if not isinstance(context, dict):
         return None
     context = dict(context)
-    if (
-        candidate is not None
-        and context.get("slot") != _codex_oauth_candidate_slot(candidate)
-    ):
-        return None
+    if candidate is not None:
+        candidate_slot = _codex_oauth_candidate_slot(candidate)
+        if context.get("slot") != candidate_slot:
+            identity = context.get("candidate_identity")
+            if not isinstance(identity, dict):
+                return None
+            for field in ("provider", "model", "route_family"):
+                expected = str(identity.get(field) or "")
+                actual = str(candidate.get(field) or "")
+                if expected != actual:
+                    return None
     return context
 
 
@@ -630,11 +636,13 @@ def _apply_codex_oauth_failover_context_to_state(
     )
     if (
         context is None
-        or context.get("prior_account_hash")
-        == candidate.get("codex_oauth_account_hash")
+        or candidate.get("codex_oauth_account_hash")
+        in set(context.get("attempted_account_hashes") or ())
     ):
         return state
-    state["failover_ordinal"] = 1
+    state["failover_ordinal"] = len(
+        context.get("attempted_account_hashes") or ()
+    )
     state["prior_account_outcome"] = dict(
         context.get("prior_account_outcome") or {}
     )
@@ -651,30 +659,32 @@ def _plan_codex_oauth_account_failover(
     has_continuation_state: bool,
     has_previous_response_id: bool = False,
     has_account_bound_state: bool = False,
+    account_failover_replay_safe: bool = False,
 ) -> bool:
-    """Plan the sole request-local account move for one candidate slot."""
+    """Plan a request-local move to another eligible account for one slot."""
     if not _is_codex_oauth_account_candidate(candidate):
         return False
-    if has_account_bound_state or selection.get("has_account_bound_state"):
+    if (
+        has_account_bound_state
+        or selection.get("has_account_bound_state")
+        or has_previous_response_id
+    ) and not account_failover_replay_safe:
         return False
     interchangeable = (
         candidate.get("codex_oauth_credential_affinity") == "interchangeable"
     )
-    if has_continuation_state and (
-        not interchangeable or has_previous_response_id
-    ):
+    if has_continuation_state and not interchangeable:
         return False
 
-    failover_ordinal = int(selection.get("failover_ordinal") or 0)
     existing = _get_codex_oauth_request_local_failover_context(
         request,
         candidate=candidate,
     )
-    if failover_ordinal > 0 or existing is not None:
-        _block_codex_oauth_request_local_candidate_slot(
-            request,
-            candidate=candidate,
-        )
+    account_hash = candidate.get("codex_oauth_account_hash")
+    attempted_account_hashes = list(
+        (existing or {}).get("attempted_account_hashes") or ()
+    )
+    if account_hash in attempted_account_hashes:
         attempt_record["account_failover_limit_reached"] = True
         return False
 
@@ -713,15 +723,25 @@ def _plan_codex_oauth_account_failover(
         for key, value in prior_account_outcome.items()
         if value is not None
     }
+    attempted_account_hashes.append(account_hash)
+    prior_account_outcomes = list(
+        (existing or {}).get("prior_account_outcomes") or ()
+    )
+    prior_account_outcomes.append(prior_account_outcome)
     setattr(
         request.state,
         "aawm_codex_oauth_request_local_failover_context",
         {
             "slot": _codex_oauth_candidate_slot(candidate),
-            "prior_account_hash": candidate.get(
-                "codex_oauth_account_hash"
-            ),
+            "candidate_identity": {
+                field: candidate.get(field)
+                for field in ("provider", "model", "route_family")
+            },
+            "attempted_account_hashes": attempted_account_hashes,
+            "prior_account_hash": account_hash,
+            "prior_account_outcomes": prior_account_outcomes,
             "prior_account_outcome": prior_account_outcome,
+            "portable_replay": bool(account_failover_replay_safe),
         },
     )
     _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
@@ -3374,7 +3394,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     if isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "owned":
         affinity = sa.owner_record_as_affinity_hint(
             session_owner_record,
-            preserve_account_identity=has_account_bound_state,
+            preserve_account_identity=True,
         )
         session_owner_guard_meta.update(
             {
@@ -3444,9 +3464,24 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         if existing_affinity is not None:
             affinity_bypassed = True
 
+    account_identity_pinned = has_account_bound_state
+    account_failover_context = (
+        _get_codex_oauth_request_local_failover_context(
+            request,
+            candidate=affinity,
+        )
+        if isinstance(affinity, dict)
+        else None
+    )
+    if (
+        account_failover_context is not None
+        and account_failover_context.get("portable_replay")
+    ):
+        account_identity_pinned = False
+
     affinity = _apply_codex_oauth_inventory_affinity_policy(
         affinity,
-        account_bound=has_account_bound_state,
+        account_bound=account_identity_pinned,
     )
     if affinity is not None:
         affinity_candidate = _find_codex_auto_agent_affinity_candidate(
@@ -3456,7 +3491,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             request=request,
         )
         if affinity_candidate is None:
-            if has_account_bound_state and _affinity_pins_account_identity(affinity):
+            if account_identity_pinned and _affinity_pins_account_identity(affinity):
                 pinned_candidate_shape = {
                     "provider": affinity.get("provider"),
                     "model": affinity.get("model"),
@@ -3560,7 +3595,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             isinstance(session_owner_record, dict)
             and sa._record_state(session_owner_record) == "owned"
         ):
-            if has_account_bound_state:
+            if account_identity_pinned:
                 _raise_codex_auto_agent_redispatch_required(
                     candidate=dict(affinity_state.get("candidate") or {}),
                     lane_key=affinity_state.get("lane_key")
@@ -3581,7 +3616,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 failure_phase="session_owner_owned_affinity_unavailable",
                 mismatch_reason="session_owner: owner candidate unavailable",
             )
-        if has_account_bound_state and _affinity_pins_account_identity(affinity):
+        if account_identity_pinned and _affinity_pins_account_identity(affinity):
             _raise_codex_auto_agent_redispatch_required(
                 candidate=dict(affinity_state.get("candidate") or affinity),
                 lane_key=affinity_state.get("lane_key")

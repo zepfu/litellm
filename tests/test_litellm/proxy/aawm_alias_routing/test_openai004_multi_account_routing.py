@@ -640,7 +640,7 @@ def _account_selection(
 
 
 @pytest.mark.asyncio
-async def test_candidate_loop_allows_exactly_one_account_move(
+async def test_candidate_loop_exhausts_all_accounts_before_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_candidate_loop_host(monkeypatch)
@@ -654,19 +654,20 @@ async def test_candidate_loop_allows_exactly_one_account_move(
             "aawm_codex_oauth_request_local_failover_context",
             None,
         )
-        if context is None:
-            selected_labels.append("account1")
-            return _account_selection(
-                "account1",
-                "hash-account-1",
-                failover_ordinal=0,
-            )
-        selected_labels.append("account2")
-        return _account_selection(
-            "account2",
-            "hash-account-2",
-            failover_ordinal=1,
+        attempted = set(
+            (context or {}).get("attempted_account_hashes") or ()
         )
+        for ordinal, account in enumerate(("account1", "account2", "account3")):
+            account_hash = f"hash-{account}"
+            if account_hash in attempted:
+                continue
+            selected_labels.append(account)
+            return _account_selection(
+                account,
+                account_hash,
+                failover_ordinal=ordinal,
+            )
+        raise HTTPException(status_code=429, detail="all accounts exhausted")
 
     async def _perform(
         *,
@@ -699,8 +700,8 @@ async def test_candidate_loop_allows_exactly_one_account_move(
             log_label="Codex",
         )
     assert exc_info.value.status_code == 429
-    assert selected_labels == ["account1", "account2"]
-    assert performed_labels == ["account1", "account2"]
+    assert selected_labels == ["account1", "account2", "account3"]
+    assert performed_labels == selected_labels
     request_identity = attempt_records._resolve_auto_agent_alias_request_identity(
         request
     )
@@ -712,9 +713,18 @@ async def test_candidate_loop_allows_exactly_one_account_move(
     assert [item["account_label"] for item in captured_attempts] == [
         "account1",
         "account2",
+        "account3",
     ]
     assert captured_attempts[0]["request_outcome"] == "pending_failover"
-    assert captured_attempts[1]["request_outcome"] == "failed"
+    assert captured_attempts[1]["request_outcome"] == "pending_failover"
+    assert captured_attempts[2]["request_outcome"] == "failed"
+    context = request.state.aawm_codex_oauth_request_local_failover_context
+    assert context["attempted_account_hashes"] == [
+        "hash-account1",
+        "hash-account2",
+        "hash-account3",
+    ]
+    assert len(context["prior_account_outcomes"]) == 3
     terminal_event = {
         "event_type": "no_candidate_available",
         "request_outcome": "failed",
@@ -1088,6 +1098,171 @@ async def test_stream_failure_after_response_start_is_not_retried(
         await response.body_iterator.__anext__()
     assert selection_count == 1
     assert perform_count == 1
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_transient_capacity_retries_same_account_before_failover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    sleep = AsyncMock()
+    monkeypatch.setattr(candidate_loop.asyncio, "sleep", sleep)
+    request = _request()
+    selected_labels: list[str] = []
+    performed_labels: list[str] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        selected_labels.append("account1")
+        assert len(selected_labels) == 1, "account2 must not be selected"
+        return _account_selection(
+            "account1",
+            "hash-account-1",
+            failover_ordinal=0,
+            credential_affinity="interchangeable",
+        )
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        account = candidate["codex_oauth_account_label"]
+        performed_labels.append(account)
+        if len(performed_labels) == 1:
+            raise RuntimeError("capacity exhausted")
+        return Response(content=b"account1-recovered")
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    response = await candidate_loop.handle_alias_route(
+        _loop_services(
+            select_candidate=_select,
+            perform_candidate=_perform,
+        ),
+        alias_family="codex_auto_agent",
+        alias_model="basic",
+        request=request,
+        prepared_request_body={"model": "basic"},
+        max_candidate_attempts=1,
+        get_active_cooldown_state_fn=_zero,
+        attempts_metadata_key="codex_auto_agent_attempts",
+        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+        no_candidate_detail="no candidate",
+        log_label="Codex",
+    )
+
+    assert response.body == b"account1-recovered"
+    assert selected_labels == ["account1"]
+    assert performed_labels == ["account1", "account1"]
+    sleep.assert_awaited_once_with(10.0)
+    request_outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    captured_attempts = list(request_outcome.get("attempts") or [])
+    assert [item["account_label"] for item in captured_attempts] == [
+        "account1",
+        "account1",
+    ]
+    assert captured_attempts[0]["pre_commit_retry"]["action"] == "retry_same_account"
+    assert (
+        captured_attempts[0]["pre_commit_retry"]["error_class"]
+        == "capacity_exhausted"
+    )
+    assert captured_attempts[1]["status"] == "succeeded"
+    assert captured_attempts[1]["request_outcome"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_stream_pre_first_byte_usage_limit_fails_over_before_downstream_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc, *args, candidate=None, **kwargs: "usage_limit_reached",
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_get_codex_auto_agent_cooldown_seconds",
+        lambda exc, *, candidate: 30.0,
+    )
+    request = _request()
+    selected_labels: list[str] = []
+    performed_labels: list[str] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        context = getattr(
+            request.state,
+            "aawm_codex_oauth_request_local_failover_context",
+            None,
+        )
+        account = "account2" if context is not None else "account1"
+        selected_labels.append(account)
+        return _account_selection(
+            account,
+            f"hash-{account}",
+            failover_ordinal=1 if context is not None else 0,
+            credential_affinity="interchangeable",
+        )
+
+    async def _account2_stream():
+        yield b"account2-chunk"
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        account = candidate["codex_oauth_account_label"]
+        performed_labels.append(account)
+        if account == "account1":
+            raise RuntimeError("usage limit reached")
+        return StreamingResponse(
+            _account2_stream(),
+            media_type="text/event-stream",
+        )
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    response = await candidate_loop.handle_alias_route(
+        _loop_services(
+            select_candidate=_select,
+            perform_candidate=_perform,
+        ),
+        alias_family="codex_auto_agent",
+        alias_model="basic",
+        request=request,
+        prepared_request_body={"model": "basic", "stream": True},
+        max_candidate_attempts=1,
+        get_active_cooldown_state_fn=_zero,
+        attempts_metadata_key="codex_auto_agent_attempts",
+        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+        no_candidate_detail="no candidate",
+        log_label="Codex",
+    )
+
+    assert isinstance(response, StreamingResponse)
+    chunks = [chunk async for chunk in response.body_iterator]
+    assert chunks == [b"account2-chunk"]
+    assert selected_labels == ["account1", "account2"]
+    assert performed_labels == ["account1", "account2"]
+    request_identity = attempt_records._resolve_auto_agent_alias_request_identity(
+        request
+    )
+    assert request_identity
+    request_outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    assert request_outcome["outcome"] == "recovered"
+    assert request_outcome["request_identity"] == request_identity
+    captured_attempts = list(request_outcome.get("attempts") or [])
+    assert [item["account_label"] for item in captured_attempts] == [
+        "account1",
+        "account2",
+    ]
+    assert captured_attempts[0]["error_class"] == "usage_limit_reached"
+    assert captured_attempts[0]["request_outcome"] == "pending_failover"
+    assert captured_attempts[1]["status"] == "recovered"
+    assert captured_attempts[1]["request_outcome"] == "recovered"
 
 
 @pytest.mark.asyncio
@@ -2035,6 +2210,40 @@ def test_account_bound_state_blocks_interchangeable_failover() -> None:
     )
 
 
+def test_replayable_account_bound_state_allows_interchangeable_failover() -> None:
+    request = _request()
+    candidate = {
+        **_candidate(),
+        "codex_oauth_account_label": "account1",
+        "codex_oauth_account_hash": "hash-account-1",
+        "codex_oauth_lane_key": "codex-oauth:account1:hash-account-1",
+        "codex_oauth_credential_affinity": "interchangeable",
+    }
+    selection_state = {
+        "candidate": candidate,
+        "failover_ordinal": 0,
+        "has_account_bound_state": True,
+    }
+
+    assert selection._plan_codex_oauth_account_failover(
+        request,
+        candidate=candidate,
+        selection=selection_state,
+        attempt_record={
+            "failure_phase": "direct_openai_provider_response",
+            "attempted_provider_call": True,
+        },
+        error_class="usage_limit_reached",
+        has_continuation_state=True,
+        has_previous_response_id=False,
+        has_account_bound_state=True,
+        account_failover_replay_safe=True,
+    )
+    context = request.state.aawm_codex_oauth_request_local_failover_context
+    assert context["portable_replay"] is True
+    assert context["attempted_account_hashes"] == ["hash-account-1"]
+
+
 def _owned_interchangeable_record(label: str = "account1") -> dict[str, Any]:
     account_hash = f"hash-{label.replace('account', 'account-')}"
     if label == "account1":
@@ -2267,6 +2476,83 @@ async def test_unavailable_bound_owner_fails_closed_without_alternate_account(
     assert detail["attempted_provider_call"] is False
     assert loaded == ["account1"]
     alternate.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_replayable_bound_owner_capacity_failure_selects_alternate_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_account_bound_selector(
+        monkeypatch,
+        bound=True,
+        owner_label="account1",
+    )
+    now = datetime.now(timezone.utc)
+    alias_routing_state.record_normalized_quota_observations(
+        [
+            _quota_observation(
+                account_hash="hash-account-1",
+                observed_at=now,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=True,
+            ),
+            _quota_observation(
+                account_hash="hash-account-2",
+                observed_at=now,
+                reset_at=now + timedelta(days=2),
+                quota_period="seven_day",
+                window_minutes=10080,
+                exhausted=False,
+                remaining_pct=90.0,
+            ),
+        ]
+    )
+    request = _request()
+    failed_candidate = {
+        **_candidate(),
+        "codex_oauth_account_label": "account1",
+        "codex_oauth_account_hash": "hash-account-1",
+        "codex_oauth_lane_key": "codex-oauth:account1:hash-account-1",
+        "codex_oauth_credential_affinity": "interchangeable",
+    }
+    assert selection._plan_codex_oauth_account_failover(
+        request,
+        candidate=failed_candidate,
+        selection={
+            "candidate": failed_candidate,
+            "failover_ordinal": 0,
+            "has_account_bound_state": True,
+        },
+        attempt_record={
+            "failure_phase": "direct_openai_provider_response",
+            "attempted_provider_call": True,
+        },
+        error_class="usage_limit_reached",
+        has_continuation_state=True,
+        has_account_bound_state=True,
+        account_failover_replay_safe=True,
+    )
+
+    selected = await lpe._select_codex_auto_agent_candidate(
+        request=request,
+        request_body={
+            "model": "basic",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "done",
+                }
+            ],
+        },
+    )
+
+    assert selected["candidate"]["codex_oauth_account_label"] == "account2"
+    assert selected["candidate"]["codex_oauth_account_hash"] == "hash-account-2"
+    assert selected["has_account_bound_state"] is True
+    assert selected["failover_ordinal"] == 1
 
 
 @pytest.mark.asyncio

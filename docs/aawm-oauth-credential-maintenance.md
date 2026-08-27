@@ -215,18 +215,25 @@ The optional inventory `routing` object controls account-pool behavior. Its
 backward-compatible default is account-pinned priority order. A configured
 `credential_affinity: interchangeable` pool keeps provider, model, route,
 endpoint, and encrypted-state-format session affinity while treating account
-label/hash/lane as per-attempt telemetry. Stateless continuation input may then
-make at most one immediate pre-first-byte move to another admissible account
-after a capacity, rate-limit, usage-limit, or candidate-unavailable failure.
-Any presence of account-bound Responses state, including `previous_response_id`,
-encrypted content, reasoning items, or function-call output, pins the request
-to the recorded account even in an interchangeable pool. If that account is
-unavailable, routing fails closed and does not try an alternate account. Fresh
-requests retain quota balancing and the permitted pre-state failover described
-above. The state itself is not persisted by the routing metadata: encrypted
-content, prompts, credentials, and raw account identifiers are excluded. After
-the first response byte, or after the single account move is consumed, no
-further account failover is planned.
+label/hash/lane as per-attempt telemetry. Fresh requests and replay-safe inline
+continuations may move immediately through every other eligible interchangeable
+account after definitive account exhaustion (`usage_limit_reached`), an
+account-scoped rate limit, or candidate-unavailable. A transient pre-commit
+`capacity_exhausted`/overload retries once on the same account; if repeated, it
+returns the existing retryable pre-stream `503` without rotating accounts.
+Definitive exhaustion, account-scoped rate limits, and candidate-unavailable
+may traverse every other eligible interchangeable account before terminal
+error. Each account is attempted at most once for those failover cases, and
+each failed account receives only its own lane cooldown.
+
+Opaque upstream-only continuation state, including `previous_response_id`,
+remains pinned to the recorded account even in an interchangeable pool. If
+that account is unavailable, routing fails closed rather than dropping
+conversation state and replaying only the current delta. Inline reasoning and
+function-call history may move accounts only when the complete request body is
+replay-safe. The state itself is not persisted by the routing metadata:
+encrypted content, prompts, credentials, and raw account identifiers are
+excluded. After the first response byte, no account failover is planned.
 
 With `strategy: dual_quota_balance`, routing evaluates the overall seven-day
 Codex and Codex Spark seven-day families together. If either account spread is

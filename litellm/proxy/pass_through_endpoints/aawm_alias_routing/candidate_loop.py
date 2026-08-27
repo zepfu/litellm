@@ -401,8 +401,40 @@ async def handle_alias_route(  # noqa: PLR0915
     # attempts. Must not reset when the outer candidate-selection loop re-enters.
     native_grok_continuation_transient_provider_attempts = 0
     provider_candidate_attempts = 0
-    account_failover_attempts_by_slot: dict[Optional[str], int] = {}
     same_account_transient_attempts_by_slot: dict[Optional[str], int] = {}
+    account_failover_replay_safe = (
+        _session_affinity_mod().is_replay_safe_session_owner_redispatch_body(
+            prepared_request_body
+        )
+    )
+
+    def _prefer_codex_oauth_account_failover(
+        *,
+        candidate: dict[str, Any],
+        selection: dict[str, Any],
+        error_class: Optional[str],
+    ) -> bool:
+        if error_class in _error_signals._RESPONSES_PRE_COMMIT_TRANSIENT_CLASSES:
+            return False
+        if error_class not in {
+            "capacity_exhausted",
+            "rate_limited",
+            "usage_limit_reached",
+            "candidate_unavailable",
+        }:
+            return False
+        if not candidate.get("codex_oauth_account_hash"):
+            return False
+        if (
+            selection.get("has_account_bound_state")
+            or has_previous_response_id
+        ) and not account_failover_replay_safe:
+            return False
+        return (
+            not has_continuation_state
+            or candidate.get("codex_oauth_credential_affinity")
+            == "interchangeable"
+        )
 
     def _raise_terminal_alias_failure(exc: Exception) -> Any:
         last_attempt = attempts[-1] if attempts else {}
@@ -496,6 +528,11 @@ async def handle_alias_route(  # noqa: PLR0915
                 request_body=prepared_request_body,
             )
         except HTTPException as exc:
+            if attempts:
+                _mark_auto_agent_alias_request_terminal_failure(
+                    request,
+                    attempts[-1],
+                )
             if exc.status_code == 429 and not _is_auto_agent_alias_in_flight_cooldown_http_exception(exc):
                 _emit_auto_agent_alias_no_candidate_event(
                     alias_family=alias_family,
@@ -508,35 +545,7 @@ async def handle_alias_route(  # noqa: PLR0915
             raise
         candidate = selection["candidate"]
         failover_ordinal = int(selection.get("failover_ordinal") or 0)
-        if failover_ordinal > 0:
-            account_failover_slot = _codex_oauth_candidate_slot(candidate)
-            account_failover_attempts = (
-                account_failover_attempts_by_slot.get(
-                    account_failover_slot,
-                    0,
-                )
-                + 1
-            )
-            account_failover_attempts_by_slot[account_failover_slot] = (
-                account_failover_attempts
-            )
-            if account_failover_attempts > 1:
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail={
-                        "error": {
-                            "message": (
-                                "Codex OAuth account failover limit was "
-                                "reached before dispatch."
-                            ),
-                            "type": "rate_limit_error",
-                            "code": (
-                                "aawm_codex_oauth_account_failover_limit"
-                            ),
-                        }
-                    },
-                )
-        else:
+        if failover_ordinal == 0:
             provider_candidate_attempts += 1
         attempt_record = _codex_auto_agent_candidate_public_shape(
             candidate,
@@ -575,6 +584,7 @@ async def handle_alias_route(  # noqa: PLR0915
                 error_class=admission_error_class,
                 has_continuation_state=has_continuation_state,
                 has_previous_response_id=has_previous_response_id,
+                account_failover_replay_safe=account_failover_replay_safe,
             )
             if account_failover_planned:
                 provider_candidate_attempts = max(
@@ -926,7 +936,16 @@ async def handle_alias_route(  # noqa: PLR0915
                             ),
                         )
                     )
+                    prefer_account_failover = (
+                        _prefer_codex_oauth_account_failover(
+                            candidate=candidate,
+                            selection=selection,
+                            error_class=early_pre_commit_error_class,
+                        )
+                    )
                     skip_cooldown_for_same_account_retry = (
+                        not prefer_account_failover
+                        and
                         early_pre_commit_retry_plan["action"]
                         in {"retry_same_account", "pre_stream_unavailable"}
                     )
@@ -993,7 +1012,15 @@ async def handle_alias_route(  # noqa: PLR0915
                         same_account_transient_attempts_by_slot.get(account_slot, 0)
                     ),
                 )
-                if pre_commit_retry_plan["action"] == "retry_same_account":
+                prefer_account_failover = _prefer_codex_oauth_account_failover(
+                    candidate=candidate,
+                    selection=selection,
+                    error_class=error_class,
+                )
+                if (
+                    not prefer_account_failover
+                    and pre_commit_retry_plan["action"] == "retry_same_account"
+                ):
                     wait_seconds = float(pre_commit_retry_plan["wait_seconds"] or 0.0)
                     attempt_record["pre_commit_retry"] = {
                         "action": pre_commit_retry_plan["action"],
@@ -1031,7 +1058,10 @@ async def handle_alias_route(  # noqa: PLR0915
                         add_alias_metadata_fn=add_alias_metadata_fn,
                     )
                     continue
-                if pre_commit_retry_plan["action"] == "pre_stream_unavailable":
+                if (
+                    not prefer_account_failover
+                    and pre_commit_retry_plan["action"] == "pre_stream_unavailable"
+                ):
                     attempt_record["pre_commit_retry"] = {
                         "action": pre_commit_retry_plan["action"],
                         "error_class": error_class,
@@ -1106,6 +1136,7 @@ async def handle_alias_route(  # noqa: PLR0915
                     error_class=error_class,
                     has_continuation_state=has_continuation_state,
                     has_previous_response_id=has_previous_response_id,
+                    account_failover_replay_safe=account_failover_replay_safe,
                 )
                 if cooldown_scope == "none" and not has_continuation_state:
                     _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
@@ -1181,7 +1212,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         add_alias_metadata_fn=add_alias_metadata_fn,
                     )
                     verbose_proxy_logger.debug(
-                        "%s auto-agent alias %s moving once from Codex OAuth "
+                        "%s auto-agent alias %s moving from Codex OAuth "
                         "account %s after %s",
                         log_label,
                         alias_model,

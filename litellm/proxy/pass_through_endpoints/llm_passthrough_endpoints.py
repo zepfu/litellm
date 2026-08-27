@@ -392,7 +392,7 @@ from litellm.llms.alibaba_token_plan.adapters import (
 )
 from litellm.llms.kimi_code.adapters import adapter as _kimi_code_adapters
 from litellm.llms.zai_coding_plan.adapters import (
-    adapter as _zai_coding_plan_adapters,
+    adapter as _zai_coding_plan_adapters,  # noqa: F401 - provider registration
 )
 from litellm.types.llms.openai import (
     RESPONSES_API_TERMINAL_STREAM_EVENTS,  # noqa: F401 - Wave 6A host binding
@@ -3455,6 +3455,10 @@ async def _retry_direct_codex_oauth_after_usage_limit(
     selection: dict[str, Any],
     exc: Exception,
 ) -> Optional[tuple[Any, dict[str, Any]]]:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as _sa,
+    )
+
     cooldown_seconds = (
         _aawm_codex_oauth.direct_codex_usage_limit_retry_after_seconds(exc)
     )
@@ -3511,6 +3515,11 @@ async def _retry_direct_codex_oauth_after_usage_limit(
             has_previous_response_id=bool(
                 request_body.get("previous_response_id")
             ),
+            account_failover_replay_safe=(
+                _sa.is_replay_safe_session_owner_redispatch_body(
+                    request_body
+                )
+            ),
         )
     )
     _aawm_dev_fault_plan.note_direct_openai_managed_failure(
@@ -3522,18 +3531,26 @@ async def _retry_direct_codex_oauth_after_usage_limit(
     if not retry_planned:
         return None
 
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
-        session_affinity as _sa,
-    )
-
     if not _sa.reset_released_request_session_owner_guard(request):
         return None
-    retry_auth, retry_selection, _metadata = (
-        await _aawm_codex_oauth.select_and_bind_direct_codex_oauth_inventory(
-            request,
-            request_body=request_body,
+    try:
+        retry_auth, retry_selection, _metadata = (
+            await _aawm_codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+                request,
+                request_body=request_body,
+            )
         )
-    )
+    except HTTPException as selection_exc:
+        detail = selection_exc.detail
+        error = detail.get("error") if isinstance(detail, dict) else None
+        if (
+            selection_exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+            and isinstance(error, dict)
+            and error.get("code")
+            == "aawm_codex_oauth_direct_inventory_unavailable"
+        ):
+            return None
+        raise
     return retry_auth, retry_selection
 
 
