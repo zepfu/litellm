@@ -11,6 +11,7 @@ import pytest
 from fastapi import HTTPException, Request
 from starlette.responses import Response, StreamingResponse
 
+from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints import (
     llm_passthrough_endpoints as lpe,
 )
@@ -24,6 +25,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     codex_oauth,
     error_signals,
     selection,
+    session_affinity,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import rollup
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
@@ -94,6 +96,35 @@ def _token_invalidated_error() -> HTTPException:
             }
         },
     )
+
+
+_OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE = (
+    "Item with id 'rs_abc123' not found. "
+    "Items are not persisted when store is set to false. "
+    "Try again with store set to true."
+)
+
+
+def _unpersisted_item_not_found_error() -> ProxyException:
+    exc = ProxyException(
+        message=_OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE,
+        type="invalid_request_error",
+        param=None,
+        code=400,
+        openai_code="invalid_request_error",
+    )
+    exc.status_code = 400
+    exc.detail = {
+        "error": {
+            "message": _OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE,
+            "type": "invalid_request_error",
+            "code": "invalid_request_error",
+        }
+    }
+    return exc
+
+
+
 
 
 def _record(
@@ -1024,6 +1055,159 @@ async def test_candidate_loop_token_invalidated_fails_over_without_cooldown(
     assert resolved_plans[0].applied_scope == "request_local"
     assert resolved_plans[0].memory_keys == ()
     assert resolved_plans[0].durable_keys == ()
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_reloads_changed_codex_credential_after_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        error_signals._classify_codex_auto_agent_retryable_exhaustion,
+    )
+    request = _request()
+    selected_labels: list[str] = []
+    performed_labels: list[str] = []
+    reload_calls: list[dict[str, Any]] = []
+    reset_calls: list[Request] = []
+    removed_intents: list[Any] = []
+    bound_candidates: list[dict[str, Any]] = []
+
+    registry = alias_routing_state.publication_intents
+    real_remove = registry.remove
+
+    def _remove(intent: Any) -> None:
+        removed_intents.append(intent)
+        real_remove(intent)
+
+    monkeypatch.setattr(registry, "remove", _remove)
+    session_affinity = candidate_loop._session_affinity_mod()
+
+    def _reset(req: Request) -> bool:
+        reset_calls.append(req)
+        req.state._aawm_session_owner_guarded = False
+        return True
+
+    monkeypatch.setattr(
+        session_affinity,
+        "reset_released_request_session_owner_guard",
+        _reset,
+    )
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: session_affinity,
+    )
+
+    def _bind(req: Request, candidate: dict[str, Any]) -> dict[str, Any]:
+        bound_candidates.append(dict(candidate))
+        return candidate
+
+    monkeypatch.setattr(
+        codex_oauth,
+        "_bind_codex_oauth_candidate_to_request",
+        _bind,
+    )
+
+    refreshed_auth = codex_oauth.CodexOAuthRequestAuth(
+        account_label="account1",
+        account_hash="hash-account-1",
+        lane_key="codex-oauth:account1:hash-account-1",
+        headers={
+            "Authorization": "Bearer refreshed-token",
+            "chatgpt-account-id": "account1",
+        },
+    )
+
+    async def _reload(
+        req: Request,
+        *,
+        account_label: str,
+        model: str | None = None,
+        expected_account_hash: str | None = None,
+        expected_lane_key: str | None = None,
+    ) -> codex_oauth.CodexOAuthRequestAuth:
+        reload_calls.append(
+            {
+                "account_label": account_label,
+                "model": model,
+                "expected_account_hash": expected_account_hash,
+                "expected_lane_key": expected_lane_key,
+            }
+        )
+        assert len(removed_intents) == 1
+        assert removed_intents[0].done.is_set()
+        assert req.state._aawm_session_owner_guarded is False
+        return refreshed_auth
+
+    monkeypatch.setattr(
+        codex_oauth,
+        "reload_codex_oauth_credential_after_token_invalidated",
+        _reload,
+    )
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        selected_labels.append("account1")
+        return _account_selection(
+            "account1",
+            "hash-account-1",
+            failover_ordinal=0,
+        )
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        performed_labels.append(candidate["codex_oauth_account_label"])
+        if len(performed_labels) == 1:
+            request.state._aawm_session_owner_guarded = True
+            raise _token_invalidated_error()
+        return Response(content=b"account1-recovered", status_code=200)
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    response = await candidate_loop.handle_alias_route(
+        _loop_services(
+            select_candidate=_select,
+            perform_candidate=_perform,
+        ),
+        alias_family="codex_auto_agent",
+        alias_model="basic",
+        request=request,
+        prepared_request_body={"model": "basic"},
+        max_candidate_attempts=1,
+        get_active_cooldown_state_fn=_zero,
+        attempts_metadata_key="codex_auto_agent_attempts",
+        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+        no_candidate_detail="no candidate",
+        log_label="Codex",
+    )
+
+    assert response.body == b"account1-recovered"
+    assert selected_labels == ["account1"]
+    assert performed_labels == ["account1", "account1"]
+    assert reload_calls == [
+        {
+            "account_label": "account1",
+            "model": "gpt-5.3-codex",
+            "expected_account_hash": "hash-account-1",
+            "expected_lane_key": "codex-oauth:account1:hash-account-1",
+        }
+    ]
+    assert reset_calls == [request]
+    assert bound_candidates == [
+        _account_selection(
+            "account1",
+            "hash-account-1",
+            failover_ordinal=0,
+        )["candidate"]
+    ]
+    assert len(removed_intents) == 2
+    assert all(intent.done.is_set() for intent in removed_intents)
 
 
 @pytest.mark.asyncio
@@ -3339,6 +3523,177 @@ async def test_openai_proxy_route_direct_token_invalidated_retries_next_account(
     persist.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_openai_proxy_route_direct_token_invalidated_reloads_same_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_direct_inventory_auth(monkeypatch)
+    request = _direct_request()
+    body = {"model": "gpt-5.6-sol", "input": "hello"}
+    provider_auth: list[str | None] = []
+    reload_calls: list[dict[str, Any]] = []
+
+    async def _fake_get_body(req):
+        return dict(body)
+
+    async def _fake_base_handler(**kwargs):
+        authorization = (kwargs.get("extra_headers") or {}).get("Authorization")
+        provider_auth.append(authorization)
+        if authorization == "Bearer server-token-account1":
+            raise _token_invalidated_error()
+        assert authorization == "Bearer refreshed-token-account1"
+        return Response(content=b"ok", status_code=200)
+
+    refreshed_auth = codex_oauth.CodexOAuthRequestAuth(
+        account_label="account1",
+        account_hash="hash-account-1",
+        lane_key="codex-oauth:account1:hash-account-1",
+        headers={
+            "Authorization": "Bearer refreshed-token-account1",
+            "ChatGPT-Account-Id": "server-acct-account1",
+            "session_id": "sess-direct-1",
+            "originator": "litellm-server",
+        },
+    )
+
+    async def _reload(
+        req: Request,
+        *,
+        account_label: str,
+        model: str | None = None,
+        expected_account_hash: str | None = None,
+        expected_lane_key: str | None = None,
+    ) -> codex_oauth.CodexOAuthRequestAuth:
+        reload_calls.append(
+            {
+                "account_label": account_label,
+                "expected_account_hash": expected_account_hash,
+                "expected_lane_key": expected_lane_key,
+            }
+        )
+        return refreshed_auth
+
+    publish = AsyncMock()
+    persist = AsyncMock()
+    monkeypatch.setattr(lpe, "get_request_body", _fake_get_body)
+    monkeypatch.setattr(
+        lpe.BaseOpenAIPassThroughHandler,
+        "_base_openai_pass_through_handler",
+        _fake_base_handler,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_resolve_codex_auto_agent_alias_model",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(lpe, "_is_oa_xai_request_body", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        lpe, "_is_grok_native_oauth_request_body", lambda *_a, **_k: False
+    )
+    monkeypatch.setattr(
+        codex_oauth,
+        "reload_codex_oauth_credential_after_token_invalidated",
+        _reload,
+    )
+    monkeypatch.setattr(lpe, "_publish_codex_cooldown_memory", publish)
+    monkeypatch.setattr(lpe, "_persist_codex_cooldown_durable", persist)
+
+    response = await lpe.openai_proxy_route(
+        endpoint="v1/responses",
+        request=request,
+        fastapi_response=Response(),
+        user_api_key_dict=object(),  # type: ignore[arg-type]
+    )
+
+    assert response.status_code == 200
+    assert provider_auth == [
+        "Bearer server-token-account1",
+        "Bearer refreshed-token-account1",
+    ]
+    assert reload_calls == [
+        {
+            "account_label": "account1",
+            "expected_account_hash": "hash-account-1",
+            "expected_lane_key": "codex-oauth:account1:hash-account-1",
+        }
+    ]
+    publish.assert_not_awaited()
+    persist.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_route_direct_token_invalidated_unsafe_continuation_requires_redispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_direct_inventory_auth(monkeypatch)
+    request = _direct_request()
+    body = {
+        "model": "gpt-5.6-sol",
+        "previous_response_id": "resp-123",
+        "input": "continue",
+    }
+    provider_auth: list[str | None] = []
+    reload = AsyncMock(return_value=None)
+
+    async def _fake_get_body(req):
+        return dict(body)
+
+    async def _fake_base_handler(**kwargs):
+        provider_auth.append(
+            (kwargs.get("extra_headers") or {}).get("Authorization")
+        )
+        raise _token_invalidated_error()
+
+    publish = AsyncMock()
+    persist = AsyncMock()
+    monkeypatch.setattr(lpe, "get_request_body", _fake_get_body)
+    monkeypatch.setattr(
+        lpe.BaseOpenAIPassThroughHandler,
+        "_base_openai_pass_through_handler",
+        _fake_base_handler,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_resolve_codex_auto_agent_alias_model",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(lpe, "_is_oa_xai_request_body", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        lpe, "_is_grok_native_oauth_request_body", lambda *_a, **_k: False
+    )
+    monkeypatch.setattr(
+        codex_oauth,
+        "reload_codex_oauth_credential_after_token_invalidated",
+        reload,
+    )
+    monkeypatch.setattr(lpe, "_publish_codex_cooldown_memory", publish)
+    monkeypatch.setattr(lpe, "_persist_codex_cooldown_durable", persist)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await lpe.openai_proxy_route(
+            endpoint="v1/responses",
+            request=request,
+            fastapi_response=Response(),
+            user_api_key_dict=object(),  # type: ignore[arg-type]
+        )
+
+    assert exc_info.value.status_code == 409
+    detail = exc_info.value.detail
+    assert detail["redispatch_required"] is True
+    assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert detail["failure_phase"] == "direct_openai_token_invalidated"
+    reload.assert_awaited_once()
+    reload_kwargs = reload.await_args.kwargs
+    assert reload_kwargs["account_label"] == "account1"
+    assert reload_kwargs["expected_account_hash"] == "hash-account-1"
+    assert reload_kwargs["expected_lane_key"] == (
+        "codex-oauth:account1:hash-account-1"
+    )
+    assert provider_auth == ["Bearer server-token-account1"]
+    publish.assert_not_awaited()
+    persist.assert_not_awaited()
+
+
 def test_direct_codex_token_invalidated_predicate_is_narrow() -> None:
     assert codex_oauth.is_direct_codex_token_invalidated_error(
         _token_invalidated_error()
@@ -3557,3 +3912,480 @@ def test_direct_codex_usage_limit_retry_after_does_not_mutate_exception_detail()
         now_epoch=0.0,
     )
     assert exc.detail == {"quota": {"resets_in_seconds": 60_000.0, "other": "value"}}
+
+
+def test_openai_responses_unpersisted_item_not_found_predicate_is_exact() -> None:
+    candidate = _candidate()
+    endpoint = "/v1/responses"
+
+    assert error_signals.is_openai_responses_unpersisted_item_not_found_error(
+        _unpersisted_item_not_found_error(),
+        candidate=candidate,
+        endpoint=endpoint,
+        provider_returned=True,
+    )
+
+    # The same structured text raised locally must not be treated as provider
+    # evidence.
+    assert not error_signals.is_openai_responses_unpersisted_item_not_found_error(
+        _unpersisted_item_not_found_error(),
+        candidate=candidate,
+        endpoint=endpoint,
+    )
+
+    for wrong_candidate in (
+        {**candidate, "provider": "xai"},
+        {**candidate, "route_family": "codex_openrouter_responses_adapter"},
+    ):
+        assert not error_signals.is_openai_responses_unpersisted_item_not_found_error(
+            _unpersisted_item_not_found_error(),
+            candidate=wrong_candidate,
+            endpoint=endpoint,
+            provider_returned=True,
+        )
+    assert not error_signals.is_openai_responses_unpersisted_item_not_found_error(
+        _unpersisted_item_not_found_error(),
+        candidate=candidate,
+        endpoint="/v1/chat/completions",
+        provider_returned=True,
+    )
+
+    wrong_status = _unpersisted_item_not_found_error()
+    wrong_status.status_code = 422
+    assert not error_signals.is_openai_responses_unpersisted_item_not_found_error(
+        wrong_status,
+        candidate=candidate,
+        endpoint=endpoint,
+        provider_returned=True,
+    )
+    assert not error_signals.is_openai_responses_unpersisted_item_not_found_error(
+        HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": _OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE,
+                    "type": "server_error",
+                }
+            },
+        ),
+        candidate=candidate,
+        endpoint=endpoint,
+        provider_returned=True,
+    )
+    for near_match in (
+        "Item with id 'msg_abc123' not found. "
+        "Items are not persisted when store is set to false. "
+        "Try again with store set to true.",
+        "Item with id 'rs_abc123' not found.",
+        "Item with id 'rs_abc123' not found. "
+        "Items are not persisted when store is set to false",
+        f" {_OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE}",
+    ):
+        assert not error_signals.is_openai_responses_unpersisted_item_not_found_error(
+            HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "message": near_match,
+                        "type": "invalid_request_error",
+                    }
+                },
+            ),
+            candidate=candidate,
+            endpoint=endpoint,
+            provider_returned=True,
+        )
+    assert not error_signals.is_openai_responses_unpersisted_item_not_found_error(
+        HTTPException(
+            status_code=400,
+            detail={
+                "message": _OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE,
+                "type": "invalid_request_error",
+            },
+        ),
+        candidate=candidate,
+        endpoint=endpoint,
+        provider_returned=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_unpersisted_item_not_found_continuation_uses_session_owner_redispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    monkeypatch.setattr(
+        lpe,
+        "_codex_auto_agent_request_has_continuation_state",
+        lambda body: True,
+    )
+    request = _request()
+    performed_labels: list[str] = []
+    mutation_calls: list[str] = []
+    warning_details: list[dict[str, Any]] = []
+
+    def _unexpected_mutation(name: str):
+        def _raise(*args: Any, **kwargs: Any) -> None:
+            mutation_calls.append(name)
+            raise AssertionError(f"unexpected {name}")
+
+        return _raise
+
+    async def _unexpected_async_mutation(
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        mutation_calls.append("redis_or_reload")
+        raise AssertionError("unexpected Redis cooldown or credential reload")
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        return _account_selection(
+            "account1",
+            "hash-account-1",
+            failover_ordinal=0,
+            credential_affinity="interchangeable",
+        )
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        performed_labels.append(candidate["codex_oauth_account_label"])
+        raise _unpersisted_item_not_found_error()
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    monkeypatch.setattr(
+        lpe,
+        "_record_codex_failure_evidence",
+        _unexpected_mutation("failure_evidence"),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_exclude_codex_auto_agent_request_local_candidate_without_cooldown",
+        _unexpected_mutation("request_local_exclusion"),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        _unexpected_mutation("account_failover"),
+    )
+    monkeypatch.setattr(
+        codex_oauth,
+        "reload_codex_oauth_credential_after_token_invalidated",
+        _unexpected_async_mutation,
+    )
+    monkeypatch.setattr(
+        session_affinity.verbose_proxy_logger,
+        "warning",
+        lambda *args, **kwargs: warning_details.append(kwargs["extra"]),
+    )
+    services = replace(
+        _loop_services(
+            select_candidate=_select,
+            perform_candidate=_perform,
+        ),
+        resolve_cooldown_publication_fn=_unexpected_mutation(
+            "cooldown_resolution"
+        ),
+        publish_cooldown_memory_fn=_unexpected_mutation("cooldown_memory"),
+        persist_cooldown_fn=_unexpected_async_mutation,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body={
+                "model": "basic",
+                "previous_response_id": "resp_store_false_1",
+            },
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_zero,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidate",
+            log_label="Codex",
+        )
+
+    assert performed_labels == ["account1"]
+    assert exc_info.value.status_code == 409
+    detail = exc_info.value.detail
+    assert detail["redispatch_required"] is True
+    assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert detail["attempted_provider_call"] is True
+    assert (
+        detail["failure_phase"]
+        == "openai_responses_unpersisted_item_not_found_continuation"
+    )
+    assert mutation_calls == []
+    assert not hasattr(
+        request.state,
+        "aawm_codex_oauth_request_local_failover_context",
+    )
+    assert any(
+        warning.get("attempted_provider_call") is True
+        for warning in warning_details
+    )
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_unpersisted_item_not_found_without_continuation_does_not_redispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    monkeypatch.setattr(
+        lpe,
+        "_codex_auto_agent_request_has_continuation_state",
+        lambda body: False,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc, *args, candidate=None, **kwargs: None,
+    )
+    request = _request()
+    upstream_exc = _unpersisted_item_not_found_error()
+    mutation_calls: list[str] = []
+
+    def _unexpected_mutation(name: str):
+        def _raise(*args: Any, **kwargs: Any) -> None:
+            mutation_calls.append(name)
+            raise AssertionError(f"unexpected {name}")
+
+        return _raise
+
+    async def _unexpected_async_mutation(
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        mutation_calls.append("redis_or_reload")
+        raise AssertionError("unexpected Redis cooldown or credential reload")
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        return _account_selection(
+            "account1",
+            "hash-account-1",
+            failover_ordinal=0,
+        )
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        raise upstream_exc
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    monkeypatch.setattr(
+        lpe,
+        "_record_codex_failure_evidence",
+        _unexpected_mutation("failure_evidence"),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_exclude_codex_auto_agent_request_local_candidate_without_cooldown",
+        _unexpected_mutation("request_local_exclusion"),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        _unexpected_mutation("account_failover"),
+    )
+    monkeypatch.setattr(
+        codex_oauth,
+        "reload_codex_oauth_credential_after_token_invalidated",
+        _unexpected_async_mutation,
+    )
+    services = replace(
+        _loop_services(
+            select_candidate=_select,
+            perform_candidate=_perform,
+        ),
+        resolve_cooldown_publication_fn=_unexpected_mutation(
+            "cooldown_resolution"
+        ),
+        publish_cooldown_memory_fn=_unexpected_mutation("cooldown_memory"),
+        persist_cooldown_fn=_unexpected_async_mutation,
+    )
+
+    with pytest.raises(ProxyException) as exc_info:
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body={"model": "basic", "input": "fresh"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_zero,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidate",
+            log_label="Codex",
+        )
+
+    assert exc_info.value is upstream_exc
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail["error"]["message"] == (
+        _OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE
+    )
+    assert mutation_calls == []
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_route_direct_unpersisted_item_not_found_continuation_requires_redispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_direct_inventory_auth(monkeypatch)
+    request = _direct_request()
+    body = {
+        "model": "gpt-5.6-sol",
+        "previous_response_id": "resp-store-false",
+        "input": "continue",
+    }
+    provider_calls = 0
+    warning_details: list[dict[str, Any]] = []
+    retry = AsyncMock(side_effect=AssertionError("unexpected direct retry"))
+    publish = AsyncMock(side_effect=AssertionError("unexpected cooldown memory"))
+    persist = AsyncMock(side_effect=AssertionError("unexpected cooldown Redis"))
+    reload = AsyncMock(side_effect=AssertionError("unexpected credential reload"))
+
+    async def _fake_get_body(req):
+        return dict(body)
+
+    async def _fake_base_handler(**kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        raise _unpersisted_item_not_found_error()
+
+    monkeypatch.setattr(lpe, "get_request_body", _fake_get_body)
+    monkeypatch.setattr(
+        lpe.BaseOpenAIPassThroughHandler,
+        "_base_openai_pass_through_handler",
+        _fake_base_handler,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_resolve_codex_auto_agent_alias_model",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(lpe, "_is_oa_xai_request_body", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        lpe, "_is_grok_native_oauth_request_body", lambda *_a, **_k: False
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_retry_direct_codex_oauth_after_account_failure",
+        retry,
+    )
+    monkeypatch.setattr(lpe, "_publish_codex_cooldown_memory", publish)
+    monkeypatch.setattr(lpe, "_persist_codex_cooldown_durable", persist)
+    monkeypatch.setattr(
+        codex_oauth,
+        "reload_codex_oauth_credential_after_token_invalidated",
+        reload,
+    )
+    monkeypatch.setattr(
+        session_affinity.verbose_proxy_logger,
+        "warning",
+        lambda *args, **kwargs: warning_details.append(kwargs["extra"]),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await lpe.openai_proxy_route(
+            endpoint="v1/responses",
+            request=request,
+            fastapi_response=Response(),
+            user_api_key_dict=object(),  # type: ignore[arg-type]
+        )
+
+    assert provider_calls == 1
+    assert exc_info.value.status_code == 409
+    detail = exc_info.value.detail
+    assert detail["redispatch_required"] is True
+    assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert detail["attempted_provider_call"] is True
+    assert (
+        detail["failure_phase"]
+        == "direct_openai_responses_unpersisted_item_not_found"
+    )
+    retry.assert_not_awaited()
+    publish.assert_not_called()
+    persist.assert_not_awaited()
+    reload.assert_not_awaited()
+    assert any(
+        warning.get("attempted_provider_call") is True
+        for warning in warning_details
+    )
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_route_direct_unpersisted_item_not_found_without_continuation_passthrough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_direct_inventory_auth(monkeypatch)
+    request = _direct_request()
+    body = {"model": "gpt-5.6-sol", "input": "fresh turn"}
+    upstream_exc = _unpersisted_item_not_found_error()
+    retry = AsyncMock(side_effect=AssertionError("unexpected direct retry"))
+    publish = AsyncMock(side_effect=AssertionError("unexpected cooldown memory"))
+    persist = AsyncMock(side_effect=AssertionError("unexpected cooldown Redis"))
+    reload = AsyncMock(side_effect=AssertionError("unexpected credential reload"))
+
+    async def _fake_get_body(req):
+        return dict(body)
+
+    async def _fake_base_handler(**kwargs):
+        raise upstream_exc
+
+    monkeypatch.setattr(lpe, "get_request_body", _fake_get_body)
+    monkeypatch.setattr(
+        lpe.BaseOpenAIPassThroughHandler,
+        "_base_openai_pass_through_handler",
+        _fake_base_handler,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_resolve_codex_auto_agent_alias_model",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(lpe, "_is_oa_xai_request_body", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        lpe, "_is_grok_native_oauth_request_body", lambda *_a, **_k: False
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_retry_direct_codex_oauth_after_account_failure",
+        retry,
+    )
+    monkeypatch.setattr(lpe, "_publish_codex_cooldown_memory", publish)
+    monkeypatch.setattr(lpe, "_persist_codex_cooldown_durable", persist)
+    monkeypatch.setattr(
+        codex_oauth,
+        "reload_codex_oauth_credential_after_token_invalidated",
+        reload,
+    )
+
+    with pytest.raises(ProxyException) as exc_info:
+        await lpe.openai_proxy_route(
+            endpoint="v1/responses",
+            request=request,
+            fastapi_response=Response(),
+            user_api_key_dict=object(),  # type: ignore[arg-type]
+        )
+
+    assert exc_info.value is upstream_exc
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail["error"]["message"] == (
+        _OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE
+    )
+    retry.assert_not_awaited()
+    publish.assert_not_called()
+    persist.assert_not_awaited()
+    reload.assert_not_awaited()

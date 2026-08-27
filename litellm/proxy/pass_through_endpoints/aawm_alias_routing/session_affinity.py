@@ -2820,6 +2820,7 @@ def _build_session_owner_redispatch_summary(
     *,
     mismatch_reason: Optional[str],
     failure_phase: str,
+    attempted_provider_call: bool = False,
 ) -> str:
     reason = _sanitize_session_owner_log_label(
         mismatch_reason or failure_phase,
@@ -2827,7 +2828,8 @@ def _build_session_owner_redispatch_summary(
     ) or "session-owner mismatch"
     return (
         "LiteLLM Proxy: HTTP 409 session-owner mismatch requires redispatch; "
-        "redispatch_required=true; attempted_provider_call=false; "
+        "redispatch_required=true; "
+        f"attempted_provider_call={str(bool(attempted_provider_call)).lower()}; "
         f"reason={reason}; action=redispatch with a fresh session"
     )[:_SESSION_OWNER_LOG_MAX_SUMMARY_CHARS]
 
@@ -2842,11 +2844,13 @@ def _emit_session_owner_redispatch_observability(
     candidate_endpoint: Optional[str],
     owner_attrs: Mapping[str, Any],
     request: Any,
+    attempted_provider_call: bool = False,
 ) -> None:
     """Emit one proxy WARNING and one rollup failure. Never raises."""
     summary = _build_session_owner_redispatch_summary(
         mismatch_reason=mismatch_reason,
         failure_phase=failure_phase,
+        attempted_provider_call=attempted_provider_call,
     )
     try:
         verbose_proxy_logger.warning(
@@ -2857,7 +2861,7 @@ def _emit_session_owner_redispatch_observability(
                 "status_code": _SESSION_OWNER_LOG_STATUS_CODE,
                 "failure_kind": "session_owner_mismatch",
                 "redispatch_required": True,
-                "attempted_provider_call": False,
+                "attempted_provider_call": bool(attempted_provider_call),
             },
             exc_info=False,
         )
@@ -2921,8 +2925,9 @@ def raise_session_owner_redispatch_required(
     message: Optional[str] = None,
     attribution: Optional[Mapping[str, Any]] = None,
     request: Any = None,
+    attempted_provider_call: bool = False,
 ) -> None:
-    """Fail before egress with structured redispatch_required. Never returns.
+    """Raise structured redispatch_required with truthful egress state.
 
     Reopened D1-614 observability is best-effort and cannot alter this response.
     """
@@ -3001,7 +3006,7 @@ def raise_session_owner_redispatch_required(
         "redispatch_required": True,
         "redispatch_reason": mismatch_reason or failure_phase,
         "failure_phase": failure_phase,
-        "attempted_provider_call": False,
+        "attempted_provider_call": bool(attempted_provider_call),
         "canonical_session_identity": session_identity,
         "session_owner": provenance,
         "candidate": shaped_candidate,
@@ -3026,6 +3031,7 @@ def raise_session_owner_redispatch_required(
         candidate_endpoint=candidate_endpoint,
         owner_attrs=owner_attrs,
         request=request,
+        attempted_provider_call=attempted_provider_call,
     )
     # Direct OpenAI / nested Codex guards raise 409 before
     # pass_through_request registers ACCESS replacement. Register once so

@@ -1,4 +1,4 @@
-# Temporary litellm-alpha stabilization mapping for ``work``.
+# Temporary litellm-alpha Cursor-first work fallback.
 defaults: {}
 
 aliases:
@@ -7,4 +7,14 @@ aliases:
       - provider: cursor_agent
         model: cursor_agent/cursor-grok-4.6-high
         route_family: codex_cursor_agent_aiserver_adapter
+        priority: 110
+
+      - provider: xai
+        model: xai/grok-4.6
+        route_family: codex_grok_native_responses_adapter
         priority: 100
+
+      - provider: xai
+        model: oa_xai/grok-4.6
+        route_family: codex_xai_oauth_responses_adapter
+        priority: 90

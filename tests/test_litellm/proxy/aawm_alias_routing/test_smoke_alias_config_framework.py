@@ -68,7 +68,7 @@ def test_basic_yaml_compiles() -> None:
     assert basic_candidate.reasoning_effort == "low"
 
 
-def test_alpha_stabilization_alias_mappings_are_single_direct_candidates() -> None:
+def test_alpha_stabilization_single_route_alias_mappings() -> None:
     """Temporary alpha aliases expose only their explicitly assigned route."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
         config_compiler as compiler,
@@ -88,13 +88,6 @@ def test_alpha_stabilization_alias_mappings_are_single_direct_candidates() -> No
             "zai_coding_plan/glm-5.3-flash",
             "codex_zai_coding_plan_chat_completions_adapter",
             "low",
-        ),
-        "work.yaml": (
-            "work",
-            "cursor_agent",
-            "cursor_agent/cursor-grok-4.6-high",
-            "codex_cursor_agent_aiserver_adapter",
-            None,
         ),
         "expert.yaml": (
             "expert",
@@ -133,6 +126,31 @@ def test_alpha_stabilization_alias_mappings_are_single_direct_candidates() -> No
         assert candidate.route_family == route_family
         assert candidate.priority == 100
         assert candidate.reasoning_effort == reasoning_effort
+
+
+def test_work_yaml_orders_cursor_then_native_then_managed_xai() -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        config_compiler as compiler,
+    )
+
+    with open(
+        os.path.join(_ALIAS_CONFIG_DIR, "work.yaml"), "r", encoding="utf-8"
+    ) as handle:
+        snapshot = compiler.compile_yaml(handle.read())
+
+    assert [
+        (candidate.provider, candidate.model, candidate.route_family, candidate.priority)
+        for candidate in snapshot.aliases["work"].candidates
+    ] == [
+        (
+            "cursor_agent",
+            "cursor_agent/cursor-grok-4.6-high",
+            "codex_cursor_agent_aiserver_adapter",
+            110,
+        ),
+        ("xai", "xai/grok-4.6", "codex_grok_native_responses_adapter", 100),
+        ("xai", "oa_xai/grok-4.6", "codex_xai_oauth_responses_adapter", 90),
+    ]
 
 
 def test_refresh_endpoint_registered() -> None:

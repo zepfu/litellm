@@ -17,6 +17,7 @@ from litellm.llms.cursor_agent.connect import (
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     codex_candidate_calls,
 )
+from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
 
 
 def _request() -> Request:
@@ -71,6 +72,44 @@ def _clear_replay_registry() -> None:
     codex_candidate_calls._clear_cursor_replay_registry()
     yield
     codex_candidate_calls._clear_cursor_replay_registry()
+
+
+def _store_replay_state(response_id: str = "resp-replay") -> None:
+    codex_candidate_calls._store_cursor_replay_state(
+        response_id,
+        messages=[
+            {"role": "user", "content": "run pwd"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"pwd"}',
+                        },
+                    }
+                ],
+            },
+        ],
+        tools=[],
+    )
+
+
+def _replay_body(response_id: str = "resp-replay") -> dict[str, Any]:
+    return {
+        "model": "work",
+        "previous_response_id": response_id,
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": "pwd output",
+            }
+        ],
+    }
 
 
 def test_cursor_codex_path_returns_native_function_call_and_replays_tool_history(
@@ -600,3 +639,221 @@ def test_installed_cursor_candidate_closure_resolves_cursor_dependencies(
             )
         )
     assert "expected installed Cursor failure" in exc_info.value.message
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error_type", "error_code"),
+    [
+        (408, "upstream_timeout", "upstream_timeout"),
+        (500, "upstream_error", "upstream_transient_internal"),
+        (502, "upstream_error", "upstream_transient_internal"),
+        (503, "upstream_error", "upstream_transient_internal"),
+        (504, "upstream_timeout", "upstream_timeout"),
+        (529, "upstream_error", "upstream_transient_internal"),
+    ],
+)
+def test_cursor_transient_statuses_preserve_retry_classification(
+    status_code: int,
+    error_type: str,
+    error_code: str,
+) -> None:
+    from litellm.proxy._types import ProxyException
+
+    candidate = _candidate(provider="cursor_agent")
+    with pytest.raises(ProxyException) as exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=CursorConnectError(
+                "Cursor upstream failure",
+                status_code=status_code,
+            ),
+            candidate=candidate,
+        )
+
+    exc = exc_info.value
+    assert exc.code == str(status_code)
+    assert exc.status_code == status_code
+    assert exc.type == error_type
+    assert exc.detail["error"]["type"] == error_type
+    assert exc.detail["error"]["code"] == error_code
+    assert (
+        exc.detail["error"]["code"]
+        != "aawm_codex_auto_agent_candidate_unavailable"
+    )
+    classified = (
+        llm_passthrough_endpoints._classify_codex_auto_agent_retryable_exhaustion(
+            exc,
+            candidate=candidate,
+        )
+    )
+    assert classified == error_code
+    assert (
+        llm_passthrough_endpoints._get_codex_auto_agent_candidate_cooldown_scope(
+            classified,
+            candidate=candidate,
+        )
+        == "request_local"
+    )
+
+
+def test_cursor_transport_failure_maps_to_request_local_transient() -> None:
+    from litellm.proxy._types import ProxyException
+
+    candidate = _candidate(provider="cursor_agent")
+    with pytest.raises(ProxyException) as exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=OSError("connection reset"),
+            candidate=candidate,
+        )
+
+    exc = exc_info.value
+    assert exc.status_code == 502
+    assert exc.detail["error"]["code"] == "upstream_transient_internal"
+    classified = (
+        llm_passthrough_endpoints._classify_codex_auto_agent_retryable_exhaustion(
+            exc,
+            candidate=candidate,
+        )
+    )
+    assert classified == "upstream_transient_internal"
+    assert (
+        llm_passthrough_endpoints._get_codex_auto_agent_candidate_cooldown_scope(
+            classified,
+            candidate=candidate,
+        )
+        == "request_local"
+    )
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 429])
+def test_cursor_auth_and_non_transient_fail_closed_to_durable_unavailable(
+    status_code: int,
+) -> None:
+    from litellm.proxy._types import ProxyException
+
+    candidate = _candidate(provider="cursor_agent")
+    with pytest.raises(ProxyException) as exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=CursorConnectError(
+                "Cursor non-transient failure",
+                status_code=status_code,
+            ),
+            candidate=candidate,
+        )
+
+    exc = exc_info.value
+    assert exc.status_code == status_code
+    assert (
+        exc.detail["error"]["code"]
+        == "aawm_codex_auto_agent_candidate_unavailable"
+    )
+    classified = (
+        llm_passthrough_endpoints._classify_codex_auto_agent_retryable_exhaustion(
+            exc,
+            candidate=candidate,
+        )
+    )
+    assert classified == "candidate_unavailable"
+    assert (
+        llm_passthrough_endpoints._get_codex_auto_agent_candidate_cooldown_scope(
+            classified,
+            candidate=candidate,
+        )
+        == "candidate"
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        CursorConnectError("timeout", status_code=408),
+        CursorConnectError("internal", status_code=500),
+        CursorConnectError("bad gateway", status_code=502),
+        CursorConnectError("unavailable", status_code=503),
+        CursorConnectError("gateway timeout", status_code=504),
+        CursorConnectError("overloaded", status_code=529),
+        OSError("transport reset"),
+    ],
+    ids=["408", "500", "502", "503", "504", "529", "transport"],
+)
+def test_cursor_transient_failures_preserve_replay_state(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: Exception,
+) -> None:
+    class FakeCursorClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self,
+            _payload: dict[str, Any],
+            **_kwargs: Any,
+        ) -> CursorAgentRunResult:
+            raise failure
+
+    monkeypatch.setattr(
+        "litellm.llms.cursor_agent.connect.CursorAgentConnectClient",
+        FakeCursorClient,
+    )
+    _store_replay_state()
+
+    with pytest.raises(type(failure)):
+        _call(_replay_body())
+
+    state = codex_candidate_calls._peek_cursor_replay_state("resp-replay")
+    assert state["messages"]
+
+
+def test_cursor_success_consumes_replay_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeCursorClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self,
+            _payload: dict[str, Any],
+            **_kwargs: Any,
+        ) -> CursorAgentRunResult:
+            return CursorAgentRunResult(text="done", turn_ended=True)
+
+    monkeypatch.setattr(
+        "litellm.llms.cursor_agent.connect.CursorAgentConnectClient",
+        FakeCursorClient,
+    )
+    _store_replay_state()
+
+    response = _call(_replay_body())
+
+    assert response.status_code == 200
+    with pytest.raises(CursorConnectError, match="missing"):
+        codex_candidate_calls._peek_cursor_replay_state("resp-replay")
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 429])
+def test_cursor_terminal_failures_consume_replay_state(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    class FakeCursorClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self,
+            _payload: dict[str, Any],
+            **_kwargs: Any,
+        ) -> CursorAgentRunResult:
+            raise CursorConnectError("terminal", status_code=status_code)
+
+    monkeypatch.setattr(
+        "litellm.llms.cursor_agent.connect.CursorAgentConnectClient",
+        FakeCursorClient,
+    )
+    _store_replay_state()
+
+    with pytest.raises(CursorConnectError):
+        _call(_replay_body())
+
+    with pytest.raises(CursorConnectError, match="missing"):
+        codex_candidate_calls._peek_cursor_replay_state("resp-replay")

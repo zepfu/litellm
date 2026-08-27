@@ -53,6 +53,7 @@ from litellm.proxy.pass_through_endpoints.provider_failure_classifiers.cohere im
     classify_cohere_failure,
 )
 
+from . import codex_oauth as _codex_oauth_mod
 from . import error_signals as _error_signals
 from . import dev_fault_plan as _dev_fault_plan
 from .interfaces import (
@@ -83,6 +84,14 @@ def _session_affinity_mod():
         session_affinity as mod,
     )
     return mod
+
+
+def _request_endpoint_path(request: Any) -> Optional[str]:
+    try:
+        path = getattr(getattr(request, "url", None), "path", None)
+    except Exception:
+        path = None
+    return path if isinstance(path, str) else None
 
 
 def _admission_mod():
@@ -402,6 +411,7 @@ async def handle_alias_route(  # noqa: PLR0915
     native_grok_continuation_transient_provider_attempts = 0
     provider_candidate_attempts = 0
     same_account_transient_attempts_by_slot: dict[Optional[str], int] = {}
+    token_invalidated_reload_attempts: set[str] = set()
     account_failover_replay_safe = (
         _session_affinity_mod().is_replay_safe_session_owner_redispatch_body(
             prepared_request_body
@@ -744,6 +754,7 @@ async def handle_alias_route(  # noqa: PLR0915
                 # (Exception, CancelledError, KeyboardInterrupt, etc.).
                 try:
                     session_owner_lease = None
+                    attempted_provider_call = False
                     try:
                         sa = _session_affinity_mod()
                         session_owner_identity = selection.get(
@@ -809,6 +820,7 @@ async def handle_alias_route(  # noqa: PLR0915
                             request,
                             candidate=candidate,
                         )
+                        attempted_provider_call = True
                         response = await perform_candidate_request_fn(
                             candidate=candidate,
                             candidate_body=candidate_body,
@@ -849,6 +861,65 @@ async def handle_alias_route(  # noqa: PLR0915
                         # Release probe lock FIRST (unconditional, before any
                         # resolver call that might raise).
                         probe_lock.release()
+
+                    if (
+                        probe_failure_exc is not None
+                        and _error_signals.is_openai_responses_unpersisted_item_not_found_error(
+                            probe_failure_exc,
+                            candidate=candidate,
+                            endpoint=_request_endpoint_path(request),
+                            provider_returned=(
+                                attempted_provider_call
+                                and isinstance(probe_failure_exc, ProxyException)
+                            ),
+                        )
+                    ):
+                        if not has_continuation_state:
+                            raise probe_failure_exc
+                        attempt_record["status"] = (
+                            "terminal_in_flight_unpersisted_item_not_found"
+                        )
+                        attempt_record["failure_phase"] = (
+                            "openai_responses_unpersisted_item_not_found_continuation"
+                        )
+                        attempt_record["attempted_provider_call"] = True
+                        _record_auto_agent_alias_attempt_failure(
+                            alias_family=alias_family,
+                            alias_model=alias_model,
+                            request=request,
+                            prepared_request_body=prepared_request_body,
+                            selection=selection,
+                            attempts=attempts,
+                            attempt_record=attempt_record,
+                            error_class="openai_responses_unpersisted_item_not_found",
+                            add_alias_metadata_fn=add_alias_metadata_fn,
+                            redispatch_required=True,
+                        )
+                        session_identity = selection.get("session_owner_identity")
+                        if not isinstance(session_identity, str) or not session_identity:
+                            session_identity = selection.get("canonical_session_identity")
+                        if not isinstance(session_identity, str) or not session_identity:
+                            session_identity = (
+                                _session_affinity_mod().resolve_canonical_session_identity(
+                                    request,
+                                    prepared_request_body,
+                                )
+                            )
+                        _session_affinity_mod().raise_session_owner_redispatch_required(
+                            session_identity=session_identity,
+                            alias_model=alias_model,
+                            candidate=candidate,
+                            failure_phase=(
+                                "openai_responses_unpersisted_item_not_found_continuation"
+                            ),
+                            message=(
+                                "OpenAI Responses continuation referenced an "
+                                "unpersisted item (store=false). Do not continue "
+                                "this session; redispatch a fresh response."
+                            ),
+                            attempted_provider_call=True,
+                            request=request,
+                        )
 
                     # Resolve the plan AFTER lock release.  If the resolver
                     # raises, the outer BaseException handler cleans up the
@@ -1008,6 +1079,92 @@ async def handle_alias_route(  # noqa: PLR0915
                         intent.complete(error=cleanup_exc)
                         alias_routing_state.publication_intents.remove(intent)
                     raise
+
+                reload_label = str(
+                    candidate.get("codex_oauth_account_label") or ""
+                )
+                reload_account_hash = str(
+                    candidate.get("codex_oauth_account_hash") or ""
+                ) or None
+                reload_lane_key = str(
+                    candidate.get("codex_oauth_lane_key") or ""
+                ) or None
+                token_invalidated_reload = None
+                if (
+                    early_pre_commit_error_class == "token_invalidated"
+                    and reload_label
+                    and reload_account_hash is not None
+                    and reload_lane_key is not None
+                    and reload_label not in token_invalidated_reload_attempts
+                    and _session_affinity_mod().reset_released_request_session_owner_guard(
+                        request
+                    )
+                ):
+                    token_invalidated_reload_attempts.add(reload_label)
+                    token_invalidated_reload = (
+                        await _codex_oauth_mod.reload_codex_oauth_credential_after_token_invalidated(
+                            request,
+                            account_label=reload_label,
+                            model=str(candidate.get("model") or "") or None,
+                            expected_account_hash=reload_account_hash,
+                            expected_lane_key=reload_lane_key,
+                        )
+                    )
+                    if token_invalidated_reload is not None:
+                        if (
+                            token_invalidated_reload.account_label != reload_label
+                            or token_invalidated_reload.account_hash
+                            != reload_account_hash
+                            or token_invalidated_reload.lane_key != reload_lane_key
+                            or _codex_oauth_mod._bind_codex_oauth_candidate_to_request(
+                                request,
+                                candidate,
+                            )
+                            is None
+                        ):
+                            token_invalidated_reload = None
+                    if token_invalidated_reload is not None:
+                        attempt_record["token_invalidated_reload"] = {
+                            "account_label": reload_label,
+                            "credential_material_changed": True,
+                            "same_account_retry": True,
+                        }
+                        _record_auto_agent_alias_attempt_failure(
+                            alias_family=alias_family,
+                            alias_model=alias_model,
+                            request=request,
+                            prepared_request_body=prepared_request_body,
+                            selection=selection,
+                            attempts=attempts,
+                            attempt_record=attempt_record,
+                            error_class="token_invalidated",
+                            add_alias_metadata_fn=add_alias_metadata_fn,
+                        )
+                        verbose_proxy_logger.debug(
+                            "%s auto-agent alias %s reloaded changed Codex "
+                            "OAuth credential for account %s after "
+                            "token_invalidated; retrying same account once",
+                            log_label,
+                            alias_model,
+                            reload_label,
+                        )
+                        attempt_record = _codex_auto_agent_candidate_public_shape(
+                            candidate,
+                            lane_key=selection.get("lane_key"),
+                            reason="token_invalidated_same_account_reload",
+                        )
+                        attempts.append(attempt_record)
+                        candidate_body = _record_auto_agent_alias_attempt_started(
+                            alias_family=alias_family,
+                            alias_model=alias_model,
+                            request=request,
+                            prepared_request_body=prepared_request_body,
+                            selection=selection,
+                            attempts=attempts,
+                            attempt_record=attempt_record,
+                            add_alias_metadata_fn=add_alias_metadata_fn,
+                        )
+                        continue
 
                 # --- failure handling (post-release) ---------------------------
                 failure_exc = probe_failure_exc
@@ -1192,6 +1349,52 @@ async def handle_alias_route(  # noqa: PLR0915
                         request,
                         candidate=candidate,
                         lane_key=selection.get("lane_key"),
+                    )
+                if (
+                    error_class == "token_invalidated"
+                    and has_continuation_state
+                    and not account_failover_replay_safe
+                    and not account_failover_planned
+                ):
+                    attempt_record["status"] = (
+                        "terminal_in_flight_token_invalidated"
+                    )
+                    failure_body = _record_auto_agent_alias_attempt_failure(
+                        alias_family=alias_family,
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        error_class=error_class,
+                        add_alias_metadata_fn=add_alias_metadata_fn,
+                        redispatch_required=True,
+                    )
+                    failure_metadata = failure_body.get("litellm_metadata") or {}
+                    raise_redispatch_required_fn(
+                        candidate=candidate,
+                        lane_key=selection.get("lane_key"),
+                        cooldown_seconds=0.0,
+                        error_tokens=error_tokens,
+                        alias_model=alias_model,
+                        error_class=error_class,
+                        cooldown_scope="none",
+                        error_status_code=attempt_record.get("error_status_code"),
+                        error_type=attempt_record.get("error_type"),
+                        error_code=attempt_record.get("error_code"),
+                        retry_after_seconds=0.0,
+                        failure_phase="token_invalidated_continuation",
+                        attempted_provider_call=attempt_record.get(
+                            "attempted_provider_call"
+                        ),
+                        audit_events=failure_metadata.get(
+                            "aawm_alias_routing_audit_events"
+                        ),
+                        attempts=failure_metadata.get(attempts_metadata_key),
+                        skipped_candidates=failure_metadata.get(
+                            skipped_candidates_metadata_key
+                        ),
                     )
                 if (
                     has_continuation_state

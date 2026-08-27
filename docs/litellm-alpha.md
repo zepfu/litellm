@@ -96,10 +96,11 @@ metadata require an image rebuild.
 ## Start
 
 Use the same environment preparation required by `litellm-dev`, including the
-two expected Codex OAuth account hashes. Live `auto-review` /
-`codex-auto-review` testing also requires `ZAI_KEY` and
-`AAWM_OPENROUTER_API_KEY`; alpha receives only the provider credentials present
-when its container is created.
+two expected Codex OAuth account hashes. Live testing of the current temporary
+`read` and `basic` aliases requires `ZAI_KEY`. Live `auto-review` /
+`codex-auto-review` testing requires `ZAI_KEY` and `AAWM_OPENROUTER_API_KEY`;
+alpha receives only the provider credentials present when its container is
+created.
 
 ```bash
 docker compose -f docker-compose.alpha.yml build litellm-alpha
@@ -121,6 +122,19 @@ The import path must resolve under `/app/litellm`.
 When a watched file changes, the logs should show the existing LiteLLM process
 stop and a new process start. Wait for `/health/liveliness` before running the
 next live test.
+
+## Current Alpha Acceptance
+
+On August 27, 2026, current alpha live acceptance succeeded as follows:
+
+- `read` and `basic` succeeded through `zai_coding_plan/glm-5.3-flash`.
+- `work` succeeded through `cursor_agent/cursor-grok-4.6-high` without xAI
+  fallback.
+- `expert` succeeded through `gpt-5.6-terra`.
+- `sota-openai` (`gpt` role) succeeded through `gpt-5.6-sol`.
+
+This is alpha acceptance only, not `litellm-dev`/production acceptance or
+production evidence.
 
 ## Rebuild
 
@@ -153,5 +167,7 @@ development database connections for parity. Treat all calls as real provider
 and development-data operations. It is isolated by port, container name,
 environment label, process application names, and alias-routing Redis
 namespace, but it is not a sandbox for destructive database or provider tests.
-The Cursor auth-file wiring is testing-only; this document does not claim
-Cursor live acceptance.
+The Cursor auth-file wiring is testing-only. The August 27, 2026 alpha
+acceptance records successful `work` routing through
+Cursor without xAI fallback, not `litellm-dev`/production acceptance or
+production evidence.

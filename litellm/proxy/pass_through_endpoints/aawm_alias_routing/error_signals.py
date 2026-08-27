@@ -50,6 +50,7 @@ from .policy import (
     CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS,
     CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY as _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
     CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER as _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
+    CODEX_AUTO_AGENT_NATIVE_PROVIDER as _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
     CODEX_AUTO_AGENT_XAI_PROVIDER as _CODEX_AUTO_AGENT_XAI_PROVIDER,
 )
 from .types import Payload
@@ -679,6 +680,12 @@ def _is_codex_auto_agent_xai_candidate(
     return candidate.get("provider") == _CODEX_AUTO_AGENT_XAI_PROVIDER
 
 
+def _is_codex_auto_agent_cursor_agent_candidate(
+    candidate: Optional[dict[str, Any]],
+) -> bool:
+    return isinstance(candidate, dict) and candidate.get("provider") == "cursor_agent"
+
+
 # ---------------------------------------------------------------------------
 # Kimi code helpers
 # ---------------------------------------------------------------------------
@@ -991,6 +998,11 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
             return "none"
     if error_class == "safety_policy_denied":
         return "request_local"
+    if _is_codex_auto_agent_cursor_agent_candidate(candidate) and error_class in {
+        "upstream_timeout",
+        "upstream_transient_internal",
+    }:
+        return "request_local"
     # Native Grok 4.5 is live. Broad candidate-unavailable probes can still
     # happen on transient/request-shape blips, so do not evict the native
     # candidate from routing. Other xAI alias candidates (Composer, Grok Build,
@@ -1159,6 +1171,75 @@ def _is_alibaba_token_plan_unsupported_model_response(
     return False
 
 
+# Exact OpenAI Responses provider text for missing reasoning items when
+# store=false. Match only after upstream returns this shape; never validate
+# proactively. Item ids are the Responses reasoning/item form ``rs_...``.
+_OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_RE = re.compile(
+    r"Item with id '(rs_[A-Za-z0-9_-]+)' not found\. "
+    r"Items are not persisted when store is set to false\."
+    r"(?: Try again with store set to true\.)?"
+)
+_OPENAI_RESPONSES_ENDPOINT_PATHS = frozenset(
+    {
+        "/responses",
+        "/v1/responses",
+        "/openai/responses",
+        "/openai/v1/responses",
+        "/openai_passthrough/responses",
+        "/openai_passthrough/v1/responses",
+    }
+)
+
+
+def _is_openai_responses_endpoint(endpoint: Any) -> bool:
+    if not isinstance(endpoint, str) or not endpoint.strip():
+        return False
+    try:
+        normalized_path = httpx.URL(endpoint).path.rstrip("/")
+    except Exception:
+        return False
+    if not normalized_path.startswith("/"):
+        normalized_path = "/" + normalized_path
+    return normalized_path in _OPENAI_RESPONSES_ENDPOINT_PATHS
+
+
+def _openai_responses_unpersisted_item_not_found_message(exc: Any) -> Optional[str]:
+    """Return the exact structured provider message text, else None."""
+    if _extract_adapter_exception_status_code(exc) != 400:
+        return None
+    detail = getattr(exc, "detail", None)
+    if not isinstance(detail, dict):
+        return None
+    error = detail.get("error")
+    if not isinstance(error, dict) or error.get("type") != "invalid_request_error":
+        return None
+    message = error.get("message")
+    if not isinstance(message, str):
+        return None
+    if _OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_RE.fullmatch(message) is None:
+        return None
+    return message
+
+
+def is_openai_responses_unpersisted_item_not_found_error(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]] = None,
+    endpoint: Optional[str] = None,
+    provider_returned: bool = False,
+) -> bool:
+    """True only for the exact OpenAI Responses provider error shape."""
+    if not provider_returned or not isinstance(candidate, dict):
+        return False
+    if (
+        candidate.get("provider") != _CODEX_AUTO_AGENT_NATIVE_PROVIDER
+        or candidate.get("route_family") != "codex_responses"
+        or not _is_openai_responses_endpoint(endpoint)
+    ):
+        return False
+    return _openai_responses_unpersisted_item_not_found_message(exc) is not None
+
+
 def _classify_codex_auto_agent_retryable_exhaustion(
     exc: Any,
     *,
@@ -1168,6 +1249,11 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     assert _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS is not None
     status_code = _extract_adapter_exception_status_code(exc)
     tokens = _extract_codex_auto_agent_error_tokens(exc)
+    if _is_codex_auto_agent_cursor_agent_candidate(candidate):
+        if status_code in {500, 502, 503, 529}:
+            return "upstream_transient_internal"
+        if status_code in {408, 504}:
+            return "upstream_timeout"
     if _is_codex_auto_agent_grok_account_quota_exhaustion(exc):
         return "capacity_exhausted"
     if _is_alibaba_token_plan_unsupported_model_response(exc, candidate=candidate):
@@ -1581,6 +1667,8 @@ _HOST_FUNCTION_NAMES = (
     "_is_codex_auto_agent_grok_account_quota_candidate",
     "_get_codex_auto_agent_grok_account_quota_lane_cooldown_key",
     "_is_codex_auto_agent_grok_account_quota_exhaustion",
+    "is_openai_responses_unpersisted_item_not_found_error",
+    "_openai_responses_unpersisted_item_not_found_message",
     "_classify_codex_auto_agent_retryable_exhaustion",
     "_is_codex_auto_agent_retryable_exhaustion",
     "plan_responses_pre_commit_retry",

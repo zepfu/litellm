@@ -3461,6 +3461,7 @@ async def _retry_direct_codex_oauth_after_account_failure(
     )
 
     is_usage_limit = error_class == "usage_limit_reached"
+    is_token_invalidated = error_class == "token_invalidated"
     cooldown_seconds = (
         _aawm_codex_oauth.direct_codex_usage_limit_retry_after_seconds(exc)
         if is_usage_limit
@@ -3509,6 +3510,66 @@ async def _retry_direct_codex_oauth_after_account_failure(
             "cooldown_seconds": round(float(cooldown_seconds), 3),
         }
         retry_attempt_record.update(retry_after_hint)
+    has_continuation_state = selection.get("request_mode") != "fresh"
+    account_failover_replay_safe = (
+        _sa.is_replay_safe_session_owner_redispatch_body(request_body)
+    )
+    _aawm_dev_fault_plan.note_direct_openai_managed_failure(
+        request,
+        request_body,
+        selection=selection,
+        attempt_record=injected_attempt_record,
+    )
+    if is_token_invalidated and isinstance(candidate, dict):
+        account_label = str(candidate.get("codex_oauth_account_label") or "")
+        account_hash = str(candidate.get("codex_oauth_account_hash") or "")
+        account_lane = str(candidate.get("codex_oauth_lane_key") or "")
+        if account_label and account_hash and account_lane:
+            retry_auth = (
+                await _aawm_codex_oauth.reload_codex_oauth_credential_after_token_invalidated(
+                    request,
+                    account_label=account_label,
+                    model=str(candidate.get("model") or "") or None,
+                    expected_account_hash=account_hash,
+                    expected_lane_key=account_lane,
+                )
+            )
+            if (
+                retry_auth is not None
+                and retry_auth.account_label == account_label
+                and retry_auth.account_hash == account_hash
+                and retry_auth.lane_key == account_lane
+                and _sa.reset_released_request_session_owner_guard(request)
+                and _aawm_codex_oauth._bind_codex_oauth_candidate_to_request(
+                    request,
+                    candidate,
+                )
+                is not None
+            ):
+                return retry_auth, dict(selection)
+    if (
+        is_token_invalidated
+        and has_continuation_state
+        and not account_failover_replay_safe
+    ):
+        session_identity = selection.get("canonical_session_identity")
+        if not isinstance(session_identity, str):
+            session_identity = _sa.resolve_canonical_session_identity(
+                request,
+                request_body,
+            )
+        _sa.raise_session_owner_redispatch_required(
+            session_identity=session_identity,
+            alias_model=selection.get("alias_model")
+            or request_body.get("model"),
+            candidate=candidate if isinstance(candidate, dict) else None,
+            failure_phase="direct_openai_token_invalidated",
+            message=(
+                "Codex token invalidation requires a fresh dispatch when "
+                "continuation replay is not safe."
+            ),
+            request=request,
+        )
     retry_planned = (
         isinstance(candidate, dict)
         and _aawm_selection._plan_codex_oauth_account_failover(
@@ -3517,22 +3578,12 @@ async def _retry_direct_codex_oauth_after_account_failure(
             selection=selection,
             attempt_record=retry_attempt_record,
             error_class=error_class,
-            has_continuation_state=selection.get("request_mode") != "fresh",
+            has_continuation_state=has_continuation_state,
             has_previous_response_id=bool(
                 request_body.get("previous_response_id")
             ),
-            account_failover_replay_safe=(
-                _sa.is_replay_safe_session_owner_redispatch_body(
-                    request_body
-                )
-            ),
+            account_failover_replay_safe=account_failover_replay_safe,
         )
-    )
-    _aawm_dev_fault_plan.note_direct_openai_managed_failure(
-        request,
-        request_body,
-        selection=selection,
-        attempt_record=injected_attempt_record,
     )
     if not retry_planned:
         return None
@@ -5885,6 +5936,7 @@ async def openai_proxy_route(  # noqa: PLR0915
             raise Exception("Required 'OPENAI_API_KEY' in environment to make pass-through calls to OpenAI.")
 
     while True:
+        attempted_provider_call = False
         try:
             if use_direct_codex_oauth_inventory:
                 _aawm_dev_fault_plan.note_direct_openai_managed_attempt(
@@ -5892,6 +5944,7 @@ async def openai_proxy_route(  # noqa: PLR0915
                     request_body,
                     selection=direct_codex_selection_state,
                 )
+            attempted_provider_call = True
             response = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
                 endpoint=endpoint,
                 request=request,
@@ -5911,6 +5964,65 @@ async def openai_proxy_route(  # noqa: PLR0915
                 )
             return response
         except (HTTPException, ProxyException) as exc:
+            candidate = None
+            if isinstance(direct_codex_selection_state, dict):
+                candidate = direct_codex_selection_state.get("candidate")
+            if (
+                _aawm_error_signals.is_openai_responses_unpersisted_item_not_found_error(
+                    exc,
+                    candidate=candidate if isinstance(candidate, dict) else None,
+                    endpoint=endpoint,
+                    provider_returned=(
+                        attempted_provider_call and isinstance(exc, ProxyException)
+                    ),
+                )
+                and _codex_auto_agent_request_has_continuation_state(request_body)
+            ):
+                from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+                    session_affinity as _sa,
+                )
+
+                session_identity = None
+                if isinstance(direct_codex_selection_state, dict):
+                    session_identity = direct_codex_selection_state.get(
+                        "canonical_session_identity"
+                    ) or direct_codex_selection_state.get("session_owner_identity")
+                if not isinstance(session_identity, str) or not session_identity:
+                    session_identity = _sa.resolve_canonical_session_identity(
+                        request,
+                        request_body,
+                    )
+                _sa.raise_session_owner_redispatch_required(
+                    session_identity=session_identity,
+                    alias_model=(
+                        (
+                            direct_codex_selection_state.get("alias_model")
+                            if isinstance(direct_codex_selection_state, dict)
+                            else None
+                        )
+                        or request_body.get("model")
+                    ),
+                    candidate=candidate if isinstance(candidate, dict) else None,
+                    failure_phase=(
+                        "direct_openai_responses_unpersisted_item_not_found"
+                    ),
+                    message=(
+                        "OpenAI Responses continuation referenced an "
+                        "unpersisted item (store=false). Do not continue "
+                        "this session; redispatch a fresh response."
+                    ),
+                    request=request,
+                    attempted_provider_call=True,
+                )
+            if _aawm_error_signals.is_openai_responses_unpersisted_item_not_found_error(
+                exc,
+                candidate=candidate if isinstance(candidate, dict) else None,
+                endpoint=endpoint,
+                provider_returned=(
+                    attempted_provider_call and isinstance(exc, ProxyException)
+                ),
+            ):
+                raise
             direct_account_error_class: Optional[str] = None
             if _aawm_codex_oauth.is_direct_codex_usage_limit_error(exc):
                 direct_account_error_class = "usage_limit_reached"

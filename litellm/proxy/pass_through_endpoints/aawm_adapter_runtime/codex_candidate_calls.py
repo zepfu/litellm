@@ -30,6 +30,9 @@ _OPENCODE_GO_ALIAS_CANDIDATE_TIMEOUT_SECONDS = 30.0
 _CURSOR_REPLAY_TTL_SECONDS = 600.0
 _CURSOR_REPLAY_MAX_SIZE = 256
 _CURSOR_REPLAY_REGISTRY: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_CURSOR_REPLAY_PRESERVED_STATUS_CODES = frozenset(
+    {408, 500, 502, 503, 504, 529}
+)
 
 
 def _prune_cursor_replay_registry(now: Optional[float] = None) -> None:
@@ -61,23 +64,59 @@ def _store_cursor_replay_state(
         _CURSOR_REPLAY_REGISTRY.popitem(last=False)
 
 
-def _take_cursor_replay_state(response_id: str) -> dict[str, Any]:
+def _peek_cursor_replay_state(response_id: str) -> dict[str, Any]:
     from litellm.llms.cursor_agent.connect import CursorConnectError
 
     now = time.monotonic()
-    state = _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
-    _prune_cursor_replay_registry(now)
+    state = _CURSOR_REPLAY_REGISTRY.get(response_id)
     if state is None:
+        _prune_cursor_replay_registry(now)
         raise CursorConnectError(
             "Cursor Agent continuation state is missing for previous_response_id.",
             status_code=409,
         )
     if float(state["expires_at"]) <= now:
+        _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
+        _prune_cursor_replay_registry(now)
         raise CursorConnectError(
             "Cursor Agent continuation state expired for previous_response_id.",
             status_code=409,
         )
+    _prune_cursor_replay_registry(now)
+    _CURSOR_REPLAY_REGISTRY.move_to_end(response_id)
     return state
+
+
+def _consume_cursor_replay_state(
+    response_id: str,
+    *,
+    expected_state: Optional[dict[str, Any]] = None,
+) -> None:
+    current = _CURSOR_REPLAY_REGISTRY.get(response_id)
+    if expected_state is not None and current is not expected_state:
+        return
+    _CURSOR_REPLAY_REGISTRY.pop(response_id, None)
+
+
+def _take_cursor_replay_state(response_id: str) -> dict[str, Any]:
+    state = _peek_cursor_replay_state(response_id)
+    _consume_cursor_replay_state(response_id, expected_state=state)
+    return state
+
+
+def _cursor_replay_failure_is_transient(
+    exc: BaseException,
+    *,
+    transport_failure: bool = False,
+) -> bool:
+    raw_status = getattr(exc, "status_code", None)
+    try:
+        status_code = int(raw_status) if raw_status is not None else None
+    except (TypeError, ValueError):
+        status_code = None
+    if status_code in _CURSOR_REPLAY_PRESERVED_STATUS_CODES:
+        return True
+    return transport_failure and status_code is None
 
 
 def _clear_cursor_replay_registry() -> None:
@@ -1164,7 +1203,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(
     replay_state: Optional[dict[str, Any]] = None
     previous_response_id = request_body.get("previous_response_id")
     if isinstance(previous_response_id, str) and previous_response_id:
-        replay_state = _take_cursor_replay_state(previous_response_id)
+        replay_state = _peek_cursor_replay_state(previous_response_id)
     messages = _responses_input_to_cursor_messages(
         request_body,
         prior_messages=(
@@ -1224,23 +1263,53 @@ async def _perform_codex_auto_agent_cursor_agent_request(
             extra_headers=extra_headers,
             stop_on_tool_call=True,
         )
-    except CursorConnectError:
+    except Exception as exc:
+        if (
+            isinstance(previous_response_id, str)
+            and replay_state is not None
+            and not _cursor_replay_failure_is_transient(
+                exc,
+                transport_failure=not isinstance(exc, CursorConnectError),
+            )
+        ):
+            _consume_cursor_replay_state(
+                previous_response_id,
+                expected_state=replay_state,
+            )
         raise
 
-    result.validate_terminal()
-    if result.exec_server_messages and not (
-        result.tool_calls or result.text or result.turn_ended
-    ):
-        raise CursorConnectError(
-            "Cursor Agent returned execServerMessage without a replayable "
-            "tool-call event; the bounded fresh-Run continuation bridge "
-            "cannot represent that server message.",
-            status_code=502,
-        )
-    if not result.tool_calls and not result.text and not result.turn_ended:
-        raise CursorConnectError(
-            "Cursor Agent Connect completed without text, a function call, or turnEnded.",
-            status_code=502,
+    try:
+        result.validate_terminal()
+        if result.exec_server_messages and not (
+            result.tool_calls or result.text or result.turn_ended
+        ):
+            raise CursorConnectError(
+                "Cursor Agent returned execServerMessage without a replayable "
+                "tool-call event; the bounded fresh-Run continuation bridge "
+                "cannot represent that server message.",
+                status_code=502,
+            )
+        if not result.tool_calls and not result.text and not result.turn_ended:
+            raise CursorConnectError(
+                "Cursor Agent Connect completed without text, a function call, or turnEnded.",
+                status_code=502,
+            )
+    except Exception as exc:
+        if (
+            isinstance(previous_response_id, str)
+            and replay_state is not None
+            and not _cursor_replay_failure_is_transient(exc)
+        ):
+            _consume_cursor_replay_state(
+                previous_response_id,
+                expected_state=replay_state,
+            )
+        raise
+
+    if isinstance(previous_response_id, str) and replay_state is not None:
+        _consume_cursor_replay_state(
+            previous_response_id,
+            expected_state=replay_state,
         )
 
     model = str(candidate.get("model") or request_body.get("model") or "")
@@ -1273,6 +1342,16 @@ def _raise_cursor_agent_alias_error(
     exc: Exception,
     candidate: dict[str, Any],
 ) -> None:
+    """Translate a Cursor Agent failure while preserving upstream semantics.
+
+    Transport/upstream 500/502/503/529 keep their status and map to the
+    existing transient/timeout classification so a Cursor blip advances to
+    the next candidate instead of publishing a durable candidate cooldown.
+    HTTP 408/504 map to the existing timeout classification.
+    Auth (401/403) and other non-transient failures stay on the
+    ``aawm_codex_auto_agent_candidate_unavailable`` code so they remain
+    durably unavailable.
+    """
     from litellm.proxy._types import ProxyException
 
     status_code = int(getattr(exc, "status_code", 502) or 502)
@@ -1281,24 +1360,34 @@ def _raise_cursor_agent_alias_error(
     message = str(getattr(exc, "message", None) or exc)
     model = str(candidate.get("model") or "")
     route_family = str(candidate.get("route_family") or "")
+    if status_code in (408, 504):
+        error_code = "upstream_timeout"
+        error_type = "upstream_timeout"
+    elif status_code in (500, 502, 503, 529):
+        error_code = "upstream_transient_internal"
+        error_type = "upstream_error"
+    else:
+        error_code = "aawm_codex_auto_agent_candidate_unavailable"
+        error_type = "authentication_error" if status_code == 401 else "upstream_error"
     detail = (
-        "aawm_codex_auto_agent_candidate_unavailable: "
         f"cursor_agent request failed; model={model} "
-        f"route_family={route_family}; {message}"
+        f"route_family={route_family}; status={status_code}; {message}"
     )
     proxy_exc = ProxyException(
         message=detail,
-        type="authentication_error" if status_code == 401 else "upstream_error",
+        type=error_type,
         param="model",
         code=status_code,
     )
+    setattr(proxy_exc, "status_code", status_code)
     setattr(
         proxy_exc,
         "detail",
         {
             "error": {
                 "message": detail,
-                "code": "aawm_codex_auto_agent_candidate_unavailable",
+                "type": error_type,
+                "code": error_code,
             }
         },
     )

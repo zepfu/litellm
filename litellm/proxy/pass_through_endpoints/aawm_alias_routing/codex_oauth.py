@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import hashlib
 import json
 import os
 import math
@@ -416,6 +417,7 @@ async def _load_bound_codex_oauth_auth(
                 "attempted_provider_call": False,
             },
         )
+    _record_codex_oauth_dispatched_auth(request, selection)
     return selection
 
 
@@ -424,6 +426,115 @@ async def _load_local_codex_auth_headers(request: Request) -> dict[str, str]:
     selection = await _load_local_codex_auth_selection(request)
     return dict(selection.headers)
 
+
+
+# ---------------------------------------------------------------------------
+# OPENAI-024: token_invalidated recovery. Auth invalidation is not capacity:
+# it never applies a cooldown. Dispatched-token fingerprints are request-local
+# and secret-safe (SHA-256 over header items, never the token itself).
+# ---------------------------------------------------------------------------
+
+_CODEX_OAUTH_INVALIDATION_RECOVERY_STATE_ATTR = (
+    "aawm_codex_oauth_invalidation_recovery"
+)
+
+
+def _codex_oauth_auth_fingerprint(auth: "CodexOAuthRequestAuth") -> str:
+    material = json.dumps(sorted(auth.headers.items()), separators=(",", ":"))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _get_codex_oauth_invalidation_recovery_state(
+    request: Request,
+) -> dict[str, Any]:
+    state = getattr(
+        request.state, _CODEX_OAUTH_INVALIDATION_RECOVERY_STATE_ATTR, None
+    )
+    if not isinstance(state, dict):
+        state = {"fingerprints": {}, "reloaded": set()}
+        setattr(
+            request.state,
+            _CODEX_OAUTH_INVALIDATION_RECOVERY_STATE_ATTR,
+            state,
+        )
+    return state
+
+
+def _record_codex_oauth_dispatched_auth(
+    request: Request,
+    auth: "CodexOAuthRequestAuth",
+) -> None:
+    state = _get_codex_oauth_invalidation_recovery_state(request)
+    state["fingerprints"][auth.account_label] = _codex_oauth_auth_fingerprint(
+        auth
+    )
+
+
+async def reload_codex_oauth_credential_after_token_invalidated(
+    request: Request,
+    *,
+    account_label: str,
+    model: Optional[str] = None,
+    expected_account_hash: Optional[str] = None,
+    expected_lane_key: Optional[str] = None,
+) -> Optional["CodexOAuthRequestAuth"]:
+    """Re-read the selected managed credential once after token_invalidated.
+
+    The re-read runs under the account's existing credential file lock and
+    returns fresh auth only when the token material changed since dispatch.
+    Returns ``None`` (never raises) when the material is unchanged, the
+    account was already re-read for this request, no dispatch fingerprint
+    exists, or the credential is not readable; callers then traverse other
+    eligible accounts (replay-safe requests) or signal redispatch-required.
+    """
+    cleaned_label = _clean_codex_auth_value(account_label)
+    if cleaned_label is None:
+        return None
+    state = getattr(
+        request.state, _CODEX_OAUTH_INVALIDATION_RECOVERY_STATE_ATTR, None
+    )
+    if not isinstance(state, dict):
+        return None
+    reloaded = state.setdefault("reloaded", set())
+    if cleaned_label in reloaded:
+        return None
+    prior_fingerprint = state.get("fingerprints", {}).get(cleaned_label)
+    if prior_fingerprint is None:
+        return None
+    reloaded.add(cleaned_label)
+
+    from litellm.secret_managers.credential_file_lock import (
+        CredentialFileLockError,
+        credential_file_lock,
+    )
+
+    try:
+        inventory = load_codex_oauth_inventory()
+        record = inventory.select_record(label=cleaned_label, model=model)
+    except CodexOAuthInventoryError:
+        return None
+    try:
+        with credential_file_lock(record.lock_path):
+            selection = await _load_codex_oauth_headers_for_record(
+                request, record
+            )
+    except (HTTPException, CredentialFileLockError):
+        return None
+    if _codex_oauth_auth_fingerprint(selection) == prior_fingerprint:
+        return None
+    if (
+        (
+            expected_account_hash is not None
+            and selection.account_hash != expected_account_hash
+        )
+        or (
+            expected_lane_key is not None
+            and selection.lane_key != expected_lane_key
+        )
+    ):
+        return None
+    _record_codex_oauth_dispatched_auth(request, selection)
+    return selection
 
 
 # ---------------------------------------------------------------------------
