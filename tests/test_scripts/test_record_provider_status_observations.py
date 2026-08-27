@@ -2041,12 +2041,26 @@ def test_oauth_schedule_reinspects_external_replacement_after_local_failure(
 
 
 def test_xai_incident_deadline_boundary_does_not_consume_attempt_throttle() -> None:
+    eligibility_cadence_seconds = 300.0
+    refresh_attempt_interval_seconds = 300.0
+    refresh_buffer_seconds = 900.0
+    consumer_rejection_buffer_seconds = 300.0
     issuance = datetime(2026, 8, 12, 17, 18, 43, 881054, tzinfo=timezone.utc)
     expiry = datetime(2026, 8, 12, 23, 18, 43, 881054, tzinfo=timezone.utc)
     assert expiry - issuance == timedelta(hours=6)
-    due_boundary = expiry - timedelta(minutes=15)
+    due_boundary = expiry - timedelta(seconds=refresh_buffer_seconds)
     assert due_boundary == datetime(
         2026, 8, 12, 23, 3, 43, 881054, tzinfo=timezone.utc
+    )
+    first_observation = due_boundary - timedelta(
+        seconds=eligibility_cadence_seconds
+    )
+    next_observation = first_observation + timedelta(
+        seconds=eligibility_cadence_seconds
+    )
+    assert next_observation == due_boundary
+    consumer_rejection_boundary = expiry - timedelta(
+        seconds=consumer_rejection_buffer_seconds
     )
 
     schedule = loop.OAuthRefreshScheduleState()
@@ -2054,8 +2068,8 @@ def test_xai_incident_deadline_boundary_does_not_consume_attempt_throttle() -> N
     calls = []
     eligibility_times = iter(
         (
-            datetime(2026, 8, 12, 22, 38, 44, tzinfo=timezone.utc),
-            datetime(2026, 8, 12, 23, 3, 44, tzinfo=timezone.utc),
+            first_observation,
+            next_observation,
         )
     )
 
@@ -2091,16 +2105,23 @@ def test_xai_incident_deadline_boundary_does_not_consume_attempt_throttle() -> N
             "value", value
         ),
         now_monotonic=100.0,
-        wall_now=datetime(2026, 8, 12, 22, 38, 44, tzinfo=timezone.utc),
+        wall_now=first_observation,
         eligibility_inspector=inspect,
         refresh_call=refresh,
         force=False,
-        attempt_interval_seconds=300.0,
-        eligibility_cadence_seconds=300.0,
-        buffer_seconds=900.0,
+        attempt_interval_seconds=refresh_attempt_interval_seconds,
+        eligibility_cadence_seconds=eligibility_cadence_seconds,
+        buffer_seconds=refresh_buffer_seconds,
     )
     assert first[3]["refresh_result_class"] == "refresh_not_due"
     assert first[3]["actual_attempted"] is False
+    assert first[3]["eligibility_cadence_seconds"] == eligibility_cadence_seconds
+    assert (
+        first[3]["refresh_attempt_interval_seconds"]
+        == refresh_attempt_interval_seconds
+    )
+    assert first[3]["refresh_buffer_seconds"] == refresh_buffer_seconds
+    assert last_attempt["value"] is None
     assert calls == []
 
     second = loop._run_oauth_refresh_schedule(
@@ -2110,17 +2131,28 @@ def test_xai_incident_deadline_boundary_does_not_consume_attempt_throttle() -> N
             "value", value
         ),
         now_monotonic=101.0,
-        wall_now=datetime(2026, 8, 12, 23, 3, 44, tzinfo=timezone.utc),
+        wall_now=next_observation,
         eligibility_inspector=inspect,
         refresh_call=refresh,
         force=False,
-        attempt_interval_seconds=300.0,
-        eligibility_cadence_seconds=300.0,
-        buffer_seconds=900.0,
+        attempt_interval_seconds=refresh_attempt_interval_seconds,
+        eligibility_cadence_seconds=eligibility_cadence_seconds,
+        buffer_seconds=refresh_buffer_seconds,
     )
     assert second[3]["refresh_result_class"] == "refresh_due"
     assert second[3]["actual_attempted"] is True
-    assert second[3]["last_actual_attempt_at"] == "2026-08-12T23:03:44Z"
+    assert second[3]["eligibility_cadence_seconds"] == eligibility_cadence_seconds
+    assert (
+        second[3]["refresh_attempt_interval_seconds"]
+        == refresh_attempt_interval_seconds
+    )
+    assert second[3]["refresh_buffer_seconds"] == refresh_buffer_seconds
+    assert second[3]["last_actual_attempt_at"] == next_observation.isoformat().replace(
+        "+00:00", "Z"
+    )
+    assert consumer_rejection_boundary - next_observation >= timedelta(
+        seconds=consumer_rejection_buffer_seconds
+    )
     assert calls == [True]
 
 
