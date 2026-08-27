@@ -1014,7 +1014,7 @@ def _cursor_response_input_items(request_body: dict[str, Any]) -> list[Any]:
     return [raw_input]
 
 
-def _responses_input_to_cursor_messages(
+def _responses_input_to_cursor_messages(  # noqa: PLR0915
     request_body: dict[str, Any],
     *,
     prior_messages: Optional[list[dict[str, Any]]] = None,
