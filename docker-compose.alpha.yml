@@ -78,7 +78,9 @@ services:
       - /home/zepfu/.litellm/xai:/home/zepfu/.litellm/xai:ro
       - /home/zepfu/.kimi-code/credentials:/home/zepfu/.kimi-code/credentials:ro
       - /home/zepfu/.hermes:/home/zepfu/.hermes:ro
-      - /home/zepfu/.config/cursor/auth.json:/home/zepfu/.config/cursor/auth.json:ro
+      # Mount the containing directory (not the single auth file) so sidecar
+      # atomic auth replacement is visible without recreating alpha.
+      - /home/zepfu/.config/cursor:/home/zepfu/.config/cursor:ro
       - ${AAWM_KIMI_NATIVE_DESCRIPTOR_DIR:-/home/zepfu/.kimi-code/native-contract}:/run/aawm/kimi-descriptor:ro
       - ${AAWM_GROK_CLIENT_VERSION_CACHE_DIR:-/home/zepfu/.cache/aawm/grok}:/run/aawm/grok:ro
       - /home/zepfu/.qwen/settings.json:/home/zepfu/.qwen/settings.json:ro

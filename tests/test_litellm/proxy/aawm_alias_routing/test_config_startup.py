@@ -1227,8 +1227,8 @@ class TestAlphaComposeContract:
         volumes = alpha["volumes"]
         assert isinstance(volumes, list)
         cursor_mount = (
-            "/home/zepfu/.config/cursor/auth.json:"
-            "/home/zepfu/.config/cursor/auth.json:ro"
+            "/home/zepfu/.config/cursor:"
+            "/home/zepfu/.config/cursor:ro"
         )
         assert cursor_mount in volumes
 

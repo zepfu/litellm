@@ -45,8 +45,9 @@ does not share candidate cooldown or affinity keys with `litellm-dev`.
 - Tailscale endpoint: `http://100.109.19.233:4011`
 - Config: `/app/litellm-dev-config.yaml`, bind-mounted from this repository
 - Source: `/app`, bind-mounted read-only from this repository
-- Cursor GUI auth file: `/home/zepfu/.config/cursor/auth.json`, bind-mounted
-  read-only at the same path
+- Cursor GUI auth directory: `/home/zepfu/.config/cursor`, bind-mounted
+  read-only at the same path; the directory mount keeps sidecar atomic
+  auth-file replacement visible without recreating alpha
 - Cursor auth path variable:
   `LITELLM_CURSOR_AGENT_AUTH_FILE=/home/zepfu/.config/cursor/auth.json`
 - Proxy environment label:
@@ -62,7 +63,8 @@ does not share candidate cooldown or affinity keys with `litellm-dev`.
 - Session-history spool:
   `/app/.analysis/runtime/litellm-alpha/session_history`
 
-The Cursor Agent provider reads the mounted GUI auth file. A fresh
+The Cursor Agent provider reads the GUI auth file inside the mounted
+directory. A fresh
 `accessToken` is used directly; an `apiKey`/`api_key` is exchanged with
 `https://api2.cursor.sh/auth/exchange_user_api_key`, and the returned
 `accessToken` is used as the Agent bearer credential. Only the auth-file path
@@ -129,7 +131,9 @@ On August 27, 2026, current alpha live acceptance succeeded as follows:
 
 - `read` and `basic` succeeded through `zai_coding_plan/glm-5.3-flash`.
 - `work` succeeded through `cursor_agent/cursor-grok-4.6-high` without xAI
-  fallback.
+  fallback in the temporary Cursor-first work graph. This August 27, 2026
+  result is historical and is not evidence for the current shared CFG-035/038
+  graph.
 - `expert` succeeded through `gpt-5.6-terra`.
 - `sota-openai` (`gpt` role) succeeded through `gpt-5.6-sol`.
 
@@ -167,7 +171,7 @@ development database connections for parity. Treat all calls as real provider
 and development-data operations. It is isolated by port, container name,
 environment label, process application names, and alias-routing Redis
 namespace, but it is not a sandbox for destructive database or provider tests.
-The Cursor auth-file wiring is testing-only. The August 27, 2026 alpha
-acceptance records successful `work` routing through
-Cursor without xAI fallback, not `litellm-dev`/production acceptance or
-production evidence.
+The Cursor auth-file wiring is testing-only. The August 27, 2026 `work`
+acceptance is historical for the temporary Cursor-first work graph; it is not
+evidence for the current shared CFG-035/038 graph or
+`litellm-dev`/production acceptance.
