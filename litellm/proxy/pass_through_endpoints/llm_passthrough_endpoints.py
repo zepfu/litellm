@@ -5973,7 +5973,11 @@ async def openai_proxy_route(  # noqa: PLR0915
                     candidate=candidate if isinstance(candidate, dict) else None,
                     endpoint=endpoint,
                     provider_returned=(
-                        attempted_provider_call and isinstance(exc, ProxyException)
+                        attempted_provider_call
+                        and (
+                            isinstance(exc, ProxyException)
+                            or bool(getattr(exc, "_aawm_provider_returned", False))
+                        )
                     ),
                 )
                 and _codex_auto_agent_request_has_continuation_state(request_body)
@@ -6019,7 +6023,11 @@ async def openai_proxy_route(  # noqa: PLR0915
                 candidate=candidate if isinstance(candidate, dict) else None,
                 endpoint=endpoint,
                 provider_returned=(
-                    attempted_provider_call and isinstance(exc, ProxyException)
+                    attempted_provider_call
+                    and (
+                        isinstance(exc, ProxyException)
+                        or bool(getattr(exc, "_aawm_provider_returned", False))
+                    )
                 ),
             ):
                 raise

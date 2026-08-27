@@ -42,6 +42,9 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     AliasRoutingStateManager,
     alias_routing_state,
 )
+from litellm.proxy.pass_through_endpoints.streaming_handler import (
+    ResponsesStreamPreCommitFailure,
+)
 from litellm.secret_managers import codex_oauth_inventory
 from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialRecord,
@@ -122,6 +125,30 @@ def _unpersisted_item_not_found_error() -> ProxyException:
         }
     }
     return exc
+
+
+def _stream_token_invalidated_error() -> HTTPException:
+    return ResponsesStreamPreCommitFailure(
+        error_class="token_invalidated",
+        classification="token_invalidated",
+        retryable=False,
+        error_code="token_invalidated",
+        error_type="invalid_request_error",
+        status_code=401,
+        message="The access token has been invalidated.",
+    ).as_http_exception()
+
+
+def _stream_unpersisted_item_not_found_error() -> HTTPException:
+    return ResponsesStreamPreCommitFailure(
+        error_class="openai_responses_unpersisted_item_not_found",
+        classification="openai_responses_unpersisted_item_not_found",
+        retryable=False,
+        error_code="invalid_request_error",
+        error_type="invalid_request_error",
+        status_code=400,
+        message=_OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE,
+    ).as_http_exception()
 
 
 
@@ -1012,7 +1039,7 @@ async def test_candidate_loop_token_invalidated_fails_over_without_cooldown(
         candidate_body: dict[str, Any],
     ) -> Response:
         if candidate["codex_oauth_account_label"] == "account1":
-            raise _token_invalidated_error()
+            raise _stream_token_invalidated_error()
         return Response(content=b"recovered", status_code=200)
 
     def _resolve_publication(**kwargs: Any) -> CooldownPublicationPlan:
@@ -4052,7 +4079,7 @@ async def test_candidate_loop_unpersisted_item_not_found_continuation_uses_sessi
         candidate_body: dict[str, Any],
     ) -> Response:
         performed_labels.append(candidate["codex_oauth_account_label"])
-        raise _unpersisted_item_not_found_error()
+        raise _stream_unpersisted_item_not_found_error()
 
     async def _zero(_key: str) -> tuple[float, str]:
         return 0.0, "local_fallback"
@@ -4098,10 +4125,10 @@ async def test_candidate_loop_unpersisted_item_not_found_continuation_uses_sessi
         await candidate_loop.handle_alias_route(
             services,
             alias_family="codex_auto_agent",
-            alias_model="basic",
+            alias_model="codex-auto-review",
             request=request,
             prepared_request_body={
-                "model": "basic",
+                "model": "codex-auto-review",
                 "previous_response_id": "resp_store_false_1",
             },
             max_candidate_attempts=1,

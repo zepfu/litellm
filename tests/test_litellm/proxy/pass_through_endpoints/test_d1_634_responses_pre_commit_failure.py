@@ -108,6 +108,7 @@ def _failed_lifecycle_stream(
 class _FakeUpstreamStream:
     def __init__(self, chunks: list[bytes]) -> None:
         self._chunks = chunks
+        self.aiter_calls = 0
         self.status_code = 200
         self.headers = httpx.Headers({"content-type": "text/event-stream"})
         self.request = httpx.Request(
@@ -116,6 +117,7 @@ class _FakeUpstreamStream:
         )
 
     async def aiter_bytes(self):
+        self.aiter_calls += 1
         for chunk in self._chunks:
             yield chunk
 
@@ -203,6 +205,209 @@ async def test_peek_holds_lifecycle_until_failed_without_downstream_commit():
     assert failure.retryable is True
     assert failure.classification == "transient_capacity"
     assert isinstance(peeked, object)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "error_code",
+        "error_message",
+        "expected_error_class",
+        "expected_status_code",
+    ),
+    [
+        (
+            "token_invalidated",
+            "The access token has been invalidated.",
+            "token_invalidated",
+            401,
+        ),
+        (
+            "invalid_request_error",
+            (
+                "Item with id 'rs_abc123' not found. "
+                "Items are not persisted when store is set to false. "
+                "Try again with store set to true."
+            ),
+            "openai_responses_unpersisted_item_not_found",
+            400,
+        ),
+    ],
+    ids=["token-invalidated", "unpersisted-rs-item"],
+)
+async def test_peek_classifies_native_codex_recovery_errors_before_commit(
+    error_code: str,
+    error_message: str,
+    expected_error_class: str,
+    expected_status_code: int,
+) -> None:
+    chunks = [
+        _sse(
+            "response.created",
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_recovery",
+                    "status": "in_progress",
+                    "model": "gpt-5.4",
+                    "output": [],
+                },
+            },
+        ),
+        _sse(
+            "error",
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": error_code,
+                    "message": error_message,
+                },
+            },
+        ),
+    ]
+
+    peeked, failure = await PassThroughStreamingHandler.peek_responses_pre_commit_stream(
+        _FakeUpstreamStream(chunks)
+    )
+
+    assert failure is not None
+    assert failure.error_class == expected_error_class
+    assert failure.status_code == expected_status_code
+    assert failure.provider_returned is True
+    http_exc = failure.as_http_exception()
+    assert http_exc.status_code == expected_status_code
+    assert getattr(http_exc, "_aawm_provider_returned", False) is True
+    assert [chunk async for chunk in peeked.aiter_bytes()] == chunks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "error_code",
+        "error_message",
+        "expected_error_class",
+        "raw_error_marker",
+    ),
+    [
+        (
+            "token_invalidated",
+            "The access token has been invalidated.",
+            "token_invalidated",
+            "The access token has been invalidated.",
+        ),
+        (
+            "invalid_request_error",
+            (
+                "Item with id 'rs_abc123' not found. "
+                "Items are not persisted when store is set to false. "
+                "Try again with store set to true."
+            ),
+            "openai_responses_unpersisted_item_not_found",
+            "Items are not persisted when store is set to false.",
+        ),
+    ],
+    ids=["token-invalidated", "unpersisted-rs-item"],
+)
+async def test_chunk_processor_terminalizes_native_recovery_once_after_commit(
+    error_code: str,
+    error_message: str,
+    expected_error_class: str,
+    raw_error_marker: str,
+) -> None:
+    response_chunks = [
+        _sse(
+            "response.created",
+            {
+                "type": "response.created",
+                "response": {
+                    "id": "resp_recovery",
+                    "status": "in_progress",
+                    "model": "gpt-5.4",
+                    "output": [],
+                },
+            },
+        ),
+        _sse(
+            "response.output_text.delta",
+            {
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "delta": "hello",
+            },
+        ),
+        _sse(
+            "error",
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": error_code,
+                    "message": error_message,
+                },
+            },
+        ),
+    ]
+    response = _FakeUpstreamStream(response_chunks)
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {}
+    success_handler_kwargs = _route_kwargs()
+    success_handler_kwargs["litellm_params"]["metadata"].update(
+        {
+            "codex_auto_agent_selected_provider": "openai",
+            "codex_auto_agent_selected_model": "gpt-5.4",
+            "codex_auto_agent_selected_account_label": "account1",
+            "codex_auto_agent_selected_account_hash": "hash-account-1",
+            "codex_auto_agent_selected_account_lane": (
+                "codex-oauth:account1:hash-account-1"
+            ),
+            "model_alias_label": "codex-auto-review",
+            "canonical_session_identity": "session-1",
+        }
+    )
+    finalize = AsyncMock()
+
+    with patch.object(
+        PassThroughStreamingHandler,
+        "_route_streaming_logging_to_handler",
+        new=finalize,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.emit_aawm_route_status_event"
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup"
+    ):
+        emitted = [
+            chunk
+            async for chunk in PassThroughStreamingHandler.chunk_processor(
+                response=response,
+                request_body={
+                    "model": "gpt-5.4",
+                    "previous_response_id": "resp-previous",
+                    "stream": True,
+                },
+                litellm_logging_obj=logging_obj,
+                endpoint_type=EndpointType.OPENAI,
+                start_time=datetime.now(),
+                passthrough_success_handler_obj=MagicMock(
+                    spec=PassThroughEndpointLogging
+                ),
+                url_route="https://chatgpt.com/backend-api/codex/responses",
+                custom_llm_provider="openai",
+                success_handler_kwargs=success_handler_kwargs,
+            )
+        ]
+        await asyncio.sleep(0)
+
+    rendered = b"".join(emitted).decode("utf-8")
+    assert rendered.count("event: response.failed") == 1
+    assert rendered.count("data: [DONE]") == 1
+    assert rendered.count('"delta":"hello"') == 1
+    assert raw_error_marker not in rendered
+    metadata = success_handler_kwargs["litellm_params"]["metadata"]
+    assert metadata["error_class"] == expected_error_class
+    assert metadata["stream_hidden_retry_safe"] is False
+    assert response.aiter_calls == 1
+    finalize.assert_awaited_once()
 
 
 @pytest.mark.asyncio

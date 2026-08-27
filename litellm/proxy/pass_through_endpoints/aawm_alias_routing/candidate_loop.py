@@ -870,7 +870,16 @@ async def handle_alias_route(  # noqa: PLR0915
                             endpoint=_request_endpoint_path(request),
                             provider_returned=(
                                 attempted_provider_call
-                                and isinstance(probe_failure_exc, ProxyException)
+                                and (
+                                    isinstance(probe_failure_exc, ProxyException)
+                                    or bool(
+                                        getattr(
+                                            probe_failure_exc,
+                                            "_aawm_provider_returned",
+                                            False,
+                                        )
+                                    )
+                                )
                             ),
                         )
                     ):

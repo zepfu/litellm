@@ -101,6 +101,12 @@ _RESPONSES_ACCOUNT_EXHAUSTION_CLASSES = frozenset(
         "usage_limit_reached",
     }
 )
+_RESPONSES_STREAM_REDISPATCH_CLASSES = frozenset(
+    {
+        "token_invalidated",
+        "openai_responses_unpersisted_item_not_found",
+    }
+)
 
 
 class ResponsesStreamPreCommitFailure(Exception):
@@ -130,10 +136,11 @@ class ResponsesStreamPreCommitFailure(Exception):
         self.pre_commit_retry_exhausted = pre_commit_retry_exhausted
         self.error_payload = error_payload if isinstance(error_payload, dict) else None
         self.message = message or classification
+        self.provider_returned = True
         self.detail = {
             "error": {
                 "message": self.message,
-                "type": error_class,
+                "type": error_type or error_class,
                 "code": error_code or classification,
                 "retryable": retryable,
             }
@@ -161,11 +168,13 @@ class ResponsesStreamPreCommitFailure(Exception):
             else:
                 retry_after_header = str(retry_after)
             headers = {"Retry-After": retry_after_header}
-        return HTTPException(
+        http_exception = HTTPException(
             status_code=status_code,
             detail=self.detail,
             headers=headers,
         )
+        setattr(http_exception, "_aawm_provider_returned", self.provider_returned)
+        return http_exception
 
 
 class _PrefixedHttpxByteStream:
@@ -516,9 +525,89 @@ class PassThroughStreamingHandler:
         return None
 
     @staticmethod
+    def _extract_responses_stream_error_fields(
+        error_payload: Optional[Dict[str, Any]],
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        if not isinstance(error_payload, dict):
+            return None, None, None
+
+        candidates: List[Dict[str, Any]] = [error_payload]
+        nested_error = error_payload.get("error")
+        if isinstance(nested_error, dict):
+            candidates.append(nested_error)
+        response_payload = error_payload.get("response")
+        if isinstance(response_payload, dict):
+            response_error = response_payload.get("error")
+            if isinstance(response_error, dict):
+                candidates.append(response_error)
+
+        code: Optional[str] = None
+        error_type: Optional[str] = None
+        message: Optional[str] = None
+        for candidate in candidates:
+            if code is None:
+                raw_code = candidate.get("code")
+                if isinstance(raw_code, str) and raw_code.strip():
+                    code = raw_code.strip()
+            if error_type is None:
+                raw_type = candidate.get("type")
+                if isinstance(raw_type, str) and raw_type.strip():
+                    error_type = raw_type.strip()
+            if message is None:
+                raw_message = candidate.get("message")
+                if isinstance(raw_message, str) and raw_message.strip():
+                    message = raw_message.strip()
+            if code is not None and error_type is not None and message is not None:
+                break
+        return code, error_type, message
+
+    @staticmethod
+    def _is_responses_unpersisted_item_not_found_payload(
+        error_payload: Optional[Dict[str, Any]],
+    ) -> bool:
+        code, error_type, message = (
+            PassThroughStreamingHandler._extract_responses_stream_error_fields(
+                error_payload
+            )
+        )
+        if not isinstance(message, str):
+            return False
+        if error_type not in {"invalid_request_error", "error", None}:
+            return False
+        if (
+            error_type != "invalid_request_error"
+            and code != "invalid_request_error"
+        ):
+            return False
+        from .aawm_alias_routing.error_signals import (
+            _OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_RE,
+        )
+
+        return (
+            _OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_RE.fullmatch(message)
+            is not None
+        )
+
+    @staticmethod
     def _classify_responses_pre_commit_error(
         error_payload: Optional[Dict[str, Any]],
     ) -> tuple[str, str, bool]:
+        error_code, error_type, error_message = (
+            PassThroughStreamingHandler._extract_responses_stream_error_fields(
+                error_payload
+            )
+        )
+        if error_code == "token_invalidated":
+            return "token_invalidated", "token_invalidated", False
+        if PassThroughStreamingHandler._is_responses_unpersisted_item_not_found_payload(
+            error_payload
+        ):
+            return (
+                "openai_responses_unpersisted_item_not_found",
+                "openai_responses_unpersisted_item_not_found",
+                False,
+            )
+
         tokens: set[str] = set()
         if isinstance(error_payload, dict):
             for key in ("code", "type", "param"):
@@ -539,6 +628,9 @@ class PassThroughStreamingHandler:
                     nested_message = nested.get("message")
                     if isinstance(nested_message, str) and nested_message.strip():
                         tokens.add(nested_message.strip().lower())
+        for value in (error_code, error_type, error_message):
+            if isinstance(value, str) and value.strip():
+                tokens.add(value.strip().lower())
         joined = " ".join(sorted(tokens))
         if any(
             marker in joined
@@ -626,21 +718,41 @@ class PassThroughStreamingHandler:
                 error_payload
             )
         )
+        extracted_code, extracted_type, extracted_message = (
+            PassThroughStreamingHandler._extract_responses_stream_error_fields(
+                error_payload
+            )
+        )
         sanitized_message = None
         error_code = None
         error_type = None
+        status_code = None
         if isinstance(error_payload, dict):
             sanitized_message = (
                 OpenAIPassthroughLoggingHandler._sanitize_responses_terminal_error_for_logging(
                     error_payload
                 )
             )
-            raw_code = error_payload.get("code")
-            raw_type = error_payload.get("type")
-            if isinstance(raw_code, str) and raw_code.strip():
-                error_code = raw_code.strip()
-            if isinstance(raw_type, str) and raw_type.strip():
-                error_type = raw_type.strip()
+            raw_status_code = error_payload.get("status_code")
+            if isinstance(raw_status_code, int):
+                status_code = raw_status_code
+            elif isinstance(raw_status_code, str) and raw_status_code.strip():
+                try:
+                    status_code = int(raw_status_code.strip())
+                except ValueError:
+                    status_code = None
+        if extracted_code:
+            error_code = extracted_code
+        if extracted_type:
+            error_type = extracted_type
+        if extracted_message:
+            sanitized_message = extracted_message
+        if error_class == "token_invalidated":
+            status_code = 401
+        elif error_class == "openai_responses_unpersisted_item_not_found":
+            status_code = 400
+            error_type = "invalid_request_error"
+            error_code = error_code or "invalid_request_error"
         if not sanitized_message:
             sanitized_message = classification
         if pre_commit_retry_exhausted and retryable:
@@ -652,10 +764,63 @@ class PassThroughStreamingHandler:
             retry_after_seconds=retry_after_seconds,
             error_code=error_code or event_type,
             error_type=error_type or event_type,
+            status_code=status_code,
             message=sanitized_message,
             pre_commit_retry_exhausted=pre_commit_retry_exhausted,
             error_payload=error_payload,
         )
+
+    @staticmethod
+    def _find_responses_stream_recovery_failure(
+        lines: List[str],
+    ) -> Optional[ResponsesStreamPreCommitFailure]:
+        for event_type, payload in PassThroughStreamingHandler._iter_responses_sse_events(
+            lines
+        ):
+            error_payload = (
+                PassThroughStreamingHandler._extract_responses_stream_error_payload(
+                    event_type,
+                    payload,
+                )
+            )
+            if error_payload is None:
+                continue
+            failure = PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                error_payload=error_payload,
+                event_type=event_type,
+            )
+            if failure.error_class in _RESPONSES_STREAM_REDISPATCH_CLASSES:
+                return failure
+        return None
+
+    @staticmethod
+    def _remove_responses_stream_recovery_failure_events(
+        chunk: bytes,
+    ) -> tuple[bytes, bool]:
+        """Remove native recovery errors while retaining same-chunk output."""
+        if not chunk:
+            return chunk, False
+        try:
+            decoded = chunk.decode("utf-8")
+        except (AttributeError, UnicodeDecodeError):
+            return b"", False
+
+        normalized = decoded.replace("\r\n", "\n")
+        blocks = normalized.split("\n\n")
+        filtered_blocks: List[str] = []
+        removed = False
+        for block in blocks:
+            if block:
+                failure = PassThroughStreamingHandler._find_responses_stream_recovery_failure(
+                    block.splitlines()
+                )
+                if failure is not None:
+                    removed = True
+                    continue
+            filtered_blocks.append(block)
+        if not removed:
+            return chunk, False
+        return "\n\n".join(filtered_blocks).encode("utf-8"), True
 
     @staticmethod
     async def peek_responses_pre_commit_stream(
@@ -1183,6 +1348,7 @@ class PassThroughStreamingHandler:
                 else None
             )
             responses_terminal_seen = False
+            responses_substantive_seen = False
             held_responses_done_suffix = b""
             buffer_raw_bytes = True
             if PassThroughStreamingHandler._stream_summary_first_finalize_eligible(
@@ -1266,16 +1432,19 @@ class PassThroughStreamingHandler:
                 downstream_byte_count += len(chunk)
                 _mark_first_emitted_chunk()
 
-            def _consume_responses_lines(lines: List[str]) -> None:
-                nonlocal responses_terminal_seen
+            def _consume_responses_lines(
+                lines: List[str],
+            ) -> Optional[ResponsesStreamPreCommitFailure]:
+                nonlocal responses_terminal_seen, responses_substantive_seen
                 if responses_sse_tracker is None:
-                    return
+                    return None
                 if not responses_terminal_seen:
                     responses_terminal_seen = (
                         PassThroughStreamingHandler._responses_lines_have_terminal_event(
                             lines
                         )
                     )
+                recovery_failure: Optional[ResponsesStreamPreCommitFailure] = None
                 for raw_line in lines:
                     line = _strip_chunk_line(raw_line)
                     if not line.startswith("data:"):
@@ -1290,10 +1459,34 @@ class PassThroughStreamingHandler:
                             responses_sse_tracker
                         )
                         continue
+                    if PassThroughStreamingHandler._is_responses_substantive_event(
+                        decoded_event.get("type"),
+                        decoded_event,
+                    ):
+                        responses_substantive_seen = True
+                    extracted_error = (
+                        PassThroughStreamingHandler._extract_responses_stream_error_payload(
+                            decoded_event.get("type"),
+                            decoded_event,
+                        )
+                    )
+                    if extracted_error is not None and recovery_failure is None:
+                        candidate_failure = (
+                            PassThroughStreamingHandler._build_responses_pre_commit_failure(
+                                error_payload=extracted_error,
+                                event_type=decoded_event.get("type"),
+                            )
+                        )
+                        if (
+                            candidate_failure.error_class
+                            in _RESPONSES_STREAM_REDISPATCH_CLASSES
+                        ):
+                            recovery_failure = candidate_failure
                     OpenAIPassthroughLoggingHandler._consume_responses_sse_event(
                         responses_sse_tracker,
                         decoded_event,
                     )
+                return recovery_failure
 
             async for chunk in response.aiter_bytes():
                 current_chunk_at = datetime.now()
@@ -1344,8 +1537,65 @@ class PassThroughStreamingHandler:
                         custom_llm_provider=custom_llm_provider,
                     )
                     responses_terminal_accumulator.feed(chunk)
-                    _consume_responses_lines(responses_terminal_accumulator.lines)
+                    recovery_failure = _consume_responses_lines(
+                        responses_terminal_accumulator.lines
+                    )
                     responses_terminal_accumulator.lines.clear()
+
+                    if (
+                        recovery_failure is not None
+                        and (
+                            responses_substantive_seen
+                            or downstream_chunk_count > 0
+                        )
+                    ):
+                        filtered_chunk, removed_failure = (
+                            PassThroughStreamingHandler._remove_responses_stream_recovery_failure_events(
+                                chunk
+                            )
+                        )
+                        if filtered_chunk and (
+                            removed_failure or recovery_failure is None
+                        ):
+                            _record_responses_wire_chunk(filtered_chunk)
+                            await _publish_transfer_chunks(
+                                first_downstream=first_emitted_at is not None
+                                and downstream_chunk_count == 1
+                            )
+                            yield filtered_chunk
+                        failure_context = (
+                            PassThroughStreamingHandler._build_responses_stream_redispatch_failure_context(
+                                failure=recovery_failure,
+                                request_body=(
+                                    request_body
+                                    if isinstance(request_body, dict)
+                                    else None
+                                ),
+                                success_handler_kwargs=success_handler_kwargs,
+                                url_route=url_route,
+                                custom_llm_provider=custom_llm_provider,
+                                chunk_count=chunk_count,
+                                total_stream_bytes=total_stream_bytes,
+                            )
+                        )
+                        metadata.update(failure_context)
+                        metadata["aawm_stream_interrupted"] = True
+                        metadata["aawm_route_rollup_turn_suppressed"] = True
+                        held_responses_done_suffix = b""
+                        responses_terminal_seen = True
+                        terminal_chunks = (
+                            PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
+                                endpoint_type=endpoint_type,
+                                url_route=url_route,
+                                custom_llm_provider=custom_llm_provider,
+                                failure_context=failure_context,
+                                exc=recovery_failure,
+                            )
+                        )
+                        for terminal_chunk in terminal_chunks:
+                            _record_responses_wire_chunk(terminal_chunk)
+                            yield terminal_chunk
+                        break
 
                     if responses_terminal_seen:
                         if held_responses_done_suffix:
@@ -1944,6 +2194,153 @@ class PassThroughStreamingHandler:
         return context
 
     @staticmethod
+    def _build_responses_stream_redispatch_failure_context(
+        *,
+        failure: ResponsesStreamPreCommitFailure,
+        request_body: Optional[dict],
+        success_handler_kwargs: Optional[Dict[str, Any]],
+        url_route: str,
+        custom_llm_provider: Optional[str],
+        chunk_count: int,
+        total_stream_bytes: int,
+    ) -> Dict[str, Any]:
+        metadata = PassThroughStreamingHandler._ensure_streaming_metadata(
+            success_handler_kwargs
+        )
+        selected_provider = (
+            metadata.get("codex_auto_agent_selected_provider")
+            or custom_llm_provider
+            or "openai"
+        )
+        selected_model = (
+            metadata.get("codex_auto_agent_selected_model")
+            or (request_body or {}).get("model")
+        )
+        selected_route_family = (
+            metadata.get("codex_auto_agent_selected_route_family")
+            or metadata.get("route_family")
+            or "codex_responses"
+        )
+        candidate = {
+            "provider": selected_provider,
+            "model": selected_model,
+            "route_family": selected_route_family,
+            "codex_oauth_account_label": metadata.get(
+                "codex_auto_agent_selected_account_label"
+            ),
+            "codex_oauth_account_hash": metadata.get(
+                "codex_auto_agent_selected_account_hash"
+            ),
+            "codex_oauth_lane_key": metadata.get(
+                "codex_auto_agent_selected_account_lane"
+            ),
+        }
+        alias_model = (
+            metadata.get("model_alias_label")
+            or metadata.get("requested_model_alias")
+            or metadata.get("codex_auto_agent_alias")
+            or (request_body or {}).get("model")
+        )
+        session_identity = (
+            metadata.get("canonical_session_identity")
+            or metadata.get("session_id")
+        )
+        has_continuation_state = bool(
+            isinstance(request_body, dict)
+            and request_body.get("previous_response_id")
+        ) or alias_model == "codex-auto-review"
+        if failure.error_class == "token_invalidated":
+            failure_phase = (
+                "token_invalidated_continuation"
+                if has_continuation_state
+                else "token_invalidated_stream"
+            )
+            message = (
+                "Codex Responses stream authentication was invalidated after "
+                "output began; redispatch a fresh response."
+            )
+        else:
+            failure_phase = (
+                "openai_responses_unpersisted_item_not_found_continuation"
+                if has_continuation_state
+                else "openai_responses_unpersisted_item_not_found_stream"
+            )
+            message = (
+                "OpenAI Responses continuation referenced an unpersisted item "
+                "(store=false). Do not continue this session; redispatch a "
+                "fresh response."
+            )
+
+        from fastapi import HTTPException
+
+        from .aawm_alias_routing import session_affinity
+
+        try:
+            session_affinity.raise_session_owner_redispatch_required(
+                session_identity=(
+                    str(session_identity) if session_identity is not None else None
+                ),
+                alias_model=(
+                    str(alias_model) if alias_model is not None else None
+                ),
+                candidate=candidate,
+                failure_phase=failure_phase,
+                message=message,
+                attempted_provider_call=True,
+            )
+        except HTTPException as redispatch_exc:
+            detail = redispatch_exc.detail
+        else:
+            detail = {}
+
+        if not isinstance(detail, dict):
+            detail = {}
+        contract_error = detail.get("error")
+        if not isinstance(contract_error, dict):
+            contract_error = {
+                "message": message,
+                "type": "invalid_request_error",
+                "code": "aawm_session_owner_redispatch_required",
+            }
+        terminal_error_payload = {
+            "message": str(contract_error.get("message") or message),
+            "type": str(contract_error.get("type") or "invalid_request_error"),
+            "code": str(
+                contract_error.get("code")
+                or "aawm_session_owner_redispatch_required"
+            ),
+            "param": contract_error.get("param"),
+            "redispatch_required": True,
+        }
+        terminal_metadata = {
+            "redispatch_required": True,
+            "redispatch_reason": detail.get("redispatch_reason") or failure_phase,
+            "failure_phase": detail.get("failure_phase") or failure_phase,
+            "attempted_provider_call": True,
+            "canonical_session_identity": detail.get(
+                "canonical_session_identity"
+            )
+            or session_identity,
+        }
+        return {
+            "failure_kind": "streaming_session_owner_redispatch_required",
+            "error_class": failure.error_class,
+            "error_code": terminal_error_payload["code"],
+            "error_message": terminal_error_payload["message"],
+            "stream_failure_stage": "stream_interrupted_after_first_byte",
+            "stream_chunks_seen": chunk_count,
+            "stream_bytes_seen": total_stream_bytes,
+            "stream_hidden_retry_safe": False,
+            "responses_api_terminal": True,
+            "model": selected_model,
+            "model_alias": alias_model,
+            "route_family": selected_route_family,
+            "terminal_error_payload": terminal_error_payload,
+            "terminal_metadata": terminal_metadata,
+            "source_url": url_route,
+        }
+
+    @staticmethod
     def _build_post_first_byte_terminal_stream_chunks(
         *,
         endpoint_type: EndpointType,
@@ -2001,7 +2398,15 @@ class PassThroughStreamingHandler:
                 b"data: [DONE]\n\n",
             ]
 
-        message = failure_context.get("error_message")
+        custom_error_payload = failure_context.get("terminal_error_payload")
+        if isinstance(custom_error_payload, dict):
+            error_payload = dict(custom_error_payload)
+            message = error_payload.get("message")
+            if not isinstance(message, str) or not message:
+                message = failure_context.get("error_message")
+        else:
+            message = failure_context.get("error_message")
+            error_payload = {}
         if not message:
             if exc is None:
                 raise ValueError("exc is required for failed stream terminal chunks")
@@ -2009,14 +2414,15 @@ class PassThroughStreamingHandler:
                 "Streaming response interrupted after first byte due to upstream read "
                 f"timeout: {exc}"
             )
-        error_payload = {
-            "type": "proxy_stream_terminal_error",
-            "code": failure_context.get("error_code")
+        error_payload.setdefault("type", "proxy_stream_terminal_error")
+        error_payload.setdefault(
+            "code",
+            failure_context.get("error_code")
             or failure_context.get("failure_kind")
             or "streaming_upstream_read_failure",
-            "message": message,
-            "param": None,
-        }
+        )
+        error_payload.setdefault("message", message)
+        error_payload.setdefault("param", None)
 
         if endpoint_type == EndpointType.ANTHROPIC:
             payload = {
