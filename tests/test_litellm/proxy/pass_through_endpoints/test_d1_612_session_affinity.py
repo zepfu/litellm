@@ -1497,7 +1497,11 @@ def _codex_selector_request(thread_id: str = "selector-thread") -> Any:
     return request
 
 
-def _patch_codex_selector_basics(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, dict[str, Any]]:
+def _patch_codex_selector_basics(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    has_account_bound_state: bool = True,
+) -> tuple[Any, dict[str, Any]]:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing import selection as sel
 
     selector_globals = sel._select_codex_auto_agent_candidate.__globals__
@@ -1521,8 +1525,9 @@ def _patch_codex_selector_basics(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, 
         selector_globals, "_resolve_codex_session_key", lambda *_args, **_kwargs: "key"
     )
     monkeypatch.setitem(selector_globals, "_has_continuation_state", lambda _body: True)
+
     def _has_account_bound_state(_body: Any) -> bool:
-        return True
+        return has_account_bound_state
 
     monkeypatch.setitem(
         selector_globals, "_has_account_bound_state", _has_account_bound_state
@@ -1706,10 +1711,84 @@ async def test_codex_compatible_owned_redispatch_metadata_remains_pinned(
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_review_replay_safe_owned_alias_mismatch_uses_effective_identity(
+async def test_codex_account_bound_removed_owned_route_preserves_owner_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sel, candidate = _patch_codex_selector_basics(monkeypatch)
+    sel, _ = _patch_codex_selector_basics(
+        monkeypatch,
+        has_account_bound_state=True,
+    )
+    selector_globals = sel._select_codex_auto_agent_candidate.__globals__
+    monkeypatch.setitem(
+        selector_globals,
+        "_lookup_active_snapshot_canonical_alias",
+        lambda *_args, **_kwargs: "codex-auto-review",
+    )
+    request = _codex_selector_request("base-thread")
+    owner_record = {
+        "state": "owned",
+        "owner": "owner-a",
+        "attributes": {
+            "provider": "other",
+            "model": "removed-model",
+            "route_family": "other_route",
+            "codex_oauth_account_label": "owner-account",
+            "codex_oauth_account_hash": "owner-hash",
+            "codex_oauth_lane_key": "owner-lane",
+        },
+    }
+    owner_lookup = AsyncMock(return_value=(owner_record, "owner-key", None))
+    monkeypatch.setattr(sa, "get_session_owner_record", owner_lookup)
+    monkeypatch.setattr(
+        sa,
+        "owner_record_as_affinity_hint",
+        lambda _record, **_kwargs: dict(owner_record["attributes"]),
+    )
+    monkeypatch.setitem(
+        selector_globals,
+        "_find_codex_auto_agent_affinity_candidate",
+        lambda *_args, **_kwargs: None,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await sel._select_codex_auto_agent_candidate(
+            request=request,
+            request_body={
+                "model": "codex-auto-review",
+                "litellm_metadata": {"redispatch_ordinal": 1},
+                "input": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_owner",
+                        "encrypted_content": "account-bound",
+                    }
+                ],
+            },
+        )
+
+    assert exc_info.value.status_code == 429
+    detail = exc_info.value.detail
+    assert detail["error"]["code"] == "aawm_codex_auto_agent_redispatch_required"
+    assert detail["failure_phase"] == "account_bound_owner_unavailable"
+    assert detail["redispatch_required"] is True
+    assert detail["attempted_provider_call"] is False
+    assert detail["candidate"]["account_lane"] == "owner-lane"
+    owner_lookup.assert_awaited_once_with(
+        session_identity="base-thread:codex-auto-review",
+        request=request,
+        wait_for_foreign_reservation=True,
+    )
+    assert sa.get_request_effective_session_identity(request) is None
+
+
+@pytest.mark.asyncio
+async def test_codex_unbound_fresh_child_owned_route_mismatch_uses_effective_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sel, candidate = _patch_codex_selector_basics(
+        monkeypatch,
+        has_account_bound_state=False,
+    )
     selector_globals = sel._select_codex_auto_agent_candidate.__globals__
     monkeypatch.setitem(
         selector_globals,
@@ -1754,15 +1833,14 @@ async def test_codex_auto_review_replay_safe_owned_alias_mismatch_uses_effective
             "model": "codex-auto-review",
             "litellm_metadata": {"redispatch_ordinal": 1},
             "input": [
-                {"type": "reasoning", "summary": [{"type": "text", "text": "r"}]},
                 {"type": "function_call", "name": "inspect", "call_id": "call-1"},
-                {"type": "function_call_output", "call_id": "call-1", "output": "ok"},
             ],
         },
     )
 
     assert selected["selection_reason"] == "first_available"
     assert selected["candidate"] == candidate
+    assert selected["has_account_bound_state"] is False
     assert selected["canonical_session_identity"] == "base-thread"
     assert selected["session_owner_identity"].startswith(
         "aawm-session-owner-redispatch-v1:"

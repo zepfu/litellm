@@ -623,6 +623,120 @@ async def test_fragmented_streaming_sse_stamp_happens_after_reassembly():
     route_handler.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_xai_fragmented_streaming_sse_stamps_after_reassembly():
+    event = {
+        "type": "response.output_item.done",
+        "item": {
+            "type": "reasoning",
+            "id": "rs_xai_stream_split",
+            "encrypted_content": XAI_CIPHERTEXT,
+        },
+    }
+    reasoning_chunk = (
+        "event: response.output_item.done\n"
+        "data: "
+        + json.dumps(event)
+        + "\n\n"
+    ).encode("utf-8")
+    ciphertext_bytes = XAI_CIPHERTEXT.encode("utf-8")
+    ciphertext_start = reasoning_chunk.index(ciphertext_bytes)
+    split_at = ciphertext_start + len(ciphertext_bytes) // 2
+    terminal_chunk = (
+        "event: response.completed\n"
+        "data: "
+        + json.dumps(
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_xai_stream_split",
+                    "status": "completed",
+                    "output": [],
+                },
+            }
+        )
+        + "\n\n"
+    ).encode("utf-8")
+    provider_chunks = [
+        reasoning_chunk[:split_at],
+        reasoning_chunk[split_at:],
+        terminal_chunk,
+        b"data: [DONE]\n\n",
+    ]
+
+    async def _aiter_bytes():
+        for provider_chunk in provider_chunks:
+            yield provider_chunk
+
+    response = MagicMock()
+    response.headers = httpx.Headers({})
+    response.aiter_bytes = _aiter_bytes
+    logging_obj = MagicMock()
+    logging_obj.model_call_details = {}
+    logging_obj._update_completion_start_time = MagicMock()
+    success_handler_kwargs = {
+        "litellm_params": {
+            "metadata": {
+                "codex_auto_agent_selected_provider": "xai",
+                "codex_auto_agent_selected_model": "grok-4.6",
+                "codex_auto_agent_selected_route_family": "xai_oauth",
+            }
+        }
+    }
+    route_handler = AsyncMock()
+
+    with patch.object(
+        PassThroughStreamingHandler,
+        "_route_streaming_logging_to_handler",
+        route_handler,
+    ):
+        emitted = [
+            chunk
+            async for chunk in PassThroughStreamingHandler.chunk_processor(
+                response=response,
+                request_body={
+                    "model": "grok-4.6",
+                    "litellm_metadata": {
+                        "codex_auto_agent_selected_provider": "xai",
+                        "codex_auto_agent_selected_model": "grok-4.6",
+                        "codex_auto_agent_selected_route_family": "xai_oauth",
+                    },
+                },
+                litellm_logging_obj=logging_obj,
+                endpoint_type=EndpointType.OPENAI,
+                start_time=datetime.now(),
+                passthrough_success_handler_obj=MagicMock(
+                    spec=PassThroughEndpointLogging
+                ),
+                url_route="https://api.x.ai/v1/responses",
+                custom_llm_provider="xai",
+                success_handler_kwargs=success_handler_kwargs,
+            )
+        ]
+        await asyncio.sleep(0.05)
+
+    stamped_chunk = next(
+        chunk for chunk in emitted if b"response.output_item.done" in chunk
+    )
+    data_line = next(
+        line for line in stamped_chunk.splitlines() if line.startswith(b"data:")
+    )
+    parsed = json.loads(data_line.removeprefix(b"data:").strip())
+    stamped_item = parsed["item"]
+    assert stamped_item["encrypted_content"].startswith("aawm_erp:")
+    assert XAI_CIPHERTEXT in stamped_item["encrypted_content"]
+    _provenance, original = erp.unwrap_encrypted_content_with_provenance(
+        stamped_item["encrypted_content"]
+    )
+    assert original == XAI_CIPHERTEXT
+    assert stamped_item[erp.ROUTE_IDENTITY_FIELD] == {
+        "producer_provider": "xai",
+        "producer_model": "grok-4.6",
+        "producer_route_family": "xai_oauth",
+    }
+    route_handler.assert_awaited_once()
+
+
 def _assert_clean_upstream_encrypted_item(sent_json: dict[str, Any], ciphertext: str) -> None:
     assert isinstance(sent_json, dict)
     input_items = sent_json.get("input")

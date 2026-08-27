@@ -1358,6 +1358,14 @@ class PassThroughStreamingHandler:
                     custom_llm_provider=custom_llm_provider,
                 )
             )
+            is_non_openai_responses_stream = (
+                endpoint_type == EndpointType.OPENAI
+                and not is_fork_owned_responses_stream
+                and custom_llm_provider != "openai"
+                and OpenAIPassthroughLoggingHandler.is_openai_responses_route(
+                    url_route
+                )
+            )
             responses_terminal_accumulator = (
                 _PassThroughStreamLineAccumulator()
                 if is_fork_owned_responses_stream
@@ -1690,6 +1698,32 @@ class PassThroughStreamingHandler:
                         if modified_chunk is not None:
                             chunk = modified_chunk
 
+                if is_non_openai_responses_stream:
+                    responses_sse_event_buffer += bytes(chunk)
+                    complete_chunk, responses_sse_event_buffer = (
+                        PassThroughStreamingHandler._split_responses_sse_event_buffer(
+                            responses_sse_event_buffer
+                        )
+                    )
+                    if not complete_chunk:
+                        continue
+                    complete_chunk = PassThroughStreamingHandler._stamp_encrypted_reasoning_in_responses_sse_chunk(
+                        complete_chunk,
+                        request_body=(
+                            request_body if isinstance(request_body, dict) else None
+                        ),
+                        custom_llm_provider=custom_llm_provider,
+                    )
+                    downstream_chunk_count += 1
+                    downstream_byte_count += len(complete_chunk)
+                    _mark_first_emitted_chunk()
+                    await _publish_transfer_chunks(
+                        first_downstream=first_emitted_at is not None
+                        and downstream_chunk_count == 1
+                    )
+                    yield complete_chunk
+                    continue
+
                 # OPENAI-006 / CFG-029: stamp encrypted reasoning and
                 # aawm_route_identity on non-OpenAI Responses streams too
                 # (e.g. xAI) so producer identity survives into Ohmypi JSONL.
@@ -1772,6 +1806,17 @@ class PassThroughStreamingHandler:
                         responses_sse_tracker
                     )
                 )
+            elif is_non_openai_responses_stream and responses_sse_event_buffer:
+                trailing_partial = responses_sse_event_buffer
+                responses_sse_event_buffer = b""
+                downstream_chunk_count += 1
+                downstream_byte_count += len(trailing_partial)
+                _mark_first_emitted_chunk()
+                await _publish_transfer_chunks(
+                    first_downstream=first_emitted_at is not None
+                    and downstream_chunk_count == 1
+                )
+                yield trailing_partial
 
             # After all chunks are processed, handle post-processing
             end_time = datetime.now()

@@ -3590,6 +3590,13 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             if (
                 isinstance(session_owner_record, dict)
                 and sa._record_state(session_owner_record) == "owned"
+                # Replay-safe account-bound state must fail on owner removal
+                # before effective-identity selection can cross accounts.
+                and not (
+                    account_identity_pinned
+                    and _affinity_pins_account_identity(affinity)
+                    and sa.is_replay_safe_session_owner_redispatch_body(request_body)
+                )
             ):
                 return await _reselect_owned_affinity_with_effective_identity(
                     candidate={
