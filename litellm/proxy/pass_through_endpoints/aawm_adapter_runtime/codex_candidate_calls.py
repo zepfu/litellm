@@ -41,6 +41,10 @@ _CURSOR_REPLAY_PRESERVED_STATUS_CODES = frozenset(
 )
 
 
+class _CursorPostEgressOutputError(ValueError):
+    """A returned Cursor payload could not be normalized after provider Run."""
+
+
 def _close_cursor_retained_session(state: Optional[dict[str, Any]]) -> None:
     if not isinstance(state, dict):
         return
@@ -1020,6 +1024,16 @@ def _cursor_function_call_message(
     }
 
 
+def _validate_cursor_returned_tool_calls(tool_calls: list[Any]) -> None:
+    for tool_call in tool_calls:
+        item = _cursor_as_mapping(tool_call)
+        if not item.get("call_id") or not item.get("name"):
+            raise _CursorPostEgressOutputError(
+                "Cursor Agent returned a malformed function call; "
+                "call_id and name are required."
+            )
+
+
 def _cursor_tool_result_message(
     item: dict[str, Any],
     function_calls: dict[str, str],
@@ -1205,9 +1219,10 @@ def _responses_input_to_cursor_messages(  # noqa: PLR0915
 
 def _cursor_messages_with_result_tool_calls(
     messages: list[dict[str, Any]],
-    tool_calls: list[dict[str, Any]],
+    tool_calls: list[Any],
 ) -> list[dict[str, Any]]:
     replay_messages = copy.deepcopy(messages)
+    _validate_cursor_returned_tool_calls(tool_calls)
     if replay_messages and replay_messages[-1].get(
         _CURSOR_TOOL_CONTINUATION_CUE_MARKER
     ):
@@ -1403,6 +1418,13 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             await retained_session.aclose()
             raise
 
+        try:
+            replay_messages = _cursor_messages_with_result_tool_calls(
+                messages,
+                result.tool_calls,
+            )
+        except _CursorPostEgressOutputError as exc:
+            _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
         model = str(candidate.get("model") or request_body.get("model") or "")
         response_body = _cursor_responses_response_body(
             model=model,
@@ -1412,10 +1434,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             next_session = result.retained_session
             _store_cursor_replay_state(
                 response_body["id"],
-                messages=_cursor_messages_with_result_tool_calls(
-                    messages,
-                    result.tool_calls,
-                ),
+                messages=replay_messages,
                 tools=request_tools if isinstance(request_tools, list) else [],
                 retained_session=next_session,
             )
@@ -1483,6 +1502,8 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             stop_on_tool_call=True,
             retain_on_tool_call=True,
         )
+    except _CursorPostEgressOutputError:
+        raise
     except Exception as exc:
         if (
             isinstance(previous_response_id, str)
@@ -1503,16 +1524,23 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         previous_response_id=previous_response_id,
         replay_state=replay_state,
     )
-
-    model = str(candidate.get("model") or request_body.get("model") or "")
-    response_body = _cursor_responses_response_body(model=model, result=result)
+    try:
+        _validate_cursor_returned_tool_calls(result.tool_calls)
+        model = str(candidate.get("model") or request_body.get("model") or "")
+        response_body = _cursor_responses_response_body(model=model, result=result)
+    except _CursorPostEgressOutputError as exc:
+        _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
     if result.tool_calls:
-        _store_cursor_replay_state(
-            response_body["id"],
-            messages=_cursor_messages_with_result_tool_calls(
+        try:
+            replay_messages = _cursor_messages_with_result_tool_calls(
                 messages,
                 result.tool_calls,
-            ),
+            )
+        except _CursorPostEgressOutputError as exc:
+            _raise_cursor_agent_alias_error(exc=exc, candidate=candidate)
+        _store_cursor_replay_state(
+            response_body["id"],
+            messages=replay_messages,
             tools=request_tools if isinstance(request_tools, list) else [],
             retained_session=result.retained_session,
         )
@@ -1570,6 +1598,33 @@ def _raise_cursor_agent_alias_error(
         ineligibility_summary = (
             "the Cursor Agent session requested an unsupported operation"
         )
+    if isinstance(exc, _CursorPostEgressOutputError):
+        error_message = (
+            "Cursor Agent request failed after provider Run; "
+            f"model={model} route_family={route_family}; {message}"
+        )
+        proxy_exc = ProxyException(
+            message=error_message,
+            type="upstream_error",
+            param="model",
+            code=502,
+        )
+        setattr(proxy_exc, "status_code", 502)
+        setattr(proxy_exc, "candidate_status", "retryable")
+        setattr(proxy_exc, "failure_phase", "candidate_post_egress_normalization")
+        setattr(proxy_exc, "attempted_provider_call", True)
+        setattr(
+            proxy_exc,
+            "detail",
+            {
+                "error": {
+                    "message": error_message,
+                    "code": "upstream_transient_internal",
+                    "type": "upstream_error",
+                }
+            },
+        )
+        raise proxy_exc from exc
     elif isinstance(exc, ValueError):
         attempted_provider_call = False
         ineligibility_summary = "pre-egress Cursor request conversion failed"

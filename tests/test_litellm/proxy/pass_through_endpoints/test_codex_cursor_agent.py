@@ -869,6 +869,52 @@ def test_cursor_text_requires_turn_ended_and_tool_boundary_does_not(
     assert json.loads(response.body)["output"][0]["type"] == "function_call"
 
 
+@pytest.mark.parametrize("omitted_key", ["call_id", "name"])
+def test_cursor_malformed_returned_tool_call_is_post_egress_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+    omitted_key: str,
+) -> None:
+    from litellm.proxy._types import ProxyException
+
+    ran = False
+    tool_call = {
+        "id": "cursor-tool-call",
+        "call_id": "call-1",
+        "name": "exec_command",
+        "arguments": "{}",
+    }
+    tool_call.pop(omitted_key)
+
+    class FakeCursorClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self,
+            _payload: dict[str, Any],
+            **_kwargs: Any,
+        ) -> CursorAgentRunResult:
+            nonlocal ran
+            ran = True
+            return CursorAgentRunResult(tool_calls=[tool_call])
+
+    monkeypatch.setattr(
+        "litellm.llms.cursor_agent.connect.CursorAgentConnectClient",
+        FakeCursorClient,
+    )
+
+    with pytest.raises(ProxyException) as exc_info:
+        _call({"model": "work", "input": "run"})
+
+    exc = exc_info.value
+    assert ran is True
+    assert exc.status_code == 502
+    assert exc.detail["error"]["code"] == "upstream_transient_internal"
+    assert exc.failure_phase == "candidate_post_egress_normalization"
+    assert exc.attempted_provider_call is True
+    assert codex_candidate_calls._CURSOR_REPLAY_REGISTRY == {}
+
+
 def test_cursor_route_family_is_codex_only() -> None:
     with pytest.raises(ValueError, match="codex_cursor_agent_aiserver_adapter"):
         _call(
