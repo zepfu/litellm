@@ -1,8 +1,8 @@
 """CFG-035/038: operational alias replacement and retained Nous lane policy.
 
 Operational ``basic`` and ``work`` aliases no longer contain the withdrawn
-OX-alpha block. The ``work`` alias keeps the canonical direct Cursor, native
-xAI, and OAuth xAI Grok order.
+OX-alpha block. The ``work`` alias declares the shared CFG-035 graph and
+inherits the canonical Grok order through ``work-other`` and ``sota-xai``.
 
 No provider egress, no live Hermes reads.
 """
@@ -19,6 +19,10 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import (
     compile_yaml,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+    AliasReference,
+    RoutingCandidate,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
     compile_directory,
@@ -100,29 +104,39 @@ def test_basic_yaml_replaces_legacy_ox_alpha_block_with_zai_flash():
 
 def test_work_yaml_compiles_shared_cfg035_cfg038_graph():
     snapshot = compile_directory(_ALIAS_CONFIG_DIR)
-    work_candidates = snapshot.aliases["work"].candidates
-    first, second, third = work_candidates
-    assert _candidate_identity(first) == (
-        "cursor_agent",
-        "cursor_agent/cursor-grok-4.6-high",
-        "codex_cursor_agent_aiserver_adapter",
-    )
-    assert first.priority == 110
-    assert _candidate_identity(second) == (
-        "xai",
-        "xai/grok-4.6",
-        "codex_grok_native_responses_adapter",
-    )
-    assert second.priority == 100
-    assert _candidate_identity(third) == (
-        "xai",
-        "oa_xai/grok-4.6",
-        "codex_xai_oauth_responses_adapter",
-    )
-    assert third.priority == 90
+    entries = snapshot.aliases["work"].candidates
+    assert len(entries) == 6
+    assert [
+        (
+            ("REF", entry.alias_name, None, entry.priority)
+            if isinstance(entry, AliasReference)
+            else (entry.provider, entry.model, entry.route_family, entry.priority)
+        )
+        for entry in entries
+    ] == [
+        (
+            "zai_coding_plan",
+            _ZAI_MODEL,
+            _CODEX_ZAI_ROUTE_FAMILY,
+            110,
+        ),
+        ("openai", "gpt-5.3-codex-spark", "codex_responses", 100),
+        ("REF", "work-other", None, 90),
+        ("anthropic", "claude-sonnet-5[1m]", "anthropic_messages", 80),
+        ("anthropic", "claude-sonnet-5", "anthropic_messages", 70),
+        ("openai", "gpt-5.6-luna", "codex_responses", 0),
+    ]
+    for candidate in entries[3:5]:
+        assert isinstance(candidate, RoutingCandidate)
+        assert candidate.anthropic_route_family == "anthropic_messages"
+        assert candidate.reasoning_effort == "max"
+        assert candidate.tui_attached == "Claude"
+    luna = entries[-1]
+    assert isinstance(luna, RoutingCandidate)
+    assert luna.reasoning_effort == "max"
     assert not any(
         getattr(candidate, "model", None) in _LEGACY_OX_MODELS
-        for candidate in work_candidates
+        for candidate in entries
     )
 
 

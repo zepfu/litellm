@@ -122,8 +122,9 @@ def test_standalone_alias_mappings() -> None:
         assert candidate.reasoning_effort == reasoning_effort
 
 
-def test_work_yaml_compiles_shared_cfg035_cfg038_graph() -> None:
+def test_work_yaml_compiles_current_graph() -> None:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+        AliasReference,
         RoutingCandidate,
     )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
@@ -133,36 +134,56 @@ def test_work_yaml_compiles_shared_cfg035_cfg038_graph() -> None:
     snapshot = compile_directory(Path(_ALIAS_CONFIG_DIR))
     entries = snapshot.aliases["work"].candidates
 
-    assert len(entries) == 3
-    assert all(isinstance(entry, RoutingCandidate) for entry in entries)
+    assert len(entries) == 6
+    assert isinstance(entries[2], AliasReference)
+    assert all(
+        isinstance(entry, RoutingCandidate)
+        for index, entry in enumerate(entries)
+        if index != 2
+    )
     assert [
         (
-            entry.provider,
-            entry.model,
-            entry.route_family,
-            entry.priority,
+            ("REF", entry.alias_name, None, entry.priority)
+            if isinstance(entry, AliasReference)
+            else (
+                entry.provider,
+                entry.model,
+                entry.route_family,
+                entry.priority,
+            )
         )
         for entry in entries
     ] == [
         (
-            "cursor_agent",
-            "cursor_agent/cursor-grok-4.6-high",
-            "codex_cursor_agent_aiserver_adapter",
+            "zai_coding_plan",
+            "zai_coding_plan/glm-5.3-flash",
+            "codex_zai_coding_plan_chat_completions_adapter",
             110,
         ),
         (
-            "xai",
-            "xai/grok-4.6",
-            "codex_grok_native_responses_adapter",
+            "openai",
+            "gpt-5.3-codex-spark",
+            "codex_responses",
             100,
         ),
         (
-            "xai",
-            "oa_xai/grok-4.6",
-            "codex_xai_oauth_responses_adapter",
+            "REF",
+            "work-other",
+            None,
             90,
         ),
+        ("anthropic", "claude-sonnet-5[1m]", "anthropic_messages", 80),
+        ("anthropic", "claude-sonnet-5", "anthropic_messages", 70),
+        ("openai", "gpt-5.6-luna", "codex_responses", 0),
     ]
+    for candidate in entries[3:5]:
+        assert isinstance(candidate, RoutingCandidate)
+        assert candidate.anthropic_route_family == "anthropic_messages"
+        assert candidate.reasoning_effort == "max"
+        assert candidate.tui_attached == "Claude"
+    luna = entries[-1]
+    assert isinstance(luna, RoutingCandidate)
+    assert luna.reasoning_effort == "max"
 
 
 def test_refresh_endpoint_registered() -> None:

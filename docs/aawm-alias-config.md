@@ -273,15 +273,14 @@ actual routed fallback.
 
 The `work` alias is compiled from `work.yaml`. Candidate order is:
 
-1. OpenCode Go `ox-alpha-free` (`provider: opencode_go`,
-   `codex_opencode_go_adapter`, Codex-only; no Anthropic Go adapter)
-2. Direct Nous `stealth/ox-alpha` (`provider: nous`,
-   `codex_nous_chat_completions_adapter`, Codex-only)
-3. OpenRouter `openrouter/stealth/ox-alpha`
-4. OpenAI `gpt-5.3-codex-spark`
-5. Nested `alias_reference: work-other`
-6. Claude-origin only: native Anthropic Sonnet tail
-7. OpenAI `gpt-5.6-luna` last resort
+1. Z.AI Coding Plan `zai_coding_plan/glm-5.3-flash` (priority 110)
+2. OpenAI `gpt-5.3-codex-spark` (priority 100)
+3. Nested `alias_reference: work-other` (priority 90)
+4. Claude-origin only: native Anthropic `claude-sonnet-5[1m]`
+   (priority 80, `reasoning_effort: max`)
+5. Claude-origin only: native Anthropic `claude-sonnet-5`
+   (priority 70, `reasoning_effort: max`)
+6. OpenAI `gpt-5.6-luna` (priority 0, `reasoning_effort: max`)
 
 `work-other` is an ordinary configured alias compiled from `work-other.yaml`.
 It is a valid exact-name route and a valid `alias_reference` target. It remains
@@ -289,12 +288,15 @@ absent from Codex and Claude TUI selection only because those clients' explicit
 model-definition inclusion lists omit it, not because YAML or Python marks it
 internal.
 
-During the daily half-open window `22:00-08:00 UTC+8` (CFG-020), `work-other`
-promotes `alias_reference: sota-deepseek` (`alibaba_token_plan/deepseek-v4-pro`)
-ahead of `sota-moonshot` and `sota-xai`. Outside that window the DeepSeek
-reference is omitted from new selection, so the order is Moonshot, then xAI
-(`oa_xai/grok-4.6` preferred, then inherited `cursor_agent/cursor-grok-4.6-high`).
-Qwen 3.8 Max and Qwen 3.7 Max are not `work-other` candidates. Closing the
+Its candidates are `alias_reference: sota-deepseek` (priority 110, scheduled
+for the daily half-open window `22:00-08:00 UTC+8`), `alias_reference:
+sota-moonshot` (priority 100), and `alias_reference: sota-xai` (priority 90).
+Thus Codex's effective expansion through `work-other` is DeepSeek -> Moonshot
+-> `sota-xai` during the window, and Moonshot -> `sota-xai` outside it.
+`sota-xai` currently expands in this order: Cursor
+`cursor_agent/cursor-grok-4.6-high`, native xAI/OIDC `xai/grok-4.6`, then
+managed xAI/OAuth `oa_xai/grok-4.6`. The Claude-only Sonnet leaves do not enter
+this Codex expansion; Luna remains the final OpenAI fallback. Closing the
 window prevents new affinity and does not evict an existing session owner.
 
 ## Maintained `expert` alias behavior (CFG-013 / CFG-020)

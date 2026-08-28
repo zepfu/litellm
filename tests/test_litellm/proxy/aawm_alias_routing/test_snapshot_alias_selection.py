@@ -569,6 +569,43 @@ def test_canonical_work_other_inherits_sota_xai_order_after_daily_deepseek() -> 
             "xai/grok-4.6",
             "oa_xai/grok-4.6",
         ]
+        inherited_grok = outside[1:]
+        assert [
+            (
+                candidate["provider"],
+                candidate["model"],
+                candidate["route_family"],
+            )
+            for candidate in inherited_grok
+        ] == [
+            (
+                "cursor_agent",
+                "cursor_agent/cursor-grok-4.6-high",
+                "codex_cursor_agent_aiserver_adapter",
+            ),
+            (
+                "xai",
+                "xai/grok-4.6",
+                "codex_grok_native_responses_adapter",
+            ),
+            (
+                "xai",
+                "oa_xai/grok-4.6",
+                "codex_xai_oauth_responses_adapter",
+            ),
+        ]
+        assert all(
+            candidate["alias_reference"] == "sota-xai"
+            and candidate["resolved_alias"] == "sota-xai"
+            and candidate["alias_path"] == ["work-other", "sota-xai"]
+            for candidate in inherited_grok
+        )
+        assert len(
+            {
+                candidate["cooldown_identity_tag"]
+                for candidate in inherited_grok
+            }
+        ) == 3
         assert all(
             "qwen" not in str(candidate["model"])
             for candidate in (*inside, *outside)
@@ -618,13 +655,33 @@ def test_canonical_work_other_inherits_sota_xai_order_after_daily_deepseek() -> 
         snapshot_select.set_active_routing_snapshot(previous)
 
 
-def test_canonical_work_selects_direct_grok_order() -> None:
+def test_canonical_work_selects_effective_codex_order() -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+        AliasReference,
+        RoutingCandidate,
+    )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
         DEFAULT_CONFIG_DIR,
         compile_directory,
     )
 
     snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    declared = snapshot.aliases["work"].candidates
+    direct_models = {
+        entry.model for entry in declared if isinstance(entry, RoutingCandidate)
+    }
+    grok_models = (
+        "cursor_agent/cursor-grok-4.6-high",
+        "xai/grok-4.6",
+        "oa_xai/grok-4.6",
+    )
+    assert direct_models.isdisjoint(grok_models)
+    assert [
+        (entry.alias_name, entry.priority)
+        for entry in declared
+        if isinstance(entry, AliasReference)
+    ] == [("work-other", 90)]
+
     previous = snapshot_select.get_active_routing_snapshot()
     snapshot_select.set_active_routing_snapshot(snapshot)
     try:
@@ -643,16 +700,40 @@ def test_canonical_work_selects_direct_grok_order() -> None:
             for candidate in selected
         ] == [
             (
+                "zai_coding_plan",
+                "zai_coding_plan/glm-5.3-flash",
+                "codex_zai_coding_plan_chat_completions_adapter",
+                110,
+            ),
+            (
+                "openai",
+                "gpt-5.3-codex-spark",
+                "codex_responses",
+                100,
+            ),
+            (
+                "alibaba_token_plan",
+                "alibaba_token_plan/deepseek-v4-pro",
+                "codex_alibaba_token_plan_chat_completions_adapter",
+                90,
+            ),
+            (
+                "kimi_code",
+                "kimi_code/k3",
+                "codex_kimi_chat_completions_adapter",
+                90,
+            ),
+            (
                 "cursor_agent",
                 "cursor_agent/cursor-grok-4.6-high",
                 "codex_cursor_agent_aiserver_adapter",
-                110,
+                90,
             ),
             (
                 "xai",
                 "xai/grok-4.6",
                 "codex_grok_native_responses_adapter",
-                100,
+                90,
             ),
             (
                 "xai",
@@ -660,11 +741,45 @@ def test_canonical_work_selects_direct_grok_order() -> None:
                 "codex_xai_oauth_responses_adapter",
                 90,
             ),
+            (
+                "openai",
+                "gpt-5.6-luna",
+                "codex_responses",
+                0,
+            ),
         ]
-        assert all(
-            "alias_reference" not in candidate
-            for candidate in selected
+        assert [candidate.get("alias_reference") for candidate in selected] == [
+            None,
+            None,
+            "work-other",
+            "work-other",
+            "work-other",
+            "work-other",
+            "work-other",
+            None,
+        ]
+        inherited_grok = [
+            candidate for candidate in selected if candidate["model"] in grok_models
+        ]
+        assert [candidate["model"] for candidate in inherited_grok] == list(
+            grok_models
         )
+        assert all(
+            candidate["alias_reference"] == "work-other"
+            and candidate["resolved_alias"] == "sota-xai"
+            for candidate in inherited_grok
+        )
+        assert len(
+            {
+                candidate["cooldown_identity_tag"]
+                for candidate in inherited_grok
+            }
+        ) == 3
+        assert all(
+            sum(candidate["model"] == model for candidate in selected) == 1
+            for model in grok_models
+        )
+        assert selected[-1]["last_resort"] is True
     finally:
         snapshot_select.set_active_routing_snapshot(previous)
 

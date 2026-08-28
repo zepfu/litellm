@@ -98,23 +98,21 @@ _OPERATIONAL_ALIAS_ORDER = {
     ],
     "work": [
         (
-            "cursor_agent",
-            "cursor_agent/cursor-grok-4.6-high",
-            "codex_cursor_agent_aiserver_adapter",
+            "zai_coding_plan",
+            "zai_coding_plan/glm-5.3-flash",
+            "codex_zai_coding_plan_chat_completions_adapter",
             110,
         ),
         (
-            "xai",
-            "xai/grok-4.6",
-            "codex_grok_native_responses_adapter",
+            "openai",
+            "gpt-5.3-codex-spark",
+            "codex_responses",
             100,
         ),
-        (
-            "xai",
-            "oa_xai/grok-4.6",
-            "codex_xai_oauth_responses_adapter",
-            90,
-        ),
+        ("REF", "work-other", None, 90),
+        ("anthropic", "claude-sonnet-5[1m]", "anthropic_messages", 80),
+        ("anthropic", "claude-sonnet-5", "anthropic_messages", 70),
+        ("openai", "gpt-5.6-luna", "codex_responses", 0),
     ],
     "work-other": [
         ("REF", "sota-deepseek", None, 110),
