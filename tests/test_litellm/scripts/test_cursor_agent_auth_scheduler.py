@@ -392,7 +392,26 @@ def test_cursor_agent_auth_real_eligibility_refreshes_at_expiry_minus_buffer(
     assert event["credential_health"] == "fresh"
     assert event["usable"] is True
     assert event["auth_observation_status"] == "fresh"
-    serialized = json.dumps(event, sort_keys=True)
+    assert event["credential_fingerprint"]
+    assert event["previous_credential_fingerprint"]
+    assert (
+        event["credential_fingerprint"]
+        != event["previous_credential_fingerprint"]
+    )
+    observation = loop._build_cursor_agent_auth_observation(config, event)
+    assert (
+        observation["metadata"]["credential_fingerprint"]
+        == event["credential_fingerprint"]
+    )
+    assert (
+        observation["metadata"]["previous_credential_fingerprint"]
+        == event["previous_credential_fingerprint"]
+    )
+    serialized = json.dumps(
+        {"event": event, "observation": observation},
+        sort_keys=True,
+        default=str,
+    )
     for value in (
         "refresh-secret-value",
         "api-secret-value",
@@ -568,7 +587,18 @@ def test_cursor_agent_auth_event_is_sanitized_and_usage_poll_stays_disabled(
     )
 
     assert event is not None
-    serialized = json.dumps(event)
+    assert event["credential_fingerprint"]
+    assert event["previous_credential_fingerprint"] is None
+    observation = loop._build_cursor_agent_auth_observation(config, event)
+    assert (
+        observation["metadata"]["credential_fingerprint"]
+        == event["credential_fingerprint"]
+    )
+    assert observation["metadata"]["previous_credential_fingerprint"] is None
+    serialized = json.dumps(
+        {"event": event, "observation": observation},
+        default=str,
+    )
     for value in ("refresh-secret-value", "api-secret-value", _jwt(0)):
         assert value not in serialized
     assert event["attempted"] is False

@@ -4328,6 +4328,16 @@ def _build_cursor_agent_auth_observation(
         },
     }
     metadata.update(_oauth_refresh_observation_metadata(event))
+    metadata.update(
+        {
+            "credential_fingerprint": _redacted_summary_field(
+                event.get("credential_fingerprint")
+            ),
+            "previous_credential_fingerprint": _redacted_summary_field(
+                event.get("previous_credential_fingerprint")
+            ),
+        }
+    )
     return {
         "observed_at": observed_at,
         "environment": event.get("environment") or config.environment,
@@ -12423,6 +12433,13 @@ def _run_cursor_agent_auth_refresh_task(
         "auth_file": config.cursor_agent_auth_file,
         "credential_shape": _redacted_summary_field(
             summary.get("credential_shape") or final.get("credential_shape")
+        ),
+        "credential_fingerprint": _redacted_summary_field(
+            summary.get("credential_fingerprint")
+            or final.get("credential_fingerprint")
+        ),
+        "previous_credential_fingerprint": _redacted_summary_field(
+            summary.get("previous_credential_fingerprint")
         ),
         "refresh_capability": _redacted_summary_field(
             summary.get("refresh_capability")
