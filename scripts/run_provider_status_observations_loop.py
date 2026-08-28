@@ -7646,21 +7646,46 @@ def _cursor_agent_usage_url(config: ProviderStatusLoopConfig) -> str:
     return current_period_usage_url(config.cursor_agent_usage_dashboard_url)
 
 
+def _load_cursor_agent_usage_access_token(auth_file: str) -> Optional[str]:
+    """Read the Cursor auth file in place without copying or refreshing it.
+
+    Only ``accessToken`` (canonical) and ``access_token`` (compatibility)
+    count as bearer tokens; ``apiKey`` and ``refreshToken`` are never used
+    here and no request-time exchange is performed.
+    """
+    payload = cursor_agent_auth_refresh._read_auth_data(
+        Path(auth_file).expanduser()
+    )
+    for key in ("accessToken", "access_token"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def _fetch_cursor_agent_usage_payload(
     config: ProviderStatusLoopConfig,
 ) -> Dict[str, Any]:
     attempt_count = 1
     retry_count = 0
+    access_token: Optional[str] = None
     try:
-        access_token = resolve_access_token(allow_exchange=False)
-    except Exception as exc:
-        raise _cursor_agent_usage_poll_error(
-            status_code=None,
-            telemetry_class="auth",
-            attempt_count=attempt_count,
-            retry_count=retry_count,
-            message="Cursor Agent usage poll has no usable access token.",
-        ) from exc
+        access_token = _load_cursor_agent_usage_access_token(
+            config.cursor_agent_auth_file
+        )
+    except Exception:
+        access_token = None
+    if access_token is None:
+        try:
+            access_token = resolve_access_token(allow_exchange=False)
+        except Exception as exc:
+            raise _cursor_agent_usage_poll_error(
+                status_code=None,
+                telemetry_class="auth",
+                attempt_count=attempt_count,
+                retry_count=retry_count,
+                message="Cursor Agent usage poll has no usable access token.",
+            ) from exc
 
     usage_url = _cursor_agent_usage_url(config)
     headers = build_dashboard_headers(access_token)

@@ -182,7 +182,11 @@ def test_cursor_agent_usage_fetch_uses_mocked_connect_json(
     monkeypatch.setenv("CURSOR_CLI_KEY", "cli-key-must-be-ignored")
     monkeypatch.setattr(loop.urllib_request, "urlopen", fake_urlopen)
 
-    config = _config(loop, tmp_path)
+    config = _config(
+        loop,
+        tmp_path,
+        cursor_agent_auth_file=str(tmp_path / "absent-cursor-auth.json"),
+    )
     fetched = loop._fetch_cursor_agent_usage_payload(config)
 
     assert fetched["status_code"] == 200
@@ -198,6 +202,45 @@ def test_cursor_agent_usage_fetch_uses_mocked_connect_json(
     assert captured["body"] == b"{}"
     assert "agentn" not in captured["url"]
     assert "/v0/me" not in captured["url"]
+
+
+def test_cursor_agent_usage_fetch_reads_camelcase_mounted_auth_file(
+    loop, tmp_path, monkeypatch
+) -> None:
+    for name in ("CURSOR_AUTH_TOKEN", "CURSOR_API_KEY", "CURSOR_CLI_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    auth_file = tmp_path / "cursor-auth.json"
+    auth_file.write_text(
+        json.dumps(
+            {
+                "accessToken": "mounted-file-access-token",
+                "refreshToken": "mounted-refresh-token",
+                "apiKey": "mounted-api-key",
+                "access_token": "compat-access-token",
+            }
+        ),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_urlopen(request, timeout=None):
+        captured["headers"] = {
+            key.lower(): value for key, value in request.header_items()
+        }
+        return _UsageResponse(
+            json.dumps(_camelcase_usage_payload()).encode("utf-8")
+        )
+
+    monkeypatch.setattr(loop.urllib_request, "urlopen", fake_urlopen)
+
+    config = _config(loop, tmp_path, cursor_agent_auth_file=str(auth_file))
+    fetched = loop._fetch_cursor_agent_usage_payload(config)
+
+    assert fetched["status_code"] == 200
+    assert (
+        captured["headers"]["authorization"]
+        == "Bearer mounted-file-access-token"
+    )
 
 
 def test_cursor_agent_usage_failed_refresh_keeps_last_good_state(
@@ -253,7 +296,11 @@ def test_cursor_agent_usage_does_not_log_credentials(
 
     monkeypatch.setattr(loop.urllib_request, "urlopen", fake_urlopen)
     event = loop._run_cursor_agent_usage_poll_task(
-        _config(loop, tmp_path),
+        _config(
+            loop,
+            tmp_path,
+            cursor_agent_auth_file=str(tmp_path / "absent-cursor-auth.json"),
+        ),
         loop.SidecarTaskState(),
         now_monotonic=1.0,
     )
