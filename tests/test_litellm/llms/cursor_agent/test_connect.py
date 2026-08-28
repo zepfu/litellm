@@ -13,7 +13,7 @@ import httpx
 import pytest
 from h2.config import H2Configuration
 from h2.connection import H2Connection
-from h2.events import DataReceived, RequestReceived, StreamEnded
+from h2.events import DataReceived, RequestReceived, StreamEnded, WindowUpdated
 
 from litellm.llms.cursor_agent import connect as cursor_connect
 from litellm.llms.cursor_agent.connect import (
@@ -272,6 +272,77 @@ class _H2LoopbackPeer:
                     self.response_sent = True
             elif isinstance(event, StreamEnded):
                 self.request_stream_ended = True
+        outbound = self.server.data_to_send()
+        if outbound:
+            self.incoming.put_nowait(outbound)
+
+    async def drain(self) -> None:
+        return None
+
+    def get_extra_info(self, name: str) -> Any:
+        return _FakeTLS() if name == "ssl_object" else None
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+class _H2WindowUpdatePeer:
+    def __init__(self) -> None:
+        self.server = H2Connection(
+            config=H2Configuration(
+                client_side=False,
+                header_encoding="utf-8",
+            )
+        )
+        self.server.initiate_connection()
+        self.incoming: asyncio.Queue[bytes] = asyncio.Queue()
+        self.incoming.put_nowait(self.server.data_to_send())
+        self.stream_id = 0
+        self.window_updates: list[int] = []
+        self.terminal_sent = False
+        self.closed = False
+
+    async def open_connection(self, *_args: Any, **_kwargs: Any) -> tuple[Any, Any]:
+        return self, self
+
+    async def read(self, _size: int) -> bytes:
+        return await self.incoming.get()
+
+    def write(self, data: bytes) -> None:
+        for event in self.server.receive_data(data):
+            if isinstance(event, RequestReceived):
+                self.stream_id = event.stream_id
+                self.server.send_headers(
+                    event.stream_id,
+                    [
+                        (":status", "200"),
+                        ("content-type", "application/connect+proto"),
+                    ],
+                    end_stream=False,
+                )
+                for _ in range(3):
+                    self.server.send_data(
+                        event.stream_id,
+                        _server_text_frame("x" * 16_000),
+                        end_stream=False,
+                    )
+            elif isinstance(event, DataReceived):
+                self.server.acknowledge_received_data(
+                    event.flow_controlled_length,
+                    event.stream_id,
+                )
+            elif isinstance(event, WindowUpdated):
+                self.window_updates.append(event.stream_id)
+                if event.stream_id == self.stream_id and not self.terminal_sent:
+                    self.server.send_data(
+                        event.stream_id,
+                        _server_turn_ended_frame() + _end_stream_frame(),
+                        end_stream=True,
+                    )
+                    self.terminal_sent = True
         outbound = self.server.data_to_send()
         if outbound:
             self.incoming.put_nowait(outbound)
@@ -751,6 +822,26 @@ def test_h2_bidi_receives_terminal_before_request_half_close(
     assert peer.request_headers["content-type"] == "application/connect+proto"
     request_frames = decode_connect_proto_frames(bytes(peer.request_body))
     assert _top_level_fields(request_frames[0].payload)[0][0] == 1
+
+
+def test_h2_bidi_flushes_response_window_updates_without_pending_request_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer = _H2WindowUpdatePeer()
+    monkeypatch.setattr(asyncio, "open_connection", peer.open_connection)
+    client = CursorAgentConnectClient(auth=CursorAgentAuth("access-token"))
+
+    result = asyncio.run(
+        client.run(
+            _run_request(),
+            url="https://cursor.test/agent.v1.AgentService/Run",
+            timeout=0.5,
+        )
+    )
+
+    assert result.turn_ended is True
+    assert peer.stream_id in peer.window_updates
+    assert peer.terminal_sent is True
 
 
 def test_h2_bidi_completes_server_driven_request_context_and_kv_startup(

@@ -2069,7 +2069,7 @@ class CursorAgentRetainedSession:
         return result
 
     async def _flush_pending(self) -> None:
-        while self.pending:
+        while True:
             outbound = CursorAgentConnectClient._flush_h2_request_data(
                 self.connection,
                 self.stream_id,
