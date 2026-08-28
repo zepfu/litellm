@@ -26,7 +26,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait as futures_wait
 from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Collection, Dict, List, Mapping, Optional, Sequence, Union
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -66,6 +66,14 @@ try:
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     nous_oauth_refresh = importlib.import_module("nous_oauth_refresh")
+
+try:
+    from scripts import cursor_agent_auth_refresh
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    cursor_agent_auth_refresh = importlib.import_module(
+        "cursor_agent_auth_refresh"
+    )
 
 # The canonical module is a required image dependency. Missing it must fail at
 # import time instead of silently creating a divergent local contract.
@@ -161,6 +169,15 @@ DEFAULT_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS = (
 NOUS_OAUTH_SIDECAR_AUTH_FILE_ENV_VARS = (
     "LITELLM_NOUS_OAUTH_AUTH_FILE",
     "AAWM_HERMES_AUTH_FILE",
+)
+DEFAULT_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS = (
+    cursor_agent_auth_refresh.DEFAULT_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS
+)
+DEFAULT_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS = (
+    cursor_agent_auth_refresh.DEFAULT_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS
+)
+DEFAULT_CURSOR_AGENT_AUTH_HTTP_TIMEOUT_SECONDS = (
+    cursor_agent_auth_refresh.DEFAULT_CURSOR_AGENT_AUTH_HTTP_TIMEOUT_SECONDS
 )
 DEFAULT_PROVIDER_AUTH_HEALTH_POLL_ENABLED = False
 DEFAULT_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS = 3600.0
@@ -1425,6 +1442,24 @@ class ProviderStatusLoopConfig:
     )
     nous_oauth_force_refresh: bool = False
     nous_oauth_http_timeout_seconds: float = DEFAULT_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS
+    cursor_agent_auth_refresh_enabled: bool = False
+    cursor_agent_auth_file: str = (
+        cursor_agent_auth_refresh.DEFAULT_CURSOR_AGENT_AUTH_FILE
+    )
+    cursor_agent_auth_file_source: str = "default"
+    cursor_agent_auth_lock_file: str = (
+        cursor_agent_auth_refresh.DEFAULT_CURSOR_AGENT_AUTH_LOCK_FILE
+    )
+    cursor_agent_auth_refresh_interval_seconds: float = (
+        DEFAULT_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS
+    )
+    cursor_agent_auth_refresh_buffer_seconds: int = (
+        DEFAULT_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS
+    )
+    cursor_agent_auth_force_refresh: bool = False
+    cursor_agent_auth_http_timeout_seconds: float = (
+        DEFAULT_CURSOR_AGENT_AUTH_HTTP_TIMEOUT_SECONDS
+    )
     provider_auth_health_poll_enabled: bool = DEFAULT_PROVIDER_AUTH_HEALTH_POLL_ENABLED
     provider_auth_health_poll_interval_seconds: float = (
         DEFAULT_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS
@@ -1520,6 +1555,7 @@ class ProviderStatusLoopConfig:
 
 @dataclass
 class SidecarTaskState:
+    next_generic_cycle_due_monotonic: Optional[float] = None
     grok_oidc_refresh_schedule: "OAuthRefreshScheduleState" = dataclass_field(
         default_factory=lambda: OAuthRefreshScheduleState()
     )
@@ -1535,6 +1571,9 @@ class SidecarTaskState:
     nous_oauth_refresh_schedule: "OAuthRefreshScheduleState" = dataclass_field(
         default_factory=lambda: OAuthRefreshScheduleState()
     )
+    cursor_agent_auth_refresh_schedule: "OAuthRefreshScheduleState" = dataclass_field(
+        default_factory=lambda: OAuthRefreshScheduleState()
+    )
     grok_oidc_last_attempt_monotonic: Optional[float] = None
     codex_oauth_last_attempt_monotonic_by_label: Dict[str, float] = dataclass_field(
         default_factory=dict
@@ -1548,6 +1587,7 @@ class SidecarTaskState:
     xai_oauth_last_attempt_monotonic: Optional[float] = None
     kimi_oauth_last_attempt_monotonic: Optional[float] = None
     nous_oauth_last_attempt_monotonic: Optional[float] = None
+    cursor_agent_auth_last_attempt_monotonic: Optional[float] = None
     provider_auth_health_poll_last_attempt_monotonic: Optional[float] = None
     kimi_usage_last_attempt_monotonic: Optional[float] = None
     kimi_usage_refresh_pending: bool = False
@@ -1789,6 +1829,31 @@ def _resolve_nous_oauth_sidecar_auth_file(
 
     _maybe_reject_default_auth_source("default")
     return DEFAULT_NOUS_OAUTH_AUTH_FILE, "default"
+
+
+def _resolve_cursor_agent_auth_file(
+    explicit_auth_file: Optional[str],
+) -> tuple[str, str]:
+    explicit_value = (
+        explicit_auth_file.strip()
+        if isinstance(explicit_auth_file, str) and explicit_auth_file.strip()
+        else None
+    )
+
+    aawm_auth_file = os.getenv(
+        "AAWM_CURSOR_AGENT_AUTH_FILE",
+        "",
+    ).strip()
+    if aawm_auth_file:
+        return str(Path(aawm_auth_file).expanduser()), "AAWM_CURSOR_AGENT_AUTH_FILE"
+
+    if explicit_value and explicit_value != (
+        cursor_agent_auth_refresh.DEFAULT_CURSOR_AGENT_AUTH_FILE
+    ):
+        return str(Path(explicit_value).expanduser()), "explicit"
+
+    _maybe_reject_default_auth_source("default")
+    return cursor_agent_auth_refresh.DEFAULT_CURSOR_AGENT_AUTH_FILE, "default"
 
 
 def _grok_billing_cache_path_class() -> str:
@@ -2334,6 +2399,93 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         help=(
             "HTTP timeout for Hermes Nous Portal OAuth token endpoint calls. "
             "Defaults to AAWM_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS or 30."
+        ),
+    )
+    cursor_auth_group = parser.add_mutually_exclusive_group()
+    cursor_auth_group.add_argument(
+        "--cursor-agent-auth-refresh-enabled",
+        dest="cursor_agent_auth_refresh_enabled",
+        action="store_true",
+        default=_env_bool("AAWM_CURSOR_AGENT_AUTH_REFRESH_ENABLED", False),
+        help=(
+            "Run the Cursor Agent auth refresh task from this sidecar loop. "
+            "Defaults to AAWM_CURSOR_AGENT_AUTH_REFRESH_ENABLED or false."
+        ),
+    )
+    cursor_auth_group.add_argument(
+        "--no-cursor-agent-auth-refresh",
+        dest="cursor_agent_auth_refresh_enabled",
+        action="store_false",
+        help="Disable the Cursor Agent auth refresh task.",
+    )
+    parser.add_argument(
+        "--cursor-agent-auth-file",
+        dest="cursor_agent_auth_file",
+        default=os.getenv(
+            "AAWM_CURSOR_AGENT_AUTH_FILE",
+            cursor_agent_auth_refresh.DEFAULT_CURSOR_AGENT_AUTH_FILE,
+        ),
+        help=(
+            "Cursor Agent auth JSON file maintained by this sidecar. Defaults "
+            "to AAWM_CURSOR_AGENT_AUTH_FILE or the reviewed sidecar path."
+        ),
+    )
+    parser.add_argument(
+        "--cursor-agent-auth-lock-file",
+        dest="cursor_agent_auth_lock_file",
+        default=os.getenv(
+            "AAWM_CURSOR_AGENT_AUTH_LOCK_FILE",
+            cursor_agent_auth_refresh.DEFAULT_CURSOR_AGENT_AUTH_LOCK_FILE,
+        ),
+        help=(
+            "Lock file for sidecar Cursor Agent auth refresh writes. Defaults "
+            "to AAWM_CURSOR_AGENT_AUTH_LOCK_FILE or the reviewed sidecar lock."
+        ),
+    )
+    parser.add_argument(
+        "--cursor-agent-auth-refresh-interval-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS",
+            DEFAULT_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS,
+        ),
+        help=(
+            "Minimum seconds between Cursor Agent auth refresh attempts. This "
+            "cadence is independent of the generic provider poll interval and "
+            "defaults to AAWM_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS or 300."
+        ),
+    )
+    parser.add_argument(
+        "--cursor-agent-auth-refresh-buffer-seconds",
+        type=int,
+        default=_env_int(
+            "AAWM_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS",
+            DEFAULT_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS,
+        ),
+        help=(
+            "Refresh buffer for non-forced Cursor Agent auth refreshes. "
+            "Defaults to AAWM_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS or 900."
+        ),
+    )
+    parser.add_argument(
+        "--cursor-agent-auth-force-refresh",
+        action="store_true",
+        default=_env_bool("AAWM_CURSOR_AGENT_AUTH_FORCE_REFRESH", False),
+        help=(
+            "Refresh the Cursor Agent credential on every scheduled attempt "
+            "even when its access token is still valid."
+        ),
+    )
+    parser.add_argument(
+        "--cursor-agent-auth-http-timeout-seconds",
+        type=float,
+        default=_env_float(
+            "AAWM_CURSOR_AGENT_AUTH_HTTP_TIMEOUT_SECONDS",
+            DEFAULT_CURSOR_AGENT_AUTH_HTTP_TIMEOUT_SECONDS,
+        ),
+        help=(
+            "HTTP timeout for Cursor Agent auth exchanges. Defaults to "
+            "AAWM_CURSOR_AGENT_AUTH_HTTP_TIMEOUT_SECONDS or 30."
         ),
     )
     provider_auth_health_group = parser.add_mutually_exclusive_group()
@@ -3063,6 +3215,7 @@ def _validate_config_args(args: argparse.Namespace) -> None:
     _validate_xai_oauth_config_args(args)
     _validate_kimi_oauth_config_args(args)
     _validate_nous_oauth_config_args(args)
+    _validate_cursor_agent_auth_config_args(args)
     _validate_provider_auth_health_poll_config_args(args)
     _validate_kimi_usage_config_args(args)
     _validate_zai_coding_plan_quota_config_args(args)
@@ -3199,6 +3352,30 @@ def _validate_kimi_oauth_config_args(args: argparse.Namespace) -> None:
     )
 
 
+def _validate_cursor_agent_auth_config_args(args: argparse.Namespace) -> None:
+    _require_positive_finite(
+        args.cursor_agent_auth_refresh_interval_seconds,
+        "--cursor-agent-auth-refresh-interval-seconds",
+    )
+    _require_nonnegative_finite(
+        args.cursor_agent_auth_refresh_buffer_seconds,
+        "--cursor-agent-auth-refresh-buffer-seconds",
+    )
+    _require_positive_finite(
+        args.cursor_agent_auth_http_timeout_seconds,
+        "--cursor-agent-auth-http-timeout-seconds",
+    )
+    _validate_fixed_buffer_eligibility_cadence(
+        enabled=args.cursor_agent_auth_refresh_enabled,
+        force=args.cursor_agent_auth_force_refresh,
+        buffer_seconds=args.cursor_agent_auth_refresh_buffer_seconds,
+        buffer_option="--cursor-agent-auth-refresh-buffer-seconds",
+        provider_name="Cursor Agent auth",
+        outer_cadence=args.cursor_agent_auth_refresh_interval_seconds,
+        outer_cadence_option="--cursor-agent-auth-refresh-interval-seconds",
+    )
+
+
 def _require_positive_finite(value: float, option: str) -> None:
     if not math.isfinite(float(value)):
         raise SystemExit(f"{option} must be finite")
@@ -3221,12 +3398,13 @@ def _validate_fixed_buffer_eligibility_cadence(
     buffer_option: str,
     provider_name: str,
     outer_cadence: float,
+    outer_cadence_option: str = "--interval-seconds",
 ) -> None:
     if not enabled or force or outer_cadence <= buffer_seconds:
         return
     raise SystemExit(
         f"{provider_name} OAuth eligibility cadence is unsafe: "
-        f"--interval-seconds={outer_cadence:g} exceeds "
+        f"{outer_cadence_option}={outer_cadence:g} exceeds "
         f"{buffer_option}={buffer_seconds:g}; "
         "outer eligibility cadence must not exceed the refresh buffer"
     )
@@ -3394,6 +3572,10 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         resolved_nous_oauth_auth_file,
         resolved_nous_oauth_auth_file_source,
     ) = _resolve_nous_oauth_sidecar_auth_file(args.nous_oauth_auth_file)
+    (
+        resolved_cursor_agent_auth_file,
+        resolved_cursor_agent_auth_file_source,
+    ) = _resolve_cursor_agent_auth_file(args.cursor_agent_auth_file)
 
     return ProviderStatusLoopConfig(
         apply=args.apply,
@@ -3452,6 +3634,20 @@ def parse_config(argv: Optional[Sequence[str]] = None) -> ProviderStatusLoopConf
         nous_oauth_refresh_buffer_seconds=args.nous_oauth_refresh_buffer_seconds,
         nous_oauth_force_refresh=args.nous_oauth_force_refresh,
         nous_oauth_http_timeout_seconds=args.nous_oauth_http_timeout_seconds,
+        cursor_agent_auth_refresh_enabled=args.cursor_agent_auth_refresh_enabled,
+        cursor_agent_auth_file=resolved_cursor_agent_auth_file,
+        cursor_agent_auth_file_source=resolved_cursor_agent_auth_file_source,
+        cursor_agent_auth_lock_file=args.cursor_agent_auth_lock_file,
+        cursor_agent_auth_refresh_interval_seconds=(
+            args.cursor_agent_auth_refresh_interval_seconds
+        ),
+        cursor_agent_auth_refresh_buffer_seconds=(
+            args.cursor_agent_auth_refresh_buffer_seconds
+        ),
+        cursor_agent_auth_force_refresh=args.cursor_agent_auth_force_refresh,
+        cursor_agent_auth_http_timeout_seconds=(
+            args.cursor_agent_auth_http_timeout_seconds
+        ),
         provider_auth_health_poll_enabled=args.provider_auth_health_poll_enabled,
         provider_auth_health_poll_interval_seconds=(
             args.provider_auth_health_poll_interval_seconds
@@ -4093,6 +4289,77 @@ def _persist_nous_oauth_auth_observation(
         return False, 0, None, "apply_disabled"
 
     observation = _build_nous_oauth_auth_observation(config, event)
+    dsn = _resolve_dsn(config)
+    try:
+        inserted_count = probes.insert_provider_auth_observations(
+            dsn,
+            [observation],
+            lock_timeout_ms=config.db_lock_timeout_ms,
+            statement_timeout_ms=config.db_statement_timeout_ms,
+        )
+    except probes.ProviderStatusDatabaseWriteSkipped as exc:
+        return False, 0, exc.error_class, _redacted_failure_message(str(exc))
+    except Exception as exc:
+        return False, 0, exc.__class__.__name__, _redacted_failure_message(str(exc))
+    return True, inserted_count, None, None
+
+
+def _build_cursor_agent_auth_observation(
+    config: ProviderStatusLoopConfig,
+    event: Mapping[str, Any],
+) -> Dict[str, Any]:
+    observed_at = _parse_sidecar_timestamp(event.get("observed_at")) or datetime.now(
+        timezone.utc
+    )
+    expires_at = _parse_sidecar_timestamp(event.get("expires_at"))
+    status = _provider_auth_status_from_event(event)
+    successful_validation = _oauth_refresh_successful_validation(event, status)
+    auth_file = event.get("auth_file") or config.cursor_agent_auth_file
+    metadata = {
+        "auth_file_hash_algorithm": "sha256",
+        "auth_file_source": config.cursor_agent_auth_file_source,
+        "refresh_buffer_seconds": config.cursor_agent_auth_refresh_buffer_seconds,
+        "refresh_interval_seconds": config.cursor_agent_auth_refresh_interval_seconds,
+        "force_refresh": config.cursor_agent_auth_force_refresh,
+        "raw_status_flags": {
+            "attempted": bool(event.get("attempted")),
+            "refreshed": bool(event.get("refreshed")),
+            "skipped": bool(event.get("skipped")),
+        },
+    }
+    metadata.update(_oauth_refresh_observation_metadata(event))
+    return {
+        "observed_at": observed_at,
+        "environment": event.get("environment") or config.environment,
+        "provider": "cursor_agent",
+        "auth_family": "cursor_agent_auth",
+        "credential_scope": _redacted_summary_field(
+            event.get("refresh_method")
+            or "apiKey_exchange",
+            limit=512,
+        ),
+        "auth_file_hash": probes.auth_file_identity_hash(auth_file),
+        "status": status,
+        "attempted": bool(event.get("attempted")),
+        "refreshed": bool(event.get("refreshed")),
+        "skipped": bool(event.get("skipped")),
+        "expires_at": expires_at,
+        "last_success_at": observed_at if successful_validation else None,
+        "source_task": "cursor_agent_auth_refresh",
+        "error_class": _redacted_summary_field(event.get("error_class")),
+        "error_message": _redacted_failure_message(event.get("error_message")),
+        "metadata": metadata,
+    }
+
+
+def _persist_cursor_agent_auth_observation(
+    config: ProviderStatusLoopConfig,
+    event: Mapping[str, Any],
+) -> tuple[bool, int, Optional[str], Optional[str]]:
+    if not config.apply:
+        return False, 0, None, "apply_disabled"
+
+    observation = _build_cursor_agent_auth_observation(config, event)
     dsn = _resolve_dsn(config)
     try:
         inserted_count = probes.insert_provider_auth_observations(
@@ -11292,6 +11559,10 @@ def _merge_oauth_refresh_eligibility(
     )
     if post.get("error_class") and summary_expires_at is not None:
         merged["expires_at"] = _scheduler_timestamp(summary_expires_at)
+        merged["credential_health"] = (
+            "expired" if summary_expires_at <= wall_now else "fresh"
+        )
+        merged["usable"] = summary_expires_at > wall_now
         window_seconds = (
             effective_threshold_seconds
             if effective_threshold_seconds is not None
@@ -11304,10 +11575,6 @@ def _merge_oauth_refresh_eligibility(
         merged["next_refresh_check_at"] = _scheduler_timestamp(
             wall_now + timedelta(seconds=max(1.0, cadence_seconds))
         )
-        merged["credential_health"] = (
-            "expired" if summary_expires_at <= wall_now else "fresh"
-        )
-        merged["usable"] = summary_expires_at > wall_now
     # A transient post-call read failure must not erase the last known expiry
     # or deadline. The next outer cycle rereads the pathname again.
     if post.get("error_class") and not post.get("expires_at"):
@@ -11349,12 +11616,28 @@ def _oauth_refresh_result_class(
     return "refresh_due"
 
 
+def _refresh_summary_reports_success(
+    summary: Mapping[str, Any],
+) -> bool:
+    return bool(
+        not summary.get("error_class")
+        and (summary.get("refreshed") or summary.get("skipped"))
+    )
+
+
 def _effective_oauth_credential_health(
     eligibility: Mapping[str, Any],
     *,
     result_class: str,
+    operation_summary: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
     """Project scheduling state into the existing health vocabulary."""
+    if (
+        operation_summary is not None
+        and _refresh_summary_reports_success(operation_summary)
+        and operation_summary.get("health_status") in {"fresh", "degraded", "malformed"}
+    ):
+        return str(operation_summary["health_status"])
     if result_class == "expired":
         return "expired"
     inspected_health = _redacted_summary_field(
@@ -11489,6 +11772,7 @@ def _record_oauth_refresh_schedule_outcome(
     effective_health = _effective_oauth_credential_health(
         final,
         result_class=result_class,
+        operation_summary=operation_summary,
     )
     schedule.eligibility_checked_at = final.get("eligibility_checked_at")
     schedule.refresh_due_at = final.get("refresh_due_at")
@@ -12069,6 +12353,93 @@ def _run_nous_oauth_refresh_task(
         skip_error_class,
         skip_reason,
     ) = _persist_nous_oauth_auth_observation(config, event)
+    event["auth_observation_status"] = _provider_auth_status_from_event(event)
+    event["auth_observation_persisted"] = persisted
+    event["auth_observation_inserted_count"] = inserted_count
+    event["auth_observation_skip_error_class"] = skip_error_class
+    event["auth_observation_skip_reason"] = skip_reason
+    return event
+
+
+def _run_cursor_agent_auth_refresh_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now_monotonic: float,
+    now_wall: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    if not config.cursor_agent_auth_refresh_enabled:
+        return None
+    wall_now = _normalize_scheduler_wall_now(now_wall)
+    final, summary, _post, evidence, helper_called = _run_oauth_refresh_schedule(
+        schedule=state.cursor_agent_auth_refresh_schedule,
+        last_attempt_monotonic=state.cursor_agent_auth_last_attempt_monotonic,
+        set_last_attempt_monotonic=lambda value: setattr(
+            state,
+            "cursor_agent_auth_last_attempt_monotonic",
+            value,
+        ),
+        now_monotonic=now_monotonic,
+        wall_now=wall_now,
+        eligibility_inspector=lambda *, now: (
+            cursor_agent_auth_refresh.inspect_cursor_agent_auth_refresh_eligibility(
+                config.cursor_agent_auth_file,
+                buffer_seconds=config.cursor_agent_auth_refresh_buffer_seconds,
+                now=now,
+                poll_interval_seconds=(
+                    config.cursor_agent_auth_refresh_interval_seconds
+                ),
+                force=config.cursor_agent_auth_force_refresh,
+            )
+        ),
+        refresh_call=lambda callback: (
+            cursor_agent_auth_refresh.refresh_cursor_agent_auth_file(
+                config.cursor_agent_auth_file,
+                buffer_seconds=config.cursor_agent_auth_refresh_buffer_seconds,
+                force=config.cursor_agent_auth_force_refresh,
+                lock_file=config.cursor_agent_auth_lock_file,
+                http_timeout_seconds=config.cursor_agent_auth_http_timeout_seconds,
+                on_exchange_attempt=callback,
+            )
+        ),
+        force=config.cursor_agent_auth_force_refresh,
+        attempt_interval_seconds=config.cursor_agent_auth_refresh_interval_seconds,
+        eligibility_cadence_seconds=config.cursor_agent_auth_refresh_interval_seconds,
+        buffer_seconds=config.cursor_agent_auth_refresh_buffer_seconds,
+    )
+
+    event = {
+        "event": "cursor_agent_auth_refresh",
+        "observed_at": _scheduler_timestamp(wall_now),
+        "environment": config.environment,
+        "health_status": _redacted_summary_field(
+            summary.get("health_status") or final.get("credential_health")
+        ),
+        "attempted": bool(summary.get("attempted")),
+        "refreshed": bool(summary.get("refreshed")),
+        "skipped": bool(summary.get("skipped")) or (
+            not helper_called and not summary.get("error_class")
+        ),
+        "auth_file": config.cursor_agent_auth_file,
+        "credential_shape": _redacted_summary_field(
+            summary.get("credential_shape") or final.get("credential_shape")
+        ),
+        "refresh_capability": _redacted_summary_field(
+            summary.get("refresh_capability")
+            or final.get("refresh_capability"),
+        ),
+        "refresh_method": _redacted_summary_field(summary.get("refresh_method")),
+        "expires_at": final.get("expires_at") or summary.get("expires_at"),
+        "error_class": _redacted_summary_field(summary.get("error_class")),
+        "error_message": _redacted_failure_message(summary.get("error_message")),
+        **evidence,
+    }
+    (
+        persisted,
+        inserted_count,
+        skip_error_class,
+        skip_reason,
+    ) = _persist_cursor_agent_auth_observation(config, event)
     event["auth_observation_status"] = _provider_auth_status_from_event(event)
     event["auth_observation_persisted"] = persisted
     event["auth_observation_inserted_count"] = inserted_count
@@ -13048,6 +13419,7 @@ def _run_observability_anomaly_scan_task(
 
 SIDECAR_OPTIONAL_POLL_DEADLINE_SECONDS = 0.05
 SIDECAR_OPTIONAL_POLL_MAX_WORKERS = 1
+_SIDECAR_MAX_WAKE_DELAY_SECONDS = 86_400.0
 _SIDECAR_OPTIONAL_POLL_EXECUTOR: Optional[ThreadPoolExecutor] = None
 
 
@@ -13091,6 +13463,7 @@ def run_due_sidecar_tasks(
         _run_xai_oauth_refresh_task,
         _run_kimi_oauth_refresh_task,
         _run_nous_oauth_refresh_task,
+        _run_cursor_agent_auth_refresh_task,
     }
     optional_pending: list[tuple[str, Any]] = []
     for runner, event_name in (
@@ -13100,6 +13473,7 @@ def run_due_sidecar_tasks(
         (_run_xai_oauth_refresh_task, "xai_oauth_refresh"),
         (_run_kimi_oauth_refresh_task, "kimi_oauth_refresh"),
         (_run_nous_oauth_refresh_task, "nous_oauth_refresh"),
+        (_run_cursor_agent_auth_refresh_task, "cursor_agent_auth_refresh"),
         (_run_kimi_usage_poll_task, "kimi_usage_poll"),
         (_run_zai_coding_plan_quota_poll_task, "zai_coding_plan_quota_poll"),
         (_run_cursor_agent_usage_poll_task, "cursor_agent_usage_poll"),
@@ -13118,6 +13492,7 @@ def run_due_sidecar_tasks(
                     _run_xai_oauth_refresh_task,
                     _run_kimi_oauth_refresh_task,
                     _run_nous_oauth_refresh_task,
+                    _run_cursor_agent_auth_refresh_task,
                 }:
                     runner_kwargs["now_wall"] = wall_now
                 result = runner(config, state, **runner_kwargs)
@@ -13205,6 +13580,9 @@ def _sidecar_one_shot_policy(event: Mapping[str, Any]) -> str:
         "grok_oidc_refresh",
         "codex_oauth_refresh",
         "xai_oauth_refresh",
+        "kimi_oauth_refresh",
+        "nous_oauth_refresh",
+        "cursor_agent_auth_refresh",
     }:
         return "required"
     if event_name.endswith("_aggregate"):
@@ -13273,10 +13651,112 @@ def _emit(payload: Dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
+def _sidecar_refresh_deadline(
+    schedule: Optional[OAuthRefreshScheduleState],
+    *,
+    now: float,
+) -> Optional[float]:
+    """Translate a sanitized wall-clock refresh deadline into monotonic time."""
+    if schedule is None:
+        return None
+    due_at = _parse_sidecar_timestamp(schedule.next_refresh_check_at)
+    if due_at is None:
+        return None
+    if due_at.tzinfo is None:
+        due_at = due_at.replace(tzinfo=timezone.utc)
+    delay_seconds = (due_at - datetime.now(timezone.utc)).total_seconds()
+    return now + max(0.0, min(delay_seconds, _SIDECAR_MAX_WAKE_DELAY_SECONDS))
+
+
+def _cursor_agent_auth_refresh_is_due(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now: float,
+) -> bool:
+    if not config.cursor_agent_auth_refresh_enabled:
+        return False
+    deadline = _sidecar_refresh_deadline(
+        state.cursor_agent_auth_refresh_schedule,
+        now=now,
+    )
+    return deadline is not None and deadline <= now
+
+
+def _run_due_cursor_agent_auth_task(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now: float,
+) -> list[Dict[str, Any]]:
+    if not _cursor_agent_auth_refresh_is_due(config, state, now=now):
+        return []
+    try:
+        cursor_event = _run_cursor_agent_auth_refresh_task(
+            config,
+            state,
+            now_monotonic=now,
+        )
+    except Exception as exc:
+        _emit(
+            {
+                "event": "provider_status_sidecar_task_error",
+                "observed_at": _utc_timestamp(),
+                "environment": config.environment,
+                "task": "cursor_agent_auth_refresh",
+                "error_class": exc.__class__.__name__,
+                "error_message": _redacted_failure_message(str(exc)),
+                "traceback": traceback.format_exc(limit=5),
+            }
+        )
+        return []
+    if cursor_event is None:
+        return []
+    _emit(cursor_event)
+    return [cursor_event]
+
+
 def _utc_timestamp() -> str:
     return (
         datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     )
+
+
+def _next_sidecar_wake_delay(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now: float,
+) -> float:
+    generic_cycle_deadline = state.next_generic_cycle_due_monotonic
+    if generic_cycle_deadline is None:
+        generic_cycle_deadline = now + config.interval_seconds
+    sidecar_deadline = _sidecar_refresh_deadline(
+        state.cursor_agent_auth_refresh_schedule,
+        now=now,
+    )
+    next_deadline = generic_cycle_deadline
+    if config.cursor_agent_auth_refresh_enabled and sidecar_deadline is not None:
+        next_deadline = min(next_deadline, sidecar_deadline)
+    return max(0.0, next_deadline - now)
+
+
+def _sleep_until_next_sidecar_deadline(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    should_stop: Callable[[], bool],
+) -> None:
+    now = time.monotonic()
+    wake_delay = _next_sidecar_wake_delay(
+        config,
+        state,
+        now=now,
+    )
+    sleep_deadline = now + wake_delay
+    while wake_delay > 0 and not should_stop():
+        time.sleep(min(wake_delay, 1.0))
+        wake_delay = sleep_deadline - time.monotonic()
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -13334,7 +13814,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     sidecar_state = SidecarTaskState()
     while not stopping:
-        cycle_started = time.monotonic()
+        now = time.monotonic()
+        generic_cycle_deadline = sidecar_state.next_generic_cycle_due_monotonic
+        if generic_cycle_deadline is None:
+            generic_cycle_deadline = now
+            sidecar_state.next_generic_cycle_due_monotonic = (
+                generic_cycle_deadline
+            )
+        if now < generic_cycle_deadline:
+            sidecar_events = _run_due_cursor_agent_auth_task(
+                config,
+                sidecar_state,
+                now=now,
+            )
+            _sleep_until_next_sidecar_deadline(
+                config,
+                sidecar_state,
+                should_stop=lambda: stopping,
+            )
+            continue
+
+        sidecar_state.next_generic_cycle_due_monotonic = (
+            generic_cycle_deadline + config.interval_seconds
+        )
         try:
             _emit(run_cycle(config))
         except Exception as exc:
@@ -13377,10 +13879,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             _emit(one_shot_status)
             return 1 if one_shot_status["required_failure_count"] else 0
 
-        remaining_seconds = config.interval_seconds - (time.monotonic() - cycle_started)
-        while remaining_seconds > 0 and not stopping:
-            time.sleep(min(remaining_seconds, 1.0))
-            remaining_seconds = config.interval_seconds - (time.monotonic() - cycle_started)
+        _sleep_until_next_sidecar_deadline(
+            config,
+            sidecar_state,
+            should_stop=lambda: stopping,
+        )
 
     _emit(
         {
