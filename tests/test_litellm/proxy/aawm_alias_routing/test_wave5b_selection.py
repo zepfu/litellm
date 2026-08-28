@@ -596,6 +596,22 @@ class TestCodexSelectorFirstChoice:
         assert result["candidate"]["provider"] == "xai"
         assert result["skipped"][0]["reason"] == "candidate_ineligible"
         assert result["skipped"][0]["cooldown_state_source"] == "local_fallback"
+        assert (
+            getattr(
+                request.state,
+                "aawm_alias_request_local_cooldown_until",
+                None,
+            )
+            is None
+        )
+        assert (
+            getattr(
+                request.state,
+                "aawm_alias_request_local_excluded_keys",
+                None,
+            )
+            is None
+        )
 
     @pytest.mark.asyncio
     async def test_excluded_candidate_keeps_active_cooldown_reason(self):
@@ -998,6 +1014,66 @@ class TestAnthropicSelectorFirstChoice:
         assert result["request_mode"] == "fresh_redispatch"
         assert result["redispatch_ordinal"] == 2
         assert result["affinity_bypassed"] is True
+
+    @pytest.mark.asyncio
+    async def test_deterministic_exclusion_advances_real_selector(self):
+        request = _make_request()
+        candidates = (
+            _candidate("anthropic", "claude-sonnet-4-20250514"),
+            _candidate("openai", "gpt-4o"),
+        )
+        _set_selection_candidates(candidates)
+        result = await selection._select_anthropic_auto_agent_candidate(
+            request=request,
+            request_body={"model": "basic"},
+            excluded_candidate_keys=frozenset(
+                {"anthropic:claude-sonnet-4-20250514:anthropic:primary"}
+            ),
+        )
+
+        assert result["candidate"]["provider"] == "openai"
+        assert result["skipped"][0]["reason"] == "candidate_ineligible"
+        assert result["skipped"][0]["cooldown_state_source"] == "local_fallback"
+
+    @pytest.mark.asyncio
+    async def test_excluded_candidate_keeps_active_cooldown_reason(self):
+        request = _make_request()
+        candidates = (
+            _candidate("anthropic", "claude-sonnet-4-20250514"),
+            _candidate("openai", "gpt-4o"),
+        )
+        _set_selection_candidates(candidates)
+
+        async def _cooled(key: str) -> tuple[float, str]:
+            if "claude" in key:
+                return (60.0, "durable_cache")
+            return (0.0, "local_fallback")
+
+        _set_selection_runtime(
+            "_get_anthropic_active_cooldown_state",
+            _cooled,
+        )
+        _set_selection_runtime(
+            "_get_anthropic_merged_codex_openai_cooldown_state",
+            _cooled,
+        )
+        result = await selection._select_anthropic_auto_agent_candidate(
+            request=request,
+            request_body={"model": "basic"},
+            excluded_candidate_keys=frozenset(
+                {"anthropic:claude-sonnet-4-20250514:anthropic:primary"}
+            ),
+        )
+
+        assert result["candidate"]["provider"] == "openai"
+        skipped = next(
+            candidate
+            for candidate in result["skipped"]
+            if candidate["provider"] == "anthropic"
+        )
+        assert skipped["reason"] == "cooldown"
+        assert skipped["cooldown_seconds"] == 60.0
+        assert skipped["cooldown_state_source"] == "durable_cache"
 
 
 # ---------------------------------------------------------------------------

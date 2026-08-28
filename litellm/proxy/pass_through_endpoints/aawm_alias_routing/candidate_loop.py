@@ -446,7 +446,7 @@ async def handle_alias_route(  # noqa: PLR0915
     raise_redispatch_required_fn = services.raise_redispatch_fn
     is_codex_alias = validate_alias_family(alias_family) == "codex"
     codex_failure_evidence_alias = alias_model if is_codex_alias else None
-    attempted_candidate_keys: set[str] = set()
+    failed_provider_candidate_keys: set[str] = set()
     deterministically_ineligible_candidate_keys: set[str] = set()
 
     register_aawm_route_rollup_access_log_replacement(request)
@@ -586,11 +586,10 @@ async def handle_alias_route(  # noqa: PLR0915
             selection_kwargs: dict[str, Any] = {
                 "request": request,
                 "request_body": prepared_request_body,
-            }
-            if is_codex_alias:
-                selection_kwargs["excluded_candidate_keys"] = frozenset(
+                "excluded_candidate_keys": frozenset(
                     deterministically_ineligible_candidate_keys
-                )
+                ),
+            }
             selection = await select_candidate_fn(**selection_kwargs)
         except HTTPException as exc:
             if attempts:
@@ -610,7 +609,7 @@ async def handle_alias_route(  # noqa: PLR0915
             raise
         candidate = selection["candidate"]
         cooldown_key = str(selection["cooldown_key"])
-        if cooldown_key in attempted_candidate_keys:
+        if cooldown_key in failed_provider_candidate_keys:
             if attempts:
                 _mark_auto_agent_alias_request_terminal_failure(
                     request,
@@ -626,7 +625,6 @@ async def handle_alias_route(  # noqa: PLR0915
                     }
                 },
             ))
-        attempted_candidate_keys.add(cooldown_key)
         failover_ordinal = int(selection.get("failover_ordinal") or 0)
         if failover_ordinal == 0:
             provider_candidate_attempts += 1
@@ -1288,6 +1286,8 @@ async def handle_alias_route(  # noqa: PLR0915
                 # --- failure handling (post-release) ---------------------------
                 failure_exc = probe_failure_exc
                 assert failure_exc is not None
+                if attempted_provider_call:
+                    failed_provider_candidate_keys.add(cooldown_key)
                 kimi_failure_metadata = _get_safe_kimi_code_probe_failure_metadata(
                     failure_exc,
                     candidate=candidate,

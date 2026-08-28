@@ -619,6 +619,18 @@ def _get_codex_auto_agent_request_local_cooldown_seconds(
     return remaining
 
 
+def _peek_codex_auto_agent_request_local_cooldown_seconds(
+    request: Request,
+    *,
+    cooldown_key: str,
+) -> float:
+    state = getattr(request.state, "aawm_alias_request_local_cooldown_until", None)
+    if not isinstance(state, dict):
+        return 0.0
+    until = state.get(cooldown_key, 0.0)
+    return max(0.0, until - time.monotonic())
+
+
 def _set_codex_auto_agent_request_local_cooldown(
     request: Request,
     *,
@@ -644,6 +656,13 @@ def _get_codex_auto_agent_request_local_excluded_keys(
     excluded = set()
     setattr(request.state, "aawm_alias_request_local_excluded_keys", excluded)
     return excluded
+
+
+def _peek_codex_auto_agent_request_local_excluded_keys(
+    request: Request,
+) -> AbstractSet[str]:
+    excluded = getattr(request.state, "aawm_alias_request_local_excluded_keys", None)
+    return excluded if isinstance(excluded, set) else frozenset()
 
 
 def _codex_oauth_candidate_slot(
@@ -676,6 +695,17 @@ def _get_codex_oauth_request_local_blocked_slots(
         blocked,
     )
     return blocked
+
+
+def _peek_codex_oauth_request_local_blocked_slots(
+    request: Request,
+) -> AbstractSet[str]:
+    blocked = getattr(
+        request.state,
+        "aawm_codex_oauth_request_local_blocked_slots",
+        None,
+    )
+    return blocked if isinstance(blocked, set) else frozenset()
 
 
 def _block_codex_oauth_request_local_candidate_slot(
@@ -907,14 +937,16 @@ def _apply_codex_auto_agent_request_local_candidate_state(
         candidate=candidate,
         lane_key=lane_key,
     )
-    request_local_cooldown_seconds = _get_codex_auto_agent_request_local_cooldown_seconds(
+    request_local_cooldown_seconds = _peek_codex_auto_agent_request_local_cooldown_seconds(
         request,
         cooldown_key=request_local_cooldown_key,
     )
     if request_local_cooldown_seconds > cooldown_seconds:
         cooldown_seconds = request_local_cooldown_seconds
         cooldown_state_source = "request_local"
-    if request_local_cooldown_key in _get_codex_auto_agent_request_local_excluded_keys(request):
+    if request_local_cooldown_key in _peek_codex_auto_agent_request_local_excluded_keys(
+        request
+    ):
         if request_local_cooldown_seconds <= 0:
             cooldown_seconds = max(cooldown_seconds, 0.001)
         cooldown_state_source = "request_local"
@@ -923,7 +955,7 @@ def _apply_codex_auto_agent_request_local_candidate_state(
     if (
         account_slot is not None
         and account_slot
-        in _get_codex_oauth_request_local_blocked_slots(request)
+        in _peek_codex_oauth_request_local_blocked_slots(request)
     ):
         cooldown_state_source = "request_local"
         skip_reason = "account_failover_limit"
@@ -2439,6 +2471,7 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
     candidate_template: dict[str, Any],
     openai_lane_key: Optional[str] = None,
     anthropic_lane_key: Optional[str] = None,
+    excluded_candidate_keys: Optional[AbstractSet[str]] = None,
 ) -> dict[str, Any]:
     assert _get_anthropic_active_cooldown_state is not None
     candidate = dict(candidate_template)
@@ -2480,6 +2513,10 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         candidate,
         lane_key,
         cooldown_identity_tag=_cooldown_identity_tag,
+    )
+    excluded_candidate = (
+        excluded_candidate_keys is not None
+        and cooldown_key in excluded_candidate_keys
     )
     (
         cooldown_seconds,
@@ -2557,6 +2594,8 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         )
         cooldown_seconds = forced_cooldown_seconds
         cooldown_state_source = cooldown_state_source_override or "forced_candidate_cooldown"
+    if excluded_candidate and cooldown_seconds <= 0 and skip_reason is None:
+        skip_reason = "candidate_ineligible"
     state: dict[str, Any] = {
         "candidate": candidate,
         "lane_key": lane_key,
@@ -2653,12 +2692,14 @@ async def _build_anthropic_auto_agent_affinity_candidate_state(
     *,
     candidate_template: dict[str, Any],
     affinity: dict[str, Any],
+    excluded_candidate_keys: Optional[AbstractSet[str]] = None,
 ) -> dict[str, Any]:
     if not _candidate_uses_codex_oauth(candidate_template):
         return _attach_normalized_quota_state(
             await _build_anthropic_auto_agent_candidate_state(
                 request,
                 candidate_template=candidate_template,
+                excluded_candidate_keys=excluded_candidate_keys,
             )
         )
     contexts = await _resolve_codex_oauth_account_candidate_contexts(
@@ -2672,6 +2713,7 @@ async def _build_anthropic_auto_agent_affinity_candidate_state(
         request,
         candidate_template=context["candidate"],
         openai_lane_key=context["lane_key"],
+        excluded_candidate_keys=excluded_candidate_keys,
     )
     return _apply_codex_oauth_account_context_to_state(
         request,
@@ -2736,6 +2778,7 @@ async def _build_anthropic_auto_agent_candidate_states(
     *,
     alias_model: str,
     client_product_label: Optional[str] = None,
+    excluded_candidate_keys: Optional[AbstractSet[str]] = None,
 ) -> list[dict[str, Any]]:
     openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
     anthropic_lane_key = _resolve_anthropic_auto_agent_native_cooldown_lane_key(request)
@@ -2760,6 +2803,7 @@ async def _build_anthropic_auto_agent_candidate_states(
                     candidate_template=context["candidate"],
                     openai_lane_key=context["lane_key"],
                     anthropic_lane_key=anthropic_lane_key,
+                    excluded_candidate_keys=excluded_candidate_keys,
                 )
                 states.append(
                     _apply_codex_oauth_account_context_to_state(
@@ -2776,6 +2820,7 @@ async def _build_anthropic_auto_agent_candidate_states(
                     candidate_template=candidate_template,
                     openai_lane_key=openai_lane_key,
                     anthropic_lane_key=anthropic_lane_key,
+                    excluded_candidate_keys=excluded_candidate_keys,
                 )
             )
         )
@@ -3905,6 +3950,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
     *,
     request: Request,
     request_body: dict[str, Any],
+    excluded_candidate_keys: Optional[AbstractSet[str]] = None,
 ) -> dict[str, Any]:
     assert _resolve_anthropic_session_key is not None
     assert _has_continuation_state is not None
@@ -4125,6 +4171,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                 request,
                 candidate_template=affinity_candidate,
                 affinity=affinity,
+                excluded_candidate_keys=excluded_candidate_keys,
             )
         )
         if (
@@ -4216,6 +4263,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
         request,
         alias_model=alias_model,
         client_product_label=client_product_label,
+        excluded_candidate_keys=excluded_candidate_keys,
     )
     skipped = _build_auto_agent_skipped_candidates_from_states(states)
     request.state.aawm_alias_terminal_skipped_candidates = skipped
@@ -4311,10 +4359,13 @@ _HOST_FUNCTION_NAMES = (
     "_get_codex_auto_agent_request_local_cooldown_key",
     "_get_codex_auto_agent_request_local_cooldown_state",
     "_get_codex_auto_agent_request_local_cooldown_seconds",
+    "_peek_codex_auto_agent_request_local_cooldown_seconds",
     "_set_codex_auto_agent_request_local_cooldown",
     "_get_codex_auto_agent_request_local_excluded_keys",
+    "_peek_codex_auto_agent_request_local_excluded_keys",
     "_codex_oauth_candidate_slot",
     "_get_codex_oauth_request_local_blocked_slots",
+    "_peek_codex_oauth_request_local_blocked_slots",
     "_block_codex_oauth_request_local_candidate_slot",
     "_get_codex_oauth_request_local_failover_context",
     "_apply_codex_oauth_failover_context_to_state",

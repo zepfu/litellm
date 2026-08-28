@@ -30,7 +30,7 @@ import asyncio
 import dataclasses
 import inspect
 from types import SimpleNamespace
-from typing import Any, Callable, Optional, Sequence
+from typing import AbstractSet, Any, Callable, Optional, Sequence
 from unittest.mock import MagicMock
 
 import pytest
@@ -257,6 +257,7 @@ _CALLBACK_PARAMETER_KINDS: dict[str, dict[str, inspect._ParameterKind]] = {
     "select_candidate_fn": {
         "request": inspect.Parameter.KEYWORD_ONLY,
         "request_body": inspect.Parameter.KEYWORD_ONLY,
+        "excluded_candidate_keys": inspect.Parameter.KEYWORD_ONLY,
     },
     "perform_candidate_request_fn": {
         "candidate": inspect.Parameter.KEYWORD_ONLY,
@@ -547,11 +548,6 @@ async def test_alias_route_services_signature_contracts(  # noqa: PLR0915
             # against the expected parameter names, kinds, and coroutine
             # status.  An incompatible target (e.g. one requiring
             # ``wrong_required_name``) fails here.
-            if alias_family == "codex_auto_agent" and field_name == "select_candidate_fn":
-                expected_parameters = {
-                    **expected_parameters,
-                    "excluded_candidate_keys": inspect.Parameter.KEYWORD_ONLY,
-                }
             signature = inspect.signature(real_targets[field_name])
             actual_parameters = signature.parameters
             variadic_parameters = [
@@ -604,8 +600,132 @@ async def _typed_select_candidate(
     *,
     request: Request,
     request_body: dict[str, Any],
+    excluded_candidate_keys: Optional[AbstractSet[str]] = None,
 ) -> dict[str, Any]:
     return {}
+
+
+@pytest.mark.asyncio
+async def test_shared_loop_forwards_deterministic_exclusions_for_anthropic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _IneligibleCandidateError(lpe.HTTPException):
+        def __init__(self) -> None:
+            super().__init__(
+                status_code=503,
+                detail={
+                    "error": {
+                        "code": "aawm_codex_auto_agent_candidate_ineligible",
+                    }
+                },
+            )
+            self.candidate_status = "ineligible"
+            self.ineligibility_reason = "unsupported"
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    first_cooldown_key = "anthropic:unsupported"
+    selections = [
+        {
+            "candidate": {
+                "provider": "anthropic",
+                "model": "unsupported",
+                "route_family": "anthropic_responses_adapter",
+            },
+            "lane_key": "anthropic:primary",
+            "cooldown_key": first_cooldown_key,
+            "selection_reason": "first_available",
+        },
+        {
+            "candidate": {
+                "provider": "openai",
+                "model": "supported",
+                "route_family": "openai_responses_adapter",
+            },
+            "lane_key": "openai:primary",
+            "cooldown_key": "openai:supported",
+            "selection_reason": "first_available",
+            "skipped": [],
+        },
+    ]
+    selection_exclusions: list[frozenset[str]] = []
+
+    async def _select_candidate(
+        *,
+        request: Request,
+        request_body: dict[str, Any],
+        excluded_candidate_keys: Optional[AbstractSet[str]] = None,
+    ) -> dict[str, Any]:
+        selection_exclusions.append(frozenset(excluded_candidate_keys or ()))
+        return selections.pop(0)
+
+    async def _perform_candidate_request(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        if candidate["model"] == "unsupported":
+            raise _IneligibleCandidateError()
+        return {"model": candidate["model"], "body": candidate_body}
+
+    async def _no_active_cooldown(_cooldown_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def _fail(name: str) -> Callable[..., Any]:
+        def _unexpected(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError(f"{name} must not run")
+
+        return _unexpected
+
+    for name in (
+        "_record_codex_failure_evidence",
+        "_exclude_codex_auto_agent_request_local_candidate_without_cooldown",
+        "_apply_request_local_cooldown_from_plan",
+    ):
+        monkeypatch.setattr(lpe, name, _fail(name))
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        candidate_loop,
+        "alias_routing_state",
+        type(alias_routing_state)(),
+    )
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select_candidate,
+        perform_candidate_request_fn=_perform_candidate_request,
+        resolve_cooldown_publication_fn=_fail("resolve_cooldown_publication_fn"),
+        publish_cooldown_memory_fn=_fail("publish_cooldown_memory_fn"),
+        persist_cooldown_fn=_fail("persist_cooldown_fn"),
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=lambda request_body, **_kwargs: request_body,
+        raise_redispatch_fn=_fail("raise_redispatch_fn"),
+    )
+
+    response = await candidate_loop.handle_alias_route(
+        services,
+        alias_family="anthropic_auto_agent",
+        alias_model="seam-contract",
+        request=request,
+        prepared_request_body={},
+        max_candidate_attempts=2,
+        get_active_cooldown_state_fn=_no_active_cooldown,
+        attempts_metadata_key="attempts",
+        skipped_candidates_metadata_key="skipped",
+        no_candidate_detail="no candidates",
+        log_label="Anthropic",
+    )
+
+    assert response["model"] == "supported"
+    assert selection_exclusions == [
+        frozenset(),
+        frozenset({first_cooldown_key}),
+    ]
 
 
 async def _typed_perform_candidate_request(
