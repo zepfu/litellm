@@ -214,15 +214,16 @@ adapter at `https://inference-api.nousresearch.com/v1`. Nous auth,
 cooldown, capacity, and usage stay independent of OpenRouter free-daily
 quota and OpenAI Codex OAuth.
 
-The managed `sota-xai` candidate has no candidate-level reasoning override:
-caller `reasoning.effort=xhigh` is sent unchanged to `oa_xai/grok-4.6`, with
-requested/native effort metadata and the provider-native field/provider
-recorded. Its route rollup is `grok-4.6(sota-xai):xhigh`. `sota-xai` then
-appends Cursor Grok (`cursor_agent/cursor-grok-4.6-high`, priority 90) as a
-lower-priority fallback so `work` / `work-other` inherit it. Cursor Grok
-stays distinct from `oa_xai/grok-4.6` and `xai/grok-4.6`; xAI remains
-preferred. Codex/Anthropic Cursor Agent alias dispatch is fail-closed in
-this catalog wave and does not route through Cloud Agents `cursor`.
+`sota-xai` follows the CFG-038 provider-neutral order: Cursor Grok
+(`cursor_agent/cursor-grok-4.6-high`, priority 110), native xAI/OIDC
+(`xai/grok-4.6`, priority 100), then managed xAI/OAuth
+(`oa_xai/grok-4.6`, priority 90). `work` / `work-other` inherit this order,
+and the three lanes remain distinct. The managed OAuth candidate has no
+candidate-level reasoning override: caller `reasoning.effort=xhigh` is sent
+unchanged to `oa_xai/grok-4.6`, with requested/native effort metadata and the
+provider-native field/provider recorded. Its route rollup is
+`grok-4.6(sota-xai):xhigh`. Cursor Agent uses `cursor_agent`, not Cloud Agents
+`cursor`.
 
 For this managed `oa_xai`/`sota-xai` flow, Grok 4.6 adapts both the
 `collaboration` and `multi_agent_v1` namespaces. Those children are flattened
@@ -281,6 +282,11 @@ The `work` alias is compiled from `work.yaml`. Candidate order is:
 5. Claude-origin only: native Anthropic `claude-sonnet-5`
    (priority 70, `reasoning_effort: max`)
 6. OpenAI `gpt-5.6-luna` (priority 0, `reasoning_effort: max`)
+
+The direct Z.AI Coding Plan leaf is Codex-only: it declares a Codex
+`route_family` and no `anthropic_route_family`. Anthropic projection omits
+that leaf and begins at the first compatible candidate; the native Sonnet
+leaves remain attached only to Claude-origin requests.
 
 `work-other` is an ordinary configured alias compiled from `work-other.yaml`.
 It is a valid exact-name route and a valid `alias_reference` target. It remains
