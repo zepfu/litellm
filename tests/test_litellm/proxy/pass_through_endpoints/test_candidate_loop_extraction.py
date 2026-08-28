@@ -306,6 +306,207 @@ def test_resolve_failure_plan_classifies_coding_plan_1113_as_terminal_routing() 
     assert plan.applied_scope == "candidate"
 
 
+@pytest.mark.asyncio
+async def test_candidate_loop_non_401_provider_terminal_error_does_not_rotate_account(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [
+                (b"user-agent", b"codex-cli/1.0"),
+                (b"originator", b"codex_cli_rs"),
+            ],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    body = {"model": "basic", "input": "hello", "stream": False}
+    candidate = {
+        "provider": "openai",
+        "model": "gpt-5.3-codex",
+        "route_family": "codex_responses",
+        "codex_oauth_account_label": "account-test",
+        "codex_oauth_account_hash": "hash-account-test",
+        "codex_oauth_lane_key": "codex-oauth:test",
+        "codex_oauth_credential_affinity": "interchangeable",
+    }
+    selection = {
+        "candidate": candidate,
+        "alias_model": "basic",
+        "lane_key": "codex-oauth:test",
+        "cooldown_key": "codex-oauth:test",
+        "selection_reason": "first_choice",
+        "skipped": [],
+    }
+    provider_calls: list[dict[str, Any]] = []
+    rotation_calls: list[dict[str, Any]] = []
+
+    class _ProviderTerminalError(HTTPException):
+        def __init__(self) -> None:
+            super().__init__(
+                status_code=403,
+                detail={
+                    "error": {
+                        "message": "provider rejected request",
+                        "type": "invalid_request_error",
+                        "code": "aawm_auto_agent_failed_responses_payload",
+                    }
+                },
+            )
+
+    async def _select(**_kwargs) -> dict[str, Any]:
+        return selection
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        provider_calls.append(
+            {"candidate": dict(candidate), "body": dict(candidate_body)}
+        )
+        raise _ProviderTerminalError()
+
+    def _plan_account_failover(_request, **kwargs) -> bool:
+        rotation_calls.append(kwargs)
+        return False
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args, **_kwargs) -> None:
+        return None
+
+    async def _execute_publication(
+        *,
+        plan,
+        publish_cooldown_memory_fn,
+        **_kwargs,
+    ):
+        publish_cooldown_memory_fn(
+            keys=plan.memory_keys,
+            seconds=plan.duration_seconds,
+            allow_ttl_shrink=plan.allow_ttl_shrink,
+        )
+        return None
+
+    def _publish_cooldown(*, keys, seconds, **_kwargs) -> None:
+        for key in keys:
+            request.state.__dict__.setdefault("_test_cooldowns", {})[key] = seconds
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs):
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease):
+            return None
+
+    async def _ensure_session_owner_guard(**_kwargs):
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    session_affinity = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
+        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_ensure_session_owner_guard,
+        get_request_session_owner_lease=lambda _request: None,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+        get_session_owner_record=lambda **_kwargs: (None, None, None),
+        request_has_effective_session_identity=lambda _request: False,
+        build_session_owner_provenance=lambda **_kwargs: {},
+        reset_released_request_session_owner_guard=lambda _request: False,
+        SessionOwnerMutationOutcome=SimpleNamespace(
+            CONFLICT="conflict",
+            ERROR="error",
+            NOT_HELD="not_held",
+        ),
+    )
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=lpe._resolve_auto_agent_cooldown_publication_plan,
+        publish_cooldown_memory_fn=_publish_cooldown,
+        persist_cooldown_fn=_noop_async,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=lpe._add_codex_auto_agent_alias_metadata,
+        raise_redispatch_fn=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("non-401 terminal failure must not redispatch")
+        ),
+    )
+
+    monkeypatch.setattr(
+        candidate_loop, "_session_affinity_mod", lambda: session_affinity
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        lpe,
+        "_codex_oauth_candidate_slot",
+        lambda candidate: candidate["codex_oauth_account_hash"],
+    )
+    monkeypatch.setattr(
+        lpe, "_plan_codex_oauth_account_failover", _plan_account_failover
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc, *, candidate=None: "provider_terminal_error"
+        if getattr(exc, "status_code", None) == 403
+        else None,
+    )
+    monkeypatch.setattr(lpe, "_record_codex_failure_evidence", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        lpe, "execute_cooldown_publication_transaction", _execute_publication
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda events, *, request_body=None: None,
+    )
+    monkeypatch.setattr(
+        lpe, "_emit_auto_agent_alias_route_event", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.aawm_runtime_error_logging.persist_agent_terminal_error",
+        lambda **_kwargs: True,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body=body,
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_no_active_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    assert len(provider_calls) == 1
+    assert len(rotation_calls) == 1
+    assert rotation_calls[0]["provider_status_code"] == 403
+    assert caught.value.status_code == 502
+    assert caught.value.detail["error"]["type"] == "provider_terminal_error"
+    assert not hasattr(
+        request.state, "aawm_codex_oauth_request_local_failover_context"
+    )
+
+
 def test_resolve_failure_plan_preserves_genuine_quota_transient_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

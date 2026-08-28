@@ -3508,6 +3508,9 @@ async def _retry_direct_codex_oauth_after_account_failure(
             "failure_phase": "direct_openai_provider_response",
             "attempted_provider_call": True,
             "cooldown_seconds": round(float(cooldown_seconds), 3),
+            "error_status_code": _aawm_error_signals._extract_adapter_exception_status_code(
+                exc
+            ),
         }
         retry_attempt_record.update(retry_after_hint)
     has_continuation_state = selection.get("request_mode") != "fresh"
@@ -3583,6 +3586,7 @@ async def _retry_direct_codex_oauth_after_account_failure(
                 request_body.get("previous_response_id")
             ),
             account_failover_replay_safe=account_failover_replay_safe,
+            provider_status_code=retry_attempt_record["error_status_code"],
         )
     )
     if not retry_planned:

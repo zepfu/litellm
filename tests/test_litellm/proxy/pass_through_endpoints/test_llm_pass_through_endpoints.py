@@ -28248,6 +28248,9 @@ class TestOpenAIPassthroughRoute:
         from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
             codex_oauth,
         )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            selection as routing_selection,
+        )
         from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
             openai_proxy_route,
         )
@@ -28284,6 +28287,36 @@ class TestOpenAIPassthroughRoute:
             _binding("account1", "hash-account-1", 0),
             _binding("account2", "hash-account-2", 1),
         ]
+        binder_failover_states: list[tuple[tuple[str, ...], frozenset[str]]] = []
+
+        async def _bind_from_request_failover_state(
+            bind_request, *, request_body=None
+        ):
+            context = routing_selection._get_codex_oauth_request_local_failover_context(
+                bind_request
+            )
+            attempted_account_hashes = tuple(
+                (context or {}).get("attempted_account_hashes") or ()
+            )
+            excluded_candidate_keys = frozenset(
+                routing_selection._peek_codex_auto_agent_request_local_excluded_keys(
+                    bind_request
+                )
+            )
+            binder_failover_states.append(
+                (attempted_account_hashes, excluded_candidate_keys)
+            )
+            for binding in bindings:
+                selection = binding[1]
+                candidate = selection["candidate"]
+                if (
+                    candidate["codex_oauth_account_hash"]
+                    not in attempted_account_hashes
+                    and selection["cooldown_key"] not in excluded_candidate_keys
+                ):
+                    return binding
+            raise AssertionError("no unattempted direct OAuth account remains")
+
         generic_401 = HTTPException(
             status_code=401,
             detail={
@@ -28319,7 +28352,7 @@ class TestOpenAIPassthroughRoute:
             return_value=False,
         ), patch(
             "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth.select_and_bind_direct_codex_oauth_inventory",
-            new=AsyncMock(side_effect=bindings),
+            new=AsyncMock(side_effect=_bind_from_request_failover_state),
         ) as mock_bind, patch.object(
             llm_passthrough_endpoints.BaseOpenAIPassThroughHandler,
             "_base_openai_pass_through_handler",
@@ -28340,6 +28373,17 @@ class TestOpenAIPassthroughRoute:
         assert response.status_code == 200
         assert attempts == ["Bearer account1", "Bearer account2"]
         assert mock_bind.await_count == 2
+        assert binder_failover_states == [
+            ((), frozenset()),
+            (
+                ("hash-account-1",),
+                frozenset(
+                    {
+                        "openai:gpt-5.6-sol:codex-oauth:account1:hash-account-1"
+                    }
+                ),
+            ),
+        ]
         mock_publish.assert_not_called()
         mock_persist.assert_not_awaited()
 

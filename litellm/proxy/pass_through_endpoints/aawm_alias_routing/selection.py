@@ -783,6 +783,7 @@ def _plan_codex_oauth_account_failover(
     has_previous_response_id: bool = False,
     has_account_bound_state: bool = False,
     account_failover_replay_safe: bool = False,
+    provider_status_code: Optional[int] = None,
 ) -> bool:
     """Plan a request-local move to another eligible account for one slot."""
     if not _is_codex_oauth_account_candidate(candidate):
@@ -811,13 +812,22 @@ def _plan_codex_oauth_account_failover(
         attempt_record["account_failover_limit_reached"] = True
         return False
 
-    if error_class not in {
+    if error_class == "provider_terminal_error":
+        fresh_unbound_request_401 = (
+            not has_continuation_state
+            and not has_previous_response_id
+            and not has_account_bound_state
+            and bool(attempt_record.get("attempted_provider_call"))
+            and provider_status_code == 401
+        )
+        if not fresh_unbound_request_401:
+            return False
+    elif error_class not in {
         "capacity_exhausted",
         "rate_limited",
         "token_invalidated",
         "usage_limit_reached",
         "candidate_unavailable",
-        "provider_terminal_error",
     }:
         return False
 
@@ -2636,6 +2646,13 @@ def _apply_codex_oauth_account_context_to_state(
             state,
             account_hash=account_hash,
         )
+        if (
+            state.get("skip_reason") == "candidate_ineligible"
+            and state.get("quota_exhausted_windows")
+        ):
+            state["skip_reason"] = "quota_exhausted"
+            state["cooldown_state_source"] = "normalized_quota_observation"
+            state["terminal_reset"] = _build_codex_oauth_terminal_reset_information([state])
     return _apply_codex_oauth_failover_context_to_state(request, state)
 
 

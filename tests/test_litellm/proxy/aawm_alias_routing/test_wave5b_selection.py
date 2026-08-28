@@ -655,6 +655,131 @@ class TestCodexSelectorFirstChoice:
         assert skipped["cooldown_seconds"] == 60.0
         assert skipped["cooldown_state_source"] == "durable_cache"
 
+    @pytest.mark.asyncio
+    async def test_excluded_candidate_prefers_normalized_quota_terminal_reset(self):
+        request = _make_request()
+        candidate = _oauth_account_candidate()
+        cooldown_key = "openai:gpt-5.3-codex:codex-oauth:account1:hash-account-1"
+        quota_windows = [
+            {
+                "quota_period": "five_hour",
+                "window_minutes": 300,
+                "status": "fresh",
+                "exhausted": True,
+                "remaining_pct": 0,
+                "reset_at": "2030-01-01T00:00:00Z",
+            }
+        ]
+        _set_selection_candidates((candidate,))
+
+        async def _candidate_state(
+            _request,
+            *,
+            candidate_template,
+            openai_lane_key=None,
+            excluded_candidate_keys=None,
+        ):
+            lane_key = openai_lane_key or candidate_template["codex_oauth_lane_key"]
+            state = {
+                "candidate": candidate_template,
+                "lane_key": lane_key,
+                "cooldown_key": cooldown_key,
+                "cooldown_seconds": 0.0,
+                "cooldown_state_source": "local_fallback",
+            }
+            if excluded_candidate_keys and cooldown_key in excluded_candidate_keys:
+                state["skip_reason"] = "candidate_ineligible"
+            return state
+
+        def _quota_state(state, *, account_hash=None):
+            if account_hash == "hash-account-1":
+                state["quota_exhausted_windows"] = quota_windows
+            return state
+
+        async def _candidate_contexts(_request, *, candidate_template, affinity=None):
+            return [
+                {
+                    "candidate": candidate_template,
+                    "lane_key": candidate_template["codex_oauth_lane_key"],
+                    "auth_status": "ready",
+                }
+            ]
+
+        restored = {
+            "_build_codex_auto_agent_candidate_state": selection._build_codex_auto_agent_candidate_state,
+            "_resolve_codex_oauth_account_candidate_contexts": selection._resolve_codex_oauth_account_candidate_contexts,
+            "_hydrate_codex_oauth_quota_observations": selection._hydrate_codex_oauth_quota_observations,
+            "_attach_normalized_quota_state": selection._attach_normalized_quota_state,
+        }
+        try:
+            _set_selection_runtime(
+                "_build_codex_auto_agent_candidate_state", _candidate_state
+            )
+            _set_selection_runtime(
+                "_resolve_codex_oauth_account_candidate_contexts", _candidate_contexts
+            )
+            _set_selection_runtime(
+                "_hydrate_codex_oauth_quota_observations", AsyncMock(return_value=None)
+            )
+            _set_selection_runtime("_attach_normalized_quota_state", _quota_state)
+
+            with pytest.raises(HTTPException) as caught:
+                await selection._select_codex_auto_agent_candidate(
+                    request=request,
+                    request_body={"model": "basic"},
+                    excluded_candidate_keys=frozenset({cooldown_key}),
+                )
+        finally:
+            for name, value in restored.items():
+                _set_selection_runtime(name, value)
+
+        assert caught.value.status_code == 429
+        detail = caught.value.detail
+        assert detail["candidates"][-1]["reason"] == "quota_exhausted"
+        assert (
+            detail["candidates"][-1]["cooldown_state_source"]
+            == "normalized_quota_observation"
+        )
+        assert detail["terminal_reset"]["reason"] == "codex_oauth_quota_exhausted"
+        assert detail["terminal_reset"]["next_reset_at"] == "2030-01-01T00:00:00Z"
+        assert detail["terminal_reset"]["accounts"] == [
+            {
+                "account_hash": "hash-account-1",
+                "account_label": "account1",
+                "account_lane": "codex-oauth:account1:hash-account-1",
+                "exhausted_windows": quota_windows,
+            }
+        ]
+
+    def test_non_401_provider_terminal_error_does_not_plan_account_rotation(self):
+        request = _make_request()
+        candidate = _oauth_account_candidate()
+        selection_state = {
+            "candidate": candidate,
+            "failover_ordinal": 0,
+            "has_account_bound_state": False,
+        }
+        attempt = {
+            "failure_phase": "direct_openai_provider_response",
+            "attempted_provider_call": True,
+            "error_status_code": 403,
+        }
+
+        assert not selection._plan_codex_oauth_account_failover(
+            request,
+            candidate=candidate,
+            selection=selection_state,
+            attempt_record=attempt,
+            error_class="provider_terminal_error",
+            has_continuation_state=False,
+            has_previous_response_id=False,
+            has_account_bound_state=False,
+            provider_status_code=403,
+        )
+        assert not hasattr(
+            request.state, "aawm_codex_oauth_request_local_failover_context"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Codex selector: last-resort

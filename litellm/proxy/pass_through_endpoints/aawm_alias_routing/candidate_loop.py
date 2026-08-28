@@ -691,6 +691,7 @@ async def handle_alias_route(  # noqa: PLR0915
                 has_continuation_state=has_continuation_state,
                 has_previous_response_id=has_previous_response_id,
                 account_failover_replay_safe=account_failover_replay_safe,
+                provider_status_code=attempt_record.get("error_status_code"),
             )
             if account_failover_planned:
                 provider_candidate_attempts = max(
@@ -1502,6 +1503,7 @@ async def handle_alias_route(  # noqa: PLR0915
                     has_continuation_state=has_continuation_state,
                     has_previous_response_id=has_previous_response_id,
                     account_failover_replay_safe=account_failover_replay_safe,
+                    provider_status_code=attempt_record.get("error_status_code"),
                 )
                 if (
                     cooldown_scope == "none"
