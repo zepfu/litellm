@@ -818,8 +818,21 @@ async def test_anthropic_toctou_barrier_family_resolution() -> None:  # noqa: PL
                 "cooldown_state_source": "local_fallback",
             }
 
+        selection_kwargs: list[dict[str, Any]] = []
+
         async def _select(*, request: Any, request_body: Any) -> dict[str, Any]:
+            selection_kwargs.append(
+                {
+                    "request": request,
+                    "request_body": request_body,
+                }
+            )
             return _anthropic_selection()
+
+        def _raise_uninspectable_signature() -> Any:
+            raise TypeError("uninspectable legacy selector")
+
+        _select.__signature__ = property(_raise_uninspectable_signature)
 
         async def _perform(*, candidate: Any, candidate_body: Any) -> Response:
             nonlocal perform_count
@@ -931,6 +944,10 @@ async def test_anthropic_toctou_barrier_family_resolution() -> None:  # noqa: PL
             f"Expected HTTPException from skipped waiter, got {type(waiter_result)}: {waiter_result}"
         )
         assert waiter_result.status_code == 429
+        assert len(selection_kwargs) == 1
+        assert set(selection_kwargs[0]) == {"request", "request_body"}, (
+            "legacy Anthropic selector must not receive excluded_candidate_keys"
+        )
 
         # Anthropic state must show the cooldown.
         anthropic_state = mgr.family("anthropic_auto_agent")

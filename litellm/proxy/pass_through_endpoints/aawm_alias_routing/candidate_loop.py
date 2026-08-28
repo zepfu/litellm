@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 from typing import TYPE_CHECKING, Any, Optional
 
 import httpx
@@ -176,6 +177,29 @@ _CODEX_COHERE_ROUTE_FAMILY = "codex_cohere_chat_completions_adapter"
 _CODEX_COHERE_CHAT_V2_URL = httpx.URL("https://api.cohere.com/v2/chat")
 _CODEX_ZAI_CODING_PLAN_PROVIDER = "zai_coding_plan"
 _CODEX_ZAI_CODING_PLAN_ROUTE_FAMILY = "codex_zai_coding_plan_chat_completions_adapter"
+
+
+def _accepts_excluded_candidate_keys(select_candidate_fn: Any) -> bool:
+    """Support CFG-040 legacy selectors without weakening the typed seam.
+
+    Type-erased callbacks still receive the new keyword. Explicit historical
+    keyword-only callbacks reject it, as do callbacks whose signature cannot
+    be inspected safely, so omit it before selector traversal.
+    """
+    try:
+        signature = inspect.signature(select_candidate_fn)
+    except (TypeError, ValueError):
+        return False
+    parameter = signature.parameters.get("excluded_candidate_keys")
+    if parameter is not None:
+        return parameter.kind not in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.VAR_POSITIONAL,
+        )
+    return any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
 
 
 def _classify_codex_cohere_candidate_failure(
@@ -586,10 +610,11 @@ async def handle_alias_route(  # noqa: PLR0915
             selection_kwargs: dict[str, Any] = {
                 "request": request,
                 "request_body": prepared_request_body,
-                "excluded_candidate_keys": frozenset(
-                    deterministically_ineligible_candidate_keys
-                ),
             }
+            if _accepts_excluded_candidate_keys(select_candidate_fn):
+                selection_kwargs["excluded_candidate_keys"] = frozenset(
+                    deterministically_ineligible_candidate_keys
+                )
             selection = await select_candidate_fn(**selection_kwargs)
         except HTTPException as exc:
             if attempts:
