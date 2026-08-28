@@ -42,6 +42,15 @@ class _FakeDurableAliasCache:
         self.redis_cache = self
         self.payloads: dict[str, dict[str, Any]] = {}
 
+    @property
+    def init_async_client(self) -> Any:
+        # Keep cooldown publication on the legacy fake path, then expose the
+        # raw read seam required by session-owner lookup.
+        return (lambda: self) if self.payloads else None
+
+    async def get(self, name: str) -> Any:
+        return self.payloads.get(name)
+
     async def async_get_cache(self, *, key: str, **_: Any) -> Any:
         return self.payloads.get(key)
 
@@ -370,6 +379,10 @@ async def test_should_persist_one_kimi_managed_account_lane_and_continue_to_grok
                 "last_resort": False,
             },
         )
+        last_resort_state = await selection._build_codex_auto_agent_candidate_state(
+            _request("/v1/responses"),
+            candidate_template={**kimi_candidate, "last_resort": True},
+        )
         standard_state = await selection._build_anthropic_auto_agent_candidate_state(
             _request("/v1/messages"),
             candidate_template={
@@ -384,6 +397,12 @@ async def test_should_persist_one_kimi_managed_account_lane_and_continue_to_grok
         assert standard_state["cooldown_seconds"] > 0
         assert highspeed_state["cooldown_scope"] == "managed_account"
         assert standard_state["cooldown_scope"] == "managed_account"
+        assert last_resort_state["skip_reason"] == "managed_account_cooldown"
+        assert last_resort_state["cooldown_scope"] == "managed_account"
+        assert (
+            last_resort_state["cooldown_state_source"]
+            == "kimi_managed_account:durable_cache"
+        )
 
         spark_candidate = next(
             candidate
@@ -407,6 +426,7 @@ async def test_should_persist_one_kimi_managed_account_lane_and_continue_to_grok
         )
 
     assert selection_result["candidate"]["model"] in {
+        "zai_coding_plan/glm-5.3-flash",
         "oa_xai/grok-4.5",
         "alibaba_token_plan/qwen3.8-max",
     }
