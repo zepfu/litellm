@@ -115,6 +115,7 @@ from litellm.llms.cursor_agent.usage import (
     CURSOR_AGENT_USAGE_QUOTA_TYPE,
     CURSOR_AGENT_USAGE_SOURCE,
     grok_bot_reevaluation_checkpoint,
+    hash_cursor_agent_auth_jwt_identity,
     parse_current_period_usage,
 )
 
@@ -7741,12 +7742,19 @@ def _fetch_cursor_agent_usage_payload(
             retry_count=retry_count,
             message="Cursor Dashboard usage endpoint returned a non-object payload.",
         )
+    # Only a successful HTTP 200 authenticates this exact access token; derive
+    # a stable non-secret fallback identity from its JWT iss+sub claims.
+    auth_identity_hash, auth_identity_fields = hash_cursor_agent_auth_jwt_identity(
+        access_token
+    )
     return {
         "status_code": status_code,
         "payload": payload,
         "attempt_count": attempt_count,
         "retry_count": retry_count,
         "usage_url": usage_url,
+        "auth_identity_hash": auth_identity_hash,
+        "auth_identity_fields": auth_identity_fields,
     }
 
 
@@ -7755,15 +7763,26 @@ def _build_cursor_agent_usage_rate_limit_payloads(
     *,
     observed_at: datetime,
     response_body: Mapping[str, Any],
+    fetched: Optional[Mapping[str, Any]] = None,
 ) -> tuple[list[tuple[Any, ...]], Dict[str, Any]]:
     _ = config
     snapshot = parse_current_period_usage(response_body)
     grok_bot = snapshot.get("grok_bot") or grok_bot_reevaluation_checkpoint()
+    account_hash = snapshot.get("account_hash")
+    account_identity_fields = list(snapshot.get("account_identity_fields") or [])
+    account_identity_source = "provider_payload" if account_hash else None
+    if not account_hash and isinstance(fetched, Mapping):
+        fallback_hash = fetched.get("auth_identity_hash")
+        if isinstance(fallback_hash, str) and fallback_hash:
+            account_hash = fallback_hash
+            account_identity_fields = list(fetched.get("auth_identity_fields") or [])
+            account_identity_source = "auth_jwt"
     parser_summary: Dict[str, Any] = {
         "source_version": CURSOR_AGENT_USAGE_PARSER_VERSION,
         "window_state": snapshot["state"],
-        "account_identity_hashed": snapshot.get("account_hash") is not None,
-        "account_identity_fields": list(snapshot.get("account_identity_fields") or []),
+        "account_identity_hashed": account_hash is not None,
+        "account_identity_fields": account_identity_fields,
+        "account_identity_source": account_identity_source,
         "quota_key": CURSOR_AGENT_MONTHLY_QUOTA_KEY,
         "quota_period": CURSOR_AGENT_USAGE_QUOTA_PERIOD,
         "weekly_grok_bot": grok_bot.get("status"),
@@ -7771,7 +7790,6 @@ def _build_cursor_agent_usage_rate_limit_payloads(
         "weekly_grok_bot_reevaluation_ready": bool(grok_bot.get("reevaluation_ready")),
         "valid_window_count": 0,
     }
-    account_hash = snapshot.get("account_hash")
     if not account_hash:
         parser_summary["telemetry_status"] = "missing_account_identity"
         return [], parser_summary
@@ -7781,6 +7799,9 @@ def _build_cursor_agent_usage_rate_limit_payloads(
 
     parser_summary["telemetry_status"] = "valid"
     parser_summary["valid_window_count"] = 1
+    evidence = dict(snapshot.get("evidence") or {})
+    if account_identity_source == "auth_jwt":
+        evidence["account_identity_fields"] = account_identity_fields
     payload = (
         observed_at,
         CURSOR_AGENT_USAGE_CLIENT,
@@ -7799,7 +7820,7 @@ def _build_cursor_agent_usage_rate_limit_payloads(
         snapshot.get("billing_period_start_at"),
         snapshot.get("billing_period_end_at"),
         json.dumps(snapshot.get("raw_provider_fields") or {}, sort_keys=True),
-        json.dumps(snapshot.get("evidence") or {}, sort_keys=True),
+        json.dumps(evidence, sort_keys=True),
         CURSOR_AGENT_USAGE_SOURCE,
         None,
         None,
@@ -13002,6 +13023,7 @@ def _run_cursor_agent_usage_poll_task(
             config,
             observed_at=observed_at,
             response_body=fetched["payload"],
+            fetched=fetched,
         )
         summary.update(parser_summary)
         summary["observation_count"] = len(payloads)

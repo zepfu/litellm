@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import importlib.util
 import json
 import sys
@@ -336,3 +338,111 @@ def test_cursor_agent_usage_poll_respects_interval(loop, tmp_path, monkeypatch) 
     second = loop._run_cursor_agent_usage_poll_task(config, state, now_monotonic=10.0)
     assert first["observation_count"] == 1
     assert second is None
+
+
+def _make_cursor_jwt(claims: dict, *, signature: str = "sig-a") -> str:
+    header = (
+        base64.urlsafe_b64encode(json.dumps({"alg": "HS256"}).encode("utf-8"))
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    payload = (
+        base64.urlsafe_b64encode(json.dumps(claims).encode("utf-8"))
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    return f"{header}.{payload}.{signature}"
+
+
+def _identity_free_usage_payload() -> dict:
+    return {
+        "billingCycleStart": 1754524800,
+        "billingCycleEnd": 1757203200,
+        "planUsage": {
+            "includedSpend": 1250,
+            "remaining": 8750,
+            "limit": 10000,
+        },
+    }
+
+
+def test_cursor_agent_usage_poll_persists_auth_jwt_fallback_identity(
+    loop, tmp_path, monkeypatch
+) -> None:
+    for name in ("CURSOR_AUTH_TOKEN", "CURSOR_API_KEY", "CURSOR_CLI_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    token = _make_cursor_jwt(
+        {"iss": "https://authenticator.cursor.sh", "sub": "live-user-sub", "exp": 2000}
+    )
+    auth_file = tmp_path / "cursor-auth.json"
+    auth_file.write_text(
+        json.dumps(
+            {
+                "accessToken": token,
+                "refreshToken": "mounted-refresh-secret",
+                "apiKey": "mounted-api-key-secret",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        loop.urllib_request,
+        "urlopen",
+        lambda request, timeout=None: _UsageResponse(
+            json.dumps(_identity_free_usage_payload()).encode("utf-8")
+        ),
+    )
+    persisted_payloads: list = []
+
+    def fake_persist(_config, payloads):
+        persisted_payloads.extend(payloads)
+        return len(payloads)
+
+    monkeypatch.setattr(loop, "_persist_cursor_agent_usage_observations", fake_persist)
+
+    config = _config(loop, tmp_path, cursor_agent_auth_file=str(auth_file), apply=True)
+    event = loop._run_cursor_agent_usage_poll_task(
+        config, loop.SidecarTaskState(), now_monotonic=1.0
+    )
+
+    expected_hash = hashlib.sha256(
+        b"cursor-agent-auth-jwt|iss=https://authenticator.cursor.sh|sub=live-user-sub"
+    ).hexdigest()
+    assert event["telemetry_status"] == "valid"
+    assert event["persisted"] is True
+    assert event["inserted_count"] == 1
+    assert event["account_identity_hashed"] is True
+    assert event["account_identity_source"] == "auth_jwt"
+    assert event["account_identity_fields"] == ["auth.accessToken.jwt.iss+sub"]
+    assert len(persisted_payloads) == 1
+    assert persisted_payloads[0][3] == expected_hash
+    serialized = json.dumps(event, default=str) + json.dumps(
+        persisted_payloads, default=str
+    )
+    assert "live-user-sub" not in serialized
+    assert "authenticator.cursor.sh" not in serialized
+    assert token not in serialized
+    assert "mounted-refresh-secret" not in serialized
+    assert "mounted-api-key-secret" not in serialized
+
+
+def test_cursor_agent_usage_payload_identity_priority_over_auth_jwt(
+    loop, tmp_path
+) -> None:
+    fetched = {
+        "auth_identity_hash": "ab" * 32,
+        "auth_identity_fields": ["auth.accessToken.jwt.iss+sub"],
+    }
+    payloads, summary = loop._build_cursor_agent_usage_rate_limit_payloads(
+        _config(loop, tmp_path),
+        observed_at=datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc),
+        response_body=_camelcase_usage_payload(),
+        fetched=fetched,
+    )
+    expected = hashlib.sha256(
+        b"cursor-agent-account|user.id=acct-not-for-persistence"
+    ).hexdigest()
+    assert summary["telemetry_status"] == "valid"
+    assert summary["account_identity_source"] == "provider_payload"
+    assert summary["account_identity_fields"] == ["user.id"]
+    assert payloads[0][3] == expected

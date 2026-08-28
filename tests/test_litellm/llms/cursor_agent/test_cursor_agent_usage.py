@@ -13,8 +13,10 @@ from litellm.llms.cursor_agent.common_utils import (
 from litellm.llms.cursor_agent.usage import (
     CURSOR_AGENT_GROK_BOT_USAGE_SOURCE_ENV,
     CURSOR_AGENT_MONTHLY_QUOTA_KEY,
+    CURSOR_AGENT_AUTH_JWT_IDENTITY_SOURCE,
     grok_bot_reevaluation_checkpoint,
     hash_cursor_agent_account_identity,
+    hash_cursor_agent_auth_jwt_identity,
     parse_current_period_usage,
 )
 
@@ -158,3 +160,48 @@ def test_no_cli_subprocess_on_usage_parse():
         current_period_usage_url(None)
         mock_popen.assert_not_called()
         mock_run.assert_not_called()
+
+
+def _b64url(data: bytes) -> str:
+    import base64
+
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _make_jwt(claims, *, signature: str = "sig-a") -> str:
+    header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode("utf-8"))
+    payload = _b64url(json.dumps(claims).encode("utf-8"))
+    return f"{header}.{payload}.{signature}"
+
+
+def test_auth_jwt_identity_stable_across_refresh_and_differs_per_subject():
+    claims = {"iss": "https://authenticator.cursor.sh", "sub": "user-123"}
+    expected = hashlib.sha256(
+        b"cursor-agent-auth-jwt|iss=https://authenticator.cursor.sh|sub=user-123"
+    ).hexdigest()
+    refreshed_a = _make_jwt({**claims, "exp": 1000}, signature="sig-a")
+    refreshed_b = _make_jwt({**claims, "exp": 2000}, signature="sig-b")
+    other_subject = _make_jwt({"iss": claims["iss"], "sub": "user-456"})
+
+    hash_a, fields_a = hash_cursor_agent_auth_jwt_identity(refreshed_a)
+    hash_b, fields_b = hash_cursor_agent_auth_jwt_identity(refreshed_b)
+    hash_other, _ = hash_cursor_agent_auth_jwt_identity(other_subject)
+
+    assert hash_a == expected
+    assert hash_b == hash_a
+    assert fields_a == [CURSOR_AGENT_AUTH_JWT_IDENTITY_SOURCE]
+    assert fields_b == [CURSOR_AGENT_AUTH_JWT_IDENTITY_SOURCE]
+    assert hash_other is not None and hash_other != hash_a
+    assert "user-123" not in hash_a
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        {"iss": "https://authenticator.cursor.sh"},
+        {"iss": "https://authenticator.cursor.sh", "sub": ""},
+        {"iss": "https://authenticator.cursor.sh", "sub": 12345},
+    ],
+)
+def test_auth_jwt_identity_fails_closed_without_sub(claims):
+    assert hash_cursor_agent_auth_jwt_identity(_make_jwt(claims)) == (None, [])

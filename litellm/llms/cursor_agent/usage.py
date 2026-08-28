@@ -12,7 +12,9 @@ xAI Grok Build weekly credits or BugBot license RPCs as Grok Bot.
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -28,6 +30,7 @@ CURSOR_AGENT_USAGE_QUOTA_PERIOD = "monthly"
 CURSOR_AGENT_MONTHLY_QUOTA_KEY = "cursor_agent_monthly:cents"
 CURSOR_AGENT_GROK_BOT_USAGE_SOURCE_ENV = "AAWM_CURSOR_AGENT_GROK_BOT_USAGE_SOURCE"
 CURSOR_AGENT_GROK_BOT_STATUS = "unknown"
+CURSOR_AGENT_AUTH_JWT_IDENTITY_SOURCE = "auth.accessToken.jwt.iss+sub"
 
 _PLAN_USAGE_KEYS = ("planUsage", "plan_usage")
 _INCLUDED_SPEND_KEYS = ("includedSpend", "included_spend")
@@ -174,6 +177,47 @@ def hash_cursor_agent_account_identity(
         unique_fields.append(field_name)
     material = ("cursor-agent-account|" + "|".join(unique_parts)).encode("utf-8")
     return hashlib.sha256(material).hexdigest(), unique_fields
+
+
+def hash_cursor_agent_auth_jwt_identity(
+    access_token: Optional[str],
+) -> Tuple[Optional[str], List[str]]:
+    """Hash the accepted access token's JWT iss+sub as a fallback identity.
+
+    Valid only after a successful Dashboard HTTP 200, which authenticates
+    the exact token. Requires a nonempty ``sub``; never returns raw iss,
+    sub, or token material, and never hashes the whole rotating token,
+    refresh token, API key, or combined credential fingerprint.
+    """
+    if not isinstance(access_token, str):
+        return None, []
+    parts = access_token.strip().split(".")
+    if len(parts) != 3:
+        return None, []
+    try:
+        encoded_payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(
+            base64.urlsafe_b64decode(encoded_payload.encode("ascii"))
+        )
+    except (ValueError, TypeError, UnicodeDecodeError, base64.binascii.Error):
+        return None, []
+    if not isinstance(claims, Mapping):
+        return None, []
+    subject = claims.get("sub")
+    if not isinstance(subject, str) or not subject.strip():
+        return None, []
+    issuer = claims.get("iss")
+    normalized_issuer = issuer.strip().lower() if isinstance(issuer, str) else ""
+    material = (
+        "cursor-agent-auth-jwt|iss="
+        + normalized_issuer
+        + "|sub="
+        + subject.strip()
+    ).encode("utf-8")
+    return (
+        hashlib.sha256(material).hexdigest(),
+        [CURSOR_AGENT_AUTH_JWT_IDENTITY_SOURCE],
+    )
 
 
 def parse_current_period_usage(payload: Mapping[str, Any]) -> Dict[str, Any]:
