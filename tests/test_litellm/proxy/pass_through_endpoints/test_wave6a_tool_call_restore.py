@@ -857,6 +857,86 @@ class TestCustomStreamEventPayload:
         assert completed["response"]["output"][0]["type"] == "custom_tool_call"
         assert completed["response"]["output"][0]["call_id"] == call_id
 
+    def test_stream_keeps_interleaved_whitespace_distinct_call_ids_correlated(
+        self,
+        host_deps: None,
+    ) -> None:
+        state: dict[str, dict[str, Any]] = {}
+        stable_item_ids: dict[str, str] = {}
+        for output_index, call_id in enumerate(("tool", " tool ")):
+            added, count = mod._restore_adapted_custom_tool_calls_in_stream_event_payload(
+                {
+                    "type": "response.output_item.added",
+                    "output_index": output_index,
+                    "item": {
+                        "type": "function_call",
+                        "id": f"fc_legacy_{output_index}",
+                        "call_id": call_id,
+                        "name": "my_tool",
+                    },
+                },
+                request_body={"tools": []},
+                adapter_model="m",
+                adapted_names={"my_tool"},
+                state_by_key=state,
+            )
+            assert count == 1
+            assert added is not None
+            stable_item_ids[call_id] = added["item"]["id"]
+
+        assert stable_item_ids["tool"] == generate_responses_custom_tool_call_item_id("tool")
+        assert stable_item_ids[" tool "] == generate_responses_custom_tool_call_item_id(" tool ")
+        assert stable_item_ids["tool"] != stable_item_ids[" tool "]
+
+        accumulated_arguments = {call_id: "" for call_id in stable_item_ids}
+        for call_id, delta in (
+            ("tool", '{"input":"plain'),
+            (" tool ", '{"input":"spaced'),
+            ("tool", '-call"}'),
+            (" tool ", '-call"}'),
+        ):
+            result, count = mod._restore_adapted_custom_tool_calls_in_stream_event_payload(
+                {
+                    "type": "response.function_call_arguments.delta",
+                    "call_id": call_id,
+                    "delta": delta,
+                },
+                request_body={"tools": []},
+                adapter_model="m",
+                adapted_names={"my_tool"},
+                state_by_key=state,
+            )
+            assert count == 1
+            assert result is None
+            accumulated_arguments[call_id] += delta
+            call_state = mod._get_adapted_custom_tool_stream_state(
+                state,
+                {"call_id": call_id},
+            )
+            assert call_state is not None
+            assert call_state["item_id"] == stable_item_ids[call_id]
+            assert call_state["arguments"] == accumulated_arguments[call_id]
+
+        expected_inputs = {
+            "tool": "plain-call",
+            " tool ": "spaced-call",
+        }
+        for call_id, expected_input in expected_inputs.items():
+            result, count = mod._restore_adapted_custom_tool_calls_in_stream_event_payload(
+                {
+                    "type": "response.function_call_arguments.done",
+                    "call_id": call_id,
+                },
+                request_body={"tools": []},
+                adapter_model="m",
+                adapted_names={"my_tool"},
+                state_by_key=state,
+            )
+            assert count == 1
+            assert result is not None
+            assert result["item_id"] == stable_item_ids[call_id]
+            assert result["input"] == expected_input
+
     def test_unrelated_event_passthrough(self, host_deps: None) -> None:
         state: dict[str, dict[str, Any]] = {}
         payload = {"type": "response.completed", "response": {"status": "completed"}}

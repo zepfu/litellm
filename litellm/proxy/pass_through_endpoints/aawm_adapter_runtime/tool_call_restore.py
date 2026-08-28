@@ -477,7 +477,7 @@ def _adapted_custom_tool_stream_state_keys(
         for field in ("call_id", "id", "item_id"):
             value = source.get(field)
             if isinstance(value, str) and value.strip():
-                keys.append(f"id:{value.strip()}")
+                keys.append(f"id:{value}")
         output_index = source.get("output_index")
         if isinstance(output_index, int):
             keys.append(f"output:{output_index}")
@@ -499,7 +499,7 @@ def _remember_adapted_custom_tool_stream_state(
     }
     keys = _adapted_custom_tool_stream_state_keys(event_payload, item=item)
     if isinstance(item_id, str) and item_id.strip():
-        keys.append(f"id:{item_id.strip()}")
+        keys.append(f"id:{item_id}")
     for key in dict.fromkeys(keys):
         state_by_key[key] = state
     return state
