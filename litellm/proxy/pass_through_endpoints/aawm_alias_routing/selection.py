@@ -3743,6 +3743,40 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             excluded_candidate_keys=excluded_candidate_keys,
         )
         if (
+            request_mode == "ordinary_continuation"
+            and isinstance(session_owner_record, dict)
+            and sa._record_state(session_owner_record) == "owned"
+            and _candidate_matches_affinity(
+                affinity_state["candidate"],
+                affinity,
+            )
+            and (
+                not (
+                    account_identity_pinned
+                    and _affinity_pins_account_identity(affinity)
+                )
+                or affinity_state.get("lane_key")
+                == affinity.get("codex_oauth_lane_key")
+            )
+            and affinity_state.get("skip_reason") is None
+            and 0 < affinity_state["cooldown_seconds"] <= 1.0
+        ):
+            await asyncio.sleep(
+                min(affinity_state["cooldown_seconds"], 1.0)
+            )
+            affinity_state = await _build_codex_auto_agent_affinity_candidate_state(
+                request,
+                candidate_template=affinity_candidate,
+                affinity=affinity,
+                excluded_candidate_keys=excluded_candidate_keys,
+            )
+            if affinity_state["cooldown_seconds"] > 0:
+                _raise_codex_auto_agent_in_flight_cooldown(
+                    candidate=affinity_state["candidate"],
+                    lane_key=affinity_state.get("lane_key"),
+                    cooldown_seconds=affinity_state["cooldown_seconds"],
+                )
+        if (
             _candidate_matches_affinity(
                 affinity_state["candidate"],
                 affinity,

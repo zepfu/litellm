@@ -1907,6 +1907,333 @@ class TestCodexAccountBound:
         alternate.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_micro_cooldown_clears_after_one_wait_on_same_owner_lane(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pinned = _oauth_account_candidate()
+        hot_state = {
+            "candidate": pinned,
+            "lane_key": pinned["codex_oauth_lane_key"],
+            "cooldown_seconds": 0.5,
+            "skip_reason": None,
+            "cooldown_state_source": "memory",
+        }
+        clear_state = {**hot_state, "cooldown_seconds": 0.0}
+        alternate = self._patch_bound_owner_selector(
+            monkeypatch,
+            affinity_state=hot_state,
+        )
+        _set_selection_runtime_value(
+            "_has_continuation_state",
+            lambda _body: True,
+            monkeypatch,
+        )
+        state_builder = AsyncMock(side_effect=[hot_state, clear_state])
+        _set_selection_runtime_value(
+            "_build_codex_auto_agent_affinity_candidate_state",
+            state_builder,
+            monkeypatch,
+        )
+        sleep = AsyncMock()
+        monkeypatch.setattr(selection.asyncio, "sleep", sleep)
+        body = {"model": "basic", "previous_response_id": "resp_123"}
+
+        result = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body=body,
+        )
+
+        sleep.assert_awaited_once_with(0.5)
+        assert state_builder.await_count == 2
+        assert result["selection_reason"] == "session_affinity"
+        assert result["candidate"] == pinned
+        assert result["account_bound_owner_lane"] == pinned["codex_oauth_lane_key"]
+        assert body == {"model": "basic", "previous_response_id": "resp_123"}
+        alternate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_micro_cooldown_remains_hot_then_uses_existing_raise(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pinned = _oauth_account_candidate()
+        first_state = {
+            "candidate": pinned,
+            "lane_key": pinned["codex_oauth_lane_key"],
+            "cooldown_seconds": 0.5,
+            "skip_reason": None,
+            "cooldown_state_source": "memory",
+        }
+        refreshed_state = {**first_state, "cooldown_seconds": 0.25}
+        alternate = self._patch_bound_owner_selector(
+            monkeypatch,
+            affinity_state=first_state,
+        )
+        _set_selection_runtime_value(
+            "_has_continuation_state",
+            lambda _body: True,
+            monkeypatch,
+        )
+        state_builder = AsyncMock(
+            side_effect=[first_state, refreshed_state]
+        )
+        _set_selection_runtime_value(
+            "_build_codex_auto_agent_affinity_candidate_state",
+            state_builder,
+            monkeypatch,
+        )
+        sleep = AsyncMock()
+        monkeypatch.setattr(selection.asyncio, "sleep", sleep)
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            session_affinity as sa,
+        )
+
+        activate = AsyncMock(
+            side_effect=AssertionError("effective identity must not activate")
+        )
+        monkeypatch.setattr(
+            sa,
+            "activate_session_owner_redispatch_effective_identity",
+            activate,
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={"model": "basic"},
+            )
+
+        sleep.assert_awaited_once_with(0.5)
+        assert state_builder.await_count == 2
+        assert exc_info.value.status_code == 429
+        assert exc_info.value.detail["error"]["code"] == (
+            "aawm_codex_auto_agent_in_flight_provider_cooling_down"
+        )
+        assert exc_info.value.detail["candidate"]["cooldown_seconds"] == 0.25
+        assert exc_info.value.headers["Retry-After"] == "1"
+        activate.assert_not_awaited()
+        alternate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_micro_cooldown_longer_than_one_second_is_unchanged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pinned = _oauth_account_candidate()
+        state = {
+            "candidate": pinned,
+            "lane_key": pinned["codex_oauth_lane_key"],
+            "cooldown_seconds": 1.1,
+            "skip_reason": None,
+            "cooldown_state_source": "memory",
+        }
+        alternate = self._patch_bound_owner_selector(
+            monkeypatch,
+            affinity_state=state,
+        )
+        _set_selection_runtime_value(
+            "_has_continuation_state",
+            lambda _body: True,
+            monkeypatch,
+        )
+        state_builder = AsyncMock(return_value=state)
+        _set_selection_runtime_value(
+            "_build_codex_auto_agent_affinity_candidate_state",
+            state_builder,
+            monkeypatch,
+        )
+        sleep = AsyncMock()
+        monkeypatch.setattr(selection.asyncio, "sleep", sleep)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={"model": "basic"},
+            )
+
+        sleep.assert_not_awaited()
+        assert state_builder.await_count == 1
+        assert exc_info.value.status_code == 429
+        alternate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_micro_cooldown_cancellation_propagates(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pinned = _oauth_account_candidate()
+        state = {
+            "candidate": pinned,
+            "lane_key": pinned["codex_oauth_lane_key"],
+            "cooldown_seconds": 0.5,
+            "skip_reason": None,
+            "cooldown_state_source": "memory",
+        }
+        alternate = self._patch_bound_owner_selector(
+            monkeypatch,
+            affinity_state=state,
+        )
+        _set_selection_runtime_value(
+            "_has_continuation_state",
+            lambda _body: True,
+            monkeypatch,
+        )
+        state_builder = AsyncMock(return_value=state)
+        _set_selection_runtime_value(
+            "_build_codex_auto_agent_affinity_candidate_state",
+            state_builder,
+            monkeypatch,
+        )
+        sleep = AsyncMock(side_effect=selection.asyncio.CancelledError)
+        monkeypatch.setattr(selection.asyncio, "sleep", sleep)
+
+        with pytest.raises(selection.asyncio.CancelledError):
+            await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={"model": "basic"},
+            )
+
+        sleep.assert_awaited_once_with(0.5)
+        assert state_builder.await_count == 1
+        alternate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_micro_cooldown_does_not_activate_effective_identity(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        pinned = _oauth_account_candidate()
+        hot_state = {
+            "candidate": pinned,
+            "lane_key": pinned["codex_oauth_lane_key"],
+            "cooldown_seconds": 0.5,
+            "skip_reason": None,
+            "cooldown_state_source": "memory",
+        }
+        clear_state = {**hot_state, "cooldown_seconds": 0.0}
+        alternate = self._patch_bound_owner_selector(
+            monkeypatch,
+            affinity_state=hot_state,
+        )
+        _set_selection_runtime_value(
+            "_has_continuation_state",
+            lambda _body: True,
+            monkeypatch,
+        )
+        state_builder = AsyncMock(side_effect=[hot_state, clear_state])
+        _set_selection_runtime_value(
+            "_build_codex_auto_agent_affinity_candidate_state",
+            state_builder,
+            monkeypatch,
+        )
+        sleep = AsyncMock()
+        monkeypatch.setattr(selection.asyncio, "sleep", sleep)
+        activate = AsyncMock(
+            side_effect=AssertionError("effective identity must not activate")
+        )
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            session_affinity as sa,
+        )
+
+        monkeypatch.setattr(
+            sa,
+            "activate_session_owner_redispatch_effective_identity",
+            activate,
+        )
+
+        body = {"model": "basic", "previous_response_id": "resp_123"}
+        result = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body=body,
+        )
+
+        assert result["candidate"]["codex_oauth_account_label"] == "account1"
+        assert result["account_bound_owner_lane"] == pinned["codex_oauth_lane_key"]
+        assert body["previous_response_id"] == "resp_123"
+        activate.assert_not_awaited()
+        alternate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_micro_cooldown_clears_for_alibaba_token_plan_owner_lane(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            session_affinity as sa,
+        )
+
+        pinned = {
+            "provider": "alibaba_token_plan",
+            "model": "alibaba_token_plan/qwen3.6-flash",
+            "route_family": "codex_alibaba_token_plan_chat_completions_adapter",
+            "last_resort": False,
+        }
+        affinity = dict(pinned)
+        hot_state = {
+            "candidate": pinned,
+            "lane_key": "alibaba_token_plan",
+            "cooldown_seconds": 0.5,
+            "skip_reason": None,
+            "cooldown_state_source": "memory",
+        }
+        clear_state = {**hot_state, "cooldown_seconds": 0.0}
+        alternate = self._patch_bound_owner_selector(
+            monkeypatch,
+            affinity_state=hot_state,
+            stub_classifier=False,
+        )
+        _set_selection_runtime_value(
+            "_has_continuation_state",
+            lambda _body: True,
+            monkeypatch,
+        )
+        _set_selection_runtime_value(
+            "_find_codex_auto_agent_affinity_candidate",
+            lambda *_args, **_kwargs: pinned,
+            monkeypatch,
+        )
+        monkeypatch.setattr(
+            sa,
+            "owner_record_as_affinity_hint",
+            lambda *_args, **_kwargs: affinity,
+        )
+        state_builder = AsyncMock(side_effect=[hot_state, clear_state])
+        _set_selection_runtime_value(
+            "_build_codex_auto_agent_affinity_candidate_state",
+            state_builder,
+            monkeypatch,
+        )
+        sleep = AsyncMock()
+        monkeypatch.setattr(selection.asyncio, "sleep", sleep)
+        activate = AsyncMock(
+            side_effect=AssertionError("effective identity must not activate")
+        )
+        monkeypatch.setattr(
+            sa,
+            "activate_session_owner_redispatch_effective_identity",
+            activate,
+        )
+        body = {
+            "model": "basic",
+            "previous_response_id": "resp_alibaba_123",
+        }
+
+        result = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body=body,
+        )
+
+        sleep.assert_awaited_once_with(0.5)
+        assert state_builder.await_count == 2
+        assert result["candidate"] == pinned
+        assert result["lane_key"] == "alibaba_token_plan"
+        assert result["session_owner_id"] == "owner-1"
+        assert body["previous_response_id"] == "resp_alibaba_123"
+        activate.assert_not_awaited()
+        alternate.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_resp_previous_response_id_fails_closed_without_alternate(
         self,
         monkeypatch: pytest.MonkeyPatch,
