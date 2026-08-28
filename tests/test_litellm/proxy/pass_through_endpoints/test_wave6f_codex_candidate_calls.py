@@ -252,6 +252,96 @@ class TestDispatchBehavior:
             )
 
 
+class TestNativeOpenAIContinuationStorageDefaults:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("request_body", "expected_store", "expected_stream"),
+        [
+            (
+                {
+                    "model": "gpt-5.6-sol",
+                    "input": [{"type": "message", "role": "user", "content": "fresh"}],
+                    "stream": False,
+                },
+                False,
+                True,
+            ),
+            (
+                {
+                    "model": "gpt-5.6-sol",
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": "continue",
+                        }
+                    ],
+                    "previous_response_id": "resp_previous",
+                    "stream": False,
+                },
+                True,
+                False,
+            ),
+            (
+                {
+                    "model": "gpt-5.6-sol",
+                    "input": [
+                        {
+                            "type": "reasoning",
+                            "id": "rs_previous",
+                            "summary": [],
+                        }
+                    ],
+                    "stream": False,
+                },
+                True,
+                False,
+            ),
+        ],
+    )
+    async def test_native_openai_storage_defaults_preserve_continuations(
+        self,
+        request_body: dict[str, Any],
+        expected_store: bool,
+        expected_stream: bool,
+    ) -> None:
+        import litellm
+
+        pass_through_request = AsyncMock(return_value=MagicMock())
+        host: dict[str, Any] = {
+            "__builtins__": __builtins__,
+            "litellm": litellm,
+            "pass_through_request": pass_through_request,
+            "_AAWM_ALIAS_CANDIDATE_RETRYABLE_UPSTREAM_STATUS_CODES_DEFAULT": [
+                429,
+                500,
+                502,
+                503,
+                504,
+            ],
+            "_drop_unsupported_codex_request_params_from_request_body": (
+                lambda body: (body, [])
+            ),
+        }
+        codex_candidate_calls.install(host)
+
+        await host["_perform_codex_auto_agent_native_openai_request"](
+            request=MagicMock(),
+            fastapi_response=MagicMock(),
+            user_api_key_dict=MagicMock(),
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+            request_body=request_body,
+            custom_headers={},
+        )
+
+        call_kwargs = pass_through_request.await_args.kwargs
+        assert call_kwargs["custom_body"]["store"] is expected_store
+        assert call_kwargs["custom_body"]["stream"] is expected_stream
+        assert call_kwargs["stream"] is expected_stream
+
+
 # ── Callback ordering (Kimi route) ─────────────────────────────────
 
 

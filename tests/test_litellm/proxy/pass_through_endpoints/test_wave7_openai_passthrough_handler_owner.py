@@ -847,7 +847,9 @@ class TestBaseHandlerDispatch:
         validate_response.assert_not_awaited()
         endpoint_func.assert_awaited_once()
         assert endpoint_func.await_args.kwargs["custom_body"] == {
-            "model": "grok-native"
+            "model": "grok-native",
+            "store": False,
+            "stream": True,
         }
 
     def test_observability_body_is_safe_set_and_forwarded_as_custom_body(self):
@@ -1038,6 +1040,96 @@ class TestBaseHandlerDispatch:
 
         assert result is not None
         assert events == ["resolve", "dispatch"]
+
+
+class TestCodexContinuationStorageDefaults:
+    @pytest.mark.parametrize(
+        ("request_body", "expected_store", "expected_stream"),
+        [
+            (
+                {
+                    "model": "basic",
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": "fresh request",
+                        }
+                    ],
+                    "stream": False,
+                },
+                False,
+                True,
+            ),
+            (
+                {
+                    "model": "basic",
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": "previous response continuation",
+                        }
+                    ],
+                    "previous_response_id": "resp_previous",
+                    "stream": False,
+                },
+                True,
+                False,
+            ),
+            (
+                {
+                    "model": "basic",
+                    "input": [
+                        {
+                            "type": "reasoning",
+                            "id": "rs_previous",
+                            "summary": [],
+                        }
+                    ],
+                    "stream": False,
+                },
+                True,
+                False,
+            ),
+        ],
+    )
+    def test_codex_responses_storage_defaults_preserve_continuations(
+        self,
+        request_body: dict[str, Any],
+        expected_store: bool,
+        expected_stream: bool,
+    ) -> None:
+        endpoint_func = AsyncMock(return_value="storage-defaults-ok")
+        create_fn = MagicMock(return_value=endpoint_func)
+        install_runtime(
+            _make_runtime(
+                get_request_body_fn=AsyncMock(return_value=deepcopy(request_body)),
+                resolve_codex_auto_agent_alias_model_fn=(
+                    lambda body, **kwargs: "basic"
+                ),
+                try_dispatch_codex_request_fn=AsyncMock(return_value=None),
+                create_pass_through_route_fn=create_fn,
+            )
+        )
+
+        result = asyncio.run(
+            BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+                endpoint="/v1/responses",
+                request=_fake_request("POST"),
+                fastapi_response=MagicMock(),
+                user_api_key_dict=MagicMock(),
+                base_target_url="https://api.openai.com",
+                api_key="sk-test",
+                custom_llm_provider=litellm.LlmProviders.OPENAI,
+            )
+        )
+
+        assert result == "storage-defaults-ok"
+        call_kwargs = endpoint_func.await_args.kwargs
+        assert call_kwargs["custom_body"]["store"] is expected_store
+        assert call_kwargs["custom_body"]["stream"] is expected_stream
+        assert create_fn.call_args.kwargs["is_streaming_request"] is expected_stream
 
 
 # ---------------------------------------------------------------------------

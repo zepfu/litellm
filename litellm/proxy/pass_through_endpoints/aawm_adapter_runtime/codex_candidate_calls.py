@@ -232,6 +232,63 @@ def _get_runtime_text_watermark_config() -> Any:
     return load_text_watermark_config(payload)
 
 
+def _input_contains_upstream_continuation_item(
+    value: Any,
+    _seen: Optional[set[int]] = None,
+) -> bool:
+    if isinstance(value, (dict, list)):
+        if _seen is None:
+            _seen = set()
+        value_id = id(value)
+        if value_id in _seen:
+            return False
+        _seen.add(value_id)
+
+    if isinstance(value, list):
+        return any(
+            _input_contains_upstream_continuation_item(item, _seen)
+            for item in value
+        )
+    if not isinstance(value, dict):
+        return False
+
+    item_type = value.get("type")
+    item_id = value.get("id")
+    if (
+        isinstance(item_type, str)
+        and item_type in {"reasoning", "item_reference"}
+        and isinstance(item_id, str)
+        and item_id.startswith("rs_")
+    ):
+        return True
+
+    item_reference = value.get("item_reference")
+    if isinstance(item_reference, str) and item_reference.startswith("rs_"):
+        return True
+    if isinstance(item_reference, dict):
+        referenced_id = item_reference.get("id")
+        if isinstance(referenced_id, str) and referenced_id.startswith("rs_"):
+            return True
+
+    return any(
+        _input_contains_upstream_continuation_item(child, _seen)
+        for child in value.values()
+    )
+
+
+def _request_has_upstream_continuation_state(request_body: Any) -> bool:
+    if not isinstance(request_body, dict):
+        return False
+
+    previous_response_id = request_body.get("previous_response_id")
+    if isinstance(previous_response_id, str) and previous_response_id.strip():
+        return True
+
+    return _input_contains_upstream_continuation_item(
+        request_body.get("input")
+    )
+
+
 if TYPE_CHECKING:
     import httpx
     import litellm as litellm
@@ -513,6 +570,10 @@ def install(
         ("load_text_watermark_config", load_text_watermark_config),
         ("_get_runtime_text_watermark_config", _get_runtime_text_watermark_config),
         ("_watermark_endpoint_from_path", _watermark_endpoint_from_path),
+        (
+            "_request_has_upstream_continuation_state",
+            _request_has_upstream_continuation_state,
+        ),
         ("_opencode_go_tool_type", _opencode_go_tool_type),
         ("_opencode_go_tool_types", _opencode_go_tool_types),
         ("_extract_opencode_go_offending_tool_index", _extract_opencode_go_offending_tool_index),
@@ -2400,6 +2461,9 @@ async def _perform_codex_auto_agent_native_openai_request(
         normalize_direct_openai_legacy_function_call_history_ids,
     )
 
+    has_upstream_continuation = _request_has_upstream_continuation_state(
+        request_body
+    )
     request_body = normalize_direct_openai_legacy_function_call_history_ids(
         request_body
     )
@@ -2420,11 +2484,17 @@ async def _perform_codex_auto_agent_native_openai_request(
             url=target_url,
         )
     )
-    request_body = {
-        **request_body,
-        "store": False,
-        "stream": True,
-    }
+    if has_upstream_continuation:
+        request_body = {
+            **request_body,
+            "store": True,
+        }
+    else:
+        request_body = {
+            **request_body,
+            "store": False,
+            "stream": True,
+        }
     is_streaming_request = bool(request_body.get("stream"))
     resolved_headers = (
         dict(custom_headers)
