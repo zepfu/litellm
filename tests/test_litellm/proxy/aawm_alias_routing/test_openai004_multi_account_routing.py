@@ -1299,27 +1299,138 @@ async def test_candidate_loop_all_token_invalidated_accounts_fail_closed(
 
 
 @pytest.mark.asyncio
-async def test_candidate_loop_generic_401_does_not_fail_over(
+async def test_candidate_loop_fresh_generic_401_advances_to_later_candidate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_candidate_loop_host(monkeypatch)
     monkeypatch.setattr(
         lpe,
         "_classify_codex_auto_agent_retryable_exhaustion",
-        error_signals._classify_codex_auto_agent_retryable_exhaustion,
+        lambda exc, *args, candidate=None, **kwargs: None,
     )
     request = _request()
-    selected_labels: list[str] = []
+    earlier = {
+        "provider": "openrouter",
+        "model": "openrouter/owl-alpha",
+        "route_family": "codex_openrouter_completion_adapter",
+        "last_resort": False,
+    }
+    luna = {
+        "provider": "openai",
+        "model": "gpt-5.6-luna",
+        "route_family": "codex_responses",
+        "last_resort": True,
+        "reasoning_effort": "low",
+    }
+    selected_models: list[str] = []
+    performed_models: list[str] = []
 
     async def _select(**kwargs: Any) -> dict[str, Any]:
-        selected_labels.append("account1")
-        return _account_selection(
-            "account1",
-            "hash-account1",
-            failover_ordinal=0,
+        excluded = selection._get_codex_auto_agent_request_local_excluded_keys(
+            request
         )
+        for candidate, lane_key in ((earlier, "openrouter"), (luna, "openai")):
+            cooldown_key = selection._get_codex_auto_agent_request_local_cooldown_key(
+                candidate=candidate,
+                lane_key=lane_key,
+            )
+            if cooldown_key in excluded:
+                continue
+            selected_models.append(candidate["model"])
+            return {
+                "candidate": candidate,
+                "lane_key": lane_key,
+                "cooldown_key": f"{candidate['provider']}:{candidate['model']}:{lane_key}",
+                "selection_reason": (
+                    "last_resort" if candidate is luna else "first_available"
+                ),
+                "session_key": None,
+                "skipped": [],
+            }
+        raise HTTPException(status_code=429, detail="all candidates exhausted")
 
     async def _perform(**kwargs: Any) -> Response:
+        candidate = kwargs["candidate"]
+        performed_models.append(candidate["model"])
+        if candidate is earlier:
+            raise HTTPException(
+                status_code=401,
+                detail={"error": {"code": "invalid_api_key"}},
+            )
+        return Response(content=b"luna")
+
+    def _resolve_publication(**kwargs: Any) -> CooldownPublicationPlan:
+        assert kwargs["error_class"] == "provider_terminal_error"
+        return CooldownPublicationPlan(applied_scope="none")
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    response = await candidate_loop.handle_alias_route(
+        replace(
+            _loop_services(
+                select_candidate=_select,
+                perform_candidate=_perform,
+            ),
+            resolve_cooldown_publication_fn=_resolve_publication,
+        ),
+        alias_family="codex_auto_agent",
+        alias_model="basic",
+        request=request,
+        prepared_request_body={"model": "basic"},
+        max_candidate_attempts=2,
+        get_active_cooldown_state_fn=_zero,
+        attempts_metadata_key="codex_auto_agent_attempts",
+        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+        no_candidate_detail="no candidate",
+        log_label="Codex",
+    )
+
+    assert response.body == b"luna"
+    assert selected_models == ["openrouter/owl-alpha", "gpt-5.6-luna"]
+    assert performed_models == ["openrouter/owl-alpha", "gpt-5.6-luna"]
+    attempts = attempt_records._auto_agent_alias_request_outcome_state(request)[
+        "attempts"
+    ]
+    assert attempts[0]["model"] == "openrouter/owl-alpha"
+    assert attempts[0]["error_class"] == "provider_terminal_error"
+    assert attempts[0]["attempted_provider_call"] is True
+    assert attempts[-1]["model"] == "gpt-5.6-luna"
+    assert attempts[-1]["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_unsafe_continuation_generic_401_does_not_advance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc, *args, candidate=None, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_codex_auto_agent_request_has_continuation_state",
+        lambda body: True,
+    )
+    request = _request()
+    selected_models: list[str] = []
+    performed_models: list[str] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        selected_models.append("gpt-5.3-codex")
+        assert len(selected_models) == 1
+        selected = _account_selection(
+            "account1",
+            "hash-account-1",
+            failover_ordinal=0,
+            credential_affinity="interchangeable",
+        )
+        return selected
+
+    async def _perform(**kwargs: Any) -> Response:
+        performed_models.append(kwargs["candidate"]["model"])
         raise HTTPException(
             status_code=401,
             detail={"error": {"code": "invalid_api_key"}},
@@ -1328,11 +1439,18 @@ async def test_candidate_loop_generic_401_does_not_fail_over(
     async def _zero(_key: str) -> tuple[float, str]:
         return 0.0, "local_fallback"
 
+    def _resolve_publication(**kwargs: Any) -> CooldownPublicationPlan:
+        assert kwargs["error_class"] is None
+        return CooldownPublicationPlan(applied_scope="none")
+
     with pytest.raises(HTTPException) as exc_info:
         await candidate_loop.handle_alias_route(
-            _loop_services(
-                select_candidate=_select,
-                perform_candidate=_perform,
+            replace(
+                _loop_services(
+                    select_candidate=_select,
+                    perform_candidate=_perform,
+                ),
+                resolve_cooldown_publication_fn=_resolve_publication,
             ),
             alias_family="codex_auto_agent",
             alias_model="basic",
@@ -1347,7 +1465,9 @@ async def test_candidate_loop_generic_401_does_not_fail_over(
         )
 
     assert exc_info.value.status_code == 401
-    assert selected_labels == ["account1"]
+    assert selected_models == ["gpt-5.3-codex"]
+    assert performed_models == ["gpt-5.3-codex"]
+    assert getattr(request.state, "aawm_alias_request_local_excluded_keys", set()) == set()
 
 
 @pytest.mark.asyncio
