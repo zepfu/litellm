@@ -143,6 +143,25 @@ def _attribution(
     }
 
 
+def _assert_xai_candidate_classification(
+    cursor: RoutingCandidate,
+    oidc: RoutingCandidate,
+    oauth: RoutingCandidate,
+) -> None:
+    cursor_public = _public_candidate(cursor, route_family=_CURSOR_ROUTE)
+    oidc_public = _public_candidate(oidc, route_family=_OIDC_ROUTE)
+    oauth_public = _public_candidate(oauth, route_family=_OAUTH_ROUTE)
+    assert _is_codex_auto_agent_cursor_agent_candidate(cursor_public)
+    assert not _is_codex_auto_agent_xai_candidate(cursor_public)
+    assert not _is_codex_auto_agent_grok_account_quota_candidate(cursor_public)
+    assert _is_codex_auto_agent_xai_candidate(oidc_public)
+    assert _is_codex_auto_agent_xai_candidate(oauth_public)
+    assert _is_codex_auto_agent_grok_account_quota_candidate(oidc_public)
+    assert _is_codex_auto_agent_grok_account_quota_candidate(oauth_public)
+    assert not _is_codex_auto_agent_cursor_agent_candidate(oidc_public)
+    assert not _is_codex_auto_agent_cursor_agent_candidate(oauth_public)
+
+
 def test_sota_xai_yaml_compiles_cursor_then_oidc_then_oauth() -> None:
     snapshot = compile_yaml(_SOTA_XAI_YAML.read_text(encoding="utf-8"))
     alias = snapshot.aliases["sota-xai"]
@@ -244,18 +263,7 @@ def test_sota_xai_compiled_candidates_keep_distinct_route_lane_credential_failur
         )
         assert oidc_attr["quota_cooldown_key"] != oauth_attr["quota_cooldown_key"]
 
-        cursor_public = _public_candidate(cursor, route_family=_CURSOR_ROUTE)
-        oidc_public = _public_candidate(oidc, route_family=_OIDC_ROUTE)
-        oauth_public = _public_candidate(oauth, route_family=_OAUTH_ROUTE)
-        assert _is_codex_auto_agent_cursor_agent_candidate(cursor_public)
-        assert not _is_codex_auto_agent_xai_candidate(cursor_public)
-        assert not _is_codex_auto_agent_grok_account_quota_candidate(cursor_public)
-        assert _is_codex_auto_agent_xai_candidate(oidc_public)
-        assert _is_codex_auto_agent_xai_candidate(oauth_public)
-        assert _is_codex_auto_agent_grok_account_quota_candidate(oidc_public)
-        assert _is_codex_auto_agent_grok_account_quota_candidate(oauth_public)
-        assert not _is_codex_auto_agent_cursor_agent_candidate(oidc_public)
-        assert not _is_codex_auto_agent_cursor_agent_candidate(oauth_public)
+        _assert_xai_candidate_classification(cursor, oidc, oauth)
 
         selected = snapshot_select._select_snapshot_candidates(
             "sota-xai",
