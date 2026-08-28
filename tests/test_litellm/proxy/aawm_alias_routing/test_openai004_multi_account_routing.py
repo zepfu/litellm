@@ -140,6 +140,32 @@ def _unpersisted_item_not_found_error(
     return exc
 
 
+def _adapter_wrapped_unpersisted_item_not_found_error(
+    *,
+    message: str = _OPENAI_RESPONSES_UNPERSISTED_ITEM_CURRENT_MESSAGE,
+    status_code: int = 404,
+    error_type: str = "invalid_request_error",
+    detail: str | None = None,
+) -> ProxyException:
+    if detail is None:
+        detail = json.dumps(
+            {
+                "error": {
+                    "message": message,
+                    "type": error_type,
+                }
+            }
+        )
+    exc = ProxyException(
+        message=detail,
+        type="None",
+        param="None",
+        code=status_code,
+    )
+    exc.detail = detail
+    return exc
+
+
 def _stream_token_invalidated_error() -> HTTPException:
     return ResponsesStreamPreCommitFailure(
         error_class="token_invalidated",
@@ -4222,6 +4248,77 @@ def test_openai_responses_unpersisted_item_not_found_predicate_is_exact() -> Non
     )
 
 
+def test_openai_responses_unpersisted_item_not_found_accepts_exact_adapter_wrapped_404(
+) -> None:
+    candidate = _candidate()
+    endpoint = "/v1/responses"
+    valid_error = _adapter_wrapped_unpersisted_item_not_found_error()
+
+    assert valid_error.detail == valid_error.message
+    assert valid_error.code == "404"
+    assert valid_error.type == "None"
+    assert valid_error.param == "None"
+    assert not hasattr(valid_error, "status_code")
+    assert error_signals.is_openai_responses_unpersisted_item_not_found_error(
+        valid_error,
+        candidate=candidate,
+        endpoint=endpoint,
+        provider_returned=True,
+    )
+
+    for message, status_code in (
+        (_OPENAI_RESPONSES_UNPERSISTED_ITEM_CURRENT_MESSAGE, 400),
+        (_OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE, 404),
+        (_OPENAI_RESPONSES_UNPERSISTED_ITEM_NO_SUGGESTION_MESSAGE, 404),
+    ):
+        assert not error_signals.is_openai_responses_unpersisted_item_not_found_error(
+            _adapter_wrapped_unpersisted_item_not_found_error(
+                message=message,
+                status_code=status_code,
+            ),
+            candidate=candidate,
+            endpoint=endpoint,
+            provider_returned=True,
+        )
+
+    valid_payload = json.loads(valid_error.detail)
+    invalid_details = (
+        _adapter_wrapped_unpersisted_item_not_found_error(
+            error_type="server_error",
+        ),
+        _adapter_wrapped_unpersisted_item_not_found_error(
+            detail='{"error": {"type": "invalid_request_error", "message":',
+        ),
+        _adapter_wrapped_unpersisted_item_not_found_error(
+            detail=f"{valid_error.detail}\n{valid_error.detail}",
+        ),
+        _adapter_wrapped_unpersisted_item_not_found_error(
+            detail=json.dumps([valid_payload]),
+        ),
+        _adapter_wrapped_unpersisted_item_not_found_error(
+            detail=json.dumps({"data": valid_payload}),
+        ),
+        _adapter_wrapped_unpersisted_item_not_found_error(
+            detail=json.dumps({"error": json.dumps(valid_payload["error"])}),
+        ),
+        _adapter_wrapped_unpersisted_item_not_found_error(
+            detail=f"provider error: {valid_error.detail}",
+        ),
+    )
+    for invalid_error in invalid_details:
+        assert not error_signals.is_openai_responses_unpersisted_item_not_found_error(
+            invalid_error,
+            candidate=candidate,
+            endpoint=endpoint,
+            provider_returned=True,
+        )
+    assert not error_signals.is_openai_responses_unpersisted_item_not_found_error(
+        valid_error,
+        candidate=candidate,
+        endpoint=endpoint,
+    )
+
+
 @pytest.mark.asyncio
 async def test_candidate_loop_unpersisted_item_not_found_continuation_uses_session_owner_redispatch(
     monkeypatch: pytest.MonkeyPatch,
@@ -4492,6 +4589,7 @@ async def test_openai_proxy_route_direct_unpersisted_item_not_found_continuation
     provider_calls = 0
     provider_bodies: list[dict[str, Any]] = []
     warning_details: list[dict[str, Any]] = []
+    upstream_exc = _adapter_wrapped_unpersisted_item_not_found_error()
     retry = AsyncMock(side_effect=AssertionError("unexpected direct retry"))
     publish = AsyncMock(side_effect=AssertionError("unexpected cooldown memory"))
     persist = AsyncMock(side_effect=AssertionError("unexpected cooldown Redis"))
@@ -4509,10 +4607,7 @@ async def test_openai_proxy_route_direct_unpersisted_item_not_found_continuation
                 "store": body["store"],
             }
         )
-        raise _unpersisted_item_not_found_error(
-            message=_OPENAI_RESPONSES_UNPERSISTED_ITEM_CURRENT_MESSAGE,
-            status_code=404,
-        )
+        raise upstream_exc
 
     monkeypatch.setattr(lpe, "get_request_body", _fake_get_body)
     monkeypatch.setattr(

@@ -1278,9 +1278,15 @@ def _openai_responses_unpersisted_item_not_found_message(exc: Any) -> Optional[s
     if message_re is None:
         return None
     detail = getattr(exc, "detail", None)
-    if not isinstance(detail, dict):
+    if isinstance(detail, dict):
+        payloads: list[object] = [detail]
+    elif isinstance(detail, str):
+        payloads = _parse_json_payloads_from_text_candidates([detail])
+    else:
         return None
-    error = detail.get("error")
+    if len(payloads) != 1 or not isinstance(payloads[0], dict):
+        return None
+    error = payloads[0].get("error")
     if not isinstance(error, dict) or error.get("type") != "invalid_request_error":
         return None
     message = error.get("message")
