@@ -33,7 +33,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Mapping, Optional, cast
+from typing import Any, Awaitable, Callable, Mapping, Optional, TypeVar, cast
 
 from fastapi import HTTPException
 
@@ -44,6 +44,9 @@ from litellm.secret_managers.credential_error_sanitizer import (
 
 from . import durable
 from .types import Payload
+
+
+_SessionOwnerLeaseOperationT = TypeVar("_SessionOwnerLeaseOperationT")
 
 
 class SessionOwnerRecordState(str, Enum):
@@ -67,6 +70,22 @@ class SessionOwnerMutationOutcome(str, Enum):
     CONFLICT = "conflict"
     ERROR = "error"
     SKIPPED = "skipped"
+
+
+class SessionOwnerLeaseRenewalError(RuntimeError):
+    """The in-flight reservation could not be renewed safely."""
+
+    failure_phase = "session_owner_reservation_renewal"
+
+    def __init__(
+        self,
+        *,
+        session_identity: Optional[str],
+        reason: str = "reservation renewal failed",
+    ) -> None:
+        self.session_identity = session_identity
+        self.reason = reason
+        super().__init__(f"session_owner: {reason}")
 
 
 @dataclass(frozen=True)
@@ -106,6 +125,11 @@ class SessionOwnerLease:
     attributes: Payload = field(default_factory=dict)
     promoted: bool = False
     released: bool = False
+    renewal_task: Optional[Any] = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 _SESSION_OWNER_STATE_KIND = "session_owner"
@@ -193,6 +217,8 @@ _REQUIRED_OWNER_ATTRIBUTE_KEYS = (
 _DEFAULT_RESERVATION_TTL_SECONDS = 120.0
 _MIN_RESERVATION_TTL_SECONDS = 30.0
 _MAX_RESERVATION_TTL_SECONDS = 900.0
+_DEFAULT_RESERVATION_RENEWAL_INTERVAL_SECONDS = 30.0
+_MIN_RESERVATION_RENEWAL_INTERVAL_SECONDS = 1.0
 _DEFAULT_RESERVATION_WAIT_TIMEOUT_SECONDS = 0.25
 _DEFAULT_RESERVATION_WAIT_POLL_SECONDS = 0.025
 _MAX_RESERVATION_WAIT_TIMEOUT_SECONDS = 1.0
@@ -2143,6 +2169,248 @@ async def _renew_reservation(
     return cast(Payload, renewed)
 
 
+def _session_owner_lease_is_renewable(
+    lease: Optional[SessionOwnerLease],
+) -> bool:
+    return (
+        lease is not None
+        and lease.held_reservation
+        and not lease.promoted
+        and not lease.released
+    )
+
+
+def _stop_session_owner_lease_renewal(
+    lease: Optional[SessionOwnerLease],
+) -> None:
+    if lease is None:
+        return
+    task = lease.renewal_task
+    if task is None or task.done():
+        return
+    try:
+        current_task = asyncio.current_task()
+    except RuntimeError:
+        current_task = None
+    if task is not current_task:
+        task.cancel()
+
+
+def _normalize_reservation_renewal_interval(
+    ttl_seconds: float,
+    interval_seconds: Optional[float],
+) -> float:
+    ttl = _normalize_reservation_ttl(ttl_seconds)
+    if interval_seconds is None:
+        return min(
+            _DEFAULT_RESERVATION_RENEWAL_INTERVAL_SECONDS,
+            max(_MIN_RESERVATION_RENEWAL_INTERVAL_SECONDS, ttl / 3.0),
+        )
+    try:
+        interval = float(interval_seconds)
+    except (TypeError, ValueError):
+        interval = _DEFAULT_RESERVATION_RENEWAL_INTERVAL_SECONDS
+    if not math.isfinite(interval) or interval <= 0:
+        interval = _DEFAULT_RESERVATION_RENEWAL_INTERVAL_SECONDS
+    return max(0.001, min(ttl / 2.0, interval))
+
+
+async def _renew_session_owner_lease_once(
+    lease: SessionOwnerLease,
+    *,
+    ttl_seconds: float,
+) -> Optional[Payload]:
+    """Renew one held lease without ever reacquiring a missing reservation."""
+
+    if not _session_owner_lease_is_renewable(lease):
+        return None
+    session_identity = _clean_optional_str(lease.session_identity)
+    token = _clean_optional_str(lease.reservation_token)
+    if session_identity is None or token is None:
+        return None
+    cache_key = _clean_optional_str(lease.cache_key)
+    if cache_key is None:
+        cache_key = build_aawm_alias_routing_session_owner_cache_key(
+            session_identity=session_identity
+        )
+
+    redis_cache, error = await _get_redis_cache()
+    if error is not None or redis_cache is None:
+        return None
+    try:
+        record = await _read_session_owner_record(
+            redis_cache=redis_cache,
+            cache_key=cache_key,
+        )
+        if (
+            record is None
+            or _record_state(record) != SessionOwnerRecordState.RESERVED.value
+            or _clean_optional_str(record.get(_RECORD_TOKEN_FIELD)) != token
+        ):
+            return None
+        return await _renew_reservation(
+            redis_cache=redis_cache,
+            cache_key=cache_key,
+            record=record,
+            ttl_seconds=ttl_seconds,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _session_owner_lease_renewal_loop(
+    lease: SessionOwnerLease,
+    *,
+    ttl_seconds: float,
+    interval_seconds: float,
+) -> None:
+    while _session_owner_lease_is_renewable(lease):
+        try:
+            await asyncio.sleep(interval_seconds)
+            if not _session_owner_lease_is_renewable(lease):
+                return
+            renewed = await _renew_session_owner_lease_once(
+                lease,
+                ttl_seconds=ttl_seconds,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise SessionOwnerLeaseRenewalError(
+                session_identity=lease.session_identity,
+            ) from exc
+        if renewed is None:
+            if not _session_owner_lease_is_renewable(lease):
+                return
+            raise SessionOwnerLeaseRenewalError(
+                session_identity=lease.session_identity,
+            )
+
+
+async def _cancel_and_await_tasks(*tasks: Any) -> None:
+    active_tasks = [
+        task
+        for task in tasks
+        if task is not None and not task.done()
+    ]
+    for task in active_tasks:
+        task.cancel()
+    if not tasks:
+        return
+    cleanup = asyncio.gather(*tasks, return_exceptions=True)
+    cancelled = False
+    try:
+        await asyncio.shield(cleanup)
+    except asyncio.CancelledError:
+        cancelled = True
+        await cleanup
+    if cancelled:
+        raise asyncio.CancelledError
+
+
+def _session_owner_renewal_task_error(
+    task: Any,
+    lease: SessionOwnerLease,
+) -> Optional[BaseException]:
+    if not task.done():
+        return None
+    if not _session_owner_lease_is_renewable(lease):
+        if task.cancelled():
+            return None
+        # Consume an unexpected task exception after a nested finalizer has
+        # already made the lease terminal.
+        try:
+            task.exception()
+        except BaseException:
+            pass
+        return None
+    if task.cancelled():
+        return SessionOwnerLeaseRenewalError(
+            session_identity=lease.session_identity,
+        )
+    return task.exception()
+
+
+async def run_with_session_owner_lease_renewal(
+    lease: Optional[SessionOwnerLease],
+    operation: Callable[[], Awaitable[_SessionOwnerLeaseOperationT]],
+    *,
+    reservation_ttl_seconds: float = _DEFAULT_RESERVATION_TTL_SECONDS,
+    renewal_interval_seconds: Optional[float] = None,
+) -> _SessionOwnerLeaseOperationT:
+    """Run one provider operation while renewing its held reservation.
+
+    A lost or replaced reservation cancels the operation and raises a
+    fail-closed error. The provider and renewal tasks are always joined before
+    this function returns or raises.
+    """
+
+    if not _session_owner_lease_is_renewable(lease):
+        return await operation()
+    assert lease is not None
+
+    existing_task = lease.renewal_task
+    if existing_task is not None and not existing_task.done():
+        # A nested adapter operation is covered by the outer operation's
+        # renewal task; never create competing renewers for one lease.
+        return await operation()
+    lease.renewal_task = None
+
+    ttl = _normalize_reservation_ttl(reservation_ttl_seconds)
+    interval = _normalize_reservation_renewal_interval(
+        ttl,
+        renewal_interval_seconds,
+    )
+    operation_task = asyncio.ensure_future(operation())
+    try:
+        renewal_task = asyncio.create_task(
+            _session_owner_lease_renewal_loop(
+                lease,
+                ttl_seconds=ttl,
+                interval_seconds=interval,
+            )
+        )
+    except BaseException:
+        await _cancel_and_await_tasks(operation_task)
+        raise
+    lease.renewal_task = renewal_task
+
+    try:
+        done, _ = await asyncio.wait(
+            {operation_task, renewal_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if operation_task in done:
+            renewal_error = (
+                _session_owner_renewal_task_error(renewal_task, lease)
+                if renewal_task in done
+                else None
+            )
+            try:
+                result = operation_task.result()
+            except BaseException:
+                # The provider's own failure/cancellation remains primary, but
+                # the renewal task exception has already been consumed above.
+                raise
+            if renewal_error is not None:
+                raise renewal_error
+            return result
+
+        renewal_error = _session_owner_renewal_task_error(renewal_task, lease)
+        if renewal_error is not None:
+            await _cancel_and_await_tasks(operation_task)
+            raise renewal_error
+        return await operation_task
+    finally:
+        try:
+            await _cancel_and_await_tasks(operation_task, renewal_task)
+        finally:
+            if lease.renewal_task is renewal_task:
+                lease.renewal_task = None
+
+
 async def promote_session_owner_reservation(  # noqa: PLR0911
     *,
     session_identity: Optional[str],
@@ -2454,6 +2722,7 @@ async def finalize_session_owner_lease_on_success(
         SessionOwnerMutationOutcome.ALREADY_OWNED,
     }:
         lease.promoted = True
+        _stop_session_owner_lease_renewal(lease)
     return result
 
 
@@ -2472,6 +2741,7 @@ async def finalize_session_owner_lease_on_failure(
         SessionOwnerMutationOutcome.ALREADY_OWNED,
     }:
         lease.released = True
+        _stop_session_owner_lease_renewal(lease)
     return result
 
 

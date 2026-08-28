@@ -22,9 +22,11 @@ class _FakeRedisClient:
         self._parent = parent
 
     async def get(self, name: str) -> Any:
+        self._parent._purge_expired(name)
         return self._parent._data.get(name)
 
     async def set(self, name: str, value: Any, nx: bool = False, ex: Any = None) -> bool:
+        self._parent._purge_expired(name)
         if nx and name in self._parent._data:
             return False
         if isinstance(value, (bytes, bytearray)):
@@ -35,7 +37,12 @@ class _FakeRedisClient:
             encoded = json.dumps(value).encode("utf-8")
         self._parent._data[name] = encoded
         if ex is not None:
-            self._parent._ttl[name] = float(ex)
+            ttl = float(ex)
+            self._parent._ttl[name] = ttl
+            self._parent._expires_at[name] = self._parent._clock + ttl
+        else:
+            self._parent._ttl.pop(name, None)
+            self._parent._expires_at.pop(name, None)
         return True
 
     async def delete(self, *names: str) -> int:
@@ -44,16 +51,19 @@ class _FakeRedisClient:
             if name in self._parent._data:
                 self._parent._data.pop(name, None)
                 self._parent._ttl.pop(name, None)
+                self._parent._expires_at.pop(name, None)
                 deleted += 1
         return deleted
 
     async def persist(self, name: str) -> bool:
         self._parent._ttl.pop(name, None)
+        self._parent._expires_at.pop(name, None)
         return True
 
     async def eval(self, script: str, numkeys: int, *args: Any) -> Any:
         # Minimal Lua semantics used by session_affinity promote/release/renew.
         key = args[0]
+        self._parent._purge_expired(key)
         raw = self._parent._data.get(key)
         if "PERSIST" in script and "reservation_token" in script and "owned" in script:
             # promote
@@ -71,6 +81,7 @@ class _FakeRedisClient:
                 payload["reserved_at_epoch"] = current["reserved_at_epoch"]
             self._parent._data[key] = json.dumps(payload).encode("utf-8")
             self._parent._ttl.pop(key, None)
+            self._parent._expires_at.pop(key, None)
             return [1, json.dumps(payload)]
         if "DEL" in script and "reserved" in script:
             token = args[1]
@@ -82,13 +93,22 @@ class _FakeRedisClient:
             if current.get("state") == "reserved" and current.get("reservation_token") == token:
                 self._parent._data.pop(key, None)
                 self._parent._ttl.pop(key, None)
+                self._parent._expires_at.pop(key, None)
                 return 1
             return 0
         if "last_renewed_at_epoch" in script or ("EX" in script and "reserved" in script):
+            self._parent.renewal_calls += 1
             token = args[1]
             payload_json = args[2]
             ttl = float(args[3])
             if raw is None:
+                return 0
+            if self._parent.drop_reservation_on_renewal:
+                self._parent._data.pop(key, None)
+                self._parent._ttl.pop(key, None)
+                self._parent._expires_at.pop(key, None)
+                return 0
+            if self._parent.fail_renewal:
                 return 0
             current = json.loads(raw.decode("utf-8"))
             if current.get("state") != "reserved" or current.get("reservation_token") != token:
@@ -96,6 +116,7 @@ class _FakeRedisClient:
             payload = json.loads(payload_json)
             self._parent._data[key] = json.dumps(payload).encode("utf-8")
             self._parent._ttl[key] = ttl
+            self._parent._expires_at[key] = self._parent._clock + ttl
             return 1
         raise AssertionError(f"unexpected eval script: {script[:80]}")
 
@@ -105,9 +126,25 @@ class _FakeRedisCache:
         self.namespace = namespace
         self._data: dict[str, bytes] = {}
         self._ttl: dict[str, float] = {}
+        self._expires_at: dict[str, float] = {}
+        self._clock = 0.0
         self.set_calls: list[dict[str, Any]] = []
+        self.renewal_calls = 0
+        self.fail_renewal = False
+        self.drop_reservation_on_renewal = False
         self.fail_set_error: Optional[BaseException] = None
         self._client = _FakeRedisClient(self)
+
+    def _purge_expired(self, name: str) -> None:
+        expires_at = self._expires_at.get(name)
+        if expires_at is None or expires_at > self._clock:
+            return
+        self._data.pop(name, None)
+        self._ttl.pop(name, None)
+        self._expires_at.pop(name, None)
+
+    def advance_time(self, seconds: float) -> None:
+        self._clock += float(seconds)
 
     def check_and_fix_namespace(self, key: str) -> str:
         return f"{self.namespace}:{key}"
@@ -2164,6 +2201,180 @@ async def test_no_fixed_six_hour_owned_expiry() -> None:
     assert p.owner_record is not None
     assert p.owner_record.get("persistent") is True
     assert "expires_at_epoch" not in (p.owner_record or {})
+
+
+@pytest.mark.asyncio
+async def test_lease_renewal_survives_ttl_until_promotion() -> None:
+    redis = _FakeRedisCache()
+    attrs = _full_attrs()
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        guard = await sa.guard_session_owner_before_egress(
+            session_identity="sess-renewal-long-operation",
+            requested_attributes=attrs,
+            reservation_ttl_seconds=30,
+        )
+        lease = sa.lease_from_guard_result(guard, attributes=attrs)
+        real_sleep = asyncio.sleep
+
+        async def advance_time_and_yield(delay: float) -> None:
+            redis.advance_time(delay)
+            await real_sleep(0)
+
+        async def provider_operation() -> str:
+            while redis.renewal_calls < 4:
+                await real_sleep(0)
+            return "provider response"
+
+        with patch.object(
+            sa.asyncio,
+            "sleep",
+            new=advance_time_and_yield,
+        ):
+            result = await sa.run_with_session_owner_lease_renewal(
+                lease,
+                provider_operation,
+                reservation_ttl_seconds=30,
+            )
+
+        assert result == "provider response"
+        assert redis.renewal_calls >= 4
+        assert redis._clock > 30
+        assert lease.renewal_task is None
+
+        promoted = await sa.finalize_session_owner_lease_on_success(
+            lease,
+            attributes=attrs,
+        )
+
+    assert promoted is not None
+    assert promoted.outcome is sa.SessionOwnerMutationOutcome.PROMOTED
+    assert lease.promoted is True
+
+
+@pytest.mark.asyncio
+async def test_lease_renewal_loss_cancels_operation_and_prevents_promotion() -> None:
+    redis = _FakeRedisCache()
+    attrs = _full_attrs()
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        guard = await sa.guard_session_owner_before_egress(
+            session_identity="sess-renewal-lost",
+            requested_attributes=attrs,
+            reservation_ttl_seconds=30,
+        )
+        lease = sa.lease_from_guard_result(guard, attributes=attrs)
+        operation_cancelled = asyncio.Event()
+        real_sleep = asyncio.sleep
+        never = asyncio.Event()
+
+        async def provider_operation() -> None:
+            try:
+                await never.wait()
+            except asyncio.CancelledError:
+                operation_cancelled.set()
+                raise
+
+        async def fail_after_yield(_: float) -> None:
+            redis.drop_reservation_on_renewal = True
+            await real_sleep(0)
+
+        with patch.object(sa.asyncio, "sleep", new=fail_after_yield):
+            with pytest.raises(sa.SessionOwnerLeaseRenewalError):
+                await sa.run_with_session_owner_lease_renewal(
+                    lease,
+                    provider_operation,
+                    reservation_ttl_seconds=30,
+                    renewal_interval_seconds=1,
+                )
+
+        assert operation_cancelled.is_set()
+        assert redis.renewal_calls == 1
+        assert lease.renewal_task is None
+
+        promoted = await sa.promote_session_owner_reservation(
+            session_identity=lease.session_identity,
+            reservation_token=lease.reservation_token,
+            attributes=attrs,
+        )
+        released = await sa.finalize_session_owner_lease_on_failure(lease)
+
+    assert promoted.outcome is sa.SessionOwnerMutationOutcome.NOT_HELD
+    assert released is not None
+    assert released.outcome is sa.SessionOwnerMutationOutcome.NOT_HELD
+    assert lease.released is True
+
+
+@pytest.mark.asyncio
+async def test_lease_renewal_cleans_up_after_operation_exception() -> None:
+    redis = _FakeRedisCache()
+    attrs = _full_attrs()
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        guard = await sa.guard_session_owner_before_egress(
+            session_identity="sess-renewal-exception",
+            requested_attributes=attrs,
+        )
+        lease = sa.lease_from_guard_result(guard, attributes=attrs)
+        real_sleep = asyncio.sleep
+
+        async def provider_operation() -> None:
+            await real_sleep(0)
+            raise RuntimeError("provider failed")
+
+        with pytest.raises(RuntimeError, match="provider failed"):
+            await sa.run_with_session_owner_lease_renewal(
+                lease,
+                provider_operation,
+            )
+
+        assert lease.renewal_task is None
+        released = await sa.finalize_session_owner_lease_on_failure(lease)
+
+    assert released is not None
+    assert released.outcome is sa.SessionOwnerMutationOutcome.RELEASED
+    assert lease.released is True
+
+
+@pytest.mark.asyncio
+async def test_lease_renewal_cleans_up_on_caller_cancellation() -> None:
+    redis = _FakeRedisCache()
+    attrs = _full_attrs()
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        guard = await sa.guard_session_owner_before_egress(
+            session_identity="sess-renewal-cancelled",
+            requested_attributes=attrs,
+        )
+        lease = sa.lease_from_guard_result(guard, attributes=attrs)
+        operation_started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def provider_operation() -> None:
+            operation_started.set()
+            await never.wait()
+
+        task = asyncio.create_task(
+            sa.run_with_session_owner_lease_renewal(
+                lease,
+                provider_operation,
+            )
+        )
+        await operation_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert lease.renewal_task is None
+        released = await sa.finalize_session_owner_lease_on_failure(lease)
+
+    assert released is not None
+    assert released.outcome is sa.SessionOwnerMutationOutcome.RELEASED
+    assert lease.released is True
 
 
 # ---------------------------------------------------------------------------

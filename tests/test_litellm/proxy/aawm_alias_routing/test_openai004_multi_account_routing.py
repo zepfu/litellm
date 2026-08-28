@@ -752,6 +752,137 @@ def _account_selection(
 
 
 @pytest.mark.asyncio
+async def test_candidate_loop_wraps_provider_call_with_session_owner_renewal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    request = _request()
+    wrapper_calls: list[tuple[Any, Any]] = []
+    provider_calls = 0
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        return _account_selection(
+            "account1",
+            "hash-account-1",
+            failover_ordinal=0,
+        )
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        nonlocal provider_calls
+        provider_calls += 1
+        return Response(content=b"wrapped", status_code=200)
+
+    async def _renew(lease: Any, operation: Any) -> Response:
+        wrapper_calls.append((lease, operation))
+        return await operation()
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    monkeypatch.setattr(
+        session_affinity,
+        "run_with_session_owner_lease_renewal",
+        _renew,
+    )
+    response = await candidate_loop.handle_alias_route(
+        _loop_services(
+            select_candidate=_select,
+            perform_candidate=_perform,
+        ),
+        alias_family="codex_auto_agent",
+        alias_model="basic",
+        request=request,
+        prepared_request_body={"model": "basic"},
+        max_candidate_attempts=1,
+        get_active_cooldown_state_fn=_zero,
+        attempts_metadata_key="codex_auto_agent_attempts",
+        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+        no_candidate_detail="no candidate",
+        log_label="Codex",
+    )
+
+    assert response.status_code == 200
+    assert provider_calls == 1
+    assert len(wrapper_calls) == 1
+    assert wrapper_calls[0][0] is not None
+    assert callable(wrapper_calls[0][1])
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_renewal_loss_redispatches_after_provider_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    request = _request()
+    provider_calls = 0
+    wrapper_calls = 0
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        return _account_selection(
+            "account1",
+            "hash-account-1",
+            failover_ordinal=0,
+        )
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        nonlocal provider_calls
+        provider_calls += 1
+        return Response(content=b"provider-returned", status_code=200)
+
+    async def _renew(lease: Any, operation: Any) -> Response:
+        nonlocal wrapper_calls
+        wrapper_calls += 1
+        await operation()
+        raise session_affinity.SessionOwnerLeaseRenewalError(
+            session_identity=None,
+            reason="reservation token lost",
+        )
+
+    async def _zero(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    monkeypatch.setattr(
+        session_affinity,
+        "run_with_session_owner_lease_renewal",
+        _renew,
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await candidate_loop.handle_alias_route(
+            _loop_services(
+                select_candidate=_select,
+                perform_candidate=_perform,
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body={"model": "basic"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_zero,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidate",
+            log_label="Codex",
+        )
+
+    assert provider_calls == 1
+    assert wrapper_calls == 1
+    assert exc_info.value.status_code == 409
+    detail = exc_info.value.detail
+    assert detail["redispatch_required"] is True
+    assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert detail["failure_phase"] == "session_owner_reservation_renewal"
+    assert detail["attempted_provider_call"] is True
+
+
+@pytest.mark.asyncio
 async def test_candidate_loop_exhausts_all_accounts_before_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

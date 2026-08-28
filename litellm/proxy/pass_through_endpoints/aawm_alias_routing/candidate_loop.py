@@ -969,10 +969,27 @@ async def handle_alias_route(  # noqa: PLR0915
                             candidate=candidate,
                         )
                         attempted_provider_call = True
-                        response = await perform_candidate_request_fn(
-                            candidate=candidate,
-                            candidate_body=candidate_body,
+
+                        async def _perform_candidate_request() -> Response:
+                            return await perform_candidate_request_fn(
+                                candidate=candidate,
+                                candidate_body=candidate_body,
+                            )
+
+                        run_with_lease_renewal = getattr(
+                            sa,
+                            "run_with_session_owner_lease_renewal",
+                            None,
                         )
+                        if callable(run_with_lease_renewal):
+                            response = await run_with_lease_renewal(
+                                session_owner_lease,
+                                _perform_candidate_request,
+                            )
+                        else:
+                            # Keep older extracted-host test seams usable while
+                            # the runtime host rolls out the renewal helper.
+                            response = await _perform_candidate_request()
                         # Authoritative success: promote reserved -> owned.
                         promote_result = await sa.finalize_session_owner_lease_on_success(
                             session_owner_lease,
@@ -996,6 +1013,15 @@ async def handle_alias_route(  # noqa: PLR0915
                                 failure_phase="session_owner_promote_after_success",
                                 request=request,
                             )
+                    except asyncio.CancelledError:
+                        if session_owner_lease is not None:
+                            try:
+                                await _session_affinity_mod().finalize_session_owner_lease_on_failure(
+                                    session_owner_lease
+                                )
+                            except Exception:  # noqa: BLE001
+                                pass
+                        raise
                     except Exception as probe_exc:  # noqa: PERF203
                         probe_failure_exc = probe_exc
                         if session_owner_lease is not None:
@@ -1009,6 +1035,32 @@ async def handle_alias_route(  # noqa: PLR0915
                         # Release probe lock FIRST (unconditional, before any
                         # resolver call that might raise).
                         probe_lock.release()
+
+                    renewal_error_type = getattr(
+                        sa,
+                        "SessionOwnerLeaseRenewalError",
+                        (),
+                    )
+                    if (
+                        probe_failure_exc is not None
+                        and isinstance(probe_failure_exc, renewal_error_type)
+                    ):
+                        attempt_record["attempted_provider_call"] = (
+                            attempted_provider_call
+                        )
+                        sa.raise_session_owner_redispatch_required(
+                            session_identity=session_owner_identity,
+                            alias_model=selection.get("alias_model") or alias_model,
+                            candidate=candidate,
+                            failure_phase="session_owner_reservation_renewal",
+                            message=(
+                                "Session ownership reservation was lost while "
+                                "the provider operation was in flight; "
+                                "redispatch a fresh response."
+                            ),
+                            attempted_provider_call=attempted_provider_call,
+                            request=request,
+                        )
 
                     if (
                         probe_failure_exc is not None
