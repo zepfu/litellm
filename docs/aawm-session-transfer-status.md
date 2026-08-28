@@ -156,6 +156,10 @@ The registry reuses the managed AAWM alias-routing Redis connection
 (`AAWM_ALIAS_ROUTING_REDIS_*`) but stores records under
 `aawm:session-transfer:<namespace>:...`. Cooldown and affinity keys are never
 shared. Optional override: `AAWM_SESSION_TRANSFER_STATE_NAMESPACE`.
+All best-effort Redis work in one registry operation shares a single deadline
+shorter than the shared connection's minimum socket timeout, so a blocked
+read/write degrades the record instead of holding the request. Index writes are
+idempotent on every upsert, so failures retry and index TTLs refresh.
 
 When Redis is not attached, the process falls back to a memory store and
 reports `registry.state=unavailable` or `degraded`. Process-local state is

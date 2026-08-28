@@ -749,3 +749,164 @@ async def test_rr117_finished_calls_prune_heartbeat_map_and_keep_active(registry
     await registry.upsert(live, {"phase": "response_streaming"}, force=True)
     assert registry._last_heartbeat_mono["hb-live"] >= first
     assert list(registry._last_heartbeat_mono) == ["hb-live"]
+
+
+class BlockingRedisSetStore:
+    """DualCache-shaped store whose durable SET hangs past the deadline."""
+
+    def __init__(self) -> None:
+        self.values = {}
+        self.set_calls = 0
+        self.sadd_calls = 0
+        self.rpush_calls = 0
+        self.index_read_attempts = 0
+        self.index_write_attempts = 0
+        self.in_memory_cache = InMemoryCache()
+        self.redis_cache = self
+
+    async def async_get_cache(self, key, **kwargs):
+        if ":idx:" in key:
+            self.index_read_attempts += 1
+        return await self.in_memory_cache.async_get_cache(key)
+
+    async def async_set_cache(self, key, value, ttl=None, **kwargs):
+        self.set_calls += 1
+        if ":idx:" in key:
+            self.index_write_attempts += 1
+        await asyncio.sleep(5.0)
+        self.values[key] = value
+
+    async def async_set_cache_sadd(self, key, value, ttl=None, **kwargs):
+        self.sadd_calls += 1
+
+    async def async_rpush(self, key, values, **kwargs):
+        self.rpush_calls += 1
+
+    async def async_batch_get_cache(self, keys, **kwargs):
+        self.index_read_attempts += sum(":idx:" in key for key in keys)
+        return [await self.async_get_cache(key) for key in keys]
+
+
+@pytest.mark.asyncio
+async def test_blocking_redis_set_degrades_within_deadline(
+    monkeypatch,
+):
+    from litellm.proxy.aawm_session_transfer import registry as registry_module
+
+    monkeypatch.setattr(registry_module, "REDIS_OPERATION_DEADLINE_SECONDS", 0.02)
+    store = BlockingRedisSetStore()
+    item = SessionTransferRegistry(cache=store, source_instance="worker-a")
+    started = asyncio.get_running_loop().time()
+    record = await item.upsert(_identity(), {"phase": "awaiting_upstream"})
+    elapsed = asyncio.get_running_loop().time() - started
+    assert record is not None
+    assert record["redis_degraded"] is True
+    assert record["freshness"] == "unavailable"
+    assert record["phase"] == "awaiting_upstream"
+    assert elapsed < 0.25
+    assert await item.get_by_call_id("call-1") is not None
+    assert store.set_calls == 1
+    assert store.sadd_calls == 0
+    assert store.rpush_calls == 0
+    assert store.index_read_attempts == 0
+    assert store.index_write_attempts == 0
+
+
+class BlockingRedisSaddStore:
+    """DualCache-shaped store whose SADD hangs past the deadline."""
+
+    def __init__(self) -> None:
+        self.values = {}
+        self.sadd_attempts = 0
+        self.rpush_attempts = 0
+        self.index_read_attempts = 0
+        self.index_write_attempts = 0
+        self.in_memory_cache = InMemoryCache()
+        self.redis_cache = self
+
+    async def async_get_cache(self, key, **kwargs):
+        if ":idx:" in key:
+            self.index_read_attempts += 1
+        return self.values.get(key)
+
+    async def async_set_cache(self, key, value, ttl=None, **kwargs):
+        if ":idx:" in key:
+            self.index_write_attempts += 1
+        self.values[key] = value
+
+    async def async_set_cache_sadd(self, key, value, ttl=None, **kwargs):
+        self.sadd_attempts += 1
+        await asyncio.sleep(5.0)
+        members = value if isinstance(value, list) else [value]
+        existing = self.values.get(key) or []
+        self.values[key] = list(existing) + list(members)
+
+    async def async_rpush(self, key, values, **kwargs):
+        self.rpush_attempts += 1
+
+    async def async_batch_get_cache(self, keys, **kwargs):
+        self.index_read_attempts += sum(":idx:" in key for key in keys)
+        return [await self.async_get_cache(key) for key in keys]
+
+
+class BlockingOverflowBatchReadStore:
+    """Store with an oversized index whose batch record read hangs."""
+
+    def __init__(self) -> None:
+        self.values = {}
+        self.batch_attempts = 0
+
+    async def async_get_cache(self, key, **kwargs):
+        return self.values.get(key)
+
+    async def async_set_cache(self, key, value, ttl=None, **kwargs):
+        self.values[key] = value
+
+    async def async_batch_get_cache(self, keys, **kwargs):
+        self.batch_attempts += 1
+        await asyncio.sleep(5.0)
+
+
+@pytest.mark.asyncio
+async def test_blocking_sadd_is_deadline_bounded_and_degraded(
+    monkeypatch,
+):
+    from litellm.proxy.aawm_session_transfer import registry as registry_module
+
+    monkeypatch.setattr(registry_module, "REDIS_OPERATION_DEADLINE_SECONDS", 0.02)
+    store = BlockingRedisSaddStore()
+    item = SessionTransferRegistry(cache=store, source_instance="worker-a")
+    started = asyncio.get_running_loop().time()
+    record = await item.upsert(_identity(), {"phase": "awaiting_upstream"})
+    elapsed = asyncio.get_running_loop().time() - started
+    assert record is not None
+    assert record["redis_degraded"] is True
+    assert store.sadd_attempts == 1
+    assert store.rpush_attempts == 0
+    assert store.index_read_attempts == 0
+    assert store.index_write_attempts == 0
+    assert elapsed < 0.25
+
+
+@pytest.mark.asyncio
+async def test_blocking_batch_read_is_deadline_bounded_and_degraded(
+    monkeypatch,
+):
+    from litellm.proxy.aawm_session_transfer import registry as registry_module
+
+    monkeypatch.setattr(registry_module, "REDIS_OPERATION_DEADLINE_SECONDS", 0.02)
+    store = BlockingOverflowBatchReadStore()
+    item = SessionTransferRegistry(cache=store, source_instance="worker-a")
+    store.values[item._index_key("agent_id", "agent-overflow")] = [
+        f"call-overflow-{index}" for index in range(MAX_INDEX_MEMBERS + 1)
+    ]
+    started = asyncio.get_running_loop().time()
+    record = await item.upsert(
+        _identity(agent_id="agent-overflow"),
+        {"phase": "awaiting_upstream"},
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+    assert record is not None
+    assert record["redis_degraded"] is True
+    assert store.batch_attempts >= 1
+    assert elapsed < 0.25

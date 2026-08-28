@@ -7,6 +7,7 @@ Telemetry failures never raise into serving traffic.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -14,7 +15,7 @@ import os
 import socket
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
 
 from litellm.proxy.aawm_alias_routing_redis import (
     get_dual_cache,
@@ -47,6 +48,11 @@ TERMINAL_TTL_SECONDS = 45
 STALE_AFTER_SECONDS = 30
 HEARTBEAT_MIN_INTERVAL_SECONDS = 0.75
 INDEX_TTL_SECONDS = 180
+# Single deadline for all best-effort Redis work in one registry operation. It
+# must stay shorter than the shared alias-routing Redis minimum socket timeout
+# so a blocked GET/SET/SADD/RPUSH degrades gracefully instead of holding the
+# serving request until the socket layer gives up.
+REDIS_OPERATION_DEADLINE_SECONDS = 0.5
 
 _registry_override: Optional["SessionTransferRegistry"] = None
 _default_registry: Optional["SessionTransferRegistry"] = None
@@ -82,6 +88,22 @@ def resolve_transfer_namespace() -> str:
 
 def _hash_identity(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+async def _with_deadline(
+    deadline: Optional[float], make_operation: Callable[[], Awaitable[Any]]
+) -> Any:
+    """Run a Redis-backed awaitable within the remaining operation deadline.
+
+    ``make_operation`` is called lazily so no coroutine is created (and none
+    can be left unawaited) when the deadline is already exhausted.
+    """
+    if deadline is None:
+        return await make_operation()
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise asyncio.TimeoutError
+    return await asyncio.wait_for(make_operation(), timeout=remaining)
 
 
 class InMemoryTransferStore:
@@ -244,10 +266,16 @@ class SessionTransferRegistry:
             return members
         return []
 
-    async def _read_raw(self, key: str) -> Any:
+    async def _read_raw(
+        self, key: str, deadline: Optional[float] = None
+    ) -> Any:
         store = self._store()
         try:
-            return await store.async_get_cache(key=key)
+            if store is self._memory:
+                return await store.async_get_cache(key=key)
+            return await _with_deadline(
+                deadline, lambda: store.async_get_cache(key=key)
+            )
         except Exception as exc:
             self._mark_degraded(exc)
             logger.debug("session-transfer registry read failed", exc_info=True)
@@ -258,16 +286,22 @@ class SessionTransferRegistry:
                     return None
             return None
 
-    async def _batch_read_raw(self, keys: List[str]) -> List[Any]:
+    async def _batch_read_raw(
+        self, keys: List[str], deadline: Optional[float] = None
+    ) -> List[Any]:
         if not keys:
             return []
         store = self._store()
         batch = getattr(store, "async_batch_get_cache", None)
         if callable(batch):
+            async def _batch() -> Any:
+                try:
+                    return await batch(keys=keys)
+                except TypeError:
+                    return await batch(keys)
+
             try:
-                result = await batch(keys=keys)
-            except TypeError:
-                result = await batch(keys)
+                result = await _with_deadline(deadline, _batch)
             except Exception as exc:
                 self._mark_degraded(exc)
                 logger.debug(
@@ -276,19 +310,34 @@ class SessionTransferRegistry:
                 result = None
             if isinstance(result, list) and len(result) == len(keys):
                 return result
-        return [await self._read_raw(key) for key in keys]
+        return [await self._read_raw(key, deadline=deadline) for key in keys]
 
-    async def _write_redis_cache(self, redis_cache: Any, key: str, value: Any, ttl: int) -> bool:
-        try:
-            await redis_cache.async_set_cache(
-                key=key, value=value, ttl=ttl, raise_on_error=True
-            )
-            return True
-        except TypeError:
-            await redis_cache.async_set_cache(key=key, value=value, ttl=ttl)
-            return True
+    async def _write_redis_cache(
+        self,
+        redis_cache: Any,
+        key: str,
+        value: Any,
+        ttl: int,
+        deadline: Optional[float] = None,
+    ) -> bool:
+        async def _set() -> None:
+            try:
+                await redis_cache.async_set_cache(
+                    key=key, value=value, ttl=ttl, raise_on_error=True
+                )
+            except TypeError:
+                await redis_cache.async_set_cache(key=key, value=value, ttl=ttl)
 
-    async def _write_raw(self, key: str, value: Any, ttl: int) -> bool:
+        await _with_deadline(deadline, _set)
+        return True
+
+    async def _write_raw(
+        self,
+        key: str,
+        value: Any,
+        ttl: int,
+        deadline: Optional[float] = None,
+    ) -> bool:
         encoded = json.dumps(value, separators=(",", ":"), default=str)
         store = self._store()
         try:
@@ -304,7 +353,11 @@ class SessionTransferRegistry:
                     await in_memory.async_set_cache(key=key, value=encoded, ttl=ttl)
                 try:
                     await self._write_redis_cache(
-                        redis_cache, key=key, value=encoded, ttl=ttl
+                        redis_cache,
+                        key=key,
+                        value=encoded,
+                        ttl=ttl,
+                        deadline=deadline,
                     )
                 except Exception as exc:
                     self._mark_degraded(exc)
@@ -317,7 +370,13 @@ class SessionTransferRegistry:
                         )
                     return False
             else:
-                await store.async_set_cache(key=key, value=encoded, ttl=ttl)
+                if store is self._memory:
+                    await store.async_set_cache(key=key, value=encoded, ttl=ttl)
+                else:
+                    await _with_deadline(
+                        deadline,
+                        lambda: store.async_set_cache(key=key, value=encoded, ttl=ttl),
+                    )
             if store is not self._memory:
                 await self._memory.async_set_cache(key=key, value=encoded, ttl=ttl)
             return True
@@ -330,7 +389,9 @@ class SessionTransferRegistry:
                 pass
             return False
 
-    async def _prefer_live_index_members(self, members: List[str]) -> List[str]:
+    async def _prefer_live_index_members(
+        self, members: List[str], deadline: Optional[float] = None
+    ) -> List[str]:
         unique: List[str] = []
         seen: set[str] = set()
         for item in members:
@@ -340,7 +401,8 @@ class SessionTransferRegistry:
         if len(unique) <= MAX_INDEX_MEMBERS:
             return unique
         raw_records = await self._batch_read_raw(
-            [self._record_key(call_id) for call_id in unique]
+            [self._record_key(call_id) for call_id in unique],
+            deadline=deadline,
         )
         live: List[str] = []
         other: List[str] = []
@@ -360,27 +422,54 @@ class SessionTransferRegistry:
             kept.extend(other[-remaining:])
         return kept
 
-    async def _read_index(self, field: str, value: str) -> List[str]:
-        raw = await self._read_raw(self._index_key(field, value))
+    async def _read_index(
+        self,
+        field: str,
+        value: str,
+        deadline: Optional[float] = None,
+    ) -> List[str]:
+        raw = await self._read_raw(self._index_key(field, value), deadline=deadline)
         members = self._decode_index_members(raw)
         if len(members) > MAX_INDEX_MEMBERS:
-            return await self._prefer_live_index_members(members)
+            return await self._prefer_live_index_members(members, deadline=deadline)
         return members
 
     async def _write_index(
-        self, field: str, value: str, call_ids: List[str], ttl: int
+        self,
+        field: str,
+        value: str,
+        call_ids: List[str],
+        ttl: int,
+        deadline: Optional[float] = None,
     ) -> bool:
-        bounded = await self._prefer_live_index_members(call_ids)
-        return await self._write_raw(self._index_key(field, value), bounded, ttl)
+        bounded = await self._prefer_live_index_members(call_ids, deadline=deadline)
+        return await self._write_raw(
+            self._index_key(field, value), bounded, ttl, deadline=deadline
+        )
 
-    async def _add_index_member(self, field: str, value: str, call_id: str) -> bool:
+    async def _add_index_member(
+        self,
+        field: str,
+        value: str,
+        call_id: str,
+        deadline: Optional[float] = None,
+    ) -> bool:
         store = self._store()
         key = self._index_key(field, value)
         sadd = getattr(store, "async_set_cache_sadd", None)
         if callable(sadd):
             try:
-                await sadd(key=key, value=[call_id], ttl=INDEX_TTL_SECONDS)
+                await _with_deadline(
+                    deadline,
+                    lambda: sadd(key=key, value=[call_id], ttl=INDEX_TTL_SECONDS),
+                )
                 return True
+            except asyncio.TimeoutError as exc:
+                self._mark_degraded(exc)
+                logger.debug(
+                    "session-transfer atomic index sadd timed out", exc_info=True
+                )
+                return False
             except Exception as exc:
                 self._mark_degraded(exc)
                 logger.debug(
@@ -388,21 +477,32 @@ class SessionTransferRegistry:
                 )
         rpush = getattr(store, "async_rpush", None)
         if callable(rpush):
+            async def _rpush() -> None:
+                try:
+                    await rpush(key=key, values=[call_id])
+                except TypeError:
+                    await rpush(key, [call_id])
+
             try:
-                await rpush(key=key, values=[call_id])
+                await _with_deadline(deadline, _rpush)
                 return True
-            except TypeError:
-                await rpush(key, [call_id])
-                return True
+            except asyncio.TimeoutError as exc:
+                self._mark_degraded(exc)
+                logger.debug(
+                    "session-transfer atomic index rpush timed out", exc_info=True
+                )
+                return False
             except Exception as exc:
                 self._mark_degraded(exc)
                 logger.debug(
                     "session-transfer atomic index rpush failed", exc_info=True
                 )
-        members = await self._read_index(field, value)
+        members = await self._read_index(field, value, deadline=deadline)
         if call_id not in members:
             members.append(call_id)
-        return await self._write_index(field, value, members, INDEX_TTL_SECONDS)
+        return await self._write_index(
+            field, value, members, INDEX_TTL_SECONDS, deadline=deadline
+        )
 
     def _annotate_freshness(self, record: Dict[str, Any]) -> Dict[str, Any]:
         phase = normalize_phase(record.get("phase"))
@@ -443,7 +543,12 @@ class SessionTransferRegistry:
             call_id = sanitize_identity(identity.get("litellm_call_id"))
             if not call_id:
                 return None
-            existing = self._decode_record(await self._read_raw(self._record_key(call_id)))
+            # One monotonic deadline shared by every best-effort Redis
+            # operation in this upsert (read, durable write, index updates).
+            deadline = time.monotonic() + REDIS_OPERATION_DEADLINE_SECONDS
+            existing = self._decode_record(
+                await self._read_raw(self._record_key(call_id), deadline=deadline)
+            )
             record = new_transfer_record() if existing is None else existing
             record = merge_records(record, identity)
             if updates:
@@ -465,7 +570,9 @@ class SessionTransferRegistry:
                     self._last_heartbeat_mono[call_id] = now_mono
             record = self._annotate_freshness(record)
             ttl = TERMINAL_TTL_SECONDS if terminal else ACTIVE_TTL_SECONDS
-            wrote = await self._write_raw(self._record_key(call_id), record, ttl)
+            wrote = await self._write_raw(
+                self._record_key(call_id), record, ttl, deadline=deadline
+            )
             if not wrote:
                 record["redis_degraded"] = True
                 record["freshness"] = (
@@ -473,10 +580,23 @@ class SessionTransferRegistry:
                     if record.get("freshness") != "terminal"
                     else record.get("freshness")
                 )
+                if terminal:
+                    self._drop_heartbeat(call_id)
+                return record
             for field, value in iter_identity_values(record):
                 if field == "litellm_call_id":
                     continue
-                indexed = await self._add_index_member(field, value, call_id)
+                try:
+                    indexed = await self._add_index_member(
+                        field, value, call_id, deadline=deadline
+                    )
+                except Exception as exc:
+                    self._mark_degraded(exc)
+                    logger.debug(
+                        "session-transfer index update failed", exc_info=True
+                    )
+                    record["redis_degraded"] = True
+                    break
                 if not indexed:
                     record["redis_degraded"] = True
             if terminal:
