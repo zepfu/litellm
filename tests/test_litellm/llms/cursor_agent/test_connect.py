@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -1526,8 +1527,84 @@ def test_auth_refresh_window_and_file_precedence(tmp_path: Path, monkeypatch) ->
 
     auth_file.write_text(json.dumps({"apiKey": "key-file"}), encoding="utf-8")
     auth = CursorAgentAuth(exchange=exchange)
-    assert asyncio.run(auth.resolve()) == "exchanged-key-file"
-    assert exchanged == ["key-env", "key-file"]
+    with pytest.raises(CursorConnectError, match="request-time API key exchange is not supported"):
+        asyncio.run(auth.resolve())
+    assert exchanged == ["key-env"]
+
+
+def test_managed_auth_file_replacement_invalidates_cache_before_egress(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth_file = tmp_path / "cursor-auth.json"
+    auth_file.write_text(json.dumps({"accessToken": "expired-access"}), encoding="utf-8")
+    monkeypatch.delenv("CURSOR_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    monkeypatch.setenv("LITELLM_CURSOR_AGENT_AUTH_FILE", str(auth_file))
+
+    auth = CursorAgentAuth(exchange=lambda key: (_ for _ in ()).throw(AssertionError("exchange called")))
+    assert asyncio.run(auth.resolve()) == "expired-access"
+    replacement_file = tmp_path / "cursor-auth-replacement.json"
+    replacement_file.write_text(
+        json.dumps({"accessToken": "replacement-access"}),
+        encoding="utf-8",
+    )
+    os.replace(replacement_file, auth_file)
+
+    class Response:
+        status_code = 200
+        headers = {"content-type": "application/connect+proto"}
+        http_version = "HTTP/2"
+        content = _server_text_frame("ok") + _server_turn_ended_frame() + _end_stream_frame()
+
+    class Client:
+        def __init__(self) -> None:
+            self.requests: list[dict[str, Any]] = []
+
+        async def post(self, _url: str, **kwargs: Any) -> Response:
+            self.requests.append(kwargs)
+            return Response()
+
+        async def aclose(self) -> None:
+            return None
+
+    transport = Client()
+    client = CursorAgentConnectClient(auth=auth, client_factory=lambda: transport)
+    assert asyncio.run(client.run(_run_request())).text == "ok"
+    assert transport.requests[0]["headers"]["authorization"] == "Bearer replacement-access"
+
+
+def test_managed_auth_file_rejection_fails_closed_and_sanitized(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth_file = tmp_path / "cursor-auth.json"
+    auth_file.write_text(
+        json.dumps({"accessToken": "rejected-access", "apiKey": "key-file"}),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("CURSOR_AUTH_TOKEN", raising=False)
+    monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+    monkeypatch.setenv("LITELLM_CURSOR_AGENT_AUTH_FILE", str(auth_file))
+
+    exchange_calls: list[str] = []
+
+    async def exchange(raw_api_key: str) -> str:
+        exchange_calls.append(raw_api_key)
+        return "sidecar-access"
+
+    auth = CursorAgentAuth(exchange=exchange)
+    assert asyncio.run(auth.resolve()) == "rejected-access"
+    auth.invalidate("rejected-access")
+    auth_file.write_text(json.dumps({"apiKey": "key-file"}), encoding="utf-8")
+
+    with pytest.raises(CursorConnectError, match="request-time API key exchange is not supported") as exc_info:
+        asyncio.run(auth.resolve(force_refresh=True, rejected_token="rejected-access"))
+    assert exchange_calls == []
+    assert str(exc_info.value) == exc_info.value.message
+    assert exc_info.value.body is None
+    assert "key-file" not in str(exc_info.value)
+    assert "rejected-access" not in str(exc_info.value)
 
 
 def test_auth_exchange_is_singleflight_and_401_retries_once() -> None:

@@ -2668,14 +2668,75 @@ def _read_secret_env(name: str) -> str:
 
 
 def _read_auth_file() -> Dict[str, Any]:
+    return _read_managed_auth_file().auth_file
+
+
+def _managed_auth_file_path() -> Optional[str]:
     path = _read_secret_env(CURSOR_AGENT_AUTH_FILE_ENV)
+    return path or None
+
+
+@dataclass(frozen=True)
+class _CursorAgentAuthFileIdentity:
+    path: str
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    content_digest: str
+
+
+@dataclass(frozen=True)
+class _CursorAgentAuthFileRead:
+    auth_file: Dict[str, Any]
+    identity: Optional[_CursorAgentAuthFileIdentity]
+    error: Optional[str] = None
+
+
+class _CursorAgentAuthFileHandle:
+    def __init__(self, path: str) -> None:
+        self._handle = Path(path).open("rb")
+
+    def __enter__(self) -> "_CursorAgentAuthFileHandle":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self._handle.close()
+
+    def read(self) -> bytes:
+        return self._handle.read()
+
+    def stat(self) -> os.stat_result:
+        return os.fstat(self._handle.fileno())
+
+
+def _read_managed_auth_file() -> _CursorAgentAuthFileRead:
+    """Read the sidecar-owned credential without writing or refreshing it."""
+    path = _managed_auth_file_path()
     if not path:
-        return {}
+        return _CursorAgentAuthFileRead({}, None, "unavailable")
     try:
-        loaded = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return {}
-    return dict(loaded) if isinstance(loaded, Mapping) else {}
+        with _CursorAgentAuthFileHandle(path) as auth_handle:
+            raw_auth_file = auth_handle.read()
+            file_stat = auth_handle.stat()
+    except (OSError, ValueError):
+        return _CursorAgentAuthFileRead({}, None, "unreadable")
+
+    identity = _CursorAgentAuthFileIdentity(
+        path=path,
+        device=file_stat.st_dev,
+        inode=file_stat.st_ino,
+        size=file_stat.st_size,
+        mtime_ns=file_stat.st_mtime_ns,
+        content_digest=hashlib.sha256(raw_auth_file).hexdigest(),
+    )
+    try:
+        loaded = json.loads(raw_auth_file.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _CursorAgentAuthFileRead({}, identity, "invalid-json")
+    if not isinstance(loaded, Mapping):
+        return _CursorAgentAuthFileRead({}, identity, "invalid-shape")
+    return _CursorAgentAuthFileRead(dict(loaded), identity)
 
 
 async def exchange_cursor_api_key_for_access_token(
@@ -2775,6 +2836,8 @@ class CursorAgentAuth:
         self._cached_token: Optional[str] = None
         self._lock = asyncio.Lock()
         self._rejected_tokens: set[str] = set()
+        self._file_identity: Optional[_CursorAgentAuthFileIdentity] = None
+        self._file_error: Optional[str] = None
 
     async def resolve(
         self,
@@ -2786,13 +2849,17 @@ class CursorAgentAuth:
             self._rejected_tokens.add(rejected_token)
             force_refresh = True
         if (
-            not force_refresh
+            not _managed_auth_file_path()
+            and not force_refresh
             and self._cached_token
             and self._cached_token not in self._rejected_tokens
             and access_token_is_fresh(self._cached_token)
         ):
             return self._cached_token
         async with self._lock:
+            auth_read: Optional[_CursorAgentAuthFileRead] = None
+            if _managed_auth_file_path():
+                auth_read = self._refresh_file_cache_metadata()
             if (
                 not force_refresh
                 and self._cached_token
@@ -2800,11 +2867,25 @@ class CursorAgentAuth:
                 and access_token_is_fresh(self._cached_token)
             ):
                 return self._cached_token
-            token = await self._resolve_uncached()
+            token = await self._resolve_uncached(auth_read=auth_read)
             self._cached_token = token
             return token
 
-    async def _resolve_uncached(self) -> str:
+    def _refresh_file_cache_metadata(self) -> _CursorAgentAuthFileRead:
+        auth_read = _read_managed_auth_file()
+        changed = self._file_identity != auth_read.identity or self._file_error != auth_read.error
+        if changed:
+            self._cached_token = None
+            self._rejected_tokens.clear()
+        self._file_identity = auth_read.identity
+        self._file_error = auth_read.error
+        return auth_read
+
+    async def _resolve_uncached(
+        self,
+        *,
+        auth_read: Optional[_CursorAgentAuthFileRead] = None,
+    ) -> str:
         explicit = self.explicit_credential
         if explicit and explicit not in self._rejected_tokens:
             if _looks_like_raw_api_key(explicit):
@@ -2825,18 +2906,21 @@ class CursorAgentAuth:
             if exchanged not in self._rejected_tokens:
                 return exchanged
 
-        auth_file = _read_auth_file()
+        if auth_read is None:
+            auth_read = _read_managed_auth_file()
+        auth_file = auth_read.auth_file
         file_access = str(auth_file.get("accessToken") or auth_file.get("access_token") or "").strip()
         if file_access and file_access not in self._rejected_tokens:
             if access_token_is_fresh(file_access):
                 return file_access
 
-        file_api_key = str(auth_file.get("apiKey") or auth_file.get("api_key") or "").strip()
-        if file_api_key:
-            exchanged = await self._exchange_key(file_api_key)
-            if exchanged not in self._rejected_tokens:
-                return exchanged
-
+        if _managed_auth_file_path():
+            raise CursorConnectError(
+                "Cursor Agent auth file does not contain a fresh accessToken; "
+                "request-time API key exchange is not supported in managed "
+                "auth-file mode.",
+                status_code=401,
+            )
         raise CursorConnectError(
             "Cursor Agent requires a valid access token or raw API key.",
             status_code=401,
@@ -2929,15 +3013,11 @@ def resolve_cursor_access_token_sync(
     file_access = str(auth_file.get("accessToken") or auth_file.get("access_token") or "").strip()
     if file_access and access_token_is_fresh(file_access):
         return file_access
-    file_api_key = str(auth_file.get("apiKey") or auth_file.get("api_key") or "").strip()
-    if file_api_key and allow_exchange:
-        return exchange_cursor_api_key_for_access_token_sync(
-            file_api_key,
-            dashboard_base=dashboard_base,
-        )
-    if file_api_key:
+    if _managed_auth_file_path():
         raise CursorConnectError(
-            "Cursor API key exchange is required for the Cursor auth file API key.",
+            "Cursor Agent auth file does not contain a fresh accessToken. "
+            "CURSOR_CLI_KEY is ignored and auth-file API keys are not exchanged "
+            "at request time.",
             status_code=401,
         )
     raise CursorConnectError(
