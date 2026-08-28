@@ -1042,63 +1042,49 @@ class TestBaseHandlerDispatch:
         assert events == ["resolve", "dispatch"]
 
 
-class TestCodexContinuationStorageDefaults:
+class TestCodexResponsesEgressContract:
     @pytest.mark.parametrize(
-        ("request_body", "expected_store", "expected_stream"),
+        "request_body",
         [
-            (
-                {
-                    "model": "basic",
-                    "input": [
-                        {
-                            "type": "message",
-                            "role": "user",
-                            "content": "fresh request",
-                        }
-                    ],
-                    "stream": False,
-                },
-                False,
-                True,
-            ),
-            (
-                {
-                    "model": "basic",
-                    "input": [
-                        {
-                            "type": "message",
-                            "role": "user",
-                            "content": "previous response continuation",
-                        }
-                    ],
-                    "previous_response_id": "resp_previous",
-                    "stream": False,
-                },
-                True,
-                False,
-            ),
-            (
-                {
-                    "model": "basic",
-                    "input": [
-                        {
-                            "type": "reasoning",
-                            "id": "rs_previous",
-                            "summary": [],
-                        }
-                    ],
-                    "stream": False,
-                },
-                True,
-                False,
-            ),
+            {
+                "model": "basic",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": "fresh request",
+                    }
+                ],
+                "stream": False,
+            },
+            {
+                "model": "basic",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": "previous response continuation",
+                    }
+                ],
+                "previous_response_id": "resp_previous",
+                "stream": False,
+            },
+            {
+                "model": "basic",
+                "input": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_previous",
+                        "summary": [],
+                    }
+                ],
+                "stream": False,
+            },
         ],
     )
-    def test_codex_responses_storage_defaults_preserve_continuations(
+    def test_codex_responses_always_disable_storage_and_stream(
         self,
         request_body: dict[str, Any],
-        expected_store: bool,
-        expected_stream: bool,
     ) -> None:
         endpoint_func = AsyncMock(return_value="storage-defaults-ok")
         create_fn = MagicMock(return_value=endpoint_func)
@@ -1127,9 +1113,9 @@ class TestCodexContinuationStorageDefaults:
 
         assert result == "storage-defaults-ok"
         call_kwargs = endpoint_func.await_args.kwargs
-        assert call_kwargs["custom_body"]["store"] is expected_store
-        assert call_kwargs["custom_body"]["stream"] is expected_stream
-        assert create_fn.call_args.kwargs["is_streaming_request"] is expected_stream
+        assert call_kwargs["custom_body"]["store"] is False
+        assert call_kwargs["custom_body"]["stream"] is True
+        assert create_fn.call_args.kwargs["is_streaming_request"] is True
 
 
 # ---------------------------------------------------------------------------

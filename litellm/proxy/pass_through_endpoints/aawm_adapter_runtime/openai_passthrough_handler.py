@@ -75,63 +75,6 @@ def _identity_codex_tool_adapter(
     return request_body, []
 
 
-def _input_contains_upstream_continuation_item(
-    value: Any,
-    _seen: Optional[set[int]] = None,
-) -> bool:
-    if isinstance(value, (dict, list)):
-        if _seen is None:
-            _seen = set()
-        value_id = id(value)
-        if value_id in _seen:
-            return False
-        _seen.add(value_id)
-
-    if isinstance(value, list):
-        return any(
-            _input_contains_upstream_continuation_item(item, _seen)
-            for item in value
-        )
-    if not isinstance(value, dict):
-        return False
-
-    item_type = value.get("type")
-    item_id = value.get("id")
-    if (
-        isinstance(item_type, str)
-        and item_type in {"reasoning", "item_reference"}
-        and isinstance(item_id, str)
-        and item_id.startswith("rs_")
-    ):
-        return True
-
-    item_reference = value.get("item_reference")
-    if isinstance(item_reference, str) and item_reference.startswith("rs_"):
-        return True
-    if isinstance(item_reference, dict):
-        referenced_id = item_reference.get("id")
-        if isinstance(referenced_id, str) and referenced_id.startswith("rs_"):
-            return True
-
-    return any(
-        _input_contains_upstream_continuation_item(child, _seen)
-        for child in value.values()
-    )
-
-
-def _request_has_upstream_continuation_state(request_body: Any) -> bool:
-    if not isinstance(request_body, dict):
-        return False
-
-    previous_response_id = request_body.get("previous_response_id")
-    if isinstance(previous_response_id, str) and previous_response_id.strip():
-        return True
-
-    return _input_contains_upstream_continuation_item(
-        request_body.get("input")
-    )
-
-
 # ---------------------------------------------------------------------------
 # Typed runtime / dependency bundle
 # ---------------------------------------------------------------------------
@@ -480,9 +423,6 @@ class BaseOpenAIPassThroughHandler:
 
         if request.method == "POST":
             request_body = await rt.get_request_body_fn(request)
-            has_upstream_continuation = _request_has_upstream_continuation_state(
-                request_body
-            )
             watermark_intake = apply_request_watermark_intake(
                 body=request_body,
                 config=_get_runtime_text_watermark_config(),
@@ -666,17 +606,11 @@ class BaseOpenAIPassThroughHandler:
                 )
             )
             if is_codex_responses_request:
-                if has_upstream_continuation:
-                    prepared_request_body = {
-                        **prepared_request_body,
-                        "store": True,
-                    }
-                else:
-                    prepared_request_body = {
-                        **prepared_request_body,
-                        "store": False,
-                        "stream": True,
-                    }
+                prepared_request_body = {
+                    **prepared_request_body,
+                    "store": False,
+                    "stream": True,
+                }
             if body_was_prepared or prepared_request_body is not request_body:
                 rt.safe_set_request_parsed_body_fn(
                     request, prepared_request_body

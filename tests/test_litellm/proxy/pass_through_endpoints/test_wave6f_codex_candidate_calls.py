@@ -252,58 +252,44 @@ class TestDispatchBehavior:
             )
 
 
-class TestNativeOpenAIContinuationStorageDefaults:
+class TestNativeOpenAIResponsesEgressContract:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        ("request_body", "expected_store", "expected_stream"),
+        "request_body",
         [
-            (
-                {
-                    "model": "gpt-5.6-sol",
-                    "input": [{"type": "message", "role": "user", "content": "fresh"}],
-                    "stream": False,
-                },
-                False,
-                True,
-            ),
-            (
-                {
-                    "model": "gpt-5.6-sol",
-                    "input": [
-                        {
-                            "type": "message",
-                            "role": "user",
-                            "content": "continue",
-                        }
-                    ],
-                    "previous_response_id": "resp_previous",
-                    "stream": False,
-                },
-                True,
-                False,
-            ),
-            (
-                {
-                    "model": "gpt-5.6-sol",
-                    "input": [
-                        {
-                            "type": "reasoning",
-                            "id": "rs_previous",
-                            "summary": [],
-                        }
-                    ],
-                    "stream": False,
-                },
-                True,
-                False,
-            ),
+            {
+                "model": "gpt-5.6-sol",
+                "input": [{"type": "message", "role": "user", "content": "fresh"}],
+                "stream": False,
+            },
+            {
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": "continue",
+                    }
+                ],
+                "previous_response_id": "resp_previous",
+                "stream": False,
+            },
+            {
+                "model": "gpt-5.6-sol",
+                "input": [
+                    {
+                        "type": "reasoning",
+                        "id": "rs_previous",
+                        "summary": [],
+                    }
+                ],
+                "stream": False,
+            },
         ],
     )
-    async def test_native_openai_storage_defaults_preserve_continuations(
+    async def test_native_openai_responses_always_disable_storage_and_stream(
         self,
         request_body: dict[str, Any],
-        expected_store: bool,
-        expected_stream: bool,
     ) -> None:
         import litellm
 
@@ -337,9 +323,9 @@ class TestNativeOpenAIContinuationStorageDefaults:
         )
 
         call_kwargs = pass_through_request.await_args.kwargs
-        assert call_kwargs["custom_body"]["store"] is expected_store
-        assert call_kwargs["custom_body"]["stream"] is expected_stream
-        assert call_kwargs["stream"] is expected_stream
+        assert call_kwargs["custom_body"]["store"] is False
+        assert call_kwargs["custom_body"]["stream"] is True
+        assert call_kwargs["stream"] is True
 
 
 # ── Callback ordering (Kimi route) ─────────────────────────────────
