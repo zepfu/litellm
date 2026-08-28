@@ -7550,6 +7550,8 @@ def test_build_rate_limit_observations_extracts_codex_response_headers() -> None
         {
             "session_id": "session-codex-header-rate",
             "passthrough_route_family": "codex_responses",
+            "codex_oauth_account_hash": "codex-account-hash-alpha",
+            "provider_account_hash": "codex-account-hash-alpha",
             "codex_response_headers": {
                 "source": "codex_response_headers",
                 "x-codex-active-limit": "premium",
@@ -7722,6 +7724,165 @@ def test_build_rate_limit_observations_drops_only_malformed_codex_headers() -> N
     )
 
     assert observations == []
+
+
+def test_codex_rate_limit_observations_preserve_selected_account_hash_over_bearer() -> None:
+    """OPENAI-023: successful Codex headers key to the selected account, not
+    to the bearer identity that rotates between requests."""
+    selected_account_hash = "codex-account-hash-alpha"
+    bearer_tokens = ("Bearer codex-access-one", "Bearer codex-access-two")
+    observations_by_bearer = []
+
+    for call_id, bearer_token in enumerate(bearer_tokens, start=1):
+        kwargs = _base_kwargs()
+        kwargs["model"] = "gpt-5.5"
+        kwargs["custom_llm_provider"] = "openai"
+        kwargs["litellm_call_id"] = f"call-openai-023-success-{call_id}"
+        kwargs["litellm_params"]["metadata"].update(
+            {
+                "session_id": f"session-openai-023-success-{call_id}",
+                "passthrough_route_family": "codex_responses",
+                "codex_oauth_account_hash": selected_account_hash,
+                "provider_account_hash": selected_account_hash,
+                "user_api_key_hash": "caller-key-hash",
+            }
+        )
+        kwargs["litellm_params"]["metadata"]["codex_response_headers"] = {
+            "source": "codex_response_headers",
+            "x-codex-active-limit": "premium",
+            "x-codex-primary-reset-after-seconds": "3600",
+            "x-codex-primary-used-percent": "18.25",
+            "x-codex-primary-window-minutes": "300",
+        }
+        kwargs["litellm_params"]["proxy_server_request"] = {"headers": {"authorization": bearer_token}}
+        kwargs["user_api_key_dict"] = {"api_key": bearer_token, "api_key_hash": "caller-key-hash"}
+        end_time = datetime(2026, 5, 5, 21, 24, tzinfo=timezone.utc)
+
+        observations = _build_rate_limit_observations(
+            kwargs=kwargs,
+            result={"choices": []},
+            start_time=end_time,
+            end_time=end_time,
+        )
+
+        assert len(observations) == 1
+        observation = observations[0]
+        assert observation["source"] == "codex_response_headers"
+        assert observation["account_hash"] == selected_account_hash
+        assert observation["limit_key"] == (
+            "openai:codex:codex-account-hash-alpha:codex:primary:300"
+        )
+        assert bearer_token.removeprefix("Bearer ") not in json.dumps(observation, default=str)
+        observations_by_bearer.append(observation)
+
+    assert observations_by_bearer[0]["limit_key"] == observations_by_bearer[1]["limit_key"]
+
+
+def test_generic_rate_limit_account_hash_preserves_precedence_and_short_hash() -> None:
+    """Generic routes retain caller/API-key precedence and legacy hashing."""
+    kwargs = _base_kwargs()
+    kwargs["custom_llm_provider"] = "openai"
+    metadata = kwargs["litellm_params"]["metadata"]
+    metadata.update(
+        {
+            "passthrough_route_family": "openai_responses",
+            "provider_account_hash": "  provider/Account.Hash-B  ",
+            "user_api_key_hash": "caller-key-hash",
+        }
+    )
+
+    assert aawm_agent_identity._extract_rate_limit_account_hash(kwargs, metadata) == (
+        aawm_agent_identity._short_hash(b"caller-key-hash")
+    )
+
+    metadata.pop("user_api_key_hash")
+    assert aawm_agent_identity._extract_rate_limit_account_hash(kwargs, metadata) == (
+        aawm_agent_identity._short_hash(b"provider/Account.Hash-B")
+    )
+
+
+def test_codex_oauth_account_hash_preserves_exact_selected_value() -> None:
+    selected_account_hash = "  Codex/Account.Hash-A  "
+    kwargs = _base_kwargs()
+    kwargs["custom_llm_provider"] = "openai"
+    metadata = kwargs["litellm_params"]["metadata"]
+    metadata.update(
+        {
+            "passthrough_route_family": "codex_responses",
+            "codex_auto_agent_selected_provider": "openai",
+            "codex_auto_agent_selected_route_family": "codex_responses",
+            "codex_oauth_account_hash": selected_account_hash,
+            "user_api_key_hash": "caller-key-hash",
+        }
+    )
+
+    assert aawm_agent_identity._extract_rate_limit_account_hash(kwargs, metadata) == selected_account_hash
+
+
+def test_codex_provider_account_hash_preserves_exact_selected_value() -> None:
+    selected_account_hash = "  Provider/Account.Hash-B  "
+    kwargs = _base_kwargs()
+    kwargs["custom_llm_provider"] = "openai"
+    metadata = kwargs["litellm_params"]["metadata"]
+    metadata.update(
+        {
+            "passthrough_route_family": "codex_responses",
+            "codex_auto_agent_selected_provider": "openai",
+            "codex_auto_agent_selected_route_family": "codex_responses",
+            "provider_account_hash": selected_account_hash,
+            "user_api_key_hash": "caller-key-hash",
+        }
+    )
+
+    assert aawm_agent_identity._extract_rate_limit_account_hash(kwargs, metadata) == selected_account_hash
+
+
+def test_codex_usage_limit_error_preserves_selected_account_hash_over_bearer() -> None:
+    """OPENAI-023: exhaustion also keys to the selected account, not the
+    caller identity."""
+    selected_account_hash = "codex-account-hash-alpha"
+    bearer_token = "Bearer codex-access-rotated"
+    kwargs = _base_kwargs()
+    kwargs["model"] = "gpt-5.5"
+    kwargs["custom_llm_provider"] = "openai"
+    kwargs["litellm_call_id"] = "call-openai-023-usage-limit"
+    kwargs["litellm_params"]["metadata"].update(
+        {
+            "session_id": "session-openai-023-usage-limit",
+            "passthrough_route_family": "codex_responses",
+            "codex_oauth_account_hash": selected_account_hash,
+            "provider_account_hash": selected_account_hash,
+            "user_api_key_hash": "caller-key-hash",
+        }
+    )
+    kwargs["litellm_params"]["proxy_server_request"] = {"headers": {"authorization": bearer_token}}
+    kwargs["user_api_key_dict"] = {"api_key": bearer_token, "api_key_hash": "caller-key-hash"}
+    end_time = datetime(2026, 5, 5, 21, 24, tzinfo=timezone.utc)
+
+    observations = _build_rate_limit_observations(
+        kwargs=kwargs,
+        result={
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "Usage limit reached; resets in 3600 seconds",
+                "resets_in_seconds": 3600,
+            }
+        },
+        start_time=end_time,
+        end_time=end_time,
+    )
+
+    assert len(observations) == 1
+    observation = observations[0]
+    assert observation["source"] == "codex_usage_limit_error"
+    assert observation["status"] == "exhausted"
+    assert observation["account_hash"] == selected_account_hash
+    assert observation["limit_key"] == (
+        "openai:codex:codex-account-hash-alpha:gpt-5.5:usage_limit:unknown_window"
+    )
+    serialized = json.dumps(observation, default=str)
+    assert "codex-access-rotated" not in serialized
+    assert "caller-key-hash" not in serialized
 
 
 def test_build_rate_limit_observations_extracts_anthropic_response_headers() -> None:

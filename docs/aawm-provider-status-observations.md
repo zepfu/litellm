@@ -270,6 +270,24 @@ request routing (OPENAI-004)`.
 Enrollment, removal, label/hash handling, permissions, rotation, and rollback
 are defined in `docs/aawm-oauth-credential-maintenance.md`.
 
+### Scheduled quota observation and consumer contract
+
+`aawm_tristore` is the deployment contract for scheduled Codex quota
+observations and their LiteLLM consumers. The sidecar persists scheduled
+per-account quota snapshots; LiteLLM uses selected Codex account identity to
+keep session history, response-derived observations, and quota consumers on
+the same account boundary. When merged route/provider metadata proves a
+selected native Codex route (`openai` with `codex_responses` or `codex_oauth`),
+selected `codex_oauth_account_hash` / `provider_account_hash` values are
+stable configured account identities and are preserved verbatim by LiteLLM
+rate-limit attribution. They are not hashed again and do not fall through to
+caller API-key or Authorization-derived identity when present. Outside that
+Codex-selected context, generic account extraction retains its established
+caller/API-key precedence and `_short_hash` behavior; `provider_account_hash`
+is not a generic override. Optional generic provider status selectors remain
+supported only as already implemented; they are not Codex deployment
+authority.
+
 ## Grok banked usage-limit resets (XAI-005 / XAI-006 / XAI-007)
 
 The sidecar can poll grok.com `GetRemainingResets` for banked usage-limit reset

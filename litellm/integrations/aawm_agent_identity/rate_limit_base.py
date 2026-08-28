@@ -269,6 +269,34 @@ def _extract_rate_limit_account_hash(
     kwargs: Dict[str, Any],
     metadata: Dict[str, Any],
 ) -> Optional[str]:
+    selected_route_family = _first_non_empty_string(
+        metadata.get("codex_auto_agent_selected_route_family"),
+        metadata.get("passthrough_route_family"),
+        metadata.get("openai_passthrough_route_family"),
+        metadata.get("route_family"),
+    )
+    selected_provider_value = (
+        metadata.get("codex_auto_agent_selected_provider")
+        or metadata.get("provider")
+        or metadata.get("custom_llm_provider")
+        or kwargs.get("custom_llm_provider")
+    )
+    selected_provider_value = getattr(selected_provider_value, "value", selected_provider_value)
+    selected_provider = _normalize_session_history_provider_name(selected_provider_value)
+    if (
+        selected_provider == "openai"
+        and str(selected_route_family or "").lower() in {"codex_oauth", "codex_responses"}
+    ):
+        # These routing-selected hashes are already stable deployment
+        # identities. Preserve them verbatim and do not derive a caller
+        # identity from a rotating bearer token when one is present.
+        for selected_account_hash in (
+            metadata.get("codex_oauth_account_hash"),
+            metadata.get("provider_account_hash"),
+        ):
+            if isinstance(selected_account_hash, str) and selected_account_hash:
+                return selected_account_hash
+
     headers = _extract_headers_from_kwargs(kwargs)
     user_api_key_dict = kwargs.get("user_api_key_dict") or kwargs.get("user_api_key")
     candidates = [
