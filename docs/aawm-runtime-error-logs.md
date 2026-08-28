@@ -468,7 +468,11 @@ their normal logging behavior for exhausted transient upstream failures.
 Alias route failure logging uses one canonical warning by default: the route
 status line written through the AAWM route access logger (for example
 `Status: Cooling Down` / `Failed` / `Exhausted`). Rollup buckets still record
-zero-turn status updates for the same failure. Full structured
+zero-turn status updates for the same failure. Terminal no-candidate and
+pre-attempt terminal warnings additionally emit one sanitized
+`AAWM_ALIAS_ROUTE: terminal warning` line by default even when both JSON flags
+are off; it carries bounded alias/status fields only (no session identities,
+candidate inventories, or upstream error text). Full structured
 `AAWM_ALIAS_ROUTE` JSON audit lines are investigation-only and require
 `AAWM_ALIAS_ROUTE_VERBOSE_JSON=1` (also accepts `true`, `yes`, `debug`, or
 `verbose`). Healthy alias selection events remain suppressed unless

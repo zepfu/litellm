@@ -158,6 +158,119 @@ class TestEmitRouteEvent:
             audit_persist._emit_auto_agent_alias_route_event(event, level="warning")
             mock_info.assert_called_once()
 
+    def test_terminal_warning_emits_sanitized_default_line_when_flags_off(
+        self, _configure_audit_persist
+    ):
+        event = {
+            "event_type": "no_candidate_available",
+            "candidate_status": "all_candidates_unavailable",
+            "alias_model": "codex-auto",
+            "error_status_code": 429,
+            "failure_class": "rate_limited",
+            "attempt_count": 2,
+            "redispatch_required": False,
+            "session_id": "secret-session-1234",
+            "source_error": "secret upstream detail",
+        }
+        with patch.object(
+            audit_persist.verbose_aawm_route_logger, "warning"
+        ) as mock_warning, patch.object(
+            audit_persist.verbose_aawm_route_logger, "info"
+        ) as mock_info:
+            audit_persist._emit_auto_agent_alias_route_event(event, level="warning")
+            mock_info.assert_not_called()
+            mock_warning.assert_called_once()
+            message = mock_warning.call_args[0][0]
+            assert message.startswith("AAWM_ALIAS_ROUTE: terminal warning")
+            assert "alias_model=codex-auto" in message
+            assert "error_status_code=429" in message
+            assert "failure_class=rate_limited" in message
+            assert "secret-session-1234" not in message
+            assert "secret upstream detail" not in message
+
+    def test_info_event_stays_suppressed_when_flags_off(
+        self, _configure_audit_persist
+    ):
+        event = {"event_type": "candidate_selected", "candidate_status": "selected"}
+        with patch.object(
+            audit_persist.verbose_aawm_route_logger, "warning"
+        ) as mock_warning, patch.object(
+            audit_persist.verbose_aawm_route_logger, "info"
+        ) as mock_info:
+            audit_persist._emit_auto_agent_alias_route_event(event)
+            mock_info.assert_not_called()
+            mock_warning.assert_not_called()
+
+    def test_candidate_failure_warning_keeps_rollup_only_when_flags_off(
+        self, _configure_audit_persist
+    ):
+        event = {
+            "event_type": "candidate_retryable_failure",
+            "candidate_status": "cooldown_set",
+            "failure_class": "provider_terminal_error",
+            "alias_model": "basic",
+        }
+        with patch.object(
+            audit_persist.verbose_aawm_route_logger, "warning"
+        ) as mock_warning:
+            audit_persist._emit_auto_agent_alias_route_event(event, level="warning")
+            mock_warning.assert_not_called()
+        assert _configure_audit_persist["rollup_calls"] == [event]
+
+    @pytest.mark.parametrize(
+        ("event_type", "candidate_status", "failure_phase", "error_code"),
+        [
+            (
+                "in_flight_pinned_session_cooldown",
+                "pinned_session_cooldown",
+                "session_affinity_cooldown",
+                "aawm_codex_auto_agent_in_flight_provider_cooling_down",
+            ),
+            (
+                "provider_lane_admission_rejected",
+                "admission_denied",
+                "provider_lane_admission",
+                "aawm_provider_lane_capacity_unavailable",
+            ),
+        ],
+    )
+    def test_pre_attempt_terminal_warnings_emit_when_flags_off(
+        self,
+        _configure_audit_persist,
+        event_type,
+        candidate_status,
+        failure_phase,
+        error_code,
+    ):
+        event = {
+            "event_type": event_type,
+            "candidate_status": candidate_status,
+            "failure_phase": failure_phase,
+            "error_code": error_code,
+            "error_status_code": 429,
+            "attempted_provider_call": False,
+            "redispatch_required": event_type
+            == "in_flight_pinned_session_cooldown",
+            "session_id": "secret-session",
+            "source_error": "secret provider detail",
+        }
+        with patch.object(
+            audit_persist.verbose_aawm_route_logger, "warning"
+        ) as mock_warning, patch.object(
+            audit_persist.verbose_aawm_route_logger, "info"
+        ) as mock_info:
+            audit_persist._emit_auto_agent_alias_route_event(event, level="warning")
+            mock_info.assert_not_called()
+            mock_warning.assert_called_once()
+            message = mock_warning.call_args[0][0]
+            assert message.startswith("AAWM_ALIAS_ROUTE: terminal warning")
+            assert f"event_type={event_type}" in message
+            assert f"candidate_status={candidate_status}" in message
+            assert f"failure_phase={failure_phase}" in message
+            assert f"error_code={error_code}" in message
+            assert "secret-session" not in message
+            assert "secret provider detail" not in message
+
 
 # ---------------------------------------------------------------------------
 # _persist_auto_agent_alias_audit_only_events_best_effort tests

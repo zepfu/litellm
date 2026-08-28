@@ -206,6 +206,363 @@ async def test_candidate_loop_resolves_generic_status_helper_from_live_host() ->
     )
 
 
+@pytest.mark.asyncio
+async def test_candidate_loop_records_in_flight_pinned_cooldown_without_no_candidate_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [(b"user-agent", b"codex-cli/1.0")],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    body = {"model": "basic", "input": "hello", "stream": False}
+    detail = {
+        "error": {
+            "type": "invalid_request_error",
+            "code": "aawm_codex_auto_agent_in_flight_provider_cooling_down",
+            "message": "pinned session target is cooling down",
+        },
+        "candidate": {
+            "provider": "openai",
+            "model": "gpt-5.5-codex",
+            "route_family": "codex_responses",
+            "lane_key": "codex-oauth:pinned",
+            "cooldown_key": "openai:pinned",
+        },
+        "redispatch_required": True,
+    }
+    original_exc = HTTPException(
+        status_code=429,
+        detail=detail,
+        headers={"Retry-After": "9"},
+    )
+    emitted: list[dict[str, Any]] = []
+    persisted: list[list[dict[str, Any]]] = []
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        raise original_exc
+
+    async def _perform(**_kwargs: Any) -> object:
+        raise AssertionError("pinned cooldown must stop before provider I/O")
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: SimpleNamespace(
+            is_replay_safe_session_owner_redispatch_body=lambda _body: False
+        ),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_route_event",
+        lambda event, **_kwargs: emitted.append(event),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda events, *, request_body=None: persisted.append(events),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_no_candidate_event",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("pinned cooldown is not all-candidates exhaustion")
+        ),
+    )
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=None,
+        publish_cooldown_memory_fn=None,
+        persist_cooldown_fn=None,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=lambda request_body, **_kwargs: request_body,
+        raise_redispatch_fn=None,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body=body,
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=None,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    assert caught.value is original_exc
+    assert caught.value.detail is detail
+    assert caught.value.headers == {"Retry-After": "9"}
+    assert len(emitted) == 1
+    event = emitted[0]
+    assert event["event_type"] == "in_flight_pinned_session_cooldown"
+    assert event["candidate_status"] == "pinned_session_cooldown"
+    assert event["failure_phase"] == "session_affinity_cooldown"
+    assert (
+        event["error_code"]
+        == "aawm_codex_auto_agent_in_flight_provider_cooling_down"
+    )
+    assert event["error_type"] == "invalid_request_error"
+    assert event["error_status_code"] == 429
+    assert event["attempted_provider_call"] is False
+    assert event["redispatch_required"] is True
+    assert event["fallback_result"] != "no_candidate_available"
+    assert len(persisted) == 1
+    assert persisted[0][-1] == event
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_other_redispatch_429_emits_no_terminal_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [(b"user-agent", b"codex-cli/1.0")],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    body = {"model": "basic", "input": "hello", "stream": False}
+    detail = {
+        "error": {
+            "type": "invalid_request_error",
+            "code": "aawm_codex_auto_agent_redispatch_required",
+            "message": "redispatch required",
+        },
+        "redispatch_required": True,
+    }
+    original_exc = HTTPException(
+        status_code=429,
+        detail=detail,
+        headers={"Retry-After": "3"},
+    )
+    pinned_events: list[dict[str, Any]] = []
+    no_candidate_events: list[dict[str, Any]] = []
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        raise original_exc
+
+    async def _perform(**_kwargs: Any) -> object:
+        raise AssertionError("redispatch-required selection must stop before provider I/O")
+
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: SimpleNamespace(
+            is_replay_safe_session_owner_redispatch_body=lambda _body: False
+        ),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_pre_attempt_terminal_event",
+        lambda **kwargs: pinned_events.append(kwargs),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_no_candidate_event",
+        lambda **kwargs: no_candidate_events.append(kwargs),
+    )
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=None,
+        publish_cooldown_memory_fn=None,
+        persist_cooldown_fn=None,
+        set_session_affinity_fn=None,
+        add_alias_metadata_fn=None,
+        raise_redispatch_fn=None,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body=body,
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=None,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    assert caught.value is original_exc
+    assert caught.value.detail is detail
+    assert caught.value.headers == {"Retry-After": "3"}
+    assert pinned_events == []
+    assert no_candidate_events == []
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_records_non_failover_admission_denial_before_raise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [(b"user-agent", b"codex-cli/1.0")],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    body = {"model": "basic", "input": "hello", "stream": False}
+    candidate = {
+        "provider": "openai",
+        "model": "gpt-5.5-codex",
+        "route_family": "codex_responses",
+        "codex_oauth_account_hash": "account-hash",
+        "codex_oauth_lane_key": "codex-oauth:account",
+    }
+    selection = {
+        "candidate": candidate,
+        "cooldown_key": "openai:account",
+        "lane_key": "codex-oauth:account",
+        "selection_reason": "first_choice",
+    }
+    admission_decision = SimpleNamespace(
+        allowed=False,
+        reason="capacity_unavailable",
+        detail_code="aawm_provider_lane_capacity_unavailable",
+        lane_fingerprint="lane-fingerprint",
+        provider="openai",
+        account_hash="account-hash",
+        limit_scope="concurrency",
+        exhaustion_kind=None,
+    )
+    detail = {
+        "error": {
+            "type": "rate_limit_error",
+            "code": "aawm_provider_lane_capacity_unavailable",
+            "message": "lane capacity unavailable",
+        }
+    }
+    original_exc = HTTPException(
+        status_code=429,
+        detail=detail,
+        headers={"Retry-After": "4"},
+    )
+    emitted: list[dict[str, Any]] = []
+    persisted: list[list[dict[str, Any]]] = []
+    provider_calls: list[dict[str, Any]] = []
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        return selection
+
+    async def _perform(**kwargs: Any) -> object:
+        provider_calls.append(kwargs)
+        raise AssertionError("admission denial must stop before provider I/O")
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return admission_decision
+
+        def admission_deny_error_class(self, _decision: object) -> str:
+            return "capacity_exhausted"
+
+        def raise_provider_lane_admission_rejected(self, *_args: Any, **_kwargs: Any) -> None:
+            raise original_exc
+
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: SimpleNamespace(
+            is_replay_safe_session_owner_redispatch_body=lambda _body: False
+        ),
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_route_event",
+        lambda event, **_kwargs: emitted.append(event),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda events, *, request_body=None: persisted.append(events),
+    )
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=None,
+        publish_cooldown_memory_fn=None,
+        persist_cooldown_fn=None,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=lambda request_body, **_kwargs: request_body,
+        raise_redispatch_fn=None,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body=body,
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=None,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    assert caught.value is original_exc
+    assert caught.value.detail is detail
+    assert caught.value.headers == {"Retry-After": "4"}
+    assert provider_calls == []
+    assert len(emitted) == 1
+    event = emitted[0]
+    assert event["event_type"] == "provider_lane_admission_rejected"
+    assert event["candidate_status"] == "admission_denied"
+    assert event["failure_phase"] == "provider_lane_admission"
+    assert event["error_code"] == "aawm_provider_lane_capacity_unavailable"
+    assert event["failure_class"] == "capacity_exhausted"
+    assert event["error_status_code"] == 429
+    assert event["attempted_provider_call"] is False
+    assert event["admission_reason"] == "capacity_unavailable"
+    assert event["admission_detail_code"] == "aawm_provider_lane_capacity_unavailable"
+    assert event["admission_lane_fingerprint"] == "lane-fingerprint"
+    assert len(persisted) == 1
+    assert persisted[0][-1] == event
+
+
 def test_resolve_failure_plan_classifies_alibaba_model_not_found_as_candidate_unavailable() -> None:
     """Alibaba candidate + structured ModelNotFound -> ``candidate_unavailable``.
 

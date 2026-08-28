@@ -123,12 +123,82 @@ def _emit_auto_agent_alias_route_event(
 
     _record_auto_agent_alias_route_status_rollup(event)
     if not (_aawm_alias_route_verbose_json_enabled() or _aawm_alias_route_healthy_json_enabled()):
+        if level == "warning":
+            _emit_auto_agent_alias_route_default_warning(event)
         return
     if not _should_emit_auto_agent_alias_route_event(event, level=level):
         return
     log_payload = {"event": "aawm_alias_route", **event}
     message = "AAWM_ALIAS_ROUTE: {}".format(json.dumps(log_payload, sort_keys=True, default=str, separators=(",", ":")))
     verbose_aawm_route_logger.info(message)
+
+
+def _emit_auto_agent_alias_route_default_warning(event: dict[str, Any]) -> None:
+    """Emit one sanitized operator-visible line for terminal warning events.
+
+    Terminal no-candidate and pre-attempt terminal events carry
+    level="warning" but previously produced no container log unless a JSON flag
+    was enabled. Normal candidate-failure events are intentionally excluded:
+    their status lines already surface via the route status rollup, so this
+    default must not duplicate them.
+    """
+    if str(event.get("event_type") or "") not in {
+        "no_candidate_available",
+        "in_flight_pinned_session_cooldown",
+        "provider_lane_admission_rejected",
+    }:
+        return
+    verbose_aawm_route_logger.warning(
+        "AAWM_ALIAS_ROUTE: terminal warning {}".format(
+            _format_auto_agent_alias_route_default_warning_fields(event)
+        )
+    )
+
+
+def _format_auto_agent_alias_route_default_warning_fields(
+    event: dict[str, Any],
+) -> str:
+    """Bounded key=value rendering of terminal-warning fields.
+
+    Session identities, candidate inventories, and free-form error text are
+    never included; labels are charset-restricted and length-capped.
+    """
+
+    def _label(value: Any) -> str:
+        if value is None:
+            return "<missing>"
+        sanitized = re.sub(r"[^A-Za-z0-9_.:/-]+", "_", str(value).strip())
+        return sanitized[:64] or "<missing>"
+
+    int_keys = ("error_status_code", "attempt_count")
+    bool_keys = ("redispatch_required", "agent_session_killed", "attempted_provider_call")
+    label_keys = (
+        "event_type",
+        "alias_family",
+        "alias_model",
+        "candidate_status",
+        "failure_phase",
+        "failure_class",
+        "error_type",
+        "error_code",
+        "terminal_outcome",
+        "fallback_result",
+        "client_product_label",
+    )
+    parts: list[str] = []
+    for key in label_keys:
+        value = event.get(key)
+        if value is not None:
+            parts.append(f"{key}={_label(value)}")
+    for key in int_keys:
+        value = event.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            parts.append(f"{key}={value}")
+    for key in bool_keys:
+        value = event.get(key)
+        if isinstance(value, bool):
+            parts.append(f"{key}={'true' if value else 'false'}")
+    return " ".join(parts) or "event_type=<missing>"
 
 
 def _should_emit_auto_agent_alias_route_event(
@@ -353,6 +423,8 @@ from types import FunctionType as _FunctionType
 
 _HOST_FUNCTION_NAMES = (
     "_emit_auto_agent_alias_route_event",
+    "_emit_auto_agent_alias_route_default_warning",
+    "_format_auto_agent_alias_route_default_warning_fields",
     "_should_emit_auto_agent_alias_route_event",
     "_persist_auto_agent_alias_audit_only_events_best_effort",
 )

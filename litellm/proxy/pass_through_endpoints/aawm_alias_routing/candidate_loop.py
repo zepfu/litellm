@@ -414,6 +414,7 @@ async def handle_alias_route(  # noqa: PLR0915
     _codex_auto_agent_candidate_public_shape = _lpe._codex_auto_agent_candidate_public_shape
     _record_auto_agent_alias_attempt_started = _lpe._record_auto_agent_alias_attempt_started
     _is_auto_agent_alias_in_flight_cooldown_http_exception = _lpe._is_auto_agent_alias_in_flight_cooldown_http_exception
+    _emit_auto_agent_alias_pre_attempt_terminal_event = _lpe._emit_auto_agent_alias_pre_attempt_terminal_event
     _emit_auto_agent_alias_no_candidate_event = _lpe._emit_auto_agent_alias_no_candidate_event
     _get_safe_kimi_code_probe_failure_metadata = _lpe._get_safe_kimi_code_probe_failure_metadata
     _classify_kimi_code_auto_agent_probe_failure = _lpe._classify_kimi_code_auto_agent_probe_failure
@@ -623,15 +624,43 @@ async def handle_alias_route(  # noqa: PLR0915
                     request,
                     attempts[-1],
                 )
-            if exc.status_code == 429 and not _is_auto_agent_alias_in_flight_cooldown_http_exception(exc):
-                _emit_auto_agent_alias_no_candidate_event(
-                    alias_family=alias_family,
-                    alias_model=alias_model,
-                    request=request,
-                    request_body=prepared_request_body,
-                    exc=exc,
-                    attempts=attempts,
+            if exc.status_code == 429:
+                selection_detail = exc.detail if isinstance(exc.detail, dict) else {}
+                selection_error = selection_detail.get("error")
+                selection_error_code = (
+                    selection_error.get("code")
+                    if isinstance(selection_error, dict)
+                    else None
                 )
+                if selection_error_code in {
+                    "aawm_codex_auto_agent_in_flight_provider_cooling_down",
+                    "aawm_anthropic_auto_agent_in_flight_provider_cooling_down",
+                }:
+                    _emit_auto_agent_alias_pre_attempt_terminal_event(
+                        alias_family=alias_family,
+                        alias_model=alias_model,
+                        request=request,
+                        request_body=prepared_request_body,
+                        event_type="in_flight_pinned_session_cooldown",
+                        candidate_status="pinned_session_cooldown",
+                        failure_phase="session_affinity_cooldown",
+                        error_status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                        detail=exc.detail,
+                        attempts=attempts,
+                        failure_class="in_flight_pinned_session_cooldown",
+                        redispatch_required=True,
+                    )
+                elif not _is_auto_agent_alias_in_flight_cooldown_http_exception(
+                    exc
+                ):
+                    _emit_auto_agent_alias_no_candidate_event(
+                        alias_family=alias_family,
+                        alias_model=alias_model,
+                        request=request,
+                        request_body=prepared_request_body,
+                        exc=exc,
+                        attempts=attempts,
+                    )
             raise
         candidate = selection["candidate"]
         cooldown_key = str(selection["cooldown_key"])
@@ -723,6 +752,29 @@ async def handle_alias_route(  # noqa: PLR0915
                     admission_decision.reason,
                 )
                 continue
+            _emit_auto_agent_alias_pre_attempt_terminal_event(
+                alias_family=alias_family,
+                alias_model=alias_model,
+                request=request,
+                request_body=prepared_request_body,
+                event_type="provider_lane_admission_rejected",
+                candidate_status="admission_denied",
+                failure_phase="provider_lane_admission",
+                error_status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                error_code=admission_decision.detail_code,
+                candidate=attempt_record,
+                selection=selection,
+                attempts=attempts,
+                failure_class=admission_error_class,
+                error_type="rate_limit_error",
+                extra_fields={
+                    "admission_reason": admission_decision.reason,
+                    "admission_detail_code": admission_decision.detail_code,
+                    "admission_lane_fingerprint": admission_decision.lane_fingerprint,
+                    "admission_limit_scope": admission_decision.limit_scope,
+                    "admission_exhaustion_kind": admission_decision.exhaustion_kind,
+                },
+            )
             admission.raise_provider_lane_admission_rejected(
                 admission_decision,
                 candidate=candidate,

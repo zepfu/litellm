@@ -190,6 +190,153 @@ def _resolve_auto_agent_alias_terminal_candidates(
     )
 
 
+def _emit_auto_agent_alias_pre_attempt_terminal_event(  # noqa: PLR0915
+    *,
+    alias_family: str,
+    alias_model: str,
+    request: Request,
+    request_body: dict[str, Any],
+    event_type: str,
+    candidate_status: str,
+    failure_phase: str,
+    error_status_code: int,
+    error_code: Optional[Any] = None,
+    candidate: Optional[Mapping[str, Any]] = None,
+    selection: Optional[Mapping[str, Any]] = None,
+    attempts: Optional[list[dict[str, Any]]] = None,
+    detail: Any = None,
+    failure_class: Optional[str] = None,
+    error_type: Optional[str] = None,
+    redispatch_required: bool = False,
+    extra_fields: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Emit and persist a terminal event that stopped before provider I/O."""
+    assert _build_auto_agent_alias_audit_events is not None
+    assert _emit_auto_agent_alias_route_event is not None
+    assert _persist_auto_agent_alias_audit_only_events_best_effort is not None
+
+    try:
+        detail_mapping = detail if isinstance(detail, Mapping) else {}
+        detail_error = detail_mapping.get("error")
+        if not isinstance(detail_error, Mapping):
+            detail_error = {}
+        if error_code is None:
+            error_code = detail_error.get("code")
+        if error_type is None:
+            error_type = detail_error.get("type")
+
+        terminal_candidate = dict(candidate or {})
+        detail_candidate = detail_mapping.get("candidate")
+        if not terminal_candidate and isinstance(detail_candidate, Mapping):
+            terminal_candidate = dict(detail_candidate)
+        for key in (
+            "provider",
+            "model",
+            "route_family",
+            "lane_key",
+            "cooldown_key",
+            "cooldown_seconds",
+            "cooldown_scope",
+            "retry_after_seconds",
+        ):
+            if terminal_candidate.get(key) is None:
+                value = detail_mapping.get(key)
+                if value is None:
+                    value = detail_error.get(key)
+                if value is not None:
+                    terminal_candidate[key] = value
+
+        terminal_selection = dict(selection or {})
+        for key in ("session_key", "lane_key", "cooldown_key", "in_flight_session"):
+            if terminal_selection.get(key) is None:
+                value = detail_mapping.get(key)
+                if value is not None:
+                    terminal_selection[key] = value
+        terminal_selection["candidate"] = terminal_candidate
+
+        normalized_attempts = [
+            copy.deepcopy(attempt)
+            for attempt in attempts or []
+            if isinstance(attempt, dict)
+        ]
+        terminal_attempt = dict(terminal_candidate)
+        terminal_attempt.update(
+            {
+                "status": candidate_status,
+                "attempted_provider_call": False,
+                "error_status_code": error_status_code,
+                "failure_phase": failure_phase,
+            }
+        )
+        if failure_class is not None:
+            terminal_attempt["error_class"] = failure_class
+        if error_type is not None:
+            terminal_attempt["error_type"] = error_type
+        if error_code is not None:
+            terminal_attempt["error_code"] = str(error_code)
+        if extra_fields:
+            terminal_attempt.update(extra_fields)
+
+        matching_keys = tuple(
+            key
+            for key in ("provider", "model", "route_family", "lane_key")
+            if terminal_candidate.get(key) is not None
+        )
+        if matching_keys and normalized_attempts and all(
+            normalized_attempts[-1].get(key) == terminal_candidate.get(key)
+            for key in matching_keys
+        ):
+            normalized_attempts[-1].update(terminal_attempt)
+        else:
+            normalized_attempts.append(terminal_attempt)
+
+        audit_events = _build_auto_agent_alias_audit_events(
+            alias_family=alias_family,
+            alias_model=alias_model,
+            request=request,
+            request_body=request_body,
+            selection=terminal_selection,
+            attempts=normalized_attempts,
+        )
+        event = copy.deepcopy(audit_events[-1]) if audit_events else {}
+        event.update(
+            {
+                "event_type": event_type,
+                "candidate_status": candidate_status,
+                "failure_phase": failure_phase,
+                "error_status_code": int(error_status_code),
+                "attempted_provider_call": False,
+                "redispatch_required": bool(redispatch_required),
+                "terminal_outcome": (
+                    "redispatch_required" if redispatch_required else "failed"
+                ),
+                "fallback_result": event_type,
+                "attempt_count": len(normalized_attempts),
+                "attempts": copy.deepcopy(normalized_attempts),
+            }
+        )
+        if failure_class is not None:
+            event["failure_class"] = failure_class
+        if error_type is not None:
+            event["error_type"] = error_type
+        if error_code is not None:
+            event["error_code"] = str(error_code)
+        if extra_fields:
+            event.update(copy.deepcopy(dict(extra_fields)))
+
+        _emit_auto_agent_alias_route_event(event, level="warning")
+        _persist_auto_agent_alias_audit_only_events_best_effort(
+            [*audit_events[:-1], event],
+            request_body=request_body,
+        )
+    except Exception:
+        # Observability must never replace the original terminal response.
+        verbose_proxy_logger.debug(
+            "Failed to emit pre-attempt terminal alias audit event",
+            exc_info=True,
+        )
+
+
 def _emit_auto_agent_alias_no_candidate_event(
     *,
     alias_family: str,
@@ -381,6 +528,7 @@ from types import FunctionType as _FunctionType
 _HOST_FUNCTION_NAMES = (
     "_enrich_auto_agent_alias_terminal_event_from_attempts",
     "_resolve_auto_agent_alias_terminal_candidates",
+    "_emit_auto_agent_alias_pre_attempt_terminal_event",
     "_emit_auto_agent_alias_no_candidate_event",
 )
 
