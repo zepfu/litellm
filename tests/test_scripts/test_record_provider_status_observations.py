@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from subprocess import TimeoutExpired
+from threading import Event
 from urllib import error as urllib_error
 from urllib.parse import parse_qs, urlsplit
 
@@ -8434,6 +8435,146 @@ def test_run_due_sidecar_tasks_emits_codex_reset_credit_poll_event(monkeypatch) 
     assert "access-token-secret" not in event_json
     assert "acct-openai-primary" not in event_json
     assert '"account_id"' not in event_json
+
+
+def test_run_due_sidecar_tasks_retains_pending_optional_poll_results(  # noqa: PLR0915
+    monkeypatch,
+) -> None:
+    config = _codex_reset_credit_poll_config(kimi_usage_poll_enabled=True)
+    blocking_started = Event()
+    release_blocking = Event()
+    codex_started = Event()
+    release_codex = Event()
+    codex_finished = Event()
+    calls = {"required": 0, "blocking": 0, "codex": 0}
+
+    def fake_required_refresh(
+        _config,
+        _state,
+        *,
+        now_monotonic,
+        now_wall=None,
+    ):
+        del now_monotonic, now_wall
+        calls["required"] += 1
+        return [{"event": "codex_oauth_refresh", "required": True}]
+
+    def fake_blocking_optional(_config, state, *, now_monotonic):
+        last_attempt = state.kimi_usage_last_attempt_monotonic
+        if (
+            last_attempt is not None
+            and now_monotonic - last_attempt < config.kimi_usage_poll_interval_seconds
+        ):
+            return None
+        state.kimi_usage_last_attempt_monotonic = now_monotonic
+        calls["blocking"] += 1
+        blocking_started.set()
+        if not release_blocking.wait(timeout=2.0):
+            raise AssertionError("blocking optional task was not released")
+        return {"event": "kimi_usage_poll", "blocking": True}
+
+    def fake_queued_codex(_config, state, *, now_monotonic):
+        last_attempt = state.codex_reset_credit_last_attempt_monotonic_by_label.get(
+            "account1"
+        )
+        if (
+            last_attempt is not None
+            and now_monotonic - last_attempt
+            < config.codex_reset_credit_poll_interval_seconds
+        ):
+            return []
+        state.codex_reset_credit_last_attempt_monotonic_by_label["account1"] = (
+            now_monotonic
+        )
+        calls["codex"] += 1
+        codex_started.set()
+        if not release_codex.wait(timeout=2.0):
+            raise AssertionError("queued Codex task was not released")
+        codex_finished.set()
+        return [{"event": "codex_reset_credit_poll", "queued": True}]
+
+    monkeypatch.setattr(loop, "_run_codex_oauth_refresh_task", fake_required_refresh)
+    monkeypatch.setattr(loop, "_run_kimi_usage_poll_task", fake_blocking_optional)
+    monkeypatch.setattr(loop, "_run_codex_reset_credit_poll_task", fake_queued_codex)
+
+    state = loop.SidecarTaskState()
+    optional_event_names = {"kimi_usage_poll", "codex_reset_credit_poll"}
+
+    try:
+        started_at = time.monotonic()
+        first_events = loop.run_due_sidecar_tasks(
+            config,
+            state,
+            now_monotonic=100.0,
+        )
+        elapsed = time.monotonic() - started_at
+
+        assert elapsed < 1.0
+        assert blocking_started.wait(timeout=1.0)
+        assert [event["event"] for event in first_events] == ["codex_oauth_refresh"]
+        assert calls == {"required": 1, "blocking": 1, "codex": 0}
+        assert "kimi_usage_poll" in state.optional_poll_futures
+        assert "codex_reset_credit_poll" in state.optional_poll_futures
+
+        second_events = loop.run_due_sidecar_tasks(
+            config,
+            state,
+            now_monotonic=101.0,
+        )
+        assert [
+            event
+            for event in second_events
+            if event.get("event") in optional_event_names
+        ] == []
+        assert calls == {"required": 2, "blocking": 1, "codex": 0}
+
+        release_blocking.set()
+        assert codex_started.wait(timeout=1.0)
+
+        third_events = loop.run_due_sidecar_tasks(
+            config,
+            state,
+            now_monotonic=102.0,
+        )
+        assert [
+            event["event"]
+            for event in third_events
+            if event.get("event") in optional_event_names
+        ] == ["kimi_usage_poll"]
+        assert calls == {"required": 3, "blocking": 1, "codex": 1}
+        assert "codex_reset_credit_poll" in state.optional_poll_futures
+
+        release_codex.set()
+        assert codex_finished.wait(timeout=1.0)
+
+        fourth_events = loop.run_due_sidecar_tasks(
+            config,
+            state,
+            now_monotonic=103.0,
+        )
+        assert [
+            event["event"]
+            for event in fourth_events
+            if event.get("event") in optional_event_names
+        ] == ["codex_reset_credit_poll"]
+
+        fifth_events = loop.run_due_sidecar_tasks(
+            config,
+            state,
+            now_monotonic=104.0,
+        )
+        assert [
+            event
+            for event in fifth_events
+            if event.get("event") in optional_event_names
+        ] == []
+        all_events = first_events + second_events + third_events + fourth_events + fifth_events
+        assert sum(event["event"] == "kimi_usage_poll" for event in all_events) == 1
+        assert sum(event["event"] == "codex_reset_credit_poll" for event in all_events) == 1
+        assert calls == {"required": 5, "blocking": 1, "codex": 1}
+    finally:
+        release_blocking.set()
+        release_codex.set()
 
 
 def test_codex_quota_observations_keep_distinct_fresh_windows_without_inventing_model() -> None:

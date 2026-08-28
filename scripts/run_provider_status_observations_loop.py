@@ -22,7 +22,7 @@ import traceback
 import urllib.error
 import urllib.request
 import uuid
-from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
+from concurrent.futures import Future, ThreadPoolExecutor, wait as futures_wait
 from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1580,6 +1580,9 @@ class SidecarTaskState:
         default_factory=dict
     )
     observability_anomaly_scan_last_attempt_monotonic: Optional[float] = None
+    optional_poll_futures: Dict[str, Future[Any]] = dataclass_field(
+        default_factory=dict
+    )
 
 
 _OAUTH_TERMINAL_REFRESH_ERROR_CLASSES = frozenset(
@@ -13048,6 +13051,29 @@ SIDECAR_OPTIONAL_POLL_MAX_WORKERS = 1
 _SIDECAR_OPTIONAL_POLL_EXECUTOR: Optional[ThreadPoolExecutor] = None
 
 
+def _append_optional_poll_future_result(
+    events: list[Dict[str, Any]],
+    config: ProviderStatusLoopConfig,
+    event_name: str,
+    future: Future[Any],
+) -> None:
+    try:
+        result = future.result()
+    except Exception as exc:
+        result = {
+            "event": event_name,
+            "observed_at": _utc_timestamp(),
+            "environment": config.environment,
+            "attempted": True,
+            "error_class": exc.__class__.__name__,
+            "error_message": _redacted_failure_message(str(exc)),
+        }
+    if isinstance(result, list):
+        events.extend(result)
+    elif result is not None:
+        events.append(result)
+
+
 def run_due_sidecar_tasks(
     config: ProviderStatusLoopConfig,
     state: SidecarTaskState,
@@ -13111,8 +13137,20 @@ def run_due_sidecar_tasks(
             continue
         optional_pending.append((event_name, runner))
 
-    if optional_pending:
-        global _SIDECAR_OPTIONAL_POLL_EXECUTOR
+    global _SIDECAR_OPTIONAL_POLL_EXECUTOR
+    pending_optional_names = set(state.optional_poll_futures)
+    for event_name, future in list(state.optional_poll_futures.items()):
+        if not future.done():
+            continue
+        del state.optional_poll_futures[event_name]
+        _append_optional_poll_future_result(events, config, event_name, future)
+
+    optional_to_submit = [
+        (event_name, runner)
+        for event_name, runner in optional_pending
+        if event_name not in pending_optional_names
+    ]
+    if optional_to_submit:
         executor = _SIDECAR_OPTIONAL_POLL_EXECUTOR
         if executor is None:
             executor = ThreadPoolExecutor(
@@ -13134,32 +13172,23 @@ def run_due_sidecar_tasks(
                     "error_message": _redacted_failure_message(str(exc)),
                 }
 
-        submitted = [
-            (event_name, executor.submit(_run_optional, event_name, runner))
-            for event_name, runner in optional_pending
-        ]
+        for event_name, runner in optional_to_submit:
+            state.optional_poll_futures[event_name] = executor.submit(
+                _run_optional,
+                event_name,
+                runner,
+            )
+
+    if state.optional_poll_futures:
         done, _not_done = futures_wait(
-            [future for _event_name, future in submitted],
+            list(state.optional_poll_futures.values()),
             timeout=SIDECAR_OPTIONAL_POLL_DEADLINE_SECONDS,
         )
-        for event_name, future in submitted:
+        for event_name, future in list(state.optional_poll_futures.items()):
             if future not in done:
                 continue
-            try:
-                result = future.result()
-            except Exception as exc:
-                result = {
-                    "event": event_name,
-                    "observed_at": _utc_timestamp(),
-                    "environment": config.environment,
-                    "attempted": True,
-                    "error_class": exc.__class__.__name__,
-                    "error_message": _redacted_failure_message(str(exc)),
-                }
-            if isinstance(result, list):
-                events.extend(result)
-            elif result is not None:
-                events.append(result)
+            del state.optional_poll_futures[event_name]
+            _append_optional_poll_future_result(events, config, event_name, future)
     events.extend(
         _run_provider_auth_health_poll_task(
             config,
