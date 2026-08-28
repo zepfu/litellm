@@ -11,7 +11,18 @@ from datetime import datetime, timezone
 from math import isfinite
 import time
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union, cast
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Union,
+    cast,
+)
 from urllib.parse import parse_qsl, urlencode, urlparse
 
 import httpx
@@ -3994,6 +4005,32 @@ async def _aawm_session_owner_on_upstream_result(
         )
 
 
+async def _aawm_run_with_session_owner_lease_renewal(
+    *,
+    request: Request,
+    operation: Callable[[], Awaitable[Any]],
+) -> Any:
+    sa = _session_affinity_mod()
+    lease = sa.get_request_session_owner_lease(request)
+    renewal_runner = getattr(sa, "run_with_session_owner_lease_renewal", None)
+    if renewal_runner is None:
+        return await operation()
+
+    renewal_error_type = getattr(sa, "SessionOwnerLeaseRenewalError", None)
+    try:
+        return await renewal_runner(lease, operation)
+    except Exception as exc:  # noqa: BLE001
+        if renewal_error_type is None or not isinstance(exc, renewal_error_type):
+            raise
+        sa.raise_session_owner_redispatch_required(
+            session_identity=getattr(lease, "session_identity", None),
+            candidate=getattr(lease, "attributes", None),
+            failure_phase="session_owner_reservation_renewal",
+            attempted_provider_call=True,
+            request=request,
+        )
+
+
 async def pass_through_request(  # noqa: PLR0915
     request: Request,
     target: str,
@@ -4618,13 +4655,16 @@ async def pass_through_request(  # noqa: PLR0915
                 (
                     response,
                     req,
-                ) = await _execute_passthrough_pre_first_byte_with_hidden_retries(
-                    kwargs=kwargs,
-                    operation_name="stream_pre_first_byte",
-                    operation=_send_stream_pre_first_byte,
-                    caller_managed_hidden_retry=caller_managed_hidden_retry,
-                    url=url,
-                    custom_llm_provider=custom_llm_provider,
+                ) = await _aawm_run_with_session_owner_lease_renewal(
+                    request=request,
+                    operation=lambda: _execute_passthrough_pre_first_byte_with_hidden_retries(
+                        kwargs=kwargs,
+                        operation_name="stream_pre_first_byte",
+                        operation=_send_stream_pre_first_byte,
+                        caller_managed_hidden_retry=caller_managed_hidden_retry,
+                        url=url,
+                        custom_llm_provider=custom_llm_provider,
+                    ),
                 )
             except ResponsesStreamPreCommitFailure as pre_commit_exc:
                 await _aawm_session_owner_on_upstream_result(
@@ -4809,13 +4849,16 @@ async def pass_through_request(  # noqa: PLR0915
             return response
 
         try:
-            response = await _execute_passthrough_pre_first_byte_with_hidden_retries(
-                kwargs=kwargs,
-                operation_name="non_stream_pre_first_byte",
-                operation=_send_non_stream_pre_first_byte,
-                caller_managed_hidden_retry=caller_managed_hidden_retry,
-                url=url,
-                custom_llm_provider=custom_llm_provider,
+            response = await _aawm_run_with_session_owner_lease_renewal(
+                request=request,
+                operation=lambda: _execute_passthrough_pre_first_byte_with_hidden_retries(
+                    kwargs=kwargs,
+                    operation_name="non_stream_pre_first_byte",
+                    operation=_send_non_stream_pre_first_byte,
+                    caller_managed_hidden_retry=caller_managed_hidden_retry,
+                    url=url,
+                    custom_llm_provider=custom_llm_provider,
+                ),
             )
         except Exception:
             await _aawm_session_owner_on_upstream_result(

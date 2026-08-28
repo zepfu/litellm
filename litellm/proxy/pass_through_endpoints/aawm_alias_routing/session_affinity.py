@@ -130,6 +130,7 @@ class SessionOwnerLease:
         repr=False,
         compare=False,
     )
+    finalizing: bool = False
 
 
 _SESSION_OWNER_STATE_KIND = "session_owner"
@@ -2175,9 +2176,29 @@ def _session_owner_lease_is_renewable(
     return (
         lease is not None
         and lease.held_reservation
+        and not lease.finalizing
         and not lease.promoted
         and not lease.released
     )
+
+
+async def _barrier_session_owner_lease_renewal(
+    lease: SessionOwnerLease,
+) -> None:
+    lease.finalizing = True
+    task = lease.renewal_task
+    if task is None:
+        return
+    try:
+        current_task = asyncio.current_task()
+    except RuntimeError:
+        current_task = None
+    if task is not current_task:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    if lease.renewal_task is task:
+        lease.renewal_task = None
 
 
 def _stop_session_owner_lease_renewal(
@@ -2710,6 +2731,7 @@ async def finalize_session_owner_lease_on_success(
 ) -> Optional[SessionOwnerMutationResult]:
     if lease is None or not lease.held_reservation or lease.promoted or lease.released:
         return None
+    await _barrier_session_owner_lease_renewal(lease)
     result = await promote_session_owner_reservation(
         session_identity=lease.session_identity,
         reservation_token=lease.reservation_token,
@@ -2731,6 +2753,7 @@ async def finalize_session_owner_lease_on_failure(
 ) -> Optional[SessionOwnerMutationResult]:
     if lease is None or not lease.held_reservation or lease.promoted or lease.released:
         return None
+    await _barrier_session_owner_lease_renewal(lease)
     result = await release_session_owner_reservation(
         session_identity=lease.session_identity,
         reservation_token=lease.reservation_token,

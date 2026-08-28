@@ -2254,6 +2254,94 @@ async def test_lease_renewal_survives_ttl_until_promotion() -> None:
 
 
 @pytest.mark.asyncio
+async def test_lease_renewal_finalizer_barrier_promotes_from_provider_operation() -> None:
+    redis = _FakeRedisCache()
+    attrs = _full_attrs()
+    session_identity = "sess-renewal-finalizer-success"
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        guard = await sa.guard_session_owner_before_egress(
+            session_identity=session_identity,
+            requested_attributes=attrs,
+        )
+        lease = sa.lease_from_guard_result(guard, attributes=attrs)
+        real_sleep = asyncio.sleep
+
+        async def provider_operation() -> str:
+            await real_sleep(0)
+            assert lease.renewal_task is not None
+            assert not lease.renewal_task.done()
+            promoted = await sa.finalize_session_owner_lease_on_success(
+                lease,
+                attributes=attrs,
+            )
+            assert promoted is not None
+            assert promoted.outcome is sa.SessionOwnerMutationOutcome.PROMOTED
+            return "provider response"
+
+        result = await sa.run_with_session_owner_lease_renewal(
+            lease,
+            provider_operation,
+            reservation_ttl_seconds=30,
+            renewal_interval_seconds=1,
+        )
+        record, _, error = await sa.get_session_owner_record(
+            session_identity=session_identity,
+        )
+
+    assert result == "provider response"
+    assert error is None
+    assert record is not None
+    assert record["state"] == sa.SessionOwnerRecordState.OWNED.value
+    assert lease.promoted is True
+    assert lease.released is False
+    assert lease.renewal_task is None
+
+
+@pytest.mark.asyncio
+async def test_lease_renewal_finalizer_barrier_releases_from_provider_operation() -> None:
+    redis = _FakeRedisCache()
+    attrs = _full_attrs()
+    session_identity = "sess-renewal-finalizer-failure"
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        guard = await sa.guard_session_owner_before_egress(
+            session_identity=session_identity,
+            requested_attributes=attrs,
+        )
+        lease = sa.lease_from_guard_result(guard, attributes=attrs)
+        real_sleep = asyncio.sleep
+
+        async def provider_operation() -> None:
+            await real_sleep(0)
+            assert lease.renewal_task is not None
+            assert not lease.renewal_task.done()
+            released = await sa.finalize_session_owner_lease_on_failure(lease)
+            assert released is not None
+            assert released.outcome is sa.SessionOwnerMutationOutcome.RELEASED
+            raise RuntimeError("provider failed")
+
+        with pytest.raises(RuntimeError, match="provider failed"):
+            await sa.run_with_session_owner_lease_renewal(
+                lease,
+                provider_operation,
+                reservation_ttl_seconds=30,
+                renewal_interval_seconds=1,
+            )
+        record, _, error = await sa.get_session_owner_record(
+            session_identity=session_identity,
+        )
+
+    assert error is None
+    assert record is None
+    assert lease.promoted is False
+    assert lease.released is True
+    assert lease.renewal_task is None
+
+
+@pytest.mark.asyncio
 async def test_lease_renewal_loss_cancels_operation_and_prevents_promotion() -> None:
     redis = _FakeRedisCache()
     attrs = _full_attrs()

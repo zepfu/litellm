@@ -3746,6 +3746,201 @@ class TestPassThroughRequestRetryableFailures:
         assert kwargs == {}
 
     @pytest.mark.asyncio
+    async def test_pass_through_request_renews_entire_hidden_retry_operation(self):
+        from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            session_affinity as sa,
+        )
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            pass_through_request,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = SimpleNamespace(path="/test/endpoint")
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+        mock_request.state = SimpleNamespace()
+        custom_body = {"model": "gpt-5.4"}
+        upstream_response = MagicMock()
+        upstream_response.status_code = 200
+        upstream_response.headers = {"content-type": "application/json"}
+        upstream_response.aiter_bytes = AsyncMock(return_value=[b'{"ok": true}'])
+        upstream_response.aread = AsyncMock(return_value=b'{"ok": true}')
+        lease = SimpleNamespace(
+            session_identity="session-1",
+            attributes={
+                "provider": "openai",
+                "model": "gpt-5.4",
+                "route_family": "openai",
+            },
+        )
+        events = []
+
+        async def run_with_renewal(lease_arg, operation):
+            events.append(("renewal_start", lease_arg))
+            result = await operation()
+            events.append(("renewal_end", lease_arg))
+            return result
+
+        async def execute_hidden_retries(**kwargs):
+            events.append(("hidden_retries", kwargs["operation_name"]))
+            return upstream_response
+
+        with patch.object(
+            pte,
+            "_aawm_session_owner_pre_send_guard",
+            new=AsyncMock(),
+        ), patch.object(
+            sa,
+            "get_request_session_owner_lease",
+            return_value=lease,
+        ), patch.object(
+            sa,
+            "run_with_session_owner_lease_renewal",
+            new=run_with_renewal,
+        ), patch.object(
+            sa,
+            "finalize_request_session_owner_lease",
+            new=AsyncMock(),
+        ) as finalize_lease, patch.object(
+            pte,
+            "_execute_passthrough_pre_first_byte_with_hidden_retries",
+            new=execute_hidden_retries,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch.object(
+            pte.pass_through_endpoint_logging,
+            "pass_through_async_success_handler",
+            new_callable=AsyncMock,
+        ):
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+            mock_logging_obj.post_call_success_hook = AsyncMock()
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            await pass_through_request(
+                request=mock_request,
+                target="https://api.openai.com/v1/responses",
+                custom_headers={},
+                user_api_key_dict=MagicMock(),
+                custom_body=custom_body,
+                custom_llm_provider="openai",
+                stream=False,
+            )
+
+        assert [event[0] for event in events] == [
+            "renewal_start",
+            "hidden_retries",
+            "renewal_end",
+        ]
+        assert events[0][1] is lease
+        assert events[1][1] == "non_stream_pre_first_byte"
+        finalize_lease.assert_awaited_once()
+        assert (
+            finalize_lease.await_args.kwargs["failure_phase"]
+            == "session_owner_pass_through_promote"
+        )
+
+    @pytest.mark.asyncio
+    async def test_pass_through_request_renewal_loss_returns_409_without_promotion(
+        self,
+    ):
+        from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            session_affinity as sa,
+        )
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            pass_through_request,
+        )
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = SimpleNamespace(path="/test/endpoint")
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+        mock_request.state = SimpleNamespace()
+        custom_body = {"model": "gpt-5.4"}
+        lease = SimpleNamespace(
+            session_identity="session-1",
+            attributes={
+                "provider": "openai",
+                "model": "gpt-5.4",
+                "route_family": "openai",
+            },
+        )
+        renewal_error = sa.SessionOwnerLeaseRenewalError(
+            session_identity=lease.session_identity,
+            reason="reservation replaced",
+        )
+
+        with patch.object(
+            pte,
+            "_aawm_session_owner_pre_send_guard",
+            new=AsyncMock(),
+        ), patch.object(
+            sa,
+            "get_request_session_owner_lease",
+            return_value=lease,
+        ), patch.object(
+            sa,
+            "run_with_session_owner_lease_renewal",
+            new=AsyncMock(side_effect=renewal_error),
+        ), patch.object(
+            sa,
+            "finalize_request_session_owner_lease",
+            new=AsyncMock(),
+        ) as finalize_lease, patch.object(
+            pte,
+            "_execute_passthrough_pre_first_byte_with_hidden_retries",
+            new=AsyncMock(),
+        ) as hidden_retries, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+            mock_logging_obj.post_call_success_hook = AsyncMock()
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            with pytest.raises(ProxyException) as exc_info:
+                await pass_through_request(
+                    request=mock_request,
+                    target="https://api.openai.com/v1/responses",
+                    custom_headers={},
+                    user_api_key_dict=MagicMock(),
+                    custom_body=custom_body,
+                    custom_llm_provider="openai",
+                    stream=False,
+                )
+
+        detail = exc_info.value.detail
+        assert str(exc_info.value.code) == "409"
+        assert detail["failure_phase"] == "session_owner_reservation_renewal"
+        assert detail["attempted_provider_call"] is True
+        assert detail["canonical_session_identity"] == "session-1"
+        assert detail["candidate"] == {
+            "provider": "openai",
+            "model": "gpt-5.4",
+            "route_family": "openai",
+        }
+        hidden_retries.assert_not_awaited()
+        finalize_lease.assert_awaited_once()
+        assert (
+            finalize_lease.await_args.kwargs["failure_phase"]
+            == "session_owner_pass_through_release"
+        )
+        assert "response" not in finalize_lease.await_args.kwargs
+        assert "exc" in finalize_lease.await_args.kwargs
+
+    @pytest.mark.asyncio
     async def test_pass_through_request_preserves_retry_headers_and_skips_failure_hook(
         self,
     ):
