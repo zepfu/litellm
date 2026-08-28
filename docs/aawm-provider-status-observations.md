@@ -115,6 +115,36 @@ Relevant environment variables:
 - `AAWM_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS`: minimum seconds between
   inspections; defaults to `3600`.
 
+## Cursor Agent Auth Refresh
+
+The sidecar owns automatic maintenance of the Cursor Agent credential in
+`/home/zepfu/.config/cursor/auth.json`. LiteLLM proxies mount that directory
+read-only and only consume the replacement produced by the sidecar. The auth
+task writes through the sibling
+`/home/zepfu/.config/cursor/auth.json.lock` and atomically replaces the auth
+file in place, so consumers observe the replacement without a restart.
+
+The dev Compose task is enabled with:
+
+- `AAWM_CURSOR_AGENT_AUTH_REFRESH_ENABLED=1`
+- `AAWM_CURSOR_AGENT_AUTH_FILE=/home/zepfu/.config/cursor/auth.json`
+- `AAWM_CURSOR_AGENT_AUTH_LOCK_FILE=/home/zepfu/.config/cursor/auth.json.lock`
+- `AAWM_CURSOR_AGENT_AUTH_FILE_UID=1000` / `GID=1000` / `MODE=0o600`
+- `AAWM_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS=300`
+- `AAWM_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS=900`
+- `AAWM_CURSOR_AGENT_AUTH_FORCE_REFRESH=0`
+- `AAWM_CURSOR_AGENT_AUTH_HTTP_TIMEOUT_SECONDS=30`
+
+The interval is independent of `AAWM_PROVIDER_STATUS_INTERVAL_SECONDS`. When
+an exchangeable `apiKey` is present, the sidecar calls the verified
+`/auth/exchange_user_api_key` endpoint and persists the complete returned
+credential shape, including `accessToken` and any provider-returned
+`refreshToken`. It never executes or supervises the Cursor CLI. When only an
+expired or near-expiry access token is available, or no exchangeable API key
+exists, the task fails closed with sanitized credential-health evidence
+rather than treating that token as usable. Optional Cursor Agent usage polling
+remains a separate, disabled task.
+
 ## Deadline-Aware OAuth Refresh Scheduling
 
 The scheduled Grok OIDC, managed xAI OAuth, Kimi OAuth, Codex OAuth, and

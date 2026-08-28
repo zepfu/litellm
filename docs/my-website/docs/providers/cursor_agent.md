@@ -101,6 +101,15 @@ source exists; until then the checkpoint stays unknown.
 The poller is disabled by default so LiteLLM does not send live
 dashboard traffic.
 
+The provider-status sidecar can separately maintain the GUI auth file at
+`/home/zepfu/.config/cursor/auth.json` using the verified API-key exchange
+endpoint. LiteLLM proxies consume the containing directory read-only, while the
+sidecar writes a complete replacement atomically under a filesystem lock. The
+sidecar does not execute or depend on the Cursor CLI. If no exchangeable
+`apiKey` is available, it fails closed rather than continuing with an expired
+or unusable access token. Optional usage polling remains disabled and is not
+auth-refresh evidence.
+
 ## What this is not
 
 - Cloud Agents `/v0/agents` on `https://api.cursor.com`

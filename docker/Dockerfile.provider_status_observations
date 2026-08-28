@@ -34,6 +34,7 @@ COPY scripts/codex_oauth_refresh.py /app/scripts/codex_oauth_refresh.py
 COPY scripts/xai_oauth_refresh.py /app/scripts/xai_oauth_refresh.py
 COPY scripts/kimi_oauth_refresh.py /app/scripts/kimi_oauth_refresh.py
 COPY scripts/nous_oauth_refresh.py /app/scripts/nous_oauth_refresh.py
+COPY scripts/cursor_agent_auth_refresh.py /app/scripts/cursor_agent_auth_refresh.py
 COPY scripts/run_provider_status_observations_loop.py /app/scripts/run_provider_status_observations_loop.py
 COPY litellm/secret_managers/credential_error_sanitizer.py /app/litellm/secret_managers/credential_error_sanitizer.py
 COPY litellm/secret_managers/credential_file_lock.py /app/litellm/secret_managers/credential_file_lock.py
@@ -50,6 +51,7 @@ COPY litellm/secret_managers/grok_native_version_contract.py /app/litellm/secret
 # Stdlib Cursor Agent usage helpers (not the full cursor_agent provider).
 COPY litellm/llms/cursor_agent/constants.py /app/litellm/llms/cursor_agent/constants.py
 COPY litellm/llms/cursor_agent/dashboard.py /app/litellm/llms/cursor_agent/dashboard.py
+COPY litellm/llms/cursor_agent/connect.py /app/litellm/llms/cursor_agent/connect.py
 COPY litellm/llms/cursor_agent/usage.py /app/litellm/llms/cursor_agent/usage.py
 RUN touch \
     /app/scripts/__init__.py \
