@@ -14,10 +14,9 @@ litellm/proxy/aawm_alias_config/
 ```
 
 Codex TUI OC-003 requires native ``read`` even though Ohmypi
-``compiled_aliases`` omits it. ``read.yaml`` publishes that alias as an
-``alias_reference`` to ``basic`` so OpenCode Go ``ox-alpha-free`` stays
-first and Codex does not send ``model=read`` to ChatGPT as a native
-model.
+``compiled_aliases`` omits it. ``read.yaml`` publishes that alias with the
+same first ``basic`` candidate so that Codex does not send ``model=read`` to
+ChatGPT as a native model.
 
 Relative to the repository root (and `/app/litellm/proxy/aawm_alias_config/`
 inside the container). The path is resolved from
@@ -141,24 +140,24 @@ generated from every snapshot alias and do not invent a denylist.
 
 ## Provider-pinned aliases (CFG-029)
 
-Each identity in `REGISTERED_PROVIDERS` has exactly one discoverable
-`provider-<id>` alias (`provider-openai`, `provider-anthropic`,
+Provider-pinned aliases are configured acceptance surfaces, not a required
+one-to-one inventory of `REGISTERED_PROVIDERS`. The current configured
+`provider-<id>` aliases are `provider-openai`, `provider-anthropic`,
 `provider-openrouter`, `provider-xai`, `provider-kimi_code`,
-`provider-alibaba_token_plan`, `provider-zai_coding_plan`,
-`provider-cohere`, `provider-nous`, `provider-cursor_agent`,
-`provider-opencode_zen`, `provider-opencode_go`, `provider-nvidia`).
-These aliases are acceptance surfaces, not operational routing policy.
-They do not change
+`provider-alibaba_token_plan`, `provider-zai_coding_plan`, `provider-cohere`,
+`provider-cursor_agent`, `provider-opencode_zen`, and `provider-nvidia`.
+These aliases are not operational routing policy. They do not change
 `basic` / `work` / `expert` / `sota` candidate order.
 
-Each provider alias is a closed same-provider candidate set:
+Each configured `provider-*` alias is a closed same-provider candidate set:
 
 - Candidates never cross provider boundaries.
 - Candidates never `alias_reference` an operational or other-provider
   alias.
 - Fallback is allowed only among models inside that alias.
-- A registered provider with no alias is reported as uncovered at
-  compile time once any `provider-*` alias exists.
+
+Registered providers without a configured alias are informationally reported
+by `uncovered_registered_providers`; they do not cause compilation to fail.
 
 `provider-nvidia` is a registered closed same-provider alias. It uses
 NVIDIA NIM credentials only, carries no `alias_reference`, and does not
@@ -184,41 +183,30 @@ nine mixed `orchestration_children`. Provider coverage is selected with
 The maintained alias name is `basic`. Every request uses this common candidate
 order:
 
-1. OpenCode Go `ox-alpha-free` (`provider: opencode_go`,
-   `codex_opencode_go_adapter`, Codex-only; no Anthropic Go adapter)
-2. Direct Nous `stealth/ox-alpha` (`provider: nous`,
-   `codex_nous_chat_completions_adapter`, Codex-only; independent
-   Hermes OAuth lane; Anthropic `nous/*` fails closed and is omitted
-   from Claude snapshots)
-3. OpenRouter `openrouter/stealth/ox-alpha`
-4. Direct Cohere North Mini Code (`cohere/north-mini-code-1-0`,
+1. Z.AI Coding Plan `zai_coding_plan/glm-5.3-flash`
+   (`reasoning_effort: low`, priority 100)
+2. Direct Cohere North Mini Code (`cohere/north-mini-code-1-0`,
    `provider: cohere`, `codex_cohere_chat_completions_adapter`,
-   `lane=cohere_native`)
-5. OpenRouter Cohere North Mini Code free
+   `lane=cohere_native`, priority 90)
+3. OpenRouter Cohere North Mini Code free
    (`openrouter/cohere/north-mini-code:free`) as an independent fallback
-6. OpenRouter Owl Alpha
-7. OpenCode Zen deepseek-v4-flash
-8. OpenCode Zen big-pickle
-9. Alibaba Token Plan deepseek-v4-flash-0731
-10. Cursor Agent Composer 2.5 standard (`cursor_agent/composer-2.5`,
+4. OpenRouter Owl Alpha
+5. OpenCode Zen deepseek-v4-flash
+6. OpenCode Zen big-pickle
+7. Alibaba Token Plan deepseek-v4-flash-0731
+8. Cursor Agent Composer 2.5 standard (`cursor_agent/composer-2.5`,
    `provider: cursor_agent`, `codex_cursor_agent_aiserver_adapter`,
    priority 42). Distinct from `composer-2.5-fast` and from xAI
    `grok-composer-2.5-fast`. Alias YAML uses `cursor_agent`, not Cloud
    Agents `cursor`.
-11. Alibaba Token Plan qwen3.6-flash
-
-Claude-origin snapshots omit OpenCode Go and Nous (both Codex-only) and
-keep OpenRouter `openrouter/stealth/ox-alpha` as the first OX-alpha
-candidate. Direct `nous/<id>` remains a Codex-only chat-completions
-adapter at `https://inference-api.nousresearch.com/v1`. Nous auth,
-cooldown, capacity, and usage stay independent of OpenRouter free-daily
-quota and OpenAI Codex OAuth.
+9. Alibaba Token Plan qwen3.6-flash
 
 `sota-xai` follows the CFG-038 provider-neutral order: Cursor Grok
 (`cursor_agent/cursor-grok-4.6-high`, priority 110), native xAI/OIDC
 (`xai/grok-4.6`, priority 100), then managed xAI/OAuth
-(`oa_xai/grok-4.6`, priority 90). `work` / `work-other` inherit this order,
-and the three lanes remain distinct. The managed OAuth candidate has no
+(`oa_xai/grok-4.6`, priority 90). `work-other` inherits this order through
+`alias_reference: sota-xai`, and the three lanes remain distinct. The managed
+OAuth candidate has no
 candidate-level reasoning override: caller `reasoning.effort=xhigh` is sent
 unchanged to `oa_xai/grok-4.6`, with requested/native effort metadata and the
 provider-native field/provider recorded. Its route rollup is
@@ -234,7 +222,7 @@ Grok remains a separate, unchanged flow.
 
 Codex 0.149 may advertise the same collaboration children as
 `functions.collaboration` with child `wait` instead of the catalog keys
-`collaboration` / `wait_agent`. OpenCode Go flatten treats those advertised
+`collaboration` / `wait_agent`. AAWM flatten treats those advertised
 names as aliases of the catalog adapters so `spawn_agent` / `wait` stay
 function tools and are not dropped as an unsupported hosted `namespace`.
 

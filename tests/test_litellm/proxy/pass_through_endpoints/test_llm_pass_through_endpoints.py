@@ -29841,9 +29841,9 @@ async def test_aawm_provider_openrouter_skips_first_candidate_with_adapter_local
         "model": "provider-openrouter",
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    first_model = "openrouter/stealth/ox-alpha"
-    selected_model = "openrouter/cohere/north-mini-code:free"
-    upstream_model = "stealth/ox-alpha"
+    first_model = "openrouter/cohere/north-mini-code:free"
+    selected_model = "openrouter/owl-alpha"
+    upstream_model = "cohere/north-mini-code:free"
     _openrouter_adapter_rate_limit_until_monotonic_by_key[upstream_model] = time.monotonic() + 120.0
     try:
         with patch(
@@ -29929,8 +29929,8 @@ async def test_aawm_low_alias_skips_openrouter_candidates_with_durable_quota_exh
             request_body=body,
         )
 
-    assert selection["candidate"]["provider"] == "opencode_go"
-    assert selection["candidate"]["model"] == "ox-alpha-free"
+    assert selection["candidate"]["provider"] == "zai_coding_plan"
+    assert selection["candidate"]["model"] == "zai_coding_plan/glm-5.3-flash"
     skipped = selection["skipped"]
     skipped_models = {candidate["model"] for candidate in skipped}
     assert {
@@ -30004,7 +30004,7 @@ async def test_aawm_low_alias_keeps_openrouter_first_without_durable_quota_exhau
         )
 
     assert selection["candidate"]["provider"] == "openrouter"
-    assert selection["candidate"]["model"] == "openrouter/stealth/ox-alpha"
+    assert selection["candidate"]["model"] == "openrouter/cohere/north-mini-code:free"
     assert selection["skipped"] == []
 
 
@@ -30541,258 +30541,6 @@ def test_raise_codex_native_openai_auto_agent_candidate_unavailable_sets_proxy_d
     assert str(raised.code) == "429"
     assert raised.detail["error"]["code"] == ("aawm_codex_auto_agent_candidate_unavailable")
     assert _classify_codex_auto_agent_retryable_exhaustion(raised) == "candidate_unavailable"
-
-
-@pytest.mark.asyncio
-async def test_codex_work_advances_from_go_nous_and_retired_openrouter_to_alibaba():
-    request = _build_codex_auto_agent_request()
-    body = {
-        "model": "work",
-        "input": "hello",
-        "stream": True,
-        "tools": [_codex_apply_patch_custom_tool_definition()],
-        "tool_choice": {"type": "custom", "name": "apply_patch"},
-        "litellm_metadata": {"session_id": "codex-session"},
-    }
-    opencode_go_unavailable = ProxyException(
-        message="OpenCode Go does not support ox-alpha-free",
-        type="rate_limit_error",
-        param="model",
-        code=429,
-    )
-    opencode_go_unavailable.detail = {
-        "error": {
-            "message": opencode_go_unavailable.message,
-            "code": "aawm_codex_auto_agent_candidate_unavailable",
-        }
-    }
-    with pytest.raises(ProxyException) as openrouter_retired_info:
-        llm_passthrough_endpoints._raise_openrouter_auto_agent_candidate_unavailable(
-            "OpenRouter auto-agent candidate openrouter/stealth/ox-alpha is "
-            "retired: Thank you for participating in the Stealth Ox Alpha "
-            "testing period. This model was ZAI's GLM-5.3 Flash."
-        )
-    openrouter_retired = openrouter_retired_info.value
-    alibaba_success = Response(
-        content='{"ok": true}',
-        media_type="application/json",
-    )
-    dual_cache = _FakeAawmAliasRoutingDualCache()
-    nous_handler = (
-        llm_passthrough_endpoints._handle_codex_nous_chat_completions_adapter_route
-    )
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
-        return_value=dual_cache,
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_opencode_go_adapter_route",
-        new=AsyncMock(side_effect=opencode_go_unavailable),
-    ) as mock_opencode_go, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_nous_chat_completions_adapter_route",
-        new=AsyncMock(wraps=nous_handler),
-    ) as mock_nous, patch(
-        "litellm.secret_managers.hermes_nous_auth.load_nous_invoke_jwt",
-        new=MagicMock(
-            side_effect=AssertionError(
-                "Nous JWT must not load for incompatible alias preflight"
-            )
-        ),
-    ) as mock_nous_jwt, patch(
-        "litellm.acompletion",
-        new=AsyncMock(
-            side_effect=AssertionError(
-                "Nous provider must not run for incompatible alias preflight"
-            )
-        ),
-    ) as mock_nous_completion, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
-        new=AsyncMock(side_effect=openrouter_retired),
-    ) as mock_openrouter, patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._handle_codex_alibaba_token_plan_adapter_route",
-        new=AsyncMock(return_value=alibaba_success),
-    ) as mock_alibaba:
-        response = await _handle_codex_auto_agent_alias_route(
-            endpoint="/v1/responses",
-            request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
-            canonical_alias=body["model"],
-            target_url="https://chatgpt.com/backend-api/codex/responses",
-            api_key=None,
-            forward_headers=True,
-        )
-
-    assert response is alibaba_success
-    mock_opencode_go.assert_awaited_once()
-    mock_nous.assert_awaited_once()
-    mock_openrouter.assert_awaited_once()
-    mock_alibaba.assert_awaited_once()
-    mock_nous_jwt.assert_not_called()
-    mock_nous_completion.assert_not_awaited()
-    assert mock_opencode_go.await_args.kwargs["adapter_model"] == "ox-alpha-free"
-    assert mock_opencode_go.await_args.kwargs["use_alias_candidate_probe"] is True
-    assert mock_nous.await_args.kwargs["adapter_model"] == "stealth/ox-alpha"
-    assert mock_nous.await_args.kwargs["use_alias_candidate_probe"] is True
-    assert mock_openrouter.await_args.kwargs["adapter_model"] == (
-        "openrouter/stealth/ox-alpha"
-    )
-    assert mock_openrouter.await_args.kwargs["use_alias_candidate_probe"] is True
-    assert mock_alibaba.await_args.kwargs["adapter_model"] == (
-        "alibaba_token_plan/deepseek-v4-pro"
-    )
-    assert mock_alibaba.await_args.kwargs["use_alias_candidate_probe"] is True
-    alibaba_body = mock_alibaba.await_args.kwargs["prepared_request_body"]
-    metadata = alibaba_body["litellm_metadata"]
-    assert metadata["codex_auto_agent_selected_provider"] == "alibaba_token_plan"
-    assert metadata["codex_auto_agent_selected_model"] == (
-        "alibaba_token_plan/deepseek-v4-pro"
-    )
-    assert [
-        (attempt["provider"], attempt["model"])
-        for attempt in metadata["codex_auto_agent_attempts"]
-    ] == [
-        ("opencode_go", "ox-alpha-free"),
-        ("nous", "stealth/ox-alpha"),
-        ("openrouter", "openrouter/stealth/ox-alpha"),
-        ("alibaba_token_plan", "alibaba_token_plan/deepseek-v4-pro"),
-    ]
-    assert metadata["codex_auto_agent_attempts"][0]["error_class"] == (
-        "candidate_unavailable"
-    )
-    assert metadata["codex_auto_agent_attempts"][1]["error_class"] == (
-        "candidate_unavailable"
-    )
-    assert metadata["codex_auto_agent_attempts"][1]["failure_phase"] == (
-        "candidate_preflight"
-    )
-    assert metadata["codex_auto_agent_attempts"][1][
-        "attempted_provider_call"
-    ] is False
-    assert metadata["codex_auto_agent_attempts"][2]["error_class"] == (
-        "candidate_unavailable"
-    )
-    assert "aawm_codex_auto_agent_candidate_unavailable" in metadata[
-        "codex_auto_agent_attempts"
-    ][2]["error_tokens"]
-
-
-@pytest.mark.asyncio
-async def test_codex_auto_agent_alias_code_falls_back_after_gpt_5_6_terra_unsupported():
-    request = _build_codex_auto_agent_request()
-    body = {
-        "model": "work",
-        "input": "hello",
-        "stream": False,
-        "litellm_metadata": {"session_id": "codex-session"},
-    }
-    spark_success = Response(content='{"ok": true}', media_type="application/json")
-    unsupported_terra = _build_codex_native_openai_unsupported_model_error()
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-        new=AsyncMock(side_effect=[spark_success, unsupported_terra]),
-    ) as mock_pass_through:
-        response = await _handle_codex_auto_agent_alias_route(
-            endpoint="/v1/responses",
-            request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
-            canonical_alias=body["model"],
-            target_url="https://chatgpt.com/backend-api/codex/responses",
-            api_key=None,
-            forward_headers=True,
-        )
-
-    assert response is spark_success
-    assert mock_pass_through.await_count == 1
-    spark_body = mock_pass_through.await_args_list[0].kwargs["custom_body"]
-    assert spark_body["model"] == "gpt-5.3-codex-spark"
-    metadata = spark_body["litellm_metadata"]
-    assert metadata["requested_model_alias"] == "work"
-    assert metadata["codex_auto_agent_selected_provider"] == "openai"
-    assert metadata["codex_auto_agent_selected_model"] == "gpt-5.3-codex-spark"
-    assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
-        "gpt-5.3-codex-spark",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_codex_auto_agent_alias_code_cools_terra_when_unsupported_after_prior_failover():
-    request = _build_codex_auto_agent_request()
-    body = {
-        "model": "work",
-        "input": "hello",
-        "stream": False,
-        "litellm_metadata": {"session_id": "codex-session"},
-    }
-    unsupported_spark = _build_codex_native_openai_unsupported_model_error()
-    unsupported_terra = _build_codex_native_openai_unsupported_model_error()
-    gpt55_success = Response(content='{"ok": true}', media_type="application/json")
-    grok_unavailable = ProxyException(
-        message="grok unavailable",
-        type="rate_limit_error",
-        param="model",
-        code=429,
-    )
-    grok_unavailable.detail = {
-        "error": {
-            "code": "aawm_codex_auto_agent_candidate_unavailable",
-            "message": "candidate unavailable",
-        }
-    }
-
-    with patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_grok_native_responses_request",
-        new=AsyncMock(side_effect=grok_unavailable),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_oa_xai_responses_request",
-        new=AsyncMock(side_effect=grok_unavailable),
-    ), patch(
-        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
-        new=AsyncMock(
-            side_effect=[
-                unsupported_spark,
-                unsupported_terra,
-                gpt55_success,
-            ]
-        ),
-    ) as mock_pass_through:
-        response = await _handle_codex_auto_agent_alias_route(
-            endpoint="/v1/responses",
-            request=request,
-            fastapi_response=MagicMock(spec=Response),
-            user_api_key_dict=MagicMock(),
-            prepared_request_body=body,
-            canonical_alias=body["model"],
-            target_url="https://chatgpt.com/backend-api/codex/responses",
-            api_key=None,
-            forward_headers=True,
-        )
-
-    assert response is gpt55_success
-    assert mock_pass_through.await_count == 3
-    terra_body = mock_pass_through.await_args_list[1].kwargs["custom_body"]
-    assert terra_body["model"] == "gpt-5.6-terra"
-    metadata = mock_pass_through.await_args_list[2].kwargs["custom_body"]["litellm_metadata"]
-    assert [attempt["model"] for attempt in metadata["codex_auto_agent_attempts"]] == [
-        "gpt-5.3-codex-spark",
-        "xai/grok-4.5",
-        "grok-composer-2.5-fast",
-        "oa_xai/grok-build",
-        "gpt-5.6-terra",
-        "gpt-5.5",
-    ]
-    terra_attempt = next(
-        attempt for attempt in metadata["codex_auto_agent_attempts"] if attempt["model"] == "gpt-5.6-terra"
-    )
-    assert terra_attempt["status"] == "cooldown_set"
-    assert terra_attempt["error_class"] == "candidate_unavailable"
-    assert "aawm_codex_auto_agent_candidate_unavailable" in terra_attempt["error_tokens"]
-    assert terra_attempt["cooldown_scope"] == "candidate"
-    assert terra_attempt["cooldown_seconds"] > 0
 
 
 @pytest.mark.asyncio

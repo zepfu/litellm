@@ -1817,7 +1817,6 @@ def test_should_publish_provider_aliases_in_compiled_catalog_and_provider_covera
     hv, config
 ) -> None:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import (
-        provider_alias_name,
         uncovered_registered_providers,
     )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_schema import (
@@ -1829,15 +1828,15 @@ def test_should_publish_provider_aliases_in_compiled_catalog_and_provider_covera
     )
 
     snapshot = compile_directory(DEFAULT_CONFIG_DIR)
-    expected = [
-        provider_alias_name(provider_id)
-        for provider_id in sorted(REGISTERED_PROVIDERS)
-    ]
+    expected = hv.expand_group("provider_coverage", config)
     aliases = hv.compiled_aliases(config)
     for name in expected:
         assert name in aliases
         assert name in snapshot.aliases
-    assert uncovered_registered_providers(snapshot.aliases) == ()
+    assert uncovered_registered_providers(snapshot.aliases) == (
+        "nous",
+        "opencode_go",
+    )
     assert "nvidia" in REGISTERED_PROVIDERS
     assert "provider-nvidia" in expected
     assert "provider-nvidia" in aliases
@@ -1853,17 +1852,11 @@ def test_should_publish_provider_aliases_in_compiled_catalog_and_provider_covera
 def test_should_plan_provider_coverage_orchestration_children_and_prompt(
     hv, config
 ) -> None:
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import (
-        provider_alias_name,
-    )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_schema import (
         REGISTERED_PROVIDERS,
     )
 
-    expected = [
-        provider_alias_name(provider_id)
-        for provider_id in sorted(REGISTERED_PROVIDERS)
-    ]
+    expected = hv.expand_group("provider_coverage", config)
     assert "nvidia" in REGISTERED_PROVIDERS
     assert "provider-nvidia" in expected
     plan = hv.build_plan(
@@ -4977,17 +4970,11 @@ def test_should_stage_provider_coverage_child_agent_profiles(
     hv, config, tmp_path: Path
 ) -> None:
     from hv2.drivers.ohmypi import OhmypiDriver
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import (
-        provider_alias_name,
-    )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_schema import (
         REGISTERED_PROVIDERS,
     )
 
-    expected = [
-        provider_alias_name(provider_id)
-        for provider_id in sorted(REGISTERED_PROVIDERS)
-    ]
+    expected = hv.expand_group("provider_coverage", config)
     assert "nvidia" in REGISTERED_PROVIDERS
     assert "provider-nvidia" in expected
     cfg = _clone_config(config)

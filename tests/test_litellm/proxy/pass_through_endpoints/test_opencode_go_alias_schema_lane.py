@@ -1,8 +1,8 @@
 """OC-001 / OR-001: OpenCode Go Codex-only schema and lane selection.
 
 Verifies the reusable ``opencode_go`` provider identity, the Codex-only Go
-adapter route family, the static Go cooldown lane, and that compiled ``basic``
-/ ``work`` YAML place Go then OpenRouter ox-alpha first.
+adapter route family, the static Go cooldown lane, and the canonical/bundled
+cost-map entries.
 
 No provider egress, no synthetic LLM calls.
 """
@@ -29,23 +29,13 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_schema impor
     REGISTERED_PROVIDERS,
     REGISTERED_ROUTE_FAMILIES,
 )
-from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
-    compile_directory,
-)
-
-
 _CODEX_GO_ROUTE_FAMILY = "codex_opencode_go_adapter"
 _GO_MODEL = "ox-alpha-free"
-_OPENROUTER_OX_ALPHA_MODEL = "openrouter/stealth/ox-alpha"
 _REPO_ROOT = os.path.dirname(
     os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     )
 )
-_BASIC_YAML_PATH = os.path.join(
-    _REPO_ROOT, "litellm", "proxy", "aawm_alias_config", "basic.yaml"
-)
-_ALIAS_CONFIG_DIR = Path(_REPO_ROOT) / "litellm" / "proxy" / "aawm_alias_config"
 _CANONICAL_COST_MAP_PATH = Path(_REPO_ROOT) / "model_prices_and_context_window.json"
 _BUNDLED_COST_MAP_PATH = (
     Path(_REPO_ROOT) / "litellm" / "bundled_model_prices_and_context_window_fallback.json"
@@ -198,118 +188,6 @@ aliases:
 """
         with pytest.raises(ConfigCompileError):
             compile_yaml(raw)
-
-    def test_basic_yaml_places_go_then_openrouter_ox_alpha_first(self):
-        with open(_BASIC_YAML_PATH, "r", encoding="utf-8") as handle:
-            snapshot = compile_yaml(handle.read())
-
-        basic_candidates = snapshot.aliases["basic"].candidates
-        first = basic_candidates[0]
-        second = basic_candidates[1]
-        third = basic_candidates[2]
-        assert (
-            first.provider,
-            first.model,
-            first.route_family,
-        ) == (
-            "opencode_go",
-            _GO_MODEL,
-            _CODEX_GO_ROUTE_FAMILY,
-        )
-        assert first.priority == 100
-        assert first.anthropic_route_family is None
-        assert (
-            second.provider,
-            second.model,
-            second.route_family,
-        ) == (
-            "nous",
-            "stealth/ox-alpha",
-            "codex_nous_chat_completions_adapter",
-        )
-        assert second.priority == 97
-        assert second.anthropic_route_family is None
-        assert (
-            third.provider,
-            third.model,
-            third.route_family,
-        ) == (
-            "openrouter",
-            _OPENROUTER_OX_ALPHA_MODEL,
-            "codex_openrouter_completion_adapter",
-        )
-        assert third.priority == 95
-
-        north_pairs = [
-            (candidate.provider, candidate.model, candidate.route_family)
-            for candidate in basic_candidates
-            if candidate.model
-            in {
-                "cohere/north-mini-code-1-0",
-                "openrouter/cohere/north-mini-code:free",
-            }
-        ]
-        assert north_pairs == [
-            (
-                "cohere",
-                "cohere/north-mini-code-1-0",
-                "codex_cohere_chat_completions_adapter",
-            ),
-            (
-                "openrouter",
-                "openrouter/cohere/north-mini-code:free",
-                "codex_openrouter_completion_adapter",
-            ),
-        ]
-        cohere_index = next(
-            index
-            for index, candidate in enumerate(basic_candidates)
-            if candidate.model == "cohere/north-mini-code-1-0"
-        )
-        assert cohere_index == 3
-        assert basic_candidates[cohere_index - 1].model == _OPENROUTER_OX_ALPHA_MODEL
-
-    def test_work_yaml_places_go_then_openrouter_ox_alpha_first(self):
-        snapshot = compile_directory(_ALIAS_CONFIG_DIR)
-        work_candidates = snapshot.aliases["work"].candidates
-        first = work_candidates[0]
-        second = work_candidates[1]
-        third = work_candidates[2]
-        fourth = work_candidates[3]
-        assert (
-            first.provider,
-            first.model,
-            first.route_family,
-        ) == (
-            "opencode_go",
-            _GO_MODEL,
-            _CODEX_GO_ROUTE_FAMILY,
-        )
-        assert first.priority == 110
-        assert first.anthropic_route_family is None
-        assert (
-            second.provider,
-            second.model,
-            second.route_family,
-        ) == (
-            "nous",
-            "stealth/ox-alpha",
-            "codex_nous_chat_completions_adapter",
-        )
-        assert second.priority == 107
-        assert second.anthropic_route_family is None
-        assert (
-            third.provider,
-            third.model,
-            third.route_family,
-        ) == (
-            "openrouter",
-            _OPENROUTER_OX_ALPHA_MODEL,
-            "codex_openrouter_completion_adapter",
-        )
-        assert third.priority == 105
-        assert fourth.model == "gpt-5.3-codex-spark"
-
 
 class TestOpenCodeGoLaneSelection:
     def test_lane_key_is_static_and_separate_from_zen_and_openrouter(self):
