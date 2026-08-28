@@ -492,6 +492,7 @@ async def handle_alias_route(  # noqa: PLR0915
     provider_candidate_attempts = 0
     same_account_transient_attempts_by_slot: dict[Optional[str], int] = {}
     token_invalidated_reload_attempts: set[str] = set()
+    openai_responses_unpersisted_item_repair_attempted = False
     account_failover_replay_safe = (
         _session_affinity_mod().is_replay_safe_session_owner_redispatch_body(
             prepared_request_body
@@ -981,6 +982,48 @@ async def handle_alias_route(  # noqa: PLR0915
                     ):
                         if not has_continuation_state:
                             raise probe_failure_exc
+                        if not openai_responses_unpersisted_item_repair_attempted:
+                            item_id = (
+                                _error_signals._extract_openai_responses_unpersisted_item_id(
+                                    probe_failure_exc
+                                )
+                            )
+                            if item_id is not None:
+                                repaired_request_body = (
+                                    _error_signals.remove_openai_responses_unpersisted_input_item(
+                                        prepared_request_body,
+                                        item_id,
+                                    )
+                                )
+                                if repaired_request_body is not None:
+                                    _lpe._replace_request_body_in_place(
+                                        prepared_request_body,
+                                        repaired_request_body,
+                                    )
+                                    _lpe._safe_set_request_parsed_body(
+                                        request,
+                                        prepared_request_body,
+                                    )
+                                    openai_responses_unpersisted_item_repair_attempted = True
+                                    intent.complete()
+                                    alias_routing_state.publication_intents.remove(intent)
+                                    attempt_record = _codex_auto_agent_candidate_public_shape(
+                                        candidate,
+                                        lane_key=selection.get("lane_key"),
+                                        reason="openai_unpersisted_item_same_candidate_retry",
+                                    )
+                                    attempts.append(attempt_record)
+                                    candidate_body = _record_auto_agent_alias_attempt_started(
+                                        alias_family=alias_family,
+                                        alias_model=alias_model,
+                                        request=request,
+                                        prepared_request_body=prepared_request_body,
+                                        selection=selection,
+                                        attempts=attempts,
+                                        attempt_record=attempt_record,
+                                        add_alias_metadata_fn=add_alias_metadata_fn,
+                                    )
+                                    continue
                         attempt_record["status"] = (
                             "terminal_in_flight_unpersisted_item_not_found"
                         )

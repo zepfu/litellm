@@ -1261,6 +1261,44 @@ def _openai_responses_unpersisted_item_not_found_message(exc: Any) -> Optional[s
     return message
 
 
+def _extract_openai_responses_unpersisted_item_id(exc: Any) -> Optional[str]:
+    """Return the exact missing Responses item ID from a validated message."""
+    message = _openai_responses_unpersisted_item_not_found_message(exc)
+    if message is None:
+        return None
+    match = _OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_RE.fullmatch(message)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def remove_openai_responses_unpersisted_input_item(
+    request_body: dict[str, Any],
+    item_id: str,
+) -> Optional[dict[str, Any]]:
+    """Copy a Responses body after removing one uniquely matching input item."""
+    if not isinstance(request_body, dict):
+        return None
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
+        return None
+
+    matching_indexes = [
+        index
+        for index, item in enumerate(input_items)
+        if isinstance(item, dict) and item.get("id") == item_id
+    ]
+    if len(matching_indexes) != 1:
+        return None
+
+    matching_index = matching_indexes[0]
+    repaired_body = dict(request_body)
+    repaired_body["input"] = [
+        item for index, item in enumerate(input_items) if index != matching_index
+    ]
+    return repaired_body
+
+
 def is_openai_responses_unpersisted_item_not_found_error(
     exc: Any,
     *,
@@ -1711,6 +1749,8 @@ _HOST_FUNCTION_NAMES = (
     "_is_codex_auto_agent_grok_account_quota_exhaustion",
     "is_openai_responses_unpersisted_item_not_found_error",
     "_openai_responses_unpersisted_item_not_found_message",
+    "_extract_openai_responses_unpersisted_item_id",
+    "remove_openai_responses_unpersisted_input_item",
     "_classify_codex_auto_agent_retryable_exhaustion",
     "_is_codex_auto_agent_retryable_exhaustion",
     "plan_responses_pre_commit_retry",
