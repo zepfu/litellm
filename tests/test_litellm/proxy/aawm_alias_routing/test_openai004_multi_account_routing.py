@@ -106,20 +106,33 @@ _OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE = (
     "Items are not persisted when store is set to false. "
     "Try again with store set to true."
 )
+_OPENAI_RESPONSES_UNPERSISTED_ITEM_NO_SUGGESTION_MESSAGE = (
+    "Item with id 'rs_abc123' not found. "
+    "Items are not persisted when store is set to false."
+)
+_OPENAI_RESPONSES_UNPERSISTED_ITEM_CURRENT_MESSAGE = (
+    "Item with id 'rs_abc123' not found. "
+    "Items are not persisted when `store` is set to false. "
+    "Try again with `store` set to true, or remove this item from your input."
+)
 
 
-def _unpersisted_item_not_found_error() -> ProxyException:
+def _unpersisted_item_not_found_error(
+    *,
+    message: str = _OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE,
+    status_code: int = 400,
+) -> ProxyException:
     exc = ProxyException(
-        message=_OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE,
+        message=message,
         type="invalid_request_error",
         param=None,
-        code=400,
+        code=status_code,
         openai_code="invalid_request_error",
     )
-    exc.status_code = 400
+    exc.status_code = status_code
     exc.detail = {
         "error": {
-            "message": _OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE,
+            "message": message,
             "type": "invalid_request_error",
             "code": "invalid_request_error",
         }
@@ -146,8 +159,8 @@ def _stream_unpersisted_item_not_found_error() -> HTTPException:
         retryable=False,
         error_code="invalid_request_error",
         error_type="invalid_request_error",
-        status_code=400,
-        message=_OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE,
+        status_code=404,
+        message=_OPENAI_RESPONSES_UNPERSISTED_ITEM_CURRENT_MESSAGE,
     ).as_http_exception()
 
 
@@ -4071,6 +4084,23 @@ def test_openai_responses_unpersisted_item_not_found_predicate_is_exact() -> Non
         endpoint=endpoint,
         provider_returned=True,
     )
+    assert error_signals.is_openai_responses_unpersisted_item_not_found_error(
+        _unpersisted_item_not_found_error(
+            message=_OPENAI_RESPONSES_UNPERSISTED_ITEM_NO_SUGGESTION_MESSAGE,
+        ),
+        candidate=candidate,
+        endpoint=endpoint,
+        provider_returned=True,
+    )
+    assert error_signals.is_openai_responses_unpersisted_item_not_found_error(
+        _unpersisted_item_not_found_error(
+            message=_OPENAI_RESPONSES_UNPERSISTED_ITEM_CURRENT_MESSAGE,
+            status_code=404,
+        ),
+        candidate=candidate,
+        endpoint=endpoint,
+        provider_returned=True,
+    )
 
     # The same structured text raised locally must not be treated as provider
     # evidence.
@@ -4097,14 +4127,30 @@ def test_openai_responses_unpersisted_item_not_found_predicate_is_exact() -> Non
         provider_returned=True,
     )
 
-    wrong_status = _unpersisted_item_not_found_error()
-    wrong_status.status_code = 422
-    assert not error_signals.is_openai_responses_unpersisted_item_not_found_error(
-        wrong_status,
-        candidate=candidate,
-        endpoint=endpoint,
-        provider_returned=True,
-    )
+    for message, status_code in (
+        (_OPENAI_RESPONSES_UNPERSISTED_ITEM_CURRENT_MESSAGE, 400),
+        (_OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE, 404),
+        (_OPENAI_RESPONSES_UNPERSISTED_ITEM_NO_SUGGESTION_MESSAGE, 404),
+    ):
+        assert not error_signals.is_openai_responses_unpersisted_item_not_found_error(
+            _unpersisted_item_not_found_error(
+                message=message,
+                status_code=status_code,
+            ),
+            candidate=candidate,
+            endpoint=endpoint,
+            provider_returned=True,
+        )
+    for status_code in (401, 403, 422, 500):
+        assert not error_signals.is_openai_responses_unpersisted_item_not_found_error(
+            _unpersisted_item_not_found_error(
+                message=_OPENAI_RESPONSES_UNPERSISTED_ITEM_CURRENT_MESSAGE,
+                status_code=status_code,
+            ),
+            candidate=candidate,
+            endpoint=endpoint,
+            provider_returned=True,
+        )
     assert not error_signals.is_openai_responses_unpersisted_item_not_found_error(
         HTTPException(
             status_code=400,
@@ -4126,6 +4172,26 @@ def test_openai_responses_unpersisted_item_not_found_predicate_is_exact() -> Non
         "Item with id 'rs_abc123' not found.",
         "Item with id 'rs_abc123' not found. "
         "Items are not persisted when store is set to false",
+        "Item with id 'rs_abc123' not found. "
+        "Items are not persisted when `store` is set to false.",
+        "Item with id 'rs_abc123' not found. "
+        "Items are not persisted when `store` is set to false. "
+        "Try again with `store` set to true.",
+        "Item with id 'rs_abc123' not found. "
+        "Items are not persisted when `store` is set to false. "
+        "Try again with store set to true, or remove this item from your input.",
+        "Item with id 'rs_abc123' not found. "
+        "Items are not persisted when store is set to false. "
+        "Try again with `store` set to true, or remove this item from your input.",
+        "Item with id 'rs_abc123' not found. "
+        "Items are not persisted when store is set to false. "
+        "Try again with store set to true, or remove this item.",
+        _OPENAI_RESPONSES_UNPERSISTED_ITEM_CURRENT_MESSAGE
+        + " Additional provider text.",
+        _OPENAI_RESPONSES_UNPERSISTED_ITEM_CURRENT_MESSAGE.replace(
+            "rs_abc123",
+            "msg_abc123",
+        ),
         f" {_OPENAI_RESPONSES_UNPERSISTED_ITEM_MESSAGE}",
     ):
         assert not error_signals.is_openai_responses_unpersisted_item_not_found_error(
@@ -4168,8 +4234,17 @@ async def test_candidate_loop_unpersisted_item_not_found_continuation_uses_sessi
     )
     request = _request()
     performed_labels: list[str] = []
+    performed_bodies: list[dict[str, Any]] = []
     mutation_calls: list[str] = []
     warning_details: list[dict[str, Any]] = []
+    prepared_body = {
+        "model": "codex-auto-review",
+        "previous_response_id": "resp_store_false_1",
+        "input": [{"type": "reasoning", "id": "rs_stale", "summary": []}],
+        "store": False,
+    }
+    original_body = dict(prepared_body)
+    original_body["input"] = list(prepared_body["input"])
 
     def _unexpected_mutation(name: str):
         def _raise(*args: Any, **kwargs: Any) -> None:
@@ -4199,6 +4274,12 @@ async def test_candidate_loop_unpersisted_item_not_found_continuation_uses_sessi
         candidate_body: dict[str, Any],
     ) -> Response:
         performed_labels.append(candidate["codex_oauth_account_label"])
+        performed_bodies.append(
+            {
+                "input": list(candidate_body["input"]),
+                "store": candidate_body["store"],
+            }
+        )
         raise _stream_unpersisted_item_not_found_error()
 
     async def _zero(_key: str) -> tuple[float, str]:
@@ -4247,10 +4328,7 @@ async def test_candidate_loop_unpersisted_item_not_found_continuation_uses_sessi
             alias_family="codex_auto_agent",
             alias_model="codex-auto-review",
             request=request,
-            prepared_request_body={
-                "model": "codex-auto-review",
-                "previous_response_id": "resp_store_false_1",
-            },
+            prepared_request_body=prepared_body,
             max_candidate_attempts=1,
             get_active_cooldown_state_fn=_zero,
             attempts_metadata_key="codex_auto_agent_attempts",
@@ -4260,10 +4338,22 @@ async def test_candidate_loop_unpersisted_item_not_found_continuation_uses_sessi
         )
 
     assert performed_labels == ["account1"]
+    assert performed_bodies == [
+        {
+            "input": original_body["input"],
+            "store": False,
+        }
+    ]
+    assert prepared_body == original_body
     assert exc_info.value.status_code == 409
     detail = exc_info.value.detail
     assert detail["redispatch_required"] is True
     assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert detail["error"]["message"] == (
+        "OpenAI Responses continuation referenced an unpersisted item "
+        "(store=false). Do not continue this session; redispatch a fresh "
+        "response."
+    )
     assert detail["attempted_provider_call"] is True
     assert (
         detail["failure_phase"]
@@ -4394,22 +4484,35 @@ async def test_openai_proxy_route_direct_unpersisted_item_not_found_continuation
     body = {
         "model": "gpt-5.6-sol",
         "previous_response_id": "resp-store-false",
-        "input": "continue",
+        "input": [{"type": "reasoning", "id": "rs_stale", "summary": []}],
+        "store": False,
     }
+    original_body = dict(body)
+    original_body["input"] = list(body["input"])
     provider_calls = 0
+    provider_bodies: list[dict[str, Any]] = []
     warning_details: list[dict[str, Any]] = []
     retry = AsyncMock(side_effect=AssertionError("unexpected direct retry"))
     publish = AsyncMock(side_effect=AssertionError("unexpected cooldown memory"))
     persist = AsyncMock(side_effect=AssertionError("unexpected cooldown Redis"))
     reload = AsyncMock(side_effect=AssertionError("unexpected credential reload"))
 
-    async def _fake_get_body(req):
-        return dict(body)
+    async def _fake_get_body(_req):
+        return body
 
     async def _fake_base_handler(**kwargs):
         nonlocal provider_calls
         provider_calls += 1
-        raise _unpersisted_item_not_found_error()
+        provider_bodies.append(
+            {
+                "input": list(body["input"]),
+                "store": body["store"],
+            }
+        )
+        raise _unpersisted_item_not_found_error(
+            message=_OPENAI_RESPONSES_UNPERSISTED_ITEM_CURRENT_MESSAGE,
+            status_code=404,
+        )
 
     monkeypatch.setattr(lpe, "get_request_body", _fake_get_body)
     monkeypatch.setattr(
@@ -4453,10 +4556,22 @@ async def test_openai_proxy_route_direct_unpersisted_item_not_found_continuation
         )
 
     assert provider_calls == 1
+    assert provider_bodies == [
+        {
+            "input": original_body["input"],
+            "store": False,
+        }
+    ]
+    assert body == original_body
     assert exc_info.value.status_code == 409
     detail = exc_info.value.detail
     assert detail["redispatch_required"] is True
     assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert detail["error"]["message"] == (
+        "OpenAI Responses continuation referenced an unpersisted item "
+        "(store=false). Do not continue this session; redispatch a fresh "
+        "response."
+    )
     assert detail["attempted_provider_call"] is True
     assert (
         detail["failure_phase"]

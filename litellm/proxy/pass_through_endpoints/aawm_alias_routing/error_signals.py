@@ -1214,10 +1214,37 @@ def _is_alibaba_token_plan_unsupported_model_response(
 # Exact OpenAI Responses provider text for missing reasoning items when
 # store=false. Match only after upstream returns this shape; never validate
 # proactively. Item ids are the Responses reasoning/item form ``rs_...``.
-_OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_RE = re.compile(
+_OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_PREFIX_RE = (
     r"Item with id '(rs_[A-Za-z0-9_-]+)' not found\. "
+)
+_OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_400_SUFFIX_RE = (
+    r"(?:"
     r"Items are not persisted when store is set to false\."
-    r"(?: Try again with store set to true\.)?"
+    r"|Items are not persisted when store is set to false\. "
+    r"Try again with store set to true\."
+    r")"
+)
+_OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_404_SUFFIX_RE = (
+    r"Items are not persisted when `store` is set to false\. "
+    r"Try again with `store` set to true, or remove this item from your input\."
+)
+_OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_RE_BY_STATUS = {
+    400: re.compile(
+        _OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_PREFIX_RE
+        + _OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_400_SUFFIX_RE
+    ),
+    404: re.compile(
+        _OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_PREFIX_RE
+        + _OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_404_SUFFIX_RE
+    ),
+}
+_OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_RE = re.compile(
+    _OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_PREFIX_RE
+    + "(?:"
+    + _OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_400_SUFFIX_RE
+    + "|"
+    + _OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_404_SUFFIX_RE
+    + ")"
 )
 _OPENAI_RESPONSES_ENDPOINT_PATHS = frozenset(
     {
@@ -1245,7 +1272,10 @@ def _is_openai_responses_endpoint(endpoint: Any) -> bool:
 
 def _openai_responses_unpersisted_item_not_found_message(exc: Any) -> Optional[str]:
     """Return the exact structured provider message text, else None."""
-    if _extract_adapter_exception_status_code(exc) != 400:
+    message_re = _OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_RE_BY_STATUS.get(
+        _extract_adapter_exception_status_code(exc)
+    )
+    if message_re is None:
         return None
     detail = getattr(exc, "detail", None)
     if not isinstance(detail, dict):
@@ -1256,47 +1286,9 @@ def _openai_responses_unpersisted_item_not_found_message(exc: Any) -> Optional[s
     message = error.get("message")
     if not isinstance(message, str):
         return None
-    if _OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_RE.fullmatch(message) is None:
+    if message_re.fullmatch(message) is None:
         return None
     return message
-
-
-def _extract_openai_responses_unpersisted_item_id(exc: Any) -> Optional[str]:
-    """Return the exact missing Responses item ID from a validated message."""
-    message = _openai_responses_unpersisted_item_not_found_message(exc)
-    if message is None:
-        return None
-    match = _OPENAI_RESPONSES_UNPERSISTED_ITEM_NOT_FOUND_RE.fullmatch(message)
-    if match is None:
-        return None
-    return match.group(1)
-
-
-def remove_openai_responses_unpersisted_input_item(
-    request_body: dict[str, Any],
-    item_id: str,
-) -> Optional[dict[str, Any]]:
-    """Copy a Responses body after removing one uniquely matching input item."""
-    if not isinstance(request_body, dict):
-        return None
-    input_items = request_body.get("input")
-    if not isinstance(input_items, list):
-        return None
-
-    matching_indexes = [
-        index
-        for index, item in enumerate(input_items)
-        if isinstance(item, dict) and item.get("id") == item_id
-    ]
-    if len(matching_indexes) != 1:
-        return None
-
-    matching_index = matching_indexes[0]
-    repaired_body = dict(request_body)
-    repaired_body["input"] = [
-        item for index, item in enumerate(input_items) if index != matching_index
-    ]
-    return repaired_body
 
 
 def is_openai_responses_unpersisted_item_not_found_error(
@@ -1749,8 +1741,6 @@ _HOST_FUNCTION_NAMES = (
     "_is_codex_auto_agent_grok_account_quota_exhaustion",
     "is_openai_responses_unpersisted_item_not_found_error",
     "_openai_responses_unpersisted_item_not_found_message",
-    "_extract_openai_responses_unpersisted_item_id",
-    "remove_openai_responses_unpersisted_input_item",
     "_classify_codex_auto_agent_retryable_exhaustion",
     "_is_codex_auto_agent_retryable_exhaustion",
     "plan_responses_pre_commit_retry",

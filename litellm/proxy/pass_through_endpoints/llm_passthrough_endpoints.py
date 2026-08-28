@@ -5939,7 +5939,6 @@ async def openai_proxy_route(  # noqa: PLR0915
         if openai_api_key is None:
             raise Exception("Required 'OPENAI_API_KEY' in environment to make pass-through calls to OpenAI.")
 
-    openai_responses_unpersisted_item_repair_attempted = False
     while True:
         attempted_provider_call = False
         try:
@@ -5987,25 +5986,6 @@ async def openai_proxy_route(  # noqa: PLR0915
                 )
                 and _codex_auto_agent_request_has_continuation_state(request_body)
             ):
-                if not openai_responses_unpersisted_item_repair_attempted:
-                    item_id = _aawm_error_signals._extract_openai_responses_unpersisted_item_id(
-                        exc
-                    )
-                    if item_id is not None:
-                        repaired_request_body = (
-                            _aawm_error_signals.remove_openai_responses_unpersisted_input_item(
-                                request_body,
-                                item_id,
-                            )
-                        )
-                        if repaired_request_body is not None:
-                            _replace_request_body_in_place(
-                                request_body,
-                                repaired_request_body,
-                            )
-                            _safe_set_request_parsed_body(request, request_body)
-                            openai_responses_unpersisted_item_repair_attempted = True
-                            continue
                 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
                     session_affinity as _sa,
                 )
