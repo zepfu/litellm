@@ -58,7 +58,7 @@ Config-driven alias routing uses:
 - `sota-zai`: `zai_coding_plan/glm-5.3` (priority 110), then last-resort
   `alibaba_token_plan/glm-5.2` (priority 100)
 - `basic`: the config-driven low-cost alias; Cursor Composer 2.5 standard (`cursor_agent/composer-2.5`) sits at priority 42 after `alibaba_token_plan/deepseek-v4-flash-0731`
-- `work`: `gpt-5.3-codex-spark` → nested `work-other` alias reference → Claude-only native Sonnet tail → `gpt-5.6-luna`
+- `work`: `zai_coding_plan/glm-5.3-flash` (priority 110) → `gpt-5.3-codex-spark` → nested `work-other` alias reference → Claude-only native Sonnet tail → `gpt-5.6-luna`
 - `work-other`: ordinary configured alias and valid exact-name / `alias_reference` target; omitted from Codex and Claude TUI selection only by those clients' explicit model-definition inclusion lists. During `22:00-08:00 UTC+8` the order is `sota-deepseek` (`alibaba_token_plan/deepseek-v4-pro`), then `sota-moonshot`, then `sota-xai` in its declared order: Cursor Agent `cursor_agent/cursor-grok-4.6-high`, native xAI OIDC `xai/grok-4.6`, then managed xAI OAuth `oa_xai/grok-4.6`. Outside that window DeepSeek is omitted from new selection. Qwen Max models are not `work-other` candidates.
 - `expert`: Terra-only, using OpenAI/Codex `gpt-5.6-terra` (`codex_responses`, priority 100) with authoritative `reasoning_effort: max`; the compiled alias has no nightly promotion, Anthropic-specific candidate, or other fallback.
 

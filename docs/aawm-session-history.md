@@ -1584,6 +1584,7 @@ Plan `zai_coding_plan/glm-5.3` first; Alibaba Token Plan `glm-5.2` is the
 last-resort leaf on the same alias.
 
 `basic` is the config-driven low-cost alias. `work` uses
+`zai_coding_plan/glm-5.3-flash` (priority 110), then
 `gpt-5.3-codex-spark`, then the nested `work-other` alias reference, then for
 Claude origins only the native Anthropic Sonnet tail, and finally
 `gpt-5.6-luna`. `work-other` is an ordinary configured alias and a valid
