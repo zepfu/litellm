@@ -216,7 +216,17 @@ def _emit_auto_agent_alias_no_candidate_event(
         alias_model=alias_model,
         request=request,
         candidates=candidates,
-        attempts=attempts,
+        attempts=(
+            normalized_attempts := [
+                {
+                    key: value
+                    for key, value in attempt.items()
+                    if key != "kimi_code_failure" or isinstance(value, Mapping)
+                }
+                for attempt in attempts or []
+                if isinstance(attempt, dict)
+            ]
+        ),
     )
     context = _get_auto_agent_alias_request_context(
         request,
@@ -276,7 +286,7 @@ def _emit_auto_agent_alias_no_candidate_event(
     )
     normalized_attempts = _enrich_auto_agent_alias_terminal_event_from_attempts(
         event,
-        attempts,
+        normalized_attempts,
     )
     event["terminal_outcome"] = "agent_session_terminated"
     event["fallback_result"] = "no_candidate_available"
