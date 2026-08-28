@@ -47,6 +47,7 @@ EXPECTED_SYMBOLS = (
     "_normalize_adapted_custom_tool_stream_item_id",
     "_normalize_adapted_custom_tool_stream_response_body",
     "_restore_adapted_custom_tool_stream_output_item",
+    "_restore_adapted_custom_tool_stream_iterator",
     "_restore_adapted_custom_tool_calls_in_stream_event_payload",
     "_restore_adapted_custom_tool_calls_in_sse_event_block",
     "_restore_adapted_custom_tool_calls_in_streaming_response",

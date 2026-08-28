@@ -73,6 +73,7 @@ _HOST_FUNCTION_NAMES = (
     "_normalize_adapted_custom_tool_stream_item_id",
     "_normalize_adapted_custom_tool_stream_response_body",
     "_restore_adapted_custom_tool_stream_output_item",
+    "_restore_adapted_custom_tool_stream_iterator",
     "_restore_adapted_custom_tool_calls_in_stream_event_payload",
     "_restore_adapted_custom_tool_calls_in_sse_event_block",
     "_restore_adapted_custom_tool_calls_in_streaming_response",
@@ -787,6 +788,35 @@ def _restore_adapted_custom_tool_calls_in_sse_event_block(
     return "\n".join(restored_lines), restored_count
 
 
+async def _restore_adapted_custom_tool_stream_iterator(
+    original_iterator: Any,
+    *,
+    request_body: Optional[dict[str, Any]],
+    adapter_model: str,
+    adapted_names: set[str],
+) -> Any:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        sse as sse_runtime,
+    )
+
+    state_by_key: dict[str, dict[str, Any]] = {}
+    async for event_block, has_trailing_separator in sse_runtime._iter_sse_event_blocks_with_separator(
+        original_iterator
+    ):
+        restored_block, _ = _restore_adapted_custom_tool_calls_in_sse_event_block(
+            event_block,
+            request_body=request_body,
+            adapter_model=adapter_model,
+            adapted_names=adapted_names,
+            state_by_key=state_by_key,
+        )
+        if restored_block is not None:
+            if has_trailing_separator:
+                yield f"{restored_block}\n\n"
+            else:
+                yield restored_block
+
+
 def _restore_adapted_custom_tool_calls_in_streaming_response(
     response: StreamingResponse,
     *,
@@ -802,28 +832,13 @@ def _restore_adapted_custom_tool_calls_in_streaming_response(
 
     original_iterator = response.body_iterator
 
-    async def _restoring_iterator() -> Any:
-        from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
-            sse as sse_runtime,
-        )
-
-        state_by_key: dict[str, dict[str, Any]] = {}
-        async for event_block, has_trailing_separator in sse_runtime._iter_sse_event_blocks_with_separator(original_iterator):
-            restored_block, _ = _restore_adapted_custom_tool_calls_in_sse_event_block(
-                event_block,
-                request_body=request_body,
-                adapter_model=adapter_model,
-                adapted_names=adapted_names,
-                state_by_key=state_by_key,
-            )
-            if restored_block is not None:
-                if has_trailing_separator:
-                    yield f"{restored_block}\n\n"
-                else:
-                    yield restored_block
-
     return StreamingResponse(
-        _restoring_iterator(),
+        _restore_adapted_custom_tool_stream_iterator(
+            original_iterator,
+            request_body=request_body,
+            adapter_model=adapter_model,
+            adapted_names=adapted_names,
+        ),
         headers=dict(response.headers),
         status_code=response.status_code,
         media_type=response.media_type or "text/event-stream",
