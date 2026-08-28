@@ -22,6 +22,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 from fastapi import HTTPException
 import pytest
@@ -30,6 +31,11 @@ from starlette.requests import Request
 from litellm.proxy.pass_through_endpoints import aawm_alias_routing as package
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import candidate_loop
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import snapshot_select
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+    DEFAULT_CONFIG_DIR,
+    compile_directory,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     AliasRoutingStateManager,
 )
@@ -745,3 +751,545 @@ async def test_candidate_loop_ineligible_falls_through_without_request_local_sta
         "aawm_alias_request_local_cooldown_until",
         None,
     ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", (400, 422))
+@pytest.mark.parametrize("include_failure_metadata", (True, False))
+async def test_candidate_loop_kimi_invalid_request_persists_terminal_inventory_before_raise(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    include_failure_metadata: bool,
+) -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [
+                (b"user-agent", b"codex-cli/1.0"),
+                (b"originator", b"codex_cli_rs"),
+            ],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    body = {"model": "kimi-terminal-test", "input": "hello", "stream": False}
+    candidate = {
+        "provider": "kimi_code",
+        "model": "kimi_code/k3-high",
+        "route_family": "codex_kimi_chat_completions_adapter",
+        "last_resort": True,
+    }
+    selection = {
+        "candidate": candidate,
+        "lane_key": "kimi_code_managed_account",
+        "cooldown_key": "kimi_code:kimi_code/k3-high:kimi_code_managed_account",
+        "selection_reason": "last_resort",
+        "skipped": [],
+    }
+
+    class _KimiInvalidRequest(RuntimeError):
+        def __init__(self) -> None:
+            super().__init__("Managed Kimi Code rejected the request shape.")
+            self.status_code = status_code
+            self.detail = {
+                "error": {
+                    "message": "Managed Kimi Code rejected the request shape.",
+                    "type": "invalid_request_error",
+                    "code": "kimi_code_invalid_request",
+                }
+            }
+            if include_failure_metadata:
+                self.kimi_code_probe_failure_metadata = {
+                    "kind": "malformed",
+                    "scope": "none",
+                    "upstream_id": "k3",
+                    "metadata_gate": "none",
+                    "status_code": status_code,
+                    "trace_id": "trace-candidate-loop",
+                    "reset_reason": "malformed_provider_response",
+                }
+
+    async def _select(**_kwargs) -> dict[str, Any]:
+        return selection
+
+    async def _perform(**_kwargs) -> object:
+        raise _KimiInvalidRequest()
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args, **_kwargs) -> None:
+        return None
+
+    def _add_metadata(
+        candidate_body: dict[str, Any],
+        *,
+        attempts: list[dict[str, Any]],
+        **_kwargs,
+    ) -> dict[str, Any]:
+        return {
+            **candidate_body,
+            "litellm_metadata": {"codex_auto_agent_attempts": attempts},
+        }
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=lpe._resolve_auto_agent_cooldown_publication_plan,
+        publish_cooldown_memory_fn=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Kimi invalid requests must not publish cooldown memory")
+        ),
+        persist_cooldown_fn=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Kimi invalid requests must not persist cooldown state")
+        ),
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=_add_metadata,
+        raise_redispatch_fn=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Kimi invalid requests must not signal redispatch")
+        ),
+    )
+
+    async def _owner_lookup(**_kwargs):
+        return None, None, None
+
+    async def _owner_guard(**_kwargs):
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    session_affinity = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
+        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=lambda _request: None,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+        get_session_owner_record=_owner_lookup,
+        request_has_effective_session_identity=lambda _request: False,
+        build_session_owner_provenance=lambda **_kwargs: {},
+        reset_released_request_session_owner_guard=lambda _request: False,
+        SessionOwnerMutationOutcome=SimpleNamespace(
+            CONFLICT="conflict",
+            ERROR="error",
+            NOT_HELD="not_held",
+        ),
+    )
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs):
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease):
+            return None
+
+    persisted: list[list[dict[str, Any]]] = []
+    terminal_records: list[dict[str, Any]] = []
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+    monkeypatch.setattr(candidate_loop, "_session_affinity_mod", lambda: session_affinity)
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(lpe, "_record_codex_failure_evidence", lambda **_kwargs: None)
+    monkeypatch.setattr(lpe, "_plan_codex_oauth_account_failover", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        lpe,
+        "_persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda events, *, request_body=None: persisted.append(events),
+    )
+    monkeypatch.setattr(lpe, "_emit_auto_agent_alias_route_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "litellm.proxy.aawm_runtime_error_logging.persist_agent_terminal_error",
+        lambda **kwargs: terminal_records.append(kwargs) or True,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model=body["model"],
+            request=request,
+            prepared_request_body=body,
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_no_active_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    assert caught.value.status_code == status_code
+    assert caught.value.detail["error"]["code"] == "kimi_code_invalid_request"
+    assert len(persisted) == 1
+    terminal_event = persisted[0][-1]
+    assert terminal_event["event_type"] == "no_candidate_available"
+    assert terminal_event["error_status_code"] == status_code
+    assert terminal_event["candidate_count"] == 1
+    assert terminal_event["candidates"][0]["model"] == "kimi_code/k3-high"
+    assert terminal_event["candidates"][0]["terminal_disposition"] == "attempted"
+    assert terminal_event["candidates"][0]["reason"] == "kimi_code_no_cooldown"
+    assert terminal_event["attempts"][0]["cooldown_scope"] == "none"
+    assert terminal_event["attempts"][0]["request_outcome"] == "failed"
+    assert len(terminal_records) == 1
+    assert terminal_records[0]["error_context"]["candidate_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_accounts_terminal_inventory(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    previous_snapshot = snapshot_select.set_active_routing_snapshot(
+        compile_directory(DEFAULT_CONFIG_DIR)
+    )
+    cooldowns: dict[str, float] = {}
+    persisted: list[list[dict[str, Any]]] = []
+
+    async def _noop_async(*_args, **_kwargs) -> None:
+        return None
+
+    async def _owner_lookup(**_kwargs):
+        return None, None, None
+
+    async def _owner_guard(**_kwargs):
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    session_affinity = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
+        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=lambda _request: None,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+        get_session_owner_record=_owner_lookup,
+        request_has_effective_session_identity=lambda _request: False,
+        build_session_owner_provenance=lambda **_kwargs: {},
+        reset_released_request_session_owner_guard=lambda _request: False,
+        SessionOwnerMutationOutcome=SimpleNamespace(
+            CONFLICT="conflict",
+            ERROR="error",
+            NOT_HELD="not_held",
+        ),
+    )
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs):
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease):
+            return None
+
+    async def _active_cooldown(key: str) -> tuple[float, str]:
+        if "zai_coding_plan/glm-5.3-flash" in key:
+            return 30.0, "memory"
+        return cooldowns.get(key, 0.0), "memory"
+
+    async def _codex_oauth_contexts(
+        _request,
+        *,
+        candidate_template: dict[str, Any],
+        affinity=None,
+    ) -> list[dict[str, Any]]:
+        _ = affinity
+        return [
+            {
+                "candidate": {
+                    **candidate_template,
+                    "codex_oauth_account_label": "account-test",
+                    "codex_oauth_account_hash": "account-hash-test",
+                    "codex_oauth_lane_key": "codex-oauth:test",
+                    "codex_oauth_credential_affinity": "interchangeable",
+                },
+                "lane_key": "codex-oauth:test",
+                "auth_status": "ready",
+            }
+        ]
+
+    async def _execute_publication(
+        *,
+        plan,
+        publish_cooldown_memory_fn,
+        **_kwargs,
+    ):
+        publish_cooldown_memory_fn(
+            keys=plan.memory_keys,
+            seconds=plan.duration_seconds,
+            allow_ttl_shrink=plan.allow_ttl_shrink,
+        )
+        return None
+
+    def _publish_cooldown(
+        *,
+        keys,
+        seconds: float,
+        allow_ttl_shrink: bool = False,
+    ) -> None:
+        _ = allow_ttl_shrink
+        for key in keys:
+            cooldowns[key] = seconds
+
+    async def _no_openrouter_quota(
+        *,
+        candidate,
+        cooldown_seconds,
+        cooldown_state_source,
+        skip_reason,
+    ):
+        _ = candidate
+        return cooldown_seconds, cooldown_state_source, skip_reason
+
+    async def _no_openrouter_adapter_cooldown(_model: str) -> float:
+        return 0.0
+
+    monkeypatch.setattr(candidate_loop, "_session_affinity_mod", lambda: session_affinity)
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(lpe, "_session_affinity_mod", lambda: session_affinity)
+    monkeypatch.setattr(lpe, "_get_codex_auto_agent_active_cooldown_state", _active_cooldown)
+    monkeypatch.setattr(
+        lpe,
+        "_get_openrouter_adapter_active_cooldown_seconds",
+        _no_openrouter_adapter_cooldown,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_apply_openrouter_durable_quota_candidate_cooldown",
+        _no_openrouter_quota,
+    )
+    monkeypatch.setattr(lpe, "_apply_cohere_local_quota_state", lambda state: state)
+    monkeypatch.setattr(lpe, "_resolve_codex_oauth_account_candidate_contexts", _codex_oauth_contexts)
+    monkeypatch.setattr(lpe._aawm_selection, "_hydrate_codex_oauth_quota_observations", _noop_async)
+    monkeypatch.setattr(lpe, "_get_codex_auto_agent_session_affinity", lambda _key: _noop_async())
+    monkeypatch.setattr(lpe, "_record_codex_failure_evidence", lambda **_kwargs: None)
+    monkeypatch.setattr(lpe, "_plan_codex_oauth_account_failover", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(lpe, "execute_cooldown_publication_transaction", _execute_publication)
+    monkeypatch.setattr(
+        lpe._codex_failure_evidence_gate,
+        "current_decision",
+        lambda **_kwargs: SimpleNamespace(should_cool=True, duration_seconds=30.0),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda events, *, request_body=None: persisted.append(events),
+    )
+    monkeypatch.setattr(lpe, "_emit_auto_agent_alias_route_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "litellm.proxy.aawm_runtime_error_logging.persist_agent_terminal_error",
+        lambda **_kwargs: True,
+    )
+
+    def _request(*, claude_origin: bool = False) -> Request:
+        return Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/openai_passthrough/v1/responses",
+                "headers": [
+                    (
+                        b"user-agent",
+                        b"claude-code/1.0" if claude_origin else b"codex-cli/1.0",
+                    ),
+                    (
+                        b"originator",
+                        b"claude-code" if claude_origin else b"codex_cli_rs",
+                    ),
+                ],
+                "query_string": b"",
+                "server": ("testserver", 80),
+                "client": ("testclient", 123),
+                "scheme": "http",
+            }
+        )
+
+    def _failure_for(model: str) -> Exception:
+        if model in {
+            "openrouter/cohere/north-mini-code:free",
+            "alibaba_token_plan/deepseek-v4-flash-0731",
+        }:
+            return _IneligibleCandidateError()
+        if model in {"cohere/north-mini-code-1-0", "big-pickle"}:
+            return HTTPException(status_code=401, detail="generic provider auth failure")
+        if model == "openrouter/owl-alpha":
+            return HTTPException(
+                status_code=429,
+                detail={"error": {"code": "rate_limit_exceeded"}},
+            )
+        if model == "deepseek-v4-flash-free":
+            return HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "code": "OPENROUTER_INVALID_CHAT_MESSAGE",
+                        "message": "adapter rejected message shape",
+                    }
+                },
+            )
+        if model == "cursor_agent/composer-2.5":
+            return HTTPException(status_code=504, detail="adapter timed out")
+        if model == "alibaba_token_plan/qwen3.6-flash":
+            return HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "ModelNotFound",
+                        "message": "Model not exist",
+                    }
+                },
+            )
+        return HTTPException(
+            status_code=429,
+            detail={"error": {"code": "rate_limit_exceeded"}},
+        )
+
+    async def _run(*, success_model: str | None):
+        cooldowns.clear()
+        request = _request()
+        body = {"model": "basic", "input": "hello", "stream": False}
+        calls: list[tuple[str, dict[str, Any]]] = []
+
+        async def _perform(
+            *,
+            candidate: dict[str, Any],
+            candidate_body: dict[str, Any],
+        ) -> object:
+            calls.append((candidate["model"], candidate_body))
+            if candidate["model"] == success_model:
+                return {"model": candidate["model"], "body": candidate_body}
+            raise _failure_for(candidate["model"])
+
+        services = SimpleNamespace(
+            select_candidate_fn=lpe._select_codex_auto_agent_candidate,
+            perform_candidate_request_fn=_perform,
+            resolve_cooldown_publication_fn=lpe._resolve_auto_agent_cooldown_publication_plan,
+            publish_cooldown_memory_fn=_publish_cooldown,
+            persist_cooldown_fn=_noop_async,
+            set_session_affinity_fn=_noop_async,
+            add_alias_metadata_fn=lpe._add_codex_auto_agent_alias_metadata,
+            raise_redispatch_fn=lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("fresh basic traversal must not signal redispatch")
+            ),
+        )
+        client_product = lpe._extract_auto_agent_alias_client_product_label(
+            request,
+            body,
+        )
+        enumeration = lpe._resolve_aawm_alias_selection_enumeration(
+            request,
+            "basic",
+            ingress="codex",
+            client_product_label=client_product,
+        )
+        return await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body=body,
+            max_candidate_attempts=len(enumeration.candidates),
+            get_active_cooldown_state_fn=_active_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        ), calls
+
+    try:
+        monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+        luna_response, luna_calls = await _run(success_model="gpt-5.6-luna")
+        assert luna_response["model"] == "gpt-5.6-luna"
+        assert [model for model, _body in luna_calls] == [
+            "cohere/north-mini-code-1-0",
+            "openrouter/cohere/north-mini-code:free",
+            "openrouter/owl-alpha",
+            "deepseek-v4-flash-free",
+            "big-pickle",
+            "alibaba_token_plan/deepseek-v4-flash-0731",
+            "cursor_agent/composer-2.5",
+            "alibaba_token_plan/qwen3.6-flash",
+            "gpt-5.6-luna",
+        ]
+        luna_body = luna_calls[-1][1]
+        assert luna_body["model"] == "gpt-5.6-luna"
+        assert luna_body["reasoning"] == {"effort": "low"}
+
+        monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+        early_response, early_calls = await _run(success_model="big-pickle")
+        assert early_response["model"] == "big-pickle"
+        assert [model for model, _body in early_calls] == [
+            "cohere/north-mini-code-1-0",
+            "openrouter/cohere/north-mini-code:free",
+            "openrouter/owl-alpha",
+            "deepseek-v4-flash-free",
+            "big-pickle",
+        ]
+        assert all(model != "gpt-5.6-luna" for model, _body in early_calls)
+
+        claude_request = _request(claude_origin=True)
+        claude_body = {"model": "basic", "input": "hello", "stream": False}
+        claude_product = lpe._extract_auto_agent_alias_client_product_label(
+            claude_request,
+            claude_body,
+        )
+        assert claude_product == "Claude/1.0"
+        claude_candidates = lpe._resolve_aawm_alias_selection_enumeration(
+            claude_request,
+            "basic",
+            ingress="codex",
+            client_product_label=claude_product,
+        ).candidates
+        assert len(claude_candidates) == 9
+        assert all(
+            candidate["model"] != "gpt-5.6-luna"
+            for candidate in claude_candidates
+        )
+
+        monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+        with pytest.raises(HTTPException) as caught:
+            await _run(success_model=None)
+        assert caught.value.status_code == 429
+        terminal_event = persisted[-1][-1]
+        inventory = terminal_event["candidates"]
+        assert [candidate["model"] for candidate in inventory] == [
+            "zai_coding_plan/glm-5.3-flash",
+            "cohere/north-mini-code-1-0",
+            "openrouter/cohere/north-mini-code:free",
+            "openrouter/owl-alpha",
+            "deepseek-v4-flash-free",
+            "big-pickle",
+            "alibaba_token_plan/deepseek-v4-flash-0731",
+            "cursor_agent/composer-2.5",
+            "alibaba_token_plan/qwen3.6-flash",
+            "gpt-5.6-luna",
+        ]
+        assert [
+            (candidate["terminal_disposition"], candidate["reason"])
+            for candidate in inventory
+        ] == [
+            ("skipped", "cooldown"),
+            ("attempted", "provider_terminal_error"),
+            ("attempted", "candidate_deterministically_ineligible"),
+            ("attempted", "rate_limited"),
+            ("attempted", "provider_format_rejected"),
+            ("attempted", "provider_terminal_error"),
+            ("attempted", "candidate_deterministically_ineligible"),
+            ("attempted", "upstream_timeout"),
+            ("attempted", "candidate_unavailable"),
+            ("attempted", "rate_limited"),
+        ]
+        assert inventory[-1]["reasoning_effort"] == "low"
+        assert terminal_event["candidate_count"] == len(inventory) == 10
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous_snapshot)
