@@ -232,6 +232,13 @@ may traverse every other eligible interchangeable account before terminal
 error. Each account is attempted at most once for those failover cases, and
 each failed account receives only its own lane cooldown.
 
+For managed OpenAI/Codex OAuth, a fresh request that receives a generic
+provider-returned HTTP `401` after provider I/O advances to the next eligible
+OAuth account without writing a process-local memory or Redis lane cooldown for
+the failed lane. A `401` on a continuation or account-bound request remains
+pinned to its recorded account and fails closed; it is not eligible for account
+rotation.
+
 Opaque upstream-only continuation state, including `previous_response_id`,
 remains pinned to the recorded account even in an interchangeable pool. If
 that account is unavailable, routing fails closed rather than dropping

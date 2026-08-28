@@ -16,12 +16,13 @@ from fastapi import Response
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     codex_candidate_calls,
     model_resolution,
+    response_utils,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import (
     compile_yaml,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
-    selection,
+    error_signals,
     snapshot_select,
 )
 
@@ -151,12 +152,38 @@ async def test_should_reject_nous_alias_probe_stock_codex_contract_before_provid
         )
 
     raised = exc_info.value
-    assert raised.code == "429"
+    assert raised.code == "400"
+    assert raised.type == "invalid_request_error"
+    assert raised.code != "429"
+    assert raised.type != "rate_limit_error"
     assert raised.detail["error"]["code"] == (
-        "aawm_codex_auto_agent_candidate_unavailable"
+        "aawm_codex_auto_agent_candidate_ineligible"
     )
+    assert raised.candidate_status == "ineligible"
+    assert raised.ineligibility_reason == "contract_incompatible"
     assert raised.failure_phase == "candidate_preflight"
     assert raised.attempted_provider_call is False
+    assert "rate_limit_error" not in json.dumps(raised.detail)
+    failure_class = error_signals._classify_codex_auto_agent_retryable_exhaustion(
+        raised,
+        candidate={
+            "provider": "nous",
+            "model": _ADAPTER_MODEL,
+            "route_family": _CODEX_NOUS_ROUTE_FAMILY,
+        },
+    )
+    assert failure_class == "candidate_deterministically_ineligible"
+    assert (
+        error_signals._get_codex_auto_agent_candidate_cooldown_scope(
+            failure_class,
+            candidate={
+                "provider": "nous",
+                "model": _ADAPTER_MODEL,
+                "route_family": _CODEX_NOUS_ROUTE_FAMILY,
+            },
+        )
+        == "none"
+    )
     jwt_loader.assert_not_called()
     completion.assert_not_awaited()
 
@@ -217,19 +244,12 @@ async def test_should_preserve_direct_nous_stream_request_provider_path(
 
 
 @pytest.mark.asyncio
-async def test_should_post_to_nous_inference_chat_completions(
+async def test_should_post_to_nous_inference_chat_completions(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import litellm
     from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
     from litellm.secret_managers import hermes_nous_auth
-
-    handler = getattr(
-        codex_candidate_calls,
-        "_handle_codex_nous_chat_completions_adapter_route",
-        None,
-    )
-    assert handler is not None, "missing _handle_codex_nous_chat_completions_adapter_route"
 
     captured: dict[str, Any] = {}
 
@@ -293,6 +313,9 @@ async def test_should_post_to_nous_inference_chat_completions(
         "_build_adapted_route_rollup_kwargs": MagicMock(return_value={}),
         "_emit_adapted_route_access_log": MagicMock(),
         "_add_route_family_logging_metadata": lambda body, family: body,
+        "_build_responses_response_from_adapter_response": (
+            response_utils._build_responses_response_from_adapter_response
+        ),
         "_get_proxy_shared_aiohttp_session": lambda: None,
         "BaseOpenAIPassThroughHandler": MagicMock(
             _assemble_headers=MagicMock(
@@ -305,10 +328,7 @@ async def test_should_post_to_nous_inference_chat_completions(
         validate_outgoing_egress=_validate_outgoing_egress
     )
 
-    bound_handler = host.get(
-        "_handle_codex_nous_chat_completions_adapter_route",
-        handler,
-    )
+    bound_handler = host["_handle_codex_nous_chat_completions_adapter_route"]
     try:
         response = await bound_handler(
             endpoint="/v1/responses",

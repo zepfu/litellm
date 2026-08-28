@@ -94,6 +94,15 @@ _RATE_LIMIT_ERROR_TOKENS = frozenset(
         "rate_limit_exceeded",
     }
 )
+_CANDIDATE_INELIGIBILITY_REASONS = (
+    "retired",
+    "disabled",
+    "unsupported",
+    "contract_incompatible",
+    "preflight_skipped",
+)
+_CANDIDATE_INELIGIBILITY_CODE = "aawm_codex_auto_agent_candidate_ineligible"
+_CANDIDATE_INELIGIBILITY_CLASS = "candidate_deterministically_ineligible"
 
 
 class _FakeExc(Exception):
@@ -276,6 +285,28 @@ class TestErrorTokens:
 
 
 class TestClassification:
+    @pytest.mark.parametrize("reason", _CANDIDATE_INELIGIBILITY_REASONS)
+    def test_classify_explicit_candidate_ineligibility_before_fallbacks(self, reason: str):
+        exc = _FakeExc(
+            message="grok-4.5 model not found; quota exhausted; too many requests",
+            code=_CANDIDATE_INELIGIBILITY_CODE,
+            candidate_status="ineligible",
+            ineligibility_reason=reason,
+            failure_phase="candidate_preflight",
+            attempted_provider_call=False,
+            status_code=502,
+        )
+
+        assert exc.code == _CANDIDATE_INELIGIBILITY_CODE
+        assert exc.candidate_status == "ineligible"
+        assert exc.ineligibility_reason == reason
+        assert exc.failure_phase == "candidate_preflight"
+        assert exc.attempted_provider_call is False
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(exc)
+            == _CANDIDATE_INELIGIBILITY_CLASS
+        )
+
     def test_classify_capacity_exhausted(self):
         exc = _FakeExc(message="model capacity exhausted")
         assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "capacity_exhausted"
@@ -572,6 +603,57 @@ class TestKimiMetadata:
 
 
 class TestCooldownScope:
+    def test_deterministic_ineligibility_has_no_cooldown_scope(self):
+        assert (
+            _get_codex_auto_agent_cooldown_scope(_CANDIDATE_INELIGIBILITY_CLASS)
+            == "none"
+        )
+
+    @pytest.mark.parametrize("provider", ("openai", "xai", "alibaba_token_plan"))
+    def test_deterministic_ineligibility_scope_is_provider_independent(
+        self,
+        provider: str,
+    ):
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                _CANDIDATE_INELIGIBILITY_CLASS,
+                candidate={"provider": provider, "model": "example-model"},
+            )
+            == "none"
+        )
+
+    def test_genuine_quota_exhaustion_keeps_existing_classification_and_scope(self):
+        exc = _FakeExc(message="usage_limit_reached")
+        candidate = {"provider": "openai", "model": "gpt-5"}
+
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(exc)
+            == "usage_limit_reached"
+        )
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                "usage_limit_reached",
+                candidate=candidate,
+            )
+            == "candidate"
+        )
+
+    def test_genuine_transient_throttle_keeps_existing_classification_and_scope(self):
+        exc = _FakeExc(message="bad gateway", status_code=502)
+        candidate = {"provider": "openai", "model": "gpt-5.3-codex-spark"}
+
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(exc)
+            == "upstream_transient_internal"
+        )
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                "upstream_transient_internal",
+                candidate=candidate,
+            )
+            == "candidate"
+        )
+
     def test_durable_class_gets_candidate_scope(self):
         assert _get_codex_auto_agent_cooldown_scope("rate_limited") == "candidate"
 

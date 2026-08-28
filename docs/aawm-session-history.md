@@ -1323,6 +1323,11 @@ Operational notes:
 - Read order: memory first, then durable cache hydrate; if durable cache is absent
   or unavailable, selectors keep the existing in-memory fallback without failing
   the request.
+- Managed OpenAI/Codex OAuth inventory lanes treat a fresh generic
+  provider-returned HTTP `401` as account rotation: routing advances to the next
+  eligible OAuth account without writing a process-local memory or Redis lane
+  cooldown. A continuation or account-bound `401` remains pinned to its recorded
+  account and fails closed instead of rotating.
 - Session-history / alias metadata may include lightweight source fields such as
   `codex_auto_agent_affinity_state_source`, `codex_auto_agent_cooldown_state_source`,
   `anthropic_auto_agent_affinity_state_source`, and
@@ -1561,9 +1566,10 @@ unchanged. Session/request metadata records the requested/native effort as
 `grok-4.6(sota-xai):xhigh`.
 
 
-Grok 4.6 is the active managed `sota-xai` candidate. Historical native Grok 4.5
-behavior remains distinct: generic `aawm_codex_auto_agent_candidate_unavailable`
-probe failures do not apply a durable Grok 4.5 cooldown, native Grok 4.5 uses
+`sota-xai` serves Grok 4.6 through the three lanes above; its managed OAuth
+lane is last after Cursor and native OIDC. Historical native Grok 4.5 behavior
+remains distinct: generic `aawm_codex_auto_agent_candidate_unavailable` probe
+failures do not apply a durable Grok 4.5 cooldown, native Grok 4.5 uses
 cooldown scope `none`, and other xAI alias candidates use request-local
 exclusion only. Explicit usage, quota, rate-limit, or capacity signals still
 use the normal durable candidate cooldown/fallback path. Native Grok 4.5
@@ -1585,15 +1591,10 @@ exact-name / `alias_reference` target; it is omitted from Codex and Claude TUI
 selection only because those clients' explicit model-definition inclusion lists
 leave it out. During `22:00-08:00 UTC+8`, `work-other` promotes
 `sota-deepseek` ahead of `sota-moonshot` and `sota-xai`; outside that window
-new selection is Moonshot then xAI. `expert` promotes
-`alibaba_token_plan/qwen3.8-max` first during the same daily window, then
-Claude-origin native Anthropic `claude-opus-5`, then universal
-`gpt-5.6-terra` as the last resort with authoritative `reasoning_effort: max`
-on every compiled candidate (CFG-006). Canonical Opus 5 is inherently 1M-context, so
-there is no `claude-opus-5[1m]` selector; Terra is the direct/default
-candidate for Codex/non-Claude/missing/unknown origins outside the window and remains eligible
-for Claude after an Opus failure. Anthropic models remain native Anthropic
-egress only.
+new selection is Moonshot then xAI. The compiled `expert` alias is Terra-only:
+OpenAI/Codex `gpt-5.6-terra` (`codex_responses`, priority 100) with
+authoritative `reasoning_effort: max`; it has no nightly promotion,
+Anthropic-specific candidate, or other fallback.
 
 OpenAI `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` pricing in
 `model_prices_and_context_window.json` follows the official GPT-5.6 preview page
@@ -2339,7 +2340,9 @@ top-level fields.
 
 ## Managed xAI Grok 4.6 reference-cost metadata
 
-The active `sota-xai` alias uses managed `oa_xai/grok-4.6`. Its session-history
+The active `sota-xai` alias order is Cursor Agent
+(`cursor_agent/cursor-grok-4.6-high`) -> native xAI OIDC (`xai/grok-4.6`) ->
+managed xAI OAuth (`oa_xai/grok-4.6`). The managed candidate's session-history
 record keeps the managed rate as reference metadata rather than an invoice
 cost: `actual_invoice_cost_known` is `false` and `response_cost_usd` remains
 `NULL`. The reference provenance is the xAI Grok 4.6 source, created timestamp

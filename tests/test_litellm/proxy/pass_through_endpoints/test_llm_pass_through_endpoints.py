@@ -17604,6 +17604,117 @@ def test_auto_agent_alias_no_candidate_persists_complete_attempt_sequence(
     assert terminal_record["agent_session_killed"] is True
 
 
+@pytest.mark.parametrize(
+    "kimi_code_failure",
+    [
+        pytest.param("malformed-kimi-metadata", id="malformed-kimi-metadata"),
+        pytest.param(None, id="none-kimi-metadata"),
+    ],
+)
+def test_auto_agent_alias_no_candidate_persists_complete_inventory_with_kimi_metadata(
+    monkeypatch,
+    kimi_code_failure,
+):
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "work",
+        "instructions": "You are a 'worker' agent.",
+        "litellm_metadata": {
+            "session_id": "codex-session",
+            "agent_id": "agent-kimi-terminal",
+        },
+    }
+    kimi_attempt = {
+        "provider": "kimi_code",
+        "model": "kimi_code/k3-high",
+        "route_family": "kimi_code",
+        "lane_key": "__managed_account__",
+        "reason": "first_available",
+        "status": "failed",
+        "error_class": "kimi_code_no_cooldown",
+        "attempted_provider_call": True,
+        "kimi_code_failure": kimi_code_failure,
+    }
+    spark_attempt = {
+        "provider": "openai",
+        "model": "gpt-5.3-codex-spark",
+        "route_family": "codex_responses",
+        "lane_key": "__default__",
+        "reason": "first_available",
+        "status": "cooldown_set",
+        "error_class": "rate_limited",
+        "attempted_provider_call": True,
+    }
+    skipped_luna = {
+        "provider": "openai",
+        "model": "gpt-5.6-luna",
+        "route_family": "codex_responses",
+        "last_resort": True,
+        "reason": "managed_account_cooldown",
+    }
+    request.state.aawm_alias_selection_context = {
+        ("codex", "work"): SimpleNamespace(
+            candidates=(kimi_attempt, spark_attempt, skipped_luna),
+            commit_token=None,
+        )
+    }
+    persisted = []
+    terminal_records = []
+
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda events, *, request_body=None: persisted.append(events),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._emit_auto_agent_alias_route_event",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.aawm_runtime_error_logging.persist_agent_terminal_error",
+        lambda **kwargs: terminal_records.append(kwargs) or True,
+    )
+
+    _emit_auto_agent_alias_no_candidate_event(
+        alias_family="codex_auto_agent",
+        alias_model="work",
+        request=request,
+        request_body=body,
+        exc=HTTPException(
+            status_code=429,
+            detail={
+                "candidates": [skipped_luna],
+                "error": {"code": "all_unavailable"},
+            },
+        ),
+        attempts=[kimi_attempt, spark_attempt],
+    )
+
+    assert len(persisted) == 1
+    events = persisted[0]
+    assert [event["model"] for event in events[:-1]] == [
+        "gpt-5.6-luna",
+        "kimi_code/k3-high",
+        "gpt-5.3-codex-spark",
+    ]
+    terminal_event = events[-1]
+    assert terminal_event["event_type"] == "no_candidate_available"
+    assert terminal_event["attempt_count"] == 2
+    assert "kimi_code_failure" not in terminal_event["attempts"][0]
+    assert len(terminal_records) == 1
+    terminal_context = terminal_records[0]["error_context"]
+    assert terminal_context["candidate_count"] == 3
+    assert [
+        candidate["terminal_disposition"]
+        for candidate in terminal_context["candidates"]
+    ] == ["attempted", "attempted", "skipped"]
+    assert terminal_context["candidates"][-1]["reason"] == (
+        "managed_account_cooldown"
+    )
+    assert terminal_context["candidates"][0]["model"] == "kimi_code/k3-high"
+    assert terminal_context["candidates"][0]["outcome"] == "failed"
+    assert terminal_context["candidates"][1]["model"] == "gpt-5.3-codex-spark"
+
+
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_redispatch_audit_event_includes_cooldown_state_and_activity(
     monkeypatch,
@@ -17810,6 +17921,9 @@ async def test_codex_auto_agent_native_openai_keeps_shared_transient_retry_enabl
     assert call_kwargs["caller_managed_hidden_retry"] is False
     assert call_kwargs["expected_target_family"] == "openai"
     assert call_kwargs["egress_credential_family"] == "openai"
+    assert call_kwargs["stream"] is True
+    assert call_kwargs["custom_body"]["store"] is False
+    assert call_kwargs["custom_body"]["stream"] is True
 
 
 @pytest.mark.asyncio
@@ -22792,6 +22906,132 @@ async def test_codex_auto_agent_alias_openrouter_retryable_failure_reaches_mini(
 
 
 @pytest.mark.asyncio
+async def test_codex_auto_agent_alias_same_model_generic_401_rolls_to_next_oauth_account(
+    monkeypatch,
+):
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+
+    request = _build_codex_auto_agent_request()
+    body = {
+        "model": "basic",
+        "input": "hello",
+        "stream": False,
+        "litellm_metadata": {"session_id": "codex-session"},
+    }
+    same_model = "gpt-5.6-sol"
+    shared_config_epoch_tag = "test-codex-config"
+
+    def _selection(account_label: str, account_hash: str, ordinal: int):
+        account_lane_key = f"codex-oauth:{account_label}:{account_hash}"
+        return {
+            "candidate": {
+                "provider": "openai",
+                "model": same_model,
+                "route_family": "codex_responses",
+                "codex_oauth_account_label": account_label,
+                "codex_oauth_account_hash": account_hash,
+                "codex_oauth_lane_key": account_lane_key,
+                "config_epoch_tag": shared_config_epoch_tag,
+            },
+            "lane_key": account_lane_key,
+            "cooldown_key": f"openai:{same_model}:{account_lane_key}",
+            "failover_ordinal": ordinal,
+            "request_mode": "fresh",
+            "has_account_bound_state": False,
+            "alias_model": "basic",
+        }
+
+    generic_401 = HTTPException(
+        status_code=401,
+        detail={
+            "error": {
+                "message": "generic provider auth failure",
+                "type": "authentication_error",
+            }
+        },
+    )
+    setattr(generic_401, "_aawm_provider_returned", True)
+    success = Response(content='{"ok": true}', media_type="application/json")
+    selections = [
+        _selection("account1", "hash-account-1", 0),
+        _selection("account2", "hash-account-2", 1),
+    ]
+    no_op_guard = SimpleNamespace(
+        decision=SimpleNamespace(value="unowned"),
+        reservation_token=None,
+        held_reservation=False,
+        provenance={},
+    )
+
+    with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._select_codex_auto_agent_candidate",
+        new=AsyncMock(side_effect=selections),
+    ) as mock_select, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_alias_candidate_request",
+        new=AsyncMock(side_effect=[generic_401, success]),
+    ) as mock_perform, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._publish_codex_cooldown_memory",
+    ) as mock_publish, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_codex_cooldown_durable",
+        new=AsyncMock(),
+    ) as mock_persist, patch.object(
+        sa,
+        "ensure_session_owner_guard_for_request",
+        new=AsyncMock(return_value=no_op_guard),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_codex_auto_agent_active_cooldown_state",
+        new=AsyncMock(return_value=(0.0, "memory")),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._set_codex_auto_agent_session_affinity",
+        new=AsyncMock(),
+    ):
+        response = await _handle_codex_auto_agent_alias_route(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            prepared_request_body=body,
+            canonical_alias=body["model"],
+            target_url="https://chatgpt.com/backend-api/codex/responses",
+            api_key=None,
+            forward_headers=True,
+        )
+
+    assert response is success
+    assert mock_select.await_count == 2
+    assert mock_perform.await_count == 2
+    selected_candidates = [
+        call.kwargs["candidate"] for call in mock_perform.await_args_list
+    ]
+    assert [candidate["codex_oauth_account_label"] for candidate in selected_candidates] == [
+        "account1",
+        "account2",
+    ]
+    assert {candidate["model"] for candidate in selected_candidates} == {same_model}
+    assert {
+        candidate["route_family"] for candidate in selected_candidates
+    } == {"codex_responses"}
+    assert [
+        candidate["codex_oauth_lane_key"] for candidate in selected_candidates
+    ] == [
+        "codex-oauth:account1:hash-account-1",
+        "codex-oauth:account2:hash-account-2",
+    ]
+    mock_publish.assert_not_called()
+    mock_persist.assert_not_awaited()
+    attempts = mock_perform.await_args_list[-1].kwargs["candidate_body"][
+        "litellm_metadata"
+    ]["codex_auto_agent_attempts"]
+    assert len(attempts) == 2
+    assert attempts[0]["account_label"] == "account1"
+    assert attempts[0]["error_class"] == "provider_terminal_error"
+    assert attempts[0]["status"] != "cooldown_set"
+    assert attempts[1]["account_label"] == "account2"
+
+
+@pytest.mark.asyncio
 async def test_codex_auto_agent_alias_low_openrouter_raw_provider_error_reaches_next_openrouter_candidate(
     monkeypatch,
 ):
@@ -23887,6 +24127,10 @@ async def test_codex_auto_agent_alias_in_flight_affinity_cooldown_does_not_switc
 async def test_openai_passthrough_route_sets_repository_trace_environment_and_session(
     monkeypatch,
 ):
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+
     monkeypatch.setenv("LITELLM_LANGFUSE_TRACE_ENVIRONMENT", "dev")
 
     mock_request = MagicMock(spec=Request)
@@ -23894,6 +24138,7 @@ async def test_openai_passthrough_route_sets_repository_trace_environment_and_se
     mock_request.headers = {
         "session_id": "codex-session-123",
         "user-agent": "codex-cli/1.0",
+        "chatgpt-account-id": "acct-trace-test",
         "x-aawm-repository": "git@github.com:zepfu/litellm.git",
     }
     mock_request.query_params = {}
@@ -23906,6 +24151,8 @@ async def test_openai_passthrough_route_sets_repository_trace_environment_and_se
             return_value={
                 "model": "gpt-5.4",
                 "input": "hello",
+                "store": True,
+                "stream": False,
                 "reasoning": {"effort": "xhigh"},
                 "tool_choice": "auto",
                 "parallel_tool_calls": True,
@@ -23926,6 +24173,20 @@ async def test_openai_passthrough_route_sets_repository_trace_environment_and_se
     ) as mock_set_parsed_body, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route",
         return_value=AsyncMock(return_value={"ok": True}),
+    ) as mock_create_route, patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.try_dispatch_codex_request",
+        new=AsyncMock(return_value=None),
+    ), patch.object(
+        sa,
+        "ensure_session_owner_guard_for_request",
+        new=AsyncMock(
+            return_value=SimpleNamespace(
+                decision=SimpleNamespace(value="unowned"),
+                reservation_token=None,
+                held_reservation=False,
+                provenance={},
+            )
+        ),
     ):
         result = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
             endpoint="/responses",
@@ -23940,6 +24201,9 @@ async def test_openai_passthrough_route_sets_repository_trace_environment_and_se
     assert result == {"ok": True}
     mock_set_parsed_body.assert_called_once()
     prepared_body = mock_set_parsed_body.call_args.args[1]
+    assert prepared_body["store"] is False
+    assert prepared_body["stream"] is True
+    assert mock_create_route.call_args.kwargs["is_streaming_request"] is True
     litellm_metadata = prepared_body["litellm_metadata"]
     assert litellm_metadata["session_id"] == "codex-session-123"
     assert litellm_metadata["trace_environment"] == "dev"
@@ -27978,6 +28242,108 @@ class TestOpenAIPassthroughRoute:
         mock_persist.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_openai006_fresh_direct_generic_401_retries_next_account(
+        self, monkeypatch
+    ):
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            codex_oauth,
+        )
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            openai_proxy_route,
+        )
+
+        monkeypatch.setenv("LITELLM_CODEX_OAUTH_INVENTORY", '{"schema_version":1}')
+        body = {"model": "gpt-5.6-sol", "input": "hello"}
+        request = self._openai006_request()
+
+        def _binding(label: str, account_hash: str, ordinal: int):
+            lane = f"codex-oauth:{label}:{account_hash}"
+            auth = codex_oauth.CodexOAuthRequestAuth(
+                account_label=label,
+                account_hash=account_hash,
+                lane_key=lane,
+                headers={"Authorization": f"Bearer {label}"},
+            )
+            selection = {
+                "candidate": {
+                    "provider": "openai",
+                    "model": "gpt-5.6-sol",
+                    "route_family": "codex_responses",
+                    "codex_oauth_account_label": label,
+                    "codex_oauth_account_hash": account_hash,
+                    "codex_oauth_lane_key": lane,
+                },
+                "lane_key": lane,
+                "cooldown_key": f"openai:gpt-5.6-sol:{lane}",
+                "failover_ordinal": ordinal,
+                "request_mode": "fresh",
+            }
+            return auth, selection, body
+
+        bindings = [
+            _binding("account1", "hash-account-1", 0),
+            _binding("account2", "hash-account-2", 1),
+        ]
+        generic_401 = HTTPException(
+            status_code=401,
+            detail={
+                "error": {
+                    "message": "generic provider auth failure",
+                    "type": "authentication_error",
+                }
+            },
+        )
+        setattr(generic_401, "_aawm_provider_returned", True)
+        attempts: list[str] = []
+
+        async def _fake_base(**kwargs):
+            authorization = (kwargs.get("extra_headers") or {}).get(
+                "Authorization"
+            )
+            attempts.append(authorization)
+            if authorization == "Bearer account1":
+                raise generic_401
+            return Response(content=b"ok", status_code=200)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_alias_model",
+            return_value=None,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_oa_xai_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_grok_native_oauth_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth.select_and_bind_direct_codex_oauth_inventory",
+            new=AsyncMock(side_effect=bindings),
+        ) as mock_bind, patch.object(
+            llm_passthrough_endpoints.BaseOpenAIPassThroughHandler,
+            "_base_openai_pass_through_handler",
+            new=_fake_base,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._publish_codex_cooldown_memory"
+        ) as mock_publish, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_codex_cooldown_durable",
+            new=AsyncMock(),
+        ) as mock_persist:
+            response = await openai_proxy_route(
+                endpoint="v1/responses",
+                request=request,
+                fastapi_response=Response(),
+                user_api_key_dict=object(),  # type: ignore[arg-type]
+            )
+
+        assert response.status_code == 200
+        assert attempts == ["Bearer account1", "Bearer account2"]
+        assert mock_bind.await_count == 2
+        mock_publish.assert_not_called()
+        mock_persist.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_openai006_fresh_direct_wrapped_usage_limit_retries_next_account(
         self, monkeypatch
     ):
@@ -28308,6 +28674,97 @@ class TestOpenAIPassthroughRoute:
             ]
             == 600.0
         )
+
+    @pytest.mark.asyncio
+    async def test_openai006_continuation_generic_401_fails_closed(
+        self, monkeypatch
+    ):
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            codex_oauth,
+        )
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            openai_proxy_route,
+        )
+
+        monkeypatch.setenv("LITELLM_CODEX_OAUTH_INVENTORY", '{"schema_version":1}')
+        body = {
+            "model": "gpt-5.6-sol",
+            "input": "continue",
+            "previous_response_id": "resp_account1",
+        }
+        request = self._openai006_request()
+        lane = "codex-oauth:account1:hash-account-1"
+        selected = codex_oauth.CodexOAuthRequestAuth(
+            account_label="account1",
+            account_hash="hash-account-1",
+            lane_key=lane,
+            headers={"Authorization": "Bearer account1"},
+        )
+        selection = {
+            "candidate": {
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "route_family": "codex_responses",
+                "codex_oauth_account_label": "account1",
+                "codex_oauth_account_hash": "hash-account-1",
+                "codex_oauth_lane_key": lane,
+            },
+            "lane_key": lane,
+            "cooldown_key": f"openai:gpt-5.6-sol:{lane}",
+            "failover_ordinal": 0,
+            "request_mode": "ordinary_continuation",
+        }
+        generic_401 = HTTPException(
+            status_code=401,
+            detail={
+                "error": {
+                    "message": "generic provider auth failure",
+                    "type": "authentication_error",
+                }
+            },
+        )
+        setattr(generic_401, "_aawm_provider_returned", True)
+
+        async def _fake_base(**_kwargs):
+            raise generic_401
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_alias_model",
+            return_value=None,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_oa_xai_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_grok_native_oauth_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth.select_and_bind_direct_codex_oauth_inventory",
+            new=AsyncMock(return_value=(selected, selection, body)),
+        ) as mock_bind, patch.object(
+            llm_passthrough_endpoints.BaseOpenAIPassThroughHandler,
+            "_base_openai_pass_through_handler",
+            new=_fake_base,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._publish_codex_cooldown_memory"
+        ) as mock_publish, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_codex_cooldown_durable",
+            new=AsyncMock(),
+        ) as mock_persist:
+            with pytest.raises(HTTPException) as exc_info:
+                await openai_proxy_route(
+                    endpoint="v1/responses",
+                    request=request,
+                    fastapi_response=Response(),
+                    user_api_key_dict=object(),  # type: ignore[arg-type]
+                )
+
+        assert exc_info.value is generic_401
+        assert mock_bind.await_count == 1
+        mock_publish.assert_not_called()
+        mock_persist.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_openai006_previous_response_usage_limit_does_not_switch_accounts(

@@ -1537,6 +1537,12 @@ def _raise_cursor_agent_alias_error(
 ) -> None:
     """Translate a Cursor Agent failure while preserving upstream semantics.
 
+    Pre-egress request-conversion ``ValueError`` failures and Cursor Connect
+    protocol rejections of unsupported exec/interactive operations are
+    deterministic candidate ineligibility, not upstream 502s: they map to
+    the ``aawm_codex_auto_agent_candidate_ineligible`` contract so the
+    candidate loop records a no-cooldown ineligibility instead of a
+    transient upstream retry.
     Transport/upstream 500/502/503/529 keep their status and map to the
     existing transient/timeout classification so a Cursor blip advances to
     the next candidate instead of publishing a durable candidate cooldown.
@@ -1545,14 +1551,60 @@ def _raise_cursor_agent_alias_error(
     ``aawm_codex_auto_agent_candidate_unavailable`` code so they remain
     durably unavailable.
     """
+    from litellm.llms.cursor_agent.connect import CursorConnectProtocolError
     from litellm.proxy._types import ProxyException
+
+    message = str(getattr(exc, "message", None) or exc)
+    model = str(candidate.get("model") or "")
+    route_family = str(candidate.get("route_family") or "")
+    attempted_provider_call: Optional[bool] = None
+    ineligibility_summary = ""
+    if isinstance(exc, CursorConnectProtocolError) and message.startswith(
+        (
+            "Cursor Agent requested unsupported external exec field ",
+            "Cursor Agent requested unsupported local exec operation ",
+            "Cursor Agent requested an unsupported interactive client response.",
+        )
+    ):
+        attempted_provider_call = True
+        ineligibility_summary = (
+            "the Cursor Agent session requested an unsupported operation"
+        )
+    elif isinstance(exc, ValueError):
+        attempted_provider_call = False
+        ineligibility_summary = "pre-egress Cursor request conversion failed"
+    if attempted_provider_call is not None:
+        detail_message = (
+            "Cursor Agent candidate is ineligible: "
+            f"{ineligibility_summary}; model={model} "
+            f"route_family={route_family}; {message}"
+        )
+        proxy_exc = ProxyException(
+            message=detail_message,
+            type="invalid_request_error",
+            param="model",
+            code=400,
+        )
+        setattr(proxy_exc, "status_code", 400)
+        setattr(proxy_exc, "candidate_status", "ineligible")
+        setattr(proxy_exc, "ineligibility_reason", "unsupported")
+        setattr(proxy_exc, "failure_phase", "candidate_preflight")
+        setattr(proxy_exc, "attempted_provider_call", attempted_provider_call)
+        setattr(
+            proxy_exc,
+            "detail",
+            {
+                "error": {
+                    "message": detail_message,
+                    "code": "aawm_codex_auto_agent_candidate_ineligible",
+                }
+            },
+        )
+        raise proxy_exc from exc
 
     status_code = int(getattr(exc, "status_code", 502) or 502)
     if status_code < 400 or status_code > 599:
         status_code = 502
-    message = str(getattr(exc, "message", None) or exc)
-    model = str(candidate.get("model") or "")
-    route_family = str(candidate.get("route_family") or "")
     if status_code in (408, 504):
         error_code = "upstream_timeout"
         error_type = "upstream_timeout"
@@ -2313,7 +2365,12 @@ async def _perform_codex_auto_agent_native_openai_request(
             url=target_url,
         )
     )
-    is_streaming_request = "stream" in str(target_url)
+    request_body = {
+        **request_body,
+        "store": False,
+        "stream": True,
+    }
+    is_streaming_request = bool(request_body.get("stream"))
     resolved_headers = (
         dict(custom_headers)
         if custom_headers is not None
@@ -4473,29 +4530,37 @@ async def _handle_codex_nous_chat_completions_adapter_route(  # noqa: PLR0915
         or bool(prepared_request_body.get("tools"))
         or bool(prepared_request_body.get("tool_choice"))
     ):
-        from litellm.proxy.pass_through_endpoints.providers.common import (
-            _raise_candidate_unavailable,
-        )
         from litellm.proxy._types import ProxyException
 
         incompatibility = ValueError(
             "Nous stealth/ox-alpha cannot accept the stock Codex "
             "streaming and tool request contract."
         )
-        try:
-            _raise_candidate_unavailable(
-                incompatibility,
-                message=(
-                    "Nous auto-agent candidate is incompatible with the "
-                    "requested Codex streaming or tool contract."
-                ),
-                error_type="rate_limit_error",
-                status_code=429,
-            )
-        except ProxyException as exc:
-            setattr(exc, "failure_phase", "candidate_preflight")
-            setattr(exc, "attempted_provider_call", False)
-            raise
+        message = (
+            "Nous auto-agent candidate is incompatible with the "
+            "requested Codex streaming or tool contract."
+        )
+        exc = ProxyException(
+            message=message,
+            type="invalid_request_error",
+            param="model",
+            code=400,
+        )
+        setattr(exc, "candidate_status", "ineligible")
+        setattr(exc, "ineligibility_reason", "contract_incompatible")
+        setattr(exc, "failure_phase", "candidate_preflight")
+        setattr(exc, "attempted_provider_call", False)
+        setattr(
+            exc,
+            "detail",
+            {
+                "error": {
+                    "message": message,
+                    "code": "aawm_codex_auto_agent_candidate_ineligible",
+                }
+            },
+        )
+        raise exc from incompatibility
     request_body = dict(prepared_request_body)
     request_body["model"] = adapter_model
     request_input = request_body.get("input", "")

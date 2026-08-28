@@ -15,7 +15,9 @@ litellm/proxy/aawm_alias_config/
 
 Codex TUI OC-003 requires native ``read`` even though Ohmypi
 ``compiled_aliases`` omits it. ``read.yaml`` publishes that alias with the
-same first ``basic`` candidate so that Codex does not send ``model=read`` to
+same first candidate as ``basic``: Z.AI Coding Plan
+``zai_coding_plan/glm-5.3-flash`` at priority 100 with
+``reasoning_effort: low``. Codex therefore does not send ``model=read`` to
 ChatGPT as a native model.
 
 Relative to the repository root (and `/app/litellm/proxy/aawm_alias_config/`
@@ -180,8 +182,8 @@ nine mixed `orchestration_children`. Provider coverage is selected with
 
 ## Maintained `basic` alias behavior (CFG-008)
 
-The maintained alias name is `basic`. Every request uses this common candidate
-order:
+The maintained alias name is `basic`. Every origin uses this common candidate
+prefix, in order:
 
 1. Z.AI Coding Plan `zai_coding_plan/glm-5.3-flash`
    (`reasoning_effort: low`, priority 100)
@@ -258,6 +260,16 @@ invoice cost remains unknown. Reference totals are provenance metadata and
 never standard spend or `response_cost_usd`; Luna remains the last-resort
 actual routed fallback.
 
+## Candidate failure fall-through
+
+During Codex alias selection, a deterministic preflight rejection with
+`candidate_status: ineligible` and an approved reason (`retired`, `disabled`,
+`unsupported`, `contract_incompatible`, or `preflight_skipped`) is recorded as
+`candidate_deterministically_ineligible` with `cooldown_scope: none`. It
+publishes neither local nor durable cooldown state, and the candidate loop
+continues to the next eligible candidate. This is distinct from provider
+failures, which use the normal retry and cooldown classification.
+
 ## Maintained `work` and `work-other` alias behavior
 
 The `work` alias is compiled from `work.yaml`. Candidate order is:
@@ -295,31 +307,20 @@ window prevents new affinity and does not evict an existing session owner.
 
 ## Maintained `expert` alias behavior (CFG-013 / CFG-020)
 
-The `expert` alias is compiled from `expert.yaml` in the canonical directory.
-It has three compiled candidates:
+The `expert` alias is compiled from `expert.yaml` and currently has one
+candidate: OpenAI/Codex `gpt-5.6-terra` (`codex_responses`, priority 100,
+`reasoning_effort: max`). The current YAML has no nightly promotion or
+Anthropic-specific expert candidate.
 
-1. **Nightly promotion** (CFG-020): Alibaba Token Plan `qwen3.8-max` at
-   priority 110, scheduled `22:00-08:00 UTC+8`. This leaf is first for every
-   ingress while the window is open. It is not a `sota-alibaba` reference, so
-   Qwen 3.7 Max is not pulled in.
-2. **Claude-origin requests only** (`tui_attached: Claude`): native Anthropic
-   `claude-opus-5`. Canonical Opus 5 is inherently a 1M-context model, so there
-   is no `claude-opus-5[1m]` selector; a second selector would duplicate the
-   same upstream model.
-3. **Universal last resort** (`priority: 0`): OpenAI/Codex `gpt-5.6-terra`.
-   Terra carries no `tui_excluded` gate, so it remains available to Claude as
-   the fallback after an Opus failure and is the direct/default candidate
-   outside the nightly window for Codex, non-Claude, missing, unknown, and
-   otherwise unconfigured origins.
+## Maintained `sota-openai` alias behavior
 
-In-window Claude-origin order is Qwen, then Opus, then Terra. In-window Codex
-and non-Claude order is Qwen, then Terra. Outside the window the previous
-Opus/Terra behavior is unchanged. Closing the window prevents new affinity
-and does not evict an existing session owner.
-
-Qwen, Opus, and Terra all carry authoritative `reasoning_effort: max`. This
-value replaces caller-provided reasoning through the shared CFG-006 candidate
-pipeline; there is no expert-specific reasoning precedence.
+The `sota-openai` alias is compiled from `sota-openai.yaml` and currently has
+one candidate: OpenAI/Codex `gpt-5.6-sol` (`codex_responses`, priority 100,
+`reasoning_effort: medium`). The generic `sota` dispatch selects
+`sota-openai` for Codex and default origins. Its `grok` branch selects
+`sota-xai`, whose order is Cursor Agent
+`cursor_agent/cursor-grok-4.6-high`, native xAI/OIDC `xai/grok-4.6`, then
+managed xAI/OAuth `oa_xai/grok-4.6`.
 
 ## Candidate schedule windows
 

@@ -205,6 +205,30 @@ class TestRollupStatus:
         event = {"selection_reason": "auth_degraded_no_valid_token"}
         assert _auto_agent_alias_route_rollup_status(event) == "Degraded"
 
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "retired",
+            "disabled",
+            "unsupported",
+            "contract_incompatible",
+            "preflight_skipped",
+        ],
+    )
+    def test_deterministic_ineligibility_is_explicitly_ineligible(
+        self,
+        reason: str,
+    ) -> None:
+        event = {
+            "candidate_status": "candidate_ineligible_no_cooldown",
+            "ineligibility_reason": reason,
+            "failure_class": "candidate_deterministically_ineligible",
+            "cooldown_scope": "none",
+        }
+        status = _auto_agent_alias_route_rollup_status(event)
+        assert status == "Ineligible"
+        assert status != "Cooling Down"
+
     def test_retryable_no_cooldown_with_error(self):
         event = {"candidate_status": "retryable_no_cooldown", "error_status_code": 500}
         assert _auto_agent_alias_route_rollup_status(event) == "Failed"

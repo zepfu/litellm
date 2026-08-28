@@ -334,6 +334,53 @@ class TestRetryableAttemptRecord:
         assert "cooldown_seconds" not in record
         assert record["cooldown_scope"] == "none"
 
+    @pytest.mark.parametrize(
+        ("reason", "attempted_provider_call"),
+        [
+            ("retired", True),
+            ("disabled", True),
+            ("unsupported", True),
+            ("contract_incompatible", True),
+            ("preflight_skipped", False),
+        ],
+    )
+    def test_deterministic_ineligibility_preserves_contract_without_cooldown(
+        self,
+        reason: str,
+        attempted_provider_call: bool,
+    ) -> None:
+        record: dict[str, Any] = {
+            "status": "pending",
+            "cooldown_seconds": 99.0,
+        }
+        exc = Exception(f"candidate is {reason}")
+        exc._status_code = None  # type: ignore[attr-defined]
+        exc._tokens = set()  # type: ignore[attr-defined]
+        exc._type_code = (None, None)  # type: ignore[attr-defined]
+        exc._retry_after = None  # type: ignore[attr-defined]
+        exc.candidate_status = "ineligible"  # type: ignore[attr-defined]
+        exc.ineligibility_reason = reason  # type: ignore[attr-defined]
+        exc.failure_phase = f"{reason}_check"  # type: ignore[attr-defined]
+        exc.attempted_provider_call = attempted_provider_call  # type: ignore[attr-defined]
+
+        attempt_records._update_codex_auto_agent_retryable_attempt_record(
+            attempt_record=record,
+            exc=exc,
+            error_class="candidate_deterministically_ineligible",
+            cooldown_seconds=300.0,
+            alias_model="test-alias",
+            cooldown_scope="candidate",
+        )
+
+        assert record["status"] == "candidate_ineligible_no_cooldown"
+        assert record["error_class"] == "candidate_deterministically_ineligible"
+        assert record["candidate_status"] == "ineligible"
+        assert record["ineligibility_reason"] == reason
+        assert record["failure_phase"] == f"{reason}_check"
+        assert record["attempted_provider_call"] is attempted_provider_call
+        assert record["cooldown_scope"] == "none"
+        assert "cooldown_seconds" not in record
+
     def test_usage_limit_attaches_raw_quota_resets_while_cooldown_is_capped(self) -> None:
         record: dict[str, Any] = {}
         exc = Exception("usage limit reached")

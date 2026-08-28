@@ -267,6 +267,61 @@ def _classify_codex_zai_coding_plan_candidate_failure(
     return None
 
 
+def _classify_codex_fresh_auth_failure(
+    exc: Exception,
+    *,
+    candidate: Optional[dict[str, Any]],
+    selection: dict[str, Any],
+    is_codex_alias: bool,
+    has_continuation_state: bool,
+    has_previous_response_id: bool,
+    attempted_provider_call: bool,
+) -> Optional[str]:
+    """Advance past generic provider auth failures on fresh Codex requests."""
+    if (
+        not is_codex_alias
+        or not isinstance(candidate, dict)
+        or has_continuation_state
+        or has_previous_response_id
+        or selection.get("has_account_bound_state")
+        or not attempted_provider_call
+        or _error_signals._extract_adapter_exception_status_code(exc) != 401
+        or _codex_oauth_mod.is_direct_codex_token_invalidated_error(exc)
+    ):
+        return None
+    return "provider_terminal_error"
+
+
+def _classify_kimi_invalid_request_failure(
+    exc: Exception,
+    *,
+    candidate: Optional[dict[str, Any]],
+    kimi_failure_metadata: Optional[dict[str, Any]],
+) -> Optional[str]:
+    if (
+        not isinstance(candidate, dict)
+        or candidate.get("provider") != "kimi_code"
+        or (
+            kimi_failure_metadata is not None
+            and (
+                kimi_failure_metadata.get("kind") != "malformed"
+                or kimi_failure_metadata.get("scope") != "none"
+            )
+        )
+    ):
+        return None
+    detail = getattr(exc, "detail", None)
+    detail_error = detail.get("error") if isinstance(detail, dict) else None
+    status_code = _error_signals._extract_adapter_exception_status_code(exc)
+    if (
+        status_code in {400, 422}
+        and isinstance(detail_error, dict)
+        and detail_error.get("code") == "kimi_code_invalid_request"
+    ):
+        return "kimi_code_no_cooldown"
+    return None
+
+
 def _exception_chain_contains_type(
     exc: BaseException, expected: type[BaseException]
 ) -> bool:
@@ -389,9 +444,10 @@ async def handle_alias_route(  # noqa: PLR0915
     set_session_affinity_fn = services.set_session_affinity_fn
     add_alias_metadata_fn = services.add_alias_metadata_fn
     raise_redispatch_required_fn = services.raise_redispatch_fn
-    codex_failure_evidence_alias = (
-        alias_model if validate_alias_family(alias_family) == "codex" else None
-    )
+    is_codex_alias = validate_alias_family(alias_family) == "codex"
+    codex_failure_evidence_alias = alias_model if is_codex_alias else None
+    attempted_candidate_keys: set[str] = set()
+    deterministically_ineligible_candidate_keys: set[str] = set()
 
     register_aawm_route_rollup_access_log_replacement(request)
     _bind_auto_agent_alias_request_identity(request)
@@ -432,6 +488,7 @@ async def handle_alias_route(  # noqa: PLR0915
             "token_invalidated",
             "usage_limit_reached",
             "candidate_unavailable",
+            "provider_terminal_error",
         }:
             return False
         if not candidate.get("codex_oauth_account_hash"):
@@ -449,73 +506,65 @@ async def handle_alias_route(  # noqa: PLR0915
 
     def _raise_terminal_alias_failure(exc: Exception) -> Any:
         last_attempt = attempts[-1] if attempts else {}
+        terminal_exc: Optional[HTTPException] = None
         kimi_failure_metadata = _get_safe_kimi_code_probe_failure_metadata(
             exc,
             candidate=candidate if isinstance(candidate, dict) else None,
         )
-        if (
-            kimi_failure_metadata is not None
-            and kimi_failure_metadata.get("kind") == "malformed"
-            and kimi_failure_metadata.get("scope") == "none"
+        if _classify_kimi_invalid_request_failure(
+            exc,
+            candidate=candidate if isinstance(candidate, dict) else None,
+            kimi_failure_metadata=kimi_failure_metadata,
         ):
             detail = getattr(exc, "detail", None)
-            if (
-                isinstance(detail, dict)
-                and isinstance(detail.get("error"), dict)
-                and detail["error"].get("code") == "kimi_code_invalid_request"
-            ):
+            if isinstance(detail, dict):
                 status_code = int(
-                    kimi_failure_metadata.get("status_code")
+                    (kimi_failure_metadata or {}).get("status_code")
                     or getattr(exc, "status_code", 400)
                     or 400
                 )
                 if status_code not in {400, 422}:
                     status_code = 400
-                last_attempt_record = attempts[-1] if attempts else None
-                if isinstance(last_attempt_record, dict):
-                    _mark_auto_agent_alias_request_terminal_failure(
-                        request,
-                        last_attempt_record,
-                    )
-                raise HTTPException(
+                terminal_exc = HTTPException(
                     status_code=status_code,
                     detail=detail,
-                ) from None
-        error_class = str(
-            last_attempt.get("error_class")
-            or _classify_codex_auto_agent_retryable_exhaustion(
-                exc, candidate=candidate
+                )
+        if terminal_exc is None:
+            error_class = str(
+                last_attempt.get("error_class")
+                or _classify_codex_auto_agent_retryable_exhaustion(
+                    exc, candidate=candidate
+                )
+                or "provider_terminal_error"
             )
-            or "provider_terminal_error"
-        )
-        if error_class in {
-            "capacity_exhausted",
-            "rate_limited",
-            "usage_limit_reached",
-        }:
-            terminal_status_code = status.HTTP_429_TOO_MANY_REQUESTS
-        elif error_class == "safety_policy_denied":
-            terminal_status_code = status.HTTP_403_FORBIDDEN
-        elif error_class == "upstream_timeout":
-            terminal_status_code = status.HTTP_504_GATEWAY_TIMEOUT
-        elif error_class == "candidate_unavailable":
-            terminal_status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        else:
-            terminal_status_code = status.HTTP_502_BAD_GATEWAY
-        source_error = _get_codex_auto_agent_source_error_summary(
-            exc,
-            status_code=_extract_adapter_exception_status_code(exc),
-        )
-        terminal_exc = HTTPException(
-            status_code=terminal_status_code,
-            detail={
-                "error": {
-                    "message": source_error,
-                    "type": error_class,
-                    "code": "all_candidates_unavailable",
-                }
-            },
-        )
+            if error_class in {
+                "capacity_exhausted",
+                "rate_limited",
+                "usage_limit_reached",
+            }:
+                terminal_status_code = status.HTTP_429_TOO_MANY_REQUESTS
+            elif error_class == "safety_policy_denied":
+                terminal_status_code = status.HTTP_403_FORBIDDEN
+            elif error_class == "upstream_timeout":
+                terminal_status_code = status.HTTP_504_GATEWAY_TIMEOUT
+            elif error_class == "candidate_unavailable":
+                terminal_status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            else:
+                terminal_status_code = status.HTTP_502_BAD_GATEWAY
+            source_error = _get_codex_auto_agent_source_error_summary(
+                exc,
+                status_code=_extract_adapter_exception_status_code(exc),
+            )
+            terminal_exc = HTTPException(
+                status_code=terminal_status_code,
+                detail={
+                    "error": {
+                        "message": source_error,
+                        "type": error_class,
+                        "code": "all_candidates_unavailable",
+                    }
+                },
+            )
         last_attempt = attempts[-1] if attempts else None
         if isinstance(last_attempt, dict):
             _mark_auto_agent_alias_request_terminal_failure(
@@ -534,10 +583,15 @@ async def handle_alias_route(  # noqa: PLR0915
 
     while provider_candidate_attempts < max_candidate_attempts:
         try:
-            selection = await select_candidate_fn(
-                request=request,
-                request_body=prepared_request_body,
-            )
+            selection_kwargs: dict[str, Any] = {
+                "request": request,
+                "request_body": prepared_request_body,
+            }
+            if is_codex_alias:
+                selection_kwargs["excluded_candidate_keys"] = frozenset(
+                    deterministically_ineligible_candidate_keys
+                )
+            selection = await select_candidate_fn(**selection_kwargs)
         except HTTPException as exc:
             if attempts:
                 _mark_auto_agent_alias_request_terminal_failure(
@@ -555,6 +609,24 @@ async def handle_alias_route(  # noqa: PLR0915
                 )
             raise
         candidate = selection["candidate"]
+        cooldown_key = str(selection["cooldown_key"])
+        if cooldown_key in attempted_candidate_keys:
+            if attempts:
+                _mark_auto_agent_alias_request_terminal_failure(
+                    request,
+                    attempts[-1],
+                )
+            _raise_terminal_alias_failure(last_retryable_exc or HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail={
+                    "error": {
+                        "message": "No further eligible Codex auto-agent candidates.",
+                        "type": "provider_terminal_error",
+                        "code": "all_candidates_unavailable",
+                    }
+                },
+            ))
+        attempted_candidate_keys.add(cooldown_key)
         failover_ordinal = int(selection.get("failover_ordinal") or 0)
         if failover_ordinal == 0:
             provider_candidate_attempts += 1
@@ -934,7 +1006,17 @@ async def handle_alias_route(  # noqa: PLR0915
                     # raises, the outer BaseException handler cleans up the
                     # intent.  No lock is held here (canonical order: no family
                     # lock entry while retaining a pre-acquired probe lock).
+                    fresh_codex_auth_error_class: Optional[str] = None
                     if probe_failure_exc is not None:
+                        fresh_codex_auth_error_class = _classify_codex_fresh_auth_failure(
+                            probe_failure_exc,
+                            candidate=candidate,
+                            selection=selection,
+                            is_codex_alias=codex_failure_evidence_alias is not None,
+                            has_continuation_state=has_continuation_state,
+                            has_previous_response_id=has_previous_response_id,
+                            attempted_provider_call=attempted_provider_call,
+                        )
                         probe_failure_plan = _resolve_failure_plan(
                             resolve_cooldown_publication_fn=resolve_cooldown_publication_fn,
                             record_codex_failure_evidence_fn=_record_codex_failure_evidence,
@@ -949,6 +1031,7 @@ async def handle_alias_route(  # noqa: PLR0915
                             classify_retryable_fn=_classify_codex_auto_agent_retryable_exhaustion,
                             grok_quota_fn=_is_codex_auto_agent_grok_account_quota_exhaustion,
                             cooldown_seconds_fn=_get_codex_auto_agent_cooldown_seconds,
+                            fresh_codex_auth_error_class=fresh_codex_auth_error_class,
                         )
                         intent.plan = probe_failure_plan
 
@@ -1005,6 +1088,8 @@ async def handle_alias_route(  # noqa: PLR0915
                                 probe_failure_exc, candidate=candidate
                             )
                         )
+                    if early_pre_commit_error_class is None:
+                        early_pre_commit_error_class = fresh_codex_auth_error_class
                     early_pre_commit_retry_plan = (
                         _error_signals.plan_responses_pre_commit_retry(
                             error_class=early_pre_commit_error_class,
@@ -1024,6 +1109,30 @@ async def handle_alias_route(  # noqa: PLR0915
                             error_class=early_pre_commit_error_class,
                         )
                     )
+                    skip_cooldown_for_account_failover = (
+                        prefer_account_failover
+                        and early_pre_commit_error_class
+                        == "provider_terminal_error"
+                        and _extract_adapter_exception_status_code(
+                            probe_failure_exc
+                        )
+                        == status.HTTP_401_UNAUTHORIZED
+                    )
+                    if skip_cooldown_for_account_failover:
+                        probe_failure_plan = CooldownPublicationPlan(
+                            applied_scope="none",
+                            grok_account_quota_exhausted=(
+                                probe_failure_plan.grok_account_quota_exhausted
+                                if probe_failure_plan is not None
+                                else False
+                            ),
+                            kimi_failure_metadata=(
+                                probe_failure_plan.kimi_failure_metadata
+                                if probe_failure_plan is not None
+                                else None
+                            ),
+                        )
+                        intent.plan = probe_failure_plan
                     skip_cooldown_for_same_account_retry = (
                         not prefer_account_failover
                         and
@@ -1047,6 +1156,7 @@ async def handle_alias_route(  # noqa: PLR0915
                     if (
                         probe_failure_plan is not None
                         and not skip_cooldown_for_same_account_retry
+                        and not skip_cooldown_for_account_failover
                     ):
                         try:
                             publication_transaction_result = (
@@ -1184,6 +1294,12 @@ async def handle_alias_route(  # noqa: PLR0915
                 )
                 error_class = _classify_kimi_code_auto_agent_probe_failure(kimi_failure_metadata)
                 if error_class is None:
+                    error_class = _classify_kimi_invalid_request_failure(
+                        failure_exc,
+                        candidate=candidate,
+                        kimi_failure_metadata=kimi_failure_metadata,
+                    )
+                if error_class is None:
                     error_class = _classify_codex_cohere_candidate_failure(
                         failure_exc,
                         candidate=candidate,
@@ -1199,7 +1315,16 @@ async def handle_alias_route(  # noqa: PLR0915
                         failure_exc, candidate=candidate
                     )
                 if error_class is None:
+                    error_class = fresh_codex_auth_error_class
+                if error_class is None:
                     raise _proxy_exception_for_unclassified_probe_failure(failure_exc)
+                deterministically_ineligible = (
+                    _error_signals._is_codex_auto_agent_candidate_deterministically_ineligible(
+                        failure_exc
+                    )
+                )
+                if deterministically_ineligible:
+                    deterministically_ineligible_candidate_keys.add(cooldown_key)
                 last_retryable_exc = failure_exc
                 account_slot = _codex_oauth_candidate_slot(candidate)
                 same_account_transient_attempts_by_slot[account_slot] = (
@@ -1353,7 +1478,11 @@ async def handle_alias_route(  # noqa: PLR0915
                     has_previous_response_id=has_previous_response_id,
                     account_failover_replay_safe=account_failover_replay_safe,
                 )
-                if cooldown_scope == "none" and not has_continuation_state:
+                if (
+                    cooldown_scope == "none"
+                    and not has_continuation_state
+                    and not deterministically_ineligible
+                ):
                     _exclude_codex_auto_agent_request_local_candidate_without_cooldown(
                         request,
                         candidate=candidate,
@@ -1595,6 +1724,7 @@ def _resolve_failure_plan(
     classify_retryable_fn: ClassifyRetryableFailureFn,
     grok_quota_fn: IsGrokAccountQuotaFailureFn,
     cooldown_seconds_fn: GetCooldownSecondsFn,
+    fresh_codex_auth_error_class: Optional[str] = None,
 ) -> CooldownPublicationPlan:
     """Resolve ONE publication plan for ``exc`` (pure, no I/O).
 
@@ -1602,8 +1732,25 @@ def _resolve_failure_plan(
     identifies a Codex configured alias, then resolves scope/target keys
     without cooldown-map or durable writes.
     """
+    if _error_signals._is_codex_auto_agent_candidate_deterministically_ineligible(exc):
+        return CooldownPublicationPlan(
+            memory_keys=(),
+            durable_keys=(),
+            duration_seconds=0.0,
+            applied_scope="none",
+            request_local_action=None,
+            grok_account_quota_exhausted=False,
+            kimi_failure_metadata=None,
+            allow_ttl_shrink=False,
+        )
     kimi_failure_metadata = kimi_failure_metadata_fn(exc, candidate=candidate)
     error_class = classify_kimi_fn(kimi_failure_metadata)
+    if error_class is None:
+        error_class = _classify_kimi_invalid_request_failure(
+            exc,
+            candidate=candidate,
+            kimi_failure_metadata=kimi_failure_metadata,
+        )
     if error_class is None:
         error_class = _classify_codex_cohere_candidate_failure(
             exc,
@@ -1617,6 +1764,8 @@ def _resolve_failure_plan(
         )
     if error_class is None:
         error_class = classify_retryable_fn(exc, candidate=candidate)
+    if error_class is None:
+        error_class = fresh_codex_auth_error_class
     grok_account_quota_exhausted = grok_quota_fn(exc, candidate=candidate)
     cooldown_seconds = cooldown_seconds_fn(exc, candidate=candidate)
     if codex_failure_evidence_alias is not None:

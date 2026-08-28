@@ -1137,6 +1137,125 @@ def test_cursor_auth_and_non_transient_fail_closed_to_durable_unavailable(
     )
 
 
+def test_cursor_preflight_conversion_value_error_maps_to_ineligible() -> None:
+    from litellm.proxy._types import ProxyException
+
+    candidate = _candidate(provider="cursor_agent")
+    with pytest.raises(ProxyException) as exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=ValueError("Binary or non-text content is not supported."),
+            candidate=candidate,
+        )
+
+    exc = exc_info.value
+    assert exc.status_code == 400
+    assert exc.code == "400"
+    assert exc.type == "invalid_request_error"
+    assert exc.candidate_status == "ineligible"
+    assert exc.ineligibility_reason == "unsupported"
+    assert exc.failure_phase == "candidate_preflight"
+    assert exc.attempted_provider_call is False
+    assert (
+        exc.detail["error"]["code"]
+        == "aawm_codex_auto_agent_candidate_ineligible"
+    )
+    classified = (
+        llm_passthrough_endpoints._classify_codex_auto_agent_retryable_exhaustion(
+            exc,
+            candidate=candidate,
+        )
+    )
+    assert classified == "candidate_deterministically_ineligible"
+    assert (
+        llm_passthrough_endpoints._get_codex_auto_agent_candidate_cooldown_scope(
+            classified,
+            candidate=candidate,
+        )
+        == "none"
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Cursor Agent requested unsupported external exec field 9.",
+        "Cursor Agent requested unsupported local exec operation field 4.",
+        "Cursor Agent requested an unsupported interactive client response.",
+    ],
+    ids=["external-exec", "local-exec", "interactive-client"],
+)
+def test_cursor_unsupported_operation_protocol_error_maps_to_ineligible(
+    message: str,
+) -> None:
+    from litellm.proxy._types import ProxyException
+
+    candidate = _candidate(provider="cursor_agent")
+    with pytest.raises(ProxyException) as exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=CursorConnectProtocolError(message),
+            candidate=candidate,
+        )
+
+    exc = exc_info.value
+    assert exc.status_code == 400
+    assert exc.code == "400"
+    assert exc.type == "invalid_request_error"
+    assert exc.candidate_status == "ineligible"
+    assert exc.ineligibility_reason == "unsupported"
+    assert exc.failure_phase == "candidate_preflight"
+    assert exc.attempted_provider_call is True
+    assert (
+        exc.detail["error"]["code"]
+        == "aawm_codex_auto_agent_candidate_ineligible"
+    )
+    classified = (
+        llm_passthrough_endpoints._classify_codex_auto_agent_retryable_exhaustion(
+            exc,
+            candidate=candidate,
+        )
+    )
+    assert classified == "candidate_deterministically_ineligible"
+    assert (
+        llm_passthrough_endpoints._get_codex_auto_agent_candidate_cooldown_scope(
+            classified,
+            candidate=candidate,
+        )
+        == "none"
+    )
+
+
+def test_cursor_unrelated_protocol_errors_keep_transient_502_semantics() -> None:
+    from litellm.proxy._types import ProxyException
+
+    candidate = _candidate(provider="cursor_agent")
+    with pytest.raises(ProxyException) as exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=CursorConnectProtocolError(
+                "Cursor Connect response ended with an incomplete frame."
+            ),
+            candidate=candidate,
+        )
+
+    exc = exc_info.value
+    assert exc.status_code == 502
+    assert exc.detail["error"]["code"] == "upstream_transient_internal"
+    assert getattr(exc, "candidate_status", None) != "ineligible"
+    classified = (
+        llm_passthrough_endpoints._classify_codex_auto_agent_retryable_exhaustion(
+            exc,
+            candidate=candidate,
+        )
+    )
+    assert classified == "upstream_transient_internal"
+    assert (
+        llm_passthrough_endpoints._get_codex_auto_agent_candidate_cooldown_scope(
+            classified,
+            candidate=candidate,
+        )
+        == "request_local"
+    )
+
+
 @pytest.mark.parametrize(
     "failure",
     [

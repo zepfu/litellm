@@ -568,6 +568,77 @@ class TestCodexSelectorFirstChoice:
         assert result["redispatch_ordinal"] == 2
         assert result["affinity_bypassed"] is True
 
+    @pytest.mark.asyncio
+    async def test_deterministic_exclusion_advances_real_selector(self):
+        request = _make_request()
+        candidates = (
+            _candidate("openai", "gpt-4o"),
+            _candidate("xai", "grok-4"),
+        )
+        mock_enum = SelectionEnumeration(candidates=candidates, commit_token=None)
+
+        with patch.dict(
+            selection._select_codex_auto_agent_candidate.__globals__,
+            {
+                "_resolve_aawm_alias_selection_enumeration": (
+                    lambda request, canonical_alias, *, ingress, client_product_label=None: mock_enum
+                )
+            },
+        ):
+            result = await selection._select_codex_auto_agent_candidate(
+                request=request,
+                request_body={"model": "basic"},
+                excluded_candidate_keys=frozenset(
+                    {"openai:gpt-4o:openai:primary"}
+                ),
+            )
+
+        assert result["candidate"]["provider"] == "xai"
+        assert result["skipped"][0]["reason"] == "candidate_ineligible"
+        assert result["skipped"][0]["cooldown_state_source"] == "local_fallback"
+
+    @pytest.mark.asyncio
+    async def test_excluded_candidate_keeps_active_cooldown_reason(self):
+        request = _make_request()
+        candidates = (
+            _candidate("openai", "gpt-4o"),
+            _candidate("xai", "grok-4"),
+        )
+        mock_enum = SelectionEnumeration(candidates=candidates, commit_token=None)
+
+        async def _codex_cooldown(key: str) -> tuple[float, str]:
+            if "gpt-4o" in key:
+                return (60.0, "durable_cache")
+            return (0.0, "local_fallback")
+
+        _set_selection_runtime("_get_codex_active_cooldown_state", _codex_cooldown)
+
+        with patch.dict(
+            selection._select_codex_auto_agent_candidate.__globals__,
+            {
+                "_resolve_aawm_alias_selection_enumeration": (
+                    lambda request, canonical_alias, *, ingress, client_product_label=None: mock_enum
+                )
+            },
+        ):
+            result = await selection._select_codex_auto_agent_candidate(
+                request=request,
+                request_body={"model": "basic"},
+                excluded_candidate_keys=frozenset(
+                    {"openai:gpt-4o:openai:primary"}
+                ),
+            )
+
+        assert result["candidate"]["provider"] == "xai"
+        skipped = next(
+            candidate
+            for candidate in result["skipped"]
+            if candidate["provider"] == "openai"
+        )
+        assert skipped["reason"] == "cooldown"
+        assert skipped["cooldown_seconds"] == 60.0
+        assert skipped["cooldown_state_source"] == "durable_cache"
+
 
 # ---------------------------------------------------------------------------
 # Codex selector: last-resort

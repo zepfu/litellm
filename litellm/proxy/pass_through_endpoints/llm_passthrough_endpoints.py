@@ -6036,6 +6036,21 @@ async def openai_proxy_route(  # noqa: PLR0915
                 direct_account_error_class = "usage_limit_reached"
             elif _aawm_codex_oauth.is_direct_codex_token_invalidated_error(exc):
                 direct_account_error_class = "token_invalidated"
+            elif (
+                use_direct_codex_oauth_inventory
+                and attempted_provider_call
+                and isinstance(direct_codex_selection_state, dict)
+                and direct_codex_selection_state.get("request_mode") == "fresh"
+                and not direct_codex_selection_state.get("has_account_bound_state")
+                and not _codex_auto_agent_request_has_continuation_state(request_body)
+                and _aawm_error_signals._extract_adapter_exception_status_code(exc)
+                == status.HTTP_401_UNAUTHORIZED
+                and (
+                    isinstance(exc, ProxyException)
+                    or bool(getattr(exc, "_aawm_provider_returned", False))
+                )
+            ):
+                direct_account_error_class = "provider_terminal_error"
             if (
                 not use_direct_codex_oauth_inventory
                 or direct_codex_selection_state is None

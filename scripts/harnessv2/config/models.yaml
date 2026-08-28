@@ -40,6 +40,7 @@ models:
   served_concrete_ids:
     - cursor_agent/composer-2.5
     - cursor_agent/cursor-grok-4.6-high
+    - xai/grok-4.6
     - oa_xai/grok-4.6
     - kimi_code/k3
     - cohere/north-mini-code-1-0

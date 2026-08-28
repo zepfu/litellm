@@ -42,6 +42,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     candidate_loop,
     classification,
     config_compiler as compiler,
+    session_affinity as sa,
     selection,
     snapshot_select,
 )
@@ -70,7 +71,9 @@ _SELECT_CANDIDATE_REQUIRED_KEYS = {
 
 
 @pytest.mark.asyncio
-async def test_select_candidate_fn_returns_required_selection_keys() -> None:
+async def test_select_candidate_fn_returns_required_selection_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """``_select_codex_auto_agent_candidate`` returns exactly the keys the loop consumes.
 
     Drives the session-affinity branch (continuation state + a matching
@@ -107,6 +110,28 @@ aliases:
         alias_model="seam-contract",
     )
     assert session_key is not None
+    monkeypatch.setattr(
+        sa,
+        "resolve_canonical_session_identity",
+        lambda *_args, **_kwargs: "seam-contract-session",
+    )
+
+    async def _get_matching_durable_owner(**_kwargs: Any) -> tuple[dict[str, Any], str, None]:
+        return (
+            {
+                "state": "owned",
+                "owner": "seam-contract-owner",
+                "attributes": {
+                    "provider": "openrouter",
+                    "model": "openrouter/seam-contract-model",
+                    "route_family": "codex_openrouter_completion_adapter",
+                },
+            },
+            "cache-key",
+            None,
+        )
+
+    monkeypatch.setattr(sa, "get_session_owner_record", _get_matching_durable_owner)
     previous_affinity = alias_routing_state.codex.session_affinity_by_key.get(session_key)
     alias_routing_state.codex.session_affinity_by_key[session_key] = {
         "provider": "openrouter",
@@ -119,6 +144,7 @@ aliases:
         selection_result = await selection._select_codex_auto_agent_candidate(
             request=request,
             request_body=request_body,
+            excluded_candidate_keys=frozenset(),
         )
     finally:
         snapshot_select.set_active_routing_snapshot(previous_snapshot)
@@ -521,6 +547,11 @@ async def test_alias_route_services_signature_contracts(  # noqa: PLR0915
             # against the expected parameter names, kinds, and coroutine
             # status.  An incompatible target (e.g. one requiring
             # ``wrong_required_name``) fails here.
+            if alias_family == "codex_auto_agent" and field_name == "select_candidate_fn":
+                expected_parameters = {
+                    **expected_parameters,
+                    "excluded_candidate_keys": inspect.Parameter.KEYWORD_ONLY,
+                }
             signature = inspect.signature(real_targets[field_name])
             actual_parameters = signature.parameters
             variadic_parameters = [

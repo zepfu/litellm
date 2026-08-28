@@ -125,20 +125,24 @@ When a watched file changes, the logs should show the existing LiteLLM process
 stop and a new process start. Wait for `/health/liveliness` before running the
 next live test.
 
-## Current Alpha Acceptance
+## Current Alpha Routing
 
-On August 27, 2026, current alpha live acceptance succeeded as follows:
+The current canonical alias YAML exposes these alpha test paths:
 
-- `read` and `basic` succeeded through `zai_coding_plan/glm-5.3-flash`.
-- `work` succeeded through `cursor_agent/cursor-grok-4.6-high` without xAI
-  fallback in the temporary Cursor-first work graph. This August 27, 2026
-  result is historical and is not evidence for the current shared CFG-035/038
-  graph.
-- `expert` succeeded through `gpt-5.6-terra`.
-- `sota-openai` (`gpt` role) succeeded through `gpt-5.6-sol`.
+- `read` and the first `basic` candidate use
+  `zai_coding_plan/glm-5.3-flash`.
+- `work` orders Z.AI Coding Plan, OpenAI
+  `gpt-5.3-codex-spark`, `work-other`, its Claude-only Sonnet candidates,
+  and OpenAI `gpt-5.6-luna`.
+- `expert` uses OpenAI `gpt-5.6-terra`.
+- `sota-openai` uses OpenAI `gpt-5.6-sol`.
+- `sota-xai` orders Cursor Agent
+  `cursor_agent/cursor-grok-4.6-high`, native xAI/OIDC
+  `xai/grok-4.6`, then managed xAI/OAuth `oa_xai/grok-4.6`.
 
-This is alpha acceptance only, not `litellm-dev`/production acceptance or
-production evidence.
+These are alpha-only testing paths for the current checkout. A passing alpha
+call is not `litellm-dev` or production acceptance, deployment evidence, or
+authorization to promote candidates or configuration to either environment.
 
 ## Rebuild
 
@@ -171,7 +175,6 @@ development database connections for parity. Treat all calls as real provider
 and development-data operations. It is isolated by port, container name,
 environment label, process application names, and alias-routing Redis
 namespace, but it is not a sandbox for destructive database or provider tests.
-The Cursor auth-file wiring is testing-only. The August 27, 2026 `work`
-acceptance is historical for the temporary Cursor-first work graph; it is not
-evidence for the current shared CFG-035/038 graph or
-`litellm-dev`/production acceptance.
+The Cursor auth-file wiring is testing-only. Alpha results remain confined to
+the alpha service and current checkout; they do not promote candidates or
+configuration to `litellm-dev` or production.

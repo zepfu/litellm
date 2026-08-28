@@ -535,18 +535,41 @@ def _update_codex_auto_agent_retryable_attempt_record(
         exc,
         status_code=error_status_code,
     )
+    candidate_status = getattr(exc, "candidate_status", None)
+    ineligibility_reason = getattr(exc, "ineligibility_reason", None)
+    is_deterministically_ineligible = (
+        error_class == "candidate_deterministically_ineligible"
+    )
     update: dict[str, Any] = {
-        "status": ("retryable_no_cooldown" if cooldown_scope == "none" else "cooldown_set"),
+        "status": (
+            "candidate_ineligible_no_cooldown"
+            if is_deterministically_ineligible
+            else (
+                "retryable_no_cooldown"
+                if cooldown_scope == "none"
+                else "cooldown_set"
+            )
+        ),
         "error_class": error_class,
         "error_tokens": sorted(error_tokens),
         "failure_phase": getattr(exc, "failure_phase", "provider_attempt"),
         "attempted_provider_call": getattr(exc, "attempted_provider_call", True),
         "source_error": source_error,
     }
-    if cooldown_scope != "none":
-        update["cooldown_seconds"] = round(float(cooldown_seconds), 3)
-    if cooldown_scope is not None:
-        update["cooldown_scope"] = cooldown_scope
+    if candidate_status is not None:
+        update["candidate_status"] = candidate_status
+    if ineligibility_reason is not None:
+        update["ineligibility_reason"] = ineligibility_reason
+    if is_deterministically_ineligible:
+        # Deterministic candidate rejection never publishes local or durable
+        # cooldown state, even if a caller carried a stale scope or duration.
+        attempt_record.pop("cooldown_seconds", None)
+        update["cooldown_scope"] = "none"
+    else:
+        if cooldown_scope != "none":
+            update["cooldown_seconds"] = round(float(cooldown_seconds), 3)
+        if cooldown_scope is not None:
+            update["cooldown_scope"] = cooldown_scope
     if error_status_code is not None:
         update["error_status_code"] = error_status_code
     if error_type is not None:

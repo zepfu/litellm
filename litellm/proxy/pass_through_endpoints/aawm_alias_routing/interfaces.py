@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import (
+    AbstractSet,
     TYPE_CHECKING,
     Any,
     Awaitable,
@@ -170,6 +171,7 @@ class SelectCandidateFn(Protocol):
         *,
         request: "Request",
         request_body: dict[str, Any],
+        excluded_candidate_keys: Optional[AbstractSet[str]] = None,
     ) -> dict[str, Any]:
         ...
 

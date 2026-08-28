@@ -605,6 +605,12 @@ class BaseOpenAIPassThroughHandler:
                     request_body=prepared_request_body,
                 )
             )
+            if is_codex_responses_request:
+                prepared_request_body = {
+                    **prepared_request_body,
+                    "store": False,
+                    "stream": True,
+                }
             if body_was_prepared or prepared_request_body is not request_body:
                 rt.safe_set_request_parsed_body_fn(
                     request, prepared_request_body
@@ -612,7 +618,12 @@ class BaseOpenAIPassThroughHandler:
                 endpoint_custom_body = prepared_request_body
 
         ## check for streaming
-        is_streaming_request = "stream" in str(updated_url)
+        is_streaming_request = (
+            bool(prepared_request_body.get("stream"))
+            if request.method == "POST"
+            and rt.is_openai_responses_endpoint_fn(endpoint)
+            else "stream" in str(updated_url)
+        )
 
         ## CREATE PASS-THROUGH
         endpoint_func = rt.create_pass_through_route_fn(

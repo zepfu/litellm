@@ -17,7 +17,7 @@ import random
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Mapping, Optional, Sequence
+from typing import AbstractSet, Any, Awaitable, Callable, Mapping, Optional, Sequence
 
 from fastapi import HTTPException, Request
 
@@ -787,6 +787,7 @@ def _plan_codex_oauth_account_failover(
         "token_invalidated",
         "usage_limit_reached",
         "candidate_unavailable",
+        "provider_terminal_error",
     }:
         return False
 
@@ -1692,6 +1693,7 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     *,
     candidate_template: dict[str, Any],
     openai_lane_key: Optional[str] = None,
+    excluded_candidate_keys: Optional[AbstractSet[str]] = None,
 ) -> dict[str, Any]:
     assert _get_codex_active_cooldown_state is not None
     candidate = dict(candidate_template)
@@ -1737,6 +1739,10 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         candidate,
         lane_key,
         cooldown_identity_tag=_cooldown_identity_tag,
+    )
+    excluded_candidate = (
+        excluded_candidate_keys is not None
+        and cooldown_key in excluded_candidate_keys
     )
     (
         cooldown_seconds,
@@ -1816,6 +1822,8 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         )
         cooldown_seconds = forced_cooldown_seconds
         cooldown_state_source = cooldown_state_source_override or "forced_candidate_cooldown"
+    if excluded_candidate and cooldown_seconds <= 0 and skip_reason is None:
+        skip_reason = "candidate_ineligible"
     state: dict[str, Any] = {
         "candidate": candidate,
         "lane_key": lane_key,
@@ -2597,12 +2605,14 @@ async def _build_codex_auto_agent_affinity_candidate_state(
     *,
     candidate_template: dict[str, Any],
     affinity: dict[str, Any],
+    excluded_candidate_keys: Optional[AbstractSet[str]] = None,
 ) -> dict[str, Any]:
     if not _candidate_uses_codex_oauth(candidate_template):
         return _attach_normalized_quota_state(
             await _build_codex_auto_agent_candidate_state(
                 request,
                 candidate_template=candidate_template,
+                excluded_candidate_keys=excluded_candidate_keys,
             )
         )
     contexts = await _resolve_codex_oauth_account_candidate_contexts(
@@ -2617,6 +2627,7 @@ async def _build_codex_auto_agent_affinity_candidate_state(
             request,
             candidate_template=context["candidate"],
             openai_lane_key=context["lane_key"],
+            excluded_candidate_keys=excluded_candidate_keys,
         )
         states.append(
             _apply_codex_oauth_account_context_to_state(
@@ -2674,6 +2685,7 @@ async def _build_codex_auto_agent_candidate_states(
     *,
     alias_model: str,
     client_product_label: Optional[str] = None,
+    excluded_candidate_keys: Optional[AbstractSet[str]] = None,
 ) -> list[dict[str, Any]]:
     openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
     states: list[dict[str, Any]] = []
@@ -2696,6 +2708,7 @@ async def _build_codex_auto_agent_candidate_states(
                     request,
                     candidate_template=context["candidate"],
                     openai_lane_key=context["lane_key"],
+                    excluded_candidate_keys=excluded_candidate_keys,
                 )
                 states.append(
                     _apply_codex_oauth_account_context_to_state(
@@ -2711,6 +2724,7 @@ async def _build_codex_auto_agent_candidate_states(
                     request,
                     candidate_template=candidate_template,
                     openai_lane_key=openai_lane_key,
+                    excluded_candidate_keys=excluded_candidate_keys,
                 )
             )
         )
@@ -3287,6 +3301,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     *,
     request: Request,
     request_body: dict[str, Any],
+    excluded_candidate_keys: Optional[AbstractSet[str]] = None,
 ) -> dict[str, Any]:
     assert _extract_client_product_label is not None
     assert _resolve_codex_session_key is not None
@@ -3485,6 +3500,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         return await _select_codex_auto_agent_candidate(
             request=request,
             request_body=request_body,
+            excluded_candidate_keys=excluded_candidate_keys,
         )
 
     if isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "owned":
@@ -3662,6 +3678,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             request,
             candidate_template=affinity_candidate,
             affinity=affinity,
+            excluded_candidate_keys=excluded_candidate_keys,
         )
         if (
             _candidate_matches_affinity(
@@ -3784,6 +3801,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         request,
         alias_model=alias_model,
         client_product_label=client_product_label,
+        excluded_candidate_keys=excluded_candidate_keys,
     )
     skipped = _build_auto_agent_skipped_candidates_from_states(states)
     request.state.aawm_alias_terminal_skipped_candidates = skipped

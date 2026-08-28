@@ -966,6 +966,8 @@ def _plan_codex_auto_agent_native_grok_continuation_transient_retry(
 
 
 def _get_codex_auto_agent_cooldown_scope(error_class: Optional[str]) -> str:
+    if error_class == _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CLASS:
+        return "none"
     if _is_codex_auto_agent_durable_cooldown_error_class(error_class):
         return "candidate"
     return "request_local"
@@ -977,6 +979,8 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
     candidate: Optional[dict[str, Any]] = None,
     kimi_failure_metadata: Optional[dict[str, Any]] = None,
 ) -> str:
+    if error_class == _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CLASS:
+        return "none"
     if _is_kimi_code_auto_agent_candidate(candidate):
         if (
             error_class == "kimi_code_managed_account"
@@ -1100,6 +1104,42 @@ def _is_codex_auto_agent_grok_account_quota_exhaustion(
 # ---------------------------------------------------------------------------
 # Retryable exhaustion classification
 # ---------------------------------------------------------------------------
+
+
+_CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CLASS = (
+    "candidate_deterministically_ineligible"
+)
+_CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CODE = (
+    "aawm_codex_auto_agent_candidate_ineligible"
+)
+_CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_REASONS = frozenset(
+    {
+        "retired",
+        "disabled",
+        "unsupported",
+        "contract_incompatible",
+        "preflight_skipped",
+    }
+)
+
+
+def _is_codex_auto_agent_candidate_deterministically_ineligible(exc: Any) -> bool:
+    detail = getattr(exc, "detail", None)
+    detail_error = detail.get("error") if isinstance(detail, dict) else None
+    return bool(
+        getattr(exc, "candidate_status", None) == "ineligible"
+        and getattr(exc, "ineligibility_reason", None)
+        in _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_REASONS
+        and (
+            getattr(exc, "code", None)
+            == _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CODE
+            or (
+                isinstance(detail_error, dict)
+                and detail_error.get("code")
+                == _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CODE
+            )
+        )
+    )
 
 
 _ALIBABA_TOKEN_PLAN_UNSUPPORTED_MODEL_ERROR_CODES = frozenset(
@@ -1245,6 +1285,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     *,
     candidate: Optional[dict[str, Any]] = None,
 ) -> Optional[str]:
+    if _is_codex_auto_agent_candidate_deterministically_ineligible(exc):
+        return _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CLASS
     assert _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS is not None
     assert _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS is not None
     status_code = _extract_adapter_exception_status_code(exc)

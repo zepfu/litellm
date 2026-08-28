@@ -146,9 +146,16 @@ def _auto_agent_alias_request_outcome_is_pending_failover(event: dict[str, Any])
 def _auto_agent_alias_route_rollup_status(event: dict[str, Any]) -> Optional[str]:
     event_type = str(event.get("event_type") or "")
     candidate_status = str(event.get("candidate_status") or "")
+    attempt_status = str(event.get("status") or "")
     selection_reason = str(event.get("selection_reason") or "")
     failure_class = str(event.get("failure_class") or "")
     cooldown_scope = str(event.get("cooldown_scope") or "")
+    if (
+        candidate_status in {"ineligible", "candidate_ineligible_no_cooldown"}
+        or attempt_status == "candidate_ineligible_no_cooldown"
+        or failure_class == "candidate_deterministically_ineligible"
+    ):
+        return "Ineligible"
     if event_type == "no_candidate_available":
         return "Exhausted"
     if _auto_agent_alias_request_outcome_is_recovered(event):
@@ -198,6 +205,7 @@ def _auto_agent_alias_route_status_message(event: dict[str, Any]) -> str:
         "error_code",
         "error_status_code",
         "candidate_status",
+        "ineligibility_reason",
         "selection_reason",
     ):
         value = event.get(key)
