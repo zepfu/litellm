@@ -124,6 +124,11 @@ DEFAULT_PASSTHROUGH_PRE_FIRST_BYTE_HIDDEN_RETRY_BUDGET_SECONDS = float(
     sum(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS)
 )
 
+
+class _PassthroughHiddenRetryBudgetTimeout(httpx.ReadTimeout):
+    """The shared pre-first-byte retry budget canceled an in-flight attempt."""
+
+
 from .aawm_adapter_runtime.repetitive_output import (
     bind_output_guard_to_streaming_response,
     maybe_reject_passthrough_responses_body,
@@ -1261,6 +1266,49 @@ async def _passthrough_hidden_retry_sleep(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
+async def _await_passthrough_pre_first_byte_operation(
+    operation: Any,
+    *,
+    timeout_seconds: Optional[float],
+    operation_name: str,
+) -> Any:
+    if timeout_seconds is None:
+        return await operation()
+
+    if timeout_seconds <= 0:
+        raise _PassthroughHiddenRetryBudgetTimeout(
+            f"Pass-through {operation_name} hidden retry budget exhausted"
+        )
+
+    operation_coroutine = operation()
+    try:
+        operation_task = asyncio.create_task(
+            operation_coroutine,
+            eager_start=True,
+        )
+    except TypeError:
+        operation_coroutine.close()
+        operation_task = asyncio.create_task(operation())
+    try:
+        if operation_task.done():
+            return operation_task.result()
+        done, _ = await asyncio.wait(
+            {operation_task},
+            timeout=timeout_seconds,
+        )
+        if operation_task not in done:
+            operation_task.cancel()
+            await asyncio.gather(operation_task, return_exceptions=True)
+            raise _PassthroughHiddenRetryBudgetTimeout(
+                f"Pass-through {operation_name} hidden retry budget exhausted"
+            )
+        return operation_task.result()
+    finally:
+        if not operation_task.done():
+            operation_task.cancel()
+        await asyncio.gather(operation_task, return_exceptions=True)
+
+
 def _get_passthrough_hidden_retry_wait_seconds(attempt_index: int) -> float:
     if attempt_index < 0:
         return 0.0
@@ -1550,6 +1598,22 @@ def _record_passthrough_hidden_retry_metadata(
         ] = failure_classification
 
 
+def _mark_passthrough_hidden_retry_budget_exhausted(
+    kwargs: Optional[dict],
+    *,
+    budget_seconds: float,
+    elapsed_seconds: float,
+) -> None:
+    if not isinstance(kwargs, dict):
+        return
+    metadata = _ensure_passthrough_metadata(kwargs)
+    metadata["aawm_passthrough_hidden_retry_budget_seconds"] = budget_seconds
+    metadata["aawm_passthrough_hidden_retry_budget_exhausted"] = True
+    metadata["aawm_passthrough_hidden_retry_elapsed_seconds"] = round(
+        elapsed_seconds, 3
+    )
+
+
 async def _execute_passthrough_pre_first_byte_with_hidden_retries(
     *,
     kwargs: Optional[dict],
@@ -1563,14 +1627,23 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
         return await operation()
 
     max_attempts = len(PASSTHROUGH_PRE_FIRST_BYTE_RETRY_BACKOFF_SECONDS) + 1
-    # Wall-clock deadline independent of per-attempt HTTP timeout (RR-056 / B2).
+    # Wall-clock budget independent of per-attempt HTTP timeout (RR-056 / B2).
     budget_seconds = _get_passthrough_hidden_retry_budget_seconds()
     start_monotonic = time.monotonic()
     attempt_number = 0
     while True:
         attempt_number += 1
         try:
-            result = await operation()
+            timeout_seconds: Optional[float] = None
+            if budget_seconds > 0:
+                timeout_seconds = budget_seconds
+                if attempt_number > 1:
+                    timeout_seconds -= time.monotonic() - start_monotonic
+            result = await _await_passthrough_pre_first_byte_operation(
+                operation,
+                timeout_seconds=timeout_seconds,
+                operation_name=operation_name,
+            )
             if attempt_number > 1:
                 _record_passthrough_hidden_retry_metadata(
                     kwargs,
@@ -1588,6 +1661,38 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
                 failure_class,
                 failure_classification,
             ) = _classify_passthrough_hidden_retry_failure(exc)
+            if isinstance(exc, _PassthroughHiddenRetryBudgetTimeout):
+                elapsed_seconds = time.monotonic() - start_monotonic
+                _record_passthrough_hidden_retry_metadata(
+                    kwargs,
+                    attempt_number=attempt_number,
+                    max_attempts=max_attempts,
+                    status_code=status_code,
+                    failure_class=failure_class,
+                    wait_seconds=0.0,
+                    final_outcome=(
+                        "failed_after_retry"
+                        if attempt_number > 1
+                        else "failed_without_retry"
+                    ),
+                    failure_classification=failure_classification,
+                )
+                _mark_passthrough_hidden_retry_budget_exhausted(
+                    kwargs,
+                    budget_seconds=budget_seconds,
+                    elapsed_seconds=elapsed_seconds,
+                )
+                verbose_proxy_logger.info(
+                    "Pass-through %s stopping hidden retries after attempt %s/%s: "
+                    "wall-clock budget %.1fs exhausted during in-flight operation "
+                    "(elapsed %.1fs)",
+                    operation_name,
+                    attempt_number,
+                    max_attempts,
+                    budget_seconds,
+                    elapsed_seconds,
+                )
+                raise
             should_retry = _is_passthrough_pre_first_byte_hidden_retryable(
                 exc,
                 status_code=status_code,
@@ -1653,15 +1758,11 @@ async def _execute_passthrough_pre_first_byte_with_hidden_retries(
                     ),
                     failure_classification=failure_classification,
                 )
-                if isinstance(kwargs, dict):
-                    metadata = _ensure_passthrough_metadata(kwargs)
-                    metadata[
-                        "aawm_passthrough_hidden_retry_budget_seconds"
-                    ] = budget_seconds
-                    metadata["aawm_passthrough_hidden_retry_budget_exhausted"] = True
-                    metadata["aawm_passthrough_hidden_retry_elapsed_seconds"] = round(
-                        elapsed_seconds, 3
-                    )
+                _mark_passthrough_hidden_retry_budget_exhausted(
+                    kwargs,
+                    budget_seconds=budget_seconds,
+                    elapsed_seconds=elapsed_seconds,
+                )
                 verbose_proxy_logger.info(
                     "Pass-through %s stopping hidden retries after attempt %s/%s: "
                     "wall-clock budget %.1fs exceeded (elapsed %.1fs, next_wait %.1fs)",

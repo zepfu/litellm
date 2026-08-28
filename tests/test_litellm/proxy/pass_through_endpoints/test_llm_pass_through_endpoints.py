@@ -3523,6 +3523,229 @@ class TestPassThroughRequestRetryableFailures:
         mock_direct_capture.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_pass_through_request_caps_in_flight_hidden_retry_at_budget(
+        self, monkeypatch
+    ):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            pass_through_request,
+        )
+
+        budget_seconds = 0.1
+        monkeypatch.setenv(
+            "AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS",
+            str(budget_seconds),
+        )
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4001/anthropic/v1/messages"
+        mock_request.headers = {"content-type": "application/json"}
+        mock_request.query_params = {}
+        custom_body = {"model": "claude-sonnet-4-6"}
+        target_url = "https://api.anthropic.com/v1/messages"
+        operation_cancelled = asyncio.Event()
+        operation_cleaned_up = asyncio.Event()
+
+        async def slow_handler(*args, **kwargs):
+            try:
+                await asyncio.sleep(30.0)
+            except asyncio.CancelledError:
+                operation_cancelled.set()
+                raise
+            finally:
+                operation_cleaned_up.set()
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+            new=slow_handler,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client"
+        ) as mock_get_client, patch(
+            "litellm.proxy.proxy_server.proxy_logging_obj"
+        ) as mock_logging_obj, patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new_callable=AsyncMock,
+        ) as mock_hidden_retry_sleep:
+            mock_client_obj = MagicMock()
+            mock_client_obj.client = MagicMock()
+            mock_get_client.return_value = mock_client_obj
+            mock_logging_obj.pre_call_hook = AsyncMock(return_value=custom_body)
+            mock_logging_obj.post_call_failure_hook = AsyncMock()
+
+            started_at = time.monotonic()
+            with pytest.raises(ProxyException) as exc_info:
+                await pass_through_request(
+                    request=mock_request,
+                    target=target_url,
+                    custom_headers={},
+                    user_api_key_dict=MagicMock(),
+                    custom_body=custom_body,
+                    custom_llm_provider="anthropic",
+                    stream=False,
+                )
+            elapsed_seconds = time.monotonic() - started_at
+
+        assert exc_info.value.code == "504"
+        assert elapsed_seconds >= budget_seconds * 0.5
+        assert elapsed_seconds < 1.0
+        assert operation_cancelled.is_set()
+        assert operation_cleaned_up.is_set()
+        mock_hidden_retry_sleep.assert_not_awaited()
+        mock_logging_obj.post_call_failure_hook.assert_awaited_once()
+
+        request_data = mock_logging_obj.post_call_failure_hook.call_args.kwargs[
+            "request_data"
+        ]
+        metadata = request_data["litellm_params"]["metadata"]
+        assert metadata["aawm_passthrough_hidden_retry_count"] == 1
+        assert metadata["aawm_passthrough_hidden_retry_final_outcome"] == (
+            "failed_without_retry"
+        )
+        assert metadata["aawm_passthrough_hidden_retry_failure_classification"] == (
+            "upstream_connectivity_failure"
+        )
+        assert metadata["aawm_passthrough_hidden_retry_budget_seconds"] == (
+            budget_seconds
+        )
+        assert metadata["aawm_passthrough_hidden_retry_budget_exhausted"] is True
+        assert (
+            metadata["aawm_passthrough_hidden_retry_elapsed_seconds"]
+            >= budget_seconds * 0.5
+        )
+
+    @pytest.mark.asyncio
+    async def test_hidden_retry_uses_remaining_budget_for_later_attempts(
+        self, monkeypatch
+    ):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            _execute_passthrough_pre_first_byte_with_hidden_retries,
+        )
+
+        budget_seconds = 0.4
+        monkeypatch.setenv(
+            "AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS",
+            str(budget_seconds),
+        )
+        kwargs: dict = {}
+        target_url = "https://api.anthropic.com/v1/messages"
+        attempt_count = 0
+        second_attempt_duration: list[float] = []
+        sleep_calls: list[float] = []
+
+        async def operation():
+            nonlocal attempt_count
+            attempt_count += 1
+            if attempt_count == 1:
+                await asyncio.sleep(0.12)
+                raise httpx.ReadTimeout(
+                    "first attempt timed out",
+                    request=httpx.Request("POST", target_url),
+                )
+
+            second_started_at = time.monotonic()
+            try:
+                await asyncio.sleep(30.0)
+            except asyncio.CancelledError:
+                second_attempt_duration.append(
+                    time.monotonic() - second_started_at
+                )
+                raise
+
+        async def fake_sleep(seconds: float) -> None:
+            sleep_calls.append(seconds)
+            await asyncio.sleep(seconds)
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._get_passthrough_hidden_retry_wait_seconds",
+            return_value=0.08,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints._passthrough_hidden_retry_sleep",
+            new=fake_sleep,
+        ):
+            with pytest.raises(httpx.ReadTimeout):
+                await _execute_passthrough_pre_first_byte_with_hidden_retries(
+                    kwargs=kwargs,
+                    operation_name="test_operation",
+                    operation=operation,
+                    caller_managed_hidden_retry=False,
+                )
+
+        assert attempt_count == 2
+        assert sleep_calls == [0.08]
+        assert len(second_attempt_duration) == 1
+        assert second_attempt_duration[0] >= 0.12
+        assert second_attempt_duration[0] < 0.32
+        metadata = kwargs["litellm_params"]["metadata"]
+        assert metadata["aawm_passthrough_hidden_retry_count"] == 2
+        assert metadata["aawm_passthrough_hidden_retry_final_outcome"] == (
+            "failed_after_retry"
+        )
+        assert metadata["aawm_passthrough_hidden_retry_failure_classification"] == (
+            "upstream_connectivity_failure"
+        )
+        assert metadata["aawm_passthrough_hidden_retry_budget_exhausted"] is True
+        assert metadata["aawm_passthrough_hidden_retry_budget_seconds"] == (
+            budget_seconds
+        )
+        assert (
+            metadata["aawm_passthrough_hidden_retry_attempts"][0]["wait_seconds"]
+            == 0.08
+        )
+
+    @pytest.mark.asyncio
+    async def test_hidden_retry_disabled_budget_does_not_cap_operation(
+        self, monkeypatch
+    ):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            _execute_passthrough_pre_first_byte_with_hidden_retries,
+        )
+
+        monkeypatch.setenv("AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS", "0")
+        kwargs: dict = {}
+
+        async def operation():
+            await asyncio.sleep(0.08)
+            return "ok"
+
+        started_at = time.monotonic()
+        result = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+            kwargs=kwargs,
+            operation_name="test_operation",
+            operation=operation,
+            caller_managed_hidden_retry=False,
+        )
+
+        assert result == "ok"
+        assert time.monotonic() - started_at >= 0.06
+        assert kwargs == {}
+
+    @pytest.mark.asyncio
+    async def test_caller_managed_hidden_retry_bypasses_positive_budget(
+        self, monkeypatch
+    ):
+        from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
+            _execute_passthrough_pre_first_byte_with_hidden_retries,
+        )
+
+        monkeypatch.setenv("AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS", "0.02")
+        kwargs: dict = {}
+
+        async def operation():
+            await asyncio.sleep(0.08)
+            return "ok"
+
+        started_at = time.monotonic()
+        result = await _execute_passthrough_pre_first_byte_with_hidden_retries(
+            kwargs=kwargs,
+            operation_name="test_operation",
+            operation=operation,
+            caller_managed_hidden_retry=True,
+        )
+
+        assert result == "ok"
+        assert time.monotonic() - started_at >= 0.06
+        assert kwargs == {}
+
+    @pytest.mark.asyncio
     async def test_pass_through_request_preserves_retry_headers_and_skips_failure_hook(
         self,
     ):

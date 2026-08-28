@@ -83,6 +83,8 @@ by provider routes. Operator-facing behaviors that are easy to miss:
   `AAWM_PASSTHROUGH_HIDDEN_RETRY_BUDGET_SECONDS` (default = sum of backoff
   schedule, currently 230s). Set `0` to disable the wall-clock bound while
   keeping the attempt-count ceiling.
+- When enabled, the remaining budget caps each in-flight pre-first-byte attempt,
+  including the first attempt; expiry cancels that operation and ends retries.
 - This is independent of the per-attempt HTTP client timeout.
 
 ### xAI failure capture (issue #2)
