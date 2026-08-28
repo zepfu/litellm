@@ -507,6 +507,10 @@ def _credential_needs_refresh(
 def _parse_expires_at(value: Any) -> Optional[datetime]:
     if value is None:
         return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
     if isinstance(value, (int, float)):
         return datetime.fromtimestamp(float(value), tz=timezone.utc)
     if isinstance(value, str) and value.strip():

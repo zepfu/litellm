@@ -543,3 +543,32 @@ def test_repair_grok_oidc_auth_file_metadata_quiet_when_already_correct(
     assert summary["attempted"] is True
     assert summary["repaired"] is False
     assert summary["error_class"] is None
+
+
+def test_inspect_grok_oidc_refresh_eligibility_formats_future_expiry(
+    tmp_path: Path,
+) -> None:
+    observed_at = datetime(2026, 8, 13, 22, 30, tzinfo=timezone.utc)
+    expires_at = observed_at + timedelta(hours=2)
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(
+        json.dumps(_scoped_payload(expires_at=expires_at)),
+        encoding="utf-8",
+    )
+
+    result = refresh.inspect_grok_oidc_refresh_eligibility(
+        auth_path,
+        buffer_seconds=300,
+        now=lambda: observed_at,
+        poll_interval_seconds=300.0,
+    )
+
+    assert result["eligibility_checked_at"] == "2026-08-13T22:30:00Z"
+    assert result["expires_at"] == "2026-08-14T00:30:00Z"
+    assert result["refresh_due_at"] == "2026-08-14T00:25:00Z"
+    assert result["next_refresh_check_at"] == "2026-08-14T00:25:00Z"
+    assert result["eligible"] is False
+    assert result["credential_health"] == "fresh"
+    assert result["usable"] is True
+    assert result["error_class"] is None
+    assert result["error_message"] is None

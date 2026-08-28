@@ -2282,6 +2282,56 @@ def test_kimi_event_and_observation_use_dynamic_refresh_threshold(
     assert "refresh-token-secret" not in rendered
 
 
+def test_grok_oidc_scheduler_reports_fresh_not_due_for_future_expiry(
+    tmp_path,
+) -> None:
+    wall_now = datetime(2026, 8, 13, 22, 30, tzinfo=timezone.utc)
+    expires_at = wall_now + timedelta(hours=2)
+    auth_file = tmp_path / "grok-auth.json"
+    auth_file.write_text(
+        json.dumps(
+            {
+                grok_oidc_refresh.DEFAULT_GROK_OIDC_SCOPE: {
+                    "key": "access-token-secret",
+                    "access_token": "access-token-secret",
+                    "refresh_token": "refresh-token-secret",
+                    "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
+                    "oidc_client_id": "client-id",
+                    "token_endpoint": "https://auth.test/token",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _grok_oidc_auth_persist_config(
+        apply=False,
+        grok_oidc_auth_file=str(auth_file),
+        grok_oidc_lock_file=str(tmp_path / "grok-auth.json.lock"),
+    )
+
+    event = loop._run_grok_oidc_refresh_task(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+        now_wall=wall_now,
+    )
+
+    assert event is not None
+    assert event["attempted"] is False
+    assert event["skipped"] is True
+    assert event["helper_called"] is False
+    assert event["refresh_result_class"] == "refresh_not_due"
+    assert event["credential_health"] == "fresh"
+    assert event["usable"] is True
+    assert event["eligibility_checked_at"] == "2026-08-13T22:30:00Z"
+    assert event["expires_at"] == "2026-08-14T00:30:00Z"
+    assert event["refresh_due_at"] == "2026-08-14T00:25:00Z"
+    assert event["next_refresh_check_at"] == "2026-08-14T00:25:00Z"
+    rendered = json.dumps(event, default=str)
+    assert "access-token-secret" not in rendered
+    assert "refresh-token-secret" not in rendered
+
+
 @pytest.mark.parametrize(
     (
         "operation_error_class",
