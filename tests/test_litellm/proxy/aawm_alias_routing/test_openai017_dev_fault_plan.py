@@ -473,6 +473,21 @@ async def test_direct_normal_usage_limit_failure_recovers_with_attempt_metadata(
     assert failed_attempt["error_code"] == "usage_limit_reached"
     assert failed_attempt["attempted_provider_call"] is True
     assert failed_attempt["request_outcome"] == "pending_failover"
+    assert failed_attempt["replay_safety"] == "replay_safe"
+    assert failed_attempt["credential_reload_outcome"] == "not_attempted"
+    assert failed_attempt["guard_reset_outcome"] == "not_attempted"
+    assert failed_attempt["failover_decision"] == "move_account"
+    assert failed_attempt["terminal_reason"] == "success"
+    assert failed_attempt["attempted_account_hashes"] == [
+        "hash-account-a",
+        "hash-account-b",
+    ]
+    assert recovered_attempt["failover_decision"] == "completed_after_failover"
+    assert recovered_attempt["terminal_reason"] == "success"
+    assert recovered_attempt["attempted_account_hashes"] == [
+        "hash-account-a",
+        "hash-account-b",
+    ]
     assert recovered_attempt["attempted_provider_call"] is True
     assert recovered_attempt["request_outcome"] == "recovered"
     assert [rollup["status"] for rollup in captured["rollups"]] == [
@@ -575,6 +590,17 @@ async def test_direct_normal_terminal_failures_record_exhausted_metadata(
     assert token_attempt["error_code"] == "token_invalidated"
     assert token_attempt["attempted_provider_call"] is True
     assert token_attempt["request_outcome"] == "failed"
+    assert token_attempt["replay_safety"] == "replay_safe"
+    assert token_attempt["credential_reload_outcome"] == (
+        "unchanged_already_reloaded"
+    )
+    assert token_attempt["guard_reset_outcome"] == "not_reset"
+    assert token_attempt["failover_decision"] == "terminal"
+    assert token_attempt["terminal_reason"] == "account_failover_exhausted"
+    assert token_attempt["attempted_account_hashes"] == [
+        "hash-account-a",
+        "hash-account-b",
+    ]
     assert [
         event["status"]
         for event in captured["status_events"]
@@ -587,6 +613,15 @@ async def test_direct_normal_terminal_failures_record_exhausted_metadata(
     ] == ["Exhausted"]
     assert len(captured["audit_only"]) == 1
     terminal_event = captured["audit_only"][0][0]
+    assert terminal_event["credential_reload_outcome"] == (
+        "unchanged_already_reloaded"
+    )
+    assert terminal_event["failover_decision"] == "terminal"
+    assert terminal_event["terminal_reason"] == "account_failover_exhausted"
+    assert terminal_event["attempted_account_hashes"] == [
+        "hash-account-a",
+        "hash-account-b",
+    ]
     assert terminal_event["failure_class"] == "token_invalidated"
     assert terminal_event["attempt_count"] == 2
     assert terminal_event["request_outcome"] == "failed"

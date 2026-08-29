@@ -3448,7 +3448,7 @@ async def llm_passthrough_factory_proxy_route(
     return received_value
 
 
-async def _retry_direct_codex_oauth_after_account_failure(
+async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
     *,
     request: Request,
     request_body: dict[str, Any],
@@ -3517,6 +3517,9 @@ async def _retry_direct_codex_oauth_after_account_failure(
     account_failover_replay_safe = (
         _sa.is_replay_safe_session_owner_redispatch_body(request_body)
     )
+    retry_attempt_record["replay_safety"] = (
+        "replay_safe" if account_failover_replay_safe else "replay_unsafe"
+    )
     _aawm_dev_fault_plan.note_direct_openai_managed_failure(
         request,
         request_body,
@@ -3537,11 +3540,42 @@ async def _retry_direct_codex_oauth_after_account_failure(
                     expected_lane_key=account_lane,
                 )
             )
-            if (
+            credential_reload_outcome = (
+                _aawm_codex_oauth.get_codex_oauth_credential_reload_outcome(
+                    request,
+                    account_label=account_label,
+                )
+            )
+            if credential_reload_outcome == "not_attempted":
+                credential_reload_outcome = (
+                    "reloaded"
+                    if retry_auth is not None
+                    else "unchanged_already_reloaded"
+                )
+                _aawm_codex_oauth._record_codex_oauth_credential_reload_outcome(
+                    request,
+                    account_label=account_label,
+                    outcome=credential_reload_outcome,
+                )
+            retry_attempt_record["credential_reload_outcome"] = (
+                credential_reload_outcome
+            )
+            reload_succeeded = (
                 retry_auth is not None
                 and retry_auth.account_label == account_label
                 and retry_auth.account_hash == account_hash
                 and retry_auth.lane_key == account_lane
+            )
+            if reload_succeeded:
+                retry_attempt_record["guard_reset_outcome"] = "reset"
+                retry_attempt_record["terminal_reason"] = "success"
+            else:
+                retry_attempt_record["guard_reset_outcome"] = "not_reset"
+                retry_attempt_record["terminal_reason"] = (
+                    "unchanged_already_reloaded"
+                )
+            if (
+                reload_succeeded
                 and _sa.reset_released_request_session_owner_guard(request)
                 and _aawm_codex_oauth._bind_codex_oauth_candidate_to_request(
                     request,
@@ -3589,6 +3623,14 @@ async def _retry_direct_codex_oauth_after_account_failure(
             provider_status_code=retry_attempt_record["error_status_code"],
         )
     )
+    if retry_planned:
+        retry_attempt_record["failover_decision"] = "move_account"
+        retry_attempt_record["terminal_reason"] = "success"
+    else:
+        retry_attempt_record["failover_decision"] = "terminal"
+        retry_attempt_record["terminal_reason"] = (
+            "account_failover_exhausted"
+        )
     if not retry_planned:
         return None
 
@@ -6076,6 +6118,48 @@ async def openai_proxy_route(  # noqa: PLR0915
                 )
                 raise
             retry_auth, direct_codex_selection_state = retry
+            prior_account_outcome = (
+                direct_codex_selection_state.get("prior_account_outcome")
+                if isinstance(direct_codex_selection_state, dict)
+                else None
+            )
+            failed_attempt = None
+            if isinstance(prior_account_outcome, dict):
+                failed_attempt = next(
+                    (
+                        attempt
+                        for attempt in _aawm_dev_fault_plan._direct_attempts(
+                            request
+                        )
+                        if isinstance(attempt, dict)
+                        and attempt.get("request_outcome") == "pending_failover"
+                        and attempt.get("account_hash")
+                        == prior_account_outcome.get("account_hash")
+                    ),
+                    None,
+                )
+                if failed_attempt is not None:
+                    failed_attempt.setdefault(
+                        "credential_reload_outcome",
+                        (
+                            "reloaded"
+                            if retry_auth.account_label
+                            == prior_account_outcome.get("account_label")
+                            else "moved_without_reload"
+                        ),
+                    )
+                    failed_attempt.setdefault("guard_reset_outcome", "reset")
+                    failed_attempt["failover_decision"] = "move_account"
+                    failed_attempt["terminal_reason"] = "success"
+                prior_account_outcome["credential_reload_outcome"] = (
+                    "reloaded"
+                    if retry_auth.account_label
+                    == prior_account_outcome.get("account_label")
+                    else "moved_without_reload"
+                )
+                prior_account_outcome["guard_reset_outcome"] = "reset"
+                prior_account_outcome["failover_decision"] = "move_account"
+                prior_account_outcome["terminal_reason"] = "success"
             base_target_url = os.getenv("CHATGPT_API_BASE") or CHATGPT_API_BASE
             openai_api_key = None
             extra_headers = dict(retry_auth.headers)

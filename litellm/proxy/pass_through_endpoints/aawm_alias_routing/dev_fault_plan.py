@@ -215,6 +215,148 @@ def _direct_attempts(request: Request) -> list[dict[str, Any]]:
     return attempts
 
 
+def _direct_request_trace(
+    request_body: dict[str, Any],
+    selection: dict[str, Any],
+) -> dict[str, Any]:
+    from . import session_affinity as _session_affinity
+
+    request_mode = selection.get("request_mode")
+    if request_mode not in {"fresh", "fresh_redispatch", "ordinary_continuation"}:
+        request_mode = "fresh"
+    replay_safe = (
+        _session_affinity.is_replay_safe_session_owner_redispatch_body(
+            request_body
+        )
+    )
+    return {
+        "request_mode": request_mode,
+        "has_previous_response_id": bool(
+            request_body.get("previous_response_id")
+        ),
+        "replay_safety": "replay_safe" if replay_safe else "replay_unsafe",
+        "has_account_bound_state": selection.get("has_account_bound_state"),
+        "account_bound_classification": selection.get(
+            "account_bound_classification"
+        ),
+    }
+
+
+def _direct_attempted_account_hashes(
+    request: Request,
+    attempts: list[dict[str, Any]],
+) -> list[str]:
+    """Return stable account hashes already attempted, in failover order."""
+    hashes: list[str] = []
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        account_hash = attempt.get("account_hash")
+        if (
+            isinstance(account_hash, str)
+            and account_hash
+            and account_hash not in hashes
+        ):
+            hashes.append(account_hash)
+
+    context = getattr(
+        getattr(request, "state", None),
+        "aawm_codex_oauth_request_local_failover_context",
+        None,
+    )
+    context_hashes = (
+        context.get("attempted_account_hashes")
+        if isinstance(context, dict)
+        else None
+    )
+    for account_hash in context_hashes or ():
+        if (
+            isinstance(account_hash, str)
+            and account_hash
+            and account_hash not in hashes
+        ):
+            hashes.append(account_hash)
+    return hashes
+
+
+def _apply_direct_attempt_trace(
+    request: Request,
+    request_body: dict[str, Any],
+    selection: dict[str, Any],
+    attempts: list[dict[str, Any]],
+    attempt_record: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Normalize bounded request-local decision evidence for every attempt."""
+    trace = _direct_request_trace(request_body, selection)
+    trace["attempted_account_hashes"] = _direct_attempted_account_hashes(
+        request,
+        attempts,
+    )
+    trace.update(
+        {
+            "account_failover_planned": bool(
+                attempt_record.get("account_failover_planned")
+            )
+            if attempt_record is not None
+            else False,
+            "account_failover_limit_reached": bool(
+                attempt_record.get("account_failover_limit_reached")
+            )
+            if attempt_record is not None
+            else False,
+            "guard_reset_outcome": (
+                attempt_record.get("guard_reset_outcome") or "not_attempted"
+            )
+            if attempt_record is not None
+            else "not_attempted",
+            "credential_reload_outcome": (
+                attempt_record.get("credential_reload_outcome")
+                or "not_attempted"
+            )
+            if attempt_record is not None
+            else "not_attempted",
+            "failover_decision": (
+                attempt_record.get("failover_decision") or "not_planned"
+            )
+            if attempt_record is not None
+            else "not_planned",
+            "terminal_reason": (
+                attempt_record.get("terminal_reason")
+                if attempt_record is not None
+                else None
+            ),
+        }
+    )
+    for attempt in attempts:
+        if not isinstance(attempt, dict):
+            continue
+        attempt.setdefault("replay_safety", trace["replay_safety"])
+        attempt.setdefault("guard_reset_outcome", "not_attempted")
+        attempt.setdefault("credential_reload_outcome", "not_attempted")
+        attempt.setdefault("failover_decision", "not_planned")
+        attempt["attempted_account_hashes"] = list(
+            trace["attempted_account_hashes"]
+        )
+    return trace
+
+
+def _copy_direct_attempt_trace_to_event(
+    event: dict[str, Any],
+    attempt_record: dict[str, Any],
+) -> None:
+    for field in (
+        "replay_safety",
+        "guard_reset_outcome",
+        "credential_reload_outcome",
+        "failover_decision",
+        "terminal_reason",
+        "attempted_account_hashes",
+    ):
+        value = attempt_record.get(field)
+        if value is not None:
+            event[field] = value
+
+
 def _add_direct_openai_managed_metadata(
     request_body: dict[str, Any],
     *,
@@ -222,6 +364,13 @@ def _add_direct_openai_managed_metadata(
     selection: dict[str, Any],
     attempts: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    trace = _apply_direct_attempt_trace(
+        request,
+        request_body,
+        selection,
+        attempts,
+        attempts[-1] if attempts and isinstance(attempts[-1], dict) else None,
+    )
     alias_model = _direct_alias_model(request_body, selection)
     current_body = _safe_get_request_parsed_body(request)
     metadata_body = (
@@ -235,12 +384,38 @@ def _add_direct_openai_managed_metadata(
         selection=selection,
         attempts=attempts,
     )
+    for event in audit_events:
+        if not isinstance(event, dict):
+            continue
+        attempt_number = event.get("attempt_number")
+        if (
+            isinstance(attempt_number, int)
+            and 1 <= attempt_number <= len(attempts)
+            and isinstance(attempts[attempt_number - 1], dict)
+        ):
+            _copy_direct_attempt_trace_to_event(
+                event,
+                attempts[attempt_number - 1],
+            )
+    metadata_trace = {
+        "replay_safety": trace["replay_safety"],
+        "guard_reset_outcome": trace["guard_reset_outcome"],
+        "credential_reload_outcome": trace["credential_reload_outcome"],
+        "failover_decision": trace["failover_decision"],
+        "attempted_account_hashes": trace["attempted_account_hashes"],
+    }
+    if trace["terminal_reason"] is not None:
+        metadata_trace["terminal_reason"] = trace["terminal_reason"]
     return _merge_litellm_metadata(
         metadata_body,
         extra_fields={
             "codex_auto_agent_attempts": attempts,
             "codex_auto_agent_audit_events": audit_events,
             "aawm_alias_routing_audit_events": audit_events,
+            **{
+                f"codex_auto_agent_{key}": value
+                for key, value in metadata_trace.items()
+            },
         },
     )
 
@@ -403,6 +578,13 @@ def note_direct_openai_managed_failure(
         request,
         attempt_record,
     )
+    _apply_direct_attempt_trace(
+        request,
+        request_body,
+        selection,
+        _direct_attempts(request),
+        attempt_record,
+    )
     _attempt_records._record_auto_agent_alias_attempt_failure(
         alias_family="codex_auto_agent",
         alias_model=_direct_alias_model(request_body, selection),
@@ -436,6 +618,38 @@ def note_direct_openai_managed_success(
     attempt_record = _current_direct_attempt(request)
     if attempt_record is None:
         return
+    attempts = _direct_attempts(request)
+    _apply_direct_attempt_trace(
+        request,
+        request_body,
+        selection,
+        attempts,
+        attempt_record,
+    )
+    prior_failover = any(
+        isinstance(attempt, dict)
+        and attempt is not attempt_record
+        and (
+            attempt.get("account_failover_planned")
+            or attempt.get("failover_decision") == "move_account"
+        )
+        for attempt in attempts
+    )
+    if prior_failover:
+        if attempt_record.get("credential_reload_outcome") in {
+            None,
+            "not_attempted",
+        }:
+            attempt_record["credential_reload_outcome"] = "moved_without_reload"
+        if attempt_record.get("guard_reset_outcome") in {
+            None,
+            "not_attempted",
+        }:
+            attempt_record["guard_reset_outcome"] = "reset"
+    attempt_record["failover_decision"] = (
+        "completed_after_failover" if prior_failover else "not_planned"
+    )
+    attempt_record["terminal_reason"] = "success"
     setattr(
         request_state,
         _OPENAI_FAULT_PLAN_DIRECT_SUCCESS_STATE_KEY,
@@ -492,6 +706,15 @@ def note_direct_openai_managed_terminal_exhaustion(
         not in {"usage_limit_reached", "token_invalidated"}
     ):
         return
+    attempt_record["terminal_reason"] = "account_failover_exhausted"
+    attempt_record["failover_decision"] = "terminal"
+    _apply_direct_attempt_trace(
+        request,
+        request_body,
+        selection,
+        _direct_attempts(request),
+        attempt_record,
+    )
     setattr(
         request_state,
         _OPENAI_FAULT_PLAN_DIRECT_TERMINAL_STATE_KEY,
@@ -533,6 +756,7 @@ def note_direct_openai_managed_terminal_exhaustion(
         attempted_provider_call=attempt_record.get("attempted_provider_call"),
     )
     event["attempt_count"] = len(attempts)
+    _copy_direct_attempt_trace_to_event(event, attempt_record)
     event["attempts"] = [dict(attempt) for attempt in attempts]
     event["candidates"] = [dict(attempt) for attempt in attempts]
     event["request_outcome"] = "failed"
@@ -552,6 +776,8 @@ def note_direct_openai_managed_terminal_exhaustion(
 
 __all__ = [
     "AawmOpenAIFaultPlanError",
+    "_apply_direct_attempt_trace",
+    "_copy_direct_attempt_trace_to_event",
     "_claim_openai_fault_plan_slot",
     "_get_openai_fault_plan_header",
     "_openai_fault_plan_control_enabled",

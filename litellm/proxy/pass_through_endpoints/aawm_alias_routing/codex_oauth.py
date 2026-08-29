@@ -460,6 +460,45 @@ def _get_codex_oauth_invalidation_recovery_state(
     return state
 
 
+def _record_codex_oauth_credential_reload_outcome(
+    request: Request,
+    *,
+    account_label: str,
+    outcome: str,
+) -> None:
+    if not account_label:
+        return
+    state = _get_codex_oauth_invalidation_recovery_state(request)
+    outcomes = state.setdefault("reload_outcomes", {})
+    if isinstance(outcomes, dict):
+        outcomes[account_label] = outcome
+
+
+def get_codex_oauth_credential_reload_outcome(
+    request: Request,
+    *,
+    account_label: str,
+) -> str:
+    """Return the request-local bounded reread outcome for one label."""
+    cleaned_label = _clean_codex_auth_value(account_label)
+    if cleaned_label is None:
+        return "not_attempted"
+    state = getattr(
+        request.state,
+        _CODEX_OAUTH_INVALIDATION_RECOVERY_STATE_ATTR,
+        None,
+    )
+    if not isinstance(state, dict):
+        return "not_attempted"
+    outcomes = state.get("reload_outcomes")
+    if not isinstance(outcomes, dict):
+        return "not_attempted"
+    outcome = outcomes.get(cleaned_label)
+    if outcome not in {"not_attempted", "reloaded", "unchanged_already_reloaded"}:
+        return "not_attempted"
+    return str(outcome)
+
+
 def _record_codex_oauth_dispatched_auth(
     request: Request,
     auth: "CodexOAuthRequestAuth",
@@ -497,9 +536,19 @@ async def reload_codex_oauth_credential_after_token_invalidated(
         return None
     reloaded = state.setdefault("reloaded", set())
     if cleaned_label in reloaded:
+        _record_codex_oauth_credential_reload_outcome(
+            request,
+            account_label=cleaned_label,
+            outcome="unchanged_already_reloaded",
+        )
         return None
     prior_fingerprint = state.get("fingerprints", {}).get(cleaned_label)
     if prior_fingerprint is None:
+        _record_codex_oauth_credential_reload_outcome(
+            request,
+            account_label=cleaned_label,
+            outcome="unchanged_already_reloaded",
+        )
         return None
     reloaded.add(cleaned_label)
 
@@ -512,6 +561,11 @@ async def reload_codex_oauth_credential_after_token_invalidated(
         inventory = load_codex_oauth_inventory()
         record = inventory.select_record(label=cleaned_label, model=model)
     except CodexOAuthInventoryError:
+        _record_codex_oauth_credential_reload_outcome(
+            request,
+            account_label=cleaned_label,
+            outcome="unchanged_already_reloaded",
+        )
         return None
     try:
         with credential_file_lock(record.lock_path):
@@ -519,8 +573,18 @@ async def reload_codex_oauth_credential_after_token_invalidated(
                 request, record
             )
     except (HTTPException, CredentialFileLockError):
+        _record_codex_oauth_credential_reload_outcome(
+            request,
+            account_label=cleaned_label,
+            outcome="unchanged_already_reloaded",
+        )
         return None
     if _codex_oauth_auth_fingerprint(selection) == prior_fingerprint:
+        _record_codex_oauth_credential_reload_outcome(
+            request,
+            account_label=cleaned_label,
+            outcome="unchanged_already_reloaded",
+        )
         return None
     if (
         (
@@ -532,8 +596,18 @@ async def reload_codex_oauth_credential_after_token_invalidated(
             and selection.lane_key != expected_lane_key
         )
     ):
+        _record_codex_oauth_credential_reload_outcome(
+            request,
+            account_label=cleaned_label,
+            outcome="unchanged_already_reloaded",
+        )
         return None
     _record_codex_oauth_dispatched_auth(request, selection)
+    _record_codex_oauth_credential_reload_outcome(
+        request,
+        account_label=cleaned_label,
+        outcome="reloaded",
+    )
     return selection
 
 
