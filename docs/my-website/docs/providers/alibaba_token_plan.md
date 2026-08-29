@@ -134,6 +134,14 @@ shared provider-credit observations.
 LiteLLM does not invent a per-token price for this subscription. Consumers must
 not interpret a null invoice cost as a free request.
 
+When an explicit Alibaba Token Plan five-hour or weekly exhaustion is detected
+in a response, LiteLLM publishes one shared account and lane cooldown covering
+`qwen3.8-max` and `qwen3.7-max`, including their last-resort use. Generic or
+ambiguous `429` responses do not trigger that cooldown. The cooldown lasts two
+hours plus up to one hour of jitter. Provider reset timestamps are sanitized
+telemetry only and are not used to schedule recovery. This behavior works
+without sidecar data.
+
 ## Acceptance boundary
 
 Instance-backed acceptance runs through the existing authenticated repository
