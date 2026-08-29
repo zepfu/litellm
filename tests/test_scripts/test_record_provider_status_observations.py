@@ -9302,7 +9302,7 @@ def test_compose_wires_codex_reset_credit_poll_defaults() -> None:
         in compose_text
     )
     assert (
-        "AAWM_CODEX_USAGE_URL=${AAWM_CODEX_USAGE_URL:-https://chatgpt.com/backend-api/wham/rate-limit-reset-credits}"
+        "AAWM_CODEX_USAGE_URL=${AAWM_CODEX_USAGE_URL:-https://chatgpt.com/backend-api/wham/usage}"
         in compose_text
     )
 
