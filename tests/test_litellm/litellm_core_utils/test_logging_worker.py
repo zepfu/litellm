@@ -446,6 +446,10 @@ class TestLoggingWorkerDiagnostics:
         context = record["context"]
 
         assert "LoggingWorker timed out" in record["message"]
+        assert record["traceback"] is None
+        assert record["traceback_text"] is None
+        assert record["traceback_lines"] == []
+        assert "asyncio.exceptions.TimeoutError" not in record["raw_text"]
         assert context["source"] == "logging_worker"
         assert context["event_type"] == "async_success"
         assert context["callback_name"] == "langfuse"
@@ -461,6 +465,78 @@ class TestLoggingWorkerDiagnostics:
         assert context["coroutine_name"] == "slow_async_success_handler"
         assert "sk-should-not-appear" not in record["raw_text"]
         assert "secret prompt" not in record["raw_text"]
+
+    @pytest.mark.asyncio
+    async def test_worker_timeout_preserves_cleanup_and_subsequent_delivery(self):
+        worker = LoggingWorker(timeout=0.02, max_queue_size=4, concurrency=1)
+        worker.start()
+
+        callback_cancelled = asyncio.Event()
+
+        async def slow_callback():
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                callback_cancelled.set()
+                raise
+
+        with patch(
+            "litellm.litellm_core_utils.logging_worker.verbose_logger"
+        ) as mock_logger:
+            worker.enqueue(
+                slow_callback(),
+                metadata={
+                    "callback_phase": "async_success_handler",
+                    "trace_id": "trace-timeout-cleanup",
+                },
+            )
+            await asyncio.sleep(0.15)
+
+            timeout_calls = [
+                call
+                for call in mock_logger.error.call_args_list
+                if "LoggingWorker timed out" in str(call)
+            ]
+            assert len(timeout_calls) == 1
+            assert "exc_info" not in timeout_calls[0].kwargs
+            assert timeout_calls[0].kwargs["extra"]["trace_id"] == "trace-timeout-cleanup"
+            assert (
+                timeout_calls[0].kwargs["extra"]["worker_delivery_state"] == "timed_out"
+            )
+
+            await asyncio.wait_for(callback_cancelled.wait(), timeout=1)
+            assert worker._queue is not None
+            assert worker._sem is not None
+            await asyncio.wait_for(worker._queue.join(), timeout=1)
+            assert worker._queue.empty()
+
+            subsequent_callback = AsyncMock()
+            subsequent_done = asyncio.Event()
+
+            async def subsequent_callback_with_signal():
+                await subsequent_callback()
+                subsequent_done.set()
+
+            worker.enqueue(
+                subsequent_callback_with_signal(),
+                metadata={"trace_id": "trace-after-timeout"},
+            )
+            await asyncio.wait_for(subsequent_done.wait(), timeout=1)
+            await asyncio.wait_for(worker._queue.join(), timeout=1)
+
+            running_tasks = list(worker._running_tasks)
+            if running_tasks:
+                await asyncio.wait_for(asyncio.gather(*running_tasks), timeout=1)
+            await asyncio.sleep(0)
+
+            assert len(mock_logger.error.call_args_list) == 1
+
+            assert not worker._running_tasks
+            assert not worker._helper_tasks
+            assert worker._sem is not None
+
+            await worker.stop()
+            assert subsequent_callback.called
 
     @pytest.mark.asyncio
     async def test_worker_non_timeout_failure_emits_safe_metadata(
@@ -501,6 +577,7 @@ class TestLoggingWorkerDiagnostics:
         record = json.loads((tmp_path / "dev-error.jsonl").read_text().strip())
         context = record["context"]
         assert "LoggingWorker failed while delivering" in record["message"]
+        assert "RuntimeError: callback exploded" in record["traceback_text"]
         assert context["worker_delivery_state"] == "failed"
         assert context["callback_phase"] == "async_success_handler"
         assert context["litellm_call_id"] == "call-fail-1"
@@ -625,6 +702,10 @@ class TestLoggingWorkerDiagnostics:
         context = record["context"]
 
         assert "LoggingWorker timed out" in record["message"]
+        assert record["traceback"] is None
+        assert record["traceback_text"] is None
+        assert record["traceback_lines"] == []
+        assert "asyncio.exceptions.TimeoutError" not in json.dumps(record)
         assert context["callback_name"] == "SlowLogger"
         assert context["callback_phase"] == "async_success_handler"
         assert context["litellm_call_id"] == "call-real-path"

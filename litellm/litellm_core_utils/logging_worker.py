@@ -302,7 +302,7 @@ class LoggingWorker:
                 f"worker_timeout_seconds={timeout_seconds}, "
                 f"worker_delivery_state={worker_delivery_state})"
             )
-            verbose_logger.error(message, exc_info=error, extra=extra)
+            verbose_logger.error(message, extra=extra)
             return
 
         verbose_logger.error(message, exc_info=error, extra=extra)
