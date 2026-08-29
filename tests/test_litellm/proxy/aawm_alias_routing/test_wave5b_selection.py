@@ -1971,23 +1971,41 @@ class TestAlibabaTokenPlanQuotaObservations:
         assert selection._get_codex_quota_observation_pool is None
         yield
 
-    def test_install_exports_hydration_row_identity_helper(self) -> None:
+    @pytest.mark.asyncio
+    async def test_install_rebound_hydration_normalizes_rows(self) -> None:
         original_functions = {
             name: getattr(selection, name) for name in selection._HOST_FUNCTION_NAMES
         }
         original_attach = selection._attach_aawm_alias_routing_state_sources
         try:
-            host_globals: dict[str, Any] = {}
-            selection.install(host_globals)
+            manager = AliasRoutingStateManager()
+            fetch = AsyncMock(return_value=[_alibaba_row()])
 
-            hydration = host_globals[
-                "_hydrate_alibaba_token_plan_quota_observations"
-            ]
-            assert hydration.__globals__ is host_globals
-            assert (
-                host_globals["_alibaba_token_plan_quota_row_account_hash"]
-                is selection._alibaba_token_plan_quota_row_account_hash
+            async def _get_pool():
+                return SimpleNamespace(fetch=fetch)
+
+            host_globals: dict[str, Any] = {
+                "asyncio": selection.asyncio,
+                "verbose_proxy_logger": selection.verbose_proxy_logger,
+            }
+            selection.install(host_globals)
+            host_globals.update(
+                {
+                    "alias_routing_state": manager,
+                    "_get_codex_quota_observation_environment": lambda: "prod",
+                    "_get_codex_quota_observation_pool": _get_pool,
+                }
             )
+
+            await host_globals[
+                "_hydrate_alibaba_token_plan_quota_observations"
+            ]()
+
+            fetch.assert_awaited_once()
+            observations = list(manager._normalized_quota_observations.values())
+            assert len(observations) == 1
+            assert observations[0]["account_hash"] == "hash-alibaba-1"
+            assert observations[0]["quota_key"] == "alibaba_token_plan_5h:credits"
         finally:
             for name, function in original_functions.items():
                 setattr(selection, name, function)

@@ -5171,6 +5171,7 @@ def install(host_globals: dict) -> None:
         "_alibaba_token_plan_quota_row_account_hash": (
             _alibaba_token_plan_quota_row_account_hash
         ),
+        "_codex_oauth_quota_json_mapping": _codex_oauth_quota_json_mapping,
         "_get_codex_quota_observation_pool": _get_codex_quota_observation_pool,
         "_get_codex_quota_observation_environment": (
             _get_codex_quota_observation_environment
