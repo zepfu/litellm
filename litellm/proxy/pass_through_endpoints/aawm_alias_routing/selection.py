@@ -1498,7 +1498,9 @@ async def _clear_alibaba_token_plan_account_quota_cooldown(
         for window in windows
     ):
         return False
-    from .cooldown_state import clear_alias_family_cooldown_state
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_state import (
+        clear_alias_family_cooldown_state,
+    )
 
     result = await clear_alias_family_cooldown_state(
         alias_family="codex",

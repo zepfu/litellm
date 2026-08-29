@@ -1972,7 +1972,10 @@ class TestAlibabaTokenPlanQuotaObservations:
         yield
 
     @pytest.mark.asyncio
-    async def test_install_rebound_hydration_normalizes_rows(self) -> None:
+    async def test_install_rebound_hydration_and_cooldown_clear(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         original_functions = {
             name: getattr(selection, name) for name in selection._HOST_FUNCTION_NAMES
         }
@@ -1980,6 +1983,12 @@ class TestAlibabaTokenPlanQuotaObservations:
         try:
             manager = AliasRoutingStateManager()
             fetch = AsyncMock(return_value=[_alibaba_row()])
+            clear_cooldown = AsyncMock(return_value=True)
+            monkeypatch.setattr(
+                cooldown_state,
+                "clear_alias_family_cooldown_state",
+                clear_cooldown,
+            )
 
             async def _get_pool():
                 return SimpleNamespace(fetch=fetch)
@@ -2006,6 +2015,26 @@ class TestAlibabaTokenPlanQuotaObservations:
             assert len(observations) == 1
             assert observations[0]["account_hash"] == "hash-alibaba-1"
             assert observations[0]["quota_key"] == "alibaba_token_plan_5h:credits"
+            assert await host_globals[
+                "_clear_alibaba_token_plan_account_quota_cooldown"
+            ](
+                {
+                    "windows": [
+                        {
+                            "remaining_pct": 25.0,
+                            "exhausted": False,
+                        }
+                    ]
+                }
+            )
+            clear_cooldown.assert_awaited_once_with(
+                alias_family="codex",
+                canonical_aliases=["alibaba_token_plan"],
+                cooldown_keys=[
+                    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+                ],
+                delete_durable=True,
+            )
         finally:
             for name, function in original_functions.items():
                 setattr(selection, name, function)
@@ -2085,7 +2114,9 @@ class TestAlibabaTokenPlanQuotaObservations:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         manager = AliasRoutingStateManager()
-        monkeypatch.setattr(selection, "alias_routing_state", manager)
+        _set_selection_runtime_value(
+            "alias_routing_state", manager, monkeypatch
+        )
         _set_selection_runtime_value(
             "_get_codex_quota_observation_environment",
             lambda: "prod",
@@ -2155,7 +2186,9 @@ class TestAlibabaTokenPlanQuotaObservations:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         manager = AliasRoutingStateManager()
-        monkeypatch.setattr(selection, "alias_routing_state", manager)
+        _set_selection_runtime_value(
+            "alias_routing_state", manager, monkeypatch
+        )
         now = time.time()
         _seed_alibaba_windows(remaining_pct=40.0, observed_at=now - 30)
         rows = [
@@ -2224,7 +2257,11 @@ class TestAlibabaTokenPlanQuotaObservations:
     async def test_fresh_exhausted_windows_block_both_alibaba_candidates(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(selection, "alias_routing_state", AliasRoutingStateManager())
+        _set_selection_runtime_value(
+            "alias_routing_state",
+            AliasRoutingStateManager(),
+            monkeypatch,
+        )
         _seed_alibaba_windows(remaining_pct=0.0)
         _set_selection_candidates(_alibaba_candidates())
         _set_selection_runtime_value(
@@ -2256,7 +2293,11 @@ class TestAlibabaTokenPlanQuotaObservations:
     async def test_newer_positive_row_cannot_mask_fresh_exhaustion(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(selection, "alias_routing_state", AliasRoutingStateManager())
+        _set_selection_runtime_value(
+            "alias_routing_state",
+            AliasRoutingStateManager(),
+            monkeypatch,
+        )
         _set_selection_runtime_value(
             "_hydrate_alibaba_token_plan_quota_observations",
             AsyncMock(return_value=None),
@@ -2370,8 +2411,10 @@ class TestAlibabaTokenPlanQuotaObservations:
     async def test_lone_fresh_exhausted_expired_reset_blocks_and_does_not_clear(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(
-            selection, "alias_routing_state", AliasRoutingStateManager()
+        _set_selection_runtime_value(
+            "alias_routing_state",
+            AliasRoutingStateManager(),
+            monkeypatch,
         )
         _set_selection_runtime_value(
             "_hydrate_alibaba_token_plan_quota_observations",
@@ -2551,7 +2594,11 @@ class TestAlibabaTokenPlanQuotaObservations:
     async def test_complete_positive_windows_clear_only_account_quota_key(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(selection, "alias_routing_state", AliasRoutingStateManager())
+        _set_selection_runtime_value(
+            "alias_routing_state",
+            AliasRoutingStateManager(),
+            monkeypatch,
+        )
         _seed_alibaba_windows(remaining_pct=40.0)
         _set_selection_candidates(_alibaba_candidates())
         manager = selection.alias_routing_state
