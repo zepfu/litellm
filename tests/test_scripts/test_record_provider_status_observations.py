@@ -4651,7 +4651,7 @@ def test_run_due_sidecar_tasks_resets_cached_token_when_ram_fingerprint_changes(
     monkeypatch.setattr(loop, "ALIBABA_QUOTA_HTTP_OPEN_FN", fake_urlopen)
     state = loop.SidecarTaskState()
     first = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
-    monkeypatch.setenv("ALIBABA_RAM_KEY", "LTAI5tRotatedAccessKeyId")
+    monkeypatch.setenv("ALIBABA_RAM_KEY", "fake-rotated-ram-key-id")
     second = loop.run_due_sidecar_tasks(config, state, now_monotonic=401.0)
 
     assert calls[:3] == ["Bearer first-bearer-secret"] * 3
@@ -8120,7 +8120,7 @@ def _codex_reset_credit_poll_config(**overrides):
         codex_reset_credit_poll_enabled=True,
         codex_reset_credit_poll_interval_seconds=3600.0,
         codex_reset_credit_poll_http_timeout_seconds=30.0,
-        codex_usage_url="https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",
+        codex_usage_url="https://chatgpt.com/backend-api/wham/usage",
         codex_reset_credit_poll_max_attempts=3,
         codex_reset_credit_poll_retry_backoff_seconds=0.5,
         grok_billing_poll_enabled=False,
@@ -8192,6 +8192,62 @@ def _codex_quota_payload(
         "rate_limit_reset_credits": {"available_count": 2},
         "rate_limits": rate_limits,
     }
+
+
+def _codex_live_quota_payload(
+    *,
+    include_legacy: bool = False,
+    include_spark: bool = False,
+) -> dict:
+    payload = {
+        "rate_limit": {
+            "limit_id": "codex_pro",
+            "limit_name": "Codex Pro",
+            "primary_window": {
+                "used_percent": 12.5,
+                "limit_window_seconds": 604800,
+                "reset_at": "2026-08-15T12:00:00Z",
+            },
+        }
+    }
+    if include_legacy:
+        payload["rate_limits"] = {
+            "primary": {
+                "used_percent": 99.0,
+                "window_minutes": 300,
+                "resets_at": "2026-08-08T18:00:00Z",
+            }
+        }
+    if include_spark:
+        payload["additional_rate_limits"] = [
+            {
+                "model": "gpt-5.3-codex-spark",
+                "quota_key": "codex_spark:tokens",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 20.0,
+                        "limit_window_seconds": 18000,
+                        "reset_at": "2026-08-08T18:00:00Z",
+                    },
+                    "secondary_window": {
+                        "used_percent": 30.0,
+                        "limit_window_seconds": 604800,
+                        "reset_at": "2026-08-15T12:00:00Z",
+                    },
+                },
+            },
+            {
+                "model": "gpt-5.3-codex-pro",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 80.0,
+                        "limit_window_seconds": 300,
+                        "reset_at": "2026-08-08T18:00:00Z",
+                    }
+                },
+            },
+        ]
+    return payload
 
 
 def _codex_reset_credit_auth_context(**overrides) -> dict:
@@ -8664,6 +8720,57 @@ def test_codex_quota_observations_keep_distinct_fresh_windows_without_inventing_
     )
 
 
+def test_codex_live_overall_weekly_window_prefers_singular_rate_limit() -> None:
+    config = _codex_reset_credit_poll_config(apply=False)
+    record = config.codex_oauth_inventory.records[0]
+
+    rows, summary = loop._build_codex_quota_rate_limit_observations(
+        config,
+        record=record,
+        observed_at=datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc),
+        response_body=_codex_live_quota_payload(include_legacy=True),
+    )
+
+    assert summary["period_states"] == {"seven_day": "fresh"}
+    assert [row["quota_period"] for row in rows] == ["seven_day"]
+    assert rows[0]["window_minutes"] == 10080
+    assert rows[0]["raw_provider_fields"]["limit_window_seconds"] == 604800
+    assert rows[0]["raw_provider_fields"]["reset_at"] == "2026-08-15T12:00:00Z"
+
+
+def test_codex_live_spark_windows_keep_durable_family_identity() -> None:
+    config = _codex_reset_credit_poll_config(apply=False)
+    record = config.codex_oauth_inventory.records[0]
+
+    rows, _summary = loop._build_codex_quota_rate_limit_observations(
+        config,
+        record=record,
+        observed_at=datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc),
+        response_body=_codex_live_quota_payload(include_spark=True),
+    )
+
+    overall_rows = [row for row in rows if row["quota_family"] == "overall"]
+    spark_rows = [row for row in rows if row["quota_family"] == "spark"]
+    assert [row["quota_period"] for row in overall_rows] == ["seven_day"]
+    assert {row["quota_period"] for row in spark_rows} == {
+        "five_hour",
+        "seven_day",
+    }
+    assert all(row["model"] == "gpt-5.3-codex-spark" for row in spark_rows)
+    assert all(row["quota_key"] == "codex_spark:tokens" for row in spark_rows)
+    assert all(
+        "gpt-5.3-codex-pro" not in str(row.get("model") or "")
+        for row in overall_rows
+    )
+    durable_columns = set()
+    for row in spark_rows:
+        db_payload = loop._build_codex_quota_observation_db_payload(row)
+        durable_columns.add((db_payload[5], db_payload[6]))
+    assert durable_columns == {
+        ("gpt-5.3-codex-spark", "codex_spark:tokens")
+    }
+
+
 def test_codex_quota_stale_and_unknown_windows_are_not_healthy() -> None:
     config = _codex_reset_credit_poll_config(apply=False)
     record = config.codex_oauth_inventory.records[0]
@@ -8741,6 +8848,7 @@ def test_codex_quota_poll_uses_each_inventory_records_exact_headers(
     config = _codex_reset_credit_poll_config(
         apply=False,
         codex_oauth_inventory=inventory,
+        codex_usage_url=probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL,
     )
     snapshots = {
         record.label: CodexOAuthCredentialSnapshot(
@@ -8765,6 +8873,7 @@ def test_codex_quota_poll_uses_each_inventory_records_exact_headers(
             (
                 request.get_header("Authorization"),
                 request.get_header("Chatgpt-account-id"),
+                request.full_url,
                 timeout,
             )
         )
@@ -8776,9 +8885,168 @@ def test_codex_quota_poll_uses_each_inventory_records_exact_headers(
         loop._fetch_codex_reset_credit_payload(config, record)
 
     assert requests == [
-        ("Bearer token-account1", "acct-account1", 30.0),
-        ("Bearer token-account2", "acct-account2", 30.0),
+        (
+            "Bearer token-account1",
+            "acct-account1",
+            probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL,
+            30.0,
+        ),
+        (
+            "Bearer token-account1",
+            "acct-account1",
+            "https://chatgpt.com/backend-api/wham/usage",
+            30.0,
+        ),
+        (
+            "Bearer token-account2",
+            "acct-account2",
+            probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL,
+            30.0,
+        ),
+        (
+            "Bearer token-account2",
+            "acct-account2",
+            "https://chatgpt.com/backend-api/wham/usage",
+            30.0,
+        ),
     ]
+
+
+@pytest.mark.parametrize("failing_component", ["reset-credit", "usage"])
+def test_codex_quota_poll_components_persist_independently(
+    monkeypatch,
+    failing_component,
+) -> None:
+    config = _codex_reset_credit_poll_config()
+    calls = []
+    persisted = {"credit": 0, "quota": 0}
+    record = config.codex_oauth_inventory.records[0]
+
+    def fake_endpoint_fetch(
+        _config,
+        fetch_record,
+        *,
+        poll_url,
+        endpoint_name,
+    ):
+        calls.append((fetch_record.label, endpoint_name, poll_url))
+        if endpoint_name == failing_component:
+            raise loop.CodexResetCreditPollError(
+                f"{endpoint_name} unavailable",
+                status_code=503,
+                attempt_count=1,
+                retry_count=0,
+            )
+        payload = (
+            _codex_reset_credit_payload_detail()
+            if endpoint_name == "reset-credit"
+            else _codex_quota_payload()
+        )
+        return {
+            "status_code": 200,
+            "payload": payload,
+            "auth_context": _codex_reset_credit_auth_context(),
+            "attempt_count": 1,
+            "retry_count": 0,
+            "poll_url": poll_url,
+        }
+
+    monkeypatch.setattr(loop, "_fetch_codex_endpoint_payload", fake_endpoint_fetch)
+    monkeypatch.setattr(
+        loop,
+        "_persist_codex_reset_credit_observation",
+        lambda *_args, **_kwargs: (
+            persisted.__setitem__("credit", persisted["credit"] + 1) or (1, 1)
+        ),
+    )
+    monkeypatch.setattr(
+        loop,
+        "_persist_codex_quota_observations",
+        lambda _config, observations: (
+            persisted.__setitem__("quota", len(observations))
+            or len(observations)
+        ),
+    )
+
+    events = loop._run_codex_reset_credit_poll_task(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+    poll = next(
+        event for event in events if event["event"] == "codex_reset_credit_poll"
+    )
+
+    assert calls == [
+        (
+            record.label,
+            "reset-credit",
+            probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL,
+        ),
+        (
+            record.label,
+            "usage",
+            "https://chatgpt.com/backend-api/wham/usage",
+        ),
+    ]
+    if failing_component == "reset-credit":
+        assert poll["credit_persisted"] is False
+        assert poll["quota_storage_status"] == "persisted"
+        assert poll["quota_observation_count"] == 2
+        assert persisted == {"credit": 0, "quota": 2}
+    else:
+        assert poll["credit_persisted"] is True
+        assert poll["credit_inserted_count"] == 1
+        assert poll["quota_storage_status"] == "fetch_failed"
+        assert poll["quota_observation_count"] == 0
+        assert persisted == {"credit": 1, "quota": 0}
+
+
+def test_codex_quota_poll_reports_both_component_fetch_failures(
+    monkeypatch,
+) -> None:
+    config = _codex_reset_credit_poll_config()
+    calls = []
+
+    def fake_endpoint_fetch(
+        _config,
+        _record,
+        *,
+        poll_url,
+        endpoint_name,
+    ):
+        calls.append((endpoint_name, poll_url))
+        raise loop.CodexResetCreditPollError(
+            f"{endpoint_name} unavailable Authorization=Bearer secret-token",
+            status_code=503,
+            attempt_count=1,
+            retry_count=0,
+        )
+
+    monkeypatch.setattr(loop, "_fetch_codex_endpoint_payload", fake_endpoint_fetch)
+
+    events = loop._run_codex_reset_credit_poll_task(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+    poll = next(
+        event for event in events if event["event"] == "codex_reset_credit_poll"
+    )
+
+    assert calls == [
+        ("reset-credit", probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL),
+        ("usage", loop.DEFAULT_CODEX_USAGE_URL),
+    ]
+    assert poll["reset_credit_error_class"] == "CodexResetCreditPollError"
+    assert poll["quota_error_class"] == "CodexResetCreditPollError"
+    assert poll["error_class"] == "CodexTelemetryComponentsFailed"
+    assert poll["credit_persisted"] is False
+    assert poll["quota_storage_status"] == "fetch_failed"
+    assert "reset-credit unavailable" in poll["reset_credit_error_message"]
+    assert "usage unavailable" in poll["quota_error_message"]
+    assert "secret-token" not in poll["reset_credit_error_message"]
+    assert "secret-token" not in poll["quota_error_message"]
 
 
 def test_codex_quota_poll_failure_does_not_suppress_other_account(
@@ -9307,14 +9575,15 @@ def test_compose_wires_codex_reset_credit_poll_defaults() -> None:
     )
 
 
-def test_resolve_codex_reset_credit_poll_url_maps_legacy_usage_to_detail() -> None:
+def test_resolve_codex_poll_urls_map_historical_detail_usage_value() -> None:
     config = _codex_reset_credit_poll_config(
-        codex_usage_url="https://chatgpt.com/backend-api/wham/usage"
+        codex_usage_url=probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL
     )
     assert (
         loop._resolve_codex_reset_credit_poll_url(config)
         == probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL
     )
+    assert loop._resolve_codex_usage_poll_url(config) == loop.DEFAULT_CODEX_USAGE_URL
 
 
 def test_parse_codex_reset_credit_detail_credits_builds_per_credit_rows() -> None:

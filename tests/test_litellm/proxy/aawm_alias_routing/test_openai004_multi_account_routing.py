@@ -3868,6 +3868,52 @@ def test_dual_quota_balance_and_within_band_alternation() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dual_quota_balance_accepts_observations_past_30_seconds_until_cadence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = _interchangeable_inventory()
+    monkeypatch.setattr(
+        codex_oauth_inventory,
+        "load_codex_oauth_inventory",
+        lambda: inventory,
+    )
+    monkeypatch.setattr(
+        codex_oauth,
+        "_load_codex_oauth_headers_for_record",
+        _healthy_auth,
+    )
+    _patch_selector_runtime(monkeypatch)
+    monkeypatch.setenv(
+        "AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS",
+        "3600",
+    )
+    now = datetime.now(timezone.utc)
+    alias_routing_state.record_normalized_quota_observations(
+        [
+            *_record_account_windows(
+                account_hash="hash-account-1",
+                observed_at=now - timedelta(seconds=3599),
+                five_hour_remaining=80.0,
+                weekly_remaining=10.0,
+            ),
+            *_record_account_windows(
+                account_hash="hash-account-2",
+                observed_at=now - timedelta(seconds=3599),
+                five_hour_remaining=80.0,
+                weekly_remaining=90.0,
+            ),
+        ]
+    )
+
+    selected = await lpe._select_codex_auto_agent_candidate(
+        request=_request(),
+        request_body={"model": "basic"},
+    )
+
+    assert selected["candidate"]["codex_oauth_account_label"] == "account2"
+
+
+@pytest.mark.asyncio
 async def test_openai_proxy_route_direct_uses_inventory_not_client_or_api_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

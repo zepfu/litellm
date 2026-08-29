@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -119,6 +120,8 @@ _get_codex_quota_observation_environment: Optional[
 _CODEX_OAUTH_QUOTA_CACHE_TTL_SECONDS = 30.0
 _CODEX_OAUTH_QUOTA_FAILURE_RETRY_SECONDS = 5.0
 _CODEX_OAUTH_QUOTA_LOOKUP_TIMEOUT_SECONDS = 0.5
+_CODEX_OAUTH_QUOTA_VALIDITY_DEFAULT_SECONDS = 3600.0
+_CODEX_OAUTH_QUOTA_VALIDITY_ENV = "AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS"
 _CODEX_OAUTH_QUOTA_CLIENT = "codex"
 _CODEX_OAUTH_QUOTA_SOURCE = "codex_quota_poll"
 _CODEX_OAUTH_WEEKLY_BALANCE_BAND_PP = 10.0
@@ -2393,6 +2396,41 @@ def _codex_oauth_window_remaining_pct(window: Mapping[str, Any]) -> Optional[flo
     return remaining
 
 
+def _codex_oauth_quota_validity_horizon_seconds() -> float:
+    configured = os.getenv(_CODEX_OAUTH_QUOTA_VALIDITY_ENV)
+    if configured is None:
+        return _CODEX_OAUTH_QUOTA_VALIDITY_DEFAULT_SECONDS
+    try:
+        parsed = float(configured)
+    except (TypeError, ValueError):
+        return _CODEX_OAUTH_QUOTA_VALIDITY_DEFAULT_SECONDS
+    if not math.isfinite(parsed) or parsed <= 0:
+        return _CODEX_OAUTH_QUOTA_VALIDITY_DEFAULT_SECONDS
+    return parsed
+
+
+def _codex_oauth_expected_quota_environment() -> Optional[str]:
+    if _get_codex_quota_observation_environment is None:
+        return None
+    try:
+        environment = str(
+            _get_codex_quota_observation_environment() or ""
+        ).strip()
+    except Exception:
+        return None
+    return environment or None
+
+
+def _codex_oauth_window_matches_environment(
+    window: Mapping[str, Any],
+    *,
+    expected_environment: Optional[str],
+) -> bool:
+    if expected_environment is None:
+        return True
+    return str(window.get("environment") or "").strip() == expected_environment
+
+
 def _codex_oauth_window_is_weekly(window: Mapping[str, Any]) -> bool:
     period = str(
         window.get("quota_period") or window.get("window") or ""
@@ -2517,11 +2555,20 @@ def _codex_oauth_dual_family_remaining(
     account_hash = str(
         candidate.get("codex_oauth_account_hash") or ""
     ).strip()
+    expected_environment = _codex_oauth_expected_quota_environment()
     windows = alias_routing_state.resolve_normalized_quota_windows_for_account(
         provider=str(candidate.get("provider") or ""),
         account_hash=account_hash,
-        max_age_seconds=30.0,
+        max_age_seconds=_codex_oauth_quota_validity_horizon_seconds(),
     )
+    windows = [
+        window
+        for window in windows
+        if _codex_oauth_window_matches_environment(
+            window,
+            expected_environment=expected_environment,
+        )
+    ]
     return {
         family: _codex_oauth_weekly_remaining_pct_from_windows(
             _filter_codex_oauth_quota_windows_for_family(
@@ -2864,6 +2911,7 @@ def _attach_normalized_quota_state(
     )
     request_model = str(candidate.get("model") or "")
     quota_family = _codex_oauth_quota_family_for_model(request_model)
+    expected_environment = _codex_oauth_expected_quota_environment()
     observation = _alias_routing_state.resolve_normalized_quota_observation(
         provider=str(candidate.get("provider") or ""),
         model=request_model,
@@ -2872,8 +2920,15 @@ def _attach_normalized_quota_state(
             if selected_account_hash is not None
             else None
         ),
+        max_age_seconds=_codex_oauth_quota_validity_horizon_seconds(),
     )
     if observation is None:
+        return state
+    if (
+        expected_environment is not None
+        and str(observation.get("environment") or "").strip()
+        != expected_environment
+    ):
         return state
 
     raw_windows = observation.get("windows")
@@ -2885,6 +2940,14 @@ def _attach_normalized_quota_state(
         if isinstance(raw_windows, list)
         else []
     )
+    family_windows = [
+        window
+        for window in family_windows
+        if _codex_oauth_window_matches_environment(
+            window,
+            expected_environment=expected_environment,
+        )
+    ]
     if not family_windows:
         # Do not let the other quota family hide or invent exhaustion/remaining.
         return state
@@ -5109,6 +5172,20 @@ def install(host_globals: dict) -> None:
         "_get_codex_quota_observation_environment": (
             _get_codex_quota_observation_environment
         ),
+        "_codex_oauth_quota_validity_horizon_seconds": (
+            _codex_oauth_quota_validity_horizon_seconds
+        ),
+        "_codex_oauth_expected_quota_environment": (
+            _codex_oauth_expected_quota_environment
+        ),
+        "_codex_oauth_window_matches_environment": (
+            _codex_oauth_window_matches_environment
+        ),
+        "_CODEX_OAUTH_QUOTA_VALIDITY_DEFAULT_SECONDS": (
+            _CODEX_OAUTH_QUOTA_VALIDITY_DEFAULT_SECONDS
+        ),
+        "_CODEX_OAUTH_QUOTA_VALIDITY_ENV": _CODEX_OAUTH_QUOTA_VALIDITY_ENV,
+        "os": os,
         "_hydrate_alibaba_token_plan_quota_observations": (
             _hydrate_alibaba_token_plan_quota_observations
         ),

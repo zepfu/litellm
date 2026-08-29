@@ -1755,6 +1755,31 @@ def _oauth_account_candidate(
     }
 
 
+def _codex_oauth_quota_observation(
+    *,
+    observed_at: float,
+    expected_reset_at: float,
+    environment: str = "prod",
+) -> dict[str, Any]:
+    return {
+        "provider": "openai",
+        "model": "gpt-5.3-codex",
+        "account_hash": "hash-account-1",
+        "environment": environment,
+        "quota_key": "codex:seven_day",
+        "quota_type": "tokens",
+        "limit_scope": "secondary",
+        "quota_period": "seven_day",
+        "window_minutes": 10080,
+        "remaining_pct": 75.0,
+        "observed_at": observed_at,
+        "expected_reset_at": expected_reset_at,
+        "status": "fresh",
+        "exhausted": False,
+        "source": "codex_quota_poll",
+    }
+
+
 def _alibaba_observation(
     *,
     window: str,
@@ -1855,6 +1880,88 @@ def _alibaba_row(
         "environment": environment,
         "source": "alibaba_token_plan_usage",
     }
+
+
+@pytest.mark.parametrize(
+    ("age_seconds", "reset_offset_seconds", "environment", "expected_valid"),
+    [
+        (3599.0, 1.0, "prod", True),
+        (3601.0, 1.0, "prod", False),
+        (1.0, 1.0, "prod", True),
+        (1.0, -1.0, "prod", False),
+        (-1.0, 1.0, "prod", False),
+        (1.0, 1.0, "staging", False),
+    ],
+)
+def test_codex_quota_validity_boundaries_apply_to_both_selection_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    age_seconds: float,
+    reset_offset_seconds: float,
+    environment: str,
+    expected_valid: bool,
+) -> None:
+    monkeypatch.setenv(
+        "AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS",
+        "3600",
+    )
+    _set_selection_runtime_value(
+        "_get_codex_quota_observation_environment",
+        lambda: "prod",
+        monkeypatch,
+    )
+    manager = selection.alias_routing_state
+    manager.reset_for_tests()
+    now = time.time()
+    manager.record_normalized_quota_observations(
+        [
+            _codex_oauth_quota_observation(
+                observed_at=now - age_seconds,
+                expected_reset_at=now + reset_offset_seconds,
+                environment=environment,
+            )
+        ]
+    )
+    state = {"candidate": _oauth_account_candidate()}
+
+    dual_family = selection._codex_oauth_dual_family_remaining(state)
+    attached = selection._attach_normalized_quota_state(dict(state))
+
+    if expected_valid:
+        assert dual_family["overall"] == 75.0
+        assert "quota_observation" in attached
+    else:
+        assert dual_family == {"overall": None, "spark": None}
+        assert "quota_observation" not in attached
+    manager.reset_for_tests()
+
+
+def test_codex_quota_hydration_ttl_remains_30_seconds() -> None:
+    manager = AliasRoutingStateManager()
+    now_monotonic = time.monotonic()
+
+    assert selection._CODEX_OAUTH_QUOTA_CACHE_TTL_SECONDS == 30.0
+    assert manager.codex_quota_hydration_due_account_hashes(
+        ("hash-account-1",),
+        environment="prod",
+        now_monotonic=now_monotonic,
+    ) == ("hash-account-1",)
+
+    manager.defer_codex_quota_hydration(
+        ("hash-account-1",),
+        environment="prod",
+        ttl_seconds=selection._CODEX_OAUTH_QUOTA_CACHE_TTL_SECONDS,
+        now_monotonic=now_monotonic,
+    )
+    assert manager.codex_quota_hydration_due_account_hashes(
+        ("hash-account-1",),
+        environment="prod",
+        now_monotonic=now_monotonic + 29.999,
+    ) == ()
+    assert manager.codex_quota_hydration_due_account_hashes(
+        ("hash-account-1",),
+        environment="prod",
+        now_monotonic=now_monotonic + 30.0,
+    ) == ("hash-account-1",)
 
 
 class TestAlibabaTokenPlanQuotaObservations:
