@@ -166,6 +166,13 @@ def _adapter_wrapped_unpersisted_item_not_found_error(
     return exc
 
 
+def _opaque_unpersisted_item_not_found_error(detail: bytes) -> ProxyException:
+    message = detail.decode()
+    valid_error = _adapter_wrapped_unpersisted_item_not_found_error(detail=message)
+    valid_error.detail = detail
+    return valid_error
+
+
 def _stream_token_invalidated_error() -> HTTPException:
     return ResponsesStreamPreCommitFailure(
         error_class="token_invalidated",
@@ -4448,6 +4455,41 @@ def test_openai_responses_unpersisted_item_not_found_accepts_exact_adapter_wrapp
         candidate=candidate,
         endpoint=endpoint,
     )
+
+
+def test_openai_responses_unpersisted_item_not_found_accepts_opaque_bytes_details() -> None:
+    candidate = _candidate()
+    endpoint = "/v1/responses"
+    exact_detail = json.dumps(
+        {
+            "error": {
+                "message": _OPENAI_RESPONSES_UNPERSISTED_ITEM_CURRENT_MESSAGE,
+                "type": "invalid_request_error",
+            }
+        }
+    )
+
+    exact_bytes_literal = f"b{exact_detail!r}".encode()
+    for detail in (exact_detail.encode(), exact_bytes_literal):
+        assert error_signals.is_openai_responses_unpersisted_item_not_found_error(
+            _opaque_unpersisted_item_not_found_error(detail),
+            candidate=candidate,
+            endpoint=endpoint,
+            provider_returned=True,
+        )
+
+    wrapped_bytes_literal = f'provider error: {exact_bytes_literal.decode()}'.encode()
+    duplicated_bytes_literal = (
+        f"{exact_bytes_literal.decode()}\n{exact_bytes_literal.decode()}".encode()
+    )
+    invalid_details = (wrapped_bytes_literal, duplicated_bytes_literal)
+    for detail in invalid_details:
+        assert not error_signals.is_openai_responses_unpersisted_item_not_found_error(
+            _opaque_unpersisted_item_not_found_error(detail),
+            candidate=candidate,
+            endpoint=endpoint,
+            provider_returned=True,
+        )
 
 
 @pytest.mark.asyncio

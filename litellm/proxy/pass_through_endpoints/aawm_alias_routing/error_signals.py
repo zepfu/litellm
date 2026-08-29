@@ -1280,8 +1280,21 @@ def _openai_responses_unpersisted_item_not_found_message(exc: Any) -> Optional[s
     detail = getattr(exc, "detail", None)
     if isinstance(detail, dict):
         payloads: list[object] = [detail]
-    elif isinstance(detail, str):
-        payloads = _parse_json_payloads_from_text_candidates([detail])
+    elif isinstance(detail, (str, bytes)):
+        detail_text = (
+            detail.decode("utf-8", errors="ignore")
+            if isinstance(detail, bytes)
+            else detail
+        )
+        stripped_detail = detail_text.strip()
+        if stripped_detail.startswith(("b'", 'b"')):
+            try:
+                literal_detail = ast.literal_eval(stripped_detail)
+            except Exception:
+                literal_detail = None
+            if isinstance(literal_detail, bytes):
+                detail_text = literal_detail.decode("utf-8", errors="ignore")
+        payloads = _parse_json_payloads_from_text_candidates([detail_text])
     else:
         return None
     if len(payloads) != 1 or not isinstance(payloads[0], dict):
