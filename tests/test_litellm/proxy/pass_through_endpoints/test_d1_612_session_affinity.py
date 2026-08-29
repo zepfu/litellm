@@ -215,6 +215,420 @@ def _full_attrs(**over: Any) -> dict[str, Any]:
     return base
 
 
+async def _seed_nonheld_compatible_owner_lease(
+    *,
+    request: Any,
+    session_identity: str,
+    attributes: dict[str, Any],
+) -> sa.SessionOwnerLease:
+    reserved = await sa.guard_session_owner_before_egress(
+        session_identity=session_identity,
+        requested_attributes=attributes,
+    )
+    assert reserved.decision is sa.SessionOwnerGuardDecision.UNOWNED_RESERVED
+    promoted = await sa.promote_session_owner_reservation(
+        session_identity=session_identity,
+        reservation_token=reserved.reservation_token,
+        attributes=attributes,
+    )
+    assert promoted.outcome is sa.SessionOwnerMutationOutcome.PROMOTED
+    continuation = await sa.ensure_session_owner_guard_for_request(
+        request=request,
+        session_identity=session_identity,
+        requested_attributes=attributes,
+        require_exact_attributes=True,
+        raise_on_redispatch=False,
+    )
+    assert continuation.decision is sa.SessionOwnerGuardDecision.COMPATIBLE_OWNER
+    lease = sa.get_request_session_owner_lease(request)
+    assert lease is not None
+    assert lease.held_reservation is False
+    return lease
+
+
+def _redis_snapshot(redis: _FakeRedisCache) -> tuple[Any, Any, Any]:
+    return dict(redis._data), dict(redis._ttl), dict(redis._expires_at)
+
+
+@pytest.mark.asyncio
+async def test_clear_compatible_nonheld_guard_accepts_portable_safe_body() -> None:
+    redis = _FakeRedisCache()
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    session_identity = "sess-openai-027-rebind"
+    current = _full_attrs(credential_affinity="interchangeable")
+    alternate = _full_attrs(
+        account_hash="acct-2",
+        account_label="secondary",
+        account_lane="lane-b",
+        credential_affinity="interchangeable",
+    )
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        lease = await _seed_nonheld_compatible_owner_lease(
+            request=request,
+            session_identity=session_identity,
+            attributes=current,
+        )
+        before = _redis_snapshot(redis)
+        cleared = (
+            await sa.clear_compatible_non_held_request_session_owner_guard_for_failover(
+                request=request,
+                request_body={
+                    "model": current["model"],
+                    "input": [{"role": "user", "content": "portable"}],
+                },
+                current_attributes=current,
+                alternate_attributes=alternate,
+                account_failover_planned=True,
+                account_failover_replay_safe=True,
+                has_account_bound_state=False,
+                post_commit_retry=False,
+            )
+        )
+        after = _redis_snapshot(redis)
+
+    assert cleared is True
+    assert sa.get_request_session_owner_lease(request) is None
+    assert request.state._aawm_session_owner_guarded is False
+    assert before == after
+    assert lease.released is False
+    assert lease.promoted is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "request_body",
+    [
+        {"previous_response_id": "resp_1"},
+        {"input": [{"previous_response_id": "resp_1"}]},
+        {"input": [{"id": "rs_opaque_item"}]},
+    ],
+)
+async def test_clear_compatible_nonheld_guard_rejects_provider_owned_replay_state(
+    request_body: dict[str, Any],
+) -> None:
+    redis = _FakeRedisCache()
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    session_identity = "sess-openai-027-replay-reject"
+    current = _full_attrs(credential_affinity="interchangeable")
+    alternate = _full_attrs(
+        account_hash="acct-2",
+        account_label="secondary",
+        account_lane="lane-b",
+        credential_affinity="interchangeable",
+    )
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        lease = await _seed_nonheld_compatible_owner_lease(
+            request=request,
+            session_identity=session_identity,
+            attributes=current,
+        )
+        before = _redis_snapshot(redis)
+        cleared = (
+            await sa.clear_compatible_non_held_request_session_owner_guard_for_failover(
+                request=request,
+                request_body=request_body,
+                current_attributes=current,
+                alternate_attributes=alternate,
+                account_failover_planned=True,
+                account_failover_replay_safe=True,
+                has_account_bound_state=False,
+                post_commit_retry=False,
+            )
+        )
+        after = _redis_snapshot(redis)
+
+    assert cleared is False
+    assert sa.get_request_session_owner_lease(request) is lease
+    assert request.state._aawm_session_owner_guarded is True
+    assert before == after
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failover_overrides", "credential_affinity"),
+    [
+        pytest.param(
+            {"account_failover_planned": False},
+            "interchangeable",
+            id="not-planned",
+        ),
+        pytest.param(
+            {"account_failover_replay_safe": False},
+            "interchangeable",
+            id="not-replay-safe",
+        ),
+        pytest.param(
+            {"has_account_bound_state": True},
+            "interchangeable",
+            id="account-bound-state",
+        ),
+        pytest.param(
+            {"post_commit_retry": True},
+            "interchangeable",
+            id="post-commit",
+        ),
+        pytest.param({"failover_ordinal": 2}, "interchangeable", id="second-move"),
+        pytest.param({}, "account_bound", id="non-interchangeable"),
+    ],
+)
+async def test_clear_compatible_nonheld_guard_rejects_unsafe_failover_context(
+    failover_overrides: dict[str, Any],
+    credential_affinity: str,
+) -> None:
+    redis = _FakeRedisCache()
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    session_identity = "sess-openai-027-context-reject"
+    current = _full_attrs(credential_affinity=credential_affinity)
+    alternate = _full_attrs(
+        account_hash="acct-2",
+        account_label="secondary",
+        account_lane="lane-b",
+        credential_affinity=credential_affinity,
+    )
+    failover_context = {
+        "account_failover_planned": True,
+        "account_failover_replay_safe": True,
+        "has_account_bound_state": False,
+        "post_commit_retry": False,
+        "failover_ordinal": 1,
+        **failover_overrides,
+    }
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        lease = await _seed_nonheld_compatible_owner_lease(
+            request=request,
+            session_identity=session_identity,
+            attributes=current,
+        )
+        before = _redis_snapshot(redis)
+        cleared = (
+            await sa.clear_compatible_non_held_request_session_owner_guard_for_failover(
+                request=request,
+                request_body={"input": [{"role": "user", "content": "portable"}]},
+                current_attributes=current,
+                alternate_attributes=alternate,
+                **failover_context,
+            )
+        )
+        after = _redis_snapshot(redis)
+
+    assert cleared is False
+    assert sa.get_request_session_owner_lease(request) is lease
+    assert request.state._aawm_session_owner_guarded is True
+    assert before == after
+
+
+@pytest.mark.asyncio
+async def test_clear_compatible_nonheld_guard_rejects_held_lease() -> None:
+    redis = _FakeRedisCache()
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    session_identity = "sess-openai-027-held"
+    current = _full_attrs(credential_affinity="interchangeable")
+    alternate = _full_attrs(
+        account_hash="acct-2",
+        account_label="secondary",
+        account_lane="lane-b",
+        credential_affinity="interchangeable",
+    )
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        reserved = await sa.guard_session_owner_before_egress(
+            session_identity=session_identity,
+            requested_attributes=current,
+        )
+        lease = sa.lease_from_guard_result(reserved, attributes=current)
+        sa.set_request_session_owner_lease(request, lease)
+        before = _redis_snapshot(redis)
+        cleared = (
+            await sa.clear_compatible_non_held_request_session_owner_guard_for_failover(
+                request=request,
+                request_body={"input": [{"role": "user", "content": "portable"}]},
+                current_attributes=current,
+                alternate_attributes=alternate,
+                account_failover_planned=True,
+                account_failover_replay_safe=True,
+                has_account_bound_state=False,
+                post_commit_retry=False,
+            )
+        )
+        after = _redis_snapshot(redis)
+
+    assert cleared is False
+    assert sa.get_request_session_owner_lease(request) is lease
+    assert request.state._aawm_session_owner_guarded is True
+    assert before == after
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("durable_state", "durable_owner"),
+    [("reserved", "foreign-owner"), ("owned", "foreign-owner")],
+)
+async def test_clear_compatible_nonheld_guard_rejects_durable_reservation_or_foreign_owner(
+    durable_state: str,
+    durable_owner: str,
+) -> None:
+    redis = _FakeRedisCache()
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    session_identity = "sess-openai-027-durable-reject"
+    current = _full_attrs(credential_affinity="interchangeable")
+    alternate = _full_attrs(
+        account_hash="acct-2",
+        account_label="secondary",
+        account_lane="lane-b",
+        credential_affinity="interchangeable",
+    )
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        lease = await _seed_nonheld_compatible_owner_lease(
+            request=request,
+            session_identity=session_identity,
+            attributes=current,
+        )
+        cache_key = sa.build_aawm_alias_routing_session_owner_cache_key(
+            session_identity=session_identity
+        )
+        namespaced_key = redis.check_and_fix_namespace(cache_key)
+        record = json.loads(redis._data[namespaced_key].decode("utf-8"))
+        record["state"] = durable_state
+        record["owner"] = durable_owner
+        if durable_state == "reserved":
+            record["reservation_token"] = "foreign-token"
+        redis._data[namespaced_key] = json.dumps(record).encode("utf-8")
+        before = _redis_snapshot(redis)
+        cleared = (
+            await sa.clear_compatible_non_held_request_session_owner_guard_for_failover(
+                request=request,
+                request_body={"input": [{"role": "user", "content": "portable"}]},
+                current_attributes=current,
+                alternate_attributes=alternate,
+                account_failover_planned=True,
+                account_failover_replay_safe=True,
+                has_account_bound_state=False,
+                post_commit_retry=False,
+            )
+        )
+        after = _redis_snapshot(redis)
+
+    assert cleared is False
+    assert sa.get_request_session_owner_lease(request) is lease
+    assert request.state._aawm_session_owner_guarded is True
+    assert before == after
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "alternate_overrides",
+    [
+        {"provider": "xai"},
+        {"model": "gpt-5.6-other"},
+        {"route_family": "other_route"},
+        {"endpoint_contract": "other_endpoint"},
+        {"state_format": "other_state"},
+    ],
+)
+async def test_clear_compatible_nonheld_guard_rejects_incompatible_alternate(
+    alternate_overrides: dict[str, Any],
+) -> None:
+    redis = _FakeRedisCache()
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    session_identity = "sess-openai-027-incompatible"
+    current = _full_attrs(credential_affinity="interchangeable")
+    alternate = _full_attrs(
+        account_hash="acct-2",
+        account_label="secondary",
+        account_lane="lane-b",
+        credential_affinity="interchangeable",
+        **alternate_overrides,
+    )
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        lease = await _seed_nonheld_compatible_owner_lease(
+            request=request,
+            session_identity=session_identity,
+            attributes=current,
+        )
+        before = _redis_snapshot(redis)
+        cleared = (
+            await sa.clear_compatible_non_held_request_session_owner_guard_for_failover(
+                request=request,
+                request_body={"input": [{"role": "user", "content": "portable"}]},
+                current_attributes=current,
+                alternate_attributes=alternate,
+                account_failover_planned=True,
+                account_failover_replay_safe=True,
+                has_account_bound_state=False,
+                post_commit_retry=False,
+            )
+        )
+        after = _redis_snapshot(redis)
+
+    assert cleared is False
+    assert sa.get_request_session_owner_lease(request) is lease
+    assert request.state._aawm_session_owner_guarded is True
+    assert before == after
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lease_state", ["promoted", "released"])
+async def test_clear_compatible_nonheld_guard_rejects_promoted_or_released_lease(
+    lease_state: str,
+) -> None:
+    redis = _FakeRedisCache()
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    session_identity = "sess-openai-027-lease-state"
+    current = _full_attrs(credential_affinity="interchangeable")
+    alternate = _full_attrs(
+        account_hash="acct-2",
+        account_label="secondary",
+        account_lane="lane-b",
+        credential_affinity="interchangeable",
+    )
+    with _patch_dual(redis), patch.object(
+        durable_mod, "get_aawm_alias_routing_state_namespace", return_value="ns"
+    ):
+        lease = await _seed_nonheld_compatible_owner_lease(
+            request=request,
+            session_identity=session_identity,
+            attributes=current,
+        )
+        setattr(lease, lease_state, True)
+        before = _redis_snapshot(redis)
+        cleared = (
+            await sa.clear_compatible_non_held_request_session_owner_guard_for_failover(
+                request=request,
+                request_body={"input": [{"role": "user", "content": "portable"}]},
+                current_attributes=current,
+                alternate_attributes=alternate,
+                account_failover_planned=True,
+                account_failover_replay_safe=True,
+                has_account_bound_state=False,
+                post_commit_retry=False,
+            )
+        )
+        after = _redis_snapshot(redis)
+
+    assert cleared is False
+    assert sa.get_request_session_owner_lease(request) is lease
+    assert request.state._aawm_session_owner_guarded is True
+    assert before == after
+
+
 def test_explicit_session_identity_is_authoritative() -> None:
     request = type("Request", (), {"headers": {"thread-id": "header-thread"}})()
     body = {
