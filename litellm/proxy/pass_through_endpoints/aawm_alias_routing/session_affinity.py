@@ -428,9 +428,53 @@ def activate_session_owner_redispatch_effective_identity(
 def is_replay_safe_session_owner_redispatch_body(
     request_body: Optional[Mapping[str, Any]],
 ) -> bool:
-    """Whether a full request body can be replayed under one new owner key."""
+    """Whether a full request body can be replayed under one new owner key.
 
-    return isinstance(request_body, Mapping) and "previous_response_id" not in request_body
+    A client-carried transcript can be replayed across interchangeable
+    accounts. Provider-owned response ids and opaque ``rs_*`` item references
+    cannot: the next account cannot resolve those server-side objects.
+    """
+
+    if not isinstance(request_body, Mapping):
+        return False
+
+    provider_item_reference_keys = {
+        "id",
+        "item_id",
+        "item_reference",
+        "provider_item_id",
+        "response_item_id",
+    }
+    seen: set[int] = set()
+
+    def _contains_provider_state(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            value_id = id(value)
+            if value_id in seen:
+                return False
+            seen.add(value_id)
+            if "previous_response_id" in value:
+                return True
+            for key, child in value.items():
+                normalized_key = str(key).strip().casefold()
+                if (
+                    normalized_key in provider_item_reference_keys
+                    and isinstance(child, str)
+                    and child.strip().casefold().startswith("rs_")
+                ):
+                    return True
+                if _contains_provider_state(child):
+                    return True
+            return False
+        if isinstance(value, list):
+            value_id = id(value)
+            if value_id in seen:
+                return False
+            seen.add(value_id)
+            return any(_contains_provider_state(item) for item in value)
+        return False
+
+    return not _contains_provider_state(request_body)
 
 
 def _strip_legacy_affinity_prefixes(raw: str) -> str:
@@ -3409,6 +3453,118 @@ def clear_non_held_request_session_owner_lease(request: Any) -> bool:
     setattr(state, _REQUEST_STATE_LEASE_ATTR, None)
     setattr(state, _REQUEST_STATE_GUARDED_ATTR, False)
     return True
+
+
+async def clear_compatible_non_held_request_session_owner_guard_for_failover(
+    *,
+    request: Any,
+    request_body: Optional[Mapping[str, Any]],
+    alternate_attributes: Optional[Mapping[str, Any]],
+    current_attributes: Optional[Mapping[str, Any]] = None,
+    account_failover_planned: bool,
+    account_failover_replay_safe: bool,
+    has_account_bound_state: bool,
+    post_commit_retry: bool,
+    failover_ordinal: int = 1,
+    validate_durable_owner: bool = True,
+) -> bool:
+    """Validate one portable account move, then clear only request state."""
+
+    if not request_session_owner_already_guarded(request):
+        return False
+    lease = get_request_session_owner_lease(request)
+    if (
+        lease is None
+        or lease.decision != SessionOwnerGuardDecision.COMPATIBLE_OWNER.value
+        or lease.held_reservation
+        or lease.released
+        or lease.promoted
+        or _clean_optional_str(lease.owner_id) is None
+    ):
+        return False
+    if (
+        not account_failover_planned
+        or not account_failover_replay_safe
+        or has_account_bound_state
+        or post_commit_retry
+        or failover_ordinal != 1
+        or not is_replay_safe_session_owner_redispatch_body(request_body)
+    ):
+        return False
+
+    current = _core_owner_attributes(
+        build_session_owner_attributes(extra=current_attributes or lease.attributes)
+    )
+    alternate = _core_owner_attributes(
+        build_session_owner_attributes(extra=alternate_attributes or {})
+    )
+    for attrs in (current, alternate):
+        if (
+            incomplete_owner_attribute_reason(attrs, for_promotion=True)
+            is not None
+            or not any(
+                _clean_optional_str(attrs.get(key))
+                for key in ("account_hash", "account_lane", "account_label")
+            )
+        ):
+            return False
+    if not _accounts_are_interchangeable(current, alternate):
+        return False
+    if _clean_optional_str(current.get("model")) != _clean_optional_str(
+        alternate.get("model")
+    ):
+        return False
+    if (
+        _compatibility_mismatch_reason(
+            owner_record={
+                _RECORD_STATE_FIELD: SessionOwnerRecordState.OWNED.value,
+                _RECORD_OWNER_FIELD: lease.owner_id,
+                _RECORD_ATTRIBUTES_FIELD: current,
+            },
+            requested_attributes=alternate,
+            require_exact_attributes=True,
+        )
+        is not None
+    ):
+        return False
+
+    if validate_durable_owner:
+        owner_record, _, error = await get_session_owner_record(
+            session_identity=lease.session_identity,
+            request=request,
+            wait_for_foreign_reservation=False,
+        )
+        if (
+            error is not None
+            or owner_record is None
+            or _record_state(owner_record) != SessionOwnerRecordState.OWNED.value
+            or _clean_optional_str(owner_record.get(_RECORD_OWNER_FIELD))
+            != _clean_optional_str(lease.owner_id)
+        ):
+            return False
+        owner_attributes = _core_owner_attributes(_owner_attributes(owner_record))
+        if (
+            incomplete_owner_attribute_reason(
+                owner_attributes, for_promotion=True
+            )
+            is not None
+            or not _accounts_are_interchangeable(owner_attributes, alternate)
+            or _compatibility_mismatch_reason(
+                owner_record=owner_record,
+                requested_attributes=current,
+                require_exact_attributes=True,
+            )
+            is not None
+            or _compatibility_mismatch_reason(
+                owner_record=owner_record,
+                requested_attributes=alternate,
+                require_exact_attributes=True,
+            )
+            is not None
+        ):
+            return False
+
+    return clear_non_held_request_session_owner_lease(request)
 
 
 def is_exact_owned_session_owner_route_mismatch(
