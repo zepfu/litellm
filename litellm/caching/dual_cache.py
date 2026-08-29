@@ -24,7 +24,7 @@ from litellm.constants import DEFAULT_MAX_REDIS_BATCH_CACHE_SIZE
 
 from .base_cache import BaseCache
 from .in_memory_cache import InMemoryCache
-from .redis_cache import RedisCache
+from .redis_cache import RedisCache, _RedisReadAvailabilityError
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Span as _Span
@@ -92,6 +92,24 @@ class DualCache(BaseCache):
         if default_redis_ttl is not None:
             self.default_redis_ttl = default_redis_ttl
 
+    def _log_redis_read_error(
+        self, error: BaseException, raise_on_error: bool
+    ) -> None:
+        if not isinstance(error, _RedisReadAvailabilityError):
+            verbose_logger.error(traceback.format_exc())
+            return
+
+        verbose_logger.error(
+            "LiteLLM DualCache Redis dependency failure",
+            extra={
+                "operation": "read",
+                "error_class": error.error_class,
+                "dependency": "redis",
+                "raise_on_error": raise_on_error,
+                "disposition": "raise" if raise_on_error else "degraded_miss",
+            },
+        )
+
     def set_cache(self, key, value, local_only: bool = False, **kwargs):
         # Update both Redis and in-memory cache
         try:
@@ -148,7 +166,9 @@ class DualCache(BaseCache):
 
             if result is None and self.redis_cache is not None and local_only is False:
                 # If not found in in-memory cache, try fetching from Redis
-                redis_kwargs = {"raise_on_error": True} if raise_on_error else {}
+                redis_kwargs = {"_wrap_redis_read_availability_error": True}
+                if raise_on_error:
+                    redis_kwargs["raise_on_error"] = True
                 redis_result = self.redis_cache.get_cache(
                     key, parent_otel_span=parent_otel_span, **redis_kwargs
                 )
@@ -161,9 +181,14 @@ class DualCache(BaseCache):
 
             print_verbose(f"get cache: cache result: {result}")
             return result
-        except Exception:
-            verbose_logger.error(traceback.format_exc())
+        except Exception as error:
+            self._log_redis_read_error(
+                error=error,
+                raise_on_error=raise_on_error,
+            )
             if raise_on_error:
+                if isinstance(error, _RedisReadAvailabilityError):
+                    raise error.original_error from None
                 raise
 
     def batch_get_cache(
@@ -227,7 +252,9 @@ class DualCache(BaseCache):
 
             if result is None and self.redis_cache is not None and local_only is False:
                 # If not found in in-memory cache, try fetching from Redis
-                redis_kwargs = {"raise_on_error": True} if raise_on_error else {}
+                redis_kwargs = {"_wrap_redis_read_availability_error": True}
+                if raise_on_error:
+                    redis_kwargs["raise_on_error"] = True
                 redis_result = await self.redis_cache.async_get_cache(
                     key, parent_otel_span=parent_otel_span, **redis_kwargs
                 )
@@ -242,9 +269,14 @@ class DualCache(BaseCache):
 
             print_verbose(f"get cache: cache result: {result}")
             return result
-        except Exception:
-            verbose_logger.error(traceback.format_exc())
+        except Exception as error:
+            self._log_redis_read_error(
+                error=error,
+                raise_on_error=raise_on_error,
+            )
             if raise_on_error:
+                if isinstance(error, _RedisReadAvailabilityError):
+                    raise error.original_error from None
                 raise
 
     def _reserve_redis_batch_keys(

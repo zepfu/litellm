@@ -10,14 +10,17 @@ Has 4 primary methods:
 
 import ast
 import asyncio
+import builtins
 import hashlib
 import inspect
 import json
 import time
+import traceback
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union, cast
 
 import litellm
+import redis.exceptions
 from litellm._logging import print_verbose, verbose_logger
 from litellm.constants import DEFAULT_REDIS_MAJOR_VERSION
 from litellm.litellm_core_utils.core_helpers import _get_parent_otel_span_from_kwargs
@@ -48,6 +51,26 @@ else:
     async_redis_client = Any
     async_redis_cluster_client = Any
     Span = Any
+
+
+_REDIS_AUTH_ERROR_TYPES = tuple(
+    error_type
+    for error_type in (
+        redis.exceptions.AuthenticationError,
+        getattr(redis.exceptions, "AuthorizationError", None),
+        getattr(redis.exceptions, "ExternalAuthProviderError", None),
+    )
+    if error_type is not None
+)
+
+
+class _RedisReadAvailabilityError(Exception):
+    """Carries an availability failure from the concrete Redis get operation."""
+
+    def __init__(self, error_class: str, original_error: Exception) -> None:
+        super().__init__("Redis read availability failure")
+        self.error_class = error_class
+        self.original_error = original_error
 
 
 def _get_call_stack_info(num_frames: int = 2) -> str:
@@ -87,6 +110,38 @@ def _get_call_stack_info(num_frames: int = 2) -> str:
         return " <- ".join(function_names)
     except Exception:
         return "unknown"
+
+
+def _classify_redis_read_error(error: BaseException) -> Optional[str]:
+    """Return a narrow availability class for Redis read failures."""
+    if isinstance(
+        error,
+        (
+            redis.exceptions.ClusterDownError,
+            redis.exceptions.MasterDownError,
+            redis.exceptions.TryAgainError,
+        ),
+    ):
+        return "availability"
+    if isinstance(
+        error,
+        (
+            redis.exceptions.ResponseError,
+            redis.exceptions.DataError,
+            redis.exceptions.InvalidResponse,
+        ),
+    ):
+        return None
+    if isinstance(error, _REDIS_AUTH_ERROR_TYPES):
+        return None
+    if isinstance(
+        error,
+        (redis.exceptions.ConnectionError, builtins.ConnectionError),
+    ):
+        return "connection"
+    if isinstance(error, (redis.exceptions.TimeoutError, builtins.TimeoutError)):
+        return "timeout"
+    return None
 
 
 class RedisCache(BaseCache):
@@ -804,11 +859,26 @@ class RedisCache(BaseCache):
 
     def get_cache(self, key, parent_otel_span: Optional[Span] = None, **kwargs):
         raise_on_error = bool(kwargs.pop("raise_on_error", False))
+        wrap_redis_read_availability_error = bool(
+            kwargs.pop("_wrap_redis_read_availability_error", False)
+        )
         try:
             key = self.check_and_fix_namespace(key=key)
             print_verbose(f"Get Redis Cache: key: {key}")
             start_time = time.time()
-            cached_response = self.redis_client.get(key)
+            try:
+                cached_response = self.redis_client.get(key)
+            except Exception as e:
+                error_class = _classify_redis_read_error(e)
+                if (
+                    error_class is None
+                    or wrap_redis_read_availability_error is False
+                ):
+                    raise
+                raise _RedisReadAvailabilityError(
+                    error_class=error_class,
+                    original_error=e,
+                ) from None
             end_time = time.time()
             _duration = end_time - start_time
             self.service_logger_obj.service_success_hook(
@@ -823,13 +893,13 @@ class RedisCache(BaseCache):
                 f"Got Redis Cache: key: {key}, cached_response {cached_response}"
             )
             return self._get_cache_logic(cached_response=cached_response)
-        except Exception as e:
-            # NON blocking - notify users Redis is throwing an exception
-            verbose_logger.error(
-                "litellm.caching.caching: get() - Got exception from REDIS: ", e
-            )
+        except _RedisReadAvailabilityError:
+            raise
+        except Exception:
             if raise_on_error:
                 raise
+            # NON blocking - notify users Redis is throwing an exception
+            verbose_logger.error(traceback.format_exc())
 
     def _run_redis_mget_operation(self, keys: List[str]) -> List[Any]:
         """
@@ -906,13 +976,28 @@ class RedisCache(BaseCache):
         from redis.asyncio import Redis
 
         raise_on_error = bool(kwargs.pop("raise_on_error", False))
-        _redis_client: Redis = self.init_async_client()  # type: ignore
-        key = self.check_and_fix_namespace(key=key)
+        wrap_redis_read_availability_error = bool(
+            kwargs.pop("_wrap_redis_read_availability_error", False)
+        )
         start_time = time.time()
 
         try:
+            _redis_client: Redis = self.init_async_client()  # type: ignore
+            key = self.check_and_fix_namespace(key=key)
             print_verbose(f"Get Async Redis Cache: key: {key}")
-            cached_response = await _redis_client.get(key)
+            try:
+                cached_response = await _redis_client.get(key)
+            except Exception as e:
+                error_class = _classify_redis_read_error(e)
+                if (
+                    error_class is None
+                    or wrap_redis_read_availability_error is False
+                ):
+                    raise
+                raise _RedisReadAvailabilityError(
+                    error_class=error_class,
+                    original_error=e,
+                ) from None
             print_verbose(
                 f"Got Async Redis Cache: key: {key}, cached_response {cached_response}"
             )
@@ -932,7 +1017,11 @@ class RedisCache(BaseCache):
                 )
             )
             return response
+        except _RedisReadAvailabilityError:
+            raise
         except Exception as e:
+            if raise_on_error:
+                raise
             end_time = time.time()
             _duration = end_time - start_time
             asyncio.create_task(
@@ -947,11 +1036,7 @@ class RedisCache(BaseCache):
                     event_metadata={"key": key},
                 )
             )
-            print_verbose(
-                f"litellm.caching.caching: async get() - Got exception from REDIS: {str(e)}"
-            )
-            if raise_on_error:
-                raise
+            verbose_logger.error(traceback.format_exc())
 
     async def async_batch_get_cache(
         self,

@@ -11,8 +11,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+import redis.exceptions
 from fastapi import HTTPException
 
+from litellm.caching.dual_cache import DualCache
+from litellm.caching.in_memory_cache import InMemoryCache
+from litellm.caching.redis_cache import RedisCache
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import durable as durable_mod
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import session_affinity as sa
 
@@ -787,6 +791,76 @@ async def test_redis_failure_fail_closed_before_egress() -> None:
         )
     assert g.decision is sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED
     assert "durable cache unavailable" in (g.mismatch_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_real_redis_session_owner_failure_raises_409_before_openai_egress() -> None:
+    from types import SimpleNamespace
+
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+
+    async_redis_client = AsyncMock()
+    async_redis_client.get.side_effect = redis.exceptions.ConnectionError(
+        "redis unavailable"
+    )
+    with patch(
+        "litellm._redis.get_redis_client",
+        return_value=MagicMock(),
+    ), patch(
+        "litellm._redis.get_redis_connection_pool",
+        return_value=MagicMock(),
+    ), patch.object(
+        RedisCache,
+        "_setup_health_pings",
+    ):
+        redis_cache = RedisCache()
+
+    dual_cache = DualCache(
+        in_memory_cache=InMemoryCache(),
+        redis_cache=redis_cache,
+    )
+    session_id = "sess-real-redis-down"
+    body = {
+        "model": "gpt-5.6-sol",
+        "litellm_metadata": {"session_id": session_id},
+    }
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        method="POST",
+        headers={"authorization": "Bearer redacted"},
+        url=httpx.URL("https://api.openai.com/v1/responses"),
+    )
+
+    with patch.object(
+        durable_mod,
+        "get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ), patch.object(
+        durable_mod,
+        "get_aawm_alias_routing_state_namespace",
+        return_value="ns",
+    ), patch.object(
+        redis_cache,
+        "init_async_client",
+        return_value=async_redis_client,
+    ), pytest.raises(HTTPException) as exc_info:
+        await pte._aawm_session_owner_pre_send_guard(
+            request=request,
+            parsed_body=body,
+            custom_llm_provider="openai",
+            egress_credential_family="openai",
+            expected_target_family="openai",
+            url=request.url,
+        )
+
+    assert async_redis_client.get.await_count == 1
+    async_redis_client.set.assert_not_awaited()
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["error"]["code"] == (
+        "aawm_session_owner_redispatch_required"
+    )
+    assert exc_info.value.detail["redispatch_required"] is True
+    assert exc_info.value.detail["attempted_provider_call"] is False
 
 
 @pytest.mark.asyncio
