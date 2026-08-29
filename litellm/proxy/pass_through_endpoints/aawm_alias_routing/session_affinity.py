@@ -457,10 +457,17 @@ def is_replay_safe_session_owner_redispatch_body(
                 return True
             for key, child in value.items():
                 normalized_key = str(key).strip().casefold()
+                encrypted_content = value.get("encrypted_content")
+                self_contained_encrypted_item = (
+                    normalized_key == "id"
+                    and isinstance(encrypted_content, str)
+                    and bool(encrypted_content.strip())
+                )
                 if (
                     normalized_key in provider_item_reference_keys
                     and isinstance(child, str)
                     and child.strip().casefold().startswith("rs_")
+                    and not self_contained_encrypted_item
                 ):
                     return True
                 if _contains_provider_state(child):
