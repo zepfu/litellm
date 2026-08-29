@@ -95,6 +95,23 @@ unavailable on port `4011` while it restarts.
 Changes to dependencies, `Dockerfile.alpha`, `requirements.txt`, or packaging
 metadata require an image rebuild.
 
+## Routing Redis Persistence
+
+The shared alias-routing Redis is owned by the dev Compose file and is not part
+of the alpha-only Compose project. It uses AOF-only persistence. The exact
+command `["redis-server", "--save", "", "--appendonly", "yes"]` uses an empty
+save schedule to explicitly disable RDB.
+
+State is stored in the existing `aawm_alias_routing_redis_data` named volume.
+The isolated routing namespaces are `aawm-routing-dev-v1` for dev,
+`aawm-routing-alpha-v1` for alpha, and `aawm-routing-prod-v1` for production.
+Both Compose consumers retain their established `AAWM_ALIAS_ROUTING_REDIS_DB`
+default of `0`; production selects its runtime-configured database when its own
+deployment supplies that variable. Keys survive Redis restarts and container
+recreation only within their configured namespace and database. Recreating the
+shared Redis service requires explicit operator approval because it can disrupt
+all consumers of that volume.
+
 ## Start
 
 Use the same environment preparation required by `litellm-dev`, including the

@@ -135,3 +135,15 @@ def test_compose_files_parse_and_declare_expected_services() -> None:
 
     assert dev["services"]["provider-status-observations"]["volumes"] is not None
     assert alpha["services"]["litellm-alpha"]["volumes"] is not None
+
+
+def test_alias_routing_redis_uses_exact_aof_only_command() -> None:
+    dev = yaml.safe_load(_DEV_COMPOSE_PATH.read_text(encoding="utf-8"))
+
+    assert dev["services"]["aawm-alias-routing-redis"]["command"] == [
+        "redis-server",
+        "--save",
+        "",
+        "--appendonly",
+        "yes",
+    ]
