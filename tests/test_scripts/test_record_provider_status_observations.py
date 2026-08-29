@@ -6885,7 +6885,7 @@ def _grok_oidc_auth_persist_config(**overrides):
     return config
 
 
-def test_passive_auth_health_poll_persists_sanitized_rows_on_cadence(
+def test_passive_auth_health_poll_persists_four_sanitized_rows_on_cadence(
     monkeypatch,
 ) -> None:
     config = _grok_oidc_auth_persist_config(
@@ -6975,16 +6975,15 @@ def test_passive_auth_health_poll_persists_sanitized_rows_on_cadence(
     early_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=200.0)
     due_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=3700.0)
 
-    assert len(first_events) == 5
+    assert len(first_events) == 4
     assert early_events == []
-    assert len(due_events) == 5
-    assert len(persisted) == 10
+    assert len(due_events) == 4
+    assert len(persisted) == 8
     assert {row["auth_family"] for row in persisted} == {
         "grok_oidc",
         "codex_oauth",
         "xai_oauth",
         "kimi_oauth",
-        "nous_oauth",
     }
     assert all(row["source_task"] == "provider_auth_health_poll" for row in persisted)
     assert all(row["metadata"]["passive_read_only"] is True for row in persisted)
