@@ -45,8 +45,8 @@ _STATE_NAMES = (
     "_aawm_session_history_worker_inflight_records",
     "_aawm_session_history_shutdown_lock",
     "_aawm_session_history_shutdown_in_progress",
-    "_aawm_session_history_worker",
 )
+_WORKER_STATE_NAME = "_aawm_session_history_worker"
 _SET_STATE_NAME = "_set_state"
 _ENCODER_NAME = "_encode_session_history_spool_value"
 
@@ -57,10 +57,6 @@ def _utc_now() -> datetime:
 
 def _module(name: str) -> Optional[Any]:
     return sys.modules.get(name)
-
-
-def _has_all(module: Any, names: Iterable[str]) -> bool:
-    return all(hasattr(module, name) for name in names)
 
 
 def _same_authoritative_state(
@@ -96,6 +92,9 @@ def _resolve_shutdown_lock_and_state() -> Tuple[Any, Any, Any]:
 def _resolve_live_state() -> Tuple[Any, Any, Any, Any, Any, Any]:
     runtime = _resolve_runtime_module()
 
+    # Worker bindings re-exported by the identity compatibility package can
+    # lag runtime after a worker replacement. Runtime owns the manifest-only
+    # worker value; queue, in-flight, shutdown, and _set_state must still match.
     identity = _module(_IDENTITY_MODULE)
     _same_authoritative_state(runtime, identity, (*_STATE_NAMES, _SET_STATE_NAME))
 
@@ -123,7 +122,7 @@ def _resolve_live_state() -> Tuple[Any, Any, Any, Any, Any, Any]:
         inflight,
         shutdown_lock,
         set_state,
-        runtime._aawm_session_history_worker,
+        getattr(runtime, _WORKER_STATE_NAME),
     )
 
 

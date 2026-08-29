@@ -26,8 +26,8 @@ STATE_NAMES = (
     "_aawm_session_history_worker_inflight_records",
     "_aawm_session_history_shutdown_lock",
     "_aawm_session_history_shutdown_in_progress",
-    "_aawm_session_history_worker",
 )
+WORKER_STATE_NAME = "_aawm_session_history_worker"
 EXTRACTOR_SHA256 = hashlib.sha256(b"gate4-test-extractor").hexdigest()
 ARTIFACT_NAMES = (
     "queued.jsonl",
@@ -53,9 +53,26 @@ del _GATE4_SOURCE
     return namespace["extract_gate4"], raw_source
 
 
+def validate_extractor_arguments(output_dir: Path) -> str:
+    return os.path.abspath(output_dir)
+
+
+def expect_ambiguous_state(extract_gate4, output_dir, name):
+    with pytest.raises(RuntimeError, match=f"ambiguous session_history state: {name}"):
+        extract_gate4(
+            output_dir,
+            lock_timeout_seconds=0.01,
+            extractor_sha256=EXTRACTOR_SHA256,
+        )
+
+
+def set_runtime_state_without_mirroring(name, value):
+    setattr(runtime, name, value)
+
+
 @pytest.fixture
 def live_state():
-    previous = {name: getattr(runtime, name) for name in STATE_NAMES}
+    previous = {name: getattr(runtime, name) for name in (*STATE_NAMES, WORKER_STATE_NAME)}
     worker_stop = threading.Event()
     worker = threading.Thread(
         target=worker_stop.wait,
@@ -228,6 +245,24 @@ def test_gate4_extractor_source_injection_preserves_and_exports_records(tmp_path
             "occurrences": {"queued": [2], "inflight": [1]},
         },
     ]
+
+
+def test_gate4_extractor_accepts_stale_identity_worker_metadata_binding(tmp_path, live_state, monkeypatch):
+    extract_gate4, _ = load_extractor_source()
+    output_dir = tmp_path / "stale-identity-worker"
+    monkeypatch.setattr(identity_host, WORKER_STATE_NAME, None)
+
+    extracted = extract_gate4(
+        str(output_dir),
+        lock_timeout_seconds=1.0,
+        extractor_sha256=EXTRACTOR_SHA256,
+    )
+
+    assert extracted["artifacts"]["manifest"] == str(output_dir / "manifest.json")
+    manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["worker"]["present"] is True
+    assert manifest["worker"]["name"] == runtime._aawm_session_history_worker.name
+    assert manifest["worker"]["ident"] == runtime._aawm_session_history_worker.ident
 
 
 def test_gate4_extractor_fails_closed_on_shutdown_lock_timeout(tmp_path, live_state):
@@ -531,6 +566,29 @@ def test_gate4_extractor_rejects_symlink_ancestor_before_lock(tmp_path, live_sta
     assert not output_dir.exists()
     assert not real_directory.joinpath("gate4-output").exists()
     assert runtime._aawm_session_history_shutdown_in_progress is False
+
+
+def test_gate4_extractor_fails_closed_on_mismatched_authoritative_identity_state(tmp_path, live_state, monkeypatch):
+    extract_gate4, _ = load_extractor_source()
+    output_dir = tmp_path / "mismatched-identity-state"
+    validated_output = validate_extractor_arguments(output_dir)
+
+    for name in STATE_NAMES:
+        if name == "_aawm_session_history_shutdown_in_progress":
+            # Runtime's real _set_state mirrors to identity before the extractor
+            # can observe a stale boolean, so emulate only the missing mirror.
+            monkeypatch.setattr(runtime, "_set_state", set_runtime_state_without_mirroring)
+        monkeypatch.setattr(identity_host, name, object())
+        expect_ambiguous_state(extract_gate4, validated_output, name)
+        monkeypatch.undo()
+        assert not output_dir.exists()
+
+    identity_host._set_state = lambda *args, **kwargs: None
+    try:
+        expect_ambiguous_state(extract_gate4, validated_output, "_set_state")
+    finally:
+        del identity_host._set_state
+    assert not output_dir.exists()
 
 
 def test_gate4_extractor_rejects_active_spool_containment(tmp_path, live_state, monkeypatch):
