@@ -12,6 +12,9 @@ from fastapi import HTTPException, Request
 from starlette.responses import Response
 
 from litellm.proxy import aawm_route_logging
+from litellm.proxy.common_utils.http_parsing_utils import (
+    _safe_get_request_parsed_body,
+)
 from litellm.proxy.pass_through_endpoints import (
     llm_passthrough_endpoints as lpe,
 )
@@ -348,6 +351,253 @@ async def test_direct_fail_success_retries_through_real_attempt_and_rollup_paths
 
 
 @pytest.mark.asyncio
+async def test_direct_without_fault_plan_records_attempt_and_success_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_gate(monkeypatch)
+    request = _request()
+    provider = AsyncMock(return_value=Response(content=b"ok", status_code=200))
+
+    async def _select(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        return (
+            _auth("account-a"),
+            _managed_selection("account-a", ordinal=0),
+            {},
+        )
+
+    captured = _install_direct_route_mocks(
+        monkeypatch,
+        select=_select,
+        handler=provider,
+    )
+
+    response = await lpe.openai_proxy_route(
+        endpoint="v1/responses",
+        request=request,
+        fastapi_response=Response(),
+        user_api_key_dict=object(),  # type: ignore[arg-type]
+    )
+
+    assert response.status_code == 200
+    provider.assert_awaited_once()
+    assert captured["bind"].await_count == 1
+    captured["access_replacement"].assert_called_once_with(request)
+    assert not hasattr(request.state, "aawm_openai_fault_plan")
+    assert not hasattr(request.state, "aawm_openai_fault_plan_slot_index")
+    assert not hasattr(
+        request.state,
+        "aawm_openai_fault_plan_injected_count",
+    )
+
+    outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    assert len(outcome["attempts"]) == 1
+    attempt = outcome["attempts"][0]
+    assert attempt["account_label"] == "account-a"
+    assert attempt["attempted_provider_call"] is True
+    assert attempt["request_outcome"] == "succeeded"
+
+    parsed_body = _safe_get_request_parsed_body(request)
+    assert parsed_body is not None
+    metadata = parsed_body["litellm_metadata"]
+    assert metadata["codex_auto_agent_attempts"] == [attempt]
+    assert len(metadata["aawm_alias_routing_audit_events"]) == 1
+    event = metadata["aawm_alias_routing_audit_events"][0]
+    assert event["event_type"] == "candidate_selected"
+    assert event["candidate_status"] == "succeeded"
+    assert event["attempted_provider_call"] is True
+
+
+@pytest.mark.asyncio
+async def test_direct_normal_usage_limit_failure_recovers_with_attempt_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_gate(monkeypatch)
+    request = _request()
+    bindings = [
+        (
+            _auth("account-a"),
+            _managed_selection("account-a", ordinal=0),
+            {},
+        ),
+        (
+            _auth("account-b"),
+            _managed_selection("account-b", ordinal=1),
+            {},
+        ),
+    ]
+    usage_limit = HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "message": "Managed OpenAI account usage limit reached.",
+                "type": "rate_limit_error",
+                "code": "usage_limit_reached",
+            },
+            "quota": {"resets_in_seconds": 1.0},
+            "failover_disposition": "usage_limit_reached",
+        },
+        headers={"Retry-After": "1"},
+    )
+    provider = AsyncMock(
+        side_effect=[
+            usage_limit,
+            Response(content=b"ok", status_code=200),
+        ]
+    )
+
+    async def _select(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        return bindings.pop(0)
+
+    captured = _install_direct_route_mocks(
+        monkeypatch,
+        select=_select,
+        handler=provider,
+    )
+
+    response = await lpe.openai_proxy_route(
+        endpoint="v1/responses",
+        request=request,
+        fastapi_response=Response(),
+        user_api_key_dict=object(),  # type: ignore[arg-type]
+    )
+
+    assert response.status_code == 200
+    assert provider.await_count == 2
+    assert captured["bind"].await_count == 2
+    outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    assert outcome["outcome"] == "recovered"
+    assert len(outcome["attempts"]) == 2
+    failed_attempt, recovered_attempt = outcome["attempts"]
+    assert failed_attempt["error_class"] == "usage_limit_reached"
+    assert failed_attempt["error_status_code"] == 429
+    assert failed_attempt["error_code"] == "usage_limit_reached"
+    assert failed_attempt["attempted_provider_call"] is True
+    assert failed_attempt["request_outcome"] == "pending_failover"
+    assert recovered_attempt["attempted_provider_call"] is True
+    assert recovered_attempt["request_outcome"] == "recovered"
+    assert [rollup["status"] for rollup in captured["rollups"]] == [
+        "Recovered"
+    ]
+    assert not hasattr(request.state, "aawm_openai_fault_plan")
+    assert not hasattr(
+        request.state,
+        "aawm_openai_fault_plan_injected_count",
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_normal_terminal_failures_record_exhausted_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_gate(monkeypatch)
+    request = _request()
+    bindings = [
+        (
+            _auth("account-a"),
+            _managed_selection("account-a", ordinal=0),
+            {},
+        ),
+        (
+            _auth("account-b"),
+            _managed_selection("account-b", ordinal=1),
+            {},
+        ),
+    ]
+    usage_limit = HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "message": "Managed OpenAI account usage limit reached.",
+                "type": "rate_limit_error",
+                "code": "usage_limit_reached",
+            },
+            "quota": {"resets_in_seconds": 1.0},
+            "failover_disposition": "usage_limit_reached",
+        },
+        headers={"Retry-After": "1"},
+    )
+    token_invalidated = HTTPException(
+        status_code=401,
+        detail={
+            "error": {
+                "message": "Managed OpenAI token invalidated.",
+                "type": "invalid_request_error",
+                "code": "token_invalidated",
+            }
+        },
+    )
+    provider = AsyncMock(side_effect=[usage_limit, token_invalidated])
+    reload_credential = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        codex_oauth,
+        "reload_codex_oauth_credential_after_token_invalidated",
+        reload_credential,
+    )
+
+    async def _select(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        if bindings:
+            return bindings.pop(0)
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "code": "aawm_codex_oauth_direct_inventory_unavailable"
+                }
+            },
+        )
+
+    captured = _install_direct_route_mocks(
+        monkeypatch,
+        select=_select,
+        handler=provider,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await lpe.openai_proxy_route(
+            endpoint="v1/responses",
+            request=request,
+            fastapi_response=Response(),
+            user_api_key_dict=object(),  # type: ignore[arg-type]
+        )
+
+    assert exc_info.value is token_invalidated
+    assert provider.await_count == 2
+    assert captured["bind"].await_count == 3
+    reload_credential.assert_awaited_once()
+    outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    assert outcome["outcome"] == "failed"
+    assert len(outcome["attempts"]) == 2
+    usage_attempt, token_attempt = outcome["attempts"]
+    assert usage_attempt["error_class"] == "usage_limit_reached"
+    assert usage_attempt["request_outcome"] == "pending_failover"
+    assert token_attempt["error_class"] == "token_invalidated"
+    assert token_attempt["error_status_code"] == 401
+    assert token_attempt["error_code"] == "token_invalidated"
+    assert token_attempt["attempted_provider_call"] is True
+    assert token_attempt["request_outcome"] == "failed"
+    assert [
+        event["status"]
+        for event in captured["status_events"]
+        if event["status"] == "Exhausted"
+    ] == ["Exhausted"]
+    assert [
+        rollup["status"]
+        for rollup in captured["rollups"]
+        if rollup["status"] == "Exhausted"
+    ] == ["Exhausted"]
+    assert len(captured["audit_only"]) == 1
+    terminal_event = captured["audit_only"][0][0]
+    assert terminal_event["failure_class"] == "token_invalidated"
+    assert terminal_event["attempt_count"] == 2
+    assert terminal_event["request_outcome"] == "failed"
+    assert not hasattr(request.state, "aawm_openai_fault_plan")
+    assert not hasattr(
+        request.state,
+        "aawm_openai_fault_plan_injected_count",
+    )
+
+
+@pytest.mark.asyncio
 async def test_direct_fail_fail_emits_one_terminal_exhausted_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -368,7 +618,16 @@ async def test_direct_fail_fail_emits_one_terminal_exhausted_status(
     provider = AsyncMock(return_value=Response(content=b"unexpected"))
 
     async def _select(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
-        return bindings.pop(0)
+        if bindings:
+            return bindings.pop(0)
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "code": "aawm_codex_oauth_direct_inventory_unavailable"
+                }
+            },
+        )
 
     captured = _install_direct_route_mocks(
         monkeypatch,
@@ -386,7 +645,7 @@ async def test_direct_fail_fail_emits_one_terminal_exhausted_status(
 
     assert "fail,fail" not in repr(exc_info.value.detail)
     provider.assert_not_awaited()
-    assert captured["bind"].await_count == 2
+    assert captured["bind"].await_count == 3
     assert captured["publish"].call_count == 2
     assert captured["persist"].await_count == 2
 
@@ -449,11 +708,13 @@ async def test_disabled_control_preserves_direct_handler_behavior(
     assert captured["bind"].await_count == 1
     captured["publish"].assert_not_called()
     captured["persist"].assert_not_awaited()
-    captured["access_replacement"].assert_not_called()
+    captured["access_replacement"].assert_called_once_with(request)
     assert captured["status_events"] == []
     assert captured["rollups"] == []
     assert not hasattr(request.state, "aawm_openai_fault_plan")
-    assert not hasattr(request.state, "aawm_alias_request_outcome")
+    outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    assert len(outcome["attempts"]) == 1
+    assert outcome["attempts"][0]["request_outcome"] == "succeeded"
 
 
 @pytest.mark.asyncio
@@ -498,12 +759,18 @@ async def test_malformed_header_preserves_direct_409_and_request_state(
     assert captured["bind"].await_count == 1
     captured["publish"].assert_not_called()
     captured["persist"].assert_not_awaited()
-    captured["access_replacement"].assert_not_called()
+    captured["access_replacement"].assert_called_once_with(request)
     assert captured["status_events"] == []
     assert captured["rollups"] == []
     assert captured["audit_only"] == []
-    _assert_no_fault_plan_state(request)
-    assert not hasattr(request.state, "aawm_alias_request_outcome")
+    assert not hasattr(request.state, "aawm_openai_fault_plan")
+    assert not hasattr(request.state, "aawm_openai_fault_plan_slot_index")
+    assert not hasattr(
+        request.state,
+        "aawm_openai_fault_plan_injected_count",
+    )
+    outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    assert len(outcome["attempts"]) == 1
 
 
 def _patch_candidate_loop_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -896,7 +1163,7 @@ async def test_concurrent_direct_requests_keep_fault_state_isolated(
     )
     assert provider_requests == [recovered_request]
     assert bind_counts[id(recovered_request)] == 2
-    assert bind_counts[id(terminal_request)] == 2
+    assert bind_counts[id(terminal_request)] == 3
 
     recovered_outcome = (
         attempt_records._auto_agent_alias_request_outcome_state(

@@ -19,6 +19,7 @@ from litellm.proxy.pass_through_endpoints.aawm_request_policy.observability_meta
 from . import attempt_records as _attempt_records
 from . import audit_build as _audit_build
 from . import audit_persist as _audit_persist
+from . import codex_oauth as _codex_oauth
 from . import selection as _selection
 
 _OPENAI_FAULT_PLAN_ENABLED_ENV = "AAWM_OPENAI_FAULT_PLAN_ENABLED"
@@ -315,17 +316,23 @@ def note_direct_openai_managed_attempt(
     *,
     selection: Optional[dict[str, Any]],
 ) -> None:
-    """Start one direct managed attempt only when an authorized slot exists."""
+    """Record one direct managed attempt and optionally inject a planned fault."""
     if not isinstance(selection, dict):
         return
     candidate = _managed_openai_oauth_candidate(selection.get("candidate"))
-    if candidate is None or not _openai_fault_plan_request_present(request):
-        return
-    slot = _claim_openai_fault_plan_slot(request)
-    if slot is None:
+    if candidate is None:
         return
 
+    fault_plan_present = _openai_fault_plan_request_present(request)
+    slot: Optional[str] = None
+    if fault_plan_present:
+        slot = _claim_openai_fault_plan_slot(request)
     _start_direct_tracking(request)
+    setattr(
+        request.state,
+        _OPENAI_FAULT_PLAN_DIRECT_SUCCESS_STATE_KEY,
+        False,
+    )
     attempt_record = _new_direct_attempt_record(
         request,
         selection=selection,
@@ -340,6 +347,8 @@ def note_direct_openai_managed_attempt(
         attempt_record=attempt_record,
         add_alias_metadata_fn=_add_direct_openai_managed_metadata,
     )
+    if fault_plan_present and slot is None:
+        raise AawmOpenAIFaultPlanError()
     if slot == "fail":
         _note_injected_failure(request)
         raise AawmOpenAIFaultPlanError()
@@ -353,8 +362,14 @@ def update_direct_openai_managed_failure_attempt(
     exc: Exception,
     cooldown_seconds: float,
 ) -> Optional[dict[str, Any]]:
-    """Apply the existing managed-attempt classifier fields to an injection."""
-    if not isinstance(exc, AawmOpenAIFaultPlanError):
+    """Apply existing classifier fields to a retryable direct attempt."""
+    if isinstance(exc, AawmOpenAIFaultPlanError):
+        error_class = "usage_limit_reached"
+    elif _codex_oauth.is_direct_codex_usage_limit_error(exc):
+        error_class = "usage_limit_reached"
+    elif _codex_oauth.is_direct_codex_token_invalidated_error(exc):
+        error_class = "token_invalidated"
+    else:
         return None
     attempt_record = _current_direct_attempt(request)
     candidate = _managed_openai_oauth_candidate(selection.get("candidate"))
@@ -363,7 +378,7 @@ def update_direct_openai_managed_failure_attempt(
     _attempt_records._update_codex_auto_agent_retryable_attempt_record(
         attempt_record=attempt_record,
         exc=exc,
-        error_class="usage_limit_reached",
+        error_class=error_class,
         cooldown_seconds=cooldown_seconds,
         cooldown_scope="candidate",
         alias_model=_direct_alias_model(request_body, selection),
@@ -379,8 +394,15 @@ def note_direct_openai_managed_failure(
     selection: dict[str, Any],
     attempt_record: Optional[dict[str, Any]],
 ) -> None:
-    if attempt_record is None or not _authorized_plan_injected_failure(request):
+    if attempt_record is None:
         return
+    error_class = attempt_record.get("error_class")
+    if error_class not in {"usage_limit_reached", "token_invalidated"}:
+        return
+    _attempt_records._mark_auto_agent_alias_request_failover_pending(
+        request,
+        attempt_record,
+    )
     _attempt_records._record_auto_agent_alias_attempt_failure(
         alias_family="codex_auto_agent",
         alias_model=_direct_alias_model(request_body, selection),
@@ -389,7 +411,7 @@ def note_direct_openai_managed_failure(
         selection=selection,
         attempts=_direct_attempts(request),
         attempt_record=attempt_record,
-        error_class="usage_limit_reached",
+        error_class=error_class,
         add_alias_metadata_fn=_add_direct_openai_managed_metadata,
     )
 
@@ -404,7 +426,6 @@ def note_direct_openai_managed_success(
     if (
         request_state is None
         or not isinstance(selection, dict)
-        or not _authorized_plan_injected_failure(request)
         or getattr(
             request_state,
             _OPENAI_FAULT_PLAN_DIRECT_SUCCESS_STATE_KEY,
@@ -421,6 +442,18 @@ def note_direct_openai_managed_success(
         True,
     )
     attempt_record["attempted_provider_call"] = True
+    attempts = _direct_attempts(request)
+    if (
+        _authorized_plan_injected_failure(request)
+        and len(attempts) > 1
+        and isinstance(attempts[-2], dict)
+        and attempts[-2].get("error_class") == "usage_limit_reached"
+        and not attempts[-2].get("request_outcome")
+    ):
+        _attempt_records._mark_auto_agent_alias_request_failover_pending(
+            request,
+            attempts[-2],
+        )
     _attempt_records._record_auto_agent_alias_attempt_success(
         alias_family="codex_auto_agent",
         alias_model=_direct_alias_model(request_body, selection),
@@ -443,7 +476,6 @@ def note_direct_openai_managed_terminal_exhaustion(
     if (
         request_state is None
         or not isinstance(selection, dict)
-        or not _authorized_plan_injected_failure(request)
         or getattr(
             request_state,
             _OPENAI_FAULT_PLAN_DIRECT_TERMINAL_STATE_KEY,
@@ -453,7 +485,12 @@ def note_direct_openai_managed_terminal_exhaustion(
         return
     attempt_record = _current_direct_attempt(request)
     candidate = _managed_openai_oauth_candidate(selection.get("candidate"))
-    if attempt_record is None or candidate is None:
+    if (
+        attempt_record is None
+        or candidate is None
+        or attempt_record.get("error_class")
+        not in {"usage_limit_reached", "token_invalidated"}
+    ):
         return
     setattr(
         request_state,
