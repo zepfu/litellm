@@ -1017,38 +1017,46 @@ parity.
 
 ## Codex Reset-Credit Poll Task
 
-The same sidecar can run an explicit hourly Codex reset-credit and quota poll.
-This is telemetry-only and separate from the five-minute provider front-door
-probes, Codex OAuth refresh, and Grok billing poll. The poll independently reads
-every enabled `LITELLM_CODEX_OAUTH_INVENTORY` record, calls the native ChatGPT
-reset-credit **detail** endpoint (default
-`https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`) with that
-record's exact `Authorization: Bearer <token>` and `ChatGPT-Account-Id`
-headers, and continues to the next record after an account-specific failure.
-Reset-credit rows use `public.provider_credit_observations`; provider-exposed
-scheduled quota windows are written synchronously to
-`public.rate_limit_observations`. The generic quota resolver honors a
-configured `AAWM_CODEX_QUOTA_DSN`; it does not enforce a particular database.
-This deployment must leave it unset or set it to the same `aawm_tristore` DSN
-as quota consumers, not split scheduled Codex windows onto another database.
-The provider-status script reuses the existing observation schema.
+The same sidecar can run an explicit hourly Codex reset-credit and live-usage
+poll. This is telemetry-only and separate from the five-minute provider
+front-door probes, Codex OAuth refresh, and Grok billing poll. Every due run
+independently reads every enabled `LITELLM_CODEX_OAUTH_INVENTORY` record, calls
+the native ChatGPT reset-credit **detail** endpoint (default
+`https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`) and the native
+ChatGPT live-usage endpoint (`AAWM_CODEX_USAGE_URL`, default
+`https://chatgpt.com/backend-api/wham/usage`) with that record's exact
+`Authorization: Bearer <token>` and `ChatGPT-Account-Id` headers, and
+continues after any component-specific or account-specific failure. Failure of
+reset-credit detail does not suppress live-usage polling for that account, and
+failure for one account does not suppress either component for another.
+Reset-credit rows use `public.provider_credit_observations`; live usage windows
+are written synchronously to `public.rate_limit_observations`. The generic
+quota resolver honors a configured `AAWM_CODEX_QUOTA_DSN`; it does not enforce
+a particular database. This deployment must leave it unset or set it to the
+same `aawm_tristore` DSN as quota consumers, not split scheduled Codex windows
+onto another database. The provider-status script reuses the existing
+observation schema.
 
-`AAWM_CODEX_USAGE_URL` remains the backward-compatible env name for the poll URL.
-If it is still set to the legacy aggregate URL (`/backend-api/wham/usage`), the
-sidecar maps it to the detail endpoint automatically. The aggregate `/wham/usage`
-response and its rate-limit window reset fields are **not** credit expiry; only
-per-credit `expires_at` from the detail `credits[]` entries (or explicit
-credit-level fields) define banked credit expiry.
+`AAWM_CODEX_USAGE_URL` remains the backward-compatible env name for the live
+usage URL and defaults to `/wham/usage`. Banked credits still come only from
+the reset-credit detail endpoint. The aggregate `/wham/usage` response and its
+rate-limit window reset fields are **not** credit expiry; only per-credit
+`expires_at` from the detail `credits[]` entries (or explicit credit-level
+fields) define banked credit expiry.
 
-OPENAI-023 keeps reset-credit observations distinct from quota-window
-observations. Reset-credit success does not prove quota availability. A
-successful payload without `rate_limits` means scheduled provider-exposed
-windows are unavailable or unsupported for that account; routing fails open
-rather than treating that absence as terminal credential failure, and it must
-not require a fixed five-hour or seven-day scheduled window. When scheduled
-polling lacks windows, response-derived OpenAI rate-limit telemetry remains the
-available quota signal. Account identity remains the stable configured account
-hash; credential material is never logged.
+OPENAI-023 keeps reset-credit observations distinct from live quota-window
+observations. Reset-credit success does not prove quota availability, and live
+usage success does not rewrite banked credit state. Live usage parsing reads
+`rate_limit.primary_window`; a base window of `604800` seconds is normalized as
+the overall seven-day quota family. The recorder does not invent an overall
+five-hour row, while provider-present Spark windows remain distinct
+observations in their own family. Account-scoped observations remain eligible
+through the configured poll interval, but wrong-environment, malformed,
+expired-reset, or genuinely stale evidence is rejected rather than treated as
+fresh quota. When live usage lacks usable windows, response-derived OpenAI
+rate-limit telemetry remains the available quota signal. Account identity
+remains the stable configured account hash; credential material is never
+logged.
 
 Relevant environment variables:
 
@@ -1056,7 +1064,7 @@ Relevant environment variables:
 - `AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS`: minimum seconds between poll
   attempts (default `3600`).
 - `AAWM_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS`: HTTP timeout.
-- `AAWM_CODEX_USAGE_URL`: poll URL (defaults to rate-limit-reset-credits).
+- `AAWM_CODEX_USAGE_URL`: live usage poll URL (defaults to `/wham/usage`).
 - `AAWM_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS`: max attempts per scheduled run.
 - `AAWM_CODEX_RESET_CREDIT_POLL_RETRY_BACKOFF_SECONDS`: retry backoff base.
 - `AAWM_CODEX_QUOTA_DSN`: optional Postgres DSN used only for direct Codex
