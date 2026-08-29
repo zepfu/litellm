@@ -6886,7 +6886,7 @@ def _grok_oidc_auth_persist_config(**overrides):
     return config
 
 
-def test_passive_auth_health_poll_persists_four_sanitized_rows_on_cadence(
+def test_passive_auth_health_poll_persists_five_sanitized_rows_on_cadence(
     monkeypatch,
 ) -> None:
     config = _grok_oidc_auth_persist_config(
@@ -6976,15 +6976,25 @@ def test_passive_auth_health_poll_persists_four_sanitized_rows_on_cadence(
     early_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=200.0)
     due_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=3700.0)
 
-    assert len(first_events) == 4
+    assert len(first_events) == 5
     assert early_events == []
-    assert len(due_events) == 4
-    assert len(persisted) == 8
+    assert len(due_events) == 5
+    assert len(persisted) == 10
+    assert {
+        event["event"] for event in first_events + due_events
+    } == {
+        "grok_oidc_passive_health_inspection",
+        "xai_oauth_passive_health_inspection",
+        "kimi_oauth_passive_health_inspection",
+        "nous_oauth_passive_health_inspection",
+        "codex_oauth_passive_health_inspection",
+    }
     assert {row["auth_family"] for row in persisted} == {
         "grok_oidc",
         "codex_oauth",
         "xai_oauth",
         "kimi_oauth",
+        "nous_oauth",
     }
     assert all(row["source_task"] == "provider_auth_health_poll" for row in persisted)
     assert all(row["metadata"]["passive_read_only"] is True for row in persisted)
@@ -7901,6 +7911,22 @@ def test_run_due_sidecar_tasks_persists_xai_oauth_auth_observation_when_apply_en
         xai_oauth_refresh_interval_seconds=3600.0,
     )
     captured = {}
+
+    monkeypatch.setattr(
+        loop.xai_oauth_refresh,
+        "inspect_xai_oauth_refresh_eligibility",
+        lambda *_args, **_kwargs: {
+            "eligibility_checked_at": "2026-06-19T12:00:00Z",
+            "expires_at": "2026-06-19T13:00:00Z",
+            "refresh_due_at": "2026-06-19T12:55:00Z",
+            "next_refresh_check_at": "2026-06-19T12:05:00Z",
+            "eligible": False,
+            "credential_health": "fresh",
+            "usable": True,
+            "error_class": None,
+            "error_message": None,
+        },
+    )
 
     def fake_xai_refresh(*_args, **kwargs):
         kwargs["on_token_endpoint_attempt"]()
