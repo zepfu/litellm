@@ -1089,10 +1089,10 @@ are
 stored only when the response actually supplies them; a model-like limit name
 is not promoted to model specificity.
 
-`codex_quota_poll_aggregate` is `healthy` when every enabled account has usable
-quota state, whether from fresh provider-present windows or absent/unsupported
-scheduled quota routed fail-open. It is `degraded` when at least one account has
-usable fresh quota state but another does not, and `terminal` when none do.
+`codex_quota_poll_aggregate` is `healthy` when every enabled account is usable
+and each quota status is `healthy` or `absent`; `degraded` when at least one
+account is usable but that condition fails; and `terminal` when no account is
+usable.
 Events must not contain access tokens,
 refresh tokens, raw auth headers, account IDs, emails, or credential paths.
 
