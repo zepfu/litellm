@@ -3567,23 +3567,27 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
                 and retry_auth.lane_key == account_lane
             )
             if reload_succeeded:
-                retry_attempt_record["guard_reset_outcome"] = "reset"
-                retry_attempt_record["terminal_reason"] = "success"
+                guard_reset_succeeded = (
+                    _sa.reset_released_request_session_owner_guard(request)
+                )
+                retry_attempt_record["guard_reset_outcome"] = (
+                    "reset" if guard_reset_succeeded else "not_reset"
+                )
+                if (
+                    guard_reset_succeeded
+                    and _aawm_codex_oauth._bind_codex_oauth_candidate_to_request(
+                        request,
+                        candidate,
+                    )
+                    is not None
+                ):
+                    retry_attempt_record["terminal_reason"] = "success"
+                    return retry_auth, dict(selection)
             else:
                 retry_attempt_record["guard_reset_outcome"] = "not_reset"
                 retry_attempt_record["terminal_reason"] = (
                     "unchanged_already_reloaded"
                 )
-            if (
-                reload_succeeded
-                and _sa.reset_released_request_session_owner_guard(request)
-                and _aawm_codex_oauth._bind_codex_oauth_candidate_to_request(
-                    request,
-                    candidate,
-                )
-                is not None
-            ):
-                return retry_auth, dict(selection)
     if (
         is_token_invalidated
         and has_continuation_state
@@ -3595,6 +3599,7 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
                 request,
                 request_body,
             )
+        retry_attempt_record["terminal_reason"] = "redispatch_required"
         _sa.raise_session_owner_redispatch_required(
             session_identity=session_identity,
             alias_model=selection.get("alias_model")

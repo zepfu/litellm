@@ -3974,6 +3974,99 @@ async def test_openai_proxy_route_direct_token_invalidated_reloads_same_account(
 
 
 @pytest.mark.asyncio
+async def test_openai_proxy_route_direct_token_invalidated_guard_reset_failure_is_not_reported_as_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_direct_inventory_auth(monkeypatch)
+    request = _direct_request()
+    body = {"model": "gpt-5.6-sol", "input": "hello"}
+    provider_auth: list[str | None] = []
+    reset_calls: list[Request] = []
+    reset_results = [False, True]
+
+    async def _fake_get_body(req):
+        return dict(body)
+
+    async def _fake_base_handler(**kwargs):
+        authorization = (kwargs.get("extra_headers") or {}).get("Authorization")
+        provider_auth.append(authorization)
+        if authorization == "Bearer server-token-account1":
+            raise _token_invalidated_error()
+        assert authorization == "Bearer server-token-account2"
+        return Response(content=b"ok", status_code=200)
+
+    refreshed_auth = codex_oauth.CodexOAuthRequestAuth(
+        account_label="account1",
+        account_hash="hash-account-1",
+        lane_key="codex-oauth:account1:hash-account-1",
+        headers={
+            "Authorization": "Bearer refreshed-token-account1",
+            "ChatGPT-Account-Id": "server-acct-account1",
+            "session_id": "sess-direct-1",
+            "originator": "litellm-server",
+        },
+    )
+    reload = AsyncMock(return_value=refreshed_auth)
+
+    def _reset_guard(req: Request) -> bool:
+        reset_calls.append(req)
+        return reset_results.pop(0)
+
+    publish = AsyncMock()
+    persist = AsyncMock()
+    monkeypatch.setattr(lpe, "get_request_body", _fake_get_body)
+    monkeypatch.setattr(
+        lpe.BaseOpenAIPassThroughHandler,
+        "_base_openai_pass_through_handler",
+        _fake_base_handler,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_resolve_codex_auto_agent_alias_model",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(lpe, "_is_oa_xai_request_body", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        lpe, "_is_grok_native_oauth_request_body", lambda *_a, **_k: False
+    )
+    monkeypatch.setattr(
+        codex_oauth,
+        "reload_codex_oauth_credential_after_token_invalidated",
+        reload,
+    )
+    monkeypatch.setattr(
+        session_affinity,
+        "reset_released_request_session_owner_guard",
+        _reset_guard,
+    )
+    monkeypatch.setattr(lpe, "_publish_codex_cooldown_memory", publish)
+    monkeypatch.setattr(lpe, "_persist_codex_cooldown_durable", persist)
+
+    response = await lpe.openai_proxy_route(
+        endpoint="v1/responses",
+        request=request,
+        fastapi_response=Response(),
+        user_api_key_dict=object(),  # type: ignore[arg-type]
+    )
+
+    assert response.status_code == 200
+    assert provider_auth == [
+        "Bearer server-token-account1",
+        "Bearer server-token-account2",
+    ]
+    assert reset_calls == [request, request]
+    assert reset_results == []
+    outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    failed_attempt, recovered_attempt = outcome["attempts"]
+    assert failed_attempt["credential_reload_outcome"] == "reloaded"
+    assert failed_attempt["guard_reset_outcome"] == "not_reset"
+    assert recovered_attempt["guard_reset_outcome"] == "reset"
+    reload.assert_awaited_once()
+    publish.assert_not_awaited()
+    persist.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_openai_proxy_route_direct_token_invalidated_unsafe_continuation_requires_redispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4040,6 +4133,7 @@ async def test_openai_proxy_route_direct_token_invalidated_unsafe_continuation_r
     assert attempt["credential_reload_outcome"] == "unchanged_already_reloaded"
     assert attempt["guard_reset_outcome"] == "not_reset"
     assert attempt["failover_decision"] == "not_planned"
+    assert attempt["terminal_reason"] == "redispatch_required"
     assert attempt["attempted_account_hashes"] == ["hash-account-1"]
     reload.assert_awaited_once()
     reload_kwargs = reload.await_args.kwargs
