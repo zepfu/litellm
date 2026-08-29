@@ -3671,8 +3671,38 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
     if not retry_planned:
         return None
 
-    if not _sa.reset_released_request_session_owner_guard(request):
-        return None
+    retry_is_safe_continuation = (
+        has_continuation_state and account_failover_replay_safe
+    )
+    if not retry_is_safe_continuation:
+        guard_reset_succeeded = (
+            _sa.reset_released_request_session_owner_guard(request)
+        )
+        retry_attempt_record["guard_reset_outcome"] = (
+            "reset" if guard_reset_succeeded else "not_reset"
+        )
+        if not guard_reset_succeeded:
+            return None
+
+    missing_request_state = object()
+    pre_selection_bound_account: Any = missing_request_state
+    pre_selection_parsed_body: Any = missing_request_state
+    if retry_is_safe_continuation:
+        request_state = getattr(request, "state", None)
+        if request_state is not None:
+            try:
+                pre_selection_bound_account = copy.deepcopy(
+                    getattr(
+                        request_state,
+                        "aawm_codex_oauth_selected_account",
+                    )
+                )
+            except AttributeError:
+                pass
+        if "parsed_body" in request.scope:
+            pre_selection_parsed_body = copy.deepcopy(
+                request.scope["parsed_body"]
+            )
     try:
         retry_auth, retry_selection, _metadata = (
             await _aawm_codex_oauth.select_and_bind_direct_codex_oauth_inventory(
@@ -3689,8 +3719,93 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
             and error.get("code")
             == "aawm_codex_oauth_direct_inventory_unavailable"
         ):
+            retry_attempt_record["failover_decision"] = "terminal"
+            retry_attempt_record["terminal_reason"] = (
+                "account_failover_second_selection_failed"
+            )
             return None
         raise
+
+    if retry_is_safe_continuation:
+        current_candidate = candidate
+        alternate_candidate = retry_selection.get("candidate")
+        current_attributes = _sa.build_session_owner_attributes(
+            provider="openai",
+            model=(
+                current_candidate.get("model")
+                if isinstance(current_candidate, dict)
+                else request_body.get("model")
+            ),
+            route_family="codex_oauth",
+            endpoint_contract="openai_responses",
+            state_format="openai_responses",
+            ingress="openai_passthrough",
+            requested_model=request_body.get("model"),
+            candidate=current_candidate
+            if isinstance(current_candidate, dict)
+            else None,
+        )
+        alternate_attributes = _sa.build_session_owner_attributes(
+            provider="openai",
+            model=(
+                alternate_candidate.get("model")
+                if isinstance(alternate_candidate, dict)
+                else request_body.get("model")
+            ),
+            route_family="codex_oauth",
+            endpoint_contract="openai_responses",
+            state_format="openai_responses",
+            ingress="openai_passthrough",
+            requested_model=request_body.get("model"),
+            candidate=alternate_candidate
+            if isinstance(alternate_candidate, dict)
+            else None,
+        )
+        guard_rebound = (
+            await _sa.clear_compatible_non_held_request_session_owner_guard_for_failover(
+                request=request,
+                request_body=request_body,
+                current_attributes=current_attributes,
+                alternate_attributes=alternate_attributes,
+                account_failover_planned=retry_planned,
+                account_failover_replay_safe=account_failover_replay_safe,
+                has_account_bound_state=bool(
+                    selection.get("has_account_bound_state")
+                ),
+                post_commit_retry=False,
+                failover_ordinal=int(
+                    retry_selection.get("failover_ordinal") or 0
+                ),
+            )
+        )
+        if not guard_rebound:
+            request_state = getattr(request, "state", None)
+            if request_state is not None:
+                if pre_selection_bound_account is missing_request_state:
+                    try:
+                        delattr(
+                            request_state,
+                            "aawm_codex_oauth_selected_account",
+                        )
+                    except AttributeError:
+                        pass
+                else:
+                    setattr(
+                        request_state,
+                        "aawm_codex_oauth_selected_account",
+                        pre_selection_bound_account,
+                    )
+            if pre_selection_parsed_body is missing_request_state:
+                request.scope.pop("parsed_body", None)
+            else:
+                request.scope["parsed_body"] = pre_selection_parsed_body
+            retry_attempt_record["guard_reset_outcome"] = "rebind_rejected"
+            retry_attempt_record["failover_decision"] = "terminal"
+            retry_attempt_record["terminal_reason"] = (
+                "account_failover_guard_rebind_failed"
+            )
+            return None
+        retry_attempt_record["guard_reset_outcome"] = "rebind_succeeded"
     return retry_auth, retry_selection
 
 
@@ -6191,7 +6306,6 @@ async def openai_proxy_route(  # noqa: PLR0915
                             else "moved_without_reload"
                         ),
                     )
-                    failed_attempt.setdefault("guard_reset_outcome", "reset")
                     failed_attempt["failover_decision"] = "move_account"
                     failed_attempt["terminal_reason"] = "success"
                 prior_account_outcome["credential_reload_outcome"] = (
@@ -6200,7 +6314,11 @@ async def openai_proxy_route(  # noqa: PLR0915
                     == prior_account_outcome.get("account_label")
                     else "moved_without_reload"
                 )
-                prior_account_outcome["guard_reset_outcome"] = "reset"
+                if failed_attempt is not None:
+                    prior_account_outcome["guard_reset_outcome"] = (
+                        failed_attempt.get("guard_reset_outcome")
+                        or "not_attempted"
+                    )
                 prior_account_outcome["failover_decision"] = "move_account"
                 prior_account_outcome["terminal_reason"] = "success"
             base_target_url = os.getenv("CHATGPT_API_BASE") or CHATGPT_API_BASE
