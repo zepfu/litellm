@@ -5168,6 +5168,9 @@ def install(host_globals: dict) -> None:
         "_ALIBABA_TOKEN_PLAN_QUOTA_CURRENT_ROWS_SQL": (
             _ALIBABA_TOKEN_PLAN_QUOTA_CURRENT_ROWS_SQL
         ),
+        "_alibaba_token_plan_quota_row_account_hash": (
+            _alibaba_token_plan_quota_row_account_hash
+        ),
         "_get_codex_quota_observation_pool": _get_codex_quota_observation_pool,
         "_get_codex_quota_observation_environment": (
             _get_codex_quota_observation_environment
