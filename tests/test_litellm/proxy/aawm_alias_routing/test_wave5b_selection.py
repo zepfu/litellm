@@ -1971,6 +1971,28 @@ class TestAlibabaTokenPlanQuotaObservations:
         assert selection._get_codex_quota_observation_pool is None
         yield
 
+    def test_install_exports_hydration_row_identity_helper(self) -> None:
+        original_functions = {
+            name: getattr(selection, name) for name in selection._HOST_FUNCTION_NAMES
+        }
+        original_attach = selection._attach_aawm_alias_routing_state_sources
+        try:
+            host_globals: dict[str, Any] = {}
+            selection.install(host_globals)
+
+            hydration = host_globals[
+                "_hydrate_alibaba_token_plan_quota_observations"
+            ]
+            assert hydration.__globals__ is host_globals
+            assert (
+                host_globals["_alibaba_token_plan_quota_row_account_hash"]
+                is selection._alibaba_token_plan_quota_row_account_hash
+            )
+        finally:
+            for name, function in original_functions.items():
+                setattr(selection, name, function)
+            selection._attach_aawm_alias_routing_state_sources = original_attach
+
     def test_exact_valid_environment_row_is_normalized(self) -> None:
         observation = selection._alibaba_token_plan_quota_observation_from_row(
             _alibaba_row(),
