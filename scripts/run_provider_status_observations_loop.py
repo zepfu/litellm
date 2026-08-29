@@ -5905,12 +5905,10 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
                 "primary": "absent",
                 "secondary": "absent",
             },
-            "period_states": {
-                "five_hour": "absent",
-                "seven_day": "absent",
-            },
+            "period_states": {},
             "fresh_window_count": 0,
             "window_count": 0,
+            "present_windows_fresh": False,
         }
 
     parent = parent or {}
@@ -5926,10 +5924,7 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
     rows: list[Dict[str, Any]] = []
     window_states: Dict[str, str] = {}
     quota_periods: Dict[str, Optional[str]] = {}
-    period_states = {
-        "five_hour": "absent",
-        "seven_day": "absent",
-    }
+    period_states: Dict[str, str] = {}
     observations_by_scope = {
         str(observation.get("limit_scope")): observation
         for observation in extracted
@@ -5956,8 +5951,7 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
         quota_period = _codex_quota_period_from_window_minutes(window_minutes)
         window_states[limit_scope] = freshness
         quota_periods[limit_scope] = quota_period
-        if quota_period in period_states:
-            period_states[quota_period] = freshness
+        period_states[quota_period] = freshness
 
         fresh_used_percentage = used_percentage if freshness == "fresh" else None
         remaining_pct = (
@@ -6032,18 +6026,23 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
         )
         rows.append(row)
 
-    fresh_window_count = sum(state == "fresh" for state in window_states.values())
-    present_window_count = sum(state != "absent" for state in window_states.values())
-    required_periods_fresh = all(
-        period_states[period] == "fresh" for period in ("five_hour", "seven_day")
+    present_window_states = [
+        state for state in window_states.values() if state != "absent"
+    ]
+    present_window_count = len(present_window_states)
+    fresh_window_count = sum(
+        state == "fresh" for state in present_window_states
+    )
+    present_windows_fresh = bool(present_window_states) and all(
+        state == "fresh" for state in present_window_states
     )
     if present_window_count == 0:
         telemetry_status = "absent"
-    elif required_periods_fresh:
+    elif present_windows_fresh:
         telemetry_status = "fresh"
     elif fresh_window_count > 0:
         telemetry_status = "partial"
-    elif "stale" in period_states.values():
+    elif "stale" in window_states.values():
         telemetry_status = "stale"
     else:
         telemetry_status = "unknown"
@@ -6054,7 +6053,7 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
         "period_states": period_states,
         "fresh_window_count": fresh_window_count,
         "window_count": present_window_count,
-        "required_periods_fresh": required_periods_fresh,
+        "present_windows_fresh": present_windows_fresh,
         "upstream_scope_present": any(
             row.get("limit_id") or row.get("limit_name") for row in rows
         ),
@@ -6315,15 +6314,12 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
             "quota_observation_count": 0,
             "quota_inserted_count": 0,
             "quota_storage_status": "not_attempted",
-            "quota_health": "terminal",
+            "quota_health": "unknown",
             "quota_window_states": {
                 "primary": "unknown",
                 "secondary": "unknown",
             },
-            "quota_period_states": {
-                "five_hour": "unknown",
-                "seven_day": "unknown",
-            },
+            "quota_period_states": {},
             "quota_periods": {},
             "status_code": None,
             "attempt_count": 0,
@@ -6414,12 +6410,14 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
                     {},
                 )
                 fresh_window_count = int(quota_summary.get("fresh_window_count", 0))
-                if quota_summary.get("required_periods_fresh"):
+                if quota_summary.get("present_windows_fresh"):
                     summary["quota_health"] = "healthy"
+                elif quota_summary.get("telemetry_status") == "absent":
+                    summary["quota_health"] = "absent"
                 elif fresh_window_count > 0:
                     summary["quota_health"] = "degraded"
                 else:
-                    summary["quota_health"] = "terminal"
+                    summary["quota_health"] = "degraded"
                 if config.apply and quota_observations:
                     summary["quota_inserted_count"] = (
                         _persist_codex_quota_observations(
@@ -6440,6 +6438,7 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
 
             summary["inserted_count"] = summary["credit_inserted_count"]
             summary["persisted"] = summary["credit_persisted"]
+
             if (
                 summary["reset_credit_error_class"]
                 and summary["quota_error_class"]
@@ -6450,7 +6449,7 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
                     f"account '{record.label}'."
                 )
 
-        quota_usable = summary["quota_health"] in {"healthy", "degraded"}
+        quota_usable = summary["quota_health"] in {"healthy", "degraded", "absent"}
         state.codex_quota_usable_by_label[record.label] = quota_usable
         state.codex_quota_status_by_label[record.label] = summary["quota_health"]
         events.append(
@@ -12112,7 +12111,13 @@ def _codex_account_aggregate_event(
         for record in records
     ]
     usable_count = sum(account["usable"] for account in accounts)
-    fully_healthy_statuses = {"fresh", "healthy", "refreshed", "skipped"}
+    fully_healthy_statuses = {
+        "absent",
+        "fresh",
+        "healthy",
+        "refreshed",
+        "skipped",
+    }
     if (
         accounts
         and usable_count == len(accounts)

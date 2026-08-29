@@ -6885,7 +6885,7 @@ def _grok_oidc_auth_persist_config(**overrides):
     return config
 
 
-def test_passive_auth_health_poll_persists_four_sanitized_rows_on_cadence(
+def test_passive_auth_health_poll_persists_sanitized_rows_on_cadence(
     monkeypatch,
 ) -> None:
     config = _grok_oidc_auth_persist_config(
@@ -6975,15 +6975,16 @@ def test_passive_auth_health_poll_persists_four_sanitized_rows_on_cadence(
     early_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=200.0)
     due_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=3700.0)
 
-    assert len(first_events) == 4
+    assert len(first_events) == 5
     assert early_events == []
-    assert len(due_events) == 4
-    assert len(persisted) == 8
+    assert len(due_events) == 5
+    assert len(persisted) == 10
     assert {row["auth_family"] for row in persisted} == {
         "grok_oidc",
         "codex_oauth",
         "xai_oauth",
         "kimi_oauth",
+        "nous_oauth",
     }
     assert all(row["source_task"] == "provider_auth_health_poll" for row in persisted)
     assert all(row["metadata"]["passive_read_only"] is True for row in persisted)
@@ -8639,7 +8640,7 @@ def test_codex_quota_observations_keep_distinct_fresh_windows_without_inventing_
         response_body=_codex_quota_payload(),
     )
 
-    assert summary["required_periods_fresh"] is True
+    assert summary["present_windows_fresh"] is True
     assert summary["period_states"] == {
         "five_hour": "fresh",
         "seven_day": "fresh",
@@ -8677,7 +8678,7 @@ def test_codex_quota_stale_and_unknown_windows_are_not_healthy() -> None:
         response_body=payload,
     )
 
-    assert summary["required_periods_fresh"] is False
+    assert summary["present_windows_fresh"] is False
     assert summary["period_states"] == {
         "five_hour": "stale",
         "seven_day": "unknown",
@@ -8688,6 +8689,49 @@ def test_codex_quota_stale_and_unknown_windows_are_not_healthy() -> None:
     assert all(row["used_percentage"] is None for row in rows)
     assert all(row["exhausted"] is False for row in rows)
     assert all(row["model"] == "gpt-5.3-codex-spark" for row in rows)
+
+
+def test_codex_quota_absent_windows_are_advisory_not_terminal_account_health() -> None:
+    config = _codex_reset_credit_poll_config()
+    record = config.codex_oauth_inventory.records[0]
+
+    rows, summary = loop._build_codex_quota_rate_limit_observations(
+        config,
+        record=record,
+        observed_at=datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc),
+        response_body={"rate_limit_reset_credits": {"available_count": 2}},
+    )
+
+    assert rows == []
+    assert summary["telemetry_status"] == "absent"
+    assert summary["window_states"] == {"primary": "absent", "secondary": "absent"}
+    assert summary["period_states"] == {}
+    assert summary["present_windows_fresh"] is False
+
+
+def test_codex_quota_non_five_hour_present_window_can_be_fresh() -> None:
+    config = _codex_reset_credit_poll_config(apply=False)
+    record = config.codex_oauth_inventory.records[0]
+    payload = _codex_quota_payload(
+        primary_reset="2026-08-08T18:00:00Z",
+        secondary_reset="2026-08-15T12:00:00Z",
+    )
+    payload["rate_limits"].pop("secondary")
+    payload["rate_limits"]["primary"]["window_minutes"] = 60
+
+    rows, summary = loop._build_codex_quota_rate_limit_observations(
+        config,
+        record=record,
+        observed_at=datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc),
+        response_body=payload,
+    )
+
+    assert summary["telemetry_status"] == "fresh"
+    assert summary["present_windows_fresh"] is True
+    assert summary["window_states"] == {"primary": "fresh", "secondary": "absent"}
+    assert summary["period_states"] == {"hourly": "fresh"}
+    assert rows[0]["quota_period"] == "hourly"
+    assert [row["limit_scope"] for row in rows] == ["primary"]
 
 
 def test_codex_quota_poll_uses_each_inventory_records_exact_headers(
@@ -9072,6 +9116,62 @@ def test_codex_quota_poll_reports_db_write_failure_disposition(
     assert poll["quota_storage_status"] == "db_write_failed"
     assert poll["quota_error_class"] == "ProviderStatusDatabaseWriteSkipped"
     assert poll["quota_health"] == "terminal"
+
+
+def test_codex_quota_poll_absent_windows_keep_credit_success_non_terminal(
+    monkeypatch,
+) -> None:
+    config = _codex_reset_credit_poll_config()
+    monkeypatch.setattr(
+        loop,
+        "_fetch_codex_reset_credit_payload",
+        lambda *_args, **_kwargs: {
+            "status_code": 200,
+            "payload": {"rate_limit_reset_credits": {"available_count": 2}},
+            "auth_context": _codex_reset_credit_auth_context(),
+            "attempt_count": 1,
+            "retry_count": 0,
+            "poll_url": probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL,
+        },
+    )
+    monkeypatch.setattr(
+        loop,
+        "_persist_codex_reset_credit_observation",
+        lambda *_args, **_kwargs: (1, 1),
+    )
+    monkeypatch.setattr(
+        loop,
+        "_persist_codex_quota_observations",
+        lambda *_args, **_kwargs: pytest.fail(
+            "absent scheduled quota windows must not be persisted"
+        ),
+    )
+
+    events = loop._run_codex_reset_credit_poll_task(
+        config,
+        loop.SidecarTaskState(),
+        now_monotonic=100.0,
+    )
+
+    poll = next(
+        event for event in events if event["event"] == "codex_reset_credit_poll"
+    )
+    assert poll["available_count"] == 2
+    assert poll["credit_persisted"] is True
+    assert poll["persisted"] is True
+    assert poll["quota_observation_count"] == 0
+    assert poll["quota_storage_status"] == "no_observations"
+    assert poll["quota_window_states"] == {
+        "primary": "absent",
+        "secondary": "absent",
+    }
+    assert poll["quota_period_states"] == {}
+    assert poll["quota_health"] == "absent"
+    assert poll["error_class"] is None
+    aggregate = next(
+        event for event in events if event["event"] == "codex_quota_poll_aggregate"
+    )
+    assert aggregate["health"] == "healthy"
 
 
 def test_codex_quota_poll_apply_disabled_keeps_quota_unpersisted(
