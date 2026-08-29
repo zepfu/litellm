@@ -28804,6 +28804,115 @@ class TestOpenAIPassthroughRoute:
         assert "api.openai.com" not in str(captured.get("base_target_url") or "")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "provider_returned",
+        [True, False],
+        ids=["marked-provider", "unmarked-local"],
+    )
+    async def test_openai006_direct_5xx_attempt_truthfulness(
+        self, monkeypatch, provider_returned
+    ):
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            codex_oauth,
+        )
+        from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+            openai_proxy_route,
+        )
+
+        monkeypatch.setenv("LITELLM_CODEX_OAUTH_INVENTORY", '{"schema_version":1}')
+        body = {"model": "gpt-5.6-sol", "input": "hello"}
+        request = self._openai006_request()
+        selected = codex_oauth.CodexOAuthRequestAuth(
+            account_label="account1",
+            account_hash="hash-account-1",
+            lane_key="codex-oauth:account1:hash-account-1",
+            headers={"Authorization": "Bearer server-token-account1"},
+        )
+        provider_error = HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": "provider returned model overload",
+                    "type": "provider_error",
+                    "code": "model_overloaded",
+                }
+            },
+        )
+        if provider_returned:
+            setattr(provider_error, "_aawm_provider_returned", True)
+
+        async def _fake_base(**_kwargs):
+            raise provider_error
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_alias_model",
+            return_value=None,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_oa_xai_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._is_grok_native_oauth_request_body",
+            return_value=False,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth.select_and_bind_direct_codex_oauth_inventory",
+            new=AsyncMock(
+                return_value=(
+                    selected,
+                    {
+                        "candidate": {
+                            "provider": "openai",
+                            "model": "gpt-5.6-sol",
+                            "route_family": "codex_responses",
+                            "codex_oauth_account_label": "account1",
+                            "codex_oauth_account_hash": "hash-account-1",
+                            "codex_oauth_lane_key": (
+                                "codex-oauth:account1:hash-account-1"
+                            ),
+                        },
+                        "cooldown_key": (
+                            "openai:gpt-5.6-sol:"
+                            "codex-oauth:account1:hash-account-1"
+                        ),
+                        "request_mode": "fresh",
+                    },
+                    body,
+                )
+            ),
+        ) as mock_bind, patch.object(
+            llm_passthrough_endpoints.BaseOpenAIPassThroughHandler,
+            "_base_openai_pass_through_handler",
+            new=_fake_base,
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._publish_codex_cooldown_memory"
+        ) as mock_publish, patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._persist_codex_cooldown_durable",
+            new=AsyncMock(),
+        ) as mock_persist:
+            with pytest.raises(HTTPException) as exc_info:
+                await openai_proxy_route(
+                    endpoint="v1/responses",
+                    request=request,
+                    fastapi_response=Response(),
+                    user_api_key_dict=object(),  # type: ignore[arg-type]
+                )
+
+        assert exc_info.value is provider_error
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail["error"]["code"] == "model_overloaded"
+        if provider_returned:
+            assert exc_info.value.detail["attempted_provider_call"] is True
+            assert getattr(exc_info.value, "attempted_provider_call") is True
+        else:
+            assert "attempted_provider_call" not in exc_info.value.detail
+            assert not hasattr(exc_info.value, "attempted_provider_call")
+        mock_bind.assert_awaited_once()
+        mock_publish.assert_not_called()
+        mock_persist.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_openai006_fresh_direct_usage_limit_retries_next_account(
         self, monkeypatch
     ):
@@ -29725,6 +29834,74 @@ class TestOpenAIPassthroughRoute:
 
 class TestGrokProxyRoute:
     """Tests for the native Grok Build pass-through route."""
+
+    @pytest.mark.asyncio
+    async def test_grok_proxy_route_preserves_exact_model_despite_alias_cooldown(
+        self,
+    ):
+        mock_request = MagicMock(spec=Request)
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost:4000/grok/v1/responses"
+        mock_request.headers = {
+            "authorization": "Bearer oidc-token",
+            "x-litellm-api-key": "litellm-test-key",
+            "x-xai-token-auth": "xai-grok-cli",
+            "content-type": "application/json",
+        }
+        mock_request.query_params = {}
+        mock_response = MagicMock(spec=Response)
+        mock_user_api_key_dict = MagicMock()
+        exact_model = "grok-composer-2.5-fast"
+        request_body = {"model": exact_model, "input": "hello"}
+        cooldown_key = f"xai:{exact_model}:xai_grok_native"
+        _codex_auto_agent_cooldown_until_monotonic_by_key[cooldown_key] = (
+            time.monotonic() + 60.0
+        )
+        aawm_alias_snapshot_select.set_active_routing_snapshot(
+            aawm_alias_config_compiler.compile_yaml(
+                f"""
+defaults: {{}}
+aliases:
+  - name: cooled-xai-alias
+    candidates:
+      - provider: xai
+        model: {exact_model}
+        route_family: codex_grok_native_responses_adapter
+        priority: 100
+"""
+            )
+        )
+
+        with patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.user_api_key_auth",
+            AsyncMock(return_value=mock_user_api_key_dict),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            AsyncMock(return_value=request_body),
+        ), patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
+            AsyncMock(return_value={"ok": True}),
+        ) as mock_pass_through:
+            result = await grok_proxy_route(
+                endpoint="v1/responses",
+                request=mock_request,
+                fastapi_response=mock_response,
+            )
+
+        assert result == {"ok": True}
+        assert (
+            _codex_auto_agent_cooldown_until_monotonic_by_key[cooldown_key]
+            > time.monotonic()
+        )
+        mock_pass_through.assert_awaited_once()
+        call_kwargs = mock_pass_through.await_args.kwargs
+        assert call_kwargs["target"] == "https://cli-chat-proxy.grok.com/v1/responses"
+        assert call_kwargs["custom_llm_provider"] == litellm.LlmProviders.XAI.value
+        assert call_kwargs["expected_target_family"] == "xai"
+        assert call_kwargs["custom_body"]["model"] == exact_model
+        assert call_kwargs["custom_headers"] == {
+            "x-grok-model-override": exact_model
+        }
 
     @pytest.mark.asyncio
     async def test_grok_proxy_route_forwards_native_auth_headers_to_cli_chat_proxy(self):

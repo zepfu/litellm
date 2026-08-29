@@ -6019,7 +6019,6 @@ async def openai_proxy_route(  # noqa: PLR0915
             raise Exception("Required 'OPENAI_API_KEY' in environment to make pass-through calls to OpenAI.")
 
     while True:
-        attempted_provider_call = False
         try:
             if use_direct_codex_oauth_inventory:
                 _aawm_dev_fault_plan.note_direct_openai_managed_attempt(
@@ -6027,7 +6026,6 @@ async def openai_proxy_route(  # noqa: PLR0915
                     request_body,
                     selection=direct_codex_selection_state,
                 )
-            attempted_provider_call = True
             response = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
                 endpoint=endpoint,
                 request=request,
@@ -6047,6 +6045,29 @@ async def openai_proxy_route(  # noqa: PLR0915
                 )
             return response
         except (HTTPException, ProxyException) as exc:
+            provider_returned = isinstance(exc, ProxyException) or bool(
+                getattr(exc, "_aawm_provider_returned", False)
+            )
+            attempted_provider_call = provider_returned
+            provider_status_code = (
+                _aawm_error_signals._extract_adapter_exception_status_code(exc)
+            )
+            is_provider_error_status = (
+                provider_status_code == status.HTTP_429_TOO_MANY_REQUESTS
+                or (
+                    provider_status_code is not None
+                    and 500 <= provider_status_code <= 599
+                )
+            )
+            if (
+                use_direct_codex_oauth_inventory
+                and attempted_provider_call
+                and is_provider_error_status
+            ):
+                setattr(exc, "attempted_provider_call", True)
+                exception_detail = getattr(exc, "detail", None)
+                if isinstance(exception_detail, dict):
+                    exception_detail["attempted_provider_call"] = True
             candidate = None
             if isinstance(direct_codex_selection_state, dict):
                 candidate = direct_codex_selection_state.get("candidate")
@@ -6055,13 +6076,7 @@ async def openai_proxy_route(  # noqa: PLR0915
                     exc,
                     candidate=candidate if isinstance(candidate, dict) else None,
                     endpoint=endpoint,
-                    provider_returned=(
-                        attempted_provider_call
-                        and (
-                            isinstance(exc, ProxyException)
-                            or bool(getattr(exc, "_aawm_provider_returned", False))
-                        )
-                    ),
+                    provider_returned=provider_returned,
                 )
                 and _codex_auto_agent_request_has_continuation_state(request_body)
             ):
@@ -6105,13 +6120,7 @@ async def openai_proxy_route(  # noqa: PLR0915
                 exc,
                 candidate=candidate if isinstance(candidate, dict) else None,
                 endpoint=endpoint,
-                provider_returned=(
-                    attempted_provider_call
-                    and (
-                        isinstance(exc, ProxyException)
-                        or bool(getattr(exc, "_aawm_provider_returned", False))
-                    )
-                ),
+                provider_returned=provider_returned,
             ):
                 raise
             direct_account_error_class: Optional[str] = None
@@ -6128,10 +6137,7 @@ async def openai_proxy_route(  # noqa: PLR0915
                 and not _codex_auto_agent_request_has_continuation_state(request_body)
                 and _aawm_error_signals._extract_adapter_exception_status_code(exc)
                 == status.HTTP_401_UNAUTHORIZED
-                and (
-                    isinstance(exc, ProxyException)
-                    or bool(getattr(exc, "_aawm_provider_returned", False))
-                )
+                and provider_returned
             ):
                 direct_account_error_class = "provider_terminal_error"
             if (

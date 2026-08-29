@@ -52,6 +52,9 @@ _ANTHROPIC_ADAPTER_CODEX_DEFAULT_AUTH_PATHS = (
     "~/.codex/auth.json",
     "~/.config/litellm/chatgpt/auth.json",
 )
+_DIRECT_CODEX_COOLDOWN_BYPASS_CONSUMED_STATE_KEY = (
+    "aawm_codex_oauth_direct_cooldown_bypass_consumed"
+)
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -982,6 +985,21 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
         "last_resort": False,
         "selection_priority": 100,
     }
+    bypass_already_consumed = bool(
+        getattr(
+            request.state,
+            _DIRECT_CODEX_COOLDOWN_BYPASS_CONSUMED_STATE_KEY,
+            False,
+        )
+    )
+    concrete_non_alias = (
+        explicit_model is not None
+        and not bypass_already_consumed
+        and _selection._lookup_active_snapshot_canonical_alias(
+            model, request=request
+        )
+        is None
+    )
     try:
         from litellm.secret_managers.codex_oauth_inventory import (
             load_codex_oauth_inventory,
@@ -1088,7 +1106,20 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             )
         )
 
+    if concrete_non_alias:
+        setattr(
+            request.state,
+            _DIRECT_CODEX_COOLDOWN_BYPASS_CONSUMED_STATE_KEY,
+            True,
+        )
+        for state in states:
+            if state.get("skip_reason") == "cooldown":
+                state.pop("skip_reason", None)
+            state["cooldown_seconds"] = 0.0
+            if state.get("cooldown_state_source") != "normalized_quota_observation":
+                state["cooldown_state_source"] = "direct_concrete_bypass"
     skipped = _selection._build_auto_agent_skipped_candidates_from_states(states)
+
     selected_state = _selection._select_first_available_codex_oauth_account_state(
         states
     )

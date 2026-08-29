@@ -28,6 +28,9 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     session_affinity,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import rollup
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_compiler import (
+    compile_yaml,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
     AliasRouteServices,
     CooldownPublicationPlan,
@@ -38,6 +41,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
     SelectionEnumeration,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import snapshot_select
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     AliasRoutingStateManager,
     alias_routing_state,
@@ -2754,6 +2758,137 @@ async def test_direct_inventory_reuses_weekly_balance_selector(
 
 
 @pytest.mark.asyncio
+async def test_direct_inventory_bypasses_cooldown_for_concrete_openai_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_direct_inventory_auth(monkeypatch)
+    request = _direct_request()
+
+    async def _cooled(_key: str) -> tuple[float, str]:
+        return 999.0, "durable_cache"
+
+    monkeypatch.setitem(
+        selection._build_codex_auto_agent_candidate_state.__globals__,
+        "_get_codex_active_cooldown_state",
+        _cooled,
+    )
+    previous_snapshot = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(None)
+    try:
+        selected_auth, selection_state, metadata_body = (
+            await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+                request,
+                request_body={"model": "gpt-5.6-sol"},
+            )
+        )
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous_snapshot)
+        alias_routing_state.reset_for_tests()
+
+    assert selected_auth.account_label == "account1"
+    assert selection_state["cooldown_state_source"] == "direct_concrete_bypass"
+    assert selection_state["cooldown_seconds"] == 0.0
+    assert selection_state["skipped"] == []
+    assert (
+        metadata_body["litellm_metadata"][
+            "codex_auto_agent_cooldown_state_source"
+        ]
+        == "direct_concrete_bypass"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_inventory_does_not_bypass_cooldown_for_model_less_native_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_direct_inventory_auth(monkeypatch)
+    request = _direct_request()
+
+    async def _cooled(_key: str) -> tuple[float, str]:
+        return 999.0, "durable_cache"
+
+    monkeypatch.setitem(
+        selection._build_codex_auto_agent_candidate_state.__globals__,
+        "_get_codex_active_cooldown_state",
+        _cooled,
+    )
+    previous_snapshot = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(None)
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+                request,
+                request_body={},
+            )
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous_snapshot)
+        alias_routing_state.reset_for_tests()
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.detail["attempted_provider_call"] is False
+    assert all(
+        candidate["reason"] == "cooldown"
+        for candidate in exc_info.value.detail["skipped_candidates"]
+    )
+    assert getattr(
+        request.state,
+        codex_oauth._DIRECT_CODEX_COOLDOWN_BYPASS_CONSUMED_STATE_KEY,
+        False,
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_direct_inventory_preserves_alias_cooldown_suppression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_direct_inventory_auth(monkeypatch)
+    request = _direct_request()
+
+    async def _cooled(_key: str) -> tuple[float, str]:
+        return 999.0, "durable_cache"
+
+    monkeypatch.setitem(
+        selection._build_codex_auto_agent_candidate_state.__globals__,
+        "_get_codex_active_cooldown_state",
+        _cooled,
+    )
+    snapshot = compile_yaml(
+        """
+defaults: {}
+aliases:
+  - name: cooled-direct-alias
+    candidates:
+      - provider: openai
+        model: gpt-5.6-sol
+        route_family: codex_responses
+        priority: 900
+    """
+    )
+    previous_snapshot = snapshot_select.get_active_routing_snapshot()
+    try:
+        snapshot_select.set_active_routing_snapshot(snapshot)
+        assert snapshot_select._lookup_active_snapshot_canonical_alias(
+            "cooled-direct-alias", request=request
+        ) == "cooled-direct-alias"
+        try:
+            await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+                request,
+                request_body={"model": "cooled-direct-alias"},
+            )
+        except HTTPException as exc:
+            assert exc.status_code == 429
+            assert exc.detail["error"]["code"] == (
+                "aawm_codex_oauth_direct_inventory_unavailable"
+            )
+            assert exc.detail["attempted_provider_call"] is False
+        else:
+            raise AssertionError("alias cooldown suppression was bypassed")
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous_snapshot)
+        alias_routing_state.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_direct_responses_binds_enabled_inventory_and_strips_inbound_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3790,6 +3925,121 @@ async def test_openai_proxy_route_direct_uses_inventory_not_client_or_api_key(
     assert "api.openai.com" not in target
     assert "account1" in loaded
     assert lpe._should_preserve_openai_client_auth(request, "v1/responses") is False
+
+
+@pytest.mark.asyncio
+async def test_openai_proxy_route_direct_cooldown_bypass_is_one_shot_before_account_failover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_direct_inventory_auth(monkeypatch)
+    monkeypatch.setenv("LITELLM_CODEX_OAUTH_INVENTORY", '{"schema_version":1}')
+    request = _direct_request()
+    body = {"model": "gpt-5.6-sol", "input": "hello"}
+    provider_accounts: list[str | None] = []
+    selection_states: list[dict[str, Any]] = []
+
+    async def _cooled(key: str) -> tuple[float, str]:
+        if "hash-account-1" in key:
+            return 999.0, "durable_cache"
+        return 0.0, "none"
+
+    monkeypatch.setitem(
+        selection._build_codex_auto_agent_candidate_state.__globals__,
+        "_get_codex_active_cooldown_state",
+        _cooled,
+    )
+    real_bind = codex_oauth.select_and_bind_direct_codex_oauth_inventory
+
+    async def _recording_bind(bind_request, *, request_body=None):
+        result = await real_bind(bind_request, request_body=request_body)
+        selection_states.append(result[1])
+        return result
+
+    monkeypatch.setattr(
+        codex_oauth,
+        "select_and_bind_direct_codex_oauth_inventory",
+        _recording_bind,
+    )
+
+    async def _fake_get_body(req):
+        return dict(body)
+
+    generic_401 = HTTPException(
+        status_code=401,
+        detail={
+            "error": {
+                "message": "generic provider auth failure",
+                "type": "authentication_error",
+            }
+        },
+    )
+    setattr(generic_401, "_aawm_provider_returned", True)
+
+    async def _fake_base_handler(**kwargs):
+        authorization = (kwargs.get("extra_headers") or {}).get("Authorization")
+        provider_accounts.append(authorization)
+        if authorization == "Bearer server-token-account1":
+            raise generic_401
+        return Response(content=b"ok", status_code=200)
+
+    publish = AsyncMock()
+    persist = AsyncMock()
+    monkeypatch.setattr(lpe, "get_request_body", _fake_get_body)
+    monkeypatch.setattr(
+        lpe,
+        "_resolve_codex_auto_agent_alias_model",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(lpe, "_is_oa_xai_request_body", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        lpe,
+        "_is_grok_native_oauth_request_body",
+        lambda *_a, **_k: False,
+    )
+    monkeypatch.setattr(
+        lpe.BaseOpenAIPassThroughHandler,
+        "_base_openai_pass_through_handler",
+        _fake_base_handler,
+    )
+    monkeypatch.setattr(lpe, "_publish_codex_cooldown_memory", publish)
+    monkeypatch.setattr(lpe, "_persist_codex_cooldown_durable", persist)
+
+    previous_snapshot = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(None)
+    try:
+        response = await lpe.openai_proxy_route(
+            endpoint="v1/responses",
+            request=request,
+            fastapi_response=Response(),
+            user_api_key_dict=object(),  # type: ignore[arg-type]
+        )
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous_snapshot)
+
+    assert response.status_code == 200
+    assert provider_accounts == [
+        "Bearer server-token-account1",
+        "Bearer server-token-account2",
+    ]
+    assert [
+        state["candidate"]["codex_oauth_account_label"]
+        for state in selection_states
+    ] == ["account1", "account2"]
+    assert selection_states[0]["cooldown_state_source"] == (
+        "direct_concrete_bypass"
+    )
+    assert selection_states[1]["selection_reason"] == (
+        "codex_oauth_account_failover"
+    )
+    assert selection_states[1]["cooldown_state_source"] == "none"
+    assert selection_states[1]["skipped"][0]["account_label"] == "account1"
+    assert getattr(
+        request.state,
+        codex_oauth._DIRECT_CODEX_COOLDOWN_BYPASS_CONSUMED_STATE_KEY,
+        False,
+    ) is True
+    publish.assert_not_awaited()
+    persist.assert_not_awaited()
 
 
 @pytest.mark.asyncio
