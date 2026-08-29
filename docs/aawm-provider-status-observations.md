@@ -1015,12 +1015,11 @@ record's exact `Authorization: Bearer <token>` and `ChatGPT-Account-Id`
 headers, and continues to the next record after an account-specific failure.
 Reset-credit rows use `public.provider_credit_observations`; provider-exposed
 scheduled quota windows are written synchronously to
-`public.rate_limit_observations`. The quota writer uses
-`AAWM_CODEX_QUOTA_DSN` when configured and otherwise falls back to the general
-provider-status DSN. `AAWM_CODEX_QUOTA_DSN` must be unset or target the same
-`aawm_tristore` database used by quota consumers; it must not split scheduled
-Codex windows onto a different database. The provider-status script reuses the
-existing observation schema.
+`public.rate_limit_observations`. The generic quota resolver honors a
+configured `AAWM_CODEX_QUOTA_DSN`; it does not enforce a particular database.
+This deployment must leave it unset or set it to the same `aawm_tristore` DSN
+as quota consumers, not split scheduled Codex windows onto another database.
+The provider-status script reuses the existing observation schema.
 
 `AAWM_CODEX_USAGE_URL` remains the backward-compatible env name for the poll URL.
 If it is still set to the legacy aggregate URL (`/backend-api/wham/usage`), the
@@ -1077,22 +1076,24 @@ omit `client` and `client_version`. Inserts dedupe on the latest row per
 Each due attempt emits `codex_reset_credit_poll` with sanitized fields such as
 `account_label`, `account_hash`, `attempted`, `persisted`, `status_code`,
 `attempt_count`, `retry_count`, `available_count`, `inserted_count`,
-`quota_accepted_count`, `quota_storage_status`, `quota_window_states`,
-`quota_period_states`, `quota_health`, `poll_url`, `error_class`, and
-`error_message`. `inserted_count` covers the synchronous reset-credit writer;
+`quota_storage_status`, `quota_window_states`, `quota_period_states`,
+`quota_health`, `poll_url`, `error_class`, and `error_message`.
+`inserted_count` covers the synchronous reset-credit writer;
 quota rows report `quota_storage_status=persisted` and
 `quota_inserted_count` after the synchronous direct insert. Provider-exposed
-scheduled quota windows are healthy only when windows actually present in the
-provider payload are fresh (for example, every present parsed window). No
-present windows explicitly record absent/unsupported scheduled quota and route
-fail-open. Stale or unknown windows retain their reset/freshness evidence but store
-no fabricated remaining or used percentage. Upstream scope and model are
+scheduled quota windows are healthy when every window actually present in the
+provider payload is fresh. Absent or unsupported scheduled quota is usable and
+routes fail-open. Stale or unknown windows retain their reset/freshness evidence
+but store no fabricated remaining or used percentage. Upstream scope and model
+are
 stored only when the response actually supplies them; a model-like limit name
 is not promoted to model specificity.
 
-`codex_quota_poll_aggregate` is `healthy` when every enabled account has both
-fresh windows, `degraded` when at least one account has usable fresh quota
-state, and `terminal` when none do. Events must not contain access tokens,
+`codex_quota_poll_aggregate` is `healthy` when every enabled account has usable
+quota state, whether from fresh provider-present windows or absent/unsupported
+scheduled quota routed fail-open. It is `degraded` when at least one account has
+usable fresh quota state but another does not, and `terminal` when none do.
+Events must not contain access tokens,
 refresh tokens, raw auth headers, account IDs, emails, or credential paths.
 
 The detail endpoint is undocumented and provider-owned; shape may change without notice.
