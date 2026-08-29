@@ -4067,7 +4067,7 @@ async def test_openai_proxy_route_direct_token_invalidated_guard_reset_failure_i
 
 
 @pytest.mark.asyncio
-async def test_openai_proxy_route_direct_token_invalidated_unsafe_continuation_requires_redispatch(
+async def test_openai_proxy_route_direct_token_invalidated_unsafe_continuation_requires_redispatch(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_direct_inventory_auth(monkeypatch)
@@ -4078,6 +4078,7 @@ async def test_openai_proxy_route_direct_token_invalidated_unsafe_continuation_r
         "input": "continue",
     }
     provider_auth: list[str | None] = []
+    persisted_audit_payloads: list[dict[str, Any]] = []
     reload = AsyncMock(return_value=None)
 
     async def _fake_get_body(req):
@@ -4088,6 +4089,19 @@ async def test_openai_proxy_route_direct_token_invalidated_unsafe_continuation_r
             (kwargs.get("extra_headers") or {}).get("Authorization")
         )
         raise _token_invalidated_error()
+
+    def _persist_audit_only(
+        events: list[dict[str, Any]],
+        *,
+        request_body: dict[str, Any] | None = None,
+    ) -> str:
+        persisted_audit_payloads.append(
+            {
+                "events": list(events),
+                "request_body": request_body,
+            }
+        )
+        return "spool_only"
 
     publish = AsyncMock()
     persist = AsyncMock()
@@ -4110,6 +4124,11 @@ async def test_openai_proxy_route_direct_token_invalidated_unsafe_continuation_r
         codex_oauth,
         "reload_codex_oauth_credential_after_token_invalidated",
         reload,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_persist_auto_agent_alias_audit_only_events_best_effort",
+        _persist_audit_only,
     )
     monkeypatch.setattr(lpe, "_publish_codex_cooldown_memory", publish)
     monkeypatch.setattr(lpe, "_persist_codex_cooldown_durable", persist)
@@ -4147,6 +4166,21 @@ async def test_openai_proxy_route_direct_token_invalidated_unsafe_continuation_r
         request,
         account_label="unrelated-account",
     ) == "not_attempted"
+    assert len(persisted_audit_payloads) == 1
+    persisted_payload = persisted_audit_payloads[0]
+    persisted_event = persisted_payload["events"][-1]
+    assert persisted_event["credential_reload_outcome"] == (
+        "unchanged_already_reloaded"
+    )
+    assert persisted_event["terminal_reason"] == "redispatch_required"
+    persisted_body = persisted_payload["request_body"]
+    assert isinstance(persisted_body, dict)
+    persisted_metadata = persisted_body["litellm_metadata"]
+    persisted_attempt = persisted_metadata["codex_auto_agent_attempts"][0]
+    assert persisted_attempt["credential_reload_outcome"] == (
+        "unchanged_already_reloaded"
+    )
+    assert persisted_attempt["terminal_reason"] == "redispatch_required"
     publish.assert_not_awaited()
     persist.assert_not_awaited()
 

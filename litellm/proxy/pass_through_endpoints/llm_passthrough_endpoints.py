@@ -3600,6 +3600,38 @@ async def _retry_direct_codex_oauth_after_account_failure(  # noqa: PLR0915
                 request_body,
             )
         retry_attempt_record["terminal_reason"] = "redispatch_required"
+        outcome = _aawm_attempt_records._auto_agent_alias_request_outcome_state(
+            request
+        )
+        attempts = outcome.get("attempts")
+        finalized_attempts = attempts if isinstance(attempts, list) else []
+        if all(
+            attempt is not retry_attempt_record for attempt in finalized_attempts
+        ):
+            finalized_attempts = [*finalized_attempts, retry_attempt_record]
+        finalized_body = (
+            _aawm_dev_fault_plan._add_direct_openai_managed_metadata(
+                request_body,
+                request=request,
+                selection=selection,
+                attempts=finalized_attempts,
+            )
+        )
+        _safe_set_request_parsed_body(request, finalized_body)
+        finalized_metadata = finalized_body.get("litellm_metadata")
+        finalized_events = (
+            finalized_metadata.get("aawm_alias_routing_audit_events")
+            if isinstance(finalized_metadata, dict)
+            else None
+        )
+        audit_events = [
+            event for event in finalized_events or [] if isinstance(event, dict)
+        ]
+        if audit_events:
+            _persist_auto_agent_alias_audit_only_events_best_effort(
+                audit_events,
+                request_body=finalized_body,
+            )
         _sa.raise_session_owner_redispatch_required(
             session_identity=session_identity,
             alias_model=selection.get("alias_model")
