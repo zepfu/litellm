@@ -189,12 +189,14 @@ same read-only consumer and single-writer directory boundary.
 - An identity mismatch is a deployment or rotation error, not a reason to
   accept the new identity automatically.
 
-The provider-status loop schedules refresh, passive health, and native
-reset-credit/quota polling independently for every enabled inventory record.
-Each label has separate timers and its configured lock path. A failure for one
-record does not suppress another, and successful skipped/no-op refreshes remain
-usable. Aggregate health is degraded while at least one record remains usable
-and terminal when none do. Sidecar events and observations use only the
+The provider-status loop schedules refresh, passive health, reset-credit
+detail polling, and live seven-day usage polling independently for every
+enabled inventory record. In the managed two-account deployment, each due round
+polls both enabled accounts for both components. Each label has separate timers
+and its configured lock path. A failure for one record or one polling
+component does not suppress another, and successful skipped/no-op refreshes
+remain usable. Aggregate health is degraded while at least one record remains
+usable and terminal when none do. Sidecar events and observations use only the
 configured label and expected safe hash; they do not emit raw paths, account
 IDs, or tokens.
 
@@ -218,27 +220,30 @@ Managed Codex OAuth request routing uses only the explicit ordered
 `LITELLM_CODEX_OAUTH_INVENTORY`. New auto-agent selections expand each Codex
 OAuth candidate template into one account lane per inventory record that is
 enabled, model-eligible, and auth-healthy at load time. Selection is
-deterministic across that ordered inventory and applies fresh per-account
-provider-exposed scheduled quota evidence from the normalized observation
-cache. Confirmed exhaustion requires a fresh window with `exhausted=true` and
-`remaining_pct <= 0`; stale, unknown, missing, or ambiguous quota evidence is
-not treated as confirmed exhaustion and does not by itself remove an otherwise
-admissible account.
+deterministic across that ordered inventory and applies valid per-account
+provider observations from the normalized cache throughout the configured poll
+cadence. Confirmed exhaustion requires a fresh window with `exhausted=true`
+and `remaining_pct <= 0`; stale, wrong-environment, malformed, expired-reset,
+missing, or ambiguous quota evidence is not treated as confirmed exhaustion and
+does not by itself remove an otherwise admissible account.
 
 The optional inventory `routing` object controls account-pool behavior. Its
 backward-compatible default is account-pinned priority order. A configured
 `credential_affinity: interchangeable` pool keeps provider, model, route,
 endpoint, and encrypted-state-format session affinity while treating account
-label/hash/lane as per-attempt telemetry. Fresh requests and replay-safe inline
-continuations may move immediately through every other eligible interchangeable
-account after definitive account exhaustion (`usage_limit_reached`), an
-account-scoped rate limit, or candidate-unavailable. A transient pre-commit
-`capacity_exhausted`/overload retries once on the same account; if repeated, it
-returns the existing retryable pre-stream `503` without rotating accounts.
-Definitive exhaustion, account-scoped rate limits, and candidate-unavailable
-may traverse every other eligible interchangeable account before terminal
-error. Each account is attempted at most once for those failover cases, and
-each failed account receives only its own lane cooldown.
+label/hash/lane as per-attempt telemetry. Fresh requests may move through every
+other eligible interchangeable account after definitive account exhaustion
+(`usage_limit_reached`), an account-scoped rate limit, or
+candidate-unavailable. Replay-safe, fully client-carried continuations may
+perform one planned pre-commit move to another eligible interchangeable
+account after an account-scoped failure that occurs before durable ownership is
+committed. A transient pre-commit `capacity_exhausted`/overload retries once
+on the same account; if repeated, it returns the existing retryable pre-stream
+`503` without rotating accounts. Definitive exhaustion, account-scoped rate
+limits, and candidate-unavailable may traverse every other eligible
+interchangeable account before terminal error for fresh requests. Each account
+is attempted at most once for those failover cases, and each failed account
+receives only its own lane cooldown.
 
 For managed OpenAI/Codex OAuth, a fresh request that receives a generic
 provider-returned HTTP `401` after provider I/O advances to the next eligible
@@ -247,14 +252,21 @@ the failed lane. A `401` on a continuation or account-bound request remains
 pinned to its recorded account and fails closed; it is not eligible for account
 rotation.
 
-Opaque upstream-only continuation state, including `previous_response_id`,
-remains pinned to the recorded account even in an interchangeable pool. If
-that account is unavailable, routing fails closed rather than dropping
-conversation state and replaying only the current delta. Inline reasoning and
-function-call history may move accounts only when the complete request body is
-replay-safe. The state itself is not persisted by the routing metadata:
-encrypted content, prompts, credentials, and raw account identifiers are
-excluded. After the first response byte, no account failover is planned.
+Nested `previous_response_id`, opaque `rs_*` references, and other
+upstream-owned continuation state remain pinned to the recorded account even in
+an interchangeable pool. Account-bound state, held or foreign ownership,
+incompatible provider/model/route/state combinations, and post-commit retries
+also remain pinned and fail closed. If the recorded account is unavailable,
+routing fails closed rather than dropping conversation state and replaying only
+the current delta. Inline reasoning and function-call history may move
+accounts only when the complete request body is replay-safe, fully
+client-carried, and still pre-commit. That move clears only the request-local
+non-held guard after durable validation, never rewrites durable owner state.
+Telemetry preserves guard-reset/rebind outcomes and second-selection failures
+as their own events rather than relabeling them as inventory exhaustion. The
+state itself is not persisted by the routing metadata: encrypted content,
+prompts, credentials, and raw account identifiers are excluded. After the
+first response byte, no account failover is planned.
 
 With `strategy: dual_quota_balance`, routing evaluates the overall seven-day
 Codex and Codex Spark seven-day families together. If either account spread is
@@ -262,8 +274,12 @@ at or above `balance_band_percentage_points`, the selector favors the account
 with more remaining quota in the most constrained family. When both families
 are within the configured band, `within_band_strategy:
 weighted_round_robin` regularly alternates eligible accounts according to
-their inventory weights. Missing or stale observations do not create quota
-facts; the within-band policy supplies the configured deterministic fallback.
+their inventory weights. Valid account-scoped observations remain eligible for
+selection throughout the configured poll cadence; `dual_quota_balance` does not
+discard them after 30 seconds and fall back to round robin while they are still
+fresh. Missing or stale observations do not create quota facts; the within-band
+policy supplies the configured deterministic fallback only when no valid
+account-scoped observation is available for that decision.
 When no account is admissible, the proxy returns a structured safe `429` that
 may include skipped candidate metadata and terminal reset information built
 only from configured labels, expected account hashes, lanes, and public quota
