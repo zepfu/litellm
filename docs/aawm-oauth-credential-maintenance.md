@@ -198,6 +198,14 @@ and terminal when none do. Sidecar events and observations use only the
 configured label and expected safe hash; they do not emit raw paths, account
 IDs, or tokens.
 
+For OPENAI-023, successful reset-credit results are distinct from quota-window
+results; reset-credit success does not prove quota availability. Successful
+payloads without `rate_limits` mean scheduled provider-exposed windows are
+unavailable or unsupported, not that the credential is terminal. Routing fails
+open and does not require a fixed five-hour or seven-day scheduled window;
+response-derived OpenAI rate-limit telemetry remains the available quota signal
+when scheduled polling lacks windows.
+
 When `LITELLM_CODEX_OAUTH_INVENTORY` is configured, all provider-status Codex
 refresh, passive-health, and reset-credit/quota work uses only those inventory
 records. The standalone `~/.codex/auth.json` and its lock remain a generic
@@ -211,7 +219,7 @@ Managed Codex OAuth request routing uses only the explicit ordered
 OAuth candidate template into one account lane per inventory record that is
 enabled, model-eligible, and auth-healthy at load time. Selection is
 deterministic across that ordered inventory and applies fresh per-account
-five-hour and weekly/seven-day quota evidence from the normalized observation
+provider-exposed scheduled quota evidence from the normalized observation
 cache. Confirmed exhaustion requires a fresh window with `exhausted=true` and
 `remaining_pct <= 0`; stale, unknown, missing, or ambiguous quota evidence is
 not treated as confirmed exhaustion and does not by itself remove an otherwise

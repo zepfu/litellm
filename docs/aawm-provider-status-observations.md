@@ -283,7 +283,7 @@ each label; one account's due check, failure, or endpoint attempt does not
 consume the other account's timer.
 
 OPENAI-004 request routing consumes the same explicit inventory plus the
-sidecar's fresh per-account five-hour and weekly/seven-day quota observations.
+sidecar's fresh per-account provider-exposed scheduled quota observations.
 The proxy selects only enabled, auth-healthy, model-eligible accounts;
 treats definitive account exhaustion (`usage_limit_reached`), account-scoped
 rate limits, and candidate-unavailable as eligible for traversal through every
@@ -1013,14 +1013,14 @@ reset-credit **detail** endpoint (default
 `https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`) with that
 record's exact `Authorization: Bearer <token>` and `ChatGPT-Account-Id`
 headers, and continues to the next record after an account-specific failure.
-Reset-credit rows use `public.provider_credit_observations`; native five-hour
-and seven-day quota windows are written synchronously to
+Reset-credit rows use `public.provider_credit_observations`; provider-exposed
+scheduled quota windows are written synchronously to
 `public.rate_limit_observations`. The quota writer uses
 `AAWM_CODEX_QUOTA_DSN` when configured and otherwise falls back to the general
-provider-status DSN. This lets deployments store Codex quota beside the
-LiteLLM callback/session-history tables that hydrate routing while leaving
-other provider-status and reset-credit writes on the sidecar's general
-database. The provider-status script reuses the existing observation schema.
+provider-status DSN. `AAWM_CODEX_QUOTA_DSN` must be unset or target the same
+`aawm_tristore` database used by quota consumers; it must not split scheduled
+Codex windows onto a different database. The provider-status script reuses the
+existing observation schema.
 
 `AAWM_CODEX_USAGE_URL` remains the backward-compatible env name for the poll URL.
 If it is still set to the legacy aggregate URL (`/backend-api/wham/usage`), the
@@ -1028,6 +1028,16 @@ sidecar maps it to the detail endpoint automatically. The aggregate `/wham/usage
 response and its rate-limit window reset fields are **not** credit expiry; only
 per-credit `expires_at` from the detail `credits[]` entries (or explicit
 credit-level fields) define banked credit expiry.
+
+OPENAI-023 keeps reset-credit observations distinct from quota-window
+observations. Reset-credit success does not prove quota availability. A
+successful payload without `rate_limits` means scheduled provider-exposed
+windows are unavailable or unsupported for that account; routing fails open
+rather than treating that absence as terminal credential failure, and it must
+not require a fixed five-hour or seven-day scheduled window. When scheduled
+polling lacks windows, response-derived OpenAI rate-limit telemetry remains the
+available quota signal. Account identity remains the stable configured account
+hash; credential material is never logged.
 
 Relevant environment variables:
 
@@ -1071,9 +1081,11 @@ Each due attempt emits `codex_reset_credit_poll` with sanitized fields such as
 `quota_period_states`, `quota_health`, `poll_url`, `error_class`, and
 `error_message`. `inserted_count` covers the synchronous reset-credit writer;
 quota rows report `quota_storage_status=persisted` and
-`quota_inserted_count` after the synchronous direct insert. The paired quota
-windows are healthy only when both five-hour and seven-day observations are
-fresh. Stale or unknown windows retain their reset/freshness evidence but store
+`quota_inserted_count` after the synchronous direct insert. Provider-exposed
+scheduled quota windows are healthy only when windows actually present in the
+provider payload are fresh (for example, every present parsed window). No
+present windows explicitly record absent/unsupported scheduled quota and route
+fail-open. Stale or unknown windows retain their reset/freshness evidence but store
 no fabricated remaining or used percentage. Upstream scope and model are
 stored only when the response actually supplies them; a model-like limit name
 is not promoted to model specificity.
