@@ -43,6 +43,11 @@ from .lane_keys import (
 )
 from .policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_BASE_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_BASE_COOLDOWN_SECONDS,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_JITTER_SECONDS as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_JITTER_SECONDS,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTED_ERROR_CLASS as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTED_ERROR_CLASS,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS,
     CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_DEFAULT_CAPACITY_COOLDOWN_SECONDS,
     CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_DEFAULT_COOLDOWN_SECONDS,
     CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS as _CODEX_AUTO_AGENT_DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
@@ -416,6 +421,19 @@ _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS: float 
 _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_JITTER_SECONDS: float = 0.05
 
 
+def _default_resolve_alibaba_token_plan_exhaustion_cooldown_seconds() -> float:
+    return _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_BASE_COOLDOWN_SECONDS + random.uniform(
+        0.0,
+        _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_JITTER_SECONDS,
+    )
+
+
+_resolve_alibaba_token_plan_exhaustion_cooldown_seconds: Callable[
+    [],
+    float,
+] = _default_resolve_alibaba_token_plan_exhaustion_cooldown_seconds
+
+
 # Reference to host_globals set by install(); configure updates it too.
 _host_globals_ref: dict | None = None
 
@@ -431,8 +449,9 @@ def configure_error_signals_runtime(  # noqa: PLR0915
     native_grok_backoff_base_seconds: float = 0.05,
     native_grok_backoff_max_seconds: float = 1.0,
     native_grok_backoff_jitter_seconds: float = 0.05,
-
-
+    resolve_alibaba_token_plan_exhaustion_cooldown_seconds: Optional[
+        Callable[[], float]
+    ] = None,
 ) -> None:
     """Bind host dependencies for error-signal extraction and classification."""
     global _get_passthrough_handled_http_error_summary
@@ -444,6 +463,7 @@ def configure_error_signals_runtime(  # noqa: PLR0915
     global _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS
     global _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS
     global _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_JITTER_SECONDS
+    global _resolve_alibaba_token_plan_exhaustion_cooldown_seconds
 
     _get_passthrough_handled_http_error_summary = get_passthrough_handled_http_error_summary
     _is_known_grok_build_usage_balance_exhausted_response = (
@@ -464,6 +484,10 @@ def configure_error_signals_runtime(  # noqa: PLR0915
     _CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_JITTER_SECONDS = (
         native_grok_backoff_jitter_seconds
     )
+    if resolve_alibaba_token_plan_exhaustion_cooldown_seconds is not None:
+        _resolve_alibaba_token_plan_exhaustion_cooldown_seconds = (
+            resolve_alibaba_token_plan_exhaustion_cooldown_seconds
+        )
     # If install() has been called, also update host_globals so rebound
     # functions see the new seam values.
     if _host_globals_ref is not None:
@@ -477,6 +501,7 @@ def configure_error_signals_runtime(  # noqa: PLR0915
         _host_globals_ref["_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS"] = _mod["_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_BASE_SECONDS"]
         _host_globals_ref["_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS"] = _mod["_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_MAX_SECONDS"]
         _host_globals_ref["_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_JITTER_SECONDS"] = _mod["_CODEX_AUTO_AGENT_NATIVE_GROK_CONTINUATION_TRANSIENT_BACKOFF_JITTER_SECONDS"]
+        _host_globals_ref["_resolve_alibaba_token_plan_exhaustion_cooldown_seconds"] = _mod["_resolve_alibaba_token_plan_exhaustion_cooldown_seconds"]
 
 
 # ---------------------------------------------------------------------------
@@ -981,6 +1006,8 @@ def _get_codex_auto_agent_candidate_cooldown_scope(
 ) -> str:
     if error_class == _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CLASS:
         return "none"
+    if error_class in _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES:
+        return "candidate"
     if _is_kimi_code_auto_agent_candidate(candidate):
         if (
             error_class == "kimi_code_managed_account"
@@ -1211,6 +1238,74 @@ def _is_alibaba_token_plan_unsupported_model_response(
     return False
 
 
+_ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTION_MESSAGE_MARKERS = (
+    "token-plan 5-hour quota has been exhausted",
+    "token-plan five-hour quota has been exhausted",
+    "five-hour token quota is exhausted",
+    "five hour token quota is exhausted",
+    "5-hour token quota is exhausted",
+    "5h token quota is exhausted",
+    "five-hour quota is exhausted",
+    "five hour quota is exhausted",
+    "5-hour quota is exhausted",
+    "5h quota is exhausted",
+)
+_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTION_MESSAGE_MARKERS = (
+    "token-plan 1-week quota has been exhausted",
+    "token-plan one-week quota has been exhausted",
+    "weekly token quota is exhausted",
+    "1-week token quota is exhausted",
+    "one-week token quota is exhausted",
+    "7-day token quota is exhausted",
+    "weekly quota is exhausted",
+    "1-week quota is exhausted",
+    "one-week quota is exhausted",
+    "7-day quota is exhausted",
+)
+
+
+def _classify_alibaba_token_plan_quota_exhaustion_response(
+    exc: Any,
+    *,
+    candidate: Optional[dict[str, Any]] = None,
+    attempted_provider_call: bool = True,
+) -> Optional[str]:
+    """Classify confirmed provider-attributed Token Plan quota exhaustion.
+
+    Matching requires Alibaba attribution, explicit provider-attempt evidence,
+    and a structured upstream error message. Ambiguous Alibaba 429 text
+    deliberately falls through to generic rate-limit handling.
+    """
+    provider_returned = bool(getattr(exc, "_aawm_provider_returned", False))
+    if (
+        not attempted_provider_call
+        or not provider_returned
+        or not isinstance(candidate, dict)
+    ):
+        return None
+    if candidate.get("provider") != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
+        return None
+    error_blocks = _iter_codex_auto_agent_error_blocks(exc)
+    if not error_blocks:
+        return None
+    for error in error_blocks:
+        message = error.get("message")
+        if not isinstance(message, str):
+            continue
+        message_lower = message.lower()
+        if any(
+            marker in message_lower
+            for marker in _ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTION_MESSAGE_MARKERS
+        ):
+            return _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTED_ERROR_CLASS
+        if any(
+            marker in message_lower
+            for marker in _ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTION_MESSAGE_MARKERS
+        ):
+            return _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS
+    return None
+
+
 # Exact OpenAI Responses provider text for missing reasoning items when
 # store=false. Match only after upstream returns this shape; never validate
 # proactively. Item ids are the Responses reasoning/item form ``rs_...``.
@@ -1333,6 +1428,7 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     exc: Any,
     *,
     candidate: Optional[dict[str, Any]] = None,
+    attempted_provider_call: bool = True,
 ) -> Optional[str]:
     if _is_codex_auto_agent_candidate_deterministically_ineligible(exc):
         return _CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_ERROR_CLASS
@@ -1347,6 +1443,13 @@ def _classify_codex_auto_agent_retryable_exhaustion(
             return "upstream_timeout"
     if _is_codex_auto_agent_grok_account_quota_exhaustion(exc):
         return "capacity_exhausted"
+    alibaba_exhaustion_class = _classify_alibaba_token_plan_quota_exhaustion_response(
+        exc,
+        candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
+    )
+    if alibaba_exhaustion_class is not None:
+        return alibaba_exhaustion_class
     if _is_alibaba_token_plan_unsupported_model_response(exc, candidate=candidate):
         return "candidate_unavailable"
     if (
@@ -1525,13 +1628,18 @@ def _get_codex_auto_agent_cooldown_seconds(
     exc: Any,
     *,
     candidate: Optional[dict[str, Any]] = None,
+    attempted_provider_call: bool = True,
 ) -> float:
     assert _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS is not None
     header_wait = _parse_codex_auto_agent_header_wait_seconds(exc)
     usage_limit_max_seconds = _resolve_codex_auto_agent_usage_limit_cooldown_max_seconds()
     error_class = _classify_codex_auto_agent_retryable_exhaustion(
-        exc, candidate=candidate
+        exc,
+        candidate=candidate,
+        attempted_provider_call=attempted_provider_call,
     )
+    if error_class in _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES:
+        return _resolve_alibaba_token_plan_exhaustion_cooldown_seconds()
     tokens = _extract_codex_auto_agent_error_tokens(exc)
     if error_class == "usage_limit_reached":
         resolved = _CODEX_AUTO_AGENT_DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS
@@ -1760,6 +1868,7 @@ _HOST_FUNCTION_NAMES = (
     "_is_codex_auto_agent_grok_account_quota_exhaustion",
     "is_openai_responses_unpersisted_item_not_found_error",
     "_openai_responses_unpersisted_item_not_found_message",
+    "_classify_alibaba_token_plan_quota_exhaustion_response",
     "_classify_codex_auto_agent_retryable_exhaustion",
     "_is_codex_auto_agent_retryable_exhaustion",
     "plan_responses_pre_commit_retry",

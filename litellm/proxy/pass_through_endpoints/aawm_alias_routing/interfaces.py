@@ -281,6 +281,7 @@ class ClassifyRetryableFailureFn(Protocol):
         exc: Exception,
         *,
         candidate: Optional[dict[str, Any]] = None,
+        attempted_provider_call: bool = True,
     ) -> Optional[str]:
         ...
 
@@ -307,6 +308,7 @@ class GetCooldownSecondsFn(Protocol):
         exc: Exception,
         *,
         candidate: dict[str, Any],
+        attempted_provider_call: bool = True,
     ) -> float:
         ...
 

@@ -6,6 +6,7 @@ Does NOT import llm_passthrough_endpoints at module scope.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
@@ -13,8 +14,19 @@ import pytest
 from fastapi import HTTPException, Request
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import selection
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    cooldown_state,
+    durable,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
     SelectionEnumeration,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
+    AliasRoutingStateManager,
 )
 
 
@@ -654,6 +666,174 @@ class TestCodexSelectorFirstChoice:
         assert skipped["reason"] == "cooldown"
         assert skipped["cooldown_seconds"] == 60.0
         assert skipped["cooldown_state_source"] == "durable_cache"
+
+    @pytest.mark.asyncio
+    async def test_alibaba_account_cooldown_suppresses_both_models_including_last_resort(
+        self,
+    ) -> None:
+        request = _make_request()
+        candidates = (
+            {
+                "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+                "model": "alibaba_token_plan/qwen3.8-max",
+                "route_family": "alibaba_token_plan_chat_completions_adapter",
+                "last_resort": False,
+            },
+            {
+                "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+                "model": "alibaba_token_plan/qwen3.7-max",
+                "route_family": "alibaba_token_plan_chat_completions_adapter",
+                "last_resort": True,
+            },
+        )
+        states: list[dict[str, Any]] = []
+        state_keys: list[str] = []
+
+        async def _cooldown_state(cooldown_key: str) -> tuple[float, str]:
+            if cooldown_key == CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY:
+                return (8434.5, "memory")
+            return (0.0, "local_fallback")
+
+        with patch.dict(
+            selection._select_codex_auto_agent_candidate.__globals__,
+            {
+                "_resolve_aawm_alias_selection_enumeration": (
+                    lambda request, canonical_alias, *, ingress, client_product_label=None: (
+                        SelectionEnumeration(candidates=candidates, commit_token=None)
+                    )
+                ),
+                "_get_codex_active_cooldown_state": _cooldown_state,
+            },
+        ):
+            for candidate in candidates:
+                state = await selection._build_codex_auto_agent_candidate_state(
+                    request,
+                    candidate_template=candidate,
+                )
+                states.append(state)
+                state_keys.append(state["cooldown_key"])
+
+        assert state_keys == [
+            "alibaba_token_plan:alibaba_token_plan/qwen3.8-max:alibaba_token_plan",
+            "alibaba_token_plan:alibaba_token_plan/qwen3.7-max:alibaba_token_plan",
+        ]
+        assert all(state["skip_reason"] == "account_quota_cooldown" for state in states)
+        assert all(
+            state["cooldown_seconds"] == 8434.5
+            and state["cooldown_state_source"] == "alibaba_token_plan_account:memory"
+            for state in states
+        )
+
+    @pytest.mark.asyncio
+    async def test_alibaba_account_cooldown_hydrates_from_durable_cache_for_fresh_selection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        request = _make_request()
+        candidates = (
+            {
+                "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+                "model": "alibaba_token_plan/qwen3.8-max",
+                "route_family": "alibaba_token_plan_chat_completions_adapter",
+                "last_resort": False,
+            },
+            {
+                "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+                "model": "alibaba_token_plan/qwen3.7-max",
+                "route_family": "alibaba_token_plan_chat_completions_adapter",
+                "last_resort": True,
+            },
+        )
+        durable_reads: list[str] = []
+        durable_cache_reads: list[str] = []
+        manager = AliasRoutingStateManager()
+        previous_manager = cooldown_state._manager
+        payload = {"expires_at_epoch": time.time() + 8434.5}
+        canonical_cache_key = durable.build_aawm_alias_routing_durable_cache_key(
+            alias_family="codex",
+            state_kind="cooldown",
+            state_key=CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
+        )
+
+        class _DurableCache:
+            async def async_get_cache(self, *, key: str, **kwargs: Any) -> Any:
+                durable_cache_reads.append(key)
+                if key == canonical_cache_key:
+                    return payload
+                return None
+
+        durable_cache = _DurableCache()
+
+        async def _read_state(**kwargs: Any) -> dict[str, Any]:
+            state_key = kwargs["state_key"]
+            durable_reads.append(state_key)
+            return await durable.read_aawm_alias_routing_state(**kwargs)
+
+        async def _active_cooldown_state(key: str) -> tuple[float, str]:
+            return await cooldown_state._get_codex_auto_agent_active_cooldown_state(
+                key,
+                _dual_cache_fn=lambda: durable_cache,
+                _read_state_fn=lambda: _read_state,
+            )
+
+        cooldown_state.configure_cooldown_state_runtime(manager=manager)
+        _set_selection_runtime("_get_codex_active_cooldown_state", _active_cooldown_state)
+        monkeypatch.setattr(
+            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity.get_session_owner_record",
+            AsyncMock(return_value=(None, None, None)),
+        )
+        mock_enum = SelectionEnumeration(candidates=candidates, commit_token=None)
+        try:
+            with patch.dict(
+                selection._select_codex_auto_agent_candidate.__globals__,
+                {
+                    "_resolve_aawm_alias_selection_enumeration": (
+                        lambda request, canonical_alias, *, ingress, client_product_label=None: mock_enum
+                    )
+                },
+            ):
+                with pytest.raises(HTTPException) as exc_info:
+                    await selection._select_codex_auto_agent_candidate(
+                        request=request,
+                        request_body={"model": "basic"},
+                    )
+        finally:
+            cooldown_state._manager = previous_manager
+
+        skipped = {
+            candidate["model"]: candidate for candidate in exc_info.value.detail["candidates"]
+        }
+        assert set(skipped) == {
+            "alibaba_token_plan/qwen3.8-max",
+            "alibaba_token_plan/qwen3.7-max",
+        }
+        assert all(
+            candidate["reason"] == "account_quota_cooldown"
+            and candidate["cooldown_seconds"] > 0
+            for candidate in skipped.values()
+        )
+        assert skipped["alibaba_token_plan/qwen3.8-max"][
+            "cooldown_state_source"
+        ] == "alibaba_token_plan_account:durable_cache"
+        assert skipped["alibaba_token_plan/qwen3.7-max"][
+            "cooldown_state_source"
+        ] in {
+            "alibaba_token_plan_account:durable_cache",
+            "alibaba_token_plan_account:memory",
+        }
+        assert (
+            durable_reads.count(
+                CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+            )
+            >= 1
+        )
+        assert durable_cache_reads.count(canonical_cache_key) >= 1
+        assert (
+            manager.codex.cooldown_until_monotonic_by_key[
+                CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+            ]
+            > time.monotonic()
+        )
 
     @pytest.mark.asyncio
     async def test_excluded_candidate_prefers_normalized_quota_terminal_reset(self):

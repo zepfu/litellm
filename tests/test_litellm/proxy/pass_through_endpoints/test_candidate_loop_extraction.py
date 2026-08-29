@@ -22,7 +22,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import HTTPException
 import pytest
@@ -40,14 +40,34 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
     AliasRoutingStateManager,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
     CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
 )
+from litellm.proxy._types import ProxyException
 
 PACKAGE_DIR = Path(package.__file__).resolve().parent
 GOD_PATH = Path(lpe.__file__).resolve()
 CANDIDATE_LOOP_PATH = PACKAGE_DIR / "candidate_loop.py"
 INTERFACES_PATH = PACKAGE_DIR / "interfaces.py"
+
+
+class _StructuredWeeklyExhaustion(Exception):
+    def __init__(self) -> None:
+        super().__init__("Token Plan exhausted")
+        self.status_code = 429
+        self._aawm_provider_returned = True
+        self.detail = {
+            "error": {
+                "type": "insufficient_quota",
+                "code": "token_plan_quota_exhausted",
+                "message": (
+                    "Your token-plan 1-week quota has been exhausted. "
+                    "The quota will reset at 08-27 12:04:00 UTC."
+                ),
+            }
+        }
 
 
 def _read(path: Path) -> str:
@@ -608,10 +628,290 @@ def test_resolve_failure_plan_classifies_alibaba_model_not_found_as_candidate_un
         classify_kimi_fn=lambda metadata: None,
         classify_retryable_fn=package.error_signals._classify_codex_auto_agent_retryable_exhaustion,
         grok_quota_fn=lambda exc, candidate=None: False,
-        cooldown_seconds_fn=lambda exc, candidate=None: 60,
+        cooldown_seconds_fn=lambda exc, candidate=None, attempted_provider_call=True: 60,
     )
 
     assert captured["error_class"] == "candidate_unavailable"
+    assert plan.applied_scope == "candidate"
+
+
+def test_resolve_failure_plan_propagates_one_alibaba_ttl_to_plan_and_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Alibaba exhaustion resolves its TTL once, then reuses it for telemetry."""
+
+    exc = _StructuredWeeklyExhaustion()
+    candidate = {"provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER}
+    captured: dict = {}
+    attempt_record: dict[str, Any] = {}
+    monkeypatch.setattr(
+        package.error_signals,
+        "_resolve_alibaba_token_plan_exhaustion_cooldown_seconds",
+        lambda: 8434.5,
+    )
+
+    def _capture_publication(**kwargs) -> object:
+        captured.update(kwargs)
+        return lpe._resolve_auto_agent_cooldown_publication_plan(**kwargs)
+
+    ttl_calls: list[bool] = []
+
+    def _cooldown_seconds(
+        exc: Exception,
+        *,
+        candidate: Optional[dict[str, Any]] = None,
+        attempted_provider_call: bool = True,
+    ) -> float:
+        ttl_calls.append(attempted_provider_call)
+        return lpe._get_codex_auto_agent_cooldown_seconds(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=attempted_provider_call,
+        )
+
+    plan = candidate_loop._resolve_failure_plan(
+        resolve_cooldown_publication_fn=_capture_publication,
+        record_codex_failure_evidence_fn=lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("confirmed exhaustion bypasses failure evidence")
+        ),
+        request=SimpleNamespace(),
+        candidate=candidate,
+        selection={
+            "cooldown_key": "alibaba:selected",
+            "lane_key": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
+        },
+        attempt_record=attempt_record,
+        exc=exc,
+        codex_failure_evidence_alias=None,
+        kimi_failure_metadata_fn=lambda exc, candidate=None: None,
+        classify_kimi_fn=lambda metadata: None,
+        classify_retryable_fn=(
+            lambda exc, candidate=None, attempted_provider_call=True: (
+                lpe._classify_codex_auto_agent_retryable_exhaustion(
+                    exc,
+                    candidate=candidate,
+                    attempted_provider_call=attempted_provider_call,
+                )
+            )
+        ),
+        grok_quota_fn=lambda exc, candidate=None: False,
+        cooldown_seconds_fn=_cooldown_seconds,
+    )
+
+    assert (
+        lpe._get_codex_auto_agent_candidate_cooldown_scope(
+            captured["error_class"],
+            candidate=candidate,
+        )
+        == "candidate"
+    )
+    assert captured["selected_cooldown_key"] == "alibaba:selected"
+    assert plan.memory_keys == (
+        CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
+    )
+    assert plan.durable_keys == (
+        CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
+    )
+    assert plan.duration_seconds == 8434.5
+    assert captured["cooldown_seconds"] == plan.duration_seconds
+    assert ttl_calls == [True]
+    assert attempt_record["cooldown_seconds"] == 8434.5
+    assert attempt_record["cooldown_scope"] == "candidate"
+
+
+def test_resolve_failure_plan_local_matching_alibaba_text_does_not_publish_account_ttl() -> None:
+    """Unconfirmed matching text stays generic and cannot cool the account."""
+
+    def _capture_publication(**kwargs) -> object:
+        captured.update(kwargs)
+        return lpe._resolve_auto_agent_cooldown_publication_plan(**kwargs)
+
+    captured: dict[str, Any] = {}
+    ttl_calls: list[bool] = []
+    exc = _StructuredWeeklyExhaustion()
+    exc.attempted_provider_call = False
+    candidate = {"provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER}
+
+    def _cooldown_seconds(
+        exc: Exception,
+        *,
+        candidate: Optional[dict[str, Any]] = None,
+        attempted_provider_call: bool = True,
+    ) -> float:
+        ttl_calls.append(attempted_provider_call)
+        return lpe._get_codex_auto_agent_cooldown_seconds(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=attempted_provider_call,
+        )
+
+    plan = candidate_loop._resolve_failure_plan(
+        resolve_cooldown_publication_fn=_capture_publication,
+        record_codex_failure_evidence_fn=lambda **kwargs: None,
+        request=SimpleNamespace(),
+        candidate=candidate,
+        selection={"cooldown_key": "alibaba:selected", "lane_key": None},
+        attempt_record={},
+        exc=exc,
+        codex_failure_evidence_alias=None,
+        kimi_failure_metadata_fn=lambda exc, candidate=None: None,
+        classify_kimi_fn=lambda metadata: None,
+        classify_retryable_fn=lpe._classify_codex_auto_agent_retryable_exhaustion,
+        grok_quota_fn=lambda exc, candidate=None: False,
+        cooldown_seconds_fn=_cooldown_seconds,
+    )
+
+    assert captured["error_class"] == "rate_limited"
+    assert captured["selected_cooldown_key"] == "alibaba:selected"
+    assert ttl_calls == [False]
+    assert plan.memory_keys == ("alibaba:selected",)
+    assert plan.durable_keys == ("alibaba:selected",)
+    assert plan.applied_scope == "candidate"
+    assert plan.duration_seconds == 3 * 60 * 60.0
+
+
+def test_resolve_failure_plan_local_http_exception_after_attempt_does_not_publish_account_ttl() -> None:
+    """A local matching HTTPException cannot publish Alibaba account cooldown."""
+
+    exc = HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "type": "insufficient_quota",
+                "code": "token_plan_quota_exhausted",
+                "message": "Your five-hour token quota is exhausted.",
+            }
+        },
+    )
+    candidate = {"provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER}
+    attempt_record = {"attempted_provider_call": True}
+    captured: dict[str, Any] = {}
+
+    def _capture_publication(**kwargs) -> object:
+        captured.update(kwargs)
+        return lpe._resolve_auto_agent_cooldown_publication_plan(**kwargs)
+
+    plan = candidate_loop._resolve_failure_plan(
+        resolve_cooldown_publication_fn=_capture_publication,
+        record_codex_failure_evidence_fn=lambda **kwargs: None,
+        request=SimpleNamespace(),
+        candidate=candidate,
+        selection={"cooldown_key": "alibaba:selected", "lane_key": None},
+        attempt_record=attempt_record,
+        exc=exc,
+        codex_failure_evidence_alias=None,
+        kimi_failure_metadata_fn=lambda exc, candidate=None: None,
+        classify_kimi_fn=lambda metadata: None,
+        classify_retryable_fn=lpe._classify_codex_auto_agent_retryable_exhaustion,
+        grok_quota_fn=lambda exc, candidate=None: False,
+        cooldown_seconds_fn=lpe._get_codex_auto_agent_cooldown_seconds,
+    )
+
+    assert getattr(exc, "_aawm_provider_returned", False) is False
+    assert captured["error_class"] == "rate_limited"
+    assert plan.memory_keys == ("alibaba:selected",)
+    assert plan.durable_keys == ("alibaba:selected",)
+    assert (
+        CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        not in plan.memory_keys
+    )
+    assert (
+        CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        not in plan.durable_keys
+    )
+    assert attempt_record["attempted_provider_call"] is True
+
+
+def test_resolve_failure_plan_unmarked_proxy_exception_after_attempt_does_not_publish_account_ttl() -> None:
+    """ProxyException type alone is not Alibaba provider-returned evidence."""
+    message = "Your five-hour token quota is exhausted."
+    exc = ProxyException(
+        message=message,
+        type="rate_limit_error",
+        param=None,
+        code=429,
+    )
+    exc.status_code = 429
+    exc.detail = {
+        "error": {
+            "type": "insufficient_quota",
+            "code": "token_plan_quota_exhausted",
+            "message": message,
+        }
+    }
+    candidate = {"provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER}
+    attempt_record = {"attempted_provider_call": True}
+    captured: dict[str, Any] = {}
+
+    def _capture_publication(**kwargs) -> object:
+        captured.update(kwargs)
+        return lpe._resolve_auto_agent_cooldown_publication_plan(**kwargs)
+
+    plan = candidate_loop._resolve_failure_plan(
+        resolve_cooldown_publication_fn=_capture_publication,
+        record_codex_failure_evidence_fn=lambda **kwargs: None,
+        request=SimpleNamespace(),
+        candidate=candidate,
+        selection={"cooldown_key": "alibaba:selected", "lane_key": None},
+        attempt_record=attempt_record,
+        exc=exc,
+        codex_failure_evidence_alias=None,
+        kimi_failure_metadata_fn=lambda exc, candidate=None: None,
+        classify_kimi_fn=lambda metadata: None,
+        classify_retryable_fn=lpe._classify_codex_auto_agent_retryable_exhaustion,
+        grok_quota_fn=lambda exc, candidate=None: False,
+        cooldown_seconds_fn=lpe._get_codex_auto_agent_cooldown_seconds,
+    )
+
+    assert getattr(exc, "_aawm_provider_returned", False) is False
+    assert captured["error_class"] == "rate_limited"
+    assert plan.memory_keys == ("alibaba:selected",)
+    assert plan.durable_keys == ("alibaba:selected",)
+    assert (
+        CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        not in plan.memory_keys
+    )
+    assert (
+        CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        not in plan.durable_keys
+    )
+    assert attempt_record["attempted_provider_call"] is True
+
+
+def test_resolve_failure_plan_passes_provider_attempt_evidence_to_classifier() -> None:
+    """Classifier evidence is propagated from the failure attempt record."""
+    classifier_calls: list[bool] = []
+
+    def _classify(
+        exc: Exception,
+        *,
+        candidate: Optional[dict[str, Any]] = None,
+        attempted_provider_call: bool = True,
+    ) -> Optional[str]:
+        classifier_calls.append(attempted_provider_call)
+        return "rate_limited"
+
+    plan = candidate_loop._resolve_failure_plan(
+        resolve_cooldown_publication_fn=lambda **kwargs: SimpleNamespace(
+            applied_scope="candidate",
+            duration_seconds=30.0,
+            **kwargs,
+        ),
+        record_codex_failure_evidence_fn=lambda **kwargs: None,
+        request=SimpleNamespace(),
+        candidate={"provider": "openai"},
+        selection={"cooldown_key": "openai:selected", "lane_key": None},
+        attempt_record={"attempted_provider_call": False},
+        exc=Exception("rate limited"),
+        codex_failure_evidence_alias=None,
+        kimi_failure_metadata_fn=lambda exc, candidate=None: None,
+        classify_kimi_fn=lambda metadata: None,
+        classify_retryable_fn=_classify,
+        grok_quota_fn=lambda exc, candidate=None: False,
+        cooldown_seconds_fn=lambda exc, candidate=None, attempted_provider_call=True: 30.0,
+    )
+
+    assert classifier_calls == [False]
     assert plan.applied_scope == "candidate"
 
 
@@ -656,7 +956,7 @@ def test_resolve_failure_plan_classifies_coding_plan_1113_as_terminal_routing() 
         classify_kimi_fn=lambda metadata: None,
         classify_retryable_fn=package.error_signals._classify_codex_auto_agent_retryable_exhaustion,
         grok_quota_fn=lambda exc, candidate=None: False,
-        cooldown_seconds_fn=lambda exc, candidate=None: 60,
+        cooldown_seconds_fn=lambda exc, candidate=None, attempted_provider_call=True: 60,
     )
 
     assert captured["error_class"] == "provider_terminal_error"
@@ -818,7 +1118,7 @@ async def test_candidate_loop_non_401_provider_terminal_error_does_not_rotate_ac
     monkeypatch.setattr(
         lpe,
         "_classify_codex_auto_agent_retryable_exhaustion",
-        lambda exc, *, candidate=None: "provider_terminal_error"
+        lambda exc, *, candidate=None, attempted_provider_call=True: "provider_terminal_error"
         if getattr(exc, "status_code", None) == 403
         else None,
     )
@@ -917,9 +1217,9 @@ def test_resolve_failure_plan_preserves_genuine_quota_transient_plan(
         codex_failure_evidence_alias="work",
         kimi_failure_metadata_fn=lambda exc, candidate=None: None,
         classify_kimi_fn=lambda metadata: None,
-        classify_retryable_fn=lambda exc, candidate=None: "rate_limited",
+        classify_retryable_fn=lambda exc, candidate=None, attempted_provider_call=True: "rate_limited",
         grok_quota_fn=lambda exc, candidate=None: True,
-        cooldown_seconds_fn=lambda exc, candidate=None: 30.0,
+        cooldown_seconds_fn=lambda exc, candidate=None, attempted_provider_call=True: 30.0,
     )
 
     assert captured["error_class"] == "rate_limited"
@@ -1095,7 +1395,7 @@ def test_resolve_failure_plan_uses_fresh_auth_after_normal_classifiers_return_no
         classify_kimi_fn=_normal_classifier("kimi"),
         classify_retryable_fn=_normal_classifier("retryable"),
         grok_quota_fn=lambda exc, candidate=None: False,
-        cooldown_seconds_fn=lambda exc, candidate=None: 60,
+        cooldown_seconds_fn=lambda exc, candidate=None, attempted_provider_call=True: 60,
         fresh_codex_auth_error_class="provider_terminal_error",
     )
 
@@ -1142,13 +1442,13 @@ def test_resolve_failure_plan_ineligible_short_circuits_evidence_and_publication
         classify_kimi_fn=lambda metadata: (_ for _ in ()).throw(
             AssertionError("classification must short-circuit")
         ),
-        classify_retryable_fn=lambda exc, candidate=None: (_ for _ in ()).throw(
+        classify_retryable_fn=lambda exc, candidate=None, attempted_provider_call=True: (_ for _ in ()).throw(
             AssertionError("classification must short-circuit")
         ),
         grok_quota_fn=lambda exc, candidate=None: (_ for _ in ()).throw(
             AssertionError("quota classification must not run")
         ),
-        cooldown_seconds_fn=lambda exc, candidate=None: (_ for _ in ()).throw(
+        cooldown_seconds_fn=lambda exc, candidate=None, attempted_provider_call=True: (_ for _ in ()).throw(
             AssertionError("cooldown seconds must not run")
         ),
     )

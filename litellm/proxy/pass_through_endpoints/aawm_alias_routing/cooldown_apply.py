@@ -24,6 +24,10 @@ from typing import Any, Awaitable, Callable, Optional, Sequence
 from fastapi import Request
 
 from .interfaces import CooldownPublicationPlan
+from .policy import (
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES,
+)
 from .types import Payload
 
 # ---------------------------------------------------------------------------
@@ -184,6 +188,19 @@ def _resolve_auto_agent_cooldown_publication_plan(
     )
     is_last_resort = bool(candidate.get("last_resort"))
     duration = max(0.0, float(cooldown_seconds))
+    if error_class in CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES:
+        return CooldownPublicationPlan(
+            memory_keys=(
+                CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
+            ),
+            durable_keys=(
+                CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
+            ),
+            duration_seconds=duration,
+            applied_scope="candidate",
+            grok_account_quota_exhausted=grok_account_quota_exhausted,
+            kimi_failure_metadata=kimi_failure_metadata,
+        )
     allow_ttl_shrink = _is_managed_openai_usage_limit_candidate(
         candidate,
         error_class,

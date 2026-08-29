@@ -19,7 +19,10 @@ from uuid import uuid4
 from fastapi import Request
 
 from .lane_keys import _CODEX_REASONING_EFFORT_TIER_INDEX
-from .policy import CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER
+from .policy import (
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES,
+    CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
+)
 from .request_metadata import (
     _extract_auto_agent_alias_canonical_thread_id,
     _extract_auto_agent_alias_parent_thread_id,
@@ -579,6 +582,10 @@ def _update_codex_auto_agent_retryable_attempt_record(
     if retry_after_seconds is not None:
         update["retry_after_seconds"] = round(float(retry_after_seconds), 3)
     if error_class == "usage_limit_reached":
+        update.update(
+            _extract_codex_auto_agent_usage_limit_raw_quota_resets(exc)
+        )
+    elif error_class in CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES:
         update.update(
             _extract_codex_auto_agent_usage_limit_raw_quota_resets(exc)
         )

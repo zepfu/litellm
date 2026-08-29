@@ -16,9 +16,20 @@ from pathlib import Path
 from typing import Any, Optional
 from unittest.mock import patch
 
+from fastapi import HTTPException
 import pytest
 
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import error_signals
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_BASE_COOLDOWN_SECONDS,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_JITTER_SECONDS,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTED_ERROR_CLASS,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.error_signals import (
     _add_codex_auto_agent_text_error_tokens,
     _build_codex_auto_agent_native_grok_continuation_retry_metadata,
@@ -207,6 +218,289 @@ def test_install_retains_host_globals_and_preserves_unrelated_names() -> None:
             assert host_globals[name] is getattr(error_signals, name)
     finally:
         error_signals._host_globals_ref = previous_host_globals
+
+
+def _alibaba_quota_error(
+    message: str,
+    *,
+    resets_at: Any = None,
+) -> _FakeExc:
+    error: dict[str, Any] = {
+        "message": message,
+        "type": "insufficient_quota",
+        "code": "token_plan_quota_exhausted",
+    }
+    if resets_at is not None:
+        error["quota"] = {"resets_in_seconds": 100_000.0, "resets_at": resets_at}
+    return _FakeExc(
+        detail={"error": error},
+        status_code=429,
+        _aawm_provider_returned=True,
+    )
+
+
+class TestAlibabaTokenPlanExhaustion:
+    @pytest.mark.parametrize(
+        ("message", "expected_class"),
+        [
+            (
+                "Your five-hour token quota is exhausted.",
+                CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTED_ERROR_CLASS,
+            ),
+            (
+                "Your 5h quota is exhausted.",
+                CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTED_ERROR_CLASS,
+            ),
+            (
+                "Your weekly token quota is exhausted.",
+                CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS,
+            ),
+            (
+                "Your 1-week quota is exhausted.",
+                CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS,
+            ),
+            (
+                (
+                    "Your token-plan 1-week quota has been exhausted. "
+                    "The quota will reset at 08-27 12:04:00 UTC."
+                ),
+                CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS,
+            ),
+        ],
+    )
+    def test_confirmed_structured_exhaustion_classes_are_distinct(
+        self,
+        message: str,
+        expected_class: str,
+    ) -> None:
+        exc = _alibaba_quota_error(message, resets_at=999_999.0)
+        candidate = {
+            "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+            "model": "alibaba_token_plan/qwen3.8-max",
+        }
+
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(exc, candidate=candidate)
+            == expected_class
+        )
+        assert expected_class in CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES
+
+    def test_local_or_foreign_alibaba_text_does_not_confirm_exhaustion(self) -> None:
+        candidate = {
+            "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+            "model": "alibaba_token_plan/qwen3.8-max",
+        }
+        foreign_candidate = dict(candidate, provider="openai")
+
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                ValueError("five-hour quota is exhausted"),
+                candidate=candidate,
+            )
+            is None
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                _alibaba_quota_error("five-hour quota is exhausted"),
+                candidate=foreign_candidate,
+            )
+            != CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTED_ERROR_CLASS
+        )
+
+    def test_matching_local_http_exception_after_attempt_remains_generic(self) -> None:
+        candidate = {
+            "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+            "model": "alibaba_token_plan/qwen3.8-max",
+        }
+        exc = HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "type": "insufficient_quota",
+                    "code": "token_plan_quota_exhausted",
+                    "message": "Your five-hour token quota is exhausted.",
+                }
+            },
+        )
+
+        assert getattr(exc, "_aawm_provider_returned", False) is False
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=True,
+            )
+            == "rate_limited"
+        )
+        assert (
+            _get_codex_auto_agent_cooldown_seconds(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=True,
+            )
+            == 3 * 60 * 60.0
+        )
+
+    def test_provider_returned_marker_confirms_http_exception_exhaustion(self) -> None:
+        candidate = {
+            "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+            "model": "alibaba_token_plan/qwen3.8-max",
+        }
+        exc = HTTPException(
+            status_code=429,
+            detail={
+                "error": {
+                    "type": "insufficient_quota",
+                    "code": "token_plan_quota_exhausted",
+                    "message": "Your five-hour token quota is exhausted.",
+                }
+            },
+        )
+        setattr(exc, "_aawm_provider_returned", True)
+
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=True,
+            )
+            == CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTED_ERROR_CLASS
+        )
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "five-hour token quota is exhausted",
+            (
+                "Your token-plan 1-week quota has been exhausted. "
+                "The quota will reset at 08-27 12:04:00 UTC."
+            ),
+        ],
+    )
+    def test_locally_generated_matching_text_remains_unconfirmed(
+        self,
+        message: str,
+    ) -> None:
+        exc = _alibaba_quota_error(message, resets_at=999_999.0)
+        exc.attempted_provider_call = False
+        candidate = {
+            "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+            "model": "alibaba_token_plan/qwen3.8-max",
+        }
+
+        assert _classify_codex_auto_agent_retryable_exhaustion(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=False,
+        ) == "rate_limited"
+        assert (
+            _get_codex_auto_agent_cooldown_seconds(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=False,
+            )
+            == 3 * 60 * 60.0
+        )
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                "rate_limited",
+                candidate=candidate,
+            )
+            == "candidate"
+        )
+        assert (
+            CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+            not in CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES
+        )
+
+    def test_ambiguous_alibaba_429_keeps_generic_rate_limit(self) -> None:
+        exc = _alibaba_quota_error("Too many requests")
+        candidate = {
+            "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+            "model": "alibaba_token_plan/qwen3.8-max",
+        }
+
+        assert _classify_codex_auto_agent_retryable_exhaustion(exc, candidate=candidate) == "rate_limited"
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                "rate_limited",
+                candidate=candidate,
+            )
+            == "candidate"
+        )
+
+    @pytest.mark.parametrize(
+        "error_class",
+        sorted(CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES),
+    )
+    def test_confirmed_exhaustion_scope_ignores_last_resort_label(
+        self,
+        error_class: str,
+    ) -> None:
+        candidate = {
+            "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+            "lane_key": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
+            "last_resort": True,
+        }
+
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                error_class,
+                candidate=candidate,
+            )
+            == "candidate"
+        )
+
+    @pytest.mark.parametrize(
+        "error_class",
+        sorted(CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES),
+    )
+    def test_confirmed_exhaustion_ttl_ignores_provider_reset(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        error_class: str,
+    ) -> None:
+        exc = _alibaba_quota_error(
+            "weekly quota is exhausted",
+            resets_at=999_999.0,
+        )
+        exc.upstream_headers = {
+            "Retry-After": "100000",
+            "x-ratelimit-reset": "999999",
+        }
+        candidate = {"provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER}
+
+        monkeypatch.setattr(
+            error_signals,
+            "_resolve_alibaba_token_plan_exhaustion_cooldown_seconds",
+            lambda: 8434.5,
+        )
+
+        assert _get_codex_auto_agent_cooldown_seconds(exc, candidate=candidate) == 8434.5
+        assert CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_JITTER_SECONDS == 3600.0
+
+    @pytest.mark.parametrize(
+        "jitter",
+        [0.0, 1799.5, 3600.0],
+    )
+    def test_confirmed_exhaustion_ttl_is_base_plus_bounded_jitter(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        jitter: float,
+    ) -> None:
+        exc = _alibaba_quota_error("five-hour quota is exhausted")
+        candidate = {"provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER}
+        monkeypatch.setattr(
+            error_signals,
+            "_resolve_alibaba_token_plan_exhaustion_cooldown_seconds",
+            lambda: CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_BASE_COOLDOWN_SECONDS
+            + jitter,
+        )
+
+        ttl = _get_codex_auto_agent_cooldown_seconds(exc, candidate=candidate)
+
+        assert ttl == CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTION_BASE_COOLDOWN_SECONDS + jitter
+        assert 7200.0 <= ttl <= 10800.0
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,10 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import attempt_reco
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
     CooldownPublicationPlan,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTED_ERROR_CLASS,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +417,46 @@ class TestRetryableAttemptRecord:
         assert record["cooldown_seconds"] == 10800.0
         assert record["provider_resets_in_seconds"] == 500000.0
         assert record["provider_resets_at"] == 900000.0
+
+    @pytest.mark.parametrize(
+        "error_class",
+        [
+            CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_FIVE_HOUR_EXHAUSTED_ERROR_CLASS,
+            CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_WEEKLY_EXHAUSTED_ERROR_CLASS,
+        ],
+    )
+    def test_alibaba_exhaustion_reset_is_telemetry_only(
+        self,
+        error_class: str,
+    ) -> None:
+        record: dict[str, Any] = {}
+        exc = Exception("token quota is exhausted")
+        exc._status_code = 429  # type: ignore[attr-defined]
+        exc._tokens = {"token_plan_quota_exhausted"}  # type: ignore[attr-defined]
+        exc._type_code = ("insufficient_quota", "token_plan_quota_exhausted")  # type: ignore[attr-defined]
+        exc._retry_after = 100_000.0  # type: ignore[attr-defined]
+        exc.detail = {  # type: ignore[attr-defined]
+            "error": {
+                "code": "token_plan_quota_exhausted",
+                "quota": {
+                    "resets_in_seconds": 900_000.0,
+                    "resets_at": 1_800_000.0,
+                },
+            }
+        }
+
+        attempt_records._update_codex_auto_agent_retryable_attempt_record(
+            attempt_record=record,
+            exc=exc,
+            error_class=error_class,
+            cooldown_seconds=8434.5,
+            cooldown_scope="candidate",
+            alias_model="codex-auto-agent",
+        )
+
+        assert record["cooldown_seconds"] == 8434.5
+        assert record["provider_resets_in_seconds"] == 900_000.0
+        assert record["provider_resets_at"] == 1_800_000.0
 
     def test_kimi_telemetry_attached_when_all_present(self, _configure_attempt_records: _StubState) -> None:
         state = _configure_attempt_records

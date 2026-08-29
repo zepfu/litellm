@@ -531,6 +531,10 @@ async def handle_alias_route(  # noqa: PLR0915
 
     def _raise_terminal_alias_failure(exc: Exception) -> Any:
         last_attempt = attempts[-1] if attempts else {}
+        attempted_provider_call = last_attempt.get("attempted_provider_call")
+        if attempted_provider_call is None:
+            attempted_provider_call = getattr(exc, "attempted_provider_call", True)
+        attempted_provider_call = bool(attempted_provider_call)
         terminal_exc: Optional[HTTPException] = None
         kimi_failure_metadata = _get_safe_kimi_code_probe_failure_metadata(
             exc,
@@ -558,7 +562,9 @@ async def handle_alias_route(  # noqa: PLR0915
             error_class = str(
                 last_attempt.get("error_class")
                 or _classify_codex_auto_agent_retryable_exhaustion(
-                    exc, candidate=candidate
+                    exc,
+                    candidate=candidate,
+                    attempted_provider_call=attempted_provider_call,
                 )
                 or "provider_terminal_error"
             )
@@ -1213,7 +1219,9 @@ async def handle_alias_route(  # noqa: PLR0915
                     if early_pre_commit_error_class is None:
                         early_pre_commit_error_class = (
                             _classify_codex_auto_agent_retryable_exhaustion(
-                                probe_failure_exc, candidate=candidate
+                                probe_failure_exc,
+                                candidate=candidate,
+                                attempted_provider_call=attempted_provider_call,
                             )
                         )
                     if early_pre_commit_error_class is None:
@@ -1442,7 +1450,9 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                 if error_class is None:
                     error_class = _classify_codex_auto_agent_retryable_exhaustion(
-                        failure_exc, candidate=candidate
+                        failure_exc,
+                        candidate=candidate,
+                        attempted_provider_call=attempted_provider_call,
                     )
                 if error_class is None:
                     error_class = fresh_codex_auth_error_class
@@ -1554,14 +1564,6 @@ async def handle_alias_route(  # noqa: PLR0915
                         candidate=candidate,
                         lane_key=selection.get("lane_key"),
                     )
-                cooldown_seconds = (
-                    publication_requested_ttl_seconds
-                    if publication_requested_ttl_seconds is not None
-                    else _get_codex_auto_agent_cooldown_seconds(
-                        failure_exc,
-                        candidate=candidate,
-                    )
-                )
                 # The plan was resolved inside the probe lock above.  After probe
                 # lock release, execute_cooldown_publication_transaction performed
                 # the atomic memory publish + durable commit + local index update
@@ -1569,6 +1571,7 @@ async def handle_alias_route(  # noqa: PLR0915
                 # Post-release only the request-local action remains.
                 plan = probe_failure_plan
                 assert plan is not None
+                cooldown_seconds = plan.duration_seconds
                 if plan.request_local_action == "request_local_cooldown":
                     _apply_request_local_cooldown_from_plan(
                         request,
@@ -1874,6 +1877,23 @@ def _resolve_failure_plan(
             kimi_failure_metadata=None,
             allow_ttl_shrink=False,
         )
+    raw_attempted_provider_call = attempt_record.get("attempted_provider_call")
+    if raw_attempted_provider_call is None:
+        raw_attempted_provider_call = getattr(exc, "attempted_provider_call", True)
+    attempted_provider_call = bool(raw_attempted_provider_call)
+    attempt_record["attempted_provider_call"] = attempted_provider_call
+
+    def _accepts_attempted_provider_call(fn: Any) -> bool:
+        try:
+            signature = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return False
+        parameter = signature.parameters.get("attempted_provider_call")
+        return parameter is not None or any(
+            item.kind == inspect.Parameter.VAR_KEYWORD
+            for item in signature.parameters.values()
+        )
+
     kimi_failure_metadata = kimi_failure_metadata_fn(exc, candidate=candidate)
     error_class = classify_kimi_fn(kimi_failure_metadata)
     if error_class is None:
@@ -1894,11 +1914,25 @@ def _resolve_failure_plan(
             candidate=candidate,
         )
     if error_class is None:
-        error_class = classify_retryable_fn(exc, candidate=candidate)
+        if _accepts_attempted_provider_call(classify_retryable_fn):
+            error_class = classify_retryable_fn(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=attempted_provider_call,
+            )
+        else:
+            error_class = classify_retryable_fn(exc, candidate=candidate)
     if error_class is None:
         error_class = fresh_codex_auth_error_class
     grok_account_quota_exhausted = grok_quota_fn(exc, candidate=candidate)
-    cooldown_seconds = cooldown_seconds_fn(exc, candidate=candidate)
+    if _accepts_attempted_provider_call(cooldown_seconds_fn):
+        cooldown_seconds = cooldown_seconds_fn(
+            exc,
+            candidate=candidate,
+            attempted_provider_call=attempted_provider_call,
+        )
+    else:
+        cooldown_seconds = cooldown_seconds_fn(exc, candidate=candidate)
     if codex_failure_evidence_alias is not None:
         record_codex_failure_evidence_fn(
             canonical_alias=codex_failure_evidence_alias,
@@ -1909,7 +1943,7 @@ def _resolve_failure_plan(
                 cooldown_seconds if error_class == "usage_limit_reached" else None
             ),
         )
-    return resolve_cooldown_publication_fn(
+    plan = resolve_cooldown_publication_fn(
         request=request,
         candidate=candidate,
         lane_key=selection.get("lane_key"),
@@ -1920,3 +1954,14 @@ def _resolve_failure_plan(
         kimi_failure_metadata=kimi_failure_metadata,
         codex_failure_evidence_alias=codex_failure_evidence_alias,
     )
+    if getattr(plan, "applied_scope", "none") != "none":
+        attempt_record["cooldown_seconds"] = round(
+            float(getattr(plan, "duration_seconds", 0.0)),
+            3,
+        )
+        attempt_record["cooldown_scope"] = getattr(
+            plan,
+            "applied_scope",
+            "none",
+        )
+    return plan

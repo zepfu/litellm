@@ -35,6 +35,7 @@ from .lane_keys import (
 from .openrouter_quota import _apply_openrouter_durable_quota_candidate_cooldown
 from .policy import (
     ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER as _ANTHROPIC_AUTO_AGENT_NATIVE_PROVIDER,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
     CODEX_AUTO_AGENT_ZAI_CODING_PLAN_LANE_KEY as _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_LANE_KEY,
@@ -1068,6 +1069,28 @@ async def _apply_codex_auto_agent_grok_account_lane_cooldown(
     return cooldown_seconds, cooldown_state_source, skip_reason
 
 
+async def _apply_codex_auto_agent_alibaba_token_plan_account_cooldown(
+    *,
+    candidate: dict[str, Any],
+    cooldown_seconds: float,
+    cooldown_state_source: Optional[str],
+    skip_reason: Optional[str],
+    get_active_cooldown_state: Callable[[str], Awaitable[tuple[float, str]]],
+) -> tuple[float, Optional[str], Optional[str]]:
+    """Suppress every Alibaba Token Plan candidate during shared account cooling."""
+    if candidate.get("provider") != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
+        return cooldown_seconds, cooldown_state_source, skip_reason
+    account_seconds, account_source = await get_active_cooldown_state(
+        _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+    )
+    if account_seconds > cooldown_seconds:
+        cooldown_seconds = account_seconds
+        cooldown_state_source = f"alibaba_token_plan_account:{account_source}"
+    if account_seconds > 0 and skip_reason is None:
+        skip_reason = "account_quota_cooldown"
+    return cooldown_seconds, cooldown_state_source, skip_reason
+
+
 # ---------------------------------------------------------------------------
 # Candidate lookup
 # ---------------------------------------------------------------------------
@@ -1798,6 +1821,17 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     ) = await _apply_codex_auto_agent_grok_account_lane_cooldown(
         candidate=candidate,
         lane_key=lane_key,
+        cooldown_seconds=cooldown_seconds,
+        cooldown_state_source=cooldown_state_source,
+        skip_reason=skip_reason,
+        get_active_cooldown_state=_get_codex_active_cooldown_state,
+    )
+    (
+        cooldown_seconds,
+        cooldown_state_source,
+        skip_reason,
+    ) = await _apply_codex_auto_agent_alibaba_token_plan_account_cooldown(
+        candidate=candidate,
         cooldown_seconds=cooldown_seconds,
         cooldown_state_source=cooldown_state_source,
         skip_reason=skip_reason,
@@ -4430,6 +4464,7 @@ _HOST_FUNCTION_NAMES = (
     "_apply_codex_auto_agent_adapter_local_candidate_cooldown",
     "_apply_kimi_code_managed_account_lane_cooldown",
     "_apply_codex_auto_agent_grok_account_lane_cooldown",
+    "_apply_codex_auto_agent_alibaba_token_plan_account_cooldown",
     "_find_codex_auto_agent_candidate",
     "_find_codex_auto_agent_affinity_candidate",
     "_find_anthropic_auto_agent_candidate",
@@ -4570,6 +4605,12 @@ def install(host_globals: dict) -> None:
         ),
         "_is_grok_account_quota_candidate": _is_grok_account_quota_candidate,
         "_get_grok_account_quota_lane_cooldown_key": _get_grok_account_quota_lane_cooldown_key,
+        "_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER": (
+            _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+        ),
+        "_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY": (
+            _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        ),
         "_is_kimi_code_candidate": _is_kimi_code_candidate,
         "_get_kimi_managed_account_cooldown_key": _get_kimi_managed_account_cooldown_key,
         "datetime": datetime,
