@@ -398,6 +398,9 @@ DEFAULT_CODEX_RESET_CREDIT_POLL_ENABLED = False
 DEFAULT_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS = 3600.0
 DEFAULT_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_CODEX_USAGE_URL = (
+    "https://chatgpt.com/backend-api/wham/usage"
+)
+DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL = (
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 )
 DEFAULT_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS = 3
@@ -3096,7 +3099,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         default=os.getenv("AAWM_CODEX_USAGE_URL", DEFAULT_CODEX_USAGE_URL),
         help=(
             "Codex usage endpoint polled by the sidecar. Defaults to "
-            "AAWM_CODEX_USAGE_URL or the native ChatGPT wham rate-limit-reset-credits URL."
+            "AAWM_CODEX_USAGE_URL or the native ChatGPT wham usage URL."
         ),
     )
     parser.add_argument(
@@ -4606,17 +4609,20 @@ def _json_safe_codex_reset_credit_value(value: Any) -> Any:
     return str(value)
 
 
-def _resolve_codex_reset_credit_poll_url(config: ProviderStatusLoopConfig) -> str:
+def _resolve_codex_reset_credit_poll_url(
+    _config: ProviderStatusLoopConfig,
+) -> str:
+    return DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL
+
+
+def _resolve_codex_usage_poll_url(config: ProviderStatusLoopConfig) -> str:
     configured = str(config.codex_usage_url).strip()
-    if not configured:
-        return probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL
-    legacy = getattr(
-        probes,
-        "LEGACY_CODEX_WHAM_USAGE_URL",
-        "https://chatgpt.com/backend-api/wham/usage",
-    )
-    if configured.rstrip("/") == legacy.rstrip("/"):
-        return probes.DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL
+    if (
+        not configured
+        or configured.rstrip("/")
+        == DEFAULT_CODEX_RESET_CREDIT_DETAIL_URL.rstrip("/")
+    ):
+        return DEFAULT_CODEX_USAGE_URL
     return configured
 
 
@@ -5329,9 +5335,12 @@ def _codex_reset_credit_retryable_url_error(exc: urllib_error.URLError) -> bool:
     return any(hint in message for hint in CODEX_RESET_CREDIT_RETRYABLE_ERROR_HINTS)
 
 
-def _fetch_codex_reset_credit_payload(
+def _fetch_codex_endpoint_payload(
     config: ProviderStatusLoopConfig,
     record: CodexOAuthCredentialRecord,
+    *,
+    poll_url: str,
+    endpoint_name: str,
 ) -> Dict[str, Any]:
     max_attempts = max(1, config.codex_reset_credit_poll_max_attempts)
     attempt_count = 0
@@ -5339,8 +5348,6 @@ def _fetch_codex_reset_credit_payload(
     last_status_code: Optional[int] = None
     last_error_hint: Optional[str] = None
     last_error_message = "Codex reset-credit poll failed."
-    poll_url = _resolve_codex_reset_credit_poll_url(config)
-
     while attempt_count < max_attempts:
         attempt_count += 1
         try:
@@ -5390,7 +5397,10 @@ def _fetch_codex_reset_credit_payload(
         except urllib_error.URLError as exc:
             last_status_code = None
             last_error_hint = None
-            last_error_message = "Codex reset-credit poll failed while contacting the reset-credit detail endpoint."
+            last_error_message = (
+                f"Codex {endpoint_name} poll failed while contacting the "
+                f"{endpoint_name} endpoint."
+            )
             if (
                 attempt_count < max_attempts
                 and _codex_reset_credit_retryable_url_error(exc)
@@ -5414,14 +5424,14 @@ def _fetch_codex_reset_credit_payload(
             payload = json.loads(response_body)
         except json.JSONDecodeError as exc:
             raise CodexResetCreditPollError(
-                "Codex reset-credit endpoint returned invalid JSON.",
+                f"Codex {endpoint_name} endpoint returned invalid JSON.",
                 status_code=int(status_code),
                 attempt_count=attempt_count,
                 retry_count=retry_count,
             ) from exc
         if not isinstance(payload, dict):
             raise CodexResetCreditPollError(
-                "Codex reset-credit endpoint returned a non-object payload.",
+                f"Codex {endpoint_name} endpoint returned a non-object payload.",
                 status_code=int(status_code),
                 attempt_count=attempt_count,
                 retry_count=retry_count,
@@ -5441,6 +5451,44 @@ def _fetch_codex_reset_credit_payload(
         attempt_count=attempt_count,
         retry_count=retry_count,
     )
+
+
+def _fetch_codex_reset_credit_payload(
+    config: ProviderStatusLoopConfig,
+    record: CodexOAuthCredentialRecord,
+) -> Dict[str, Any]:
+    """Fetch reset-credit detail and usage independently for one account."""
+    components: Dict[str, Any] = {}
+    errors: Dict[str, Exception] = {}
+    for component, poll_url, endpoint_name in (
+        (
+            "reset_credit",
+            _resolve_codex_reset_credit_poll_url(config),
+            "reset-credit",
+        ),
+        ("usage", _resolve_codex_usage_poll_url(config), "usage"),
+    ):
+        try:
+            components[component] = _fetch_codex_endpoint_payload(
+                config,
+                record,
+                poll_url=poll_url,
+                endpoint_name=endpoint_name,
+            )
+        except Exception as exc:
+            errors[component] = exc
+
+    return {
+        "components": components,
+        "component_errors": errors,
+        # Preserve the legacy single-payload shape for test seams and callers
+        # that only provide a reset-credit response.
+        **(
+            components.get("reset_credit")
+            or components.get("usage")
+            or {}
+        ),
+    }
 
 
 def _codex_quota_number(value: Any) -> Optional[float]:
@@ -5531,6 +5579,29 @@ def _codex_quota_period_from_window_minutes(
     if window_minutes == 1440:
         return "daily"
     return f"{window_minutes}_minutes"
+
+
+def _codex_quota_window_minutes(window: Mapping[str, Any]) -> Optional[int]:
+    window_minutes = _codex_quota_int(window.get("window_minutes"))
+    if window_minutes is not None:
+        return window_minutes if window_minutes > 0 else None
+    window_seconds = _codex_quota_int(window.get("limit_window_seconds"))
+    if window_seconds is None or window_seconds <= 0 or window_seconds % 60:
+        return None
+    return window_seconds // 60
+
+
+def _codex_quota_normalized_window(
+    window: Mapping[str, Any],
+) -> Dict[str, Any]:
+    normalized = dict(window)
+    normalized["window_minutes"] = _codex_quota_window_minutes(window)
+    normalized["resets_at"] = (
+        window.get("resets_at")
+        if "resets_at" in window
+        else window.get("reset_at")
+    )
+    return normalized
 
 
 def _coerce_codex_quota_payload(value: Any) -> Any:
@@ -5710,6 +5781,7 @@ def _build_codex_quota_limit_key(
     window_minutes: Optional[int],
     model: Optional[str],
     model_family: Optional[str],
+    quota_family: Optional[str] = None,
 ) -> str:
     identity = (
         _codex_quota_clean_string(limit_id)
@@ -5730,6 +5802,8 @@ def _build_codex_quota_limit_key(
         limit_scope or quota_period or "unknown_scope",
         str(window_minutes or "unknown_window"),
     )
+    if quota_family and quota_family != "overall":
+        parts = (*parts, quota_family)
     normalized_parts = [
         re.sub(r"[^a-z0-9_.-]+", "_", str(part).strip().lower()).strip("_")
         or "unknown"
@@ -5763,6 +5837,114 @@ def _find_codex_quota_rate_limits(
             continue
         return candidate_rate_limits, candidate
     return None, None
+
+
+def _find_codex_quota_rate_limit_sources(
+    response_body: Mapping[str, Any],
+) -> List[Dict[str, Any]]:
+    """Return overall and provider-present additional Codex quota families."""
+    sources: List[Dict[str, Any]] = []
+
+    def _append_source(
+        rate_limits: Any,
+        parent: Mapping[str, Any],
+        *,
+        quota_family: str,
+        source_path: str,
+        identity_source: Mapping[str, Any],
+    ) -> None:
+        if not isinstance(rate_limits, Mapping):
+            return
+        has_live_window = any(
+            isinstance(rate_limits.get(key), Mapping)
+            for key in ("primary_window", "secondary_window")
+        )
+        has_legacy_window = any(
+            isinstance(rate_limits.get(key), Mapping)
+            for key in ("primary", "secondary")
+        )
+        if not has_live_window and not has_legacy_window:
+            return
+        sources.append(
+            {
+                "rate_limits": rate_limits,
+                "parent": parent,
+                "quota_family": quota_family,
+                "source_path": source_path,
+                "identity_source": identity_source,
+            }
+        )
+
+    root_rate_limits = response_body.get("rate_limit")
+    root_source_count = len(sources)
+    if isinstance(root_rate_limits, Mapping):
+        _append_source(
+            root_rate_limits,
+            response_body,
+            quota_family="overall",
+            source_path="rate_limit",
+            identity_source=response_body,
+        )
+    if len(sources) == root_source_count:
+        legacy_root_rate_limits = response_body.get("rate_limits")
+        if isinstance(legacy_root_rate_limits, Mapping):
+            _append_source(
+                legacy_root_rate_limits,
+                response_body,
+                quota_family="overall",
+                source_path="rate_limits",
+                identity_source=response_body,
+            )
+
+    additional = response_body.get("additional_rate_limits")
+    if isinstance(additional, Mapping):
+        additional_items = list(additional.values())
+    elif isinstance(additional, list):
+        additional_items = additional
+    else:
+        additional_items = []
+    for ordinal, entry in enumerate(additional_items):
+        if not isinstance(entry, Mapping):
+            continue
+        rate_limits = entry.get("rate_limit")
+        source_key = "rate_limit"
+        if not isinstance(rate_limits, Mapping):
+            rate_limits = entry.get("rate_limits")
+            source_key = "rate_limits"
+        identity_text = " ".join(
+            str(source.get(key) or "")
+            for source in (entry, rate_limits)
+            if isinstance(source, Mapping)
+            for key in ("model", "model_id", "limit_id", "limit_name", "name")
+        ).lower()
+        quota_family = "spark" if "spark" in identity_text else "overall"
+        if quota_family != "spark":
+            continue
+        _append_source(
+            rate_limits,
+            entry,
+            quota_family=quota_family,
+            source_path=f"additional_rate_limits[{ordinal}].{source_key}",
+            identity_source=entry,
+        )
+
+    if sources:
+        return sources
+
+    # Preserve the legacy nested rate_limits contract for old fixtures and
+    # deployments that wrap the response one level below the root.
+    for candidate in _iter_codex_quota_dicts(response_body):
+        candidate_rate_limits = candidate.get("rate_limits")
+        if not isinstance(candidate_rate_limits, Mapping):
+            continue
+        _append_source(
+            candidate_rate_limits,
+            candidate,
+            quota_family="overall",
+            source_path="rate_limits",
+            identity_source=candidate,
+        )
+    return sources
 
 
 def _codex_quota_freshness(
@@ -5801,20 +5983,30 @@ def _extract_codex_quota_rate_limit_observations(
     """
     limit_id = _codex_quota_clean_string(rate_limits.get("limit_id"))
     limit_name = _codex_quota_clean_string(rate_limits.get("limit_name"))
+    quota_family = str(
+        rate_limits.get("_codex_quota_family") or "overall"
+    ).strip().lower()
+    source_path = str(
+        rate_limits.get("_codex_quota_source_path") or "rate_limits"
+    ).strip()
+    live_contract = bool(rate_limits.get("_codex_quota_live"))
     metadata = {
         "client_name": DEFAULT_CODEX_QUOTA_CLIENT,
         "litellm_environment": environment,
         "passthrough_route_family": "codex_quota_poll",
     }
-    model = upstream_model or "unknown"
+    model = upstream_model
     observations: List[Dict[str, Any]] = []
     for limit_scope in ("primary", "secondary"):
         window = rate_limits.get(limit_scope)
         if not isinstance(window, dict):
             continue
-        window_minutes = _codex_quota_int(window.get("window_minutes"))
+        window_minutes = _codex_quota_window_minutes(window)
         used_percentage = _codex_quota_number(window.get("used_percent"))
         provider_resets_at = _codex_quota_parse_timestamp(window.get("resets_at"))
+        provider_window_key = (
+            f"{limit_scope}_window" if live_contract else limit_scope
+        )
         observations.append(
             {
                 "observed_at": observed_at,
@@ -5827,6 +6019,9 @@ def _extract_codex_quota_rate_limit_observations(
                 "window_minutes": window_minutes,
                 "provider_resets_at": provider_resets_at,
                 "used_percentage": used_percentage,
+                "quota_family": quota_family,
+                "model": model,
+                "live_contract": live_contract,
                 "exhausted": bool(
                     used_percentage is not None and used_percentage >= 100
                 ),
@@ -5840,23 +6035,35 @@ def _extract_codex_quota_rate_limit_observations(
                     "limit_name": limit_name,
                     "limit_scope": limit_scope,
                     "window_minutes": window.get("window_minutes"),
+                    "limit_window_seconds": window.get("limit_window_seconds"),
                     "used_percent": window.get("used_percent"),
                     "resets_at": window.get("resets_at"),
+                    "reset_at": window.get("reset_at"),
                     "plan_type": rate_limits.get("plan_type"),
                     "rate_limit_reached_type": rate_limits.get(
                         "rate_limit_reached_type"
                     ),
+                    "quota_family": quota_family,
+                    "rate_limit_path": source_path,
                 },
                 "evidence": {
                     "signals": ["provider_rate_limits"],
                     "provider_fields": [
-                        f"rate_limits.{limit_scope}.used_percent",
-                        f"rate_limits.{limit_scope}.window_minutes",
-                        f"rate_limits.{limit_scope}.resets_at",
+                        f"{source_path}.{provider_window_key}.used_percent",
+                        (
+                            f"{source_path}.{provider_window_key}."
+                            "limit_window_seconds"
+                            if live_contract
+                            else f"{source_path}.{provider_window_key}.window_minutes"
+                        ),
+                        (
+                            f"{source_path}.{provider_window_key}.reset_at"
+                            if live_contract
+                            else f"{source_path}.{provider_window_key}.resets_at"
+                        ),
                     ],
                 },
                 "metadata": metadata,
-                "model": model,
             }
         )
 
@@ -5889,6 +6096,65 @@ def _extract_codex_quota_rate_limit_observations(
     return finalized
 
 
+def _normalize_codex_quota_rate_limit_source(
+    source: Mapping[str, Any],
+) -> Dict[str, Any]:
+    rate_limits = source["rate_limits"]
+    parent = source.get("parent")
+    identity_source = source.get("identity_source")
+    normalized = dict(rate_limits)
+    if isinstance(identity_source, Mapping):
+        for key in (
+            "limit_id",
+            "limit_name",
+            "model",
+            "model_id",
+            "model_slug",
+            "quota_key",
+            "quotaKey",
+            "plan_type",
+            "rate_limit_reached_type",
+        ):
+            if normalized.get(key) is None and identity_source.get(key) is not None:
+                normalized[key] = identity_source.get(key)
+    for limit_scope in ("primary", "secondary"):
+        live_window = rate_limits.get(f"{limit_scope}_window")
+        legacy_window = rate_limits.get(limit_scope)
+        if isinstance(live_window, Mapping):
+            normalized[limit_scope] = _codex_quota_normalized_window(live_window)
+        elif isinstance(legacy_window, Mapping):
+            normalized[limit_scope] = _codex_quota_normalized_window(legacy_window)
+    quota_family = str(source.get("quota_family") or "overall").strip().lower()
+    source_model = _codex_quota_upstream_model(normalized, parent or {})
+    source_quota_key = _codex_quota_clean_string(
+        normalized.get("quota_key") or normalized.get("quotaKey")
+    )
+    if quota_family == "spark":
+        source_model = source_model or _codex_quota_clean_string(
+            (identity_source or {}).get("limit_name")
+            if isinstance(identity_source, Mapping)
+            else None
+        )
+        source_model = source_model or _codex_quota_clean_string(
+            (identity_source or {}).get("model")
+            if isinstance(identity_source, Mapping)
+            else None
+        )
+        if not source_model or "spark" not in source_model.lower():
+            source_model = "gpt-5.3-codex-spark"
+    normalized["_codex_quota_family"] = quota_family
+    normalized["_codex_quota_source_path"] = str(
+        source.get("source_path") or "rate_limits"
+    )
+    normalized["_codex_quota_live"] = any(
+        isinstance(rate_limits.get(key), Mapping)
+        for key in ("primary_window", "secondary_window")
+    )
+    normalized["_codex_quota_source_model"] = source_model
+    normalized["_codex_quota_source_key"] = source_quota_key
+    return normalized
+
+
 def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
     config: ProviderStatusLoopConfig,
     *,
@@ -5896,9 +6162,8 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
     observed_at: datetime,
     response_body: Mapping[str, Any],
 ) -> tuple[list[Dict[str, Any]], Dict[str, Any]]:
-    rate_limits, parent = _find_codex_quota_rate_limits(response_body)
-
-    if rate_limits is None:
+    sources = _find_codex_quota_rate_limit_sources(response_body)
+    if not sources:
         return [], {
             "telemetry_status": "absent",
             "window_states": {
@@ -5911,120 +6176,147 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
             "present_windows_fresh": False,
         }
 
-    parent = parent or {}
-    upstream_model = _codex_quota_upstream_model(rate_limits, parent)
-    extracted = _extract_codex_quota_rate_limit_observations(
-        rate_limits,
-        record=record,
-        observed_at=observed_at,
-        environment=config.environment,
-        upstream_model=upstream_model,
-    )
-
     rows: list[Dict[str, Any]] = []
     window_states: Dict[str, str] = {}
     quota_periods: Dict[str, Optional[str]] = {}
     period_states: Dict[str, str] = {}
-    observations_by_scope = {
-        str(observation.get("limit_scope")): observation
-        for observation in extracted
-        if observation.get("limit_scope") in {"primary", "secondary"}
-    }
-    for limit_scope in ("primary", "secondary"):
-        observation = observations_by_scope.get(limit_scope)
-        window = rate_limits.get(limit_scope)
-        if observation is None or not isinstance(window, dict):
-            window_states[limit_scope] = "absent"
-            quota_periods[limit_scope] = None
-            continue
-
-        row = dict(observation)
-        window_minutes = row.get("window_minutes")
-        used_percentage = _codex_quota_number(row.get("used_percentage"))
-        expected_reset_at = row.get("provider_resets_at")
-        freshness = _codex_quota_freshness(
+    upstream_model_present = False
+    for source in sources:
+        rate_limits = _normalize_codex_quota_rate_limit_source(source)
+        quota_family = str(
+            rate_limits.get("_codex_quota_family") or "overall"
+        ).strip().lower()
+        source_model = rate_limits.get("_codex_quota_source_model")
+        if source_model is not None:
+            upstream_model_present = True
+        extracted = _extract_codex_quota_rate_limit_observations(
+            rate_limits,
+            record=record,
             observed_at=observed_at,
-            window_minutes=window_minutes,
-            used_percentage=used_percentage,
-            expected_reset_at=expected_reset_at,
+            environment=config.environment,
+            upstream_model=source_model,
         )
-        quota_period = _codex_quota_period_from_window_minutes(window_minutes)
-        window_states[limit_scope] = freshness
-        quota_periods[limit_scope] = quota_period
-        period_states[quota_period] = freshness
+        extracted_by_scope = {
+            str(observation.get("limit_scope")): observation
+            for observation in extracted
+            if observation.get("limit_scope") in {"primary", "secondary"}
+        }
+        for limit_scope in ("primary", "secondary"):
+            observation = extracted_by_scope.get(limit_scope)
+            window = rate_limits.get(limit_scope)
+            state_key = (
+                limit_scope
+                if quota_family == "overall"
+                else f"{quota_family}_{limit_scope}"
+            )
+            if observation is None or not isinstance(window, dict):
+                window_states.setdefault(state_key, "absent")
+                quota_periods.setdefault(state_key, None)
+                continue
 
-        fresh_used_percentage = used_percentage if freshness == "fresh" else None
-        remaining_pct = (
-            max(0.0, min(100.0, 100.0 - fresh_used_percentage))
-            if fresh_used_percentage is not None
-            else None
-        )
-        limit_id = _redacted_summary_field(row.get("limit_id"))
-        limit_name = _redacted_summary_field(row.get("limit_name"))
-        upstream_scope = limit_id or limit_name
-        raw_provider_fields = dict(row.get("raw_provider_fields") or {})
-        raw_provider_fields["freshness_state"] = freshness
-        if upstream_model is not None:
-            raw_provider_fields["upstream_model"] = upstream_model
-        evidence = dict(row.get("evidence") or {})
-        evidence.update(
-            {
-                "signals": ["codex_native_quota_poll"],
-                "freshness_state": freshness,
-                "account_label": record.label,
-                "account_hash": record.expected_account_hash,
-                "environment": config.environment,
-                "upstream_limit_scope": limit_scope,
-            }
-        )
-        if upstream_scope is not None:
-            evidence["upstream_scope"] = upstream_scope
-        if upstream_model is not None:
-            evidence["upstream_model"] = upstream_model
-        row.update(
-            {
-                "observed_at": observed_at,
-                "provider": "openai",
-                "client_family": DEFAULT_CODEX_QUOTA_CLIENT,
-                "account_hash": record.expected_account_hash,
-                "model": upstream_model,
-                "source": DEFAULT_CODEX_QUOTA_SOURCE,
-                "limit_id": limit_id,
-                "limit_name": limit_name,
-                "limit_scope": limit_scope,
-                "window_minutes": window_minutes,
-                "quota_period": quota_period,
-                "quota_type": "tokens",
-                "provider_resets_at": expected_reset_at,
-                "remaining_pct": remaining_pct,
-                "used_percentage": fresh_used_percentage,
-                "status": freshness,
-                "exhausted": bool(
-                    freshness == "fresh"
-                    and fresh_used_percentage is not None
-                    and fresh_used_percentage >= 100
-                ),
-                "raw_provider_fields": raw_provider_fields,
-                "evidence": evidence,
-                "litellm_call_id": (
-                    f"codex-quota-poll-{record.label}-{limit_scope}-"
-                    f"{observed_at.strftime('%Y%m%d%H%M%S')}"
-                ),
-            }
-        )
-        row["limit_key"] = _build_codex_quota_limit_key(
-            provider="openai",
-            client_family=DEFAULT_CODEX_QUOTA_CLIENT,
-            account_hash=record.expected_account_hash,
-            limit_id=limit_id,
-            limit_name=limit_name,
-            limit_scope=limit_scope,
-            quota_period=quota_period,
-            window_minutes=window_minutes,
-            model=upstream_model,
-            model_family=row.get("model_family"),
-        )
-        rows.append(row)
+            row = dict(observation)
+            window_minutes = row.get("window_minutes")
+            used_percentage = _codex_quota_number(row.get("used_percentage"))
+            expected_reset_at = row.get("provider_resets_at")
+            freshness = _codex_quota_freshness(
+                observed_at=observed_at,
+                window_minutes=window_minutes,
+                used_percentage=used_percentage,
+                expected_reset_at=expected_reset_at,
+            )
+            quota_period = _codex_quota_period_from_window_minutes(window_minutes)
+            window_states[state_key] = freshness
+            quota_periods[state_key] = quota_period
+            period_key = (
+                quota_period
+                if quota_family == "overall"
+                else f"{quota_family}:{quota_period}"
+            )
+            if period_key is not None:
+                period_states[period_key] = freshness
+
+            fresh_used_percentage = (
+                used_percentage if freshness == "fresh" else None
+            )
+            remaining_pct = (
+                max(0.0, min(100.0, 100.0 - fresh_used_percentage))
+                if fresh_used_percentage is not None
+                else None
+            )
+            limit_id = _redacted_summary_field(row.get("limit_id"))
+            limit_name = _redacted_summary_field(row.get("limit_name"))
+            upstream_scope = limit_id or limit_name
+            raw_provider_fields = dict(row.get("raw_provider_fields") or {})
+            raw_provider_fields["freshness_state"] = freshness
+            if source_model is not None:
+                raw_provider_fields["upstream_model"] = source_model
+            evidence = dict(row.get("evidence") or {})
+            evidence.update(
+                {
+                    "signals": ["codex_native_quota_poll"],
+                    "freshness_state": freshness,
+                    "account_label": record.label,
+                    "account_hash": record.expected_account_hash,
+                    "environment": config.environment,
+                    "upstream_limit_scope": limit_scope,
+                    "quota_family": quota_family,
+                }
+            )
+            if upstream_scope is not None:
+                evidence["upstream_scope"] = upstream_scope
+            if source_model is not None:
+                evidence["upstream_model"] = source_model
+            row.update(
+                {
+                    "observed_at": observed_at,
+                    "provider": "openai",
+                    "client_family": DEFAULT_CODEX_QUOTA_CLIENT,
+                    "account_hash": record.expected_account_hash,
+                    "model": source_model,
+                    "source": DEFAULT_CODEX_QUOTA_SOURCE,
+                    "limit_id": limit_id,
+                    "limit_name": limit_name,
+                    "limit_scope": limit_scope,
+                    "quota_family": quota_family,
+                    "window_minutes": window_minutes,
+                    "quota_period": quota_period,
+                    "quota_type": "tokens",
+                    "provider_resets_at": expected_reset_at,
+                    "remaining_pct": remaining_pct,
+                    "used_percentage": fresh_used_percentage,
+                    "status": freshness,
+                    "exhausted": bool(
+                        freshness == "fresh"
+                        and fresh_used_percentage is not None
+                        and fresh_used_percentage >= 100
+                    ),
+                    "raw_provider_fields": raw_provider_fields,
+                    "evidence": evidence,
+                    "litellm_call_id": (
+                        f"codex-quota-poll-{record.label}-{quota_family}-"
+                        f"{limit_scope}-{observed_at.strftime('%Y%m%d%H%M%S')}"
+                    ),
+                }
+            )
+            row["limit_key"] = _build_codex_quota_limit_key(
+                provider="openai",
+                client_family=DEFAULT_CODEX_QUOTA_CLIENT,
+                account_hash=record.expected_account_hash,
+                limit_id=limit_id,
+                limit_name=limit_name,
+                limit_scope=limit_scope,
+                quota_period=quota_period,
+                window_minutes=window_minutes,
+                model=source_model,
+                model_family=row.get("model_family"),
+                quota_family=quota_family,
+            )
+            source_quota_key = rate_limits.get("_codex_quota_source_key")
+            if source_quota_key is not None:
+                row["quota_key"] = source_quota_key
+            elif row.get("live_contract"):
+                row["quota_key"] = row["limit_key"]
+            rows.append(row)
 
     present_window_states = [
         state for state in window_states.values() if state != "absent"
@@ -6057,7 +6349,7 @@ def _build_codex_quota_rate_limit_observations(  # noqa: PLR0915
         "upstream_scope_present": any(
             row.get("limit_id") or row.get("limit_name") for row in rows
         ),
-        "upstream_model_present": upstream_model is not None,
+        "upstream_model_present": upstream_model_present,
     }
 
 
@@ -6071,9 +6363,10 @@ def _build_codex_quota_observation_db_payload(
     """
     limit_id = _codex_quota_clean_string(observation.get("limit_id"))
     limit_scope = _codex_quota_clean_string(observation.get("limit_scope"))
-    if limit_id and limit_scope:
+    quota_key = _codex_quota_clean_string(observation.get("quota_key"))
+    if quota_key is None and limit_id and limit_scope:
         quota_key = f"{limit_id}:{limit_scope}"
-    else:
+    if quota_key is None:
         quota_key = (
             _codex_quota_clean_string(observation.get("limit_key"))
             or _codex_quota_clean_string(observation.get("limit_name"))
@@ -6304,7 +6597,7 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
             "skipped": False,
             "account_label": record.label,
             "account_hash": record.expected_account_hash,
-            "usage_url": _resolve_codex_reset_credit_poll_url(config),
+            "usage_url": _resolve_codex_usage_poll_url(config),
             "poll_url": _resolve_codex_reset_credit_poll_url(config),
             "available_count": None,
             "inserted_count": 0,
@@ -6350,25 +6643,64 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
             else:
                 summary["attempt_count"] = 1
         else:
-            summary["status_code"] = fetched["status_code"]
-            summary["attempt_count"] = fetched.get("attempt_count", 1)
-            summary["retry_count"] = fetched.get("retry_count", 0)
+            components = fetched.get("components")
+            component_errors = fetched.get("component_errors") or {}
+            if isinstance(components, Mapping):
+                detail_fetch = components.get("reset_credit")
+                usage_fetch = components.get("usage")
+            else:
+                # Keep callers that replace the historical fetch seam working;
+                # production fetches always use the two component results above.
+                detail_fetch = fetched
+                usage_fetch = fetched
+
+            primary_fetch = detail_fetch or usage_fetch
+            if isinstance(primary_fetch, Mapping):
+                summary["status_code"] = primary_fetch.get("status_code")
+                summary["attempt_count"] = primary_fetch.get("attempt_count", 1)
+                summary["retry_count"] = primary_fetch.get("retry_count", 0)
+            usage_fetch_error = component_errors.get("usage")
+            if isinstance(usage_fetch, Mapping):
+                summary["usage_status_code"] = usage_fetch.get("status_code")
+                summary["usage_attempt_count"] = usage_fetch.get(
+                    "attempt_count", 1
+                )
+                summary["usage_retry_count"] = usage_fetch.get("retry_count", 0)
+            elif isinstance(usage_fetch_error, CodexResetCreditPollError):
+                summary["usage_status_code"] = usage_fetch_error.status_code
+                summary["usage_attempt_count"] = usage_fetch_error.attempt_count
+                summary["usage_retry_count"] = usage_fetch_error.retry_count
+
+            reset_credit_error = component_errors.get("reset_credit")
+            if isinstance(reset_credit_error, Exception):
+                summary["reset_credit_error_class"] = (
+                    reset_credit_error.__class__.__name__
+                )
+                summary["reset_credit_error_message"] = _redacted_failure_message(
+                    str(reset_credit_error)
+                )
 
             try:
+                if not isinstance(detail_fetch, Mapping):
+                    raise reset_credit_error or ValueError(
+                        "Codex reset-credit detail poll returned no result."
+                    )
                 summary["available_count"] = (
-                    _parse_codex_reset_credit_available_count(fetched["payload"])
+                    _parse_codex_reset_credit_available_count(
+                        detail_fetch["payload"]
+                    )
                 )
                 if config.apply:
                     credit_count, credit_inserted = (
                         _persist_codex_reset_credit_observation(
                             config,
                             observed_at=observed_at,
-                            response_body=fetched["payload"],
-                            auth_context=fetched["auth_context"],
-                            status_code=fetched["status_code"],
+                            response_body=detail_fetch["payload"],
+                            auth_context=detail_fetch["auth_context"],
+                            status_code=detail_fetch["status_code"],
                             attempt_count=summary["attempt_count"],
                             retry_count=summary["retry_count"],
-                            poll_url=fetched.get("poll_url"),
+                            poll_url=detail_fetch.get("poll_url"),
                         )
                     )
                     summary["credit_observation_count"] = credit_count
@@ -6378,12 +6710,12 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
                     credit_rows = _build_codex_reset_credit_observations(
                         config,
                         observed_at=observed_at,
-                        response_body=fetched["payload"],
-                        auth_context=fetched["auth_context"],
-                        status_code=fetched["status_code"],
+                        response_body=detail_fetch["payload"],
+                        auth_context=detail_fetch["auth_context"],
+                        status_code=detail_fetch["status_code"],
                         attempt_count=summary["attempt_count"],
                         retry_count=summary["retry_count"],
-                        poll_url=fetched.get("poll_url")
+                        poll_url=detail_fetch.get("poll_url")
                         or _resolve_codex_reset_credit_poll_url(config),
                     )
                     summary["credit_observation_count"] = len(credit_rows)
@@ -6394,12 +6726,16 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
                 )
 
             try:
+                if not isinstance(usage_fetch, Mapping):
+                    if isinstance(usage_fetch_error, Exception):
+                        raise usage_fetch_error
+                    raise ValueError("Codex usage poll returned no result.")
                 quota_observations, quota_summary = (
                     _build_codex_quota_rate_limit_observations(
                         config,
                         record=record,
                         observed_at=observed_at,
-                        response_body=fetched["payload"],
+                        response_body=usage_fetch["payload"],
                     )
                 )
                 summary["quota_observation_count"] = len(quota_observations)
@@ -6431,21 +6767,40 @@ def _run_codex_reset_credit_poll_task(  # noqa: PLR0915
                 else:
                     summary["quota_storage_status"] = "no_observations"
             except Exception as exc:
-                summary["quota_error_class"] = exc.__class__.__name__
-                summary["quota_error_message"] = _redacted_failure_message(str(exc))
-                summary["quota_storage_status"] = "db_write_failed"
+                component_error = (
+                    usage_fetch_error
+                    if isinstance(usage_fetch_error, Exception)
+                    else None
+                )
+                summary["quota_error_class"] = (
+                    component_error.__class__.__name__
+                    if component_error is not None
+                    else exc.__class__.__name__
+                )
+                summary["quota_error_message"] = _redacted_failure_message(
+                    str(component_error or exc)
+                )
+                summary["quota_storage_status"] = (
+                    "fetch_failed"
+                    if component_error is not None
+                    else "db_write_failed"
+                )
                 summary["quota_health"] = "terminal"
 
             summary["inserted_count"] = summary["credit_inserted_count"]
             summary["persisted"] = summary["credit_persisted"]
 
-            if (
-                summary["reset_credit_error_class"]
-                and summary["quota_error_class"]
-            ):
-                summary["error_class"] = "CodexTelemetryComponentsFailed"
+            if summary["reset_credit_error_class"] or summary["quota_error_class"]:
+                summary["error_class"] = (
+                    "CodexTelemetryComponentsFailed"
+                    if summary["reset_credit_error_class"]
+                    and summary["quota_error_class"]
+                    else "CodexResetCreditComponentFailed"
+                    if summary["reset_credit_error_class"]
+                    else "CodexUsageComponentFailed"
+                )
                 summary["error_message"] = (
-                    f"Codex reset-credit and quota telemetry failed for "
+                    f"Codex reset-credit and/or quota telemetry failed for "
                     f"account '{record.label}'."
                 )
 
