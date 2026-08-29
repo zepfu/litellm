@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from collections.abc import Callable
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -24,6 +25,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     codex_oauth,
     dev_fault_plan,
     selection,
+    session_affinity,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.interfaces import (
     AliasRouteServices,
@@ -134,8 +136,9 @@ def _install_direct_route_mocks(
     *,
     select: Callable[..., Any],
     handler: Callable[..., Any],
+    body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    body = {"model": _MODEL, "input": "test"}
+    body = body or {"model": _MODEL, "input": "test"}
 
     async def _get_request_body(_request: Request) -> dict[str, Any]:
         return dict(body)
@@ -475,7 +478,7 @@ async def test_direct_normal_usage_limit_failure_recovers_with_attempt_metadata(
     assert failed_attempt["request_outcome"] == "pending_failover"
     assert failed_attempt["replay_safety"] == "replay_safe"
     assert failed_attempt["credential_reload_outcome"] == "not_attempted"
-    assert failed_attempt["guard_reset_outcome"] == "not_attempted"
+    assert failed_attempt["guard_reset_outcome"] == "reset"
     assert failed_attempt["failover_decision"] == "move_account"
     assert failed_attempt["terminal_reason"] == "success"
     assert failed_attempt["attempted_account_hashes"] == [
@@ -490,6 +493,7 @@ async def test_direct_normal_usage_limit_failure_recovers_with_attempt_metadata(
     ]
     assert recovered_attempt["attempted_provider_call"] is True
     assert recovered_attempt["request_outcome"] == "recovered"
+    assert recovered_attempt["guard_reset_outcome"] == "not_attempted"
     assert [rollup["status"] for rollup in captured["rollups"]] == [
         "Recovered"
     ]
@@ -498,6 +502,435 @@ async def test_direct_normal_usage_limit_failure_recovers_with_attempt_metadata(
         request.state,
         "aawm_openai_fault_plan_injected_count",
     )
+
+
+@pytest.mark.asyncio
+async def test_direct_safe_continuation_rebinds_compatible_owner_before_failover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    body = {
+        "model": _MODEL,
+        "input": [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "shell", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "done"},
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "reasoned"}],
+            },
+        ],
+    }
+    bindings = [
+        (
+            _auth("account-a"),
+            {
+                **_managed_selection(
+                    "account-a",
+                    ordinal=0,
+                    request_mode="ordinary_continuation",
+                ),
+                "has_account_bound_state": False,
+            },
+            {},
+        ),
+        (
+            _auth("account-b"),
+            {
+                **_managed_selection(
+                    "account-b",
+                    ordinal=1,
+                    request_mode="ordinary_continuation",
+                ),
+                "has_account_bound_state": False,
+            },
+            {},
+        ),
+    ]
+    usage_limit = HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "message": "Managed OpenAI account usage limit reached.",
+                "type": "rate_limit_error",
+                "code": "usage_limit_reached",
+            },
+            "quota": {"resets_in_seconds": 1.0},
+            "failover_disposition": "usage_limit_reached",
+        },
+    )
+    provider = AsyncMock(
+        side_effect=[usage_limit, Response(content=b"ok", status_code=200)]
+    )
+    helper_calls: list[dict[str, Any]] = []
+    current_attributes = {
+        "provider": "openai",
+        "model": _MODEL,
+        "route_family": "codex_oauth",
+        "account_label": "account-a",
+        "account_hash": "hash-account-a",
+        "account_lane": "codex-oauth:account-a:hash-account-a",
+        "endpoint_contract": "openai_responses",
+        "state_format": "openai_responses",
+        "credential_affinity": "interchangeable",
+        "ingress": "openai_passthrough",
+        "requested_model": _MODEL,
+        "hosted_provider": "openai",
+    }
+    session_affinity.set_request_session_owner_lease(
+        request,
+        session_affinity.SessionOwnerLease(
+            session_identity="sess-openai017",
+            owner_id="owner-openai017",
+            decision=session_affinity.SessionOwnerGuardDecision.COMPATIBLE_OWNER.value,
+            attributes=current_attributes,
+        ),
+    )
+
+    async def _select(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        return bindings.pop(0)
+
+    async def _rebind(**kwargs: Any) -> bool:
+        helper_calls.append(kwargs)
+        return await real_rebind(**kwargs)
+
+    async def _owned(**kwargs: Any) -> tuple[dict[str, Any], str, None]:
+        return (
+            {
+                "state": "owned",
+                "owner": "owner-openai017",
+                "attributes": current_attributes,
+            },
+            "cache-key-openai017",
+            None,
+        )
+
+    real_rebind = (
+        session_affinity.clear_compatible_non_held_request_session_owner_guard_for_failover
+    )
+    monkeypatch.setattr(session_affinity, "get_session_owner_record", _owned)
+    monkeypatch.setattr(
+        session_affinity,
+        "clear_compatible_non_held_request_session_owner_guard_for_failover",
+        _rebind,
+    )
+    _install_direct_route_mocks(
+        monkeypatch,
+        select=_select,
+        handler=provider,
+        body=body,
+    )
+
+    response = await lpe.openai_proxy_route(
+        endpoint="v1/responses",
+        request=request,
+        fastapi_response=Response(),
+        user_api_key_dict=object(),  # type: ignore[arg-type]
+    )
+
+    assert response.status_code == 200
+    assert provider.await_count == 2
+    assert len(helper_calls) == 1
+    helper_call = helper_calls[0]
+    assert helper_call["account_failover_planned"] is True
+    assert helper_call["account_failover_replay_safe"] is True
+    assert helper_call["has_account_bound_state"] is False
+    assert helper_call["post_commit_retry"] is False
+    assert helper_call["failover_ordinal"] == 1
+    assert helper_call["current_attributes"] == current_attributes
+    assert helper_call["alternate_attributes"]["account_label"] == "account-b"
+    assert helper_call["alternate_attributes"]["account_hash"] == (
+        "hash-account-b"
+    )
+    assert session_affinity.get_request_session_owner_lease(request) is None
+    outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    assert outcome["attempts"][0]["guard_reset_outcome"] == (
+        "rebind_succeeded"
+    )
+    assert outcome["attempts"][1]["guard_reset_outcome"] == "not_attempted"
+
+
+@pytest.mark.asyncio
+async def test_direct_safe_continuation_guard_rebind_rejection_blocks_failover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    body = {"model": _MODEL, "input": [{"role": "tool", "content": "history"}]}
+    bindings = [
+        (
+            _auth("account-a"),
+            {
+                **_managed_selection(
+                    "account-a",
+                    ordinal=0,
+                    request_mode="ordinary_continuation",
+                ),
+                "has_account_bound_state": False,
+            },
+            {},
+        ),
+        (
+            _auth("account-b"),
+            {
+                **_managed_selection(
+                    "account-b",
+                    ordinal=1,
+                    request_mode="ordinary_continuation",
+                ),
+                "has_account_bound_state": False,
+            },
+            {},
+        ),
+    ]
+    usage_limit = HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "message": "Managed OpenAI account usage limit reached.",
+                "type": "rate_limit_error",
+                "code": "usage_limit_reached",
+            },
+            "failover_disposition": "usage_limit_reached",
+        },
+    )
+    provider = AsyncMock(side_effect=[usage_limit])
+    helper = AsyncMock(return_value=False)
+    pre_second_selection: dict[str, Any] = {}
+    terminal_entry: dict[str, Any] = {}
+
+    async def _select(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        if len(bindings) == 1:
+            pre_second_selection["bound_account"] = copy.deepcopy(
+                request.state.aawm_codex_oauth_selected_account
+            )
+            pre_second_selection["parsed_body"] = copy.deepcopy(
+                request.scope["parsed_body"]
+            )
+        auth, selected, metadata = bindings.pop(0)
+        setattr(
+            request.state,
+            "aawm_codex_oauth_selected_account",
+            {
+                "account_label": auth.account_label,
+                "account_hash": auth.account_hash,
+                "lane_key": auth.lane_key,
+                "model": _MODEL,
+                "credential_affinity": "interchangeable",
+            },
+        )
+        selected_body = {
+            **body,
+            "litellm_metadata": {
+                "codex_oauth_account_label": auth.account_label,
+                "codex_oauth_account_hash": auth.account_hash,
+                "codex_oauth_lane_key": auth.lane_key,
+                "codex_auto_agent_selected_account_label": auth.account_label,
+                "codex_auto_agent_selected_account_hash": auth.account_hash,
+                "codex_auto_agent_selected_account_lane": auth.lane_key,
+            },
+        }
+        lpe._safe_set_request_parsed_body(request, selected_body)
+        return auth, selected, metadata
+
+    real_terminal = (
+        dev_fault_plan.note_direct_openai_managed_terminal_exhaustion
+    )
+
+    def _capture_terminal_entry(*args: Any, **kwargs: Any) -> None:
+        terminal_entry["bound_account"] = copy.deepcopy(
+            request.state.aawm_codex_oauth_selected_account
+        )
+        terminal_entry["parsed_body"] = copy.deepcopy(
+            request.scope["parsed_body"]
+        )
+        real_terminal(*args, **kwargs)
+
+    monkeypatch.setattr(
+        session_affinity,
+        "clear_compatible_non_held_request_session_owner_guard_for_failover",
+        helper,
+    )
+    _install_direct_route_mocks(
+        monkeypatch,
+        select=_select,
+        handler=provider,
+        body=body,
+    )
+    monkeypatch.setattr(
+        dev_fault_plan,
+        "note_direct_openai_managed_terminal_exhaustion",
+        _capture_terminal_entry,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await lpe.openai_proxy_route(
+            endpoint="v1/responses",
+            request=request,
+            fastapi_response=Response(),
+            user_api_key_dict=object(),  # type: ignore[arg-type]
+        )
+
+    assert exc_info.value is usage_limit
+    assert provider.await_count == 1
+    helper.assert_awaited_once()
+    assert terminal_entry == pre_second_selection
+    assert request.state.aawm_codex_oauth_selected_account == (
+        pre_second_selection["bound_account"]
+    )
+    parsed_body = _safe_get_request_parsed_body(request)
+    assert parsed_body is not None
+    metadata = parsed_body["litellm_metadata"]
+    assert metadata["codex_oauth_account_label"] == "account-a"
+    assert metadata["codex_oauth_account_hash"] == "hash-account-a"
+    assert metadata["codex_auto_agent_selected_account_label"] == "account-a"
+    assert "account-b" not in repr(parsed_body)
+    outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    attempt = outcome["attempts"][0]
+    assert attempt["guard_reset_outcome"] == "rebind_rejected"
+    assert attempt["failover_decision"] == "terminal"
+    assert attempt["terminal_reason"] == "account_failover_guard_rebind_failed"
+
+
+@pytest.mark.asyncio
+async def test_direct_no_plan_exhaustion_keeps_generic_terminal_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    selected = _managed_selection("account-a", ordinal=0)
+    request.state.aawm_codex_oauth_request_local_failover_context = {
+        "slot": f"openai:{_MODEL}:codex_responses:",
+        "candidate_identity": {
+            "provider": "openai",
+            "model": _MODEL,
+            "route_family": "codex_responses",
+        },
+        "attempted_account_hashes": ["hash-account-a"],
+        "prior_account_hash": "hash-account-a",
+        "prior_account_outcomes": [],
+        "prior_account_outcome": {},
+        "portable_replay": True,
+    }
+    usage_limit = HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "message": "Managed OpenAI account usage limit reached.",
+                "type": "rate_limit_error",
+                "code": "usage_limit_reached",
+            },
+            "failover_disposition": "usage_limit_reached",
+        },
+    )
+    provider = AsyncMock(side_effect=[usage_limit])
+
+    async def _select(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        return _auth("account-a"), selected, {}
+
+    captured = _install_direct_route_mocks(
+        monkeypatch,
+        select=_select,
+        handler=provider,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await lpe.openai_proxy_route(
+            endpoint="v1/responses",
+            request=request,
+            fastapi_response=Response(),
+            user_api_key_dict=object(),  # type: ignore[arg-type]
+        )
+
+    assert exc_info.value is usage_limit
+    assert provider.await_count == 1
+    assert captured["bind"].await_count == 1
+    outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    attempt = outcome["attempts"][0]
+    assert attempt["account_failover_limit_reached"] is True
+    assert attempt["failover_decision"] == "terminal"
+    assert attempt["terminal_reason"] == "account_failover_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_direct_safe_continuation_second_selection_failure_preserves_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _request()
+    body = {"model": _MODEL, "input": [{"role": "tool", "content": "history"}]}
+    first_binding = (
+        _auth("account-a"),
+        {
+            **_managed_selection(
+                "account-a",
+                ordinal=0,
+                request_mode="ordinary_continuation",
+            ),
+            "has_account_bound_state": False,
+        },
+        {},
+    )
+    usage_limit = HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "message": "Managed OpenAI account usage limit reached.",
+                "type": "rate_limit_error",
+                "code": "usage_limit_reached",
+            },
+            "failover_disposition": "usage_limit_reached",
+        },
+    )
+    unavailable = HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "code": "aawm_codex_oauth_direct_inventory_unavailable"
+            }
+        },
+    )
+    provider = AsyncMock(side_effect=[usage_limit])
+    helper = AsyncMock(return_value=True)
+    selections = [first_binding]
+
+    async def _select(*args: Any, **kwargs: Any) -> tuple[Any, ...]:
+        if selections:
+            return selections.pop(0)
+        raise unavailable
+
+    monkeypatch.setattr(
+        session_affinity,
+        "clear_compatible_non_held_request_session_owner_guard_for_failover",
+        helper,
+    )
+    _install_direct_route_mocks(
+        monkeypatch,
+        select=_select,
+        handler=provider,
+        body=body,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await lpe.openai_proxy_route(
+            endpoint="v1/responses",
+            request=request,
+            fastapi_response=Response(),
+            user_api_key_dict=object(),  # type: ignore[arg-type]
+        )
+
+    assert exc_info.value is usage_limit
+    assert provider.await_count == 1
+    helper.assert_not_awaited()
+    outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    attempt = outcome["attempts"][0]
+    assert attempt["failover_decision"] == "terminal"
+    assert attempt["terminal_reason"] == "account_failover_second_selection_failed"
 
 
 @pytest.mark.asyncio
@@ -594,9 +1027,11 @@ async def test_direct_normal_terminal_failures_record_exhausted_metadata(
     assert token_attempt["credential_reload_outcome"] == (
         "unchanged_already_reloaded"
     )
-    assert token_attempt["guard_reset_outcome"] == "not_reset"
+    assert token_attempt["guard_reset_outcome"] == "reset"
     assert token_attempt["failover_decision"] == "terminal"
-    assert token_attempt["terminal_reason"] == "account_failover_exhausted"
+    assert token_attempt["terminal_reason"] == (
+        "account_failover_second_selection_failed"
+    )
     assert token_attempt["attempted_account_hashes"] == [
         "hash-account-a",
         "hash-account-b",
@@ -617,7 +1052,9 @@ async def test_direct_normal_terminal_failures_record_exhausted_metadata(
         "unchanged_already_reloaded"
     )
     assert terminal_event["failover_decision"] == "terminal"
-    assert terminal_event["terminal_reason"] == "account_failover_exhausted"
+    assert terminal_event["terminal_reason"] == (
+        "account_failover_second_selection_failed"
+    )
     assert terminal_event["attempted_account_hashes"] == [
         "hash-account-a",
         "hash-account-b",

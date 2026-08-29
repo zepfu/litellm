@@ -4099,7 +4099,7 @@ async def test_openai_proxy_route_direct_token_invalidated_retries_next_account(
     assert failed_attempt["credential_reload_outcome"] == (
         "unchanged_already_reloaded"
     )
-    assert failed_attempt["guard_reset_outcome"] == "not_reset"
+    assert failed_attempt["guard_reset_outcome"] == "reset"
     assert failed_attempt["failover_decision"] == "move_account"
     assert failed_attempt["terminal_reason"] == "success"
     assert failed_attempt["attempted_account_hashes"] == [
@@ -4107,7 +4107,7 @@ async def test_openai_proxy_route_direct_token_invalidated_retries_next_account(
         "hash-account-2",
     ]
     assert recovered_attempt["credential_reload_outcome"] == "moved_without_reload"
-    assert recovered_attempt["guard_reset_outcome"] == "reset"
+    assert recovered_attempt["guard_reset_outcome"] == "not_attempted"
     assert recovered_attempt["failover_decision"] == "completed_after_failover"
     assert recovered_attempt["terminal_reason"] == "success"
     assert recovered_attempt["attempted_account_hashes"] == [
@@ -4224,7 +4224,7 @@ async def test_openai_proxy_route_direct_token_invalidated_reloads_same_account(
 
 
 @pytest.mark.asyncio
-async def test_openai_proxy_route_direct_token_invalidated_guard_reset_failure_is_not_reported_as_reset(
+async def test_openai_proxy_route_direct_token_invalidated_failover_reset_is_recorded_on_failed_attempt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_direct_inventory_auth(monkeypatch)
@@ -4309,8 +4309,8 @@ async def test_openai_proxy_route_direct_token_invalidated_guard_reset_failure_i
     outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
     failed_attempt, recovered_attempt = outcome["attempts"]
     assert failed_attempt["credential_reload_outcome"] == "reloaded"
-    assert failed_attempt["guard_reset_outcome"] == "not_reset"
-    assert recovered_attempt["guard_reset_outcome"] == "reset"
+    assert failed_attempt["guard_reset_outcome"] == "reset"
+    assert recovered_attempt["guard_reset_outcome"] == "not_attempted"
     reload.assert_awaited_once()
     publish.assert_not_awaited()
     persist.assert_not_awaited()

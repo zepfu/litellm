@@ -641,11 +641,6 @@ def note_direct_openai_managed_success(
             "not_attempted",
         }:
             attempt_record["credential_reload_outcome"] = "moved_without_reload"
-        if attempt_record.get("guard_reset_outcome") in {
-            None,
-            "not_attempted",
-        }:
-            attempt_record["guard_reset_outcome"] = "reset"
     attempt_record["failover_decision"] = (
         "completed_after_failover" if prior_failover else "not_planned"
     )
@@ -706,7 +701,8 @@ def note_direct_openai_managed_terminal_exhaustion(
         not in {"usage_limit_reached", "token_invalidated"}
     ):
         return
-    attempt_record["terminal_reason"] = "account_failover_exhausted"
+    if attempt_record.get("terminal_reason") in {None, "success"}:
+        attempt_record["terminal_reason"] = "account_failover_exhausted"
     attempt_record["failover_decision"] = "terminal"
     _apply_direct_attempt_trace(
         request,
