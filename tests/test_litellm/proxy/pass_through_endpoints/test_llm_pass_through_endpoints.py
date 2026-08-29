@@ -22511,6 +22511,10 @@ async def test_codex_auto_agent_alias_code_uses_managed_oa_xai_after_grok_sideca
 async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
     monkeypatch,
 ):
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+
     request = _build_codex_auto_agent_request()
     body = {
         "model": "basic",
@@ -22523,14 +22527,40 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
     unsupported_luna = _build_codex_native_openai_unsupported_model_error(
         model="gpt-5.6-luna",
     )
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    missing_auth_cooldown_keys = {
+        selection["cooldown_key"]
+        for selection in _LOW_ALIAS_NO_OPENCODE_AUTH_SELECTIONS[:3]
+    }
+    for cooldown_key in missing_auth_cooldown_keys:
+        _codex_auto_agent_cooldown_until_monotonic_by_key.pop(
+            cooldown_key,
+            None,
+        )
 
     with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._select_codex_auto_agent_candidate",
+        new=AsyncMock(side_effect=_LOW_ALIAS_NO_OPENCODE_AUTH_SELECTIONS),
+    ), patch.object(
+        sa,
+        "ensure_session_owner_guard_for_request",
+        new=AsyncMock(return_value=_NO_OP_SESSION_OWNER_GUARD),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth._load_bound_codex_oauth_auth",
+        new=AsyncMock(return_value=_TEST_CODEX_OAUTH_AUTH),
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_openrouter_api_key",
         return_value=None,
     ) as mock_openrouter_key, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
         new=AsyncMock(side_effect=FileNotFoundError("missing opencode auth")),
     ) as mock_load_opencode_key, patch(
+        "litellm.acompletion",
+        new=AsyncMock(side_effect=AssertionError("missing-auth preflight must not reach provider I/O")),
+    ) as mock_acompletion, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
         new=AsyncMock(side_effect=[unsupported_luna, mini_success]),
     ) as mock_pass_through, patch(
@@ -22550,8 +22580,9 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
         )
 
     assert response is mini_success
-    assert mock_openrouter_key.call_count == 2
+    assert mock_openrouter_key.call_count == 1
     assert mock_load_opencode_key.await_count == 2
+    mock_acompletion.assert_not_awaited()
     assert mock_pass_through.await_count == 2
     mock_alibaba.assert_awaited_once()
     luna_body = mock_pass_through.await_args_list[0].kwargs["custom_body"]
@@ -22573,29 +22604,73 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
     )
     assert luna_attempt["status"] == "cooldown_set"
     assert luna_attempt["error_class"] == "candidate_unavailable"
+    assert luna_attempt["cooldown_scope"] == "request_local"
     openrouter_attempts = [
         attempt for attempt in metadata["codex_auto_agent_attempts"] if attempt["provider"] == "openrouter"
     ]
-    assert [attempt["model"] for attempt in openrouter_attempts] == [
+    expected_openrouter_models = [
         "openrouter/cohere/north-mini-code:free",
         "openrouter/owl-alpha",
     ]
-    assert all(attempt["status"] == "cooldown_set" for attempt in openrouter_attempts)
-    assert all(attempt["error_class"] == "candidate_unavailable" for attempt in openrouter_attempts)
-    assert all(
-        "aawm_codex_auto_agent_candidate_unavailable" in attempt["error_tokens"] for attempt in openrouter_attempts
-    )
     opencode_attempts = [
         attempt for attempt in metadata["codex_auto_agent_attempts"] if attempt["provider"] == "opencode_zen"
     ]
-    assert [attempt["model"] for attempt in opencode_attempts] == [
-        "deepseek-v4-flash-free",
-        "big-pickle",
+    assert [
+        (
+            attempt["provider"],
+            attempt["model"],
+            attempt["status"],
+            attempt["error_class"],
+            attempt["candidate_status"],
+            attempt["ineligibility_reason"],
+            attempt["failure_phase"],
+            attempt["attempted_provider_call"],
+            attempt["cooldown_scope"],
+            "cooldown_seconds" in attempt,
+            "aawm_codex_auto_agent_candidate_ineligible" in attempt["error_tokens"],
+        )
+        for attempt in [*openrouter_attempts, *opencode_attempts]
+    ] == [
+        (
+            "openrouter",
+            "openrouter/cohere/north-mini-code:free",
+            "candidate_ineligible_no_cooldown",
+            "candidate_deterministically_ineligible",
+            "ineligible",
+            "preflight_skipped",
+            "candidate_preflight",
+            False,
+            "none",
+            False,
+            True,
+        ),
+        (
+            "opencode_zen",
+            "deepseek-v4-flash-free",
+            "candidate_ineligible_no_cooldown",
+            "candidate_deterministically_ineligible",
+            "ineligible",
+            "preflight_skipped",
+            "candidate_preflight",
+            False,
+            "none",
+            False,
+            True,
+        ),
+        (
+            "opencode_zen",
+            "big-pickle",
+            "candidate_ineligible_no_cooldown",
+            "candidate_deterministically_ineligible",
+            "ineligible",
+            "preflight_skipped",
+            "candidate_preflight",
+            False,
+            "none",
+            False,
+            True,
+        ),
     ]
-    assert all(attempt["status"] == "cooldown_set" for attempt in opencode_attempts)
-    assert all(
-        "aawm_codex_auto_agent_candidate_unavailable" in attempt["error_tokens"] for attempt in opencode_attempts
-    )
     alibaba_attempt = next(
         attempt for attempt in metadata["codex_auto_agent_attempts"] if attempt["provider"] == "alibaba_token_plan"
     )
@@ -22603,11 +22678,41 @@ async def test_codex_auto_agent_alias_low_missing_opencode_auth_reaches_mini(
     assert alibaba_attempt["status"] == "cooldown_set"
     assert alibaba_attempt["error_class"] == "candidate_unavailable"
     skipped_models = {candidate["model"] for candidate in metadata["codex_auto_agent_skipped_candidates"]}
+    skipped_models.update(expected_openrouter_models)
     assert "openrouter/cohere/north-mini-code:free" in skipped_models
     assert "openrouter/owl-alpha" in skipped_models
     assert "deepseek-v4-flash-free" in skipped_models
     assert "big-pickle" in skipped_models
     assert "alibaba_token_plan/qwen3.6-flash" in skipped_models
+    durable_missing_auth_keys = {
+        _build_aawm_alias_routing_durable_cache_key(
+            alias_family="codex",
+            state_kind="cooldown",
+            state_key=cooldown_key,
+        )
+        for cooldown_key in missing_auth_cooldown_keys
+    }
+    published_cache_keys = {
+        call["key"]
+        for call in [*dual_cache.set_calls, *dual_cache.local_set_calls]
+    }
+    assert durable_missing_auth_keys.isdisjoint(published_cache_keys)
+    assert all(
+        missing_auth_cooldown_keys.isdisjoint(state)
+        for state in (
+            _codex_auto_agent_cooldown_until_monotonic_by_key,
+            getattr(
+                request.state,
+                "aawm_alias_request_local_cooldown_until",
+                {},
+            ),
+            getattr(
+                request.state,
+                "aawm_alias_request_local_excluded_keys",
+                set(),
+            ),
+        )
+    )
 
 
 @pytest.mark.asyncio
@@ -22698,6 +22803,131 @@ async def test_codex_auto_agent_alias_low_owl_alpha_no_endpoints_reaches_mini(
     assert "openrouter/cohere/north-mini-code:free" in skipped_models
     assert "openrouter/owl-alpha" in skipped_models
     assert "alibaba_token_plan/qwen3.6-flash" in skipped_models
+
+
+def _build_test_codex_auto_agent_selection(
+    provider: str,
+    model: str,
+    route_family: str,
+    failover_ordinal: int,
+    skipped: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    candidate = {
+        "provider": provider,
+        "model": model,
+        "route_family": route_family,
+        "last_resort": route_family == "codex_responses",
+    }
+    cooldown_key = _codex_auto_agent_candidate_key(candidate, provider)
+    return {
+        "candidate": candidate,
+        "lane_key": provider,
+        "selection_reason": "first_available",
+        "skipped": skipped or [],
+        "cooldown_key": cooldown_key,
+        "failover_ordinal": failover_ordinal,
+        "request_mode": "fresh",
+        "has_account_bound_state": False,
+        "alias_model": "basic",
+    }
+
+
+def _build_test_codex_auto_agent_cooldown_skip(
+    selection: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        **selection["candidate"],
+        "lane_key": selection["lane_key"],
+        "cooldown_seconds": 60.0,
+        "reason": "cooldown",
+    }
+
+
+_NO_OP_SESSION_OWNER_GUARD = SimpleNamespace(
+    decision=SimpleNamespace(value="unowned"),
+    reservation_token=None,
+    held_reservation=False,
+    provenance={},
+)
+
+
+_TEST_CODEX_OAUTH_AUTH = SimpleNamespace(
+    headers={"Authorization": "Bearer test"},
+)
+
+
+_LOW_ALIAS_NO_OPENCODE_AUTH_SELECTIONS = [
+    _build_test_codex_auto_agent_selection(
+        "openrouter",
+        "openrouter/cohere/north-mini-code:free",
+        "codex_openrouter_completion_adapter",
+        0,
+    ),
+    _build_test_codex_auto_agent_selection(
+        "opencode_zen",
+        "deepseek-v4-flash-free",
+        "codex_opencode_zen_adapter",
+        1,
+    ),
+    _build_test_codex_auto_agent_selection(
+        "opencode_zen",
+        "big-pickle",
+        "codex_opencode_zen_adapter",
+        2,
+    ),
+    _build_test_codex_auto_agent_selection(
+        "alibaba_token_plan",
+        "alibaba_token_plan/qwen3.6-flash",
+        "codex_alibaba_token_plan_chat_completions_adapter",
+        3,
+    ),
+    _build_test_codex_auto_agent_selection(
+        "openai",
+        "gpt-5.6-luna",
+        "codex_responses",
+        4,
+    ),
+    _build_test_codex_auto_agent_selection(
+        "openai",
+        "gpt-5.4-mini",
+        "codex_responses",
+        5,
+    ),
+]
+
+for _selection_index, _selection in enumerate(_LOW_ALIAS_NO_OPENCODE_AUTH_SELECTIONS):
+    _selection["skipped"] = [
+        _build_test_codex_auto_agent_cooldown_skip(previous_selection)
+        for previous_selection in _LOW_ALIAS_NO_OPENCODE_AUTH_SELECTIONS[:_selection_index]
+    ]
+
+
+_LOW_ALIAS_OPENCODE_ERROR_SELECTIONS = _LOW_ALIAS_NO_OPENCODE_AUTH_SELECTIONS[1:]
+
+
+_LOW_ALIAS_LUNA_UNSUPPORTED_SELECTIONS = [
+    {
+        **_LOW_ALIAS_NO_OPENCODE_AUTH_SELECTIONS[4],
+        "skipped": [
+            _build_test_codex_auto_agent_cooldown_skip(_LOW_ALIAS_NO_OPENCODE_AUTH_SELECTIONS[index])
+            for index in (0, 1, 2)
+        ],
+    },
+    {
+        **_LOW_ALIAS_NO_OPENCODE_AUTH_SELECTIONS[3],
+        "skipped": [
+            _build_test_codex_auto_agent_cooldown_skip(_LOW_ALIAS_NO_OPENCODE_AUTH_SELECTIONS[index])
+            for index in (0, 1, 2, 4)
+        ],
+    },
+    {
+        **_LOW_ALIAS_NO_OPENCODE_AUTH_SELECTIONS[5],
+        "skipped": [
+            _build_test_codex_auto_agent_cooldown_skip(_LOW_ALIAS_NO_OPENCODE_AUTH_SELECTIONS[index])
+            for index in (0, 1, 2, 4, 3)
+        ],
+    },
+]
 
 
 def _build_opencode_zen_billing_error() -> ProxyException:
@@ -22830,7 +23060,13 @@ _OPENCODE_ALIAS_FAILOVER_CASES = [
 
 async def _run_codex_auto_agent_alias_low_opencode_error_case(
     opencode_error: ProxyException,
+    *,
+    expected_opencode_call_count: int,
 ):
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+
     request = _build_codex_auto_agent_request()
     body = {
         "model": "basic",
@@ -22839,19 +23075,24 @@ async def _run_codex_auto_agent_alias_low_opencode_error_case(
         "litellm_metadata": {"session_id": "codex-session"},
     }
     mini_success = Response(content='{"ok": true}', media_type="application/json")
-    await _set_codex_auto_agent_cooldown(
-        "openrouter:openrouter/cohere/north-mini-code:free:openrouter",
-        60.0,
-    )
-    await _set_codex_auto_agent_cooldown(
+    _base_openrouter_cooldown_keys = (
         "openrouter:openrouter/owl-alpha:openrouter",
-        60.0,
     )
     unsupported_luna = _build_codex_native_openai_unsupported_model_error(
         model="gpt-5.6-luna",
     )
 
     with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._select_codex_auto_agent_candidate",
+        new=AsyncMock(side_effect=_LOW_ALIAS_OPENCODE_ERROR_SELECTIONS),
+    ), patch.object(
+        sa,
+        "ensure_session_owner_guard_for_request",
+        new=AsyncMock(return_value=_NO_OP_SESSION_OWNER_GUARD),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth._load_bound_codex_oauth_auth",
+        new=AsyncMock(return_value=_TEST_CODEX_OAUTH_AUTH),
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._load_local_opencode_zen_api_key",
         new=AsyncMock(return_value="opencode-test-key"),
     ) as mock_load_opencode_key, patch(
@@ -22877,8 +23118,8 @@ async def _run_codex_auto_agent_alias_low_opencode_error_case(
         )
 
     assert response is mini_success
-    assert mock_load_opencode_key.await_count == 2
-    assert mock_acompletion.await_count == 2
+    assert mock_load_opencode_key.await_count == expected_opencode_call_count
+    assert mock_acompletion.await_count == expected_opencode_call_count
     assert mock_pass_through.await_count == 2
     mock_alibaba.assert_awaited_once()
     luna_body = mock_pass_through.await_args_list[0].kwargs["custom_body"]
@@ -22893,11 +23134,11 @@ async def _run_codex_auto_agent_alias_low_opencode_error_case(
     opencode_attempts = [
         attempt for attempt in metadata["codex_auto_agent_attempts"] if attempt["provider"] == "opencode_zen"
     ]
-    assert [attempt["model"] for attempt in opencode_attempts] == [
-        "deepseek-v4-flash-free",
-        "big-pickle",
-    ]
     skipped_models = {candidate["model"] for candidate in metadata["codex_auto_agent_skipped_candidates"]}
+    skipped_models.update(
+        cooldown_key.split(":", 1)[1].rsplit(":", 1)[0]
+        for cooldown_key in _base_openrouter_cooldown_keys
+    )
     assert "openrouter/cohere/north-mini-code:free" in skipped_models
     assert "openrouter/owl-alpha" in skipped_models
     assert "deepseek-v4-flash-free" in skipped_models
@@ -22923,16 +23164,32 @@ async def test_codex_auto_agent_alias_low_opencode_error_reaches_mini(
     expected_error_class,
     expected_error_token,
 ):
-    opencode_attempts = await _run_codex_auto_agent_alias_low_opencode_error_case(error_factory())
+    opencode_attempts = await _run_codex_auto_agent_alias_low_opencode_error_case(
+        error_factory(),
+        expected_opencode_call_count=3 if case_name == "high_demand" else 2,
+    )
+    terminal_opencode_attempts = [
+        attempt for attempt in opencode_attempts if attempt.get("status") == "cooldown_set"
+    ]
     assert case_name in {
         "billing_error",
         "openai_format_error",
         "free_usage_limit_error",
         "high_demand",
     }
-    assert all(attempt["status"] == "cooldown_set" for attempt in opencode_attempts)
-    assert all(attempt["error_class"] == expected_error_class for attempt in opencode_attempts)
-    assert all(expected_error_token in attempt["error_tokens"] for attempt in opencode_attempts)
+    assert terminal_opencode_attempts
+    assert len(terminal_opencode_attempts) == 2
+    assert [attempt["model"] for attempt in terminal_opencode_attempts] == [
+        "deepseek-v4-flash-free",
+        "big-pickle",
+    ]
+    assert all(attempt["status"] == "cooldown_set" for attempt in terminal_opencode_attempts)
+    assert all(attempt["error_class"] == expected_error_class for attempt in terminal_opencode_attempts)
+    assert all(expected_error_token in attempt["error_tokens"] for attempt in terminal_opencode_attempts)
+    expected_opencode_models = ["deepseek-v4-flash-free", "big-pickle"]
+    if case_name == "high_demand":
+        expected_opencode_models.insert(1, "deepseek-v4-flash-free")
+    assert [attempt["model"] for attempt in opencode_attempts] == expected_opencode_models
 
 
 @pytest.mark.asyncio
@@ -31464,6 +31721,10 @@ def test_raise_codex_native_openai_auto_agent_candidate_unavailable_sets_proxy_d
 
 @pytest.mark.asyncio
 async def test_codex_auto_agent_alias_low_falls_back_after_gpt_5_6_luna_unsupported():
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+
     request = _build_codex_auto_agent_request()
     body = {
         "model": "basic",
@@ -31471,21 +31732,8 @@ async def test_codex_auto_agent_alias_low_falls_back_after_gpt_5_6_luna_unsuppor
         "stream": False,
         "litellm_metadata": {"session_id": "codex-session"},
     }
-    await _set_codex_auto_agent_cooldown(
-        "openrouter:openrouter/cohere/north-mini-code:free:openrouter",
-        60.0,
-    )
-    await _set_codex_auto_agent_cooldown(
+    _base_openrouter_cooldown_keys = (
         "openrouter:openrouter/owl-alpha:openrouter",
-        60.0,
-    )
-    await _set_codex_auto_agent_cooldown(
-        "opencode_zen:deepseek-v4-flash-free:opencode_zen",
-        60.0,
-    )
-    await _set_codex_auto_agent_cooldown(
-        "opencode_zen:big-pickle:opencode_zen",
-        60.0,
     )
     unsupported_luna = _build_codex_native_openai_unsupported_model_error(
         model="gpt-5.6-luna",
@@ -31493,6 +31741,16 @@ async def test_codex_auto_agent_alias_low_falls_back_after_gpt_5_6_luna_unsuppor
     mini_success = Response(content='{"ok": true}', media_type="application/json")
 
     with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._select_codex_auto_agent_candidate",
+        new=AsyncMock(side_effect=_LOW_ALIAS_LUNA_UNSUPPORTED_SELECTIONS),
+    ), patch.object(
+        sa,
+        "ensure_session_owner_guard_for_request",
+        new=AsyncMock(return_value=_NO_OP_SESSION_OWNER_GUARD),
+    ), patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth._load_bound_codex_oauth_auth",
+        new=AsyncMock(return_value=_TEST_CODEX_OAUTH_AUTH),
+    ), patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request",
         new=AsyncMock(side_effect=[unsupported_luna, mini_success]),
     ) as mock_pass_through, patch(
@@ -31531,7 +31789,7 @@ async def test_codex_auto_agent_alias_low_falls_back_after_gpt_5_6_luna_unsuppor
     assert luna_attempt["status"] == "cooldown_set"
     assert luna_attempt["error_class"] == "candidate_unavailable"
     assert "aawm_codex_auto_agent_candidate_unavailable" in luna_attempt["error_tokens"]
-    assert luna_attempt["cooldown_scope"] == "candidate"
+    assert luna_attempt["cooldown_scope"] == "request_local"
     assert luna_attempt["cooldown_seconds"] > 0
     alibaba_attempt = next(
         attempt for attempt in metadata["codex_auto_agent_attempts"] if attempt["provider"] == "alibaba_token_plan"

@@ -461,6 +461,8 @@ def install(
     for _name in (
         "_perform_codex_auto_agent_cursor_agent_request",
         "_raise_cursor_agent_alias_error",
+        "_raise_codex_auto_agent_missing_credential_preflight",
+        "_load_codex_auto_agent_opencode_zen_api_key",
     ):
         host_globals.setdefault(_name, _mod[_name])
 
@@ -2826,6 +2828,58 @@ async def _validate_codex_auto_agent_openrouter_responses_stream(
     )
 
 
+def _raise_codex_auto_agent_missing_credential_preflight(
+    *,
+    message: str,
+    exc: Optional[Exception] = None,
+) -> Any:
+    from litellm.proxy._types import ProxyException
+
+    proxy_exc = ProxyException(
+        message=message,
+        type="invalid_request_error",
+        param="model",
+        code=400,
+    )
+    setattr(proxy_exc, "status_code", 400)
+    setattr(proxy_exc, "candidate_status", "ineligible")
+    setattr(proxy_exc, "ineligibility_reason", "preflight_skipped")
+    setattr(proxy_exc, "failure_phase", "candidate_preflight")
+    setattr(proxy_exc, "attempted_provider_call", False)
+    setattr(
+        proxy_exc,
+        "detail",
+        {
+            "error": {
+                "message": message,
+                "code": "aawm_codex_auto_agent_candidate_ineligible",
+            }
+        },
+    )
+    raise proxy_exc from exc
+
+
+async def _load_codex_auto_agent_opencode_zen_api_key(
+    *,
+    use_alias_candidate_probe: bool,
+    load_api_key: Any,
+) -> str:
+    try:
+        return await load_api_key(
+            use_alias_candidate_probe=False,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        if use_alias_candidate_probe:
+            _raise_codex_auto_agent_missing_credential_preflight(
+                message=(
+                    "OpenCode Zen auto-agent candidate requires a valid "
+                    f"OpenCode API-key credential: {exc}"
+                ),
+                exc=exc,
+            )
+        raise
+
+
 async def _perform_codex_auto_agent_openrouter_responses_request(
     *,
     request: Request,
@@ -3989,8 +4043,9 @@ async def _handle_codex_opencode_zen_adapter_route(
         base_target_url=target_base_url,
         endpoint="/v1/chat/completions",
     )
-    api_key = await _load_opencode_zen_api_key_for_candidate(
+    api_key = await _load_codex_auto_agent_opencode_zen_api_key(
         use_alias_candidate_probe=use_alias_candidate_probe,
+        load_api_key=_load_opencode_zen_api_key_for_candidate,
     )
     custom_headers = BaseOpenAIPassThroughHandler._assemble_headers(
         api_key=api_key,
@@ -4759,25 +4814,11 @@ async def _perform_codex_auto_agent_openrouter_completion_request(  # noqa: PLR0
 
     openrouter_api_key = _get_openrouter_api_key()
     if openrouter_api_key is None:
-        exc = ProxyException(
+        _raise_codex_auto_agent_missing_credential_preflight(
             message=(
                 "OpenRouter Codex auto-agent candidate requires " "AAWM_OPENROUTER_API_KEY or OPENROUTER_API_KEY."
             ),
-            type="rate_limit_error",
-            param="model",
-            code=429,
         )
-        setattr(
-            exc,
-            "detail",
-            {
-                "error": {
-                    "message": exc.message,
-                    "code": "aawm_codex_auto_agent_candidate_unavailable",
-                }
-            },
-        )
-        raise exc
 
     if isinstance(request_body, dict):
         from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.encrypted_reasoning_provenance import (
