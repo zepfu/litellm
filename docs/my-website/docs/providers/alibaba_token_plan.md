@@ -134,13 +134,25 @@ shared provider-credit observations.
 LiteLLM does not invent a per-token price for this subscription. Consumers must
 not interpret a null invoice cost as a free request.
 
+Routing and recovery use only fresh, exact-environment, healthy Alibaba Token
+Plan observations for the single configured account and the relevant `5h` and
+`7d` windows. Missing, stale, unhealthy, malformed, mismatched, partial,
+unavailable, or ambiguous evidence is unknown/fail-closed for recovery and
+cannot clear `alibaba_token_plan:__account_quota__:alibaba_token_plan`.
+
 When an explicit Alibaba Token Plan five-hour or weekly exhaustion is detected
 in a response, LiteLLM publishes one shared account and lane cooldown covering
 `qwen3.8-max` and `qwen3.7-max`, including their last-resort use. Generic or
 ambiguous `429` responses do not trigger that cooldown. The cooldown lasts two
-hours plus up to one hour of jitter. Provider reset timestamps are sanitized
-telemetry only and are not used to schedule recovery. This behavior works
-without sidecar data.
+hours plus up to one hour of jitter. Any fresh confirmed exhausted `5h` or `7d`
+window blocks all Alibaba candidates, even if its reset time has passed or the
+other window is missing. Early recovery clears only
+`alibaba_token_plan:__account_quota__:alibaba_token_plan`, and only when fresh
+positive `5h` and `7d` evidence has finite reset times in the future and no
+fresh exhausted evidence exists. Newer unavailable evidence invalidates older
+positive cached observations; cross-account positive ambiguity neither blocks
+nor clears. Response-driven cooldown behavior continues to work without
+sidecar data.
 
 ## Acceptance boundary
 

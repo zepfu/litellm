@@ -756,6 +756,18 @@ consumed fraction is exactly zero. That unused window is persisted with
 `reset_at_state=absent_unused_window` evidence. A missing reset for a consumed
 window remains malformed telemetry and is not persisted.
 
+LiteLLM admits Alibaba candidates using only fresh, exact-environment,
+healthy observations for the single configured account and the relevant `5h`
+and `7d` windows. Missing, stale, unhealthy, malformed, mismatched, partial,
+unavailable, or ambiguous evidence is unknown/fail-closed for recovery and
+cannot clear `alibaba_token_plan:__account_quota__:alibaba_token_plan`. A
+fresh confirmed exhausted window blocks all Alibaba candidates even when its
+reset has expired or the other window is unavailable. Early recovery clears
+only that cooldown key, and only for fresh positive `5h` plus `7d` evidence
+whose reset times are finite and in the future with no fresh exhausted
+evidence. Newer unavailable evidence invalidates older positive cached
+observations; cross-account positive ambiguity neither blocks nor clears.
+
 The same scheduled poll separately reads the manual reset-card inventory from
 `zeldaHttp.apikeyMgr./tokenplan/personal/api/v2/reset-card/list`. These cards
 are operator-consumable weekly quota resets, not the automatic rolling 5-hour
