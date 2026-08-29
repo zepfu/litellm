@@ -124,6 +124,13 @@ _CODEX_OAUTH_QUOTA_SOURCE = "codex_quota_poll"
 _CODEX_OAUTH_WEEKLY_BALANCE_BAND_PP = 10.0
 _CODEX_OAUTH_QUOTA_FAMILY_OVERALL = "overall"
 _CODEX_OAUTH_QUOTA_FAMILY_SPARK = "spark"
+_ALIBABA_TOKEN_PLAN_QUOTA_CACHE_TTL_SECONDS = 30.0
+_ALIBABA_TOKEN_PLAN_QUOTA_FAILURE_RETRY_SECONDS = 5.0
+_ALIBABA_TOKEN_PLAN_QUOTA_LOOKUP_TIMEOUT_SECONDS = 0.5
+_ALIBABA_TOKEN_PLAN_QUOTA_CLIENT = "qwen-cloud-console"
+_ALIBABA_TOKEN_PLAN_QUOTA_SOURCE = "alibaba_token_plan_usage"
+_ALIBABA_TOKEN_PLAN_QUOTA_PARSER_VERSION = "alibaba_token_plan_usage_v3"
+_ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS = frozenset({"5h", "7d"})
 _CODEX_OAUTH_QUOTA_CURRENT_ROWS_SQL = """
 SELECT DISTINCT ON (
     NULLIF(BTRIM(evidence->>'environment'), ''),
@@ -150,6 +157,41 @@ WHERE provider = $1
   AND source = $3
   AND NULLIF(BTRIM(evidence->>'environment'), '') = $4
   AND account_hash = ANY($5::text[])
+ORDER BY
+    NULLIF(BTRIM(evidence->>'environment'), ''),
+    account_hash,
+    COALESCE(model, ''),
+    quota_key,
+    observed_at DESC,
+    id DESC
+"""
+
+_ALIBABA_TOKEN_PLAN_QUOTA_CURRENT_ROWS_SQL = """
+SELECT DISTINCT ON (
+    NULLIF(BTRIM(evidence->>'environment'), ''),
+    account_hash,
+    COALESCE(model, ''),
+    quota_key
+)
+    observed_at,
+    provider,
+    client,
+    model,
+    account_hash,
+    quota_key,
+    quota_period,
+    quota_type,
+    expected_reset_at,
+    remaining_pct,
+    raw_provider_fields,
+    evidence,
+    NULLIF(BTRIM(evidence->>'environment'), '') AS environment,
+    source
+FROM public.rate_limit_observations
+WHERE provider = $1
+  AND client = $2
+  AND source = $3
+  AND NULLIF(BTRIM(evidence->>'environment'), '') = $4
 ORDER BY
     NULLIF(BTRIM(evidence->>'environment'), ''),
     account_hash,
@@ -1089,6 +1131,381 @@ async def _apply_codex_auto_agent_alibaba_token_plan_account_cooldown(
     if account_seconds > 0 and skip_reason is None:
         skip_reason = "account_quota_cooldown"
     return cooldown_seconds, cooldown_state_source, skip_reason
+
+
+def _alibaba_token_plan_quota_observation_from_row(
+    row: Any,
+    *,
+    expected_environment: str,
+) -> Optional[dict[str, Any]]:
+    try:
+        values = dict(row)
+    except Exception:
+        return None
+    environment = str(values.get("environment") or "").strip()
+    if environment != expected_environment:
+        return None
+    try:
+        evidence = _codex_oauth_quota_json_mapping(values.get("evidence"))
+    except Exception:
+        return None
+    if (
+        values.get("provider")
+        != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+        or values.get("client") != _ALIBABA_TOKEN_PLAN_QUOTA_CLIENT
+        or values.get("source") != _ALIBABA_TOKEN_PLAN_QUOTA_SOURCE
+        or evidence.get("parser_version")
+        != _ALIBABA_TOKEN_PLAN_QUOTA_PARSER_VERSION
+        or evidence.get("telemetry_status") != "valid"
+    ):
+        return None
+    evidence_window = str(evidence.get("window") or "")
+    row_window = str(values.get("quota_period") or "")
+    window = evidence_window
+    if window not in _ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS:
+        return None
+    expected_quota_key = (
+        f"alibaba_token_plan_{window}:credits"
+    )
+    if (
+        evidence_window != row_window
+        or values.get("quota_key") != expected_quota_key
+    ):
+        return None
+    observed_at = alias_routing_state._quota_observation_timestamp(
+        values.get("observed_at"),
+    )
+    expected_reset_at = alias_routing_state._quota_observation_timestamp(
+        values.get("expected_reset_at"),
+    )
+    remaining_pct = values.get("remaining_pct")
+    if (
+        observed_at is None
+        or isinstance(remaining_pct, bool)
+        or not isinstance(remaining_pct, (int, float))
+        or not math.isfinite(float(remaining_pct))
+        or not 0.0 <= float(remaining_pct) <= 100.0
+    ):
+        return None
+    return {
+        "provider": _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        "model": values.get("model"),
+        "account_hash": values.get("account_hash"),
+        "environment": environment,
+        "quota_key": values.get("quota_key"),
+        "quota_period": window,
+        "quota_type": values.get("quota_type"),
+        "remaining_pct": float(remaining_pct),
+        "observed_at": observed_at,
+        "expected_reset_at": expected_reset_at,
+        "status": "fresh",
+        "exhausted": float(remaining_pct) <= 0.0,
+        "source": _ALIBABA_TOKEN_PLAN_QUOTA_SOURCE,
+    }
+
+
+def _alibaba_token_plan_quota_row_account_hash(
+    row: Any,
+    *,
+    expected_environment: str,
+) -> Optional[str]:
+    """Retain exact row identity even when its telemetry is unusable."""
+    try:
+        values = dict(row)
+    except Exception:
+        return None
+    account_hash = str(values.get("account_hash") or "").strip()
+    if (
+        str(values.get("environment") or "").strip() != expected_environment
+        or values.get("provider")
+        != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+        or values.get("client") != _ALIBABA_TOKEN_PLAN_QUOTA_CLIENT
+        or values.get("source") != _ALIBABA_TOKEN_PLAN_QUOTA_SOURCE
+        or not account_hash
+    ):
+        return None
+    return account_hash
+
+
+async def _hydrate_alibaba_token_plan_quota_observations() -> None:
+    """Hydrate exact-identity Alibaba rows for the configured environment."""
+    if (
+        _get_codex_quota_observation_pool is None
+        or _get_codex_quota_observation_environment is None
+    ):
+        return
+    try:
+        environment = str(
+            _get_codex_quota_observation_environment() or ""
+        ).strip()
+    except Exception as exc:
+        verbose_proxy_logger.debug(
+            "Alibaba Token Plan quota environment resolution failed closed "
+            "(error_class=%s)",
+            exc.__class__.__name__,
+        )
+        return
+    if not environment:
+        return
+    account_hash = "alibaba_token_plan"
+    due_account_hashes = (
+        alias_routing_state.codex_quota_hydration_due_account_hashes(
+            (account_hash,),
+            environment=environment,
+        )
+    )
+    if not due_account_hashes:
+        return
+    async with alias_routing_state.codex_quota_hydration_lock:
+        due_account_hashes = (
+            alias_routing_state.codex_quota_hydration_due_account_hashes(
+                (account_hash,),
+                environment=environment,
+            )
+        )
+        if not due_account_hashes:
+            return
+        try:
+
+            async def _fetch_rows() -> Any:
+                pool = await _get_codex_quota_observation_pool()
+                return await pool.fetch(
+                    _ALIBABA_TOKEN_PLAN_QUOTA_CURRENT_ROWS_SQL,
+                    _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+                    _ALIBABA_TOKEN_PLAN_QUOTA_CLIENT,
+                    _ALIBABA_TOKEN_PLAN_QUOTA_SOURCE,
+                    environment,
+                )
+
+            rows = await asyncio.wait_for(
+                _fetch_rows(),
+                timeout=_ALIBABA_TOKEN_PLAN_QUOTA_LOOKUP_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            alias_routing_state.defer_codex_quota_hydration(
+                due_account_hashes,
+                environment=environment,
+                ttl_seconds=(
+                    _ALIBABA_TOKEN_PLAN_QUOTA_FAILURE_RETRY_SECONDS
+                ),
+            )
+            verbose_proxy_logger.debug(
+                "Alibaba Token Plan quota hydration failed closed "
+                "(error_class=%s)",
+                exc.__class__.__name__,
+            )
+            return
+        observations = [
+            observation
+            for row in rows
+            if (
+                observation
+                := _alibaba_token_plan_quota_observation_from_row(
+                    row,
+                    expected_environment=environment,
+                )
+            )
+        ]
+        replacement_account_hashes = {
+            row_account_hash
+            for row in rows
+            if (
+                row_account_hash
+                := _alibaba_token_plan_quota_row_account_hash(
+                    row,
+                    expected_environment=environment,
+                )
+            )
+        }
+        replacement_account_hashes.update(
+            str(observation.get("account_hash") or "").strip()
+            for observation in observations
+        )
+        replacement_account_hashes.discard("")
+        alias_routing_state.replace_normalized_quota_observations(
+            observations,
+            provider=_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+            source=_ALIBABA_TOKEN_PLAN_QUOTA_SOURCE,
+            account_hashes=(
+                replacement_account_hashes
+                if replacement_account_hashes
+                else (account_hash,)
+            ),
+        )
+        alias_routing_state.defer_codex_quota_hydration(
+            due_account_hashes,
+            environment=environment,
+            ttl_seconds=_ALIBABA_TOKEN_PLAN_QUOTA_CACHE_TTL_SECONDS,
+        )
+
+
+def _alibaba_token_plan_quota_evidence(
+    *,
+    state_manager: Optional[Any] = None,
+    now_epoch: Optional[float] = None,
+) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
+    """Resolve exact Alibaba evidence, or unknown without side-effect blocks."""
+    state_manager = state_manager or alias_routing_state
+    try:
+        configured_environment = str(
+            _get_codex_quota_observation_environment() or ""
+        ).strip()
+    except Exception:
+        return None, []
+    now = time.time() if now_epoch is None else float(now_epoch)
+    fresh_windows: dict[str, dict[str, Any]] = {}
+    with state_manager._normalized_quota_observations_lock:
+        observations = [
+            dict(observation)
+            for key, observation in (
+                state_manager._normalized_quota_observations.items()
+            )
+            if (
+                key[0] == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+                and key[4] == configured_environment
+            )
+        ]
+    fresh = [
+        observation
+        for observation in observations
+        if (
+            0 <= now - observation["observed_at"] <= 900.0
+            and str(observation.get("quota_period") or "")
+            in _ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS
+            and observation.get("quota_key")
+            == (
+                "alibaba_token_plan_"
+                f"{observation.get('quota_period')}:credits"
+            )
+            and isinstance(observation.get("exhausted"), bool)
+        )
+    ]
+    if not fresh:
+        return None, []
+    account_hashes = {
+        str(observation.get("account_hash") or "").strip()
+        for observation in fresh
+    }
+    if len(account_hashes) != 1 or "" in account_hashes:
+        return None, []
+    confirmed_exhausted_windows = {
+        str(observation.get("quota_period") or "")
+        for observation in fresh
+        if observation.get("exhausted") is True
+        and observation.get("quota_period")
+        in _ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS
+    }
+    if confirmed_exhausted_windows:
+        return None, sorted(
+            (
+                observation
+                for observation in fresh
+                if observation.get("exhausted") is True
+                and observation.get("quota_period")
+                in confirmed_exhausted_windows
+            ),
+            key=lambda observation: str(observation.get("quota_period") or ""),
+        )
+    for observation in fresh:
+        window = str(observation.get("quota_period") or "")
+        if window not in _ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS:
+            continue
+        current = fresh_windows.get(window)
+        current_exhausted = current is not None and current.get("exhausted") is True
+        observation_exhausted = observation.get("exhausted") is True
+        if (
+            current is None
+            or (observation_exhausted and not current_exhausted)
+            or (not current_exhausted and observation["observed_at"] >= current["observed_at"])
+        ):
+            fresh_windows[window] = observation
+    if set(fresh_windows) != set(_ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS):
+        return None, []
+    windows = [fresh_windows[window] for window in sorted(fresh_windows)]
+    evidence: dict[str, Any] = {
+        "provider": _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        "client": _ALIBABA_TOKEN_PLAN_QUOTA_CLIENT,
+        "source": _ALIBABA_TOKEN_PLAN_QUOTA_SOURCE,
+        "parser_version": _ALIBABA_TOKEN_PLAN_QUOTA_PARSER_VERSION,
+        "telemetry_status": "valid",
+        "account_hash": next(iter(account_hashes)),
+        "observation_age_seconds": max(
+            0.0,
+            now - max(observation["observed_at"] for observation in windows),
+        ),
+        "windows": windows,
+    }
+    return evidence, windows
+
+
+def _attach_alibaba_token_plan_quota_state(
+    state: dict[str, Any],
+    *,
+    state_manager: Optional[Any] = None,
+    now_epoch: Optional[float] = None,
+) -> dict[str, Any]:
+    candidate = state.get("candidate")
+    if not isinstance(candidate, dict):
+        return state
+    if (
+        candidate.get("provider")
+        != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+        or state.get("skip_reason") is not None
+    ):
+        return state
+    observation, windows = _alibaba_token_plan_quota_evidence(
+        state_manager=state_manager,
+        now_epoch=now_epoch,
+    )
+    if observation is None:
+        if windows:
+            state["quota_windows"] = windows
+            state["quota_exhausted_windows"] = windows
+            state["skip_reason"] = "quota_exhausted"
+            state["cooldown_state_source"] = "normalized_quota_observation"
+        return state
+    state["alibaba_token_plan_quota_observation"] = observation
+    state["quota_windows"] = windows
+    state["quota_snapshot_age_seconds"] = round(
+        float(observation["observation_age_seconds"]),
+        3,
+    )
+    state["quota_remaining_pct"] = min(
+        float(window["remaining_pct"]) for window in windows
+    )
+    exhausted = [window for window in windows if window.get("exhausted")]
+    if exhausted:
+        state["quota_exhausted_windows"] = exhausted
+        state["skip_reason"] = "quota_exhausted"
+        state["cooldown_state_source"] = "normalized_quota_observation"
+    return state
+
+
+async def _clear_alibaba_token_plan_account_quota_cooldown(
+    evidence: Mapping[str, Any],
+    *,
+    delete_durable: bool = True,
+) -> bool:
+    windows = evidence.get("windows")
+    if not isinstance(windows, list) or not windows:
+        return False
+    if any(
+        window.get("exhausted")
+        or float(window.get("remaining_pct", -1)) <= 0
+        for window in windows
+    ):
+        return False
+    from .cooldown_state import clear_alias_family_cooldown_state
+
+    result = await clear_alias_family_cooldown_state(
+        alias_family="codex",
+        canonical_aliases=[_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY],
+        cooldown_keys=[
+            _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        ],
+        delete_durable=delete_durable,
+    )
+    return bool(result)
 
 
 # ---------------------------------------------------------------------------
@@ -2698,13 +3115,17 @@ async def _build_codex_auto_agent_affinity_candidate_state(
     excluded_candidate_keys: Optional[AbstractSet[str]] = None,
 ) -> dict[str, Any]:
     if not _candidate_uses_codex_oauth(candidate_template):
-        return _attach_normalized_quota_state(
-            await _build_codex_auto_agent_candidate_state(
-                request,
-                candidate_template=candidate_template,
-                excluded_candidate_keys=excluded_candidate_keys,
-            )
+        candidate_state = await _build_codex_auto_agent_candidate_state(
+            request,
+            candidate_template=candidate_template,
+            excluded_candidate_keys=excluded_candidate_keys,
         )
+        if candidate_template.get(
+            "provider"
+        ) == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
+            await _hydrate_alibaba_token_plan_quota_observations()
+            return _attach_alibaba_token_plan_quota_state(candidate_state)
+        return _attach_normalized_quota_state(candidate_state)
     contexts = await _resolve_codex_oauth_account_candidate_contexts(
         request,
         candidate_template=candidate_template,
@@ -2779,15 +3200,24 @@ async def _build_codex_auto_agent_candidate_states(
     alias_model: str,
     client_product_label: Optional[str] = None,
     excluded_candidate_keys: Optional[AbstractSet[str]] = None,
+    candidates: Optional[Sequence[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
     states: list[dict[str, Any]] = []
-    for candidate_template in _resolve_aawm_alias_selection_enumeration(
-        request,
-        alias_model,
-        ingress="codex",
-        client_product_label=client_product_label,
-    ).candidates:
+    if candidates is None:
+        candidates = _resolve_aawm_alias_selection_enumeration(
+            request,
+            alias_model,
+            ingress="codex",
+            client_product_label=client_product_label,
+        ).candidates
+    if any(
+        candidate.get("provider")
+        == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+        for candidate in candidates
+    ):
+        await _hydrate_alibaba_token_plan_quota_observations()
+    for candidate_template in candidates:
         if _candidate_uses_codex_oauth(candidate_template):
             contexts = await _resolve_codex_oauth_account_candidate_contexts(
                 request,
@@ -2811,16 +3241,21 @@ async def _build_codex_auto_agent_candidate_states(
                     )
                 )
             continue
-        states.append(
-            _attach_normalized_quota_state(
-                await _build_codex_auto_agent_candidate_state(
-                    request,
-                    candidate_template=candidate_template,
-                    openai_lane_key=openai_lane_key,
-                    excluded_candidate_keys=excluded_candidate_keys,
-                )
-            )
+        candidate_state = await _build_codex_auto_agent_candidate_state(
+            request,
+            candidate_template=candidate_template,
+            openai_lane_key=openai_lane_key,
+            excluded_candidate_keys=excluded_candidate_keys,
         )
+        if candidate_template.get(
+            "provider"
+        ) == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
+            candidate_state = _attach_alibaba_token_plan_quota_state(
+                candidate_state
+            )
+        else:
+            candidate_state = _attach_normalized_quota_state(candidate_state)
+        states.append(candidate_state)
     return states
 
 
@@ -3927,11 +4362,44 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             skipped_candidates=affinity_skipped,
         )
 
+    candidates = _resolve_aawm_alias_selection_enumeration(
+        request,
+        alias_model,
+        ingress="codex",
+        client_product_label=client_product_label,
+    ).candidates
+    if any(
+        candidate.get("provider")
+        == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
+        for candidate in candidates
+    ):
+        await _hydrate_alibaba_token_plan_quota_observations()
+    alibaba_evidence, _alibaba_windows = _alibaba_token_plan_quota_evidence()
+    if alibaba_evidence is not None:
+        windows = alibaba_evidence["windows"]
+        now_epoch = time.time()
+        valid_positive_windows = all(
+            isinstance(window, dict)
+            and not window.get("exhausted")
+            and isinstance(window.get("remaining_pct"), (int, float))
+            and not isinstance(window.get("remaining_pct"), bool)
+            and float(window["remaining_pct"]) > 0.0
+            and isinstance(window.get("expected_reset_at"), (int, float))
+            and not isinstance(window.get("expected_reset_at"), bool)
+            and math.isfinite(float(window["expected_reset_at"]))
+            and float(window["expected_reset_at"]) > now_epoch
+            for window in windows
+        )
+        if valid_positive_windows:
+            await _clear_alibaba_token_plan_account_quota_cooldown(
+                alibaba_evidence
+            )
     states = await _build_codex_auto_agent_candidate_states(
         request,
         alias_model=alias_model,
         client_product_label=client_product_label,
         excluded_candidate_keys=excluded_candidate_keys,
+        candidates=candidates,
     )
     skipped = _build_auto_agent_skipped_candidates_from_states(states)
     request.state.aawm_alias_terminal_skipped_candidates = skipped
@@ -4465,6 +4933,11 @@ _HOST_FUNCTION_NAMES = (
     "_apply_kimi_code_managed_account_lane_cooldown",
     "_apply_codex_auto_agent_grok_account_lane_cooldown",
     "_apply_codex_auto_agent_alibaba_token_plan_account_cooldown",
+    "_alibaba_token_plan_quota_observation_from_row",
+    "_hydrate_alibaba_token_plan_quota_observations",
+    "_alibaba_token_plan_quota_evidence",
+    "_attach_alibaba_token_plan_quota_state",
+    "_clear_alibaba_token_plan_account_quota_cooldown",
     "_find_codex_auto_agent_candidate",
     "_find_codex_auto_agent_affinity_candidate",
     "_find_anthropic_auto_agent_candidate",
@@ -4610,6 +5083,44 @@ def install(host_globals: dict) -> None:
         ),
         "_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY": (
             _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        ),
+        "_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY": (
+            _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY
+        ),
+        "_ALIBABA_TOKEN_PLAN_QUOTA_CACHE_TTL_SECONDS": (
+            _ALIBABA_TOKEN_PLAN_QUOTA_CACHE_TTL_SECONDS
+        ),
+        "_ALIBABA_TOKEN_PLAN_QUOTA_FAILURE_RETRY_SECONDS": (
+            _ALIBABA_TOKEN_PLAN_QUOTA_FAILURE_RETRY_SECONDS
+        ),
+        "_ALIBABA_TOKEN_PLAN_QUOTA_LOOKUP_TIMEOUT_SECONDS": (
+            _ALIBABA_TOKEN_PLAN_QUOTA_LOOKUP_TIMEOUT_SECONDS
+        ),
+        "_ALIBABA_TOKEN_PLAN_QUOTA_CLIENT": _ALIBABA_TOKEN_PLAN_QUOTA_CLIENT,
+        "_ALIBABA_TOKEN_PLAN_QUOTA_SOURCE": _ALIBABA_TOKEN_PLAN_QUOTA_SOURCE,
+        "_ALIBABA_TOKEN_PLAN_QUOTA_PARSER_VERSION": (
+            _ALIBABA_TOKEN_PLAN_QUOTA_PARSER_VERSION
+        ),
+        "_ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS": _ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS,
+        "_ALIBABA_TOKEN_PLAN_QUOTA_CURRENT_ROWS_SQL": (
+            _ALIBABA_TOKEN_PLAN_QUOTA_CURRENT_ROWS_SQL
+        ),
+        "_get_codex_quota_observation_pool": _get_codex_quota_observation_pool,
+        "_get_codex_quota_observation_environment": (
+            _get_codex_quota_observation_environment
+        ),
+        "_hydrate_alibaba_token_plan_quota_observations": (
+            _hydrate_alibaba_token_plan_quota_observations
+        ),
+        "_alibaba_token_plan_quota_observation_from_row": (
+            _alibaba_token_plan_quota_observation_from_row
+        ),
+        "_alibaba_token_plan_quota_evidence": _alibaba_token_plan_quota_evidence,
+        "_attach_alibaba_token_plan_quota_state": (
+            _attach_alibaba_token_plan_quota_state
+        ),
+        "_clear_alibaba_token_plan_account_quota_cooldown": (
+            _clear_alibaba_token_plan_account_quota_cooldown
         ),
         "_is_kimi_code_candidate": _is_kimi_code_candidate,
         "_get_kimi_managed_account_cooldown_key": _get_kimi_managed_account_cooldown_key,

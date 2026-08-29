@@ -9088,7 +9088,6 @@ def _build_alibaba_quota_rate_limit_payloads(
     subscription: Mapping[str, Any],
     auth_source: str = "unknown",
 ) -> list[tuple[Any, ...]]:
-    del config
     definitions = (
         (
             "5h",
@@ -9145,6 +9144,7 @@ def _build_alibaba_quota_rate_limit_payloads(
             ],
             "parser_version": ALIBABA_TOKEN_PLAN_PARSER_VERSION,
             "telemetry_status": "valid",
+            "environment": config.environment,
             "window": window,
             "auth_source": auth_source,
             "unit_note": (

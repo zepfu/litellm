@@ -7,6 +7,7 @@ Does NOT import llm_passthrough_endpoints at module scope.
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
@@ -93,6 +94,7 @@ def _set_selection_candidates(
 @pytest.fixture(autouse=True)
 def _configure_selection():
     """Configure selection runtime with fresh stubs before each test."""
+    previous_alias_routing_state = selection.alias_routing_state
     async def _noop_cooldown(key: str, seconds: float) -> None:
         pass
 
@@ -185,6 +187,8 @@ def _configure_selection():
         get_grok_account_quota_lane_cooldown_key=lambda c, lk: None,
         is_kimi_code_candidate=lambda c: isinstance(c, dict) and c.get("provider") == "kimi_code",
         get_kimi_managed_account_cooldown_key=lambda: "kimi_code:__managed_account__:kimi_code_managed_account",
+        get_codex_quota_observation_pool=None,
+        get_codex_quota_observation_environment=None,
     )
     runtime.update(
         {
@@ -208,6 +212,7 @@ def _configure_selection():
         with patch.dict(runtime_globals, runtime):
             yield
     finally:
+        selection.alias_routing_state = previous_alias_routing_state
         for name, value in previous_runtime.items():
             setattr(selection, name, value)
         for name, value in previous_runtime_globals.items():
@@ -1748,6 +1753,880 @@ def _oauth_account_candidate(
         "codex_oauth_lane_key": f"codex-oauth:{label}:{account_hash}",
         "codex_oauth_credential_affinity": "interchangeable",
     }
+
+
+def _alibaba_observation(
+    *,
+    window: str,
+    remaining_pct: float,
+    observed_at: float,
+    environment: str = "prod",
+    account_hash: str = "hash-alibaba-1",
+    model: str = "alibaba_token_plan/qwen3.8-max",
+) -> dict[str, Any]:
+    return {
+        "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        "model": model,
+        "account_hash": account_hash,
+        "environment": environment,
+        "quota_key": f"alibaba_token_plan_{window}:credits",
+        "quota_period": window,
+        "quota_type": "credits",
+        "remaining_pct": remaining_pct,
+        "observed_at": observed_at,
+        "expected_reset_at": observed_at + 3600.0,
+        "status": "fresh",
+        "exhausted": remaining_pct <= 0,
+        "source": "alibaba_token_plan_usage",
+    }
+
+
+def _seed_alibaba_windows(
+    *,
+    remaining_pct: float,
+    observed_at: Optional[float] = None,
+    environment: str = "prod",
+    models: tuple[str, str] = (
+        "alibaba_token_plan/qwen3.8-max",
+        "alibaba_token_plan/qwen3.7-max",
+    ),
+) -> None:
+    now = time.time() if observed_at is None else observed_at
+    selection.alias_routing_state.record_normalized_quota_observations(
+        [
+            _alibaba_observation(
+                window="5h",
+                remaining_pct=remaining_pct,
+                observed_at=now,
+                environment=environment,
+                model=models[0],
+            ),
+            _alibaba_observation(
+                window="7d",
+                remaining_pct=remaining_pct,
+                observed_at=now,
+                environment=environment,
+                model=models[1],
+            ),
+        ]
+    )
+
+
+def _alibaba_candidates() -> tuple[dict[str, Any], dict[str, Any]]:
+    return (
+        {
+            "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+            "model": "alibaba_token_plan/qwen3.8-max",
+            "route_family": "alibaba_token_plan_chat_completions_adapter",
+            "last_resort": False,
+        },
+        {
+            "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+            "model": "alibaba_token_plan/qwen3.7-max",
+            "route_family": "alibaba_token_plan_chat_completions_adapter",
+            "last_resort": True,
+        },
+    )
+
+
+def _alibaba_row(
+    *,
+    environment: Optional[str] = "prod",
+    parser_version: str = "alibaba_token_plan_usage_v3",
+    telemetry_status: str = "valid",
+) -> dict[str, Any]:
+    return {
+        "observed_at": time.time() - 10,
+        "provider": CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        "client": "qwen-cloud-console",
+        "model": "alibaba_token_plan/qwen3.8-max",
+        "account_hash": "hash-alibaba-1",
+        "quota_key": "alibaba_token_plan_5h:credits",
+        "quota_period": "5h",
+        "quota_type": "credits",
+        "expected_reset_at": time.time() + 3600,
+        "remaining_pct": 25.0,
+        "evidence": {
+            "environment": environment,
+            "parser_version": parser_version,
+            "telemetry_status": telemetry_status,
+            "window": "5h",
+        },
+        "environment": environment,
+        "source": "alibaba_token_plan_usage",
+    }
+
+
+class TestAlibabaTokenPlanQuotaObservations:
+    @pytest.fixture(autouse=True)
+    def _require_isolated_selection_runtime(self):
+        assert selection._get_codex_quota_observation_environment is None
+        assert selection._get_codex_quota_observation_pool is None
+        yield
+
+    def test_exact_valid_environment_row_is_normalized(self) -> None:
+        observation = selection._alibaba_token_plan_quota_observation_from_row(
+            _alibaba_row(),
+            expected_environment="prod",
+        )
+
+        assert observation is not None
+        assert observation["provider"] == "alibaba_token_plan"
+        assert observation["account_hash"] == "hash-alibaba-1"
+        assert observation["environment"] == "prod"
+        assert observation["quota_key"] == "alibaba_token_plan_5h:credits"
+        assert observation["exhausted"] is False
+
+    @pytest.mark.parametrize(
+        "row_kwargs",
+        [
+            {"environment": None},
+            {"environment": "staging"},
+            {"parser_version": "alibaba_token_plan_usage_v2"},
+            {"telemetry_status": "unhealthy"},
+        ],
+    )
+    def test_invalid_identity_or_environment_rows_are_unknown(
+        self, row_kwargs: dict[str, Any]
+    ) -> None:
+        observation = selection._alibaba_token_plan_quota_observation_from_row(
+            _alibaba_row(**row_kwargs),
+            expected_environment="prod",
+        )
+
+        assert observation is None
+
+    @pytest.mark.parametrize(
+        ("quota_period", "quota_key"),
+        [
+            ("7d", "alibaba_token_plan_5h:credits"),
+            ("5h", "alibaba_token_plan_7d:credits"),
+        ],
+    )
+    def test_mismatched_window_and_quota_key_rows_are_unknown(
+        self,
+        quota_period: str,
+        quota_key: str,
+    ) -> None:
+        row = _alibaba_row()
+        row["quota_period"] = quota_period
+        row["quota_key"] = quota_key
+
+        assert (
+            selection._alibaba_token_plan_quota_observation_from_row(
+                row,
+                expected_environment="prod",
+            )
+            is None
+        )
+
+    def test_mismatched_evidence_and_row_window_is_unknown(self) -> None:
+        row = _alibaba_row()
+        row["quota_period"] = "7d"
+        row["quota_key"] = "alibaba_token_plan_7d:credits"
+
+        assert (
+            selection._alibaba_token_plan_quota_observation_from_row(
+                row,
+                expected_environment="prod",
+            )
+            is None
+        )
+
+    @pytest.mark.asyncio
+    async def test_hydration_uses_due_gate_and_actual_account_hashes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manager = AliasRoutingStateManager()
+        monkeypatch.setattr(selection, "alias_routing_state", manager)
+        _set_selection_runtime_value(
+            "_get_codex_quota_observation_environment",
+            lambda: "prod",
+            monkeypatch,
+        )
+        rows = [
+            _alibaba_row(),
+            {
+                **_alibaba_row(),
+                "model": "alibaba_token_plan/qwen3.7-max",
+                "quota_period": "7d",
+                "quota_key": "alibaba_token_plan_7d:credits",
+                "evidence": {
+                    **_alibaba_row()["evidence"],
+                    "window": "7d",
+                },
+            },
+        ]
+        fetch_args: list[tuple[Any, ...]] = []
+
+        async def _fetch(sql: str, *args: Any):
+            fetch_args.append((sql, *args))
+            return rows
+
+        fetch = AsyncMock(side_effect=_fetch)
+
+        async def _get_pool():
+            return SimpleNamespace(fetch=fetch)
+
+        _set_selection_runtime_value(
+            "_get_codex_quota_observation_pool", _get_pool, monkeypatch
+        )
+
+        await selection._hydrate_alibaba_token_plan_quota_observations()
+
+        fetch.assert_awaited_once()
+        sql, provider, client, source, environment = fetch_args[0]
+        assert provider == "alibaba_token_plan"
+        assert client == "qwen-cloud-console"
+        assert source == "alibaba_token_plan_usage"
+        assert environment == "prod"
+        assert "NULLIF(BTRIM(evidence->>'environment'), '') = $4" in sql
+        assert {
+            observation["quota_period"]
+            for observation in manager._normalized_quota_observations.values()
+        } == {"5h", "7d"}
+        assert manager.codex_quota_hydration_due_account_hashes(
+            ("alibaba_token_plan",),
+            environment="prod",
+        ) == ()
+
+        deferred_pool = AsyncMock(side_effect=AssertionError("must stay deferred"))
+
+        async def _get_deferred_pool():
+            return SimpleNamespace(fetch=deferred_pool)
+
+        _set_selection_runtime_value(
+            "_get_codex_quota_observation_pool",
+            _get_deferred_pool,
+            monkeypatch,
+        )
+        await selection._hydrate_alibaba_token_plan_quota_observations()
+        deferred_pool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_newer_unavailable_rows_remove_prior_positive_clear_eligibility(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manager = AliasRoutingStateManager()
+        monkeypatch.setattr(selection, "alias_routing_state", manager)
+        now = time.time()
+        _seed_alibaba_windows(remaining_pct=40.0, observed_at=now - 30)
+        rows = [
+            {
+                **_alibaba_row(telemetry_status="unavailable"),
+                "observed_at": now,
+                "model": model,
+                "quota_period": window,
+                "quota_key": f"alibaba_token_plan_{window}:credits",
+                "evidence": {
+                    **_alibaba_row(telemetry_status="unavailable")["evidence"],
+                    "window": window,
+                },
+            }
+            for window, model in (
+                ("5h", "alibaba_token_plan/qwen3.8-max"),
+                ("7d", "alibaba_token_plan/qwen3.7-max"),
+            )
+        ]
+
+        async def _get_pool():
+            return SimpleNamespace(fetch=AsyncMock(return_value=rows))
+
+        _set_selection_runtime_value(
+            "_get_codex_quota_observation_pool", _get_pool, monkeypatch
+        )
+        _set_selection_runtime_value(
+            "_get_codex_quota_observation_environment",
+            lambda: "prod",
+            monkeypatch,
+        )
+        _set_selection_candidates(_alibaba_candidates())
+        account_key = CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+
+        async def _cooldown_state(key: str) -> tuple[float, str]:
+            if key == account_key:
+                return (60.0, "durable_cache")
+            return (0.0, "local_fallback")
+
+        _set_selection_runtime_value(
+            "_get_codex_active_cooldown_state", _cooldown_state, monkeypatch
+        )
+        clear = AsyncMock()
+        _set_selection_runtime_value(
+            "_clear_alibaba_token_plan_account_quota_cooldown",
+            clear,
+            monkeypatch,
+        )
+
+        with pytest.raises(HTTPException) as caught:
+            await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={
+                    "model": "basic",
+                    "litellm_metadata": {"redispatch_ordinal": 1},
+                },
+            )
+
+        assert [
+            candidate["reason"] for candidate in caught.value.detail["candidates"]
+        ] == ["account_quota_cooldown", "account_quota_cooldown"]
+        assert not manager._normalized_quota_observations
+        clear.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_fresh_exhausted_windows_block_both_alibaba_candidates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(selection, "alias_routing_state", AliasRoutingStateManager())
+        _seed_alibaba_windows(remaining_pct=0.0)
+        _set_selection_candidates(_alibaba_candidates())
+        _set_selection_runtime_value(
+            "_get_codex_quota_observation_environment",
+            lambda: "prod",
+            monkeypatch,
+        )
+
+        with pytest.raises(HTTPException) as caught:
+            await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={
+                    "model": "basic",
+                    "litellm_metadata": {"redispatch_ordinal": 1},
+                },
+            )
+
+        detail = caught.value.detail
+        assert [candidate["reason"] for candidate in detail["candidates"]] == [
+            "quota_exhausted",
+            "quota_exhausted",
+        ]
+        assert all(
+            candidate["cooldown_state_source"] == "normalized_quota_observation"
+            for candidate in detail["candidates"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_newer_positive_row_cannot_mask_fresh_exhaustion(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(selection, "alias_routing_state", AliasRoutingStateManager())
+        _set_selection_runtime_value(
+            "_hydrate_alibaba_token_plan_quota_observations",
+            AsyncMock(return_value=None),
+            monkeypatch,
+        )
+        now = time.time()
+        exhausted_observation = _alibaba_observation(
+            window="5h",
+            remaining_pct=0.0,
+            observed_at=now - 10,
+        )
+        selection.alias_routing_state.record_normalized_quota_observations(
+            [
+                exhausted_observation,
+                _alibaba_observation(
+                    window="5h",
+                    remaining_pct=40.0,
+                    observed_at=now,
+                    model="alibaba_token_plan/qwen3.7-max",
+                ),
+                _alibaba_observation(
+                    window="7d",
+                    remaining_pct=40.0,
+                    observed_at=now,
+                ),
+            ]
+        )
+        _set_selection_candidates(_alibaba_candidates())
+        _set_selection_runtime_value(
+            "_get_codex_quota_observation_environment",
+            lambda: "prod",
+            monkeypatch,
+        )
+        clear = AsyncMock()
+        _set_selection_runtime_value(
+            "_clear_alibaba_token_plan_account_quota_cooldown",
+            clear,
+            monkeypatch,
+        )
+
+        with pytest.raises(HTTPException) as caught:
+            await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={
+                    "model": "basic",
+                    "litellm_metadata": {"redispatch_ordinal": 1},
+                },
+            )
+
+        detail = caught.value.detail
+        assert [candidate["reason"] for candidate in detail["candidates"]] == [
+            "quota_exhausted",
+            "quota_exhausted",
+        ]
+        assert clear.assert_not_awaited() is None
+
+    @pytest.mark.asyncio
+    async def test_cross_account_positive_windows_do_not_block_or_clear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            selection, "alias_routing_state", AliasRoutingStateManager()
+        )
+        _set_selection_runtime_value(
+            "_hydrate_alibaba_token_plan_quota_observations",
+            AsyncMock(return_value=None),
+            monkeypatch,
+        )
+        now = time.time()
+        selection.alias_routing_state.record_normalized_quota_observations(
+            [
+                _alibaba_observation(
+                    window="5h",
+                    remaining_pct=40.0,
+                    observed_at=now,
+                    account_hash="hash-alibaba-1",
+                ),
+                _alibaba_observation(
+                    window="7d",
+                    remaining_pct=40.0,
+                    observed_at=now,
+                    account_hash="hash-alibaba-2",
+                ),
+            ]
+        )
+        _set_selection_candidates(_alibaba_candidates())
+        _set_selection_runtime_value(
+            "_get_codex_quota_observation_environment",
+            lambda: "prod",
+            monkeypatch,
+        )
+        clear = AsyncMock()
+        _set_selection_runtime_value(
+            "_clear_alibaba_token_plan_account_quota_cooldown",
+            clear,
+            monkeypatch,
+        )
+
+        result = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body={"model": "basic"},
+        )
+
+        assert result["candidate"]["model"] == (
+            "alibaba_token_plan/qwen3.8-max"
+        )
+        assert result["skipped"] == []
+        clear.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_lone_fresh_exhausted_expired_reset_blocks_and_does_not_clear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            selection, "alias_routing_state", AliasRoutingStateManager()
+        )
+        _set_selection_runtime_value(
+            "_hydrate_alibaba_token_plan_quota_observations",
+            AsyncMock(return_value=None),
+            monkeypatch,
+        )
+        now = time.time()
+        observation = _alibaba_observation(
+            window="5h",
+            remaining_pct=0.0,
+            observed_at=now - 30,
+        )
+        observation["expected_reset_at"] = now - 1
+        selection.alias_routing_state.record_normalized_quota_observations(
+            [observation]
+        )
+        _set_selection_candidates(_alibaba_candidates())
+        _set_selection_runtime_value(
+            "_get_codex_quota_observation_environment",
+            lambda: "prod",
+            monkeypatch,
+        )
+        clear = AsyncMock()
+        _set_selection_runtime_value(
+            "_clear_alibaba_token_plan_account_quota_cooldown",
+            clear,
+            monkeypatch,
+        )
+
+        with pytest.raises(HTTPException) as caught:
+            await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={
+                    "model": "basic",
+                    "litellm_metadata": {"redispatch_ordinal": 1},
+                },
+            )
+
+        detail = caught.value.detail
+        assert [candidate["reason"] for candidate in detail["candidates"]] == [
+            "quota_exhausted",
+            "quota_exhausted",
+        ]
+        assert clear.assert_not_awaited() is None
+
+    @pytest.mark.asyncio
+    async def test_expired_positive_windows_do_not_clear_active_cooldown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            selection, "alias_routing_state", AliasRoutingStateManager()
+        )
+        _set_selection_runtime_value(
+            "_hydrate_alibaba_token_plan_quota_observations",
+            AsyncMock(return_value=None),
+            monkeypatch,
+        )
+        now = time.time()
+        observations = [
+            _alibaba_observation(
+                window=window,
+                remaining_pct=40.0,
+                observed_at=now - 30,
+            )
+            for window in ("5h", "7d")
+        ]
+        for observation in observations:
+            observation["expected_reset_at"] = now - 1
+        selection.alias_routing_state.record_normalized_quota_observations(
+            observations
+        )
+        _set_selection_candidates(_alibaba_candidates())
+        _set_selection_runtime_value(
+            "_get_codex_quota_observation_environment",
+            lambda: "prod",
+            monkeypatch,
+        )
+        account_key = CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+
+        async def _cooldown_state(key: str) -> tuple[float, str]:
+            if key == account_key:
+                return (60.0, "durable_cache")
+            return (0.0, "local_fallback")
+
+        _set_selection_runtime_value(
+            "_get_codex_active_cooldown_state", _cooldown_state, monkeypatch
+        )
+        clear = AsyncMock()
+        _set_selection_runtime_value(
+            "_clear_alibaba_token_plan_account_quota_cooldown",
+            clear,
+            monkeypatch,
+        )
+
+        with pytest.raises(HTTPException) as caught:
+            await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={
+                    "model": "basic",
+                    "litellm_metadata": {"redispatch_ordinal": 1},
+                },
+            )
+
+        assert [
+            candidate["reason"] for candidate in caught.value.detail["candidates"]
+        ] == ["account_quota_cooldown", "account_quota_cooldown"]
+        clear.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_mismatched_window_identity_is_unknown_and_does_not_clear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            selection, "alias_routing_state", AliasRoutingStateManager()
+        )
+        _set_selection_runtime_value(
+            "_hydrate_alibaba_token_plan_quota_observations",
+            AsyncMock(return_value=None),
+            monkeypatch,
+        )
+        now = time.time()
+        observation = _alibaba_observation(
+            window="5h",
+            remaining_pct=40.0,
+            observed_at=now,
+        )
+        observation["quota_period"] = "7d"
+        observation["quota_key"] = "alibaba_token_plan_5h:credits"
+        selection.alias_routing_state.record_normalized_quota_observations(
+            [
+                observation,
+                _alibaba_observation(
+                    window="7d",
+                    remaining_pct=40.0,
+                    observed_at=now,
+                ),
+            ]
+        )
+        _set_selection_candidates(_alibaba_candidates())
+        _set_selection_runtime_value(
+            "_get_codex_quota_observation_environment",
+            lambda: "prod",
+            monkeypatch,
+        )
+        account_key = CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+
+        async def _cooldown_state(key: str) -> tuple[float, str]:
+            if key == account_key:
+                return (60.0, "durable_cache")
+            return (0.0, "local_fallback")
+
+        _set_selection_runtime_value(
+            "_get_codex_active_cooldown_state", _cooldown_state, monkeypatch
+        )
+        clear = AsyncMock()
+        _set_selection_runtime_value(
+            "_clear_alibaba_token_plan_account_quota_cooldown",
+            clear,
+            monkeypatch,
+        )
+
+        with pytest.raises(HTTPException) as caught:
+            await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={
+                    "model": "basic",
+                    "litellm_metadata": {"redispatch_ordinal": 1},
+                },
+            )
+
+        assert [
+            candidate["reason"] for candidate in caught.value.detail["candidates"]
+        ] == ["account_quota_cooldown", "account_quota_cooldown"]
+        assert clear.assert_not_awaited() is None
+
+    @pytest.mark.asyncio
+    async def test_complete_positive_windows_clear_only_account_quota_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(selection, "alias_routing_state", AliasRoutingStateManager())
+        _seed_alibaba_windows(remaining_pct=40.0)
+        _set_selection_candidates(_alibaba_candidates())
+        manager = selection.alias_routing_state
+        monkeypatch.setattr(cooldown_state, "_manager", manager)
+        account_key = CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        candidate_key = (
+            "alibaba_token_plan:alibaba_token_plan/qwen3.8-max:"
+            "alibaba_token_plan"
+        )
+        manager.codex.cooldown_until_monotonic_by_key[account_key] = (
+            time.monotonic() + 60
+        )
+        manager.codex.cooldown_until_monotonic_by_key[candidate_key] = (
+            time.monotonic() + 60
+        )
+
+        async def _cooldown_state(key: str) -> tuple[float, str]:
+            return (0.0, "local_fallback")
+
+        _set_selection_runtime_value(
+            "_get_codex_active_cooldown_state", _cooldown_state, monkeypatch
+        )
+        _set_selection_runtime_value(
+            "_get_codex_quota_observation_environment",
+            lambda: "prod",
+            monkeypatch,
+        )
+        real_clear = cooldown_state.clear_alias_family_cooldown_state
+        clear_calls: list[dict[str, Any]] = []
+
+        async def _clear(**kwargs: Any):
+            clear_calls.append(kwargs)
+            return await real_clear(**{**kwargs, "delete_durable": False})
+
+        monkeypatch.setattr(
+            cooldown_state, "clear_alias_family_cooldown_state", _clear
+        )
+
+        result = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body={"model": "basic"},
+        )
+
+        assert result["candidate"]["model"] in {
+            "alibaba_token_plan/qwen3.8-max",
+            "alibaba_token_plan/qwen3.7-max",
+        }
+        assert clear_calls == [
+            {
+                "alias_family": "codex",
+                "canonical_aliases": ["alibaba_token_plan"],
+                "cooldown_keys": [account_key],
+                "delete_durable": True,
+            }
+        ]
+        assert account_key not in manager.codex.cooldown_until_monotonic_by_key
+        assert manager.codex.cooldown_until_monotonic_by_key[candidate_key] > (
+            time.monotonic()
+        )
+
+    @pytest.mark.parametrize(
+        ("remaining_pct", "environment"),
+        [
+            (25.0, "staging"),
+            (25.0, "prod"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_stale_and_wrong_environment_evidence_are_unknown(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        remaining_pct: float,
+        environment: str,
+    ) -> None:
+        _set_selection_runtime_value(
+            "_get_codex_quota_observation_environment",
+            lambda: "prod",
+            monkeypatch,
+        )
+        manager = AliasRoutingStateManager()
+        monkeypatch.setattr(selection, "alias_routing_state", manager)
+        observed_at = (
+            time.time() - 901
+            if environment == "prod"
+            else time.time()
+        )
+        _seed_alibaba_windows(
+            remaining_pct=remaining_pct,
+            observed_at=observed_at,
+            environment=environment,
+        )
+        evidence, windows = selection._alibaba_token_plan_quota_evidence(
+            state_manager=manager,
+            now_epoch=time.time()
+        )
+
+        assert evidence is None
+        assert windows == []
+
+    @pytest.mark.asyncio
+    async def test_partial_window_is_unknown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_selection_runtime_value(
+            "_get_codex_quota_observation_environment",
+            lambda: "prod",
+            monkeypatch,
+        )
+        manager = AliasRoutingStateManager()
+        manager.record_normalized_quota_observations(
+            [
+                _alibaba_observation(
+                    window="5h",
+                    remaining_pct=25.0,
+                    observed_at=time.time(),
+                )
+            ]
+        )
+
+        evidence, windows = selection._alibaba_token_plan_quota_evidence(
+            state_manager=manager,
+            now_epoch=time.time()
+        )
+
+        assert evidence is None
+        assert windows == []
+
+    def test_malformed_and_ambiguous_rows_are_unknown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_selection_runtime_value(
+            "_get_codex_quota_observation_environment",
+            lambda: "prod",
+            monkeypatch,
+        )
+        valid_observation = selection._alibaba_token_plan_quota_observation_from_row(
+            _alibaba_row(),
+            expected_environment="prod",
+        )
+        malformed = selection._alibaba_token_plan_quota_observation_from_row(
+            {**_alibaba_row(), "evidence": "{invalid"},
+            expected_environment="prod",
+        )
+        unavailable = selection._alibaba_token_plan_quota_observation_from_row(
+            {
+                **_alibaba_row(),
+                "evidence": {
+                    **_alibaba_row()["evidence"],
+                    "telemetry_status": "unavailable",
+                },
+            },
+            expected_environment="prod",
+        )
+
+        assert valid_observation is not None
+        assert malformed is None
+        assert unavailable is None
+
+        assert valid_observation is not None
+        manager = AliasRoutingStateManager()
+        manager.record_normalized_quota_observations(
+            [
+                {
+                    **valid_observation,
+                    "quota_period": "7d",
+                    "quota_key": "alibaba_token_plan_7d:credits",
+                },
+                {
+                    **valid_observation,
+                    "account_hash": "hash-alibaba-2",
+                    "quota_period": "5h",
+                },
+            ]
+        )
+        evidence, windows = selection._alibaba_token_plan_quota_evidence(
+            state_manager=manager,
+            now_epoch=time.time(),
+        )
+
+        assert evidence is None
+        assert windows == []
+
+    @pytest.mark.asyncio
+    async def test_unknown_sidecar_leaves_ali004_cooldown_intact(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _set_selection_candidates(_alibaba_candidates())
+        _set_selection_runtime_value(
+            "_get_codex_quota_observation_environment",
+            lambda: "prod",
+            monkeypatch,
+        )
+        account_key = CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+
+        async def _cooldown_state(key: str) -> tuple[float, str]:
+            if key == account_key:
+                return (60.0, "durable_cache")
+            return (0.0, "local_fallback")
+
+        clear = AsyncMock()
+        _set_selection_runtime_value(
+            "_get_codex_active_cooldown_state", _cooldown_state, monkeypatch
+        )
+        _set_selection_runtime_value(
+            "_clear_alibaba_token_plan_account_quota_cooldown",
+            clear,
+            monkeypatch,
+        )
+
+        with pytest.raises(HTTPException) as caught:
+            await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={
+                    "model": "basic",
+                    "litellm_metadata": {"redispatch_ordinal": 1},
+                },
+            )
+
+        assert [
+            candidate["reason"] for candidate in caught.value.detail["candidates"]
+        ] == ["account_quota_cooldown", "account_quota_cooldown"]
+        clear.assert_not_awaited()
 
 
 def _owned_interchangeable_record(
