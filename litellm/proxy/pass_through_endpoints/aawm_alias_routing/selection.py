@@ -3898,6 +3898,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
     request: Request,
     request_body: dict[str, Any],
     excluded_candidate_keys: Optional[AbstractSet[str]] = None,
+    _replay_safety: Any = None,
 ) -> dict[str, Any]:
     assert _extract_client_product_label is not None
     assert _resolve_codex_session_key is not None
@@ -3934,10 +3935,12 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         request,
         request_body,
     )
-    if (
-        is_auto_review
-        and not sa.is_replay_safe_session_owner_redispatch_body(request_body)
-    ):
+    replay_safety = (
+        _replay_safety
+        if _replay_safety is not None
+        else sa.classify_session_owner_replay_safety_body(request_body)
+    )
+    if is_auto_review and not replay_safety.safe:
         sa.raise_session_owner_redispatch_required(
             session_identity=resolved_session_identity,
             alias_model=alias_model,
@@ -3948,6 +3951,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 "or unsafe opaque rs_* provider state."
             ),
             request=request,
+            replay_safety=replay_safety,
         )
     canonical_session_identity = resolved_session_identity
     session_owner_identity = resolved_session_identity
@@ -4049,7 +4053,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         failure_phase: str,
         mismatch_reason: str,
     ) -> dict[str, Any]:
-        if not sa.is_replay_safe_session_owner_redispatch_body(request_body):
+        if not replay_safety.safe:
             sa.raise_session_owner_redispatch_required(
                 session_identity=session_owner_identity,
                 alias_model=alias_model,
@@ -4064,6 +4068,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                     mismatch_reason=mismatch_reason,
                 ),
                 request=request,
+                replay_safety=replay_safety,
             )
         if session_owner_identity is None:
             sa.raise_session_owner_redispatch_required(
@@ -4081,7 +4086,10 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                 ),
                 request=request,
             )
-        if sa.request_has_effective_session_identity(request):
+        if (
+            sa.request_has_effective_session_identity(request)
+            and not is_auto_review
+        ):
             sa.raise_session_owner_redispatch_required(
                 session_identity=session_owner_identity,
                 alias_model=alias_model,
@@ -4100,13 +4108,21 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         effective_identity = sa.activate_session_owner_redispatch_effective_identity(
             request=request,
             base_session_identity=session_owner_identity,
+            replace_existing_auto_review_owner=is_auto_review,
         )
         if effective_identity is None:
+            effective_identity_conflict = sa.request_has_effective_session_identity(
+                request
+            )
             sa.raise_session_owner_redispatch_required(
                 session_identity=session_owner_identity,
                 alias_model=alias_model,
                 candidate=candidate,
-                failure_phase=failure_phase,
+                failure_phase=(
+                    "session_owner_effective_identity_conflict"
+                    if effective_identity_conflict
+                    else failure_phase
+                ),
                 guard=sa.SessionOwnerGuardResult(
                     decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
                     session_identity=session_owner_identity,
@@ -4121,6 +4137,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             request=request,
             request_body=request_body,
             excluded_candidate_keys=excluded_candidate_keys,
+            _replay_safety=replay_safety,
         )
 
     if isinstance(session_owner_record, dict) and sa._record_state(session_owner_record) == "owned":
@@ -4226,12 +4243,16 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             if (
                 isinstance(session_owner_record, dict)
                 and sa._record_state(session_owner_record) == "owned"
-                # Replay-safe account-bound state must fail on owner removal
-                # before effective-identity selection can cross accounts.
-                and not (
-                    account_identity_pinned
-                    and _affinity_pins_account_identity(affinity)
-                    and sa.is_replay_safe_session_owner_redispatch_body(request_body)
+                and (
+                    # Preserve ordinary account-bound owner pinning while
+                    # allowing portable auto-review history to move under its
+                    # request-local redispatch identity.
+                    (is_auto_review and replay_safety.safe)
+                    or not (
+                        account_identity_pinned
+                        and _affinity_pins_account_identity(affinity)
+                        and replay_safety.safe
+                    )
                 )
             ):
                 return await _reselect_owned_affinity_with_effective_identity(

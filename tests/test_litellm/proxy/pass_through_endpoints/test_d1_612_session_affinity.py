@@ -215,6 +215,22 @@ def _full_attrs(**over: Any) -> dict[str, Any]:
     return base
 
 
+def _full_adapter_reasoning_item(
+    *,
+    summary: Any = None,
+) -> dict[str, Any]:
+    return {
+        "type": "reasoning",
+        "id": "rs_adapter_item",
+        "summary": summary,
+        "encrypted_content": None,
+        "content": None,
+        "internal_chat_message_metadata_passthrough": {
+            "turn_id": "turn-adapter-item",
+        },
+    }
+
+
 async def _seed_nonheld_compatible_owner_lease(
     *,
     request: Any,
@@ -248,6 +264,213 @@ async def _seed_nonheld_compatible_owner_lease(
 
 def _redis_snapshot(redis: _FakeRedisCache) -> tuple[Any, Any, Any]:
     return dict(redis._data), dict(redis._ttl), dict(redis._expires_at)
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        pytest.param(None, id="null-summary"),
+        pytest.param(
+            [{"type": "summary_text", "text": "local adapter summary"}],
+            id="nonempty-summary",
+        ),
+    ],
+)
+def test_replay_safety_accepts_full_adapter_reasoning_item(
+    summary: Any,
+) -> None:
+    body = {"input": [_full_adapter_reasoning_item(summary=summary)]}
+
+    result = sa.classify_session_owner_replay_safety_body(body)
+
+    assert result.safe is True
+    assert result.field_path is None
+    assert result.classification is None
+    assert sa.is_replay_safe_session_owner_redispatch_body(body) is True
+
+
+def test_replay_safety_accepts_encrypted_self_contained_reasoning_item() -> None:
+    body = {
+        "input": [
+            {
+                "type": "reasoning",
+                "id": "rs_encrypted_item",
+                "encrypted_content": "portable-encrypted-state",
+            }
+        ]
+    }
+
+    result = sa.classify_session_owner_replay_safety_body(body)
+
+    assert result.safe is True
+    assert sa.is_replay_safe_session_owner_redispatch_body(body) is True
+
+
+@pytest.mark.parametrize(
+    ("request_body", "field_path", "classification"),
+    [
+        pytest.param(
+            {"previous_response_id": "resp_provider_state"},
+            "$.previous_response_id",
+            "previous_response_id",
+            id="top-level-previous-response-id",
+        ),
+        pytest.param(
+            {"metadata": [{"previous_response_id": "rs_provider_state"}]},
+            "$.*[0].previous_response_id",
+            "previous_response_id",
+            id="nested-previous-response-id",
+        ),
+        pytest.param(
+            {"input": [{"type": "reasoning", "id": "rs_provider_item"}]},
+            "$.*[0].id",
+            "id_only_reasoning_reference",
+            id="id-only-reasoning",
+        ),
+        pytest.param(
+            {
+                "attacker-secret-ancestor": {
+                    "nested-secret-ancestor": [
+                        {"provider_item_id": "rs_secret_reference"}
+                    ]
+                }
+            },
+            "$.*.*[0].provider_item_id",
+            "explicit_item_reference",
+            id="attacker-controlled-ancestor-keys",
+        ),
+        *[
+            pytest.param(
+                {"input": [{"type": "message", field: "rs_provider_reference"}]},
+                f"$.*[0].{field}",
+                "explicit_item_reference",
+                id=field,
+            )
+            for field in (
+                "item_id",
+                "item_reference",
+                "provider_item_id",
+                "response_item_id",
+            )
+        ],
+    ],
+)
+def test_replay_safety_rejects_recursive_provider_state(
+    request_body: dict[str, Any],
+    field_path: str,
+    classification: str,
+) -> None:
+    result = sa.classify_session_owner_replay_safety_body(request_body)
+
+    assert result.safe is False
+    assert result.field_path == field_path
+    assert result.classification == classification
+    assert sa.is_replay_safe_session_owner_redispatch_body(request_body) is False
+
+
+@pytest.mark.parametrize(
+    "previous_response_id",
+    [None, "", "   "],
+    ids=["null", "empty", "whitespace"],
+)
+def test_replay_safety_treats_empty_previous_response_id_as_absent(
+    previous_response_id: Any,
+) -> None:
+    body = {
+        "previous_response_id": previous_response_id,
+        "input": [{"role": "user", "content": "portable"}],
+    }
+
+    result = sa.classify_session_owner_replay_safety_body(body)
+
+    assert result.safe is True
+    assert sa.is_replay_safe_session_owner_redispatch_body(body) is True
+
+
+def test_replay_unsafe_409_detail_omits_request_owner_and_candidate_secrets() -> None:
+    replay_safety = sa.classify_session_owner_replay_safety_body(
+        {
+            "attacker-secret-ancestor": [
+                {"previous_response_id": "resp-secret-provider-state"}
+            ]
+        }
+    )
+    guard = sa.SessionOwnerGuardResult(
+        decision=sa.SessionOwnerGuardDecision.REDISPATCH_REQUIRED,
+        session_identity="canonical-session-secret",
+        cache_key="cache-key-secret",
+        owner_id="owner-id-secret",
+        owner_record={
+            "state": "owned",
+            "owner": "owner-id-secret",
+            "attributes": {
+                "provider": "owner-provider-secret",
+                "model": "owner-model-secret",
+                "route_family": "owner-route-secret",
+                "account_hash": "owner-account-secret",
+            },
+        },
+        mismatch_reason="mismatch-reason-secret",
+    )
+    message = (
+        "Codex auto-review cannot own provider response state. Send a "
+        "self-contained replay-safe body without previous_response_id "
+        "or unsafe opaque rs_* provider state."
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        sa.raise_session_owner_redispatch_required(
+            session_identity="canonical-session-secret",
+            guard=guard,
+            alias_model="codex-auto-review",
+            candidate={
+                "provider": "candidate-provider-secret",
+                "model": "candidate-model-secret",
+                "route_family": "candidate-route-secret",
+                "codex_oauth_account_hash": "candidate-account-secret",
+            },
+            failure_phase="session_owner_replay_unsafe_auto_review",
+            message=message,
+            replay_safety=replay_safety,
+        )
+
+    assert exc_info.value.status_code == 409
+    detail = exc_info.value.detail
+    assert detail == {
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "code": "aawm_session_owner_redispatch_required",
+        },
+        "redispatch_required": True,
+        "redispatch_reason": "previous_response_id",
+        "failure_phase": "session_owner_replay_unsafe_auto_review",
+        "attempted_provider_call": False,
+        "alias_model": "codex-auto-review",
+        "redispatch_model": "codex-auto-review",
+        "replay_safety": {
+            "field_path": "$.*[0].previous_response_id",
+            "classification": "previous_response_id",
+        },
+    }
+    detail_text = json.dumps(detail, sort_keys=True)
+    for secret in (
+        "attacker-secret-ancestor",
+        "resp-secret-provider-state",
+        "canonical-session-secret",
+        "cache-key-secret",
+        "owner-id-secret",
+        "owner-provider-secret",
+        "owner-model-secret",
+        "owner-route-secret",
+        "owner-account-secret",
+        "mismatch-reason-secret",
+        "candidate-provider-secret",
+        "candidate-model-secret",
+        "candidate-route-secret",
+        "candidate-account-secret",
+    ):
+        assert secret not in detail_text
 
 
 @pytest.mark.asyncio
@@ -2119,6 +2342,14 @@ async def test_auto_review_selector_uses_review_owner_identity_without_mutating_
     )
     owner_lookup = AsyncMock(return_value=(None, "review-owner-key", None))
     monkeypatch.setattr(sa, "get_session_owner_record", owner_lookup)
+    replay_classifier = MagicMock(
+        wraps=sa.classify_session_owner_replay_safety_body
+    )
+    monkeypatch.setattr(
+        sa,
+        "classify_session_owner_replay_safety_body",
+        replay_classifier,
+    )
     request = _codex_selector_request("parent-thread")
     request_body = {
         "model": review_alias,
@@ -2165,6 +2396,72 @@ async def test_auto_review_selector_uses_review_owner_identity_without_mutating_
     )
     assert request_body == body_before
     assert request.headers == headers_before
+    replay_classifier.assert_called_once_with(request_body)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("review_alias", ["codex-auto-review", "auto-review"])
+async def test_auto_review_replays_full_adapter_reasoning_without_poisoning_guardian(
+    monkeypatch: pytest.MonkeyPatch,
+    review_alias: str,
+) -> None:
+    sel, candidate = _patch_codex_selector_basics(monkeypatch)
+    selector_globals = sel._select_codex_auto_agent_candidate.__globals__
+    monkeypatch.setitem(
+        selector_globals,
+        "_lookup_active_snapshot_canonical_alias",
+        lambda *_args, **_kwargs: review_alias,
+    )
+    owner_lookup = AsyncMock(return_value=(None, "review-owner-key", None))
+    monkeypatch.setattr(sa, "get_session_owner_record", owner_lookup)
+
+    first_request = _codex_selector_request("guardian-thread")
+    first_request.state.aawm_alias_request_litellm_call_id = "review-call-one"
+    first_body = {
+        "model": review_alias,
+        "input": [{"role": "user", "content": "first review"}],
+    }
+    first_body_before = json.loads(json.dumps(first_body))
+    first_headers_before = dict(first_request.headers)
+
+    first_selection = await sel._select_codex_auto_agent_candidate(
+        request=first_request,
+        request_body=first_body,
+    )
+
+    adapter_item = _full_adapter_reasoning_item()
+    second_request = _codex_selector_request("guardian-thread")
+    second_request.state.aawm_alias_request_litellm_call_id = "review-call-two"
+    second_body = {
+        "model": review_alias,
+        "input": [
+            adapter_item,
+            {"role": "user", "content": "second review"},
+        ],
+    }
+    second_body_before = json.loads(json.dumps(second_body))
+    second_headers_before = dict(second_request.headers)
+
+    second_selection = await sel._select_codex_auto_agent_candidate(
+        request=second_request,
+        request_body=second_body,
+    )
+
+    first_owner = first_selection["session_owner_identity"]
+    second_owner = second_selection["session_owner_identity"]
+    assert first_selection["candidate"] == candidate
+    assert second_selection["candidate"] == candidate
+    assert first_owner.startswith("aawm-codex-auto-review-owner-v1:")
+    assert second_owner.startswith("aawm-codex-auto-review-owner-v1:")
+    assert first_owner != second_owner
+    assert owner_lookup.await_count == 2
+    assert [
+        call.kwargs["session_identity"] for call in owner_lookup.await_args_list
+    ] == [first_owner, second_owner]
+    assert first_body == first_body_before
+    assert first_request.headers == first_headers_before
+    assert second_body == second_body_before
+    assert second_request.headers == second_headers_before
 
 
 @pytest.mark.asyncio
@@ -2296,9 +2593,10 @@ async def test_auto_review_replay_unsafe_opaque_state_stays_409(
                     {
                         "type": "reasoning",
                         "id": "provider-item",
-                        "encrypted_content": "account-bound",
+                        "encrypted_content": "ciphertext-must-not-leak",
+                        "content": "reasoning-content-must-not-leak",
                     },
-                    {"type": "reasoning", "id": "rs_owner"},
+                    {"type": "reasoning", "id": "rs_sensitive_item"},
                 ],
             },
         )
@@ -2309,25 +2607,33 @@ async def test_auto_review_replay_unsafe_opaque_state_stays_409(
     assert detail["failure_phase"] == "session_owner_replay_unsafe_auto_review"
     assert detail["redispatch_required"] is True
     assert detail["attempted_provider_call"] is False
+    assert detail["replay_safety"] == {
+        "field_path": "$.*[1].id",
+        "classification": "id_only_reasoning_reference",
+    }
+    detail_text = str(detail)
+    assert "ciphertext-must-not-leak" not in detail_text
+    assert "reasoning-content-must-not-leak" not in detail_text
+    assert "rs_sensitive_item" not in detail_text
     owner_record_lookup.assert_not_awaited()
     assert sa.get_request_effective_session_identity(request) is None
 
 
 @pytest.mark.asyncio
-async def test_codex_unbound_fresh_child_owned_route_mismatch_uses_effective_identity(
+@pytest.mark.parametrize("review_alias", ["codex-auto-review", "auto-review"])
+async def test_auto_review_full_adapter_owned_route_mismatch_uses_effective_identity(
     monkeypatch: pytest.MonkeyPatch,
+    review_alias: str,
 ) -> None:
-    sel, candidate = _patch_codex_selector_basics(
-        monkeypatch,
-        has_account_bound_state=False,
-    )
+    sel, candidate = _patch_codex_selector_basics(monkeypatch)
     selector_globals = sel._select_codex_auto_agent_candidate.__globals__
     monkeypatch.setitem(
         selector_globals,
         "_lookup_active_snapshot_canonical_alias",
-        lambda *_args, **_kwargs: "codex-auto-review",
+        lambda *_args, **_kwargs: review_alias,
     )
     request = _codex_selector_request("base-thread")
+    request.state.aawm_alias_request_litellm_call_id = "owned-review-call"
     owner_record = {
         "state": "owned",
         "owner": "owner-a",
@@ -2340,12 +2646,19 @@ async def test_codex_unbound_fresh_child_owned_route_mismatch_uses_effective_ide
             "codex_oauth_lane_key": "owner-lane",
         },
     }
+    owner_lookups: list[str] = []
 
     async def _get_owner_record(*, session_identity: str | None, **_kwargs: Any) -> tuple[Any, str, None]:
-        if session_identity == "base-thread:codex-auto-review":
-            return owner_record, "owner-key", None
         assert session_identity is not None
-        assert session_identity.startswith("aawm-codex-auto-review-owner-v1:")
+        owner_lookups.append(session_identity)
+        if len(owner_lookups) == 1:
+            assert session_identity.startswith(
+                "aawm-codex-auto-review-owner-v1:"
+            )
+            return owner_record, "owner-key", None
+        assert session_identity.startswith(
+            "aawm-session-owner-redispatch-v1:"
+        )
         return None, "effective-key", None
 
     monkeypatch.setattr(sa, "get_session_owner_record", _get_owner_record)
@@ -2359,24 +2672,40 @@ async def test_codex_unbound_fresh_child_owned_route_mismatch_uses_effective_ide
         "_find_codex_auto_agent_affinity_candidate",
         lambda *_args, **_kwargs: None,
     )
+    replay_classifier = MagicMock(
+        wraps=sa.classify_session_owner_replay_safety_body
+    )
+    monkeypatch.setattr(
+        sa,
+        "classify_session_owner_replay_safety_body",
+        replay_classifier,
+    )
+    request_body = {
+        "model": review_alias,
+        "litellm_metadata": {"redispatch_ordinal": 1},
+        "input": [
+            _full_adapter_reasoning_item(),
+            {"role": "user", "content": "review this change"},
+        ],
+    }
+    body_before = json.loads(json.dumps(request_body))
+    headers_before = dict(request.headers)
+
     selected = await sel._select_codex_auto_agent_candidate(
         request=request,
-        request_body={
-            "model": "codex-auto-review",
-            "litellm_metadata": {"redispatch_ordinal": 1},
-            "input": [
-                {"type": "function_call", "name": "inspect", "call_id": "call-1"},
-            ],
-        },
+        request_body=request_body,
     )
 
     assert selected["selection_reason"] == "first_available"
     assert selected["candidate"] == candidate
-    assert selected["has_account_bound_state"] is False
+    assert selected["has_account_bound_state"] is True
     assert selected["canonical_session_identity"] == "base-thread"
     assert selected["session_owner_identity"].startswith(
-        "aawm-codex-auto-review-owner-v1:"
+        "aawm-session-owner-redispatch-v1:"
     )
+    assert len(owner_lookups) == 2
+    assert owner_lookups[1] == selected["session_owner_identity"]
+    assert owner_lookups[0] != owner_lookups[1]
     assert sa.get_request_effective_session_identity(request) == selected[
         "session_owner_identity"
     ]
@@ -2385,6 +2714,9 @@ async def test_codex_unbound_fresh_child_owned_route_mismatch_uses_effective_ide
         == "base-thread"
     )
     assert selected["affinity_bypassed"] is True
+    replay_classifier.assert_called_once_with(request_body)
+    assert request_body == body_before
+    assert request.headers == headers_before
 
 
 @pytest.mark.asyncio

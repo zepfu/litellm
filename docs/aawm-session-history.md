@@ -1981,7 +1981,7 @@ family, so operators can distinguish provider traffic without also seeing raw
 
 ### Codex auto-review decision rollups
 
-Codex auto-review preserves guardian correlation, but it does not create durable session ownership. Ownership is request-local, the reservation is released after each successful review, and replay-unsafe provider-owned continuation state is rejected before provider egress.
+Codex auto-review preserves guardian correlation, but it does not create durable session ownership. Ownership is request-local, the reservation is released after each successful review, self-contained full adapter reasoning items with local correlation IDs and no unresolved provider state are replay-safe, and genuine provider-owned continuation or reference state remains fail-closed before provider egress.
 
 `codex-auto-review` responses are recognized only when the completed response
 contains exactly one assistant `output_text` item whose entire text is one JSON

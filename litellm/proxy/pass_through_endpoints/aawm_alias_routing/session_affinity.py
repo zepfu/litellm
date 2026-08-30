@@ -134,6 +134,15 @@ class SessionOwnerLease:
     finalizing: bool = False
 
 
+@dataclass(frozen=True)
+class SessionOwnerReplaySafetyResult:
+    """Pure structural replay-safety classification for one request body."""
+
+    safe: bool
+    field_path: Optional[str] = None
+    classification: Optional[str] = None
+
+
 _SESSION_OWNER_STATE_KIND = "session_owner"
 _SESSION_OWNER_REDISPATCH_EFFECTIVE_IDENTITY_PREFIX = (
     "aawm-session-owner-redispatch-v1:"
@@ -216,6 +225,37 @@ _REQUIRED_OWNER_ATTRIBUTE_KEYS = (
     "endpoint_contract",
     "state_format",
 )
+
+_REPLAY_SAFETY_EXPLICIT_REFERENCE_KEYS = frozenset(
+    {
+        "item_id",
+        "item_reference",
+        "provider_item_id",
+        "response_item_id",
+    }
+)
+_REPLAY_SAFETY_TERMINAL_FIELD_NAMES = (
+    _REPLAY_SAFETY_EXPLICIT_REFERENCE_KEYS
+    | frozenset({"previous_response_id", "id"})
+)
+_REPLAY_SAFETY_FULL_REASONING_ITEM_KEYS = frozenset(
+    {
+        "summary",
+        "encrypted_content",
+        "content",
+        "internal_chat_message_metadata_passthrough",
+    }
+)
+_REPLAY_SAFETY_CLASSIFICATIONS = frozenset(
+    {
+        "previous_response_id",
+        "id_only_reasoning_reference",
+        "explicit_item_reference",
+        "invalid_body_shape",
+    }
+)
+_REPLAY_SAFETY_MAX_FIELD_PATH_CHARS = 256
+_REPLAY_SAFETY_MAPPING_PATH_SEGMENT = object()
 
 # Short renewable hold while upstream I/O is in flight. Not a fixed ownership
 # expiry — owned records are persistent until explicit retirement.
@@ -444,21 +484,32 @@ def activate_session_owner_redispatch_effective_identity(
     *,
     request: Any,
     base_session_identity: Optional[str],
+    replace_existing_auto_review_owner: bool = False,
 ) -> Optional[str]:
     """Set one deterministic server-side redispatch identity for this request.
 
     The identity is derived only from the already resolved canonical base
-    identity. It is never exposed through request headers or request bodies,
-    and an existing effective identity is never derived again.
+    identity and is never exposed through request headers or request bodies.
+    An auto-review request-local owner may be replaced once; other existing
+    effective identities are never derived again.
     """
 
     if request is None:
         return None
     state = getattr(request, "state", None)
-    if state is None or get_request_effective_session_identity(request) is not None:
+    if state is None:
         return None
     base = _clean_optional_str(base_session_identity)
     if base is None:
+        return None
+    existing_identity = get_request_effective_session_identity(request)
+    if existing_identity is not None and not (
+        replace_existing_auto_review_owner
+        and existing_identity == base
+        and existing_identity.startswith(
+            _CODEX_AUTO_REVIEW_SESSION_OWNER_IDENTITY_PREFIX
+        )
+    ):
         return None
     digest = hashlib.sha256(
         (
@@ -472,63 +523,157 @@ def activate_session_owner_redispatch_effective_identity(
     return effective_identity
 
 
-def is_replay_safe_session_owner_redispatch_body(
-    request_body: Optional[Mapping[str, Any]],
-) -> bool:
-    """Whether a full request body can be replayed under one new owner key.
+def _replay_safety_json_path(path: tuple[object, ...]) -> str:
+    if not path:
+        return "$"
+    terminal_field = path[-1] if isinstance(path[-1], str) else ""
+    if terminal_field not in _REPLAY_SAFETY_TERMINAL_FIELD_NAMES:
+        return "$"
+    result = "$"
+    for segment in path[:-1]:
+        if isinstance(segment, int):
+            result += f"[{segment}]"
+        else:
+            result += ".*"
+    result += f".{terminal_field}"
+    if len(result) > _REPLAY_SAFETY_MAX_FIELD_PATH_CHARS:
+        return f"$.**.{terminal_field}"
+    return result
 
-    A client-carried transcript can be replayed across interchangeable
-    accounts. Provider-owned response ids and opaque ``rs_*`` item references
-    cannot: the next account cannot resolve those server-side objects.
+
+def _replay_safety_failure(
+    path: tuple[object, ...],
+    classification: str,
+) -> SessionOwnerReplaySafetyResult:
+    return SessionOwnerReplaySafetyResult(
+        safe=False,
+        field_path=_replay_safety_json_path(path),
+        classification=classification,
+    )
+
+
+def _has_nonempty_replay_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (Mapping, list, tuple, set, frozenset)):
+        return bool(value)
+    return bool(value)
+
+
+def _is_full_client_carried_reasoning_item(value: Mapping[str, Any]) -> bool:
+    item_type = value.get("type")
+    item_id = value.get("id")
+    if (
+        not isinstance(item_type, str)
+        or item_type.strip().casefold() != "reasoning"
+        or not isinstance(item_id, str)
+        or not item_id.strip().casefold().startswith("rs_")
+        or not _REPLAY_SAFETY_FULL_REASONING_ITEM_KEYS.issubset(value)
+    ):
+        return False
+    metadata = value.get("internal_chat_message_metadata_passthrough")
+    return isinstance(metadata, Mapping) and _has_nonempty_replay_value(
+        metadata.get("turn_id")
+    )
+
+
+def classify_session_owner_replay_safety_body(
+    request_body: Optional[Mapping[str, Any]],
+) -> SessionOwnerReplaySafetyResult:
+    """Classify whether a request body can move under a new owner key.
+
+    The result contains only a bounded structural path and a fixed
+    classification. It never returns request values, prompts, or encrypted
+    state.
     """
 
     if not isinstance(request_body, Mapping):
-        return False
+        return _replay_safety_failure((), "invalid_body_shape")
 
-    provider_item_reference_keys = {
-        "id",
-        "item_id",
-        "item_reference",
-        "provider_item_id",
-        "response_item_id",
-    }
     seen: set[int] = set()
 
-    def _contains_provider_state(value: Any) -> bool:
+    def _find_failure(
+        value: Any,
+        path: tuple[object, ...],
+    ) -> Optional[SessionOwnerReplaySafetyResult]:
         if isinstance(value, Mapping):
             value_id = id(value)
             if value_id in seen:
-                return False
+                return None
             seen.add(value_id)
-            if "previous_response_id" in value:
-                return True
+
             for key, child in value.items():
-                normalized_key = str(key).strip().casefold()
-                encrypted_content = value.get("encrypted_content")
-                self_contained_encrypted_item = (
-                    normalized_key == "id"
-                    and isinstance(encrypted_content, str)
-                    and bool(encrypted_content.strip())
+                normalized_key = (
+                    key.strip().casefold() if isinstance(key, str) else ""
                 )
+                child_path = (*path, _REPLAY_SAFETY_MAPPING_PATH_SEGMENT)
+                if normalized_key == "previous_response_id" and _has_nonempty_replay_value(
+                    child
+                ):
+                    return _replay_safety_failure(
+                        (*path, normalized_key),
+                        "previous_response_id",
+                    )
                 if (
-                    normalized_key in provider_item_reference_keys
+                    normalized_key in _REPLAY_SAFETY_EXPLICIT_REFERENCE_KEYS
+                    and _has_nonempty_replay_value(child)
+                ):
+                    return _replay_safety_failure(
+                        (*path, normalized_key),
+                        "explicit_item_reference",
+                    )
+                if (
+                    normalized_key == "id"
                     and isinstance(child, str)
                     and child.strip().casefold().startswith("rs_")
-                    and not self_contained_encrypted_item
                 ):
-                    return True
-                if _contains_provider_state(child):
-                    return True
-            return False
+                    encrypted_content = value.get("encrypted_content")
+                    self_contained_encrypted_item = (
+                        isinstance(encrypted_content, str)
+                        and bool(encrypted_content.strip())
+                    )
+                    if not self_contained_encrypted_item and not (
+                        _is_full_client_carried_reasoning_item(value)
+                    ):
+                        classification = (
+                            "id_only_reasoning_reference"
+                            if str(value.get("type", "")).strip().casefold()
+                            == "reasoning"
+                            else "explicit_item_reference"
+                        )
+                        return _replay_safety_failure(
+                            (*path, normalized_key),
+                            classification,
+                        )
+
+                failure = _find_failure(child, child_path)
+                if failure is not None:
+                    return failure
+            return None
+
         if isinstance(value, list):
             value_id = id(value)
             if value_id in seen:
-                return False
+                return None
             seen.add(value_id)
-            return any(_contains_provider_state(item) for item in value)
-        return False
+            for index, item in enumerate(value):
+                failure = _find_failure(item, (*path, index))
+                if failure is not None:
+                    return failure
+        return None
 
-    return not _contains_provider_state(request_body)
+    failure = _find_failure(request_body, ())
+    return failure or SessionOwnerReplaySafetyResult(safe=True)
+
+
+def is_replay_safe_session_owner_redispatch_body(
+    request_body: Optional[Mapping[str, Any]],
+) -> bool:
+    """Whether a full request body can be replayed under one new owner key."""
+
+    return classify_session_owner_replay_safety_body(request_body).safe
 
 
 def _strip_legacy_affinity_prefixes(raw: str) -> str:
@@ -3365,6 +3510,80 @@ def _register_session_owner_inbound_access_log_replacement(request: Any) -> None
         pass
 
 
+def _bounded_replay_safety_detail(
+    replay_safety: Optional[SessionOwnerReplaySafetyResult],
+) -> Optional[dict[str, str]]:
+    if (
+        replay_safety is None
+        or replay_safety.safe
+        or replay_safety.field_path is None
+        or replay_safety.classification not in _REPLAY_SAFETY_CLASSIFICATIONS
+        or len(replay_safety.field_path) > _REPLAY_SAFETY_MAX_FIELD_PATH_CHARS
+    ):
+        return None
+    field_path = replay_safety.field_path
+    classification = replay_safety.classification
+    if classification == "invalid_body_shape":
+        if field_path != "$":
+            return None
+    else:
+        allowed_terminal_fields = (
+            {"previous_response_id"}
+            if classification == "previous_response_id"
+            else (
+                {"id"}
+                if classification == "id_only_reasoning_reference"
+                else _REPLAY_SAFETY_EXPLICIT_REFERENCE_KEYS
+            )
+        )
+        terminal_field = next(
+            (
+                field
+                for field in allowed_terminal_fields
+                if field_path.endswith(f".{field}")
+            ),
+            None,
+        )
+        if terminal_field is None:
+            return None
+        structural_prefix = field_path[: -len(terminal_field) - 1]
+        if re.fullmatch(
+            r"\$(?:(?:\.\*|\.\*\*|\[\d+\]))*",
+            structural_prefix,
+        ) is None:
+            return None
+    return {
+        "field_path": field_path,
+        "classification": classification,
+    }
+
+
+def _build_minimized_replay_unsafe_detail(
+    *,
+    error_detail: Mapping[str, str],
+    failure_phase: str,
+    alias_model: Optional[str],
+    replay_safety_detail: Optional[dict[str, str]],
+) -> Optional[dict[str, Any]]:
+    if (
+        failure_phase != "session_owner_replay_unsafe_auto_review"
+        or replay_safety_detail is None
+    ):
+        return None
+    detail: dict[str, Any] = {
+        "error": dict(error_detail),
+        "redispatch_required": True,
+        "redispatch_reason": replay_safety_detail["classification"],
+        "failure_phase": failure_phase,
+        "attempted_provider_call": False,
+        "replay_safety": replay_safety_detail,
+    }
+    if alias_model in {"codex-auto-review", "auto-review"}:
+        detail["alias_model"] = alias_model
+        detail["redispatch_model"] = alias_model
+    return detail
+
+
 def raise_session_owner_redispatch_required(
     *,
     session_identity: Optional[str],
@@ -3378,6 +3597,7 @@ def raise_session_owner_redispatch_required(
     request: Any = None,
     attempted_provider_call: bool = False,
     terminal_marker: Any = None,
+    replay_safety: Optional[SessionOwnerReplaySafetyResult] = None,
 ) -> None:
     """Raise structured redispatch_required with truthful egress state.
 
@@ -3443,33 +3663,44 @@ def raise_session_owner_redispatch_required(
         claim_outcome=claim_outcome,
     )
 
-    detail: dict[str, Any] = {
-        "error": {
-            "message": message
-            or (
-                "Session ownership requires a fresh dispatch. The current "
-                "session is pinned to a different or unavailable owner; do not "
-                "continue this session against another provider/model/route/"
-                "account. Redispatch with a new session identity."
-            ),
-            "type": "invalid_request_error",
-            "code": _SESSION_OWNER_REDISPATCH_ERROR_CODE,
-        },
-        "redispatch_required": True,
-        "redispatch_reason": mismatch_reason or failure_phase,
-        "failure_phase": failure_phase,
-        "attempted_provider_call": bool(attempted_provider_call),
-        "canonical_session_identity": session_identity,
-        "session_owner": provenance,
-        "candidate": shaped_candidate,
+    error_detail = {
+        "message": message
+        or (
+            "Session ownership requires a fresh dispatch. The current "
+            "session is pinned to a different or unavailable owner; do not "
+            "continue this session against another provider/model/route/"
+            "account. Redispatch with a new session identity."
+        ),
+        "type": "invalid_request_error",
+        "code": _SESSION_OWNER_REDISPATCH_ERROR_CODE,
     }
-    if alias_model is not None:
-        detail["alias_model"] = alias_model
-        detail["redispatch_model"] = alias_model
-    if owner_attrs:
-        detail["selected_provider"] = owner_attrs.get("provider")
-        detail["selected_model"] = owner_attrs.get("model")
-        detail["selected_route_family"] = owner_attrs.get("route_family")
+    replay_safety_detail = _bounded_replay_safety_detail(replay_safety)
+    detail = _build_minimized_replay_unsafe_detail(
+        error_detail=error_detail,
+        failure_phase=failure_phase,
+        alias_model=alias_model,
+        replay_safety_detail=replay_safety_detail,
+    )
+    if detail is None:
+        detail = {
+            "error": error_detail,
+            "redispatch_required": True,
+            "redispatch_reason": mismatch_reason or failure_phase,
+            "failure_phase": failure_phase,
+            "attempted_provider_call": bool(attempted_provider_call),
+            "canonical_session_identity": session_identity,
+            "session_owner": provenance,
+            "candidate": shaped_candidate,
+        }
+        if alias_model is not None:
+            detail["alias_model"] = alias_model
+            detail["redispatch_model"] = alias_model
+        if owner_attrs:
+            detail["selected_provider"] = owner_attrs.get("provider")
+            detail["selected_model"] = owner_attrs.get("model")
+            detail["selected_route_family"] = owner_attrs.get("route_family")
+        if replay_safety_detail is not None:
+            detail["replay_safety"] = replay_safety_detail
 
     # Keep the legacy attribution argument for callers; reopened D1-614 intentionally
     # does not emit its values.

@@ -254,14 +254,16 @@ rotation.
 
 Nested `previous_response_id`, opaque `rs_*` references, and other
 upstream-owned continuation state remain pinned to the recorded account even in
-an interchangeable pool. Account-bound state, held or foreign ownership,
-incompatible provider/model/route/state combinations, and post-commit retries
-also remain pinned and fail closed. If the recorded account is unavailable,
-routing fails closed rather than dropping conversation state and replaying only
-the current delta. Inline reasoning and function-call history may move
-accounts only when the complete request body is replay-safe, fully
-client-carried, and still pre-commit. That move clears only the request-local
-non-held guard after durable validation, never rewrites durable owner state.
+an interchangeable pool. Self-contained full adapter reasoning items with
+local correlation IDs and no unresolved provider state are replay-safe.
+Account-bound state, held or foreign ownership, incompatible
+provider/model/route/state combinations, and post-commit retries also remain
+pinned and fail closed. If the recorded account is unavailable, routing fails
+closed rather than dropping conversation state and replaying only the current
+delta. Inline reasoning and function-call history may move accounts only when
+the complete request body is replay-safe, fully client-carried, and still
+pre-commit. That move clears only the request-local non-held guard after
+durable validation, never rewrites durable owner state.
 Telemetry preserves guard-reset/rebind outcomes and second-selection failures
 as their own events rather than relabeling them as inventory exhaustion. The
 state itself is not persisted by the routing metadata: encrypted content,
