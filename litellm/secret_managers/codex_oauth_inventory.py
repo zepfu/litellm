@@ -29,6 +29,13 @@ _SAFE_LABEL_RE = re.compile(r"\A[a-z][a-z0-9._-]{0,63}\Z")
 _ACCOUNT_HASH_RE = re.compile(
     rf"\A[0-9a-f]{{{CODEX_OAUTH_ACCOUNT_HASH_LENGTH}}}\Z"
 )
+_EMAIL_LOCAL_PART_RE = re.compile(r"\A[A-Za-z0-9._%+-]+\Z")
+_EMAIL_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_EMAIL_DOMAIN_LABEL_RE = re.compile(
+    r"\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z",
+    re.IGNORECASE,
+)
+CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY = "OpenAI-account(redacted)"
 _ROOT_FIELDS = frozenset({"schema_version", "routing", "accounts"})
 _ROOT_REQUIRED_FIELDS = frozenset({"schema_version", "accounts"})
 _ROUTING_FIELDS = frozenset(
@@ -190,6 +197,7 @@ class CodexOAuthCredentialSnapshot:
     expires_at: Optional[float]
     access_token: str = field(repr=False)
     account_id: str = field(repr=False)
+    account_display: Optional[str] = None
 
 
 def codex_oauth_account_identity_hash(account_id: Any) -> str:
@@ -202,6 +210,46 @@ def codex_oauth_account_identity_hash(account_id: Any) -> str:
     return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[
         :CODEX_OAUTH_ACCOUNT_HASH_LENGTH
     ]
+
+
+def codex_oauth_masked_account_display(email: Any) -> Optional[str]:
+    """Return a bounded display form for an untrusted email claim.
+
+    Long local parts expose exactly four leading and four trailing
+    characters. Short local parts expose only their first character, so no
+    complete local part is returned. Invalid values have no display.
+    """
+    if not isinstance(email, str) or email != email.strip():
+        return None
+    cleaned = email.strip()
+    if not cleaned or _EMAIL_CONTROL_RE.search(cleaned):
+        return None
+    if len(cleaned) > 254 or cleaned.count("@") != 1:
+        return None
+    local_part, domain = cleaned.split("@", 1)
+    if (
+        not local_part
+        or local_part.startswith(".")
+        or local_part.endswith(".")
+        or ".." in local_part
+        or _EMAIL_LOCAL_PART_RE.fullmatch(local_part) is None
+    ):
+        return None
+    domain_labels = domain.split(".")
+    if (
+        len(domain) > 253
+        or len(domain_labels) < 2
+        or any(
+            _EMAIL_DOMAIN_LABEL_RE.fullmatch(label) is None
+            for label in domain_labels
+        )
+    ):
+        return None
+    if len(local_part) >= 10:
+        return f"{local_part[:4]}*{local_part[-4:]}@{domain}"
+    if len(local_part) >= 2:
+        return f"{local_part[0]}*{local_part[-1]}@{domain}"
+    return f"{local_part[0]}*@{domain}"
 
 
 def load_codex_oauth_inventory(
@@ -343,9 +391,11 @@ def load_codex_oauth_credential(
         raise CodexOAuthCredentialError(
             f"Codex OAuth credential '{record.label}' is missing access_token."
         )
-    account_id, account_hash = validate_codex_oauth_account_identity(
-        record,
-        token_data,
+    account_id, account_hash, account_display = (
+        validate_codex_oauth_account_identity(
+            record,
+            token_data,
+        )
     )
     return CodexOAuthCredentialSnapshot(
         record=record,
@@ -353,6 +403,7 @@ def load_codex_oauth_credential(
         expires_at=get_codex_oauth_token_expiry(token_data),
         access_token=access_token,
         account_id=account_id,
+        account_display=account_display or CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY,
     )
 
 
@@ -375,7 +426,7 @@ def get_codex_oauth_token_data(
 def validate_codex_oauth_account_identity(
     record: CodexOAuthCredentialRecord,
     token_data: Mapping[str, Any],
-) -> tuple[str, str]:
+) -> tuple[str, str, Optional[str]]:
     """Validate internal identity coherence and the configured account pin."""
     account_ids: list[str] = []
     configured_account_id = _clean_string(token_data.get("account_id"))
@@ -409,7 +460,21 @@ def validate_codex_oauth_account_identity(
             expected_account_hash=record.expected_account_hash,
             actual_account_hash=account_hash,
         )
-    return account_id, account_hash
+    email: Optional[str] = None
+    for token_field in ("id_token", "access_token"):
+        token = _clean_string(token_data.get(token_field))
+        if token is None:
+            continue
+        auth_claims = _decode_jwt_claims_without_validation(token).get(
+            "https://api.openai.com/auth"
+        )
+        if not isinstance(auth_claims, dict):
+            continue
+        candidate_email = _clean_string(auth_claims.get("email"))
+        if candidate_email is not None:
+            email = candidate_email
+            break
+    return account_id, account_hash, codex_oauth_masked_account_display(email)
 
 
 def get_codex_oauth_token_expiry(
@@ -715,6 +780,7 @@ def _clean_string(value: Any) -> Optional[str]:
 
 
 __all__ = [
+    "CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY",
     "CODEX_OAUTH_ACCOUNT_HASH_LENGTH",
     "CODEX_OAUTH_AUTH_FILE_MAX_BYTES",
     "CODEX_OAUTH_AUTH_FILE_MODE",
@@ -728,6 +794,7 @@ __all__ = [
     "CodexOAuthInventoryError",
     "CodexOAuthRoutingPolicy",
     "codex_oauth_account_identity_hash",
+    "codex_oauth_masked_account_display",
     "get_codex_oauth_token_data",
     "get_codex_oauth_token_expiry",
     "load_codex_oauth_credential",

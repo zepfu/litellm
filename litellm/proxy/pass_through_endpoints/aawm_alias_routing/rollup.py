@@ -22,6 +22,10 @@ from litellm.proxy.aawm_route_logging import (
     record_aawm_route_rollup,
 )
 
+from .policy import (
+    CODEX_AUTO_AGENT_NATIVE_PROVIDER as _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+)
+
 from .codex_oauth import _clean_codex_auth_value
 
 # ---------------------------------------------------------------------------
@@ -162,6 +166,13 @@ def _auto_agent_alias_route_rollup_status(event: dict[str, Any]) -> Optional[str
         return "Recovered"
     if _auto_agent_alias_request_outcome_is_pending_failover(event):
         # Same-request account failover is diagnostic until the request ends.
+        if (
+            event.get("attempted_provider_call") is True
+            and _clean_codex_auth_value(event.get("provider"))
+            == _CODEX_AUTO_AGENT_NATIVE_PROVIDER
+            and _clean_codex_auth_value(event.get("account_hash"))
+        ):
+            return "Failed"
         return None
     if "auth_degraded" in candidate_status or "auth_degraded" in selection_reason:
         return "Degraded"
@@ -228,6 +239,15 @@ def _should_emit_auto_agent_alias_route_status_event(
         status != "Recovered"
         or event.get("selection_reason") != "codex_oauth_account_failover"
     ):
+        if (
+            status == "Failed"
+            and _auto_agent_alias_request_outcome_is_pending_failover(event)
+            and event.get("attempted_provider_call") is True
+            and _clean_codex_auth_value(event.get("provider"))
+            == _CODEX_AUTO_AGENT_NATIVE_PROVIDER
+            and _clean_codex_auth_value(event.get("account_hash"))
+        ):
+            return False
         return True
     if event.get("redispatch_required") or event.get("redispatch_threshold_crossed"):
         return True
@@ -328,13 +348,38 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
     effort = _normalize_aawm_route_log_reasoning_effort(
         event.get("reasoning_effort_native_value")
     )
-    origin_kwargs: dict[str, Any] = {}
-    if request_identity:
-        from litellm.proxy.aawm_route_logging import _AawmRouteRollupOriginIdentity
+    from litellm.proxy.aawm_route_logging import _AawmRouteRollupOriginIdentity
 
-        origin_kwargs["origin_identity"] = _AawmRouteRollupOriginIdentity(
+    attempted_provider_call = event.get("attempted_provider_call") is True
+    is_native_openai_provider = (
+        _clean_codex_auth_value(event.get("provider"))
+        == _CODEX_AUTO_AGENT_NATIVE_PROVIDER
+    )
+    account_hash = _clean_codex_auth_value(event.get("account_hash"))
+    account_display = _clean_codex_auth_value(event.get("account_display"))
+    origin_identity = None
+    if request_identity or (attempted_provider_call and account_hash):
+        origin_identity = _AawmRouteRollupOriginIdentity(
             litellm_call_id=request_identity,
+            provider=(
+                _clean_codex_auth_value(event.get("provider"))
+                if attempted_provider_call
+                else None
+            ),
+            account_identity=(
+                account_hash
+                if attempted_provider_call and is_native_openai_provider
+                else None
+            ),
+            account_display=(
+                account_display
+                if attempted_provider_call and is_native_openai_provider
+                else None
+            ),
         )
+    origin_kwargs = (
+        {} if origin_identity is None else {"origin_identity": origin_identity}
+    )
     for label in model_labels:
         record_aawm_route_rollup(
             group_header_label=group_header_label,

@@ -1210,6 +1210,9 @@ async def handle_alias_route(  # noqa: PLR0915
                             candidate,
                         )
                         assert response is not None
+                        attempt_record["attempted_provider_call"] = (
+                            attempted_provider_call
+                        )
                         _record_auto_agent_alias_attempt_success(
                             alias_family=alias_family,
                             alias_model=alias_model,

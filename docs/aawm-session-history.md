@@ -1926,6 +1926,11 @@ interval elapses. Each rollup subline uses
 `:<effort-or-none>` segment and an optional trailing status tag (`[Degraded]`,
 `[Cooling Down]`, `[Failed]`, or `[Exhausted]`). Existing aliases remain inside
 the model label, producing shapes such as `gpt-5.6-luna(work):max`.
+Managed OpenAI provider egress uses ` - model(alias) (masked-account):effort`
+only for the attempted account; configured or pre-egress-skipped accounts do not
+render. Same-account retries aggregate, and distinct attempted accounts remain
+separate sublines in attempt order. Missing or invalid account display metadata
+renders as `OpenAI-account(redacted)`.
 `Cooling Down` is reserved for actual candidate-scoped cooldown or
 skipped-cooldown state; `retryable_no_cooldown`, scope `none`, and request-local
 redispatch/failover failures render as `Failed` instead of `Cooling Down`.

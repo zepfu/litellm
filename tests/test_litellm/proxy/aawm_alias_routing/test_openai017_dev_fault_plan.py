@@ -79,11 +79,13 @@ def _request(
 
 def _auth(label: str) -> codex_oauth.CodexOAuthRequestAuth:
     account_hash = f"hash-{label}"
+    display_initial = label.rsplit("-", 1)[-1][0]
     return codex_oauth.CodexOAuthRequestAuth(
         account_label=label,
         account_hash=account_hash,
         lane_key=f"codex-oauth:{label}:{account_hash}",
         headers={"Authorization": f"Bearer {label}"},
+        account_display=f"{display_initial}*@litellm.invalid",
     )
 
 
@@ -95,6 +97,7 @@ def _managed_selection(
 ) -> dict[str, Any]:
     account_hash = f"hash-{label}"
     lane = f"codex-oauth:{label}:{account_hash}"
+    display_initial = label.rsplit("-", 1)[-1][0]
     return {
         "candidate": {
             "provider": "openai",
@@ -104,6 +107,7 @@ def _managed_selection(
             "codex_oauth_account_label": label,
             "codex_oauth_account_hash": account_hash,
             "codex_oauth_lane_key": lane,
+            "codex_oauth_account_display": f"{display_initial}*@litellm.invalid",
             "codex_oauth_credential_affinity": "interchangeable",
         },
         "lane_key": lane,
@@ -347,9 +351,17 @@ async def test_direct_fail_success_retries_through_real_attempt_and_rollup_paths
     ]
     assert outcome["attempts"][0]["request_outcome"] == "pending_failover"
     assert outcome["attempts"][1]["request_outcome"] == "recovered"
+    assert [
+        rollup["origin_identity"].account_display
+        for rollup in captured["rollups"]
+    ] == [
+        "a*@litellm.invalid",
+        "b*@litellm.invalid",
+    ]
     assert captured["status_events"] == []
     assert [rollup["status"] for rollup in captured["rollups"]] == [
-        "Recovered"
+        "Failed",
+        "Recovered",
     ]
 
 
@@ -398,6 +410,7 @@ async def test_direct_without_fault_plan_records_attempt_and_success_metadata(
     assert attempt["account_label"] == "account-a"
     assert attempt["attempted_provider_call"] is True
     assert attempt["request_outcome"] == "succeeded"
+    assert attempt["account_display"] == "a*@litellm.invalid"
 
     parsed_body = _safe_get_request_parsed_body(request)
     assert parsed_body is not None
@@ -408,6 +421,8 @@ async def test_direct_without_fault_plan_records_attempt_and_success_metadata(
     assert event["event_type"] == "candidate_selected"
     assert event["candidate_status"] == "succeeded"
     assert event["attempted_provider_call"] is True
+    assert event["account_display"] == "a*@litellm.invalid"
+    assert captured["rollups"] == []
 
 
 @pytest.mark.asyncio
@@ -495,8 +510,19 @@ async def test_direct_normal_usage_limit_failure_recovers_with_attempt_metadata(
     assert recovered_attempt["request_outcome"] == "recovered"
     assert recovered_attempt["guard_reset_outcome"] == "not_attempted"
     assert [rollup["status"] for rollup in captured["rollups"]] == [
-        "Recovered"
+        "Failed",
+        "Recovered",
     ]
+    assert [
+        rollup["origin_identity"].account_display
+        for rollup in captured["rollups"]
+    ] == [
+        "a*@litellm.invalid",
+        "b*@litellm.invalid",
+    ]
+    assert captured["rollups"][1]["origin_identity"].account_display == (
+        "b*@litellm.invalid"
+    )
     assert not hasattr(request.state, "aawm_openai_fault_plan")
     assert not hasattr(
         request.state,

@@ -287,6 +287,10 @@ def _quota_observation(
     }
 
 
+def _masked_account_display(label: str) -> str:
+    return f"{label[0]}*@litellm.invalid"
+
+
 async def _healthy_auth(
     _request: Request,
     record: CodexOAuthCredentialRecord,
@@ -302,6 +306,7 @@ async def _healthy_auth(
             "Authorization": f"Bearer token-{record.label}",
             "chatgpt-account-id": f"id-{record.label}",
         },
+        account_display=_masked_account_display(record.label),
     )
 
 
@@ -742,6 +747,7 @@ def _account_selection(
         "codex_oauth_account_label": account_label,
         "codex_oauth_account_hash": account_hash,
         "codex_oauth_lane_key": lane,
+        "codex_oauth_account_display": _masked_account_display(account_label),
     }
     if credential_affinity is not None:
         candidate["codex_oauth_credential_affinity"] = credential_affinity
@@ -1165,6 +1171,12 @@ async def test_candidate_loop_continuation_usage_limit_fails_over_interchangeabl
     assert captured_attempts[0]["request_outcome"] == "pending_failover"
     assert captured_attempts[1]["status"] == "recovered"
     assert captured_attempts[1]["request_outcome"] == "recovered"
+    assert captured_attempts[0].get("account_display") == (
+        _masked_account_display("account1")
+    )
+    assert captured_attempts[1].get("account_display") == (
+        _masked_account_display("account2")
+    )
     pending_event = {
         "event_type": "candidate_retryable_failure",
         "candidate_status": captured_attempts[0].get("status"),
@@ -1181,6 +1193,14 @@ async def test_candidate_loop_continuation_usage_limit_fails_over_interchangeabl
         "request_identity": request_identity,
     }
     assert rollup._auto_agent_alias_route_rollup_status(pending_event) is None
+    pending_event.update(
+        {
+            "provider": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+            "account_hash": "hash-account-1",
+            "attempted_provider_call": True,
+        }
+    )
+    assert rollup._auto_agent_alias_route_rollup_status(pending_event) == "Failed"
     assert rollup._auto_agent_alias_route_rollup_status(recovered_event) == "Recovered"
 
 
@@ -1325,6 +1345,7 @@ async def test_candidate_loop_reloads_changed_codex_credential_after_cleanup(
             "Authorization": "Bearer refreshed-token",
             "chatgpt-account-id": "account1",
         },
+        account_display=_masked_account_display("account1"),
     )
 
     async def _reload(
@@ -2243,6 +2264,7 @@ async def test_selected_account_drives_both_ingress_auth_and_redaction(
             "Authorization": "Bearer selected-token",
             "chatgpt-account-id": "selected-account-id",
         },
+        account_display=_masked_account_display("account2"),
     )
 
     async def _load_selected(
@@ -2572,6 +2594,7 @@ def _patch_direct_inventory_auth(
                 "session_id": "sess-direct-1",
                 "originator": "litellm-server",
             },
+            account_display=_masked_account_display(record.label),
         )
 
     monkeypatch.setattr(
@@ -3868,6 +3891,99 @@ async def test_account_bound_resolve_does_not_consult_alternate_account(
     assert loaded == ["account2"]
 
 
+@pytest.mark.asyncio
+async def test_candidate_contexts_propagate_only_validated_account_display(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        codex_oauth_inventory,
+        "load_codex_oauth_inventory",
+        _interchangeable_inventory,
+    )
+    loaded_labels: list[str] = []
+
+    async def _auth(
+        _request: Request,
+        record: CodexOAuthCredentialRecord,
+    ) -> codex_oauth.CodexOAuthRequestAuth:
+        loaded_labels.append(record.label)
+        if record.label == "account2":
+            raise HTTPException(status_code=401, detail="auth unavailable")
+        return await _healthy_auth(_request, record)
+
+    monkeypatch.setattr(
+        codex_oauth,
+        "_load_codex_oauth_headers_for_record",
+        _auth,
+    )
+    malicious_metadata = {
+        "codex_oauth_account_display": "unmasked@example.com",
+        "codex_auto_agent_selected_account_display": "unmasked@example.com",
+    }
+    contexts = await selection._resolve_codex_oauth_account_candidate_contexts(
+        _request(),
+        candidate_template={
+            **_candidate(),
+            "litellm_metadata": malicious_metadata,
+        },
+        affinity=None,
+    )
+
+    assert loaded_labels == ["account1", "account2"]
+    healthy = next(
+        context
+        for context in contexts
+        if context["candidate"]["codex_oauth_account_label"] == "account1"
+    )
+    skipped = next(
+        context
+        for context in contexts
+        if context["candidate"]["codex_oauth_account_label"] == "account2"
+    )
+    assert healthy["candidate"]["codex_oauth_account_display"] == (
+        "a*@litellm.invalid"
+    )
+    assert healthy["candidate"]["litellm_metadata"] == malicious_metadata
+    assert "codex_oauth_account_display" not in skipped["candidate"]
+
+
+def test_alias_metadata_propagates_native_account_display_only() -> None:
+    selection = _account_selection(
+        "account1",
+        "hash-account-1",
+        failover_ordinal=0,
+    )
+    body = attempt_records._add_codex_auto_agent_alias_metadata(
+        {"model": "basic"},
+        request=_request(),
+        selection={**selection, "alias_model": "basic"},
+        attempts=[],
+    )
+    metadata = body["litellm_metadata"]
+    assert metadata["codex_auto_agent_selected_account_display"] == (
+        _masked_account_display("account1")
+    )
+
+    non_openai_candidate = {
+        **selection["candidate"],
+        "provider": "openrouter",
+        "codex_oauth_account_display": "unmasked@example.com",
+    }
+    non_openai_body = attempt_records._add_codex_auto_agent_alias_metadata(
+        {"model": "basic"},
+        request=_request(),
+        selection={
+            **selection,
+            "alias_model": "basic",
+            "candidate": non_openai_candidate,
+        },
+        attempts=[],
+    )
+    assert "codex_auto_agent_selected_account_display" not in (
+        non_openai_body["litellm_metadata"]
+    )
+
+
 def test_fresh_codex_oauth_selector_preserves_priority_order() -> None:
     inventory = _interchangeable_inventory()
     states = [
@@ -4235,6 +4351,7 @@ async def test_openai_proxy_route_direct_token_invalidated_reloads_same_account(
             "session_id": "sess-direct-1",
             "originator": "litellm-server",
         },
+        account_display=_masked_account_display("account1"),
     )
 
     async def _reload(
@@ -4341,6 +4458,7 @@ async def test_openai_proxy_route_direct_token_invalidated_failover_reset_is_rec
             "session_id": "sess-direct-1",
             "originator": "litellm-server",
         },
+        account_display=_masked_account_display("account1"),
     )
     reload = AsyncMock(return_value=refreshed_auth)
 

@@ -343,6 +343,7 @@ def _codex_auto_agent_candidate_public_shape(
     lane_key: Optional[str] = None,
     cooldown_seconds: Optional[float] = None,
     reason: Optional[str] = None,
+    account_display: Optional[str] = None,
 ) -> dict[str, Any]:
     shaped: dict[str, Any] = {
         "provider": candidate["provider"],
@@ -354,6 +355,7 @@ def _codex_auto_agent_candidate_public_shape(
         ("codex_oauth_account_label", "account_label"),
         ("codex_oauth_account_hash", "account_hash"),
         ("codex_oauth_lane_key", "account_lane"),
+        ("codex_oauth_account_display", "account_display"),
         ("codex_oauth_account_priority", "account_priority"),
         ("codex_oauth_account_weight", "account_weight"),
         ("codex_oauth_credential_affinity", "credential_affinity"),
@@ -368,6 +370,8 @@ def _codex_auto_agent_candidate_public_shape(
         shaped["cooldown_seconds"] = round(float(cooldown_seconds), 3)
     if reason is not None:
         shaped["reason"] = reason
+    if account_display is not None:
+        shaped["account_display"] = account_display
     return shaped
 
 
@@ -1965,6 +1969,8 @@ async def _resolve_codex_oauth_account_candidate_contexts(
 ) -> list[dict[str, Any]]:
     """Resolve ordered, auth-checked account contexts without carrying secrets."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.codex_oauth import (
+        _remove_proxy_owned_account_display_fields,
+        _validated_codex_account_display,
         _codex_oauth_account_lane_key,
         _load_codex_oauth_headers_for_record,
     )
@@ -1973,6 +1979,7 @@ async def _resolve_codex_oauth_account_candidate_contexts(
         load_codex_oauth_inventory,
     )
 
+    _remove_proxy_owned_account_display_fields(candidate_template)
     model = str(candidate_template.get("model") or "")
     pinned_label: Optional[str] = None
     pinned_hash: Optional[str] = None
@@ -2137,6 +2144,13 @@ async def _resolve_codex_oauth_account_candidate_contexts(
                         "failure_phase": "account_identity_mismatch",
                         "attempted_provider_call": False,
                     }
+                )
+            else:
+                account_candidate["codex_oauth_account_display"] = (
+                    _validated_codex_account_display(
+                        candidate=account_candidate,
+                        loaded=loaded,
+                    )
                 )
         contexts.append(context)
     return contexts

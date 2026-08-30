@@ -13,19 +13,24 @@ from starlette.requests import Request
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import codex_oauth
 from litellm.secret_managers.codex_oauth_inventory import (
     CODEX_OAUTH_INVENTORY_ENV,
+    CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY,
     CodexOAuthCredentialError,
     CodexOAuthInventoryError,
     codex_oauth_account_identity_hash,
+    codex_oauth_masked_account_display,
     load_codex_oauth_credential,
     load_codex_oauth_inventory,
 )
 from scripts import codex_oauth_refresh
 
 
-def _jwt(account_id: str, *, expires_at: int) -> str:
+def _jwt(account_id: str, *, expires_at: int, email: str | None = None) -> str:
+    auth_claims = {"chatgpt_account_id": account_id}
+    if email is not None:
+        auth_claims["email"] = email
     payload = {
         "exp": expires_at,
-        "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+        "https://api.openai.com/auth": auth_claims,
     }
     encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
     return f"header.{encoded.rstrip('=')}.signature"
@@ -35,17 +40,22 @@ def _write_auth(
     path: Path,
     *,
     account_id: str,
-    token_name: str,
+    token_name: str = "one",
+    email: str | None = None,
     expires_at: int,
 ) -> str:
-    access_token = _jwt(account_id, expires_at=expires_at)
+    access_token = _jwt(account_id, expires_at=expires_at, email=email)
     path.write_text(
         json.dumps(
             {
                 "tokens": {
                     "access_token": access_token,
                     "refresh_token": f"refresh-{token_name}",
-                    "id_token": _jwt(account_id, expires_at=expires_at),
+                    "id_token": _jwt(
+                        account_id,
+                        expires_at=expires_at,
+                        email=email,
+                    ),
                     "account_id": account_id,
                     "expires_at": expires_at,
                 }
@@ -119,6 +129,80 @@ def _configure_codex_oauth_runtime() -> None:
             or request.headers.get(f"x-pass-{name}")
         )
     )
+
+
+def test_codex_oauth_masked_account_display_bounded_by_local_length() -> None:
+    assert codex_oauth_masked_account_display("long.local.name@example.com") == (
+        "long*name@example.com"
+    )
+    assert codex_oauth_masked_account_display("ab@example.com") == (
+        "a*b@example.com"
+    )
+    assert codex_oauth_masked_account_display("abcdefghi@example.com") == (
+        "a*i@example.com"
+    )
+    assert codex_oauth_masked_account_display("complete@example.com") == (
+        "c*e@example.com"
+    )
+    assert codex_oauth_masked_account_display("c@example.com") == (
+        "c*@example.com"
+    )
+    assert codex_oauth_masked_account_display("user@example.com\n") is None
+    assert codex_oauth_masked_account_display("us\ter@example.com") is None
+    assert codex_oauth_masked_account_display("../etc/passwd@example.com") is None
+    assert codex_oauth_masked_account_display("user@../example.com") is None
+    assert codex_oauth_masked_account_display("user@-example.com") is None
+    assert codex_oauth_masked_account_display("user@example.com.") is None
+    assert codex_oauth_masked_account_display("@example.com") is None
+    assert codex_oauth_masked_account_display("local@") is None
+
+
+def test_loader_derives_only_masked_account_display(tmp_path: Path) -> None:
+    account = _account(
+        tmp_path,
+        label="account1",
+        account_id="acct-one",
+        priority=10,
+        models=["*"],
+    )
+    _write_auth(
+        Path(account["auth_path"]),
+        account_id="acct-one",
+        email="complete.name@example.com",
+        expires_at=int(time.time()) + 3600,
+    )
+    credential = load_codex_oauth_credential(
+        load_codex_oauth_inventory(_inventory_json([account])).records[0]
+    )
+
+    assert credential.account_display == "comp*name@example.com"
+    assert "complete.name" not in repr(credential)
+
+
+def test_loader_degrades_missing_email_without_identity_or_token_leakage(
+    tmp_path: Path,
+) -> None:
+    account = _account(
+        tmp_path,
+        label="account1",
+        account_id="acct-one",
+        priority=10,
+        models=["*"],
+    )
+    access_token = _write_auth(
+        Path(account["auth_path"]),
+        account_id="acct-one",
+        token_name="secret-token-marker",
+        expires_at=int(time.time()) + 3600,
+    )
+    credential = load_codex_oauth_credential(
+        load_codex_oauth_inventory(_inventory_json([account])).records[0]
+    )
+
+    assert credential.account_display == CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY
+    assert "acct-one" not in repr(credential)
+    assert "secret-token-marker" not in repr(credential)
+    assert access_token not in repr(credential)
 
 
 def test_inventory_is_explicit_ordered_and_model_eligible(tmp_path: Path) -> None:

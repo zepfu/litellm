@@ -1705,6 +1705,7 @@ def _resolve_aawm_route_rollup_redundant_destination(
             tuple[str, ...],
             int,
             tuple[str, ...],
+            Optional[str],
         ]
     ],
 ) -> Optional[str]:
@@ -1757,8 +1758,10 @@ def _format_aawm_route_rollup_lines(
             tuple[str, ...],
             int,
             tuple[str, ...],
+            Optional[str],
         ]
     ],
+    request_outcome: Optional[str] = None,
     now: Optional[datetime] = None,
     early: bool = False,
 ) -> list[str]:
@@ -1788,10 +1791,12 @@ def _format_aawm_route_rollup_lines(
         approved_rationales,
         denied_reviews,
         denied_rationales,
+        account_display,
     ) in sublines:
         message_suffix = f" [{message}]" if message else ""
+        account_suffix = f" ({account_display})" if account_display else ""
         lines.append(
-            f" - {model_label}:{effort} - Turns: {turns}"
+            f" - {model_label}{account_suffix}:{effort} - Turns: {turns}"
             f"{message_suffix}"
             f"{_format_aawm_route_rollup_status_tag(status)}"
             f"{_format_aawm_route_rollup_subline_destination_suffix(outgoing_target=outgoing_target, common_destination=common_destination)}"
@@ -1802,6 +1807,8 @@ def _format_aawm_route_rollup_lines(
         if denied_reviews:
             lines.append(f"   - Denied: {denied_reviews}")
             lines.extend(f"     - {rationale}" for rationale in denied_rationales)
+    if request_outcome:
+        lines.append(f" - Request: [{request_outcome}]")
     return lines
 
 
@@ -1811,6 +1818,9 @@ class _AawmRouteRollupOriginIdentity:
     canonical_session_identity: Optional[str] = None
     actor_id: Optional[str] = None
     thread_id: Optional[str] = None
+    provider: Optional[str] = None
+    account_identity: Optional[str] = None
+    account_display: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1943,11 +1953,57 @@ class _AawmRouteRollupSubline:
 class _AawmRouteRollupGroup:
     group_header_label: str
     incoming_endpoint: str
-    sublines: dict[tuple[str, str, str], _AawmRouteRollupSubline] = field(
+    sublines: dict[
+        tuple[str, str, str, Optional[str]], _AawmRouteRollupSubline
+    ] = field(
         default_factory=dict
     )
-    subline_order: list[tuple[str, str, str]] = field(default_factory=list)
+    subline_order: list[tuple[str, str, str, Optional[str]]] = field(
+        default_factory=list
+    )
+    account_display_by_identity: dict[str, str] = field(default_factory=dict)
+    request_terminal_states: dict[str, _AawmRouteRollupRequestTerminalState] = (
+        field(default_factory=dict)
+    )
+    unscoped_terminal_state: Optional[_AawmRouteRollupRequestTerminalState] = None
     event_sequence: int = 0
+
+    def record_request_terminal_status(
+        self,
+        *,
+        status: str,
+        sequence: int,
+        message: Optional[str],
+        request_identity: Optional[str],
+    ) -> None:
+        state = _AawmRouteRollupRequestTerminalState(
+            status=status,
+            sequence=sequence,
+            message=message,
+        )
+        if request_identity and (
+            request_identity in self.request_terminal_states
+            or len(self.request_terminal_states)
+            < _AAWM_ROUTE_ROLLUP_MAX_ORIGIN_IDENTITIES
+        ):
+            self.request_terminal_states[request_identity] = state
+        elif not (
+            state.status == "Recovered"
+            and self.unscoped_terminal_state is not None
+            and self.unscoped_terminal_state.status in {"Failed", "Exhausted"}
+        ):
+            self.unscoped_terminal_state = state
+
+    def effective_request_terminal_state(
+        self,
+    ) -> Optional[_AawmRouteRollupRequestTerminalState]:
+        states = [
+            *self.request_terminal_states.values(),
+            *([self.unscoped_terminal_state] if self.unscoped_terminal_state else []),
+        ]
+        if not states:
+            return None
+        return max(states, key=lambda state: state.sequence)
 
     def ordered_sublines(
         self,
@@ -1963,6 +2019,7 @@ class _AawmRouteRollupGroup:
             tuple[str, ...],
             int,
             tuple[str, ...],
+            Optional[str],
         ]
     ]:
         return [
@@ -1977,6 +2034,9 @@ class _AawmRouteRollupGroup:
                 tuple(self.sublines[subline_key].approved_rationales),
                 self.sublines[subline_key].denied_reviews,
                 tuple(self.sublines[subline_key].denied_rationales),
+                self.account_display_by_identity.get(subline_key[3])
+                if subline_key[3] is not None
+                else None,
             )
             for subline_key in self.subline_order
             if subline_key in self.sublines
@@ -2072,7 +2132,29 @@ class AawmRouteRollupAccumulator:
             )
             self._groups[group_key] = group
 
-        subline_key = (cleaned_model_label, cleaned_effort, cleaned_outgoing_target)
+        account_identity = (
+            origin_identity.account_identity
+            if origin_identity is not None
+            else None
+        )
+        account_display = (
+            origin_identity.account_display
+            if origin_identity is not None
+            else None
+        )
+        if (
+            account_identity is not None
+            and account_display is not None
+            and group.account_display_by_identity.get(account_identity)
+            != account_display
+        ):
+            group.account_display_by_identity[account_identity] = account_display
+        subline_key = (
+            cleaned_model_label,
+            cleaned_effort,
+            cleaned_outgoing_target,
+            account_identity,
+        )
         subline = group.sublines.get(subline_key)
         subline_already_existed = subline is not None
         if subline is None:
@@ -2135,6 +2217,16 @@ class AawmRouteRollupAccumulator:
 
         group.event_sequence += 1
         if normalized_status in _AAWM_ROUTE_ROLLUP_REQUEST_TERMINAL_STATUS_VALUES:
+            group.record_request_terminal_status(
+                status=normalized_status,
+                sequence=group.event_sequence,
+                message=message,
+                request_identity=(
+                    origin_identity.litellm_call_id
+                    if origin_identity is not None
+                    else None
+                ),
+            )
             subline.record_terminal_status(
                 status=normalized_status,
                 sequence=group.event_sequence,
@@ -2254,6 +2346,11 @@ class AawmRouteRollupAccumulator:
             group_header_label=group.group_header_label,
             incoming_endpoint=group.incoming_endpoint,
             sublines=group.ordered_sublines(),
+            request_outcome=(
+                group.effective_request_terminal_state().status
+                if group.effective_request_terminal_state() is not None
+                else None
+            ),
             now=now,
             early=early,
         )
@@ -2886,6 +2983,27 @@ def _build_aawm_route_rollup_origin_identity(
         canonical_session_identity=_identity_value("canonical_session_identity"),
         actor_id=_identity_value("origin_actor_id"),
         thread_id=_identity_value("origin_thread_id"),
+        provider=_identity_value("codex_auto_agent_selected_provider"),
+        account_identity=_identity_value("codex_oauth_account_hash")
+        or _identity_value("codex_auto_agent_selected_account_hash"),
+        account_display=(
+            _clean_aawm_route_log_field(
+                context.get("codex_oauth_account_display")
+            )
+            or _clean_aawm_route_log_field(
+                context.get("codex_auto_agent_selected_account_display")
+            )
+            or _clean_aawm_route_log_field(
+                metadata.get("codex_oauth_account_display")
+                if isinstance(metadata, dict)
+                else None
+            )
+            or _clean_aawm_route_log_field(
+                metadata.get("codex_auto_agent_selected_account_display")
+                if isinstance(metadata, dict)
+                else None
+            )
+        ),
     )
     if not any(
         (
@@ -2959,7 +3077,10 @@ def record_aawm_route_rollup_turn(
         model_label=str(context.get("model_label") or ""),
         effort=str(context.get("reasoning_effort") or "none"),
         turns=turns,
-        origin_identity=_build_aawm_route_rollup_origin_identity(context),
+        origin_identity=_build_aawm_route_rollup_origin_identity(
+            context,
+            metadata=metadata,
+        ),
         review_decision=review_decision,
         review_correlation=review_correlation,
         now=now,

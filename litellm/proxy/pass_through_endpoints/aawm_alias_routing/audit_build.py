@@ -21,6 +21,9 @@ from .lane_keys import (
     _CODEX_AUTO_AGENT_REASONING_EFFORT_AUDIT_FIELDS,
     _codex_auto_agent_candidate_key,
 )
+from .policy import (
+    CODEX_AUTO_AGENT_NATIVE_PROVIDER as _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+)
 from .selection import (
     _auto_agent_alias_float,
     _codex_auto_agent_candidate_public_shape,
@@ -291,7 +294,7 @@ def _build_auto_agent_alias_audit_event(
     elif isinstance(error_tokens, set):
         event["error_tokens"] = sorted(error_tokens)
 
-    for public_field, candidate_fields in (
+    account_display_fields = (
         (
             "account_label",
             ("account_label", "codex_oauth_account_label"),
@@ -304,7 +307,17 @@ def _build_auto_agent_alias_audit_event(
             "account_lane",
             ("account_lane", "codex_oauth_lane_key"),
         ),
-    ):
+    )
+    if attempted_provider_call is True and _clean_codex_auth_value(
+        candidate.get("provider")
+    ) == _CODEX_AUTO_AGENT_NATIVE_PROVIDER:
+        account_display_fields += (
+            (
+                "account_display",
+                ("account_display", "codex_oauth_account_display"),
+            ),
+        )
+    for public_field, candidate_fields in account_display_fields:
         for candidate_field in candidate_fields:
             value = candidate.get(candidate_field)
             if value is not None:

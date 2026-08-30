@@ -26,6 +26,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup import (
     _record_auto_agent_alias_route_status_rollup,
     _resolve_auto_agent_alias_route_rollup_group_header_label,
     _resolve_auto_agent_alias_route_rollup_outgoing_target,
+    _should_emit_auto_agent_alias_route_status_event,
     configure_rollup_runtime,
 )
 
@@ -595,6 +596,67 @@ class TestRecordRouteStatusRollup:
         base.update(overrides)
         return base
 
+    @pytest.fixture()
+    def accumulator(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> aawm_route_logging.AawmRouteRollupAccumulator:
+        accumulator = aawm_route_logging.AawmRouteRollupAccumulator(
+            interval_seconds=60
+        )
+        monkeypatch.setattr(
+            rollup_mod,
+            "record_aawm_route_rollup",
+            lambda **kwargs: accumulator.record(**kwargs),
+        )
+        return accumulator
+
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.emit_aawm_route_status_event",
+    )
+    def test_display_is_gated_on_native_openai_provider_attempt(
+        self,
+        mock_emit,
+        accumulator: aawm_route_logging.AawmRouteRollupAccumulator,
+    ):
+        event = self._make_event(
+            event_type="candidate_retryable_failure",
+            candidate_status="cooldown_set",
+            provider="openrouter",
+            account_hash="hash-account-1",
+            account_display="unmasked@example.com",
+            attempted_provider_call=True,
+            request_identity="openrouter-call",
+        )
+        _record_auto_agent_alias_route_status_rollup(event)
+
+        assert mock_emit.call_args.kwargs["model_label"] == "gpt-4o"
+        lines = accumulator.flush(force=True)
+        assert "unmasked@example.com" not in "\n".join(lines)
+
+    @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.emit_aawm_route_status_event",
+    )
+    def test_display_is_suppressed_before_provider_attempt(
+        self,
+        mock_emit,
+        accumulator: aawm_route_logging.AawmRouteRollupAccumulator,
+    ):
+        event = self._make_event(
+            event_type="candidate_skipped_cooldown",
+            candidate_status="skipped_cooldown",
+            provider="codex",
+            account_hash="hash-account-1",
+            account_display="a*@example.com",
+            attempted_provider_call=False,
+            request_identity="skipped-call",
+        )
+        _record_auto_agent_alias_route_status_rollup(event)
+
+        lines = accumulator.flush(force=True)
+        assert lines[1].startswith(" - gpt-4o(basic):none")
+        assert "a*@example.com" not in lines[1]
+
     @patch(
         "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.record_aawm_route_rollup",
     )
@@ -980,6 +1042,201 @@ class TestRecordRouteStatusRollup:
         )
         assert "[Exhausted]" in lines[1]
 
+    def test_attempted_account_rendering_and_retries_aggregate(self) -> None:
+        accumulator = aawm_route_logging.AawmRouteRollupAccumulator(
+            interval_seconds=60
+        )
+        common = {
+            "group_header_label": "repo",
+            "incoming_endpoint": "/v1/responses",
+            "outgoing_target": "chatgpt.com/backend-api/codex/responses",
+            "model_label": "gpt-5.6-sol",
+            "effort": "none",
+            "turns": 0,
+        }
+
+        accumulator.record(
+            **common,
+            status="Failed",
+            origin_identity=aawm_route_logging._AawmRouteRollupOriginIdentity(
+                litellm_call_id="call-1",
+                account_identity="hash-account-1",
+                account_display="a*@example.com",
+            ),
+        )
+        accumulator.record(
+            **common,
+            status="Failed",
+            origin_identity=aawm_route_logging._AawmRouteRollupOriginIdentity(
+                litellm_call_id="call-2",
+                account_identity="hash-account-2",
+                account_display="b*@example.com",
+            ),
+        )
+        accumulator.record(
+            **common,
+            status="Recovered",
+            origin_identity=aawm_route_logging._AawmRouteRollupOriginIdentity(
+                litellm_call_id="call-1",
+                account_identity="hash-account-1",
+                account_display="a*@example.com",
+            ),
+        )
+
+        lines = accumulator.flush(force=True)
+        assert " - gpt-5.6-sol (a*@example.com):none" in lines[1]
+        assert " - gpt-5.6-sol (b*@example.com):none" in lines[2]
+        assert "[Recovered]" in lines[1]
+        assert "[Failed]" in lines[2]
+        assert " - Request: [Recovered]" in lines
+        assert " - Request: [Failed]" not in lines
+
+    def test_pending_openai_failover_records_failed_account_then_recovery(
+        self,
+        accumulator: aawm_route_logging.AawmRouteRollupAccumulator,
+    ) -> None:
+        common = {
+            "event_type": "candidate_retryable_failure",
+            "alias_model": "basic",
+            "model": "gpt-5.6-sol",
+            "rollup_group_header_label": "repo",
+            "host_name": "host",
+            "incoming_endpoint": "/v1/responses",
+            "route_family": "codex_responses",
+            "provider": "openai",
+            "account_hash": "hash-account-1",
+            "account_display": "a*@example.com",
+            "attempted_provider_call": True,
+            "request_identity": "request-1",
+            "request_outcome": "pending_failover",
+            "account_failover_planned": True,
+            "failure_class": "usage_limit_reached",
+            "error_status_code": 429,
+        }
+
+        pending_status = _auto_agent_alias_route_rollup_status(common)
+        assert pending_status == "Failed"
+        assert _should_emit_auto_agent_alias_route_status_event(
+            common,
+            status=pending_status,
+        ) is False
+        rollup_mod._record_auto_agent_alias_route_status_rollup(common)
+
+        recovered = dict(common)
+        recovered.update(
+            {
+                "event_type": "candidate_recovered",
+                "candidate_status": "recovered",
+                "request_outcome": "recovered",
+                "account_hash": "hash-account-2",
+                "account_display": "b*@example.com",
+                "failure_class": None,
+                "error_status_code": None,
+                "account_failover_planned": False,
+            }
+        )
+        rollup_mod._record_auto_agent_alias_route_status_rollup(recovered)
+
+        lines = accumulator.flush(force=True)
+        assert " - gpt-5.6-sol(basic) (a*@example.com):none" in lines[1]
+        assert "[Failed]" in lines[1]
+        assert " - gpt-5.6-sol(basic) (b*@example.com):none" in lines[2]
+        assert "[Recovered]" in lines[2]
+        assert " - Request: [Recovered]" in lines
+
+    def test_one_attempted_account_renders_one_account_line(self) -> None:
+        accumulator = aawm_route_logging.AawmRouteRollupAccumulator(
+            interval_seconds=60
+        )
+        accumulator.record(
+            group_header_label="repo",
+            incoming_endpoint="/v1/responses",
+            outgoing_target="chatgpt.com/backend-api/codex/responses",
+            model_label="gpt-5.6-sol",
+            effort="none",
+            turns=1,
+            status="Recovered",
+            origin_identity=aawm_route_logging._AawmRouteRollupOriginIdentity(
+                litellm_call_id="one-account-call",
+                account_identity="hash-account-1",
+                account_display="a*@example.com",
+            ),
+        )
+
+        lines = accumulator.flush(force=True)
+        account_lines = [
+            line for line in lines if line.startswith(" - gpt-5.6-sol")
+        ]
+        assert account_lines == [
+            " - gpt-5.6-sol (a*@example.com):none - Turns: 1 [Recovered]"
+        ]
+        assert " - Request: [Recovered]" in lines
+
+    def test_skipped_account_has_no_rendered_account_display(self) -> None:
+        accumulator = aawm_route_logging.AawmRouteRollupAccumulator(
+            interval_seconds=60
+        )
+        accumulator.record(
+            group_header_label="repo",
+            incoming_endpoint="/v1/responses",
+            outgoing_target="candidate_selection",
+            model_label="gpt-5.6-sol",
+            effort="none",
+            turns=0,
+            status="Failed",
+            origin_identity=aawm_route_logging._AawmRouteRollupOriginIdentity(
+                litellm_call_id="call-skipped",
+                account_identity=None,
+                account_display="must-not-render@example.com",
+            ),
+        )
+
+        lines = accumulator.flush(force=True)
+        assert lines[1].startswith(" - gpt-5.6-sol:none")
+
+    def test_request_failure_is_not_hidden_by_unrelated_recovery(self) -> None:
+        accumulator = aawm_route_logging.AawmRouteRollupAccumulator(
+            interval_seconds=60
+        )
+        common = {
+            "group_header_label": "repo",
+            "incoming_endpoint": "/v1/responses",
+            "outgoing_target": "chatgpt.com/backend-api/codex/responses",
+            "model_label": "gpt-5.6-sol",
+            "effort": "none",
+            "turns": 0,
+        }
+        identities = {
+            "failed": aawm_route_logging._AawmRouteRollupOriginIdentity(
+                litellm_call_id="failed-call",
+                account_identity="hash-account-a",
+                account_display="a*@example.com",
+            ),
+            "recovered": aawm_route_logging._AawmRouteRollupOriginIdentity(
+                litellm_call_id="recovered-call",
+                account_identity="hash-account-b",
+                account_display="b*@example.com",
+            ),
+        }
+
+        accumulator.record(
+            **common,
+            status="Recovered",
+            origin_identity=identities["recovered"],
+        )
+        accumulator.record(
+            **common,
+            status="Failed",
+            origin_identity=identities["failed"],
+        )
+
+        lines = accumulator.flush(force=True)
+        assert " - gpt-5.6-sol (b*@example.com):none" in lines[1]
+        assert " - gpt-5.6-sol (a*@example.com):none" in lines[2]
+        assert "[Recovered]" in lines[1]
+        assert "[Failed]" in lines[2]
+        assert " - Request: [Failed]" in lines
+        assert " - Request: [Recovered]" not in lines
 
 # ---------------------------------------------------------------------------
 # install() host binding
@@ -993,6 +1250,9 @@ class TestInstallHostBinding:
         mock_record = MagicMock()
         host: dict[str, Any] = {
             "_clean_codex_auth_value": rollup_mod._clean_codex_auth_value,
+            "_CODEX_AUTO_AGENT_NATIVE_PROVIDER": (
+                rollup_mod._CODEX_AUTO_AGENT_NATIVE_PROVIDER
+            ),
             "emit_aawm_route_status_event": mock_emit,
             "record_aawm_route_rollup": mock_record,
             "build_aawm_route_rollup_group_header_label": MagicMock(

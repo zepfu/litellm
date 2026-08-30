@@ -30,6 +30,7 @@ from litellm.secret_managers.codex_oauth_inventory import (
     CodexOAuthCredentialRecord,
     CodexOAuthCredentialSnapshot,
     CodexOAuthInventoryError,
+    CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY,
     load_codex_oauth_credential,
     load_codex_oauth_inventory,
 )
@@ -54,6 +55,10 @@ _ANTHROPIC_ADAPTER_CODEX_DEFAULT_AUTH_PATHS = (
 )
 _DIRECT_CODEX_COOLDOWN_BYPASS_CONSUMED_STATE_KEY = (
     "aawm_codex_oauth_direct_cooldown_bypass_consumed"
+)
+_PROXY_OWNED_ACCOUNT_DISPLAY_METADATA_KEYS = (
+    "codex_oauth_account_display",
+    "codex_auto_agent_selected_account_display",
 )
 
 # ---------------------------------------------------------------------------
@@ -187,6 +192,7 @@ class CodexOAuthRequestAuth:
     account_hash: str
     lane_key: str
     headers: dict[str, str] = field(repr=False)
+    account_display: str = CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY
 
 
 def _codex_oauth_account_lane_key(
@@ -236,6 +242,34 @@ def _codex_oauth_candidate_identity(
         "account_hash": account_hash,
         "lane_key": lane_key,
     }
+
+
+def _remove_proxy_owned_account_display_fields(candidate: dict[str, Any]) -> None:
+    """Client input is untrusted for proxy-owned account display fields."""
+    for key in _PROXY_OWNED_ACCOUNT_DISPLAY_METADATA_KEYS:
+        candidate.pop(key, None)
+        metadata = candidate.get("litellm_metadata")
+        if isinstance(metadata, dict):
+            metadata.pop(key, None)
+
+
+def _validated_codex_account_display(
+    *,
+    candidate: dict[str, Any],
+    loaded: CodexOAuthRequestAuth,
+) -> str:
+    identity = _codex_oauth_candidate_identity(candidate)
+    if (
+        identity is None
+        or identity["account_label"] != loaded.account_label
+        or identity["account_hash"] != loaded.account_hash
+        or identity["lane_key"] != loaded.lane_key
+    ):
+        return CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY
+    return (
+        _clean_codex_auth_value(loaded.account_display)
+        or CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY
+    )
 
 
 def _bind_codex_oauth_candidate_to_request(
@@ -337,6 +371,9 @@ async def _load_codex_oauth_headers_for_record(
             access_token=credential.access_token,
             account_id=credential.account_id,
             session_id=session_id,
+        ),
+        account_display=(
+            credential.account_display or CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY
         ),
     )
 
@@ -883,6 +920,7 @@ async def _resolve_model_less_direct_codex_oauth_contexts(
 
     contexts: list[dict[str, Any]] = []
     for record in records:
+        _remove_proxy_owned_account_display_fields(candidate_template)
         lane_key = _codex_oauth_account_lane_key(
             account_label=record.label,
             account_hash=record.expected_account_hash,
@@ -924,6 +962,13 @@ async def _resolve_model_less_direct_codex_oauth_contexts(
                         "failure_phase": "account_identity_mismatch",
                         "attempted_provider_call": False,
                     }
+                )
+            else:
+                account_candidate["codex_oauth_account_display"] = (
+                    _validated_codex_account_display(
+                        candidate=account_candidate,
+                        loaded=loaded,
+                    )
                 )
         contexts.append(context)
     return contexts
@@ -1221,12 +1266,16 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             "codex_oauth_account_label": selected_auth.account_label,
             "codex_oauth_account_hash": selected_auth.account_hash,
             "codex_oauth_lane_key": selected_auth.lane_key,
+            "codex_oauth_account_display": selected_auth.account_display,
             "codex_auto_agent_selected_provider": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
             "codex_auto_agent_selected_model": model,
             "codex_auto_agent_selected_route_family": "codex_responses",
             "codex_auto_agent_selected_account_label": selected_auth.account_label,
             "codex_auto_agent_selected_account_hash": selected_auth.account_hash,
             "codex_auto_agent_selected_account_lane": selected_auth.lane_key,
+            "codex_auto_agent_selected_account_display": (
+                selected_auth.account_display
+            ),
             "codex_auto_agent_lane_key": selected_state.get("lane_key")
             or selected_auth.lane_key,
             "codex_auto_agent_selection_reason": selection_reason,
@@ -1251,6 +1300,7 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
                     candidate,
                     lane_key=selected_state.get("lane_key"),
                     reason=selection_reason,
+                    account_display=selected_auth.account_display,
                 )
             ],
         },

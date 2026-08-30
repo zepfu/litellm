@@ -22,6 +22,7 @@ from .lane_keys import _CODEX_REASONING_EFFORT_TIER_INDEX
 from .policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_EXHAUSTED_ERROR_CLASSES,
     CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
+    CODEX_AUTO_AGENT_NATIVE_PROVIDER,
 )
 from .request_metadata import (
     _extract_auto_agent_alias_canonical_thread_id,
@@ -1320,6 +1321,18 @@ def _add_codex_auto_agent_alias_metadata(
             ),
             "codex_auto_agent_selected_account_lane": candidate.get(
                 "codex_oauth_lane_key"
+            ),
+            **(
+                {
+                    "codex_auto_agent_selected_account_display": candidate.get(
+                        "codex_oauth_account_display"
+                    )
+                }
+                if (
+                    candidate.get("provider") == CODEX_AUTO_AGENT_NATIVE_PROVIDER
+                    and candidate.get("codex_oauth_account_display") is not None
+                )
+                else {}
             ),
             "codex_auto_agent_quota_snapshot_age_seconds": selection.get(
                 "quota_snapshot_age_seconds"
