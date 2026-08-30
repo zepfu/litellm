@@ -23,6 +23,9 @@ from litellm.proxy.pass_through_endpoints.aawm_text_watermark.config import (
 from litellm.proxy.pass_through_endpoints.aawm_text_watermark.policy import (
     apply_request_watermark_egress,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.audit_persist import (
+    _emit_aawm_terminal_error,
+)
 from litellm.secret_managers.credential_error_sanitizer import (
     sanitize_credential_error_message,
 )
@@ -458,6 +461,7 @@ def install(
     production facade.
     """
     _mod = globals()
+    host_globals.setdefault("_emit_aawm_terminal_error", _emit_aawm_terminal_error)
     for _name in (
         "_perform_codex_auto_agent_cursor_agent_request",
         "_raise_cursor_agent_alias_error",
@@ -2709,6 +2713,43 @@ def _bind_responses_stream_timeout_terminalizer(
             metadata["aawm_stream_terminal_emitted"] = True
             metadata["aawm_route_rollup_turn_suppressed"] = True
             metadata["aawm_route_rollup_turn_recorded"] = True
+
+        _emit_aawm_terminal_error(
+            {
+                "event_type": "responses_stream_terminal",
+                "endpoint": identity.get("endpoint"),
+                "alias_family": identity.get("route_family") or adapter_label,
+                "alias_model": (
+                    identity.get("model_alias")
+                    or identity.get("requested_model_alias")
+                    or adapter_model
+                ),
+                "selected_provider": identity.get("provider") or provider,
+                "selected_model": adapter_model,
+                "selected_route": (
+                    identity.get("route_family") or identity.get("upstream_url")
+                ),
+                "status_code": 504,
+                "error_code": "streaming_upstream_read_timeout",
+                "failure_class": "streaming_upstream_read_timeout",
+                "failure_phase": failure_context["stream_failure_stage"],
+                "attempted_provider_call": True,
+                "redispatch_required": False,
+                "terminal_outcome": "failed",
+                "fallback_result": "none",
+                "attempt_count": (
+                    metadata.get("attempt_count")
+                    if isinstance(metadata, dict)
+                    else None
+                ),
+                "correlation_id": (
+                    identity.get("litellm_call_id")
+                    or identity.get("request_id")
+                    or identity.get("trace_id")
+                ),
+            },
+            marker=metadata if isinstance(metadata, dict) else identity,
+        )
 
         PassThroughStreamingHandler._record_post_first_byte_stream_terminal_rollup(
             success_handler_kwargs=rollup_kwargs,

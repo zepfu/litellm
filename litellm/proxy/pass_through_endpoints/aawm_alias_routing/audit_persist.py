@@ -12,9 +12,12 @@ import hashlib
 import json
 import os
 import re
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from litellm._logging import verbose_aawm_route_logger, verbose_proxy_logger
+from litellm.secret_managers.credential_error_sanitizer import (
+    sanitize_credential_error_message,
+)
 
 # ---------------------------------------------------------------------------
 # Injected runtime seams (god-module / host)
@@ -28,6 +31,36 @@ _record_auto_agent_alias_route_status_rollup: Optional[Callable[..., None]] = No
 # configure or omit the parameters entirely.
 
 _AAWM_ALIAS_ROUTE_VERBOSE_JSON_ENV = "AAWM_ALIAS_ROUTE_VERBOSE_JSON"
+_AAWM_ALIAS_TERMINAL_ERROR_EVENT_TYPES = frozenset(
+    {
+        "no_candidate_available",
+        "in_flight_pinned_session_cooldown",
+        "provider_lane_admission_rejected",
+        "redispatch_required",
+    }
+)
+_AAWM_TERMINAL_ERROR_MARKER_KEY = "aawm_terminal_error_emitted"
+_AAWM_TERMINAL_ERROR_HASH_CHARS = 16
+_AAWM_TERMINAL_ERROR_MAX_LABEL_CHARS = 96
+_AAWM_TERMINAL_ERROR_SECRET_FIELD_NAMES = (
+    "api_key",
+    "apikey",
+    "key",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "client_secret",
+    "secret",
+    "token",
+    "password",
+)
+_AAWM_TERMINAL_ERROR_EMAIL_RE = re.compile(
+    r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"
+)
+_AAWM_TERMINAL_ERROR_BEARER_RE = re.compile(
+    r"(?i)\bbearer\s+['\"]?[A-Z0-9._~+/=-]{8,}"
+)
+_AAWM_TERMINAL_ERROR_SK_RE = re.compile(r"(?i)\bsk-[A-Z0-9_-]{6,}")
 
 
 def _aawm_alias_route_verbose_json_enabled() -> bool:
@@ -114,6 +147,220 @@ def configure_audit_persist_runtime(
 # ---------------------------------------------------------------------------
 
 
+def _is_auto_agent_alias_terminal_error_event(event: Mapping[str, Any]) -> bool:
+    event_type = str(event.get("event_type") or "")
+    return event_type in _AAWM_ALIAS_TERMINAL_ERROR_EVENT_TYPES
+
+
+def _sanitize_terminal_error_label(value: Any) -> Optional[str]:
+    if value is None or isinstance(value, (dict, list, tuple, set)):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    text = sanitize_credential_error_message(
+        text,
+        field_names=_AAWM_TERMINAL_ERROR_SECRET_FIELD_NAMES,
+    )
+    text = _AAWM_TERMINAL_ERROR_EMAIL_RE.sub("[REDACTED_EMAIL]", text)
+    text = _AAWM_TERMINAL_ERROR_BEARER_RE.sub("Bearer_[REDACTED]", text)
+    text = _AAWM_TERMINAL_ERROR_SK_RE.sub("sk-[REDACTED]", text)
+    text = re.sub(r"[^\x20-\x7E]", "_", text)
+    text = " ".join(text.split())
+    return text[:_AAWM_TERMINAL_ERROR_MAX_LABEL_CHARS] or None
+
+
+def _terminal_error_context_value(
+    context: Mapping[str, Any],
+    *keys: str,
+) -> Any:
+    for key in keys:
+        value = context.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _terminal_error_safe_integer(value: Any, *, maximum: int) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    try:
+        integer = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0, min(integer, maximum))
+
+
+def _terminal_error_code(context: Mapping[str, Any]) -> Any:
+    event_type = str(context.get("event_type") or "")
+    error_code = _terminal_error_context_value(
+        context,
+        "terminal_error_code",
+        "response_error_code",
+        "error_code",
+        "code",
+    )
+    alias_family = str(
+        _terminal_error_context_value(context, "alias_family", "model_family") or ""
+    ).casefold()
+    if event_type == "redispatch_required" and (
+        error_code is None
+        or str(error_code).strip().isdigit()
+    ):
+        if "session_owner" in alias_family:
+            return "aawm_session_owner_redispatch_required"
+        if alias_family.startswith("codex"):
+            return "aawm_codex_auto_agent_redispatch_required"
+    if (
+        event_type == "no_candidate_available"
+        and error_code is None
+        and context.get("attempted_provider_call") is False
+        and _terminal_error_safe_integer(context.get("attempt_count"), maximum=10_000)
+        in (None, 0)
+    ):
+        if alias_family.startswith("codex"):
+            return "aawm_codex_auto_agent_all_candidates_cooling_down"
+    return error_code
+
+
+def _terminal_error_marker_is_set(marker: Any) -> bool:
+    if marker is None:
+        return False
+    if isinstance(marker, Mapping):
+        return marker.get(_AAWM_TERMINAL_ERROR_MARKER_KEY) is True
+    try:
+        return bool(getattr(marker, _AAWM_TERMINAL_ERROR_MARKER_KEY, False))
+    except Exception:
+        return False
+
+
+def _set_terminal_error_marker(marker: Any) -> None:
+    if marker is None:
+        return
+    if isinstance(marker, dict):
+        marker[_AAWM_TERMINAL_ERROR_MARKER_KEY] = True
+        return
+    try:
+        setattr(marker, _AAWM_TERMINAL_ERROR_MARKER_KEY, True)
+    except Exception:
+        pass
+
+
+def _build_terminal_error_log_fields(
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
+    label_fields = (
+        ("endpoint", ("endpoint", "incoming_endpoint")),
+        ("alias_family", ("alias_family", "model_family")),
+        ("alias_model", ("alias_model", "model_alias", "requested_model_alias")),
+        ("selected_provider", ("selected_provider", "provider")),
+        ("selected_model", ("selected_model", "model")),
+        (
+            "selected_route",
+            (
+                "selected_route",
+                "selected_route_family",
+                "route_family",
+                "outgoing_target",
+                "route",
+            ),
+        ),
+        ("error_code", ("error_code", "code")),
+        (
+            "failure_class",
+            ("failure_class", "error_class", "failure_kind"),
+        ),
+        (
+            "failure_phase",
+            ("failure_phase", "stream_failure_stage", "phase"),
+        ),
+        ("terminal_outcome", ("terminal_outcome", "outcome")),
+        ("fallback_result", ("fallback_result", "fallback")),
+        ("event_type", ("event_type",)),
+    )
+    fields: dict[str, Any] = {}
+    for output_key, source_keys in label_fields:
+        source_value = (
+            _terminal_error_code(context)
+            if output_key == "error_code"
+            else _terminal_error_context_value(context, *source_keys)
+        )
+        value = _sanitize_terminal_error_label(source_value)
+        if value is not None:
+            fields[output_key] = value
+
+    status_code = _terminal_error_safe_integer(
+        _terminal_error_context_value(
+            context,
+            "status_code",
+            "error_status_code",
+            "http_status",
+        ),
+        maximum=999,
+    )
+    if status_code is not None:
+        fields["status_code"] = status_code
+
+    attempt_count = _terminal_error_safe_integer(
+        context.get("attempt_count"),
+        maximum=10_000,
+    )
+    if attempt_count is not None:
+        fields["attempt_count"] = attempt_count
+
+    for key in ("attempted_provider_call", "redispatch_required"):
+        value = context.get(key)
+        if isinstance(value, bool):
+            fields[key] = value
+
+    correlation_value = _terminal_error_context_value(
+        context,
+        "correlation_id",
+        "safe_correlation_id",
+        "litellm_call_id",
+        "request_id",
+        "trace_id",
+        "session_id",
+    )
+    correlation_label = _sanitize_terminal_error_label(correlation_value)
+    if correlation_label is not None:
+        fields["correlation_id"] = (
+            "sha256:"
+            + hashlib.sha256(correlation_label.encode("utf-8")).hexdigest()[
+                :_AAWM_TERMINAL_ERROR_HASH_CHARS
+            ]
+        )
+    return fields
+
+
+def _emit_aawm_terminal_error(
+    context: Mapping[str, Any],
+    *,
+    marker: Any = None,
+) -> bool:
+    """Emit one bounded operator ERROR and optionally mark its response state."""
+    if _terminal_error_marker_is_set(marker):
+        return False
+
+    fields = _build_terminal_error_log_fields(context)
+    message_fields = " ".join(
+        f"{key}={value}"
+        for key, value in fields.items()
+    )
+    try:
+        verbose_proxy_logger.error(
+            "AAWM_TERMINAL_ERROR: %s",
+            message_fields or "event_type=<missing>",
+            extra={"aawm_terminal_error": True, **fields},
+            exc_info=False,
+        )
+    except Exception:
+        # Terminal observability must never change the client-facing outcome.
+        return False
+    _set_terminal_error_marker(marker)
+    return True
+
+
 def _emit_auto_agent_alias_route_event(
     event: dict[str, Any],
     *,
@@ -122,9 +369,11 @@ def _emit_auto_agent_alias_route_event(
     assert _record_auto_agent_alias_route_status_rollup is not None
 
     _record_auto_agent_alias_route_status_rollup(event)
+    if _is_auto_agent_alias_terminal_error_event(event):
+        _emit_aawm_terminal_error(event)
     if not (_aawm_alias_route_verbose_json_enabled() or _aawm_alias_route_healthy_json_enabled()):
         if level == "warning":
-            _emit_auto_agent_alias_route_default_warning(event)
+            return
         return
     if not _should_emit_auto_agent_alias_route_event(event, level=level):
         return
@@ -134,25 +383,9 @@ def _emit_auto_agent_alias_route_event(
 
 
 def _emit_auto_agent_alias_route_default_warning(event: dict[str, Any]) -> None:
-    """Emit one sanitized operator-visible line for terminal warning events.
-
-    Terminal no-candidate and pre-attempt terminal events carry
-    level="warning" but previously produced no container log unless a JSON flag
-    was enabled. Normal candidate-failure events are intentionally excluded:
-    their status lines already surface via the route status rollup, so this
-    default must not duplicate them.
-    """
-    if str(event.get("event_type") or "") not in {
-        "no_candidate_available",
-        "in_flight_pinned_session_cooldown",
-        "provider_lane_admission_rejected",
-    }:
-        return
-    verbose_aawm_route_logger.warning(
-        "AAWM_ALIAS_ROUTE: terminal warning {}".format(
-            _format_auto_agent_alias_route_default_warning_fields(event)
-        )
-    )
+    """Compatibility wrapper for the terminal operator ERROR boundary."""
+    if _is_auto_agent_alias_terminal_error_event(event):
+        _emit_aawm_terminal_error(event)
 
 
 def _format_auto_agent_alias_route_default_warning_fields(
@@ -512,8 +745,10 @@ def install(host_globals: dict) -> None:
         ("_record_auto_agent_alias_route_status_rollup", _record_auto_agent_alias_route_status_rollup),
         ("_aawm_alias_route_verbose_json_enabled", _aawm_alias_route_verbose_json_enabled),
         ("_aawm_alias_route_healthy_json_enabled", _aawm_alias_route_healthy_json_enabled),
+        ("_is_auto_agent_alias_terminal_error_event", _is_auto_agent_alias_terminal_error_event),
     ):
         host_globals.setdefault(_sk, _sv)
+    host_globals.setdefault("_emit_aawm_terminal_error", _emit_aawm_terminal_error)
 
 # ---------------------------------------------------------------------------
 # Module __setattr__ propagation for test-fixture seam restores

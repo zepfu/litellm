@@ -158,35 +158,156 @@ class TestEmitRouteEvent:
             audit_persist._emit_auto_agent_alias_route_event(event, level="warning")
             mock_info.assert_called_once()
 
-    def test_terminal_warning_emits_sanitized_default_line_when_flags_off(
-        self, _configure_audit_persist
+    @pytest.mark.parametrize(
+        ("event_type", "redispatch_required", "failure_phase"),
+        [
+            ("no_candidate_available", False, "candidate_selection"),
+            (
+                "in_flight_pinned_session_cooldown",
+                True,
+                "session_affinity_cooldown",
+            ),
+            ("provider_lane_admission_rejected", False, "provider_lane_admission"),
+            ("redispatch_required", True, "provider_attempt"),
+        ],
+    )
+    @pytest.mark.parametrize("json_flags_enabled", [False, True])
+    def test_terminal_event_emits_one_error_independent_of_json_flags(
+        self,
+        _configure_audit_persist,
+        event_type,
+        redispatch_required,
+        failure_phase,
+        json_flags_enabled,
     ):
+        _configure_audit_persist["verbose_enabled"].return_value = json_flags_enabled
+        _configure_audit_persist["healthy_enabled"].return_value = json_flags_enabled
         event = {
-            "event_type": "no_candidate_available",
-            "candidate_status": "all_candidates_unavailable",
+            "event_type": event_type,
+            "alias_family": "codex_auto_agent",
             "alias_model": "codex-auto",
-            "error_status_code": 429,
+            "provider": "openrouter",
+            "model": "openrouter/example",
+            "route_family": "codex_openrouter_completion_adapter",
+            "status_code": 429,
+            "error_code": "aawm_terminal_test",
             "failure_class": "rate_limited",
+            "failure_phase": failure_phase,
             "attempt_count": 2,
-            "redispatch_required": False,
+            "attempted_provider_call": event_type == "redispatch_required",
+            "redispatch_required": redispatch_required,
+            "terminal_outcome": (
+                "redispatch_required" if redispatch_required else "failed"
+            ),
+            "fallback_result": "none",
             "session_id": "secret-session-1234",
-            "source_error": "secret upstream detail",
         }
         with patch.object(
+            audit_persist.verbose_proxy_logger, "error"
+        ) as mock_error, patch.object(
             audit_persist.verbose_aawm_route_logger, "warning"
         ) as mock_warning, patch.object(
             audit_persist.verbose_aawm_route_logger, "info"
         ) as mock_info:
             audit_persist._emit_auto_agent_alias_route_event(event, level="warning")
-            mock_info.assert_not_called()
-            mock_warning.assert_called_once()
-            message = mock_warning.call_args[0][0]
-            assert message.startswith("AAWM_ALIAS_ROUTE: terminal warning")
-            assert "alias_model=codex-auto" in message
-            assert "error_status_code=429" in message
-            assert "failure_class=rate_limited" in message
-            assert "secret-session-1234" not in message
-            assert "secret upstream detail" not in message
+
+        mock_error.assert_called_once()
+        mock_warning.assert_not_called()
+        assert mock_info.call_count == int(json_flags_enabled)
+        assert _configure_audit_persist["rollup_calls"] == [event]
+        error_call = mock_error.call_args
+        assert error_call.args[0] == "AAWM_TERMINAL_ERROR: %s"
+        fields = error_call.kwargs["extra"]
+        assert fields["event_type"] == event_type
+        assert fields["status_code"] == 429
+        assert fields["attempted_provider_call"] is (
+            event_type == "redispatch_required"
+        )
+        assert fields["redispatch_required"] is redispatch_required
+        assert fields["terminal_outcome"] == (
+            "redispatch_required" if redispatch_required else "failed"
+        )
+        assert "secret-session-1234" not in json.dumps(error_call, default=str)
+
+    @pytest.mark.parametrize("json_flags_enabled", [False, True])
+    def test_healthy_event_is_not_promoted_to_error(
+        self, _configure_audit_persist, json_flags_enabled
+    ):
+        _configure_audit_persist["verbose_enabled"].return_value = json_flags_enabled
+        _configure_audit_persist["healthy_enabled"].return_value = json_flags_enabled
+        event = {
+            "event_type": "candidate_selected",
+            "candidate_status": "selected",
+            "alias_model": "codex-auto",
+        }
+        with patch.object(
+            audit_persist.verbose_proxy_logger, "error"
+        ) as mock_error, patch.object(
+            audit_persist.verbose_aawm_route_logger, "info"
+        ) as mock_info:
+            audit_persist._emit_auto_agent_alias_route_event(event)
+
+        mock_error.assert_not_called()
+        assert mock_info.call_count == int(json_flags_enabled)
+
+    def test_terminal_error_marker_suppresses_nested_duplicate(
+        self, _configure_audit_persist
+    ):
+        marker: dict[str, Any] = {}
+        context = {
+            "event_type": "redispatch_required",
+            "status_code": 429,
+            "error_code": "aawm_redispatch_required",
+            "failure_class": "rate_limited",
+            "attempted_provider_call": True,
+            "redispatch_required": True,
+        }
+        with patch.object(
+            audit_persist.verbose_proxy_logger, "error"
+        ) as mock_error:
+            assert (
+                audit_persist._emit_aawm_terminal_error(context, marker=marker)
+                is True
+            )
+            assert (
+                audit_persist._emit_aawm_terminal_error(context, marker=marker)
+                is False
+            )
+
+        mock_error.assert_called_once()
+        assert marker[audit_persist._AAWM_TERMINAL_ERROR_MARKER_KEY] is True
+
+    def test_terminal_error_redacts_identifiers_and_free_form_details(
+        self, _configure_audit_persist
+    ):
+        context = {
+            "event_type": "no_candidate_available",
+            "alias_model": "worker@example.com",
+            "selected_provider": "sk-live-abcdef123456",
+            "selected_route": "Bearer very-secret-token",
+            "session_id": "session-secret-123",
+            "source_error": "raw upstream secret detail",
+        }
+        with patch.object(
+            audit_persist.verbose_proxy_logger, "error"
+        ) as mock_error:
+            audit_persist._emit_aawm_terminal_error(context)
+
+        mock_error.assert_called_once()
+        rendered = json.dumps(mock_error.call_args, default=str)
+        for raw_value in (
+            "worker@example.com",
+            "sk-live-abcdef123456",
+            "very-secret-token",
+            "session-secret-123",
+            "raw upstream secret detail",
+        ):
+            assert raw_value not in rendered
+        fields = mock_error.call_args.kwargs["extra"]
+        assert fields["alias_model"] == "[REDACTED_EMAIL]"
+        assert fields["selected_provider"] == "sk-[REDACTED]"
+        assert fields["selected_route"] == "Bearer_[REDACTED]"
+        assert fields["correlation_id"].startswith("sha256:")
 
     def test_info_event_stays_suppressed_when_flags_off(
         self, _configure_audit_persist
@@ -217,6 +338,55 @@ class TestEmitRouteEvent:
             mock_warning.assert_not_called()
         assert _configure_audit_persist["rollup_calls"] == [event]
 
+    def test_terminal_token_invalidation_emits_once_and_nonterminal_failures_do_not(
+        self, _configure_audit_persist
+    ):
+        events = [
+            {
+                "event_type": "redispatch_required",
+                "candidate_status": "terminal_in_flight_token_invalidated",
+                "error_status_code": 429,
+                "error_code": "token_invalidated",
+                "failure_class": "token_invalidated",
+                "failure_phase": "provider_attempt",
+                "attempted_provider_call": True,
+                "redispatch_required": True,
+            },
+            {
+                "event_type": "candidate_retryable_failure",
+                "candidate_status": "cooldown_set",
+                "error_status_code": 429,
+                "error_code": "rate_limit_exceeded",
+                "failure_class": "rate_limited",
+                "attempted_provider_call": True,
+                "redispatch_required": False,
+            },
+            {
+                "event_type": "candidate_selected",
+                "candidate_status": "selected",
+                "attempted_provider_call": False,
+                "redispatch_required": False,
+            },
+        ]
+        with patch.object(
+            audit_persist.verbose_proxy_logger, "error"
+        ) as mock_error:
+            for event in events:
+                audit_persist._emit_auto_agent_alias_route_event(
+                    event,
+                    level="warning",
+                )
+
+        mock_error.assert_called_once()
+        fields = mock_error.call_args.kwargs["extra"]
+        assert fields["event_type"] == "redispatch_required"
+        assert fields["error_code"] == "token_invalidated"
+        assert fields["status_code"] == 429
+        assert fields["failure_phase"] == "provider_attempt"
+        assert fields["attempted_provider_call"] is True
+        assert fields["redispatch_required"] is True
+        assert _configure_audit_persist["rollup_calls"] == events
+
     @pytest.mark.parametrize(
         ("event_type", "candidate_status", "failure_phase", "error_code"),
         [
@@ -234,7 +404,7 @@ class TestEmitRouteEvent:
             ),
         ],
     )
-    def test_pre_attempt_terminal_warnings_emit_when_flags_off(
+    def test_pre_attempt_terminal_events_emit_one_error_when_flags_off(
         self,
         _configure_audit_persist,
         event_type,
@@ -255,21 +425,25 @@ class TestEmitRouteEvent:
             "source_error": "secret provider detail",
         }
         with patch.object(
+            audit_persist.verbose_proxy_logger, "error"
+        ) as mock_error, patch.object(
             audit_persist.verbose_aawm_route_logger, "warning"
         ) as mock_warning, patch.object(
             audit_persist.verbose_aawm_route_logger, "info"
         ) as mock_info:
             audit_persist._emit_auto_agent_alias_route_event(event, level="warning")
             mock_info.assert_not_called()
-            mock_warning.assert_called_once()
-            message = mock_warning.call_args[0][0]
-            assert message.startswith("AAWM_ALIAS_ROUTE: terminal warning")
-            assert f"event_type={event_type}" in message
-            assert f"candidate_status={candidate_status}" in message
-            assert f"failure_phase={failure_phase}" in message
-            assert f"error_code={error_code}" in message
-            assert "secret-session" not in message
-            assert "secret provider detail" not in message
+            mock_warning.assert_not_called()
+            mock_error.assert_called_once()
+            fields = mock_error.call_args.kwargs["extra"]
+            assert fields["event_type"] == event_type
+            assert fields["failure_phase"] == failure_phase
+            assert fields["error_code"] == error_code
+            assert fields["status_code"] == 429
+            assert "secret-session" not in json.dumps(mock_error.call_args, default=str)
+            assert "secret provider detail" not in json.dumps(
+                mock_error.call_args, default=str
+            )
 
 
 # ---------------------------------------------------------------------------

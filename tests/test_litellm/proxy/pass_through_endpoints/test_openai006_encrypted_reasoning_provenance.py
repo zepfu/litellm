@@ -188,6 +188,96 @@ def test_guard_rejects_known_xai_foreign_before_upstream():
     assert XAI_CIPHERTEXT not in str(detail)
 
 
+def test_pre_send_incompatible_reasoning_emits_one_sanitized_terminal_error():
+    from litellm.proxy.pass_through_endpoints import pass_through_endpoints as pte
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import audit_persist
+
+    provenance = erp.build_encrypted_reasoning_provenance(
+        producer_provider="xai",
+        producer_model="producer-secret-model",
+        producer_route_family="secret-route-family",
+        account_label="secret-account",
+    )
+    item = erp.stamp_encrypted_reasoning_provenance_on_item(
+        _reasoning_item(
+            item_id="rs-secret-item",
+            encrypted_content=XAI_CIPHERTEXT,
+        ),
+        provenance,
+    )
+    body = {
+        "model": "gpt-5.6-sol",
+        "input": [
+            item,
+            {
+                "type": "message",
+                "role": "user",
+                "content": "prompt-secret-value",
+            },
+        ],
+    }
+    request = MagicMock()
+    request.state = SimpleNamespace()
+
+    class _SA:
+        @staticmethod
+        def resolve_canonical_session_identity(request, body):
+            return "session-secret-identity"
+
+    with patch.object(pte, "_session_affinity_mod", lambda: _SA), patch.object(
+        audit_persist.verbose_proxy_logger,
+        "error",
+    ) as mock_error:
+        with pytest.raises(HTTPException) as exc_info:
+            pte._aawm_apply_openai_encrypted_reasoning_pre_send(
+                request=request,
+                parsed_body=body,
+                custom_llm_provider="openai",
+                egress_credential_family="codex_oauth",
+                expected_target_family="openai",
+                url=httpx.URL("https://chatgpt.com/backend-api/codex/responses"),
+                provider_bound_body=body,
+            )
+        assert (
+            pte._emit_openai_encrypted_reasoning_redispatch_terminal_error(
+                exc_info.value,
+                marker=request.state,
+                correlation_id="outer-correlation-secret",
+            )
+            is False
+        )
+
+    error = exc_info.value
+    assert error.status_code == 409
+    detail = error.detail
+    assert isinstance(detail, dict)
+    assert detail["error"]["code"] == "aawm_encrypted_reasoning_redispatch_required"
+    assert detail["failure_phase"] == "encrypted_reasoning_openai_pre_send"
+    assert detail["redispatch_required"] is True
+    assert detail["attempted_provider_call"] is False
+    assert XAI_CIPHERTEXT not in str(detail)
+
+    mock_error.assert_called_once()
+    fields = mock_error.call_args.kwargs["extra"]
+    assert fields["error_code"] == detail["error"]["code"]
+    assert fields["status_code"] == error.status_code
+    assert fields["failure_phase"] == detail["failure_phase"]
+    assert fields["redispatch_required"] is True
+    assert fields["attempted_provider_call"] is False
+    assert fields["correlation_id"].startswith("sha256:")
+    rendered = json.dumps(mock_error.call_args, default=str)
+    for secret in (
+        XAI_CIPHERTEXT,
+        "rs-secret-item",
+        "producer-secret-model",
+        "secret-route-family",
+        "secret-account",
+        "prompt-secret-value",
+        "session-secret-identity",
+    ):
+        assert secret not in rendered
+
+
 def test_guard_rejects_foreign_state_format_even_if_provider_label_missing_family():
     # Explicit foreign state format must fail closed.
     item = _reasoning_item(

@@ -3150,7 +3150,7 @@ async def test_lease_renewal_cleans_up_on_caller_cancellation() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Reopened D1-614: one proxy WARNING and one failure rollup for handled owner 409s.
+# Reopened D1-614: one proxy ERROR and one failure rollup for handled owner 409s.
 # ---------------------------------------------------------------------------
 
 _D614_SESSION_ID = "sess-d614-raw-1234567890"
@@ -3208,7 +3208,7 @@ def _d614_guard_result() -> "sa.SessionOwnerGuardResult":
     )
 
 
-def test_d614_owner_409_emits_one_proxy_warning_and_one_failure_rollup() -> None:
+def test_d614_owner_409_emits_one_proxy_error_and_one_failure_rollup() -> None:  # noqa: PLR0915
     from types import SimpleNamespace
 
     state = SimpleNamespace(
@@ -3229,6 +3229,8 @@ def test_d614_owner_409_emits_one_proxy_warning_and_one_failure_rollup() -> None
     rollup = MagicMock(return_value=True)
 
     with patch.object(
+        sa.verbose_proxy_logger, "error"
+    ) as proxy_error, patch.object(
         sa.verbose_proxy_logger, "warning"
     ) as proxy_warning, patch(
         "litellm.proxy.aawm_route_logging.record_aawm_route_rollup_failure",
@@ -3252,13 +3254,23 @@ def test_d614_owner_409_emits_one_proxy_warning_and_one_failure_rollup() -> None
             request=request,
         )
 
-    proxy_warning.assert_called_once()
+    proxy_error.assert_called_once()
+    proxy_warning.assert_not_called()
     rollup.assert_called_once()
     dedicated_warning.assert_not_called()
 
-    warning_call = proxy_warning.call_args
-    assert warning_call.args[0] == "%s"
-    summary = warning_call.args[1]
+    error_call = proxy_error.call_args
+    assert error_call.args[0] == "AAWM_TERMINAL_ERROR: %s"
+    error_fields = error_call.kwargs["extra"]
+    assert error_fields["event_type"] == "redispatch_required"
+    assert error_fields["status_code"] == 409
+    assert error_fields["failure_class"] == "session_owner_redispatch"
+    assert error_fields["failure_phase"] == "session_owner_mismatch"
+    assert error_fields["attempted_provider_call"] is False
+    assert error_fields["redispatch_required"] is True
+    assert error_fields["correlation_id"].startswith("sha256:")
+
+    summary = rollup.call_args.kwargs["message"]
     assert rollup.call_args.kwargs == {
         "message": summary,
         "status": "Failed",
@@ -3271,7 +3283,7 @@ def test_d614_owner_409_emits_one_proxy_warning_and_one_failure_rollup() -> None
     assert "attempted_provider_call=false" in summary
     assert "[REDACTED]" in summary
     assert len(summary) <= 480
-    assert warning_call.kwargs["exc_info"] is False
+    assert error_call.kwargs["exc_info"] is False
 
     rollup_kwargs = rollup.call_args.args[0]
     rollup_context = rollup_kwargs["litellm_params"]["metadata"][
@@ -3286,8 +3298,8 @@ def test_d614_owner_409_emits_one_proxy_warning_and_one_failure_rollup() -> None
     }
     emitted = json.dumps(
         {
-            "warning": warning_call.args,
-            "warning_kwargs": warning_call.kwargs,
+            "error": error_call.args,
+            "error_kwargs": error_call.kwargs,
             "rollup": rollup.call_args,
         },
         default=str,
@@ -3313,17 +3325,50 @@ def test_d614_owner_409_emits_one_proxy_warning_and_one_failure_rollup() -> None
     assert _D614_RESERVATION_TOKEN not in json.dumps(detail)
 
 
+def test_d614_nested_owner_409_uses_one_terminal_error_marker() -> None:
+    from types import SimpleNamespace
+
+    state = SimpleNamespace(
+        aawm_alias_request_context={
+            "litellm_call_id": _D614_CALL_ID,
+            "trace_id": _D614_TRACE_ID,
+        },
+        aawm_alias_request_litellm_call_id=_D614_CALL_ID,
+    )
+    request = SimpleNamespace(
+        state=state,
+        url=SimpleNamespace(path="/v1/responses"),
+    )
+    rollup = MagicMock(return_value=True)
+
+    with patch.object(sa.verbose_proxy_logger, "error") as proxy_error, patch(
+        "litellm.proxy.aawm_route_logging.record_aawm_route_rollup_failure",
+        rollup,
+    ):
+        for _ in range(2):
+            with pytest.raises(HTTPException) as exc_info:
+                sa.raise_session_owner_redispatch_required(
+                    session_identity=_D614_SESSION_ID,
+                    guard=_d614_guard_result(),
+                    alias_model="Codex-auto-agent",
+                    failure_phase="session_owner_mismatch",
+                    request=request,
+                )
+            assert exc_info.value.status_code == 409
+
+    proxy_error.assert_called_once()
+    assert rollup.call_count == 2
+
+
 def _d614_raise_with_observability(
     *,
-    warning_side_effect: Optional[BaseException] = None,
+    error_side_effect: Optional[BaseException] = None,
     rollup_side_effect: Optional[BaseException] = None,
 ) -> tuple[HTTPException, MagicMock, MagicMock]:
     rollup = MagicMock(side_effect=rollup_side_effect, return_value=True)
     with patch.object(
-        sa.verbose_proxy_logger,
-        "warning",
-        side_effect=warning_side_effect,
-    ) as proxy_warning, patch(
+        sa.verbose_proxy_logger, "error", side_effect=error_side_effect
+    ) as proxy_error, patch(
         "litellm.proxy.aawm_route_logging.record_aawm_route_rollup_failure",
         rollup,
     ), pytest.raises(HTTPException) as exc_info:
@@ -3333,13 +3378,13 @@ def _d614_raise_with_observability(
             alias_model="Codex-auto-agent",
             failure_phase="session_owner_mismatch",
         )
-    return exc_info.value, proxy_warning, rollup
+    return exc_info.value, proxy_error, rollup
 
 
-def test_d614_proxy_warning_failure_still_raises_identical_409() -> None:
+def test_d614_proxy_error_failure_still_raises_identical_409() -> None:
     baseline, _, _ = _d614_raise_with_observability()
     failed, proxy_warning, rollup = _d614_raise_with_observability(
-        warning_side_effect=RuntimeError("logging backend down"),
+        error_side_effect=RuntimeError("logging backend down"),
     )
     proxy_warning.assert_called_once()
     rollup.assert_called_once()
@@ -3349,10 +3394,10 @@ def test_d614_proxy_warning_failure_still_raises_identical_409() -> None:
 
 def test_d614_rollup_failure_still_raises_identical_409() -> None:
     baseline, _, _ = _d614_raise_with_observability()
-    failed, proxy_warning, rollup = _d614_raise_with_observability(
+    failed, proxy_error, rollup = _d614_raise_with_observability(
         rollup_side_effect=RuntimeError("rollup backend down"),
     )
-    proxy_warning.assert_called_once()
+    proxy_error.assert_called_once()
     rollup.assert_called_once()
     assert failed.status_code == baseline.status_code == 409
     assert failed.detail == baseline.detail
@@ -3702,6 +3747,8 @@ async def test_d614_full_wrapper_records_owner_409_once_before_egress() -> None:
             "_direct_capture_xai_passthrough_failure",
             new=AsyncMock(),
         ), patch.object(
+            sa.verbose_proxy_logger, "error"
+        ) as proxy_error, patch.object(
             sa.verbose_proxy_logger, "warning"
         ) as proxy_warning, patch(
             "litellm.proxy.aawm_route_logging.record_aawm_route_rollup_failure",
@@ -3732,14 +3779,20 @@ async def test_d614_full_wrapper_records_owner_409_once_before_egress() -> None:
                 stream=False,
             )
 
-    proxy_warning.assert_called_once()
+    proxy_error.assert_called_once()
+    proxy_warning.assert_not_called()
     rollup.assert_called_once()
     dedicated_warning.assert_not_called()
     provider_send.assert_not_awaited()
-    warning_call = proxy_warning.call_args
-    summary = warning_call.args[1]
-    assert warning_call.args[0] == "%s"
-    assert warning_call.kwargs["exc_info"] is False
+    error_call = proxy_error.call_args
+    assert error_call.args[0] == "AAWM_TERMINAL_ERROR: %s"
+    error_fields = error_call.kwargs["extra"]
+    assert error_fields["event_type"] == "redispatch_required"
+    assert error_fields["status_code"] == 409
+    assert error_fields["attempted_provider_call"] is False
+    assert error_fields["redispatch_required"] is True
+    assert error_call.kwargs["exc_info"] is False
+    summary = rollup.call_args.kwargs["message"]
     assert rollup.call_args.kwargs == {
         "message": summary,
         "status": "Failed",
@@ -3751,8 +3804,8 @@ async def test_d614_full_wrapper_records_owner_409_once_before_egress() -> None:
 
     emitted = json.dumps(
         {
-            "warning": warning_call.args,
-            "warning_kwargs": warning_call.kwargs,
+            "error": error_call.args,
+            "error_kwargs": error_call.kwargs,
             "rollup": rollup.call_args,
         },
         default=str,

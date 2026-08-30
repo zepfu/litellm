@@ -156,6 +156,7 @@ from .aawm_text_watermark.policy import (
 from .aawm_alias_routing.output_guard_config import (
     output_guard_context_from_passthrough,
 )
+from .aawm_alias_routing.audit_persist import _emit_aawm_terminal_error
 from .streaming_handler import (
     RESPONSES_PRE_COMMIT_TRANSIENT_MAX_ATTEMPTS,
     RESPONSES_PRE_COMMIT_TRANSIENT_RETRY_WAIT_SECONDS,
@@ -864,6 +865,42 @@ def _is_handled_session_owner_redispatch_required(
         and detail.get("attempted_provider_call") is False
         and isinstance(error, dict)
         and error.get("code") == "aawm_session_owner_redispatch_required"
+    )
+
+
+def _emit_openai_encrypted_reasoning_redispatch_terminal_error(
+    exc: Exception,
+    *,
+    marker: Any = None,
+    correlation_id: Any = None,
+) -> bool:
+    """Emit the bounded encrypted-reasoning 409 once per request marker."""
+    status_code = _extract_exception_status_code(exc)
+    if not isinstance(exc, HTTPException) or status_code != status.HTTP_409_CONFLICT:
+        return False
+    detail = getattr(exc, "detail", None)
+    if not isinstance(detail, dict):
+        return False
+    error = detail.get("error")
+    if (
+        not isinstance(error, dict)
+        or error.get("code") != "aawm_encrypted_reasoning_redispatch_required"
+    ):
+        return False
+    return _emit_aawm_terminal_error(
+        {
+            "event_type": "redispatch_required",
+            "status_code": status_code,
+            "error_code": error.get("code"),
+            "failure_class": "encrypted_reasoning_incompatible",
+            "failure_phase": detail.get("failure_phase"),
+            "attempted_provider_call": detail.get("attempted_provider_call"),
+            "redispatch_required": detail.get("redispatch_required"),
+            "terminal_outcome": "redispatch_required",
+            "fallback_result": "none",
+            "correlation_id": correlation_id,
+        },
+        marker=marker,
     )
 
 
@@ -3797,21 +3834,29 @@ def _aawm_apply_openai_encrypted_reasoning_pre_send(
     session_identity = sa.resolve_canonical_session_identity(
         request, identity_source
     )
-    prepared, disposition = guard_openai_encrypted_reasoning_egress(
-        send_body,
-        session_identity=session_identity,
-        target_provider="openai",
-        target_route_family=egress_credential_family or expected_target_family,
-        failure_phase="encrypted_reasoning_openai_pre_send",
-        strip_function_output_ciphertext_without_plaintext=(
-            should_strip_encrypted_function_output_without_plaintext(
-                url=url,
-                egress_credential_family=egress_credential_family,
-                custom_llm_provider=custom_llm_provider,
-                request_body=identity_source,
-            )
-        ),
-    )
+    try:
+        prepared, disposition = guard_openai_encrypted_reasoning_egress(
+            send_body,
+            session_identity=session_identity,
+            target_provider="openai",
+            target_route_family=egress_credential_family or expected_target_family,
+            failure_phase="encrypted_reasoning_openai_pre_send",
+            strip_function_output_ciphertext_without_plaintext=(
+                should_strip_encrypted_function_output_without_plaintext(
+                    url=url,
+                    egress_credential_family=egress_credential_family,
+                    custom_llm_provider=custom_llm_provider,
+                    request_body=identity_source,
+                )
+            ),
+        )
+    except HTTPException as exc:
+        _emit_openai_encrypted_reasoning_redispatch_terminal_error(
+            exc,
+            marker=getattr(request, "state", None),
+            correlation_id=session_identity,
+        )
+        raise
 
     # Synchronize the prepared body into the live send body used by httpx.
     # ``prepare`` returns a new dict when items change; a top-level shallow
@@ -5282,16 +5327,48 @@ async def pass_through_request(  # noqa: PLR0915
                     "Failed to append request-shape terminal error intake",
                     exc_info=True,
                 )
-            verbose_proxy_logger.warning(
-                "Pass through endpoint surfaced Responses request-shape deserialization failure status=%s error=%s",
-                status_code,
-                str(e),
-                extra=error_log_context,
+            _emit_aawm_terminal_error(
+                {
+                    "event_type": "request_shape_deserialization_failed",
+                    "endpoint": error_log_context.get("endpoint"),
+                    "alias_family": error_log_context.get("route_family"),
+                    "alias_model": error_log_context.get("model_alias"),
+                    "selected_provider": error_log_context.get("provider"),
+                    "selected_model": error_log_context.get("model"),
+                    "selected_route": (
+                        error_log_context.get("route_family")
+                        or error_log_context.get("upstream_url")
+                    ),
+                    "status_code": status_code,
+                    "error_code": "request_shape_deserialization_failed",
+                    "failure_class": (
+                        error_log_context.get("failure_class")
+                        or error_log_context.get(
+                            "aawm_passthrough_request_shape_error_class"
+                        )
+                        or "request_shape_deserialization_failed"
+                    ),
+                    "failure_phase": (
+                        error_log_context.get("failure_phase")
+                        or "request_shape_deserialization"
+                    ),
+                    "attempted_provider_call": True,
+                    "redispatch_required": False,
+                    "terminal_outcome": "request_rejected",
+                    "fallback_result": "none",
+                    "correlation_id": error_log_context.get("litellm_call_id"),
+                },
+                marker=getattr(request, "state", None) or error_log_context,
             )
         elif suppress_handled_http_client_error_traceback:
             handled_error_summary = _get_passthrough_handled_http_error_summary(
                 e,
                 status_code=status_code,
+            )
+            _emit_openai_encrypted_reasoning_redispatch_terminal_error(
+                e,
+                marker=getattr(request, "state", None) or error_log_context,
+                correlation_id=error_log_context.get("litellm_call_id"),
             )
             emit_aawm_error_intake_only(
                 verbose_proxy_logger,

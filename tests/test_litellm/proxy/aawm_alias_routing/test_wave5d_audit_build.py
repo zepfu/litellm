@@ -587,6 +587,7 @@ class TestBuildAuditEvents:
             {"provider": "openai", "model": "gpt-4.1", "route_family": "openai", "status": "selected"},
             {"provider": "openai", "model": "gpt-4.1", "route_family": "openai", "status": "cooldown_set", "error_class": "rate_limit"},
             {"provider": "openai", "model": "gpt-4.1", "route_family": "openai", "status": "terminal_in_flight_cooldown_set"},
+            {"provider": "openai", "model": "gpt-4.1", "route_family": "openai", "status": "terminal_in_flight_token_invalidated", "error_class": "token_invalidated"},
         ]
         events = _build_auto_agent_alias_audit_events(
             alias_family="codex",
@@ -598,8 +599,11 @@ class TestBuildAuditEvents:
         )
         assert events[0]["event_type"] == "candidate_selected"
         assert events[1]["event_type"] == "candidate_retryable_failure"
+        assert events[1]["redispatch_required"] is False
         assert events[2]["event_type"] == "redispatch_required"
         assert events[2]["redispatch_required"] is True
+        assert events[3]["event_type"] == "redispatch_required"
+        assert events[3]["redispatch_required"] is True
 
     def test_fallback_to_selection_candidate(self):
         selection = _minimal_selection(

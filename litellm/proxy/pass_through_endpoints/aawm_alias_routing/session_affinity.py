@@ -43,6 +43,7 @@ from litellm.secret_managers.credential_error_sanitizer import (
 )
 
 from . import durable
+from .audit_persist import _emit_aawm_terminal_error
 from .types import Payload
 
 
@@ -3235,25 +3236,85 @@ def _emit_session_owner_redispatch_observability(
     owner_attrs: Mapping[str, Any],
     request: Any,
     attempted_provider_call: bool = False,
+    terminal_marker: Any = None,
 ) -> None:
-    """Emit one proxy WARNING and one rollup failure. Never raises."""
+    """Emit one proxy ERROR and one rollup failure. Never raises."""
     summary = _build_session_owner_redispatch_summary(
         mismatch_reason=mismatch_reason,
         failure_phase=failure_phase,
         attempted_provider_call=attempted_provider_call,
     )
     try:
-        verbose_proxy_logger.warning(
-            "%s",
-            summary,
+        endpoint = None
+        if request is not None:
+            request_url = getattr(request, "url", None)
+            endpoint = getattr(request_url, "path", None)
+        request_context: Mapping[str, Any] = {}
+        request_call_id = None
+        if request is not None:
+            state = getattr(request, "state", None)
+            context = (
+                getattr(state, _SESSION_OWNER_REQUEST_CONTEXT_STATE_KEY, None)
+                if state is not None
+                else None
+            )
+            if isinstance(context, Mapping):
+                request_context = context
+                request_call_id = context.get("litellm_call_id")
+            if request_call_id is None and state is not None:
+                request_call_id = getattr(
+                    state,
+                    _SESSION_OWNER_REQUEST_CALL_ID_STATE_KEY,
+                    None,
+                )
+        _emit_aawm_terminal_error(
+            {
+                "event_type": "redispatch_required",
+                "endpoint": endpoint,
+                "alias_family": (
+                    owner_attrs.get("state_format")
+                    or owner_attrs.get("route_family")
+                    or "session_owner"
+                ),
+                "alias_model": alias_model,
+                "selected_provider": (
+                    owner_attrs.get("provider")
+                    or shaped_candidate.get("provider")
+                ),
+                "selected_model": (
+                    owner_attrs.get("model")
+                    or shaped_candidate.get("model")
+                ),
+                "selected_route": (
+                    owner_attrs.get("route_family")
+                    or shaped_candidate.get("route_family")
+                    or candidate_endpoint
+                ),
+                "status_code": _SESSION_OWNER_LOG_STATUS_CODE,
+                "error_code": _SESSION_OWNER_REDISPATCH_ERROR_CODE,
+                "failure_class": "session_owner_redispatch",
+                "failure_phase": failure_phase,
+                "attempted_provider_call": bool(attempted_provider_call),
+                "redispatch_required": True,
+                "terminal_outcome": "redispatch_required",
+                "fallback_result": "none",
+                "litellm_call_id": request_call_id,
+                "trace_id": request_context.get("trace_id"),
+                "session_id": session_identity,
+            },
+            marker=terminal_marker,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # Keep the bounded summary for the durable route rollup. It is
+        # intentionally separate from the operator ERROR field allowlist.
+        verbose_proxy_logger.debug(
+            "Session-owner redispatch ERROR boundary recorded",
             extra={
                 "source": "session_owner_affinity",
                 "status_code": _SESSION_OWNER_LOG_STATUS_CODE,
-                "failure_kind": "session_owner_mismatch",
-                "redispatch_required": True,
-                "attempted_provider_call": bool(attempted_provider_call),
             },
-            exc_info=False,
         )
     except Exception:  # noqa: BLE001
         pass
@@ -3316,6 +3377,7 @@ def raise_session_owner_redispatch_required(
     attribution: Optional[Mapping[str, Any]] = None,
     request: Any = None,
     attempted_provider_call: bool = False,
+    terminal_marker: Any = None,
 ) -> None:
     """Raise structured redispatch_required with truthful egress state.
 
@@ -3422,6 +3484,11 @@ def raise_session_owner_redispatch_required(
         owner_attrs=owner_attrs,
         request=request,
         attempted_provider_call=attempted_provider_call,
+        terminal_marker=(
+            terminal_marker
+            if terminal_marker is not None
+            else getattr(request, "state", None)
+        ),
     )
     # Direct OpenAI / nested Codex guards raise 409 before
     # pass_through_request registers ACCESS replacement. Register once so

@@ -2919,7 +2919,7 @@ class TestPassThroughRequestRetryableFailures:
         assert "ReadTimeout" in payload["traceback"]
 
     @pytest.mark.asyncio
-    async def test_streaming_timeout_after_first_chunk_marks_retry_unsafe(
+    async def test_streaming_timeout_after_first_chunk_marks_retry_unsafe(  # noqa: PLR0915
         self,
         monkeypatch,
         tmp_path,
@@ -2997,15 +2997,21 @@ class TestPassThroughRequestRetryableFailures:
         error_log_path = tmp_path / "dev-error.jsonl"
         payloads = [json.loads(line) for line in error_log_path.read_text(encoding="utf-8").splitlines()]
         payload = next(
-            item for item in payloads if "Streaming response interrupted after first byte" in item["message"]
+            item
+            for item in payloads
+            if item["message"].startswith("AAWM_TERMINAL_ERROR:")
         )
 
-        assert payload["context"]["failure_kind"] == "streaming_upstream_read_timeout"
-        assert payload["context"]["stream_failure_stage"] == "stream_interrupted_after_first_byte"
-        assert payload["context"]["stream_hidden_retry_safe"] is False
-        assert payload["context"]["stream_chunks_seen"] == 1
-        assert payload["context"]["stream_bytes_seen"] == len(chunks[0])
+        assert payload["context"]["status_code"] == 504
+        message = payload["message"]
+        assert "error_code=streaming_upstream_read_timeout" in message
+        assert "failure_class=streaming_upstream_read_timeout" in message
+        assert "failure_phase=stream_interrupted_after_first_byte" in message
+        assert "attempted_provider_call=True" in message
+        assert "redispatch_required=False" in message
         assert payload["traceback"] is None
+        assert "correlation_id=sha256:" in message
+        assert "call-stream-after-first-byte" not in json.dumps(payload)
         metadata = success_handler_kwargs["litellm_params"]["metadata"]
         assert metadata["aawm_stream_interrupted"] is True
         assert metadata["failure_kind"] == "streaming_upstream_read_timeout"
@@ -3100,6 +3106,15 @@ class TestPassThroughRequestRetryableFailures:
         monkeypatch.setattr(
             "litellm.proxy.pass_through_endpoints.streaming_handler.record_aawm_route_rollup",
             _capture_rollup,
+        )
+        terminal_error_calls: list[tuple[dict[str, Any], dict[str, Any]]] = []
+
+        def _capture_terminal_error(context, **kwargs):
+            terminal_error_calls.append((context, kwargs))
+
+        monkeypatch.setattr(
+            "litellm.proxy.pass_through_endpoints.streaming_handler._emit_aawm_terminal_error",
+            _capture_terminal_error,
         )
 
         logging_obj = MagicMock()
@@ -3210,8 +3225,82 @@ class TestPassThroughRequestRetryableFailures:
         ) == []
         assert len(status_events) == 1
         assert len(rollup_events) == 1
+        assert len(terminal_error_calls) == 1
+        terminal_error_context, terminal_error_kwargs = terminal_error_calls[0]
+        assert terminal_error_context["event_type"] == "responses_stream_terminal"
+        assert (
+            terminal_error_context["error_code"]
+            == failed_payload["response"]["error"]["code"]
+        )
+        assert terminal_error_context["failure_phase"] == (
+            "stream_interrupted_after_first_byte"
+        )
+        assert terminal_error_context["attempted_provider_call"] is True
+        assert terminal_error_context["redispatch_required"] is False
+        assert terminal_error_kwargs["marker"] is success_handler_kwargs["litellm_params"]["metadata"]
         logging_obj.async_failure_handler.assert_awaited_once()
         assert streaming_logger_calls == []
+
+    @pytest.mark.asyncio
+    async def test_streaming_session_owner_redispatch_emits_one_terminal_error(self):
+        target_url = "https://chatgpt.com/backend-api/codex/responses"
+        metadata = {}
+        success_handler_kwargs = {"litellm_params": {"metadata": metadata}}
+        failure = PassThroughStreamingHandler._build_responses_pre_commit_failure(
+            error_payload={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "token_invalidated",
+                    "message": "token invalidated",
+                },
+            },
+            event_type="error",
+        )
+        logging_obj = MagicMock()
+        logging_obj.async_failure_handler = AsyncMock()
+
+        with patch.object(verbose_proxy_logger, "error") as proxy_error, patch(
+            "litellm.proxy.aawm_route_logging.record_aawm_route_rollup_failure"
+        ):
+            failure_context = (
+                PassThroughStreamingHandler._build_responses_stream_redispatch_failure_context(
+                    failure=failure,
+                    request_body={"model": "gpt-5.4"},
+                    success_handler_kwargs=success_handler_kwargs,
+                    url_route=target_url,
+                    custom_llm_provider="openai",
+                    chunk_count=2,
+                    total_stream_bytes=128,
+                )
+            )
+            terminal_chunks = (
+                PassThroughStreamingHandler._build_post_first_byte_terminal_stream_chunks(
+                    endpoint_type=EndpointType.OPENAI,
+                    url_route=target_url,
+                    custom_llm_provider="openai",
+                    failure_context=failure_context,
+                    exc=failure,
+                )
+            )
+            failed_payload = json.loads(
+                terminal_chunks[0].split(b"\ndata: ", 1)[1]
+            )
+            await PassThroughStreamingHandler._finalize_failed_responses_stream(
+                litellm_logging_obj=logging_obj,
+                kwargs=success_handler_kwargs,
+                metadata=metadata,
+                all_chunks=[terminal_chunks[0].decode("utf-8")],
+                request_body={"model": "gpt-5.4"},
+                start_time=datetime.now(),
+                end_time=datetime.now(),
+                terminal_event_type="response.failed",
+                terminal_payload=failed_payload["response"],
+                handler_branch_state=["initial"],
+            )
+
+        proxy_error.assert_called_once()
+        assert metadata["aawm_terminal_error_emitted"] is True
 
     @pytest.mark.asyncio
     async def test_streaming_post_response_logging_error_jsonl_includes_context(
@@ -17746,26 +17835,63 @@ async def test_codex_auto_agent_alias_sota_falls_through_to_gpt_5_5_last_resort(
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_agent_alias_logs_no_candidate_without_provider_attempt():
+async def test_codex_auto_agent_alias_logs_no_candidate_without_provider_attempt(
+    monkeypatch,
+):
     request = _build_codex_auto_agent_request()
     request.scope.update({'client': ('172.19.0.1', 52834), 'method': 'POST', 'http_version': '1.1'})
     clear_aawm_route_access_log_replacements()
     route_status = []
     body = {'model': 'sota', 'litellm_metadata': {'session_id': 'codex-session', 'agent_id': 'agent-123', 'repository': 'litellm'}}
-    with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info') as mock_info, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning') as mock_warning, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock()) as mock_pass_through, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.emit_aawm_route_status_event', side_effect=lambda **kwargs: route_status.append(kwargs)):
+    async def _healthy_oauth_contexts(
+        request,
+        *,
+        candidate_template,
+        affinity=None,
+    ):
+        del request, affinity
+        return [
+            {
+                "candidate": {
+                    **candidate_template,
+                    "codex_oauth_account_label": "test-account",
+                    "codex_oauth_account_hash": "0123456789ab",
+                    "codex_oauth_lane_key": "codex-oauth:test-account",
+                    "codex_oauth_account_priority": 0,
+                    "codex_oauth_account_weight": 1.0,
+                },
+                "lane_key": "codex-oauth:test-account",
+                "auth_status": "healthy",
+            }
+        ]
+
+    monkeypatch.setattr(
+        llm_passthrough_endpoints,
+        "_resolve_codex_oauth_account_candidate_contexts",
+        _healthy_oauth_contexts,
+    )
+    dual_cache = _FakeAawmAliasRoutingDualCache()
+    with patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache', return_value=dual_cache), patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.info') as mock_info, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.warning') as mock_warning, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.verbose_proxy_logger.error') as mock_error, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.pass_through_request', new=AsyncMock()) as mock_pass_through, patch('litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.emit_aawm_route_status_event', side_effect=lambda **kwargs: route_status.append(kwargs)):
         selection = await _select_codex_auto_agent_candidate(request=request, request_body=body)
         await _set_codex_auto_agent_cooldown(selection['cooldown_key'], 60.0)
-        selection2 = await _select_codex_auto_agent_candidate(request=request, request_body=body)
-        await _set_codex_auto_agent_cooldown(selection2['cooldown_key'], 60.0)
         with pytest.raises(HTTPException) as exc_info:
             await _handle_codex_auto_agent_alias_route(endpoint='/v1/responses', request=request, fastapi_response=MagicMock(spec=Response), user_api_key_dict=MagicMock(), prepared_request_body=body, canonical_alias=body["model"], target_url='https://chatgpt.com/backend-api/codex/responses', api_key=None, forward_headers=True)
     assert exc_info.value.status_code == 429
     mock_pass_through.assert_not_called()
     access_record = logging.LogRecord(name='uvicorn.access', level=logging.INFO, pathname=__file__, lineno=1, msg='%s - "%s %s HTTP/%s" %d', args=('172.19.0.1:52834', 'POST', '/openai_passthrough/v1/responses', '1.1', 429), exc_info=None)
     assert AawmRouteAccessLogReplacementFilter().filter(access_record) is False
-    assert route_status == [{'alias_model': 'sota', 'model_label': 'sota', 'status': 'Exhausted', 'message': 'error_status_code=429; candidate_status=all_candidates_unavailable'}, {'alias_model': 'sota', 'model_label': 'gpt-5.6-sol', 'status': 'Exhausted', 'message': 'error_status_code=429; candidate_status=all_candidates_unavailable'}, {'alias_model': 'sota', 'model_label': 'gpt-5.5', 'status': 'Exhausted', 'message': 'error_status_code=429; candidate_status=all_candidates_unavailable'}]
+    assert route_status == [{'alias_model': 'sota', 'model_label': 'sota', 'status': 'Exhausted', 'message': 'error_status_code=429; candidate_status=all_candidates_unavailable'}, {'alias_model': 'sota', 'model_label': 'gpt-5.6-sol', 'status': 'Exhausted', 'message': 'error_status_code=429; candidate_status=all_candidates_unavailable'}]
     _assert_alias_route_logs_exclude_event_types(mock_info, 'candidate_attempt_started')
     assert _alias_route_log_payloads(mock_warning) == []
+    mock_error.assert_called_once()
+    error_call = mock_error.call_args
+    assert error_call.args[0] == "AAWM_TERMINAL_ERROR: %s"
+    error_fields = error_call.kwargs["extra"]
+    assert error_fields["event_type"] == "no_candidate_available"
+    assert error_fields["status_code"] == exc_info.value.status_code
+    assert error_fields["error_code"] == exc_info.value.detail["error"]["code"]
+    assert error_fields["redispatch_required"] is False
+    assert error_fields["attempted_provider_call"] is False
 
 
 
@@ -31484,8 +31610,14 @@ async def test_codex_auto_agent_alias_in_flight_redispatch_includes_audit_metada
             "status": "RESOURCE_EXHAUSTED",
         }
     }
+    dual_cache = _FakeAawmAliasRoutingDualCache()
 
     with patch(
+        "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._get_aawm_alias_routing_dual_cache",
+        return_value=dual_cache,
+    ), patch.object(
+        llm_passthrough_endpoints.verbose_proxy_logger, "error"
+    ) as mock_error, patch(
         "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._perform_codex_auto_agent_openrouter_completion_request",
         new=AsyncMock(side_effect=openrouter_error),
     ):
@@ -31511,6 +31643,17 @@ async def test_codex_auto_agent_alias_in_flight_redispatch_includes_audit_metada
     assert detail["redispatch_required"] is True
     assert isinstance(detail["aawm_alias_routing_audit_events"], list)
     assert any(event["event_type"] == "redispatch_required" for event in detail["aawm_alias_routing_audit_events"])
+    mock_error.assert_called_once()
+    error_call = mock_error.call_args
+    assert error_call.args[0] == "AAWM_TERMINAL_ERROR: %s"
+    error_fields = error_call.kwargs["extra"]
+    assert error_fields["event_type"] == "redispatch_required"
+    assert error_fields["status_code"] == detail["error_status_code"]
+    assert error_fields["error_code"] == detail["error"]["code"]
+    assert error_fields["attempted_provider_call"] is True
+    assert error_fields["redispatch_required"] is True
+    assert error_fields["selected_provider"] == "openrouter"
+    assert error_fields["selected_model"] == "openrouter/cohere/north-mini-code:free"
 
 
 @pytest.mark.asyncio

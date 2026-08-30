@@ -47,6 +47,7 @@ from .llm_provider_handlers.openai_passthrough_logging_handler import (
 from .llm_provider_handlers.vertex_passthrough_logging_handler import (
     VertexPassthroughLoggingHandler,
 )
+from .aawm_alias_routing.audit_persist import _emit_aawm_terminal_error
 from .success_handler import PassThroughEndpointLogging
 
 
@@ -2099,10 +2100,48 @@ class PassThroughStreamingHandler:
         ):
             error_log_context["aawm_stream_terminal_emitted"] = True
 
-        verbose_proxy_logger.error(
-            "Streaming response interrupted after first byte in chunk_processor: %s",
-            str(exc),
-            extra=exception_context,
+        _emit_aawm_terminal_error(
+            {
+                "event_type": "responses_stream_terminal",
+                "endpoint": failure_context.get("endpoint"),
+                "alias_family": (
+                    failure_context.get("alias_family")
+                    or failure_context.get("model_family")
+                    or failure_context.get("route_family")
+                    or custom_llm_provider
+                ),
+                "alias_model": (
+                    failure_context.get("model_alias")
+                    or failure_context.get("requested_model_alias")
+                    or failure_context.get("model")
+                ),
+                "selected_provider": failure_context.get("provider"),
+                "selected_model": failure_context.get("model"),
+                "selected_route": (
+                    failure_context.get("route_family")
+                    or failure_context.get("upstream_url")
+                ),
+                "status_code": failure_context.get("status_code"),
+                "error_code": failure_context.get("error_code")
+                or failure_context.get("failure_kind"),
+                "failure_class": failure_context.get("error_class")
+                or failure_context.get("failure_kind"),
+                "failure_phase": failure_context.get("stream_failure_stage"),
+                "attempted_provider_call": True,
+                "redispatch_required": metadata.get("redispatch_required") is True,
+                "terminal_outcome": "failed",
+                "fallback_result": metadata.get("fallback_result") or "none",
+                "attempt_count": metadata.get("attempt_count"),
+                "correlation_id": (
+                    metadata.get("litellm_call_id")
+                    or metadata.get("request_id")
+                    or metadata.get("trace_id")
+                    or failure_context.get("litellm_call_id")
+                    or failure_context.get("request_id")
+                    or failure_context.get("trace_id")
+                ),
+            },
+            marker=metadata,
         )
 
         # The stream has already emitted bytes to the client, so this
@@ -2205,9 +2244,46 @@ class PassThroughStreamingHandler:
         clean_eof_exc = RuntimeError(
             PassThroughStreamingHandler._CLEAN_EOF_INCOMPLETE_REASON
         )
-        verbose_proxy_logger.error(
-            "Streaming response ended after partial bytes without a terminal event",
-            extra=error_log_context or failure_context,
+        _emit_aawm_terminal_error(
+            {
+                "event_type": "responses_stream_terminal",
+                "endpoint": failure_context.get("endpoint"),
+                "alias_family": (
+                    failure_context.get("alias_family")
+                    or failure_context.get("model_family")
+                    or failure_context.get("route_family")
+                    or custom_llm_provider
+                ),
+                "alias_model": (
+                    failure_context.get("model_alias")
+                    or failure_context.get("requested_model_alias")
+                    or failure_context.get("model")
+                ),
+                "selected_provider": failure_context.get("provider"),
+                "selected_model": failure_context.get("model"),
+                "selected_route": (
+                    failure_context.get("route_family")
+                    or failure_context.get("upstream_url")
+                ),
+                "status_code": failure_context.get("status_code"),
+                "error_code": "streaming_upstream_clean_eof",
+                "failure_class": "streaming_upstream_clean_eof",
+                "failure_phase": failure_context.get("stream_failure_stage"),
+                "attempted_provider_call": True,
+                "redispatch_required": metadata.get("redispatch_required") is True,
+                "terminal_outcome": "incomplete",
+                "fallback_result": metadata.get("fallback_result") or "none",
+                "attempt_count": metadata.get("attempt_count"),
+                "correlation_id": (
+                    metadata.get("litellm_call_id")
+                    or metadata.get("request_id")
+                    or metadata.get("trace_id")
+                    or failure_context.get("litellm_call_id")
+                    or failure_context.get("request_id")
+                    or failure_context.get("trace_id")
+                ),
+            },
+            marker=metadata,
         )
         try:
             await litellm_logging_obj.async_failure_handler(
@@ -2386,6 +2462,7 @@ class PassThroughStreamingHandler:
                 failure_phase=failure_phase,
                 message=message,
                 attempted_provider_call=True,
+                terminal_marker=metadata,
             )
         except HTTPException as redispatch_exc:
             detail = redispatch_exc.detail
@@ -3003,6 +3080,64 @@ class PassThroughStreamingHandler:
             "model": request_body.get("model") if isinstance(request_body, dict) else None,
         }
         metadata.update(failure_context)
+        route_context = metadata.get("aawm_route_rollup_context")
+        if not isinstance(route_context, dict):
+            route_context = {}
+        redispatch_required = metadata.get("redispatch_required") is True
+        error_code = None
+        if isinstance(error_payload, dict):
+            error_code = error_payload.get("code") or error_payload.get("type")
+        _emit_aawm_terminal_error(
+            {
+                "event_type": terminal_event_type or "response.failed",
+                "endpoint": (
+                    metadata.get("endpoint")
+                    or route_context.get("incoming_endpoint")
+                ),
+                "alias_family": (
+                    metadata.get("alias_family")
+                    or metadata.get("model_family")
+                    or metadata.get("route_family")
+                    or "responses"
+                ),
+                "alias_model": (
+                    metadata.get("model_alias")
+                    or metadata.get("model_alias_label")
+                    or metadata.get("requested_model_alias")
+                    or request_body.get("model")
+                ),
+                "selected_provider": (
+                    metadata.get("codex_auto_agent_selected_provider")
+                    or metadata.get("provider")
+                ),
+                "selected_model": (
+                    metadata.get("codex_auto_agent_selected_model")
+                    or failure_context.get("model")
+                ),
+                "selected_route": (
+                    metadata.get("codex_auto_agent_selected_route_family")
+                    or metadata.get("route_family")
+                    or route_context.get("outgoing_target")
+                ),
+                "status_code": metadata.get("status_code"),
+                "error_code": error_code or classification,
+                "failure_class": error_class,
+                "failure_phase": failure_context["stream_failure_stage"],
+                "attempted_provider_call": True,
+                "redispatch_required": redispatch_required,
+                "terminal_outcome": (
+                    "redispatch_required" if redispatch_required else "failed"
+                ),
+                "fallback_result": metadata.get("fallback_result") or "none",
+                "attempt_count": metadata.get("attempt_count"),
+                "correlation_id": (
+                    metadata.get("litellm_call_id")
+                    or metadata.get("request_id")
+                    or metadata.get("trace_id")
+                ),
+            },
+            marker=metadata,
+        )
         PassThroughStreamingHandler._sync_logging_obj_model_call_details_from_kwargs(
             litellm_logging_obj,
             kwargs,

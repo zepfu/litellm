@@ -417,7 +417,10 @@ def _build_auto_agent_alias_audit_events(
             continue
         status = str(attempt.get("status") or "").strip()
         failure_class = attempt.get("error_class")
-        redispatch_required = status == "terminal_in_flight_cooldown_set"
+        redispatch_required = status in {
+            "terminal_in_flight_cooldown_set",
+            "terminal_in_flight_token_invalidated",
+        }
         if redispatch_required:
             event_type = "redispatch_required"
         elif failure_class or status == "cooldown_set":

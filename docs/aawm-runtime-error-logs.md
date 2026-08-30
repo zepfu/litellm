@@ -700,6 +700,29 @@ Each terminal-agent row is one append-only JSON object. Top-level fields include
   - `agent_session_killed` — whether this outcome terminated the agent session
 - `context` — bounded nested metadata used for triage
 
+### Default terminal `ERROR` contract
+
+Every structured terminal-agent response emits one sanitized default `ERROR`
+line prefixed `AAWM_TERMINAL_ERROR`, independent of
+`AAWM_ALIAS_ROUTE_VERBOSE_JSON` and `AAWM_ALIAS_ROUTE_LOG_HEALTHY`. Its bounded
+diagnostics are limited to endpoint and alias labels, selected
+provider/model/route, event and failure classification, status and attempt
+counts, terminal/fallback state, attempted-provider and redispatch booleans,
+and a hashed correlation identifier.
+
+Nested and wrapped paths share the `aawm_terminal_error_emitted` marker. The
+first successful emission sets the marker and later attempts are suppressed,
+so one structured terminal response produces one default line. This operator
+line is separate from durable alias-audit and `session_history` persistence;
+those persistence paths remain unchanged.
+
+The fields come from an explicit allowlist, with secret redaction and bounded
+text lengths. Credentials, OAuth/API keys, authorization headers, raw request
+or response bodies, prompts, tool arguments or results, provider error text,
+and encrypted continuation or reasoning content are excluded. Correlation,
+session, request, and trace identifiers are not emitted raw; the default
+`ERROR` line uses `sha256:<16 hex>` instead.
+
 Useful `context` identity and attempt fields (when available):
 
 - route/provider: `source`, `container`, `endpoint` /
