@@ -2676,11 +2676,13 @@ def _direct_request(
 
 def _patch_direct_inventory_auth(
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    inventory: CodexOAuthInventory | None = None,
 ) -> list[str]:
     loaded: list[str] = []
 
     def _fake_inventory() -> CodexOAuthInventory:
-        return _inventory()
+        return inventory if inventory is not None else _inventory()
 
     async def _fake_load_headers(
         request: Request,
@@ -2980,6 +2982,230 @@ async def test_direct_responses_respects_session_owner_account_pin(
     assert selected_auth.account_hash == "hash-account-2"
     assert set(loaded) == {"account2"}
     assert selection.get("selection_reason") == "session_owner_pin"
+
+
+@pytest.mark.asyncio
+async def test_direct_responses_respects_interchangeable_session_owner_for_previous_response_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = _patch_direct_inventory_auth(
+        monkeypatch,
+        inventory=_interchangeable_inventory(),
+    )
+    request = _direct_request()
+    body = {
+        "model": "gpt-5.3-codex",
+        "input": "continue",
+        "previous_response_id": "resp_account1",
+    }
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+
+    async def _owned(**_kwargs):
+        return (_owned_interchangeable_record("account1"), "cache-key", None)
+
+    monkeypatch.setattr(
+        sa,
+        "resolve_canonical_session_identity",
+        lambda *a, **k: "sess-direct-owner",
+    )
+    monkeypatch.setattr(sa, "get_session_owner_record", _owned)
+    now = datetime.now(timezone.utc)
+    alias_routing_state.reset_for_tests()
+    alias_routing_state.record_normalized_quota_observations(
+        [
+            *_record_account_windows(
+                account_hash="hash-account-1",
+                observed_at=now,
+                five_hour_remaining=10.0,
+                weekly_remaining=10.0,
+            ),
+            *_record_account_windows(
+                account_hash="hash-account-2",
+                observed_at=now,
+                five_hour_remaining=90.0,
+                weekly_remaining=90.0,
+            ),
+        ]
+    )
+    try:
+        selected_auth, selection, _metadata_body = (
+            await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+                request,
+                request_body=body,
+            )
+        )
+    finally:
+        alias_routing_state.reset_for_tests()
+
+    assert selected_auth.account_label == "account1"
+    assert selection["candidate"]["codex_oauth_account_label"] == "account1"
+    assert selection["quota_remaining_pct"] == 10.0
+    assert selection["selection_reason"] == "session_owner_pin"
+    assert selection["request_mode"] == "ordinary_continuation"
+    assert set(loaded) == {"account1"}
+
+
+@pytest.mark.asyncio
+async def test_direct_responses_respects_interchangeable_request_metadata_account_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = _patch_direct_inventory_auth(
+        monkeypatch,
+        inventory=_interchangeable_inventory(),
+    )
+    request = _direct_request()
+    body = {
+        "model": "gpt-5.3-codex",
+        "input": "continue",
+        "litellm_metadata": {
+            "codex_oauth_account_label": "account1",
+            "codex_oauth_account_hash": "hash-account-1",
+            "codex_oauth_lane_key": "codex-oauth:account1:hash-account-1",
+        },
+    }
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+
+    monkeypatch.setattr(
+        sa,
+        "resolve_canonical_session_identity",
+        lambda *a, **k: None,
+    )
+    now = datetime.now(timezone.utc)
+    alias_routing_state.reset_for_tests()
+    alias_routing_state.record_normalized_quota_observations(
+        [
+            *_record_account_windows(
+                account_hash="hash-account-1",
+                observed_at=now,
+                five_hour_remaining=10.0,
+                weekly_remaining=10.0,
+            ),
+            *_record_account_windows(
+                account_hash="hash-account-2",
+                observed_at=now,
+                five_hour_remaining=90.0,
+                weekly_remaining=90.0,
+            ),
+        ]
+    )
+    try:
+        selected_auth, selection, metadata_body = (
+            await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+                request,
+                request_body=body,
+            )
+        )
+    finally:
+        alias_routing_state.reset_for_tests()
+
+    assert selected_auth.account_label == "account1"
+    assert selection["candidate"]["codex_oauth_account_label"] == "account1"
+    assert selection["quota_remaining_pct"] == 10.0
+    assert selection["selection_reason"] == "request_metadata_pin"
+    assert selection["request_mode"] == "ordinary_continuation"
+    assert set(loaded) == {"account1"}
+    meta = metadata_body.get("litellm_metadata") or {}
+    assert meta["codex_auto_agent_selection_reason"] == "request_metadata_pin"
+
+
+@pytest.mark.asyncio
+async def test_direct_responses_fails_closed_when_interchangeable_session_owner_is_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loaded = _patch_direct_inventory_auth(
+        monkeypatch,
+        inventory=_interchangeable_inventory(),
+    )
+    request = _direct_request()
+    body = {
+        "model": "gpt-5.3-codex",
+        "input": "continue",
+        "previous_response_id": "resp_account1",
+    }
+
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        session_affinity as sa,
+    )
+
+    async def _owned(**_kwargs):
+        return (_owned_interchangeable_record("account1"), "cache-key", None)
+
+    monkeypatch.setattr(
+        sa,
+        "resolve_canonical_session_identity",
+        lambda *a, **k: "sess-direct-owner",
+    )
+    monkeypatch.setattr(sa, "get_session_owner_record", _owned)
+    now = datetime.now(timezone.utc)
+    alias_routing_state.reset_for_tests()
+    alias_routing_state.record_normalized_quota_observations(
+        [
+            *_record_account_windows(
+                account_hash="hash-account-1",
+                observed_at=now,
+                five_hour_remaining=0.0,
+                weekly_remaining=10.0,
+            ),
+            *_record_account_windows(
+                account_hash="hash-account-2",
+                observed_at=now,
+                five_hour_remaining=90.0,
+                weekly_remaining=90.0,
+            ),
+        ]
+    )
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+                request,
+                request_body=body,
+            )
+    finally:
+        alias_routing_state.reset_for_tests()
+
+    assert exc_info.value.status_code == 429
+    detail = exc_info.value.detail
+    assert detail["error"]["code"] == (
+        "aawm_codex_oauth_direct_inventory_unavailable"
+    )
+    assert detail["error"]["message"] == (
+        "The required pinned Codex OAuth owner account is currently exhausted "
+        "or unavailable for direct Responses traffic. Alternate accounts were "
+        "intentionally not considered because this continuation is owner-bound "
+        "and non-portable."
+    )
+    assert detail["attempted_provider_call"] is False
+    assert detail["selection_reason"] == "session_owner_pin"
+    assert detail["alternate_accounts_considered"] is False
+    assert detail["continuation_portable"] is False
+    assert detail["account"] == {
+        "account_label": "account1",
+        "account_hash": "hash-account-1",
+        "account_lane": "codex-oauth:account1:hash-account-1",
+    }
+    assert detail["terminal_reset"]["reason"] == (
+        "codex_oauth_quota_exhausted"
+    )
+    assert detail["terminal_reset"]["accounts"][0]["account_label"] == (
+        "account1"
+    )
+    assert detail["terminal_reset"]["accounts"][0]["exhausted_windows"][0][
+        "reset_at"
+    ]
+    assert len(detail["skipped_candidates"]) == 1
+    skipped_owner = detail["skipped_candidates"][0]
+    assert skipped_owner["account_label"] == "account1"
+    assert skipped_owner["reason"] == "quota_exhausted"
+    assert skipped_owner["cooldown_state_source"] == (
+        "normalized_quota_observation"
+    )
+    assert set(loaded) == {"account1"}
 
 
 @pytest.mark.asyncio
