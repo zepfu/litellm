@@ -85,7 +85,7 @@ def test_provider_status_has_writable_cursor_directory_and_exact_auth_env() -> N
     assert "AAWM_CURSOR_AGENT_USAGE_POLL_ENABLED=${AAWM_CURSOR_AGENT_USAGE_POLL_ENABLED:-0}" in sidecar
     assert (
         "AAWM_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS="
-        "${AAWM_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS:-3600}" in sidecar
+        "${AAWM_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS:-600}" in sidecar
     )
 
 

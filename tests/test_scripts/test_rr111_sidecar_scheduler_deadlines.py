@@ -26,7 +26,7 @@ def _scheduler_config(**overrides):
         "grok_oidc_refresh_enabled": True,
         "grok_oidc_auth_file": "/tmp/rr111-grok-oidc-auth.json",
         "alibaba_quota_poll_enabled": True,
-        "alibaba_quota_poll_interval_seconds": 300.0,
+        "alibaba_quota_poll_interval_seconds": 600.0,
     }
     kwargs.update(overrides)
     return loop.ProviderStatusLoopConfig(**kwargs)

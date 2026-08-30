@@ -109,7 +109,7 @@ def test_cursor_agent_usage_poll_is_disabled_by_default(loop, monkeypatch) -> No
     config = loop.parse_config([])
 
     assert config.cursor_agent_usage_poll_enabled is False
-    assert config.cursor_agent_usage_poll_interval_seconds == 3600.0
+    assert config.cursor_agent_usage_poll_interval_seconds == 600.0
     assert config.cursor_agent_usage_poll_http_timeout_seconds == 30.0
     assert config.cursor_agent_usage_dashboard_url == "https://api2.cursor.sh"
     assert loop.run_due_sidecar_tasks(config, loop.SidecarTaskState(), now_monotonic=1.0) == []
@@ -332,12 +332,14 @@ def test_cursor_agent_usage_poll_respects_interval(loop, tmp_path, monkeypatch) 
         "_fetch_cursor_agent_usage_payload",
         lambda _config: {"status_code": 200, "payload": _camelcase_usage_payload()},
     )
-    config = _config(loop, tmp_path, cursor_agent_usage_poll_interval_seconds=3600.0)
+    config = _config(loop, tmp_path, cursor_agent_usage_poll_interval_seconds=600.0)
     state = loop.SidecarTaskState()
-    first = loop._run_cursor_agent_usage_poll_task(config, state, now_monotonic=1.0)
-    second = loop._run_cursor_agent_usage_poll_task(config, state, now_monotonic=10.0)
+    first = loop._run_cursor_agent_usage_poll_task(config, state, now_monotonic=0.0)
+    second = loop._run_cursor_agent_usage_poll_task(config, state, now_monotonic=599.0)
+    third = loop._run_cursor_agent_usage_poll_task(config, state, now_monotonic=600.0)
     assert first["observation_count"] == 1
     assert second is None
+    assert third["observation_count"] == 1
 
 
 def _make_cursor_jwt(claims: dict, *, signature: str = "sig-a") -> str:

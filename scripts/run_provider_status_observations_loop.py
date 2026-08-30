@@ -183,11 +183,11 @@ DEFAULT_CURSOR_AGENT_AUTH_HTTP_TIMEOUT_SECONDS = (
 DEFAULT_PROVIDER_AUTH_HEALTH_POLL_ENABLED = False
 DEFAULT_PROVIDER_AUTH_HEALTH_POLL_INTERVAL_SECONDS = 3600.0
 DEFAULT_KIMI_USAGE_POLL_ENABLED = False
-DEFAULT_KIMI_USAGE_POLL_INTERVAL_SECONDS = 3600.0
+DEFAULT_KIMI_USAGE_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_KIMI_USAGE_URL = _kimi_resolve_endpoint_url(None, "usages")
 DEFAULT_ZAI_CODING_PLAN_QUOTA_POLL_ENABLED = False
-DEFAULT_ZAI_CODING_PLAN_QUOTA_POLL_INTERVAL_SECONDS = 3600.0
+DEFAULT_ZAI_CODING_PLAN_QUOTA_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_ZAI_CODING_PLAN_QUOTA_POLL_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_ZAI_CODING_PLAN_QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
 DEFAULT_ZAI_CODING_PLAN_SUBSCRIPTION_URL = "https://api.z.ai/api/biz/subscription/list"
@@ -306,7 +306,7 @@ KIMI_USAGE_START_FIELDS = (
     "periodstart",
 )
 DEFAULT_ALIBABA_QUOTA_POLL_ENABLED = False
-DEFAULT_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS = 300.0
+DEFAULT_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_ALIBABA_SUBSCRIPTION_POLL_INTERVAL_SECONDS = 21_600.0
 DEFAULT_ALIBABA_QUOTA_POLL_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_ALIBABA_QUOTA_GATEWAY_URL = (
@@ -353,11 +353,11 @@ ALIBABA_TOKEN_PLAN_RESET_CARD_PARSER_VERSION = "alibaba_token_plan_reset_card_v1
 ALIBABA_QUOTA_RETRYABLE_HTTP_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
 ALIBABA_QUOTA_POLL_SLEEP_FN: Callable[[float], None] = time.sleep
 DEFAULT_CURSOR_AGENT_USAGE_POLL_ENABLED = False
-DEFAULT_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS = 3600.0
+DEFAULT_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_CURSOR_AGENT_USAGE_DASHBOARD_URL = CURSOR_AGENT_DASHBOARD_HOST
 DEFAULT_GROK_BILLING_POLL_ENABLED = False
-DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS = 3600.0
+DEFAULT_GROK_BILLING_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_GROK_BILLING_URL = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 DEFAULT_GROK_BILLING_CLIENT_IDENTIFIER = "grok-cli"
@@ -371,7 +371,7 @@ GROK_BILLING_POLL_BACKOFF_SECONDS = DEFAULT_GROK_BILLING_POLL_RETRY_BACKOFF_SECO
 _GROK_BILLING_POLL_ATTEMPTS = GROK_BILLING_POLL_ATTEMPTS
 _GROK_BILLING_POLL_BACKOFF_SECONDS = GROK_BILLING_POLL_BACKOFF_SECONDS
 DEFAULT_XAI_RESET_POLL_ENABLED = False
-DEFAULT_XAI_RESET_POLL_INTERVAL_SECONDS = 3600.0
+DEFAULT_XAI_RESET_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_XAI_RESET_POLL_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_XAI_RESET_POLL_URL = (
     "https://grok.com/prod_mc_billing.ConsumerUiSvc/GetRemainingResets"
@@ -395,7 +395,7 @@ GROK_BILLING_WEEKLY_CREDITS_QUOTA_KEY = "xai_grok_build_weekly_credits:credits"
 GROK_BILLING_MONTHLY_REQUESTS_QUOTA_KEY = "xai_grok_build_monthly_requests:requests"
 GROK_BILLING_MONTHLY_CREDITS_QUOTA_KEY = "xai_grok_build_monthly_credits:credits"
 DEFAULT_CODEX_RESET_CREDIT_POLL_ENABLED = False
-DEFAULT_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS = 3600.0
+DEFAULT_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS = 600.0
 DEFAULT_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_CODEX_USAGE_URL = (
     "https://chatgpt.com/backend-api/wham/usage"
@@ -2601,7 +2601,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         ),
         help=(
             "Minimum seconds between Kimi Code usage poll attempts. Defaults to "
-            "AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS or 3600."
+            "AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS or 600."
         ),
     )
     parser.add_argument(
@@ -2644,7 +2644,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         ),
         help=(
             "Minimum seconds between Z.AI Coding Plan quota poll attempts. "
-            "Defaults to AAWM_ZAI_CODING_PLAN_QUOTA_POLL_INTERVAL_SECONDS or 3600."
+            "Defaults to AAWM_ZAI_CODING_PLAN_QUOTA_POLL_INTERVAL_SECONDS or 600."
         ),
     )
     parser.add_argument(
@@ -2711,7 +2711,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         help=(
             "Minimum seconds between Alibaba usage and reset-card inventory "
             "polls. Defaults to "
-            "AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS or 300."
+            "AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS or 600."
         ),
     )
     parser.add_argument(
@@ -2778,7 +2778,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             DEFAULT_GROK_BILLING_POLL_ENABLED,
         ),
         help=(
-            "Run the hourly Grok billing poll from this sidecar loop. "
+            "Run the ten-minute (600-second) Grok billing poll from this sidecar loop. "
             "Defaults to AAWM_GROK_BILLING_POLL_ENABLED or false."
         ),
     )
@@ -2786,7 +2786,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         "--no-grok-billing-poll",
         dest="grok_billing_poll_enabled",
         action="store_false",
-        help="Disable the hourly Grok billing poll task.",
+        help="Disable the ten-minute Grok billing poll task.",
     )
     parser.add_argument(
         "--grok-billing-poll-interval-seconds",
@@ -2797,7 +2797,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         ),
         help=(
             "Minimum seconds between Grok billing poll attempts. Defaults to "
-            "AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS or 3600."
+            "AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS or 600."
         ),
     )
     parser.add_argument(
@@ -2955,7 +2955,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         ),
         help=(
             "Minimum seconds between Grok GetRemainingResets poll attempts. "
-            "Defaults to AAWM_XAI_RESET_POLL_INTERVAL_SECONDS or 3600."
+            "Defaults to AAWM_XAI_RESET_POLL_INTERVAL_SECONDS or 600."
         ),
     )
     parser.add_argument(
@@ -3022,7 +3022,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         ),
         help=(
             "Minimum seconds between Cursor Agent usage poll attempts. "
-            "Defaults to AAWM_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS or 3600."
+            "Defaults to AAWM_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS or 600."
         ),
     )
     parser.add_argument(
@@ -3060,7 +3060,8 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
             DEFAULT_CODEX_RESET_CREDIT_POLL_ENABLED,
         ),
         help=(
-            "Run the hourly Codex reset-credit poll from this sidecar loop. "
+            "Run the ten-minute (600-second) Codex reset-credit poll from this "
+            "sidecar loop. "
             "Defaults to AAWM_CODEX_RESET_CREDIT_POLL_ENABLED or false."
         ),
     )
@@ -3068,7 +3069,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         "--no-codex-reset-credit-poll",
         dest="codex_reset_credit_poll_enabled",
         action="store_false",
-        help="Disable the hourly Codex reset-credit poll task.",
+        help="Disable the ten-minute Codex reset-credit poll task.",
     )
     parser.add_argument(
         "--codex-reset-credit-poll-interval-seconds",
@@ -3079,7 +3080,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         ),
         help=(
             "Minimum seconds between Codex reset-credit poll attempts. Defaults "
-            "to AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS or 3600."
+            "to AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS or 600."
         ),
     )
     parser.add_argument(
@@ -7652,7 +7653,7 @@ def _zai_coding_plan_remaining_pct(
     return max(0.0, min(100.0, remaining_pct))
 
 
-def _build_zai_coding_plan_quota_rate_limit_payloads(
+def _build_zai_coding_plan_quota_rate_limit_payloads(  # noqa: PLR0915
     config: ProviderStatusLoopConfig,
     *,
     observed_at: datetime,

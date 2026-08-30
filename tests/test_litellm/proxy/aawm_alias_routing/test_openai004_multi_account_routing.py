@@ -3885,20 +3885,20 @@ async def test_dual_quota_balance_accepts_observations_past_30_seconds_until_cad
     _patch_selector_runtime(monkeypatch)
     monkeypatch.setenv(
         "AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS",
-        "3600",
+        "600",
     )
     now = datetime.now(timezone.utc)
     alias_routing_state.record_normalized_quota_observations(
         [
             *_record_account_windows(
                 account_hash="hash-account-1",
-                observed_at=now - timedelta(seconds=3599),
+                observed_at=now - timedelta(seconds=599),
                 five_hour_remaining=80.0,
                 weekly_remaining=10.0,
             ),
             *_record_account_windows(
                 account_hash="hash-account-2",
-                observed_at=now - timedelta(seconds=3599),
+                observed_at=now - timedelta(seconds=599),
                 five_hour_remaining=80.0,
                 weekly_remaining=90.0,
             ),

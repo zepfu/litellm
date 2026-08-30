@@ -321,7 +321,8 @@ authority.
 ## Grok banked usage-limit resets (XAI-005 / XAI-006 / XAI-007)
 
 The sidecar can poll grok.com `GetRemainingResets` for banked usage-limit reset
-tokens. This is independent of the hourly Grok CLI billing poll. Auth reuses
+tokens. This is independent of the ten-minute (600-second) Grok CLI billing
+poll. Auth reuses
 the existing Grok OIDC file (`AAWM_GROK_OIDC_AUTH_FILE`); there is no separate
 cookie file, `AAWM_GROK_WEB_AUTH_*` variable, or grok-web cookie mount.
 
@@ -358,7 +359,7 @@ inventory synthesizes used/expired for previously available rows.
 Relevant environment variables:
 
 - `AAWM_XAI_RESET_POLL_ENABLED`: defaults to disabled (`0` / `false`).
-- `AAWM_XAI_RESET_POLL_INTERVAL_SECONDS`: defaults to `3600`.
+- `AAWM_XAI_RESET_POLL_INTERVAL_SECONDS`: defaults to `600`.
 - `AAWM_XAI_RESET_POLL_HTTP_TIMEOUT_SECONDS`: defaults to `30`.
 - `AAWM_XAI_RESET_POLL_URL`: defaults to the grok.com `GetRemainingResets`
   endpoint. Attempts/backoff match Grok billing (`3` / `0.5s`).
@@ -530,9 +531,10 @@ id tokens, or raw credential payloads.
 
 ## Grok Billing Poll Task
 
-The same sidecar can also run an explicit hourly Grok billing poll. This is
-telemetry-only and separate from the five-minute provider front-door probes and
-the Grok OIDC refresh task. The poll reads the current OIDC credential from
+The same sidecar can also run an explicit ten-minute (600-second) Grok billing
+poll. This is telemetry-only and separate from the five-minute provider
+front-door probes and the Grok OIDC refresh task. The poll reads the current
+OIDC credential from
 `AAWM_GROK_OIDC_AUTH_FILE`, derives the Grok account identity headers from the
 scoped credential record, and calls
 `https://cli-chat-proxy.grok.com/v1/billing?format=credits` with Grok CLI-style
@@ -637,14 +639,15 @@ credential and accepted capability remain required.
 The provider-status sidecar enables this poll with the existing Kimi Code
 credential already mounted for OAuth maintenance. It sends an authenticated
 `GET https://api.kimi.com/coding/v1/usages`; it does not create, copy, or
-reauthorize a credential. The scheduled quota cadence is hourly and is
-independent of the five-minute provider-status and Kimi OAuth-maintenance loop.
+reauthorize a credential. The scheduled quota cadence is ten minutes (600
+seconds) and is independent of the five-minute provider-status and Kimi
+OAuth-maintenance loop.
 
 Relevant Kimi usage environment variables:
 
 - `AAWM_KIMI_USAGE_POLL_ENABLED`: enables the scheduled native usage poll.
 - `AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS`: minimum seconds between usage poll
-  attempts; the managed sidecar default is `3600`.
+  attempts; the managed sidecar default is `600`.
 - `AAWM_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS`: native usage endpoint timeout;
   the managed sidecar default is `30`.
 
@@ -678,7 +681,7 @@ Relevant environment variables:
 - `AAWM_ZAI_CODING_PLAN_QUOTA_POLL_ENABLED`: enables the scheduled poll.
   Defaults to disabled (`0`).
 - `AAWM_ZAI_CODING_PLAN_QUOTA_POLL_INTERVAL_SECONDS`: minimum seconds between
-  attempts; default `3600`.
+  attempts; default `600`.
 - `AAWM_ZAI_CODING_PLAN_QUOTA_POLL_HTTP_TIMEOUT_SECONDS`: quota HTTP timeout;
   default `30`.
 - Credential order is `ZAI_KEY` then `ZAI_CODING_PLAN_API_KEY`. Ordinary
@@ -720,7 +723,7 @@ Relevant environment variables:
 - `AAWM_CURSOR_AGENT_USAGE_POLL_ENABLED`: enables the scheduled poll.
   Defaults to disabled so the sidecar does not send live dashboard traffic.
 - `AAWM_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS`: minimum seconds between
-  attempts; default `3600`.
+  attempts; default `600`.
 - `AAWM_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS`: dashboard RPC
   timeout; default `30`.
 - `AAWM_CURSOR_AGENT_USAGE_DASHBOARD_URL`: Dashboard host override;
@@ -840,7 +843,7 @@ Relevant environment variables:
   in-memory credential fingerprint; never logged or persisted.
 - `AAWM_ALIBABA_QUOTA_POLL_ENABLED`: enables the scheduled poll.
 - `AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS`: minimum seconds between usage
-  polls; the managed sidecar default is `300`.
+  polls; the managed sidecar default is `600`.
 - `AAWM_ALIBABA_SUBSCRIPTION_POLL_INTERVAL_SECONDS`: minimum seconds between
   subscription refreshes; the managed sidecar default is `21600`.
 - `AAWM_ALIBABA_QUOTA_POLL_HTTP_TIMEOUT_SECONDS`: request timeout; the managed
@@ -926,7 +929,7 @@ Relevant environment variables:
 
 - `AAWM_GROK_BILLING_POLL_ENABLED`: enables the scheduled billing poll.
 - `AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS`: minimum seconds between billing
-  poll attempts.
+  poll attempts; the managed sidecar default is `600`.
 - `AAWM_GROK_BILLING_POLL_HTTP_TIMEOUT_SECONDS`: billing endpoint timeout.
 - `AAWM_GROK_BILLING_URL`: billing endpoint URL.
 - `AAWM_GROK_BILLING_CLIENT_VERSION`: explicit billing-only client-version
@@ -1017,8 +1020,8 @@ parity.
 
 ## Codex Reset-Credit Poll Task
 
-The same sidecar can run an explicit hourly Codex reset-credit and live-usage
-poll. This is telemetry-only and separate from the five-minute provider
+The same sidecar can run an explicit ten-minute (600-second) Codex reset-credit
+and live-usage poll. This is telemetry-only and separate from the five-minute provider
 front-door probes, Codex OAuth refresh, and Grok billing poll. Every due run
 independently reads every enabled `LITELLM_CODEX_OAUTH_INVENTORY` record, calls
 the native ChatGPT reset-credit **detail** endpoint (default
@@ -1062,7 +1065,7 @@ Relevant environment variables:
 
 - `AAWM_CODEX_RESET_CREDIT_POLL_ENABLED`: enables the scheduled poll.
 - `AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS`: minimum seconds between poll
-  attempts (default `3600`).
+  attempts (default `600`).
 - `AAWM_CODEX_RESET_CREDIT_POLL_HTTP_TIMEOUT_SECONDS`: HTTP timeout.
 - `AAWM_CODEX_USAGE_URL`: live usage poll URL (defaults to `/wham/usage`).
 - `AAWM_CODEX_RESET_CREDIT_POLL_MAX_ATTEMPTS`: max attempts per scheduled run.
@@ -1137,7 +1140,8 @@ Nous Portal OAuth remain separate credential families and tasks.
 
 The same sidecar can also run a scheduled session-history and rate-limit
 telemetry anomaly scan. This is separate from the five-minute provider
-front-door probes and the hourly credential or billing tasks. When enabled, the
+front-door probes, credential refresh tasks, and ten-minute allowance/billing
+tasks. When enabled, the
 scan reads recent `public.session_history` and `public.rate_limit_observations`
 rows and looks for persistence or mapping inconsistencies such as missing
 provider/model fields, alias metadata that was not promoted, token or tool
@@ -1196,8 +1200,8 @@ Relevant environment variables:
   rewriting the shared active file. `LITELLM_AAWM_ERROR_LOG_BACKUP_COUNT` is not
   used by this writer (backup-count `0` must never delete unresolved intake here).
 
-In managed dev compose the task is enabled by default on the same hourly cadence
-as the other scheduled sidecar tasks. The scan uses the sidecar environment name
+In managed dev compose the task is enabled by default with its independent
+one-hour cadence. The scan uses the sidecar environment name
 (`AAWM_LITELLM_ENVIRONMENT`) for the output filename, so a `dev` sidecar writes
 `/app/.analysis/dev-error.jsonl` inside the container and `.analysis/dev-error.jsonl`
 in this repo when `.analysis` is mounted.

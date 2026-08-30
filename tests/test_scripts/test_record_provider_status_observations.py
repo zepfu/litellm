@@ -442,7 +442,7 @@ def _grok_billing_poll_config(**overrides):
         grok_oidc_refresh_enabled=False,
         grok_oidc_auth_file="/home/zepfu/.grok/auth.json",
         grok_billing_poll_enabled=True,
-        grok_billing_poll_interval_seconds=3600.0,
+        grok_billing_poll_interval_seconds=600.0,
         grok_billing_poll_http_timeout_seconds=30.0,
         grok_billing_url="https://cli-chat-proxy.grok.com/v1/billing?format=credits",
         grok_billing_client_version="0.2.55",
@@ -535,7 +535,7 @@ def _alibaba_quota_poll_config(**overrides):
         db_lock_timeout_ms=1000,
         db_statement_timeout_ms=5000,
         alibaba_quota_poll_enabled=True,
-        alibaba_quota_poll_interval_seconds=300.0,
+        alibaba_quota_poll_interval_seconds=600.0,
         alibaba_subscription_poll_interval_seconds=21600.0,
         alibaba_quota_poll_http_timeout_seconds=30.0,
         alibaba_quota_gateway_url=loop.DEFAULT_ALIBABA_QUOTA_GATEWAY_URL,
@@ -1361,7 +1361,7 @@ def test_loop_config_defaults_match_container_schedule(monkeypatch) -> None:
     assert config.codex_quota_dsn is None
     assert config.require_pgbouncer is False
     assert config.grok_billing_poll_enabled is False
-    assert config.grok_billing_poll_interval_seconds == 3600.0
+    assert config.grok_billing_poll_interval_seconds == 600.0
     assert config.grok_billing_poll_http_timeout_seconds == 30.0
     assert (
         config.grok_billing_url
@@ -1506,7 +1506,7 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         assert expected_codex_setting in compose_text
     for expected_kimi_usage_setting in (
         "AAWM_KIMI_USAGE_POLL_ENABLED=${AAWM_KIMI_USAGE_POLL_ENABLED:-1}",
-        "AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS=${AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS:-3600}",
+        "AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS=${AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS:-600}",
         "AAWM_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS=${AAWM_KIMI_USAGE_POLL_HTTP_TIMEOUT_SECONDS:-30}",
     ):
         assert expected_kimi_usage_setting in compose_text
@@ -1516,13 +1516,13 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
     )
     for expected_cursor_usage_setting in (
         "AAWM_CURSOR_AGENT_USAGE_POLL_ENABLED=${AAWM_CURSOR_AGENT_USAGE_POLL_ENABLED:-0}",
-        "AAWM_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS=${AAWM_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS:-3600}",
+        "AAWM_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS=${AAWM_CURSOR_AGENT_USAGE_POLL_INTERVAL_SECONDS:-600}",
         "AAWM_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS=${AAWM_CURSOR_AGENT_USAGE_POLL_HTTP_TIMEOUT_SECONDS:-30}",
         "AAWM_CURSOR_AGENT_USAGE_DASHBOARD_URL=${AAWM_CURSOR_AGENT_USAGE_DASHBOARD_URL:-https://api2.cursor.sh}",
     ):
         assert expected_cursor_usage_setting in compose_text
     assert (
-        "AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS=${AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS:-3600}"
+        "AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS=${AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS:-600}"
         in compose_text
     )
     assert (
@@ -4091,7 +4091,7 @@ def test_alibaba_mint_permission_denied_is_auth_and_keeps_last_good(
         loop.run_due_sidecar_tasks(
             _alibaba_quota_poll_config(),
             state,
-            now_monotonic=400.0,
+            now_monotonic=700.0,
         )
     )
 
@@ -4508,8 +4508,8 @@ def test_run_due_sidecar_tasks_schedules_alibaba_quota_inventory(
 
     state = loop.SidecarTaskState()
     first = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
-    throttled = loop.run_due_sidecar_tasks(config, state, now_monotonic=200.0)
-    usage_only = loop.run_due_sidecar_tasks(config, state, now_monotonic=401.0)
+    throttled = loop.run_due_sidecar_tasks(config, state, now_monotonic=699.0)
+    usage_only = loop.run_due_sidecar_tasks(config, state, now_monotonic=700.0)
     refreshed = loop.run_due_sidecar_tasks(config, state, now_monotonic=21701.0)
 
     assert calls == [
@@ -4589,7 +4589,7 @@ def test_run_due_sidecar_tasks_reuses_cached_alibaba_bearer_across_polls(
     )
     state = loop.SidecarTaskState()
     first = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
-    second = loop.run_due_sidecar_tasks(config, state, now_monotonic=401.0)
+    second = loop.run_due_sidecar_tasks(config, state, now_monotonic=701.0)
     apis = [
         parse_qs(urlsplit(request.full_url).query)["api"][0]
         for request in gateway_calls
@@ -4652,7 +4652,7 @@ def test_run_due_sidecar_tasks_resets_cached_token_when_ram_fingerprint_changes(
     state = loop.SidecarTaskState()
     first = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
     monkeypatch.setenv("ALIBABA_RAM_KEY", "fake-rotated-ram-key-id")
-    second = loop.run_due_sidecar_tasks(config, state, now_monotonic=401.0)
+    second = loop.run_due_sidecar_tasks(config, state, now_monotonic=701.0)
 
     assert calls[:3] == ["Bearer first-bearer-secret"] * 3
     assert calls[3:] == ["Bearer second-bearer-secret"] * 3
@@ -4899,7 +4899,7 @@ def test_compose_wires_alibaba_quota_poll_defaults() -> None:
         "https://bailian-singapore-cs.alibabacloud.com/cli/api.json}"
         in sidecar
     )
-    assert "AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS=${AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS:-300}" in sidecar
+    assert "AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS=${AAWM_ALIBABA_QUOTA_POLL_INTERVAL_SECONDS:-600}" in sidecar
     assert (
         "AAWM_ALIBABA_SUBSCRIPTION_POLL_INTERVAL_SECONDS=${AAWM_ALIBABA_SUBSCRIPTION_POLL_INTERVAL_SECONDS:-21600}"
         in sidecar
@@ -4995,8 +4995,8 @@ def test_run_due_sidecar_tasks_throttles_grok_billing_poll(monkeypatch) -> None:
 
     state = loop.SidecarTaskState()
     first_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
-    second_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=200.0)
-    third_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=3701.0)
+    second_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=699.0)
+    third_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=700.0)
 
     assert calls == {"fetch": 2, "persist": 0}
     assert first_events[0]["event"] == "grok_billing_poll"
@@ -5007,6 +5007,54 @@ def test_run_due_sidecar_tasks_throttles_grok_billing_poll(monkeypatch) -> None:
     assert second_events == []
     assert third_events[0]["event"] == "grok_billing_poll"
 
+
+
+def test_run_due_sidecar_tasks_throttles_zai_coding_plan_quota_poll(monkeypatch) -> None:
+    config = _grok_billing_poll_config(
+        grok_billing_poll_enabled=False,
+        zai_coding_plan_quota_poll_enabled=True,
+        zai_coding_plan_quota_poll_interval_seconds=600.0,
+        apply=False,
+    )
+    calls = {"fetch": 0}
+
+    monkeypatch.setattr(
+        loop,
+        "_fetch_zai_coding_plan_json",
+        lambda *_args, **_kwargs: (
+            calls.__setitem__("fetch", calls["fetch"] + 1)
+            or {
+                "status_code": 200,
+                "payload": {
+                    "data": {
+                        "limit": {"quota": 1000, "remaining": 500},
+                        "used": 500,
+                    },
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        loop,
+        "_resolve_zai_coding_plan_quota_api_key",
+        lambda: "fake-zai-key",
+    )
+
+    state = loop.SidecarTaskState()
+    first_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
+    second_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=699.0)
+    third_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=700.0)
+
+    assert calls == {"fetch": 4}
+    first_poll = next(
+        event for event in first_events if event["event"] == "zai_coding_plan_quota_poll"
+    )
+    third_poll = next(
+        event for event in third_events if event["event"] == "zai_coding_plan_quota_poll"
+    )
+    assert first_poll["attempted"] is True
+    assert second_events == []
+    assert third_poll["attempted"] is True
 
 def test_loop_config_reads_grok_billing_http_method_override(monkeypatch) -> None:
     monkeypatch.setenv("AAWM_GROK_BILLING_HTTP_METHOD", "post")
@@ -8144,7 +8192,7 @@ def _codex_reset_credit_poll_config(**overrides):
         codex_auth_file="/home/zepfu/.codex/auth.json",
         codex_auth_file_source="AAWM_CODEX_AUTH_FILE",
         codex_reset_credit_poll_enabled=True,
-        codex_reset_credit_poll_interval_seconds=3600.0,
+        codex_reset_credit_poll_interval_seconds=600.0,
         codex_reset_credit_poll_http_timeout_seconds=30.0,
         codex_usage_url="https://chatgpt.com/backend-api/wham/usage",
         codex_reset_credit_poll_max_attempts=3,
@@ -8513,8 +8561,8 @@ def test_run_due_sidecar_tasks_throttles_codex_reset_credit_poll(monkeypatch) ->
 
     state = loop.SidecarTaskState()
     first_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=100.0)
-    second_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=200.0)
-    third_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=3701.0)
+    second_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=699.0)
+    third_events = loop.run_due_sidecar_tasks(config, state, now_monotonic=700.0)
 
     assert calls == {"fetch": 2}
     first_poll = next(
@@ -9592,7 +9640,7 @@ def test_compose_wires_codex_reset_credit_poll_defaults() -> None:
         in compose_text
     )
     assert (
-        "AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS=${AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS:-3600}"
+        "AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS=${AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS:-600}"
         in compose_text
     )
     assert (

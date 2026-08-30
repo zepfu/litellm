@@ -1079,7 +1079,7 @@ def test_rr089_kimi_usage_poll_is_disabled_by_default(loop, monkeypatch) -> None
     config = loop.parse_config([])
 
     assert config.kimi_usage_poll_enabled is False
-    assert config.kimi_usage_poll_interval_seconds == 3600.0
+    assert config.kimi_usage_poll_interval_seconds == 600.0
     assert config.kimi_usage_poll_http_timeout_seconds == 30.0
     assert loop.DEFAULT_KIMI_USAGE_URL == "https://api.kimi.com/coding/v1/usages"
     assert loop.run_due_sidecar_tasks(config, loop.SidecarTaskState(), now_monotonic=1.0) == []
@@ -1643,7 +1643,7 @@ def test_rr089_kimi_usage_refresh_triggered_poll_does_not_recurse(
         tmp_path,
         kimi_usage_poll_enabled=True,
         kimi_oauth_auth_file=str(credential),
-        kimi_usage_poll_interval_seconds=3600.0,
+        kimi_usage_poll_interval_seconds=600.0,
     )
     responses = iter(
         (
@@ -1724,7 +1724,7 @@ def test_rr089_kimi_usage_poll_scheduling_and_refresh_trigger(
         kimi_oauth_lock_file=str(tmp_path / "kimi.lock"),
         kimi_usage_poll_enabled=True,
         kimi_oauth_refresh_interval_seconds=3600.0,
-        kimi_usage_poll_interval_seconds=3600.0,
+        kimi_usage_poll_interval_seconds=600.0,
         observability_anomaly_scan_enabled=False,
     )
 
@@ -1776,7 +1776,14 @@ def test_rr089_kimi_usage_poll_scheduling_and_refresh_trigger(
     assert usage_event["trigger"] == "oauth_refresh"
     assert usage_event["observation_count"] == 2
     assert usage_event["persisted"] is False
-    assert loop._run_kimi_usage_poll_task(config, state, now_monotonic=101.0) is None
+    assert loop._run_kimi_usage_poll_task(config, state, now_monotonic=699.0) is None
+    interval_event = loop._run_kimi_usage_poll_task(
+        config,
+        state,
+        now_monotonic=700.0,
+    )
+    assert interval_event is not None
+    assert interval_event["trigger"] == "interval"
 
 
 def test_rr089_kimi_usage_persistence_reuses_exact_dedupe_sql_payload(

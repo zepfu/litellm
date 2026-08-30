@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import gzip
-import hashlib
 import importlib.util
 import os
 import shutil
@@ -439,9 +438,9 @@ class WeeklyBillingIndependenceTests(unittest.TestCase):
 
         config = SimpleNamespace(
             grok_billing_poll_enabled=True,
-            grok_billing_poll_interval_seconds=3600,
+            grok_billing_poll_interval_seconds=600,
             xai_reset_poll_enabled=True,
-            xai_reset_poll_interval_seconds=3600,
+            xai_reset_poll_interval_seconds=600,
         )
         tasks = loop.iter_scheduled_provider_poll_tasks(config)
         names = [task[0] if isinstance(task, tuple) else getattr(task, "name", "") for task in tasks]
@@ -537,7 +536,7 @@ class ConfigDefaultsTests(unittest.TestCase):
             parser = loop.build_arg_parser()
             args = parser.parse_args([])
             self.assertFalse(bool(int(getattr(args, "xai_reset_poll_enabled", 0))))
-            self.assertEqual(int(args.xai_reset_poll_interval_seconds), 3600)
+            self.assertEqual(int(args.xai_reset_poll_interval_seconds), 600)
             self.assertEqual(int(args.xai_reset_poll_http_timeout_seconds), 30)
             self.assertEqual(args.xai_reset_poll_url, DEFAULT_RESETS_URL)
         finally:

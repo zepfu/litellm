@@ -1885,8 +1885,9 @@ def _alibaba_row(
 @pytest.mark.parametrize(
     ("age_seconds", "reset_offset_seconds", "environment", "expected_valid"),
     [
-        (3599.0, 1.0, "prod", True),
-        (3601.0, 1.0, "prod", False),
+        (599.0, 1.0, "prod", True),
+        (600.0, 1.0, "prod", True),
+        (601.0, 1.0, "prod", False),
         (1.0, 1.0, "prod", True),
         (1.0, -1.0, "prod", False),
         (-1.0, 1.0, "prod", False),
@@ -1902,7 +1903,7 @@ def test_codex_quota_validity_boundaries_apply_to_both_selection_paths(
 ) -> None:
     monkeypatch.setenv(
         "AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS",
-        "3600",
+        "600",
     )
     _set_selection_runtime_value(
         "_get_codex_quota_observation_environment",
@@ -1912,6 +1913,7 @@ def test_codex_quota_validity_boundaries_apply_to_both_selection_paths(
     manager = selection.alias_routing_state
     manager.reset_for_tests()
     now = time.time()
+    monkeypatch.setattr(selection.time, "time", lambda: now)
     manager.record_normalized_quota_observations(
         [
             _codex_oauth_quota_observation(

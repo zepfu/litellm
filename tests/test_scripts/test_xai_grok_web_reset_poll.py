@@ -6,13 +6,12 @@ import ast
 import hashlib
 import importlib.util
 import inspect
-import os
 import re
 import sys
 import time
 import urllib.error
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 import pytest
 
@@ -642,7 +641,7 @@ def _xai_reset_poll_config(loop_mod, **overrides):
         "db_lock_timeout_ms": 1000,
         "db_statement_timeout_ms": 5000,
         "xai_reset_poll_enabled": True,
-        "xai_reset_poll_interval_seconds": 3600.0,
+        "xai_reset_poll_interval_seconds": 600.0,
         "xai_reset_poll_http_timeout_seconds": 1.0,
         "xai_reset_poll_url": DEFAULT_RESETS_URL,
         "xai_reset_poll_max_attempts": 5,
@@ -650,6 +649,39 @@ def _xai_reset_poll_config(loop_mod, **overrides):
     }
     kwargs.update(overrides)
     return loop_mod.ProviderStatusLoopConfig(**kwargs)
+
+
+def test_xai_reset_poll_respects_600_second_interval(loop_mod, monkeypatch):
+    calls = []
+
+    def fake_run_once(*_args, **_kwargs):
+        calls.append("poll")
+        return {"outcome": "ok"}
+
+    monkeypatch.setattr(loop_mod, "_run_xai_reset_poll_once", fake_run_once)
+    config = _xai_reset_poll_config(loop_mod, apply=False)
+    state = loop_mod.SidecarTaskState()
+
+    first = loop_mod._run_xai_reset_poll_task(
+        config,
+        state,
+        now_monotonic=100.0,
+    )
+    early = loop_mod._run_xai_reset_poll_task(
+        config,
+        state,
+        now_monotonic=699.0,
+    )
+    due = loop_mod._run_xai_reset_poll_task(
+        config,
+        state,
+        now_monotonic=700.0,
+    )
+
+    assert first == {"outcome": "ok"}
+    assert early is None
+    assert due == {"outcome": "ok"}
+    assert calls == ["poll", "poll"]
 
 
 def test_previous_credit_state_load_failure_does_not_commit_complete_lifecycle(

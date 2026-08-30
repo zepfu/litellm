@@ -3228,7 +3228,7 @@ def _recursive_yaml_source_inventory(
 
 
 # Maximum age for fresh availability evidence (used as default parameter).
-_AVAILABILITY_FRESHNESS_SECONDS = 3600.0
+_AVAILABILITY_FRESHNESS_SECONDS = 600.0
 
 
 def _derive_ingresses_from_snapshot(
@@ -4250,7 +4250,7 @@ _NEGATIVE_AVAILABILITY_STATUSES = frozenset(
     {"at capacity", "unavailable", "cooling down", "failed", "exhausted", "cooldown"}
 )
 # Maximum age for fresh availability evidence.
-_AVAILABILITY_FRESHNESS_SECONDS = 3600.0
+_AVAILABILITY_FRESHNESS_SECONDS = 600.0
 
 
 # Required quota windows per exact (provider, model) identity (Finding 1).

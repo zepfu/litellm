@@ -380,14 +380,16 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    Grok CLI auth file. Do not configure prod LiteLLM to refresh, seed, copy, or
    write the Grok CLI credential directly. Keep managed `oa_xai/*`
    `LITELLM_XAI_OAUTH_AUTH_FILE` on LiteLLM-owned writable storage.
-   The provider-status sidecar must also enable the hourly Grok billing poll
-   (`AAWM_GROK_BILLING_POLL_ENABLED=1`) with the Grok CLI billing headers and
-   the writable `.grok` mount. After sidecar recreation, verify the logs emit a
-   `grok_billing_poll` event with `status_code=200` and `persisted=true`; the
-   LiteLLM serving container does not emit this scheduled billing snapshot.
-   The same provider-status sidecar must enable hourly native Kimi usage
-   polling with `AAWM_KIMI_USAGE_POLL_ENABLED=1`,
-   `AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS=3600`, and the existing writable
+   The provider-status sidecar must also enable the ten-minute (600-second)
+   Grok billing poll (`AAWM_GROK_BILLING_POLL_ENABLED=1` and
+   `AAWM_GROK_BILLING_POLL_INTERVAL_SECONDS=600`) with the Grok CLI billing
+   headers and the writable `.grok` mount. After sidecar recreation, verify the
+   logs emit a `grok_billing_poll` event with `status_code=200` and
+   `persisted=true`; the LiteLLM serving container does not emit this scheduled
+   billing snapshot. The same provider-status sidecar must enable ten-minute
+   (600-second) native Kimi usage polling with
+   `AAWM_KIMI_USAGE_POLL_ENABLED=1`,
+   `AAWM_KIMI_USAGE_POLL_INTERVAL_SECONDS=600`, and the existing writable
    Kimi credential mount used for OAuth maintenance. Do not copy or
    reauthorize the credential. After sidecar recreation, verify a sanitized
    `kimi_usage_poll` event reports `status_code=200`, `persisted=true`, and a
