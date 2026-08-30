@@ -568,6 +568,10 @@ def build_run_request(
         or str(uuid.uuid4())
     )
     agent_session_id = optional_params.get("agent_session_id")
+    exclude_workspace_context = optional_params.get(
+        "exclude_workspace_context",
+        optional_params.get("excludeWorkspaceContext"),
+    )
 
     request: Dict[str, Any] = {
         "conversationState": _merge_conversation_state(optional_params),
@@ -591,6 +595,8 @@ def build_run_request(
         request["action"]["userMessageAction"]["conversationHistory"] = history
     if agent_session_id:
         request["agentSessionId"] = agent_session_id
+    if exclude_workspace_context is not None:
+        request["excludeWorkspaceContext"] = bool(exclude_workspace_context)
     return {
         "runRequest": request,
     }

@@ -1395,7 +1395,9 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             else None
         ),
     )
-    optional_params: dict[str, Any] = {}
+    optional_params: dict[str, Any] = {
+        "exclude_workspace_context": True,
+    }
     request_tools = request_body.get("tools")
     if not isinstance(request_tools, list) and isinstance(replay_state, dict):
         request_tools = replay_state.get("tools")
