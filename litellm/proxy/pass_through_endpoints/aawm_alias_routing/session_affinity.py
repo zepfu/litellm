@@ -144,6 +144,9 @@ _REQUEST_STATE_EFFECTIVE_SESSION_IDENTITY_ATTR = (
     "_aawm_session_owner_effective_identity"
 )
 _CODEX_AUTO_REVIEW_SESSION_IDENTITY_SUFFIX = ":codex-auto-review"
+_CODEX_AUTO_REVIEW_SESSION_OWNER_IDENTITY_PREFIX = (
+    "aawm-codex-auto-review-owner-v1:"
+)
 _REQUEST_STATE_CODEX_AUTO_REVIEW_SESSION_IDENTITY_ATTR = (
     "_aawm_codex_auto_review_session_identity"
 )
@@ -391,6 +394,49 @@ def activate_codex_auto_review_session_identity(
         review_identity,
     )
     return review_identity
+
+
+def activate_codex_auto_review_session_owner_identity(
+    *,
+    request: Any,
+    parent_session_identity: Optional[str],
+    request_call_identity: Optional[str] = None,
+) -> Optional[str]:
+    """Bind one request-local owner identity for a Codex auto-review request.
+
+    The logical guardian identity is retained separately for correlation.  The
+    owner identity is opaque, unique to the request-call identity, and must
+    never become durable guardian affinity.
+    """
+
+    if request is None:
+        return None
+    parent_identity = _clean_optional_str(parent_session_identity)
+    request_call = _clean_optional_str(request_call_identity)
+    if parent_identity is None or request_call is None:
+        return None
+    digest = hashlib.sha256(
+        (
+            _CODEX_AUTO_REVIEW_SESSION_OWNER_IDENTITY_PREFIX
+            + "\x00"
+            + parent_identity
+            + "\x00"
+            + request_call
+        ).encode("utf-8")
+    ).hexdigest()
+    owner_identity = (
+        f"{_CODEX_AUTO_REVIEW_SESSION_OWNER_IDENTITY_PREFIX}{digest}"
+    )
+    state = getattr(request, "state", None)
+    if state is not None:
+        existing_identity = get_request_effective_session_identity(request)
+        if existing_identity is None:
+            setattr(
+                state,
+                _REQUEST_STATE_EFFECTIVE_SESSION_IDENTITY_ATTR,
+                owner_identity,
+            )
+    return owner_identity
 
 
 def activate_session_owner_redispatch_effective_identity(
@@ -3706,3 +3752,30 @@ async def claim_session_owner_on_success(**kwargs: Any) -> SessionOwnerMutationR
     """Promote path alias — requires reservation_token in kwargs."""
 
     return await promote_session_owner_reservation(**kwargs)
+
+
+async def finalize_codex_auto_review_lease_on_success(
+    lease: Optional[SessionOwnerLease],
+) -> Optional[SessionOwnerMutationResult]:
+    """Release the request-local reservation after an authoritative response.
+
+    Auto-review ownership is scoped to one approval invocation.  Reusing the
+    normal promotion helper would create durable guardian affinity, defeating
+    free candidate selection on the next review.
+    """
+
+    if lease is None or not lease.held_reservation or lease.promoted or lease.released:
+        return None
+    await _barrier_session_owner_lease_renewal(lease)
+    result = await release_session_owner_reservation(
+        session_identity=lease.session_identity,
+        reservation_token=lease.reservation_token,
+    )
+    if result.outcome in {
+        SessionOwnerMutationOutcome.RELEASED,
+        SessionOwnerMutationOutcome.NOT_HELD,
+        SessionOwnerMutationOutcome.ALREADY_OWNED,
+    }:
+        lease.released = True
+        _stop_session_owner_lease_renewal(lease)
+    return result

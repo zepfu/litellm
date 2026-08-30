@@ -3929,13 +3929,29 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             },
         )
     sa = _session_affinity_mod()
+    is_auto_review = alias_model == "codex-auto-review"
     resolved_session_identity = sa.resolve_canonical_session_identity(
         request,
         request_body,
     )
+    if (
+        is_auto_review
+        and not sa.is_replay_safe_session_owner_redispatch_body(request_body)
+    ):
+        sa.raise_session_owner_redispatch_required(
+            session_identity=resolved_session_identity,
+            alias_model=alias_model,
+            failure_phase="session_owner_replay_unsafe_auto_review",
+            message=(
+                "Codex auto-review cannot own provider response state. Send a "
+                "self-contained replay-safe body without previous_response_id "
+                "or unsafe opaque rs_* provider state."
+            ),
+            request=request,
+        )
     canonical_session_identity = resolved_session_identity
     session_owner_identity = resolved_session_identity
-    if alias_model == "codex-auto-review":
+    if is_auto_review:
         parent_session_identity = (
             sa.get_request_codex_auto_review_parent_session_identity(request)
             or resolved_session_identity
@@ -3948,9 +3964,17 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             sa.get_request_codex_auto_review_parent_session_identity(request)
             or parent_session_identity
         )
-        session_owner_identity = sa.resolve_canonical_session_identity(
-            request,
-            request_body,
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing.attempt_records import (
+            _bind_auto_agent_alias_request_identity,
+        )
+
+        session_owner_identity = (
+            sa.get_request_effective_session_identity(request)
+            or sa.activate_codex_auto_review_session_owner_identity(
+                request=request,
+                parent_session_identity=canonical_session_identity,
+                request_call_identity=_bind_auto_agent_alias_request_identity(request),
+            )
         )
     client_product_label = _extract_client_product_label(request, request_body)
     session_key = _resolve_codex_session_key(

@@ -1983,11 +1983,29 @@ def test_codex_auto_review_identity_is_exact_idempotent_and_canonical() -> None:
         sa.get_request_codex_auto_review_parent_session_identity(request)
         == "parent-thread"
     )
+    request_call = request.state.aawm_alias_request_litellm_call_id = "request-call"
+    owner_identity = sa.activate_codex_auto_review_session_owner_identity(
+        request=request,
+        parent_session_identity="parent-thread",
+        request_call_identity=request_call,
+    )
+    assert owner_identity.startswith("aawm-codex-auto-review-owner-v1:")
+    assert owner_identity != "parent-thread"
+    assert owner_identity != "parent-thread:codex-auto-review"
+    assert sa.get_request_effective_session_identity(request) == owner_identity
+    assert sa.resolve_canonical_session_identity(request=request) == owner_identity
+    assert sa.get_request_codex_auto_review_parent_session_identity(request) == (
+        "parent-thread"
+    )
     assert (
         sa.get_request_codex_auto_review_parent_session_identity(
-            already_suffixed_request
+                already_suffixed_request
+            )
+            == "parent-thread"
         )
-        == "parent-thread"
+    request.state._state.pop(
+        sa._REQUEST_STATE_EFFECTIVE_SESSION_IDENTITY_ATTR,
+        None,
     )
     assert (
         sa.resolve_canonical_session_identity(
@@ -2116,13 +2134,14 @@ async def test_codex_auto_review_selector_uses_review_owner_identity_without_mut
     }
     body_before = json.loads(json.dumps(request_body))
     headers_before = dict(request.headers)
+    request.state.aawm_alias_request_litellm_call_id = "request-call-one"
 
     selected = await sel._select_codex_auto_agent_candidate(
         request=request,
         request_body=request_body,
     )
 
-    review_identity = "parent-thread:codex-auto-review"
+    review_identity = sa.get_request_effective_session_identity(request)
     owner_lookup.assert_awaited_once_with(
         session_identity=review_identity,
         request=request,
@@ -2131,7 +2150,12 @@ async def test_codex_auto_review_selector_uses_review_owner_identity_without_mut
     assert selected["candidate"] == candidate
     assert selected["canonical_session_identity"] == "parent-thread"
     assert selected["session_owner_identity"] == review_identity
-    assert sa.get_request_codex_auto_review_session_identity(request) == review_identity
+    assert review_identity is not None
+    assert review_identity.startswith("aawm-codex-auto-review-owner-v1:")
+    assert review_identity != "parent-thread"
+    assert sa.get_request_codex_auto_review_session_identity(request) == (
+        "parent-thread:codex-auto-review"
+    )
     assert (
         sa.get_request_codex_auto_review_parent_session_identity(request)
         == "parent-thread"
@@ -2157,6 +2181,7 @@ async def test_namespaced_codex_auto_review_lookup_uses_canonical_alias(
         AsyncMock(return_value=(None, "review-owner-key", None)),
     )
     request = _codex_selector_request("namespaced-parent")
+    request.state.aawm_alias_request_litellm_call_id = "request-call-two"
     request_body = {
         "model": "  ChatGPT/Codex-Auto-Review  ",
         "input": [{"type": "function_call", "name": "inspect"}],
@@ -2173,9 +2198,11 @@ async def test_namespaced_codex_auto_review_lookup_uses_canonical_alias(
     assert selected["candidate"] == candidate
     assert selected["alias_model"] == "codex-auto-review"
     assert selected["canonical_session_identity"] == "namespaced-parent"
-    assert (
-        selected["session_owner_identity"]
-        == "namespaced-parent:codex-auto-review"
+    assert selected["session_owner_identity"].startswith(
+        "aawm-codex-auto-review-owner-v1:"
+    )
+    assert selected["session_owner_identity"] == (
+        sa.get_request_effective_session_identity(request)
     )
 
 
@@ -2250,30 +2277,9 @@ async def test_codex_account_bound_removed_owned_route_preserves_owner_unavailab
         lambda *_args, **_kwargs: "codex-auto-review",
     )
     request = _codex_selector_request("base-thread")
-    owner_record = {
-        "state": "owned",
-        "owner": "owner-a",
-        "attributes": {
-            "provider": "other",
-            "model": "removed-model",
-            "route_family": "other_route",
-            "codex_oauth_account_label": "owner-account",
-            "codex_oauth_account_hash": "owner-hash",
-            "codex_oauth_lane_key": "owner-lane",
-        },
-    }
-    owner_lookup = AsyncMock(return_value=(owner_record, "owner-key", None))
-    monkeypatch.setattr(sa, "get_session_owner_record", owner_lookup)
-    monkeypatch.setattr(
-        sa,
-        "owner_record_as_affinity_hint",
-        lambda _record, **_kwargs: dict(owner_record["attributes"]),
-    )
-    monkeypatch.setitem(
-        selector_globals,
-        "_find_codex_auto_agent_affinity_candidate",
-        lambda *_args, **_kwargs: None,
-    )
+    request.state.aawm_alias_request_litellm_call_id = "unsafe-review-call"
+    owner_record_lookup = AsyncMock(return_value=(None, "owner-key", None))
+    monkeypatch.setattr(sa, "get_session_owner_record", owner_record_lookup)
 
     with pytest.raises(HTTPException) as exc_info:
         await sel._select_codex_auto_agent_candidate(
@@ -2284,25 +2290,21 @@ async def test_codex_account_bound_removed_owned_route_preserves_owner_unavailab
                 "input": [
                     {
                         "type": "reasoning",
-                        "id": "rs_owner",
+                        "id": "provider-item",
                         "encrypted_content": "account-bound",
-                    }
+                    },
+                    {"type": "reasoning", "id": "rs_owner"},
                 ],
             },
         )
 
-    assert exc_info.value.status_code == 429
+    assert exc_info.value.status_code == 409
     detail = exc_info.value.detail
-    assert detail["error"]["code"] == "aawm_codex_auto_agent_redispatch_required"
-    assert detail["failure_phase"] == "account_bound_owner_unavailable"
+    assert detail["error"]["code"] == "aawm_session_owner_redispatch_required"
+    assert detail["failure_phase"] == "session_owner_replay_unsafe_auto_review"
     assert detail["redispatch_required"] is True
     assert detail["attempted_provider_call"] is False
-    assert detail["candidate"]["account_lane"] == "owner-lane"
-    owner_lookup.assert_awaited_once_with(
-        session_identity="base-thread:codex-auto-review",
-        request=request,
-        wait_for_foreign_reservation=True,
-    )
+    owner_record_lookup.assert_not_awaited()
     assert sa.get_request_effective_session_identity(request) is None
 
 
@@ -2338,7 +2340,7 @@ async def test_codex_unbound_fresh_child_owned_route_mismatch_uses_effective_ide
         if session_identity == "base-thread:codex-auto-review":
             return owner_record, "owner-key", None
         assert session_identity is not None
-        assert session_identity.startswith("aawm-session-owner-redispatch-v1:")
+        assert session_identity.startswith("aawm-codex-auto-review-owner-v1:")
         return None, "effective-key", None
 
     monkeypatch.setattr(sa, "get_session_owner_record", _get_owner_record)
@@ -2368,8 +2370,11 @@ async def test_codex_unbound_fresh_child_owned_route_mismatch_uses_effective_ide
     assert selected["has_account_bound_state"] is False
     assert selected["canonical_session_identity"] == "base-thread"
     assert selected["session_owner_identity"].startswith(
-        "aawm-session-owner-redispatch-v1:"
+        "aawm-codex-auto-review-owner-v1:"
     )
+    assert sa.get_request_effective_session_identity(request) == selected[
+        "session_owner_identity"
+    ]
     assert (
         sa.get_request_codex_auto_review_parent_session_identity(request)
         == "base-thread"
@@ -2383,34 +2388,14 @@ async def test_codex_owned_alias_mismatch_with_previous_response_id_stays_409(
 ) -> None:
     sel, _candidate = _patch_codex_selector_basics(monkeypatch)
     selector_globals = sel._select_codex_auto_agent_candidate.__globals__
-    request = _codex_selector_request("base-thread")
-    owner_record = {
-        "state": "owned",
-        "owner": "owner-a",
-        "attributes": {
-            "provider": "other",
-            "model": "removed",
-            "route_family": "other",
-            "codex_oauth_account_label": "owner-account",
-            "codex_oauth_account_hash": "owner-hash",
-            "codex_oauth_lane_key": "owner-lane",
-        },
-    }
-    monkeypatch.setattr(
-        sa,
-        "get_session_owner_record",
-        AsyncMock(return_value=(owner_record, "owner-key", None)),
-    )
-    monkeypatch.setattr(
-        sa,
-        "owner_record_as_affinity_hint",
-        lambda _record, **_kwargs: dict(owner_record["attributes"]),
-    )
+    request = _codex_selector_request()
     monkeypatch.setitem(
         selector_globals,
-        "_find_codex_auto_agent_affinity_candidate",
-        lambda *_args, **_kwargs: None,
+        "_lookup_active_snapshot_canonical_alias",
+        lambda *_args, **_kwargs: "codex-auto-review",
     )
+    owner_record_lookup = AsyncMock()
+    monkeypatch.setattr(sa, "get_session_owner_record", owner_record_lookup)
     monkeypatch.setattr(
         sa,
         "raise_session_owner_redispatch_required",
@@ -2421,13 +2406,16 @@ async def test_codex_owned_alias_mismatch_with_previous_response_id_stays_409(
         await sel._select_codex_auto_agent_candidate(
             request=request,
             request_body={
-                "model": "alias",
+                "model": "codex-auto-review",
                 "previous_response_id": "resp-owned",
                 "input": [{"type": "function_call", "name": "inspect"}],
             },
         )
 
     assert exc_info.value.status_code == 409
+    detail = exc_info.value.detail
+    assert detail["failure_phase"] == "session_owner_replay_unsafe_auto_review"
+    owner_record_lookup.assert_not_awaited()
     assert sa.get_request_effective_session_identity(request) is None
 
 
@@ -2554,6 +2542,207 @@ async def test_codex_effective_identity_second_owned_conflict_stays_409(
 
     assert exc_info.value.status_code == 409
     activate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_auto_review_owners_are_distinct_and_free_selection_moves_candidates() -> None:
+    attrs_a = _full_attrs(
+        model="model-a",
+        account_hash="acct-a",
+        account_label="account-a",
+        account_lane="lane-a",
+    )
+    attrs_b = _full_attrs(
+        model="model-b",
+        account_hash="acct-b",
+        account_label="account-b",
+        account_lane="lane-b",
+    )
+    parent_identity = "guardian-thread"
+    owners: list[str] = []
+    owner_keys: list[str] = []
+    redis = _FakeRedisCache()
+
+    for request_call, attributes in (
+        ("review-call-one", attrs_a),
+        ("review-call-two", attrs_b),
+    ):
+        request = type("Req", (), {})()
+        request.state = type("State", (), {})()
+        request.state.aawm_alias_request_litellm_call_id = request_call
+        sa.activate_codex_auto_review_session_identity(
+            request=request,
+            parent_session_identity=parent_identity,
+        )
+        owner = sa.activate_codex_auto_review_session_owner_identity(
+            request=request,
+            parent_session_identity=parent_identity,
+            request_call_identity=request_call,
+        )
+        assert owner is not None
+        owners.append(owner)
+        with _patch_dual(redis):
+            guard = await sa.ensure_session_owner_guard_for_request(
+                request=request,
+                session_identity=owner,
+                requested_attributes=attributes,
+            )
+            assert guard.cache_key is not None
+            owner_keys.append(guard.cache_key)
+            assert guard.decision is sa.SessionOwnerGuardDecision.UNOWNED_RESERVED
+            assert guard.held_reservation is True
+            lease = sa.get_request_session_owner_lease(request)
+            assert lease is not None
+            result = await sa.finalize_codex_auto_review_lease_on_success(lease)
+            assert result is not None
+            assert result.outcome is sa.SessionOwnerMutationOutcome.RELEASED
+            assert lease.released is True
+
+    assert owners[0] != owners[1]
+    assert owner_keys[0] != owner_keys[1]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_auto_review_owners_do_not_collide() -> None:
+    redis = _FakeRedisCache()
+    attributes = _full_attrs(
+        account_hash="acct-concurrent",
+        account_label="account-concurrent",
+        account_lane="lane-concurrent",
+    )
+
+    async def _review(request_call: str) -> tuple[str, sa.SessionOwnerGuardResult]:
+        request = type("Req", (), {})()
+        request.state = type("State", (), {})()
+        request.state.aawm_alias_request_litellm_call_id = request_call
+        owner = sa.activate_codex_auto_review_session_owner_identity(
+            request=request,
+            parent_session_identity="guardian-thread",
+            request_call_identity=request_call,
+        )
+        assert owner is not None
+        with _patch_dual(redis):
+            guard = await sa.guard_session_owner_before_egress(
+                session_identity=owner,
+                requested_attributes=attributes,
+            )
+            return owner, guard
+
+    owners, guards = zip(*(await asyncio.gather(_review("same"), _review("other"))), strict=True)
+    assert owners[0] != owners[1]
+    assert [guard.decision for guard in guards] == [
+        sa.SessionOwnerGuardDecision.UNOWNED_RESERVED,
+        sa.SessionOwnerGuardDecision.UNOWNED_RESERVED,
+    ]
+    assert len(redis._data) == 2
+
+
+@pytest.mark.asyncio
+async def test_auto_review_lease_cleanup_does_not_accumulate_or_promote() -> None:
+    redis = _FakeRedisCache()
+    attributes = _full_attrs(
+        account_hash="acct-cleanup",
+        account_label="account-cleanup",
+        account_lane="lane-cleanup",
+    )
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+    request.state.aawm_alias_request_litellm_call_id = "cleanup-call"
+    owner = sa.activate_codex_auto_review_session_owner_identity(
+        request=request,
+        parent_session_identity="guardian-thread",
+        request_call_identity="cleanup-call",
+    )
+    assert owner is not None
+
+    with _patch_dual(redis):
+        success_lease = None
+        guard = await sa.ensure_session_owner_guard_for_request(
+            request=request,
+            session_identity=owner,
+            requested_attributes=attributes,
+        )
+        assert guard.decision is sa.SessionOwnerGuardDecision.UNOWNED_RESERVED
+        success_lease = sa.get_request_session_owner_lease(request)
+        assert success_lease is not None
+        success = await sa.finalize_codex_auto_review_lease_on_success(success_lease)
+        assert success is not None
+        assert success.outcome is sa.SessionOwnerMutationOutcome.RELEASED
+
+        failure_guard = await sa.ensure_session_owner_guard_for_request(
+            request=request,
+            session_identity=owner,
+            requested_attributes=attributes,
+            raise_on_redispatch=False,
+        )
+        assert failure_guard.decision is sa.SessionOwnerGuardDecision.UNOWNED_RESERVED
+        failure_lease = sa.get_request_session_owner_lease(request)
+        assert failure_lease is not None
+        failure = await sa.finalize_session_owner_lease_on_failure(failure_lease)
+        assert failure is not None
+        assert failure.outcome is sa.SessionOwnerMutationOutcome.RELEASED
+
+        cancel_guard = await sa.ensure_session_owner_guard_for_request(
+            request=request,
+            session_identity=owner,
+            requested_attributes=attributes,
+            raise_on_redispatch=False,
+        )
+        assert cancel_guard.decision is sa.SessionOwnerGuardDecision.UNOWNED_RESERVED
+        cancel_lease = sa.get_request_session_owner_lease(request)
+        assert cancel_lease is not None
+        cancellation = await sa.finalize_session_owner_lease_on_failure(cancel_lease)
+        assert cancellation is not None
+        assert cancellation.outcome is sa.SessionOwnerMutationOutcome.RELEASED
+
+        snapshot = _redis_snapshot(redis)
+        assert all(not data for data in snapshot)
+
+    assert success_lease is not None
+    assert failure_lease is not None
+    assert cancel_lease is not None
+    assert success_lease.promoted is False
+    assert failure_lease.promoted is False
+    assert cancel_lease.promoted is False
+
+
+@pytest.mark.asyncio
+async def test_codex_ordinary_ownership_promotes_durable_record() -> None:
+    redis = _FakeRedisCache()
+    attributes = _full_attrs()
+    request = type("Req", (), {})()
+    request.state = type("State", (), {})()
+
+    with _patch_dual(redis):
+        guard = await sa.ensure_session_owner_guard_for_request(
+            request=request,
+            session_identity="ordinary-session",
+            requested_attributes=attributes,
+        )
+        assert guard.decision is sa.SessionOwnerGuardDecision.UNOWNED_RESERVED
+        lease = sa.get_request_session_owner_lease(request)
+        assert lease is not None
+        result = await sa.finalize_session_owner_lease_on_success(
+            lease,
+            attributes=attributes,
+        )
+        assert result is not None
+        assert result.outcome is sa.SessionOwnerMutationOutcome.PROMOTED
+
+        owner_record, cache_key, error = await sa.get_session_owner_record(
+            session_identity="ordinary-session",
+            request=request,
+        )
+        assert error is None
+        assert owner_record is not None
+        assert owner_record["state"] == "owned"
+        assert owner_record.get("reservation_token") is None
+        assert cache_key == guard.cache_key
+        assert set(redis._data) == {
+            f"litellm:{cache_key}" if cache_key is not None else ""
+        }
+
+    sa.set_request_session_owner_lease(request, None)
 
 
 @pytest.mark.asyncio

@@ -996,29 +996,46 @@ async def handle_alias_route(  # noqa: PLR0915
                             # Keep older extracted-host test seams usable while
                             # the runtime host rolls out the renewal helper.
                             response = await _perform_candidate_request()
-                        # Authoritative success: promote reserved -> owned.
-                        promote_result = await sa.finalize_session_owner_lease_on_success(
-                            session_owner_lease,
-                            attributes=owner_attributes,
-                            candidate=candidate,
-                        )
-                        if promote_result is not None and promote_result.outcome in {
-                            sa.SessionOwnerMutationOutcome.CONFLICT,
-                            sa.SessionOwnerMutationOutcome.ERROR,
-                            sa.SessionOwnerMutationOutcome.NOT_HELD,
-                        }:
-                            # Success bytes may already be in flight to the client;
-                            # fail closed for subsequent requests by not treating
-                            # ownership as established. Still surface structured error
-                            # for non-streaming callers by raising.
-                            sa.raise_session_owner_redispatch_required(
-                                session_identity=session_owner_identity,
-                                mutation=promote_result,
-                                alias_model=selection.get("alias_model") or alias_model,
-                                candidate=candidate,
-                                failure_phase="session_owner_promote_after_success",
-                                request=request,
+                        is_auto_review = (
+                            alias_model == "codex-auto-review"
+                            or sa.get_request_codex_auto_review_parent_session_identity(
+                                request
                             )
+                            is not None
+                        )
+                        if is_auto_review:
+                            finalize_result = (
+                                await sa.finalize_codex_auto_review_lease_on_success(
+                                    session_owner_lease
+                                )
+                            )
+                        else:
+                            # Authoritative success: promote reserved -> owned.
+                            finalize_result = (
+                                await sa.finalize_session_owner_lease_on_success(
+                                    session_owner_lease,
+                                    attributes=owner_attributes,
+                                    candidate=candidate,
+                                )
+                            )
+                            if finalize_result is not None and finalize_result.outcome in {
+                                sa.SessionOwnerMutationOutcome.CONFLICT,
+                                sa.SessionOwnerMutationOutcome.ERROR,
+                                sa.SessionOwnerMutationOutcome.NOT_HELD,
+                            }:
+                                # Success bytes may already be in flight to the
+                                # client; fail closed for subsequent requests by
+                                # not treating ownership as established. Surface a
+                                # structured error for non-streaming callers.
+                                sa.raise_session_owner_redispatch_required(
+                                    session_identity=session_owner_identity,
+                                    mutation=finalize_result,
+                                    alias_model=selection.get("alias_model")
+                                    or alias_model,
+                                    candidate=candidate,
+                                    failure_phase="session_owner_promote_after_success",
+                                    request=request,
+                                )
                     except asyncio.CancelledError:
                         if session_owner_lease is not None:
                             try:
