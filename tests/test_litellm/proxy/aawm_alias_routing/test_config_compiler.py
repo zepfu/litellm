@@ -327,9 +327,10 @@ aliases:
 
 
 def test_canonical_work_other_compiles_scheduled_deepseek_without_alibaba() -> None:
-    """CFG-020: work-other promotes scheduled DeepSeek and drops sota-alibaba."""
+    """CFG-041: work-other orders scheduled DeepSeek, Z.AI, Moonshot, then xAI."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
         AliasReference,
+        RoutingCandidate,
     )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
         DEFAULT_CONFIG_DIR,
@@ -338,23 +339,36 @@ def test_canonical_work_other_compiles_scheduled_deepseek_without_alibaba() -> N
 
     snapshot = compile_directory(DEFAULT_CONFIG_DIR)
     alias = snapshot.aliases["work-other"]
-    assert all(isinstance(entry, AliasReference) for entry in alias.candidates)
-    identities = [(entry.alias_name, entry.priority) for entry in alias.candidates]
+    identities = [
+        (
+            ("REF", entry.alias_name, None, entry.priority)
+            if isinstance(entry, AliasReference)
+            else (entry.provider, entry.model, entry.route_family, entry.priority)
+        )
+        for entry in alias.candidates
+    ]
     assert identities == [
-        ("sota-deepseek", 110),
-        ("sota-moonshot", 100),
-        ("sota-xai", 90),
+        ("REF", "sota-deepseek", None, 110),
+        (
+            "zai_coding_plan",
+            "zai_coding_plan/glm-5.3-flash",
+            "codex_zai_coding_plan_chat_completions_adapter",
+            100,
+        ),
+        ("REF", "sota-moonshot", None, 90),
+        ("REF", "sota-xai", None, 80),
     ]
     deepseek = alias.candidates[0]
+    assert isinstance(deepseek, AliasReference)
     assert deepseek.schedule is not None
     assert deepseek.schedule.kind == "daily"
-    assert all(entry.alias_name != "sota-alibaba" for entry in alias.candidates)
+    assert isinstance(alias.candidates[1], RoutingCandidate)
     owner = snapshot.aliases["sota-deepseek"].candidates[0]
     assert owner.schedule is None
 
 
 def test_canonical_work_compiles_current_graph() -> None:
-    """The work alias preserves its direct candidates and work-other reference."""
+    """CFG-041: work delegates first to work-other, then keeps native tails."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
         AliasReference,
         RoutingCandidate,
@@ -367,12 +381,12 @@ def test_canonical_work_compiles_current_graph() -> None:
     snapshot = compile_directory(DEFAULT_CONFIG_DIR)
     entries = snapshot.aliases["work"].candidates
 
-    assert len(entries) == 6
-    assert isinstance(entries[2], AliasReference)
+    assert len(entries) == 4
+    assert isinstance(entries[0], AliasReference)
     assert all(
         isinstance(entry, RoutingCandidate)
         for index, entry in enumerate(entries)
-        if index != 2
+        if index != 0
     )
     assert [
         (
@@ -382,29 +396,12 @@ def test_canonical_work_compiles_current_graph() -> None:
         )
         for entry in entries
     ] == [
-        (
-            "zai_coding_plan",
-            "zai_coding_plan/glm-5.3-flash",
-            "codex_zai_coding_plan_chat_completions_adapter",
-            110,
-        ),
-        (
-            "openai",
-            "gpt-5.3-codex-spark",
-            "codex_responses",
-            100,
-        ),
-        (
-            "REF",
-            "work-other",
-            None,
-            90,
-        ),
+        ("REF", "work-other", None, 110),
         ("anthropic", "claude-sonnet-5[1m]", "anthropic_messages", 80),
         ("anthropic", "claude-sonnet-5", "anthropic_messages", 70),
         ("openai", "gpt-5.6-luna", "codex_responses", 0),
     ]
-    sonnet_1m, sonnet = entries[3:5]
+    sonnet_1m, sonnet = entries[1:3]
     assert isinstance(sonnet_1m, RoutingCandidate)
     assert isinstance(sonnet, RoutingCandidate)
     for candidate in (sonnet_1m, sonnet):
@@ -420,11 +417,37 @@ def test_canonical_work_compiles_current_graph() -> None:
     }
     assert direct_models.isdisjoint(
         {
+            "zai_coding_plan/glm-5.3-flash",
             "cursor_agent/cursor-grok-4.6-high",
             "xai/grok-4.6",
             "oa_xai/grok-4.6",
         }
     )
+
+
+def test_canonical_provider_openai_compiles_cheapest_first_at_low_effort() -> None:
+    """CFG-041: provider-openai is Luna, Terra, Sol with low effort."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    alias = snapshot.aliases["provider-openai"]
+    assert [
+        (
+            candidate.provider,
+            candidate.model,
+            candidate.route_family,
+            candidate.priority,
+            candidate.reasoning_effort,
+        )
+        for candidate in alias.candidates
+    ] == [
+        ("openai", "gpt-5.6-luna", "codex_responses", 100, "low"),
+        ("openai", "gpt-5.6-terra", "codex_responses", 90, "low"),
+        ("openai", "gpt-5.6-sol", "codex_responses", 0, "low"),
+    ]
 
 
 def test_canonical_provider_nvidia_compiles_closed_nim_set_without_alias_reference() -> None:
@@ -523,43 +546,6 @@ aliases:
 """
     with pytest.raises(compiler.ConfigCompileError, match="NVIDIA-native"):
         compiler.compile_yaml(nvidia_on_openrouter)
-
-
-def test_canonical_read_alias_compiles_direct_zai_coding_plan_first() -> None:
-    """Live ``read`` must compile as an AAWM alias, not a ChatGPT-native model.
-
-    Codex TUI OC-003 uses ``--model read`` even though Ohmypi
-    ``compiled_aliases`` omits it. Without this YAML the passthrough
-    catalog does not list ``read``, and Codex sends it to ChatGPT as
-    ``The 'read' model is not supported``.
-    """
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
-        DEFAULT_CONFIG_DIR,
-        compile_directory,
-    )
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.catalog import (
-        iter_compiled_alias_names,
-    )
-
-    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
-    assert "read" in snapshot.aliases
-    alias = snapshot.aliases["read"]
-    assert len(alias.candidates) == 1
-    assert getattr(alias.candidates[0], "alias_name", None) is None
-    basic = snapshot.aliases["basic"].candidates[0]
-    assert basic.provider == "zai_coding_plan"
-    assert basic.model == "zai_coding_plan/glm-5.3-flash"
-    assert basic.route_family == "codex_zai_coding_plan_chat_completions_adapter"
-    read_candidate = alias.candidates[0]
-    assert read_candidate.provider == "zai_coding_plan"
-    assert read_candidate.model == "zai_coding_plan/glm-5.3-flash"
-    assert read_candidate.route_family == (
-        "codex_zai_coding_plan_chat_completions_adapter"
-    )
-    assert read_candidate.reasoning_effort == "low"
-    names = iter_compiled_alias_names(snapshot)
-    assert "read" in names
-    assert "basic" in names
 
 
 def test_inheritance_resolves_at_compile() -> None:
@@ -754,9 +740,10 @@ aliases:
     )
 
 
-def test_codex_auto_review_yaml_compiles_requested_cross_provider_chain() -> None:
-    """Dedicated auto-review YAML keeps the exact low-reasoning fallback order."""
+def test_auto_review_yaml_compiles_combined_public_alias_graph() -> None:
+    """CFG-041: one document owns both public auto-review alias names."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+        AliasReference,
         RoutingCandidate,
     )
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
@@ -765,9 +752,26 @@ def test_codex_auto_review_yaml_compiles_requested_cross_provider_chain() -> Non
     )
 
     snapshot = compile_directory(DEFAULT_CONFIG_DIR)
-    alias = snapshot.aliases["codex-auto-review"]
-    assert alias.dispatch is None
-    assert all(isinstance(candidate, RoutingCandidate) for candidate in alias.candidates)
+    auto_review = snapshot.aliases["auto-review"]
+    codex_auto_review = snapshot.aliases["codex-auto-review"]
+    assert auto_review.dispatch is None
+    assert codex_auto_review.dispatch is None
+    assert len(codex_auto_review.candidates) == 1
+    public_reference = codex_auto_review.candidates[0]
+    assert isinstance(public_reference, AliasReference)
+    assert (public_reference.alias_name, public_reference.priority) == (
+        "auto-review",
+        100,
+    )
+
+    helper_reference = auto_review.candidates[0]
+    assert isinstance(helper_reference, AliasReference)
+    assert (helper_reference.alias_name, helper_reference.priority) == (
+        "auto-review-other",
+        100,
+    )
+    concrete = auto_review.candidates[1:]
+    assert all(isinstance(candidate, RoutingCandidate) for candidate in concrete)
     assert [
         (
             candidate.provider,
@@ -776,27 +780,13 @@ def test_codex_auto_review_yaml_compiles_requested_cross_provider_chain() -> Non
             candidate.priority,
             candidate.reasoning_effort,
         )
-        for candidate in alias.candidates
+        for candidate in concrete
     ] == [
-        (
-            "alibaba_token_plan",
-            "alibaba_token_plan/deepseek-v4-flash-0731",
-            "codex_alibaba_token_plan_chat_completions_adapter",
-            100,
-            "low",
-        ),
-        (
-            "zai_coding_plan",
-            "zai_coding_plan/glm-5.3-flash",
-            "codex_zai_coding_plan_chat_completions_adapter",
-            90,
-            "low",
-        ),
         (
             "openai",
             "gpt-5.6-luna",
             "codex_responses",
-            80,
+            90,
             "low",
         ),
         (
@@ -823,16 +813,25 @@ aliases:
         compiler.compile_yaml(invalid)
 
 
-def test_auto_review_yaml_replicates_codex_auto_review_candidates() -> None:
-    """OMP ``auto-review`` keeps the canonical review routing contract."""
+def test_auto_review_other_preserves_low_effort_helper_candidates() -> None:
+    """CFG-041: every concrete helper candidate keeps low reasoning."""
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
         DEFAULT_CONFIG_DIR,
         compile_directory,
     )
 
     snapshot = compile_directory(DEFAULT_CONFIG_DIR)
-    canonical = snapshot.aliases["codex-auto-review"]
-    replica = snapshot.aliases["auto-review"]
-
-    assert replica.dispatch == canonical.dispatch
-    assert replica.candidates == canonical.candidates
+    helper = snapshot.aliases["auto-review-other"]
+    assert [
+        (
+            candidate.model,
+            candidate.priority,
+            candidate.reasoning_effort,
+            candidate.schedule.kind if candidate.schedule is not None else None,
+        )
+        for candidate in helper.candidates
+    ] == [
+        ("alibaba_token_plan/deepseek-v4-flash-0731", 100, "low", "daily"),
+        ("zai_coding_plan/glm-5.3-flash", 90, "low", None),
+        ("cursor_agent/composer-2.5", 80, "low", None),
+    ]

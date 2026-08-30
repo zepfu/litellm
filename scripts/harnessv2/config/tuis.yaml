@@ -24,14 +24,18 @@ tuis:
     project_agents_dir: "{cwd}/.omp/agents"
     orchestration_child_agents:
       - basic
+      - basic-other
       - work
+      - work-other
       - expert
+      - expert-other
       - sota
       - sota-xai
       - sota-alibaba
       - sota-moonshot
       - sota-zai
       - auto-review
+      - auto-review-other
     tmux:
       socket: tmux37
       session: omp-alpha-test
@@ -145,8 +149,7 @@ tuis:
         - AAWM_HARNESS_USER_ID
   # Interactive Codex TUI. Never `codex exec`, never `-p`/`--print` (Codex
   # `-p` is `--profile`; harness uses `-c model_provider=` instead).
-  # Default live surface is native `basic` and `read` only. Do not add `read`
-  # to models.compiled_aliases.
+  # Default live surface is native `basic` only.
   codex:
     enabled: true
     binary: codex
@@ -155,10 +158,8 @@ tuis:
     session_dir: /tmp/hv2-codex-sessions
     default_models:
       - basic
-      - read
     default_orchestration_parent: basic
-    default_orchestration_children:
-      - read
+    default_orchestration_children: []
     model_prompt: codex_model
     orchestration_prompt: codex_orchestration
     identity:

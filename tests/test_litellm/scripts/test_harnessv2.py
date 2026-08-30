@@ -20,14 +20,18 @@ _ORCH_FIXTURES = _HV2 / "fixtures" / "orch"
 _CODEX_DRIVER = _HV2 / "hv2" / "drivers" / "codex.py"
 _ORCH_BASELINE_CHILDREN = (
     "basic",
+    "basic-other",
     "work",
+    "work-other",
     "expert",
+    "expert-other",
     "sota",
     "sota-xai",
     "sota-alibaba",
     "sota-moonshot",
     "sota-zai",
     "auto-review",
+    "auto-review-other",
 )
 
 if str(_HV2) not in sys.path:
@@ -154,7 +158,6 @@ def test_should_load_yaml_includes_and_compiled_aliases(hv, config) -> None:
     assert "ohmypi" in config["tuis"]["implemented"]
     assert "grok" in config["tuis"]["stubs"]
     assert "opencode" in config["tuis"]["stubs"]
-    assert "read" not in aliases
     assert "-p" in config["tuis"]["ohmypi"]["forbid_flags"]
     assert "--print" in config["tuis"]["ohmypi"]["forbid_flags"]
     assert "-p" not in config["tuis"]["ohmypi"]["argv_launch_model"]
@@ -164,7 +167,8 @@ def test_should_load_yaml_includes_and_compiled_aliases(hv, config) -> None:
         assert "codex" not in config["tuis"]["stubs"]
         assert config["tuis"]["codex"]["select_model"]["tools_for_model"] is True
         assert config["tuis"]["codex"]["select_model"]["tools_for_orchestration"] is True
-        assert config["tuis"]["codex"]["default_models"] == ["basic", "read"]
+        assert config["tuis"]["codex"]["default_models"] == ["basic"]
+        assert config["tuis"]["codex"]["default_orchestration_children"] == []
         assert "-p" not in config["tuis"]["codex"]["argv_launch_model"]
         assert "--print" not in config["tuis"]["codex"]["argv_launch_model"]
         assert "exec" not in config["tuis"]["codex"]["argv_launch_model"]
@@ -212,7 +216,7 @@ def test_should_expand_model_groups_from_yaml(hv, config) -> None:
     assert children == list(_ORCH_BASELINE_CHILDREN)
     assert "auto-review" in children
     assert "codex-auto-review" not in children
-    assert "work-other" not in children
+    assert "work-other" in children
     assert "sota-deepseek" not in children
     assert config["tuis"]["ohmypi"]["orchestration_child_agents"] == list(
         _ORCH_BASELINE_CHILDREN
@@ -1031,22 +1035,22 @@ def test_should_plan_codex_catalog_model_and_orchestration_as_non_stub(hv, confi
         dry_run=True,
         write_artifact=None,
     )
-    orch = hv.build_plan(
-        config=config,
-        kind="orchestration",
-        instance_token="alpha",
-        tui="codex",
-        models=None,
-        orchestration_parent=None,
-        orchestration_children=None,
-        dry_run=True,
-        write_artifact=None,
-    )
+    with pytest.raises(hv.PlanError, match="orchestration-children"):
+        hv.build_plan(
+            config=config,
+            kind="orchestration",
+            instance_token="alpha",
+            tui="codex",
+            models=None,
+            orchestration_parent=None,
+            orchestration_children=None,
+            dry_run=True,
+            write_artifact=None,
+        )
     assert catalog.tui == "codex"
     assert catalog.kind == "catalog"
     assert model.tui == "codex"
-    assert list(model.models) == ["basic", "read"]
-    assert "read" not in hv.compiled_aliases(config)
+    assert list(model.models) == ["basic"]
     assert list(model.models) != hv.compiled_aliases(config)
     assert "hv2-codex-child" in model.extra["pong_prompt"]
     assert "PONG" not in model.extra["pong_prompt"]
@@ -1056,14 +1060,6 @@ def test_should_plan_codex_catalog_model_and_orchestration_as_non_stub(hv, confi
     assert "print that exact stdout" in model.extra["pong_prompt"]
     assert "Call spawn_agent" in model.extra["pong_prompt"]
     assert "non-empty message" in model.extra["pong_prompt"]
-    assert "/root/hv2_child_read" not in model.extra["pong_prompt"]
-    assert orch.tui == "codex"
-    assert list(orch.orchestration_parents) == ["basic"]
-    assert list(orch.orchestration_children) == ["read"]
-    assert "hv2-codex-child" in orch.extra["orchestration_prompt_template"]
-    assert "model=read" in orch.extra["orchestration_prompt_template"]
-    assert "model=basic" not in orch.extra["orchestration_prompt_template"]
-    assert "agent=sota-xai" not in orch.extra["orchestration_prompt_template"]
     work = hv.build_plan(
         config=config,
         kind="orchestration",
@@ -1081,20 +1077,20 @@ def test_should_plan_codex_catalog_model_and_orchestration_as_non_stub(hv, confi
     assert "agent=sota-xai" not in work.extra["orchestration_prompt_template"]
 
 
-def test_should_plan_explicit_codex_basic_and_read_without_compiled_all(hv, config) -> None:
+def test_should_plan_explicit_codex_basic_without_compiled_all(hv, config) -> None:
     _skip_unless_codex_tui_shipped(config)
     plan = hv.build_plan(
         config=config,
         kind="model",
         instance_token="alpha",
         tui="codex",
-        models=["basic,read"],
+        models=["basic"],
         orchestration_parent=None,
         orchestration_children=None,
         dry_run=True,
         write_artifact=None,
     )
-    assert list(plan.models) == ["basic", "read"]
+    assert list(plan.models) == ["basic"]
     all_plan = hv.build_plan(
         config=config,
         kind="model",
@@ -1159,7 +1155,7 @@ def test_should_refuse_codex_print_and_exec_flags(hv, config) -> None:
     from hv2.drivers.codex import CodexDriver
 
     driver = CodexDriver(config)
-    argv = driver.launch_argv("read")
+    argv = driver.launch_argv("basic")
     assert "-p" not in argv
     assert "--print" not in argv
     assert "exec" not in argv
@@ -1797,7 +1793,6 @@ def test_should_plan_orchestration_parents_and_children(hv, config) -> None:
     assert "sota-openai" in plan.orchestration_parents
     assert "sota-moonshot" in plan.orchestration_parents
     assert list(plan.orchestration_children) == list(_ORCH_BASELINE_CHILDREN)
-    assert "work-other" not in plan.orchestration_children
     assert "sota-deepseek" not in plan.orchestration_children
     assert "codex-auto-review" not in plan.orchestration_children
     prompt = plan.extra["orchestration_prompt_template"]
@@ -3320,7 +3315,7 @@ def test_should_reject_unchanged_old_orchestration_evidence_on_wait_and_final(
         tui="codex",
         models=None,
         orchestration_parent="basic",
-        orchestration_children="read",
+        orchestration_children="basic",
         dry_run=True,
         write_artifact=None,
     )

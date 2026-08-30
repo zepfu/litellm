@@ -9,8 +9,3 @@ aliases:
         model: openrouter/cohere/north-mini-code:free
         route_family: codex_openrouter_completion_adapter
         priority: 90
-
-      - provider: openrouter
-        model: openrouter/owl-alpha
-        route_family: codex_openrouter_completion_adapter
-        priority: 80

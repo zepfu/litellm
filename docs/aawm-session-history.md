@@ -1583,19 +1583,25 @@ origin and defaults to `sota-openai`. `sota-alibaba` uses
 Plan `zai_coding_plan/glm-5.3` first; Alibaba Token Plan `glm-5.2` is the
 last-resort leaf on the same alias.
 
-`basic` is the config-driven low-cost alias. `work` uses
-`zai_coding_plan/glm-5.3-flash` (priority 110), then
-`gpt-5.3-codex-spark`, then the nested `work-other` alias reference, then for
-Claude origins only the native Anthropic Sonnet tail, and finally
-`gpt-5.6-luna`. `work-other` is an ordinary configured alias and a valid
-exact-name / `alias_reference` target; it is omitted from Codex and Claude TUI
-selection only because those clients' explicit model-definition inclusion lists
-leave it out. During `22:00-08:00 UTC+8`, `work-other` promotes
-`sota-deepseek` ahead of `sota-moonshot` and `sota-xai`; outside that window
-new selection is Moonshot then xAI. The compiled `expert` alias is Terra-only:
-OpenAI/Codex `gpt-5.6-terra` (`codex_responses`, priority 100) with
-authoritative `reasoning_effort: max`; it has no nightly promotion,
-Anthropic-specific candidate, or other fallback.
+`basic` is the config-driven low-cost alias: direct Cohere, OpenRouter Cohere,
+and the two OpenCode Zen leaves precede `alias_reference: basic-other`.
+`basic-other` admits Alibaba DeepSeek Flash during `22:00-08:00 UTC+8`, then
+uses Z.AI Flash and Cursor Composer before mutually exclusive priority-zero
+Luna/Haiku tails.
+
+`work` first references `work-other`, then for Claude origins only keeps the
+native Anthropic Sonnet tail, and finally uses `gpt-5.6-luna`. During
+`22:00-08:00 UTC+8`, `work-other` orders `sota-deepseek`, Z.AI Flash,
+`sota-moonshot`, then `sota-xai`; outside that window new selection begins
+with Z.AI Flash. `expert` references `expert-other` before the final
+OpenAI/Codex `gpt-5.6-terra` fallback. `expert-other` admits Alibaba Qwen Max
+during the same window, then uses Cursor Grok and native xAI.
+
+`auto-review` references `auto-review-other`, then uses low-effort Luna and
+priority-zero OpenRouter DeepSeek. Its helper admits Alibaba DeepSeek Flash
+during the same window before low-effort Z.AI Flash and Cursor Composer.
+`codex-auto-review` remains a public alias reference to `auto-review`, so both
+public names share one concrete candidate graph.
 
 OpenAI `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna` pricing in
 `model_prices_and_context_window.json` follows the official GPT-5.6 preview page
@@ -1917,7 +1923,7 @@ interval elapses. Each rollup subline uses
 ` - model(alias):effort-or-none - Turns: N` with a mandatory
 `:<effort-or-none>` segment and an optional trailing status tag (`[Degraded]`,
 `[Cooling Down]`, `[Failed]`, or `[Exhausted]`). Existing aliases remain inside
-the model label, producing shapes such as `gpt-5.3-codex-spark(work):low`.
+the model label, producing shapes such as `gpt-5.6-luna(work):max`.
 `Cooling Down` is reserved for actual candidate-scoped cooldown or
 skipped-cooldown state; `retryable_no_cooldown`, scope `none`, and request-local
 redispatch/failover failures render as `Failed` instead of `Cooling Down`.
@@ -2430,8 +2436,7 @@ failures. Alias probes cool down only that OpenRouter candidate, record
 `OPENROUTER_PROVIDER_RAW_ERROR` in attempt metadata, and continue to the next
 declared candidate rather than surfacing an ASGI traceback to the client.
 OpenRouter alias-probe 404 responses whose provider message indicates no
-endpoint is available for the requested model (for example
-`No endpoints found for openrouter/owl-alpha`) are classified as
+endpoint is available for the requested model are classified as
 candidate-unavailable during alias-probe dispatch. LiteLLM applies the normal
 per-candidate cooldown, records the skipped attempt in alias metadata, and
 continues to the next declared candidate instead of surfacing an ASGI traceback.

@@ -22,8 +22,13 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_schema impor
     resolve_anthropic_route_family,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+    RoutingCandidate,
     RoutingSnapshot,
     active_routing_snapshot_holder,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+    DEFAULT_CONFIG_DIR,
+    compile_directory,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
     _routing_candidate_to_anthropic_public_dict,
@@ -707,22 +712,15 @@ aliases:
         assert shaped["route_family"] == "anthropic_opencode_zen_responses_adapter"
 
     def test_basic_yaml_compiles_with_opencode_candidates(self):
-        """The production basic.yaml with OpenCode candidates compiles."""
-        import os
-
-        yaml_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))),
-            "litellm",
-            "proxy",
-            "aawm_alias_config",
-            "basic.yaml",
-        )
-        with open(yaml_path) as f:
-            raw = f.read()
-        snapshot = compile_yaml(raw)
+        """The production alias directory resolves basic and basic-other."""
+        snapshot = compile_directory(DEFAULT_CONFIG_DIR)
         assert "basic" in snapshot.aliases
         # OpenCode candidates with explicit overrides compile fine
-        by_model = {c.model: c for c in snapshot.aliases["basic"].candidates}
+        by_model = {
+            candidate.model: candidate
+            for candidate in snapshot.aliases["basic"].candidates
+            if isinstance(candidate, RoutingCandidate)
+        }
         assert by_model["deepseek-v4-flash-free"].anthropic_route_family == "anthropic_opencode_zen_responses_adapter"
         assert by_model["big-pickle"].anthropic_route_family == "anthropic_opencode_zen_completion_adapter"
 

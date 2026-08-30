@@ -161,10 +161,11 @@ OMP-facing `auto-review` and Codex-client compatibility
 `provider-anthropic` and all `claude-*` aliases from that expansion;
 they remain catalog/history facts:
 
-- `basic`, `work`, `work-other`, `expert`, `sota`
+- `basic`, `basic-other`, `work`, `work-other`, `expert`, `expert-other`,
+  `sota`
 - `sota-openai`, `sota-xai`, `sota-alibaba`, `sota-moonshot`,
   `sota-deepseek`, `sota-zai`
-- `auto-review`, `codex-auto-review`
+- `auto-review`, `auto-review-other`, `codex-auto-review`
 - configured non-empty `provider-<id>` aliases
   (`provider-openai`, `provider-anthropic`, `provider-openrouter`,
   `provider-xai`, `provider-kimi_code`, `provider-alibaba_token_plan`,
@@ -187,10 +188,12 @@ Groups:
 - `all` → compiled aliases except `provider-anthropic` and all
   `claude-*` aliases (catalog/history only; do not select or run)
 - `all-sota` → the six `sota-*` parents
-- `orchestration_children` (nine) → `basic`, `work`, `expert`, `sota`,
-  `sota-xai`, `sota-alibaba`, `sota-moonshot`, `sota-zai`, `auto-review`.
+- `orchestration_children` (thirteen) → `basic`, `basic-other`, `work`,
+  `work-other`, `expert`, `expert-other`, `sota`, `sota-xai`,
+  `sota-alibaba`, `sota-moonshot`, `sota-zai`, `auto-review`,
+  `auto-review-other`.
   Spawn name is `auto-review`, not `codex-auto-review`. Not orchestration
-  children: `work-other`, `sota-deepseek`, `codex-auto-review`.
+  children: `sota-deepseek`, `codex-auto-review`.
 - `provider_coverage` → the configured non-empty `provider-<id>` aliases
   listed in `models.yaml`, except `provider-anthropic`. It is not derived
   from every direct identity in `REGISTERED_PROVIDERS`. All `claude-*`
@@ -217,8 +220,8 @@ skip the logging gate. Independent `--test model` stays available
 |---|---|---|
 | `platform` | forbidden | Health, custom HTTP, error JSONL, Redis prefix SCAN, docker logs |
 | `catalog` | optional | CFG-023/024 HTTP catalog; Ohmypi picker if `--tui ohmypi`; Codex skips live picker |
-| `model` | required | Independent per-alias TUI turn (not baseline). Ohmypi: idle exact PONG or provider 404. Codex: tool-bearing child command on `basic`/`read` |
-| `orchestration` | required | Ohmypi parent spawns the selected children group (default nine mixed aliases, or `provider_coverage`); Codex uses a smaller parent/child set |
+| `model` | required | Independent per-alias TUI turn (not baseline). Ohmypi: idle exact PONG or provider 404. Codex: tool-bearing child command on `basic` |
+| `orchestration` | required | Ohmypi parent spawns the selected children group (default thirteen mixed aliases, or `provider_coverage`); Codex defaults to parent `basic` and requires explicit children |
 
 `--dry-run` prints the resolved plan and exits 0. No TUI, no HTTP, no
 docker logs of protected containers. Use it to confirm instance/kind/
@@ -322,11 +325,11 @@ Post-TUI `docker_logs` uses the same `require_rollup` + Ohmypi identity
 gate as model kind (§7). `child_evidence.ok` is not docker_logs pass.
 
 Default parent: `sota-openai` (group `all-sota`). Default children are
-the nine mixed `orchestration_children`: `basic`, `work`, `expert`,
-`sota`, `sota-xai`, `sota-alibaba`, `sota-moonshot`, `sota-zai`,
-`auto-review`. Spawn name is `auto-review`, not `codex-auto-review`.
-Not mixed orch children: `work-other`, `sota-deepseek`,
-`codex-auto-review`, and the `provider-*` aliases.
+the thirteen mixed `orchestration_children`: `basic`, `basic-other`, `work`,
+`work-other`, `expert`, `expert-other`, `sota`, `sota-xai`, `sota-alibaba`,
+`sota-moonshot`, `sota-zai`, `auto-review`, `auto-review-other`. Spawn name
+is `auto-review`, not `codex-auto-review`. Not mixed orch children:
+`sota-deepseek`, `codex-auto-review`, and the `provider-*` aliases.
 
 Provider-pinned coverage is a **separate** group. Select it with
 `--orchestration-children provider_coverage` (or an explicit
@@ -352,20 +355,20 @@ every selected child, including `provider-*` names when that group is
 selected. Those names are harness profiles staged from
 `config/ohmypi-agents/` into `{cwd}/.omp/agents`
 (`/tmp/omp-alpha-workspace/.omp/agents` by default). Staging follows
-the planned children list, not a hardcoded nine-name fallback, when
+the planned children list, not the configured default group, when
 `--orchestration-children` is set. They are **not** the built-in
 Ohmypi names (`scout`, `designer`, `reviewer`, …) and **not** LiteLLM
 catalog ids. Session `--model` stays
 `litellm-alpha-passthrough/<parent>`.
 
 `※ recap:` is wait-complete only. Ohmypi 17.4 often finishes the parent
-turn with the nine-child PONG / date list and idle `hub` peers, without
+turn with the thirteen-child PONG / date list and idle `hub` peers, without
 a recap glyph. Missing recap is **not** a fail when `child_evidence.ok`
 is true.
 
 The runner then calls `child_spawn_evidence()` against Ohmypi session
 JSONL, including nested `session_dir/<parent-id>/*.jsonl` child
-transcripts. Pass requires successful child completions for all nine
+transcripts. Pass requires successful child completions for all thirteen
 orchestration children. Ohmypi 17.4 delivers those as:
 
 - `hub` job rows (`details.jobs[].resolvedModel` /
@@ -380,7 +383,7 @@ orchestration children. Ohmypi 17.4 delivers those as:
 A `Spawned N background agents using basic, work, expert, sota, …` line
 is spawn intent, not a completed child result. Recap-only, `Unknown
 agent`, failed preflight, or empty hub/task completions is fail. The
-wait loop does not stop on recap while any of the nine children is still
+wait loop does not stop on recap while any of the thirteen children is still
 missing. Leave the dedicated tmux session open after
 `_step_tui_orchestration`; do not close it at the end of the kind.
 SIGHUP during `hub wait` is not a pass. Operator inspects leftovers
@@ -477,8 +480,8 @@ From `config/tuis.yaml`:
 | CWD | dedicated `/tmp/hv2-codex-workspace-<session>` (`--cd`); leftover sessions do not share one workspace |
 | Session dir | `/tmp/hv2-codex-sessions/hv2-<alias>` |
 | tmux socket | `tmux37` (`wait_reply_seconds` 600, `wait_idle_seconds` 180) |
-| Default models | `basic`, `read` (`read` is not in `compiled_aliases`) |
-| Default orch | parent `basic`, child `read` |
+| Default models | `basic` |
+| Default orch | parent `basic`; `--orchestration-children` required |
 | Forbid | `-p`, `--print`, `--profile`, `exec` |
 | Model tools | on (not `--no-tools` PONG) |
 | Orchestration tools | on |
@@ -509,10 +512,9 @@ submit is YAML `submit_keys` (default `C-m`) after YAML
 newline, and immediate `C-m` after `paste-buffer` is ignored until
 the composer finishes ingesting the paste. Never send that submit
 chord into leftover operator panes.
-Codex `--model all` still
-expands compiled aliases if the operator asks, but the Codex default
-path (`--model` omitted) is `basic` + `read`, not the Ohmypi 13-alias
-matrix.
+Codex `--model all` still expands compiled aliases if the operator asks, but
+the Codex default path (`--model` omitted) is `basic`, not the Ohmypi
+27-alias catalog.
 
 ---
 
@@ -613,8 +615,7 @@ Expected traceback signature (warning, not fail): `model=work` with
 miss probe.
 
 Soft-fail signatures (warning, not `ok` flip) live under
-`checks.yaml` `soft_fail` (example: OpenRouter `owl-alpha` 404
-`No endpoints found`).
+`checks.yaml` `soft_fail`.
 
 On halt:
 
@@ -672,7 +673,7 @@ leftover-uvicorn invert, Ohmypi forbid `-p`, Ohmypi rollup identity
 (`require_rollup` + `tui=ohmypi`, including concurrent
 `aawm-infrastructure@thoth` and concurrent Codex-client
 `litellm@thoth` + `codex-auto-review`), Codex interactive TUI plans
-(`basic`/`read`, identity overlay, dedicated tmux, no print/exec),
+(`basic`, identity overlay, dedicated tmux, no print/exec),
 Codex rollup identity (`tui=codex`), grok/opencode stubs, Claude out of
 scope and excluded from current closeout (historical mentions
 legacy/non-goal), dry-run plans, H-6 prompt substring needles.
@@ -742,9 +743,10 @@ Repeat `--model` / comma-separated ids, or omit it to expand `all`
 Same leftover-uvicorn gate **and** the Ohmypi identity rollup gate
 (§7). Recap is wait-only, never pass evidence: `tui_orchestration`
 fails unless `child_evidence.ok` is true for the selected children.
-Default mixed orch still requires the nine `orchestration_children`
-(`basic`, `work`, `expert`, `sota`, `sota-xai`, `sota-alibaba`,
-`sota-moonshot`, `sota-zai`, `auto-review`). Spawn name is
+Default mixed orch still requires the thirteen `orchestration_children`
+(`basic`, `basic-other`, `work`, `work-other`, `expert`, `expert-other`,
+`sota`, `sota-xai`, `sota-alibaba`, `sota-moonshot`, `sota-zai`,
+`auto-review`, `auto-review-other`). Spawn name is
 `auto-review`, not `codex-auto-review`. Historical recap-only
 `ok: true` artifacts are stale relative to the current gate. Leave
 the dedicated parent session open after `_step_tui_orchestration`.
@@ -821,9 +823,10 @@ python scripts/harnessv2/run.py \
    reload, resume the **same** row.
 8. Baseline next: `--test orchestration --orchestration-parent
    sota-openai` after leftover uvicorn is gone. Gate spawn on
-   `child_evidence.ok` for the nine orchestration children (`basic`,
-   `work`, `expert`, `sota`, `sota-xai`, `sota-alibaba`,
-   `sota-moonshot`, `sota-zai`, `auto-review`; spawn name
+   `child_evidence.ok` for the thirteen orchestration children (`basic`,
+   `basic-other`, `work`, `work-other`, `expert`, `expert-other`, `sota`,
+   `sota-xai`, `sota-alibaba`, `sota-moonshot`, `sota-zai`, `auto-review`,
+   `auto-review-other`; spawn name
    `auto-review`, not `codex-auto-review`). Recap is wait-only, never
    pass evidence. Post-TUI `docker_logs` still needs
    `litellm#Ohmypi[<version>]@<host>` (concurrent
@@ -860,7 +863,7 @@ Proven on `litellm-alpha` (do not re-claim without a new artifact):
 | CFG-023 catalog GET leftover uvicorn | 0 leftover ACCESS |
 | T-5 leftover uvicorn (discovery probes) | closed: post-cursor leftover ACCESS except `/health*` is **0**, including native `GET /v2/model/info` **500**. Worker reloaded via watchfiles after `_logging.py` mtime `2026-08-22T02:36:57Z`. Cursor `2026-08-22T02:44:06Z`. Ohmypi TUI was not used for this proof. |
 | `--test model` `work` / `basic` / `expert` / `sota` / `work-other` | `work` / `work-other` evidence is stale after the shared CFG-035/038 graph; rerun before current acceptance claims. |
-| `--test orchestration --orchestration-parent sota-openai` | Live 2026-08-23 nine-child orch on `cceab88cd3`: TUI `child_evidence.ok` for all nine children; leftover session `hv2-ohmypi-sota-openai-3839403` left open. `docker_logs` failed on concurrent `aawm-infrastructure@thoth` until the §7 concurrent-workspace filter. Live 2026-08-23 orch retry3 on `e397f7b12e`: `docker_logs` failed on concurrent `litellm@thoth /openai_passthrough/responses` + `codex-auto-review` until the §7 concurrent Codex-client filter. That retry3 TUI also missed `basic` / `work` / `expert` / `sota` (Ohmypi no-yield / null yield) — a separate spawn flake, not this identity gate. Do **not** treat those live artifacts as a full orch pass until TUI nine-child `child_evidence.ok` and `docker_logs` are both green. Four-child artifact (`/tmp/grok-goal-4ce5b5ad827f/implementer/hv2-orch.json`) is historical. Recap-only `ok: true` and the 2026-08-22T06:17 premature-close (`hv2-orch-premature-close.json`, nested `date` without `yield`) are not spawn proof. Current TUI gate is `child_evidence.ok` for the nine orchestration children; recap is wait-only. |
+| `--test orchestration --orchestration-parent sota-openai` | Historical 2026-08-23 nine-child orch on `cceab88cd3`: TUI `child_evidence.ok` for all nine then-configured children; leftover session `hv2-ohmypi-sota-openai-3839403` left open. `docker_logs` failed on concurrent `aawm-infrastructure@thoth` until the §7 concurrent-workspace filter. Historical retry3 on `e397f7b12e` failed on concurrent `litellm@thoth /openai_passthrough/responses` + `codex-auto-review` and separately missed `basic` / `work` / `expert` / `sota`. Those artifacts predate the current graph. Current acceptance requires `child_evidence.ok` for all thirteen configured orchestration children plus green `docker_logs`; recap remains wait-only. |
 | T-1 unhashable `type` list / ASGI | closed |
 | T-4 `UnicodeDecodeError` truncated UTF-8 peek | closed (incremental decoder `errors="ignore"`) |
 | H-6 wait needle | closed (`※ recap:`; ignore needles contained in the sent prompt) |

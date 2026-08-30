@@ -1,4 +1,4 @@
 20260824 12:00:00 litellm#Codex[0.142.5]@thoth /openai_passthrough/v1/responses
  - gpt-5.4(basic):medium - Turns: 1
 20260824 12:00:12 litellm#Codex[0.142.5]@thoth /openai_passthrough/responses
- - gpt-5.4(read):low - Turns: 2
+ - gpt-5.6-luna(work):max - Turns: 2

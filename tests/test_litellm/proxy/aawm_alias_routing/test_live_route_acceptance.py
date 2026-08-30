@@ -648,7 +648,7 @@ async def test_scenario_c1_concurrent_cold_probes_single_flight_under_contention
     ``probe_total == 1``.
     """
     primary_model = "openrouter/cohere/north-mini-code:free"
-    secondary_model = "openrouter/owl-alpha"
+    secondary_model = "openrouter/~deepseek/deepseek-v4-flash-latest"
     snapshot_select.set_active_routing_snapshot(
         compiler.compile_yaml(
             f"""

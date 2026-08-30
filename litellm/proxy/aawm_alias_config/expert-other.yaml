@@ -1,0 +1,24 @@
+# CFG-041: shared helper for expert alias.
+defaults: {}
+
+aliases:
+  - name: expert-other
+    candidates:
+      - provider: alibaba_token_plan
+        model: alibaba_token_plan/qwen3.8-max
+        route_family: codex_alibaba_token_plan_chat_completions_adapter
+        priority: 100
+        schedule:
+          start_time: "22:00:00"
+          end_time: "08:00:00"
+          utc_offset: "+08:00"
+
+      - provider: cursor_agent
+        model: cursor_agent/cursor-grok-4.6-high
+        route_family: codex_cursor_agent_aiserver_adapter
+        priority: 90
+
+      - provider: xai
+        model: xai/grok-4.6
+        route_family: codex_grok_native_responses_adapter
+        priority: 0

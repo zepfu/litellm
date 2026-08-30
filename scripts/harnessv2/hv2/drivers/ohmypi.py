@@ -259,14 +259,18 @@ class OhmypiDriver:
         if not names:
             names = as_str_list(self.spec.get("orchestration_child_agents")) or [
                 "basic",
+                "basic-other",
                 "work",
+                "work-other",
                 "expert",
+                "expert-other",
                 "sota",
                 "sota-xai",
                 "sota-alibaba",
                 "sota-moonshot",
                 "sota-zai",
                 "auto-review",
+                "auto-review-other",
             ]
         written: list[str] = []
         missing: list[str] = []

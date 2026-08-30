@@ -10,7 +10,6 @@ No provider egress, no synthetic LLM calls.
 
 from __future__ import annotations
 
-import os
 from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
@@ -32,18 +31,16 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_schema impor
     REGISTERED_PROVIDERS,
     REGISTERED_ROUTE_FAMILIES,
 )
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_snapshot import (
+    RoutingCandidate,
+)
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+    DEFAULT_CONFIG_DIR,
+    compile_directory,
+)
 
 _CODEX_COHERE_ROUTE_FAMILY = "codex_cohere_chat_completions_adapter"
 _COHERE_MODEL = "cohere/command-a-03-2025"
-_REPO_ROOT = os.path.dirname(
-    os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    )
-)
-_BASIC_YAML_PATH = os.path.join(
-    _REPO_ROOT, "litellm", "proxy", "aawm_alias_config", "basic.yaml"
-)
-
 _COHERE_ALIAS_YAML = """\
 defaults: {}
 aliases:
@@ -248,14 +245,14 @@ aliases:
             compile_yaml(raw)
 
     def test_basic_yaml_keeps_direct_cohere_ahead_of_openrouter_fallback(self):
-        with open(_BASIC_YAML_PATH, "r", encoding="utf-8") as handle:
-            snapshot = compile_yaml(handle.read())
+        snapshot = compile_directory(DEFAULT_CONFIG_DIR)
 
         basic_candidates = snapshot.aliases["basic"].candidates
         north_pairs = [
             (candidate.provider, candidate.model, candidate.route_family)
             for candidate in basic_candidates
-            if candidate.model
+            if isinstance(candidate, RoutingCandidate)
+            and candidate.model
             in {
                 "cohere/north-mini-code-1-0",
                 "openrouter/cohere/north-mini-code:free",
@@ -273,20 +270,17 @@ aliases:
                 "codex_openrouter_completion_adapter",
             ),
         ]
-        # Direct Cohere stays immediately after the ox-alpha pair and still
-        # ahead of OpenRouter North Mini Code free. Alias head is no longer
-        # Cohere once OpenCode Go / OpenRouter ox-alpha land first.
+        # Direct Cohere remains the basic head and stays ahead of the
+        # independent OpenRouter North Mini Code fallback.
         cohere_index = next(
             index
             for index, candidate in enumerate(basic_candidates)
-            if candidate.model == "cohere/north-mini-code-1-0"
+            if isinstance(candidate, RoutingCandidate)
+            and candidate.model == "cohere/north-mini-code-1-0"
         )
         assert basic_candidates[cohere_index].provider == "cohere"
         assert basic_candidates[cohere_index].priority == 90
-        assert (
-            basic_candidates[cohere_index - 1].model
-            == "openrouter/stealth/ox-alpha"
-        )
+        assert cohere_index == 0
         assert basic_candidates[cohere_index + 1].provider == "openrouter"
         assert (
             basic_candidates[cohere_index + 1].model

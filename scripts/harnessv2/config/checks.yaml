@@ -184,11 +184,6 @@ checks:
     timeout_seconds: 20
 soft_fail:
   signatures:
-    - name: openrouter_owl_alpha_404
-      models:
-        - openrouter/owl-alpha
-      match: "No endpoints found"
-      client_status: 404
     - name: ms037_kimi_no_candidate
       models:
         - sota-moonshot

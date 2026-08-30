@@ -1,11 +1,14 @@
-# Temporary litellm-alpha stabilization mapping for ``expert``.
+# CFG-041: expert alias graph.
 defaults: {}
 
 aliases:
   - name: expert
     candidates:
+      - alias_reference: expert-other
+        priority: 100
+
       - provider: openai
         model: gpt-5.6-terra
         route_family: codex_responses
-        priority: 100
+        priority: 0
         reasoning_effort: max

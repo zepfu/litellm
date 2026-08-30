@@ -1,21 +1,11 @@
-# Shared CFG-035/038 work graph.
+# CFG-041: work alias graph.
 defaults: {}
 
 aliases:
   - name: work
     candidates:
-      - provider: zai_coding_plan
-        model: zai_coding_plan/glm-5.3-flash
-        route_family: codex_zai_coding_plan_chat_completions_adapter
-        priority: 110
-
-      - provider: openai
-        model: gpt-5.3-codex-spark
-        route_family: codex_responses
-        priority: 100
-
       - alias_reference: work-other
-        priority: 90
+        priority: 110
 
       - provider: anthropic
         model: claude-sonnet-5[1m]

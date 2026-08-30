@@ -1,3 +1,4 @@
+# CFG-041: shared helper for work alias.
 defaults: {}
 
 aliases:
@@ -9,7 +10,11 @@ aliases:
           start_time: "22:00:00"
           end_time: "08:00:00"
           utc_offset: "+08:00"
-      - alias_reference: sota-moonshot
+      - provider: zai_coding_plan
+        model: zai_coding_plan/glm-5.3-flash
+        route_family: codex_zai_coding_plan_chat_completions_adapter
         priority: 100
-      - alias_reference: sota-xai
+      - alias_reference: sota-moonshot
         priority: 90
+      - alias_reference: sota-xai
+        priority: 80

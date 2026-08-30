@@ -1902,8 +1902,6 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
             return None
 
     async def _active_cooldown(key: str) -> tuple[float, str]:
-        if "zai_coding_plan/glm-5.3-flash" in key:
-            return 30.0, "memory"
         return cooldowns.get(key, 0.0), "memory"
 
     async def _codex_oauth_contexts(
@@ -2027,15 +2025,11 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
         if model in {
             "openrouter/cohere/north-mini-code:free",
             "alibaba_token_plan/deepseek-v4-flash-0731",
+            "zai_coding_plan/glm-5.3-flash",
         }:
             return _IneligibleCandidateError()
         if model in {"cohere/north-mini-code-1-0", "big-pickle"}:
             return HTTPException(status_code=401, detail="generic provider auth failure")
-        if model == "openrouter/owl-alpha":
-            return HTTPException(
-                status_code=429,
-                detail={"error": {"code": "rate_limit_exceeded"}},
-            )
         if model == "deepseek-v4-flash-free":
             return HTTPException(
                 status_code=400,
@@ -2048,17 +2042,6 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
             )
         if model == "cursor_agent/composer-2.5":
             return HTTPException(status_code=504, detail="adapter timed out")
-        if model == "alibaba_token_plan/qwen3.6-flash":
-            return HTTPException(
-                status_code=400,
-                detail={
-                    "error": {
-                        "type": "invalid_request_error",
-                        "code": "ModelNotFound",
-                        "message": "Model not exist",
-                    }
-                },
-            )
         return HTTPException(
             status_code=429,
             detail={"error": {"code": "rate_limit_exceeded"}},
@@ -2123,12 +2106,11 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
         assert [model for model, _body in luna_calls] == [
             "cohere/north-mini-code-1-0",
             "openrouter/cohere/north-mini-code:free",
-            "openrouter/owl-alpha",
             "deepseek-v4-flash-free",
             "big-pickle",
             "alibaba_token_plan/deepseek-v4-flash-0731",
+            "zai_coding_plan/glm-5.3-flash",
             "cursor_agent/composer-2.5",
-            "alibaba_token_plan/qwen3.6-flash",
             "gpt-5.6-luna",
         ]
         luna_body = luna_calls[-1][1]
@@ -2141,7 +2123,6 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
         assert [model for model, _body in early_calls] == [
             "cohere/north-mini-code-1-0",
             "openrouter/cohere/north-mini-code:free",
-            "openrouter/owl-alpha",
             "deepseek-v4-flash-free",
             "big-pickle",
         ]
@@ -2160,7 +2141,7 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
             ingress="codex",
             client_product_label=claude_product,
         ).candidates
-        assert len(claude_candidates) == 9
+        assert len(claude_candidates) == 7
         assert all(
             candidate["model"] != "gpt-5.6-luna"
             for candidate in claude_candidates
@@ -2173,33 +2154,29 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
         terminal_event = persisted[-1][-1]
         inventory = terminal_event["candidates"]
         assert [candidate["model"] for candidate in inventory] == [
-            "zai_coding_plan/glm-5.3-flash",
             "cohere/north-mini-code-1-0",
             "openrouter/cohere/north-mini-code:free",
-            "openrouter/owl-alpha",
             "deepseek-v4-flash-free",
             "big-pickle",
             "alibaba_token_plan/deepseek-v4-flash-0731",
+            "zai_coding_plan/glm-5.3-flash",
             "cursor_agent/composer-2.5",
-            "alibaba_token_plan/qwen3.6-flash",
             "gpt-5.6-luna",
         ]
         assert [
             (candidate["terminal_disposition"], candidate["reason"])
             for candidate in inventory
         ] == [
-            ("skipped", "cooldown"),
             ("attempted", "provider_terminal_error"),
             ("attempted", "candidate_deterministically_ineligible"),
-            ("attempted", "rate_limited"),
             ("attempted", "provider_format_rejected"),
             ("attempted", "provider_terminal_error"),
             ("attempted", "candidate_deterministically_ineligible"),
+            ("attempted", "candidate_deterministically_ineligible"),
             ("attempted", "upstream_timeout"),
-            ("attempted", "candidate_unavailable"),
             ("attempted", "rate_limited"),
         ]
         assert inventory[-1]["reasoning_effort"] == "low"
-        assert terminal_event["candidate_count"] == len(inventory) == 10
+        assert terminal_event["candidate_count"] == len(inventory) == 8
     finally:
         snapshot_select.set_active_routing_snapshot(previous_snapshot)

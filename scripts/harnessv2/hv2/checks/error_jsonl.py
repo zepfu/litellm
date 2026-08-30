@@ -71,7 +71,7 @@ def scan_new_rows(
             text=_row_text(parsed),
             model=_row_models(parsed),
         )
-        # Signature match + null traceback is a YAML-tunable warning (owl-alpha / MS-037).
+        # Signature match + null traceback is a YAML-tunable warning.
         if matches and traceback_empty:
             soft_fail_matches.extend(matches)
             for match in matches:

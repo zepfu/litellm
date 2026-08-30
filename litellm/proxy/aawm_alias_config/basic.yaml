@@ -1,33 +1,9 @@
-# AAWM alias-routing config for the ``basic`` alias (CFG-008).
-# Every origin shares the common Cohere/OpenRouter/OpenCode/Alibaba prefix,
-# then receives a mutually exclusive TUI-specific last resort:
-#   - Claude-origin requests only: native Anthropic Haiku
-#     (tui_attached: Claude; Luna is excluded via tui_excluded).
-#   - Codex and every non-Claude/missing/unknown origin: gpt-5.6-luna with
-#     authoritative ``reasoning_effort: low`` applied through the shared
-#     CFG-006 candidate pipeline (Haiku is gated out via tui_attached).
-#
-# Direct Cohere North Mini Code is an independent ``provider: cohere`` /
-# ``lane=cohere_native`` lane. The OpenRouter North Mini Code candidate is
-# a separate fallback and must not share capacity, error, or cooldown state.
-# Anthropic skip for Cohere is existing design (Codex-only route family).
-#
-# Compiled by config_compiler.compile_yaml() into an immutable RoutingSnapshot.
-# priority: 0 is reserved for last-resort candidates and is always placed
-# last in the compiled ordering; declaration order among zeros is preserved
-# (Luna before Haiku).
-
+# CFG-041: basic alias graph.
 defaults: {}
 
 aliases:
   - name: basic
     candidates:
-      - provider: zai_coding_plan
-        model: zai_coding_plan/glm-5.3-flash
-        route_family: codex_zai_coding_plan_chat_completions_adapter
-        priority: 100
-        reasoning_effort: low
-
       - provider: cohere
         model: cohere/north-mini-code-1-0
         route_family: codex_cohere_chat_completions_adapter
@@ -37,11 +13,6 @@ aliases:
         model: openrouter/cohere/north-mini-code:free
         route_family: codex_openrouter_completion_adapter
         priority: 80
-
-      - provider: openrouter
-        model: openrouter/owl-alpha
-        route_family: codex_openrouter_completion_adapter
-        priority: 70
 
       - provider: opencode_zen
         model: deepseek-v4-flash-free
@@ -55,42 +26,5 @@ aliases:
         anthropic_route_family: anthropic_opencode_zen_completion_adapter
         priority: 50
 
-      - provider: alibaba_token_plan
-        model: alibaba_token_plan/deepseek-v4-flash-0731
-        route_family: codex_alibaba_token_plan_chat_completions_adapter
-        priority: 45
-
-      # Cursor Composer 2.5 standard is distinct from Fast. Alias YAML uses
-      # cursor_agent, not Cloud Agents cursor. Dispatch is fail-closed until
-      # the Codex/Anthropic Cursor Agent adapter wave lands.
-      - provider: cursor_agent
-        model: cursor_agent/composer-2.5
-        route_family: codex_cursor_agent_aiserver_adapter
-        priority: 42
-
-      - provider: alibaba_token_plan
-        model: alibaba_token_plan/qwen3.6-flash
-        route_family: codex_alibaba_token_plan_chat_completions_adapter
-        priority: 40
-
-      # Default-branch last resort: Codex and every non-Claude/missing/
-      # unknown origin. CFG-006: the configured low reasoning replaces any
-      # caller-provided reasoning through the shared candidate pipeline;
-      # ``basic`` routing implements no separate reasoning precedence.
-      # tui_excluded keeps Luna ineligible for Claude-origin requests.
-      - provider: openai
-        model: gpt-5.6-luna
-        route_family: codex_responses
+      - alias_reference: basic-other
         priority: 0
-        reasoning_effort: low
-        tui_excluded: Claude
-
-      # Claude-branch last resort: native Anthropic Haiku only.
-      # Anthropic-native credentials/egress on both ingress projections
-      # (anthropic_messages on Codex ingress is fail-closed at shaping).
-      - provider: anthropic
-        model: claude-haiku-4-5-20251001
-        route_family: anthropic_messages
-        anthropic_route_family: anthropic_messages
-        priority: 0
-        tui_attached: Claude

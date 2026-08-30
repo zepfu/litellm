@@ -30,12 +30,6 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup impo
 _OPERATIONAL_ALIAS_ORDER = {
     "basic": [
         (
-            "zai_coding_plan",
-            "zai_coding_plan/glm-5.3-flash",
-            "codex_zai_coding_plan_chat_completions_adapter",
-            100,
-        ),
-        (
             "cohere",
             "cohere/north-mini-code-1-0",
             "codex_cohere_chat_completions_adapter",
@@ -46,12 +40,6 @@ _OPERATIONAL_ALIAS_ORDER = {
             "openrouter/cohere/north-mini-code:free",
             "codex_openrouter_completion_adapter",
             80,
-        ),
-        (
-            "openrouter",
-            "openrouter/owl-alpha",
-            "codex_openrouter_completion_adapter",
-            70,
         ),
         (
             "opencode_zen",
@@ -65,23 +53,26 @@ _OPERATIONAL_ALIAS_ORDER = {
             "codex_opencode_zen_adapter",
             50,
         ),
+        ("REF", "basic-other", None, 0),
+    ],
+    "basic-other": [
         (
             "alibaba_token_plan",
             "alibaba_token_plan/deepseek-v4-flash-0731",
             "codex_alibaba_token_plan_chat_completions_adapter",
-            45,
+            100,
+        ),
+        (
+            "zai_coding_plan",
+            "zai_coding_plan/glm-5.3-flash",
+            "codex_zai_coding_plan_chat_completions_adapter",
+            90,
         ),
         (
             "cursor_agent",
             "cursor_agent/composer-2.5",
             "codex_cursor_agent_aiserver_adapter",
-            42,
-        ),
-        (
-            "alibaba_token_plan",
-            "alibaba_token_plan/qwen3.6-flash",
-            "codex_alibaba_token_plan_chat_completions_adapter",
-            40,
+            80,
         ),
         (
             "openai",
@@ -97,60 +88,32 @@ _OPERATIONAL_ALIAS_ORDER = {
         ),
     ],
     "work": [
-        (
-            "zai_coding_plan",
-            "zai_coding_plan/glm-5.3-flash",
-            "codex_zai_coding_plan_chat_completions_adapter",
-            110,
-        ),
-        (
-            "openai",
-            "gpt-5.3-codex-spark",
-            "codex_responses",
-            100,
-        ),
-        ("REF", "work-other", None, 90),
+        ("REF", "work-other", None, 110),
         ("anthropic", "claude-sonnet-5[1m]", "anthropic_messages", 80),
         ("anthropic", "claude-sonnet-5", "anthropic_messages", 70),
         ("openai", "gpt-5.6-luna", "codex_responses", 0),
     ],
     "work-other": [
         ("REF", "sota-deepseek", None, 110),
-        ("REF", "sota-moonshot", None, 100),
-        ("REF", "sota-xai", None, 90),
+        (
+            "zai_coding_plan",
+            "zai_coding_plan/glm-5.3-flash",
+            "codex_zai_coding_plan_chat_completions_adapter",
+            100,
+        ),
+        ("REF", "sota-moonshot", None, 90),
+        ("REF", "sota-xai", None, 80),
     ],
     "expert": [
+        ("REF", "expert-other", None, 100),
         (
             "openai",
             "gpt-5.6-terra",
             "codex_responses",
-            100,
+            0,
         ),
     ],
-    "sota-openai": [
-        ("openai", "gpt-5.6-sol", "codex_responses", 100),
-    ],
-    "sota-xai": [
-        (
-            "cursor_agent",
-            "cursor_agent/cursor-grok-4.6-high",
-            "codex_cursor_agent_aiserver_adapter",
-            110,
-        ),
-        (
-            "xai",
-            "xai/grok-4.6",
-            "codex_grok_native_responses_adapter",
-            100,
-        ),
-        (
-            "xai",
-            "oa_xai/grok-4.6",
-            "codex_xai_oauth_responses_adapter",
-            90,
-        ),
-    ],
-    "sota-alibaba": [
+    "expert-other": [
         (
             "alibaba_token_plan",
             "alibaba_token_plan/qwen3.8-max",
@@ -158,53 +121,69 @@ _OPERATIONAL_ALIAS_ORDER = {
             100,
         ),
         (
-            "alibaba_token_plan",
-            "alibaba_token_plan/qwen3.7-max",
-            "codex_alibaba_token_plan_chat_completions_adapter",
+            "cursor_agent",
+            "cursor_agent/cursor-grok-4.6-high",
+            "codex_cursor_agent_aiserver_adapter",
+            90,
+        ),
+        (
+            "xai",
+            "xai/grok-4.6",
+            "codex_grok_native_responses_adapter",
             0,
         ),
     ],
-    "sota-moonshot": [
+    "auto-review": [
+        ("REF", "auto-review-other", None, 100),
         (
-            "kimi_code",
-            "kimi_code/k3",
-            "codex_kimi_chat_completions_adapter",
-            100,
+            "openai",
+            "gpt-5.6-luna",
+            "codex_responses",
+            90,
+        ),
+        (
+            "openrouter",
+            "openrouter/~deepseek/deepseek-v4-flash-latest",
+            "codex_openrouter_completion_adapter",
+            0,
         ),
     ],
-    "sota-deepseek": [
+    "auto-review-other": [
         (
             "alibaba_token_plan",
-            "alibaba_token_plan/deepseek-v4-pro",
+            "alibaba_token_plan/deepseek-v4-flash-0731",
             "codex_alibaba_token_plan_chat_completions_adapter",
             100,
         ),
-    ],
-    "sota-zai": [
         (
             "zai_coding_plan",
-            "zai_coding_plan/glm-5.3",
+            "zai_coding_plan/glm-5.3-flash",
             "codex_zai_coding_plan_chat_completions_adapter",
-            110,
+            90,
         ),
         (
-            "alibaba_token_plan",
-            "alibaba_token_plan/glm-5.2",
-            "codex_alibaba_token_plan_chat_completions_adapter",
-            100,
+            "cursor_agent",
+            "cursor_agent/composer-2.5",
+            "codex_cursor_agent_aiserver_adapter",
+            80,
         ),
     ],
+    "codex-auto-review": [
+        ("REF", "auto-review", None, 100),
+    ],
+    "sota-openai": [
+        ("openai", "gpt-5.6-sol", "codex_responses", 100),
+    ],
 }
-
-_CONFIGURED_PROVIDER_IDS = tuple(
-    sorted(REGISTERED_PROVIDERS - {"nous", "opencode_go"})
-)
 _WITHDRAWN_OX_ALPHA_MODELS = frozenset(
     {
         "ox-alpha-free",
         "stealth/ox-alpha",
         "openrouter/stealth/ox-alpha",
     }
+)
+_CONFIGURED_PROVIDER_IDS = tuple(
+    sorted(REGISTERED_PROVIDERS - {"nous", "opencode_go"})
 )
 
 
@@ -299,6 +278,25 @@ def test_provider_nvidia_keeps_closed_five_model_nim_set() -> None:
         assert entry.route_family == "codex_nvidia_completion_adapter"
         assert entry.anthropic_route_family is None
     assert all(not isinstance(entry, AliasReference) for entry in alias.candidates)
+
+
+def test_provider_openai_keeps_cheapest_first_low_effort_order() -> None:
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    alias = snapshot.aliases["provider-openai"]
+    assert [
+        (
+            entry.provider,
+            entry.model,
+            entry.route_family,
+            entry.priority,
+            entry.reasoning_effort,
+        )
+        for entry in alias.candidates
+    ] == [
+        ("openai", "gpt-5.6-luna", "codex_responses", 100, "low"),
+        ("openai", "gpt-5.6-terra", "codex_responses", 90, "low"),
+        ("openai", "gpt-5.6-sol", "codex_responses", 0, "low"),
+    ]
 
 
 def test_provider_nvidia_rejects_alias_reference_and_openrouter_escape() -> None:
@@ -437,7 +435,7 @@ aliases:
   - name: provider-openai
     candidates:
       - provider: openrouter
-        model: openrouter/owl-alpha
+        model: openrouter/cohere/north-mini-code:free
         route_family: codex_openrouter_completion_adapter
         priority: 100
 """

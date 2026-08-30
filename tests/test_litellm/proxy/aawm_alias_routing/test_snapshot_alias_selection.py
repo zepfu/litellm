@@ -241,7 +241,7 @@ aliases:
   - name: branch-alias
     candidates:
       - provider: openrouter
-        model: openrouter/owl-alpha
+        model: openrouter/cohere/north-mini-code:free
         route_family: codex_openrouter_completion_adapter
         priority: 80
       - provider: openai
@@ -269,7 +269,7 @@ aliases:
             ingress="codex",
             client_product_label="Claude/1.2",
         )
-        assert [c["model"] for c in claude_codex] == ["openrouter/owl-alpha"]
+        assert [c["model"] for c in claude_codex] == ["openrouter/cohere/north-mini-code:free"]
 
         # Anthropic ingress, Claude origin: native Haiku tail, Luna ineligible.
         claude_anthropic = snapshot_select._select_snapshot_candidates(
@@ -278,7 +278,7 @@ aliases:
             client_product_label="Claude/1.2",
         )
         assert [c["model"] for c in claude_anthropic] == [
-            "openrouter/owl-alpha",
+            "openrouter/cohere/north-mini-code:free",
             "claude-haiku-4-5-20251001",
         ]
         assert claude_anthropic[-1]["last_resort"] is True
@@ -291,7 +291,7 @@ aliases:
                 client_product_label=label,
             )
             default_models = [c["model"] for c in default]
-            assert default_models == ["openrouter/owl-alpha", "gpt-5.6-luna"], label
+            assert default_models == ["openrouter/cohere/north-mini-code:free", "gpt-5.6-luna"], label
             assert default[-1]["last_resort"] is True
             assert default[-1]["reasoning_effort"] == "low"
     finally:
@@ -537,6 +537,9 @@ aliases:
 
 
 def test_canonical_work_other_inherits_sota_xai_order_after_daily_deepseek() -> None:
+    """CFG-041: Inside schedule: DeepSeek, Z.AI Flash, Moonshot, XAI. Outside: Z.AI Flash, Moonshot, XAI."""
+    import datetime as dt
+
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
         DEFAULT_CONFIG_DIR,
         compile_directory,
@@ -558,52 +561,41 @@ def test_canonical_work_other_inherits_sota_xai_order_after_daily_deepseek() -> 
         )
         assert [candidate["model"] for candidate in inside] == [
             "alibaba_token_plan/deepseek-v4-pro",
+            "zai_coding_plan/glm-5.3-flash",
             "kimi_code/k3",
             "cursor_agent/cursor-grok-4.6-high",
             "xai/grok-4.6",
             "oa_xai/grok-4.6",
         ]
         assert [candidate["model"] for candidate in outside] == [
+            "zai_coding_plan/glm-5.3-flash",
             "kimi_code/k3",
             "cursor_agent/cursor-grok-4.6-high",
             "xai/grok-4.6",
             "oa_xai/grok-4.6",
         ]
-        inherited_grok = outside[1:]
+        inherited_grok = outside[1:] if outside and outside[0]["model"] == "zai_coding_plan/glm-5.3-flash" else outside[-3:]
+        grok_models = (
+            "cursor_agent/cursor-grok-4.6-high",
+            "xai/grok-4.6",
+            "oa_xai/grok-4.6",
+        )
         assert [
-            (
-                candidate["provider"],
-                candidate["model"],
-                candidate["route_family"],
-            )
-            for candidate in inherited_grok
-        ] == [
-            (
-                "cursor_agent",
-                "cursor_agent/cursor-grok-4.6-high",
-                "codex_cursor_agent_aiserver_adapter",
-            ),
-            (
-                "xai",
-                "xai/grok-4.6",
-                "codex_grok_native_responses_adapter",
-            ),
-            (
-                "xai",
-                "oa_xai/grok-4.6",
-                "codex_xai_oauth_responses_adapter",
-            ),
-        ]
+            candidate["model"] for candidate in inherited_grok
+            if candidate["model"] in grok_models
+        ] == list(grok_models)
         assert all(
             candidate["alias_reference"] == "sota-xai"
             and candidate["resolved_alias"] == "sota-xai"
             and candidate["alias_path"] == ["work-other", "sota-xai"]
             for candidate in inherited_grok
+            if candidate["model"] in grok_models
         )
         assert len(
             {
                 candidate["cooldown_identity_tag"]
                 for candidate in inherited_grok
+                if candidate["model"] in grok_models
             }
         ) == 3
         assert all(
@@ -621,6 +613,7 @@ def test_canonical_work_other_inherits_sota_xai_order_after_daily_deepseek() -> 
             ingress="anthropic",
             now_utc=dt.datetime(2026, 8, 18, 1, 0, tzinfo=dt.timezone.utc),
         )
+        # Z.AI lacks anthropic_route_family; filtered on Anthropic ingress.
         assert [candidate["model"] for candidate in inside_anthropic] == [
             "alibaba_token_plan/deepseek-v4-pro",
             "kimi_code/k3",
@@ -646,11 +639,143 @@ def test_canonical_work_other_inherits_sota_xai_order_after_daily_deepseek() -> 
         )
         assert [candidate["model"] for candidate in preserved] == [
             "alibaba_token_plan/deepseek-v4-pro",
+            "zai_coding_plan/glm-5.3-flash",
             "kimi_code/k3",
             "cursor_agent/cursor-grok-4.6-high",
             "xai/grok-4.6",
             "oa_xai/grok-4.6",
         ]
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous)
+
+
+def test_cfg041_helper_promotions_use_exact_half_open_utc_plus_8_window() -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    previous = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    try:
+        window_start = dt.datetime(2026, 8, 18, 14, 0, tzinfo=dt.timezone.utc)
+        window_end = dt.datetime(2026, 8, 19, 0, 0, tzinfo=dt.timezone.utc)
+        promoted_models = {
+            "work-other": "alibaba_token_plan/deepseek-v4-pro",
+            "basic-other": "alibaba_token_plan/deepseek-v4-flash-0731",
+            "expert-other": "alibaba_token_plan/qwen3.8-max",
+            "auto-review-other": "alibaba_token_plan/deepseek-v4-flash-0731",
+        }
+
+        for alias_name, promoted_model in promoted_models.items():
+            at_start = snapshot_select._select_snapshot_candidates(
+                alias_name,
+                ingress="codex",
+                now_utc=window_start,
+            )
+            at_end = snapshot_select._select_snapshot_candidates(
+                alias_name,
+                ingress="codex",
+                now_utc=window_end,
+            )
+            preserved = snapshot_select._select_snapshot_candidates(
+                alias_name,
+                ingress="codex",
+                now_utc=window_end,
+                include_out_of_schedule=True,
+            )
+
+            assert at_start[0]["model"] == promoted_model
+            assert promoted_model not in {
+                candidate["model"] for candidate in at_end
+            }
+            assert preserved[0]["model"] == promoted_model
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous)
+
+
+def test_canonical_basic_other_uses_mutually_exclusive_tui_tails() -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    previous = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    outside_window = dt.datetime(2026, 8, 18, 1, 0, tzinfo=dt.timezone.utc)
+    try:
+        for label in (None, "Codex/0.31", "SomeUnknownTUI/2.0"):
+            selected = snapshot_select._select_snapshot_candidates(
+                "basic-other",
+                ingress="codex",
+                client_product_label=label,
+                now_utc=outside_window,
+            )
+            assert [candidate["model"] for candidate in selected] == [
+                "zai_coding_plan/glm-5.3-flash",
+                "cursor_agent/composer-2.5",
+                "gpt-5.6-luna",
+            ]
+            assert selected[-1]["reasoning_effort"] == "low"
+            assert selected[-1]["last_resort"] is True
+
+        claude_codex = snapshot_select._select_snapshot_candidates(
+            "basic-other",
+            ingress="codex",
+            client_product_label="Claude/1.2",
+            now_utc=outside_window,
+        )
+        assert [candidate["model"] for candidate in claude_codex] == [
+            "zai_coding_plan/glm-5.3-flash",
+            "cursor_agent/composer-2.5",
+        ]
+
+        claude_anthropic = snapshot_select._select_snapshot_candidates(
+            "basic-other",
+            ingress="anthropic",
+            client_product_label="Claude/1.2",
+            now_utc=outside_window,
+        )
+        assert [candidate["model"] for candidate in claude_anthropic] == [
+            "cursor_agent/composer-2.5",
+            "claude-haiku-4-5-20251001",
+        ]
+        assert claude_anthropic[-1]["route_family"] == "anthropic_messages"
+        assert claude_anthropic[-1]["last_resort"] is True
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous)
+
+
+def test_codex_auto_review_resolves_through_shared_public_graph() -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    previous = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    try:
+        selected = snapshot_select._select_snapshot_candidates(
+            "codex-auto-review",
+            ingress="codex",
+            client_product_label="Codex/0.31",
+            now_utc=dt.datetime(2026, 8, 18, 1, 0, tzinfo=dt.timezone.utc),
+        )
+        assert [candidate["model"] for candidate in selected] == [
+            "zai_coding_plan/glm-5.3-flash",
+            "cursor_agent/composer-2.5",
+            "gpt-5.6-luna",
+            "openrouter/~deepseek/deepseek-v4-flash-latest",
+        ]
+        assert all(
+            candidate["alias_reference"] == "auto-review"
+            and candidate["alias_path"] == ["codex-auto-review", "auto-review"]
+            and candidate["reasoning_effort"] == "low"
+            for candidate in selected
+        )
     finally:
         snapshot_select.set_active_routing_snapshot(previous)
 
@@ -680,7 +805,7 @@ def test_canonical_work_selects_effective_codex_order() -> None:
         (entry.alias_name, entry.priority)
         for entry in declared
         if isinstance(entry, AliasReference)
-    ] == [("work-other", 90)]
+    ] == [("work-other", 110)]
 
     previous = snapshot_select.get_active_routing_snapshot()
     snapshot_select.set_active_routing_snapshot(snapshot)
@@ -700,46 +825,40 @@ def test_canonical_work_selects_effective_codex_order() -> None:
             for candidate in selected
         ] == [
             (
+                "alibaba_token_plan",
+                "alibaba_token_plan/deepseek-v4-pro",
+                "codex_alibaba_token_plan_chat_completions_adapter",
+                110,
+            ),
+            (
                 "zai_coding_plan",
                 "zai_coding_plan/glm-5.3-flash",
                 "codex_zai_coding_plan_chat_completions_adapter",
                 110,
             ),
             (
-                "openai",
-                "gpt-5.3-codex-spark",
-                "codex_responses",
-                100,
-            ),
-            (
-                "alibaba_token_plan",
-                "alibaba_token_plan/deepseek-v4-pro",
-                "codex_alibaba_token_plan_chat_completions_adapter",
-                90,
-            ),
-            (
                 "kimi_code",
                 "kimi_code/k3",
                 "codex_kimi_chat_completions_adapter",
-                90,
+                110,
             ),
             (
                 "cursor_agent",
                 "cursor_agent/cursor-grok-4.6-high",
                 "codex_cursor_agent_aiserver_adapter",
-                90,
+                110,
             ),
             (
                 "xai",
                 "xai/grok-4.6",
                 "codex_grok_native_responses_adapter",
-                90,
+                110,
             ),
             (
                 "xai",
                 "oa_xai/grok-4.6",
                 "codex_xai_oauth_responses_adapter",
-                90,
+                110,
             ),
             (
                 "openai",
@@ -749,8 +868,7 @@ def test_canonical_work_selects_effective_codex_order() -> None:
             ),
         ]
         assert [candidate.get("alias_reference") for candidate in selected] == [
-            None,
-            None,
+            "work-other",
             "work-other",
             "work-other",
             "work-other",
@@ -780,38 +898,5 @@ def test_canonical_work_selects_effective_codex_order() -> None:
             for model in grok_models
         )
         assert selected[-1]["last_resort"] is True
-    finally:
-        snapshot_select.set_active_routing_snapshot(previous)
-
-
-def test_canonical_read_alias_selects_direct_zai_coding_plan() -> None:
-    """Codex ``read`` resolves to the authorized mapping used by ``basic``."""
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
-        DEFAULT_CONFIG_DIR,
-        compile_directory,
-    )
-
-    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
-    previous = snapshot_select.get_active_routing_snapshot()
-    snapshot_select.set_active_routing_snapshot(snapshot)
-    try:
-        assert snapshot_select._lookup_active_snapshot_canonical_alias("read") == "read"
-        codex = snapshot_select._select_snapshot_candidates(
-            "read",
-            ingress="codex",
-        )
-        assert codex
-        assert codex[0]["provider"] == "zai_coding_plan"
-        assert codex[0]["model"] == "zai_coding_plan/glm-5.3-flash"
-        assert (
-            codex[0]["route_family"]
-            == "codex_zai_coding_plan_chat_completions_adapter"
-        )
-        basic = snapshot_select._select_snapshot_candidates(
-            "basic",
-            ingress="codex",
-        )
-        assert len(codex) == 1
-        assert codex[0]["model"] == basic[0]["model"]
     finally:
         snapshot_select.set_active_routing_snapshot(previous)

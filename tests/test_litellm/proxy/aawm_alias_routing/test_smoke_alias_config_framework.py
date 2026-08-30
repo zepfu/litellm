@@ -39,16 +39,14 @@ def test_module_imports() -> None:
 
 
 def test_basic_yaml_compiles() -> None:
-    """``basic.yaml`` compiles into a valid snapshot with a stable content-derived hash."""
-    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
-        config_compiler as compiler,
+    """CFG-041: basic.yaml compiles via directory since it references basic-other."""
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        compile_directory,
     )
 
-    with open(_BASIC_YAML_PATH, "r", encoding="utf-8") as handle:
-        raw_yaml = handle.read()
-
-    first = compiler.compile_yaml(raw_yaml)
-    second = compiler.compile_yaml(raw_yaml)
+    snapshot = compile_directory(Path(_ALIAS_CONFIG_DIR))
+    first = snapshot
+    second = compile_directory(Path(_ALIAS_CONFIG_DIR))
 
     assert "basic" in first.aliases
     assert len(first.aliases["basic"].candidates) > 0
@@ -60,13 +58,12 @@ def test_basic_yaml_compiles() -> None:
     assert first.config_epoch != second.config_epoch
 
     basic_candidate = first.aliases["basic"].candidates[0]
-    assert basic_candidate.provider == "zai_coding_plan"
-    assert basic_candidate.model == "zai_coding_plan/glm-5.3-flash"
+    assert basic_candidate.provider == "cohere"
+    assert basic_candidate.model == "cohere/north-mini-code-1-0"
     assert basic_candidate.route_family == (
-        "codex_zai_coding_plan_chat_completions_adapter"
+        "codex_cohere_chat_completions_adapter"
     )
-    assert basic_candidate.priority == 100
-    assert basic_candidate.reasoning_effort == "low"
+    assert basic_candidate.priority == 90
 
 
 def test_standalone_alias_mappings() -> None:
@@ -76,20 +73,6 @@ def test_standalone_alias_mappings() -> None:
     )
 
     expected = {
-        "read.yaml": (
-            "read",
-            "zai_coding_plan",
-            "zai_coding_plan/glm-5.3-flash",
-            "codex_zai_coding_plan_chat_completions_adapter",
-            "low",
-        ),
-        "expert.yaml": (
-            "expert",
-            "openai",
-            "gpt-5.6-terra",
-            "codex_responses",
-            "max",
-        ),
         "sota-openai.yaml": (
             "sota-openai",
             "openai",
@@ -134,12 +117,12 @@ def test_work_yaml_compiles_current_graph() -> None:
     snapshot = compile_directory(Path(_ALIAS_CONFIG_DIR))
     entries = snapshot.aliases["work"].candidates
 
-    assert len(entries) == 6
-    assert isinstance(entries[2], AliasReference)
+    assert len(entries) == 4
+    assert isinstance(entries[0], AliasReference)
     assert all(
         isinstance(entry, RoutingCandidate)
         for index, entry in enumerate(entries)
-        if index != 2
+        if index != 0
     )
     assert [
         (
@@ -155,28 +138,16 @@ def test_work_yaml_compiles_current_graph() -> None:
         for entry in entries
     ] == [
         (
-            "zai_coding_plan",
-            "zai_coding_plan/glm-5.3-flash",
-            "codex_zai_coding_plan_chat_completions_adapter",
-            110,
-        ),
-        (
-            "openai",
-            "gpt-5.3-codex-spark",
-            "codex_responses",
-            100,
-        ),
-        (
             "REF",
             "work-other",
             None,
-            90,
+            110,
         ),
         ("anthropic", "claude-sonnet-5[1m]", "anthropic_messages", 80),
         ("anthropic", "claude-sonnet-5", "anthropic_messages", 70),
         ("openai", "gpt-5.6-luna", "codex_responses", 0),
     ]
-    for candidate in entries[3:5]:
+    for candidate in entries[1:3]:
         assert isinstance(candidate, RoutingCandidate)
         assert candidate.anthropic_route_family == "anthropic_messages"
         assert candidate.reasoning_effort == "max"

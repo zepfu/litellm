@@ -13,13 +13,6 @@ candidate tables and no startup or no-snapshot fallback.
 litellm/proxy/aawm_alias_config/
 ```
 
-Codex TUI OC-003 requires native ``read`` even though Ohmypi
-``compiled_aliases`` omits it. ``read.yaml`` publishes that alias with the
-same first candidate as ``basic``: Z.AI Coding Plan
-``zai_coding_plan/glm-5.3-flash`` at priority 100 with
-``reasoning_effort: low``. Codex therefore does not send ``model=read`` to
-ChatGPT as a native model.
-
 Relative to the repository root (and `/app/litellm/proxy/aawm_alias_config/`
 inside the container). The path is resolved from
 `litellm/proxy/pass_through_endpoints/aawm_alias_routing/config_startup.py`
@@ -176,32 +169,37 @@ family.
 
 Harness v2 publishes these ids on `compiled_aliases` and in group
 `provider_coverage`. Operational Ohmypi orchestration still uses the
-nine mixed `orchestration_children`. Provider coverage is selected with
+thirteen mixed `orchestration_children`. Provider coverage is selected with
 `--orchestration-children provider_coverage`. Ohmypi auto-retry onto
 `sota` / OpenAI is a provider-specific failure, not a pass.
 
-## Maintained `basic` alias behavior (CFG-008)
+`provider-openai` is the closed egress-validation sequence
+`gpt-5.6-luna` (priority 100), `gpt-5.6-terra` (priority 90), then
+`gpt-5.6-sol` (priority 0). All three candidates use
+`reasoning_effort: low`; this does not change `sota-openai`.
 
-The maintained alias name is `basic`. Every origin uses this common candidate
-prefix, in order:
+## Maintained `basic` and `basic-other` alias behavior
 
-1. Z.AI Coding Plan `zai_coding_plan/glm-5.3-flash`
-   (`reasoning_effort: low`, priority 100)
-2. Direct Cohere North Mini Code (`cohere/north-mini-code-1-0`,
+The `basic` alias keeps the low-cost common prefix, in order:
+
+1. Direct Cohere North Mini Code (`cohere/north-mini-code-1-0`,
    `provider: cohere`, `codex_cohere_chat_completions_adapter`,
    `lane=cohere_native`, priority 90)
-3. OpenRouter Cohere North Mini Code free
-   (`openrouter/cohere/north-mini-code:free`) as an independent fallback
-4. OpenRouter Owl Alpha
-5. OpenCode Zen deepseek-v4-flash
-6. OpenCode Zen big-pickle
-7. Alibaba Token Plan deepseek-v4-flash-0731
-8. Cursor Agent Composer 2.5 standard (`cursor_agent/composer-2.5`,
-   `provider: cursor_agent`, `codex_cursor_agent_aiserver_adapter`,
-   priority 42). Distinct from `composer-2.5-fast` and from xAI
-   `grok-composer-2.5-fast`. Alias YAML uses `cursor_agent`, not Cloud
-   Agents `cursor`.
-9. Alibaba Token Plan qwen3.6-flash
+2. OpenRouter Cohere North Mini Code free
+   (`openrouter/cohere/north-mini-code:free`, priority 80) as an independent
+   fallback
+3. OpenCode Zen `deepseek-v4-flash-free` (priority 60)
+4. OpenCode Zen `big-pickle` (priority 50)
+5. `alias_reference: basic-other` (priority 0)
+
+`basic-other` orders Alibaba Token Plan
+`alibaba_token_plan/deepseek-v4-flash-0731` (priority 100, admitted only during
+the recurring half-open `22:00-08:00 UTC+8` window), Z.AI Coding Plan
+`zai_coding_plan/glm-5.3-flash` (priority 90), and Cursor Agent
+`cursor_agent/composer-2.5` (priority 80). It then has mutually exclusive
+priority-zero tails: OpenAI `gpt-5.6-luna` with `reasoning_effort: low` for
+non-Claude, missing, and unknown origins, or native Anthropic
+`claude-haiku-4-5-20251001` for Claude origins.
 
 `sota-xai` follows the CFG-038 provider-neutral order: Cursor Grok
 (`cursor_agent/cursor-grok-4.6-high`, priority 110), native xAI/OIDC
@@ -248,9 +246,9 @@ candidates are the `qwen3.8-max-preview` promo, `kimi-for-coding`, and
 `gpt-5.4-mini`.
 
 Cost metadata for these shared candidates is route-specific. OpenRouter North
-may carry a third-party hosted reference baseline, while Owl Alpha is
-unpriced. OpenCode Big Pickle and its free DeepSeek route remain unpriced, and
-Alibaba DeepSeek V4 Flash and Qwen 3.6 are reference-priced only under the
+may carry a third-party hosted reference baseline. OpenCode Big Pickle and its
+free DeepSeek route remain unpriced, and Alibaba DeepSeek V4 Flash is
+reference-priced only under the
 subscription `actual_invoice_cost_known=false` contract, using the
 international Model Studio direct list rate rather than claiming Token Plan
 subscription invoice economics. Cursor Composer 2.5 standard and Cursor Grok
@@ -274,43 +272,55 @@ failures, which use the normal retry and cooldown classification.
 
 The `work` alias is compiled from `work.yaml`. Candidate order is:
 
-1. Z.AI Coding Plan `zai_coding_plan/glm-5.3-flash` (priority 110)
-2. OpenAI `gpt-5.3-codex-spark` (priority 100)
-3. Nested `alias_reference: work-other` (priority 90)
-4. Claude-origin only: native Anthropic `claude-sonnet-5[1m]`
+1. Nested `alias_reference: work-other` (priority 110)
+2. Claude-origin only: native Anthropic `claude-sonnet-5[1m]`
    (priority 80, `reasoning_effort: max`)
-5. Claude-origin only: native Anthropic `claude-sonnet-5`
+3. Claude-origin only: native Anthropic `claude-sonnet-5`
    (priority 70, `reasoning_effort: max`)
-6. OpenAI `gpt-5.6-luna` (priority 0, `reasoning_effort: max`)
-
-The direct Z.AI Coding Plan leaf is Codex-only: it declares a Codex
-`route_family` and no `anthropic_route_family`. Anthropic projection omits
-that leaf and begins at the first compatible candidate; the native Sonnet
-leaves remain attached only to Claude-origin requests.
+4. OpenAI `gpt-5.6-luna` (priority 0, `reasoning_effort: max`)
 
 `work-other` is an ordinary configured alias compiled from `work-other.yaml`.
-It is a valid exact-name route and a valid `alias_reference` target. It remains
-absent from Codex and Claude TUI selection only because those clients' explicit
-model-definition inclusion lists omit it, not because YAML or Python marks it
-internal.
+It is a valid exact-name route, a valid `alias_reference` target, and an
+Ohmypi orchestration child.
 
 Its candidates are `alias_reference: sota-deepseek` (priority 110, scheduled
-for the daily half-open window `22:00-08:00 UTC+8`), `alias_reference:
-sota-moonshot` (priority 100), and `alias_reference: sota-xai` (priority 90).
-Thus Codex's effective expansion through `work-other` is DeepSeek -> Moonshot
--> `sota-xai` during the window, and Moonshot -> `sota-xai` outside it.
+for the daily half-open window `22:00-08:00 UTC+8`), Z.AI Coding Plan
+`zai_coding_plan/glm-5.3-flash` (priority 100), `alias_reference:
+sota-moonshot` (priority 90), and `alias_reference: sota-xai` (priority 80).
+Thus Codex's effective expansion through `work-other` is DeepSeek -> Z.AI ->
+Moonshot -> `sota-xai` during the window, and Z.AI -> Moonshot -> `sota-xai`
+outside it.
 `sota-xai` currently expands in this order: Cursor
 `cursor_agent/cursor-grok-4.6-high`, native xAI/OIDC `xai/grok-4.6`, then
 managed xAI/OAuth `oa_xai/grok-4.6`. The Claude-only Sonnet leaves do not enter
 this Codex expansion; Luna remains the final OpenAI fallback. Closing the
 window prevents new affinity and does not evict an existing session owner.
 
-## Maintained `expert` alias behavior (CFG-013 / CFG-020)
+## Maintained `expert` and `expert-other` alias behavior
 
-The `expert` alias is compiled from `expert.yaml` and currently has one
-candidate: OpenAI/Codex `gpt-5.6-terra` (`codex_responses`, priority 100,
-`reasoning_effort: max`). The current YAML has no nightly promotion or
-Anthropic-specific expert candidate.
+The `expert` alias first references `expert-other` (priority 100), then falls
+back to OpenAI/Codex `gpt-5.6-terra` (`codex_responses`, priority 0,
+`reasoning_effort: max`). `expert-other` orders scheduled Alibaba Token Plan
+`alibaba_token_plan/qwen3.8-max` (priority 100, `22:00-08:00 UTC+8`), Cursor
+Agent `cursor_agent/cursor-grok-4.6-high` (priority 90), and native xAI/OIDC
+`xai/grok-4.6` (priority 0). It does not include managed xAI/OAuth or
+Anthropic candidates.
+
+## Maintained `auto-review` aliases
+
+`auto-review` first references `auto-review-other` (priority 100), then uses
+OpenAI `gpt-5.6-luna` (priority 90) and priority-zero OpenRouter
+`openrouter/~deepseek/deepseek-v4-flash-latest`. The concrete fallback
+candidates use `reasoning_effort: low`.
+
+`auto-review-other` orders scheduled Alibaba Token Plan
+`alibaba_token_plan/deepseek-v4-flash-0731` (priority 100,
+`22:00-08:00 UTC+8`), Z.AI Coding Plan
+`zai_coding_plan/glm-5.3-flash` (priority 90), and Cursor Agent
+`cursor_agent/composer-2.5` (priority 80), all at low effort.
+`codex-auto-review` remains a public name but contains only
+`alias_reference: auto-review`; both public aliases are defined in
+`auto-review.yaml`.
 
 ## Maintained `sota-openai` alias behavior
 
@@ -380,7 +390,9 @@ registers the AAWM access-log replacement so leftover uvicorn
 `INFO: … "GET /openai_passthrough/v1/models"` lines are suppressed
 the same way as alias Responses POSTs. Usage is
 `POST /openai_passthrough/v1/responses`. Generic `/v1/chat/completions` is
-not an alias ingress. The public name is `sota-zai`. Non-Codex-native GET
+not an alias ingress. The current snapshot contains 27 aliases, including
+`basic-other`, `expert-other`, `auto-review-other`, `auto-review`, and
+`codex-auto-review`. The public name is `sota-zai`. Non-Codex-native GET
 also lists served concrete provider ids with mode/context/cost from the
 bundled cost map or `aawm_reference_pricing`. Provenance is explicit and
 is not invoice cost. Cursor Grok is distinct from `oa_xai/grok-4.6`.

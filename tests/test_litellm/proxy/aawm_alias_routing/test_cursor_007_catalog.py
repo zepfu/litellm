@@ -37,7 +37,6 @@ from litellm.types.utils import LlmProviders
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
-_BASIC_YAML_PATH = _REPO_ROOT / "litellm" / "proxy" / "aawm_alias_config" / "basic.yaml"
 _SOTA_XAI_YAML_PATH = (
     _REPO_ROOT / "litellm" / "proxy" / "aawm_alias_config" / "sota-xai.yaml"
 )
@@ -87,27 +86,27 @@ class TestCursorAgentRegistration:
 
 
 class TestCursorAgentCompile:
-    def test_basic_yaml_places_composer_after_deepseek_flash_at_priority_42(self):
-        snapshot = compile_yaml(_BASIC_YAML_PATH.read_text(encoding="utf-8"))
-        candidates = snapshot.aliases["basic"].candidates
+    def test_basic_other_places_composer_after_zai_at_priority_80(self):
+        snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+        candidates = snapshot.aliases["basic-other"].candidates
         models = [candidate.model for candidate in candidates]
         composer = _candidate_by_model(candidates, _COMPOSER_MODEL)
         deepseek = _candidate_by_model(
             candidates, "alibaba_token_plan/deepseek-v4-flash-0731"
         )
-        qwen = _candidate_by_model(candidates, "alibaba_token_plan/qwen3.6-flash")
+        zai = _candidate_by_model(candidates, "zai_coding_plan/glm-5.3-flash")
 
         assert composer.provider == "cursor_agent"
         assert composer.route_family == _CODEX_CURSOR_ROUTE_FAMILY
         assert composer.anthropic_route_family == _ANTHROPIC_CURSOR_ROUTE_FAMILY
-        assert composer.priority == 42
-        assert deepseek.priority == 45
-        assert qwen.priority == 40
+        assert composer.priority == 80
+        assert deepseek.priority == 100
+        assert zai.priority == 90
         assert models.index("alibaba_token_plan/deepseek-v4-flash-0731") < models.index(
             _COMPOSER_MODEL
         )
-        assert models.index(_COMPOSER_MODEL) < models.index(
-            "alibaba_token_plan/qwen3.6-flash"
+        assert models.index("zai_coding_plan/glm-5.3-flash") < models.index(
+            _COMPOSER_MODEL
         )
         assert "composer-2.5-fast" not in models
         assert all(candidate.provider != "cursor" for candidate in candidates)

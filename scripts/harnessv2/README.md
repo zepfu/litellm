@@ -69,8 +69,8 @@ a baseline full-suite step.
 |---|---|---|
 | `platform` | forbidden | Health, custom endpoints, error JSONL, Redis prefix SCAN, docker logs |
 | `catalog` | optional | CFG-023/024 HTTP catalog; Ohmypi picker if `--tui ohmypi`; Codex skips live picker |
-| `model` | required | Independent per-alias TUI turn (not baseline). Ohmypi: idle exact PONG or provider 404. Codex: tool-bearing child `date`/`pwd` stdout plus `hv2-codex-child` on `basic`/`read`; local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome is not a pass |
-| `orchestration` | required | Parent alias spawns children. Ohmypi default is the nine mixed aliases; `--orchestration-children provider_coverage` spawns the provider-pinned aliases. Codex uses a smaller parent/child set |
+| `model` | required | Independent per-alias TUI turn (not baseline). Ohmypi: idle exact PONG or provider 404. Codex: tool-bearing child `date`/`pwd` stdout plus `hv2-codex-child` on `basic`; local `/root/hv2_child_*` or `/root/hv2_codex_child*` chrome is not a pass |
+| `orchestration` | required | Parent alias spawns children. Ohmypi default is the thirteen mixed aliases; `--orchestration-children provider_coverage` spawns the provider-pinned aliases. Codex defaults to parent `basic` and requires explicit children |
 
 `--test model` and `--test orchestration` launch a dedicated interactive
 tmux session on socket `tmux37`. Ohmypi uses `hv2-ohmypi-<model>-<pid>`
@@ -104,8 +104,8 @@ Ohmypi `--model all` expands compiled aliases, including OMP-facing
 `auto-review`, Codex-client compatibility `codex-auto-review`, and the
 `provider-<id>` aliases except `provider-anthropic` and all `claude-*`
 aliases. Those remain catalog/history facts, not current closeout
-selection/run targets. Codex `--test model` defaults to `basic` and
-`read` only; `read` is not a compiled alias. Do not treat Ohmypi
+selection/run targets. Codex `--test model` defaults to `basic` only.
+Do not treat Ohmypi
 `--model all` as the Codex OC-003 surface. Codex model/orchestration is
 tool-bearing (child `date`/`pwd`); it is not Ohmypi `--no-tools` PONG.
 `--tui grok` and `--tui opencode` remain stubs. `--tui claude` stays out
@@ -179,14 +179,15 @@ lines and are ignored. The run fails and remaining steps are skipped.
 `--test catalog --tui ohmypi` requires the picker selector
 `litellm-alpha-passthrough/<alias>` (a bare alias substring is not
 enough). `--test orchestration` pastes `agent=basic` / `work` /
-`expert` / `sota` / `sota-xai` / `sota-alibaba` / `sota-moonshot` /
-`sota-zai` / `auto-review` (no `model=` spawn field; spawn name is
+`expert` / `basic-other` / `work-other` / `expert-other` / `sota` /
+`sota-xai` / `sota-alibaba` / `sota-moonshot` / `sota-zai` /
+`auto-review` / `auto-review-other` (no `model=` spawn field; spawn name is
 `auto-review`, not `codex-auto-review`). Not orch children:
-`work-other`, `sota-deepseek`, `codex-auto-review`. Each child's first
+`sota-deepseek`, `codex-auto-review`. Each child's first
 directive is exact `PONG`, then `date`, then a follow-up parallel
 `pwd` / `uname -s` / `echo omp-alpha-fanout`. Profiles are staged into
 `{cwd}/.omp/agents`. The run fails unless Ohmypi `task` / `hub`
-completions exist for all nine children (`hub` jobs, `async-result`
+completions exist for all thirteen children (`hub` jobs, `async-result`
 `<task-result>`, idle hub peers, or nested child `yield`). Nested
 `bash` `date` while the parent is still waiting is not a pass. A spawn
 announcement is not a pass. `※ recap:` is wait-complete only;

@@ -368,12 +368,16 @@ def build_plan(  # noqa: PLR0915
         if not parent_token:
             raise PlanError("--orchestration-parent is required")
         parents = _expand_named_models(parent_token, config)
-        child_token = (
-            orchestration_children
-            or tui_spec.get("default_orchestration_children")
-            or spec.get("default_children_group")
-            or "orchestration_children"
-        )
+        if orchestration_children:
+            child_token = orchestration_children
+        elif "default_orchestration_children" in tui_spec:
+            child_token = tui_spec.get("default_orchestration_children")
+            if not child_token:
+                raise PlanError("--orchestration-children is required")
+        else:
+            child_token = (
+                spec.get("default_children_group") or "orchestration_children"
+            )
         children = _expand_named_models(child_token, config)
         prompt_name = str(tui_spec.get("orchestration_prompt") or "orchestration")
         raw_template = _prompt_text(
