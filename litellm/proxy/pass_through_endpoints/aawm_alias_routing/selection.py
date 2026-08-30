@@ -3929,7 +3929,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             },
         )
     sa = _session_affinity_mod()
-    is_auto_review = alias_model == "codex-auto-review"
+    is_auto_review = alias_model in {"codex-auto-review", "auto-review"}
     resolved_session_identity = sa.resolve_canonical_session_identity(
         request,
         request_body,

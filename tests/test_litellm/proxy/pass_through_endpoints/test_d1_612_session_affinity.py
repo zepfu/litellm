@@ -2106,20 +2106,22 @@ def _patch_codex_selector_basics(
 
 
 @pytest.mark.asyncio
-async def test_codex_auto_review_selector_uses_review_owner_identity_without_mutating_body(
+@pytest.mark.parametrize("review_alias", ["codex-auto-review", "auto-review"])
+async def test_auto_review_selector_uses_review_owner_identity_without_mutating_body(
     monkeypatch: pytest.MonkeyPatch,
+    review_alias: str,
 ) -> None:
     sel, candidate = _patch_codex_selector_basics(monkeypatch)
     monkeypatch.setitem(
         sel._select_codex_auto_agent_candidate.__globals__,
         "_lookup_active_snapshot_canonical_alias",
-        lambda *_args, **_kwargs: "codex-auto-review",
+        lambda *_args, **_kwargs: review_alias,
     )
     owner_lookup = AsyncMock(return_value=(None, "review-owner-key", None))
     monkeypatch.setattr(sa, "get_session_owner_record", owner_lookup)
     request = _codex_selector_request("parent-thread")
     request_body = {
-        "model": "codex-auto-review",
+        "model": review_alias,
         "input": [
             {
                 "type": "function_call",
@@ -2148,6 +2150,7 @@ async def test_codex_auto_review_selector_uses_review_owner_identity_without_mut
         wait_for_foreign_reservation=True,
     )
     assert selected["candidate"] == candidate
+    assert selected["alias_model"] == review_alias
     assert selected["canonical_session_identity"] == "parent-thread"
     assert selected["session_owner_identity"] == review_identity
     assert review_identity is not None
@@ -2263,8 +2266,10 @@ async def test_codex_compatible_owned_redispatch_metadata_remains_pinned(
 
 
 @pytest.mark.asyncio
-async def test_codex_account_bound_removed_owned_route_preserves_owner_unavailable(
+@pytest.mark.parametrize("review_alias", ["codex-auto-review", "auto-review"])
+async def test_auto_review_replay_unsafe_opaque_state_stays_409(
     monkeypatch: pytest.MonkeyPatch,
+    review_alias: str,
 ) -> None:
     sel, _ = _patch_codex_selector_basics(
         monkeypatch,
@@ -2274,7 +2279,7 @@ async def test_codex_account_bound_removed_owned_route_preserves_owner_unavailab
     monkeypatch.setitem(
         selector_globals,
         "_lookup_active_snapshot_canonical_alias",
-        lambda *_args, **_kwargs: "codex-auto-review",
+        lambda *_args, **_kwargs: review_alias,
     )
     request = _codex_selector_request("base-thread")
     request.state.aawm_alias_request_litellm_call_id = "unsafe-review-call"
@@ -2285,7 +2290,7 @@ async def test_codex_account_bound_removed_owned_route_preserves_owner_unavailab
         await sel._select_codex_auto_agent_candidate(
             request=request,
             request_body={
-                "model": "codex-auto-review",
+                "model": review_alias,
                 "litellm_metadata": {"redispatch_ordinal": 1},
                 "input": [
                     {
@@ -2383,8 +2388,10 @@ async def test_codex_unbound_fresh_child_owned_route_mismatch_uses_effective_ide
 
 
 @pytest.mark.asyncio
-async def test_codex_owned_alias_mismatch_with_previous_response_id_stays_409(
+@pytest.mark.parametrize("review_alias", ["codex-auto-review", "auto-review"])
+async def test_auto_review_replay_unsafe_previous_response_id_stays_409(
     monkeypatch: pytest.MonkeyPatch,
+    review_alias: str,
 ) -> None:
     sel, _candidate = _patch_codex_selector_basics(monkeypatch)
     selector_globals = sel._select_codex_auto_agent_candidate.__globals__
@@ -2392,7 +2399,7 @@ async def test_codex_owned_alias_mismatch_with_previous_response_id_stays_409(
     monkeypatch.setitem(
         selector_globals,
         "_lookup_active_snapshot_canonical_alias",
-        lambda *_args, **_kwargs: "codex-auto-review",
+        lambda *_args, **_kwargs: review_alias,
     )
     owner_record_lookup = AsyncMock()
     monkeypatch.setattr(sa, "get_session_owner_record", owner_record_lookup)
@@ -2406,7 +2413,7 @@ async def test_codex_owned_alias_mismatch_with_previous_response_id_stays_409(
         await sel._select_codex_auto_agent_candidate(
             request=request,
             request_body={
-                "model": "codex-auto-review",
+                "model": review_alias,
                 "previous_response_id": "resp-owned",
                 "input": [{"type": "function_call", "name": "inspect"}],
             },

@@ -997,7 +997,7 @@ async def handle_alias_route(  # noqa: PLR0915
                             # the runtime host rolls out the renewal helper.
                             response = await _perform_candidate_request()
                         is_auto_review = (
-                            alias_model == "codex-auto-review"
+                            alias_model in {"codex-auto-review", "auto-review"}
                             or sa.get_request_codex_auto_review_parent_session_identity(
                                 request
                             )
