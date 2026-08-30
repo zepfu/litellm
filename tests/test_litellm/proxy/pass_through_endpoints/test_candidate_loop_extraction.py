@@ -31,6 +31,7 @@ from starlette.requests import Request
 from litellm.proxy.pass_through_endpoints import aawm_alias_routing as package
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import candidate_loop
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import session_affinity
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import snapshot_select
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
     DEFAULT_CONFIG_DIR,
@@ -1465,8 +1466,13 @@ def test_resolve_failure_plan_ineligible_short_circuits_evidence_and_publication
 
 
 @pytest.mark.asyncio
-async def test_candidate_loop_ineligible_falls_through_without_request_local_state(
+@pytest.mark.parametrize(
+    "alias_model",
+    ("aawm-test", "codex-auto-review", "auto-review"),
+)
+async def test_candidate_loop_ineligible_falls_through_without_request_local_state(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
+    alias_model: str,
 ) -> None:
     request = SimpleNamespace(state=SimpleNamespace())
     alias_routing_state = AliasRoutingStateManager()
@@ -1500,6 +1506,25 @@ async def test_candidate_loop_ineligible_falls_through_without_request_local_sta
     ]
     provider_calls: list[str] = []
     selection_kwargs: list[dict] = []
+    replay_safety_results: list[
+        session_affinity.SessionOwnerReplaySafetyResult
+    ] = []
+    original_classifier = (
+        session_affinity.classify_session_owner_replay_safety_body
+    )
+
+    def _classify_replay_safety(
+        request_body: dict,
+    ) -> session_affinity.SessionOwnerReplaySafetyResult:
+        result = original_classifier(request_body)
+        replay_safety_results.append(result)
+        return result
+
+    monkeypatch.setattr(
+        session_affinity,
+        "classify_session_owner_replay_safety_body",
+        _classify_replay_safety,
+    )
 
     async def _perform_candidate(
         *,
@@ -1569,12 +1594,31 @@ async def test_candidate_loop_ineligible_falls_through_without_request_local_sta
         "_plan_codex_oauth_account_failover",
         _no_account_failover,
     )
+    prepared_request_body = (
+        {
+            "model": alias_model,
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_adapter_carried_reasoning",
+                    "summary": None,
+                    "encrypted_content": None,
+                    "content": None,
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": "turn-adapter-item",
+                    },
+                }
+            ],
+        }
+        if alias_model in {"codex-auto-review", "auto-review"}
+        else {}
+    )
     response = await candidate_loop.handle_alias_route(
         services,
         alias_family="codex",
-        alias_model="aawm-test",
+        alias_model=alias_model,
         request=request,
-        prepared_request_body={},
+        prepared_request_body=prepared_request_body,
         max_candidate_attempts=2,
         get_active_cooldown_state_fn=_no_active_cooldown,
         attempts_metadata_key="attempts",
@@ -1589,6 +1633,14 @@ async def test_candidate_loop_ineligible_falls_through_without_request_local_sta
     assert selection_kwargs[1]["excluded_candidate_keys"] == frozenset(
         {"openai:unsupported"}
     )
+    assert len(replay_safety_results) == 1
+    if alias_model in {"codex-auto-review", "auto-review"}:
+        assert replay_safety_results[0].safe is True
+        assert selection_kwargs[0]["_replay_safety"] is replay_safety_results[0]
+        assert selection_kwargs[1]["_replay_safety"] is replay_safety_results[0]
+    else:
+        assert "_replay_safety" not in selection_kwargs[0]
+        assert "_replay_safety" not in selection_kwargs[1]
     assert metadata_attempts
     assert all(captured is metadata_attempts[0] for captured in metadata_attempts)
     attempts = metadata_attempts[-1]

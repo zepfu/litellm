@@ -470,6 +470,14 @@ async def handle_alias_route(  # noqa: PLR0915
     add_alias_metadata_fn = services.add_alias_metadata_fn
     raise_redispatch_required_fn = services.raise_redispatch_fn
     is_codex_alias = validate_alias_family(alias_family) == "codex"
+    replay_safety = (
+        _session_affinity_mod().classify_session_owner_replay_safety_body(
+            prepared_request_body
+        )
+        if is_codex_alias
+        and alias_model in {"codex-auto-review", "auto-review"}
+        else None
+    )
     codex_failure_evidence_alias = alias_model if is_codex_alias else None
     failed_provider_candidate_keys: set[str] = set()
     deterministically_ineligible_candidate_keys: set[str] = set()
@@ -494,7 +502,9 @@ async def handle_alias_route(  # noqa: PLR0915
     same_account_transient_attempts_by_slot: dict[Optional[str], int] = {}
     token_invalidated_reload_attempts: set[str] = set()
     account_failover_replay_safe = (
-        _session_affinity_mod().is_replay_safe_session_owner_redispatch_body(
+        replay_safety.safe
+        if replay_safety is not None
+        else _session_affinity_mod().is_replay_safe_session_owner_redispatch_body(
             prepared_request_body
         )
     )
@@ -618,6 +628,8 @@ async def handle_alias_route(  # noqa: PLR0915
                 "request": request,
                 "request_body": prepared_request_body,
             }
+            if replay_safety is not None:
+                selection_kwargs["_replay_safety"] = replay_safety
             if _accepts_excluded_candidate_keys(select_candidate_fn):
                 selection_kwargs["excluded_candidate_keys"] = frozenset(
                     deterministically_ineligible_candidate_keys
