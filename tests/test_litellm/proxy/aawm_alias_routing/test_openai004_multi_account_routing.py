@@ -237,9 +237,7 @@ def _interchangeable_inventory() -> CodexOAuthInventory:
         records=_inventory().records,
         routing=CodexOAuthRoutingPolicy(
             credential_affinity="interchangeable",
-            strategy="dual_quota_balance",
-            balance_band_percentage_points=10.0,
-            within_band_strategy="weighted_round_robin",
+            strategy="priority",
         ),
     )
 
@@ -2361,52 +2359,106 @@ async def test_selected_account_drives_both_ingress_auth_and_redaction(
 
 # ---------------------------------------------------------------------------
 
-# OPENAI-006: soft weekly account balancing + independent quota families
+# OPENAI-029: deterministic fresh account selection
+# ---------------------------------------------------------------------------
 
 
-def _record_account_windows(
-    *,
-    account_hash: str,
-    observed_at: datetime,
-    five_hour_remaining: float,
-    weekly_remaining: float,
-    model: str = "gpt-5.3-codex",
-    five_hour_exhausted: bool | None = None,
-    weekly_exhausted: bool | None = None,
-) -> list[dict[str, Any]]:
-    if five_hour_exhausted is None:
-        five_hour_exhausted = five_hour_remaining <= 0
-    if weekly_exhausted is None:
-        weekly_exhausted = weekly_remaining <= 0
-    return [
-        _quota_observation(
-            account_hash=account_hash,
-            observed_at=observed_at,
-            reset_at=observed_at + timedelta(hours=2),
-            quota_period="five_hour",
-            window_minutes=300,
-            exhausted=five_hour_exhausted,
-            remaining_pct=five_hour_remaining,
-            model=model,
+def _priority_inventory() -> CodexOAuthInventory:
+    return CodexOAuthInventory(
+        records=(
+            _record("account1", "hash-account-1", 20, 0),
+            _record("account2", "hash-account-2", 10, 1),
+            _record("account3", "hash-account-3", 10, 2),
         ),
-        _quota_observation(
-            account_hash=account_hash,
-            observed_at=observed_at,
-            reset_at=observed_at + timedelta(days=2),
-            quota_period="seven_day",
-            window_minutes=10080,
-            exhausted=weekly_exhausted,
-            remaining_pct=weekly_remaining,
-            model=model,
+        routing=CodexOAuthRoutingPolicy(
+            credential_affinity="interchangeable",
+            strategy="priority",
         ),
-    ]
+    )
 
 
 @pytest.mark.asyncio
-async def test_fresh_selection_prefers_less_depleted_weekly_outside_10pt_band(
+async def test_fresh_priority_tie_break_and_direct_alias_paths_agree(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    inventory = _inventory()
+    inventory = _priority_inventory()
+    monkeypatch.setattr(
+        codex_oauth_inventory,
+        "load_codex_oauth_inventory",
+        lambda: inventory,
+    )
+    monkeypatch.setattr(
+        codex_oauth,
+        "_load_codex_oauth_headers_for_record",
+        _healthy_auth,
+    )
+    _patch_selector_runtime(monkeypatch)
+    now = datetime.now(timezone.utc)
+    alias_routing_state.reset_for_tests()
+    # Quota evidence remains eligibility/telemetry input, not fresh priority.
+    alias_routing_state.record_normalized_quota_observations(
+        [
+            _quota_observation(
+                account_hash="hash-account-1",
+                observed_at=now,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=False,
+                remaining_pct=90.0,
+            ),
+            _quota_observation(
+                account_hash="hash-account-2",
+                observed_at=now,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=False,
+                remaining_pct=10.0,
+            ),
+            _quota_observation(
+                account_hash="hash-account-3",
+                observed_at=now,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=False,
+                remaining_pct=90.0,
+            ),
+        ]
+    )
+
+    alias_selected = await lpe._select_codex_auto_agent_candidate(
+        request=_request(),
+        request_body={"model": "basic"},
+    )
+    assert alias_selected["candidate"][
+        "codex_oauth_account_label"
+    ] == "account2"
+    assert alias_selected["candidate"][
+        "codex_oauth_account_priority"
+    ] == 10
+    alias_routing_state.reset_for_tests()
+
+    _patch_direct_inventory_auth(monkeypatch, inventory=inventory)
+    direct_selected_auth, direct_selection, _metadata = (
+        await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
+            _direct_request(),
+            request_body={"model": "gpt-5.3-codex"},
+        )
+    )
+    assert direct_selected_auth.account_label == "account2"
+    assert direct_selection["candidate"][
+        "codex_oauth_account_label"
+    ] == alias_selected["candidate"]["codex_oauth_account_label"]
+    alias_routing_state.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_fresh_selection_overflows_only_for_confirmed_exhaustion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = _priority_inventory()
     monkeypatch.setattr(
         codex_oauth_inventory,
         "load_codex_oauth_inventory",
@@ -2422,17 +2474,23 @@ async def test_fresh_selection_prefers_less_depleted_weekly_outside_10pt_band(
     alias_routing_state.reset_for_tests()
     alias_routing_state.record_normalized_quota_observations(
         [
-            *_record_account_windows(
-                account_hash="hash-account-1",
-                observed_at=now,
-                five_hour_remaining=80.0,
-                weekly_remaining=50.0,
-            ),
-            *_record_account_windows(
+            _quota_observation(
                 account_hash="hash-account-2",
                 observed_at=now,
-                five_hour_remaining=80.0,
-                weekly_remaining=65.0,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=True,
+                remaining_pct=0.0,
+            ),
+            _quota_observation(
+                account_hash="hash-account-3",
+                observed_at=now,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=False,
+                remaining_pct=10.0,
             ),
         ]
     )
@@ -2441,202 +2499,14 @@ async def test_fresh_selection_prefers_less_depleted_weekly_outside_10pt_band(
         request=_request(),
         request_body={"model": "basic"},
     )
-    assert selected["candidate"]["codex_oauth_account_label"] == "account2"
-    assert selected["selection_diagnostics"]["strategy"] == (
-        "weekly_quota_balance"
-    )
-    assert selected["selection_diagnostics"]["weekly_remaining_spread_pp"] >= 10.0
-    assert selected["quota_family"] == "overall"
-    alias_routing_state.reset_for_tests()
-
-
-@pytest.mark.asyncio
-async def test_fresh_selection_permits_either_account_inside_10pt_weekly_band(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    inventory = _inventory()
-    monkeypatch.setattr(
-        codex_oauth_inventory,
-        "load_codex_oauth_inventory",
-        lambda: inventory,
-    )
-    monkeypatch.setattr(
-        codex_oauth,
-        "_load_codex_oauth_headers_for_record",
-        _healthy_auth,
-    )
-    _patch_selector_runtime(monkeypatch)
-    now = datetime.now(timezone.utc)
-    alias_routing_state.reset_for_tests()
-    alias_routing_state.record_normalized_quota_observations(
-        [
-            *_record_account_windows(
-                account_hash="hash-account-1",
-                observed_at=now,
-                five_hour_remaining=90.0,
-                weekly_remaining=55.0,
-            ),
-            *_record_account_windows(
-                account_hash="hash-account-2",
-                observed_at=now,
-                five_hour_remaining=90.0,
-                weekly_remaining=50.0,
-            ),
-        ]
-    )
-
-    selected = await lpe._select_codex_auto_agent_candidate(
-        request=_request(),
-        request_body={"model": "basic"},
-    )
-    # Inventory order/priority is preserved inside the soft band.
-    assert selected["candidate"]["codex_oauth_account_label"] == "account1"
-    diagnostics = selected.get("selection_diagnostics") or {}
-    assert diagnostics.get("strategy") != "weekly_quota_balance"
-    alias_routing_state.reset_for_tests()
-
-
-@pytest.mark.asyncio
-async def test_confirmed_five_hour_exhaustion_overrides_weekly_alignment(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    inventory = _inventory()
-    monkeypatch.setattr(
-        codex_oauth_inventory,
-        "load_codex_oauth_inventory",
-        lambda: inventory,
-    )
-    monkeypatch.setattr(
-        codex_oauth,
-        "_load_codex_oauth_headers_for_record",
-        _healthy_auth,
-    )
-    _patch_selector_runtime(monkeypatch)
-    now = datetime.now(timezone.utc)
-    alias_routing_state.reset_for_tests()
-    # account1 is weekly-preferred (spread >= 10) but five-hour exhausted.
-    alias_routing_state.record_normalized_quota_observations(
-        [
-            *_record_account_windows(
-                account_hash="hash-account-1",
-                observed_at=now,
-                five_hour_remaining=0.0,
-                weekly_remaining=90.0,
-                five_hour_exhausted=True,
-            ),
-            *_record_account_windows(
-                account_hash="hash-account-2",
-                observed_at=now,
-                five_hour_remaining=70.0,
-                weekly_remaining=50.0,
-            ),
-        ]
-    )
-
-    selected = await lpe._select_codex_auto_agent_candidate(
-        request=_request(),
-        request_body={"model": "basic"},
-    )
-    assert selected["candidate"]["codex_oauth_account_label"] == "account2"
-    assert selected.get("skip_reason") is None
-    alias_routing_state.reset_for_tests()
-
-
-@pytest.mark.asyncio
-async def test_overall_and_spark_quota_families_balance_independently(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    inventory = _inventory()
-    monkeypatch.setattr(
-        codex_oauth_inventory,
-        "load_codex_oauth_inventory",
-        lambda: inventory,
-    )
-    monkeypatch.setattr(
-        codex_oauth,
-        "_load_codex_oauth_headers_for_record",
-        _healthy_auth,
-    )
-    _patch_selector_runtime(monkeypatch)
-    now = datetime.now(timezone.utc)
-    alias_routing_state.reset_for_tests()
-    # Overall weekly prefers account2; Spark weekly prefers account1.
-    alias_routing_state.record_normalized_quota_observations(
-        [
-            *_record_account_windows(
-                account_hash="hash-account-1",
-                observed_at=now,
-                five_hour_remaining=80.0,
-                weekly_remaining=40.0,
-                model="gpt-5.3-codex",
-            ),
-            *_record_account_windows(
-                account_hash="hash-account-2",
-                observed_at=now,
-                five_hour_remaining=80.0,
-                weekly_remaining=70.0,
-                model="gpt-5.3-codex",
-            ),
-            *_record_account_windows(
-                account_hash="hash-account-1",
-                observed_at=now,
-                five_hour_remaining=80.0,
-                weekly_remaining=75.0,
-                model="gpt-5.3-codex-spark",
-            ),
-            *_record_account_windows(
-                account_hash="hash-account-2",
-                observed_at=now,
-                five_hour_remaining=80.0,
-                weekly_remaining=45.0,
-                model="gpt-5.3-codex-spark",
-            ),
-        ]
-    )
-
-    overall = await lpe._select_codex_auto_agent_candidate(
-        request=_request(),
-        request_body={"model": "basic"},
-    )
-    assert overall["candidate"]["codex_oauth_account_label"] == "account2"
-    assert overall["quota_family"] == "overall"
-    assert all(
-        "spark" not in str(window.get("model") or "").lower()
-        for window in overall.get("quota_windows") or []
-    )
-
-    # Spark candidate path: rebuild selector with spark model template.
-    spark_candidate = {
-        "provider": CODEX_AUTO_AGENT_NATIVE_PROVIDER,
-        "model": "gpt-5.3-codex-spark",
-        "route_family": "codex_responses",
-        "last_resort": False,
-        "selection_priority": 100,
-    }
-    enumeration = SelectionEnumeration(
-        candidates=(spark_candidate,),
-        commit_token=None,
-    )
-    monkeypatch.setattr(
-        lpe,
-        "_resolve_aawm_alias_selection_enumeration",
-        lambda *args, **kwargs: enumeration,
-    )
-    monkeypatch.setattr(
-        lpe,
-        "_select_snapshot_candidates",
-        lambda *args, **kwargs: list(enumeration.candidates),
-    )
-
-    spark = await lpe._select_codex_auto_agent_candidate(
-        request=_request(),
-        request_body={"model": "basic"},
-    )
-    assert spark["candidate"]["codex_oauth_account_label"] == "account1"
-    assert spark["quota_family"] == "spark"
-    assert all(
-        "spark" in str(window.get("model") or "").lower()
-        for window in spark.get("quota_windows") or []
+    assert selected["candidate"][
+        "codex_oauth_account_label"
+    ] == "account3"
+    skipped = selected.get("skipped") or []
+    assert any(
+        item.get("account_label") == "account2"
+        and item.get("reason") == "quota_exhausted"
+        for item in skipped
     )
     alias_routing_state.reset_for_tests()
 
@@ -2715,48 +2585,6 @@ def _patch_direct_inventory_auth(
         _fake_load_headers,
     )
     return loaded
-
-
-@pytest.mark.asyncio
-async def test_direct_inventory_reuses_weekly_balance_selector(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    loaded = _patch_direct_inventory_auth(monkeypatch)
-    request = _direct_request()
-    now = datetime.now(timezone.utc)
-    alias_routing_state.reset_for_tests()
-    alias_routing_state.record_normalized_quota_observations(
-        [
-            *_record_account_windows(
-                account_hash="hash-account-1",
-                observed_at=now,
-                five_hour_remaining=80.0,
-                weekly_remaining=40.0,
-            ),
-            *_record_account_windows(
-                account_hash="hash-account-2",
-                observed_at=now,
-                five_hour_remaining=80.0,
-                weekly_remaining=70.0,
-            ),
-        ]
-    )
-
-    selected_auth, selection_state, _metadata = (
-        await codex_oauth.select_and_bind_direct_codex_oauth_inventory(
-            request,
-            request_body={"model": "gpt-5.3-codex"},
-        )
-    )
-    assert selected_auth.account_label == "account2"
-    assert selection_state["candidate"]["codex_oauth_account_label"] == (
-        "account2"
-    )
-    assert selection_state["selection_diagnostics"]["strategy"] == (
-        "weekly_quota_balance"
-    )
-    assert loaded
-    alias_routing_state.reset_for_tests()
 
 
 @pytest.mark.asyncio
@@ -3016,17 +2844,23 @@ async def test_direct_responses_respects_interchangeable_session_owner_for_previ
     alias_routing_state.reset_for_tests()
     alias_routing_state.record_normalized_quota_observations(
         [
-            *_record_account_windows(
+            _quota_observation(
                 account_hash="hash-account-1",
                 observed_at=now,
-                five_hour_remaining=10.0,
-                weekly_remaining=10.0,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=False,
+                remaining_pct=10.0,
             ),
-            *_record_account_windows(
+            _quota_observation(
                 account_hash="hash-account-2",
                 observed_at=now,
-                five_hour_remaining=90.0,
-                weekly_remaining=90.0,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=False,
+                remaining_pct=90.0,
             ),
         ]
     )
@@ -3080,17 +2914,23 @@ async def test_direct_responses_respects_interchangeable_request_metadata_accoun
     alias_routing_state.reset_for_tests()
     alias_routing_state.record_normalized_quota_observations(
         [
-            *_record_account_windows(
+            _quota_observation(
                 account_hash="hash-account-1",
                 observed_at=now,
-                five_hour_remaining=10.0,
-                weekly_remaining=10.0,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=False,
+                remaining_pct=10.0,
             ),
-            *_record_account_windows(
+            _quota_observation(
                 account_hash="hash-account-2",
                 observed_at=now,
-                five_hour_remaining=90.0,
-                weekly_remaining=90.0,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=False,
+                remaining_pct=90.0,
             ),
         ]
     )
@@ -3146,17 +2986,23 @@ async def test_direct_responses_fails_closed_when_interchangeable_session_owner_
     alias_routing_state.reset_for_tests()
     alias_routing_state.record_normalized_quota_observations(
         [
-            *_record_account_windows(
+            _quota_observation(
                 account_hash="hash-account-1",
                 observed_at=now,
-                five_hour_remaining=0.0,
-                weekly_remaining=10.0,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=True,
+                remaining_pct=0.0,
             ),
-            *_record_account_windows(
+            _quota_observation(
                 account_hash="hash-account-2",
                 observed_at=now,
-                five_hour_remaining=90.0,
-                weekly_remaining=90.0,
+                reset_at=now + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=False,
+                remaining_pct=90.0,
             ),
         ]
     )
@@ -3638,7 +3484,7 @@ def _patch_account_bound_selector(
 
 
 @pytest.mark.asyncio
-async def test_unbound_owner_keeps_quota_weighted_interchangeable_balancing(
+async def test_unbound_owner_uses_deterministic_priority_selector(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     loaded = _patch_account_bound_selector(monkeypatch, bound=False)
@@ -3651,7 +3497,8 @@ async def test_unbound_owner_keeps_quota_weighted_interchangeable_balancing(
                 reset_at=now + timedelta(hours=2),
                 quota_period="five_hour",
                 window_minutes=300,
-                exhausted=True,
+                exhausted=False,
+                remaining_pct=10.0,
             ),
             _quota_observation(
                 account_hash="hash-account-2",
@@ -3669,7 +3516,8 @@ async def test_unbound_owner_keeps_quota_weighted_interchangeable_balancing(
         request=_request(),
         request_body={"model": "basic"},
     )
-    assert selected["candidate"]["codex_oauth_account_label"] == "account2"
+    assert selected["candidate"]["codex_oauth_account_label"] == "account1"
+    assert selected["candidate"]["codex_oauth_account_priority"] == 10
     assert selected["has_account_bound_state"] is False
     assert selected["account_bound_classification"] == "unbound"
     assert "account1" in loaded
@@ -4020,7 +3868,7 @@ async def test_account_bound_resolve_does_not_consult_alternate_account(
     assert loaded == ["account2"]
 
 
-def test_dual_quota_balance_and_within_band_alternation() -> None:
+def test_fresh_codex_oauth_selector_preserves_priority_order() -> None:
     inventory = _interchangeable_inventory()
     states = [
         {
@@ -4036,65 +3884,25 @@ def test_dual_quota_balance_and_within_band_alternation() -> None:
                     inventory.routing.credential_affinity
                 ),
                 "codex_oauth_selection_strategy": inventory.routing.strategy,
-                "codex_oauth_balance_band_pp": 10.0,
-                "codex_oauth_within_band_strategy": (
-                    inventory.routing.within_band_strategy
-                ),
             },
             "cooldown_seconds": 0.0,
         }
         for record in inventory.records
     ]
-    now = datetime.now(timezone.utc)
-    alias_routing_state.reset_for_tests()
-    alias_routing_state.record_normalized_quota_observations(
-        [
-            *_record_account_windows(
-                account_hash="hash-account-1",
-                observed_at=now,
-                five_hour_remaining=80.0,
-                weekly_remaining=35.0,
-            ),
-            *_record_account_windows(
-                account_hash="hash-account-2",
-                observed_at=now,
-                five_hour_remaining=80.0,
-                weekly_remaining=70.0,
-            ),
-            *_record_account_windows(
-                account_hash="hash-account-1",
-                observed_at=now,
-                five_hour_remaining=80.0,
-                weekly_remaining=52.0,
-                model="gpt-5.3-codex-spark",
-            ),
-            *_record_account_windows(
-                account_hash="hash-account-2",
-                observed_at=now,
-                five_hour_remaining=80.0,
-                weekly_remaining=48.0,
-                model="gpt-5.3-codex-spark",
-            ),
-        ]
-    )
-    selected = selection._select_first_available_codex_oauth_account_state(states)
-    assert selected["candidate"]["codex_oauth_account_label"] == "account2"
-    assert selected["selection_diagnostics"]["controlling_quota_family"] == (
-        "overall"
-    )
+    exhausted = dict(states[0])
+    exhausted["skip_reason"] = "quota_exhausted"
 
-    alias_routing_state.reset_for_tests()
-    first = selection._select_first_available_codex_oauth_account_state(states)
-    second = selection._select_first_available_codex_oauth_account_state(states)
-    assert [
-        first["candidate"]["codex_oauth_account_label"],
-        second["candidate"]["codex_oauth_account_label"],
-    ] == ["account1", "account2"]
-    alias_routing_state.reset_for_tests()
+    selected = selection._select_first_available_codex_oauth_account_state(states)
+    assert selected["candidate"]["codex_oauth_account_label"] == "account1"
+
+    overflow = selection._select_first_available_codex_oauth_account_state(
+        [exhausted, *states[1:]]
+    )
+    assert overflow["candidate"]["codex_oauth_account_label"] == "account2"
 
 
 @pytest.mark.asyncio
-async def test_dual_quota_balance_accepts_observations_past_30_seconds_until_cadence(
+async def test_priority_stability_ignores_stale_balancing_cadence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     inventory = _interchangeable_inventory()
@@ -4116,17 +3924,23 @@ async def test_dual_quota_balance_accepts_observations_past_30_seconds_until_cad
     now = datetime.now(timezone.utc)
     alias_routing_state.record_normalized_quota_observations(
         [
-            *_record_account_windows(
+            _quota_observation(
                 account_hash="hash-account-1",
-                observed_at=now - timedelta(seconds=599),
-                five_hour_remaining=80.0,
-                weekly_remaining=10.0,
+                observed_at=now - timedelta(seconds=3599),
+                reset_at=now - timedelta(seconds=3599) + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=False,
+                remaining_pct=10.0,
             ),
-            *_record_account_windows(
+            _quota_observation(
                 account_hash="hash-account-2",
-                observed_at=now - timedelta(seconds=599),
-                five_hour_remaining=80.0,
-                weekly_remaining=90.0,
+                observed_at=now - timedelta(seconds=3599),
+                reset_at=now - timedelta(seconds=3599) + timedelta(hours=2),
+                quota_period="five_hour",
+                window_minutes=300,
+                exhausted=False,
+                remaining_pct=90.0,
             ),
         ]
     )
@@ -4136,7 +3950,7 @@ async def test_dual_quota_balance_accepts_observations_past_30_seconds_until_cad
         request_body={"model": "basic"},
     )
 
-    assert selected["candidate"]["codex_oauth_account_label"] == "account2"
+    assert selected["candidate"]["codex_oauth_account_label"] == "account1"
 
 
 @pytest.mark.asyncio

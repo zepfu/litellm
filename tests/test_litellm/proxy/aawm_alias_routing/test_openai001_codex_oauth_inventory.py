@@ -170,7 +170,7 @@ def test_inventory_is_explicit_ordered_and_model_eligible(tmp_path: Path) -> Non
     assert inventory.routing.credential_affinity == "pinned"
 
 
-def test_inventory_parses_interchangeable_dual_quota_policy(
+def test_inventory_parses_interchangeable_priority_policy(
     tmp_path: Path,
 ) -> None:
     account = _account(
@@ -185,17 +185,13 @@ def test_inventory_parses_interchangeable_dual_quota_policy(
             [account],
             routing={
                 "credential_affinity": "interchangeable",
-                "strategy": "dual_quota_balance",
-                "balance_band_percentage_points": 10,
-                "within_band_strategy": "weighted_round_robin",
+                "strategy": "priority",
             },
         )
     )
 
     assert inventory.routing.accounts_are_interchangeable is True
-    assert inventory.routing.strategy == "dual_quota_balance"
-    assert inventory.routing.balance_band_percentage_points == 10.0
-    assert inventory.routing.within_band_strategy == "weighted_round_robin"
+    assert inventory.routing.strategy == "priority"
 
 
 @pytest.mark.parametrize(

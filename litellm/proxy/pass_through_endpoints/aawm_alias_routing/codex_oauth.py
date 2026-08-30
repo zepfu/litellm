@@ -864,12 +864,6 @@ async def _resolve_model_less_direct_codex_oauth_contexts(
                 inventory.routing.credential_affinity
             ),
             "codex_oauth_selection_strategy": inventory.routing.strategy,
-            "codex_oauth_balance_band_pp": (
-                inventory.routing.balance_band_percentage_points
-            ),
-            "codex_oauth_within_band_strategy": (
-                inventory.routing.within_band_strategy
-            ),
         }
     except CodexOAuthInventoryError:
         records = ()
@@ -1016,12 +1010,6 @@ async def select_and_bind_direct_codex_oauth_inventory(  # noqa: PLR0915
             {
                 "codex_oauth_credential_affinity": routing.credential_affinity,
                 "codex_oauth_selection_strategy": routing.strategy,
-                "codex_oauth_balance_band_pp": (
-                    routing.balance_band_percentage_points
-                ),
-                "codex_oauth_within_band_strategy": (
-                    routing.within_band_strategy
-                ),
             }
         )
 

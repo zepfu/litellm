@@ -35,8 +35,6 @@ _ROUTING_FIELDS = frozenset(
     {
         "credential_affinity",
         "strategy",
-        "balance_band_percentage_points",
-        "within_band_strategy",
     }
 )
 _ACCOUNT_FIELDS = frozenset(
@@ -109,12 +107,10 @@ class CodexOAuthCredentialRecord:
 
 @dataclass(frozen=True)
 class CodexOAuthRoutingPolicy:
-    """Optional account-pool routing policy with backward-compatible defaults."""
+    """Optional account-pool routing policy."""
 
     credential_affinity: str = "pinned"
     strategy: str = "priority"
-    balance_band_percentage_points: float = 10.0
-    within_band_strategy: str = "priority"
 
     @property
     def accounts_are_interchangeable(self) -> bool:
@@ -322,31 +318,13 @@ def _parse_routing_policy(value: Any) -> CodexOAuthRoutingPolicy:
             "Codex OAuth routing credential_affinity is unsupported."
         )
     strategy = value.get("strategy", "priority")
-    if strategy not in {"priority", "dual_quota_balance"}:
+    if strategy != "priority":
         raise CodexOAuthInventoryError(
             "Codex OAuth routing strategy is unsupported."
-        )
-    within_band_strategy = value.get("within_band_strategy", "priority")
-    if within_band_strategy not in {"priority", "weighted_round_robin"}:
-        raise CodexOAuthInventoryError(
-            "Codex OAuth routing within_band_strategy is unsupported."
-        )
-    raw_band = value.get("balance_band_percentage_points", 10.0)
-    if (
-        not isinstance(raw_band, (int, float))
-        or isinstance(raw_band, bool)
-        or not math.isfinite(float(raw_band))
-        or not 0 < float(raw_band) <= 100
-    ):
-        raise CodexOAuthInventoryError(
-            "Codex OAuth routing balance_band_percentage_points must be "
-            "greater than 0 and at most 100."
         )
     return CodexOAuthRoutingPolicy(
         credential_affinity=credential_affinity,
         strategy=strategy,
-        balance_band_percentage_points=float(raw_band),
-        within_band_strategy=within_band_strategy,
     )
 
 

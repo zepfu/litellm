@@ -124,7 +124,6 @@ _CODEX_OAUTH_QUOTA_VALIDITY_DEFAULT_SECONDS = 600.0
 _CODEX_OAUTH_QUOTA_VALIDITY_ENV = "AAWM_CODEX_RESET_CREDIT_POLL_INTERVAL_SECONDS"
 _CODEX_OAUTH_QUOTA_CLIENT = "codex"
 _CODEX_OAUTH_QUOTA_SOURCE = "codex_quota_poll"
-_CODEX_OAUTH_WEEKLY_BALANCE_BAND_PP = 10.0
 _CODEX_OAUTH_QUOTA_FAMILY_OVERALL = "overall"
 _CODEX_OAUTH_QUOTA_FAMILY_SPARK = "spark"
 _ALIBABA_TOKEN_PLAN_QUOTA_CACHE_TTL_SECONDS = 30.0
@@ -359,8 +358,6 @@ def _codex_auto_agent_candidate_public_shape(
         ("codex_oauth_account_weight", "account_weight"),
         ("codex_oauth_credential_affinity", "credential_affinity"),
         ("codex_oauth_selection_strategy", "selection_strategy"),
-        ("codex_oauth_balance_band_pp", "balance_band_percentage_points"),
-        ("codex_oauth_within_band_strategy", "within_band_strategy"),
     ):
         value = candidate.get(source_field)
         if value is not None:
@@ -379,8 +376,6 @@ def _codex_oauth_routing_candidate_fields(inventory: Any) -> dict[str, Any]:
     return {
         "codex_oauth_credential_affinity": routing.credential_affinity,
         "codex_oauth_selection_strategy": routing.strategy,
-        "codex_oauth_balance_band_pp": routing.balance_band_percentage_points,
-        "codex_oauth_within_band_strategy": routing.within_band_strategy,
     }
 
 
@@ -2039,12 +2034,6 @@ async def _resolve_codex_oauth_account_candidate_contexts(
                 inventory.routing.credential_affinity
             ),
             "codex_oauth_selection_strategy": inventory.routing.strategy,
-            "codex_oauth_balance_band_pp": (
-                inventory.routing.balance_band_percentage_points
-            ),
-            "codex_oauth_within_band_strategy": (
-                inventory.routing.within_band_strategy
-            ),
         }
         if pinned_label is not None and (
             not interchangeable_affinity or pin_interchangeable_account
@@ -2444,266 +2433,10 @@ def _codex_oauth_window_is_weekly(window: Mapping[str, Any]) -> bool:
     return period == "seven_day" or window_minutes == 10080
 
 
-def _codex_oauth_weekly_remaining_pct_from_windows(
-    windows: Sequence[Any],
-) -> Optional[float]:
-    """Return the conservative fresh weekly remaining percentage, if known."""
-    weekly_values: list[float] = []
-    for window in windows:
-        if not isinstance(window, dict) or not _codex_oauth_window_is_weekly(window):
-            continue
-        status = str(window.get("status") or "").strip().lower()
-        if status and status != "fresh":
-            continue
-        remaining = _codex_oauth_window_remaining_pct(window)
-        if remaining is not None:
-            weekly_values.append(remaining)
-    if not weekly_values:
-        return None
-    return min(weekly_values)
-
-
-def _codex_oauth_state_weekly_remaining_pct(state: Mapping[str, Any]) -> Optional[float]:
-    windows = state.get("quota_windows")
-    if isinstance(windows, list):
-        remaining = _codex_oauth_weekly_remaining_pct_from_windows(windows)
-        if remaining is not None:
-            return remaining
-    observation = state.get("quota_observation")
-    if isinstance(observation, Mapping):
-        obs_windows = observation.get("windows")
-        if isinstance(obs_windows, list):
-            family = _codex_oauth_quota_family_for_model(
-                (state.get("candidate") or {}).get("model")
-                if isinstance(state.get("candidate"), Mapping)
-                else None
-            )
-            filtered = _filter_codex_oauth_quota_windows_for_family(
-                obs_windows,
-                family=family,
-            )
-            return _codex_oauth_weekly_remaining_pct_from_windows(filtered)
-    return None
-
-
-def _prefer_codex_oauth_weekly_balanced_state(
-    states: Sequence[dict[str, Any]],
-) -> Optional[dict[str, Any]]:
-    """Soft weekly account balancing across otherwise eligible OAuth accounts.
-
-    Prefer the less-depleted account when the applicable weekly remaining spread
-    is at least 10 percentage points. Within the band, either eligible account
-    is permitted and inventory/candidate order is preserved. Confirmed five-hour
-    exhaustion is handled before this function by excluding those accounts from
-    ``states``.
-    """
-    oauth_states = [
-        state
-        for state in states
-        if isinstance(state.get("candidate"), dict)
-        and _is_codex_oauth_account_candidate(state["candidate"])
-    ]
-    if len(oauth_states) < 2:
-        return None
-
-    scored: list[tuple[float, dict[str, Any]]] = []
-    unscored: list[dict[str, Any]] = []
-    for state in oauth_states:
-        remaining = _codex_oauth_state_weekly_remaining_pct(state)
-        if remaining is None:
-            unscored.append(state)
-        else:
-            scored.append((remaining, state))
-
-    if len(scored) < 2:
-        # Balancing requires comparable weekly evidence for at least two accounts.
-        return None
-
-    max_remaining = max(remaining for remaining, _state in scored)
-    min_remaining = min(remaining for remaining, _state in scored)
-    spread = max_remaining - min_remaining
-    if spread + 1e-9 < 10.0:
-        # Within the soft band: either eligible account is permitted.
-        return None
-
-    preferred = [
-        state
-        for remaining, state in scored
-        if abs(remaining - max_remaining) <= 0.001
-    ]
-    if not preferred:
-        return None
-    selected = preferred[0]
-    selected = dict(selected)
-    selected["selection_diagnostics"] = {
-        **dict(selected.get("selection_diagnostics") or {}),
-        "strategy": "weekly_quota_balance",
-        "quota_family": _codex_oauth_quota_family_for_model(
-            selected.get("candidate", {}).get("model")
-        ),
-        "weekly_balance_band_pp": 10.0,
-        "weekly_remaining_spread_pp": round(spread, 3),
-        "preferred_weekly_remaining_pct": max_remaining,
-    }
-    return selected
-
-
-def _codex_oauth_dual_family_remaining(
-    state: Mapping[str, Any],
-) -> dict[str, Optional[float]]:
-    candidate = state.get("candidate")
-    if not isinstance(candidate, Mapping):
-        return {"overall": None, "spark": None}
-    account_hash = str(
-        candidate.get("codex_oauth_account_hash") or ""
-    ).strip()
-    expected_environment = _codex_oauth_expected_quota_environment()
-    windows = alias_routing_state.resolve_normalized_quota_windows_for_account(
-        provider=str(candidate.get("provider") or ""),
-        account_hash=account_hash,
-        max_age_seconds=_codex_oauth_quota_validity_horizon_seconds(),
-    )
-    windows = [
-        window
-        for window in windows
-        if _codex_oauth_window_matches_environment(
-            window,
-            expected_environment=expected_environment,
-        )
-    ]
-    return {
-        family: _codex_oauth_weekly_remaining_pct_from_windows(
-            _filter_codex_oauth_quota_windows_for_family(
-                windows,
-                family=family,
-            )
-        )
-        for family in ("overall", "spark")
-    }
-
-
-def _select_codex_oauth_weighted_round_robin_state(
-    states: Sequence[dict[str, Any]],
-) -> dict[str, Any]:
-    weighted_states: list[tuple[dict[str, Any], float]] = []
-    for state in states:
-        candidate = state["candidate"]
-        try:
-            weight = float(candidate.get("codex_oauth_account_weight", 1.0))
-        except (TypeError, ValueError):
-            weight = 1.0
-        weighted_states.append((state, max(0.01, weight)))
-    minimum_weight = min(weight for _state, weight in weighted_states)
-    slot_counts = [
-        max(1, min(100, int(round(weight / minimum_weight))))
-        for _state, weight in weighted_states
-    ]
-    slots = [
-        state
-        for ordinal in range(max(slot_counts))
-        for (state, _weight), slot_count in zip(weighted_states, slot_counts)
-        if ordinal < slot_count
-    ]
-    identities = ",".join(
-        str(state["candidate"].get("codex_oauth_account_hash") or "")
-        for state in states
-    )
-    cursor_key = ("codex_oauth_accounts", identities)
-    cursor = alias_routing_state.round_robin_cursor.get(cursor_key, 0)
-    selected = slots[cursor % len(slots)]
-    alias_routing_state.round_robin_cursor[cursor_key] = cursor + 1
-    return selected
-
-
-def _prefer_codex_oauth_dual_quota_balanced_state(
-    states: Sequence[dict[str, Any]],
-) -> Optional[dict[str, Any]]:
-    if len(states) < 2:
-        return states[0] if states else None
-    candidate = states[0].get("candidate")
-    if not isinstance(candidate, Mapping):
-        return None
-    if candidate.get("codex_oauth_selection_strategy") != "dual_quota_balance":
-        return None
-    try:
-        band = float(candidate.get("codex_oauth_balance_band_pp", 10.0))
-    except (TypeError, ValueError):
-        band = 10.0
-
-    observations = {
-        str(state["candidate"].get("codex_oauth_account_hash") or ""): (
-            _codex_oauth_dual_family_remaining(state)
-        )
-        for state in states
-    }
-    spreads: dict[str, float] = {}
-    for family in ("overall", "spark"):
-        values = [
-            family_values[family]
-            for family_values in observations.values()
-            if family_values[family] is not None
-        ]
-        if len(values) >= 2:
-            spreads[family] = max(values) - min(values)
-
-    constrained = [
-        family for family, spread in spreads.items()
-        if spread + 1e-9 >= band
-    ]
-    if constrained:
-        controlling_family = max(
-            constrained,
-            key=lambda family: (spreads[family], family == "overall"),
-        )
-        scored = [
-            (
-                observations[
-                    str(state["candidate"].get("codex_oauth_account_hash") or "")
-                ][controlling_family],
-                state,
-            )
-            for state in states
-        ]
-        known = [(value, state) for value, state in scored if value is not None]
-        if known:
-            selected = max(known, key=lambda item: item[0])[1]
-            selected = dict(selected)
-            selected["selection_diagnostics"] = {
-                **dict(selected.get("selection_diagnostics") or {}),
-                "strategy": "dual_quota_balance",
-                "balance_band_percentage_points": band,
-                "controlling_quota_family": controlling_family,
-                "weekly_remaining_spreads_pp": {
-                    key: round(value, 3) for key, value in spreads.items()
-                },
-                "account_weekly_remaining_pct": observations,
-            }
-            return selected
-
-    if (
-        candidate.get("codex_oauth_within_band_strategy")
-        == "weighted_round_robin"
-    ):
-        selected = dict(
-            _select_codex_oauth_weighted_round_robin_state(states)
-        )
-        selected["selection_diagnostics"] = {
-            **dict(selected.get("selection_diagnostics") or {}),
-            "strategy": "weighted_round_robin",
-            "balance_band_percentage_points": band,
-            "weekly_remaining_spreads_pp": {
-                key: round(value, 3) for key, value in spreads.items()
-            },
-            "account_weekly_remaining_pct": observations,
-        }
-        return selected
-    return None
-
-
 def _select_first_available_codex_oauth_account_state(
     states: Sequence[dict[str, Any]],
 ) -> Optional[dict[str, Any]]:
-    """Pick the first eligible account, applying soft weekly balancing when useful."""
+    """Pick the first account in deterministic configured priority order."""
     available = [
         state
         for state in states
@@ -2711,11 +2444,7 @@ def _select_first_available_codex_oauth_account_state(
     ]
     if not available:
         return None
-    dual_balanced = _prefer_codex_oauth_dual_quota_balanced_state(available)
-    if dual_balanced is not None:
-        return dual_balanced
-    balanced = _prefer_codex_oauth_weekly_balanced_state(available)
-    return balanced if balanced is not None else available[0]
+    return available[0]
 
 
 def _format_codex_oauth_quota_reset_at(value: Any) -> Optional[str]:
@@ -3488,8 +3217,7 @@ def _select_available_state(
     group = tier[0]["candidate"].get("selection_group")
     strategy = tier[0]["candidate"].get("selection_strategy")
     if not group or not strategy:
-        balanced = _prefer_codex_oauth_weekly_balanced_state(tier)
-        return balanced if balanced is not None else tier[0]
+        return tier[0]
 
     states_by_choice: dict[str, list[dict[str, Any]]] = {}
     weights: dict[str, float] = {}
@@ -5090,12 +4818,6 @@ _HOST_FUNCTION_NAMES = (
     "_filter_codex_oauth_quota_windows_for_family",
     "_codex_oauth_window_remaining_pct",
     "_codex_oauth_window_is_weekly",
-    "_codex_oauth_weekly_remaining_pct_from_windows",
-    "_codex_oauth_state_weekly_remaining_pct",
-    "_prefer_codex_oauth_weekly_balanced_state",
-    "_codex_oauth_dual_family_remaining",
-    "_select_codex_oauth_weighted_round_robin_state",
-    "_prefer_codex_oauth_dual_quota_balanced_state",
     "_select_first_available_codex_oauth_account_state",
     "_apply_codex_oauth_account_context_to_state",
     "_build_codex_auto_agent_affinity_candidate_state",
@@ -5172,7 +4894,6 @@ def install(host_globals: dict) -> None:
     host_globals.update({
         "alias_routing_state": alias_routing_state,
         "math": math,
-        "_CODEX_OAUTH_WEEKLY_BALANCE_BAND_PP": _CODEX_OAUTH_WEEKLY_BALANCE_BAND_PP,
         "_CODEX_OAUTH_QUOTA_FAMILY_OVERALL": _CODEX_OAUTH_QUOTA_FAMILY_OVERALL,
         "_CODEX_OAUTH_QUOTA_FAMILY_SPARK": _CODEX_OAUTH_QUOTA_FAMILY_SPARK,
         "_get_codex_active_cooldown_state": _get_codex_active_cooldown_state,
