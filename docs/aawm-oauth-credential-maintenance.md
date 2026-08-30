@@ -118,8 +118,8 @@ the same inventory to the proxy and provider-status sidecar:
 
 | Label | Auth path | Independent lock path | Priority | Weight | Enabled | Models |
 | --- | --- | --- | --- | --- | --- | --- |
-| `account1` | `/home/zepfu/.codex/account1.auth.json` | `/home/zepfu/.codex/account1.auth.json.lock` | `10` | `1.0` | `AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED` (default `true`) | `["*"]` |
-| `account2` | `/home/zepfu/.codex/account2.auth.json` | `/home/zepfu/.codex/account2.auth.json.lock` | `20` | `1.0` | `AAWM_CODEX_OAUTH_ACCOUNT2_ENABLED` (default `true`) | `["*"]` |
+| `account1` | `/home/zepfu/.codex/account1.auth.json` | `/home/zepfu/.codex/account1.auth.json.lock` | `10` (primary) | `1.0` | `AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED` (default `true`) | `["*"]` |
+| `account2` | `/home/zepfu/.codex/account2.auth.json` | `/home/zepfu/.codex/account2.auth.json.lock` | `20` (overflow) | `1.0` | `AAWM_CODEX_OAUTH_ACCOUNT2_ENABLED` (default `true`) | `["*"]` |
 
 Operator mapping for those enrolled files (documentation only; not inventory
 schema fields):
@@ -129,8 +129,13 @@ schema fields):
 | `account1` | Seshat `~/.codex/auth.json` | `rdkick+openai@pm.me` |
 | `account2` | Thoth `~/.codex/auth.json` | `rdkick+openai2@pm.me` |
 
-Selection order is priority first and declaration order second. Labels are
-stable, non-secret operator names; they are not upstream account identities.
+Selection order is configured primary first and overflow second: `account1` is
+the primary, and `account2` is the overflow account. The inventory's
+`strategy: priority` uses the numeric priority first and declaration order
+second, so this order is deterministic. The per-record `weight` remains an
+inventory schema field but does not alter primary/overflow selection. Labels
+are stable, non-secret operator names; they are not upstream account
+identities.
 Configured labels differ from hashed upstream identities and must not be used
 interchangeably.
 Each record separately pins a 12-character lowercase SHA-256 prefix derived
@@ -214,36 +219,38 @@ records. The standalone `~/.codex/auth.json` and its lock remain a generic
 single-file primitive for operation outside inventory mode; they are never a
 managed-inventory fallback.
 
-## Codex multi-account request routing (OPENAI-004)
+## Codex multi-account request routing (OPENAI-004, OPENAI-029)
 
 Managed Codex OAuth request routing uses only the explicit ordered
 `LITELLM_CODEX_OAUTH_INVENTORY`. New auto-agent selections expand each Codex
 OAuth candidate template into one account lane per inventory record that is
-enabled, model-eligible, and auth-healthy at load time. Selection is
-deterministic across that ordered inventory and applies valid per-account
-provider observations from the normalized cache throughout the configured poll
-cadence. Confirmed exhaustion requires a fresh window with `exhausted=true`
-and `remaining_pct <= 0`; stale, wrong-environment, malformed, expired-reset,
-missing, or ambiguous quota evidence is not treated as confirmed exhaustion and
-does not by itself remove an otherwise admissible account.
+enabled, model-eligible, and auth-healthy at load time. Fresh requests use the
+configured primary/overflow order: the primary account is selected first, then
+each eligible overflow account in order. A fresh request may fail over only
+after a real eligible account-scoped failure, including definitive account
+exhaustion (`usage_limit_reached`), an account-scoped rate limit,
+candidate-unavailable, or a generic provider-returned `401` after provider
+I/O. Each account is attempted at most once for those failover cases, and each
+failed account receives only its own lane cooldown.
 
-The optional inventory `routing` object controls account-pool behavior. Its
-backward-compatible default is account-pinned priority order. A configured
-`credential_affinity: interchangeable` pool keeps provider, model, route,
-endpoint, and encrypted-state-format session affinity while treating account
-label/hash/lane as per-attempt telemetry. Fresh requests may move through every
-other eligible interchangeable account after definitive account exhaustion
-(`usage_limit_reached`), an account-scoped rate limit, or
-candidate-unavailable. Replay-safe, fully client-carried continuations may
-perform one planned pre-commit move to another eligible interchangeable
-account after an account-scoped failure that occurs before durable ownership is
-committed. A transient pre-commit `capacity_exhausted`/overload retries once
-on the same account; if repeated, it returns the existing retryable pre-stream
-`503` without rotating accounts. Definitive exhaustion, account-scoped rate
-limits, and candidate-unavailable may traverse every other eligible
-interchangeable account before terminal error for fresh requests. Each account
-is attempted at most once for those failover cases, and each failed account
-receives only its own lane cooldown.
+Continuations are owner-first. Each continuation gets one owner-first attempt
+against the recorded upstream owner account and remains pinned unless the
+complete request is replay-safe, fully client-carried, still pre-commit, and
+that owner returns a real eligible account-scoped failure. At most one planned
+pre-commit move to an eligible overflow account is allowed. A transient
+pre-commit
+`capacity_exhausted`/overload retries once on the same account; if repeated,
+it returns the existing retryable pre-stream `503` without rotating accounts.
+After the first response byte, no account failover is planned.
+
+The configured `credential_affinity: interchangeable` pool keeps provider,
+model, route, endpoint, and encrypted-state-format session affinity while
+treating account label/hash/lane as per-attempt telemetry. Each account keeps
+its independent credential, refresh state, lock, lane cooldown, and quota
+telemetry. Confirmed exhaustion requires a fresh window with `exhausted=true`
+and `remaining_pct <= 0`; stale, wrong-environment, malformed, expired-reset,
+missing, or ambiguous quota evidence is not treated as confirmed exhaustion
+and does not by itself remove an otherwise admissible account.
 
 For managed OpenAI/Codex OAuth, a fresh request that receives a generic
 provider-returned HTTP `401` after provider I/O advances to the next eligible
@@ -270,18 +277,13 @@ state itself is not persisted by the routing metadata: encrypted content,
 prompts, credentials, and raw account identifiers are excluded. After the
 first response byte, no account failover is planned.
 
-With `strategy: dual_quota_balance`, routing evaluates the overall seven-day
-Codex and Codex Spark seven-day families together. If either account spread is
-at or above `balance_band_percentage_points`, the selector favors the account
-with more remaining quota in the most constrained family. When both families
-are within the configured band, `within_band_strategy:
-weighted_round_robin` regularly alternates eligible accounts according to
-their inventory weights. Valid account-scoped observations remain eligible for
-selection throughout the configured poll cadence; `dual_quota_balance` does not
-discard them after 30 seconds and fall back to round robin while they are still
-fresh. Missing or stale observations do not create quota facts; the within-band
-policy supplies the configured deterministic fallback only when no valid
-account-scoped observation is available for that decision.
+Quota observations remain inputs for account eligibility, confirmed exhaustion,
+reset and cooldown handling, and quota telemetry. They do not synchronize
+accounts by remaining-percentage bands and do not select accounts by
+round-robin rotation. Valid observations therefore inform whether an account
+is admissible or exhausted without changing the configured primary/overflow
+order for fresh requests. Missing or stale observations do not create quota
+facts or reorder the inventory.
 When no account is admissible, the proxy returns a structured safe `429` that
 may include skipped candidate metadata and terminal reset information built
 only from configured labels, expected account hashes, lanes, and public quota

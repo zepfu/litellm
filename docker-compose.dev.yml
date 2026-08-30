@@ -1,11 +1,11 @@
 # Explicit Codex OAuth inventory labels (non-secret operator mapping only):
 # - account1: sourced from Seshat ~/.codex/auth.json; owner rdkick+openai@pm.me
 # - account2: sourced from Thoth ~/.codex/auth.json; owner rdkick+openai2@pm.me
+# Deterministic primary/overflow order: account1 (priority 10), then account2
+# (priority 20).
 x-codex-oauth-inventory: &codex-oauth-inventory >-
   LITELLM_CODEX_OAUTH_INVENTORY={"schema_version":1,"routing":{
-  "credential_affinity":"interchangeable","strategy":"dual_quota_balance",
-  "balance_band_percentage_points":10,
-  "within_band_strategy":"weighted_round_robin"},"accounts":[
+  "credential_affinity":"interchangeable","strategy":"priority"},"accounts":[
   {"label":"account1","auth_path":"/home/zepfu/.codex/account1.auth.json",
   "lock_path":"/home/zepfu/.codex/account1.auth.json.lock","priority":10,
   "weight":1.0,"enabled":${AAWM_CODEX_OAUTH_ACCOUNT1_ENABLED:-true},
