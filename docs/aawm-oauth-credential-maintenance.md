@@ -485,7 +485,7 @@ Dev compose source (not a live apply):
 - `litellm-dev` bind-mounts `/home/zepfu/.hermes` read-only and sets
   `LITELLM_NOUS_OAUTH_AUTH_FILE`.
 - `provider-status-observations` bind-mounts the same directory writable and
-  enables `AAWM_NOUS_OAUTH_REFRESH_ENABLED=1` with interval `300`, buffer `900`,
+  enables `AAWM_NOUS_OAUTH_REFRESH_ENABLED=1` with interval `300`, buffer `300`,
   force `0`, timeout `30`, uid/gid `1000`, and mode `0o600`.
 - Directory mounts, not file mounts, so atomic `os.replace` is visible without
   a proxy restart.

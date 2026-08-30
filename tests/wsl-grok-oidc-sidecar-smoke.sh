@@ -160,16 +160,16 @@ require_contains "$compose_file" 'AAWM_XAI_OAUTH_AUTH_FILE_MODE=0o600' \
   "managed xAI auth mode 0o600"
 require_contains "$compose_file" 'AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS=300' \
   "Grok refresh interval 300"
-require_contains "$compose_file" 'AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS=900' \
-  "Grok refresh buffer 900"
+require_contains "$compose_file" 'AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS=300' \
+  "Grok refresh buffer 300"
 require_contains "$compose_file" 'AAWM_GROK_OIDC_FORCE_REFRESH=0' \
   "Grok force refresh disabled"
 require_contains "$compose_file" 'AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS=30' \
   "Grok HTTP timeout 30"
 require_contains "$compose_file" 'AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS=300' \
   "managed xAI refresh interval 300"
-require_contains "$compose_file" 'AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=900' \
-  "managed xAI refresh buffer 900"
+require_contains "$compose_file" 'AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=300' \
+  "managed xAI refresh buffer 300"
 require_contains "$compose_file" 'AAWM_XAI_OAUTH_FORCE_REFRESH=0' \
   "managed xAI force refresh disabled"
 require_contains "$compose_file" 'AAWM_XAI_OAUTH_HTTP_TIMEOUT_SECONDS=30' \

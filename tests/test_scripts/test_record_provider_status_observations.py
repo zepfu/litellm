@@ -1486,7 +1486,7 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         in compose_text
     )
     assert (
-        "AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS=${AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS:-3600}"
+        "AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS=${AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS:-300}"
         in compose_text
     )
     assert "AAWM_GROK_OIDC_FORCE_REFRESH=${AAWM_GROK_OIDC_FORCE_REFRESH:-1}" in compose_text
@@ -1622,7 +1622,7 @@ def test_provider_status_compose_wires_managed_xai_oauth_sidecar_refresh() -> No
         in compose_text
     )
     assert (
-        "AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=${AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS:-900}"
+        "AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=${AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS:-300}"
         in compose_text
     )
     assert (
@@ -1660,7 +1660,7 @@ def test_validate_xai_oauth_guardrail_rejects_outer_cadence_above_buffer() -> No
         match=(
             r"--interval-seconds=901 exceeds "
             r"--xai-oauth-refresh-buffer-seconds=900; "
-            r"outer eligibility cadence must not exceed the refresh buffer"
+            r"outer eligibility cadence must not exceed the minimum refresh threshold"
         ),
     ):
         loop._validate_xai_oauth_config_args(
@@ -2580,7 +2580,7 @@ def test_provider_status_compose_aawm_network_rendered_default_name() -> None:
     assert proxy_inventory == sidecar_inventory
     sidecar_environment = services["provider-status-observations"]["environment"]
     assert sidecar_environment["AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS"] == "300"
-    assert sidecar_environment["AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS"] == "900"
+    assert sidecar_environment["AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS"] == "300"
     assert sidecar_environment["AAWM_XAI_OAUTH_FORCE_REFRESH"] == "0"
     inventory = json.loads(proxy_inventory)
     assert inventory["schema_version"] == 1
@@ -7414,7 +7414,10 @@ def test_codex_inventory_refresh_isolates_failures_and_keeps_label_timers(
                 {
                     "tokens": {
                         "access_token": _build_test_jwt(
-                            {"exp": initial_expiry}
+                            {
+                                "iat": int((wall_now - timedelta(hours=1)).timestamp()),
+                                "exp": initial_expiry,
+                            }
                         ),
                         "refresh_token": f"refresh-{record.label}",
                         "account_id": f"acct-{record.label}",
@@ -7443,7 +7446,10 @@ def test_codex_inventory_refresh_isolates_failures_and_keeps_label_timers(
                 {
                     "tokens": {
                         "access_token": _build_test_jwt(
-                            {"exp": refreshed_expiry}
+                            {
+                                "iat": int((wall_now - timedelta(hours=1)).timestamp()),
+                                "exp": refreshed_expiry,
+                            }
                         ),
                         "refresh_token": f"rotated-{record.label}",
                         "account_id": f"acct-{record.label}",
@@ -7642,6 +7648,16 @@ def test_codex_actual_attempt_throttle_retains_failed_degraded_aggregate(
                 "tokens": {
                     "access_token": _build_test_jwt(
                         {
+                            "iat": int(
+                                datetime(
+                                    2026,
+                                    8,
+                                    13,
+                                    22,
+                                    0,
+                                    tzinfo=timezone.utc,
+                                ).timestamp()
+                            ),
                             "exp": int(
                                 datetime(
                                     2026,
@@ -7741,6 +7757,118 @@ def test_codex_actual_attempt_throttle_retains_failed_degraded_aggregate(
         }
     ]
     assert state.codex_oauth_last_attempt_monotonic_by_label["account1"] == 100.0
+
+
+def test_codex_failed_midpoint_attempt_retries_each_account_before_expiry(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    inventory = _codex_oauth_inventory("account1", "account2", root=tmp_path)
+    wall_start = datetime(2026, 8, 13, 22, 30, tzinfo=timezone.utc)
+    access_token = _build_test_jwt(
+        {
+            "iat": int((wall_start - timedelta(seconds=450)).timestamp()),
+            "exp": int((wall_start + timedelta(seconds=450)).timestamp()),
+        }
+    )
+    for record in inventory.records:
+        record.auth_path.write_text(
+            json.dumps(
+                {
+                    "tokens": {
+                        "access_token": access_token,
+                        "refresh_token": f"refresh-{record.label}",
+                        "account_id": f"acct-{record.label}",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+    config = _codex_oauth_auth_persist_config(
+        apply=False,
+        interval_seconds=900.0,
+        codex_oauth_inventory=inventory,
+        codex_refresh_interval_seconds=300.0,
+    )
+    helper_calls: list[str] = []
+
+    def fake_refresh(selected_record, **kwargs):
+        helper_calls.append(selected_record.label)
+        kwargs["on_token_endpoint_attempt"]()
+        return {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "account_label": selected_record.label,
+            "account_hash": selected_record.expected_account_hash,
+            "expires_at": None,
+            "error_class": "HTTPError",
+            "error_message": "temporary token endpoint failure",
+            "error_hint": None,
+        }
+
+    monkeypatch.setattr(
+        loop.codex_oauth_refresh,
+        "refresh_codex_oauth_inventory_record",
+        fake_refresh,
+    )
+    monkeypatch.setattr(
+        loop,
+        "_persist_codex_auth_observation",
+        lambda *_args, **_kwargs: (False, 0, None, "apply_disabled"),
+    )
+    state = loop.SidecarTaskState()
+
+    first_events = loop._run_codex_oauth_refresh_task(
+        config,
+        state,
+        now_monotonic=100.0,
+        now_wall=wall_start,
+    )
+    first_refreshes = [
+        event for event in first_events if event["event"] == "codex_oauth_refresh"
+    ]
+    assert helper_calls == ["account1", "account2"]
+    assert {
+        label: state.codex_oauth_last_attempt_monotonic_by_label[label]
+        for label in ("account1", "account2")
+    } == {"account1": 100.0, "account2": 100.0}
+    assert all(
+        event["next_refresh_check_at"]
+        == (wall_start + timedelta(seconds=300)).isoformat().replace(
+            "+00:00", "Z"
+        )
+        for event in first_refreshes
+    )
+
+    loop._run_codex_oauth_refresh_task(
+        config,
+        state,
+        now_monotonic=101.0,
+        now_wall=wall_start + timedelta(seconds=1),
+    )
+    assert helper_calls == ["account1", "account2"]
+
+    second_events = loop._run_codex_oauth_refresh_task(
+        config,
+        state,
+        now_monotonic=401.0,
+        now_wall=wall_start + timedelta(seconds=301),
+    )
+    second_refreshes = [
+        event for event in second_events if event["event"] == "codex_oauth_refresh"
+    ]
+
+    assert helper_calls == ["account1", "account2", "account1", "account2"]
+    assert [event["account_label"] for event in second_refreshes] == [
+        "account1",
+        "account2",
+    ]
+    assert all(event["actual_attempted"] is True for event in second_refreshes)
+    assert {
+        label: state.codex_oauth_last_attempt_monotonic_by_label[label]
+        for label in ("account1", "account2")
+    } == {"account1": 401.0, "account2": 401.0}
 
 
 def test_codex_inventory_passive_health_isolates_records(monkeypatch) -> None:

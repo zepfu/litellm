@@ -227,7 +227,7 @@ def test_defaults_are_portable_tilde_paths(nous) -> None:
     assert "/home/zepfu" not in nous.DEFAULT_NOUS_OAUTH_LOCK_FILE
     assert nous.DEFAULT_NOUS_OAUTH_TOKEN_ENDPOINT == _TOKEN_ENDPOINT
     assert nous.DEFAULT_NOUS_OAUTH_CLIENT_ID == _CLIENT_ID
-    assert nous.DEFAULT_NOUS_OAUTH_REFRESH_BUFFER_SECONDS == 900
+    assert nous.DEFAULT_NOUS_OAUTH_REFRESH_BUFFER_SECONDS == 300
     assert nous.DEFAULT_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS == 30.0
     assert nous.DEFAULT_NOUS_OAUTH_AUTH_FILE_MODE == 0o600
     assert getattr(nous, "DEFAULT_NOUS_OAUTH_FORCE_REFRESH", False) is False
@@ -315,7 +315,7 @@ def test_eligibility_not_due_does_not_call_token_endpoint_or_throttle(
             nous,
             auth_path,
             force=False,
-            buffer_seconds=900,
+            buffer_seconds=300,
             on_token_endpoint_attempt=lambda: attempts.append(1),
         )
 
@@ -341,7 +341,7 @@ def test_inspect_eligibility_not_due_is_read_only(nous, tmp_path: Path) -> None:
         with patch.object(nous.urllib_request, "urlopen") as urlopen:
             summary = nous.inspect_nous_oauth_refresh_eligibility(
                 auth_path,
-                buffer_seconds=900,
+                buffer_seconds=300,
             )
 
     assert summary["eligible"] is False
@@ -364,7 +364,7 @@ def test_inspect_eligibility_includes_non_secret_credential_identity(
         )
     )
     _write_hermes(auth_path, original)
-    first = nous.inspect_nous_oauth_refresh_eligibility(auth_path, buffer_seconds=900)
+    first = nous.inspect_nous_oauth_refresh_eligibility(auth_path, buffer_seconds=300)
     identity = first["credential_identity"]
     assert identity
     assert "mtime_ns=" in identity
@@ -381,7 +381,7 @@ def test_inspect_eligibility_includes_non_secret_credential_identity(
         )
     )
     _write_hermes(auth_path, replaced)
-    second = nous.inspect_nous_oauth_refresh_eligibility(auth_path, buffer_seconds=900)
+    second = nous.inspect_nous_oauth_refresh_eligibility(auth_path, buffer_seconds=300)
     assert second["credential_identity"] != identity
     assert "obtained_at=2026-08-24T20:00:00Z" in second["credential_identity"]
     assert "old-access" not in second["credential_identity"]
@@ -399,7 +399,7 @@ def test_missing_expires_at_is_eligible_and_degraded(nous, tmp_path: Path) -> No
 
     summary = nous.inspect_nous_oauth_refresh_eligibility(
         auth_path,
-        buffer_seconds=900,
+        buffer_seconds=300,
     )
 
     assert summary["eligible"] is True
@@ -421,7 +421,7 @@ def test_unparseable_expires_at_is_eligible_and_degraded(nous, tmp_path: Path) -
 
     summary = nous.inspect_nous_oauth_refresh_eligibility(
         auth_path,
-        buffer_seconds=900,
+        buffer_seconds=300,
     )
 
     assert summary["eligible"] is True
@@ -447,7 +447,7 @@ def test_eligibility_uses_earlier_of_access_and_agent_key_expiry(
 
     summary = nous.inspect_nous_oauth_refresh_eligibility(
         auth_path,
-        buffer_seconds=900,
+        buffer_seconds=300,
         now=lambda: now,
     )
 
@@ -475,7 +475,7 @@ def test_due_refresh_posts_portal_form_and_refresh_header(
             nous,
             auth_path,
             force=False,
-            buffer_seconds=900,
+            buffer_seconds=300,
             on_token_endpoint_attempt=lambda: attempts.append(1),
         )
 
@@ -856,7 +856,7 @@ def test_loop_nous_oauth_help_defaults_are_portable() -> None:
 
 
 def test_sidecar_buffer_and_attempt_interval_defaults(nous) -> None:
-    assert nous.DEFAULT_NOUS_OAUTH_REFRESH_BUFFER_SECONDS == 900
+    assert nous.DEFAULT_NOUS_OAUTH_REFRESH_BUFFER_SECONDS == 300
     interval = getattr(nous, "DEFAULT_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS", 300)
     assert int(interval) == 300
     if not _LOOP_SCRIPT.is_file() or _LOOP_SCRIPT.stat().st_size == 0:
@@ -876,7 +876,7 @@ def test_sidecar_buffer_and_attempt_interval_defaults(nous) -> None:
     ) in compose
     assert (
         "AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS="
-        "${AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS:-900}"
+        "${AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS:-300}"
     ) in compose
     assert (
         "AAWM_NOUS_OAUTH_FORCE_REFRESH="

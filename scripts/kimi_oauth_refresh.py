@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import os
@@ -89,6 +90,9 @@ class KimiOAuthSummary:
     scope: str
     expires_at: Optional[str] = None
     auth_degraded: bool = False
+    refresh_threshold_seconds: Optional[float] = None
+    refresh_threshold_source: Optional[str] = None
+    refresh_threshold_degraded: bool = False
     error_class: Optional[str] = None
     error_message: Optional[str] = None
 
@@ -101,6 +105,9 @@ class KimiOAuthSummary:
             "scope": self.scope,
             "expires_at": self.expires_at,
             "auth_degraded": self.auth_degraded,
+            "refresh_threshold_seconds": self.refresh_threshold_seconds,
+            "refresh_threshold_source": self.refresh_threshold_source,
+            "refresh_threshold_degraded": self.refresh_threshold_degraded,
             "error_class": self.error_class,
             "error_message": self.error_message,
         }
@@ -115,7 +122,7 @@ def inspect_kimi_oauth_credential_health(auth_file: str | Path) -> Dict[str, Any
         access_token = credential.get("access_token")
         if not isinstance(access_token, str) or not access_token.strip():
             raise KimiOAuthError("Kimi OAuth credential is missing access_token.")
-        expires_at = _as_finite_number(credential.get("expires_at"))
+        expires_at = _credential_expires_at(credential)
         if expires_at is None:
             return _kimi_health_summary(
                 resolved_auth_file,
@@ -414,13 +421,21 @@ def refresh_kimi_oauth_auth_file(
                 lock.assert_owned()
                 peer_credential = _read_credential_payload(auth_path)
                 if _refresh_token_changed(credential, peer_credential):
+                    threshold, threshold_source, threshold_degraded = (
+                        _credential_refresh_threshold_metadata(peer_credential)
+                    )
                     return KimiOAuthSummary(
                         attempted=True,
                         refreshed=False,
                         skipped=True,
                         auth_file=str(auth_path),
                         scope=_credential_scope(peer_credential, active_scope),
-                        expires_at=_format_expires_at(peer_credential.get("expires_at")),
+                        expires_at=_format_expires_at(
+                            _credential_expires_at(peer_credential)
+                        ),
+                        refresh_threshold_seconds=threshold,
+                        refresh_threshold_source=threshold_source,
+                        refresh_threshold_degraded=threshold_degraded,
                     ).as_dict()
                 lock.assert_owned()
                 _write_credential_payload(
@@ -437,13 +452,20 @@ def refresh_kimi_oauth_auth_file(
 
             lock.assert_owned()
             _write_credential_payload(auth_path, refreshed)
+            threshold, threshold_source, threshold_degraded = (
+                _credential_refresh_threshold_metadata(refreshed)
+            )
             return KimiOAuthSummary(
                 attempted=True,
                 refreshed=True,
                 skipped=False,
                 auth_file=str(auth_path),
                 scope=_credential_scope(refreshed, active_scope),
-                expires_at=_format_expires_at(refreshed.get("expires_at")),
+                expires_at=_format_expires_at(_credential_expires_at(refreshed)),
+                auth_degraded=threshold_degraded,
+                refresh_threshold_seconds=threshold,
+                refresh_threshold_source=threshold_source,
+                refresh_threshold_degraded=threshold_degraded,
             ).as_dict()
     except Exception as exc:
         return _failed_summary(auth_path, fallback_scope, exc)
@@ -464,8 +486,11 @@ def inspect_kimi_oauth_refresh_eligibility(
         access_token = credential.get("access_token")
         if not isinstance(access_token, str) or not access_token.strip():
             raise KimiOAuthError("Kimi OAuth credential is missing access_token.")
-        expires_at = _as_finite_number(credential.get("expires_at"))
+        expires_at = _credential_expires_at(credential)
         if expires_at is None:
+            threshold, threshold_source, threshold_degraded = (
+                _credential_refresh_threshold_metadata(credential)
+            )
             return _kimi_eligibility_summary(
                 observed_at=observed_at,
                 expires_at=None,
@@ -476,11 +501,16 @@ def inspect_kimi_oauth_refresh_eligibility(
                 credential_health="degraded",
                 usable=True,
                 scope=scope,
+                refresh_threshold_seconds=threshold,
+                refresh_threshold_source=threshold_source,
+                refresh_threshold_degraded=threshold_degraded,
                 error_class="CredentialExpiryUnavailable",
                 error_message="Kimi OAuth credential expires_at is missing or invalid.",
             )
         expiry = datetime.fromtimestamp(expires_at, timezone.utc)
-        threshold_seconds = _refresh_threshold_seconds(credential.get("expires_in"))
+        threshold_seconds, threshold_source, threshold_degraded = (
+            _credential_refresh_threshold_metadata(credential)
+        )
         refresh_due_at = expiry - timedelta(seconds=threshold_seconds)
         return _kimi_eligibility_summary(
             observed_at=observed_at,
@@ -496,6 +526,8 @@ def inspect_kimi_oauth_refresh_eligibility(
             usable=expiry > observed_at,
             scope=scope,
             refresh_threshold_seconds=threshold_seconds,
+            refresh_threshold_source=threshold_source,
+            refresh_threshold_degraded=threshold_degraded,
         )
     except Exception as exc:
         return _kimi_eligibility_summary(
@@ -508,6 +540,9 @@ def inspect_kimi_oauth_refresh_eligibility(
             credential_health="malformed",
             usable=False,
             scope=DEFAULT_KIMI_OAUTH_SCOPE,
+            refresh_threshold_seconds=float(DEFAULT_KIMI_OAUTH_REFRESH_MIN_SECONDS),
+            refresh_threshold_source="fallback",
+            refresh_threshold_degraded=True,
             error_class=exc.__class__.__name__,
             error_message=_redacted_error_message(exc),
         )
@@ -524,6 +559,8 @@ def _kimi_eligibility_summary(
     usable: bool,
     scope: str,
     refresh_threshold_seconds: Optional[float] = None,
+    refresh_threshold_source: Optional[str] = None,
+    refresh_threshold_degraded: bool = False,
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -541,6 +578,8 @@ def _kimi_eligibility_summary(
         "usable": usable,
         "scope": scope,
         "refresh_threshold_seconds": refresh_threshold_seconds,
+        "refresh_threshold_source": refresh_threshold_source,
+        "refresh_threshold_degraded": refresh_threshold_degraded,
         "error_class": error_class,
         "error_message": error_message,
     }
@@ -624,20 +663,183 @@ def _credential_needs_refresh(
     *,
     now: Callable[[], float],
 ) -> bool:
-    expires_at = _as_finite_number(credential.get("expires_at"))
+    expires_at = _credential_expires_at(credential)
     if expires_at is None:
         return True
-    return expires_at - now() <= _refresh_threshold_seconds(credential.get("expires_in"))
-
-
-def _refresh_threshold_seconds(expires_in: Any) -> float:
-    lifetime = _as_finite_number(expires_in)
-    if lifetime is None or lifetime <= 0:
-        return float(DEFAULT_KIMI_OAUTH_REFRESH_MIN_SECONDS)
-    return max(
-        float(DEFAULT_KIMI_OAUTH_REFRESH_MIN_SECONDS),
-        lifetime * DEFAULT_KIMI_OAUTH_REFRESH_THRESHOLD_RATIO,
+    return expires_at - now() <= _refresh_threshold_seconds(
+        credential.get("expires_in"),
+        access_token=credential.get("access_token"),
+        expires_at=expires_at,
+        issued_at=credential.get("issued_at") or credential.get("obtained_at"),
     )
+
+
+def _issued_lifetime_seconds(
+    expires_in: Any = None,
+    *,
+    access_token: Optional[str] = None,
+    expires_at: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+) -> Optional[float]:
+    lifetime, _source = _issued_lifetime_metadata(
+        expires_in,
+        access_token=access_token,
+        expires_at=expires_at,
+        issued_at=issued_at,
+        obtained_at=obtained_at,
+    )
+    return lifetime
+
+
+def _issued_lifetime_metadata(
+    expires_in: Any = None,
+    *,
+    access_token: Optional[str] = None,
+    expires_at: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+) -> Tuple[Optional[float], str]:
+    provider_lifetime = _as_finite_number(expires_in)
+    if provider_lifetime is not None and provider_lifetime > 0:
+        return provider_lifetime, "expires_in"
+
+    jwt_claims = _jwt_time_claims(access_token)
+    if jwt_claims is not None:
+        issued_timestamp, expiry_timestamp = jwt_claims
+        return expiry_timestamp - issued_timestamp, "jwt"
+
+    persisted_issued_at = _timestamp_seconds(
+        issued_at if issued_at is not None else obtained_at
+    )
+    persisted_expires_at = _timestamp_seconds(expires_at)
+    if (
+        persisted_issued_at is not None
+        and persisted_expires_at is not None
+        and persisted_expires_at > persisted_issued_at
+    ):
+        return persisted_expires_at - persisted_issued_at, "persisted_timestamp"
+
+    return None, "fallback"
+
+
+def _refresh_threshold_metadata(
+    expires_in: Any = None,
+    *,
+    access_token: Optional[str] = None,
+    expires_at: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+    min_seconds: float = DEFAULT_KIMI_OAUTH_REFRESH_MIN_SECONDS,
+) -> Tuple[float, str, bool]:
+    lifetime, source = _issued_lifetime_metadata(
+        expires_in,
+        access_token=access_token,
+        expires_at=expires_at,
+        issued_at=issued_at,
+        obtained_at=obtained_at,
+    )
+    if lifetime is None:
+        return float(min_seconds), "fallback", True
+    return (
+        max(float(min_seconds), lifetime * DEFAULT_KIMI_OAUTH_REFRESH_THRESHOLD_RATIO),
+        source,
+        False,
+    )
+
+
+def _refresh_threshold_seconds(
+    expires_in: Any = None,
+    *,
+    access_token: Optional[str] = None,
+    expires_at: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+    min_seconds: float = DEFAULT_KIMI_OAUTH_REFRESH_MIN_SECONDS,
+) -> float:
+    """Return the shared threshold while preserving the old positional call."""
+    threshold, _source, _degraded = _refresh_threshold_metadata(
+        expires_in,
+        access_token=access_token,
+        expires_at=expires_at,
+        issued_at=issued_at,
+        obtained_at=obtained_at,
+        min_seconds=min_seconds,
+    )
+    return threshold
+
+
+def _credential_refresh_threshold_metadata(
+    credential: Mapping[str, Any],
+) -> Tuple[float, str, bool]:
+    expires_at = _credential_expires_at(credential)
+    return _refresh_threshold_metadata(
+        credential.get("expires_in"),
+        access_token=credential.get("access_token"),
+        expires_at=expires_at,
+        issued_at=credential.get("issued_at") or credential.get("obtained_at"),
+    )
+
+
+def _credential_expires_at(credential: Mapping[str, Any]) -> Optional[float]:
+    explicit_expiry = _timestamp_seconds(credential.get("expires_at"))
+    if explicit_expiry is not None:
+        return explicit_expiry
+
+    jwt_claims = _jwt_time_claims(credential.get("access_token"))
+    if jwt_claims is not None:
+        return jwt_claims[1]
+
+    issued_at = _timestamp_seconds(
+        credential.get("issued_at") or credential.get("obtained_at")
+    )
+    lifetime = _as_finite_number(credential.get("expires_in"))
+    if issued_at is not None and lifetime is not None and lifetime > 0:
+        return issued_at + lifetime
+    return None
+
+
+def _jwt_time_claims(access_token: Any) -> Optional[Tuple[float, float]]:
+    if not isinstance(access_token, str) or not access_token.strip():
+        return None
+    try:
+        parts = access_token.split(".")
+        if len(parts) < 2:
+            return None
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")))
+        if not isinstance(claims, dict):
+            return None
+        issued_at = _as_finite_number(claims.get("iat"))
+        expires_at = _as_finite_number(claims.get("exp"))
+        if (
+            issued_at is None
+            or expires_at is None
+            or expires_at <= issued_at
+        ):
+            return None
+        return issued_at, expires_at
+    except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _timestamp_seconds(value: Any) -> Optional[float]:
+    numeric = _as_finite_number(value)
+    if numeric is not None:
+        return numeric
+    if isinstance(value, datetime):
+        timestamp = value.timestamp()
+        return timestamp if math.isfinite(timestamp) else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    timestamp = parsed.timestamp()
+    return timestamp if math.isfinite(timestamp) else None
 
 
 def _refresh_credential(
@@ -762,16 +964,50 @@ def _normalize_refreshed_credential(
         raise KimiOAuthError("Kimi OAuth token response is missing access_token.")
     if not isinstance(refresh_token, str) or not refresh_token:
         raise KimiOAuthError("Kimi OAuth token response is missing refresh_token.")
+
+    jwt_claims = _jwt_time_claims(access_token)
+    issued_at = _timestamp_seconds(
+        response.get("issued_at") or response.get("obtained_at")
+    )
+    if issued_at is None and jwt_claims is not None:
+        issued_at = jwt_claims[0]
+    jwt_expires_at = jwt_claims[1] if jwt_claims is not None else None
+    response_expires_at = _timestamp_seconds(response.get("expires_at"))
+    if response_expires_at is not None:
+        expires_at = response_expires_at
+    elif jwt_expires_at is not None:
+        expires_at = jwt_expires_at
+    elif expires_in is not None and expires_in > 0:
+        expires_at = now() + expires_in
+    elif issued_at is not None:
+        lifetime = _issued_lifetime_seconds(
+            access_token=access_token,
+            expires_at=response.get("expires_at"),
+            issued_at=issued_at,
+        )
+        expires_at = issued_at + lifetime if lifetime is not None else None
+
     if expires_in is None or expires_in <= 0:
-        raise KimiOAuthError("Kimi OAuth token response has invalid expires_in.")
-    return {
+        if jwt_claims is not None:
+            expires_in = jwt_claims[1] - jwt_claims[0]
+        elif issued_at is not None and expires_at is not None:
+            expires_in = expires_at - issued_at
+
+    normalized: Dict[str, Any] = {
         "access_token": access_token,
         "refresh_token": refresh_token,
-        "expires_at": now() + expires_in,
-        "expires_in": _json_number(expires_in),
+        "expires_at": _json_number(expires_at) if expires_at is not None else None,
+        "expires_in": (
+            _json_number(expires_in)
+            if expires_in is not None and expires_in > 0
+            else None
+        ),
         "scope": _credential_scope(response, fallback_scope),
         "token_type": _safe_token_type(response.get("token_type")),
     }
+    if issued_at is not None:
+        normalized["issued_at"] = _json_number(issued_at)
+    return normalized
 
 
 def _revoked_tombstone(
@@ -836,7 +1072,7 @@ def _json_number(value: float) -> int | float:
 
 
 def _format_expires_at(value: Any) -> Optional[str]:
-    timestamp = _as_finite_number(value)
+    timestamp = _timestamp_seconds(value)
     if timestamp is None:
         return None
     try:
@@ -850,13 +1086,20 @@ def _skipped_summary(
     scope: str,
     credential: Mapping[str, Any],
 ) -> Dict[str, Any]:
+    threshold, threshold_source, threshold_degraded = (
+        _credential_refresh_threshold_metadata(credential)
+    )
     return KimiOAuthSummary(
         attempted=False,
         refreshed=False,
         skipped=True,
         auth_file=str(auth_path),
         scope=scope,
-        expires_at=_format_expires_at(credential.get("expires_at")),
+        expires_at=_format_expires_at(_credential_expires_at(credential)),
+        auth_degraded=threshold_degraded,
+        refresh_threshold_seconds=threshold,
+        refresh_threshold_source=threshold_source,
+        refresh_threshold_degraded=threshold_degraded,
     ).as_dict()
 
 
@@ -867,6 +1110,9 @@ def _failed_summary(
     *,
     attempted: bool = False,
     auth_degraded: bool = False,
+    refresh_threshold_seconds: Optional[float] = None,
+    refresh_threshold_source: Optional[str] = None,
+    refresh_threshold_degraded: bool = False,
 ) -> Dict[str, Any]:
     return KimiOAuthSummary(
         attempted=attempted,
@@ -875,6 +1121,9 @@ def _failed_summary(
         auth_file=str(auth_path),
         scope=scope,
         auth_degraded=auth_degraded,
+        refresh_threshold_seconds=refresh_threshold_seconds,
+        refresh_threshold_source=refresh_threshold_source,
+        refresh_threshold_degraded=refresh_threshold_degraded,
         error_class=exc.__class__.__name__,
         error_message=_redacted_error_message(exc),
     ).as_dict()

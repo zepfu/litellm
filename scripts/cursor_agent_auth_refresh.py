@@ -45,7 +45,7 @@ DEFAULT_CURSOR_AGENT_AUTH_LOCK_FILE = (
     "/home/zepfu/.config/cursor/auth.json.lock"
 )
 DEFAULT_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS = 300.0
-DEFAULT_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS = 900
+DEFAULT_CURSOR_AGENT_AUTH_REFRESH_MIN_SECONDS = 300
 DEFAULT_CURSOR_AGENT_AUTH_FORCE_REFRESH = False
 DEFAULT_CURSOR_AGENT_AUTH_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_CURSOR_AGENT_AUTH_FILE_MODE = 0o600
@@ -76,6 +76,55 @@ _EXPIRY_KEYS = (
 )
 _RELATIVE_EXPIRY_KEYS = ("expiresIn", "expires_in")
 _ALL_EXPIRY_KEYS = (*_EXPIRY_KEYS, *_RELATIVE_EXPIRY_KEYS)
+
+def _issued_lifetime_seconds(
+    *,
+    expires_in: Any = None,
+    access_token: Optional[str] = None,
+) -> Optional[float]:
+    """Derive issued access-token lifetime from provider metadata.
+
+    Priority order: provider expires_in; validated JWT iat/exp.
+    Returns None when no usable lifetime metadata is available.
+    """
+    if expires_in is not None:
+        val = _as_finite_number(expires_in)
+        if val is not None and val > 0:
+            return val
+    if access_token is not None:
+        try:
+            parts = access_token.split(".")
+            if len(parts) >= 2:
+                payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+                claims = json.loads(
+                    base64.urlsafe_b64decode(payload_b64.encode("ascii"))
+                )
+                iat = claims.get("iat")
+                exp = claims.get("exp")
+                if isinstance(iat, (int, float)) and isinstance(exp, (int, float)):
+                    lifetime = float(exp) - float(iat)
+                    if lifetime > 0 and math.isfinite(lifetime):
+                        return lifetime
+        except Exception:
+            pass
+    return None
+
+
+def _refresh_threshold_seconds(
+    *,
+    expires_in: Any = None,
+    access_token: Optional[str] = None,
+    min_seconds: float = DEFAULT_CURSOR_AGENT_AUTH_REFRESH_MIN_SECONDS,
+) -> float:
+    """Return proportional refresh threshold (max of min or half-life)."""
+    lifetime = _issued_lifetime_seconds(
+        expires_in=expires_in,
+        access_token=access_token,
+    )
+    if lifetime is None or lifetime <= 0:
+        return float(min_seconds)
+    return max(float(min_seconds), lifetime * 0.5)
+
 
 NowValue = float | int | datetime
 NowProvider = Callable[[], NowValue]
@@ -170,6 +219,7 @@ def inspect_cursor_agent_auth_refresh_eligibility(
         refresh_due_at = _refresh_due_at(
             state.expires_at,
             buffer_seconds=resolved_buffer_seconds,
+            access_token=state.access_token,
         )
         if refresh_due_at is None:
             next_refresh_check_at = observed_at + timedelta(
@@ -341,6 +391,7 @@ def _refresh_locked(
                     refresh_due_at=_refresh_due_at(
                         state.expires_at,
                         buffer_seconds=buffer_seconds,
+                        access_token=state.access_token,
                     ),
                     refresh_method="none",
                 )
@@ -377,6 +428,7 @@ def _refresh_locked(
                 refresh_due_at=_refresh_due_at(
                     refreshed_state.expires_at,
                     buffer_seconds=buffer_seconds,
+                    access_token=refreshed_state.access_token,
                 ),
                 refresh_method="apiKey_exchange",
                 previous_credential_fingerprint=state.fingerprint,
@@ -389,7 +441,7 @@ def _refresh_locked(
             error_class=exc.__class__.__name__,
             error_message=_sanitize_error_message(str(exc)),
             refresh_due_at=(
-                _refresh_due_at(state.expires_at, buffer_seconds=buffer_seconds)
+                _refresh_due_at(state.expires_at, buffer_seconds=buffer_seconds, access_token=state.access_token)
                 if state is not None
                 else None
             ),
@@ -803,6 +855,9 @@ def _summary(
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
 ) -> Dict[str, Any]:
+    threshold = _refresh_threshold_seconds(
+        access_token=state.access_token if state is not None else None,
+    ) if state is not None else float(DEFAULT_CURSOR_AGENT_AUTH_REFRESH_MIN_SECONDS)
     result: Dict[str, Any] = {
         "provider": "cursor_agent",
         "status_class": status_class,
@@ -836,6 +891,7 @@ def _summary(
         "next_refresh_check_at": _format_datetime(next_refresh_check_at),
         "refresh_method": refresh_method,
         "eligibility_checked_at": _format_datetime(observed_at),
+        "refresh_threshold_seconds": threshold,
         "error_class": error_class,
         "error_message": error_message,
     }
@@ -1128,7 +1184,10 @@ def _access_token_state(
         return "unknown"
     if state.expires_at <= observed_at.timestamp():
         return "expired"
-    if state.expires_at <= observed_at.timestamp() + max(0, buffer_seconds):
+    threshold = _refresh_threshold_seconds(
+        access_token=state.access_token,
+    )
+    if state.expires_at <= observed_at.timestamp() + max(0, threshold):
         return "due"
     return "fresh"
 
@@ -1156,19 +1215,26 @@ def _refresh_is_due(
         # expiry claim is available. A known expired token never reaches this
         # branch.
         return False
-    return observed_at.timestamp() >= state.expires_at - max(0, buffer_seconds)
+    threshold = _refresh_threshold_seconds(
+        access_token=state.access_token,
+    )
+    return observed_at.timestamp() >= state.expires_at - max(0, threshold)
 
 
 def _refresh_due_at(
     expires_at: Optional[float],
     *,
     buffer_seconds: int,
+    access_token: Optional[str] = None,
 ) -> Optional[datetime]:
     if expires_at is None:
         return None
+    threshold = _refresh_threshold_seconds(
+        access_token=access_token,
+    )
     try:
         return datetime.fromtimestamp(
-            expires_at - max(0, buffer_seconds),
+            expires_at - max(0, threshold),
             timezone.utc,
         )
     except (OSError, OverflowError, ValueError):
@@ -1205,7 +1271,7 @@ def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
         return max(0, int(buffer_seconds))
     raw_value = os.getenv("AAWM_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS")
     if raw_value is None or not raw_value.strip():
-        return DEFAULT_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS
+        return DEFAULT_CURSOR_AGENT_AUTH_REFRESH_MIN_SECONDS
     return max(0, int(raw_value))
 
 
@@ -1326,6 +1392,16 @@ def _format_datetime(value: Optional[datetime]) -> Optional[str]:
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _as_finite_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _sanitize_error_message(
     message: str,
     *,
@@ -1346,6 +1422,7 @@ __all__ = (
     "DEFAULT_CURSOR_AGENT_AUTH_FORCE_REFRESH",
     "DEFAULT_CURSOR_AGENT_AUTH_HTTP_TIMEOUT_SECONDS",
     "DEFAULT_CURSOR_AGENT_AUTH_LOCK_FILE",
+    "DEFAULT_CURSOR_AGENT_AUTH_REFRESH_MIN_SECONDS",
     "DEFAULT_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS",
     "DEFAULT_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS",
     "CursorAgentAuthError",
@@ -1356,3 +1433,7 @@ __all__ = (
     "inspect_cursor_agent_auth_refresh_eligibility",
     "refresh_cursor_agent_auth_file",
 )
+
+# Backward-compatible alias for tests and callers that still reference
+# the old buffer-seconds constant.
+DEFAULT_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS = DEFAULT_CURSOR_AGENT_AUTH_REFRESH_MIN_SECONDS

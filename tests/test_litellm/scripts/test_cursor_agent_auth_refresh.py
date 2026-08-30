@@ -76,7 +76,7 @@ def test_defaults_match_cursor_sidecar_contract(cursor) -> None:
         "/home/zepfu/.config/cursor/auth.json.lock"
     )
     assert cursor.DEFAULT_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS == 300.0
-    assert cursor.DEFAULT_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS == 900
+    assert cursor.DEFAULT_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS == 300
     assert cursor.DEFAULT_CURSOR_AGENT_AUTH_FORCE_REFRESH is False
     assert cursor.DEFAULT_CURSOR_AGENT_AUTH_HTTP_TIMEOUT_SECONDS == 30.0
 
@@ -99,8 +99,8 @@ def test_health_and_eligibility_are_sanitized_and_read_only(cursor, tmp_path: Pa
     )
     eligibility = cursor.inspect_cursor_agent_auth_refresh_eligibility(
         auth_path,
-        now=1_200,
-        buffer_seconds=900,
+        now=1_800,
+        buffer_seconds=300,
         poll_interval_seconds=300,
     )
 
@@ -110,7 +110,7 @@ def test_health_and_eligibility_are_sanitized_and_read_only(cursor, tmp_path: Pa
     assert health["expires_at"].startswith("1970-01-01T00:33:20")
     assert eligibility["eligible"] is True
     assert eligibility["access_token_state"] == "due"
-    assert eligibility["refresh_due_at"].startswith("1970-01-01T00:18:20")
+    assert eligibility["refresh_due_at"].startswith("1970-01-01T00:28:20")
     serialized = json.dumps([health, eligibility])
     for value in (secret, "refresh-secret-value", "api-secret-value"):
         assert value not in serialized
@@ -183,7 +183,7 @@ def test_due_access_token_exchanges_api_key_and_persists_complete_shape(
     with patch.object(cursor.urllib_request, "urlopen", side_effect=fake_urlopen):
         result = cursor.refresh_cursor_agent_auth_file(
             auth_path,
-            buffer_seconds=900,
+            buffer_seconds=300,
             lock_file=lock_path,
             now=1_000,
             dashboard_base="https://cursor.test",
@@ -362,7 +362,7 @@ def test_due_access_token_with_refresh_token_only_fails_closed(
     ):
         result = cursor.refresh_cursor_agent_auth_file(
             auth_path,
-            buffer_seconds=900,
+            buffer_seconds=300,
             now=1_000,
         )
 

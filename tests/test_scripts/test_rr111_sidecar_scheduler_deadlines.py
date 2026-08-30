@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from scripts import run_provider_status_observations_loop as loop
 
@@ -30,6 +30,10 @@ def _scheduler_config(**overrides):
     }
     kwargs.update(overrides)
     return loop.ProviderStatusLoopConfig(**kwargs)
+
+
+def _iso(value: datetime) -> str:
+    return value.isoformat().replace("+00:00", "Z")
 
 
 def test_slow_optional_poll_does_not_delay_oauth_refresh_or_unbounded_shutdown(monkeypatch) -> None:
@@ -97,3 +101,125 @@ def test_slow_optional_poll_does_not_delay_oauth_refresh_or_unbounded_shutdown(m
     assert finished
     events = finished[0]
     assert any(event.get("event") == "grok_oidc_refresh" for event in events)
+
+
+def test_next_sidecar_wake_uses_the_earliest_managed_provider_deadline() -> None:
+    wall_now = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+    state = loop.SidecarTaskState(next_generic_cycle_due_monotonic=500.0)
+    state.grok_oidc_refresh_schedule.next_refresh_check_at = _iso(
+        wall_now + timedelta(seconds=250)
+    )
+    state.xai_oauth_refresh_schedule.next_refresh_check_at = _iso(
+        wall_now + timedelta(seconds=200)
+    )
+    state.kimi_oauth_refresh_schedule.next_refresh_check_at = _iso(
+        wall_now + timedelta(seconds=150)
+    )
+    state.nous_oauth_refresh_schedule.next_refresh_check_at = _iso(
+        wall_now + timedelta(seconds=100)
+    )
+    state.cursor_agent_auth_refresh_schedule.next_refresh_check_at = _iso(
+        wall_now + timedelta(seconds=80)
+    )
+    state.codex_oauth_refresh_schedule_by_label["account1"] = (
+        loop.OAuthRefreshScheduleState(
+            next_refresh_check_at=_iso(wall_now + timedelta(seconds=60))
+        )
+    )
+    state.codex_oauth_refresh_schedule_by_label["account2"] = (
+        loop.OAuthRefreshScheduleState(
+            next_refresh_check_at=_iso(wall_now + timedelta(seconds=40))
+        )
+    )
+    config = _scheduler_config(
+        interval_seconds=400.0,
+        codex_oauth_refresh_enabled=True,
+        xai_oauth_refresh_enabled=True,
+        kimi_oauth_refresh_enabled=True,
+        nous_oauth_refresh_enabled=True,
+        cursor_agent_auth_refresh_enabled=True,
+    )
+
+    assert (
+        loop._next_sidecar_wake_delay(
+            config,
+            state,
+            now=100.0,
+            wall_now=wall_now,
+        )
+        == 40.0
+    )
+
+
+def test_managed_refresh_runs_at_deadline_before_generic_cycle(monkeypatch) -> None:
+    wall_now = datetime(2026, 8, 30, 12, 0, tzinfo=timezone.utc)
+    state = loop.SidecarTaskState()
+    state.grok_oidc_refresh_schedule.next_refresh_check_at = _iso(wall_now)
+    state.xai_oauth_refresh_schedule.next_refresh_check_at = _iso(wall_now)
+    state.kimi_oauth_refresh_schedule.next_refresh_check_at = _iso(
+        wall_now + timedelta(seconds=1)
+    )
+    state.nous_oauth_refresh_schedule.next_refresh_check_at = _iso(
+        wall_now + timedelta(seconds=1)
+    )
+    state.cursor_agent_auth_refresh_schedule.next_refresh_check_at = _iso(
+        wall_now + timedelta(seconds=1)
+    )
+    state.codex_oauth_refresh_schedule_by_label["account1"] = (
+        loop.OAuthRefreshScheduleState(next_refresh_check_at=_iso(wall_now))
+    )
+    state.codex_oauth_refresh_schedule_by_label["account2"] = (
+        loop.OAuthRefreshScheduleState(
+            next_refresh_check_at=_iso(wall_now + timedelta(seconds=1))
+        )
+    )
+    config = _scheduler_config(
+        codex_oauth_refresh_enabled=True,
+        xai_oauth_refresh_enabled=True,
+        kimi_oauth_refresh_enabled=True,
+        nous_oauth_refresh_enabled=True,
+        cursor_agent_auth_refresh_enabled=True,
+    )
+    calls: list[str] = []
+
+    def fake_runner(name):
+        def run(_config, _state, *, now_monotonic, now_wall=None):
+            calls.append(name)
+            assert now_monotonic == 101.0
+            assert now_wall == wall_now
+            return {"event": name}
+
+        return run
+
+    for name in (
+        "grok_oidc_refresh",
+        "codex_oauth_refresh",
+        "xai_oauth_refresh",
+        "kimi_oauth_refresh",
+        "nous_oauth_refresh",
+        "cursor_agent_auth_refresh",
+    ):
+        monkeypatch.setattr(loop, f"_run_{name}_task", fake_runner(name))
+
+    assert (
+        loop._run_due_managed_refresh_tasks(
+            config,
+            state,
+            now=100.0,
+            wall_now=wall_now - timedelta(seconds=1),
+        )
+        == []
+    )
+    events = loop._run_due_managed_refresh_tasks(
+        config,
+        state,
+        now=101.0,
+        wall_now=wall_now,
+    )
+
+    assert calls == [
+        "grok_oidc_refresh",
+        "codex_oauth_refresh",
+        "xai_oauth_refresh",
+    ]
+    assert [event["event"] for event in events] == calls

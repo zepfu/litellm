@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import math
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -36,13 +38,62 @@ DEFAULT_XAI_OAUTH_AUTH_FILE = "~/.litellm/xai/oauth-auth.json"
 DEFAULT_XAI_OAUTH_LOCK_FILE = "~/.litellm/xai/oauth-auth.json.lock"
 DEFAULT_XAI_OAUTH_SCOPE = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
 DEFAULT_XAI_OAUTH_TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
-DEFAULT_XAI_OAUTH_REFRESH_BUFFER_SECONDS = 300
+DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS = 300
 DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_XAI_OAUTH_AUTH_FILE_MODE = 0o600
 DEFAULT_XAI_OAUTH_ERROR_MESSAGE_LIMIT = 500
 
 # Keep historical module alias; redaction lives in secret_managers.
 _SECRET_FIELD_NAMES = DEFAULT_SECRET_FIELD_NAMES
+
+
+def _issued_lifetime_seconds(
+    *,
+    expires_in: Any = None,
+    access_token: Optional[str] = None,
+) -> Optional[float]:
+    """Derive issued access-token lifetime from provider metadata.
+
+    Priority order: provider expires_in; validated JWT iat/exp.
+    Returns None when no usable lifetime metadata is available.
+    """
+    if expires_in is not None:
+        val = _as_finite_number(expires_in)
+        if val is not None and val > 0:
+            return val
+    if access_token is not None:
+        try:
+            parts = access_token.split(".")
+            if len(parts) >= 2:
+                payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+                claims = json.loads(
+                    base64.urlsafe_b64decode(payload_b64.encode("ascii"))
+                )
+                iat = claims.get("iat")
+                exp = claims.get("exp")
+                if isinstance(iat, (int, float)) and isinstance(exp, (int, float)):
+                    lifetime = float(exp) - float(iat)
+                    if lifetime > 0 and math.isfinite(lifetime):
+                        return lifetime
+        except Exception:
+            pass
+    return None
+
+
+def _refresh_threshold_seconds(
+    *,
+    expires_in: Any = None,
+    access_token: Optional[str] = None,
+    min_seconds: float = DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS,
+) -> float:
+    """Return proportional refresh threshold (max of min or half-life)."""
+    lifetime = _issued_lifetime_seconds(
+        expires_in=expires_in,
+        access_token=access_token,
+    )
+    if lifetime is None or lifetime <= 0:
+        return float(min_seconds)
+    return max(float(min_seconds), lifetime * 0.5)
 
 
 @dataclass(frozen=True)
@@ -224,7 +275,7 @@ def refresh_xai_oauth_auth_file(
 def inspect_xai_oauth_refresh_eligibility(
     auth_file: str | Path,
     *,
-    buffer_seconds: int = DEFAULT_XAI_OAUTH_REFRESH_BUFFER_SECONDS,
+    buffer_seconds: int = DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS,
     now: Optional[Callable[[], datetime]] = None,
     poll_interval_seconds: float = 300.0,
     scope: Optional[str] = None,
@@ -238,6 +289,12 @@ def inspect_xai_oauth_refresh_eligibility(
         credential = _select_credential_record(payload, resolved_scope)
         if not _looks_like_credential_record(credential):
             raise ValueError("xAI OAuth credential has no usable access credential.")
+        threshold_seconds = _refresh_threshold_seconds(
+            expires_in=credential.get("expires_in"),
+            access_token=(
+                credential.get("access_token") or credential.get("key")
+            ),
+        )
         expires_at = _parse_expires_at(credential.get("expires_at"))
         usable = bool(
             _clean_oauth_string(credential.get("key"))
@@ -255,8 +312,9 @@ def inspect_xai_oauth_refresh_eligibility(
                 usable=usable,
                 error_class="CredentialExpiryUnavailable",
                 error_message="xAI OAuth credential expires_at is missing or invalid.",
+                refresh_threshold_seconds=threshold_seconds,
             )
-        refresh_due_at = expires_at - timedelta(seconds=max(0, buffer_seconds))
+        refresh_due_at = expires_at - timedelta(seconds=threshold_seconds)
         return _eligibility_summary(
             observed_at=observed_at,
             expires_at=expires_at,
@@ -269,6 +327,7 @@ def inspect_xai_oauth_refresh_eligibility(
             eligible=observed_at >= refresh_due_at,
             credential_health="expired" if expires_at <= observed_at else "fresh",
             usable=usable and expires_at > observed_at,
+            refresh_threshold_seconds=threshold_seconds,
         )
     except Exception as exc:
         return _eligibility_summary(
@@ -296,6 +355,7 @@ def _eligibility_summary(
     usable: bool,
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
+    refresh_threshold_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     return {
         "eligibility_checked_at": _format_expires_at(observed_at),
@@ -307,6 +367,7 @@ def _eligibility_summary(
         "usable": usable,
         "error_class": error_class,
         "error_message": error_message,
+        "refresh_threshold_seconds": refresh_threshold_seconds,
     }
 
 
@@ -335,11 +396,11 @@ def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
         "LITELLM_XAI_OAUTH_REFRESH_BUFFER_SECONDS"
     )
     if raw_value is None or not raw_value.strip():
-        return DEFAULT_XAI_OAUTH_REFRESH_BUFFER_SECONDS
+        return DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS
     try:
         return max(0, int(raw_value))
     except ValueError:
-        return DEFAULT_XAI_OAUTH_REFRESH_BUFFER_SECONDS
+        return DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS
 
 
 @contextmanager
@@ -439,13 +500,18 @@ def _credential_needs_refresh(
 ) -> bool:
     """Return True when the credential should be refreshed.
 
-    Missing/unparseable ``expires_at`` fails safe toward refresh so a malformed
-    record is not treated as permanently fresh.
+    Uses the proportional half-life threshold derived from the credential's
+    own ``expires_in`` and ``access_token``, falling back to the passed
+    ``buffer_seconds`` when no lifetime metadata is available.
     """
     expires_at = _parse_expires_at(credential.get("expires_at"))
     if expires_at is None:
         return True
-    return datetime.now(timezone.utc) >= expires_at - timedelta(seconds=buffer_seconds)
+    threshold = _refresh_threshold_seconds(
+        expires_in=credential.get("expires_in"),
+        access_token=credential.get("access_token") or credential.get("key"),
+    )
+    return datetime.now(timezone.utc) >= expires_at - timedelta(seconds=threshold)
 
 
 def _parse_expires_at(value: Any) -> Optional[datetime]:
@@ -616,8 +682,22 @@ def _clean_oauth_string(value: Any) -> Optional[str]:
     return None
 
 
+def _as_finite_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _sanitize_error_message(
     message: str, *, limit: int = DEFAULT_XAI_OAUTH_ERROR_MESSAGE_LIMIT
 ) -> str:
     """Redact secret *values* keyed by known field names (not just the labels)."""
     return sanitize_credential_error_message(message, limit=limit)
+
+# Backward-compatible alias for tests and callers that still reference
+# the old buffer-seconds constant.
+DEFAULT_XAI_OAUTH_REFRESH_BUFFER_SECONDS = DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS

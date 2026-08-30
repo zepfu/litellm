@@ -131,7 +131,7 @@ The dev Compose task is enabled with:
 - `AAWM_CURSOR_AGENT_AUTH_LOCK_FILE=/home/zepfu/.config/cursor/auth.json.lock`
 - `AAWM_CURSOR_AGENT_AUTH_FILE_UID=1000` / `GID=1000` / `MODE=0o600`
 - `AAWM_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS=300`
-- `AAWM_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS=900`
+- `AAWM_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS=300`
 - `AAWM_CURSOR_AGENT_AUTH_FORCE_REFRESH=0`
 - `AAWM_CURSOR_AGENT_AUTH_HTTP_TIMEOUT_SECONDS=30`
 
@@ -155,7 +155,7 @@ have two separate timing controls:
   (`AAWM_PROVIDER_STATUS_INTERVAL_SECONDS`). On each eligible outer cycle, the
   sidecar performs a read-only credential inspection and derives
   `refresh_due_at` from the credential expiry and the provider refresh buffer.
-  Kimi uses `max(300, expires_in * 0.5)` and reports that effective value as
+  Every managed credential uses `max(300, issued_lifetime_seconds * 0.5)` and reports that effective value as
   `refresh_threshold_seconds`. A `refresh_not_due` inspection does not consume
   the endpoint-attempt throttle. A local or pre-network helper failure also
   leaves that throttle untouched and may retry on the next outer cycle. Every
@@ -218,7 +218,7 @@ use a hashed file identity rather than the raw credential path.
 The managed xAI dev Compose contract is exact:
 
 - `AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS=300`
-- `AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=900`
+- `AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=300`
 - `AAWM_XAI_OAUTH_FORCE_REFRESH=0`
 
 The Hermes Nous Portal OAuth dev Compose contract is exact:
@@ -228,7 +228,7 @@ The Hermes Nous Portal OAuth dev Compose contract is exact:
 - `AAWM_NOUS_OAUTH_LOCK_FILE=/home/zepfu/.hermes/auth.lock`
 - `AAWM_NOUS_OAUTH_AUTH_FILE_UID=1000` / `GID=1000` / `MODE=0o600`
 - `AAWM_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS=300`
-- `AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS=900`
+- `AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS=300`
 - `AAWM_NOUS_OAUTH_FORCE_REFRESH=0`
 - `AAWM_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS=30`
 
@@ -475,7 +475,7 @@ Rendered native defaults:
 - `AAWM_GROK_OIDC_LOCK_FILE=/home/zepfu/.grok/auth.json.lock`
 - `AAWM_GROK_OIDC_AUTH_FILE_UID=1000` / `GID=1000` / `MODE=0o600`
 - `AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS=300`
-- `AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS=900`
+- `AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS=300`
 - `AAWM_GROK_OIDC_FORCE_REFRESH=0`
 - `AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS=30`
 
@@ -486,7 +486,7 @@ Rendered managed defaults:
 - `AAWM_XAI_OAUTH_LOCK_FILE=/home/zepfu/.litellm/xai/oauth-auth.json.lock`
 - `AAWM_XAI_OAUTH_AUTH_FILE_UID=0` / `GID=0` / `MODE=0o600`
 - `AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS=300`
-- `AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=900`
+- `AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=300`
 - `AAWM_XAI_OAUTH_FORCE_REFRESH=0`
 - `AAWM_XAI_OAUTH_HTTP_TIMEOUT_SECONDS=30`
 

@@ -64,7 +64,7 @@ def _config(loop: ModuleType, tmp_path: Path, **overrides):
         cursor_agent_auth_file=str(tmp_path / "auth.json"),
         cursor_agent_auth_lock_file=str(tmp_path / "auth.json.lock"),
         cursor_agent_auth_refresh_interval_seconds=300.0,
-        cursor_agent_auth_refresh_buffer_seconds=900,
+        cursor_agent_auth_refresh_buffer_seconds=300,
         cursor_agent_auth_force_refresh=False,
         cursor_agent_auth_http_timeout_seconds=17.5,
         cursor_agent_usage_poll_enabled=False,
@@ -136,7 +136,7 @@ def test_cursor_agent_auth_scheduler_defaults_are_exact(loop, monkeypatch) -> No
         "/home/zepfu/.config/cursor/auth.json.lock"
     )
     assert config.cursor_agent_auth_refresh_interval_seconds == 300.0
-    assert config.cursor_agent_auth_refresh_buffer_seconds == 900
+    assert config.cursor_agent_auth_refresh_buffer_seconds == 300
     assert config.cursor_agent_auth_force_refresh is False
     assert config.cursor_agent_auth_http_timeout_seconds == 30.0
     assert loop.run_due_sidecar_tasks(
@@ -156,7 +156,7 @@ def test_cursor_agent_auth_validation_uses_dedicated_refresh_interval(
         cursor_agent_auth_refresh_enabled=True,
         cursor_agent_auth_force_refresh=False,
         cursor_agent_auth_refresh_interval_seconds=300.0,
-        cursor_agent_auth_refresh_buffer_seconds=900,
+        cursor_agent_auth_refresh_buffer_seconds=300,
         cursor_agent_auth_http_timeout_seconds=30.0,
         interval_seconds=1_200.0,
     )
@@ -168,8 +168,8 @@ def test_cursor_agent_auth_validation_uses_dedicated_refresh_interval(
         SystemExit,
         match=(
             r"--cursor-agent-auth-refresh-interval-seconds=901 exceeds "
-            r"--cursor-agent-auth-refresh-buffer-seconds=900; "
-            r"outer eligibility cadence must not exceed the refresh buffer"
+            r"--cursor-agent-auth-refresh-buffer-seconds=300; "
+            r"outer eligibility cadence must not exceed the minimum refresh threshold"
         ),
     ):
         loop._validate_cursor_agent_auth_config_args(args)
@@ -309,7 +309,7 @@ def test_cursor_agent_auth_refreshes_at_boundary_and_wakes_independently(
     assert refresh_calls == [
         {
             "auth_file": str(auth_path),
-            "buffer_seconds": 900,
+            "buffer_seconds": 300,
             "force": False,
             "lock_file": str(tmp_path / "auth.json.lock"),
             "http_timeout_seconds": 17.5,
@@ -338,7 +338,7 @@ def test_cursor_agent_auth_real_eligibility_refreshes_at_expiry_minus_buffer(
 
     wall_start = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
     refresh_at = wall_start + timedelta(seconds=300)
-    expires_at = refresh_at + timedelta(seconds=900)
+    expires_at = refresh_at + timedelta(seconds=300)
     auth_path = tmp_path / "auth.json"
     _write_auth(auth_path, access_expires_at=int(expires_at.timestamp()))
     config = replace(
@@ -463,8 +463,9 @@ def test_main_retains_generic_deadline_across_cursor_wake(
             handlers[loop.signal.SIGTERM](loop.signal.SIGTERM, None)
         return []
 
-    def fake_cursor_refresh(_config, state, *, now_monotonic):
+    def fake_cursor_refresh(_config, state, *, now_monotonic, now_wall=None):
         cursor_calls.append(now_monotonic)
+        assert now_wall == wall_start + timedelta(seconds=300)
         assert state.next_generic_cycle_due_monotonic == 600.0
         state.cursor_agent_auth_refresh_schedule.next_refresh_check_at = _iso(
             wall_start + timedelta(seconds=900)

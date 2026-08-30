@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import time
 from contextlib import contextmanager
@@ -42,12 +43,72 @@ DEFAULT_CODEX_AUTH_FILE = "~/.codex/auth.json"
 DEFAULT_CODEX_LOCK_FILE = "~/.codex/auth.json.lock"
 DEFAULT_CODEX_OAUTH_TOKEN_ENDPOINT = "https://auth.openai.com/oauth/token"
 DEFAULT_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-DEFAULT_CODEX_REFRESH_BUFFER_SECONDS = 300
+DEFAULT_CODEX_REFRESH_MIN_SECONDS = 300
 DEFAULT_CODEX_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_CODEX_AUTH_FILE_MODE = 0o600
 
 # Keep historical module alias; redaction lives in secret_managers.
 _SECRET_FIELD_NAMES = DEFAULT_SECRET_FIELD_NAMES
+
+
+def _issued_lifetime_seconds(
+    *,
+    expires_in: Any = None,
+    access_token: Optional[str] = None,
+    expires_at: Optional[float] = None,
+    obtained_at: Optional[float] = None,
+) -> Optional[float]:
+    """Derive issued access-token lifetime from provider metadata.
+
+    Priority order: provider expires_in; validated JWT iat/exp;
+    persisted obtained_at + expires_at pairing.
+    Returns None when no usable lifetime metadata is available.
+    """
+    if expires_in is not None:
+        val = _as_finite_number(expires_in)
+        if val is not None and val > 0:
+            return val
+    if access_token is not None:
+        try:
+            parts = access_token.split(".")
+            if len(parts) >= 2:
+                payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+                claims = json.loads(
+                    base64.urlsafe_b64decode(payload_b64.encode("ascii"))
+                )
+                iat = claims.get("iat")
+                exp = claims.get("exp")
+                if isinstance(iat, (int, float)) and isinstance(exp, (int, float)):
+                    lifetime = float(exp) - float(iat)
+                    if lifetime > 0 and math.isfinite(lifetime):
+                        return lifetime
+        except Exception:
+            pass
+    if expires_at is not None and obtained_at is not None:
+        lifetime = float(expires_at) - float(obtained_at)
+        if lifetime > 0 and math.isfinite(lifetime):
+            return lifetime
+    return None
+
+
+def _refresh_threshold_seconds(
+    *,
+    expires_in: Any = None,
+    access_token: Optional[str] = None,
+    expires_at: Optional[float] = None,
+    obtained_at: Optional[float] = None,
+    min_seconds: float = DEFAULT_CODEX_REFRESH_MIN_SECONDS,
+) -> float:
+    """Return proportional refresh threshold (max of min or half-life)."""
+    lifetime = _issued_lifetime_seconds(
+        expires_in=expires_in,
+        access_token=access_token,
+        expires_at=expires_at,
+        obtained_at=obtained_at,
+    )
+    if lifetime is None or lifetime <= 0:
+        return float(min_seconds)
+    return max(float(min_seconds), lifetime * 0.5)
 
 
 @dataclass(frozen=True)
@@ -252,7 +313,7 @@ def refresh_codex_oauth_auth_file(
 def inspect_codex_oauth_refresh_eligibility(
     auth_file: str | Path,
     *,
-    buffer_seconds: int = DEFAULT_CODEX_REFRESH_BUFFER_SECONDS,
+    buffer_seconds: int = DEFAULT_CODEX_REFRESH_MIN_SECONDS,
     now: Optional[Callable[[], float | datetime]] = None,
     poll_interval_seconds: float = 300.0,
     credential_record: Optional[CodexOAuthCredentialRecord] = None,
@@ -270,6 +331,12 @@ def inspect_codex_oauth_refresh_eligibility(
                 credential_record,
                 token_data,
             )
+        threshold_seconds = _refresh_threshold_seconds(
+            expires_in=token_data.get("expires_in"),
+            access_token=token_data.get("access_token"),
+            expires_at=_get_token_expiry(token_data),
+            obtained_at=_parse_obtained_at(token_data),
+        )
         expires_at = _get_token_expiry(token_data)
         if expires_at is None:
             return _eligibility_summary(
@@ -283,10 +350,11 @@ def inspect_codex_oauth_refresh_eligibility(
                 usable=True,
                 error_class="CredentialExpiryUnavailable",
                 error_message="Codex OAuth credential expiry is unavailable.",
+                refresh_threshold_seconds=threshold_seconds,
             )
         expires_at_datetime = datetime.fromtimestamp(expires_at, timezone.utc)
         refresh_due_at = expires_at_datetime - timedelta(
-            seconds=max(0, buffer_seconds)
+            seconds=threshold_seconds
         )
         return _eligibility_summary(
             observed_at=observed_at,
@@ -302,6 +370,7 @@ def inspect_codex_oauth_refresh_eligibility(
                 "expired" if expires_at_datetime <= observed_at else "fresh"
             ),
             usable=expires_at_datetime > observed_at,
+            refresh_threshold_seconds=threshold_seconds,
         )
     except Exception as exc:
         return _eligibility_summary(
@@ -329,6 +398,7 @@ def _eligibility_summary(
     usable: bool,
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
+    refresh_threshold_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     return {
         "eligibility_checked_at": _format_expires_at(observed_at.timestamp()),
@@ -344,6 +414,7 @@ def _eligibility_summary(
         "usable": usable,
         "error_class": error_class,
         "error_message": error_message,
+        "refresh_threshold_seconds": refresh_threshold_seconds,
     }
 
 
@@ -426,11 +497,11 @@ def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
         return max(0, int(buffer_seconds))
     raw_value = os.getenv("AAWM_CODEX_OAUTH_REFRESH_BUFFER_SECONDS")
     if raw_value is None or not raw_value.strip():
-        return DEFAULT_CODEX_REFRESH_BUFFER_SECONDS
+        return DEFAULT_CODEX_REFRESH_MIN_SECONDS
     try:
         return max(0, int(raw_value))
     except ValueError:
-        return DEFAULT_CODEX_REFRESH_BUFFER_SECONDS
+        return DEFAULT_CODEX_REFRESH_MIN_SECONDS
 
 
 @contextmanager
@@ -572,13 +643,25 @@ def _token_needs_refresh(
     *,
     buffer_seconds: int,
 ) -> bool:
+    """Return True when the token should be refreshed.
+
+    Uses the proportional half-life threshold derived from the token's
+    own ``expires_in`` and ``access_token`` JWT claims, falling back to
+    the passed ``buffer_seconds`` when no lifetime metadata is available.
+    """
     access_token = _clean_string(token_data.get("access_token"))
     if access_token is None:
         return True
     expires_at = _get_token_expiry(token_data)
     if expires_at is None:
         return True
-    return time.time() >= expires_at - max(0, buffer_seconds)
+    threshold = _refresh_threshold_seconds(
+        expires_in=token_data.get("expires_in"),
+        access_token=token_data.get("access_token"),
+        expires_at=expires_at,
+        obtained_at=_parse_obtained_at(token_data),
+    )
+    return time.time() >= expires_at - max(0, threshold)
 
 
 def _refresh_token_data(
@@ -761,6 +844,35 @@ def _extract_oauth_error_hint(response_body: Any) -> Optional[str]:
     return None
 
 
+def _parse_obtained_at(token_data: Mapping[str, Any]) -> Optional[float]:
+    """Parse a durable obtained_at timestamp from credential metadata."""
+    raw = token_data.get("obtained_at")
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return float(raw.strip())
+        except ValueError:
+            pass
+    return None
+
+
+def _as_finite_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _sanitize_error_message(message: str, *, limit: int = 500) -> str:
     """Redact secret *values* keyed by known field names (not just the labels)."""
     return sanitize_credential_error_message(message, limit=limit)
+
+# Backward-compatible alias for tests and callers that still reference
+# the old buffer-seconds constant.
+DEFAULT_CODEX_REFRESH_BUFFER_SECONDS = DEFAULT_CODEX_REFRESH_MIN_SECONDS

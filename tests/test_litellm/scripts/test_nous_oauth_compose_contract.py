@@ -115,7 +115,7 @@ def test_provider_status_has_writable_hermes_directory_and_nous_env() -> None:
         ("AAWM_NOUS_OAUTH_AUTH_FILE_GID", "1000"),
         ("AAWM_NOUS_OAUTH_AUTH_FILE_MODE", "0o600"),
         ("AAWM_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS", "300"),
-        ("AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS", "900"),
+        ("AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS", "300"),
         ("AAWM_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS", "30"),
     ):
         assert f"- {name}=${{{name}:-{default}}}" in sidecar

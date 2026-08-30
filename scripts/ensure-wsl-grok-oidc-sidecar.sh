@@ -175,14 +175,14 @@ assert_compose_contract() {
     || die "compose must enable managed xAI OAuth refresh"
   grep -Fq 'AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS=300' <<<"$text" \
     || die "compose must set Grok refresh interval 300"
-  grep -Fq 'AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS=900' <<<"$text" \
-    || die "compose must set Grok refresh buffer 900"
+  grep -Fq 'AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS=300' <<<"$text" \
+    || die "compose must set Grok refresh buffer 300"
   grep -Fq 'AAWM_GROK_OIDC_FORCE_REFRESH=0' <<<"$text" \
     || die "compose must set Grok force refresh 0"
   grep -Fq 'AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS=300' <<<"$text" \
     || die "compose must set managed xAI refresh interval 300"
-  grep -Fq 'AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=900' <<<"$text" \
-    || die "compose must set managed xAI refresh buffer 900"
+  grep -Fq 'AAWM_XAI_OAUTH_REFRESH_BUFFER_SECONDS=300' <<<"$text" \
+    || die "compose must set managed xAI refresh buffer 300"
   grep -Fq 'AAWM_XAI_OAUTH_FORCE_REFRESH=0' <<<"$text" \
     || die "compose must set managed xAI force refresh 0"
   grep -Fq 'AAWM_PROVIDER_STATUS_APPLY=0' <<<"$text" \

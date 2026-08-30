@@ -8,7 +8,9 @@ Sidecar-only writer. LiteLLM request handling must never import this to mutate
 
 from __future__ import annotations
 
+import base64
 import json
+import math
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -29,10 +31,7 @@ from litellm.secret_managers.credential_file_metadata import (
     resolve_credential_file_metadata,
     snapshot_credential_file_metadata,
 )
-from litellm.secret_managers.credential_file_write import (
-    write_and_publish_private_text,
-    write_private_temp_file_text,
-)
+from litellm.secret_managers.credential_file_write import write_and_publish_private_text
 
 # Portable ~ defaults (expanded via Path.expanduser at use sites).
 DEFAULT_NOUS_OAUTH_AUTH_FILE = "~/.hermes/auth.json"
@@ -41,7 +40,7 @@ DEFAULT_NOUS_OAUTH_PORTAL_BASE_URL = "https://portal.nousresearch.com"
 DEFAULT_NOUS_OAUTH_TOKEN_ENDPOINT = "https://portal.nousresearch.com/api/oauth/token"
 DEFAULT_NOUS_OAUTH_CLIENT_ID = "hermes-cli"
 DEFAULT_NOUS_OAUTH_SCOPE = "inference:invoke"
-DEFAULT_NOUS_OAUTH_REFRESH_BUFFER_SECONDS = 900
+DEFAULT_NOUS_OAUTH_REFRESH_MIN_SECONDS = 300
 DEFAULT_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS = 300
 DEFAULT_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_NOUS_OAUTH_AUTH_FILE_MODE = 0o600
@@ -50,6 +49,55 @@ DEFAULT_NOUS_OAUTH_ERROR_MESSAGE_LIMIT = 500
 NOUS_REFRESH_TOKEN_HEADER = "x-nous-refresh-token"
 _SECRET_FIELD_NAMES = DEFAULT_SECRET_FIELD_NAMES
 _TOKEN_PATH = "/api/oauth/token"
+
+
+def _issued_lifetime_seconds(
+    *,
+    expires_in: Any = None,
+    access_token: Optional[str] = None,
+) -> Optional[float]:
+    """Derive issued access-token lifetime from provider metadata.
+
+    Priority order: provider expires_in; validated JWT iat/exp.
+    Returns None when no usable lifetime metadata is available.
+    """
+    if expires_in is not None:
+        val = _as_finite_number(expires_in)
+        if val is not None and val > 0:
+            return val
+    if access_token is not None:
+        try:
+            parts = access_token.split(".")
+            if len(parts) >= 2:
+                payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+                claims = json.loads(
+                    base64.urlsafe_b64decode(payload_b64.encode("ascii"))
+                )
+                iat = claims.get("iat")
+                exp = claims.get("exp")
+                if isinstance(iat, (int, float)) and isinstance(exp, (int, float)):
+                    lifetime = float(exp) - float(iat)
+                    if lifetime > 0 and math.isfinite(lifetime):
+                        return lifetime
+        except Exception:
+            pass
+    return None
+
+
+def _refresh_threshold_seconds(
+    *,
+    expires_in: Any = None,
+    access_token: Optional[str] = None,
+    min_seconds: float = DEFAULT_NOUS_OAUTH_REFRESH_MIN_SECONDS,
+) -> float:
+    """Return proportional refresh threshold (max of min or half-life)."""
+    lifetime = _issued_lifetime_seconds(
+        expires_in=expires_in,
+        access_token=access_token,
+    )
+    if lifetime is None or lifetime <= 0:
+        return float(min_seconds)
+    return max(float(min_seconds), lifetime * 0.5)
 
 
 @dataclass(frozen=True)
@@ -121,7 +169,7 @@ def inspect_nous_oauth_credential_health(
 def inspect_nous_oauth_refresh_eligibility(
     auth_file: str | Path,
     *,
-    buffer_seconds: int = DEFAULT_NOUS_OAUTH_REFRESH_BUFFER_SECONDS,
+    buffer_seconds: int = DEFAULT_NOUS_OAUTH_REFRESH_MIN_SECONDS,
     now: Optional[Callable[[], datetime]] = None,
     poll_interval_seconds: float = 300.0,
 ) -> Dict[str, Any]:
@@ -132,6 +180,10 @@ def inspect_nous_oauth_refresh_eligibility(
         payload = _read_credential_payload(resolved_auth_file)
         record = _select_nous_record(payload)
         usable = _record_usable(record)
+        threshold_seconds = _refresh_threshold_seconds(
+            expires_in=record.get("expires_in"),
+            access_token=record.get("access_token"),
+        )
         expires_at, expiry_unavailable = _earliest_expiry_with_status(record)
         identity = _credential_identity(resolved_auth_file, record)
         if expiry_unavailable:
@@ -147,9 +199,10 @@ def inspect_nous_oauth_refresh_eligibility(
                 error_class="CredentialExpiryUnavailable",
                 error_message="Nous OAuth credential expires_at is missing or invalid.",
                 credential_identity=identity,
+                refresh_threshold_seconds=threshold_seconds,
             )
         assert expires_at is not None
-        refresh_due_at = expires_at - timedelta(seconds=max(0, int(buffer_seconds)))
+        refresh_due_at = expires_at - timedelta(seconds=threshold_seconds)
         return _eligibility_summary(
             observed_at=observed_at,
             expires_at=expires_at,
@@ -163,6 +216,7 @@ def inspect_nous_oauth_refresh_eligibility(
             credential_health="expired" if expires_at <= observed_at else "fresh",
             usable=usable and expires_at > observed_at,
             credential_identity=identity,
+            refresh_threshold_seconds=threshold_seconds,
         )
     except Exception as exc:
         return _eligibility_summary(
@@ -300,6 +354,7 @@ def _eligibility_summary(
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
     credential_identity: Optional[str] = None,
+    refresh_threshold_seconds: Optional[float] = None,
 ) -> Dict[str, Any]:
     return {
         "eligibility_checked_at": _format_expires_at(observed_at),
@@ -312,6 +367,7 @@ def _eligibility_summary(
         "error_class": error_class,
         "error_message": error_message,
         "credential_identity": credential_identity,
+        "refresh_threshold_seconds": refresh_threshold_seconds,
     }
 
 
@@ -367,11 +423,11 @@ def _resolve_buffer_seconds(buffer_seconds: Optional[int]) -> int:
         return max(0, int(buffer_seconds))
     raw_value = os.getenv("AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS")
     if raw_value is None or not raw_value.strip():
-        return DEFAULT_NOUS_OAUTH_REFRESH_BUFFER_SECONDS
+        return DEFAULT_NOUS_OAUTH_REFRESH_MIN_SECONDS
     try:
         return max(0, int(raw_value))
     except ValueError:
-        return DEFAULT_NOUS_OAUTH_REFRESH_BUFFER_SECONDS
+        return DEFAULT_NOUS_OAUTH_REFRESH_MIN_SECONDS
 
 
 def _snapshot_credential_file_metadata(auth_path: Path) -> CredentialFileMetadata:
@@ -486,10 +542,20 @@ def _earliest_expiry_with_status(
 def _credential_needs_refresh(
     record: Mapping[str, Any], *, buffer_seconds: int
 ) -> bool:
+    """Return True when the credential should be refreshed.
+
+    Uses the proportional half-life threshold derived from the credential's
+    own ``expires_in`` and ``access_token``, falling back to the passed
+    ``buffer_seconds`` when no lifetime metadata is available.
+    """
     expires_at, unavailable = _earliest_expiry_with_status(record)
     if unavailable or expires_at is None:
         return True
-    return datetime.now(timezone.utc) >= expires_at - timedelta(seconds=buffer_seconds)
+    threshold = _refresh_threshold_seconds(
+        expires_in=record.get("expires_in"),
+        access_token=record.get("access_token"),
+    )
+    return datetime.now(timezone.utc) >= expires_at - timedelta(seconds=threshold)
 
 
 def _parse_expires_at(value: Any) -> Optional[datetime]:
@@ -670,6 +736,16 @@ def _clean_oauth_string(value: Any) -> Optional[str]:
     return None
 
 
+def _as_finite_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _sanitize_error_message(
     message: str, *, limit: int = DEFAULT_NOUS_OAUTH_ERROR_MESSAGE_LIMIT
 ) -> str:
@@ -704,3 +780,7 @@ def _classify_oauth_error(exc: Exception) -> tuple[str, str]:
     if isinstance(exc, _NousOAuthHttpError) and exc.oauth_error:
         return exc.oauth_error, _sanitize_error_message(str(exc))
     return exc.__class__.__name__, _sanitize_error_message(str(exc))
+
+# Backward-compatible alias for tests and callers that still reference
+# the old buffer-seconds constant.
+DEFAULT_NOUS_OAUTH_REFRESH_BUFFER_SECONDS = DEFAULT_NOUS_OAUTH_REFRESH_MIN_SECONDS

@@ -90,7 +90,7 @@ def test_provider_status_compose_wires_nous_oauth_sidecar_refresh() -> None:
         in compose_text
     )
     assert (
-        "AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS=${AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS:-900}"
+        "AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS=${AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS:-300}"
         in compose_text
     )
     assert (

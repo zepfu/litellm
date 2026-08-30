@@ -30,7 +30,7 @@ _AUTH_ENV_DEFAULTS = {
     "AAWM_CURSOR_AGENT_AUTH_FILE_GID": "1000",
     "AAWM_CURSOR_AGENT_AUTH_FILE_MODE": "0o600",
     "AAWM_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS": "300",
-    "AAWM_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS": "900",
+    "AAWM_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS": "300",
     "AAWM_CURSOR_AGENT_AUTH_FORCE_REFRESH": "0",
     "AAWM_CURSOR_AGENT_AUTH_HTTP_TIMEOUT_SECONDS": "30",
 }
@@ -112,7 +112,7 @@ def test_cursor_docs_describe_sidecar_exchange_boundary() -> None:
     assert _CURSOR_AUTH_FILE in status_docs
     assert _CURSOR_LOCK_FILE in status_docs
     assert "AAWM_CURSOR_AGENT_AUTH_REFRESH_INTERVAL_SECONDS=300" in status_docs
-    assert "AAWM_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS=900" in status_docs
+    assert "AAWM_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS=300" in status_docs
     assert "AAWM_CURSOR_AGENT_AUTH_FORCE_REFRESH=0" in status_docs
     assert "/auth/exchange_user_api_key" in status_docs
     assert "accessToken" in status_docs

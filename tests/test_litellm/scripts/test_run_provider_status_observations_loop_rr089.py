@@ -521,7 +521,7 @@ def test_rr089_kimi_oauth_refresh_is_disabled_by_default(loop, monkeypatch) -> N
     assert config.kimi_oauth_refresh_enabled is False
     assert config.kimi_oauth_auth_file == "~/.kimi-code/credentials/kimi-code.json"
     assert config.kimi_oauth_lock_file == "~/.kimi-code/oauth/kimi-code"
-    assert config.kimi_oauth_refresh_interval_seconds == 3600.0
+    assert config.kimi_oauth_refresh_interval_seconds == 300.0
     assert config.kimi_oauth_force_refresh is False
     assert config.kimi_oauth_http_timeout_seconds == 30.0
     assert loop.run_due_sidecar_tasks(config, loop.SidecarTaskState(), now_monotonic=1.0) == []
@@ -754,7 +754,7 @@ def test_rr089_nous_oauth_refresh_is_disabled_by_default(loop, monkeypatch) -> N
     assert config.nous_oauth_lock_file == "~/.hermes/auth.lock"
     assert Path(config.nous_oauth_lock_file).name == "auth.lock"
     assert config.nous_oauth_refresh_interval_seconds == 300.0
-    assert config.nous_oauth_refresh_buffer_seconds == 900
+    assert config.nous_oauth_refresh_buffer_seconds == 300
     assert config.nous_oauth_force_refresh is False
     assert config.nous_oauth_http_timeout_seconds == 30.0
     assert loop.run_due_sidecar_tasks(config, loop.SidecarTaskState(), now_monotonic=1.0) == []

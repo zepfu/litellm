@@ -127,7 +127,7 @@ PROVIDER_FAILURE_FIELD_LIMIT = 160
 PROVIDER_FAILURE_MESSAGE_LIMIT = 240
 DEFAULT_GROK_OIDC_LOCK_FILE = "/home/zepfu/.grok/auth.json.lock"
 GROK_SIDECAR_NATIVE_AUTH_FILE_ENV_VARS = GROK_OIDC_AUTH_FILE_ENV_VARS
-DEFAULT_GROK_OIDC_REFRESH_INTERVAL_SECONDS = 3600.0
+DEFAULT_GROK_OIDC_REFRESH_INTERVAL_SECONDS = 300.0
 DEFAULT_GROK_OIDC_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_CODEX_AUTH_FILE = codex_oauth_refresh.DEFAULT_CODEX_AUTH_FILE
 DEFAULT_CODEX_LOCK_FILE = codex_oauth_refresh.DEFAULT_CODEX_LOCK_FILE
@@ -144,7 +144,7 @@ CODEX_SIDECAR_DEFAULT_AUTH_PATHS = (
     "~/.codex/auth.json",
     "~/.config/litellm/chatgpt/auth.json",
 )
-DEFAULT_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS = 3600.0
+DEFAULT_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS = 300.0
 DEFAULT_CODEX_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_XAI_OAUTH_AUTH_FILE = xai_oauth_refresh.DEFAULT_XAI_OAUTH_AUTH_FILE
 DEFAULT_XAI_OAUTH_LOCK_FILE = xai_oauth_refresh.DEFAULT_XAI_OAUTH_LOCK_FILE
@@ -152,14 +152,14 @@ XAI_OAUTH_SIDECAR_AUTH_FILE_ENV_VARS = (
     "LITELLM_XAI_OAUTH_AUTH_FILE",
     "LITELLM_XAI_OAUTH_MIGRATED_AUTH_FILE",
 )
-DEFAULT_XAI_OAUTH_REFRESH_INTERVAL_SECONDS = 3600.0
+DEFAULT_XAI_OAUTH_REFRESH_INTERVAL_SECONDS = 300.0
 DEFAULT_XAI_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
 # Kimi Code uses the host CLI's existing credential and its native lock
 # sentinel. The Kimi CLI's proper-lockfile implementation creates the
 # sibling `kimi-code.lock` directory beneath the mounted oauth parent.
 DEFAULT_KIMI_OAUTH_AUTH_FILE = "~/.kimi-code/credentials/kimi-code.json"
 DEFAULT_KIMI_OAUTH_LOCK_FILE = "~/.kimi-code/oauth/kimi-code"
-DEFAULT_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS = 3600.0
+DEFAULT_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS = 300.0
 DEFAULT_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS = kimi_oauth_refresh.DEFAULT_KIMI_OAUTH_HTTP_TIMEOUT_SECONDS
 DEFAULT_NOUS_OAUTH_AUTH_FILE = nous_oauth_refresh.DEFAULT_NOUS_OAUTH_AUTH_FILE
 DEFAULT_NOUS_OAUTH_LOCK_FILE = nous_oauth_refresh.DEFAULT_NOUS_OAUTH_LOCK_FILE
@@ -1408,7 +1408,9 @@ class ProviderStatusLoopConfig:
     codex_auth_file: str = DEFAULT_CODEX_AUTH_FILE
     codex_auth_file_source: str = "default"
     codex_lock_file: str = DEFAULT_CODEX_LOCK_FILE
-    codex_refresh_interval_seconds: float = DEFAULT_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS
+    codex_refresh_interval_seconds: float = (
+        DEFAULT_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS
+    )
     codex_refresh_buffer_seconds: int = (
         codex_oauth_refresh.DEFAULT_CODEX_REFRESH_BUFFER_SECONDS
     )
@@ -2102,7 +2104,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         ),
         help=(
             "Minimum seconds between Grok OIDC refresh attempts. Defaults to "
-            "AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS or 3600."
+            "AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS or 300."
         ),
     )
     parser.add_argument(
@@ -2181,7 +2183,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         ),
         help=(
             "Minimum seconds between Codex OAuth refresh attempts. Defaults "
-            "to AAWM_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS or 3600."
+            "to AAWM_CODEX_OAUTH_REFRESH_INTERVAL_SECONDS or 300."
         ),
     )
     parser.add_argument(
@@ -2272,7 +2274,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         ),
         help=(
             "Minimum seconds between managed xAI OAuth refresh attempts. "
-            "Defaults to AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS or 3600."
+            "Defaults to AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS or 300."
         ),
     )
     parser.add_argument(
@@ -2381,7 +2383,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         ),
         help=(
             "Refresh buffer for non-forced Hermes Nous Portal OAuth refreshes. "
-            "Defaults to AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS or 900."
+            "Defaults to AAWM_NOUS_OAUTH_REFRESH_BUFFER_SECONDS or 300."
         ),
     )
     parser.add_argument(
@@ -2468,7 +2470,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         ),
         help=(
             "Refresh buffer for non-forced Cursor Agent auth refreshes. "
-            "Defaults to AAWM_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS or 900."
+            "Defaults to AAWM_CURSOR_AGENT_AUTH_REFRESH_BUFFER_SECONDS or 300."
         ),
     )
     parser.add_argument(
@@ -2548,7 +2550,7 @@ def _build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915
         ),
         help=(
             "Minimum seconds between Kimi OAuth refresh attempts. Defaults to "
-            "AAWM_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS or 3600."
+            "AAWM_KIMI_OAUTH_REFRESH_INTERVAL_SECONDS or 300."
         ),
     )
     parser.add_argument(
@@ -3257,7 +3259,7 @@ def _validate_grok_oidc_config_args(args: argparse.Namespace) -> None:
         args.grok_oidc_http_timeout_seconds,
         "--grok-oidc-http-timeout-seconds",
     )
-    _validate_fixed_buffer_eligibility_cadence(
+    _validate_minimum_refresh_threshold_cadence(
         enabled=args.grok_oidc_refresh_enabled,
         force=args.grok_oidc_force_refresh,
         buffer_seconds=args.grok_oidc_refresh_buffer_seconds,
@@ -3280,7 +3282,7 @@ def _validate_codex_config_args(args: argparse.Namespace) -> None:
         args.codex_http_timeout_seconds,
         "--codex-http-timeout-seconds",
     )
-    _validate_fixed_buffer_eligibility_cadence(
+    _validate_minimum_refresh_threshold_cadence(
         enabled=args.codex_oauth_refresh_enabled,
         force=args.codex_force_refresh,
         buffer_seconds=args.codex_refresh_buffer_seconds,
@@ -3305,7 +3307,7 @@ def _validate_xai_oauth_config_args(args: argparse.Namespace) -> None:
         args.xai_oauth_http_timeout_seconds,
         "--xai-oauth-http-timeout-seconds",
     )
-    _validate_fixed_buffer_eligibility_cadence(
+    _validate_minimum_refresh_threshold_cadence(
         enabled=args.xai_oauth_refresh_enabled,
         force=args.xai_oauth_force_refresh,
         buffer_seconds=args.xai_oauth_refresh_buffer_seconds,
@@ -3328,7 +3330,7 @@ def _validate_nous_oauth_config_args(args: argparse.Namespace) -> None:
         args.nous_oauth_http_timeout_seconds,
         "--nous-oauth-http-timeout-seconds",
     )
-    _validate_fixed_buffer_eligibility_cadence(
+    _validate_minimum_refresh_threshold_cadence(
         enabled=args.nous_oauth_refresh_enabled,
         force=args.nous_oauth_force_refresh,
         buffer_seconds=args.nous_oauth_refresh_buffer_seconds,
@@ -3347,7 +3349,7 @@ def _validate_kimi_oauth_config_args(args: argparse.Namespace) -> None:
         args.kimi_oauth_http_timeout_seconds,
         "--kimi-oauth-http-timeout-seconds",
     )
-    _validate_fixed_buffer_eligibility_cadence(
+    _validate_minimum_refresh_threshold_cadence(
         enabled=args.kimi_oauth_refresh_enabled,
         force=args.kimi_oauth_force_refresh,
         buffer_seconds=float(kimi_oauth_refresh.DEFAULT_KIMI_OAUTH_REFRESH_MIN_SECONDS),
@@ -3370,7 +3372,7 @@ def _validate_cursor_agent_auth_config_args(args: argparse.Namespace) -> None:
         args.cursor_agent_auth_http_timeout_seconds,
         "--cursor-agent-auth-http-timeout-seconds",
     )
-    _validate_fixed_buffer_eligibility_cadence(
+    _validate_minimum_refresh_threshold_cadence(
         enabled=args.cursor_agent_auth_refresh_enabled,
         force=args.cursor_agent_auth_force_refresh,
         buffer_seconds=args.cursor_agent_auth_refresh_buffer_seconds,
@@ -3395,7 +3397,7 @@ def _require_nonnegative_finite(value: float, option: str) -> None:
         raise SystemExit(f"{option} must be non-negative")
 
 
-def _validate_fixed_buffer_eligibility_cadence(
+def _validate_minimum_refresh_threshold_cadence(
     *,
     enabled: bool,
     force: bool,
@@ -3411,7 +3413,7 @@ def _validate_fixed_buffer_eligibility_cadence(
         f"{provider_name} OAuth eligibility cadence is unsafe: "
         f"{outer_cadence_option}={outer_cadence:g} exceeds "
         f"{buffer_option}={buffer_seconds:g}; "
-        "outer eligibility cadence must not exceed the refresh buffer"
+        "outer eligibility cadence must not exceed the minimum refresh threshold"
     )
 
 
@@ -11986,6 +11988,14 @@ def _merge_oauth_refresh_eligibility(
         merged["next_refresh_check_at"] = _scheduler_timestamp(
             wall_now + timedelta(seconds=max(1.0, cadence_seconds))
         )
+    elif operation_summary and operation_summary.get("error_class"):
+        # A token-endpoint failure with a successful post-read must still
+        # schedule the next bounded retry independently of the outer cycle.
+        # The post-read remains authoritative for expiry and eligibility.
+        if merged.get("eligible") or not merged.get("expires_at"):
+            merged["next_refresh_check_at"] = _scheduler_timestamp(
+                wall_now + timedelta(seconds=max(1.0, cadence_seconds))
+            )
     # A transient post-call read failure must not erase the last known expiry
     # or deadline. The next outer cycle rereads the pathname again.
     if post.get("error_class") and not post.get("expires_at"):
@@ -12312,7 +12322,10 @@ def _run_oauth_refresh_schedule(
             post,
             wall_now=wall_now,
             operation_summary=operation_summary,
-            cadence_seconds=eligibility_cadence_seconds,
+            cadence_seconds=min(
+                max(1.0, eligibility_cadence_seconds),
+                max(1.0, attempt_interval_seconds),
+            ),
             buffer_seconds=buffer_seconds,
             threshold_seconds=threshold_seconds,
         )
@@ -14080,6 +14093,7 @@ def _sidecar_refresh_deadline(
     schedule: Optional[OAuthRefreshScheduleState],
     *,
     now: float,
+    wall_now: Optional[datetime] = None,
 ) -> Optional[float]:
     """Translate a sanitized wall-clock refresh deadline into monotonic time."""
     if schedule is None:
@@ -14089,7 +14103,8 @@ def _sidecar_refresh_deadline(
         return None
     if due_at.tzinfo is None:
         due_at = due_at.replace(tzinfo=timezone.utc)
-    delay_seconds = (due_at - datetime.now(timezone.utc)).total_seconds()
+    current_wall = _normalize_scheduler_wall_now(wall_now)
+    delay_seconds = (due_at - current_wall).total_seconds()
     return now + max(0.0, min(delay_seconds, _SIDECAR_MAX_WAKE_DELAY_SECONDS))
 
 
@@ -14141,6 +14156,136 @@ def _run_due_cursor_agent_auth_task(
     return [cursor_event]
 
 
+def _managed_refresh_schedule_items(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+) -> list[tuple[str, OAuthRefreshScheduleState]]:
+    items: list[tuple[str, OAuthRefreshScheduleState]] = []
+    if config.grok_oidc_refresh_enabled:
+        items.append(("grok_oidc_refresh", state.grok_oidc_refresh_schedule))
+    if config.codex_oauth_refresh_enabled:
+        items.extend(
+            (
+                f"codex_oauth_refresh:{label}",
+                schedule,
+            )
+            for label, schedule in state.codex_oauth_refresh_schedule_by_label.items()
+        )
+    if config.xai_oauth_refresh_enabled:
+        items.append(("xai_oauth_refresh", state.xai_oauth_refresh_schedule))
+    if config.kimi_oauth_refresh_enabled:
+        items.append(("kimi_oauth_refresh", state.kimi_oauth_refresh_schedule))
+    if config.nous_oauth_refresh_enabled:
+        items.append(("nous_oauth_refresh", state.nous_oauth_refresh_schedule))
+    if config.cursor_agent_auth_refresh_enabled:
+        items.append(
+            (
+                "cursor_agent_auth_refresh",
+                state.cursor_agent_auth_refresh_schedule,
+            )
+        )
+    return items
+
+
+def _managed_refresh_deadlines(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now: float,
+    wall_now: Optional[datetime] = None,
+) -> list[tuple[str, float]]:
+    deadlines: list[tuple[str, float]] = []
+    for name, schedule in _managed_refresh_schedule_items(config, state):
+        deadline = _sidecar_refresh_deadline(
+            schedule,
+            now=now,
+            wall_now=wall_now,
+        )
+        if deadline is not None:
+            deadlines.append((name, deadline))
+    return deadlines
+
+
+def _run_due_managed_refresh_tasks(
+    config: ProviderStatusLoopConfig,
+    state: SidecarTaskState,
+    *,
+    now: float,
+    wall_now: Optional[datetime] = None,
+) -> list[Dict[str, Any]]:
+    due_names = {
+        name
+        for name, deadline in _managed_refresh_deadlines(
+            config,
+            state,
+            now=now,
+            wall_now=wall_now,
+        )
+        if deadline <= now
+    }
+    if not due_names:
+        return []
+
+    wall = _normalize_scheduler_wall_now(wall_now)
+    runners: list[tuple[str, Callable[..., Any], bool]] = [
+        (
+            "grok_oidc_refresh",
+            _run_grok_oidc_refresh_task,
+            "grok_oidc_refresh" in due_names,
+        ),
+        (
+            "codex_oauth_refresh",
+            _run_codex_oauth_refresh_task,
+            any(name.startswith("codex_oauth_refresh:") for name in due_names),
+        ),
+        (
+            "xai_oauth_refresh",
+            _run_xai_oauth_refresh_task,
+            "xai_oauth_refresh" in due_names,
+        ),
+        (
+            "kimi_oauth_refresh",
+            _run_kimi_oauth_refresh_task,
+            "kimi_oauth_refresh" in due_names,
+        ),
+        (
+            "nous_oauth_refresh",
+            _run_nous_oauth_refresh_task,
+            "nous_oauth_refresh" in due_names,
+        ),
+        (
+            "cursor_agent_auth_refresh",
+            _run_cursor_agent_auth_refresh_task,
+            "cursor_agent_auth_refresh" in due_names,
+        ),
+    ]
+    events: list[Dict[str, Any]] = []
+    for event_name, runner, due in runners:
+        if not due:
+            continue
+        try:
+            result = runner(
+                config,
+                state,
+                now_monotonic=now,
+                now_wall=wall,
+            )
+        except Exception as exc:
+            result = {
+                "event": event_name,
+                "observed_at": _utc_timestamp(),
+                "environment": config.environment,
+                "attempted": True,
+                "error_class": exc.__class__.__name__,
+                "error_message": _redacted_failure_message(str(exc)),
+            }
+        if isinstance(result, list):
+            events.extend(result)
+        elif result is not None:
+            events.append(result)
+    return events
+
+
 def _utc_timestamp() -> str:
     return (
         datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -14152,17 +14297,23 @@ def _next_sidecar_wake_delay(
     state: SidecarTaskState,
     *,
     now: float,
+    wall_now: Optional[datetime] = None,
 ) -> float:
     generic_cycle_deadline = state.next_generic_cycle_due_monotonic
     if generic_cycle_deadline is None:
         generic_cycle_deadline = now + config.interval_seconds
-    sidecar_deadline = _sidecar_refresh_deadline(
-        state.cursor_agent_auth_refresh_schedule,
+    managed_deadlines = _managed_refresh_deadlines(
+        config,
+        state,
         now=now,
+        wall_now=wall_now,
     )
     next_deadline = generic_cycle_deadline
-    if config.cursor_agent_auth_refresh_enabled and sidecar_deadline is not None:
-        next_deadline = min(next_deadline, sidecar_deadline)
+    if managed_deadlines:
+        next_deadline = min(
+            next_deadline,
+            *(deadline for _name, deadline in managed_deadlines),
+        )
     return max(0.0, next_deadline - now)
 
 
@@ -14247,11 +14398,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 generic_cycle_deadline
             )
         if now < generic_cycle_deadline:
-            sidecar_events = _run_due_cursor_agent_auth_task(
+            sidecar_events = _run_due_managed_refresh_tasks(
                 config,
                 sidecar_state,
                 now=now,
             )
+            for event in sidecar_events:
+                _emit(event)
             _sleep_until_next_sidecar_deadline(
                 config,
                 sidecar_state,

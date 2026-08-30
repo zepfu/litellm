@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import io
 import json
@@ -96,6 +97,11 @@ def _http_error(status: int, payload: dict[str, Any]) -> urllib_error.HTTPError:
     )
 
 
+def _jwt(payload: dict[str, Any]) -> str:
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8"))
+    return f"header.{encoded.rstrip(b'=').decode('ascii')}.signature"
+
+
 def test_defaults_use_shared_kimi_code_credential_and_native_lock(kimi) -> None:
     assert kimi.DEFAULT_KIMI_OAUTH_AUTH_FILE == "~/.kimi-code/credentials/kimi-code.json"
     assert kimi.DEFAULT_KIMI_OAUTH_LOCK_FILE == "~/.kimi-code/oauth/kimi-code"
@@ -110,6 +116,92 @@ def test_defaults_use_shared_kimi_code_credential_and_native_lock(kimi) -> None:
 def test_refresh_threshold_is_450_seconds_for_900_second_lease(kimi) -> None:
     assert kimi._refresh_threshold_seconds(900) == 450
     assert kimi._refresh_threshold_seconds(10) == 300
+
+
+def test_issued_lifetime_uses_jwt_or_persisted_timestamp_without_descriptor_fields(
+    kimi,
+) -> None:
+    token = _jwt({"iat": 1_000, "exp": 1_900})
+
+    assert kimi._issued_lifetime_seconds(access_token=token) == 900
+    assert kimi._refresh_threshold_seconds(None, access_token=token) == 450
+    assert (
+        kimi._issued_lifetime_seconds(
+            access_token="opaque-token",
+            issued_at=1_000,
+            expires_at=1_900,
+        )
+        == 900
+    )
+
+
+def test_eligibility_derives_jwt_expiry_and_reports_lifetime_source(
+    kimi, tmp_path: Path
+) -> None:
+    auth_path = tmp_path / "credentials" / "kimi-code.json"
+    _write_credential(
+        auth_path,
+        {
+            "access_token": _jwt({"iat": 1_000, "exp": 1_900}),
+            "refresh_token": "old-refresh",
+            "scope": "kimi-code",
+            "token_type": "Bearer",
+        },
+    )
+
+    result = kimi.inspect_kimi_oauth_refresh_eligibility(
+        auth_path,
+        now=lambda: 1_000,
+        poll_interval_seconds=300,
+    )
+
+    assert result["expires_at"] == "1970-01-01T00:31:40Z"
+    assert result["refresh_due_at"] == "1970-01-01T00:24:10Z"
+    assert result["refresh_threshold_seconds"] == 450
+    assert result["refresh_threshold_source"] == "jwt"
+    assert result["refresh_threshold_degraded"] is False
+    assert result["eligible"] is False
+
+
+def test_missing_lifetime_metadata_is_explicitly_degraded(kimi, tmp_path: Path) -> None:
+    auth_path = tmp_path / "credentials" / "kimi-code.json"
+    _write_credential(
+        auth_path,
+        {
+            "access_token": "opaque-access",
+            "refresh_token": "old-refresh",
+            "scope": "kimi-code",
+            "token_type": "Bearer",
+        },
+    )
+
+    result = kimi.inspect_kimi_oauth_refresh_eligibility(
+        auth_path,
+        now=lambda: 1_000,
+        poll_interval_seconds=300,
+    )
+
+    assert result["eligible"] is True
+    assert result["credential_health"] == "degraded"
+    assert result["refresh_threshold_seconds"] == 300
+    assert result["refresh_threshold_source"] == "fallback"
+    assert result["refresh_threshold_degraded"] is True
+    assert result["error_class"] == "CredentialExpiryUnavailable"
+
+
+def test_refresh_normalization_derives_expiry_from_jwt_claims(kimi) -> None:
+    normalized = kimi._normalize_refreshed_credential(
+        {
+            "access_token": _jwt({"iat": 1_000, "exp": 1_900}),
+            "refresh_token": "new-refresh",
+        },
+        fallback_scope="kimi-code",
+        now=lambda: 1_500,
+    )
+
+    assert normalized["issued_at"] == 1_000
+    assert normalized["expires_at"] == 1_900
+    assert normalized["expires_in"] == 900
 
 
 def test_refresh_skips_when_lifetime_exceeds_dynamic_threshold(kimi, tmp_path: Path) -> None:
