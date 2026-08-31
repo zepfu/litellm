@@ -1103,8 +1103,8 @@ class TestRecordRouteStatusRollup:
         assert " - gpt-5.6-sol (b*@example.com):none" in lines[2]
         assert "[Recovered]" in lines[1]
         assert "[Failed]" in lines[2]
-        assert " - Request: [Recovered]" in lines
-        assert " - Request: [Failed]" not in lines
+        assert " - Request: [Failed]" in lines
+        assert " - Request: [Recovered]" not in lines
 
     def test_pending_openai_failover_records_failed_account_then_recovery(
         self,
