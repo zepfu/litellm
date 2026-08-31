@@ -8,6 +8,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 compose_file="${repo_root}/docker-compose.wsl-grok-oidc.yml"
 launcher="${repo_root}/scripts/ensure-wsl-grok-oidc-sidecar.sh"
 docs_file="${repo_root}/docs/aawm-provider-status-observations.md"
+dev_compose_file="${repo_root}/docker-compose.dev.yml"
 
 pass_count=0
 fail_count=0
@@ -92,6 +93,7 @@ echo "== XAI-004 WSL dual Grok OIDC + managed xAI OAuth sidecar smoke (static) =
 require_file "$compose_file"
 require_file "$launcher"
 require_file "$docs_file"
+require_file "$dev_compose_file"
 require_executable "$launcher"
 
 if bash -n "$launcher"; then
@@ -174,6 +176,15 @@ require_contains "$compose_file" 'AAWM_XAI_OAUTH_FORCE_REFRESH=0' \
   "managed xAI force refresh disabled"
 require_contains "$compose_file" 'AAWM_XAI_OAUTH_HTTP_TIMEOUT_SECONDS=30' \
   "managed xAI HTTP timeout 30"
+require_contains "$dev_compose_file" \
+  'AAWM_GROK_OIDC_FORCE_REFRESH=\$\{AAWM_GROK_OIDC_FORCE_REFRESH:-0\}' \
+  "development Grok force refresh defaults to 0"
+require_contains "$dev_compose_file" \
+  'AAWM_CODEX_OAUTH_FORCE_REFRESH=\$\{AAWM_CODEX_OAUTH_FORCE_REFRESH:-0\}' \
+  "development Codex force refresh defaults to 0"
+require_absent "$dev_compose_file" \
+  'AAWM_GROK_OIDC_FORCE_REFRESH=\$\{AAWM_GROK_OIDC_FORCE_REFRESH:-1\}|AAWM_CODEX_OAUTH_FORCE_REFRESH=\$\{AAWM_CODEX_OAUTH_FORCE_REFRESH:-1\}' \
+  "development Compose does not force Grok or Codex refresh"
 
 for flag in \
   'AAWM_CODEX_OAUTH_REFRESH_ENABLED=0' \
@@ -201,8 +212,13 @@ require_contains "$compose_file" '^[[:space:]]+- CMD$' \
   "healthcheck uses exec-form CMD"
 require_absent "$compose_file" 'CMD-SHELL' \
   "healthcheck does not embed multiline Python in CMD-SHELL"
-require_contains "$compose_file" 'remaining.* > 600|return .* > 600|total_seconds\(\) > 600' \
-  "healthcheck fails before 300s rejection boundary"
+require_contains "$compose_file" 'max\(300, issued_lifetime_seconds \* 0\.5\)' \
+  "healthcheck uses max(300, issued_lifetime_seconds * 0.5)"
+require_contains "$compose_file" 'missing or malformed lifetime|degraded fallback' \
+  "healthcheck documents degraded lifetime fallback"
+require_absent "$compose_file" \
+  'remaining[[:space:]]*>[[:space:]]*600|total_seconds\(\)[[:space:]]*>[[:space:]]*600' \
+  "healthcheck does not use fixed 600-second authority"
 require_contains "$compose_file" "record.get\\('refresh_token'\\)|refresh_token" \
   "healthcheck requires a refresh token"
 require_contains "$compose_file" "oidc_issuer|require_issuer" \
@@ -223,8 +239,12 @@ text = Path(sys.argv[1]).read_text(encoding="utf-8")
 hc = text[text.index("healthcheck:") :]
 if re.search(r"print\(|echo ", hc):
     raise SystemExit("healthcheck must not print or echo")
-if "total_seconds() > 600" not in hc and "remaining > 600" not in hc:
-    raise SystemExit("healthcheck missing remaining > 600 gate")
+if "max(300, issued_lifetime_seconds * 0.5)" not in hc:
+    raise SystemExit("healthcheck missing half-life threshold")
+if "missing or malformed lifetime" not in hc or "degraded fallback" not in hc:
+    raise SystemExit("healthcheck missing degraded lifetime fallback")
+if re.search(r"remaining\s*>\s*600|total_seconds\(\)\s*>\s*600", hc):
+    raise SystemExit("healthcheck must not use fixed 600-second authority")
 if "/home/zepfu/.grok/auth.json" not in hc:
     raise SystemExit("healthcheck must validate native auth.json")
 if "/home/zepfu/.litellm/xai/oauth-auth.json" not in hc:
@@ -300,6 +320,10 @@ require_absent "$launcher" 'local raw|raw="\$\(read_managed_credential_via_docke
   "launcher does not retain managed credential JSON in a shell variable"
 require_contains "$launcher" 'native_auth_file|managed_auth_file' \
   "launcher tracks both credential paths"
+require_contains "$launcher" 'missing or malformed lifetime|degraded fallback' \
+  "launcher allows helper lifetime fallback"
+require_absent "$launcher" 'record missing expires_at' \
+  "launcher does not block missing expiry before helper fallback"
 
 service_ref="\$service_name"
 while IFS= read -r line; do
@@ -352,6 +376,12 @@ require_contains "$docs_file" 'oauth-auth\.json' \
   "docs name managed oauth-auth.json path"
 require_contains "$docs_file" 'xai_oauth_refresh' \
   "docs name managed xai_oauth_refresh events/task"
+require_contains "$docs_file" 'max\(300, issued_lifetime_seconds \* 0\.5\)' \
+  "docs state the half-life threshold"
+require_contains "$docs_file" 'missing or malformed' \
+  "docs state missing or malformed lifetime handling"
+require_contains "$docs_file" 'degraded fallback' \
+  "docs state the degraded lifetime fallback"
 
 echo
 guard_probe_dir="$(mktemp -d)"

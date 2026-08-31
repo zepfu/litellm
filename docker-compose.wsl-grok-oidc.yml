@@ -56,6 +56,9 @@ services:
                 return False
             raise SystemExit(f"{name} must be a boolean")
 
+        # 300 seconds is the eligibility/retry cadence and minimum threshold
+        # input; valid lifetime metadata uses max(300, issued_lifetime_seconds * 0.5).
+        # Missing or malformed lifetime metadata uses the 300-second degraded fallback.
         def emit(payload):
             payload = dict(payload)
             payload.setdefault("observed_at", datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"))
@@ -266,8 +269,10 @@ services:
       # Combined credential/process health only. Never print or log token material.
       # Both native Grok OIDC and managed xAI OAuth records must be present, mode
       # 0600, hold access + refresh credentials, match expected client/scope, and
-      # keep remaining lifetime well above LiteLLM's 300s near-expiry rejection
-      # window (remaining > 600). Native requires issuer; managed may omit it.
+      # be outside the helper's refresh deadline. Valid lifetime metadata uses
+      # max(300, issued_lifetime_seconds * 0.5); missing or malformed lifetime
+      # metadata uses the 300-second degraded fallback. Native requires issuer;
+      # managed may omit it.
       test:
         - CMD
         - python
@@ -276,29 +281,14 @@ services:
           import json
           import stat
           import sys
-          from datetime import datetime, timezone
           from pathlib import Path
+          import scripts.grok_oidc_refresh as grok
+          import scripts.xai_oauth_refresh as xai
 
           scope = "https://auth.x.ai::b1a00492-073a-47ea-816f-4c329264a828"
           client = "b1a00492-073a-47ea-816f-4c329264a828"
 
-          def remaining_ok(record):
-              raw = str(record.get("expires_at") or "").strip()
-              if not raw:
-                  return False
-              normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
-              try:
-                  expires = datetime.fromisoformat(normalized)
-              except ValueError:
-                  return False
-              if expires.tzinfo is None:
-                  expires = expires.replace(tzinfo=timezone.utc)
-              remaining = (
-                  expires.astimezone(timezone.utc) - datetime.now(timezone.utc)
-              ).total_seconds()
-              return remaining > 600
-
-          def check(path, require_issuer):
+          def check(path, require_issuer, eligibility_check):
               credential_path = Path(path)
               if not credential_path.is_file():
                   return False
@@ -326,10 +316,25 @@ services:
                   and record.get("oidc_issuer") != "https://auth.x.ai"
               ):
                   return False
-              return remaining_ok(record)
+              eligibility = eligibility_check(
+                  credential_path,
+                  scope=scope,
+                  poll_interval_seconds=300,
+              )
+              return (
+                  eligibility.get("credential_health") == "fresh"
+                  and eligibility.get("usable") is True
+                  and eligibility.get("eligible") is False
+              )
 
-          healthy = check("/home/zepfu/.grok/auth.json", True) and check(
-              "/home/zepfu/.litellm/xai/oauth-auth.json", False
+          healthy = check(
+              "/home/zepfu/.grok/auth.json",
+              True,
+              grok.inspect_grok_oidc_refresh_eligibility,
+          ) and check(
+              "/home/zepfu/.litellm/xai/oauth-auth.json",
+              False,
+              xai.inspect_xai_oauth_refresh_eligibility,
           )
           sys.exit(0 if healthy else 1)
       interval: 30s

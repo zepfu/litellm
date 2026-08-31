@@ -177,6 +177,10 @@ assert_compose_contract() {
     || die "compose must set Grok refresh interval 300"
   grep -Fq 'AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS=300' <<<"$text" \
     || die "compose must set Grok refresh buffer 300"
+  grep -Fq 'max(300, issued_lifetime_seconds * 0.5)' <<<"$text" \
+    || die "compose must use the credential lifetime half-life threshold"
+  grep -Fq 'missing or malformed lifetime' <<<"$text" \
+    || die "compose must document the degraded lifetime fallback"
   grep -Fq 'AAWM_GROK_OIDC_FORCE_REFRESH=0' <<<"$text" \
     || die "compose must set Grok force refresh 0"
   grep -Fq 'AAWM_XAI_OAUTH_REFRESH_INTERVAL_SECONDS=300' <<<"$text" \
@@ -234,8 +238,8 @@ if record.get("oidc_issuer") != "https://auth.x.ai":
     raise SystemExit("native credential has unexpected Grok OIDC issuer")
 if record.get("oidc_client_id") != "b1a00492-073a-47ea-816f-4c329264a828":
     raise SystemExit("native credential has unexpected Grok OIDC client id")
-if not record.get("expires_at"):
-    raise SystemExit("native credential record missing expires_at")
+# Missing or malformed lifetime metadata is allowed so the refresh helper can
+# use its 300-second degraded fallback and perform the safe refresh path.
 if not record.get("refresh_token"):
     raise SystemExit("native credential record missing refresh token")
 if not (record.get("key") or record.get("access_token")):
@@ -279,9 +283,8 @@ if not isinstance(record, dict):
 cid = record.get("oidc_client_id") or record.get("client_id")
 if cid != client:
     raise SystemExit("managed credential has unexpected OAuth client id")
-# Managed may omit issuer; require access + refresh + expiry only.
-if not record.get("expires_at"):
-    raise SystemExit("managed credential record missing expires_at")
+# Managed may omit issuer and expiry; the refresh helper owns the degraded
+# 300-second fallback when lifetime metadata is missing or malformed.
 if not record.get("refresh_token"):
     raise SystemExit("managed credential record missing refresh token")
 if not (record.get("key") or record.get("access_token")):

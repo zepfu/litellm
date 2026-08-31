@@ -155,8 +155,12 @@ have two separate timing controls:
   (`AAWM_PROVIDER_STATUS_INTERVAL_SECONDS`). On each eligible outer cycle, the
   sidecar performs a read-only credential inspection and derives
   `refresh_due_at` from the credential expiry and the provider refresh buffer.
-  Every managed credential uses `max(300, issued_lifetime_seconds * 0.5)` and reports that effective value as
-  `refresh_threshold_seconds`. A `refresh_not_due` inspection does not consume
+  With valid issued lifetime metadata, every managed credential uses
+  `max(300, issued_lifetime_seconds * 0.5)` and reports that effective value as
+  `refresh_threshold_seconds`. The `300` value is the eligibility/retry
+  cadence and minimum threshold input, not a fixed normal authority. When
+  lifetime metadata is missing or malformed, the threshold falls back to
+  `300` and is marked degraded. A `refresh_not_due` inspection does not consume
   the endpoint-attempt throttle. A local or pre-network helper failure also
   leaves that throttle untouched and may retry on the next outer cycle. Every
   outer cycle reinspects the current credential pathname, including an inode
@@ -189,9 +193,10 @@ error fields. The result classes are:
 - `expired`: expiry overrides a refresh failure and the credential is not
   usable.
 
-Missing or malformed expiry data never makes a credential permanently fresh.
-An otherwise usable credential with missing or unparseable `expires_at` is
-eligible for the safe refresh path and is reported as degraded. A malformed or
+Missing or malformed expiry or lifetime data never makes a credential
+permanently fresh. An otherwise usable credential with missing or unparseable
+`expires_at` is eligible for the safe refresh path, uses the `300`-second
+degraded fallback threshold, and is reported as degraded. A malformed or
 unreadable credential is reported as malformed and unusable until recovery.
 Inspection and operation errors are bounded and redacted before they enter
 events or persisted auth observations.
@@ -400,11 +405,14 @@ Relevant environment variables:
   for this refresh path use the shared helpers in
   `litellm/secret_managers/credential_file_metadata.py` (same clamp/ownership
   safety as the Codex/xAI refresh scripts).
-- `AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS`: minimum seconds between attempts.
-- `AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS`: near-expiry window for non-forced
-  refreshes.
-- `AAWM_GROK_OIDC_FORCE_REFRESH`: when true, refreshes on every scheduled
-  attempt even if the current token still appears valid.
+- `AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS`: outer eligibility/retry cadence;
+  development defaults to `300` seconds.
+- `AAWM_GROK_OIDC_REFRESH_BUFFER_SECONDS`: minimum threshold input and
+  degraded fallback when lifetime metadata is unavailable; with valid issued
+  lifetime metadata, eligibility uses `max(300, issued_lifetime_seconds * 0.5)`.
+- `AAWM_GROK_OIDC_FORCE_REFRESH`: explicit override that refreshes on every
+  scheduled attempt even if the current token still appears valid; development
+  defaults to `0`.
 - `AAWM_GROK_OIDC_HTTP_TIMEOUT_SECONDS`: token endpoint timeout.
 
 Credential lock acquisition is nonblocking and fail closed. A held lock,
@@ -468,6 +476,11 @@ writable; Codex, Kimi, and Alibaba credential dirs are not mounted.
 A single cycle can run both refresh tasks. Each family keeps independent
 config variables even when both use the same defaults:
 
+The `300`-second values below are the eligibility/retry cadence and minimum
+threshold input. Valid lifetime metadata uses
+`max(300, issued_lifetime_seconds * 0.5)`; missing or malformed lifetime
+metadata uses the `300`-second degraded fallback.
+
 Rendered native defaults:
 
 - `AAWM_GROK_OIDC_REFRESH_ENABLED=1`
@@ -507,13 +520,14 @@ and fails if either proxy snapshot changes. Never run a broad compose
 compose command for this file. Status mode works before activation.
 
 Native preflight validates host-readable mode `0600` and uid/gid `1000/1000`
-plus issuer/client/access/refresh/expiry metadata. Managed preflight validates
-mode `0600` and root-family ownership (`0/0`, accepting legacy `65534` until the
-sidecar rewrites ownership). Because the host user often cannot read the
-root/nobody-owned managed file, the launcher validates managed metadata from
-`stat` and, when the file is unreadable, uses a disposable **read-only**
-`docker run` of the existing prod image with a read-only mount to validate JSON
-safely. No secrets are printed.
+plus issuer/client/access/refresh metadata. Missing or malformed expiry/lifetime
+metadata is accepted so the helper can take the `300`-second degraded fallback
+refresh path. Managed preflight validates mode `0600` and root-family ownership
+(`0/0`, accepting legacy `65534` until the sidecar rewrites ownership).
+Because the host user often cannot read the root/nobody-owned managed file, the
+launcher validates managed metadata from `stat` and, when the file is unreadable,
+uses a disposable **read-only** `docker run` of the existing prod image with a
+read-only mount to validate JSON safely. No secrets are printed.
 
 Combined credential/process health requires **both** credential records to have:
 
@@ -521,13 +535,16 @@ Combined credential/process health requires **both** credential records to have:
 - a refresh token
 - the expected client ID / scope
 - mode `0600`
-- remaining lifetime well above LiteLLM's 300-second near-expiry rejection
-  boundary (`remaining > 600` seconds)
+- helper eligibility outside its refresh deadline:
+  `max(300, issued_lifetime_seconds * 0.5)` with valid lifetime metadata, or
+  the `300`-second degraded fallback when lifetime metadata is missing or
+  malformed
 
 Native health also requires issuer `https://auth.x.ai`. Managed health may omit
 issuer. The launcher waits for that combined healthcheck before reporting
-`apply_ok`. Healthcheck and refresh logs emit no access tokens, refresh tokens,
-id tokens, or raw credential payloads.
+`apply_ok`; a missing or malformed expiry remains degraded while the running
+sidecar attempts the safe helper refresh. Healthcheck and refresh logs emit no
+access tokens, refresh tokens, id tokens, or raw credential payloads.
 
 ## Grok Billing Poll Task
 

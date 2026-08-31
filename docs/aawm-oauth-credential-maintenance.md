@@ -74,6 +74,21 @@ credentials on the request path. Direct Nous inference reads
 `LITELLM_NOUS_OAUTH_AUTH_FILE`, else `LITELLM_HERMES_AUTH_FILE`, else
 `AAWM_HERMES_AUTH_FILE`, else `~/.hermes/auth.json`.
 
+## OAuth refresh deadline contract
+
+Scheduled Grok OIDC, Codex OAuth, managed xAI OAuth, Kimi OAuth, and Nous
+Portal OAuth refreshes use deadline-aware eligibility. The `300`-second value
+is the eligibility/retry cadence and the minimum threshold input, not a fixed
+normal refresh authority. With valid issued lifetime metadata, non-forced
+refresh uses `max(300, issued_lifetime_seconds * 0.5)`. When lifetime metadata
+is missing or malformed, the helper uses the `300`-second degraded fallback;
+an otherwise usable credential with missing or unparseable `expires_at` remains
+eligible for the safe refresh path and is reported as degraded.
+
+Development Compose defaults `AAWM_GROK_OIDC_FORCE_REFRESH=0` and
+`AAWM_CODEX_OAUTH_FORCE_REFRESH=0`, so normal scheduled checks use the
+credential deadline instead of bypassing half-life eligibility.
+
 Kimi Code uses the existing host Kimi CLI credential in place. It is not a
 LiteLLM-owned second grant. A configured managed `kimi_code` route consumes the
 same credential read-only; possessing the file or naming an alias does not
