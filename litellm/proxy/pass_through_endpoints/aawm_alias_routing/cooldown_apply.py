@@ -270,7 +270,11 @@ def _resolve_auto_agent_cooldown_publication_plan(
                     kimi_failure_metadata=kimi_failure_metadata,
                 )
 
-            if error_class not in _LAST_RESORT_DURABLE_EXHAUSTION_ERROR_CLASSES:
+            if (
+                codex_failure_evidence_alias is None
+                or error_class
+                not in _LAST_RESORT_DURABLE_EXHAUSTION_ERROR_CLASSES
+            ):
                 # Ordinary last-resort failures stay request-local only.
                 return CooldownPublicationPlan(
                     duration_seconds=duration,

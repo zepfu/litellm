@@ -266,7 +266,35 @@ class TestResolvePublicationPlan:
         "error_class",
         ["capacity_exhausted", "rate_limited", "usage_limit_reached"],
     )
-    def test_last_resort_durable_exhaustion_publishes_candidate_scope(
+    def test_configured_codex_last_resort_durable_exhaustion_publishes_candidate_scope(
+        self, configured_runtime: dict, error_class: str
+    ) -> None:
+        configured_runtime["scope_fn"].return_value = "candidate"
+        configured_runtime["gate"]._decision = _FakeDecision(
+            should_cool=True,
+            duration_seconds=45.0,
+            scope="candidate",
+        )
+        plan = _resolve_auto_agent_cooldown_publication_plan(
+            request=None,
+            candidate={"provider": "p", "model": "m", "last_resort": True},
+            lane_key="lane",
+            selected_cooldown_key="ck",
+            cooldown_seconds=120.0,
+            error_class=error_class,
+            codex_failure_evidence_alias="test-alias",
+        )
+        assert plan.applied_scope == "candidate"
+        assert plan.request_local_action is None
+        assert plan.memory_keys == ("ck",)
+        assert plan.durable_keys == ("ck",)
+        assert plan.duration_seconds == 120.0
+
+    @pytest.mark.parametrize(
+        "error_class",
+        ["capacity_exhausted", "rate_limited", "usage_limit_reached"],
+    )
+    def test_anthropic_last_resort_durable_exhaustion_stays_request_local(
         self, configured_runtime: dict, error_class: str
     ) -> None:
         configured_runtime["scope_fn"].return_value = "candidate"
@@ -277,11 +305,12 @@ class TestResolvePublicationPlan:
             selected_cooldown_key="ck",
             cooldown_seconds=120.0,
             error_class=error_class,
+            codex_failure_evidence_alias=None,
         )
-        assert plan.applied_scope == "candidate"
-        assert plan.request_local_action is None
-        assert plan.memory_keys == ("ck",)
-        assert plan.durable_keys == ("ck",)
+        assert plan.applied_scope == "request_local"
+        assert plan.request_local_action == "request_local_cooldown"
+        assert plan.memory_keys == ()
+        assert plan.durable_keys == ()
         assert plan.duration_seconds == 120.0
 
     def test_last_resort_ordinary_failure_stays_request_local(
