@@ -231,18 +231,7 @@ async def test_candidate_loop_resolves_generic_status_helper_from_live_host() ->
 async def test_candidate_loop_records_in_flight_pinned_cooldown_without_no_candidate_event(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    request = Request(
-        {
-            "type": "http",
-            "method": "POST",
-            "path": "/openai_passthrough/v1/responses",
-            "headers": [(b"user-agent", b"codex-cli/1.0")],
-            "query_string": b"",
-            "server": ("testserver", 80),
-            "client": ("testclient", 123),
-            "scheme": "http",
-        }
-    )
+    request = SimpleNamespace(state=SimpleNamespace())
     body = {"model": "basic", "input": "hello", "stream": False}
     detail = {
         "error": {
@@ -1466,6 +1455,107 @@ def test_resolve_failure_plan_ineligible_short_circuits_evidence_and_publication
 
 
 @pytest.mark.asyncio
+async def test_candidate_loop_skips_preflight_cooldown_without_recording_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [(b"user-agent", b"codex-cli/1.0")],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    body = {"model": "basic", "input": "hello", "stream": False}
+    selections = [
+        {
+            "candidate": {
+                "provider": "openai",
+                "model": "cooling-down",
+                "route_family": "codex_responses",
+            },
+            "lane_key": "lane-cooling-down",
+            "cooldown_key": "openai:cooling-down",
+            "selection_reason": "first_available",
+            "skipped": [],
+        },
+        {
+            "candidate": {
+                "provider": "openai",
+                "model": "egress",
+                "route_family": "codex_responses",
+            },
+            "lane_key": "lane-egress",
+            "cooldown_key": "openai:egress",
+            "selection_reason": "first_available",
+            "skipped": [],
+        },
+    ]
+    provider_calls: list[str] = []
+    metadata_attempts: list[list[dict[str, Any]]] = []
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        return selections.pop(0)
+
+    async def _active_cooldown(key: str) -> tuple[float, str]:
+        return (12.0, "memory") if key == "openai:cooling-down" else (0.0, "memory")
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        provider_calls.append(candidate["model"])
+        return {"candidate": candidate["model"], "body": candidate_body}
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+
+    def _add_alias_metadata(body: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        metadata_attempts.append(kwargs["attempts"])
+        return body
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=None,
+        publish_cooldown_memory_fn=None,
+        persist_cooldown_fn=None,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=_add_alias_metadata,
+        raise_redispatch_fn=None,
+    )
+
+    response = await candidate_loop.handle_alias_route(
+        services,
+        alias_family="codex_auto_agent",
+        alias_model="basic",
+        request=request,
+        prepared_request_body=body,
+        max_candidate_attempts=2,
+        get_active_cooldown_state_fn=_active_cooldown,
+        attempts_metadata_key="attempts",
+        skipped_candidates_metadata_key="skipped",
+        no_candidate_detail="no candidates",
+        log_label="Codex",
+    )
+
+    assert response["candidate"] == "egress"
+    assert provider_calls == ["egress"]
+    assert metadata_attempts
+    attempts = metadata_attempts[-1]
+    assert all(captured is attempts for captured in metadata_attempts)
+    assert [attempt["model"] for attempt in attempts] == ["egress"]
+    assert attempts[0]["attempted_provider_call"] is True
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "alias_model",
     ("aawm-test", "codex-auto-review", "auto-review"),
@@ -1505,6 +1595,7 @@ async def test_candidate_loop_ineligible_falls_through_without_request_local_sta
         },
     ]
     provider_calls: list[str] = []
+    provider_attempt_snapshots: list[list[tuple[str, bool]]] = []
     selection_kwargs: list[dict] = []
     replay_safety_results: list[
         session_affinity.SessionOwnerReplaySafetyResult
@@ -1532,6 +1623,12 @@ async def test_candidate_loop_ineligible_falls_through_without_request_local_sta
         candidate_body: dict,
     ) -> object:
         provider_calls.append(candidate["model"])
+        provider_attempt_snapshots.append(
+            [
+                (attempt["model"], attempt["attempted_provider_call"])
+                for attempt in request.state.aawm_alias_request_outcome["attempts"]
+            ]
+        )
         if candidate["model"] == "unsupported":
             raise _IneligibleCandidateError()
         return {"candidate": candidate["model"], "body": candidate_body}
@@ -1629,6 +1726,10 @@ async def test_candidate_loop_ineligible_falls_through_without_request_local_sta
 
     assert response["candidate"] == "supported"
     assert provider_calls == ["unsupported", "supported"]
+    assert provider_attempt_snapshots == [
+        [("unsupported", True)],
+        [("unsupported", True), ("supported", True)],
+    ]
     assert selection_kwargs[0]["excluded_candidate_keys"] == frozenset()
     assert selection_kwargs[1]["excluded_candidate_keys"] == frozenset(
         {"openai:unsupported"}

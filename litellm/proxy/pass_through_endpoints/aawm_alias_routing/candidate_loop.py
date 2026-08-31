@@ -941,7 +941,7 @@ async def handle_alias_route(  # noqa: PLR0915
             value = selection.get(field)
             if value is not None:
                 attempt_record[field] = value
-        attempts.append(attempt_record)
+        attempt_record["attempted_provider_call"] = False
         # D1-564: provider/account lane admission after selection and before
         # attempt-start / probe lock / provider I/O. Separate from cooldown and
         # session ownership. Fail-fast only: never queue/sleep/background-retry.
@@ -1027,16 +1027,6 @@ async def handle_alias_route(  # noqa: PLR0915
             )
         admission_lease = admission_decision.lease
         try:
-            candidate_body = _record_auto_agent_alias_attempt_started(
-                alias_family=alias_family,
-                alias_model=alias_model,
-                request=request,
-                prepared_request_body=prepared_request_body,
-                selection=selection,
-                attempts=attempts,
-                attempt_record=attempt_record,
-                add_alias_metadata_fn=add_alias_metadata_fn,
-            )
             while True:
                 # CFG-004: ProbeLease / publication-intent single-flight design.
                 #
@@ -1225,7 +1215,19 @@ async def handle_alias_route(  # noqa: PLR0915
                             request,
                             candidate=candidate,
                         )
+                        attempts.append(attempt_record)
+                        attempt_record["attempted_provider_call"] = True
                         attempted_provider_call = True
+                        candidate_body = _record_auto_agent_alias_attempt_started(
+                            alias_family=alias_family,
+                            alias_model=alias_model,
+                            request=request,
+                            prepared_request_body=prepared_request_body,
+                            selection=selection,
+                            attempts=attempts,
+                            attempt_record=attempt_record,
+                            add_alias_metadata_fn=add_alias_metadata_fn,
+                        )
 
                         async def _perform_candidate_request() -> Response:
                             return await perform_candidate_request_fn(
@@ -1679,17 +1681,7 @@ async def handle_alias_route(  # noqa: PLR0915
                             lane_key=selection.get("lane_key"),
                             reason="token_invalidated_same_account_reload",
                         )
-                        attempts.append(attempt_record)
-                        candidate_body = _record_auto_agent_alias_attempt_started(
-                            alias_family=alias_family,
-                            alias_model=alias_model,
-                            request=request,
-                            prepared_request_body=prepared_request_body,
-                            selection=selection,
-                            attempts=attempts,
-                            attempt_record=attempt_record,
-                            add_alias_metadata_fn=add_alias_metadata_fn,
-                        )
+                        attempt_record["attempted_provider_call"] = False
                         continue
 
                 # --- failure handling (post-release) ---------------------------
@@ -1820,17 +1812,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         lane_key=selection.get("lane_key"),
                         reason="responses_pre_commit_same_account_retry",
                     )
-                    attempts.append(attempt_record)
-                    _record_auto_agent_alias_attempt_started(
-                        alias_family=alias_family,
-                        alias_model=alias_model,
-                        request=request,
-                        prepared_request_body=prepared_request_body,
-                        selection=selection,
-                        attempts=attempts,
-                        attempt_record=attempt_record,
-                        add_alias_metadata_fn=add_alias_metadata_fn,
-                    )
+                    attempt_record["attempted_provider_call"] = False
                     continue
                 if (
                     not prefer_account_failover
@@ -2151,17 +2133,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         lane_key=selection.get("lane_key"),
                         reason="native_grok_continuation_same_candidate_retry",
                     )
-                    attempts.append(attempt_record)
-                    candidate_body = _record_auto_agent_alias_attempt_started(
-                        alias_family=alias_family,
-                        alias_model=alias_model,
-                        request=request,
-                        prepared_request_body=prepared_request_body,
-                        selection=selection,
-                        attempts=attempts,
-                        attempt_record=attempt_record,
-                        add_alias_metadata_fn=add_alias_metadata_fn,
-                    )
+                    attempt_record["attempted_provider_call"] = False
                     continue
                 if native_grok_retry_eligible:
                     # Same-candidate budget exhausted; do not switch providers.
