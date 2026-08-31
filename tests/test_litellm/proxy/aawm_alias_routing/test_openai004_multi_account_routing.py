@@ -696,11 +696,12 @@ def _loop_services(
     select_candidate: Any,
     perform_candidate: Any,
     raise_redispatch: Any = None,
+    cooldown_scope: str = "account",
 ) -> AliasRouteServices:
     def _resolve_publication(**kwargs: Any) -> CooldownPublicationPlan:
         return CooldownPublicationPlan(
             duration_seconds=0.0,
-            applied_scope="account",
+            applied_scope=cooldown_scope,
         )
 
     async def _persist(**kwargs: Any) -> None:
@@ -847,6 +848,169 @@ async def test_candidate_loop_persists_fresh_deterministic_candidate_marker(
     assert outcome["attempts"][0][
         "candidate_semantic_ineligibility_state_source"
     ] == "memory"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_class",
+    ["upstream_timeout", "upstream_transient_internal"],
+)
+async def test_candidate_loop_persists_fresh_cursor_transient_marker(
+    monkeypatch: pytest.MonkeyPatch,
+    error_class: str,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    manager = AliasRoutingStateManager()
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", manager)
+    request = _request()
+    candidate = {
+        "provider": "cursor_agent",
+        "model": "cursor-work",
+        "route_family": "cursor_agent_responses_adapter",
+        "last_resort": False,
+    }
+    selected = {
+        "candidate": candidate,
+        "lane_key": "cursor-agent",
+        "cooldown_key": "cursor_agent:cursor-work:cursor-agent",
+        "selection_reason": "first_available",
+        "request_mode": "fresh",
+        "has_account_bound_state": False,
+        "in_flight_session": False,
+        "session_key": None,
+        "skipped": [],
+    }
+
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc, *args, candidate=None, **kwargs: error_class,
+    )
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        return dict(selected)
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        raise RuntimeError("timed out")
+
+    with pytest.raises(HTTPException):
+        await candidate_loop.handle_alias_route(
+            _loop_services(
+                select_candidate=_select,
+                perform_candidate=_perform,
+                cooldown_scope="request_local",
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=request,
+            prepared_request_body={"model": "work"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_zero_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidate",
+            log_label="Codex",
+        )
+
+    marker = manager.codex.get_candidate_semantic_ineligibility_memory(
+        selected["cooldown_key"]
+    )
+    assert marker is not None
+    assert marker["reason"] == error_class
+    assert marker["remaining_seconds"] > 0
+    outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    attempt = outcome["attempts"][0]
+    assert attempt["cooldown_scope"] == "request_local"
+    assert attempt["cooldown_scope"] != "candidate"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "has_continuation_state",
+    [
+        pytest.param(True, id="continuation-state"),
+        pytest.param(False, id="previous-response-id-only"),
+    ],
+)
+async def test_candidate_loop_persists_cursor_transient_marker_for_non_fresh_request(
+    monkeypatch: pytest.MonkeyPatch,
+    has_continuation_state: bool,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    monkeypatch.setattr(
+        lpe,
+        "_codex_auto_agent_request_has_continuation_state",
+        lambda body: has_continuation_state,
+    )
+    manager = AliasRoutingStateManager()
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", manager)
+    request = _request()
+    candidate = {
+        "provider": "cursor_agent",
+        "model": "cursor-work",
+        "route_family": "cursor_agent_responses_adapter",
+        "last_resort": False,
+    }
+    selected = {
+        "candidate": candidate,
+        "lane_key": "cursor-agent",
+        "cooldown_key": "cursor_agent:cursor-work:cursor-agent",
+        "selection_reason": "continuation",
+        "request_mode": "continuation",
+        "has_account_bound_state": False,
+        "in_flight_session": False,
+        "session_key": None,
+        "skipped": [],
+    }
+
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc, *args, candidate=None, **kwargs: "upstream_transient_internal",
+    )
+    provider_attempts: list[str] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        return dict(selected)
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        provider_attempts.append(candidate["provider"])
+        raise RuntimeError("timed out")
+
+    with pytest.raises(HTTPException):
+        await candidate_loop.handle_alias_route(
+            _loop_services(
+                select_candidate=_select,
+                perform_candidate=_perform,
+                cooldown_scope="request_local",
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=request,
+            prepared_request_body={"model": "work", "previous_response_id": "resp-1"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_zero_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidate",
+            log_label="Codex",
+        )
+
+    marker = manager.codex.get_candidate_semantic_ineligibility_memory(
+        selected["cooldown_key"]
+    )
+    assert marker is not None
+    assert marker["reason"] == "upstream_transient_internal"
+    assert provider_attempts
+    assert all(provider == "cursor_agent" for provider in provider_attempts)
 
 
 @pytest.mark.asyncio
