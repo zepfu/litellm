@@ -1494,7 +1494,7 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         "AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS=${AAWM_GROK_OIDC_REFRESH_INTERVAL_SECONDS:-300}"
         in compose_text
     )
-    assert "AAWM_GROK_OIDC_FORCE_REFRESH=${AAWM_GROK_OIDC_FORCE_REFRESH:-1}" in compose_text
+    assert "AAWM_GROK_OIDC_FORCE_REFRESH=${AAWM_GROK_OIDC_FORCE_REFRESH:-0}" in compose_text
     assert "- /home/zepfu/.codex:/home/zepfu/.codex:ro" in compose_text
     assert "- /home/zepfu/.codex:/home/zepfu/.codex" in compose_text
     assert compose_text.count("- *codex-oauth-inventory") == 2
@@ -1506,7 +1506,7 @@ def test_provider_status_compose_hardens_sidecar_db_path() -> None:
         "AAWM_CODEX_AUTH_FILE_UID=${AAWM_CODEX_AUTH_FILE_UID:-1000}",
         "AAWM_CODEX_AUTH_FILE_GID=${AAWM_CODEX_AUTH_FILE_GID:-1000}",
         "AAWM_CODEX_AUTH_FILE_MODE=${AAWM_CODEX_AUTH_FILE_MODE:-0o600}",
-        "AAWM_CODEX_OAUTH_FORCE_REFRESH=${AAWM_CODEX_OAUTH_FORCE_REFRESH:-1}",
+        "AAWM_CODEX_OAUTH_FORCE_REFRESH=${AAWM_CODEX_OAUTH_FORCE_REFRESH:-0}",
     ):
         assert expected_codex_setting in compose_text
     for expected_kimi_usage_setting in (
