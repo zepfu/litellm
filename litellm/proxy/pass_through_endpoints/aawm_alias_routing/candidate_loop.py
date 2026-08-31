@@ -1862,18 +1862,28 @@ async def handle_alias_route(  # noqa: PLR0915
                     candidate=candidate,
                     kimi_failure_metadata=kimi_failure_metadata,
                 )
+                marker_reason: str | None = None
                 if deterministically_ineligible and fresh_dispatch:
+                    marker_reason = (
+                        getattr(failure_exc, "ineligibility_reason", None)
+                        or "deterministic_candidate_ineligible"
+                    )
+                elif (
+                    fresh_dispatch
+                    and _error_signals._is_codex_auto_agent_cursor_agent_candidate(
+                        candidate
+                    )
+                    and error_class
+                    in {"upstream_timeout", "upstream_transient_internal"}
+                ):
+                    marker_reason = error_class
+                if marker_reason is not None:
                     try:
                         semantic_marker = (
                             await alias_routing_state.mark_candidate_semantic_ineligibility(
                                 alias_family=alias_family,
                                 candidate_key=cooldown_key,
-                                reason=getattr(
-                                    failure_exc,
-                                    "ineligibility_reason",
-                                    None,
-                                )
-                                or "deterministic_candidate_ineligible",
+                                reason=marker_reason,
                             )
                         )
                     except Exception:
