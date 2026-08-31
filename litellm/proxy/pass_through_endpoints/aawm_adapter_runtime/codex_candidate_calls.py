@@ -1374,6 +1374,11 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.sse import (
         _responses_sse_from_repaired_response_body,
     )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.anthropic_adapter_calls import (
+        _build_adapted_route_rollup_kwargs,
+        _record_adapted_completed_route_rollup_after_stream,
+        _record_adapted_completed_route_rollup_turn,
+    )
 
     if candidate.get("route_family") != "codex_cursor_agent_aiserver_adapter":
         raise ValueError(
@@ -1382,6 +1387,10 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         )
 
     request_body = dict(candidate_body)
+    litellm_metadata = request_body.get("litellm_metadata")
+    rollup_kwargs = _build_adapted_route_rollup_kwargs(
+        litellm_metadata if isinstance(litellm_metadata, dict) else {}
+    )
     replay_state: Optional[dict[str, Any]] = None
     previous_response_id = request_body.get("previous_response_id")
     if isinstance(previous_response_id, str) and previous_response_id:
@@ -1449,13 +1458,21 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         else:
             await retained_session.aclose()
         if bool(request_body.get("stream")):
-            return StreamingResponse(
-                _responses_sse_from_repaired_response_body(
-                    response_body,
-                    request_body=request_body,
+            return _record_adapted_completed_route_rollup_after_stream(
+                StreamingResponse(
+                    _responses_sse_from_repaired_response_body(
+                        response_body,
+                        request_body=request_body,
+                    ),
+                    media_type="text/event-stream",
                 ),
-                media_type="text/event-stream",
+                rollup_kwargs,
+                adapter_label="Cursor Agent",
             )
+        _record_adapted_completed_route_rollup_turn(
+            rollup_kwargs,
+            adapter_label="Cursor Agent",
+        )
         return Response(
             content=json.dumps(response_body, ensure_ascii=False),
             media_type="application/json",
@@ -1551,13 +1568,21 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             retained_session=result.retained_session,
         )
     if bool(request_body.get("stream")):
-        return StreamingResponse(
-            _responses_sse_from_repaired_response_body(
-                response_body,
-                request_body=request_body,
+        return _record_adapted_completed_route_rollup_after_stream(
+            StreamingResponse(
+                _responses_sse_from_repaired_response_body(
+                    response_body,
+                    request_body=request_body,
+                ),
+                media_type="text/event-stream",
             ),
-            media_type="text/event-stream",
+            rollup_kwargs,
+            adapter_label="Cursor Agent",
         )
+    _record_adapted_completed_route_rollup_turn(
+        rollup_kwargs,
+        adapter_label="Cursor Agent",
+    )
     return Response(
         content=json.dumps(response_body, ensure_ascii=False),
         media_type="application/json",

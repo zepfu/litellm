@@ -780,6 +780,21 @@ def test_cursor_retained_session_failure_closes_once() -> None:
 def test_cursor_stream_uses_responses_event_schema(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    recorded_rollups: list[dict[str, Any]] = []
+
+    def _record_rollup(rollup: dict[str, Any], **kwargs: Any) -> None:
+        recorded_rollups.append({"rollup": rollup, **kwargs})
+
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.anthropic_adapter_calls._record_adapted_completed_route_rollup_turn",
+        _record_rollup,
+    )
+    monkeypatch.setattr(
+        llm_passthrough_endpoints,
+        "_record_adapted_completed_route_rollup_turn",
+        _record_rollup,
+    )
+
     class FakeCursorClient:
         def __init__(self, **_kwargs: Any) -> None:
             pass
@@ -804,8 +819,16 @@ def test_cursor_stream_uses_responses_event_schema(
         "litellm.llms.cursor_agent.connect.CursorAgentConnectClient",
         FakeCursorClient,
     )
-    response = _call({"model": "work", "input": "run pwd", "stream": True})
+    response = _call(
+        {
+            "model": "work",
+            "input": "run pwd",
+            "stream": True,
+            "litellm_metadata": {"model_alias": "cursor-test"},
+        }
+    )
     assert isinstance(response, StreamingResponse)
+    assert recorded_rollups == []
 
     async def collect_events() -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -817,6 +840,16 @@ def test_cursor_stream_uses_responses_event_schema(
         return events
 
     events = asyncio.run(collect_events())
+    assert recorded_rollups == [
+        {
+            "rollup": {
+                "litellm_params": {
+                    "metadata": {"model_alias": "cursor-test"},
+                }
+            },
+            "adapter_label": "Cursor Agent",
+        }
+    ]
     event_types = [event["type"] for event in events]
     assert event_types == [
         "response.output_item.added",
@@ -829,6 +862,56 @@ def test_cursor_stream_uses_responses_event_schema(
     assert events[1]["arguments"] == '{"cmd":"pwd"}'
     assert events[2]["output_index"] == 0
     assert events[2]["item"]["type"] == "function_call"
+
+
+def test_cursor_non_stream_records_route_rollup_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded_rollups: list[dict[str, Any]] = []
+
+    def _record_rollup(rollup: dict[str, Any], **kwargs: Any) -> None:
+        recorded_rollups.append({"rollup": rollup, **kwargs})
+
+    monkeypatch.setattr(
+        "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.anthropic_adapter_calls._record_adapted_completed_route_rollup_turn",
+        _record_rollup,
+    )
+
+    class FakeCursorClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self,
+            _payload: dict[str, Any],
+            **_kwargs: Any,
+        ) -> CursorAgentRunResult:
+            return CursorAgentRunResult(text="done", turn_ended=True)
+
+    monkeypatch.setattr(
+        "litellm.llms.cursor_agent.connect.CursorAgentConnectClient",
+        FakeCursorClient,
+    )
+
+    response = _call(
+        {
+            "model": "work",
+            "input": "finish",
+            "litellm_metadata": {"model_alias": "cursor-test"},
+        }
+    )
+
+    assert response.status_code == 200
+    assert recorded_rollups == [
+        {
+            "rollup": {
+                "litellm_params": {
+                    "metadata": {"model_alias": "cursor-test"},
+                }
+            },
+            "adapter_label": "Cursor Agent",
+        }
+    ]
 
 
 def test_cursor_text_requires_turn_ended_and_tool_boundary_does_not(
