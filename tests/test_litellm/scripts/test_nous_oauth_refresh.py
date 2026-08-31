@@ -551,6 +551,99 @@ def test_refresh_updates_nous_provider_and_matching_pool_entry(
     assert nous_pool["last_status"] == "ok"
 
 
+def test_refresh_uses_persisted_lifetime_when_provider_lifetime_is_missing(
+    nous, tmp_path: Path
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    _write_hermes(
+        auth_path,
+        _hermes_document(
+            nous_record=_nous_record(
+                expires_at="2026-08-30T00:02:00Z",
+                agent_key_expires_at="2026-08-30T00:02:00Z",
+                expires_in=None,
+                obtained_at="2026-08-30T00:00:00Z",
+            )
+        ),
+    )
+
+    with patch.object(
+        nous.urllib_request,
+        "urlopen",
+        return_value=_Response({"access_token": "new-access"}),
+    ):
+        result = _refresh(nous, auth_path, force=True)
+
+    persisted = json.loads(auth_path.read_text(encoding="utf-8"))
+    provider = persisted["providers"]["nous"]
+    obtained_at = nous._parse_expires_at(provider["obtained_at"])
+    expires_at = nous._parse_expires_at(provider["expires_at"])
+    assert result["refreshed"] is True
+    assert result["auth_degraded"] is False
+    assert result["lifetime_source"] == "persisted"
+    assert provider["expires_in"] == 120
+    assert provider["expires_in_source"] == "persisted"
+    assert obtained_at is not None
+    assert expires_at is not None
+    assert (expires_at - obtained_at).total_seconds() == 120
+
+
+def test_missing_provider_lifetime_persists_and_reports_degraded_fallback(
+    nous, tmp_path: Path
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    _write_hermes(
+        auth_path,
+        _hermes_document(
+            nous_record=_nous_record(
+                expires_at=None,
+                agent_key_expires_at=None,
+                expires_in=None,
+                obtained_at=None,
+            )
+        ),
+    )
+
+    with patch.object(
+        nous.urllib_request,
+        "urlopen",
+        return_value=_Response({"access_token": "new-access"}),
+    ):
+        result = _refresh(nous, auth_path, force=True)
+
+    persisted = json.loads(auth_path.read_text(encoding="utf-8"))
+    provider = persisted["providers"]["nous"]
+    obtained_at = nous._parse_expires_at(provider["obtained_at"])
+    expires_at = nous._parse_expires_at(provider["expires_at"])
+    assert result["refreshed"] is True
+    assert result["auth_degraded"] is True
+    assert result["lifetime_source"] == "degraded_fallback"
+    assert result["refresh_threshold_source"] == "degraded_fallback"
+    assert result["refresh_threshold_degraded"] is True
+    assert provider["expires_in"] == nous.DEFAULT_NOUS_OAUTH_DEGRADED_LIFETIME_SECONDS
+    assert provider["expires_in_source"] == "degraded_fallback"
+    assert obtained_at is not None
+    assert expires_at is not None
+    assert (
+        expires_at - obtained_at
+    ).total_seconds() == nous.DEFAULT_NOUS_OAUTH_DEGRADED_LIFETIME_SECONDS
+
+    eligibility = nous.inspect_nous_oauth_refresh_eligibility(
+        auth_path,
+        now=lambda: obtained_at,
+    )
+    assert eligibility["credential_health"] == "degraded"
+    assert eligibility["auth_degraded"] is True
+    assert eligibility["lifetime_source"] == "degraded_fallback"
+    assert eligibility["refresh_threshold_source"] == "degraded_fallback"
+    assert eligibility["refresh_threshold_degraded"] is True
+
+    health = nous.inspect_nous_oauth_credential_health(auth_path)
+    assert health["health_status"] == "degraded"
+    assert health["auth_degraded"] is True
+    assert health["lifetime_source"] == "degraded_fallback"
+
+
 def test_refresh_preserves_unrelated_hermes_fields(nous, tmp_path: Path) -> None:
     auth_path = tmp_path / "auth.json"
     original = _hermes_document(

@@ -41,6 +41,7 @@ DEFAULT_NOUS_OAUTH_TOKEN_ENDPOINT = "https://portal.nousresearch.com/api/oauth/t
 DEFAULT_NOUS_OAUTH_CLIENT_ID = "hermes-cli"
 DEFAULT_NOUS_OAUTH_SCOPE = "inference:invoke"
 DEFAULT_NOUS_OAUTH_REFRESH_MIN_SECONDS = 300
+DEFAULT_NOUS_OAUTH_DEGRADED_LIFETIME_SECONDS = 300
 DEFAULT_NOUS_OAUTH_REFRESH_INTERVAL_SECONDS = 300
 DEFAULT_NOUS_OAUTH_HTTP_TIMEOUT_SECONDS = 30.0
 DEFAULT_NOUS_OAUTH_AUTH_FILE_MODE = 0o600
@@ -49,6 +50,17 @@ DEFAULT_NOUS_OAUTH_ERROR_MESSAGE_LIMIT = 500
 NOUS_REFRESH_TOKEN_HEADER = "x-nous-refresh-token"
 _SECRET_FIELD_NAMES = DEFAULT_SECRET_FIELD_NAMES
 _TOKEN_PATH = "/api/oauth/token"
+_LIFETIME_SOURCE_FIELD = "expires_in_source"
+_LIFETIME_SOURCE_PROVIDER = "provider"
+_LIFETIME_SOURCE_JWT = "jwt"
+_LIFETIME_SOURCE_PERSISTED = "persisted"
+_LIFETIME_SOURCE_DEGRADED = "degraded_fallback"
+_LIFETIME_SOURCES = {
+    _LIFETIME_SOURCE_PROVIDER,
+    _LIFETIME_SOURCE_JWT,
+    _LIFETIME_SOURCE_PERSISTED,
+    _LIFETIME_SOURCE_DEGRADED,
+}
 
 
 def _issued_lifetime_seconds(
@@ -61,27 +73,84 @@ def _issued_lifetime_seconds(
     Priority order: provider expires_in; validated JWT iat/exp.
     Returns None when no usable lifetime metadata is available.
     """
-    if expires_in is not None:
-        val = _as_finite_number(expires_in)
-        if val is not None and val > 0:
-            return val
-    if access_token is not None:
-        try:
-            parts = access_token.split(".")
-            if len(parts) >= 2:
-                payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-                claims = json.loads(
-                    base64.urlsafe_b64decode(payload_b64.encode("ascii"))
-                )
-                iat = claims.get("iat")
-                exp = claims.get("exp")
-                if isinstance(iat, (int, float)) and isinstance(exp, (int, float)):
-                    lifetime = float(exp) - float(iat)
-                    if lifetime > 0 and math.isfinite(lifetime):
-                        return lifetime
-        except Exception:
-            pass
-    return None
+    lifetime, _source, _degraded = _issued_lifetime_metadata(
+        expires_in=expires_in,
+        access_token=access_token,
+    )
+    return lifetime
+
+
+def _issued_lifetime_metadata(
+    *,
+    expires_in: Any = None,
+    access_token: Optional[str] = None,
+    obtained_at: Any = None,
+    refreshed_at: Any = None,
+    expires_at: Any = None,
+    persisted_source: Optional[str] = None,
+    fallback_seconds: Optional[float] = None,
+) -> tuple[Optional[float], Optional[str], bool]:
+    """Resolve lifetime and its provenance without treating fallback as measured."""
+    provider_lifetime = _as_finite_number(expires_in)
+    if provider_lifetime is not None and provider_lifetime > 0:
+        return provider_lifetime, _LIFETIME_SOURCE_PROVIDER, False
+
+    jwt_lifetime = _validated_access_token_jwt_lifetime(access_token)
+    if jwt_lifetime is not None:
+        return jwt_lifetime, _LIFETIME_SOURCE_JWT, False
+
+    persisted_lifetime = _persisted_lifetime_seconds(
+        obtained_at=obtained_at,
+        refreshed_at=refreshed_at,
+        expires_at=expires_at,
+    )
+    if persisted_lifetime is not None:
+        if persisted_source == _LIFETIME_SOURCE_DEGRADED:
+            return persisted_lifetime, _LIFETIME_SOURCE_DEGRADED, True
+        return persisted_lifetime, _LIFETIME_SOURCE_PERSISTED, False
+
+    fallback = _as_finite_number(fallback_seconds)
+    if fallback is not None and fallback > 0:
+        return fallback, _LIFETIME_SOURCE_DEGRADED, True
+    return None, None, False
+
+
+def _validated_access_token_jwt_lifetime(
+    access_token: Optional[str],
+) -> Optional[float]:
+    if not isinstance(access_token, str):
+        return None
+    parts = access_token.split(".")
+    if len(parts) != 3 or any(not part for part in parts):
+        return None
+    try:
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        payload = base64.b64decode(
+            payload_b64.encode("ascii"),
+            altchars=b"-_",
+            validate=True,
+        )
+        claims = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(claims, Mapping):
+        return None
+
+    iat = _jwt_numeric_claim(claims.get("iat"))
+    exp = _jwt_numeric_claim(claims.get("exp"))
+    if iat is None or exp is None:
+        return None
+    lifetime = exp - iat
+    if lifetime <= 0 or not math.isfinite(lifetime):
+        return None
+    return lifetime
+
+
+def _jwt_numeric_claim(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
 def _refresh_threshold_seconds(
@@ -110,6 +179,10 @@ class NousOAuthRefreshSummary:
     expires_at: Optional[str] = None
     error_class: Optional[str] = None
     error_message: Optional[str] = None
+    auth_degraded: bool = False
+    lifetime_source: Optional[str] = None
+    refresh_threshold_source: Optional[str] = None
+    refresh_threshold_degraded: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -121,6 +194,10 @@ class NousOAuthRefreshSummary:
             "expires_at": self.expires_at,
             "error_class": self.error_class,
             "error_message": self.error_message,
+            "auth_degraded": self.auth_degraded,
+            "lifetime_source": self.lifetime_source,
+            "refresh_threshold_source": self.refresh_threshold_source,
+            "refresh_threshold_degraded": self.refresh_threshold_degraded,
         }
 
 
@@ -134,6 +211,9 @@ def inspect_nous_oauth_credential_health(
         payload = _read_credential_payload(resolved_auth_file)
         record = _select_nous_record(payload)
         expires_at = _earliest_expiry(record)
+        _lifetime, lifetime_source, lifetime_degraded = _record_lifetime_metadata(
+            record
+        )
         usable = _record_usable(record)
         if expires_at is None:
             return _health_summary(
@@ -142,6 +222,8 @@ def inspect_nous_oauth_credential_health(
                 "degraded",
                 error_class="CredentialExpiryUnavailable",
                 error_message="Nous OAuth credential expires_at is missing or invalid.",
+                auth_degraded=True,
+                lifetime_source=lifetime_source or _LIFETIME_SOURCE_DEGRADED,
             )
         if expires_at <= datetime.now(timezone.utc):
             return _health_summary(
@@ -151,9 +233,30 @@ def inspect_nous_oauth_credential_health(
                 expires_at,
                 error_class="CredentialExpiredError",
                 error_message="Nous OAuth credential is expired.",
+                auth_degraded=lifetime_degraded,
+                lifetime_source=lifetime_source,
+            )
+        if lifetime_degraded:
+            return _health_summary(
+                resolved_auth_file,
+                resolved_scope,
+                "degraded",
+                expires_at,
+                error_class="CredentialExpiryDegraded",
+                error_message=(
+                    "Nous OAuth credential expiry uses a degraded lifetime fallback."
+                ),
+                usable=usable,
+                auth_degraded=True,
+                lifetime_source=lifetime_source,
             )
         return _health_summary(
-            resolved_auth_file, resolved_scope, "fresh", expires_at, usable=usable
+            resolved_auth_file,
+            resolved_scope,
+            "fresh",
+            expires_at,
+            usable=usable,
+            lifetime_source=lifetime_source,
         )
     except Exception as exc:
         return _health_summary(
@@ -163,6 +266,7 @@ def inspect_nous_oauth_credential_health(
             error_class=exc.__class__.__name__,
             error_message=_sanitize_error_message(str(exc)),
             usable=False,
+            auth_degraded=True,
         )
 
 
@@ -180,12 +284,20 @@ def inspect_nous_oauth_refresh_eligibility(
         payload = _read_credential_payload(resolved_auth_file)
         record = _select_nous_record(payload)
         usable = _record_usable(record)
-        threshold_seconds = _refresh_threshold_seconds(
-            expires_in=record.get("expires_in"),
-            access_token=record.get("access_token"),
+        (
+            threshold_seconds,
+            threshold_source,
+            threshold_degraded,
+        ) = _refresh_threshold_metadata(
+            record,
+            min_seconds=buffer_seconds,
+        )
+        _lifetime, lifetime_source, lifetime_degraded = _record_lifetime_metadata(
+            record
         )
         expires_at, expiry_unavailable = _earliest_expiry_with_status(record)
         identity = _credential_identity(resolved_auth_file, record)
+        auth_degraded = expiry_unavailable or lifetime_degraded
         if expiry_unavailable:
             return _eligibility_summary(
                 observed_at=observed_at,
@@ -200,6 +312,10 @@ def inspect_nous_oauth_refresh_eligibility(
                 error_message="Nous OAuth credential expires_at is missing or invalid.",
                 credential_identity=identity,
                 refresh_threshold_seconds=threshold_seconds,
+                auth_degraded=True,
+                lifetime_source=lifetime_source or _LIFETIME_SOURCE_DEGRADED,
+                refresh_threshold_source=threshold_source,
+                refresh_threshold_degraded=threshold_degraded,
             )
         assert expires_at is not None
         refresh_due_at = expires_at - timedelta(seconds=threshold_seconds)
@@ -213,10 +329,20 @@ def inspect_nous_oauth_refresh_eligibility(
                 else observed_at + timedelta(seconds=max(1.0, poll_interval_seconds))
             ),
             eligible=observed_at >= refresh_due_at,
-            credential_health="expired" if expires_at <= observed_at else "fresh",
+            credential_health=(
+                "expired"
+                if expires_at <= observed_at
+                else "degraded"
+                if auth_degraded
+                else "fresh"
+            ),
             usable=usable and expires_at > observed_at,
             credential_identity=identity,
             refresh_threshold_seconds=threshold_seconds,
+            auth_degraded=auth_degraded,
+            lifetime_source=lifetime_source,
+            refresh_threshold_source=threshold_source,
+            refresh_threshold_degraded=threshold_degraded,
         )
     except Exception as exc:
         return _eligibility_summary(
@@ -231,6 +357,10 @@ def inspect_nous_oauth_refresh_eligibility(
             error_class=exc.__class__.__name__,
             error_message=_sanitize_error_message(str(exc)),
             credential_identity=_credential_identity(resolved_auth_file),
+            auth_degraded=True,
+            lifetime_source=_LIFETIME_SOURCE_DEGRADED,
+            refresh_threshold_source=_LIFETIME_SOURCE_DEGRADED,
+            refresh_threshold_degraded=True,
         )
 
 
@@ -253,6 +383,10 @@ def refresh_nous_oauth_auth_file(
     )
     current_scope = DEFAULT_NOUS_OAUTH_SCOPE
     current_expires_at: Optional[str] = None
+    current_auth_degraded = False
+    current_lifetime_source: Optional[str] = None
+    current_refresh_threshold_source: Optional[str] = None
+    current_refresh_threshold_degraded = False
 
     if not force:
         eligibility = inspect_nous_oauth_refresh_eligibility(
@@ -267,6 +401,14 @@ def refresh_nous_oauth_auth_file(
                 auth_file=str(resolved_auth_file),
                 scope=current_scope,
                 expires_at=eligibility.get("expires_at"),
+                auth_degraded=bool(eligibility.get("auth_degraded")),
+                lifetime_source=eligibility.get("lifetime_source"),
+                refresh_threshold_source=eligibility.get(
+                    "refresh_threshold_source"
+                ),
+                refresh_threshold_degraded=bool(
+                    eligibility.get("refresh_threshold_degraded")
+                ),
             ).as_dict()
 
     try:
@@ -277,6 +419,16 @@ def refresh_nous_oauth_auth_file(
                 _clean_oauth_string(record.get("scope")) or DEFAULT_NOUS_OAUTH_SCOPE
             )
             current_expires_at = _format_expires_at(_earliest_expiry(record))
+            (
+                _,
+                current_lifetime_source,
+                current_auth_degraded,
+            ) = _record_lifetime_metadata(record)
+            (
+                _,
+                current_refresh_threshold_source,
+                current_refresh_threshold_degraded,
+            ) = _refresh_threshold_metadata(record)
             if not force and not _credential_needs_refresh(
                 record, buffer_seconds=resolved_buffer_seconds
             ):
@@ -287,6 +439,10 @@ def refresh_nous_oauth_auth_file(
                     auth_file=str(resolved_auth_file),
                     scope=current_scope,
                     expires_at=current_expires_at,
+                    auth_degraded=current_auth_degraded,
+                    lifetime_source=current_lifetime_source,
+                    refresh_threshold_source=current_refresh_threshold_source,
+                    refresh_threshold_degraded=current_refresh_threshold_degraded,
                 ).as_dict()
 
             refreshed = _refresh_credential_record(
@@ -297,6 +453,16 @@ def refresh_nous_oauth_auth_file(
             _apply_refreshed_tokens(payload, record, refreshed)
             _write_credential_payload(resolved_auth_file, payload)
             updated = _select_nous_record(payload)
+            (
+                _,
+                updated_lifetime_source,
+                updated_auth_degraded,
+            ) = _record_lifetime_metadata(updated)
+            (
+                _,
+                updated_threshold_source,
+                updated_threshold_degraded,
+            ) = _refresh_threshold_metadata(updated)
             return NousOAuthRefreshSummary(
                 attempted=True,
                 refreshed=True,
@@ -304,6 +470,10 @@ def refresh_nous_oauth_auth_file(
                 auth_file=str(resolved_auth_file),
                 scope=_clean_oauth_string(updated.get("scope")) or current_scope,
                 expires_at=_format_expires_at(_earliest_expiry(updated)),
+                auth_degraded=updated_auth_degraded,
+                lifetime_source=updated_lifetime_source,
+                refresh_threshold_source=updated_threshold_source,
+                refresh_threshold_degraded=updated_threshold_degraded,
             ).as_dict()
     except Exception as exc:
         error_class, error_message = _classify_oauth_error(exc)
@@ -316,6 +486,10 @@ def refresh_nous_oauth_auth_file(
             expires_at=current_expires_at,
             error_class=error_class,
             error_message=error_message,
+            auth_degraded=current_auth_degraded,
+            lifetime_source=current_lifetime_source,
+            refresh_threshold_source=current_refresh_threshold_source,
+            refresh_threshold_degraded=current_refresh_threshold_degraded,
         ).as_dict()
 
 
@@ -327,6 +501,8 @@ def _health_summary(
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
     usable: bool = True,
+    auth_degraded: bool = False,
+    lifetime_source: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "attempted": True,
@@ -339,6 +515,8 @@ def _health_summary(
         "error_class": error_class,
         "error_message": error_message,
         "usable": usable and health_status == "fresh",
+        "auth_degraded": auth_degraded,
+        "lifetime_source": lifetime_source,
     }
 
 
@@ -355,6 +533,10 @@ def _eligibility_summary(
     error_message: Optional[str] = None,
     credential_identity: Optional[str] = None,
     refresh_threshold_seconds: Optional[float] = None,
+    auth_degraded: bool = False,
+    lifetime_source: Optional[str] = None,
+    refresh_threshold_source: Optional[str] = None,
+    refresh_threshold_degraded: bool = False,
 ) -> Dict[str, Any]:
     return {
         "eligibility_checked_at": _format_expires_at(observed_at),
@@ -368,6 +550,10 @@ def _eligibility_summary(
         "error_message": error_message,
         "credential_identity": credential_identity,
         "refresh_threshold_seconds": refresh_threshold_seconds,
+        "auth_degraded": auth_degraded,
+        "lifetime_source": lifetime_source,
+        "refresh_threshold_source": refresh_threshold_source,
+        "refresh_threshold_degraded": refresh_threshold_degraded,
     }
 
 
@@ -539,6 +725,70 @@ def _earliest_expiry_with_status(
     return min(parsed), False
 
 
+def _record_lifetime_metadata(
+    record: Mapping[str, Any],
+) -> tuple[Optional[float], Optional[str], bool]:
+    stored_source = _clean_oauth_string(record.get(_LIFETIME_SOURCE_FIELD))
+    lifetime, source, degraded = _issued_lifetime_metadata(
+        expires_in=record.get("expires_in"),
+        access_token=record.get("access_token"),
+        obtained_at=record.get("obtained_at"),
+        refreshed_at=record.get("refreshed_at"),
+        expires_at=record.get("expires_at"),
+    )
+    if stored_source == _LIFETIME_SOURCE_DEGRADED:
+        return lifetime, _LIFETIME_SOURCE_DEGRADED, True
+    if lifetime is None:
+        return None, _LIFETIME_SOURCE_DEGRADED, True
+    if stored_source in _LIFETIME_SOURCES:
+        return lifetime, stored_source, False
+    return lifetime, source, degraded
+
+
+def _refresh_threshold_metadata(
+    record: Mapping[str, Any],
+    *,
+    min_seconds: float = DEFAULT_NOUS_OAUTH_REFRESH_MIN_SECONDS,
+) -> tuple[float, str, bool]:
+    lifetime, source, degraded = _record_lifetime_metadata(record)
+    if lifetime is None:
+        return (
+            float(min_seconds),
+            _LIFETIME_SOURCE_DEGRADED,
+            True,
+        )
+    return (
+        max(float(min_seconds), lifetime * 0.5),
+        source or _LIFETIME_SOURCE_DEGRADED,
+        degraded,
+    )
+
+
+def _persisted_lifetime_seconds(
+    *,
+    obtained_at: Any = None,
+    refreshed_at: Any = None,
+    expires_at: Any = None,
+) -> Optional[float]:
+    try:
+        expiry = _parse_expires_at(expires_at)
+    except (OverflowError, OSError, ValueError):
+        return None
+    if expiry is None:
+        return None
+    for issued_at_raw in (refreshed_at, obtained_at):
+        try:
+            issued_at = _parse_expires_at(issued_at_raw)
+        except (OverflowError, OSError, ValueError):
+            continue
+        if issued_at is None:
+            continue
+        lifetime = (expiry - issued_at).total_seconds()
+        if lifetime > 0 and math.isfinite(lifetime):
+            return lifetime
+    return None
+
+
 def _credential_needs_refresh(
     record: Mapping[str, Any], *, buffer_seconds: int
 ) -> bool:
@@ -551,9 +801,9 @@ def _credential_needs_refresh(
     expires_at, unavailable = _earliest_expiry_with_status(record)
     if unavailable or expires_at is None:
         return True
-    threshold = _refresh_threshold_seconds(
-        expires_in=record.get("expires_in"),
-        access_token=record.get("access_token"),
+    threshold, _source, _degraded = _refresh_threshold_metadata(
+        record,
+        min_seconds=buffer_seconds,
     )
     return datetime.now(timezone.utc) >= expires_at - timedelta(seconds=threshold)
 
@@ -660,15 +910,20 @@ def _apply_refreshed_tokens(
     if access_token is None:
         raise ValueError("Nous OAuth refresh response did not contain an access_token.")
     rotated_refresh = _clean_oauth_string(refreshed.get("refresh_token"))
-    expires_in = refreshed.get("expires_in")
+    lifetime, lifetime_source, _lifetime_degraded = _issued_lifetime_metadata(
+        expires_in=refreshed.get("expires_in"),
+        access_token=access_token,
+        obtained_at=selected.get("obtained_at"),
+        refreshed_at=selected.get("refreshed_at"),
+        expires_at=selected.get("expires_at"),
+        persisted_source=_clean_oauth_string(selected.get(_LIFETIME_SOURCE_FIELD)),
+        fallback_seconds=DEFAULT_NOUS_OAUTH_DEGRADED_LIFETIME_SECONDS,
+    )
+    if lifetime is None or lifetime_source is None:
+        raise ValueError("Nous OAuth refresh lifetime could not be resolved.")
     now = datetime.now(timezone.utc)
-    if isinstance(expires_in, (int, float)):
-        expires_at = now + timedelta(seconds=float(expires_in))
-        expires_at_text = _format_expires_at(expires_at)
-        expires_in_value: Any = int(expires_in)
-    else:
-        expires_at_text = _format_expires_at(now + timedelta(seconds=3600))
-        expires_in_value = 3600
+    expires_at_text = _format_expires_at(now + timedelta(seconds=lifetime))
+    expires_in_value: Any = _serialize_lifetime(lifetime)
 
     updates: Dict[str, Any] = {
         "access_token": access_token,
@@ -678,9 +933,12 @@ def _apply_refreshed_tokens(
         "expires_in": expires_in_value,
         "agent_key_expires_at": expires_at_text,
         "agent_key_expires_in": expires_in_value,
+        _LIFETIME_SOURCE_FIELD: lifetime_source,
         "obtained_at": _format_expires_at(now),
         "agent_key_obtained_at": _format_expires_at(now),
     }
+    if "refreshed_at" in selected:
+        updates["refreshed_at"] = _format_expires_at(now)
     if rotated_refresh is not None:
         updates["refresh_token"] = rotated_refresh
     token_type = _clean_oauth_string(refreshed.get("token_type"))
@@ -744,6 +1002,10 @@ def _as_finite_number(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _serialize_lifetime(value: float) -> int | float:
+    return int(value) if value.is_integer() else value
 
 
 def _sanitize_error_message(
