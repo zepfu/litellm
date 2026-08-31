@@ -438,6 +438,74 @@ def test_credential_needs_refresh_missing_expires_at_fail_safe(grok) -> None:
     )
 
 
+def test_eligibility_uses_persisted_timestamp_lifetime(grok, tmp_path: Path) -> None:
+    issued_at = datetime.fromtimestamp(1_000, timezone.utc)
+    expires_at = datetime.fromtimestamp(1_900, timezone.utc)
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                grok.DEFAULT_GROK_OIDC_SCOPE: {
+                    "access_token": "opaque-access",
+                    "refresh_token": "old-refresh",
+                    "obtained_at": issued_at.isoformat().replace("+00:00", "Z"),
+                    "expires_at": expires_at.isoformat().replace("+00:00", "Z"),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = grok.inspect_grok_oidc_refresh_eligibility(
+        auth_path,
+        now=lambda: issued_at,
+        poll_interval_seconds=300,
+    )
+
+    assert result["refresh_threshold_seconds"] == 450.0
+    assert result["refresh_threshold_source"] == "persisted_timestamp"
+    assert result["refresh_threshold_degraded"] is False
+    assert result["refresh_due_at"] == "1970-01-01T00:24:10Z"
+    assert result["eligible"] is False
+
+
+def test_missing_lifetime_is_explicitly_degraded_in_eligibility_and_summary(
+    grok, tmp_path: Path
+) -> None:
+    observed_at = datetime.now(timezone.utc)
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            _scoped_payload(
+                grok,
+                expires_at=observed_at + timedelta(hours=2),
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    eligibility = grok.inspect_grok_oidc_refresh_eligibility(
+        auth_path,
+        now=lambda: observed_at,
+        poll_interval_seconds=300,
+    )
+    summary = grok.refresh_grok_oidc_auth_file(
+        auth_path,
+        buffer_seconds=300,
+        force=False,
+    )
+
+    assert eligibility["credential_health"] == "fresh"
+    assert eligibility["refresh_threshold_seconds"] == 300.0
+    assert eligibility["refresh_threshold_source"] == "fallback"
+    assert eligibility["refresh_threshold_degraded"] is True
+    assert summary["skipped"] is True
+    assert summary["auth_degraded"] is True
+    assert summary["refresh_threshold_seconds"] == 300.0
+    assert summary["refresh_threshold_source"] == "fallback"
+    assert summary["refresh_threshold_degraded"] is True
+
+
 def test_credential_needs_refresh_respects_buffer(grok) -> None:
     fresh = {
         "access_token": "t",

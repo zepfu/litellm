@@ -61,6 +61,10 @@ def test_refresh_grok_oidc_auth_file_skips_when_credential_is_still_valid(
         ]["expires_at"],
         "error_class": None,
         "error_message": None,
+        "auth_degraded": True,
+        "refresh_threshold_seconds": 300.0,
+        "refresh_threshold_source": "fallback",
+        "refresh_threshold_degraded": True,
     }
 
 

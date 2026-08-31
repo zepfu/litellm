@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, Mapping, MutableMapping, Optional
+from typing import Any, Callable, Dict, Iterator, Mapping, MutableMapping, Optional, Tuple
 from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
@@ -51,49 +51,105 @@ def _issued_lifetime_seconds(
     *,
     expires_in: Any = None,
     access_token: Optional[str] = None,
+    expires_at: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+    refreshed_at: Any = None,
 ) -> Optional[float]:
-    """Derive issued access-token lifetime from provider metadata.
+    lifetime, _source = _issued_lifetime_metadata(
+        expires_in=expires_in,
+        access_token=access_token,
+        expires_at=expires_at,
+        issued_at=issued_at,
+        obtained_at=obtained_at,
+        refreshed_at=refreshed_at,
+    )
+    return lifetime
 
-    Priority order: provider expires_in; validated JWT iat/exp.
-    Returns None when no usable lifetime metadata is available.
+
+def _issued_lifetime_metadata(
+    *,
+    expires_in: Any = None,
+    access_token: Optional[str] = None,
+    expires_at: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+    refreshed_at: Any = None,
+) -> Tuple[Optional[float], str]:
+    """Derive an issued lifetime and identify the authoritative source.
+
+    Authority order is provider ``expires_in``, validated JWT ``iat``/``exp``,
+    then a persisted obtained/refreshed timestamp paired with ``expires_at``.
     """
-    if expires_in is not None:
-        val = _as_finite_number(expires_in)
-        if val is not None and val > 0:
-            return val
-    if access_token is not None:
-        try:
-            parts = access_token.split(".")
-            if len(parts) >= 2:
-                payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-                claims = json.loads(
-                    base64.urlsafe_b64decode(payload_b64.encode("ascii"))
-                )
-                iat = claims.get("iat")
-                exp = claims.get("exp")
-                if isinstance(iat, (int, float)) and isinstance(exp, (int, float)):
-                    lifetime = float(exp) - float(iat)
-                    if lifetime > 0 and math.isfinite(lifetime):
-                        return lifetime
-        except Exception:
-            pass
-    return None
+    provider_lifetime = _as_finite_number(expires_in)
+    if provider_lifetime is not None and provider_lifetime > 0:
+        return provider_lifetime, "expires_in"
+
+    jwt_claims = _jwt_time_claims(access_token)
+    if jwt_claims is not None:
+        issued_timestamp, expiry_timestamp = jwt_claims
+        return expiry_timestamp - issued_timestamp, "jwt"
+
+    persisted_issued_at = _first_timestamp_seconds(
+        issued_at,
+        obtained_at,
+        refreshed_at,
+    )
+    persisted_expires_at = _timestamp_seconds(expires_at)
+    if (
+        persisted_issued_at is not None
+        and persisted_expires_at is not None
+        and persisted_expires_at > persisted_issued_at
+    ):
+        return persisted_expires_at - persisted_issued_at, "persisted_timestamp"
+
+    return None, "fallback"
 
 
 def _refresh_threshold_seconds(
     *,
     expires_in: Any = None,
     access_token: Optional[str] = None,
+    expires_at: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+    refreshed_at: Any = None,
     min_seconds: float = DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS,
 ) -> float:
     """Return proportional refresh threshold (max of min or half-life)."""
-    lifetime = _issued_lifetime_seconds(
+    threshold, _source, _degraded = _refresh_threshold_metadata(
         expires_in=expires_in,
         access_token=access_token,
+        expires_at=expires_at,
+        issued_at=issued_at,
+        obtained_at=obtained_at,
+        refreshed_at=refreshed_at,
+        min_seconds=min_seconds,
     )
-    if lifetime is None or lifetime <= 0:
-        return float(min_seconds)
-    return max(float(min_seconds), lifetime * 0.5)
+    return threshold
+
+
+def _refresh_threshold_metadata(
+    *,
+    expires_in: Any = None,
+    access_token: Optional[str] = None,
+    expires_at: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+    refreshed_at: Any = None,
+    min_seconds: float = DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS,
+) -> Tuple[float, str, bool]:
+    lifetime, source = _issued_lifetime_metadata(
+        expires_in=expires_in,
+        access_token=access_token,
+        expires_at=expires_at,
+        issued_at=issued_at,
+        obtained_at=obtained_at,
+        refreshed_at=refreshed_at,
+    )
+    if lifetime is None:
+        return float(min_seconds), "fallback", True
+    return max(float(min_seconds), lifetime * 0.5), source, False
 
 
 @dataclass(frozen=True)
@@ -106,6 +162,10 @@ class XaiOAuthRefreshSummary:
     expires_at: Optional[str] = None
     error_class: Optional[str] = None
     error_message: Optional[str] = None
+    auth_degraded: bool = False
+    refresh_threshold_seconds: Optional[float] = None
+    refresh_threshold_source: Optional[str] = None
+    refresh_threshold_degraded: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -117,6 +177,10 @@ class XaiOAuthRefreshSummary:
             "expires_at": self.expires_at,
             "error_class": self.error_class,
             "error_message": self.error_message,
+            "auth_degraded": self.auth_degraded,
+            "refresh_threshold_seconds": self.refresh_threshold_seconds,
+            "refresh_threshold_source": self.refresh_threshold_source,
+            "refresh_threshold_degraded": self.refresh_threshold_degraded,
         }
 
 
@@ -223,8 +287,11 @@ def refresh_xai_oauth_auth_file(
         with _credential_file_lock(resolved_lock_file):
             raw_payload = _read_credential_payload(resolved_auth_file)
             credential = _select_credential_record(raw_payload, resolved_scope)
+            threshold, threshold_source, threshold_degraded = (
+                _credential_refresh_threshold_metadata(credential)
+            )
             current_expires_at = _format_expires_at(
-                _parse_expires_at(credential.get("expires_at"))
+                _credential_expires_at(credential)
             )
 
             if not force and not _credential_needs_refresh(
@@ -238,6 +305,10 @@ def refresh_xai_oauth_auth_file(
                     auth_file=str(resolved_auth_file),
                     scope=resolved_scope,
                     expires_at=current_expires_at,
+                    auth_degraded=threshold_degraded,
+                    refresh_threshold_seconds=threshold,
+                    refresh_threshold_source=threshold_source,
+                    refresh_threshold_degraded=threshold_degraded,
                 ).as_dict()
 
             refreshed = _refresh_credential_record(
@@ -250,6 +321,9 @@ def refresh_xai_oauth_auth_file(
             )
             _update_credential_record(credential, refreshed)
             _write_credential_payload(resolved_auth_file, raw_payload)
+            threshold, threshold_source, threshold_degraded = (
+                _credential_refresh_threshold_metadata(credential)
+            )
             return XaiOAuthRefreshSummary(
                 attempted=True,
                 refreshed=True,
@@ -257,10 +331,24 @@ def refresh_xai_oauth_auth_file(
                 auth_file=str(resolved_auth_file),
                 scope=resolved_scope,
                 expires_at=_format_expires_at(
-                    _parse_expires_at(credential.get("expires_at"))
+                    _credential_expires_at(credential)
                 ),
+                auth_degraded=threshold_degraded,
+                refresh_threshold_seconds=threshold,
+                refresh_threshold_source=threshold_source,
+                refresh_threshold_degraded=threshold_degraded,
             ).as_dict()
     except Exception as exc:
+        threshold: Optional[float] = None
+        threshold_source: Optional[str] = None
+        threshold_degraded = False
+        if "credential" in locals():
+            try:
+                threshold, threshold_source, threshold_degraded = (
+                    _credential_refresh_threshold_metadata(credential)
+                )
+            except Exception:
+                pass
         return XaiOAuthRefreshSummary(
             attempted=True,
             refreshed=False,
@@ -269,6 +357,10 @@ def refresh_xai_oauth_auth_file(
             scope=resolved_scope,
             error_class=exc.__class__.__name__,
             error_message=_sanitize_error_message(str(exc)),
+            auth_degraded=threshold_degraded,
+            refresh_threshold_seconds=threshold,
+            refresh_threshold_source=threshold_source,
+            refresh_threshold_degraded=threshold_degraded,
         ).as_dict()
 
 
@@ -289,13 +381,10 @@ def inspect_xai_oauth_refresh_eligibility(
         credential = _select_credential_record(payload, resolved_scope)
         if not _looks_like_credential_record(credential):
             raise ValueError("xAI OAuth credential has no usable access credential.")
-        threshold_seconds = _refresh_threshold_seconds(
-            expires_in=credential.get("expires_in"),
-            access_token=(
-                credential.get("access_token") or credential.get("key")
-            ),
+        threshold_seconds, threshold_source, threshold_degraded = (
+            _credential_refresh_threshold_metadata(credential)
         )
-        expires_at = _parse_expires_at(credential.get("expires_at"))
+        expires_at = _credential_expires_at(credential)
         usable = bool(
             _clean_oauth_string(credential.get("key"))
             or _clean_oauth_string(credential.get("access_token"))
@@ -313,6 +402,8 @@ def inspect_xai_oauth_refresh_eligibility(
                 error_class="CredentialExpiryUnavailable",
                 error_message="xAI OAuth credential expires_at is missing or invalid.",
                 refresh_threshold_seconds=threshold_seconds,
+                refresh_threshold_source=threshold_source,
+                refresh_threshold_degraded=threshold_degraded,
             )
         refresh_due_at = expires_at - timedelta(seconds=threshold_seconds)
         return _eligibility_summary(
@@ -328,6 +419,8 @@ def inspect_xai_oauth_refresh_eligibility(
             credential_health="expired" if expires_at <= observed_at else "fresh",
             usable=usable and expires_at > observed_at,
             refresh_threshold_seconds=threshold_seconds,
+            refresh_threshold_source=threshold_source,
+            refresh_threshold_degraded=threshold_degraded,
         )
     except Exception as exc:
         return _eligibility_summary(
@@ -341,6 +434,9 @@ def inspect_xai_oauth_refresh_eligibility(
             usable=False,
             error_class=exc.__class__.__name__,
             error_message=_sanitize_error_message(str(exc)),
+            refresh_threshold_seconds=float(DEFAULT_XAI_OAUTH_REFRESH_MIN_SECONDS),
+            refresh_threshold_source="fallback",
+            refresh_threshold_degraded=True,
         )
 
 
@@ -356,6 +452,8 @@ def _eligibility_summary(
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
     refresh_threshold_seconds: Optional[float] = None,
+    refresh_threshold_source: Optional[str] = None,
+    refresh_threshold_degraded: bool = False,
 ) -> Dict[str, Any]:
     return {
         "eligibility_checked_at": _format_expires_at(observed_at),
@@ -368,6 +466,8 @@ def _eligibility_summary(
         "error_class": error_class,
         "error_message": error_message,
         "refresh_threshold_seconds": refresh_threshold_seconds,
+        "refresh_threshold_source": refresh_threshold_source,
+        "refresh_threshold_degraded": refresh_threshold_degraded,
     }
 
 
@@ -504,12 +604,11 @@ def _credential_needs_refresh(
     own ``expires_in`` and ``access_token``, falling back to the passed
     ``buffer_seconds`` when no lifetime metadata is available.
     """
-    expires_at = _parse_expires_at(credential.get("expires_at"))
+    expires_at = _credential_expires_at(credential)
     if expires_at is None:
         return True
-    threshold = _refresh_threshold_seconds(
-        expires_in=credential.get("expires_in"),
-        access_token=credential.get("access_token") or credential.get("key"),
+    threshold, _source, _degraded = _credential_refresh_threshold_metadata(
+        credential
     )
     return datetime.now(timezone.utc) >= expires_at - timedelta(seconds=threshold)
 
@@ -547,6 +646,122 @@ def _format_expires_at(value: Optional[datetime]) -> Optional[str]:
     if value is None:
         return None
     return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _credential_refresh_threshold_metadata(
+    credential: Mapping[str, Any],
+) -> Tuple[float, str, bool]:
+    return _refresh_threshold_metadata(
+        expires_in=credential.get("expires_in"),
+        access_token=credential.get("access_token") or credential.get("key"),
+        expires_at=_credential_expires_at(credential),
+        issued_at=credential.get("issued_at"),
+        obtained_at=credential.get("obtained_at"),
+        refreshed_at=credential.get("refreshed_at"),
+    )
+
+
+def _credential_expires_at(credential: Mapping[str, Any]) -> Optional[datetime]:
+    explicit_expiry = _parse_expires_at(credential.get("expires_at"))
+    if explicit_expiry is not None:
+        return explicit_expiry
+
+    jwt_claims = _jwt_time_claims(
+        credential.get("access_token") or credential.get("key")
+    )
+    if jwt_claims is not None:
+        try:
+            return datetime.fromtimestamp(jwt_claims[1], tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
+
+    issued_at = _credential_issued_at(credential)
+    lifetime = _as_finite_number(credential.get("expires_in"))
+    if issued_at is not None and lifetime is not None and lifetime > 0:
+        try:
+            return datetime.fromtimestamp(
+                issued_at + lifetime,
+                tz=timezone.utc,
+            )
+        except (OSError, OverflowError, ValueError):
+            return None
+    return None
+
+
+def _credential_issued_at(credential: Mapping[str, Any]) -> Optional[float]:
+    return _first_timestamp_seconds(
+        credential.get("issued_at"),
+        credential.get("obtained_at"),
+        credential.get("refreshed_at"),
+    )
+
+
+def _jwt_time_claims(access_token: Any) -> Optional[Tuple[float, float]]:
+    if not isinstance(access_token, str) or not access_token.strip():
+        return None
+    try:
+        parts = access_token.split(".")
+        if len(parts) < 2:
+            return None
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(
+            base64.urlsafe_b64decode(payload_b64.encode("ascii"))
+        )
+        if not isinstance(claims, dict):
+            return None
+        issued_at = _as_finite_number(claims.get("iat"))
+        expires_at = _as_finite_number(claims.get("exp"))
+        if (
+            issued_at is None
+            or expires_at is None
+            or expires_at <= issued_at
+        ):
+            return None
+        return issued_at, expires_at
+    except (UnicodeDecodeError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _first_timestamp_seconds(*values: Any) -> Optional[float]:
+    for value in values:
+        timestamp = _timestamp_seconds(value)
+        if timestamp is not None:
+            return timestamp
+    return None
+
+
+def _timestamp_seconds(value: Any) -> Optional[float]:
+    numeric = _as_finite_number(value)
+    if numeric is not None:
+        if numeric >= 1_000_000_000_000:
+            numeric /= 1000.0
+        return numeric
+    if isinstance(value, datetime):
+        timestamp = value.timestamp()
+        return timestamp if math.isfinite(timestamp) else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    try:
+        numeric = float(normalized)
+    except ValueError:
+        pass
+    else:
+        if not math.isfinite(numeric):
+            return None
+        if numeric >= 1_000_000_000_000:
+            numeric /= 1000.0
+        return numeric
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    timestamp = parsed.astimezone(timezone.utc).timestamp()
+    return timestamp if math.isfinite(timestamp) else None
 
 
 def _refresh_credential_record(
@@ -627,6 +842,8 @@ def _refresh_credential_record(
 def _update_credential_record(
     credential: MutableMapping[str, Any],
     refreshed: Mapping[str, Any],
+    *,
+    now: Optional[Callable[[], datetime]] = None,
 ) -> None:
     access_token = _clean_oauth_string(refreshed.get("access_token"))
     if access_token is not None:
@@ -641,10 +858,30 @@ def _update_credential_record(
     if id_token is not None:
         credential["id_token"] = id_token
 
-    expires_in = refreshed.get("expires_in")
-    if isinstance(expires_in, (int, float)):
-        expires_at = datetime.now(timezone.utc) + timedelta(seconds=float(expires_in))
-        credential["expires_at"] = expires_at.isoformat().replace("+00:00", "Z")
+    observed_at = _resolve_wall_now(now)
+    credential["obtained_at"] = _format_expires_at(observed_at)
+    credential.pop("issued_at", None)
+    credential.pop("refreshed_at", None)
+
+    expires_in = _as_finite_number(refreshed.get("expires_in"))
+    effective_access_token = access_token
+    if effective_access_token is None:
+        effective_access_token = credential.get("access_token") or credential.get("key")
+    jwt_claims = _jwt_time_claims(effective_access_token)
+    if expires_in is not None and expires_in > 0:
+        credential["expires_in"] = _json_number(expires_in)
+        expires_at = observed_at + timedelta(seconds=expires_in)
+        credential["expires_at"] = _format_expires_at(expires_at)
+    elif jwt_claims is not None:
+        issued_at, expires_at_timestamp = jwt_claims
+        credential["issued_at"] = _json_number(issued_at)
+        credential["expires_in"] = None
+        credential["expires_at"] = _format_expires_at(
+            datetime.fromtimestamp(expires_at_timestamp, tz=timezone.utc)
+        )
+    else:
+        credential["expires_in"] = None
+        credential["expires_at"] = None
 
     token_type = _clean_oauth_string(refreshed.get("token_type"))
     if token_type is not None:
@@ -690,6 +927,10 @@ def _as_finite_number(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _json_number(value: float) -> int | float:
+    return int(value) if value.is_integer() else value
 
 
 def _sanitize_error_message(
