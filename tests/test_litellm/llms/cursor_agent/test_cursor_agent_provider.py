@@ -200,11 +200,14 @@ def test_sign_request_uses_connect_proto_framing():
         wire_type=2,
     )
     assert isinstance(user_message_action, bytes)
+    user_message_action_fields = cursor_connect._decode_proto_fields(
+        user_message_action
+    )
     assert cursor_connect._proto_last_field(
-        cursor_connect._decode_proto_fields(user_message_action),
+        user_message_action_fields,
         2,
         wire_type=2,
-    ) is None
+    ) == b""
     requested_model = cursor_connect._proto_last_field(
         run_fields,
         9,
@@ -244,6 +247,22 @@ def test_sign_request_uses_connect_proto_framing():
     ]
 
 
+def test_sign_request_rejects_nonempty_request_context():
+    request_data = build_run_request(
+        model="cursor_agent/composer-2.5",
+        messages=[{"role": "user", "content": "ping"}],
+    )
+    request_data["runRequest"]["action"]["userMessageAction"]["requestContext"] = {
+        "env": {"shell": "bash"}
+    }
+
+    with pytest.raises(
+        cursor_connect.CursorConnectProtocolError,
+        match="empty requestContext",
+    ):
+        cursor_connect.encode_agent_client_message(request_data)
+
+
 def test_prompt_maps_to_user_message_text():
     request = build_run_request(
         model="cursor_agent/composer-2.5",
@@ -258,6 +277,7 @@ def test_prompt_maps_to_user_message_text():
     assert user_message["messageId"]
     assert user_message["selectedContext"] == {}
     assert user_message["mode"] == "AGENT_MODE_AGENT"
+    assert action["requestContext"] == {}
     assert request["runRequest"]["requestedModel"]["modelId"] == "composer-2.5"
     assert "modelDetails" not in request["runRequest"]
     assert request["runRequest"]["mcpTools"] == {}

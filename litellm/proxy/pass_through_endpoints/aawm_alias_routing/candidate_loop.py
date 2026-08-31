@@ -34,7 +34,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 import httpx
 from fastapi import HTTPException
@@ -200,6 +200,194 @@ def _accepts_excluded_candidate_keys(select_candidate_fn: Any) -> bool:
         parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in signature.parameters.values()
     )
+
+
+_IN_FLIGHT_REDISPATCH_ERROR_CODES = frozenset(
+    {
+        "aawm_codex_auto_agent_in_flight_provider_cooling_down",
+        "aawm_anthropic_auto_agent_in_flight_provider_cooling_down",
+    }
+)
+_TERMINAL_ERROR_ALREADY_EMITTED_REQUEST_STATE_KEY = (
+    "aawm_terminal_error_emitted"
+)
+
+
+def _request_terminal_error_already_emitted(request: Any) -> bool:
+    state = getattr(request, "state", None)
+    if state is None:
+        return False
+    try:
+        return (
+            getattr(
+                state,
+                _TERMINAL_ERROR_ALREADY_EMITTED_REQUEST_STATE_KEY,
+                False,
+            )
+            is True
+        )
+    except Exception:
+        return False
+
+
+def _mark_request_terminal_error_emitted(request: Any) -> None:
+    state = getattr(request, "state", None)
+    if state is None:
+        return
+    try:
+        setattr(state, _TERMINAL_ERROR_ALREADY_EMITTED_REQUEST_STATE_KEY, True)
+    except Exception:
+        pass
+
+
+def _validated_redispatch_terminal_metadata(
+    exc: Exception,
+    *,
+    request: Any = None,
+) -> Optional[dict[str, Any]]:
+    """Extract only structured redispatch fields from an exception/detail."""
+    detail = getattr(exc, "detail", None)
+    detail_mapping = detail if isinstance(detail, Mapping) else {}
+    detail_error = detail_mapping.get("error")
+    detail_error = detail_error if isinstance(detail_error, Mapping) else {}
+    redispatch_error_codes = {
+        str(value)
+        for value in (
+            detail_error.get("code"),
+            detail_mapping.get("error_code"),
+            getattr(exc, "error_code", None),
+            getattr(exc, "code", None),
+        )
+        if value is not None
+    }
+    if not (
+        getattr(exc, "redispatch_required", None) is True
+        or detail_mapping.get("redispatch_required") is True
+        or bool(redispatch_error_codes & _IN_FLIGHT_REDISPATCH_ERROR_CODES)
+    ):
+        return None
+
+    def _first_value(*values: Any) -> Any:
+        for value in values:
+            if value is not None:
+                return value
+        return None
+
+    raw_status_code = _first_value(
+        getattr(exc, "status_code", None),
+        detail_mapping.get("error_status_code"),
+        detail_mapping.get("status_code"),
+        detail_error.get("status_code"),
+    )
+    try:
+        status_code = int(raw_status_code)
+    except (TypeError, ValueError):
+        status_code = 409
+    if isinstance(raw_status_code, bool) or not 400 <= status_code <= 599:
+        status_code = 409
+
+    error_code = _first_value(
+        detail_error.get("code"),
+        detail_mapping.get("error_code"),
+        getattr(exc, "error_code", None),
+        getattr(exc, "code", None),
+    )
+    error_type = _first_value(
+        detail_error.get("type"),
+        detail_mapping.get("error_type"),
+        getattr(exc, "error_type", None),
+        getattr(exc, "type", None),
+    )
+    failure_phase = _first_value(
+        detail_mapping.get("failure_phase"),
+        getattr(exc, "failure_phase", None),
+    )
+    code_text = str(error_code) if error_code is not None else ""
+    is_in_flight = code_text in _IN_FLIGHT_REDISPATCH_ERROR_CODES
+    event_type = (
+        "in_flight_pinned_session_cooldown"
+        if is_in_flight
+        else "redispatch_required"
+    )
+    candidate_status = (
+        "pinned_session_cooldown" if is_in_flight else "redispatch_required"
+    )
+    failure_class = _first_value(
+        detail_mapping.get("failure_class"),
+        detail_mapping.get("error_class"),
+        getattr(exc, "failure_class", None),
+        "in_flight_pinned_session_cooldown" if is_in_flight else "redispatch_required",
+    )
+    candidate = _first_value(
+        detail_mapping.get("candidate"),
+        getattr(exc, "candidate", None),
+    )
+    if not isinstance(candidate, Mapping):
+        candidate = None
+    extra_fields: dict[str, Any] = {}
+    if _request_terminal_error_already_emitted(request):
+        extra_fields["_aawm_terminal_error_already_emitted"] = True
+    return {
+        "detail": detail,
+        "candidate": dict(candidate) if isinstance(candidate, Mapping) else None,
+        "event_type": event_type,
+        "candidate_status": candidate_status,
+        "failure_phase": str(
+            failure_phase
+            or ("session_affinity_cooldown" if is_in_flight else "candidate_selection")
+        ),
+        "error_status_code": status_code,
+        "error_code": error_code,
+        "error_type": error_type,
+        "failure_class": str(failure_class),
+        "extra_fields": extra_fields,
+    }
+
+
+def _emit_validated_redispatch_terminal_event(
+    *,
+    exc: Exception,
+    request: Any,
+    alias_family: str,
+    alias_model: str,
+    request_body: dict[str, Any],
+    selection: Optional[Mapping[str, Any]] = None,
+    attempts: list[dict[str, Any]],
+    emit_pre_attempt_terminal_event: Any,
+) -> bool:
+    metadata = _validated_redispatch_terminal_metadata(exc, request=request)
+    if metadata is None:
+        return False
+    terminal_candidate = metadata["candidate"]
+    if terminal_candidate is None and isinstance(selection, Mapping):
+        selected_candidate = selection.get("candidate")
+        if isinstance(selected_candidate, Mapping):
+            terminal_candidate = dict(selected_candidate)
+    try:
+        emit_pre_attempt_terminal_event(
+            alias_family=alias_family,
+            alias_model=alias_model,
+            request=request,
+            request_body=request_body,
+            event_type=metadata["event_type"],
+            candidate_status=metadata["candidate_status"],
+            failure_phase=metadata["failure_phase"],
+            error_status_code=metadata["error_status_code"],
+            error_code=metadata["error_code"],
+            candidate=terminal_candidate,
+            selection=selection,
+            attempts=attempts,
+            detail=metadata["detail"],
+            failure_class=metadata["failure_class"],
+            error_type=metadata["error_type"],
+            redispatch_required=True,
+            extra_fields=metadata["extra_fields"],
+        )
+    except Exception:
+        # Terminal observability must not replace the validated client error.
+        return True
+    _mark_request_terminal_error_emitted(request)
+    return True
 
 
 def _classify_codex_cohere_candidate_failure(
@@ -509,6 +697,14 @@ async def handle_alias_route(  # noqa: PLR0915
         )
     )
 
+    def _genuinely_fresh_dispatch(selection: Mapping[str, Any]) -> bool:
+        return (
+            not has_continuation_state
+            and not has_previous_response_id
+            and not bool(selection.get("has_account_bound_state"))
+            and not bool(selection.get("in_flight_session"))
+        )
+
     def _prefer_codex_oauth_account_failover(
         *,
         candidate: dict[str, Any],
@@ -641,6 +837,18 @@ async def handle_alias_route(  # noqa: PLR0915
                     request,
                     attempts[-1],
                 )
+            if _emit_validated_redispatch_terminal_event(
+                exc=exc,
+                request=request,
+                alias_family=alias_family,
+                alias_model=alias_model,
+                request_body=prepared_request_body,
+                attempts=attempts,
+                emit_pre_attempt_terminal_event=(
+                    _emit_auto_agent_alias_pre_attempt_terminal_event
+                ),
+            ):
+                raise
             if exc.status_code == 429:
                 selection_detail = exc.detail if isinstance(exc.detail, dict) else {}
                 selection_error = selection_detail.get("error")
@@ -678,6 +886,24 @@ async def handle_alias_route(  # noqa: PLR0915
                         exc=exc,
                         attempts=attempts,
                     )
+            raise
+        except Exception as exc:
+            if attempts:
+                _mark_auto_agent_alias_request_terminal_failure(
+                    request,
+                    attempts[-1],
+                )
+            _emit_validated_redispatch_terminal_event(
+                exc=exc,
+                request=request,
+                alias_family=alias_family,
+                alias_model=alias_model,
+                request_body=prepared_request_body,
+                attempts=attempts,
+                emit_pre_attempt_terminal_event=(
+                    _emit_auto_agent_alias_pre_attempt_terminal_event
+                ),
+            )
             raise
         candidate = selection["candidate"]
         cooldown_key = str(selection["cooldown_key"])
@@ -912,6 +1138,19 @@ async def handle_alias_route(  # noqa: PLR0915
                     intent.complete(error=probe_failure_exc)
                     alias_routing_state.publication_intents.remove(intent)
                     if probe_failure_exc is not None:
+                        if _emit_validated_redispatch_terminal_event(
+                            exc=probe_failure_exc,
+                            request=request,
+                            alias_family=alias_family,
+                            alias_model=alias_model,
+                            request_body=prepared_request_body,
+                            selection=selection,
+                            attempts=attempts,
+                            emit_pre_attempt_terminal_event=(
+                                _emit_auto_agent_alias_pre_attempt_terminal_event
+                            ),
+                        ):
+                            raise probe_failure_exc
                         raise probe_failure_exc
                     break
 
@@ -1495,7 +1734,8 @@ async def handle_alias_route(  # noqa: PLR0915
                         failure_exc
                     )
                 )
-                if deterministically_ineligible:
+                fresh_dispatch = _genuinely_fresh_dispatch(selection)
+                if deterministically_ineligible and fresh_dispatch:
                     deterministically_ineligible_candidate_keys.add(cooldown_key)
                 last_retryable_exc = failure_exc
                 account_slot = _codex_oauth_candidate_slot(candidate)
@@ -1622,6 +1862,32 @@ async def handle_alias_route(  # noqa: PLR0915
                     candidate=candidate,
                     kimi_failure_metadata=kimi_failure_metadata,
                 )
+                if deterministically_ineligible and fresh_dispatch:
+                    try:
+                        semantic_marker = (
+                            await alias_routing_state.mark_candidate_semantic_ineligibility(
+                                alias_family=alias_family,
+                                candidate_key=cooldown_key,
+                                reason=getattr(
+                                    failure_exc,
+                                    "ineligibility_reason",
+                                    None,
+                                )
+                                or "deterministic_candidate_ineligible",
+                            )
+                        )
+                    except Exception:
+                        semantic_marker = None
+                    if semantic_marker is not None:
+                        attempt_record[
+                            "candidate_semantic_ineligibility_reason"
+                        ] = semantic_marker.get("reason")
+                        attempt_record[
+                            "candidate_semantic_ineligibility_state_source"
+                        ] = semantic_marker.get("state_source") or "memory"
+                        attempt_record[
+                            "candidate_semantic_ineligibility_remaining_seconds"
+                        ] = semantic_marker.get("remaining_seconds")
                 # D1-586: observational shadow action only. Does not change retry,
                 # failover, sleep, admission, or cooldown enforcement paths.
                 attempt_record["shadow_failure_action"] = (

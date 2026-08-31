@@ -579,6 +579,7 @@ def build_run_request(
                     "selectedContext": {},
                     "mode": "AGENT_MODE_AGENT",
                 },
+                "requestContext": {},
             }
         },
         "requestedModel": _build_requested_model(model_id),

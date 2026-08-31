@@ -2062,6 +2062,26 @@ when `AAWM_ALIAS_ROUTE_VERBOSE_JSON` and `AAWM_ALIAS_ROUTE_LOG_HEALTHY` are both
 off. The pre-attempt variants identify pinned-session cooldown and provider-lane
 admission denial without changing the client response.
 
+### Fresh-dispatch candidate admission telemetry
+
+Deterministic candidate-semantic failures add a finite admission marker keyed by
+the existing candidate identity. The marker is consulted only by genuinely
+fresh dispatches and does not move `previous_response_id`, retained sessions,
+account ownership, or opaque provider state between candidates. Candidate order
+continues to come from the compiled YAML snapshot; a marked candidate is
+skipped while the remaining declared order is preserved. The default marker TTL
+is 300 seconds, configurable with
+`AAWM_CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_TTL_SECONDS` and capped at 1,800
+seconds. Audit attempts and candidate-skipped events expose the bounded reason,
+state source (`memory` or `durable_cache`), and remaining TTL when available.
+
+Validated redispatch exceptions, including generic exceptions carrying
+`redispatch_required=true` and both existing in-flight provider cooldown codes,
+are normalized into a terminal audit event before they are re-raised. The
+request-scoped terminal marker prevents the pre-raise event from producing a
+second sanitized terminal error line if the outer error path observes the same
+failure.
+
 ## Langfuse Event Size Fitting
 
 Before enqueueing a Langfuse generation, LiteLLM estimates the serialized event

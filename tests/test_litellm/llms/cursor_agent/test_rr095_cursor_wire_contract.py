@@ -274,6 +274,7 @@ def test_user_message_uses_native_cursor_run_envelope():
         "selectedContext": {},
         "mode": "AGENT_MODE_AGENT",
     }
+    assert run["action"]["userMessageAction"]["requestContext"] == {}
     assert run["requestedModel"] == {"modelId": MODEL}
     assert "modelDetails" not in run
     assert run["mcpTools"] == {}

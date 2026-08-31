@@ -67,7 +67,12 @@ are stored as reference-only catalog rows with
 
 These are not Cursor Models pool / subscription invoice economics. Do not
 bake the temporary Grok 4.6 launch discount into the cost map. Alias
-dispatch for these families is fail-closed until the adapter wave lands.
+dispatch for these families uses official schema field 2,
+`UserMessageAction.requestContext`. For a fresh clean dispatch, LiteLLM
+intentionally sends that field as an empty message (`requestContext: {}`).
+The official CLI normally computes and populates `RequestContext` from local
+context; it does not itself prove an explicit `{}` send. AgentRunRequest field
+12 is never sent. The direct `cursor_agent` provider route remains available.
 
 ## Monthly usage
 

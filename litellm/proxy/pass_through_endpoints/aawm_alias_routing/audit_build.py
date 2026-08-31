@@ -181,7 +181,7 @@ def _is_auto_agent_alias_in_flight_cooldown_http_exception(
     }
 
 
-def _build_auto_agent_alias_audit_event(
+def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
     *,
     alias_family: str,
     alias_model: str,
@@ -329,11 +329,18 @@ def _build_auto_agent_alias_audit_event(
         "failover_ordinal",
         "prior_account_outcome",
         "terminal_reset",
+        "candidate_semantic_ineligibility_reason",
+        "candidate_semantic_ineligibility_state_source",
+        "candidate_semantic_ineligibility_remaining_seconds",
     ):
         value = candidate.get(field)
         if value is None:
             value = selection.get(field)
         if value is not None:
+            if field == "candidate_semantic_ineligibility_remaining_seconds":
+                value = _auto_agent_alias_float(value)
+            if value is None:
+                continue
             event[field] = value
     for field in (
         "has_account_bound_state",
@@ -373,6 +380,27 @@ def _build_auto_agent_alias_audit_event(
         candidate=candidate,
         include_activity_status=include_activity_status,
     )
+    if (
+        event_type
+        in {
+            "no_candidate_available",
+            "in_flight_pinned_session_cooldown",
+            "provider_lane_admission_rejected",
+            "redispatch_required",
+        }
+        or redispatch_required
+    ):
+        request_state = getattr(request, "state", None)
+        if (
+            request_state is not None
+            and getattr(
+                request_state,
+                "aawm_terminal_error_emitted",
+                False,
+            )
+            is True
+        ):
+            event["_aawm_terminal_error_already_emitted"] = True
     return {key: value for key, value in event.items() if value is not None}
 
 
@@ -395,6 +423,14 @@ def _build_auto_agent_alias_audit_events(
             event_type = (
                 "candidate_skipped_provider_degraded" if reason == "auth_degraded" else "candidate_skipped_cooldown"
             )
+            if (
+                reason == "candidate_ineligible"
+                and skipped_candidate.get(
+                    "candidate_semantic_ineligibility_reason"
+                )
+                is not None
+            ):
+                event_type = "candidate_skipped_semantic_ineligible"
             events.append(
                 _build_auto_agent_alias_audit_event(
                     alias_family=alias_family,
@@ -430,7 +466,7 @@ def _build_auto_agent_alias_audit_events(
             continue
         status = str(attempt.get("status") or "").strip()
         failure_class = attempt.get("error_class")
-        redispatch_required = status in {
+        redispatch_required = bool(attempt.get("redispatch_required")) or status in {
             "terminal_in_flight_cooldown_set",
             "terminal_in_flight_token_invalidated",
         }
