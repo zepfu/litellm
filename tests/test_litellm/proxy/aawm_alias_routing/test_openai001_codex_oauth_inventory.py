@@ -136,7 +136,7 @@ def test_codex_oauth_masked_account_display_bounded_by_local_length() -> None:
         "long*name@example.com"
     )
     assert codex_oauth_masked_account_display("ab@example.com") == (
-        "a*b@example.com"
+        "a*@example.com"
     )
     assert codex_oauth_masked_account_display("abcdefghi@example.com") == (
         "a*i@example.com"
@@ -145,7 +145,7 @@ def test_codex_oauth_masked_account_display_bounded_by_local_length() -> None:
         "c*e@example.com"
     )
     assert codex_oauth_masked_account_display("c@example.com") == (
-        "c*@example.com"
+        "*@example.com"
     )
     assert codex_oauth_masked_account_display("user@example.com\n") is None
     assert codex_oauth_masked_account_display("us\ter@example.com") is None

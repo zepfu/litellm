@@ -247,9 +247,11 @@ def codex_oauth_masked_account_display(email: Any) -> Optional[str]:
         return None
     if len(local_part) >= 10:
         return f"{local_part[:4]}*{local_part[-4:]}@{domain}"
-    if len(local_part) >= 2:
+    if len(local_part) >= 3:
         return f"{local_part[0]}*{local_part[-1]}@{domain}"
-    return f"{local_part[0]}*@{domain}"
+    if len(local_part) == 2:
+        return f"{local_part[0]}*@{domain}"
+    return f"*@{domain}"
 
 
 def load_codex_oauth_inventory(
