@@ -9,6 +9,7 @@ import os
 import sys
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -210,6 +211,7 @@ def test_due_access_token_exchanges_api_key_and_persists_complete_shape(
     assert saved["accessToken"] == _jwt(20_000)
     assert saved["refreshToken"] == "rotated-refresh-secret"
     assert saved["apiKey"] == "api-key-secret"
+    assert saved["obtained_at"] == 1_000
     assert saved["metadata"] == {"keep": True}
     assert auth_path.stat().st_mode & 0o777 == 0o600
     assert list(auth_path.parent.glob(".auth.json.*.tmp")) == []
@@ -339,6 +341,7 @@ def test_api_key_only_exchange_adds_access_and_refresh_tokens(
         "kind": "cursor",
         "accessToken": _jwt(20_000),
         "refreshToken": "new-refresh-secret",
+        "obtained_at": 1_000,
     }
 
 
@@ -724,3 +727,72 @@ def test_refresh_interval_environment_default_is_used(cursor, tmp_path: Path, mo
 
     assert result["eligible"] is False
     assert result["next_refresh_check_at"].startswith("1970-01-01T00:16:57")
+
+
+def test_eligibility_uses_persisted_timestamp_lifetime(
+    cursor, tmp_path: Path
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    _write_auth(
+        auth_path,
+        {
+            "accessToken": "opaque-access",
+            "refreshToken": "old-refresh",
+            "obtained_at": "1970-01-01T00:16:40Z",
+            "expiresAt": 1_900,
+        },
+    )
+
+    result = cursor.inspect_cursor_agent_auth_refresh_eligibility(
+        auth_path,
+        now=1_000,
+        poll_interval_seconds=300,
+    )
+
+    assert result["issued_lifetime_seconds"] == 900.0
+    assert result["refresh_threshold_seconds"] == 450.0
+    assert result["refresh_threshold_source"] == "persisted_timestamp"
+    assert result["refresh_threshold_degraded"] is False
+    assert result["refresh_due_at"] == "1970-01-01T00:24:10Z"
+    assert result["eligible"] is False
+
+
+def test_missing_lifetime_is_explicitly_degraded_in_eligibility_and_summary(
+    cursor, tmp_path: Path
+) -> None:
+    observed_at = datetime.now(timezone.utc)
+    auth_path = tmp_path / "auth.json"
+    _write_auth(
+        auth_path,
+        {
+            "accessToken": "opaque-access",
+            "refreshToken": "old-refresh",
+            "expiresAt": (
+                observed_at + timedelta(hours=2)
+            ).isoformat().replace("+00:00", "Z"),
+        },
+    )
+
+    eligibility = cursor.inspect_cursor_agent_auth_refresh_eligibility(
+        auth_path,
+        now=observed_at,
+        poll_interval_seconds=300,
+    )
+    summary = cursor.refresh_cursor_agent_auth_file(
+        auth_path,
+        buffer_seconds=300,
+        force=False,
+        lock_file=tmp_path / "auth.json.lock",
+    )
+
+    assert eligibility["credential_health"] == "fresh"
+    assert eligibility["issued_lifetime_seconds"] is None
+    assert eligibility["refresh_threshold_seconds"] == 300.0
+    assert eligibility["refresh_threshold_source"] == "fallback"
+    assert eligibility["refresh_threshold_degraded"] is True
+    assert summary["skipped"] is True
+    assert summary["auth_degraded"] is True
+    assert summary["issued_lifetime_seconds"] is None
+    assert summary["refresh_threshold_seconds"] == 300.0
+    assert summary["refresh_threshold_source"] == "fallback"
+    assert summary["refresh_threshold_degraded"] is True

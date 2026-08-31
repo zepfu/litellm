@@ -14,7 +14,16 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, Mapping, MutableMapping, Optional
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    Mapping,
+    MutableMapping,
+    Optional,
+    Tuple,
+)
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -77,53 +86,110 @@ _EXPIRY_KEYS = (
 _RELATIVE_EXPIRY_KEYS = ("expiresIn", "expires_in")
 _ALL_EXPIRY_KEYS = (*_EXPIRY_KEYS, *_RELATIVE_EXPIRY_KEYS)
 
+
 def _issued_lifetime_seconds(
     *,
     expires_in: Any = None,
     access_token: Optional[str] = None,
+    expires_at: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+    refreshed_at: Any = None,
 ) -> Optional[float]:
-    """Derive issued access-token lifetime from provider metadata.
+    lifetime, _source = _issued_lifetime_metadata(
+        expires_in=expires_in,
+        access_token=access_token,
+        expires_at=expires_at,
+        issued_at=issued_at,
+        obtained_at=obtained_at,
+        refreshed_at=refreshed_at,
+    )
+    return lifetime
 
-    Priority order: provider expires_in; validated JWT iat/exp.
-    Returns None when no usable lifetime metadata is available.
+
+def _issued_lifetime_metadata(
+    *,
+    expires_in: Any = None,
+    access_token: Optional[str] = None,
+    expires_at: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+    refreshed_at: Any = None,
+) -> Tuple[Optional[float], str]:
+    """Derive an issued lifetime and identify its authoritative source.
+
+    Authority order is provider ``expires_in``, validated JWT ``iat``/``exp``,
+    then a persisted obtained/refreshed timestamp paired with ``expires_at``.
     """
-    if expires_in is not None:
-        val = _as_finite_number(expires_in)
-        if val is not None and val > 0:
-            return val
-    if access_token is not None:
-        try:
-            parts = access_token.split(".")
-            if len(parts) >= 2:
-                payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-                claims = json.loads(
-                    base64.urlsafe_b64decode(payload_b64.encode("ascii"))
-                )
-                iat = claims.get("iat")
-                exp = claims.get("exp")
-                if isinstance(iat, (int, float)) and isinstance(exp, (int, float)):
-                    lifetime = float(exp) - float(iat)
-                    if lifetime > 0 and math.isfinite(lifetime):
-                        return lifetime
-        except Exception:
-            pass
-    return None
+    provider_lifetime = _as_finite_number(expires_in)
+    if provider_lifetime is not None and provider_lifetime > 0:
+        return provider_lifetime, "expires_in"
+
+    jwt_claims = _jwt_time_claims(access_token)
+    if jwt_claims is not None:
+        issued_timestamp, expiry_timestamp = jwt_claims
+        return expiry_timestamp - issued_timestamp, "jwt"
+
+    persisted_issued_at = _first_timestamp_seconds(
+        issued_at,
+        obtained_at,
+        refreshed_at,
+    )
+    persisted_expires_at = _parse_timestamp(expires_at)
+    if (
+        persisted_issued_at is not None
+        and persisted_expires_at is not None
+        and persisted_expires_at > persisted_issued_at
+    ):
+        return persisted_expires_at - persisted_issued_at, "persisted_timestamp"
+
+    return None, "fallback"
 
 
 def _refresh_threshold_seconds(
     *,
     expires_in: Any = None,
     access_token: Optional[str] = None,
+    expires_at: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+    refreshed_at: Any = None,
     min_seconds: float = DEFAULT_CURSOR_AGENT_AUTH_REFRESH_MIN_SECONDS,
 ) -> float:
     """Return proportional refresh threshold (max of min or half-life)."""
-    lifetime = _issued_lifetime_seconds(
+    threshold, _source, _degraded = _refresh_threshold_metadata(
         expires_in=expires_in,
         access_token=access_token,
+        expires_at=expires_at,
+        issued_at=issued_at,
+        obtained_at=obtained_at,
+        refreshed_at=refreshed_at,
+        min_seconds=min_seconds,
     )
-    if lifetime is None or lifetime <= 0:
-        return float(min_seconds)
-    return max(float(min_seconds), lifetime * 0.5)
+    return threshold
+
+
+def _refresh_threshold_metadata(
+    *,
+    expires_in: Any = None,
+    access_token: Optional[str] = None,
+    expires_at: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+    refreshed_at: Any = None,
+    min_seconds: float = DEFAULT_CURSOR_AGENT_AUTH_REFRESH_MIN_SECONDS,
+) -> Tuple[float, str, bool]:
+    lifetime, source = _issued_lifetime_metadata(
+        expires_in=expires_in,
+        access_token=access_token,
+        expires_at=expires_at,
+        issued_at=issued_at,
+        obtained_at=obtained_at,
+        refreshed_at=refreshed_at,
+    )
+    if lifetime is None:
+        return float(min_seconds), "fallback", True
+    return max(float(min_seconds), lifetime * 0.5), source, False
 
 
 NowValue = float | int | datetime
@@ -154,6 +220,10 @@ class _CredentialState:
     expires_at: Optional[float]
     shape: str
     fingerprint: Optional[str]
+    expires_in: Any = None
+    issued_at: Any = None
+    obtained_at: Any = None
+    refreshed_at: Any = None
 
 
 @dataclass
@@ -164,6 +234,19 @@ class _SingleflightCall:
 
 _SINGLEFLIGHT_GUARD = threading.Lock()
 _SINGLEFLIGHT_CALLS: Dict[tuple[Any, ...], _SingleflightCall] = {}
+
+
+def _credential_refresh_threshold_metadata(
+    state: _CredentialState,
+) -> Tuple[float, str, bool]:
+    return _refresh_threshold_metadata(
+        expires_in=state.expires_in,
+        access_token=state.access_token,
+        expires_at=state.expires_at,
+        issued_at=state.issued_at,
+        obtained_at=state.obtained_at,
+        refreshed_at=state.refreshed_at,
+    )
 
 
 def inspect_cursor_agent_auth_credential_health(
@@ -220,6 +303,10 @@ def inspect_cursor_agent_auth_refresh_eligibility(
             state.expires_at,
             buffer_seconds=resolved_buffer_seconds,
             access_token=state.access_token,
+            expires_in=state.expires_in,
+            issued_at=state.issued_at,
+            obtained_at=state.obtained_at,
+            refreshed_at=state.refreshed_at,
         )
         if refresh_due_at is None:
             next_refresh_check_at = observed_at + timedelta(
@@ -392,6 +479,10 @@ def _refresh_locked(
                         state.expires_at,
                         buffer_seconds=buffer_seconds,
                         access_token=state.access_token,
+                        expires_in=state.expires_in,
+                        issued_at=state.issued_at,
+                        obtained_at=state.obtained_at,
+                        refreshed_at=state.refreshed_at,
                     ),
                     refresh_method="none",
                 )
@@ -429,6 +520,10 @@ def _refresh_locked(
                     refreshed_state.expires_at,
                     buffer_seconds=buffer_seconds,
                     access_token=refreshed_state.access_token,
+                    expires_in=refreshed_state.expires_in,
+                    issued_at=refreshed_state.issued_at,
+                    obtained_at=refreshed_state.obtained_at,
+                    refreshed_at=refreshed_state.refreshed_at,
                 ),
                 refresh_method="apiKey_exchange",
                 previous_credential_fingerprint=state.fingerprint,
@@ -441,7 +536,15 @@ def _refresh_locked(
             error_class=exc.__class__.__name__,
             error_message=_sanitize_error_message(str(exc)),
             refresh_due_at=(
-                _refresh_due_at(state.expires_at, buffer_seconds=buffer_seconds, access_token=state.access_token)
+                _refresh_due_at(
+                    state.expires_at,
+                    buffer_seconds=buffer_seconds,
+                    access_token=state.access_token,
+                    expires_in=state.expires_in,
+                    issued_at=state.issued_at,
+                    obtained_at=state.obtained_at,
+                    refreshed_at=state.refreshed_at,
+                )
                 if state is not None
                 else None
             ),
@@ -595,6 +698,9 @@ def _merge_exchange_result(
         exchanged["refreshToken"],
     )
     _set_existing_or_canonical(updated, _API_KEY_KEYS, api_key)
+    updated["obtained_at"] = _json_number(observed_at.timestamp())
+    updated.pop("issued_at", None)
+    updated.pop("refreshed_at", None)
 
     for key in _ALL_EXPIRY_KEYS:
         if key in exchanged:
@@ -855,9 +961,18 @@ def _summary(
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
 ) -> Dict[str, Any]:
-    threshold = _refresh_threshold_seconds(
-        access_token=state.access_token if state is not None else None,
-    ) if state is not None else float(DEFAULT_CURSOR_AGENT_AUTH_REFRESH_MIN_SECONDS)
+    if state is None:
+        issued_lifetime_seconds: Optional[float] = None
+        threshold = float(DEFAULT_CURSOR_AGENT_AUTH_REFRESH_MIN_SECONDS)
+        threshold_source = "fallback"
+        threshold_degraded = True
+    else:
+        (
+            issued_lifetime_seconds,
+            threshold,
+            threshold_source,
+            threshold_degraded,
+        ) = _credential_refresh_threshold_metadata(state)
     result: Dict[str, Any] = {
         "provider": "cursor_agent",
         "status_class": status_class,
@@ -891,7 +1006,11 @@ def _summary(
         "next_refresh_check_at": _format_datetime(next_refresh_check_at),
         "refresh_method": refresh_method,
         "eligibility_checked_at": _format_datetime(observed_at),
+        "issued_lifetime_seconds": issued_lifetime_seconds,
         "refresh_threshold_seconds": threshold,
+        "auth_degraded": threshold_degraded,
+        "refresh_threshold_source": threshold_source,
+        "refresh_threshold_degraded": threshold_degraded,
         "error_class": error_class,
         "error_message": error_message,
     }
@@ -1041,6 +1160,10 @@ def _credential_state(payload: Mapping[str, Any]) -> _CredentialState:
         expires_at=expires_at,
         shape=shape,
         fingerprint=fingerprint,
+        expires_in=_credential_relative_expiry(payload),
+        issued_at=payload.get("issued_at"),
+        obtained_at=payload.get("obtained_at"),
+        refreshed_at=payload.get("refreshed_at"),
     )
 
 
@@ -1063,6 +1186,20 @@ def _first_string(
         if value is not None:
             return value
     return None
+
+
+def _credential_relative_expiry(payload: Mapping[str, Any]) -> Any:
+    first_value: Any = None
+    for key in _RELATIVE_EXPIRY_KEYS:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if first_value is None:
+            first_value = value
+        lifetime = _as_finite_number(value)
+        if lifetime is not None and lifetime > 0:
+            return value
+    return first_value
 
 
 def _credential_shape(
@@ -1111,12 +1248,41 @@ def _credential_expiry(
             parsed = _parse_timestamp(payload.get(key))
             if parsed is not None:
                 return parsed
-    if access_token is None:
+    if access_token is not None:
+        jwt_expiry = _decode_jwt_exp(access_token)
+        if jwt_expiry is not None:
+            return jwt_expiry
+    issued_at = _first_timestamp_seconds(
+        payload.get("issued_at"),
+        payload.get("obtained_at"),
+        payload.get("refreshed_at"),
+    )
+    lifetime = _as_finite_number(_credential_relative_expiry(payload))
+    if issued_at is not None and lifetime is not None and lifetime > 0:
+        expires_at = issued_at + lifetime
+        if math.isfinite(expires_at):
+            return expires_at
+    return None
+
+
+def _jwt_time_claims(access_token: Any) -> Optional[Tuple[float, float]]:
+    payload = _decode_jwt_payload(access_token)
+    if payload is None:
         return None
-    return _decode_jwt_exp(access_token)
+    issued_at = _as_finite_number(payload.get("iat"))
+    expires_at = _as_finite_number(payload.get("exp"))
+    if (
+        issued_at is None
+        or expires_at is None
+        or expires_at <= issued_at
+    ):
+        return None
+    return issued_at, expires_at
 
 
-def _decode_jwt_exp(token: str) -> Optional[float]:
+def _decode_jwt_payload(token: Any) -> Optional[Mapping[str, Any]]:
+    if not isinstance(token, str) or not token.strip():
+        return None
     parts = token.split(".")
     if len(parts) != 3:
         return None
@@ -1134,6 +1300,13 @@ def _decode_jwt_exp(token: str) -> Optional[float]:
     ):
         return None
     if not isinstance(payload, Mapping):
+        return None
+    return payload
+
+
+def _decode_jwt_exp(token: str) -> Optional[float]:
+    payload = _decode_jwt_payload(token)
+    if payload is None:
         return None
     value = payload.get("exp")
     if isinstance(value, bool):
@@ -1153,6 +1326,12 @@ def _parse_timestamp(value: Any) -> Optional[float]:
         if parsed > 1_000_000_000_000:
             parsed /= 1000
         return parsed if math.isfinite(parsed) else None
+    if isinstance(value, datetime):
+        parsed = value
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        timestamp = parsed.astimezone(timezone.utc).timestamp()
+        return timestamp if math.isfinite(timestamp) else None
     if not isinstance(value, str) or not value.strip():
         return None
     text = value.strip()
@@ -1172,6 +1351,14 @@ def _parse_timestamp(value: Any) -> Optional[float]:
     return parsed if math.isfinite(parsed) else None
 
 
+def _first_timestamp_seconds(*values: Any) -> Optional[float]:
+    for value in values:
+        timestamp = _parse_timestamp(value)
+        if timestamp is not None:
+            return timestamp
+    return None
+
+
 def _access_token_state(
     state: _CredentialState,
     observed_at: datetime,
@@ -1184,9 +1371,7 @@ def _access_token_state(
         return "unknown"
     if state.expires_at <= observed_at.timestamp():
         return "expired"
-    threshold = _refresh_threshold_seconds(
-        access_token=state.access_token,
-    )
+    threshold, _source, _degraded = _credential_refresh_threshold_metadata(state)
     if state.expires_at <= observed_at.timestamp() + max(0, threshold):
         return "due"
     return "fresh"
@@ -1215,9 +1400,7 @@ def _refresh_is_due(
         # expiry claim is available. A known expired token never reaches this
         # branch.
         return False
-    threshold = _refresh_threshold_seconds(
-        access_token=state.access_token,
-    )
+    threshold, _source, _degraded = _credential_refresh_threshold_metadata(state)
     return observed_at.timestamp() >= state.expires_at - max(0, threshold)
 
 
@@ -1226,11 +1409,20 @@ def _refresh_due_at(
     *,
     buffer_seconds: int,
     access_token: Optional[str] = None,
+    expires_in: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+    refreshed_at: Any = None,
 ) -> Optional[datetime]:
     if expires_at is None:
         return None
     threshold = _refresh_threshold_seconds(
+        expires_in=expires_in,
         access_token=access_token,
+        expires_at=expires_at,
+        issued_at=issued_at,
+        obtained_at=obtained_at,
+        refreshed_at=refreshed_at,
     )
     try:
         return datetime.fromtimestamp(
@@ -1400,6 +1592,10 @@ def _as_finite_number(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _json_number(value: float) -> int | float:
+    return int(value) if value.is_integer() else value
 
 
 def _sanitize_error_message(
