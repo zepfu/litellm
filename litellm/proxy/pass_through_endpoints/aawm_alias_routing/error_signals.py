@@ -56,6 +56,7 @@ from .policy import (
     CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY as _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
     CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER as _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
     CODEX_AUTO_AGENT_NATIVE_PROVIDER as _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+    CODEX_AUTO_AGENT_OPENROUTER_PROVIDER as _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
     CODEX_AUTO_AGENT_XAI_PROVIDER as _CODEX_AUTO_AGENT_XAI_PROVIDER,
 )
 from .types import Payload
@@ -1436,11 +1437,6 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     assert _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS is not None
     status_code = _extract_adapter_exception_status_code(exc)
     tokens = _extract_codex_auto_agent_error_tokens(exc)
-    if _is_codex_auto_agent_cursor_agent_candidate(candidate):
-        if status_code in {500, 502, 503, 529}:
-            return "upstream_transient_internal"
-        if status_code in {408, 504}:
-            return "upstream_timeout"
     if _is_codex_auto_agent_grok_account_quota_exhaustion(exc):
         return "capacity_exhausted"
     alibaba_exhaustion_class = _classify_alibaba_token_plan_quota_exhaustion_response(
@@ -1461,6 +1457,12 @@ def _classify_codex_auto_agent_retryable_exhaustion(
 
         if codex_oauth.is_direct_codex_token_invalidated_error(exc):
             return "token_invalidated"
+    if (
+        "free-models-per-day-high-balance" in tokens
+        and isinstance(candidate, dict)
+        and candidate.get("provider") == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
+    ):
+        return "usage_limit_reached"
     if "usage_limit_reached" in tokens:
         return "usage_limit_reached"
     if "server_overloaded" in tokens or tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS:
@@ -1492,10 +1494,30 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "safety_policy_denied"
     if status_code == 429:
         return "rate_limited"
-    if status_code in _CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES:
-        return "upstream_transient_internal"
-    if status_code == 504:
-        return "upstream_timeout"
+    from litellm.proxy._types import ProxyException
+
+    route_family = (
+        str(candidate.get("route_family") or "").strip().lower()
+        if isinstance(candidate, dict)
+        else ""
+    )
+    provider_attributed_status = (
+        attempted_provider_call
+        and isinstance(candidate, dict)
+        and bool(str(candidate.get("provider") or "").strip())
+        and bool(route_family)
+        and not route_family.startswith("anthropic_")
+        and (
+            isinstance(exc, ProxyException)
+            or bool(getattr(exc, "_aawm_provider_returned", False))
+            or _is_codex_auto_agent_cursor_agent_candidate(candidate)
+        )
+    )
+    if provider_attributed_status:
+        if status_code in _CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES:
+            return "upstream_transient_internal"
+        if status_code in {408, 504}:
+            return "upstream_timeout"
     return None
 
 

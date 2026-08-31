@@ -275,8 +275,18 @@ dispatches; continuations, `previous_response_id` requests, account-bound
 requests, and in-flight session redispatches do not consult or migrate this
 state. If durable routing state is available, the marker is hydrated across
 requests; otherwise the bounded process-local marker remains the admission
-boundary. This is distinct from provider failures, which use the normal retry
-and cooldown classification.
+boundary. The transient marker may therefore affect later fresh requests during
+its bounded TTL, but it is not a durable cooldown record. This is distinct from
+provider failures, which use the normal retry and cooldown classification.
+
+Upstream-origin evidence authorization is separate from provider-derived
+duration and monotonic TTL handling. Only evidence attributable to the upstream
+provider may advance provider evidence; client-origin, deterministic,
+safety-policy, and cancellation failures do not advance it. Provider-derived
+duration remains bounded and is represented with monotonic TTL semantics.
+D1-663 durable last-resort behavior is limited to
+`codex_failure_evidence_alias`; Anthropic and other non-Codex routes remain
+request-local.
 
 ## Maintained `work` and `work-other` alias behavior
 
