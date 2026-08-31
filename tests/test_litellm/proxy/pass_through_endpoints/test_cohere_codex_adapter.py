@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import importlib
 from types import SimpleNamespace
@@ -214,6 +215,97 @@ async def test_should_send_responses_input_tools_and_tool_results_to_transformer
     assert transform_call.kwargs["responses_api_request"]["tools"] == body["tools"]
     assert transform_call.kwargs["responses_api_request"]["stream"] is False
     assert transform_call.kwargs["input"][1]["call_id"] == "call_cohere_1"
+
+
+@pytest.mark.asyncio
+async def test_should_strip_cohere_tool_strict_without_mutating_transformed_tools(
+    cohere_host,
+):
+    schema = {
+        "type": "object",
+        "properties": {
+            "strict": {
+                "type": "string",
+                "minLength": 1,
+            },
+            "query": {
+                "type": "string",
+                "minLength": 2,
+                "maxLength": 80,
+            },
+        },
+        "required": ["strict", "query"],
+        "additionalProperties": False,
+    }
+    transformed_completion_kwargs = {
+        "model": "command-r-plus",
+        "messages": [{"role": "user", "content": "translated"}],
+        "tools": [
+            {
+                "type": "function",
+                "strict": False,
+                "function": {
+                    "name": "lookup",
+                    "description": "Look up a value",
+                    "strict": False,
+                    "parameters": schema,
+                },
+            },
+            {
+                "type": "function",
+                "name": "respond",
+                "description": "Return a value",
+                "strict": False,
+                "parameters": copy.deepcopy(schema),
+            },
+        ],
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "lookup"},
+        },
+    }
+    original_completion_kwargs = copy.deepcopy(transformed_completion_kwargs)
+    cohere_host.transform.transform_responses_api_request_to_chat_completion_request.return_value = (
+        transformed_completion_kwargs
+    )
+
+    plan = await _prepare(cohere_host)
+    bound_tools = plan.perform_kwargs["completion_kwargs"]["tools"]
+
+    assert bound_tools == [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look up a value",
+                "parameters": schema,
+            },
+        },
+        {
+            "type": "function",
+            "name": "respond",
+            "description": "Return a value",
+            "parameters": schema,
+        },
+    ]
+    assert plan.perform_kwargs["completion_kwargs"]["tool_choice"] == (
+        original_completion_kwargs["tool_choice"]
+    )
+    assert transformed_completion_kwargs == original_completion_kwargs
+    assert bound_tools is not transformed_completion_kwargs["tools"]
+    assert bound_tools[0]["function"]["parameters"]["properties"]["strict"] == {
+        "type": "string",
+        "minLength": 1,
+    }
+    assert bound_tools[0]["function"]["parameters"]["required"] == [
+        "strict",
+        "query",
+    ]
+    assert bound_tools[0]["function"]["parameters"]["properties"]["query"] == {
+        "type": "string",
+        "minLength": 2,
+        "maxLength": 80,
+    }
 
 
 @pytest.mark.asyncio

@@ -671,6 +671,9 @@ route.
 - Direct Cohere is separate from OpenRouter. An OpenRouter candidate such as
   `openrouter/cohere/north-mini-code:free` remains an OpenRouter request and must not be
   recorded or interpreted as direct Cohere-native traffic.
+- The Cohere adapter removes transformer-added function-tool `strict` descriptors
+  before Chat V2 egress while preserving nested JSON Schema fields, including a
+  property named `strict`.
 
 For COHERE-002 usage observations, the source identity is limited to accepted
 direct Codex Cohere terminal HTTP 200 `/v2/chat` calls with
