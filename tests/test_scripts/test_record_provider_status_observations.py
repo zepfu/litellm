@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import os
+import sys
 import time
 from argparse import Namespace
 from datetime import datetime, timedelta, timezone
@@ -13,6 +14,10 @@ from urllib import error as urllib_error
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+
+# Keep this large script test bound to the checkout under test when the shared
+# virtualenv has another LiteLLM checkout installed in editable mode.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from litellm.integrations import aawm_agent_identity
 from litellm.llms.xai import oauth
