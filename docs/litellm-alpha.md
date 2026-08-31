@@ -153,10 +153,7 @@ The current canonical alias YAML exposes these alpha test paths:
   leaves and OpenAI `gpt-5.6-luna`. `work-other` orders the nightly DeepSeek
   promotion, Z.AI Coding Plan, Moonshot, then xAI.
 - `expert` references `expert-other` before OpenAI `gpt-5.6-terra`;
-  `expert-other` orders nightly Alibaba Qwen Max, then native xAI. Cursor Grok
-  remains available through `sota-xai` and `provider-cursor_agent`, but is
-  excluded from expert dispatch because its top-level run can inherit unrelated
-  Cursor workspace context.
+  `expert-other` orders nightly Alibaba Qwen Max, Cursor Grok, then native xAI.
 - `auto-review` references `auto-review-other`, then Luna and OpenRouter
   DeepSeek. `codex-auto-review` references that same public graph.
 - `sota-openai` uses OpenAI `gpt-5.6-sol`.

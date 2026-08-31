@@ -13,6 +13,11 @@ aliases:
           end_time: "08:00:00"
           utc_offset: "+08:00"
 
+      - provider: cursor_agent
+        model: cursor_agent/cursor-grok-4.6-high
+        route_family: codex_cursor_agent_aiserver_adapter
+        priority: 90
+
       - provider: xai
         model: xai/grok-4.6
         route_family: codex_grok_native_responses_adapter

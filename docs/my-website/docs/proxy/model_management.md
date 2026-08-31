@@ -63,7 +63,7 @@ Config-driven alias routing uses:
 - `work`: nested `work-other` alias reference (priority 110) → Claude-only native Sonnet tail → `gpt-5.6-luna`
 - `work-other`: ordinary configured alias and valid exact-name / `alias_reference` target. During `22:00-08:00 UTC+8` the order is `sota-deepseek` (`alibaba_token_plan/deepseek-v4-pro`), Z.AI `zai_coding_plan/glm-5.3-flash`, `sota-moonshot`, then `sota-xai` in its declared order: Cursor Agent `cursor_agent/cursor-grok-4.6-high`, native xAI OIDC `xai/grok-4.6`, then managed xAI OAuth `oa_xai/grok-4.6`. Outside that window DeepSeek is omitted from new selection.
 - `expert`: `expert-other` (priority 100) → OpenAI/Codex `gpt-5.6-terra` (`codex_responses`, priority 0) with authoritative `reasoning_effort: max`
-- `expert-other`: during `22:00-08:00 UTC+8`, Alibaba `alibaba_token_plan/qwen3.8-max` (100) is admitted before native xAI `xai/grok-4.6` (0); Cursor Grok remains on `sota-xai` and `provider-cursor_agent` but is excluded from expert dispatch because its top-level run can inherit unrelated Cursor workspace context
+- `expert-other`: during `22:00-08:00 UTC+8`, Alibaba `alibaba_token_plan/qwen3.8-max` (100) is admitted before Cursor Grok `cursor_agent/cursor-grok-4.6-high` (90) and native xAI `xai/grok-4.6` (0)
 - `auto-review`: `auto-review-other` (100) → Luna at low effort (90) → priority-zero OpenRouter DeepSeek at low effort; `codex-auto-review` is a public alias reference to this graph
 - `auto-review-other`: during `22:00-08:00 UTC+8`, Alibaba DeepSeek Flash (100) is admitted before Z.AI Flash (90) and Cursor Composer (80), with low effort throughout
 

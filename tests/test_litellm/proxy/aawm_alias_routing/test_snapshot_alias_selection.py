@@ -695,7 +695,7 @@ def test_cfg041_helper_promotions_use_exact_half_open_utc_plus_8_window() -> Non
         snapshot_select.set_active_routing_snapshot(previous)
 
 
-def test_canonical_expert_other_selects_alibaba_then_native_xai() -> None:
+def test_canonical_expert_other_selects_alibaba_cursor_then_native_xai() -> None:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
         DEFAULT_CONFIG_DIR,
         compile_directory,
@@ -718,9 +718,13 @@ def test_canonical_expert_other_selects_alibaba_then_native_xai() -> None:
 
         assert [candidate["model"] for candidate in inside] == [
             "alibaba_token_plan/qwen3.8-max",
+            "cursor_agent/cursor-grok-4.6-high",
             "xai/grok-4.6",
         ]
-        assert [candidate["model"] for candidate in outside] == ["xai/grok-4.6"]
+        assert [candidate["model"] for candidate in outside] == [
+            "cursor_agent/cursor-grok-4.6-high",
+            "xai/grok-4.6",
+        ]
     finally:
         snapshot_select.set_active_routing_snapshot(previous)
 
