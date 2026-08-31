@@ -15,6 +15,7 @@ consumer migration onto shared credential_file_write:
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import os
@@ -38,6 +39,16 @@ def _load_module():
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def _jwt_with_time_claims(segment_count: int) -> str:
+    header = base64.urlsafe_b64encode(
+        b'{"alg":"none","typ":"JWT"}'
+    ).rstrip(b"=").decode("ascii")
+    payload = base64.urlsafe_b64encode(
+        b'{"iat":100,"exp":700}'
+    ).rstrip(b"=").decode("ascii")
+    return ".".join([header, payload, "signature"][:segment_count])
 
 
 @pytest.fixture(scope="module")
@@ -520,6 +531,39 @@ def test_eligibility_uses_persisted_timestamp_lifetime(
     assert result["refresh_threshold_degraded"] is False
     assert result["refresh_due_at"] == "1970-01-01T00:24:10Z"
     assert result["eligible"] is False
+
+
+def test_two_segment_jwt_uses_persisted_lifetime(xai) -> None:
+    lifetime, source = xai._issued_lifetime_metadata(
+        access_token=_jwt_with_time_claims(2),
+        obtained_at=1_000,
+        expires_at=1_900,
+    )
+
+    assert lifetime == 900.0
+    assert source == "persisted_timestamp"
+
+
+def test_two_segment_jwt_uses_degraded_fallback(xai) -> None:
+    threshold, source, degraded = xai._refresh_threshold_metadata(
+        access_token=_jwt_with_time_claims(2),
+        min_seconds=300,
+    )
+
+    assert threshold == 300.0
+    assert source == "fallback"
+    assert degraded is True
+
+
+def test_three_segment_jwt_remains_lifetime_authority(xai) -> None:
+    lifetime, source = xai._issued_lifetime_metadata(
+        access_token=_jwt_with_time_claims(3),
+        obtained_at=1_000,
+        expires_at=1_900,
+    )
+
+    assert lifetime == 600.0
+    assert source == "jwt"
 
 
 def test_missing_lifetime_is_explicitly_degraded_in_eligibility_and_summary(

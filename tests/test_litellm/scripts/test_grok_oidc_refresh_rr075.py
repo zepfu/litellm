@@ -14,6 +14,7 @@ Covers consumer migration onto shared credential write/metadata APIs:
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import os
@@ -64,6 +65,16 @@ def _scoped_payload(
             expires_at = datetime.now(timezone.utc) + timedelta(hours=2)
         record["expires_at"] = expires_at.isoformat().replace("+00:00", "Z")
     return {grok.DEFAULT_GROK_OIDC_SCOPE: record}
+
+
+def _jwt_with_time_claims(segment_count: int) -> str:
+    header = base64.urlsafe_b64encode(
+        b'{"alg":"none","typ":"JWT"}'
+    ).rstrip(b"=").decode("ascii")
+    payload = base64.urlsafe_b64encode(
+        b'{"iat":100,"exp":700}'
+    ).rstrip(b"=").decode("ascii")
+    return ".".join([header, payload, "signature"][:segment_count])
 
 
 class _FakeResponse:
@@ -467,6 +478,39 @@ def test_eligibility_uses_persisted_timestamp_lifetime(grok, tmp_path: Path) -> 
     assert result["refresh_threshold_degraded"] is False
     assert result["refresh_due_at"] == "1970-01-01T00:24:10Z"
     assert result["eligible"] is False
+
+
+def test_two_segment_jwt_uses_persisted_lifetime(grok) -> None:
+    lifetime, source = grok._issued_lifetime_metadata(
+        access_token=_jwt_with_time_claims(2),
+        obtained_at=1_000,
+        expires_at=1_900,
+    )
+
+    assert lifetime == 900.0
+    assert source == "persisted_timestamp"
+
+
+def test_two_segment_jwt_uses_degraded_fallback(grok) -> None:
+    threshold, source, degraded = grok._refresh_threshold_metadata(
+        access_token=_jwt_with_time_claims(2),
+        min_seconds=300,
+    )
+
+    assert threshold == 300.0
+    assert source == "fallback"
+    assert degraded is True
+
+
+def test_three_segment_jwt_remains_lifetime_authority(grok) -> None:
+    lifetime, source = grok._issued_lifetime_metadata(
+        access_token=_jwt_with_time_claims(3),
+        obtained_at=1_000,
+        expires_at=1_900,
+    )
+
+    assert lifetime == 600.0
+    assert source == "jwt"
 
 
 def test_missing_lifetime_is_explicitly_degraded_in_eligibility_and_summary(
