@@ -265,8 +265,19 @@ During Codex alias selection, a deterministic preflight rejection with
 `unsupported`, `contract_incompatible`, or `preflight_skipped`) is recorded as
 `candidate_deterministically_ineligible` with `cooldown_scope: none`. It
 publishes neither local nor durable cooldown state, and the candidate loop
-continues to the next eligible candidate. This is distinct from provider
-failures, which use the normal retry and cooldown classification.
+continues to the next eligible candidate. For a genuinely fresh dispatch, the
+candidate loop also records a separate semantic-ineligibility marker under the
+existing candidate identity. That marker has a default 300-second TTL, is
+bounded to 1,800 seconds, and can be overridden through
+`AAWM_CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_TTL_SECONDS` (still capped at
+1,800 seconds). It preserves the
+compiled YAML order while excluding the marked candidate from later fresh
+dispatches; continuations, `previous_response_id` requests, account-bound
+requests, and in-flight session redispatches do not consult or migrate this
+state. If durable routing state is available, the marker is hydrated across
+requests; otherwise the bounded process-local marker remains the admission
+boundary. This is distinct from provider failures, which use the normal retry
+and cooldown classification.
 
 ## Maintained `work` and `work-other` alias behavior
 

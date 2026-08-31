@@ -277,6 +277,31 @@ class TestEmitRouteEvent:
         mock_error.assert_called_once()
         assert marker[audit_persist._AAWM_TERMINAL_ERROR_MARKER_KEY] is True
 
+    def test_route_event_private_marker_suppresses_duplicate_terminal_error(
+        self, _configure_audit_persist
+    ):
+        event = {
+            "event_type": "in_flight_pinned_session_cooldown",
+            "candidate_status": "pinned_session_cooldown",
+            "error_status_code": 429,
+            "error_code": "aawm_codex_auto_agent_in_flight_provider_cooling_down",
+            "failure_class": "in_flight_pinned_session_cooldown",
+            "failure_phase": "session_affinity_cooldown",
+            "redispatch_required": True,
+            "_aawm_terminal_error_already_emitted": True,
+        }
+
+        with patch.object(
+            audit_persist.verbose_proxy_logger, "error"
+        ) as mock_error:
+            audit_persist._emit_auto_agent_alias_route_event(
+                event,
+                level="warning",
+            )
+
+        mock_error.assert_not_called()
+        assert "_aawm_terminal_error_already_emitted" not in event
+
     def test_terminal_error_redacts_identifiers_and_free_form_details(
         self, _configure_audit_persist
     ):

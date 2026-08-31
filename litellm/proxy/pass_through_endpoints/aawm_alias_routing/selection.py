@@ -11,6 +11,7 @@ Direct imports from sibling Wave 4/5A modules (``lane_keys``, ``snapshot_select`
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import math
 import os
@@ -517,6 +518,9 @@ def _build_auto_agent_skipped_candidates_from_states(
             "quota_remaining_pct",
             "quota_snapshot_age_seconds",
             "quota_windows",
+            "candidate_semantic_ineligibility_reason",
+            "candidate_semantic_ineligibility_state_source",
+            "candidate_semantic_ineligibility_remaining_seconds",
         ):
             if field in state:
                 shaped[field] = state[field]
@@ -2184,6 +2188,7 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     candidate_template: dict[str, Any],
     openai_lane_key: Optional[str] = None,
     excluded_candidate_keys: Optional[AbstractSet[str]] = None,
+    include_candidate_semantic_ineligibility: bool = False,
 ) -> dict[str, Any]:
     assert _get_codex_active_cooldown_state is not None
     candidate = dict(candidate_template)
@@ -2230,6 +2235,14 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         lane_key,
         cooldown_identity_tag=_cooldown_identity_tag,
     )
+    candidate_semantic_ineligibility = None
+    if include_candidate_semantic_ineligibility:
+        candidate_semantic_ineligibility = (
+            await alias_routing_state.get_candidate_semantic_ineligibility(
+                alias_family="codex",
+                candidate_key=cooldown_key,
+            )
+        )
     excluded_candidate = (
         excluded_candidate_keys is not None
         and cooldown_key in excluded_candidate_keys
@@ -2323,6 +2336,12 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         )
         cooldown_seconds = forced_cooldown_seconds
         cooldown_state_source = cooldown_state_source_override or "forced_candidate_cooldown"
+    if (
+        candidate_semantic_ineligibility is not None
+        and cooldown_seconds <= 0
+        and skip_reason is None
+    ):
+        skip_reason = "candidate_ineligible"
     if excluded_candidate and cooldown_seconds <= 0 and skip_reason is None:
         skip_reason = "candidate_ineligible"
     state: dict[str, Any] = {
@@ -2332,6 +2351,17 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         "cooldown_seconds": cooldown_seconds,
         "cooldown_state_source": cooldown_state_source,
     }
+    if candidate_semantic_ineligibility is not None:
+        state["candidate_semantic_ineligibility_reason"] = (
+            candidate_semantic_ineligibility.get("reason")
+        )
+        state["candidate_semantic_ineligibility_state_source"] = (
+            candidate_semantic_ineligibility.get("state_source")
+            or "memory"
+        )
+        state["candidate_semantic_ineligibility_remaining_seconds"] = (
+            candidate_semantic_ineligibility.get("remaining_seconds")
+        )
     if _config_epoch_tag is not None:
         state["config_epoch_tag"] = _config_epoch_tag
     if skip_reason is not None:
@@ -2741,6 +2771,7 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
     openai_lane_key: Optional[str] = None,
     anthropic_lane_key: Optional[str] = None,
     excluded_candidate_keys: Optional[AbstractSet[str]] = None,
+    include_candidate_semantic_ineligibility: bool = False,
 ) -> dict[str, Any]:
     assert _get_anthropic_active_cooldown_state is not None
     candidate = dict(candidate_template)
@@ -2783,6 +2814,14 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         lane_key,
         cooldown_identity_tag=_cooldown_identity_tag,
     )
+    candidate_semantic_ineligibility = None
+    if include_candidate_semantic_ineligibility:
+        candidate_semantic_ineligibility = (
+            await alias_routing_state.get_candidate_semantic_ineligibility(
+                alias_family="anthropic",
+                candidate_key=cooldown_key,
+            )
+        )
     excluded_candidate = (
         excluded_candidate_keys is not None
         and cooldown_key in excluded_candidate_keys
@@ -2863,6 +2902,12 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         )
         cooldown_seconds = forced_cooldown_seconds
         cooldown_state_source = cooldown_state_source_override or "forced_candidate_cooldown"
+    if (
+        candidate_semantic_ineligibility is not None
+        and cooldown_seconds <= 0
+        and skip_reason is None
+    ):
+        skip_reason = "candidate_ineligible"
     if excluded_candidate and cooldown_seconds <= 0 and skip_reason is None:
         skip_reason = "candidate_ineligible"
     state: dict[str, Any] = {
@@ -2872,6 +2917,17 @@ async def _build_anthropic_auto_agent_candidate_state(  # noqa: PLR0915
         "cooldown_seconds": cooldown_seconds,
         "cooldown_state_source": cooldown_state_source,
     }
+    if candidate_semantic_ineligibility is not None:
+        state["candidate_semantic_ineligibility_reason"] = (
+            candidate_semantic_ineligibility.get("reason")
+        )
+        state["candidate_semantic_ineligibility_state_source"] = (
+            candidate_semantic_ineligibility.get("state_source")
+            or "memory"
+        )
+        state["candidate_semantic_ineligibility_remaining_seconds"] = (
+            candidate_semantic_ineligibility.get("remaining_seconds")
+        )
     if _config_epoch_tag is not None:
         state["config_epoch_tag"] = _config_epoch_tag
     if skip_reason is not None:
@@ -3002,6 +3058,28 @@ async def _build_anthropic_auto_agent_affinity_candidate_state(
     )
 
 
+def _candidate_state_semantic_marker_kwargs(
+    builder: Any,
+    *,
+    enabled: bool,
+) -> dict[str, bool]:
+    if not enabled:
+        return {}
+    try:
+        signature = inspect.signature(builder)
+    except (TypeError, ValueError):
+        return {}
+    if (
+        "include_candidate_semantic_ineligibility" in signature.parameters
+        or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+    ):
+        return {"include_candidate_semantic_ineligibility": True}
+    return {}
+
+
 async def _build_codex_auto_agent_candidate_states(
     request: Request,
     *,
@@ -3009,6 +3087,7 @@ async def _build_codex_auto_agent_candidate_states(
     client_product_label: Optional[str] = None,
     excluded_candidate_keys: Optional[AbstractSet[str]] = None,
     candidates: Optional[Sequence[dict[str, Any]]] = None,
+    include_candidate_semantic_ineligibility: bool = False,
 ) -> list[dict[str, Any]]:
     openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
     states: list[dict[str, Any]] = []
@@ -3035,11 +3114,20 @@ async def _build_codex_auto_agent_candidate_states(
                 contexts
             )
             for context in contexts:
+                candidate_state_kwargs: dict[str, Any] = {
+                    "candidate_template": context["candidate"],
+                    "openai_lane_key": context["lane_key"],
+                    "excluded_candidate_keys": excluded_candidate_keys,
+                }
+                candidate_state_kwargs.update(
+                    _candidate_state_semantic_marker_kwargs(
+                        _build_codex_auto_agent_candidate_state,
+                        enabled=include_candidate_semantic_ineligibility,
+                    )
+                )
                 state = await _build_codex_auto_agent_candidate_state(
                     request,
-                    candidate_template=context["candidate"],
-                    openai_lane_key=context["lane_key"],
-                    excluded_candidate_keys=excluded_candidate_keys,
+                    **candidate_state_kwargs,
                 )
                 states.append(
                     _apply_codex_oauth_account_context_to_state(
@@ -3049,11 +3137,20 @@ async def _build_codex_auto_agent_candidate_states(
                     )
                 )
             continue
+        candidate_state_kwargs = {
+            "candidate_template": candidate_template,
+            "openai_lane_key": openai_lane_key,
+            "excluded_candidate_keys": excluded_candidate_keys,
+        }
+        candidate_state_kwargs.update(
+            _candidate_state_semantic_marker_kwargs(
+                _build_codex_auto_agent_candidate_state,
+                enabled=include_candidate_semantic_ineligibility,
+            )
+        )
         candidate_state = await _build_codex_auto_agent_candidate_state(
             request,
-            candidate_template=candidate_template,
-            openai_lane_key=openai_lane_key,
-            excluded_candidate_keys=excluded_candidate_keys,
+            **candidate_state_kwargs,
         )
         if candidate_template.get(
             "provider"
@@ -3073,6 +3170,7 @@ async def _build_anthropic_auto_agent_candidate_states(
     alias_model: str,
     client_product_label: Optional[str] = None,
     excluded_candidate_keys: Optional[AbstractSet[str]] = None,
+    include_candidate_semantic_ineligibility: bool = False,
 ) -> list[dict[str, Any]]:
     openai_lane_key = _resolve_codex_auto_agent_openai_cooldown_lane_key(request)
     anthropic_lane_key = _resolve_anthropic_auto_agent_native_cooldown_lane_key(request)
@@ -3092,12 +3190,21 @@ async def _build_anthropic_auto_agent_candidate_states(
                 contexts
             )
             for context in contexts:
+                candidate_state_kwargs: dict[str, Any] = {
+                    "candidate_template": context["candidate"],
+                    "openai_lane_key": context["lane_key"],
+                    "anthropic_lane_key": anthropic_lane_key,
+                    "excluded_candidate_keys": excluded_candidate_keys,
+                }
+                candidate_state_kwargs.update(
+                    _candidate_state_semantic_marker_kwargs(
+                        _build_anthropic_auto_agent_candidate_state,
+                        enabled=include_candidate_semantic_ineligibility,
+                    )
+                )
                 state = await _build_anthropic_auto_agent_candidate_state(
                     request,
-                    candidate_template=context["candidate"],
-                    openai_lane_key=context["lane_key"],
-                    anthropic_lane_key=anthropic_lane_key,
-                    excluded_candidate_keys=excluded_candidate_keys,
+                    **candidate_state_kwargs,
                 )
                 states.append(
                     _apply_codex_oauth_account_context_to_state(
@@ -3107,14 +3214,23 @@ async def _build_anthropic_auto_agent_candidate_states(
                     )
                 )
             continue
+        candidate_state_kwargs = {
+            "candidate_template": candidate_template,
+            "openai_lane_key": openai_lane_key,
+            "anthropic_lane_key": anthropic_lane_key,
+            "excluded_candidate_keys": excluded_candidate_keys,
+        }
+        candidate_state_kwargs.update(
+            _candidate_state_semantic_marker_kwargs(
+                _build_anthropic_auto_agent_candidate_state,
+                enabled=include_candidate_semantic_ineligibility,
+            )
+        )
         states.append(
             _attach_normalized_quota_state(
                 await _build_anthropic_auto_agent_candidate_state(
                     request,
-                    candidate_template=candidate_template,
-                    openai_lane_key=openai_lane_key,
-                    anthropic_lane_key=anthropic_lane_key,
-                    excluded_candidate_keys=excluded_candidate_keys,
+                    **candidate_state_kwargs,
                 )
             )
         )
@@ -4267,6 +4383,10 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         client_product_label=client_product_label,
         excluded_candidate_keys=excluded_candidate_keys,
         candidates=candidates,
+        include_candidate_semantic_ineligibility=(
+            request_mode in {"fresh", "fresh_redispatch"}
+            and not has_continuation_state
+        ),
     )
     skipped = _build_auto_agent_skipped_candidates_from_states(states)
     request.state.aawm_alias_terminal_skipped_candidates = skipped
@@ -4684,6 +4804,10 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
         alias_model=alias_model,
         client_product_label=client_product_label,
         excluded_candidate_keys=excluded_candidate_keys,
+        include_candidate_semantic_ineligibility=(
+            request_mode in {"fresh", "fresh_redispatch"}
+            and not has_continuation_state
+        ),
     )
     skipped = _build_auto_agent_skipped_candidates_from_states(states)
     request.state.aawm_alias_terminal_skipped_candidates = skipped
@@ -4819,6 +4943,7 @@ _HOST_FUNCTION_NAMES = (
     "_get_anthropic_auto_agent_candidate_cooldown_state",
     "_build_codex_auto_agent_candidate_state",
     "_build_anthropic_auto_agent_candidate_state",
+    "_candidate_state_semantic_marker_kwargs",
     "_format_codex_oauth_quota_reset_at",
     "_codex_oauth_quota_window_public_shape",
     "_codex_oauth_quota_window_is_confirmed_exhausted",
@@ -4907,6 +5032,7 @@ def install(host_globals: dict) -> None:
     # Copy seam variables into host_globals so rebound functions resolve them.
     host_globals.update({
         "alias_routing_state": alias_routing_state,
+        "inspect": inspect,
         "math": math,
         "_CODEX_OAUTH_QUOTA_FAMILY_OVERALL": _CODEX_OAUTH_QUOTA_FAMILY_OVERALL,
         "_CODEX_OAUTH_QUOTA_FAMILY_SPARK": _CODEX_OAUTH_QUOTA_FAMILY_SPARK,

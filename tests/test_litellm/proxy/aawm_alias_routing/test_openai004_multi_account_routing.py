@@ -766,6 +766,198 @@ def _account_selection(
     }
 
 
+async def _zero_cooldown(_key: str) -> tuple[float, str]:
+    return 0.0, "local_fallback"
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_persists_fresh_deterministic_candidate_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    manager = AliasRoutingStateManager()
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", manager)
+    request = _request()
+    candidate = {
+        "provider": "cursor_agent",
+        "model": "cursor-work",
+        "route_family": "cursor_agent_responses_adapter",
+        "last_resort": False,
+    }
+    selected = {
+        "candidate": candidate,
+        "lane_key": "cursor-agent",
+        "cooldown_key": "cursor_agent:cursor-work:cursor-agent",
+        "selection_reason": "first_available",
+        "request_mode": "fresh",
+        "has_account_bound_state": False,
+        "in_flight_session": False,
+        "session_key": None,
+        "skipped": [],
+    }
+
+    class _DeterministicCandidateError(Exception):
+        code = "aawm_codex_auto_agent_candidate_ineligible"
+        candidate_status = "ineligible"
+        ineligibility_reason = "unsupported"
+        attempted_provider_call = True
+
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc, *args, candidate=None, **kwargs: "candidate_unavailable",
+    )
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        return dict(selected)
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> Response:
+        raise _DeterministicCandidateError("unsupported candidate")
+
+    with pytest.raises(HTTPException):
+        await candidate_loop.handle_alias_route(
+            _loop_services(
+                select_candidate=_select,
+                perform_candidate=_perform,
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=request,
+            prepared_request_body={"model": "work"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_zero_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidate",
+            log_label="Codex",
+        )
+
+    marker = manager.codex.get_candidate_semantic_ineligibility_memory(
+        selected["cooldown_key"]
+    )
+    assert marker is not None
+    assert marker["reason"] == "unsupported"
+    outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    assert outcome["attempts"][0][
+        "candidate_semantic_ineligibility_state_source"
+    ] == "memory"
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_emits_generic_redispatch_before_reraise(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    request = _request()
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_pre_attempt_terminal_event",
+        lambda **kwargs: events.append(kwargs),
+    )
+    redispatch_error = RuntimeError("fresh dispatch required")
+    redispatch_error.redispatch_required = True  # type: ignore[attr-defined]
+    redispatch_error.status_code = 409  # type: ignore[attr-defined]
+    redispatch_error.error_code = (  # type: ignore[attr-defined]
+        "aawm_codex_auto_agent_redispatch_required"
+    )
+    redispatch_error.error_type = "conflict"  # type: ignore[attr-defined]
+    redispatch_error.failure_phase = "selection"  # type: ignore[attr-defined]
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        raise redispatch_error
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await candidate_loop.handle_alias_route(
+            _loop_services(
+                select_candidate=_select,
+                perform_candidate=AsyncMock(),
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=request,
+            prepared_request_body={"model": "work"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_zero_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidate",
+            log_label="Codex",
+        )
+
+    assert exc_info.value is redispatch_error
+    assert len(events) == 1
+    assert events[0]["redispatch_required"] is True
+    assert events[0]["event_type"] == "redispatch_required"
+    assert events[0]["error_status_code"] == 409
+    assert events[0]["attempts"] == []
+    assert request.state.aawm_terminal_error_emitted is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "aawm_codex_auto_agent_in_flight_provider_cooling_down",
+        "aawm_anthropic_auto_agent_in_flight_provider_cooling_down",
+    ],
+)
+async def test_candidate_loop_emits_both_in_flight_redispatch_codes(
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    request = _request()
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_pre_attempt_terminal_event",
+        lambda **kwargs: events.append(kwargs),
+    )
+    exc = HTTPException(
+        status_code=429,
+        detail={
+            "error": {
+                "code": error_code,
+                "type": "rate_limit_error",
+            }
+        },
+    )
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        raise exc
+
+    with pytest.raises(HTTPException) as exc_info:
+        await candidate_loop.handle_alias_route(
+            _loop_services(
+                select_candidate=_select,
+                perform_candidate=AsyncMock(),
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=request,
+            prepared_request_body={"model": "work"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_zero_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidate",
+            log_label="Codex",
+        )
+
+    assert exc_info.value is exc
+    assert len(events) == 1
+    assert events[0]["event_type"] == "in_flight_pinned_session_cooldown"
+    assert events[0]["candidate_status"] == "pinned_session_cooldown"
+    assert events[0]["error_code"] == error_code
+    assert events[0]["failure_class"] == "in_flight_pinned_session_cooldown"
+    assert request.state.aawm_terminal_error_emitted is True
+
+
 @pytest.mark.asyncio
 async def test_candidate_loop_wraps_provider_call_with_session_owner_renewal(
     monkeypatch: pytest.MonkeyPatch,

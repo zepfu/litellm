@@ -582,6 +582,43 @@ class TestBuildAuditEvents:
         assert events[0]["event_type"] == "candidate_skipped_provider_degraded"
         assert events[0]["candidate_status"] == "skipped_auth_degraded"
 
+    def test_semantic_ineligible_skip_preserves_marker_telemetry(self):
+        selection = _minimal_selection(
+            skipped=[
+                {
+                    "provider": "cursor_agent",
+                    "model": "cursor-work",
+                    "route_family": "cursor_agent_responses_adapter",
+                    "reason": "candidate_ineligible",
+                    "lane_key": "cursor-agent",
+                    "candidate_semantic_ineligibility_reason": "unsupported",
+                    "candidate_semantic_ineligibility_state_source": (
+                        "durable_cache"
+                    ),
+                    "candidate_semantic_ineligibility_remaining_seconds": 42.5,
+                }
+            ]
+        )
+        events = _build_auto_agent_alias_audit_events(
+            alias_family="codex",
+            alias_model="work",
+            request=_make_request(),
+            request_body={},
+            selection=selection,
+            attempts=[],
+        )
+
+        assert events[0]["event_type"] == "candidate_skipped_semantic_ineligible"
+        assert events[0]["candidate_semantic_ineligibility_reason"] == (
+            "unsupported"
+        )
+        assert events[0]["candidate_semantic_ineligibility_state_source"] == (
+            "durable_cache"
+        )
+        assert events[0]["candidate_semantic_ineligibility_remaining_seconds"] == (
+            42.5
+        )
+
     def test_attempt_event_type_classification(self):
         attempts = [
             {"provider": "openai", "model": "gpt-4.1", "route_family": "openai", "status": "selected"},

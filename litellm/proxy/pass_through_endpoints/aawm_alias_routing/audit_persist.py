@@ -40,6 +40,9 @@ _AAWM_ALIAS_TERMINAL_ERROR_EVENT_TYPES = frozenset(
     }
 )
 _AAWM_TERMINAL_ERROR_MARKER_KEY = "aawm_terminal_error_emitted"
+_AAWM_TERMINAL_ERROR_ALREADY_EMITTED_KEY = (
+    "_aawm_terminal_error_already_emitted"
+)
 _AAWM_TERMINAL_ERROR_HASH_CHARS = 16
 _AAWM_TERMINAL_ERROR_MAX_LABEL_CHARS = 96
 _AAWM_TERMINAL_ERROR_SECRET_FIELD_NAMES = (
@@ -368,9 +371,17 @@ def _emit_auto_agent_alias_route_event(
 ) -> None:
     assert _record_auto_agent_alias_route_status_rollup is not None
 
+    terminal_error_already_emitted = (
+        event.pop(_AAWM_TERMINAL_ERROR_ALREADY_EMITTED_KEY, False) is True
+    )
     _record_auto_agent_alias_route_status_rollup(event)
     if _is_auto_agent_alias_terminal_error_event(event):
-        _emit_aawm_terminal_error(event)
+        marker = (
+            {_AAWM_TERMINAL_ERROR_MARKER_KEY: True}
+            if terminal_error_already_emitted
+            else None
+        )
+        _emit_aawm_terminal_error(event, marker=marker)
     if not (_aawm_alias_route_verbose_json_enabled() or _aawm_alias_route_healthy_json_enabled()):
         if level == "warning":
             return
@@ -746,6 +757,11 @@ def install(host_globals: dict) -> None:
         ("_aawm_alias_route_verbose_json_enabled", _aawm_alias_route_verbose_json_enabled),
         ("_aawm_alias_route_healthy_json_enabled", _aawm_alias_route_healthy_json_enabled),
         ("_is_auto_agent_alias_terminal_error_event", _is_auto_agent_alias_terminal_error_event),
+        ("_AAWM_TERMINAL_ERROR_MARKER_KEY", _AAWM_TERMINAL_ERROR_MARKER_KEY),
+        (
+            "_AAWM_TERMINAL_ERROR_ALREADY_EMITTED_KEY",
+            _AAWM_TERMINAL_ERROR_ALREADY_EMITTED_KEY,
+        ),
     ):
         host_globals.setdefault(_sk, _sv)
     host_globals.setdefault("_emit_aawm_terminal_error", _emit_aawm_terminal_error)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import threading
 import time
 import uuid
@@ -49,6 +50,36 @@ _ALIAS_FAMILY_CANONICAL_MAP: dict[str, str] = {
 }
 
 _DEFAULT_CANONICAL_FAMILY = "codex"
+
+_CANDIDATE_SEMANTIC_INELIGIBILITY_STATE_KIND = (
+    "candidate_semantic_ineligibility"
+)
+_CANDIDATE_SEMANTIC_INELIGIBILITY_TTL_ENV = (
+    "AAWM_CODEX_AUTO_AGENT_CANDIDATE_INELIGIBILITY_TTL_SECONDS"
+)
+_CANDIDATE_SEMANTIC_INELIGIBILITY_TTL_SECONDS = 300.0
+_CANDIDATE_SEMANTIC_INELIGIBILITY_MAX_TTL_SECONDS = 1800.0
+_CANDIDATE_SEMANTIC_INELIGIBILITY_REASON_MAX_CHARS = 96
+
+
+def get_candidate_semantic_ineligibility_ttl_seconds() -> float:
+    """Return the bounded finite TTL for semantic candidate admission markers."""
+    raw = os.getenv(_CANDIDATE_SEMANTIC_INELIGIBILITY_TTL_ENV)
+    try:
+        parsed = float(raw) if raw is not None else _CANDIDATE_SEMANTIC_INELIGIBILITY_TTL_SECONDS
+    except (TypeError, ValueError):
+        parsed = _CANDIDATE_SEMANTIC_INELIGIBILITY_TTL_SECONDS
+    if not math.isfinite(parsed) or parsed <= 0:
+        parsed = _CANDIDATE_SEMANTIC_INELIGIBILITY_TTL_SECONDS
+    return min(parsed, _CANDIDATE_SEMANTIC_INELIGIBILITY_MAX_TTL_SECONDS)
+
+
+def _candidate_semantic_ineligibility_reason(reason: Any) -> str:
+    normalized = str(reason or "deterministic_candidate_ineligible").strip()
+    return normalized[:_CANDIDATE_SEMANTIC_INELIGIBILITY_REASON_MAX_CHARS] or (
+        "deterministic_candidate_ineligible"
+    )
+
 
 _COHERE_PROVIDER = "cohere"
 _COHERE_NATIVE_LANE = "cohere_native"
@@ -309,6 +340,9 @@ class AliasFamilyState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     cooldown_until_monotonic_by_key: dict[str, float] = field(default_factory=dict)
     cooldown_negative_until_monotonic_by_key: dict[str, float] = field(default_factory=dict)
+    candidate_semantic_ineligibility_by_key: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )
     session_affinity_by_key: dict[str, Payload] = field(default_factory=dict)
     evidence_events_by_key: dict[str, list[float]] = field(default_factory=dict)
     # CFG-004 Wave A: monotonic generation counter incremented on every clear.
@@ -340,6 +374,76 @@ class AliasFamilyState:
             return max(0.0, until - now)
         self.cooldown_until_monotonic_by_key.pop(cooldown_key, None)
         return 0.0
+
+    def get_candidate_semantic_ineligibility_memory(
+        self,
+        candidate_key: str,
+    ) -> Optional[dict[str, Any]]:
+        marker = self.candidate_semantic_ineligibility_by_key.get(candidate_key)
+        if not isinstance(marker, dict):
+            return None
+        expires_at = marker.get("expires_at_monotonic")
+        if (
+            isinstance(expires_at, (int, float))
+            and not isinstance(expires_at, bool)
+            and expires_at > time.monotonic()
+        ):
+            result = dict(marker)
+            result["state_source"] = marker.get("state_source", "memory")
+            result["remaining_seconds"] = max(
+                0.0,
+                float(expires_at) - time.monotonic(),
+            )
+            return result
+        self.candidate_semantic_ineligibility_by_key.pop(candidate_key, None)
+        return None
+
+    def set_candidate_semantic_ineligibility_memory(
+        self,
+        candidate_key: str,
+        *,
+        reason: str,
+        ttl_seconds: float,
+        state_source: str = "memory",
+        max_size: int = DEFAULT_MEMORY_STATE_MAX_SIZE,
+    ) -> Optional[dict[str, Any]]:
+        if not isinstance(candidate_key, str) or not candidate_key:
+            return None
+        try:
+            ttl = float(ttl_seconds)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(ttl) or ttl <= 0:
+            return None
+        ttl = min(ttl, _CANDIDATE_SEMANTIC_INELIGIBILITY_MAX_TTL_SECONDS)
+        now_monotonic = time.monotonic()
+        expires_at = now_monotonic + ttl
+        existing = self.candidate_semantic_ineligibility_by_key.get(candidate_key)
+        if isinstance(existing, dict):
+            existing_expires_at = existing.get("expires_at_monotonic")
+            if (
+                isinstance(existing_expires_at, (int, float))
+                and not isinstance(existing_expires_at, bool)
+                and existing_expires_at > expires_at
+            ):
+                expires_at = float(existing_expires_at)
+        marker = {
+            "candidate_key": candidate_key,
+            "reason": _candidate_semantic_ineligibility_reason(reason),
+            "expires_at_monotonic": expires_at,
+            "state_source": str(state_source or "memory"),
+        }
+        self.candidate_semantic_ineligibility_by_key[candidate_key] = marker
+        bound_memory_map(
+            self.candidate_semantic_ineligibility_by_key,
+            max_size=max_size,
+        )
+        result = dict(marker)
+        result["remaining_seconds"] = max(
+            0.0,
+            expires_at - time.monotonic(),
+        )
+        return result
 
     def peek_cooldown_remaining(self, cooldown_key: str) -> float:
         """Non-mutating, lock-free cooldown remaining check (TOCTOU guard).
@@ -525,6 +629,7 @@ class AliasFamilyState:
         """
         self.cooldown_until_monotonic_by_key.clear()
         self.cooldown_negative_until_monotonic_by_key.clear()
+        self.candidate_semantic_ineligibility_by_key.clear()
         self.session_affinity_by_key.clear()
         self.evidence_events_by_key.clear()
         # Bump generation for every tracked key so any in-flight durable read
@@ -1478,6 +1583,144 @@ class AliasRoutingStateManager:
     def family(self, alias_family: str) -> AliasFamilyState:
         resolved = self._resolve_family_name(alias_family)
         return self.anthropic if resolved == "anthropic" else self.codex
+
+    async def get_candidate_semantic_ineligibility(
+        self,
+        *,
+        alias_family: str,
+        candidate_key: str,
+    ) -> Optional[dict[str, Any]]:
+        """Read one finite semantic-admission marker, durable first after memory."""
+        canonical = validate_alias_family(alias_family)
+        family = self.family(canonical)
+        local = family.get_candidate_semantic_ineligibility_memory(candidate_key)
+        if local is not None:
+            return local
+
+        barrier = await self.key_barrier_lock(
+            f"{canonical}:candidate_semantic_ineligibility:{candidate_key}"
+        )
+        async with barrier:
+            local = family.get_candidate_semantic_ineligibility_memory(candidate_key)
+            if local is not None:
+                return local
+            try:
+                from . import durable
+
+                result = await durable.read_aawm_alias_routing_state(
+                    alias_family=canonical,
+                    state_kind=_CANDIDATE_SEMANTIC_INELIGIBILITY_STATE_KIND,
+                    state_key=candidate_key,
+                )
+            except Exception:
+                return None
+            if not isinstance(result, dict) or result.get("source") != "durable_cache":
+                return None
+            payload = result.get("payload")
+            if not isinstance(payload, dict):
+                return None
+            if str(payload.get("candidate_key") or "") != candidate_key:
+                return None
+            reason = payload.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                return None
+            try:
+                expires_at_epoch = durable.parse_aawm_alias_routing_durable_expiry(
+                    payload
+                )
+            except Exception:
+                return None
+            if (
+                expires_at_epoch is None
+                or expires_at_epoch is durable.UNBOUNDED_EXPIRY
+                or not isinstance(expires_at_epoch, (int, float))
+                or isinstance(expires_at_epoch, bool)
+            ):
+                return None
+            remaining = float(expires_at_epoch) - time.time()
+            if not math.isfinite(remaining) or remaining <= 0:
+                return None
+            hydrated = family.set_candidate_semantic_ineligibility_memory(
+                candidate_key,
+                reason=reason,
+                ttl_seconds=remaining,
+                state_source="durable_cache",
+                max_size=self.max_size,
+            )
+            if hydrated is not None:
+                hydrated["expires_at_epoch"] = float(expires_at_epoch)
+            return hydrated
+
+    async def mark_candidate_semantic_ineligibility(
+        self,
+        *,
+        alias_family: str,
+        candidate_key: str,
+        reason: str,
+        ttl_seconds: Optional[float] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Record a bounded marker and best-effort persist its finite expiry."""
+        canonical = validate_alias_family(alias_family)
+        try:
+            ttl = (
+                get_candidate_semantic_ineligibility_ttl_seconds()
+                if ttl_seconds is None
+                else float(ttl_seconds)
+            )
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(ttl) or ttl <= 0:
+            return None
+        ttl = min(ttl, _CANDIDATE_SEMANTIC_INELIGIBILITY_MAX_TTL_SECONDS)
+        family = self.family(canonical)
+        barrier = await self.key_barrier_lock(
+            f"{canonical}:candidate_semantic_ineligibility:{candidate_key}"
+        )
+        async with barrier:
+            marker = family.set_candidate_semantic_ineligibility_memory(
+                candidate_key,
+                reason=reason,
+                ttl_seconds=ttl,
+                state_source="memory",
+                max_size=self.max_size,
+            )
+            if marker is None:
+                return None
+            persisted = False
+            try:
+                from . import durable
+
+                persisted = await durable.write_aawm_alias_routing_durable_payload(
+                    alias_family=canonical,
+                    state_kind=_CANDIDATE_SEMANTIC_INELIGIBILITY_STATE_KIND,
+                    state_key=candidate_key,
+                    payload={
+                        "candidate_key": candidate_key,
+                        "reason": marker["reason"],
+                        "state_source": "durable_cache",
+                    },
+                    ttl_seconds=ttl,
+                )
+            except Exception:
+                persisted = False
+            if persisted:
+                marker = family.set_candidate_semantic_ineligibility_memory(
+                    candidate_key,
+                    reason=marker["reason"],
+                    ttl_seconds=marker["remaining_seconds"],
+                    state_source="durable_cache",
+                    max_size=self.max_size,
+                ) or marker
+            marker["durable_persisted"] = persisted
+            marker["expires_at_epoch"] = time.time() + marker["remaining_seconds"]
+            return marker
+
+    async def record_candidate_semantic_ineligibility(
+        self,
+        **kwargs: Any,
+    ) -> Optional[dict[str, Any]]:
+        """Compatibility alias for callers describing the marker as admission state."""
+        return await self.mark_candidate_semantic_ineligibility(**kwargs)
 
     def clear_cooldown_state(
         self,
