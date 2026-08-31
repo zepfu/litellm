@@ -1955,6 +1955,7 @@ def test_oauth_schedule_bounds_short_failed_retry_before_expiry() -> None:
     schedule = loop.OAuthRefreshScheduleState()
     actual_attempt = {"value": None}
     helper_calls = []
+    token_endpoint_calls = []
 
     def inspect(*, now):
         observed_at = now()
@@ -1978,6 +1979,7 @@ def test_oauth_schedule_bounds_short_failed_retry_before_expiry() -> None:
 
     def refresh(callback):
         helper_calls.append(True)
+        token_endpoint_calls.append(True)
         callback()
         return {
             "attempted": True,
@@ -2021,6 +2023,26 @@ def test_oauth_schedule_bounds_short_failed_retry_before_expiry() -> None:
     )
     assert first[3]["refresh_result_class"] == "refresh_failed"
     assert helper_calls == [True]
+
+    recorded_retry_at = datetime.fromisoformat(
+        first[3]["next_refresh_check_at"].replace("Z", "+00:00")
+    )
+    second = run_schedule(399.0, recorded_retry_at)
+
+    assert recorded_retry_at == retry_at
+    assert recorded_retry_at < expiry
+    assert second[4] is True
+    assert second[3]["actual_attempted"] is True
+    assert second[3]["last_actual_attempt_at"] == (
+        recorded_retry_at.isoformat().replace("+00:00", "Z")
+    )
+    second_retry_at = datetime.fromisoformat(
+        second[3]["next_refresh_check_at"].replace("Z", "+00:00")
+    )
+    assert second_retry_at > recorded_retry_at
+    assert second[3]["refresh_result_class"] == "refresh_failed"
+    assert helper_calls == [True, True]
+    assert token_endpoint_calls == [True, True]
 
 
 def test_oauth_schedule_reinspects_external_replacement_after_local_failure(

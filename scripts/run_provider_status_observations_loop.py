@@ -11976,11 +11976,16 @@ def _merge_oauth_refresh_eligibility(
         or _parse_sidecar_timestamp(pre.get("expires_at"))
     )
     retry_at = wall_now + timedelta(seconds=max(1.0, cadence_seconds))
+    retry_deadline = (
+        known_expires_at - timedelta(seconds=1)
+        if known_expires_at is not None
+        else None
+    )
     if (
-        known_expires_at is not None
-        and wall_now < known_expires_at <= retry_at
+        retry_deadline is not None
+        and wall_now < retry_deadline <= retry_at
     ):
-        retry_at = known_expires_at - timedelta(seconds=1)
+        retry_at = retry_deadline
     if post.get("error_class") and summary_expires_at is not None:
         merged["expires_at"] = _scheduler_timestamp(summary_expires_at)
         merged["credential_health"] = (
@@ -12280,10 +12285,18 @@ def _run_oauth_refresh_schedule(
     )
     actual_attempt_count = 0
     operation_summary: Mapping[str, Any] = {}
+    effective_attempt_interval_seconds = attempt_interval_seconds
+    pre_expires_at = _parse_sidecar_timestamp(pre.get("expires_at"))
+    if pre_expires_at is not None and pre_expires_at > wall_now:
+        remaining_lifetime_seconds = (pre_expires_at - wall_now).total_seconds()
+        effective_attempt_interval_seconds = min(
+            attempt_interval_seconds,
+            max(1.0, remaining_lifetime_seconds - 1.0),
+        )
     actual_throttled = _oauth_refresh_retry_throttled(
         last_attempt_monotonic,
         now_monotonic=now_monotonic,
-        attempt_interval_seconds=attempt_interval_seconds,
+        attempt_interval_seconds=effective_attempt_interval_seconds,
     )
     current_identity = _oauth_refresh_identity(pre)
     if (
