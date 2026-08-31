@@ -13,6 +13,7 @@ consumer migration onto shared credential_file_write:
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import os
@@ -41,6 +42,16 @@ def _load_module():
 @pytest.fixture(scope="module")
 def codex():
     return _load_module()
+
+
+def _jwt(payload: dict[str, Any]) -> str:
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8"))
+    return f"header.{encoded.rstrip(b'=').decode('ascii')}.signature"
+
+
+def _two_segment_jwt(payload: dict[str, Any]) -> str:
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8"))
+    return f"header.{encoded.rstrip(b'=').decode('ascii')}"
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +350,38 @@ def test_refresh_returns_sanitized_error_for_malformed_tokens(
     assert result["refreshed"] is False
     assert result["error_class"] == "ValueError"
     assert "tokens" in (result["error_message"] or "")
+
+
+def test_two_segment_jwt_uses_persisted_lifetime_not_jwt_claims(codex) -> None:
+    token = _two_segment_jwt({"iat": 1_000, "exp": 1_900})
+
+    assert codex._decode_jwt_claims_without_validation(token)["iat"] == 1_000
+    assert codex._jwt_time_claims(token) is None
+    assert codex._issued_lifetime_metadata(
+        access_token=token,
+        issued_at=1_000,
+        expires_at=1_900,
+    ) == (900.0, "persisted_timestamp")
+
+
+def test_two_segment_jwt_uses_degraded_fallback_without_persisted_lifetime(
+    codex,
+) -> None:
+    token = _two_segment_jwt({"iat": 1_000, "exp": 1_900})
+
+    assert codex._issued_lifetime_metadata(access_token=token) == (None, "fallback")
+    assert codex._refresh_threshold_metadata(access_token=token) == (
+        300.0,
+        "fallback",
+        True,
+    )
+
+
+def test_three_segment_jwt_remains_authoritative_for_lifetime(codex) -> None:
+    token = _jwt({"iat": 1_000, "exp": 1_900})
+
+    assert codex._jwt_time_claims(token) == (1_000.0, 1_900.0)
+    assert codex._issued_lifetime_metadata(access_token=token) == (900.0, "jwt")
 
 
 def test_eligibility_uses_persisted_timestamp_lifetime(

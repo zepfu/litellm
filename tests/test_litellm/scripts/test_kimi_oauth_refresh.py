@@ -102,6 +102,11 @@ def _jwt(payload: dict[str, Any]) -> str:
     return f"header.{encoded.rstrip(b'=').decode('ascii')}.signature"
 
 
+def _two_segment_jwt(payload: dict[str, Any]) -> str:
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8"))
+    return f"header.{encoded.rstrip(b'=').decode('ascii')}"
+
+
 def test_defaults_use_shared_kimi_code_credential_and_native_lock(kimi) -> None:
     assert kimi.DEFAULT_KIMI_OAUTH_AUTH_FILE == "~/.kimi-code/credentials/kimi-code.json"
     assert kimi.DEFAULT_KIMI_OAUTH_LOCK_FILE == "~/.kimi-code/oauth/kimi-code"
@@ -132,6 +137,30 @@ def test_issued_lifetime_uses_jwt_or_persisted_timestamp_without_descriptor_fiel
             expires_at=1_900,
         )
         == 900
+    )
+
+
+def test_two_segment_jwt_uses_persisted_lifetime_not_jwt_claims(kimi) -> None:
+    token = _two_segment_jwt({"iat": 1_000, "exp": 1_900})
+
+    assert kimi._jwt_time_claims(token) is None
+    assert kimi._issued_lifetime_metadata(
+        access_token=token,
+        issued_at=1_000,
+        expires_at=1_900,
+    ) == (900.0, "persisted_timestamp")
+
+
+def test_two_segment_jwt_uses_degraded_fallback_without_persisted_lifetime(
+    kimi,
+) -> None:
+    token = _two_segment_jwt({"iat": 1_000, "exp": 1_900})
+
+    assert kimi._issued_lifetime_metadata(access_token=token) == (None, "fallback")
+    assert kimi._refresh_threshold_metadata(access_token=token) == (
+        300.0,
+        "fallback",
+        True,
     )
 
 

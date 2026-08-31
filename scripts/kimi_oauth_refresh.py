@@ -804,7 +804,7 @@ def _jwt_time_claims(access_token: Any) -> Optional[Tuple[float, float]]:
         return None
     try:
         parts = access_token.split(".")
-        if len(parts) < 2:
+        if len(parts) != 3:
             return None
         payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
         claims = json.loads(base64.urlsafe_b64decode(payload_b64.encode("ascii")))

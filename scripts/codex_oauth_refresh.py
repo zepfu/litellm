@@ -788,6 +788,8 @@ def _decode_jwt_claims_without_validation(token: str) -> Dict[str, Any]:
 def _jwt_time_claims(access_token: Any) -> Optional[Tuple[float, float]]:
     if not isinstance(access_token, str) or not access_token.strip():
         return None
+    if len(access_token.split(".")) != 3:
+        return None
     claims = _decode_jwt_claims_without_validation(access_token)
     issued_at = _as_finite_number(claims.get("iat"))
     expires_at = _as_finite_number(claims.get("exp"))
