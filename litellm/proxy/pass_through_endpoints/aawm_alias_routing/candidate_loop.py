@@ -1940,32 +1940,48 @@ async def handle_alias_route(  # noqa: PLR0915
                         error_class=error_class,
                         add_alias_metadata_fn=add_alias_metadata_fn,
                         redispatch_required=True,
+                        defer_terminal_error=True,
                     )
                     failure_metadata = failure_body.get("litellm_metadata") or {}
-                    raise_redispatch_required_fn(
-                        candidate=candidate,
-                        lane_key=selection.get("lane_key"),
-                        cooldown_seconds=0.0,
-                        error_tokens=error_tokens,
-                        alias_model=alias_model,
-                        error_class=error_class,
-                        cooldown_scope="none",
-                        error_status_code=attempt_record.get("error_status_code"),
-                        error_type=attempt_record.get("error_type"),
-                        error_code=attempt_record.get("error_code"),
-                        retry_after_seconds=0.0,
-                        failure_phase="token_invalidated_continuation",
-                        attempted_provider_call=attempt_record.get(
-                            "attempted_provider_call"
-                        ),
-                        audit_events=failure_metadata.get(
-                            "aawm_alias_routing_audit_events"
-                        ),
-                        attempts=failure_metadata.get(attempts_metadata_key),
-                        skipped_candidates=failure_metadata.get(
-                            skipped_candidates_metadata_key
-                        ),
-                    )
+                    try:
+                        raise_redispatch_required_fn(
+                            candidate=candidate,
+                            lane_key=selection.get("lane_key"),
+                            cooldown_seconds=0.0,
+                            error_tokens=error_tokens,
+                            alias_model=alias_model,
+                            error_class=error_class,
+                            cooldown_scope="none",
+                            error_status_code=attempt_record.get("error_status_code"),
+                            error_type=attempt_record.get("error_type"),
+                            error_code=attempt_record.get("error_code"),
+                            retry_after_seconds=0.0,
+                            failure_phase="token_invalidated_continuation",
+                            attempted_provider_call=attempt_record.get(
+                                "attempted_provider_call"
+                            ),
+                            audit_events=failure_metadata.get(
+                                "aawm_alias_routing_audit_events"
+                            ),
+                            attempts=failure_metadata.get(attempts_metadata_key),
+                            skipped_candidates=failure_metadata.get(
+                                skipped_candidates_metadata_key
+                            ),
+                        )
+                    except HTTPException as final_exc:
+                        _emit_validated_redispatch_terminal_event(
+                            exc=final_exc,
+                            request=request,
+                            alias_family=alias_family,
+                            alias_model=alias_model,
+                            request_body=prepared_request_body,
+                            selection=selection,
+                            attempts=attempts,
+                            emit_pre_attempt_terminal_event=(
+                                _emit_auto_agent_alias_pre_attempt_terminal_event
+                            ),
+                        )
+                        raise
                 if (
                     has_continuation_state
                     and cooldown_scope != "none"
@@ -1983,6 +1999,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         error_class=error_class,
                         add_alias_metadata_fn=add_alias_metadata_fn,
                         redispatch_required=True,
+                        defer_terminal_error=True,
                     )
                     failure_metadata = failure_body.get("litellm_metadata") or {}
                     verbose_proxy_logger.debug(
@@ -1995,24 +2012,45 @@ async def handle_alias_route(  # noqa: PLR0915
                         error_class,
                         len(attempts),
                     )
-                    raise_redispatch_required_fn(
-                        candidate=candidate,
-                        lane_key=selection.get("lane_key"),
-                        cooldown_seconds=cooldown_seconds,
-                        error_tokens=error_tokens,
-                        alias_model=alias_model,
-                        error_class=error_class,
-                        cooldown_scope=cooldown_scope,
-                        error_status_code=attempt_record.get("error_status_code"),
-                        error_type=attempt_record.get("error_type"),
-                        error_code=attempt_record.get("error_code"),
-                        retry_after_seconds=attempt_record.get("retry_after_seconds"),
-                        failure_phase=attempt_record.get("failure_phase"),
-                        attempted_provider_call=attempt_record.get("attempted_provider_call"),
-                        audit_events=failure_metadata.get("aawm_alias_routing_audit_events"),
-                        attempts=failure_metadata.get(attempts_metadata_key),
-                        skipped_candidates=failure_metadata.get(skipped_candidates_metadata_key),
-                    )
+                    try:
+                        raise_redispatch_required_fn(
+                            candidate=candidate,
+                            lane_key=selection.get("lane_key"),
+                            cooldown_seconds=cooldown_seconds,
+                            error_tokens=error_tokens,
+                            alias_model=alias_model,
+                            error_class=error_class,
+                            cooldown_scope=cooldown_scope,
+                            error_status_code=attempt_record.get("error_status_code"),
+                            error_type=attempt_record.get("error_type"),
+                            error_code=attempt_record.get("error_code"),
+                            retry_after_seconds=attempt_record.get("retry_after_seconds"),
+                            failure_phase=attempt_record.get("failure_phase"),
+                            attempted_provider_call=attempt_record.get(
+                                "attempted_provider_call"
+                            ),
+                            audit_events=failure_metadata.get(
+                                "aawm_alias_routing_audit_events"
+                            ),
+                            attempts=failure_metadata.get(attempts_metadata_key),
+                            skipped_candidates=failure_metadata.get(
+                                skipped_candidates_metadata_key
+                            ),
+                        )
+                    except HTTPException as final_exc:
+                        _emit_validated_redispatch_terminal_event(
+                            exc=final_exc,
+                            request=request,
+                            alias_family=alias_family,
+                            alias_model=alias_model,
+                            request_body=prepared_request_body,
+                            selection=selection,
+                            attempts=attempts,
+                            emit_pre_attempt_terminal_event=(
+                                _emit_auto_agent_alias_pre_attempt_terminal_event
+                            ),
+                        )
+                        raise
                 if account_failover_planned:
                     provider_candidate_attempts = max(
                         0,

@@ -2178,6 +2178,160 @@ async def test_candidate_loop_previous_response_usage_limit_uses_redispatch(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_kind",
+    ["candidate_unavailable", "token_invalidated"],
+)
+async def test_candidate_loop_stateful_cursor_failure_logs_only_final_redispatch(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+    failure_kind: str,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    monkeypatch.setattr(
+        lpe,
+        "_codex_auto_agent_request_has_continuation_state",
+        lambda body: True,
+    )
+    failure_record_calls: list[dict[str, Any]] = []
+    real_record_failure = attempt_records._record_auto_agent_alias_attempt_failure
+
+    def _record_failure(**kwargs: Any) -> dict[str, Any]:
+        failure_record_calls.append(kwargs)
+        return real_record_failure(**kwargs)
+
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_failure",
+        _record_failure,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda *args, **kwargs: None,
+    )
+    failure = (
+        HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "aawm_codex_auto_agent_candidate_unavailable",
+                }
+            },
+        )
+        if failure_kind == "candidate_unavailable"
+        else _token_invalidated_error()
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_classify_codex_auto_agent_retryable_exhaustion",
+        lambda exc, *args, candidate=None, **kwargs: failure_kind,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_get_codex_auto_agent_cooldown_seconds",
+        lambda exc, *, candidate: 30.0,
+    )
+    request = _request()
+    candidate = {
+        "provider": "cursor_agent",
+        "model": "cursor-work",
+        "route_family": "cursor_agent_responses_adapter",
+        "last_resort": False,
+    }
+    selected = {
+        "candidate": candidate,
+        "lane_key": "cursor-agent",
+        "cooldown_key": "cursor_agent:cursor-work:cursor-agent",
+        "selection_reason": "first_available",
+        "request_mode": "continuation",
+        "has_account_bound_state": False,
+        "in_flight_session": True,
+        "session_key": "cursor-session",
+        "skipped": [],
+    }
+    selected_count = 0
+    performed_providers: list[str] = []
+    redispatch_calls: list[dict[str, Any]] = []
+    logger_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    monkeypatch.setattr(
+        audit_persist.verbose_proxy_logger,
+        "error",
+        lambda *args, **kwargs: logger_calls.append((args, kwargs)),
+    )
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        nonlocal selected_count
+        selected_count += 1
+        return dict(selected)
+
+    async def _perform(**kwargs: Any) -> Response:
+        performed_providers.append(kwargs["candidate"]["provider"])
+        raise failure
+
+    async def _cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "local_fallback"
+
+    def _raise_redispatch(**kwargs: Any) -> None:
+        redispatch_calls.append(kwargs)
+        selection._raise_codex_auto_agent_redispatch_required(**kwargs)
+
+    services = _loop_services(
+        select_candidate=_select,
+        perform_candidate=_perform,
+        raise_redispatch=_raise_redispatch,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="cursor",
+            request=request,
+            prepared_request_body={
+                "model": "cursor",
+                "previous_response_id": "cursor-response-1",
+            },
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidate",
+            log_label="Codex",
+        )
+
+    exc = exc_info.value
+    assert exc.status_code == 429
+    assert exc.detail["redispatch_required"] is True
+    assert exc.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_redispatch_required"
+    )
+    outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
+    retained_attempts = outcome["attempts"]
+    assert retained_attempts
+    assert retained_attempts[0]["provider"] == "cursor_agent"
+    assert retained_attempts[0]["model"] == "cursor-work"
+    assert retained_attempts[0]["attempted_provider_call"] is True
+    assert len(failure_record_calls) == 1
+    assert selected_count == 1
+    assert performed_providers == ["cursor_agent"]
+    assert len(redispatch_calls) == 1
+    assert redispatch_calls[0]["attempted_provider_call"] is True
+    terminal_calls = [
+        call
+        for call in logger_calls
+        if call[0] and call[0][0] == "AAWM_TERMINAL_ERROR: %s"
+    ]
+    assert len(terminal_calls) == 1
+    terminal_fields = terminal_calls[0][1]["extra"]
+    assert terminal_fields["status_code"] == 429
+    assert terminal_fields["error_code"] == (
+        "aawm_codex_auto_agent_redispatch_required"
+    )
+    assert request.state.aawm_terminal_error_emitted is True
+
+
+@pytest.mark.asyncio
 async def test_stream_failure_after_response_start_is_not_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
