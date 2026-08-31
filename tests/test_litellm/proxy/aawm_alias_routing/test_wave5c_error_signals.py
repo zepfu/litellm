@@ -848,6 +848,37 @@ class TestClassification:
         exc = _FakeExc(message="usage_limit_reached")
         assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "usage_limit_reached"
 
+    def test_classify_openrouter_free_daily_quota_as_candidate_scoped_usage_limit(self):
+        exc = _FakeExc(
+            detail={"error": {"code": "free-models-per-day-high-balance"}}
+        )
+        candidate = {
+            "provider": "openrouter",
+            "model": "openai/gpt-oss-20b:free",
+        }
+
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+            )
+            == "usage_limit_reached"
+        )
+        assert (
+            _get_codex_auto_agent_candidate_cooldown_scope(
+                "usage_limit_reached",
+                candidate=candidate,
+            )
+            == "candidate"
+        )
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate={"provider": "openai", "model": "gpt-5"},
+            )
+            is None
+        )
+
     def test_classify_none_for_unknown(self):
         exc = _FakeExc(message="all good")
         assert _classify_codex_auto_agent_retryable_exhaustion(exc) is None

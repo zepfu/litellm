@@ -56,6 +56,7 @@ from .policy import (
     CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY as _CODEX_AUTO_AGENT_KIMI_CODE_LANE_KEY,
     CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER as _CODEX_AUTO_AGENT_KIMI_CODE_PROVIDER,
     CODEX_AUTO_AGENT_NATIVE_PROVIDER as _CODEX_AUTO_AGENT_NATIVE_PROVIDER,
+    CODEX_AUTO_AGENT_OPENROUTER_PROVIDER as _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER,
     CODEX_AUTO_AGENT_XAI_PROVIDER as _CODEX_AUTO_AGENT_XAI_PROVIDER,
 )
 from .types import Payload
@@ -1456,6 +1457,12 @@ def _classify_codex_auto_agent_retryable_exhaustion(
 
         if codex_oauth.is_direct_codex_token_invalidated_error(exc):
             return "token_invalidated"
+    if (
+        "free-models-per-day-high-balance" in tokens
+        and isinstance(candidate, dict)
+        and candidate.get("provider") == _CODEX_AUTO_AGENT_OPENROUTER_PROVIDER
+    ):
+        return "usage_limit_reached"
     if "usage_limit_reached" in tokens:
         return "usage_limit_reached"
     if "server_overloaded" in tokens or tokens & _CODEX_AUTO_AGENT_CAPACITY_ERROR_TOKENS:
