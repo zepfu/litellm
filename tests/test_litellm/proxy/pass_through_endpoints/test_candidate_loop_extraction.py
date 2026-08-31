@@ -19,6 +19,7 @@ Write-only surface: this file. No production edits.
 
 from __future__ import annotations
 
+import asyncio
 import ast
 from pathlib import Path
 from types import SimpleNamespace
@@ -1553,6 +1554,184 @@ async def test_candidate_loop_skips_preflight_cooldown_without_recording_attempt
     assert all(captured is attempts for captured in metadata_attempts)
     assert [attempt["model"] for attempt in attempts] == ["egress"]
     assert attempts[0]["attempted_provider_call"] is True
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_metadata_failure_does_not_record_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [(b"user-agent", b"codex-cli/1.0")],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    captured_attempts: list[list[dict[str, Any]]] = []
+    provider_calls: list[str] = []
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        return {
+            "candidate": {
+                "provider": "openai",
+                "model": "metadata-failure",
+                "route_family": "codex_responses",
+            },
+            "lane_key": "lane-metadata-failure",
+            "cooldown_key": "openai:metadata-failure",
+            "selection_reason": "first_available",
+            "skipped": [],
+        }
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        provider_calls.append(candidate["model"])
+        return candidate_body
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def _fail_attempt_start(**kwargs: Any) -> dict[str, Any]:
+        captured_attempts.append(kwargs["attempts"])
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_started",
+        _fail_attempt_start,
+    )
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=None,
+        publish_cooldown_memory_fn=None,
+        persist_cooldown_fn=None,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=lambda body, **_kwargs: body,
+        raise_redispatch_fn=None,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body={"model": "basic", "input": "hello"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_no_active_cooldown,
+            attempts_metadata_key="attempts",
+            skipped_candidates_metadata_key="skipped",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    assert provider_calls == []
+    assert captured_attempts == [[]]
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_lease_wrapper_failure_does_not_record_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [(b"user-agent", b"codex-cli/1.0")],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    metadata_attempts: list[list[dict[str, Any]]] = []
+    provider_calls: list[str] = []
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        return {
+            "candidate": {
+                "provider": "openai",
+                "model": "lease-failure",
+                "route_family": "codex_responses",
+            },
+            "lane_key": "lane-lease-failure",
+            "cooldown_key": "openai:lease-failure",
+            "selection_reason": "first_available",
+            "skipped": [],
+        }
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        provider_calls.append(candidate["model"])
+        return candidate_body
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _fail_before_callback(
+        _lease: object,
+        _callback: object,
+    ) -> object:
+        raise asyncio.CancelledError
+
+    def _add_alias_metadata(body: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        metadata_attempts.append(kwargs["attempts"])
+        return body
+
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+    monkeypatch.setattr(
+        session_affinity,
+        "run_with_session_owner_lease_renewal",
+        _fail_before_callback,
+    )
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=None,
+        publish_cooldown_memory_fn=None,
+        persist_cooldown_fn=None,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=_add_alias_metadata,
+        raise_redispatch_fn=None,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="basic",
+            request=request,
+            prepared_request_body={"model": "basic", "input": "hello"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_no_active_cooldown,
+            attempts_metadata_key="attempts",
+            skipped_candidates_metadata_key="skipped",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    assert provider_calls == []
+    assert metadata_attempts == [[]]
 
 
 @pytest.mark.asyncio

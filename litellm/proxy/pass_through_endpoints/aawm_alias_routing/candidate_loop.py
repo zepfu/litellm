@@ -1215,9 +1215,6 @@ async def handle_alias_route(  # noqa: PLR0915
                             request,
                             candidate=candidate,
                         )
-                        attempts.append(attempt_record)
-                        attempt_record["attempted_provider_call"] = True
-                        attempted_provider_call = True
                         candidate_body = _record_auto_agent_alias_attempt_started(
                             alias_family=alias_family,
                             alias_model=alias_model,
@@ -1230,6 +1227,10 @@ async def handle_alias_route(  # noqa: PLR0915
                         )
 
                         async def _perform_candidate_request() -> Response:
+                            nonlocal attempted_provider_call
+                            attempts.append(attempt_record)
+                            attempt_record["attempted_provider_call"] = True
+                            attempted_provider_call = True
                             return await perform_candidate_request_fn(
                                 candidate=candidate,
                                 candidate_body=candidate_body,
