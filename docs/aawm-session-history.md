@@ -1583,8 +1583,10 @@ origin and defaults to `sota-openai`. `sota-alibaba` uses
 Plan `zai_coding_plan/glm-5.3` first; Alibaba Token Plan `glm-5.2` is the
 last-resort leaf on the same alias.
 
-`basic` is the config-driven low-cost alias: direct Cohere, OpenRouter Cohere,
-and the two OpenCode Zen leaves precede `alias_reference: basic-other`.
+`basic` is the config-driven low-cost alias: native Cohere
+`cohere/north-mini-code-1-0`, then OpenRouter Cohere
+`openrouter/cohere/north-mini-code:free`, then the OpenCode Zen `big-pickle`
+leaf, then `alias_reference: basic-other`.
 `basic-other` admits Alibaba DeepSeek Flash during `22:00-08:00 UTC+8`, then
 uses Z.AI Flash and Cursor Composer before mutually exclusive priority-zero
 Luna/Haiku tails.

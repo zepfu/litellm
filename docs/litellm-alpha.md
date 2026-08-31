@@ -146,9 +146,11 @@ next live test.
 
 The current canonical alias YAML exposes these alpha test paths:
 
-- `basic` orders direct Cohere, OpenRouter Cohere, and the two OpenCode Zen
-  leaves before `basic-other`. The helper adds a nightly Alibaba promotion,
-  Z.AI Coding Plan, Cursor Composer, and mutually exclusive Luna/Haiku tails.
+- `basic` orders native Cohere `cohere/north-mini-code-1-0`, then OpenRouter
+  Cohere `openrouter/cohere/north-mini-code:free`, then OpenCode Zen
+  `big-pickle`, then `basic-other`. The helper adds a nightly Alibaba
+  promotion, Z.AI Coding Plan, Cursor Composer, and mutually exclusive
+  Luna/Haiku tails.
 - `work` references `work-other`, then keeps its Claude-only native Sonnet
   leaves and OpenAI `gpt-5.6-luna`. `work-other` orders the nightly DeepSeek
   promotion, Z.AI Coding Plan, Moonshot, then xAI.

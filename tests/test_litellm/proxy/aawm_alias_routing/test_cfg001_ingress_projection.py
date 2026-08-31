@@ -721,7 +721,6 @@ aliases:
             for candidate in snapshot.aliases["basic"].candidates
             if isinstance(candidate, RoutingCandidate)
         }
-        assert by_model["deepseek-v4-flash-free"].anthropic_route_family == "anthropic_opencode_zen_responses_adapter"
         assert by_model["big-pickle"].anthropic_route_family == "anthropic_opencode_zen_completion_adapter"
 
 

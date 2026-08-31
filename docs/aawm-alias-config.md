@@ -188,9 +188,8 @@ The `basic` alias keeps the low-cost common prefix, in order:
 2. OpenRouter Cohere North Mini Code free
    (`openrouter/cohere/north-mini-code:free`, priority 80) as an independent
    fallback
-3. OpenCode Zen `deepseek-v4-flash-free` (priority 60)
-4. OpenCode Zen `big-pickle` (priority 50)
-5. `alias_reference: basic-other` (priority 0)
+3. OpenCode Zen `big-pickle` (priority 50)
+4. `alias_reference: basic-other` (priority 0)
 
 `basic-other` orders Alibaba Token Plan
 `alibaba_token_plan/deepseek-v4-flash-0731` (priority 100, admitted only during

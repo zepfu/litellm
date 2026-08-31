@@ -2104,8 +2104,8 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
         luna_response, luna_calls = await _run(success_model="gpt-5.6-luna")
         assert luna_response["model"] == "gpt-5.6-luna"
         assert [model for model, _body in luna_calls] == [
+            "cohere/north-mini-code-1-0",
             "openrouter/cohere/north-mini-code:free",
-            "deepseek-v4-flash-free",
             "big-pickle",
             "alibaba_token_plan/deepseek-v4-flash-0731",
             "zai_coding_plan/glm-5.3-flash",
@@ -2120,8 +2120,8 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
         early_response, early_calls = await _run(success_model="big-pickle")
         assert early_response["model"] == "big-pickle"
         assert [model for model, _body in early_calls] == [
+            "cohere/north-mini-code-1-0",
             "openrouter/cohere/north-mini-code:free",
-            "deepseek-v4-flash-free",
             "big-pickle",
         ]
         assert all(model != "gpt-5.6-luna" for model, _body in early_calls)
@@ -2152,8 +2152,8 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
         terminal_event = persisted[-1][-1]
         inventory = terminal_event["candidates"]
         assert [candidate["model"] for candidate in inventory] == [
+            "cohere/north-mini-code-1-0",
             "openrouter/cohere/north-mini-code:free",
-            "deepseek-v4-flash-free",
             "big-pickle",
             "alibaba_token_plan/deepseek-v4-flash-0731",
             "zai_coding_plan/glm-5.3-flash",
@@ -2164,8 +2164,8 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
             (candidate["terminal_disposition"], candidate["reason"])
             for candidate in inventory
         ] == [
+            ("attempted", "rate_limited"),
             ("attempted", "candidate_deterministically_ineligible"),
-            ("attempted", "provider_format_rejected"),
             ("attempted", "provider_terminal_error"),
             ("attempted", "candidate_deterministically_ineligible"),
             ("attempted", "candidate_deterministically_ineligible"),

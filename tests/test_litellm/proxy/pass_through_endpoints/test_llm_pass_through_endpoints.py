@@ -31408,14 +31408,11 @@ async def test_aawm_low_alias_skips_openrouter_candidates_with_durable_quota_exh
             request_body=body,
         )
 
-    assert selection["candidate"]["provider"] == "zai_coding_plan"
-    assert selection["candidate"]["model"] == "zai_coding_plan/glm-5.3-flash"
+    assert selection["candidate"]["provider"] == "cohere"
+    assert selection["candidate"]["model"] == "cohere/north-mini-code-1-0"
     skipped = selection["skipped"]
     skipped_models = {candidate["model"] for candidate in skipped}
-    assert {
-        "openrouter/cohere/north-mini-code:free",
-        "openrouter/owl-alpha",
-    } <= skipped_models
+    assert "openrouter/cohere/north-mini-code:free" in skipped_models
     assert all(
         candidate["reason"] == "durable_quota_exhausted"
         and candidate["cooldown_state_source"] == "durable_quota"
@@ -31443,13 +31440,10 @@ async def test_aawm_low_anthropic_alias_skips_openrouter_candidates_with_durable
         )
 
     assert selection["candidate"]["provider"] == "opencode_zen"
-    assert selection["candidate"]["model"] == "deepseek-v4-flash-free"
+    assert selection["candidate"]["model"] == "big-pickle"
     skipped = selection["skipped"]
     skipped_models = {candidate["model"] for candidate in skipped}
-    assert {
-        "openrouter/cohere/north-mini-code:free",
-        "openrouter/owl-alpha",
-    } <= skipped_models
+    assert "openrouter/cohere/north-mini-code:free" in skipped_models
     assert all(
         candidate["reason"] == "durable_quota_exhausted"
         and candidate["cooldown_state_source"] == "durable_quota"

@@ -43,12 +43,6 @@ _OPERATIONAL_ALIAS_ORDER = {
         ),
         (
             "opencode_zen",
-            "deepseek-v4-flash-free",
-            "codex_opencode_zen_adapter",
-            60,
-        ),
-        (
-            "opencode_zen",
             "big-pickle",
             "codex_opencode_zen_adapter",
             50,
