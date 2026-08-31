@@ -1294,6 +1294,10 @@ Operational notes:
   - Redis TTL is derived from the winning expiry and floored to one second.
     The max-expiry merge happens once before the retry loop; every retry uses
     the same merged payload and positive TTL.
+  - Upstream-origin evidence authorization is separate from provider-derived
+    duration and monotonic TTL calculation. Only real provider-attributed
+    evidence may advance provider evidence; client-origin, deterministic,
+    safety-policy, and cancellation failures do not.
   - Affinity writes additionally use
     `AAWM_ALIAS_ROUTING_DURABLE_AFFINITY_KEY_LIMIT` (default `4096`) as a
     process-local cardinality gate. An over-limit affinity write is skipped
@@ -1342,11 +1346,14 @@ Operational notes:
   operators can distinguish persistent state from process-local behavior.
 - Shared PostgreSQL durable quota (`durable_quota`) remains separate and is not
   merged across routing namespaces.
-- Bare transient upstream statuses (`500`, `502`, `503`, and `529`) that do not
+- Provider-attributed fresh replay-safe transient statuses (`408`, `500`,
+  `502`, `503`, `504`, and `529`) that do not
   carry explicit capacity, quota, rate-limit, or usage-limit evidence are
-  treated as request-local alias failures for most candidates. They are skipped
-  for the current alias progression so failover can continue, but they do not
-  write durable provider/model cooldown state. Native Grok 4.5 candidates on
+  treated as finite, request-local alias containment. They are skipped for the
+  current alias progression so failover can continue, but they do not write
+  durable provider-wide cooldown state. Direct routes retain their direct
+  behavior, while stateful continuations preserve affinity and do not migrate
+  provider state between candidates. Native Grok 4.5 candidates on
   `codex_grok_native_responses_adapter` and
   `anthropic_grok_native_responses_adapter` use cooldown scope `none` for these
   bare transient classes: fresh requests exclude the failed native candidate for
@@ -1441,6 +1448,12 @@ candidates are skipped before upstream attempts with
 `reason=durable_quota_exhausted` and `cooldown_state_source=durable_quota`; if
 the lookup fails or expires, selection fails open and preserves the declared
 alias order.
+
+The literal OpenRouter error code
+`free-models-per-day-high-balance` is OpenRouter-only
+`usage_limit_reached`. It applies exact candidate-scoped cooldown and failover
+for that OpenRouter candidate and remains separate from direct-provider quota
+state.
 
 Expected upstream provider `429` responses that are returned directly to the
 requester are still durable provider-error observations. The

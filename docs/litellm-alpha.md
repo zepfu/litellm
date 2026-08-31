@@ -173,6 +173,14 @@ These are alpha-only testing paths for the current checkout. A passing alpha
 call is not `litellm-dev` or production acceptance, deployment evidence, or
 authorization to promote candidates or configuration to either environment.
 
+For OpenRouter free candidates, the literal
+`free-models-per-day-high-balance` provider error is classified as
+OpenRouter-only `usage_limit_reached`, with exact candidate-scoped cooldown
+and failover. It is separate from direct-provider quota state. Fresh
+replay-safe provider-attributed transient `408`, `500`, `502`, `503`, `504`,
+and `529` failures remain finite and request-local; they do not establish a
+durable provider-wide cooldown, and stateful requests preserve affinity.
+
 ## Rebuild
 
 ```bash

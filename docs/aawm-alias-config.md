@@ -278,6 +278,12 @@ requests; otherwise the bounded process-local marker remains the admission
 boundary. This is distinct from provider failures, which use the normal retry
 and cooldown classification.
 
+Upstream-origin evidence authorization is separate from provider-derived
+duration and monotonic TTL handling. Only evidence attributable to the upstream
+provider may advance provider evidence; client-origin, deterministic,
+safety-policy, and cancellation failures do not advance it. Provider-derived
+duration remains bounded and is represented with monotonic TTL semantics.
+
 ## Maintained `work` and `work-other` alias behavior
 
 The `work` alias is compiled from `work.yaml`. Candidate order is:

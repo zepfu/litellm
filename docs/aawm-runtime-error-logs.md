@@ -389,7 +389,7 @@ already started and the request cannot be safely replayed.
 AAWM pass-through routes use a fixed hidden retry schedule for retry-safe
 upstream failures before the first response byte is returned to the client. The
 schedule is `5s, 15s, 30s, 60s, 120s` and applies to upstream
-`500`/`502`/`503`/`504`/`529` statuses plus pre-first-byte transport
+`408`/`500`/`502`/`503`/`504`/`529` statuses plus pre-first-byte transport
 connectivity failures such as DNS resolution errors and request timeouts.
 
 `429` rate-limit responses are not hidden-retried. They should surface to the
@@ -457,7 +457,7 @@ session side-channel mutation routes.
 
 Alias candidate probes also pass their caller-managed transient upstream status
 set into the pass-through layer. For current AAWM Codex/Anthropic alias probes,
-upstream `500`/`502`/`503`/`504`/`529` responses are owned by alias candidate
+upstream `408`/`500`/`502`/`503`/`504`/`529` responses are owned by alias candidate
 progression, not by generic pass-through exception intake. The pass-through
 layer preserves the upstream status for the alias wrapper, skips generic
 traceback-style `.analysis/*-error.jsonl` emission for those handled statuses,
@@ -481,15 +481,25 @@ candidate inventories, or upstream error text). Full structured
 `provider_terminal_error` and `candidate_unavailable` alias cooldowns are
 durable per-candidate cooldowns because those outcomes are reusable across
 requests. They prevent repeated retry/log spam for the same terminal or
-unavailable candidate until the cooldown expires. Bare transient upstream
-`500`/`502`/`503`/`529` failures remain request-local so temporary provider
-instability does not suppress a route longer than the current progression
-requires.
+unavailable candidate until the cooldown expires. Provider-attributed transient
+upstream `408`/`500`/`502`/`503`/`504`/`529` failures use fresh replay-safe
+failover as finite, request-local containment. They do not create a durable
+provider-wide cooldown. Direct routes retain their direct behavior, while
+stateful or continuation requests preserve affinity and do not migrate provider
+state across candidates. Client-origin, deterministic, safety-policy, and
+cancellation failures are not provider evidence and do not advance evidence or
+this failover classification.
 
 Native Grok 4.5 is the exception for generic candidate-availability probe
 failures: `aawm_codex_auto_agent_candidate_unavailable` does not create a timed
 cooldown for that live route. Explicit usage, quota, rate-limit, or capacity
 signals still use the normal cooldown and fallback path.
+
+The literal OpenRouter error code
+`free-models-per-day-high-balance` is classified as OpenRouter-only
+`usage_limit_reached`. It applies exact candidate-scoped cooldown and failover
+for the OpenRouter candidate; it does not create or modify direct-provider
+quota state.
 
 `malformed_tool_call_text` is also a durable per-candidate cooldown path. For
 non-spark candidates it resolves to a 30-minute cooldown; Spark candidates keep
