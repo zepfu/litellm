@@ -881,6 +881,54 @@ class TestAttemptFailure:
         assert emitted["event_type"] == "candidate_retryable_failure"
 
 
+class TestAttemptSuccess:
+    def test_recovery_event_contains_prior_and_successful_attempts_in_order(
+        self, _configure_attempt_records: _StubState
+    ) -> None:
+        state = _configure_attempt_records
+        request = _make_request()
+        attempts = [
+            {"provider": "provider-a", "status": "cooldown_set"},
+            {"provider": "provider-b", "status": "succeeded"},
+        ]
+        recovery_event = {"event_type": "candidate_succeeded", "provider": "provider-b"}
+
+        attempt_records._mark_auto_agent_alias_request_failover_pending(
+            request, attempts[0]
+        )
+
+        def _add_metadata(
+            body: dict,
+            *,
+            request: Request,
+            selection: dict,
+            attempts: list,
+        ) -> dict:
+            return {
+                **body,
+                "litellm_metadata": {
+                    "aawm_alias_routing_audit_events": [recovery_event]
+                },
+            }
+
+        attempt_records._record_auto_agent_alias_attempt_success(
+            alias_family="codex_auto_agent",
+            alias_model="codex-auto-agent",
+            request=request,
+            prepared_request_body={"model": "gpt-5"},
+            selection={"candidate": {"provider": "provider-b"}},
+            attempts=attempts,
+            attempt_record=attempts[1],
+            add_alias_metadata_fn=_add_metadata,
+        )
+
+        emitted = state.emitted_events[0]["event"]
+        assert emitted["event_type"] == "candidate_recovered"
+        assert emitted["attempts"] == attempts
+        assert emitted["attempt_count"] == 2
+        assert emitted["attempts"] is not attempts
+
+
 # ---------------------------------------------------------------------------
 # Reasoning-effort extraction and normalization
 # ---------------------------------------------------------------------------

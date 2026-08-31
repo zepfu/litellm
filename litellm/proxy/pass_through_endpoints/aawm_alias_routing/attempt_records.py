@@ -863,6 +863,10 @@ def _record_auto_agent_alias_attempt_success(
     audit_event["event_type"] = "candidate_recovered"
     audit_event["candidate_status"] = attempt_record.get("status") or "recovered"
     audit_event["request_outcome"] = "recovered"
+    audit_event["attempts"] = copy.deepcopy(attempts)
+    audit_event["attempt_count"] = sum(
+        isinstance(attempt, dict) for attempt in attempts
+    )
     _stamp_auto_agent_alias_request_identity(request=request, target=audit_event)
     _emit_auto_agent_alias_route_event(audit_event)
     return success_body
