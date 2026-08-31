@@ -936,7 +936,7 @@ async def test_candidate_loop_persists_fresh_cursor_transient_marker(
         pytest.param(False, id="previous-response-id-only"),
     ],
 )
-async def test_candidate_loop_does_not_mark_cursor_transient_marker_for_non_fresh_request(
+async def test_candidate_loop_persists_cursor_transient_marker_for_non_fresh_request(
     monkeypatch: pytest.MonkeyPatch,
     has_continuation_state: bool,
 ) -> None:
@@ -972,6 +972,7 @@ async def test_candidate_loop_does_not_mark_cursor_transient_marker_for_non_fres
         "_classify_codex_auto_agent_retryable_exhaustion",
         lambda exc, *args, candidate=None, **kwargs: "upstream_transient_internal",
     )
+    provider_attempts: list[str] = []
 
     async def _select(**kwargs: Any) -> dict[str, Any]:
         return dict(selected)
@@ -981,6 +982,7 @@ async def test_candidate_loop_does_not_mark_cursor_transient_marker_for_non_fres
         candidate: dict[str, Any],
         candidate_body: dict[str, Any],
     ) -> Response:
+        provider_attempts.append(candidate["provider"])
         raise RuntimeError("timed out")
 
     with pytest.raises(HTTPException):
@@ -988,6 +990,7 @@ async def test_candidate_loop_does_not_mark_cursor_transient_marker_for_non_fres
             _loop_services(
                 select_candidate=_select,
                 perform_candidate=_perform,
+                cooldown_scope="request_local",
             ),
             alias_family="codex_auto_agent",
             alias_model="work",
@@ -1004,7 +1007,10 @@ async def test_candidate_loop_does_not_mark_cursor_transient_marker_for_non_fres
     marker = manager.codex.get_candidate_semantic_ineligibility_memory(
         selected["cooldown_key"]
     )
-    assert marker is None
+    assert marker is not None
+    assert marker["reason"] == "upstream_transient_internal"
+    assert provider_attempts
+    assert all(provider == "cursor_agent" for provider in provider_attempts)
 
 
 @pytest.mark.asyncio

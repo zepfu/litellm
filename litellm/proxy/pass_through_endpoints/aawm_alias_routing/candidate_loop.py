@@ -1735,6 +1735,41 @@ async def handle_alias_route(  # noqa: PLR0915
                     )
                 )
                 fresh_dispatch = _genuinely_fresh_dispatch(selection)
+                marker_reason: str | None = None
+                if deterministically_ineligible and fresh_dispatch:
+                    marker_reason = (
+                        getattr(failure_exc, "ineligibility_reason", None)
+                        or "deterministic_candidate_ineligible"
+                    )
+                elif (
+                    _error_signals._is_codex_auto_agent_cursor_agent_candidate(
+                        candidate
+                    )
+                    and error_class
+                    in {"upstream_timeout", "upstream_transient_internal"}
+                ):
+                    marker_reason = error_class
+                if marker_reason is not None:
+                    try:
+                        semantic_marker = (
+                            await alias_routing_state.mark_candidate_semantic_ineligibility(
+                                alias_family=alias_family,
+                                candidate_key=cooldown_key,
+                                reason=marker_reason,
+                            )
+                        )
+                    except Exception:
+                        semantic_marker = None
+                    if semantic_marker is not None:
+                        attempt_record[
+                            "candidate_semantic_ineligibility_reason"
+                        ] = semantic_marker.get("reason")
+                        attempt_record[
+                            "candidate_semantic_ineligibility_state_source"
+                        ] = semantic_marker.get("state_source") or "memory"
+                        attempt_record[
+                            "candidate_semantic_ineligibility_remaining_seconds"
+                        ] = semantic_marker.get("remaining_seconds")
                 if deterministically_ineligible and fresh_dispatch:
                     deterministically_ineligible_candidate_keys.add(cooldown_key)
                 last_retryable_exc = failure_exc
@@ -1862,42 +1897,6 @@ async def handle_alias_route(  # noqa: PLR0915
                     candidate=candidate,
                     kimi_failure_metadata=kimi_failure_metadata,
                 )
-                marker_reason: str | None = None
-                if deterministically_ineligible and fresh_dispatch:
-                    marker_reason = (
-                        getattr(failure_exc, "ineligibility_reason", None)
-                        or "deterministic_candidate_ineligible"
-                    )
-                elif (
-                    fresh_dispatch
-                    and _error_signals._is_codex_auto_agent_cursor_agent_candidate(
-                        candidate
-                    )
-                    and error_class
-                    in {"upstream_timeout", "upstream_transient_internal"}
-                ):
-                    marker_reason = error_class
-                if marker_reason is not None:
-                    try:
-                        semantic_marker = (
-                            await alias_routing_state.mark_candidate_semantic_ineligibility(
-                                alias_family=alias_family,
-                                candidate_key=cooldown_key,
-                                reason=marker_reason,
-                            )
-                        )
-                    except Exception:
-                        semantic_marker = None
-                    if semantic_marker is not None:
-                        attempt_record[
-                            "candidate_semantic_ineligibility_reason"
-                        ] = semantic_marker.get("reason")
-                        attempt_record[
-                            "candidate_semantic_ineligibility_state_source"
-                        ] = semantic_marker.get("state_source") or "memory"
-                        attempt_record[
-                            "candidate_semantic_ineligibility_remaining_seconds"
-                        ] = semantic_marker.get("remaining_seconds")
                 # D1-586: observational shadow action only. Does not change retry,
                 # failover, sleep, admission, or cooldown enforcement paths.
                 attempt_record["shadow_failure_action"] = (
