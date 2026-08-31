@@ -163,9 +163,12 @@ The current canonical alias YAML exposes these alpha test paths:
 - `sota-xai` orders Cursor Agent
   `cursor_agent/cursor-grok-4.6-high`, native xAI/OIDC
   `xai/grok-4.6`, then managed xAI/OAuth `oa_xai/grok-4.6`.
-  Fresh Cursor Agent alias dispatches include the empty
-  `UserMessageAction.requestContext` message for workspace isolation; the
-  direct provider route remains available.
+  `UserMessageAction.requestContext` is official schema field 2. For a fresh
+  clean alias dispatch, LiteLLM intentionally sends it as an empty message
+  (`requestContext: {}`). The official CLI normally computes and populates
+  `RequestContext` from local context; it does not itself prove an explicit
+  `{}` send. AgentRunRequest field 12 is never sent, and the direct provider
+  route remains available.
 
 These are alpha-only testing paths for the current checkout. A passing alpha
 call is not `litellm-dev` or production acceptance, deployment evidence, or
