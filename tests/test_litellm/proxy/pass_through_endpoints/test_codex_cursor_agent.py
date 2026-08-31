@@ -252,7 +252,6 @@ def test_cursor_codex_path_returns_native_function_call_and_replays_tool_history
         ],
     }
     assert first_run["mcpTools"]["mcpTools"][0]["name"] == "exec_command"
-    assert first_run["excludeWorkspaceContext"] is True
     assert "rootPromptMessagesJson" not in json.dumps(first_run)
 
     second_run = FakeCursorClient.calls[1]["payload"]["runRequest"]

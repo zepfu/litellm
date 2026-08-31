@@ -301,10 +301,11 @@ window prevents new affinity and does not evict an existing session owner.
 The `expert` alias first references `expert-other` (priority 100), then falls
 back to OpenAI/Codex `gpt-5.6-terra` (`codex_responses`, priority 0,
 `reasoning_effort: max`). `expert-other` orders scheduled Alibaba Token Plan
-`alibaba_token_plan/qwen3.8-max` (priority 100, `22:00-08:00 UTC+8`), Cursor
-Agent `cursor_agent/cursor-grok-4.6-high` (priority 90), and native xAI/OIDC
-`xai/grok-4.6` (priority 0). It does not include managed xAI/OAuth or
-Anthropic candidates.
+`alibaba_token_plan/qwen3.8-max` (priority 100, `22:00-08:00 UTC+8`) before
+native xAI/OIDC `xai/grok-4.6` (priority 0). Cursor Grok remains available on
+`sota-xai` and `provider-cursor_agent`, but expert dispatch omits it because
+its top-level run can inherit unrelated Cursor workspace context. The helper
+does not include managed xAI/OAuth or Anthropic candidates.
 
 ## Maintained `auto-review` aliases
 

@@ -795,17 +795,6 @@ def encode_agent_client_message(request_payload: Mapping[str, Any]) -> bytes:
         4,
         _encode_mcp_tools(mcp_tools),
     )
-    exclude_workspace_context = _proto_mapping_value(
-        run_request,
-        "excludeWorkspaceContext",
-        "exclude_workspace_context",
-    )
-    if exclude_workspace_context is not None:
-        run_payload += _encode_proto_varint_field(
-            12,
-            bool(exclude_workspace_context),
-            include_default=True,
-        )
     run_payload += b"".join(
         (
             _encode_proto_string_field(

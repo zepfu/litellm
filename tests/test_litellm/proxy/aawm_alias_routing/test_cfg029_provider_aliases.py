@@ -121,12 +121,6 @@ _OPERATIONAL_ALIAS_ORDER = {
             100,
         ),
         (
-            "cursor_agent",
-            "cursor_agent/cursor-grok-4.6-high",
-            "codex_cursor_agent_aiserver_adapter",
-            90,
-        ),
-        (
             "xai",
             "xai/grok-4.6",
             "codex_grok_native_responses_adapter",

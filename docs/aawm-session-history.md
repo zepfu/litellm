@@ -1595,7 +1595,9 @@ native Anthropic Sonnet tail, and finally uses `gpt-5.6-luna`. During
 `sota-moonshot`, then `sota-xai`; outside that window new selection begins
 with Z.AI Flash. `expert` references `expert-other` before the final
 OpenAI/Codex `gpt-5.6-terra` fallback. `expert-other` admits Alibaba Qwen Max
-during the same window, then uses Cursor Grok and native xAI.
+during the same window, then uses native xAI. Cursor Grok remains on
+`sota-xai` and `provider-cursor_agent`; expert dispatch omits it because its
+top-level run can inherit unrelated Cursor workspace context.
 
 `auto-review` references `auto-review-other`, then uses low-effort Luna and
 priority-zero OpenRouter DeepSeek. Its helper admits Alibaba DeepSeek Flash

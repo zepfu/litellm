@@ -695,6 +695,36 @@ def test_cfg041_helper_promotions_use_exact_half_open_utc_plus_8_window() -> Non
         snapshot_select.set_active_routing_snapshot(previous)
 
 
+def test_canonical_expert_other_selects_alibaba_then_native_xai() -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
+        DEFAULT_CONFIG_DIR,
+        compile_directory,
+    )
+
+    snapshot = compile_directory(DEFAULT_CONFIG_DIR)
+    previous = snapshot_select.get_active_routing_snapshot()
+    snapshot_select.set_active_routing_snapshot(snapshot)
+    try:
+        inside = snapshot_select._select_snapshot_candidates(
+            "expert-other",
+            ingress="codex",
+            now_utc=dt.datetime(2026, 8, 18, 15, 0, tzinfo=dt.timezone.utc),
+        )
+        outside = snapshot_select._select_snapshot_candidates(
+            "expert-other",
+            ingress="codex",
+            now_utc=dt.datetime(2026, 8, 19, 1, 0, tzinfo=dt.timezone.utc),
+        )
+
+        assert [candidate["model"] for candidate in inside] == [
+            "alibaba_token_plan/qwen3.8-max",
+            "xai/grok-4.6",
+        ]
+        assert [candidate["model"] for candidate in outside] == ["xai/grok-4.6"]
+    finally:
+        snapshot_select.set_active_routing_snapshot(previous)
+
+
 def test_canonical_basic_other_uses_mutually_exclusive_tui_tails() -> None:
     from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup import (
         DEFAULT_CONFIG_DIR,

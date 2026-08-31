@@ -156,7 +156,6 @@ def test_sign_request_uses_connect_proto_framing():
             "conversation_id": "conversation-1",
             "conversation_group_id": "conversation-1",
             "run_id": "run-1",
-            "exclude_workspace_context": True,
         },
     )
     headers, body = config.sign_request(
@@ -182,7 +181,7 @@ def test_sign_request_uses_connect_proto_framing():
         run_fields,
         12,
         wire_type=0,
-    ) == 1
+    ) is None
     action = cursor_connect._proto_last_field(
         run_fields,
         2,
@@ -269,17 +268,6 @@ def test_prompt_maps_to_user_message_text():
         == request["runRequest"]["conversationId"]
     )
     assert request["runRequest"]["runId"]
-    assert "excludeWorkspaceContext" not in request["runRequest"]
-
-
-def test_run_request_preserves_explicit_workspace_context_isolation():
-    request = build_run_request(
-        model="cursor_agent/composer-2.5",
-        messages=[{"role": "user", "content": "ping"}],
-        optional_params={"exclude_workspace_context": True},
-    )
-
-    assert request["runRequest"]["excludeWorkspaceContext"] is True
 
 
 def test_run_identifiers_preserve_caller_values():

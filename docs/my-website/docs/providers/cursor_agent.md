@@ -56,12 +56,6 @@ Composer 2.5 standard is not Fast (`composer-2.5-fast`) and is not xAI
 `anthropic_cursor_agent_aiserver_adapter`. Cloud Agents `cursor` stays
 untouched.
 
-Codex alias dispatch sets Cursor Run
-`exclude_workspace_context=true`. This keeps `work` and `expert` sessions
-bound to the supplied prompt and worktree instead of inheriting unrelated
-Cursor account or editor workspace context. Direct `cursor_agent` calls retain
-the provider default.
-
 Public Cursor list rates (2026-08-19, `https://cursor.com/docs/models-and-pricing`)
 are stored as reference-only catalog rows with
 `actual_invoice_cost_known=false`:
