@@ -462,26 +462,17 @@ def validate_codex_oauth_account_identity(
             expected_account_hash=record.expected_account_hash,
             actual_account_hash=account_hash,
         )
-    email: Optional[str] = None
-    for token_field in ("id_token", "access_token"):
-        token = _clean_string(token_data.get(token_field))
-        if token is None:
-            continue
-        claims = _decode_jwt_claims_without_validation(token)
-        if token_field == "id_token":
-            top_level_email = codex_oauth_masked_account_display(
-                claims.get("email")
-            )
-            if top_level_email is not None:
-                return account_id, account_hash, top_level_email
-        auth_claims = claims.get("https://api.openai.com/auth")
-        if not isinstance(auth_claims, dict):
-            continue
-        candidate_email = _clean_string(auth_claims.get("email"))
-        if candidate_email is not None:
-            email = candidate_email
-            break
-    return account_id, account_hash, codex_oauth_masked_account_display(email)
+    # D1-676: the validated top-level ID-token `email` claim is the sole
+    # display authority; nested and access-token email claims stay redacted.
+    id_token = _clean_string(token_data.get("id_token"))
+    if id_token is not None:
+        id_token_claims = _decode_jwt_claims_without_validation(id_token)
+        top_level_email = codex_oauth_masked_account_display(
+            id_token_claims.get("email")
+        )
+        if top_level_email is not None:
+            return account_id, account_hash, top_level_email
+    return account_id, account_hash, None
 
 
 def get_codex_oauth_token_expiry(
