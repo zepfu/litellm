@@ -468,11 +468,12 @@ def validate_codex_oauth_account_identity(
         if token is None:
             continue
         claims = _decode_jwt_claims_without_validation(token)
-        top_level_email = codex_oauth_masked_account_display(
-            claims.get("email")
-        )
-        if top_level_email is not None:
-            return account_id, account_hash, top_level_email
+        if token_field == "id_token":
+            top_level_email = codex_oauth_masked_account_display(
+                claims.get("email")
+            )
+            if top_level_email is not None:
+                return account_id, account_hash, top_level_email
         auth_claims = claims.get("https://api.openai.com/auth")
         if not isinstance(auth_claims, dict):
             continue

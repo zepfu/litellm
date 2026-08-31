@@ -49,15 +49,17 @@ def _write_auth(
     *,
     account_id: str,
     token_name: str = "one",
-    email: str | None = None,
-    top_level_email: str | None = None,
+    id_token_email: str | None = None,
+    id_token_top_level_email: str | None = None,
+    access_token_email: str | None = None,
+    access_token_top_level_email: str | None = None,
     expires_at: int,
 ) -> str:
     access_token = _jwt(
         account_id,
         expires_at=expires_at,
-        email=email,
-        top_level_email=top_level_email,
+        email=access_token_email,
+        top_level_email=access_token_top_level_email,
     )
     path.write_text(
         json.dumps(
@@ -68,8 +70,8 @@ def _write_auth(
                     "id_token": _jwt(
                         account_id,
                         expires_at=expires_at,
-                        email=email,
-                        top_level_email=top_level_email,
+                        email=id_token_email,
+                        top_level_email=id_token_top_level_email,
                     ),
                     "account_id": account_id,
                     "expires_at": expires_at,
@@ -183,7 +185,7 @@ def test_loader_derives_only_masked_account_display(tmp_path: Path) -> None:
     _write_auth(
         Path(account["auth_path"]),
         account_id="acct-one",
-        email="complete.name@example.com",
+        id_token_email="complete.name@example.com",
         expires_at=int(time.time()) + 3600,
     )
     credential = load_codex_oauth_credential(
@@ -205,8 +207,9 @@ def test_loader_prefers_valid_top_level_email_claim(tmp_path: Path) -> None:
     _write_auth(
         Path(account["auth_path"]),
         account_id="acct-one",
-        email="nested@example.com",
-        top_level_email="top.level@example.com",
+        id_token_email="nested@example.com",
+        id_token_top_level_email="top.level@example.com",
+        access_token_top_level_email="access@example.com",
         expires_at=int(time.time()) + 3600,
     )
 
@@ -214,7 +217,7 @@ def test_loader_prefers_valid_top_level_email_claim(tmp_path: Path) -> None:
         load_codex_oauth_inventory(_inventory_json([account])).records[0]
     )
 
-    assert credential.account_display == "top.*evel@example.com"
+    assert credential.account_display == "t*l@example.com"
 
 
 def test_loader_falls_back_to_nested_email_claim(tmp_path: Path) -> None:
@@ -228,8 +231,9 @@ def test_loader_falls_back_to_nested_email_claim(tmp_path: Path) -> None:
     _write_auth(
         Path(account["auth_path"]),
         account_id="acct-one",
-        email="nested@example.com",
-        top_level_email="invalid",
+        id_token_email="nested@example.com",
+        id_token_top_level_email="invalid",
+        access_token_top_level_email="access@example.com",
         expires_at=int(time.time()) + 3600,
     )
 
@@ -237,7 +241,7 @@ def test_loader_falls_back_to_nested_email_claim(tmp_path: Path) -> None:
         load_codex_oauth_inventory(_inventory_json([account])).records[0]
     )
 
-    assert credential.account_display == "n*e@example.com"
+    assert credential.account_display == "n*d@example.com"
 
 
 def test_loader_redacts_invalid_email_fallback(tmp_path: Path) -> None:
@@ -251,8 +255,9 @@ def test_loader_redacts_invalid_email_fallback(tmp_path: Path) -> None:
     _write_auth(
         Path(account["auth_path"]),
         account_id="acct-one",
-        email="invalid",
-        top_level_email="also-invalid",
+        id_token_email="invalid",
+        id_token_top_level_email="also-invalid",
+        access_token_top_level_email="access@example.com",
         expires_at=int(time.time()) + 3600,
     )
 
