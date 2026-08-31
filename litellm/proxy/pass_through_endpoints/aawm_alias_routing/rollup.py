@@ -373,7 +373,7 @@ def _record_auto_agent_alias_route_status_rollup(event: dict[str, Any]) -> None:
             ),
             account_display=(
                 account_display
-                if attempted_provider_call and is_native_openai_provider
+                if attempted_provider_call and is_native_openai_provider and account_hash
                 else None
             ),
         )

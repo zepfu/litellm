@@ -634,6 +634,21 @@ class TestRecordRouteStatusRollup:
         lines = accumulator.flush(force=True)
         assert "unmasked@example.com" not in "\n".join(lines)
 
+        native_event_without_account_hash = self._make_event(
+            event_type="candidate_retryable_failure",
+            candidate_status="cooldown_set",
+            provider="openai",
+            account_display="native-without-hash@example.com",
+            attempted_provider_call=True,
+            request_identity="openai-call-without-account-hash",
+        )
+        _record_auto_agent_alias_route_status_rollup(
+            native_event_without_account_hash
+        )
+
+        lines = accumulator.flush(force=True)
+        assert "native-without-hash@example.com" not in "\n".join(lines)
+
     @patch(
         "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.emit_aawm_route_status_event",
     )
