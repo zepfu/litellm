@@ -244,7 +244,7 @@ aliases:
         with pytest.raises((ValidationError, ConfigCompileError)):
             compile_yaml(raw)
 
-    def test_basic_yaml_keeps_direct_cohere_ahead_of_openrouter_fallback(self):
+    def test_basic_yaml_has_only_openrouter_north_mini_code(self):
         snapshot = compile_directory(DEFAULT_CONFIG_DIR)
 
         basic_candidates = snapshot.aliases["basic"].candidates
@@ -260,33 +260,11 @@ aliases:
         ]
         assert north_pairs == [
             (
-                "cohere",
-                "cohere/north-mini-code-1-0",
-                _CODEX_COHERE_ROUTE_FAMILY,
-            ),
-            (
                 "openrouter",
                 "openrouter/cohere/north-mini-code:free",
                 "codex_openrouter_completion_adapter",
             ),
         ]
-        # Direct Cohere remains the basic head and stays ahead of the
-        # independent OpenRouter North Mini Code fallback.
-        cohere_index = next(
-            index
-            for index, candidate in enumerate(basic_candidates)
-            if isinstance(candidate, RoutingCandidate)
-            and candidate.model == "cohere/north-mini-code-1-0"
-        )
-        assert basic_candidates[cohere_index].provider == "cohere"
-        assert basic_candidates[cohere_index].priority == 90
-        assert cohere_index == 0
-        assert basic_candidates[cohere_index + 1].provider == "openrouter"
-        assert (
-            basic_candidates[cohere_index + 1].model
-            == "openrouter/cohere/north-mini-code:free"
-        )
-        assert basic_candidates[cohere_index + 1].priority == 80
 
 
 # ---------------------------------------------------------------------------

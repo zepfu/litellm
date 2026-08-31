@@ -30,12 +30,6 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing.config_startup impo
 _OPERATIONAL_ALIAS_ORDER = {
     "basic": [
         (
-            "cohere",
-            "cohere/north-mini-code-1-0",
-            "codex_cohere_chat_completions_adapter",
-            90,
-        ),
-        (
             "openrouter",
             "openrouter/cohere/north-mini-code:free",
             "codex_openrouter_completion_adapter",

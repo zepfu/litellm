@@ -48,11 +48,11 @@ def test_basic_yaml_keeps_legacy_ox_alpha_block_withdrawn():
     basic_candidates = snapshot.aliases["basic"].candidates
     first = basic_candidates[0]
     assert _candidate_identity(first) == (
-        "cohere",
-        "cohere/north-mini-code-1-0",
-        "codex_cohere_chat_completions_adapter",
+        "openrouter",
+        "openrouter/cohere/north-mini-code:free",
+        "codex_openrouter_completion_adapter",
     )
-    assert first.priority == 90
+    assert first.priority == 80
     assert not any(
         candidate.model in _LEGACY_OX_MODELS
         for candidate in basic_candidates
@@ -71,23 +71,11 @@ def test_basic_yaml_keeps_legacy_ox_alpha_block_withdrawn():
     ]
     assert north_pairs == [
         (
-            "cohere",
-            "cohere/north-mini-code-1-0",
-            "codex_cohere_chat_completions_adapter",
-        ),
-        (
             "openrouter",
             "openrouter/cohere/north-mini-code:free",
             "codex_openrouter_completion_adapter",
         ),
     ]
-    cohere_index = next(
-        index
-        for index, candidate in enumerate(basic_candidates)
-        if isinstance(candidate, RoutingCandidate)
-        and candidate.model == "cohere/north-mini-code-1-0"
-    )
-    assert cohere_index == 0
 
 
 def test_work_yaml_compiles_shared_cfg035_cfg038_graph():

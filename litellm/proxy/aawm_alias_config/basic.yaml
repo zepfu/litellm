@@ -4,11 +4,6 @@ defaults: {}
 aliases:
   - name: basic
     candidates:
-      - provider: cohere
-        model: cohere/north-mini-code-1-0
-        route_family: codex_cohere_chat_completions_adapter
-        priority: 90
-
       - provider: openrouter
         model: openrouter/cohere/north-mini-code:free
         route_family: codex_openrouter_completion_adapter

@@ -58,12 +58,12 @@ def test_basic_yaml_compiles() -> None:
     assert first.config_epoch != second.config_epoch
 
     basic_candidate = first.aliases["basic"].candidates[0]
-    assert basic_candidate.provider == "cohere"
-    assert basic_candidate.model == "cohere/north-mini-code-1-0"
+    assert basic_candidate.provider == "openrouter"
+    assert basic_candidate.model == "openrouter/cohere/north-mini-code:free"
     assert basic_candidate.route_family == (
-        "codex_cohere_chat_completions_adapter"
+        "codex_openrouter_completion_adapter"
     )
-    assert basic_candidate.priority == 90
+    assert basic_candidate.priority == 80
 
 
 def test_standalone_alias_mappings() -> None:
