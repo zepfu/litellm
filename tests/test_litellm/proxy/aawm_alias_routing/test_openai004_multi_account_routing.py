@@ -20,6 +20,8 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     codex_candidate_calls,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+    audit_build,
+    audit_persist,
     attempt_records,
     candidate_loop,
     codex_oauth,
@@ -896,6 +898,137 @@ async def test_candidate_loop_emits_generic_redispatch_before_reraise(
     assert events[0]["error_status_code"] == 409
     assert events[0]["attempts"] == []
     assert request.state.aawm_terminal_error_emitted is True
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_logs_structured_redispatch_once_across_emit_stack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    request = _request()
+    logger_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+    monkeypatch.setattr(
+        audit_persist.verbose_proxy_logger,
+        "error",
+        lambda *args, **kwargs: logger_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda *args, **kwargs: None,
+    )
+    redispatch_error = RuntimeError("fresh dispatch required")
+    redispatch_error.redispatch_required = True  # type: ignore[attr-defined]
+    redispatch_error.status_code = 409  # type: ignore[attr-defined]
+    redispatch_error.error_code = (  # type: ignore[attr-defined]
+        "aawm_codex_auto_agent_redispatch_required"
+    )
+    redispatch_error.failure_phase = "selection"  # type: ignore[attr-defined]
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        raise redispatch_error
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await candidate_loop.handle_alias_route(
+            _loop_services(
+                select_candidate=_select,
+                perform_candidate=AsyncMock(),
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=request,
+            prepared_request_body={"model": "work"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_zero_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidate",
+            log_label="Codex",
+        )
+
+    assert exc_info.value is redispatch_error
+    default_warning_event = audit_build._build_auto_agent_alias_audit_event(
+        alias_family="codex_auto_agent",
+        alias_model="work",
+        request=request,
+        request_body={"model": "work"},
+        selection={},
+        candidate={},
+        event_type="redispatch_required",
+        candidate_status="redispatch_required",
+        error_status_code=409,
+        error_code="aawm_codex_auto_agent_redispatch_required",
+        failure_class="redispatch_required",
+        redispatch_required=True,
+    )
+    assert default_warning_event[
+        "_aawm_terminal_error_already_emitted"
+    ] is True
+    audit_persist._emit_auto_agent_alias_route_default_warning(
+        default_warning_event
+    )
+    audit_persist._emit_aawm_terminal_error(
+        {
+            "event_type": "redispatch_required",
+            "error_status_code": 409,
+            "error_code": "aawm_session_owner_redispatch_required",
+            "redispatch_required": True,
+        },
+        marker=request.state,
+    )
+
+    terminal_calls = [
+        call
+        for call in logger_calls
+        if call[0] and call[0][0] == "AAWM_TERMINAL_ERROR: %s"
+    ]
+    assert len(terminal_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_preserves_redispatch_when_terminal_emission_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_candidate_loop_host(monkeypatch)
+    request = _request()
+    redispatch_error = RuntimeError("fresh dispatch required")
+    redispatch_error.redispatch_required = True  # type: ignore[attr-defined]
+    redispatch_error.status_code = 409  # type: ignore[attr-defined]
+    redispatch_error.error_code = (  # type: ignore[attr-defined]
+        "aawm_codex_auto_agent_redispatch_required"
+    )
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        raise redispatch_error
+
+    def _fail_terminal_emission(**kwargs: Any) -> None:
+        raise RuntimeError("terminal observability unavailable")
+
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_pre_attempt_terminal_event",
+        _fail_terminal_emission,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await candidate_loop.handle_alias_route(
+            _loop_services(
+                select_candidate=_select,
+                perform_candidate=AsyncMock(),
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=request,
+            prepared_request_body={"model": "work"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_zero_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidate",
+            log_label="Codex",
+        )
+
+    assert exc_info.value is redispatch_error
 
 
 @pytest.mark.asyncio

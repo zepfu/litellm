@@ -181,7 +181,7 @@ def _is_auto_agent_alias_in_flight_cooldown_http_exception(
     }
 
 
-def _build_auto_agent_alias_audit_event(
+def _build_auto_agent_alias_audit_event(  # noqa: PLR0915
     *,
     alias_family: str,
     alias_model: str,
@@ -380,6 +380,27 @@ def _build_auto_agent_alias_audit_event(
         candidate=candidate,
         include_activity_status=include_activity_status,
     )
+    if (
+        event_type
+        in {
+            "no_candidate_available",
+            "in_flight_pinned_session_cooldown",
+            "provider_lane_admission_rejected",
+            "redispatch_required",
+        }
+        or redispatch_required
+    ):
+        request_state = getattr(request, "state", None)
+        if (
+            request_state is not None
+            and getattr(
+                request_state,
+                "aawm_terminal_error_emitted",
+                False,
+            )
+            is True
+        ):
+            event["_aawm_terminal_error_already_emitted"] = True
     return {key: value for key, value in event.items() if value is not None}
 
 

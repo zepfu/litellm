@@ -677,7 +677,7 @@ class TestCodexSelectorFirstChoice:
         )
 
     @pytest.mark.asyncio
-    async def test_semantic_marker_is_ignored_for_continuation_selection(
+    async def test_semantic_marker_is_ignored_for_previous_response_id_when_classifier_is_false(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
@@ -700,7 +700,7 @@ class TestCodexSelectorFirstChoice:
         )
         _set_selection_runtime_value(
             "_has_continuation_state",
-            lambda body: bool(body.get("previous_response_id")),
+            lambda _body: False,
             monkeypatch,
         )
 
@@ -712,9 +712,109 @@ class TestCodexSelectorFirstChoice:
             },
         )
 
-        assert continuation["request_mode"] == "ordinary_continuation"
+        assert continuation["request_mode"] == "fresh"
         assert continuation["candidate"]["provider"] == "cursor_agent"
         assert not continuation["skipped"]
+
+    @pytest.mark.asyncio
+    async def test_semantic_marker_is_ignored_for_account_bound_selection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        manager = AliasRoutingStateManager()
+        _set_selection_runtime_value("alias_routing_state", manager, monkeypatch)
+        candidates = (
+            _candidate("cursor_agent", "cursor-work"),
+            _candidate("xai", "grok-work"),
+        )
+        _set_selection_candidates(candidates)
+        first = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body={"model": "basic"},
+        )
+        await manager.mark_candidate_semantic_ineligibility(
+            alias_family="codex",
+            candidate_key=first["cooldown_key"],
+            reason="unsupported",
+            ttl_seconds=60.0,
+        )
+        _set_selection_runtime_value(
+            "_has_account_bound_state",
+            lambda _body: True,
+            monkeypatch,
+        )
+
+        account_bound = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body={"model": "basic", "encrypted_content": "opaque"},
+        )
+
+        assert account_bound["candidate"]["provider"] == "cursor_agent"
+        assert account_bound["has_account_bound_state"] is True
+        assert account_bound["in_flight_session"] is False
+        assert not account_bound["skipped"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "state_path",
+        ["affinity_bypassed", "effective_session_owner"],
+    )
+    async def test_semantic_marker_is_ignored_for_in_flight_or_owned_selection(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        state_path: str,
+    ) -> None:
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            session_affinity as sa,
+        )
+
+        manager = AliasRoutingStateManager()
+        _set_selection_runtime_value("alias_routing_state", manager, monkeypatch)
+        candidates = (
+            _candidate("cursor_agent", "cursor-work"),
+            _candidate("xai", "grok-work"),
+        )
+        _set_selection_candidates(candidates)
+        first = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body={"model": "basic"},
+        )
+        await manager.mark_candidate_semantic_ineligibility(
+            alias_family="codex",
+            candidate_key=first["cooldown_key"],
+            reason="unsupported",
+            ttl_seconds=60.0,
+        )
+        request_body: dict[str, Any] = {"model": "basic"}
+        if state_path == "affinity_bypassed":
+            request_body["litellm_metadata"] = {"redispatch_ordinal": 1}
+            _set_selection_runtime_value(
+                "_get_codex_session_affinity",
+                AsyncMock(
+                    return_value={
+                        "provider": "cursor_agent",
+                        "model": "cursor-work",
+                        "route_family": "cursor_agent_responses_adapter",
+                        "last_resort": False,
+                    }
+                ),
+                monkeypatch,
+            )
+        else:
+            monkeypatch.setattr(
+                sa,
+                "request_has_effective_session_identity",
+                lambda _request: True,
+            )
+
+        owned = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body=request_body,
+        )
+
+        assert owned["candidate"]["provider"] == "cursor_agent"
+        assert owned["in_flight_session"] is True
+        assert not owned["skipped"]
 
     def test_semantic_marker_expires_and_candidate_key_stays_stable(
         self,

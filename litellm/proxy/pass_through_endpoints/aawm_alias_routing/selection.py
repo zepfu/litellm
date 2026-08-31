@@ -3080,6 +3080,23 @@ def _candidate_state_semantic_marker_kwargs(
     return {}
 
 
+def _candidate_semantic_marker_consult_eligible(
+    *,
+    request_mode: str,
+    has_continuation_state: bool,
+    has_previous_response_id: bool,
+    has_account_bound_state: bool,
+    in_flight_session: bool,
+) -> bool:
+    return (
+        request_mode in {"fresh", "fresh_redispatch"}
+        and not has_continuation_state
+        and not has_previous_response_id
+        and not has_account_bound_state
+        and not in_flight_session
+    )
+
+
 async def _build_codex_auto_agent_candidate_states(
     request: Request,
     *,
@@ -3850,6 +3867,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         alias_model=alias_model,
     )
     has_continuation_state = _has_continuation_state(request_body)
+    has_previous_response_id = bool(request_body.get("previous_response_id"))
     has_account_bound_state = _has_account_bound_state(request_body)
     request_mode, redispatch_ordinal = _resolve_codex_request_mode_and_ordinal(
         has_continuation_state=has_continuation_state,
@@ -4345,6 +4363,16 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             skipped_candidates=affinity_skipped,
         )
 
+    in_flight_session = bool(
+        has_continuation_state
+        or affinity_bypassed
+        or affinity is not None
+        or (
+            isinstance(session_owner_record, dict)
+            and sa._record_state(session_owner_record) == "owned"
+        )
+        or sa.request_has_effective_session_identity(request)
+    )
     candidates = _resolve_aawm_alias_selection_enumeration(
         request,
         alias_model,
@@ -4384,8 +4412,13 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
         excluded_candidate_keys=excluded_candidate_keys,
         candidates=candidates,
         include_candidate_semantic_ineligibility=(
-            request_mode in {"fresh", "fresh_redispatch"}
-            and not has_continuation_state
+            _candidate_semantic_marker_consult_eligible(
+                request_mode=request_mode,
+                has_continuation_state=has_continuation_state,
+                has_previous_response_id=has_previous_response_id,
+                has_account_bound_state=has_account_bound_state,
+                in_flight_session=in_flight_session,
+            )
         ),
     )
     skipped = _build_auto_agent_skipped_candidates_from_states(states)
@@ -4415,6 +4448,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                         "request_mode": request_mode,
                         "redispatch_ordinal": redispatch_ordinal,
                         "affinity_bypassed": affinity_bypassed,
+                        "in_flight_session": in_flight_session,
                     },
                     selected_state=state,
                 ),
@@ -4450,6 +4484,7 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
                         "request_mode": request_mode,
                         "redispatch_ordinal": redispatch_ordinal,
                         "affinity_bypassed": affinity_bypassed,
+                        "in_flight_session": in_flight_session,
                     },
                     selected_state=state,
                 ),
@@ -4494,6 +4529,7 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
 ) -> dict[str, Any]:
     assert _resolve_anthropic_session_key is not None
     assert _has_continuation_state is not None
+    assert _has_account_bound_state is not None
     assert _get_anthropic_session_affinity is not None
     assert _extract_client_product_label is not None
     alias_model = _lookup_active_snapshot_canonical_alias(
@@ -4518,6 +4554,8 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
         alias_model=alias_model,
     )
     has_continuation_state = _has_continuation_state(request_body)
+    has_previous_response_id = bool(request_body.get("previous_response_id"))
+    has_account_bound_state = _has_account_bound_state(request_body)
     request_mode, redispatch_ordinal = _resolve_codex_request_mode_and_ordinal(
         has_continuation_state=has_continuation_state,
         request_body=request_body,
@@ -4799,14 +4837,29 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
             skipped_candidates=affinity_skipped,
         )
 
+    in_flight_session = bool(
+        has_continuation_state
+        or affinity_bypassed
+        or affinity is not None
+        or (
+            isinstance(session_owner_record, dict)
+            and sa._record_state(session_owner_record) == "owned"
+        )
+        or sa.request_has_effective_session_identity(request)
+    )
     states = await _build_anthropic_auto_agent_candidate_states(
         request,
         alias_model=alias_model,
         client_product_label=client_product_label,
         excluded_candidate_keys=excluded_candidate_keys,
         include_candidate_semantic_ineligibility=(
-            request_mode in {"fresh", "fresh_redispatch"}
-            and not has_continuation_state
+            _candidate_semantic_marker_consult_eligible(
+                request_mode=request_mode,
+                has_continuation_state=has_continuation_state,
+                has_previous_response_id=has_previous_response_id,
+                has_account_bound_state=has_account_bound_state,
+                in_flight_session=in_flight_session,
+            )
         ),
     )
     skipped = _build_auto_agent_skipped_candidates_from_states(states)
@@ -4831,7 +4884,8 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                 "session_key": session_key,
                 "selection_reason": selection_reason,
                 "skipped": skipped,
-                "in_flight_session": has_continuation_state,
+                "in_flight_session": in_flight_session,
+                "has_account_bound_state": has_account_bound_state,
                 "request_mode": request_mode,
                 "redispatch_ordinal": redispatch_ordinal,
                 "affinity_bypassed": affinity_bypassed,
@@ -4858,7 +4912,8 @@ async def _select_anthropic_auto_agent_candidate(  # noqa: PLR0915
                 "session_key": session_key,
                 "selection_reason": selection_reason,
                 "skipped": skipped,
-                "in_flight_session": has_continuation_state,
+                "in_flight_session": in_flight_session,
+                "has_account_bound_state": has_account_bound_state,
                 "request_mode": request_mode,
                 "redispatch_ordinal": redispatch_ordinal,
                 "affinity_bypassed": affinity_bypassed,
@@ -4944,6 +4999,7 @@ _HOST_FUNCTION_NAMES = (
     "_build_codex_auto_agent_candidate_state",
     "_build_anthropic_auto_agent_candidate_state",
     "_candidate_state_semantic_marker_kwargs",
+    "_candidate_semantic_marker_consult_eligible",
     "_format_codex_oauth_quota_reset_at",
     "_codex_oauth_quota_window_public_shape",
     "_codex_oauth_quota_window_is_confirmed_exhausted",

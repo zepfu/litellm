@@ -395,8 +395,16 @@ def _emit_auto_agent_alias_route_event(
 
 def _emit_auto_agent_alias_route_default_warning(event: dict[str, Any]) -> None:
     """Compatibility wrapper for the terminal operator ERROR boundary."""
+    terminal_error_already_emitted = (
+        event.pop(_AAWM_TERMINAL_ERROR_ALREADY_EMITTED_KEY, False) is True
+    )
     if _is_auto_agent_alias_terminal_error_event(event):
-        _emit_aawm_terminal_error(event)
+        marker = (
+            {_AAWM_TERMINAL_ERROR_MARKER_KEY: True}
+            if terminal_error_already_emitted
+            else None
+        )
+        _emit_aawm_terminal_error(event, marker=marker)
 
 
 def _format_auto_agent_alias_route_default_warning_fields(
