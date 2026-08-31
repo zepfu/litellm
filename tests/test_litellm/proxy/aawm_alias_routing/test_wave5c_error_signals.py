@@ -114,6 +114,21 @@ _CANDIDATE_INELIGIBILITY_REASONS = (
 )
 _CANDIDATE_INELIGIBILITY_CODE = "aawm_codex_auto_agent_candidate_ineligible"
 _CANDIDATE_INELIGIBILITY_CLASS = "candidate_deterministically_ineligible"
+_CODEX_RESPONSES_CANDIDATE = {
+    "provider": "openai",
+    "model": "gpt-5",
+    "route_family": "codex_responses",
+}
+_CURSOR_CANDIDATE = {
+    "provider": "cursor_agent",
+    "model": "cursor-grok-4.6-high",
+    "route_family": "codex_cursor_agent_aiserver_adapter",
+}
+_ANTHROPIC_RESPONSES_CANDIDATE = {
+    "provider": "openai",
+    "model": "gpt-5",
+    "route_family": "anthropic_openai_responses_adapter",
+}
 
 
 class _FakeExc(Exception):
@@ -618,15 +633,167 @@ class TestClassification:
         exc.status_code = 429
         assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "rate_limited"
 
-    def test_classify_transient_by_status_502(self):
-        exc = _FakeExc(message="bad gateway")
-        exc.status_code = 502
-        assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "upstream_transient_internal"
+    @pytest.mark.parametrize(
+        (
+            "message",
+            "status_code",
+            "candidate",
+            "attempted_provider_call",
+            "provider_returned",
+            "expected",
+        ),
+        [
+            (
+                "provider timeout",
+                408,
+                _CODEX_RESPONSES_CANDIDATE,
+                True,
+                True,
+                "upstream_timeout",
+            ),
+            (
+                "provider timeout",
+                504,
+                _CODEX_RESPONSES_CANDIDATE,
+                True,
+                True,
+                "upstream_timeout",
+            ),
+            (
+                "provider failure",
+                500,
+                _CODEX_RESPONSES_CANDIDATE,
+                True,
+                True,
+                "upstream_transient_internal",
+            ),
+            (
+                "provider failure",
+                502,
+                _CODEX_RESPONSES_CANDIDATE,
+                True,
+                True,
+                "upstream_transient_internal",
+            ),
+            (
+                "provider failure",
+                503,
+                _CODEX_RESPONSES_CANDIDATE,
+                True,
+                True,
+                "upstream_transient_internal",
+            ),
+            (
+                "provider failure",
+                529,
+                _CODEX_RESPONSES_CANDIDATE,
+                True,
+                True,
+                "upstream_transient_internal",
+            ),
+            (
+                "too many requests",
+                502,
+                _CODEX_RESPONSES_CANDIDATE,
+                True,
+                True,
+                "rate_limited",
+            ),
+            (
+                "model capacity exhausted",
+                503,
+                _CODEX_RESPONSES_CANDIDATE,
+                True,
+                True,
+                "capacity_exhausted",
+            ),
+            (
+                "permission-denied content violates usage guidelines safety_check_type_cyber",
+                502,
+                _CODEX_RESPONSES_CANDIDATE,
+                True,
+                True,
+                "safety_policy_denied",
+            ),
+            (
+                "Cursor provider failure",
+                502,
+                _CURSOR_CANDIDATE,
+                True,
+                False,
+                "upstream_transient_internal",
+            ),
+            (
+                "unattributed provider failure",
+                502,
+                None,
+                True,
+                True,
+                None,
+            ),
+            (
+                "unmarked provider failure",
+                502,
+                _CODEX_RESPONSES_CANDIDATE,
+                True,
+                False,
+                None,
+            ),
+            (
+                "pre-egress provider failure",
+                502,
+                _CODEX_RESPONSES_CANDIDATE,
+                False,
+                True,
+                None,
+            ),
+            (
+                "anthropic route failure",
+                502,
+                _ANTHROPIC_RESPONSES_CANDIDATE,
+                True,
+                True,
+                None,
+            ),
+        ],
+        ids=[
+            "408-provider-timeout",
+            "504-provider-timeout",
+            "500-provider-transient",
+            "502-provider-transient",
+            "503-provider-transient",
+            "529-provider-transient",
+            "rate-limit-wins",
+            "capacity-wins",
+            "safety-wins",
+            "cursor-compatibility",
+            "missing-candidate",
+            "missing-provider-marker",
+            "not-attempted",
+            "anthropic-route",
+        ],
+    )
+    def test_classify_provider_attributed_status_fallback(
+        self,
+        message: str,
+        status_code: int,
+        candidate: Optional[dict[str, Any]],
+        attempted_provider_call: bool,
+        provider_returned: bool,
+        expected: Optional[str],
+    ) -> None:
+        exc = _FakeExc(message=message, status_code=status_code)
+        if provider_returned:
+            setattr(exc, "_aawm_provider_returned", True)
 
-    def test_classify_timeout_504(self):
-        exc = _FakeExc(message="gateway timeout")
-        exc.status_code = 504
-        assert _classify_codex_auto_agent_retryable_exhaustion(exc) == "upstream_timeout"
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+                attempted_provider_call=attempted_provider_call,
+            )
+            == expected
+        )
 
     def test_classify_usage_limit(self):
         exc = _FakeExc(message="usage_limit_reached")
@@ -933,11 +1100,21 @@ class TestCooldownScope:
         )
 
     def test_genuine_transient_throttle_keeps_existing_classification_and_scope(self):
-        exc = _FakeExc(message="bad gateway", status_code=502)
-        candidate = {"provider": "openai", "model": "gpt-5.3-codex-spark"}
+        exc = _FakeExc(
+            message="bad gateway",
+            status_code=502,
+            _aawm_provider_returned=True,
+        )
+        candidate = dict(
+            _CODEX_RESPONSES_CANDIDATE,
+            model="gpt-5.3-codex-spark",
+        )
 
         assert (
-            _classify_codex_auto_agent_retryable_exhaustion(exc)
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=candidate,
+            )
             == "upstream_transient_internal"
         )
         assert (
@@ -1139,9 +1316,11 @@ class TestHeaderWaitAndCooldown:
         assert seconds == 3 * 60 * 60.0
 
     def test_cooldown_seconds_transient(self):
-        exc = _FakeExc(message="bad gateway")
-        exc.status_code = 502
-        seconds = _get_codex_auto_agent_cooldown_seconds(exc)
+        exc = _FakeExc(message="bad gateway", status_code=502, _aawm_provider_returned=True)
+        seconds = _get_codex_auto_agent_cooldown_seconds(
+            exc,
+            candidate=_CODEX_RESPONSES_CANDIDATE,
+        )
         assert seconds == 30.0
 
     def test_cooldown_seconds_header_wait_overrides(self):
@@ -1221,9 +1400,15 @@ class TestHeaderWaitAndCooldown:
             "1800",
         )
 
-        transient_exc = _FakeExc(message="bad gateway")
-        transient_exc.status_code = 502
-        transient_seconds = _get_codex_auto_agent_cooldown_seconds(transient_exc)
+        transient_exc = _FakeExc(
+            message="bad gateway",
+            status_code=502,
+            _aawm_provider_returned=True,
+        )
+        transient_seconds = _get_codex_auto_agent_cooldown_seconds(
+            transient_exc,
+            candidate=_CODEX_RESPONSES_CANDIDATE,
+        )
         assert transient_seconds == 30.0
 
         capacity_exc = _FakeExc(message="model capacity exhausted")

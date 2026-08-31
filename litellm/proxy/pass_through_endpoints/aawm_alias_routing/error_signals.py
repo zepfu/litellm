@@ -1436,11 +1436,6 @@ def _classify_codex_auto_agent_retryable_exhaustion(
     assert _CODEX_AUTO_AGENT_RATE_LIMIT_ERROR_TOKENS is not None
     status_code = _extract_adapter_exception_status_code(exc)
     tokens = _extract_codex_auto_agent_error_tokens(exc)
-    if _is_codex_auto_agent_cursor_agent_candidate(candidate):
-        if status_code in {500, 502, 503, 529}:
-            return "upstream_transient_internal"
-        if status_code in {408, 504}:
-            return "upstream_timeout"
     if _is_codex_auto_agent_grok_account_quota_exhaustion(exc):
         return "capacity_exhausted"
     alibaba_exhaustion_class = _classify_alibaba_token_plan_quota_exhaustion_response(
@@ -1492,10 +1487,27 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "safety_policy_denied"
     if status_code == 429:
         return "rate_limited"
-    if status_code in _CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES:
-        return "upstream_transient_internal"
-    if status_code == 504:
-        return "upstream_timeout"
+    route_family = (
+        str(candidate.get("route_family") or "").strip().lower()
+        if isinstance(candidate, dict)
+        else ""
+    )
+    provider_attributed_status = (
+        attempted_provider_call
+        and isinstance(candidate, dict)
+        and bool(str(candidate.get("provider") or "").strip())
+        and bool(route_family)
+        and not route_family.startswith("anthropic_")
+        and (
+            bool(getattr(exc, "_aawm_provider_returned", False))
+            or _is_codex_auto_agent_cursor_agent_candidate(candidate)
+        )
+    )
+    if provider_attributed_status:
+        if status_code in _CODEX_AUTO_AGENT_TRANSIENT_UPSTREAM_STATUS_CODES:
+            return "upstream_transient_internal"
+        if status_code in {408, 504}:
+            return "upstream_timeout"
     return None
 
 
