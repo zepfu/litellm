@@ -145,6 +145,15 @@ def _is_managed_openai_usage_limit_candidate(
     )
 
 
+_LAST_RESORT_DURABLE_EXHAUSTION_ERROR_CLASSES = frozenset(
+    {
+        "capacity_exhausted",
+        "rate_limited",
+        "usage_limit_reached",
+    }
+)
+
+
 def _resolve_auto_agent_cooldown_publication_plan(
     *,
     request: Optional[Request],
@@ -172,11 +181,12 @@ def _resolve_auto_agent_cooldown_publication_plan(
       - Grok account-quota -> the selected key PLUS the account-lane key
 
     Codex configured aliases use the alias-scoped N-of-M failure-evidence
-    decision recorded earlier by the loop to authorize shared publication and
-    resolve its duration. The existing generic scope resolver still owns
-    provider/lane targeting, including Kimi managed-account and Grok
-    account-lane keys. Anthropic calls omit ``codex_failure_evidence_alias`` and
-    retain the direct generic scope resolver.
+    decision recorded earlier by the loop to authorize shared publication.
+    Provider-derived cooldown duration remains authoritative. The existing
+    generic scope resolver still owns provider/lane targeting, including Kimi
+    managed-account and Grok account-lane keys. Anthropic calls omit
+    ``codex_failure_evidence_alias`` and retain the direct generic scope
+    resolver.
     """
     assert _get_candidate_cooldown_scope is not None
     assert _get_kimi_managed_account_cooldown_key is not None
@@ -221,14 +231,6 @@ def _resolve_auto_agent_cooldown_publication_plan(
                 grok_account_quota_exhausted=grok_account_quota_exhausted,
                 kimi_failure_metadata=kimi_failure_metadata,
             )
-        evidence_duration = max(0.0, float(decision.duration_seconds))
-        if (
-            error_class == "kimi_code_managed_account"
-            and cooldown_scope == "managed_account"
-        ):
-            duration = max(duration, evidence_duration)
-        else:
-            duration = evidence_duration
     if cooldown_scope == "none":
         return CooldownPublicationPlan(
             applied_scope="none",
@@ -268,14 +270,15 @@ def _resolve_auto_agent_cooldown_publication_plan(
                     kimi_failure_metadata=kimi_failure_metadata,
                 )
 
-            # Last-resort, non-account-gated failures stay request-local only.
-            return CooldownPublicationPlan(
-                duration_seconds=duration,
-                applied_scope="request_local",
-                request_local_action="request_local_cooldown",
-                grok_account_quota_exhausted=grok_account_quota_exhausted,
-                kimi_failure_metadata=kimi_failure_metadata,
-            )
+            if error_class not in _LAST_RESORT_DURABLE_EXHAUSTION_ERROR_CLASSES:
+                # Ordinary last-resort failures stay request-local only.
+                return CooldownPublicationPlan(
+                    duration_seconds=duration,
+                    applied_scope="request_local",
+                    request_local_action="request_local_cooldown",
+                    grok_account_quota_exhausted=grok_account_quota_exhausted,
+                    kimi_failure_metadata=kimi_failure_metadata,
+                )
 
         memory_keys = [selected_cooldown_key]
         if grok_account_quota_exhausted:

@@ -73,7 +73,7 @@ async def test_rr054_durable_max_expiry_keeps_longer_existing_cooldown() -> None
             state_key="cand-a",
             payload={
                 "cooldown_key": "cand-a",
-                "failure_class": "rate_limit",
+                "failure_class": "usage_limit_reached",
             },
             ttl_seconds=30.0,
         )
@@ -86,7 +86,7 @@ async def test_rr054_durable_max_expiry_keeps_longer_existing_cooldown() -> None
     # Non-expiry payload fields from the new write are merged onto the longer
     # existing durable record (max-expiry, not max-payload-freeze).
     assert written["cooldown_key"] == "cand-a"
-    assert written["failure_class"] == "rate_limit"
+    assert written["failure_class"] == "usage_limit_reached"
     dual.async_set_cache.assert_awaited()
     assert dual.async_set_cache.await_args.kwargs["value"] == written
 

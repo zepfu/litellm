@@ -262,7 +262,29 @@ class TestResolvePublicationPlan:
         assert plan.durable_keys == ("ck",)
         assert plan.duration_seconds == 120.0
 
-    def test_last_resort_candidate_scope_becomes_request_local(
+    @pytest.mark.parametrize(
+        "error_class",
+        ["capacity_exhausted", "rate_limited", "usage_limit_reached"],
+    )
+    def test_last_resort_durable_exhaustion_publishes_candidate_scope(
+        self, configured_runtime: dict, error_class: str
+    ) -> None:
+        configured_runtime["scope_fn"].return_value = "candidate"
+        plan = _resolve_auto_agent_cooldown_publication_plan(
+            request=None,
+            candidate={"provider": "p", "model": "m", "last_resort": True},
+            lane_key="lane",
+            selected_cooldown_key="ck",
+            cooldown_seconds=120.0,
+            error_class=error_class,
+        )
+        assert plan.applied_scope == "candidate"
+        assert plan.request_local_action is None
+        assert plan.memory_keys == ("ck",)
+        assert plan.durable_keys == ("ck",)
+        assert plan.duration_seconds == 120.0
+
+    def test_last_resort_ordinary_failure_stays_request_local(
         self, configured_runtime: dict
     ) -> None:
         configured_runtime["scope_fn"].return_value = "candidate"
@@ -272,7 +294,7 @@ class TestResolvePublicationPlan:
             lane_key="lane",
             selected_cooldown_key="ck",
             cooldown_seconds=120.0,
-            error_class="rate_limited",
+            error_class="provider_terminal_error",
         )
         assert plan.applied_scope == "request_local"
         assert plan.request_local_action == "request_local_cooldown"
@@ -401,14 +423,14 @@ class TestResolvePublicationPlan:
             candidate={},
             lane_key=None,
             selected_cooldown_key="rp:key",
-            cooldown_seconds=0.0,
-            error_class=None,
+            cooldown_seconds=120.0,
+            error_class="rate_limited",
             codex_failure_evidence_alias="test-alias",
         )
         assert plan.applied_scope == "candidate"
         assert plan.memory_keys == ("rp:key",)
         assert plan.durable_keys == ("rp:key",)
-        assert plan.duration_seconds == 45.0
+        assert plan.duration_seconds == 120.0
         assert configured_runtime["gate"].current_calls == [
             {
                 "canonical_alias": "test-alias",
@@ -832,7 +854,7 @@ class TestApplyCodexFailureEvidence:
             candidate={"provider": "p", "model": "m"},
             lane_key="lane",
             selected_cooldown_key="rp:key",
-            cooldown_seconds=0.0,
+            cooldown_seconds=120.0,
             error_class="rate_limited",
             set_candidate_cooldown=setter,
         )
@@ -840,8 +862,8 @@ class TestApplyCodexFailureEvidence:
 
         assert result == "candidate"
         remaining = mgr.codex.get_memory_cooldown_remaining("rp:key")
-        assert remaining > 0
-        setter.assert_awaited_once_with("rp:key", 45.0)
+        assert remaining > 119.0
+        setter.assert_awaited_once_with("rp:key", 120.0)
 
     @pytest.mark.asyncio
     async def test_kimi_managed_account_evidence_preserves_provider_ttl(
