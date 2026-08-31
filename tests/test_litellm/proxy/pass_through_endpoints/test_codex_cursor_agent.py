@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
+from urllib.parse import urlparse
 
 import pytest
 from fastapi.responses import Response, StreamingResponse
@@ -18,10 +19,14 @@ from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
     codex_candidate_calls,
 )
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
+from litellm.proxy.aawm_route_logging import (
+    clear_aawm_route_rollups,
+    flush_aawm_route_rollups,
+)
 
 
-def _request() -> Request:
-    return Request(
+def _request(*, selected_account: dict[str, Any] | None = None) -> Request:
+    request = Request(
         {
             "type": "http",
             "method": "POST",
@@ -34,6 +39,9 @@ def _request() -> Request:
             "scheme": "http",
         }
     )
+    if selected_account is not None:
+        request.state.aawm_codex_oauth_selected_account = selected_account
+    return request
 
 
 def _candidate(**overrides: str) -> dict[str, str]:
@@ -51,11 +59,12 @@ def _call(
     candidate: dict[str, Any] | None = None,
     target_url: str = "",
     api_key: str | None = "access-token",
+    selected_account: dict[str, Any] | None = None,
 ) -> Response:
     return asyncio.run(
         codex_candidate_calls._perform_codex_auto_agent_cursor_agent_request(
             endpoint="/v1/responses",
-            request=_request(),
+            request=_request(selected_account=selected_account),
             fastapi_response=Response(),
             user_api_key_dict=None,
             candidate=candidate or _candidate(),
@@ -72,6 +81,49 @@ def _clear_replay_registry() -> None:
     codex_candidate_calls._clear_cursor_replay_registry()
     yield
     codex_candidate_calls._clear_cursor_replay_registry()
+
+
+@pytest.fixture
+def _route_rollup_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+    clear_aawm_route_rollups()
+    yield
+    clear_aawm_route_rollups()
+
+
+def _capture_real_route_log(
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Any]:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        anthropic_adapter_calls,
+    )
+
+    captured: dict[str, Any] = {}
+    real_emit = anthropic_adapter_calls._emit_adapted_route_access_log
+
+    def _capture(**kwargs: Any) -> None:
+        real_emit(**kwargs)
+        captured["rollup_kwargs"] = kwargs["rollup_kwargs"]
+
+    monkeypatch.setattr(
+        anthropic_adapter_calls,
+        "_emit_adapted_route_access_log",
+        _capture,
+    )
+    return captured
+
+
+def _assert_cursor_route_context(
+    captured: dict[str, Any],
+) -> None:
+    context = captured["rollup_kwargs"]["litellm_params"]["metadata"][
+        "aawm_route_rollup_context"
+    ]
+    target = urlparse(run_url(None))
+    assert context["outgoing_target"] == f"{target.netloc}{target.path}"
+    assert context["model_label"] == "work(cursor-test)"
+    assert context["codex_auto_agent_selected_provider"] == "openai"
+    assert context["codex_oauth_account_hash"] == "cursor-account"
 
 
 def _store_replay_state(response_id: str = "resp-replay") -> None:
@@ -476,7 +528,12 @@ def test_cursor_fresh_full_history_tool_output_emits_continuation_cue() -> None:
     }
 
 
-def test_cursor_retained_session_consumes_function_call_output_without_new_run() -> None:
+def test_cursor_retained_session_consumes_function_call_output_without_new_run(
+    monkeypatch: pytest.MonkeyPatch,
+    _route_rollup_state: None,
+) -> None:
+    captured = _capture_real_route_log(monkeypatch)
+
     class FakeRetainedSession:
         def __init__(self) -> None:
             self.outputs: list[list[tuple[str, Any]]] = []
@@ -523,6 +580,10 @@ def test_cursor_retained_session_consumes_function_call_output_without_new_run()
         {
             "model": "work",
             "previous_response_id": "resp-retained",
+            "litellm_metadata": {
+                "codex_auto_agent_alias": "cursor-test",
+                "litellm_call_id": "cursor-retained-call",
+            },
             "input": [
                 {
                     "type": "function_call_output",
@@ -530,7 +591,12 @@ def test_cursor_retained_session_consumes_function_call_output_without_new_run()
                     "output": "LITELLM_CURSOR_READ_V1:envelope",
                 }
             ],
-        }
+        },
+        selected_account={
+            "provider": "openai",
+            "account_hash": "cursor-account",
+            "account_display": "selected@example.com",
+        },
     )
 
     assert json.loads(response.body)["output_text"] == "read complete"
@@ -538,6 +604,12 @@ def test_cursor_retained_session_consumes_function_call_output_without_new_run()
         [("read-call", "LITELLM_CURSOR_READ_V1:envelope")]
     ]
     assert session.closed is True
+    _assert_cursor_route_context(captured)
+    flushed = flush_aawm_route_rollups(force=True)
+    assert len(flushed) == 2
+    rendered = "\n".join(flushed)
+    assert rendered.count("Turns: 1") == 1
+    assert "selected@example.com" in rendered
     with pytest.raises(CursorConnectError, match="missing"):
         codex_candidate_calls._peek_cursor_replay_state("resp-retained")
 
@@ -779,21 +851,9 @@ def test_cursor_retained_session_failure_closes_once() -> None:
 
 def test_cursor_stream_uses_responses_event_schema(
     monkeypatch: pytest.MonkeyPatch,
+    _route_rollup_state: None,
 ) -> None:
-    recorded_rollups: list[dict[str, Any]] = []
-
-    def _record_rollup(rollup: dict[str, Any], **kwargs: Any) -> None:
-        recorded_rollups.append({"rollup": rollup, **kwargs})
-
-    monkeypatch.setattr(
-        "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.anthropic_adapter_calls._record_adapted_completed_route_rollup_turn",
-        _record_rollup,
-    )
-    monkeypatch.setattr(
-        llm_passthrough_endpoints,
-        "_record_adapted_completed_route_rollup_turn",
-        _record_rollup,
-    )
+    captured = _capture_real_route_log(monkeypatch)
 
     class FakeCursorClient:
         def __init__(self, **_kwargs: Any) -> None:
@@ -824,11 +884,20 @@ def test_cursor_stream_uses_responses_event_schema(
             "model": "work",
             "input": "run pwd",
             "stream": True,
-            "litellm_metadata": {"model_alias": "cursor-test"},
-        }
+            "litellm_metadata": {
+                "codex_auto_agent_alias": "cursor-test",
+                "litellm_call_id": "cursor-stream-call",
+            },
+        },
+        selected_account={
+            "provider": "openai",
+            "account_hash": "cursor-account",
+            "account_display": "selected@example.com",
+        },
     )
     assert isinstance(response, StreamingResponse)
-    assert recorded_rollups == []
+    assert flush_aawm_route_rollups(force=True) == []
+    _assert_cursor_route_context(captured)
 
     async def collect_events() -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
@@ -840,16 +909,11 @@ def test_cursor_stream_uses_responses_event_schema(
         return events
 
     events = asyncio.run(collect_events())
-    assert recorded_rollups == [
-        {
-            "rollup": {
-                "litellm_params": {
-                    "metadata": {"model_alias": "cursor-test"},
-                }
-            },
-            "adapter_label": "Cursor Agent",
-        }
-    ]
+    flushed = flush_aawm_route_rollups(force=True)
+    assert len(flushed) == 2
+    rendered = "\n".join(flushed)
+    assert rendered.count("Turns: 1") == 1
+    assert "selected@example.com" in rendered
     event_types = [event["type"] for event in events]
     assert event_types == [
         "response.output_item.added",
@@ -866,16 +930,9 @@ def test_cursor_stream_uses_responses_event_schema(
 
 def test_cursor_non_stream_records_route_rollup_once(
     monkeypatch: pytest.MonkeyPatch,
+    _route_rollup_state: None,
 ) -> None:
-    recorded_rollups: list[dict[str, Any]] = []
-
-    def _record_rollup(rollup: dict[str, Any], **kwargs: Any) -> None:
-        recorded_rollups.append({"rollup": rollup, **kwargs})
-
-    monkeypatch.setattr(
-        "litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.anthropic_adapter_calls._record_adapted_completed_route_rollup_turn",
-        _record_rollup,
-    )
+    captured = _capture_real_route_log(monkeypatch)
 
     class FakeCursorClient:
         def __init__(self, **_kwargs: Any) -> None:
@@ -897,21 +954,25 @@ def test_cursor_non_stream_records_route_rollup_once(
         {
             "model": "work",
             "input": "finish",
-            "litellm_metadata": {"model_alias": "cursor-test"},
-        }
+            "litellm_metadata": {
+                "codex_auto_agent_alias": "cursor-test",
+                "litellm_call_id": "cursor-non-stream-call",
+            },
+        },
+        selected_account={
+            "provider": "openai",
+            "account_hash": "cursor-account",
+            "account_display": "selected@example.com",
+        },
     )
 
     assert response.status_code == 200
-    assert recorded_rollups == [
-        {
-            "rollup": {
-                "litellm_params": {
-                    "metadata": {"model_alias": "cursor-test"},
-                }
-            },
-            "adapter_label": "Cursor Agent",
-        }
-    ]
+    _assert_cursor_route_context(captured)
+    flushed = flush_aawm_route_rollups(force=True)
+    assert len(flushed) == 2
+    rendered = "\n".join(flushed)
+    assert rendered.count("Turns: 1") == 1
+    assert "selected@example.com" in rendered
 
 
 def test_cursor_text_requires_turn_ended_and_tool_boundary_does_not(

@@ -1376,6 +1376,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     )
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.anthropic_adapter_calls import (
         _build_adapted_route_rollup_kwargs,
+        _emit_adapted_route_access_log,
         _record_adapted_completed_route_rollup_after_stream,
         _record_adapted_completed_route_rollup_turn,
     )
@@ -1390,6 +1391,19 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     litellm_metadata = request_body.get("litellm_metadata")
     rollup_kwargs = _build_adapted_route_rollup_kwargs(
         litellm_metadata if isinstance(litellm_metadata, dict) else {}
+    )
+    candidate_api_base = candidate.get("api_base")
+    cursor_url = run_url(
+        str(candidate_api_base)
+        if isinstance(candidate_api_base, str) and candidate_api_base.strip()
+        else None
+    )
+    _emit_adapted_route_access_log(
+        request=request,
+        target_url=cursor_url,
+        request_body=request_body,
+        rollup_kwargs=rollup_kwargs,
+        adapter_label="Cursor Agent",
     )
     replay_state: Optional[dict[str, Any]] = None
     previous_response_id = request_body.get("previous_response_id")
@@ -1503,12 +1517,6 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         optional_params=optional_params,
     )
 
-    candidate_api_base = candidate.get("api_base")
-    cursor_url = run_url(
-        str(candidate_api_base)
-        if isinstance(candidate_api_base, str) and candidate_api_base.strip()
-        else None
-    )
     extra_headers: dict[str, str] = {}
     request_headers = getattr(request, "headers", None)
     if request_headers is not None:
