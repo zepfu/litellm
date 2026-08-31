@@ -1351,9 +1351,10 @@ Operational notes:
 - Provider-attributed fresh replay-safe transient statuses (`408`, `500`,
   `502`, `503`, `504`, and `529`) that do not
   carry explicit capacity, quota, rate-limit, or usage-limit evidence are
-  treated as finite, request-local alias containment. They are skipped for the
-  current alias progression so failover can continue, but they do not write
-  durable provider-wide cooldown state. Direct routes retain their direct
+  treated as finite alias containment. The transient semantic-ineligibility
+  marker suppresses the same narrow candidate/lane for the current progression
+  and may suppress it on later fresh eligible requests during its bounded TTL,
+  but it is not a durable cooldown record. Direct routes retain their direct
   behavior, while stateful continuations preserve affinity and do not migrate
   provider state between candidates. Native Grok 4.5 candidates on
   `codex_grok_native_responses_adapter` and
