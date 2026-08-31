@@ -1948,6 +1948,81 @@ def test_oauth_schedule_retries_pre_network_failure_next_outer_cycle() -> None:
     assert schedule.actual_attempt_count == 0
 
 
+def test_oauth_schedule_bounds_short_failed_retry_before_expiry() -> None:
+    issuance = datetime(2026, 8, 13, 22, 25, tzinfo=timezone.utc)
+    midpoint = issuance + timedelta(seconds=300)
+    expiry = issuance + timedelta(seconds=600)
+    schedule = loop.OAuthRefreshScheduleState()
+    actual_attempt = {"value": None}
+    helper_calls = []
+
+    def inspect(*, now):
+        observed_at = now()
+        return {
+            "eligibility_checked_at": observed_at.isoformat().replace(
+                "+00:00", "Z"
+            ),
+            "expires_at": expiry.isoformat().replace("+00:00", "Z"),
+            "refresh_due_at": midpoint.isoformat().replace("+00:00", "Z"),
+            "next_refresh_check_at": midpoint.isoformat().replace("+00:00", "Z"),
+            "eligible": observed_at >= midpoint,
+            "credential_health": "fresh",
+            "usable": observed_at < expiry,
+            "issued_lifetime_seconds": 600.0,
+            "refresh_threshold_seconds": 300.0,
+            "refresh_threshold_source": "jwt",
+            "refresh_threshold_degraded": False,
+            "error_class": None,
+            "error_message": None,
+        }
+
+    def refresh(callback):
+        helper_calls.append(True)
+        callback()
+        return {
+            "attempted": True,
+            "refreshed": False,
+            "skipped": False,
+            "expires_at": None,
+            "error_class": "HTTPError",
+            "error_message": "temporary token endpoint failure",
+        }
+
+    def run_schedule(now_monotonic, wall_now):
+        return loop._run_oauth_refresh_schedule(
+            schedule=schedule,
+            last_attempt_monotonic=actual_attempt["value"],
+            set_last_attempt_monotonic=lambda value: actual_attempt.__setitem__(
+                "value", value
+            ),
+            now_monotonic=now_monotonic,
+            wall_now=wall_now,
+            eligibility_inspector=inspect,
+            refresh_call=refresh,
+            force=False,
+            attempt_interval_seconds=300.0,
+            eligibility_cadence_seconds=300.0,
+            buffer_seconds=300.0,
+        )
+
+    first = run_schedule(100.0, midpoint)
+    retry_at = expiry - timedelta(seconds=1)
+
+    assert first[3]["pre_refresh_result_class"] == "refresh_due"
+    assert first[3]["actual_attempted"] is True
+    assert first[3]["last_actual_attempt_at"] == (
+        midpoint.isoformat().replace("+00:00", "Z")
+    )
+    assert first[3]["next_refresh_check_at"] == (
+        retry_at.isoformat().replace("+00:00", "Z")
+    )
+    assert first[3]["next_refresh_check_at"] < expiry.isoformat().replace(
+        "+00:00", "Z"
+    )
+    assert first[3]["refresh_result_class"] == "refresh_failed"
+    assert helper_calls == [True]
+
+
 def test_oauth_schedule_reinspects_external_replacement_after_local_failure(
     tmp_path,
 ) -> None:

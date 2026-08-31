@@ -11970,6 +11970,17 @@ def _merge_oauth_refresh_eligibility(
     summary_expires_at = _parse_sidecar_timestamp(
         (operation_summary or {}).get("expires_at")
     )
+    known_expires_at = (
+        _parse_sidecar_timestamp(merged.get("expires_at"))
+        or summary_expires_at
+        or _parse_sidecar_timestamp(pre.get("expires_at"))
+    )
+    retry_at = wall_now + timedelta(seconds=max(1.0, cadence_seconds))
+    if (
+        known_expires_at is not None
+        and wall_now < known_expires_at <= retry_at
+    ):
+        retry_at = known_expires_at - timedelta(seconds=1)
     if post.get("error_class") and summary_expires_at is not None:
         merged["expires_at"] = _scheduler_timestamp(summary_expires_at)
         merged["credential_health"] = (
@@ -11985,17 +11996,13 @@ def _merge_oauth_refresh_eligibility(
             due_at = summary_expires_at - timedelta(seconds=max(0, window_seconds))
             merged["refresh_due_at"] = _scheduler_timestamp(due_at)
             merged["eligible"] = wall_now >= due_at
-        merged["next_refresh_check_at"] = _scheduler_timestamp(
-            wall_now + timedelta(seconds=max(1.0, cadence_seconds))
-        )
+        merged["next_refresh_check_at"] = _scheduler_timestamp(retry_at)
     elif operation_summary and operation_summary.get("error_class"):
         # A token-endpoint failure with a successful post-read must still
         # schedule the next bounded retry independently of the outer cycle.
         # The post-read remains authoritative for expiry and eligibility.
         if merged.get("eligible") or not merged.get("expires_at"):
-            merged["next_refresh_check_at"] = _scheduler_timestamp(
-                wall_now + timedelta(seconds=max(1.0, cadence_seconds))
-            )
+            merged["next_refresh_check_at"] = _scheduler_timestamp(retry_at)
     # A transient post-call read failure must not erase the last known expiry
     # or deadline. The next outer cycle rereads the pathname again.
     if post.get("error_class") and not post.get("expires_at"):
