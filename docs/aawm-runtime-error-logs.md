@@ -738,7 +738,10 @@ Useful `context` identity and attempt fields (when available):
 - attempt sequence: `attempt_count`, `attempts`, `candidate_count`,
   `candidates`, plus hidden-retry scalars such as
   `hidden_retry_final_outcome`, `hidden_retry_failure_classification`,
-  `hidden_retry_count` when the failure exhausted hidden retries
+  `hidden_retry_count` when the failure exhausted hidden retries.
+  `attempt_count` counts only provider-call starts, meaning an actual HTTP/SDK
+  provider callback began; outcomes that fail before provider egress are
+  recorded as skips and do not increment `attempt_count`.
 - cooldown diagnostics when present: `cooldown_scope`, `cooldown_state_source`
 - activity/status summaries: `terminal_activity_status`,
   `actual_prior_tool_activity_summary`
