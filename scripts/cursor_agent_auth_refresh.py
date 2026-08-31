@@ -968,11 +968,18 @@ def _summary(
         threshold_degraded = True
     else:
         (
-            issued_lifetime_seconds,
             threshold,
             threshold_source,
             threshold_degraded,
         ) = _credential_refresh_threshold_metadata(state)
+        issued_lifetime_seconds = _issued_lifetime_seconds(
+            expires_in=state.expires_in,
+            access_token=state.access_token,
+            expires_at=state.expires_at,
+            issued_at=state.issued_at,
+            obtained_at=state.obtained_at,
+            refreshed_at=state.refreshed_at,
+        )
     result: Dict[str, Any] = {
         "provider": "cursor_agent",
         "status_class": status_class,
