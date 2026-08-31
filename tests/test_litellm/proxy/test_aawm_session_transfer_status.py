@@ -67,6 +67,7 @@ def _admin_user() -> UserAPIKeyAuth:
 
 def _service_user() -> UserAPIKeyAuth:
     return UserAPIKeyAuth(
+        api_key="sk-service",
         user_id="transcript",
         user_role=LitellmUserRoles.INTERNAL_USER.value,
         permissions={TRANSFER_PERMISSION: True},
@@ -79,6 +80,10 @@ def _denied_user() -> UserAPIKeyAuth:
         user_role=LitellmUserRoles.INTERNAL_USER.value,
         permissions={},
     )
+
+
+def _keyless_internal_user() -> UserAPIKeyAuth:
+    return UserAPIKeyAuth(user_role=LitellmUserRoles.INTERNAL_USER)
 
 
 @pytest.fixture
@@ -251,14 +256,18 @@ def test_identity_extraction_keeps_codex_session_without_content():
     assert "do not leak" not in json.dumps(identity)
 
 
-def test_authorization_allows_admin_and_permission_only():
+def test_authorization_allows_admin_and_permission_only(monkeypatch):
+    monkeypatch.setattr("litellm.proxy.proxy_server.master_key", "sk-configured")
     assert caller_may_read_session_transfer(_admin_user()) is True
     assert caller_may_read_session_transfer(_service_user()) is True
     assert caller_may_read_session_transfer(_denied_user()) is False
 
 
 @pytest.mark.asyncio
-async def test_endpoint_rejects_unauthorized_and_missing_filter(registry):
+async def test_endpoint_rejects_unauthorized_and_missing_filter(
+    registry, monkeypatch
+):
+    monkeypatch.setattr("litellm.proxy.proxy_server.master_key", "sk-configured")
     with pytest.raises(HTTPException) as denied:
         await get_session_transfer_status(
             session_id="sess-canon",
@@ -425,9 +434,10 @@ async def test_adapter_hook_uses_same_registry(registry):
     assert transfer["downstream_chunk_count"] == 0
 
 
-def test_http_endpoint_auth_via_dependency(registry):
+def test_http_endpoint_auth_via_dependency(registry, monkeypatch):
     app = FastAPI()
     app.include_router(router)
+    monkeypatch.setattr("litellm.proxy.proxy_server.master_key", "sk-configured")
 
     async def _auth_ok():
         return _service_user()
@@ -443,6 +453,72 @@ def test_http_endpoint_auth_via_dependency(registry):
     app.dependency_overrides[user_api_key_auth] = _auth_ok
     missing = client.get(TRANSFER_ROUTE)
     assert missing.status_code == 400
+
+
+def test_http_endpoint_keyless_internal_user_follows_live_master_key(
+    registry, monkeypatch
+):
+    app = FastAPI()
+    app.include_router(router)
+
+    async def _auth_keyless():
+        return _keyless_internal_user()
+
+    app.dependency_overrides[user_api_key_auth] = _auth_keyless
+    client = TestClient(app)
+
+    monkeypatch.setattr("litellm.proxy.proxy_server.master_key", None)
+    allowed = client.get(TRANSFER_ROUTE, params={"session_id": "sess-canon"})
+    assert allowed.status_code == 200, allowed.text
+
+    monkeypatch.setattr("litellm.proxy.proxy_server.master_key", "sk-configured")
+    denied = client.get(TRANSFER_ROUTE, params={"session_id": "sess-canon"})
+    assert denied.status_code == 403
+    assert denied.json()["detail"] == "Caller is not authorized to call this route."
+
+
+def test_http_endpoint_denies_keyless_internal_user_when_master_key_is_missing(
+    registry, monkeypatch
+):
+    from litellm.proxy import proxy_server
+
+    app = FastAPI()
+    app.include_router(router)
+
+    async def _auth_keyless():
+        return _keyless_internal_user()
+
+    app.dependency_overrides[user_api_key_auth] = _auth_keyless
+    client = TestClient(app)
+    monkeypatch.delattr(proxy_server, "master_key")
+
+    denied = client.get(TRANSFER_ROUTE, params={"session_id": "sess-canon"})
+    assert denied.status_code == 403
+
+
+def test_http_endpoint_allows_keyed_service_permission_and_admin(
+    registry, monkeypatch
+):
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+    monkeypatch.setattr("litellm.proxy.proxy_server.master_key", "sk-configured")
+
+    async def _auth_service():
+        return _service_user()
+
+    app.dependency_overrides[user_api_key_auth] = _auth_service
+    service_response = client.get(
+        TRANSFER_ROUTE, params={"session_id": "sess-canon"}
+    )
+    assert service_response.status_code == 200, service_response.text
+
+    async def _auth_admin():
+        return _admin_user()
+
+    app.dependency_overrides[user_api_key_auth] = _auth_admin
+    admin_response = client.get(TRANSFER_ROUTE, params={"session_id": "sess-canon"})
+    assert admin_response.status_code == 200, admin_response.text
 
 
 _SESSION_TRANSFER_DOCS = (
@@ -704,7 +780,9 @@ def test_rr108_docs_do_not_claim_allowed_routes_or_list_permissions_authorize():
 @pytest.mark.asyncio
 async def test_rr108_endpoint_denies_allowed_routes_only_and_allows_permission(
     registry,
+    monkeypatch,
 ):
+    monkeypatch.setattr("litellm.proxy.proxy_server.master_key", "sk-configured")
     await registry.mark_phase(_identity(), "response_streaming")
     with pytest.raises(HTTPException) as denied:
         await get_session_transfer_status(
@@ -727,7 +805,8 @@ async def test_rr108_endpoint_denies_allowed_routes_only_and_allows_permission(
     assert list_payload["result_count"] == 1
 
 
-def test_rr108_handler_rejects_allowed_routes_only_key():
+def test_rr108_handler_rejects_allowed_routes_only_key(monkeypatch):
+    monkeypatch.setattr("litellm.proxy.proxy_server.master_key", "sk-configured")
     assert caller_may_read_session_transfer(_routes_only_user()) is False
     assert caller_may_read_session_transfer(_service_user()) is True
     assert caller_may_read_session_transfer(_admin_user()) is True

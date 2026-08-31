@@ -19,10 +19,15 @@ Authorized callers:
 - proxy admin / proxy admin viewer
 - a dedicated transcript service key whose `permissions` dict includes
   `aawm_session_transfer_status`
+- a permissionless `internal_user` returned by `user_api_key_auth` while the
+  live proxy `master_key` is `None` (keyless mode)
 
-Route membership alone does not authorize this handler. All other authenticated
-callers receive HTTP 403. Unauthenticated callers fail closed through the
-existing auth dependency.
+Route membership alone does not authorize this handler. A permissionless
+`internal_user` is denied when the live proxy has a configured `master_key`;
+keyless mode is determined from that canonical live proxy setting, not from the
+role alone, bearer absence, or bearer content. All other authenticated callers
+receive HTTP 403. Unauthenticated callers fail closed through the existing auth
+dependency.
 
 The route is listed in `LiteLLMRoutes.self_managed_routes`. The handler
 enforces the permission check above.

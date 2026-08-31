@@ -22,15 +22,27 @@ router = APIRouter()
 
 
 def caller_may_read_session_transfer(user_api_key_dict: UserAPIKeyAuth) -> bool:
-    role = str(getattr(user_api_key_dict, "user_role", "") or "").lower()
+    raw_role = getattr(user_api_key_dict, "user_role", "")
+    role = str(getattr(raw_role, "value", raw_role) or "").lower()
     if role in {"proxy_admin", "proxy_admin_viewer"}:
         return True
     permissions = getattr(user_api_key_dict, "permissions", None) or []
     if isinstance(permissions, dict):
-        return bool(permissions.get(TRANSFER_PERMISSION))
-    if isinstance(permissions, (list, tuple, set)):
-        return TRANSFER_PERMISSION in permissions
-    return False
+        if permissions.get(TRANSFER_PERMISSION):
+            return True
+    elif isinstance(permissions, (list, tuple, set)):
+        if TRANSFER_PERMISSION in permissions:
+            return True
+
+    if role != "internal_user":
+        return False
+
+    from litellm.proxy import proxy_server
+
+    try:
+        return proxy_server.master_key is None
+    except AttributeError:
+        return False
 
 
 @router.get(TRANSFER_ROUTE, tags=["aawm"])
@@ -47,7 +59,7 @@ async def get_session_transfer_status(
     if not caller_may_read_session_transfer(user_api_key_dict):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Virtual key is not allowed to call this route.",
+            detail="Caller is not authorized to call this route.",
         )
     has_filter = any(
         sanitize_identity(value)
