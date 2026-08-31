@@ -852,11 +852,37 @@ async def test_candidate_loop_persists_fresh_deterministic_candidate_marker(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("provider", "route_family", "expect_marker"),
+    [
+        pytest.param(
+            "cursor_agent",
+            "cursor_agent_responses_adapter",
+            True,
+            id="cursor-compatibility",
+        ),
+        pytest.param(
+            "openrouter",
+            "codex_openrouter_completion_adapter",
+            True,
+            id="provider-neutral",
+        ),
+        pytest.param(
+            "openai",
+            "anthropic_openai_responses_adapter",
+            False,
+            id="anthropic-route-excluded",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
     "error_class",
     ["upstream_timeout", "upstream_transient_internal"],
 )
-async def test_candidate_loop_persists_fresh_cursor_transient_marker(
+async def test_candidate_loop_persists_fresh_provider_transient_marker(
     monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    route_family: str,
+    expect_marker: bool,
     error_class: str,
 ) -> None:
     _patch_candidate_loop_host(monkeypatch)
@@ -864,9 +890,9 @@ async def test_candidate_loop_persists_fresh_cursor_transient_marker(
     monkeypatch.setattr(candidate_loop, "alias_routing_state", manager)
     request = _request()
     candidate = {
-        "provider": "cursor_agent",
+        "provider": provider,
         "model": "cursor-work",
-        "route_family": "cursor_agent_responses_adapter",
+        "route_family": route_family,
         "last_resort": False,
     }
     selected = {
@@ -919,9 +945,12 @@ async def test_candidate_loop_persists_fresh_cursor_transient_marker(
     marker = manager.codex.get_candidate_semantic_ineligibility_memory(
         selected["cooldown_key"]
     )
-    assert marker is not None
-    assert marker["reason"] == error_class
-    assert marker["remaining_seconds"] > 0
+    if expect_marker:
+        assert marker is not None
+        assert marker["reason"] == error_class
+        assert marker["remaining_seconds"] > 0
+    else:
+        assert marker is None
     outcome = attempt_records._auto_agent_alias_request_outcome_state(request)
     attempt = outcome["attempts"][0]
     assert attempt["cooldown_scope"] == "request_local"

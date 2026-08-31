@@ -1742,6 +1742,18 @@ async def handle_alias_route(  # noqa: PLR0915
                         or "deterministic_candidate_ineligible"
                     )
                 elif (
+                    fresh_dispatch
+                    and account_failover_replay_safe
+                    and attempted_provider_call
+                    and bool(str(candidate.get("route_family") or "").strip())
+                    and not str(candidate.get("route_family") or "").strip().lower().startswith(
+                        "anthropic_"
+                    )
+                    and error_class
+                    in {"upstream_timeout", "upstream_transient_internal"}
+                ):
+                    marker_reason = error_class
+                elif (
                     _error_signals._is_codex_auto_agent_cursor_agent_candidate(
                         candidate
                     )
