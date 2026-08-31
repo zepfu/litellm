@@ -718,6 +718,7 @@ def _record_auto_agent_alias_attempt_failure(
     error_class: str,
     add_alias_metadata_fn: Callable[..., dict[str, Any]],
     redispatch_required: bool = False,
+    defer_terminal_error: bool = False,
 ) -> dict[str, Any]:
     assert _safe_set_request_parsed_body is not None
     assert _build_auto_agent_alias_audit_event is not None
@@ -782,6 +783,8 @@ def _record_auto_agent_alias_attempt_failure(
             audit_event["account_failover_limit_reached"] = True
         audit_event["request_outcome"] = "failed"
     _stamp_auto_agent_alias_request_identity(request=request, target=audit_event)
+    if defer_terminal_error:
+        audit_event["_aawm_terminal_error_already_emitted"] = True
     _emit_auto_agent_alias_route_event(
         audit_event,
         level="warning",
