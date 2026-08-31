@@ -1297,7 +1297,9 @@ Operational notes:
   - Upstream-origin evidence authorization is separate from provider-derived
     duration and monotonic TTL calculation. Only real provider-attributed
     evidence may advance provider evidence; client-origin, deterministic,
-    safety-policy, and cancellation failures do not.
+    safety-policy, and cancellation failures do not. D1-663 durable last-resort
+    behavior is limited to `codex_failure_evidence_alias`; Anthropic and other
+    non-Codex routes remain request-local.
   - Affinity writes additionally use
     `AAWM_ALIAS_ROUTING_DURABLE_AFFINITY_KEY_LIMIT` (default `4096`) as a
     process-local cardinality gate. An over-limit affinity write is skipped
