@@ -1154,6 +1154,9 @@ def _add_codex_auto_agent_alias_metadata(
     alias_model = _require_selection_alias_model(selection)
     target_model = candidate["model"]
     updated_body = copy.deepcopy(request_body)
+    inbound_metadata = updated_body.get("litellm_metadata")
+    if isinstance(inbound_metadata, dict):
+        inbound_metadata.pop("codex_auto_agent_selected_account_display", None)
     updated_body["model"] = target_model
     # CFG-006: an optional candidate-level YAML ``reasoning_effort`` is
     # AUTHORITATIVE. It replaces every caller/TUI reasoning representation

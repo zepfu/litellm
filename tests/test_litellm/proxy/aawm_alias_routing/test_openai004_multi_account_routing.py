@@ -3953,8 +3953,15 @@ def test_alias_metadata_propagates_native_account_display_only() -> None:
         "hash-account-1",
         failover_ordinal=0,
     )
+    request_body = {
+        "model": "basic",
+        "litellm_metadata": {
+            "codex_auto_agent_selected_account_display": "spoofed@example.com",
+            "caller_metadata": "preserve-me",
+        },
+    }
     body = attempt_records._add_codex_auto_agent_alias_metadata(
-        {"model": "basic"},
+        request_body,
         request=_request(),
         selection={**selection, "alias_model": "basic"},
         attempts=[],
@@ -3963,6 +3970,11 @@ def test_alias_metadata_propagates_native_account_display_only() -> None:
     assert metadata["codex_auto_agent_selected_account_display"] == (
         _masked_account_display("account1")
     )
+    assert metadata["caller_metadata"] == "preserve-me"
+    assert request_body["litellm_metadata"] == {
+        "codex_auto_agent_selected_account_display": "spoofed@example.com",
+        "caller_metadata": "preserve-me",
+    }
 
     non_openai_candidate = {
         **selection["candidate"],
@@ -3970,7 +3982,7 @@ def test_alias_metadata_propagates_native_account_display_only() -> None:
         "codex_oauth_account_display": "unmasked@example.com",
     }
     non_openai_body = attempt_records._add_codex_auto_agent_alias_metadata(
-        {"model": "basic"},
+        request_body,
         request=_request(),
         selection={
             **selection,
