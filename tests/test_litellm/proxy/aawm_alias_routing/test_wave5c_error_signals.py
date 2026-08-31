@@ -19,6 +19,7 @@ from unittest.mock import patch
 from fastapi import HTTPException
 import pytest
 
+from litellm.proxy._types import ProxyException
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import error_signals
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
@@ -793,6 +794,54 @@ class TestClassification:
                 attempted_provider_call=attempted_provider_call,
             )
             == expected
+        )
+
+    @pytest.mark.parametrize(
+        ("status_code", "expected"),
+        [
+            (408, "upstream_timeout"),
+            (504, "upstream_timeout"),
+            (500, "upstream_transient_internal"),
+            (502, "upstream_transient_internal"),
+            (503, "upstream_transient_internal"),
+            (529, "upstream_transient_internal"),
+        ],
+    )
+    def test_classify_provider_proxy_exception_status_fallback(
+        self,
+        status_code: int,
+        expected: str,
+    ) -> None:
+        exc = ProxyException(
+            message="provider failure",
+            type="upstream_error",
+            param="model",
+            code=status_code,
+        )
+
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=_CODEX_RESPONSES_CANDIDATE,
+                attempted_provider_call=True,
+            )
+            == expected
+        )
+
+    @pytest.mark.parametrize("status_code", [408, 500, 502, 503, 504, 529])
+    def test_local_http_exception_status_is_not_provider_transient(
+        self,
+        status_code: int,
+    ) -> None:
+        exc = HTTPException(status_code=status_code, detail="local gateway failure")
+
+        assert (
+            _classify_codex_auto_agent_retryable_exhaustion(
+                exc,
+                candidate=_CODEX_RESPONSES_CANDIDATE,
+                attempted_provider_call=True,
+            )
+            is None
         )
 
     def test_classify_usage_limit(self):

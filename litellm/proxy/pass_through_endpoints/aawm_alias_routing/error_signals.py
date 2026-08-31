@@ -1487,6 +1487,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         return "safety_policy_denied"
     if status_code == 429:
         return "rate_limited"
+    from litellm.proxy._types import ProxyException
+
     route_family = (
         str(candidate.get("route_family") or "").strip().lower()
         if isinstance(candidate, dict)
@@ -1499,7 +1501,8 @@ def _classify_codex_auto_agent_retryable_exhaustion(
         and bool(route_family)
         and not route_family.startswith("anthropic_")
         and (
-            bool(getattr(exc, "_aawm_provider_returned", False))
+            isinstance(exc, ProxyException)
+            or bool(getattr(exc, "_aawm_provider_returned", False))
             or _is_codex_auto_agent_cursor_agent_candidate(candidate)
         )
     )
