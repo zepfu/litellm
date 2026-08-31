@@ -434,6 +434,7 @@ _HOST_FUNCTION_NAMES = (
 
 _COHERE_FUNCTION_NAMES = (
     "_build_codex_cohere_adapter_request_body",
+    "_strip_strict_from_cohere_completion_tools",
     "_prepare_codex_cohere_chat_completions_adapter_route",
     "_perform_codex_cohere_chat_completions_adapter_call",
     "_handle_codex_cohere_chat_completions_adapter_route",
@@ -530,6 +531,29 @@ def install(
 
 
 # ── Extracted functions ─────────────────────────────────────────────
+
+
+def _strip_strict_from_cohere_completion_tools(
+    completion_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Remove function-tool strict flags without changing caller-owned data."""
+    tools = completion_kwargs.get("tools")
+    if not isinstance(tools, list):
+        return completion_kwargs
+
+    from copy import deepcopy
+
+    sanitized_kwargs = dict(completion_kwargs)
+    sanitized_tools = deepcopy(tools)
+    for tool in sanitized_tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function":
+            continue
+        tool.pop("strict", None)
+        function = tool.get("function")
+        if isinstance(function, dict):
+            function.pop("strict", None)
+    sanitized_kwargs["tools"] = sanitized_tools
+    return sanitized_kwargs
 
 
 def _maybe_wrap_xai_passthrough_responses_stream(
@@ -1855,6 +1879,7 @@ async def _prepare_codex_cohere_chat_completions_adapter_route(
         stream=bool(request_body.get("stream")),
         metadata=litellm_metadata,
     )
+    completion_kwargs = _strip_strict_from_cohere_completion_tools(completion_kwargs)
     completion_kwargs.update(
         {
             "metadata": litellm_metadata,
