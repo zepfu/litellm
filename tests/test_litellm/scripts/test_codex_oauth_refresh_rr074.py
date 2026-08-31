@@ -17,6 +17,7 @@ import importlib.util
 import json
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -338,6 +339,84 @@ def test_refresh_returns_sanitized_error_for_malformed_tokens(
     assert result["refreshed"] is False
     assert result["error_class"] == "ValueError"
     assert "tokens" in (result["error_message"] or "")
+
+
+def test_eligibility_uses_persisted_timestamp_lifetime(
+    codex, tmp_path: Path
+) -> None:
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": "opaque-access",
+                    "refresh_token": "old-refresh",
+                    "refreshed_at": "1970-01-01T00:16:40Z",
+                    "expires_at": 1_900,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = codex.inspect_codex_oauth_refresh_eligibility(
+        auth_path,
+        now=lambda: 1_000,
+        poll_interval_seconds=300,
+    )
+
+    assert result["issued_lifetime_seconds"] == 900.0
+    assert result["refresh_threshold_seconds"] == 450.0
+    assert result["refresh_threshold_source"] == "persisted_timestamp"
+    assert result["refresh_threshold_degraded"] is False
+    assert result["refresh_due_at"] == "1970-01-01T00:24:10Z"
+    assert result["eligible"] is False
+
+
+def test_missing_lifetime_is_explicitly_degraded_in_eligibility_and_summary(
+    codex, tmp_path: Path
+) -> None:
+    observed_at = datetime.now(timezone.utc)
+    auth_path = tmp_path / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": "opaque-access",
+                    "refresh_token": "old-refresh",
+                    "expires_at": (
+                        observed_at + timedelta(hours=2)
+                    ).isoformat().replace("+00:00", "Z"),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    auth_path.chmod(0o600)
+
+    eligibility = codex.inspect_codex_oauth_refresh_eligibility(
+        auth_path,
+        now=lambda: observed_at,
+        poll_interval_seconds=300,
+    )
+    summary = codex.refresh_codex_oauth_auth_file(
+        auth_path,
+        buffer_seconds=300,
+        force=False,
+        lock_file=tmp_path / "auth.json.lock",
+    )
+
+    assert eligibility["credential_health"] == "fresh"
+    assert eligibility["issued_lifetime_seconds"] is None
+    assert eligibility["refresh_threshold_seconds"] == 300.0
+    assert eligibility["refresh_threshold_source"] == "fallback"
+    assert eligibility["refresh_threshold_degraded"] is True
+    assert summary["skipped"] is True
+    assert summary["auth_degraded"] is True
+    assert summary["issued_lifetime_seconds"] is None
+    assert summary["refresh_threshold_seconds"] == 300.0
+    assert summary["refresh_threshold_source"] == "fallback"
+    assert summary["refresh_threshold_degraded"] is True
 
 
 # ---------------------------------------------------------------------------

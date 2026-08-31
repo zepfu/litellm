@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterator, Mapping, MutableMapping, Optional
+from typing import Any, Callable, Dict, Iterator, Mapping, MutableMapping, Optional, Tuple
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
@@ -55,60 +55,124 @@ def _issued_lifetime_seconds(
     *,
     expires_in: Any = None,
     access_token: Optional[str] = None,
-    expires_at: Optional[float] = None,
-    obtained_at: Optional[float] = None,
+    expires_at: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+    refreshed_at: Any = None,
 ) -> Optional[float]:
-    """Derive issued access-token lifetime from provider metadata.
+    lifetime, _source = _issued_lifetime_metadata(
+        expires_in=expires_in,
+        access_token=access_token,
+        expires_at=expires_at,
+        issued_at=issued_at,
+        obtained_at=obtained_at,
+        refreshed_at=refreshed_at,
+    )
+    return lifetime
 
-    Priority order: provider expires_in; validated JWT iat/exp;
-    persisted obtained_at + expires_at pairing.
-    Returns None when no usable lifetime metadata is available.
-    """
-    if expires_in is not None:
-        val = _as_finite_number(expires_in)
-        if val is not None and val > 0:
-            return val
-    if access_token is not None:
-        try:
-            parts = access_token.split(".")
-            if len(parts) >= 2:
-                payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-                claims = json.loads(
-                    base64.urlsafe_b64decode(payload_b64.encode("ascii"))
-                )
-                iat = claims.get("iat")
-                exp = claims.get("exp")
-                if isinstance(iat, (int, float)) and isinstance(exp, (int, float)):
-                    lifetime = float(exp) - float(iat)
-                    if lifetime > 0 and math.isfinite(lifetime):
-                        return lifetime
-        except Exception:
-            pass
-    if expires_at is not None and obtained_at is not None:
-        lifetime = float(expires_at) - float(obtained_at)
-        if lifetime > 0 and math.isfinite(lifetime):
-            return lifetime
-    return None
+
+def _issued_lifetime_metadata(
+    *,
+    expires_in: Any = None,
+    access_token: Optional[str] = None,
+    expires_at: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+    refreshed_at: Any = None,
+) -> Tuple[Optional[float], str]:
+    """Derive an issued lifetime and identify its authoritative source."""
+    provider_lifetime = _as_finite_number(expires_in)
+    if provider_lifetime is not None and provider_lifetime > 0:
+        return provider_lifetime, "expires_in"
+
+    jwt_claims = _jwt_time_claims(access_token)
+    if jwt_claims is not None:
+        issued_timestamp, expiry_timestamp = jwt_claims
+        return expiry_timestamp - issued_timestamp, "jwt"
+
+    persisted_issued_at = _first_timestamp_seconds(
+        issued_at,
+        obtained_at,
+        refreshed_at,
+    )
+    persisted_expires_at = _timestamp_seconds(expires_at)
+    if (
+        persisted_issued_at is not None
+        and persisted_expires_at is not None
+        and persisted_expires_at > persisted_issued_at
+    ):
+        return persisted_expires_at - persisted_issued_at, "persisted_timestamp"
+
+    return None, "fallback"
 
 
 def _refresh_threshold_seconds(
     *,
     expires_in: Any = None,
     access_token: Optional[str] = None,
-    expires_at: Optional[float] = None,
-    obtained_at: Optional[float] = None,
+    expires_at: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+    refreshed_at: Any = None,
     min_seconds: float = DEFAULT_CODEX_REFRESH_MIN_SECONDS,
 ) -> float:
     """Return proportional refresh threshold (max of min or half-life)."""
-    lifetime = _issued_lifetime_seconds(
+    threshold, _source, _degraded = _refresh_threshold_metadata(
         expires_in=expires_in,
         access_token=access_token,
         expires_at=expires_at,
+        issued_at=issued_at,
         obtained_at=obtained_at,
+        refreshed_at=refreshed_at,
+        min_seconds=min_seconds,
     )
-    if lifetime is None or lifetime <= 0:
-        return float(min_seconds)
-    return max(float(min_seconds), lifetime * 0.5)
+    return threshold
+
+
+def _refresh_threshold_metadata(
+    *,
+    expires_in: Any = None,
+    access_token: Optional[str] = None,
+    expires_at: Any = None,
+    issued_at: Any = None,
+    obtained_at: Any = None,
+    refreshed_at: Any = None,
+    min_seconds: float = DEFAULT_CODEX_REFRESH_MIN_SECONDS,
+) -> Tuple[float, str, bool]:
+    lifetime, source = _issued_lifetime_metadata(
+        expires_in=expires_in,
+        access_token=access_token,
+        expires_at=expires_at,
+        issued_at=issued_at,
+        obtained_at=obtained_at,
+        refreshed_at=refreshed_at,
+    )
+    if lifetime is None:
+        return float(min_seconds), "fallback", True
+    return max(float(min_seconds), lifetime * 0.5), source, False
+
+
+def _token_refresh_metadata(
+    token_data: Mapping[str, Any],
+) -> Tuple[Optional[float], float, str, bool]:
+    expires_at = _get_token_expiry(token_data)
+    lifetime, source = _issued_lifetime_metadata(
+        expires_in=token_data.get("expires_in"),
+        access_token=token_data.get("access_token"),
+        expires_at=expires_at,
+        issued_at=token_data.get("issued_at"),
+        obtained_at=token_data.get("obtained_at"),
+        refreshed_at=token_data.get("refreshed_at"),
+    )
+    threshold, threshold_source, degraded = _refresh_threshold_metadata(
+        expires_in=token_data.get("expires_in"),
+        access_token=token_data.get("access_token"),
+        expires_at=expires_at,
+        issued_at=token_data.get("issued_at"),
+        obtained_at=token_data.get("obtained_at"),
+        refreshed_at=token_data.get("refreshed_at"),
+    )
+    return lifetime, threshold, threshold_source or source, degraded
 
 
 @dataclass(frozen=True)
@@ -119,6 +183,11 @@ class CodexOAuthRefreshSummary:
     auth_file: str
     account_id: Optional[str] = None
     expires_at: Optional[str] = None
+    issued_lifetime_seconds: Optional[float] = None
+    auth_degraded: bool = False
+    refresh_threshold_seconds: Optional[float] = None
+    refresh_threshold_source: Optional[str] = None
+    refresh_threshold_degraded: bool = False
     error_class: Optional[str] = None
     error_message: Optional[str] = None
     error_hint: Optional[str] = None
@@ -131,6 +200,11 @@ class CodexOAuthRefreshSummary:
             "auth_file": self.auth_file,
             "account_id": self.account_id,
             "expires_at": self.expires_at,
+            "issued_lifetime_seconds": self.issued_lifetime_seconds,
+            "auth_degraded": self.auth_degraded,
+            "refresh_threshold_seconds": self.refresh_threshold_seconds,
+            "refresh_threshold_source": self.refresh_threshold_source,
+            "refresh_threshold_degraded": self.refresh_threshold_degraded,
             "error_class": self.error_class,
             "error_message": self.error_message,
             "error_hint": self.error_hint,
@@ -144,6 +218,12 @@ def inspect_codex_oauth_credential_health(auth_file: str | Path) -> Dict[str, An
         token_data = _get_token_data(_read_auth_data(resolved_auth_file))
         if _clean_string(token_data.get("access_token")) is None:
             raise ValueError("Codex OAuth credential is missing access_token.")
+        (
+            issued_lifetime_seconds,
+            threshold_seconds,
+            threshold_source,
+            threshold_degraded,
+        ) = _token_refresh_metadata(token_data)
         expires_at = _get_token_expiry(token_data)
         account_id = _extract_account_id(token_data)
         if expires_at is None:
@@ -153,6 +233,11 @@ def inspect_codex_oauth_credential_health(auth_file: str | Path) -> Dict[str, An
                 "degraded",
                 error_class="CredentialExpiryUnavailable",
                 error_message="Codex OAuth credential expiry is unavailable.",
+                issued_lifetime_seconds=issued_lifetime_seconds,
+                auth_degraded=threshold_degraded,
+                refresh_threshold_seconds=threshold_seconds,
+                refresh_threshold_source=threshold_source,
+                refresh_threshold_degraded=threshold_degraded,
             )
         expires_at_text = _format_expires_at(expires_at)
         if expires_at <= time.time():
@@ -163,9 +248,22 @@ def inspect_codex_oauth_credential_health(auth_file: str | Path) -> Dict[str, An
                 expires_at_text,
                 error_class="CredentialExpiredError",
                 error_message="Codex OAuth credential is expired.",
+                issued_lifetime_seconds=issued_lifetime_seconds,
+                auth_degraded=threshold_degraded,
+                refresh_threshold_seconds=threshold_seconds,
+                refresh_threshold_source=threshold_source,
+                refresh_threshold_degraded=threshold_degraded,
             )
         return _codex_health_summary(
-            resolved_auth_file, account_id, "fresh", expires_at_text
+            resolved_auth_file,
+            account_id,
+            "fresh",
+            expires_at_text,
+            issued_lifetime_seconds=issued_lifetime_seconds,
+            auth_degraded=threshold_degraded,
+            refresh_threshold_seconds=threshold_seconds,
+            refresh_threshold_source=threshold_source,
+            refresh_threshold_degraded=threshold_degraded,
         )
     except Exception as exc:
         return _codex_health_summary(
@@ -174,6 +272,10 @@ def inspect_codex_oauth_credential_health(auth_file: str | Path) -> Dict[str, An
             "malformed",
             error_class=exc.__class__.__name__,
             error_message=_sanitize_error_message(str(exc)),
+            auth_degraded=True,
+            refresh_threshold_seconds=float(DEFAULT_CODEX_REFRESH_MIN_SECONDS),
+            refresh_threshold_source="fallback",
+            refresh_threshold_degraded=True,
         )
 
 
@@ -184,6 +286,11 @@ def _codex_health_summary(
     expires_at: Optional[str] = None,
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
+    issued_lifetime_seconds: Optional[float] = None,
+    auth_degraded: bool = False,
+    refresh_threshold_seconds: Optional[float] = None,
+    refresh_threshold_source: Optional[str] = None,
+    refresh_threshold_degraded: bool = False,
 ) -> Dict[str, Any]:
     return {
         "attempted": True,
@@ -193,6 +300,11 @@ def _codex_health_summary(
         "account_id": account_id,
         "health_status": health_status,
         "expires_at": expires_at,
+        "issued_lifetime_seconds": issued_lifetime_seconds,
+        "auth_degraded": auth_degraded,
+        "refresh_threshold_seconds": refresh_threshold_seconds,
+        "refresh_threshold_source": refresh_threshold_source,
+        "refresh_threshold_degraded": refresh_threshold_degraded,
         "error_class": error_class,
         "error_message": error_message,
     }
@@ -224,6 +336,10 @@ def refresh_codex_oauth_auth_file(
             f"{resolved_auth_file.name}.lock"
         )
     resolved_buffer_seconds = _resolve_buffer_seconds(buffer_seconds)
+    issued_lifetime_seconds: Optional[float] = None
+    threshold_seconds: Optional[float] = float(DEFAULT_CODEX_REFRESH_MIN_SECONDS)
+    threshold_source: Optional[str] = "fallback"
+    threshold_degraded = True
 
     try:
         ensure_not_symlink_path(
@@ -256,6 +372,12 @@ def refresh_codex_oauth_auth_file(
                     credential_record,
                     token_data,
                 )
+            (
+                issued_lifetime_seconds,
+                threshold_seconds,
+                threshold_source,
+                threshold_degraded,
+            ) = _token_refresh_metadata(token_data)
             current_expires_at = _format_expires_at(_get_token_expiry(token_data))
             current_account_id = _extract_account_id(token_data)
 
@@ -270,6 +392,11 @@ def refresh_codex_oauth_auth_file(
                     auth_file=str(resolved_auth_file),
                     account_id=current_account_id,
                     expires_at=current_expires_at,
+                    issued_lifetime_seconds=issued_lifetime_seconds,
+                    auth_degraded=threshold_degraded,
+                    refresh_threshold_seconds=threshold_seconds,
+                    refresh_threshold_source=threshold_source,
+                    refresh_threshold_degraded=threshold_degraded,
                 ).as_dict()
 
             refreshed = _refresh_token_data(
@@ -285,6 +412,12 @@ def refresh_codex_oauth_auth_file(
                     credential_record,
                     token_data,
                 )
+            (
+                issued_lifetime_seconds,
+                threshold_seconds,
+                threshold_source,
+                threshold_degraded,
+            ) = _token_refresh_metadata(token_data)
             auth_data["last_refresh"] = datetime.now(timezone.utc).isoformat()
             _write_auth_data(resolved_auth_file, auth_data)
             return CodexOAuthRefreshSummary(
@@ -294,13 +427,33 @@ def refresh_codex_oauth_auth_file(
                 auth_file=str(resolved_auth_file),
                 account_id=_extract_account_id(token_data),
                 expires_at=_format_expires_at(_get_token_expiry(token_data)),
+                issued_lifetime_seconds=issued_lifetime_seconds,
+                auth_degraded=threshold_degraded,
+                refresh_threshold_seconds=threshold_seconds,
+                refresh_threshold_source=threshold_source,
+                refresh_threshold_degraded=threshold_degraded,
             ).as_dict()
     except Exception as exc:
+        if "token_data" in locals():
+            try:
+                (
+                    issued_lifetime_seconds,
+                    threshold_seconds,
+                    threshold_source,
+                    threshold_degraded,
+                ) = _token_refresh_metadata(token_data)
+            except Exception:
+                pass
         return CodexOAuthRefreshSummary(
             attempted=True,
             refreshed=False,
             skipped=False,
             auth_file=str(resolved_auth_file),
+            issued_lifetime_seconds=issued_lifetime_seconds,
+            auth_degraded=threshold_degraded,
+            refresh_threshold_seconds=threshold_seconds,
+            refresh_threshold_source=threshold_source,
+            refresh_threshold_degraded=threshold_degraded,
             error_class=exc.__class__.__name__,
             error_message=_refresh_error_message(
                 exc,
@@ -331,12 +484,12 @@ def inspect_codex_oauth_refresh_eligibility(
                 credential_record,
                 token_data,
             )
-        threshold_seconds = _refresh_threshold_seconds(
-            expires_in=token_data.get("expires_in"),
-            access_token=token_data.get("access_token"),
-            expires_at=_get_token_expiry(token_data),
-            obtained_at=_parse_obtained_at(token_data),
-        )
+        (
+            issued_lifetime_seconds,
+            threshold_seconds,
+            threshold_source,
+            threshold_degraded,
+        ) = _token_refresh_metadata(token_data)
         expires_at = _get_token_expiry(token_data)
         if expires_at is None:
             return _eligibility_summary(
@@ -350,7 +503,10 @@ def inspect_codex_oauth_refresh_eligibility(
                 usable=True,
                 error_class="CredentialExpiryUnavailable",
                 error_message="Codex OAuth credential expiry is unavailable.",
+                issued_lifetime_seconds=issued_lifetime_seconds,
                 refresh_threshold_seconds=threshold_seconds,
+                refresh_threshold_source=threshold_source,
+                refresh_threshold_degraded=threshold_degraded,
             )
         expires_at_datetime = datetime.fromtimestamp(expires_at, timezone.utc)
         refresh_due_at = expires_at_datetime - timedelta(
@@ -370,7 +526,10 @@ def inspect_codex_oauth_refresh_eligibility(
                 "expired" if expires_at_datetime <= observed_at else "fresh"
             ),
             usable=expires_at_datetime > observed_at,
+            issued_lifetime_seconds=issued_lifetime_seconds,
             refresh_threshold_seconds=threshold_seconds,
+            refresh_threshold_source=threshold_source,
+            refresh_threshold_degraded=threshold_degraded,
         )
     except Exception as exc:
         return _eligibility_summary(
@@ -384,6 +543,10 @@ def inspect_codex_oauth_refresh_eligibility(
             usable=False,
             error_class=exc.__class__.__name__,
             error_message="Codex OAuth eligibility inspection failed.",
+            issued_lifetime_seconds=None,
+            refresh_threshold_seconds=float(DEFAULT_CODEX_REFRESH_MIN_SECONDS),
+            refresh_threshold_source="fallback",
+            refresh_threshold_degraded=True,
         )
 
 
@@ -398,7 +561,10 @@ def _eligibility_summary(
     usable: bool,
     error_class: Optional[str] = None,
     error_message: Optional[str] = None,
+    issued_lifetime_seconds: Optional[float] = None,
     refresh_threshold_seconds: Optional[float] = None,
+    refresh_threshold_source: Optional[str] = None,
+    refresh_threshold_degraded: bool = False,
 ) -> Dict[str, Any]:
     return {
         "eligibility_checked_at": _format_expires_at(observed_at.timestamp()),
@@ -414,7 +580,10 @@ def _eligibility_summary(
         "usable": usable,
         "error_class": error_class,
         "error_message": error_message,
+        "issued_lifetime_seconds": issued_lifetime_seconds,
         "refresh_threshold_seconds": refresh_threshold_seconds,
+        "refresh_threshold_source": refresh_threshold_source,
+        "refresh_threshold_degraded": refresh_threshold_degraded,
     }
 
 
@@ -448,6 +617,11 @@ def refresh_codex_oauth_inventory_record(
             "account_label": record.label,
             "account_hash": record.expected_account_hash,
             "expires_at": None,
+            "issued_lifetime_seconds": None,
+            "auth_degraded": True,
+            "refresh_threshold_seconds": float(DEFAULT_CODEX_REFRESH_MIN_SECONDS),
+            "refresh_threshold_source": "fallback",
+            "refresh_threshold_degraded": True,
             "error_class": "CredentialDisabled",
             "error_message": (
                 f"Codex OAuth credential '{record.label}' is disabled."
@@ -472,6 +646,11 @@ def refresh_codex_oauth_inventory_record(
         "account_label": record.label,
         "account_hash": record.expected_account_hash,
         "expires_at": result["expires_at"],
+        "issued_lifetime_seconds": result["issued_lifetime_seconds"],
+        "auth_degraded": result["auth_degraded"],
+        "refresh_threshold_seconds": result["refresh_threshold_seconds"],
+        "refresh_threshold_source": result["refresh_threshold_source"],
+        "refresh_threshold_degraded": result["refresh_threshold_degraded"],
         "error_class": result["error_class"],
         "error_message": result["error_message"],
         "error_hint": result["error_hint"],
@@ -606,22 +785,47 @@ def _decode_jwt_claims_without_validation(token: str) -> Dict[str, Any]:
         return {}
 
 
+def _jwt_time_claims(access_token: Any) -> Optional[Tuple[float, float]]:
+    if not isinstance(access_token, str) or not access_token.strip():
+        return None
+    claims = _decode_jwt_claims_without_validation(access_token)
+    issued_at = _as_finite_number(claims.get("iat"))
+    expires_at = _as_finite_number(claims.get("exp"))
+    if (
+        issued_at is None
+        or expires_at is None
+        or expires_at <= issued_at
+    ):
+        return None
+    return issued_at, expires_at
+
+
 def _get_token_expiry(token_data: Mapping[str, Any]) -> Optional[float]:
-    expires_at = token_data.get("expires_at")
-    if isinstance(expires_at, (int, float)):
-        return float(expires_at)
-    if isinstance(expires_at, str) and expires_at.strip():
-        try:
-            return float(expires_at.strip())
-        except ValueError:
-            pass
+    expires_at = _timestamp_seconds(token_data.get("expires_at"))
+    if expires_at is not None:
+        return expires_at
 
     access_token = _clean_string(token_data.get("access_token"))
-    if access_token is None:
-        return None
-    exp = _decode_jwt_claims_without_validation(access_token).get("exp")
-    if isinstance(exp, (int, float)):
-        return float(exp)
+    if access_token is not None:
+        jwt_claims = _jwt_time_claims(access_token)
+        if jwt_claims is not None:
+            return jwt_claims[1]
+        exp = _as_finite_number(
+            _decode_jwt_claims_without_validation(access_token).get("exp")
+        )
+        if exp is not None:
+            return exp
+
+    issued_at = _first_timestamp_seconds(
+        token_data.get("issued_at"),
+        token_data.get("obtained_at"),
+        token_data.get("refreshed_at"),
+    )
+    lifetime = _as_finite_number(token_data.get("expires_in"))
+    if issued_at is not None and lifetime is not None and lifetime > 0:
+        derived_expires_at = issued_at + lifetime
+        if math.isfinite(derived_expires_at):
+            return derived_expires_at
     return None
 
 
@@ -655,12 +859,7 @@ def _token_needs_refresh(
     expires_at = _get_token_expiry(token_data)
     if expires_at is None:
         return True
-    threshold = _refresh_threshold_seconds(
-        expires_in=token_data.get("expires_in"),
-        access_token=token_data.get("access_token"),
-        expires_at=expires_at,
-        obtained_at=_parse_obtained_at(token_data),
-    )
+    _lifetime, threshold, _source, _degraded = _token_refresh_metadata(token_data)
     return time.time() >= expires_at - max(0, threshold)
 
 
@@ -735,6 +934,8 @@ def _refresh_token_data(
 def _update_token_data(
     token_data: MutableMapping[str, Any],
     refreshed: Mapping[str, Any],
+    *,
+    now: Optional[Callable[[], float]] = None,
 ) -> None:
     access_token = _clean_string(refreshed.get("access_token"))
     if access_token is None:
@@ -753,12 +954,37 @@ def _update_token_data(
     if id_token is not None:
         token_data["id_token"] = id_token
 
-    expires_at = _get_token_expiry({"access_token": access_token})
-    expires_in = refreshed.get("expires_in")
-    if expires_at is None and isinstance(expires_in, (int, float)):
-        expires_at = time.time() + float(expires_in)
-    if expires_at is not None:
-        token_data["expires_at"] = int(expires_at)
+    obtained_at = _as_finite_number(now() if now is not None else time.time())
+    if obtained_at is None:
+        obtained_at = time.time()
+    token_data["obtained_at"] = _json_number(obtained_at)
+    token_data.pop("issued_at", None)
+    token_data.pop("refreshed_at", None)
+
+    expires_in = _as_finite_number(refreshed.get("expires_in"))
+    jwt_claims = _jwt_time_claims(access_token)
+    jwt_expires_at = (
+        jwt_claims[1]
+        if jwt_claims is not None
+        else _get_token_expiry({"access_token": access_token})
+    )
+    response_expires_at = _timestamp_seconds(refreshed.get("expires_at"))
+    if expires_in is not None and expires_in > 0:
+        token_data["expires_in"] = _json_number(expires_in)
+        expires_at = obtained_at + expires_in
+    elif jwt_expires_at is not None:
+        token_data["expires_in"] = None
+        expires_at = jwt_expires_at
+    elif response_expires_at is not None:
+        token_data["expires_in"] = None
+        expires_at = response_expires_at
+    else:
+        token_data["expires_in"] = None
+        expires_at = None
+    if expires_at is not None and math.isfinite(expires_at):
+        token_data["expires_at"] = _json_number(expires_at)
+    else:
+        token_data["expires_at"] = None
 
     account_id = _extract_account_id_from_tokens(
         id_token=_clean_string(token_data.get("id_token")),
@@ -846,17 +1072,49 @@ def _extract_oauth_error_hint(response_body: Any) -> Optional[str]:
 
 def _parse_obtained_at(token_data: Mapping[str, Any]) -> Optional[float]:
     """Parse a durable obtained_at timestamp from credential metadata."""
-    raw = token_data.get("obtained_at")
-    if raw is None:
-        return None
-    if isinstance(raw, (int, float)):
-        return float(raw)
-    if isinstance(raw, str) and raw.strip():
-        try:
-            return float(raw.strip())
-        except ValueError:
-            pass
+    return _first_timestamp_seconds(
+        token_data.get("issued_at"),
+        token_data.get("obtained_at"),
+        token_data.get("refreshed_at"),
+    )
+
+
+def _first_timestamp_seconds(*values: Any) -> Optional[float]:
+    for value in values:
+        timestamp = _timestamp_seconds(value)
+        if timestamp is not None:
+            return timestamp
     return None
+
+
+def _timestamp_seconds(value: Any) -> Optional[float]:
+    numeric = _as_finite_number(value)
+    if numeric is not None:
+        return numeric
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        timestamp = value.astimezone(timezone.utc).timestamp()
+        return timestamp if math.isfinite(timestamp) else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    try:
+        numeric = float(normalized)
+    except ValueError:
+        pass
+    else:
+        return numeric if math.isfinite(numeric) else None
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    timestamp = parsed.astimezone(timezone.utc).timestamp()
+    return timestamp if math.isfinite(timestamp) else None
 
 
 def _as_finite_number(value: Any) -> Optional[float]:
@@ -867,6 +1125,10 @@ def _as_finite_number(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _json_number(value: float) -> int | float:
+    return int(value) if value.is_integer() else value
 
 
 def _sanitize_error_message(message: str, *, limit: int = 500) -> str:
