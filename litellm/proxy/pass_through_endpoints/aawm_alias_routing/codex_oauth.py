@@ -285,6 +285,16 @@ def _bind_codex_oauth_candidate_to_request(
         **identity,
         "model": str(candidate.get("model") or ""),
     }
+    from .policy import CODEX_AUTO_AGENT_NATIVE_PROVIDER
+
+    provider = _clean_codex_auth_value(candidate.get("provider"))
+    if provider == CODEX_AUTO_AGENT_NATIVE_PROVIDER:
+        bound["provider"] = provider
+        account_display = _clean_codex_auth_value(
+            candidate.get("codex_oauth_account_display")
+        )
+        if account_display is not None:
+            bound["account_display"] = account_display
     credential_affinity = _clean_codex_auth_value(
         candidate.get("codex_oauth_credential_affinity")
     )

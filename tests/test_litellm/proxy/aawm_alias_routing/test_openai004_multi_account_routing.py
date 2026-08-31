@@ -2252,6 +2252,7 @@ async def test_selected_account_drives_both_ingress_auth_and_redaction(
         "codex_oauth_lane_key": (
             "codex-oauth:account2:hash-account-2"
         ),
+        "codex_oauth_account_display": _masked_account_display("account2"),
         "raw_account_id": "raw-account-id",
         "access_token": "selected-token",
         "auth_path": "/private/oauth.json",
@@ -2314,6 +2315,9 @@ async def test_selected_account_drives_both_ingress_auth_and_redaction(
     assert native_kwargs["api_key"] is None
     assert native_kwargs["forward_headers"] is False
     assert native_kwargs["custom_headers"] == selected_auth.headers
+    bound_state = request.state.aawm_codex_oauth_selected_account
+    assert bound_state["provider"] == CODEX_AUTO_AGENT_NATIVE_PROVIDER
+    assert bound_state["account_display"] == selected_auth.account_display
 
     anthropic_request = _request(
         authorization="Bearer inbound-anthropic-secret"

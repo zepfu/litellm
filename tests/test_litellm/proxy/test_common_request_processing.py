@@ -1454,6 +1454,144 @@ class TestProxyBaseLLMRequestProcessing:
         assert "chatgpt.com/backend-api/codex/responses" not in rendered
         assert " [ROUTE] " not in rendered
 
+    def test_route_rollup_account_attribution_uses_bound_openai_state(
+        self,
+        monkeypatch,
+    ):
+        from litellm.proxy.aawm_route_logging import (
+            build_aawm_route_rollup_context,
+            record_aawm_route_rollup_failure,
+        )
+
+        clear_aawm_route_rollups()
+        monkeypatch.setenv("AAWM_ROUTE_ROLLUP_INTERVAL_SECONDS", "60")
+        target = "https://chatgpt.com/backend-api/codex/responses"
+        request_body = {"model": "gpt-5.5"}
+        spoofed_metadata = {
+            "repository": "litellm",
+            "canonical_session_identity": "session-trusted",
+            "agent_id": "agent-trusted",
+            "thread_id": "thread-trusted",
+            "codex_auto_agent_selected_provider": "openrouter",
+            "codex_oauth_account_hash": "spoofed-hash",
+            "codex_oauth_account_display": "unmasked@example.com",
+        }
+
+        try:
+            untrusted_request = _build_aawm_route_log_request(
+                url="http://127.0.0.1:4001/openai_passthrough/responses",
+                headers={"user-agent": "codex-cli/0.141.0"},
+            )
+            untrusted_request.state.aawm_codex_oauth_selected_account = None
+            untrusted_kwargs = {
+                "litellm_call_id": "call-untrusted",
+                "litellm_params": {"metadata": dict(spoofed_metadata)},
+            }
+            untrusted_context = build_aawm_route_rollup_context(
+                request=untrusted_request,
+                target=target,
+                request_body=request_body,
+                kwargs=untrusted_kwargs,
+            )
+            assert untrusted_context is not None
+            assert "codex_oauth_account_hash" not in untrusted_context
+            assert "codex_oauth_account_display" not in untrusted_context
+            emit_aawm_route_access_log(
+                request=untrusted_request,
+                target=target,
+                request_body=request_body,
+                kwargs=untrusted_kwargs,
+                completed=True,
+            )
+            untrusted_rendered = "\n".join(
+                flush_aawm_route_rollups(force=True)
+            )
+            assert " - gpt-5.5:none - Turns: 1" in untrusted_rendered
+            assert "unmasked@example.com" not in untrusted_rendered
+
+            clear_aawm_route_rollups()
+            trusted_request = _build_aawm_route_log_request(
+                url="http://127.0.0.1:4001/openai_passthrough/responses",
+                headers={"user-agent": "codex-cli/0.141.0"},
+            )
+            trusted_request.state.aawm_codex_oauth_selected_account = {
+                "provider": "openai",
+                "account_hash": "trusted-hash",
+                "account_display": "a*@example.com",
+            }
+            trusted_kwargs = {
+                "litellm_call_id": "call-trusted",
+                "litellm_params": {"metadata": dict(spoofed_metadata)},
+            }
+            trusted_context = build_aawm_route_rollup_context(
+                request=trusted_request,
+                target=target,
+                request_body=request_body,
+                kwargs=trusted_kwargs,
+            )
+            assert trusted_context is not None
+            assert trusted_context["codex_auto_agent_selected_provider"] == (
+                "openai"
+            )
+            assert trusted_context["codex_oauth_account_hash"] == "trusted-hash"
+            assert trusted_context["codex_oauth_account_display"] == (
+                "a*@example.com"
+            )
+            assert trusted_context["litellm_call_id"] == "call-trusted"
+            assert trusted_context["canonical_session_identity"] == (
+                "session-trusted"
+            )
+            assert trusted_context["origin_actor_id"] == "agent-trusted"
+            assert trusted_context["origin_thread_id"] == "thread-trusted"
+            emit_aawm_route_access_log(
+                request=trusted_request,
+                target=target,
+                request_body=request_body,
+                kwargs=trusted_kwargs,
+                completed=True,
+            )
+            trusted_rendered = "\n".join(
+                flush_aawm_route_rollups(force=True)
+            )
+            assert " - gpt-5.5 (a*@example.com):none - Turns: 1" in (
+                trusted_rendered
+            )
+            assert "unmasked@example.com" not in trusted_rendered
+
+            clear_aawm_route_rollups()
+            failed_request = _build_aawm_route_log_request(
+                url="http://127.0.0.1:4001/openai_passthrough/responses",
+                headers={"user-agent": "codex-cli/0.141.0"},
+            )
+            failed_request.state.aawm_codex_oauth_selected_account = {
+                "provider": "openai",
+                "account_hash": "trusted-hash",
+                "account_display": "a*@example.com",
+            }
+            failed_kwargs = {
+                "litellm_call_id": "call-failed",
+                "litellm_params": {"metadata": dict(spoofed_metadata)},
+            }
+            emit_aawm_route_access_log(
+                request=failed_request,
+                target=target,
+                request_body=request_body,
+                kwargs=failed_kwargs,
+                completed=False,
+            )
+            assert record_aawm_route_rollup_failure(
+                failed_kwargs,
+                message="provider returned failure",
+            )
+            failed_rendered = "\n".join(
+                flush_aawm_route_rollups(force=True)
+            )
+            assert " - gpt-5.5:none - Turns: 0" in failed_rendered
+            assert "a*@example.com" not in failed_rendered
+            assert "unmasked@example.com" not in failed_rendered
+        finally:
+            clear_aawm_route_rollups()
+
     def test_aawm_route_log_rollup_prefers_codex_turn_repository_over_placeholder_metadata(
         self,
         caplog,

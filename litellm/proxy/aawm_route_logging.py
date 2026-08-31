@@ -2715,6 +2715,28 @@ def build_aawm_route_rollup_context(
     route_type: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     metadata = _extract_aawm_route_log_metadata(request_body, kwargs)
+    bound_account_context: dict[str, Optional[str]] = {}
+    request_state = getattr(request, "state", None)
+    bound_account = (
+        getattr(request_state, "aawm_codex_oauth_selected_account", None)
+        if request_state is not None
+        else None
+    )
+    if isinstance(bound_account, dict):
+        bound_provider = _normalize_aawm_route_rollup_identity(
+            bound_account.get("provider")
+        )
+        bound_account_hash = _normalize_aawm_route_rollup_identity(
+            bound_account.get("account_hash")
+        )
+        if bound_provider == "openai" and bound_account_hash:
+            bound_account_context = {
+                "codex_auto_agent_selected_provider": bound_provider,
+                "codex_oauth_account_hash": bound_account_hash,
+                "codex_oauth_account_display": _clean_aawm_route_log_field(
+                    bound_account.get("account_display")
+                ),
+            }
     headers = dict(getattr(request, "headers", {}) or {})
     codex_turn_metadata = _get_aawm_route_log_codex_turn_metadata(
         headers=headers,
@@ -2824,6 +2846,7 @@ def build_aawm_route_rollup_context(
         ),
         "origin_actor_id": origin_actor_id,
         "origin_thread_id": origin_thread_id,
+        **bound_account_context,
         "is_codex_auto_review": _is_aawm_codex_auto_review_request(
             request_body=request_body,
             metadata=metadata,
@@ -2974,6 +2997,7 @@ def _build_aawm_route_rollup_origin_identity(
     context: dict[str, Any],
     *,
     metadata: Optional[dict[str, Any]] = None,
+    include_account_attribution: bool = False,
 ) -> Optional[_AawmRouteRollupOriginIdentity]:
     if context.get("is_codex_auto_review") is True:
         return None
@@ -2985,32 +3009,32 @@ def _build_aawm_route_rollup_origin_identity(
             metadata.get(key) if isinstance(metadata, dict) else None
         )
 
+    account_provider: Optional[str] = None
+    account_identity: Optional[str] = None
+    account_display: Optional[str] = None
+    if include_account_attribution:
+        account_provider = _normalize_aawm_route_rollup_identity(
+            context.get("codex_auto_agent_selected_provider")
+        )
+        account_identity = _normalize_aawm_route_rollup_identity(
+            context.get("codex_oauth_account_hash")
+        )
+        if account_provider != "openai" or account_identity is None:
+            account_provider = None
+            account_identity = None
+        else:
+            account_display = _clean_aawm_route_log_field(
+                context.get("codex_oauth_account_display")
+            )
+
     candidate_identity = _AawmRouteRollupOriginIdentity(
         litellm_call_id=_identity_value("litellm_call_id"),
         canonical_session_identity=_identity_value("canonical_session_identity"),
         actor_id=_identity_value("origin_actor_id"),
         thread_id=_identity_value("origin_thread_id"),
-        provider=_identity_value("codex_auto_agent_selected_provider"),
-        account_identity=_identity_value("codex_oauth_account_hash")
-        or _identity_value("codex_auto_agent_selected_account_hash"),
-        account_display=(
-            _clean_aawm_route_log_field(
-                context.get("codex_oauth_account_display")
-            )
-            or _clean_aawm_route_log_field(
-                context.get("codex_auto_agent_selected_account_display")
-            )
-            or _clean_aawm_route_log_field(
-                metadata.get("codex_oauth_account_display")
-                if isinstance(metadata, dict)
-                else None
-            )
-            or _clean_aawm_route_log_field(
-                metadata.get("codex_auto_agent_selected_account_display")
-                if isinstance(metadata, dict)
-                else None
-            )
-        ),
+        provider=account_provider,
+        account_identity=account_identity,
+        account_display=account_display,
     )
     if not any(
         (
@@ -3087,6 +3111,7 @@ def record_aawm_route_rollup_turn(
         origin_identity=_build_aawm_route_rollup_origin_identity(
             context,
             metadata=metadata,
+            include_account_attribution=True,
         ),
         review_decision=review_decision,
         review_correlation=review_correlation,
