@@ -24,7 +24,13 @@ from litellm.secret_managers.codex_oauth_inventory import (
 from scripts import codex_oauth_refresh
 
 
-def _jwt(account_id: str, *, expires_at: int, email: str | None = None) -> str:
+def _jwt(
+    account_id: str,
+    *,
+    expires_at: int,
+    email: str | None = None,
+    top_level_email: str | None = None,
+) -> str:
     auth_claims = {"chatgpt_account_id": account_id}
     if email is not None:
         auth_claims["email"] = email
@@ -32,6 +38,8 @@ def _jwt(account_id: str, *, expires_at: int, email: str | None = None) -> str:
         "exp": expires_at,
         "https://api.openai.com/auth": auth_claims,
     }
+    if top_level_email is not None:
+        payload["email"] = top_level_email
     encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
     return f"header.{encoded.rstrip('=')}.signature"
 
@@ -42,9 +50,15 @@ def _write_auth(
     account_id: str,
     token_name: str = "one",
     email: str | None = None,
+    top_level_email: str | None = None,
     expires_at: int,
 ) -> str:
-    access_token = _jwt(account_id, expires_at=expires_at, email=email)
+    access_token = _jwt(
+        account_id,
+        expires_at=expires_at,
+        email=email,
+        top_level_email=top_level_email,
+    )
     path.write_text(
         json.dumps(
             {
@@ -55,6 +69,7 @@ def _write_auth(
                         account_id,
                         expires_at=expires_at,
                         email=email,
+                        top_level_email=top_level_email,
                     ),
                     "account_id": account_id,
                     "expires_at": expires_at,
@@ -177,6 +192,75 @@ def test_loader_derives_only_masked_account_display(tmp_path: Path) -> None:
 
     assert credential.account_display == "comp*name@example.com"
     assert "complete.name" not in repr(credential)
+
+
+def test_loader_prefers_valid_top_level_email_claim(tmp_path: Path) -> None:
+    account = _account(
+        tmp_path,
+        label="account1",
+        account_id="acct-one",
+        priority=10,
+        models=["*"],
+    )
+    _write_auth(
+        Path(account["auth_path"]),
+        account_id="acct-one",
+        email="nested@example.com",
+        top_level_email="top.level@example.com",
+        expires_at=int(time.time()) + 3600,
+    )
+
+    credential = load_codex_oauth_credential(
+        load_codex_oauth_inventory(_inventory_json([account])).records[0]
+    )
+
+    assert credential.account_display == "top.*evel@example.com"
+
+
+def test_loader_falls_back_to_nested_email_claim(tmp_path: Path) -> None:
+    account = _account(
+        tmp_path,
+        label="account1",
+        account_id="acct-one",
+        priority=10,
+        models=["*"],
+    )
+    _write_auth(
+        Path(account["auth_path"]),
+        account_id="acct-one",
+        email="nested@example.com",
+        top_level_email="invalid",
+        expires_at=int(time.time()) + 3600,
+    )
+
+    credential = load_codex_oauth_credential(
+        load_codex_oauth_inventory(_inventory_json([account])).records[0]
+    )
+
+    assert credential.account_display == "n*e@example.com"
+
+
+def test_loader_redacts_invalid_email_fallback(tmp_path: Path) -> None:
+    account = _account(
+        tmp_path,
+        label="account1",
+        account_id="acct-one",
+        priority=10,
+        models=["*"],
+    )
+    _write_auth(
+        Path(account["auth_path"]),
+        account_id="acct-one",
+        email="invalid",
+        top_level_email="also-invalid",
+        expires_at=int(time.time()) + 3600,
+    )
+
+    credential = load_codex_oauth_credential(
+        load_codex_oauth_inventory(_inventory_json([account])).records[0]
+    )
+
+    assert credential.account_display == CODEX_OAUTH_REDACTED_ACCOUNT_DISPLAY
 
 
 def test_loader_degrades_missing_email_without_identity_or_token_leakage(
