@@ -1253,6 +1253,24 @@ class TestRecordRouteStatusRollup:
         assert " - Request: [Failed]" in lines
         assert " - Request: [Recovered]" not in lines
 
+        reverse_accumulator = aawm_route_logging.AawmRouteRollupAccumulator(
+            interval_seconds=60
+        )
+        reverse_accumulator.record(
+            **common,
+            status="Failed",
+            origin_identity=identities["failed"],
+        )
+        reverse_accumulator.record(
+            **common,
+            status="Recovered",
+            origin_identity=identities["recovered"],
+        )
+
+        reverse_lines = reverse_accumulator.flush(force=True)
+        assert " - Request: [Failed]" in reverse_lines
+        assert " - Request: [Recovered]" not in reverse_lines
+
 # ---------------------------------------------------------------------------
 # install() host binding
 # ---------------------------------------------------------------------------

@@ -2003,6 +2003,13 @@ class _AawmRouteRollupGroup:
         ]
         if not states:
             return None
+        unresolved = [
+            state
+            for state in states
+            if state.status in {"Failed", "Exhausted"}
+        ]
+        if unresolved:
+            return max(unresolved, key=lambda state: state.sequence)
         return max(states, key=lambda state: state.sequence)
 
     def ordered_sublines(
