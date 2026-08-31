@@ -558,6 +558,15 @@ def _encode_user_message(user_message: Mapping[str, Any]) -> bytes:
     )
 
 
+def _encode_request_context(request_context: Mapping[str, Any]) -> bytes:
+    if request_context:
+        raise CursorConnectProtocolError(
+            "Cursor Run only supports an empty requestContext for fresh "
+            "workspace-isolated requests."
+        )
+    return b""
+
+
 def _encode_user_message_action(action: Mapping[str, Any]) -> bytes:
     user_message = _proto_mapping_value(
         action,
@@ -570,6 +579,20 @@ def _encode_user_message_action(action: Mapping[str, Any]) -> bytes:
         1,
         _encode_user_message(user_message),
     )
+    request_context = _proto_mapping_value(
+        action,
+        "requestContext",
+        "request_context",
+    )
+    if request_context is not None:
+        if not isinstance(request_context, Mapping):
+            raise CursorConnectProtocolError(
+                "Cursor Run requestContext must be an object."
+            )
+        payload += _encode_proto_message_field(
+            2,
+            _encode_request_context(request_context),
+        )
     history = _proto_mapping_value(
         action,
         "conversationHistory",

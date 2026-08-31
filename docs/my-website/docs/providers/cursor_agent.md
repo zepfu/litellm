@@ -67,7 +67,10 @@ are stored as reference-only catalog rows with
 
 These are not Cursor Models pool / subscription invoice economics. Do not
 bake the temporary Grok 4.6 launch discount into the cost map. Alias
-dispatch for these families is fail-closed until the adapter wave lands.
+dispatch for these families sends a fresh `UserMessageAction.requestContext`
+as an empty message (`requestContext: {}`), matching the official clean
+workspace representation. AgentRunRequest field 12 is never sent. The direct
+`cursor_agent` provider route remains available.
 
 ## Monthly usage
 

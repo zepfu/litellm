@@ -244,6 +244,7 @@ def test_cursor_codex_path_returns_native_function_call_and_replays_tool_history
 
     first_run = FakeCursorClient.calls[0]["payload"]["runRequest"]
     assert first_run["action"]["userMessageAction"]["userMessage"]["text"] == "run pwd"
+    assert first_run["action"]["userMessageAction"]["requestContext"] == {}
     assert first_run["requestedModel"] == {
         "modelId": "grok-4.6",
         "parameters": [
