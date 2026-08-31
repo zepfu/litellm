@@ -58,7 +58,7 @@ Config-driven alias routing uses:
 - `sota-zai`: `zai_coding_plan/glm-5.3` (priority 110), then last-resort
   `alibaba_token_plan/glm-5.2` (priority 100)
 - `provider-openai`: egress-validation order `gpt-5.6-luna` (priority 100) → `gpt-5.6-terra` (priority 90) → `gpt-5.6-sol` (priority 0), all with `reasoning_effort: low`
-- `basic`: Cohere `cohere/north-mini-code-1-0` (90) → OpenRouter `openrouter/cohere/north-mini-code:free` (80) → OpenCode Zen `deepseek-v4-flash-free` (60) → OpenCode Zen `big-pickle` (50) → `basic-other`
+- `basic`: OpenRouter `openrouter/cohere/north-mini-code:free` (80) → OpenCode Zen `deepseek-v4-flash-free` (60) → OpenCode Zen `big-pickle` (50) → `basic-other`
 - `basic-other`: during `22:00-08:00 UTC+8`, Alibaba `alibaba_token_plan/deepseek-v4-flash-0731` (100) is admitted before Z.AI `zai_coding_plan/glm-5.3-flash` (90) and Cursor Composer `cursor_agent/composer-2.5` (80); the priority-zero tail is Luna at low effort for non-Claude/missing/unknown origins or native Haiku for Claude origins
 - `work`: nested `work-other` alias reference (priority 110) → Claude-only native Sonnet tail → `gpt-5.6-luna`
 - `work-other`: ordinary configured alias and valid exact-name / `alias_reference` target. During `22:00-08:00 UTC+8` the order is `sota-deepseek` (`alibaba_token_plan/deepseek-v4-pro`), Z.AI `zai_coding_plan/glm-5.3-flash`, `sota-moonshot`, then `sota-xai` in its declared order: Cursor Agent `cursor_agent/cursor-grok-4.6-high`, native xAI OIDC `xai/grok-4.6`, then managed xAI OAuth `oa_xai/grok-4.6`. Outside that window DeepSeek is omitted from new selection.

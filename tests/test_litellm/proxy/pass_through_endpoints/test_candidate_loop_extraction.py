@@ -2028,7 +2028,7 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
             "zai_coding_plan/glm-5.3-flash",
         }:
             return _IneligibleCandidateError()
-        if model in {"cohere/north-mini-code-1-0", "big-pickle"}:
+        if model == "big-pickle":
             return HTTPException(status_code=401, detail="generic provider auth failure")
         if model == "deepseek-v4-flash-free":
             return HTTPException(
@@ -2104,7 +2104,6 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
         luna_response, luna_calls = await _run(success_model="gpt-5.6-luna")
         assert luna_response["model"] == "gpt-5.6-luna"
         assert [model for model, _body in luna_calls] == [
-            "cohere/north-mini-code-1-0",
             "openrouter/cohere/north-mini-code:free",
             "deepseek-v4-flash-free",
             "big-pickle",
@@ -2121,7 +2120,6 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
         early_response, early_calls = await _run(success_model="big-pickle")
         assert early_response["model"] == "big-pickle"
         assert [model for model, _body in early_calls] == [
-            "cohere/north-mini-code-1-0",
             "openrouter/cohere/north-mini-code:free",
             "deepseek-v4-flash-free",
             "big-pickle",
@@ -2141,7 +2139,7 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
             ingress="codex",
             client_product_label=claude_product,
         ).candidates
-        assert len(claude_candidates) == 7
+        assert len(claude_candidates) == 6
         assert all(
             candidate["model"] != "gpt-5.6-luna"
             for candidate in claude_candidates
@@ -2154,7 +2152,6 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
         terminal_event = persisted[-1][-1]
         inventory = terminal_event["candidates"]
         assert [candidate["model"] for candidate in inventory] == [
-            "cohere/north-mini-code-1-0",
             "openrouter/cohere/north-mini-code:free",
             "deepseek-v4-flash-free",
             "big-pickle",
@@ -2167,7 +2164,6 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
             (candidate["terminal_disposition"], candidate["reason"])
             for candidate in inventory
         ] == [
-            ("attempted", "provider_terminal_error"),
             ("attempted", "candidate_deterministically_ineligible"),
             ("attempted", "provider_format_rejected"),
             ("attempted", "provider_terminal_error"),
@@ -2177,6 +2173,6 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
             ("attempted", "rate_limited"),
         ]
         assert inventory[-1]["reasoning_effort"] == "low"
-        assert terminal_event["candidate_count"] == len(inventory) == 8
+        assert terminal_event["candidate_count"] == len(inventory) == 7
     finally:
         snapshot_select.set_active_routing_snapshot(previous_snapshot)

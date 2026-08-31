@@ -182,15 +182,11 @@ thirteen mixed `orchestration_children`. Provider coverage is selected with
 
 The `basic` alias keeps the low-cost common prefix, in order:
 
-1. Direct Cohere North Mini Code (`cohere/north-mini-code-1-0`,
-   `provider: cohere`, `codex_cohere_chat_completions_adapter`,
-   `lane=cohere_native`, priority 90)
-2. OpenRouter Cohere North Mini Code free
-   (`openrouter/cohere/north-mini-code:free`, priority 80) as an independent
-   fallback
-3. OpenCode Zen `deepseek-v4-flash-free` (priority 60)
-4. OpenCode Zen `big-pickle` (priority 50)
-5. `alias_reference: basic-other` (priority 0)
+1. OpenRouter Cohere North Mini Code free
+   (`openrouter/cohere/north-mini-code:free`, priority 80) as the current head
+2. OpenCode Zen `deepseek-v4-flash-free` (priority 60)
+3. OpenCode Zen `big-pickle` (priority 50)
+4. `alias_reference: basic-other` (priority 0)
 
 `basic-other` orders Alibaba Token Plan
 `alibaba_token_plan/deepseek-v4-flash-0731` (priority 100, admitted only during
@@ -666,13 +662,12 @@ route.
   endpoint. Aliases that include Cohere candidates set the exact `model` string
   and `provider: cohere` in YAML; the selected route family is
   `codex_cohere_chat_completions_adapter` and the lane is `cohere_native`.
-- `basic.yaml` now carries both lanes as independent candidates. Direct trial
-  capacity is preferred: `provider: cohere`, `model: cohere/north-mini-code-1-0`,
-  `route_family: codex_cohere_chat_completions_adapter`, `priority: 90`. The
-  OpenRouter fallback remains `provider: openrouter`,
+- `basic.yaml` now begins with the OpenRouter candidate:
+  `provider: openrouter`,
   `model: openrouter/cohere/north-mini-code:free`,
-  `route_family: codex_openrouter_completion_adapter`, `priority: 80`. Do not
-  merge capacity, error, or cooldown state across those lanes.
+  `route_family: codex_openrouter_completion_adapter`, `priority: 80`. The
+  Cohere-native candidate remains on `provider-cohere`, not `basic`. Do not
+  merge capacity, error, or cooldown state across those routes.
 - Direct Cohere is separate from OpenRouter. An OpenRouter candidate such as
   `openrouter/cohere/north-mini-code:free` remains an OpenRouter request and must not be
   recorded or interpreted as direct Cohere-native traffic.
