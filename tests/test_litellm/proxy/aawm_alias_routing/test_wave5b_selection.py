@@ -995,6 +995,13 @@ class TestCodexSelectorFirstChoice:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        import importlib
+
+        importlib.import_module("litellm.proxy.proxy_server")
+        from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+            session_affinity,
+        )
+
         request = _make_request()
         candidates = (
             {
@@ -1045,7 +1052,8 @@ class TestCodexSelectorFirstChoice:
         cooldown_state.configure_cooldown_state_runtime(manager=manager)
         _set_selection_runtime("_get_codex_active_cooldown_state", _active_cooldown_state)
         monkeypatch.setattr(
-            "litellm.proxy.pass_through_endpoints.aawm_alias_routing.session_affinity.get_session_owner_record",
+            session_affinity,
+            "get_session_owner_record",
             AsyncMock(return_value=(None, None, None)),
         )
         mock_enum = SelectionEnumeration(candidates=candidates, commit_token=None)
