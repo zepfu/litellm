@@ -7761,6 +7761,7 @@ def _build_zai_coding_plan_quota_rate_limit_payloads(  # noqa: PLR0915
             "signals": ["zai_coding_plan_quota_limit"],
             "limit_type": limit_type,
             "quota_period": period,
+            "window": period,
             "account_hash": account_hash,
             "customerId_sha256": account_hash,
             "account_identity_source": "customerId_sha256",
