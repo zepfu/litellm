@@ -348,9 +348,13 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
    The fork image and model-config archive can contain the code and pricing, but
    prod will not expose the model until the compose-rendered config includes a
    `model_list` entry and the required upstream key is available in `.env`.
-   For local TEI/Nomic/rerank services, production config should route through
-   `host.docker.internal:<port>` from the container rather than a Docker bridge
-   IP such as `172.20.0.1`.
+   The eight TAP TEI embedding/rerank routes use the non-secret
+   `AAWM_TAP_MODEL_HOST` environment value, defaulting to
+   `mahaf.tailf1878c.ts.net`; their ports and route paths are fixed by the
+   config template, with `/v1` on embeddings and no `/v1` suffix on the
+   reranker. Other local services may retain their own host-gateway
+   configuration. Do not route these TAP entries through a Docker bridge IP
+   such as `172.20.0.1`.
 
    Prod error-log mirroring also requires a writable mount from this repo's
    `.analysis` directory to the container path named by
@@ -400,7 +404,7 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
 
    ```bash
    docker run --rm --entrypoint python3 aawm-litellm:latest -c \
-     "import json,pathlib; p=pathlib.Path('/usr/lib/python3.13/site-packages/litellm/model_prices_and_context_window_backup.json'); d=json.loads(p.read_text()); keys=['openrouter/qwen/qwen3-embedding-8b','openrouter/cohere/rerank-4-pro','openrouter/google/gemini-embedding-2-preview','nvidia_nim/nvidia/rerank-qa-mistral-4b','nvidia_nim/nvidia/nv-embed-v1','local_embed/ncbi/MedCPT-Article-Encoder','local_embed/ncbi/MedCPT-Query-Encoder','local_embed/allenai/specter2_base','local_embed/nasa-impact/nasa-ibm-st.38m','local_embed/cambridgeltl/SapBERT-from-PubMedBERT-fulltext','local_embed/nomic-embed-code.Q8_0.gguf','local_rerank/BAAI/bge-reranker-v2-m3']; print({k:d.get(k) for k in keys})"
+     "import json,pathlib; p=pathlib.Path('/usr/lib/python3.13/site-packages/litellm/model_prices_and_context_window_backup.json'); d=json.loads(p.read_text()); keys=['openrouter/qwen/qwen3-embedding-8b','openrouter/cohere/rerank-4-pro','openrouter/google/gemini-embedding-2-preview','nvidia_nim/nvidia/rerank-qa-mistral-4b','nvidia_nim/nvidia/nv-embed-v1','local_embed/ncbi/MedCPT-Article-Encoder','local_embed/ncbi/MedCPT-Query-Encoder','local_embed/allenai/specter2_base','local_embed/nasa-impact/nasa-ibm-st.38m','local_embed/nasa-impact/nasa-smd-ibm-st-v2','local_embed/cambridgeltl/SapBERT-from-PubMedBERT-fulltext','local_embed/nomic-embed-code.Q8_0.gguf','local_rerank/BAAI/bge-reranker-v2-m3']; print({k:d.get(k) for k in keys})"
    ```
 
 3. Start the prod container.
@@ -431,7 +435,9 @@ Promotion happens in `/home/zepfu/projects/aawm-infrastructure`.
      "grep -En 'openrouter/qwen/qwen3-embedding-8b|openrouter/cohere/rerank-4-pro|openrouter/google/gemini-embedding-2-preview|nvidia_nim/nvidia/rerank-qa-mistral-4b|nvidia_nim/nvidia/nv-embed-v1|local_embed/nomic-embed-code.Q8_0.gguf|local_rerank/BAAI/bge-reranker-v2-m3' /etc/litellm/config.yaml"
    ```
 
-   For local LLM route promotions, also verify the rendered config includes the
+   For local TAP route promotions, also verify the rendered config includes the
+   eight aliases and the configured `AAWM_TAP_MODEL_HOST` value. For local LLM
+   route promotions, verify the rendered config includes the
    chat-only route and host-gateway API base:
 
    ```bash

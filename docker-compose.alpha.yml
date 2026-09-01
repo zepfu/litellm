@@ -98,6 +98,7 @@ services:
       - LITELLM_AAWM_ERROR_LOG_ENV=alpha
       - LITELLM_AAWM_ERROR_LOG_DIR=${LITELLM_AAWM_ERROR_LOG_DIR:-/app/.analysis}
       - AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_PATH=${AAWM_ROUTE_HOST_TAILSCALE_SELF_SNAPSHOT_PATH:-/host/aawm/tailscale-self.json}
+      - AAWM_TAP_MODEL_HOST=${AAWM_TAP_MODEL_HOST:-mahaf.tailf1878c.ts.net}
       - LITELLM_LOCAL_MODEL_COST_MAP=${LITELLM_LOCAL_MODEL_COST_MAP:-True}
       - AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR=${AAWM_CAPTURE_PASSTHROUGH_FULL_PAYLOADS_DIR:-/home/zepfu/.analysis/full-payload-captures/runtime}
       # AAWM runtime database access goes through shared PgBouncer. Keep
