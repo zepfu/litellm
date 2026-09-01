@@ -47,11 +47,18 @@ Consumer-facing model names are LiteLLM aliases. The backing model and service p
 | Embedding | `tei-medcpt-query` | `ncbi/MedCPT-Query-Encoder` | `tei-medcpt-query` on `8084` | `$0.0028 / M tokens` |
 | Embedding | `specter2-adapter` | `allenai/specter2_base` with SPECTER2 adapter | `specter2-adapter` on `8086` | `$0.0046 / M tokens` |
 | Embedding | `tei-indus` | `nasa-impact/nasa-ibm-st.38m` | `tei-indus` on `8087` | `$0.0056 / M tokens` |
+| Embedding | `tei-indus-v2` | `nasa-impact/nasa-smd-ibm-st-v2` | `tei-indus-v2` on `8091` | `$0.0056 / M tokens` |
 | Embedding | `tei-sapbert` | `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` | `tei-sapbert` on `8088` | `$0.0046 / M tokens` |
+| Embedding | `tei-sapbert-source` | `cambridgeltl/SapBERT-from-PubMedBERT-fulltext` | `tei-sapbert-source` on `8092` | `$0.0046 / M tokens` |
 | Embedding | `nomic-embed-code` | `nomic-embed-code.Q8_0.gguf` | `nomic-embed-code` on `8082` | `$0.15 / M tokens` |
 | Rerank | `tei-reranker` | `BAAI/bge-reranker-v2-m3` | `tei-reranker` on `8090` | `$0.025 / M tokens` |
 
 Costs are estimated commercial-equivalent token prices for local services so LiteLLM spend and AAWM `session_history.response_cost_usd` remain populated.
+
+The eight TAP routes use `AAWM_TAP_MODEL_HOST` for their upstream host. It
+defaults to `mahaf.tailf1878c.ts.net` in the checked-in dev configuration and
+can be overridden in the LiteLLM service environment; ports and route paths
+remain fixed per alias.
 
 ## Embeddings
 
@@ -65,7 +72,9 @@ Choose the model alias that matches the retrieval domain:
 - Use `tei-medcpt-article` for biomedical article/document text.
 - Use `specter2-adapter` for scientific paper/document similarity.
 - Use `tei-indus` for NASA/earth-science document embeddings.
+- Use `tei-indus-v2` for the NASA SMD Indus v2 model.
 - Use `tei-sapbert` for biomedical entity and concept text.
+- Use `tei-sapbert-source` for the distinct source-backed SapBERT route.
 - Use `nomic-embed-code` for code-oriented embeddings.
 
 ```bash

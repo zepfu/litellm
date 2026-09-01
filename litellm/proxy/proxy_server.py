@@ -45,6 +45,7 @@ from litellm.constants import (
     AIOHTTP_NEEDS_CLEANUP_CLOSED,
     AIOHTTP_TTL_DNS_CACHE,
     AUDIO_SPEECH_CHUNK_SIZE,
+    AAWM_TAP_MODEL_HOST_DEFAULT,
     BASE_MCP_ROUTE,
     DEFAULT_MAX_RECURSE_DEPTH,
     DEFAULT_SHARED_HEALTH_CHECK_LOCK_TTL,
@@ -2637,6 +2638,20 @@ class ProxyConfig:
             with open(f"{user_config_file_path}", "w") as config_file:
                 yaml.dump(new_config, config_file, default_flow_style=False)
 
+    @staticmethod
+    def _resolve_config_string(value: str) -> Any:
+        if value.startswith("os.environ/"):
+            return get_secret(value)
+
+        environment_reference = "os.environ/AAWM_TAP_MODEL_HOST"
+        if environment_reference not in value:
+            return value
+
+        tap_model_host = (
+            os.getenv("AAWM_TAP_MODEL_HOST") or AAWM_TAP_MODEL_HOST_DEFAULT
+        )
+        return value.replace(environment_reference, tap_model_host)
+
     def _check_for_os_environ_vars(
         self, config: dict, depth: int = 0, max_depth: int = DEFAULT_MAX_RECURSE_DEPTH
     ) -> dict:
@@ -2669,9 +2684,8 @@ class ProxyConfig:
                         item = self._check_for_os_environ_vars(
                             config=item, depth=depth + 1, max_depth=max_depth
                         )
-            # if the value is a string and starts with "os.environ/" - then it's an environment variable
-            elif isinstance(value, str) and value.startswith("os.environ/"):
-                config[key] = get_secret(value)
+            elif isinstance(value, str):
+                config[key] = self._resolve_config_string(value)
         return config
 
     def _get_team_config(self, team_id: str, all_teams_config: List[Dict]) -> Dict:

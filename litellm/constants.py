@@ -172,6 +172,9 @@ DEFAULT_REASONING_EFFORT_MINIMAL_THINKING_BUDGET = int(
 # Provider-specific API base URLs
 XAI_API_BASE = "https://api.x.ai/v1"
 
+# Default host serving the AAWM TAP local models (TEI embeddings/reranker).
+AAWM_TAP_MODEL_HOST_DEFAULT = "mahaf.tailf1878c.ts.net"
+
 DEFAULT_REASONING_EFFORT_LOW_THINKING_BUDGET = int(
     os.getenv("DEFAULT_REASONING_EFFORT_LOW_THINKING_BUDGET", 1024)
 )
