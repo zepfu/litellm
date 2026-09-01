@@ -1945,6 +1945,154 @@ async def test_candidate_loop_ineligible_falls_through_without_request_local_sta
 
 
 @pytest.mark.asyncio
+async def test_candidate_loop_preserves_cursor_ineligible_terminal_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.llms.cursor_agent.connect import CursorConnectProtocolError
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        codex_candidate_calls,
+    )
+
+    request = SimpleNamespace(state=SimpleNamespace())
+    candidate = {
+        "provider": "cursor_agent",
+        "model": "cursor_agent/cursor-grok-4.6-high",
+        "route_family": "codex_cursor_agent_aiserver_adapter",
+    }
+    selection = {
+        "candidate": candidate,
+        "lane_key": "cursor_agent_cli",
+        "cooldown_key": "cursor_agent:cursor-grok-4.6-high",
+        "selection_reason": "first_available",
+        "skipped": [],
+    }
+    with pytest.raises(ProxyException) as mapped_exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=CursorConnectProtocolError(
+                "Cursor Agent requested unsupported local exec operation field 4."
+            ),
+            candidate=candidate,
+        )
+    mapped_exc = mapped_exc_info.value
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        return selection
+
+    async def _perform(**_kwargs: Any) -> object:
+        raise mapped_exc
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    session_affinity_seam = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=lambda _body: True,
+        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
+        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=lambda _request: None,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+    )
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease: object) -> None:
+            return None
+
+    failure_records: list[dict[str, Any]] = []
+    terminal_events: list[dict[str, Any]] = []
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: session_affinity_seam,
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_started",
+        lambda **kwargs: kwargs["prepared_request_body"],
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_failure",
+        lambda **kwargs: failure_records.append(kwargs),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_no_candidate_event",
+        lambda **kwargs: terminal_events.append(kwargs),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        lambda *_args, **_kwargs: False,
+    )
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=lpe._resolve_auto_agent_cooldown_publication_plan,
+        publish_cooldown_memory_fn=None,
+        persist_cooldown_fn=None,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=lambda body, **_kwargs: body,
+        raise_redispatch_fn=None,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=request,
+            prepared_request_body={"model": "work", "input": "dispatch basic"},
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_no_active_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    terminal_exc = caught.value
+    assert terminal_exc.status_code == 400
+    assert terminal_exc.detail is mapped_exc.detail
+    assert mapped_exc.type == "invalid_request_error"
+    assert (
+        terminal_exc.detail["error"]["code"]
+        == "aawm_codex_auto_agent_candidate_ineligible"
+    )
+    assert terminal_exc.candidate_status == "ineligible"
+    assert terminal_exc.ineligibility_reason == "unsupported"
+    assert terminal_exc.failure_phase == "candidate_preflight"
+    assert terminal_exc.attempted_provider_call is True
+    assert len(failure_records) == 1
+    assert failure_records[0]["attempt_record"]["error_class"] == (
+        "candidate_deterministically_ineligible"
+    )
+    assert len(terminal_events) == 1
+    assert terminal_events[0]["exc"].status_code == 400
+    assert terminal_events[0]["exc"].detail["error"]["code"] == (
+        "aawm_codex_auto_agent_candidate_ineligible"
+    )
+
+
+@pytest.mark.asyncio
 async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

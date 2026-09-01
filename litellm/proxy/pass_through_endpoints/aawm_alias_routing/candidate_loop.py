@@ -784,11 +784,26 @@ async def handle_alias_route(  # noqa: PLR0915
             ):
                 if hasattr(exc, field):
                     setattr(terminal_exc, field, getattr(exc, field))
+        elif _error_signals._is_codex_auto_agent_candidate_deterministically_ineligible(
+            exc
+        ):
+            terminal_exc = HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=getattr(exc, "detail", None),
+            )
+            for field in (
+                "candidate_status",
+                "ineligibility_reason",
+                "failure_phase",
+                "attempted_provider_call",
+            ):
+                if hasattr(exc, field):
+                    setattr(terminal_exc, field, getattr(exc, field))
         kimi_failure_metadata = _get_safe_kimi_code_probe_failure_metadata(
             exc,
             candidate=candidate if isinstance(candidate, dict) else None,
         )
-        if _classify_kimi_invalid_request_failure(
+        if terminal_exc is None and _classify_kimi_invalid_request_failure(
             exc,
             candidate=candidate if isinstance(candidate, dict) else None,
             kimi_failure_metadata=kimi_failure_metadata,
