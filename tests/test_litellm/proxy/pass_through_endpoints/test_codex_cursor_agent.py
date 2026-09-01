@@ -554,6 +554,92 @@ def test_cursor_fresh_full_history_tool_output_emits_continuation_cue() -> None:
     }
 
 
+def test_cursor_fresh_full_history_tool_output_does_not_build_replacement_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.llms.cursor_agent import common_utils
+    from litellm.proxy._types import ProxyException
+
+    build_calls: list[dict[str, Any]] = []
+    run_calls: list[dict[str, Any]] = []
+    real_build_run_request = common_utils.build_run_request
+
+    class FakeCursorClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self,
+            payload: dict[str, Any],
+            **kwargs: Any,
+        ) -> CursorAgentRunResult:
+            run_calls.append({"payload": payload, "kwargs": kwargs})
+            return CursorAgentRunResult(text="unexpected fresh run", turn_ended=True)
+
+    def _build_run_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        build_calls.append({"args": args, "kwargs": kwargs})
+        return real_build_run_request(*args, **kwargs)
+
+    monkeypatch.setattr(common_utils, "build_run_request", _build_run_request)
+    monkeypatch.setattr(
+        "litellm.llms.cursor_agent.connect.CursorAgentConnectClient",
+        FakeCursorClient,
+    )
+
+    with pytest.raises(ProxyException) as exc_info:
+        asyncio.run(
+            llm_passthrough_endpoints._perform_codex_auto_agent_alias_candidate_request(
+                endpoint="/v1/responses",
+                request=_request(),
+                fastapi_response=Response(),
+                user_api_key_dict=None,
+                candidate=_candidate(provider="cursor_agent"),
+                candidate_body={
+                    "model": "work",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {"name": "exec_command"},
+                        }
+                    ],
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": "Complete the original assignment in /workspace.",
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": "pwd-call",
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "pwd-call",
+                            "output": "/workspace",
+                        },
+                    ],
+                },
+                target_url="https://chatgpt.com/backend-api/codex/responses",
+                api_key="access-token",
+                forward_headers=False,
+            )
+        )
+
+    exc = exc_info.value
+    assert exc.status_code == 409
+    assert getattr(
+        exc,
+        codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+        False,
+    )
+    assert exc.failure_phase == "cursor_session_continuation"
+    assert exc.attempted_provider_call is False
+    assert build_calls == []
+    assert run_calls == []
+
+
 def test_cursor_retained_session_consumes_function_call_output_without_new_run(
     monkeypatch: pytest.MonkeyPatch,
     _route_rollup_state: None,

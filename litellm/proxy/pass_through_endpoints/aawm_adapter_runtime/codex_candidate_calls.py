@@ -195,15 +195,16 @@ def _take_cursor_replay_state(response_id: str) -> dict[str, Any]:
 
 def _raise_cursor_session_continuation_unavailable(
     *,
-    previous_response_id: str,
-    replay_state: dict[str, Any],
+    previous_response_id: Optional[str] = None,
+    replay_state: Optional[dict[str, Any]] = None,
 ) -> None:
     from litellm.llms.cursor_agent.connect import CursorConnectError
 
-    _consume_cursor_replay_state(
-        previous_response_id,
-        expected_state=replay_state,
-    )
+    if previous_response_id and replay_state is not None:
+        _consume_cursor_replay_state(
+            previous_response_id,
+            expected_state=replay_state,
+        )
     exc = CursorConnectError(
         "Cursor Agent tool-output continuation cannot resume because its "
         "live retained session is unavailable.",
@@ -1466,16 +1467,14 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         else None
     )
     cursor_tool_outputs = _cursor_function_call_outputs(request_body)
-    if (
-        isinstance(previous_response_id, str)
-        and previous_response_id
-        and isinstance(replay_state, dict)
-        and retained_session is None
-        and cursor_tool_outputs
-    ):
+    if cursor_tool_outputs and retained_session is None:
         _raise_cursor_session_continuation_unavailable(
-            previous_response_id=previous_response_id,
-            replay_state=replay_state,
+            previous_response_id=(
+                previous_response_id
+                if isinstance(previous_response_id, str)
+                else None
+            ),
+            replay_state=replay_state if isinstance(replay_state, dict) else None,
         )
 
     messages = _responses_input_to_cursor_messages(

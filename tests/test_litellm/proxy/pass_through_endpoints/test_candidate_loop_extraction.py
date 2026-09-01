@@ -2170,6 +2170,192 @@ async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # 
 
 
 @pytest.mark.asyncio
+async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.llms.cursor_agent.connect import CursorConnectError
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        codex_candidate_calls,
+    )
+
+    cursor_candidate = {
+        "provider": "cursor_agent",
+        "model": "cursor_agent/cursor-grok-4.6-high",
+        "route_family": "codex_cursor_agent_aiserver_adapter",
+    }
+    fallback_candidate = {
+        "provider": "openrouter",
+        "model": "openrouter/fallback",
+        "route_family": "codex_openrouter_responses_adapter",
+    }
+    selections = [
+        {
+            "candidate": cursor_candidate,
+            "lane_key": "cursor_agent_cli",
+            "cooldown_key": "cursor_agent:cursor-grok-4.6-high",
+            "selection_reason": "first_available",
+        },
+        {
+            "candidate": fallback_candidate,
+            "lane_key": "openrouter",
+            "cooldown_key": "openrouter:fallback",
+            "selection_reason": "next_available",
+        },
+    ]
+    prepared_body = {
+        "model": "work",
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "exec_command"},
+            }
+        ],
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": "Complete the original assignment in /workspace.",
+            },
+            {
+                "type": "function_call",
+                "call_id": "pwd-call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "pwd-call",
+                "output": "/workspace",
+            },
+        ],
+    }
+    source_exc = CursorConnectError(
+        "Cursor retained session unavailable",
+        status_code=409,
+    )
+    setattr(
+        source_exc,
+        codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+        True,
+    )
+    with pytest.raises(ProxyException) as mapped_exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=source_exc,
+            candidate=cursor_candidate,
+        )
+    mapped_exc = mapped_exc_info.value
+
+    routing_state = AliasRoutingStateManager()
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", routing_state)
+    selection_calls: list[dict[str, Any]] = []
+    provider_calls: list[str] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        selection_calls.append(kwargs)
+        if not selections:
+            raise AssertionError("candidate loop selected more than two candidates")
+        return dict(selections.pop(0))
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        assert candidate_body == prepared_body
+        provider_calls.append(str(candidate["provider"]))
+        if candidate["provider"] == "cursor_agent":
+            raise mapped_exc
+        return {"candidate": candidate["model"]}
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease: object) -> None:
+            return None
+
+    session_affinity_seam = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=(
+            session_affinity.is_replay_safe_session_owner_redispatch_body
+        ),
+        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
+        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=lambda _request: None,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+        reset_released_request_session_owner_guard=lambda _request: False,
+        SessionOwnerMutationOutcome=SimpleNamespace(
+            CONFLICT="conflict",
+            ERROR="error",
+            NOT_HELD="not_held",
+        ),
+    )
+
+    def _unexpected_redispatch(**_kwargs: Any) -> None:
+        raise AssertionError("self-contained continuation must try the next candidate")
+
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: session_affinity_seam,
+    )
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        lpe,
+        "execute_cooldown_publication_transaction",
+        _unexpected_redispatch,
+    )
+
+    response = await candidate_loop.handle_alias_route(
+        SimpleNamespace(
+            select_candidate_fn=_select,
+            perform_candidate_request_fn=_perform,
+            resolve_cooldown_publication_fn=lpe._resolve_auto_agent_cooldown_publication_plan,
+            publish_cooldown_memory_fn=_unexpected_redispatch,
+            persist_cooldown_fn=_unexpected_redispatch,
+            set_session_affinity_fn=_noop_async,
+            add_alias_metadata_fn=lambda body, **_kwargs: body,
+            raise_redispatch_fn=_unexpected_redispatch,
+        ),
+        alias_family="codex_auto_agent",
+        alias_model="work",
+        request=SimpleNamespace(state=SimpleNamespace()),
+        prepared_request_body=prepared_body,
+        max_candidate_attempts=2,
+        get_active_cooldown_state_fn=_no_active_cooldown,
+        attempts_metadata_key="attempts",
+        skipped_candidates_metadata_key="skipped",
+        no_candidate_detail="no candidates",
+        log_label="Codex",
+    )
+
+    assert response == {"candidate": fallback_candidate["model"]}
+    assert provider_calls == ["cursor_agent", "openrouter"]
+    assert selection_calls[0]["excluded_candidate_keys"] == frozenset()
+    assert selection_calls[1]["excluded_candidate_keys"] == frozenset(
+        {"cursor_agent:cursor-grok-4.6-high"}
+    )
+    assert routing_state.codex.cooldown_until_monotonic_by_key == {}
+    assert routing_state.codex.candidate_semantic_ineligibility_by_key == {}
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", (400, 422))
 @pytest.mark.parametrize("include_failure_metadata", (True, False))
 async def test_candidate_loop_kimi_invalid_request_persists_terminal_inventory_before_raise(
