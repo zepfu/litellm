@@ -107,6 +107,55 @@ def _resolve_callbacks(
     )
 
 
+_CODEX_AUTO_REVIEW_ALIASES = frozenset(
+    {
+        "codex-auto-review",
+        "auto-review",
+        "chatgpt/codex-auto-review",
+    }
+)
+_CODEX_AUTO_REVIEW_DECISION_PROMPT = (
+    "Codex auto-review decision contract: the entire assistant `output_text` must "
+    "be exactly one JSON object using the existing `{outcome: allow|deny, "
+    "rationale?, risk_level?, user_authorization?}` schema. Do not use tools, "
+    "setup, exploration, task execution, wrapping, or commentary."
+)
+
+
+def _apply_codex_auto_review_decision_shaping_to_request_body(
+    request_body: dict[str, Any],
+    *,
+    alias: Optional[str] = None,
+) -> dict[str, Any]:
+    effective_alias = alias
+    if effective_alias is None:
+        effective_alias = request_body.get("model")
+    if (
+        not isinstance(effective_alias, str)
+        or effective_alias.strip().casefold() not in _CODEX_AUTO_REVIEW_ALIASES
+    ):
+        return request_body
+
+    updated_body = dict(request_body)
+    for field in ("tools", "tool_choice", "parallel_tool_calls"):
+        updated_body.pop(field, None)
+
+    if "instructions" not in request_body:
+        updated_body["instructions"] = _CODEX_AUTO_REVIEW_DECISION_PROMPT
+    else:
+        existing_instructions = request_body["instructions"]
+        if isinstance(existing_instructions, str):
+            existing_text = existing_instructions.strip()
+            if _CODEX_AUTO_REVIEW_DECISION_PROMPT not in existing_text:
+                updated_body["instructions"] = (
+                    _CODEX_AUTO_REVIEW_DECISION_PROMPT
+                    if not existing_text
+                    else f"{existing_text}\n\n{_CODEX_AUTO_REVIEW_DECISION_PROMPT}"
+                )
+
+    return updated_body
+
+
 def _append_codex_auto_agent_prevention_guidance_to_instructions(
     instructions: str | None,
     *,
