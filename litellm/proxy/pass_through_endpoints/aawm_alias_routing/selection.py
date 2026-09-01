@@ -2655,6 +2655,7 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     include_candidate_semantic_ineligibility: bool = False,
 ) -> dict[str, Any]:
     assert _get_codex_active_cooldown_state is not None
+    active_cooldown_state = _get_codex_active_cooldown_state
     candidate = dict(candidate_template)
     account_lane_key = candidate.get("codex_oauth_lane_key")
     if isinstance(account_lane_key, str) and account_lane_key:
@@ -2714,7 +2715,7 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
     (
         cooldown_seconds,
         initial_cooldown_state_source,
-    ) = await _get_codex_active_cooldown_state(cooldown_key)
+    ) = await active_cooldown_state(cooldown_key)
     cooldown_state_source: Optional[str] = initial_cooldown_state_source
     (
         cooldown_seconds,
@@ -2726,7 +2727,7 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_seconds=cooldown_seconds,
         cooldown_state_source=cooldown_state_source,
         skip_reason=skip_reason,
-        get_active_cooldown_state=_get_codex_active_cooldown_state,
+        get_active_cooldown_state=active_cooldown_state,
     )
     (
         cooldown_seconds,
@@ -2737,7 +2738,7 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_seconds=cooldown_seconds,
         cooldown_state_source=cooldown_state_source,
         skip_reason=skip_reason,
-        get_active_cooldown_state=_get_codex_active_cooldown_state,
+        get_active_cooldown_state=active_cooldown_state,
     )
     (
         cooldown_seconds,
@@ -2748,7 +2749,7 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_seconds=cooldown_seconds,
         cooldown_state_source=cooldown_state_source,
         skip_reason=skip_reason,
-        get_active_cooldown_state=_get_codex_active_cooldown_state,
+        get_active_cooldown_state=active_cooldown_state,
     )
     (
         cooldown_seconds,
@@ -2760,7 +2761,7 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_seconds=cooldown_seconds,
         cooldown_state_source=cooldown_state_source,
         skip_reason=skip_reason,
-        get_active_cooldown_state=_get_codex_active_cooldown_state,
+        get_active_cooldown_state=active_cooldown_state,
     )
     (
         cooldown_seconds,
