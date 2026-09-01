@@ -1991,6 +1991,10 @@ async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # 
             candidate=candidate,
         )
     mapped_exc = mapped_exc_info.value
+    replay_safe_classifier = (
+        session_affinity.is_replay_safe_session_owner_redispatch_body
+    )
+    assert replay_safe_classifier(continuation_body) is False
 
     routing_state = AliasRoutingStateManager()
     monkeypatch.setattr(candidate_loop, "alias_routing_state", routing_state)
@@ -2037,8 +2041,8 @@ async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # 
         async def release_provider_lane_admission(self, _lease: object) -> None:
             return None
 
-    session_affinity = SimpleNamespace(
-        is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+    session_affinity_seam = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=replay_safe_classifier,
         resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
         get_request_codex_auto_review_parent_session_identity=lambda _request: None,
         build_session_owner_attributes=lambda **_kwargs: {},
@@ -2061,7 +2065,11 @@ async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # 
         publication_calls.append(kwargs)
         raise AssertionError("session-scoped failure must not publish cooldown")
 
-    monkeypatch.setattr(candidate_loop, "_session_affinity_mod", lambda: session_affinity)
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: session_affinity_seam,
+    )
     monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
     monkeypatch.setattr(
         lpe,
@@ -2170,7 +2178,7 @@ async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # 
 
 
 @pytest.mark.asyncio
-async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_candidate(
+async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_candidate(  # noqa: PLR0915
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from litellm.llms.cursor_agent.connect import CursorConnectError
@@ -2208,6 +2216,7 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
     ]
     prepared_body = {
         "model": "work",
+        "previous_response_id": "cursor-unretained",
         "tools": [
             {
                 "type": "function",
@@ -2233,6 +2242,13 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
             },
         ],
     }
+    rebuilt_candidate_bodies: list[dict[str, Any]] = []
+    rebuilt_request_body = dict(prepared_body)
+    rebuilt_request_body.pop("previous_response_id")
+    replay_safe_classifier = (
+        session_affinity.is_replay_safe_session_owner_redispatch_body
+    )
+    assert replay_safe_classifier(rebuilt_request_body) is True
     source_exc = CursorConnectError(
         "Cursor retained session unavailable",
         status_code=409,
@@ -2253,6 +2269,7 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
     monkeypatch.setattr(candidate_loop, "alias_routing_state", routing_state)
     selection_calls: list[dict[str, Any]] = []
     provider_calls: list[str] = []
+    classifier_calls: list[dict[str, Any]] = []
 
     async def _select(**kwargs: Any) -> dict[str, Any]:
         selection_calls.append(kwargs)
@@ -2265,7 +2282,9 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
         candidate: dict[str, Any],
         candidate_body: dict[str, Any],
     ) -> object:
-        assert candidate_body == prepared_body
+        assert "previous_response_id" not in candidate_body
+        assert candidate_body["model"] == candidate["model"]
+        assert replay_safe_classifier(candidate_body) is True
         provider_calls.append(str(candidate["provider"]))
         if candidate["provider"] == "cursor_agent":
             raise mapped_exc
@@ -2292,10 +2311,24 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
         async def release_provider_lane_admission(self, _lease: object) -> None:
             return None
 
+    def _classify_rebuilt_request(_body: dict[str, Any]) -> bool:
+        classifier_calls.append(_body)
+        return replay_safe_classifier(rebuilt_request_body)
+
+    def _rebuild_candidate_body(
+        body: dict[str, Any],
+        *,
+        selection: dict[str, Any],
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        rebuilt = dict(body)
+        rebuilt.pop("previous_response_id", None)
+        rebuilt["model"] = selection["candidate"]["model"]
+        rebuilt_candidate_bodies.append(rebuilt)
+        return rebuilt
+
     session_affinity_seam = SimpleNamespace(
-        is_replay_safe_session_owner_redispatch_body=(
-            session_affinity.is_replay_safe_session_owner_redispatch_body
-        ),
+        is_replay_safe_session_owner_redispatch_body=_classify_rebuilt_request,
         resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
         get_request_codex_auto_review_parent_session_identity=lambda _request: None,
         build_session_owner_attributes=lambda **_kwargs: {},
@@ -2334,7 +2367,7 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
             publish_cooldown_memory_fn=_unexpected_redispatch,
             persist_cooldown_fn=_unexpected_redispatch,
             set_session_affinity_fn=_noop_async,
-            add_alias_metadata_fn=lambda body, **_kwargs: body,
+            add_alias_metadata_fn=_rebuild_candidate_body,
             raise_redispatch_fn=_unexpected_redispatch,
         ),
         alias_family="codex_auto_agent",
@@ -2354,6 +2387,18 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
     assert selection_calls[0]["excluded_candidate_keys"] == frozenset()
     assert selection_calls[1]["excluded_candidate_keys"] == frozenset(
         {"cursor_agent:cursor-grok-4.6-high"}
+    )
+    assert classifier_calls == [prepared_body]
+    assert {
+        candidate_body["model"] for candidate_body in rebuilt_candidate_bodies
+    } == {
+        cursor_candidate["model"],
+        fallback_candidate["model"],
+    }
+    assert all(
+        "previous_response_id" not in candidate_body
+        and replay_safe_classifier(candidate_body) is True
+        for candidate_body in rebuilt_candidate_bodies
     )
     assert routing_state.codex.cooldown_until_monotonic_by_key == {}
     assert routing_state.codex.candidate_semantic_ineligibility_by_key == {}

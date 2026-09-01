@@ -716,8 +716,7 @@ async def handle_alias_route(  # noqa: PLR0915
 
     def _cursor_session_continuation_is_replay_safe_fresh_dispatch() -> bool:
         return (
-            not has_previous_response_id
-            and account_failover_replay_safe
+            account_failover_replay_safe
         )
 
     def _prefer_codex_oauth_account_failover(
