@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import ast
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -2362,6 +2363,19 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
     previous_snapshot = snapshot_select.set_active_routing_snapshot(
         compile_directory(DEFAULT_CONFIG_DIR)
     )
+    # 15:00 UTC is 23:00 at +08:00, inside Alibaba's 22:00-08:00 window.
+    fixed_schedule_now = datetime(2026, 9, 1, 15, 0, tzinfo=timezone.utc)
+    schedule_predicate = snapshot_select._is_snapshot_candidate_in_schedule_window
+
+    def _fixed_schedule_predicate(candidate: Any, *, now_utc: datetime) -> bool:
+        _ = now_utc
+        return schedule_predicate(candidate, now_utc=fixed_schedule_now)
+
+    monkeypatch.setattr(
+        snapshot_select,
+        "_is_snapshot_candidate_in_schedule_window",
+        _fixed_schedule_predicate,
+    )
     cooldowns: dict[str, float] = {}
     persisted: list[list[dict[str, Any]]] = []
 
@@ -2612,6 +2626,7 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
             "cohere/north-mini-code-1-0",
             "openrouter/cohere/north-mini-code:free",
             "big-pickle",
+            "alibaba_token_plan/deepseek-v4-flash-0731",
             "zai_coding_plan/glm-5.3-flash",
             "cursor_agent/composer-2.5",
             "gpt-5.6-luna",
@@ -2643,7 +2658,7 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
             ingress="codex",
             client_product_label=claude_product,
         ).candidates
-        assert len(claude_candidates) == 5
+        assert len(claude_candidates) == 6
         assert all(
             candidate["model"] != "gpt-5.6-luna"
             for candidate in claude_candidates
@@ -2659,6 +2674,7 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
             "cohere/north-mini-code-1-0",
             "openrouter/cohere/north-mini-code:free",
             "big-pickle",
+            "alibaba_token_plan/deepseek-v4-flash-0731",
             "zai_coding_plan/glm-5.3-flash",
             "cursor_agent/composer-2.5",
             "gpt-5.6-luna",
@@ -2671,10 +2687,11 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
             ("attempted", "candidate_deterministically_ineligible"),
             ("attempted", "provider_terminal_error"),
             ("attempted", "candidate_deterministically_ineligible"),
+            ("attempted", "candidate_deterministically_ineligible"),
             ("attempted", "upstream_timeout"),
             ("attempted", "rate_limited"),
         ]
         assert inventory[-1]["reasoning_effort"] == "low"
-        assert terminal_event["candidate_count"] == len(inventory) == 6
+        assert terminal_event["candidate_count"] == len(inventory) == 7
     finally:
         snapshot_select.set_active_routing_snapshot(previous_snapshot)
