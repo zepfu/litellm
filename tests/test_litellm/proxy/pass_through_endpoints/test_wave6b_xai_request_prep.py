@@ -340,6 +340,307 @@ def test_xai_native_model_conversion_should_preserve_nonmatching_values() -> Non
     assert request_prep._to_xai_native_passthrough_model(marker) is marker
 
 
+def test_codex_agent_message_rewrite_should_preserve_visible_text_and_drop_opaque_content() -> None:
+    ordinary_item = {
+        "type": "message",
+        "role": "user",
+        "content": "ordinary input",
+    }
+    function_call_item = {
+        "type": "function_call",
+        "call_id": "call-1",
+        "name": "lookup",
+        "arguments": {"query": "value"},
+    }
+    function_call_output_item = {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": {"value": 3},
+    }
+    reasoning_item = {
+        "type": "reasoning",
+        "encrypted_content": "reasoning-ciphertext",
+    }
+    visible_text = (
+        "Message Type: FINAL_ANSWER\n"
+        "Task name: /root\n"
+        "Sender: /root/system_time\n"
+        "Payload:\n"
+        "  visible child output  \n"
+    )
+    second_visible_text = "\nsecond visible fragment "
+    agent_message_item = {
+        "type": "agent_message",
+        "id": "opaque-agent-item-id",
+        "content": [
+            {"type": "input_text", "text": visible_text},
+            {
+                "type": "encrypted_content",
+                "encrypted_content": "child-ciphertext",
+            },
+            {"type": "input_text", "text": second_visible_text},
+        ],
+    }
+    body: Payload = {
+        "model": "xai/grok-4.6",
+        "input": [
+            ordinary_item,
+            agent_message_item,
+            function_call_item,
+            function_call_output_item,
+            reasoning_item,
+        ],
+    }
+
+    updated_body, rewritten_items = (
+        request_prep.rewrite_codex_agent_message_items_for_xai_responses(body)
+    )
+
+    assert updated_body is not body
+    assert rewritten_items == [
+        {
+            "type": "agent_message",
+            "index": 1,
+            "rewritten_type": "message",
+            "rewritten_role": "user",
+        }
+    ]
+    assert updated_body["input"][0] is ordinary_item
+    assert updated_body["input"][1] == {
+        "type": "message",
+        "role": "user",
+        "content": visible_text + "\n" + second_visible_text,
+    }
+    assert "agent_message" not in [
+        item.get("type")
+        for item in updated_body["input"]
+        if isinstance(item, dict)
+    ]
+    assert "opaque-agent-item-id" not in updated_body["input"][1]
+    assert "child-ciphertext" not in str(updated_body["input"][1])
+    assert updated_body["input"][2] is function_call_item
+    assert updated_body["input"][3] is function_call_output_item
+    assert updated_body["input"][4] is reasoning_item
+
+
+def _xai_agent_message_prep_fixture() -> tuple[
+    Payload,
+    str,
+    str,
+    Payload,
+    Payload,
+    Payload,
+    Payload,
+]:
+    visible_text = (
+        "Message Type: FINAL_ANSWER\n"
+        "Task name: /root\n"
+        "Sender: /root/system_time\n"
+        "Payload:\n"
+        "child result with trailing spaces  "
+    )
+    ciphertext = "opaque-child-ciphertext"
+    ordinary_item = {
+        "type": "message",
+        "role": "user",
+        "content": "ordinary input",
+    }
+    function_call_item = {
+        "type": "function_call",
+        "call_id": "call-1",
+        "name": "lookup",
+        "arguments": {"query": "value"},
+    }
+    function_call_output_item = {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": {"value": 3},
+    }
+    reasoning_item = {
+        "type": "reasoning",
+        "encrypted_content": "reasoning-ciphertext",
+    }
+    agent_message_item = {
+        "type": "agent_message",
+        "id": "opaque-agent-item-id",
+        "content": [
+            {"type": "input_text", "text": visible_text},
+            {
+                "type": "encrypted_content",
+                "encrypted_content": ciphertext,
+            },
+        ],
+    }
+    return (
+        {
+            "input": [
+                ordinary_item,
+                agent_message_item,
+                function_call_item,
+                function_call_output_item,
+                reasoning_item,
+            ]
+        },
+        visible_text,
+        ciphertext,
+        ordinary_item,
+        function_call_item,
+        function_call_output_item,
+        reasoning_item,
+    )
+
+
+def _drop_reasoning_for_xai_agent_message_test(
+    body: Payload,
+) -> tuple[Payload, list[Payload]]:
+    input_items = body.get("input")
+    if not isinstance(input_items, list):
+        return body, []
+    kept_items = [
+        item
+        for item in input_items
+        if not (isinstance(item, dict) and item.get("type") == "reasoning")
+    ]
+    if len(kept_items) == len(input_items):
+        return body, []
+    updated_body = dict(body)
+    updated_body["input"] = kept_items
+    return updated_body, [
+        item
+        for item in input_items
+        if isinstance(item, dict) and item.get("type") == "reasoning"
+    ]
+
+
+def _assert_xai_agent_message_prepared_body(
+    prepared_body: Payload,
+    *,
+    visible_text: str,
+    ciphertext: str,
+    ordinary_item: Payload,
+    function_call_item: Payload,
+    function_call_output_item: Payload,
+    reasoning_item: Payload,
+) -> None:
+    prepared_items = prepared_body["input"]
+    assert prepared_items[0] is ordinary_item
+    assert prepared_items[1] == {
+        "type": "message",
+        "role": "user",
+        "content": visible_text,
+    }
+    assert all(
+        item.get("type") != "agent_message"
+        for item in prepared_items
+        if isinstance(item, dict)
+    )
+    assert "encrypted_content" not in prepared_items[1]
+    assert prepared_items[2] is function_call_item
+    assert prepared_items[3] is function_call_output_item
+    assert reasoning_item not in prepared_items
+
+    metadata = prepared_body["litellm_metadata"]
+    assert metadata["xai_responses_agent_message_rewrite_count"] == 1
+    assert metadata["xai_responses_agent_message_rewrite_types"] == [
+        "agent_message"
+    ]
+    assert "xai-responses-agent-message-rewritten" in metadata["tags"]
+    assert "xai-responses-agent-message:agent_message" in metadata["tags"]
+    assert metadata["langfuse_spans"][-1] == {
+        "name": "xai.responses_agent_message_rewritten",
+        "metadata": {
+            "rewritten_count": 1,
+            "rewritten_item_types": ["agent_message"],
+        },
+    }
+    assert "xai_responses_agent_message_rewrites" not in metadata
+    assert visible_text not in repr(metadata)
+    assert ciphertext not in repr(metadata)
+    assert "opaque-agent-item-id" not in repr(metadata)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["managed", "native"])
+async def test_xai_responses_prep_should_rewrite_agent_messages_for_both_routes(
+    route: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (
+        request_body,
+        visible_text,
+        ciphertext,
+        ordinary_item,
+        function_call_item,
+        function_call_output_item,
+        reasoning_item,
+    ) = _xai_agent_message_prep_fixture()
+    request_body["model"] = (
+        "oa_xai/grok-4.6" if route == "managed" else "xai/grok-4.6"
+    )
+
+    if route == "managed":
+
+        async def prepare(body: Payload) -> bool:
+            body.update(
+                {
+                    "model": "xai/grok-4.6",
+                    "api_base": "https://api.x.ai/v1",
+                    "api_key": "managed-key",
+                    "custom_llm_provider": "xai",
+                }
+            )
+            return True
+
+        _configure(
+            is_oa_xai_model=lambda model: model == "oa_xai/grok-4.6",
+            prepare_oa_xai_request=prepare,
+            _drop_unsupported_codex_input_items_from_request_body=(
+                _drop_reasoning_for_xai_agent_message_test
+            ),
+        )
+        result = await request_prep._prepare_oa_xai_passthrough_request(
+            request_body,
+            sanitize_responses_request=True,
+        )
+        assert result == (True, "https://api.x.ai/v1", "managed-key")
+        prepared_body = request_body
+    else:
+        monkeypatch.setattr(
+            request_prep,
+            "_get_grok_native_oauth_client_version",
+            lambda: "0.1.211",
+        )
+        _configure(
+            is_grok_native_oauth_model=lambda model: (
+                model == "xai/grok-4.6"
+            ),
+            normalize_grok_native_oauth_model=lambda model: (
+                "grok-4.6" if model == "xai/grok-4.6" else None
+            ),
+            _drop_unsupported_codex_input_items_from_request_body=(
+                _drop_reasoning_for_xai_agent_message_test
+            ),
+        )
+        result = await request_prep._prepare_grok_native_oauth_passthrough_request(
+            request_body,
+            request=_request(),
+        )
+        assert result[0] is True
+        assert result[1] == "https://grok.example/v1"
+        assert result[2]["authorization"] == "Bearer oauth-token"
+        prepared_body = result[3]
+
+    _assert_xai_agent_message_prepared_body(
+        prepared_body,
+        visible_text=visible_text,
+        ciphertext=ciphertext,
+        ordinary_item=ordinary_item,
+        function_call_item=function_call_item,
+        function_call_output_item=function_call_output_item,
+        reasoning_item=reasoning_item,
+    )
+
+
 def test_tool_change_reporting_should_capture_type_and_removed_fields() -> None:
     seen_tools: list[Payload] = []
 
