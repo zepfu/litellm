@@ -18,6 +18,52 @@ else:
     LiteLLMLoggingObj = Any
 
 
+def _is_exact_new_task_empty_payload_envelope(text: str) -> bool:
+    """True for the exact empty Codex ``NEW_TASK`` spawn envelope."""
+    if not text.endswith("\n"):
+        return False
+    message_type, *rest = text[:-1].split("\n")
+    if len(rest) != 3:
+        return False
+    task_name_line, sender_line, payload_line = rest
+    return (
+        message_type == "Message Type: NEW_TASK"
+        and task_name_line.startswith("Task name: ")
+        and task_name_line[len("Task name: ") :] != ""
+        and sender_line.startswith("Sender: ")
+        and sender_line[len("Sender: ") :] != ""
+        and payload_line == "Payload:"
+    )
+
+
+def _visible_codex_agent_message_text(content: Any) -> str:
+    if not isinstance(content, list):
+        return ""
+
+    if len(content) == 2:
+        visible_part, payload_part = content
+        if isinstance(visible_part, dict) and isinstance(payload_part, dict):
+            visible_text = visible_part.get("text")
+            payload = payload_part.get("encrypted_content")
+            if (
+                visible_part.get("type") == "input_text"
+                and isinstance(visible_text, str)
+                and _is_exact_new_task_empty_payload_envelope(visible_text)
+                and payload_part.get("type") == "encrypted_content"
+                and isinstance(payload, str)
+                and payload
+            ):
+                return f"{visible_text}{payload}"
+
+    return "\n".join(
+        part["text"]
+        for part in content
+        if isinstance(part, dict)
+        and part.get("type") == "input_text"
+        and isinstance(part.get("text"), str)
+    )
+
+
 def rewrite_codex_agent_message_items_for_xai_responses(
     request_body: Dict[str, Any],
 ) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -25,10 +71,11 @@ def rewrite_codex_agent_message_items_for_xai_responses(
 
     xAI Responses does not accept the opaque Codex-only ``agent_message`` input
     item type.  Preserve the child FINAL_ANSWER text by promoting every
-    ``input_text`` content part into a plain ``user`` message item.  Any
-    ``encrypted_content`` sibling parts (opaque Codex account-bound state) are
-    dropped.  Returns ``(request_body, rewritten_items)``; when no
-    ``agent_message`` items are present the original body is returned unchanged.
+    ``input_text`` content part into a plain ``user`` message item.  Restore the
+    established exact two-part ``NEW_TASK`` envelope before conversion; all
+    other ``encrypted_content`` sibling parts remain opaque and are dropped.
+    Returns ``(request_body, rewritten_items)``; when no ``agent_message`` items
+    are present the original body is returned unchanged.
     """
     input_items = request_body.get("input")
     if not isinstance(input_items, list):
@@ -41,18 +88,7 @@ def rewrite_codex_agent_message_items_for_xai_responses(
             updated_items.append(item)
             continue
 
-        content = item.get("content")
-        if isinstance(content, list):
-            text_parts = [
-                part["text"]
-                for part in content
-                if isinstance(part, dict)
-                and part.get("type") == "input_text"
-                and isinstance(part.get("text"), str)
-            ]
-            visible_text = "\n".join(text_parts)
-        else:
-            visible_text = ""
+        visible_text = _visible_codex_agent_message_text(item.get("content"))
 
         rewritten_item: Dict[str, Any] = {
             "type": "message",
