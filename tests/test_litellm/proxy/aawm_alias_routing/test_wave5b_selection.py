@@ -24,6 +24,8 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+    CODEX_AUTO_AGENT_ZAI_CODING_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
+    CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
     SelectionEnumeration,
@@ -2139,6 +2141,114 @@ def _alibaba_row(
         "environment": environment,
         "source": "alibaba_token_plan_usage",
     }
+
+
+def _zai_observation(
+    *,
+    window: str,
+    remaining_pct: float,
+    observed_at: float,
+    environment: str = "prod",
+    account_hash: str = "hash-zai-1",
+    model: str = "zai_coding_plan/glm-5.3-flash",
+    quota_type: str = "credits",
+    expected_reset_at: Optional[float] = None,
+) -> dict[str, Any]:
+    return {
+        "provider": CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
+        "model": model,
+        "account_hash": account_hash,
+        "environment": environment,
+        "quota_key": f"zai_coding_plan_{window}:{quota_type}",
+        "quota_period": window,
+        "quota_type": quota_type,
+        "remaining_pct": remaining_pct,
+        "observed_at": observed_at,
+        "expected_reset_at": expected_reset_at,
+        "status": "fresh",
+        "exhausted": remaining_pct <= 0,
+        "source": "zai_coding_plan_quota_poll",
+    }
+
+
+def _seed_zai_windows(
+    *,
+    manager: AliasRoutingStateManager,
+    remaining_pct: float = 40.0,
+    observed_at: Optional[float] = None,
+    environment: str = "prod",
+    account_hash: str = "hash-zai-1",
+) -> None:
+    now = time.time() if observed_at is None else observed_at
+    manager.record_normalized_quota_observations(
+        [
+            _zai_observation(
+                window="5h",
+                remaining_pct=remaining_pct,
+                observed_at=now,
+                environment=environment,
+                account_hash=account_hash,
+            ),
+            _zai_observation(
+                window="7d",
+                remaining_pct=remaining_pct,
+                observed_at=now,
+                environment=environment,
+                account_hash=account_hash,
+                expected_reset_at=now + 3600.0,
+            ),
+        ]
+    )
+
+
+def _zai_row(
+    *,
+    window: str,
+    environment: Optional[str] = "prod",
+    evidence_environment: Optional[str] = None,
+    telemetry_status: str = "valid",
+    account_hash: str = "hash-zai-1",
+    model: str = "zai_coding_plan/glm-5.3-flash",
+    quota_type: str = "credits",
+    observed_at: Optional[float] = None,
+    expected_reset_at: Optional[float] = None,
+) -> dict[str, Any]:
+    observed = time.time() - 10 if observed_at is None else observed_at
+    return {
+        "observed_at": observed,
+        "provider": CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
+        "client": "zai-coding-plan",
+        "model": model,
+        "account_hash": account_hash,
+        "quota_key": f"zai_coding_plan_{window}:{quota_type}",
+        "quota_period": window,
+        "quota_type": quota_type,
+        "expected_reset_at": expected_reset_at,
+        "remaining_pct": 25.0,
+        "evidence": {
+            "environment": (
+                environment
+                if evidence_environment is None
+                else evidence_environment
+            ),
+            "telemetry_status": telemetry_status,
+            "quota_period": window,
+            "window": window,
+        },
+        "environment": environment,
+        "source": "zai_coding_plan_quota_poll",
+    }
+
+
+def _zai_candidates() -> tuple[dict[str, Any], ...]:
+    return (
+        {
+            "provider": CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
+            "model": "zai_coding_plan/glm-5.3-flash",
+            "route_family": "codex_zai_coding_plan_chat_completions_adapter",
+            "last_resort": False,
+        },
+    )
 
 
 @pytest.mark.parametrize(

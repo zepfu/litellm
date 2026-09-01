@@ -1979,6 +1979,7 @@ class AliasRoutingStateManager:
                     key,
                     {
                         "provider": provider,
+                        "client": observation.get("client"),
                         "model": model,
                         "account_hash": account_hash or None,
                         "environment": environment or None,
@@ -1993,6 +1994,11 @@ class AliasRoutingStateManager:
                         "status": observation.get("status"),
                         "exhausted": observation.get("exhausted"),
                         "source": observation.get("source"),
+                        "evidence": (
+                            dict(observation["evidence"])
+                            if isinstance(observation.get("evidence"), Mapping)
+                            else observation.get("evidence")
+                        ),
                     },
                 )
             )
@@ -2022,16 +2028,17 @@ class AliasRoutingStateManager:
             for account_hash in account_hashes
             if str(account_hash).strip()
         }
-        if not selected_account_hashes:
-            return
         with self._normalized_quota_observations_lock:
             for key, observation in list(
                 self._normalized_quota_observations.items()
             ):
                 if (
                     key[0] == provider
-                    and key[2] in selected_account_hashes
                     and observation.get("source") == source
+                    and (
+                        not selected_account_hashes
+                        or key[2] in selected_account_hashes
+                    )
                 ):
                     self._normalized_quota_observations.pop(key, None)
         self.record_normalized_quota_observations(observations)
