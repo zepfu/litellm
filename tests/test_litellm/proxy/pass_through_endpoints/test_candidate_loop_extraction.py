@@ -2194,12 +2194,16 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
             "lane_key": "cursor_agent_cli",
             "cooldown_key": "cursor_agent:cursor-grok-4.6-high",
             "selection_reason": "first_available",
+            "has_account_bound_state": True,
+            "in_flight_session": True,
         },
         {
             "candidate": fallback_candidate,
             "lane_key": "openrouter",
             "cooldown_key": "openrouter:fallback",
             "selection_reason": "next_available",
+            "has_account_bound_state": True,
+            "in_flight_session": True,
         },
     ]
     prepared_body = {

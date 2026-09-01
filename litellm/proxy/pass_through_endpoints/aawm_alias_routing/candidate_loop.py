@@ -714,14 +714,10 @@ async def handle_alias_route(  # noqa: PLR0915
             and not bool(selection.get("in_flight_session"))
         )
 
-    def _cursor_session_continuation_is_replay_safe_fresh_dispatch(
-        selection: Mapping[str, Any],
-    ) -> bool:
+    def _cursor_session_continuation_is_replay_safe_fresh_dispatch() -> bool:
         return (
             not has_previous_response_id
             and account_failover_replay_safe
-            and not bool(selection.get("has_account_bound_state"))
-            and not bool(selection.get("in_flight_session"))
         )
 
     def _prefer_codex_oauth_account_failover(
@@ -1776,9 +1772,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         error_class="candidate_deterministically_ineligible",
                         add_alias_metadata_fn=add_alias_metadata_fn,
                     )
-                    if _cursor_session_continuation_is_replay_safe_fresh_dispatch(
-                        selection
-                    ):
+                    if _cursor_session_continuation_is_replay_safe_fresh_dispatch():
                         deterministically_ineligible_candidate_keys.add(cooldown_key)
                         last_retryable_exc = failure_exc
                         break
