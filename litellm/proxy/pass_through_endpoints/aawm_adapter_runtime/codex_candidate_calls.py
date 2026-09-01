@@ -42,6 +42,9 @@ _CURSOR_TOOL_CONTINUATION_CUE_MARKER = "_cursor_tool_continuation_cue"
 _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER = (
     "_cursor_session_continuation_failure"
 )
+_CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD = "cursor_sanitized_proto_structure"
+_CURSOR_PROTO_STRUCTURE_MAX_DEPTH = 3
+_CURSOR_PROTO_STRUCTURE_MAX_ITEMS = 64
 _CURSOR_REPLAY_PRESERVED_STATUS_CODES = frozenset(
     {408, 500, 502, 503, 504, 529}
 )
@@ -49,6 +52,76 @@ _CURSOR_REPLAY_PRESERVED_STATUS_CODES = frozenset(
 
 class _CursorPostEgressOutputError(ValueError):
     """A returned Cursor payload could not be normalized after provider Run."""
+
+
+def _sanitize_cursor_proto_structure_for_telemetry(
+    body: Any,
+) -> Optional[dict[str, Any]]:
+    """Copy only the bounded, value-free Cursor protobuf wire structure."""
+    if not isinstance(body, dict):
+        return None
+    raw_fields = body.get("fields")
+    if not isinstance(raw_fields, list):
+        return None
+
+    item_count = 0
+
+    def _sanitize_fields(
+        fields: Any,
+        *,
+        depth: int,
+    ) -> Optional[list[dict[str, Any]]]:
+        nonlocal item_count
+        if not isinstance(fields, list) or depth > _CURSOR_PROTO_STRUCTURE_MAX_DEPTH:
+            return None
+
+        sanitized_fields: list[dict[str, Any]] = []
+        for raw_field in fields:
+            if (
+                item_count >= _CURSOR_PROTO_STRUCTURE_MAX_ITEMS
+                or not isinstance(raw_field, dict)
+            ):
+                return None
+            field_number = raw_field.get("field_number")
+            wire_type = raw_field.get("wire_type")
+            payload_length = raw_field.get("payload_length")
+            if (
+                isinstance(field_number, bool)
+                or not isinstance(field_number, int)
+                or field_number <= 0
+                or isinstance(wire_type, bool)
+                or not isinstance(wire_type, int)
+                or not 0 <= wire_type <= 7
+                or isinstance(payload_length, bool)
+                or not isinstance(payload_length, int)
+                or payload_length < 0
+            ):
+                return None
+
+            item_count += 1
+            sanitized_field: dict[str, Any] = {
+                "field_number": field_number,
+                "wire_type": wire_type,
+                "payload_length": payload_length,
+            }
+            nested_fields = raw_field.get("nested_fields")
+            if nested_fields is not None:
+                if depth >= _CURSOR_PROTO_STRUCTURE_MAX_DEPTH:
+                    return None
+                sanitized_nested_fields = _sanitize_fields(
+                    nested_fields,
+                    depth=depth + 1,
+                )
+                if sanitized_nested_fields is None:
+                    return None
+                sanitized_field["nested_fields"] = sanitized_nested_fields
+            sanitized_fields.append(sanitized_field)
+        return sanitized_fields
+
+    sanitized_fields = _sanitize_fields(raw_fields, depth=0)
+    if sanitized_fields is None:
+        return None
+    return {"fields": sanitized_fields}
 
 
 def _close_cursor_retained_session(state: Optional[dict[str, Any]]) -> None:
@@ -1683,6 +1756,27 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
     message = str(getattr(exc, "message", None) or exc)
     model = str(candidate.get("model") or "")
     route_family = str(candidate.get("route_family") or "")
+    cursor_sanitized_proto_structure = (
+        _sanitize_cursor_proto_structure_for_telemetry(getattr(exc, "body", None))
+        if isinstance(exc, CursorConnectProtocolError)
+        else None
+    )
+
+    def _set_mapped_detail(
+        proxy_exc: ProxyException,
+        error: dict[str, Any],
+    ) -> None:
+        mapped_detail: dict[str, Any] = {"error": error}
+        if cursor_sanitized_proto_structure is not None:
+            structure = copy.deepcopy(cursor_sanitized_proto_structure)
+            mapped_detail[_CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD] = structure
+            setattr(
+                proxy_exc,
+                _CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD,
+                copy.deepcopy(structure),
+            )
+        setattr(proxy_exc, "detail", mapped_detail)
+
     attempted_provider_call: Optional[bool] = None
     ineligibility_summary = ""
     if getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False):
@@ -1703,14 +1797,11 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
         setattr(proxy_exc, "failure_phase", "cursor_session_continuation")
         setattr(proxy_exc, "attempted_provider_call", False)
         setattr(proxy_exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, True)
-        setattr(
+        _set_mapped_detail(
             proxy_exc,
-            "detail",
             {
-                "error": {
-                    "message": detail_message,
-                    "code": "aawm_codex_auto_agent_candidate_ineligible",
-                }
+                "message": detail_message,
+                "code": "aawm_codex_auto_agent_candidate_ineligible",
             },
         )
         raise proxy_exc from exc
@@ -1740,15 +1831,12 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
         setattr(proxy_exc, "candidate_status", "retryable")
         setattr(proxy_exc, "failure_phase", "candidate_post_egress_normalization")
         setattr(proxy_exc, "attempted_provider_call", True)
-        setattr(
+        _set_mapped_detail(
             proxy_exc,
-            "detail",
             {
-                "error": {
-                    "message": error_message,
-                    "code": "upstream_transient_internal",
-                    "type": "upstream_error",
-                }
+                "message": error_message,
+                "code": "upstream_transient_internal",
+                "type": "upstream_error",
             },
         )
         raise proxy_exc from exc
@@ -1772,14 +1860,11 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
         setattr(proxy_exc, "ineligibility_reason", "unsupported")
         setattr(proxy_exc, "failure_phase", "candidate_preflight")
         setattr(proxy_exc, "attempted_provider_call", attempted_provider_call)
-        setattr(
+        _set_mapped_detail(
             proxy_exc,
-            "detail",
             {
-                "error": {
-                    "message": detail_message,
-                    "code": "aawm_codex_auto_agent_candidate_ineligible",
-                }
+                "message": detail_message,
+                "code": "aawm_codex_auto_agent_candidate_ineligible",
             },
         )
         raise proxy_exc from exc
@@ -1807,15 +1892,12 @@ def _raise_cursor_agent_alias_error(  # noqa: PLR0915
         code=status_code,
     )
     setattr(proxy_exc, "status_code", status_code)
-    setattr(
+    _set_mapped_detail(
         proxy_exc,
-        "detail",
         {
-            "error": {
-                "message": detail,
-                "type": error_type,
-                "code": error_code,
-            }
+            "message": detail,
+            "type": error_type,
+            "code": error_code,
         },
     )
     raise proxy_exc from exc

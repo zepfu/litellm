@@ -32,6 +32,7 @@ otherwise depends only on the typed :class:`AliasRouteServices` seams.
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import inspect
 from typing import TYPE_CHECKING, Any, Mapping, Optional
@@ -211,6 +212,9 @@ _IN_FLIGHT_REDISPATCH_ERROR_CODES = frozenset(
 _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER = (
     "_cursor_session_continuation_failure"
 )
+_CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD = "cursor_sanitized_proto_structure"
+_CURSOR_PROTO_STRUCTURE_MAX_DEPTH = 3
+_CURSOR_PROTO_STRUCTURE_MAX_ITEMS = 64
 _TERMINAL_ERROR_ALREADY_EMITTED_REQUEST_STATE_KEY = (
     "aawm_terminal_error_emitted"
 )
@@ -247,6 +251,83 @@ def _is_cursor_session_continuation_failure(exc: Any) -> bool:
     return bool(
         getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False)
     )
+
+
+def _extract_cursor_sanitized_proto_structure(
+    exc: Any,
+    *,
+    candidate: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    if candidate.get("provider") != "cursor_agent":
+        return None
+    detail = getattr(exc, "detail", None)
+    if not isinstance(detail, Mapping):
+        return None
+    structure = detail.get(_CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD)
+    if not isinstance(structure, Mapping):
+        return None
+    raw_fields = structure.get("fields")
+    if not isinstance(raw_fields, list):
+        return None
+
+    item_count = 0
+
+    def _copy_fields(
+        fields: Any,
+        *,
+        depth: int,
+    ) -> Optional[list[dict[str, Any]]]:
+        nonlocal item_count
+        if not isinstance(fields, list) or depth > _CURSOR_PROTO_STRUCTURE_MAX_DEPTH:
+            return None
+
+        copied_fields: list[dict[str, Any]] = []
+        for raw_field in fields:
+            if (
+                item_count >= _CURSOR_PROTO_STRUCTURE_MAX_ITEMS
+                or not isinstance(raw_field, Mapping)
+            ):
+                return None
+            field_number = raw_field.get("field_number")
+            wire_type = raw_field.get("wire_type")
+            payload_length = raw_field.get("payload_length")
+            if (
+                isinstance(field_number, bool)
+                or not isinstance(field_number, int)
+                or field_number <= 0
+                or isinstance(wire_type, bool)
+                or not isinstance(wire_type, int)
+                or not 0 <= wire_type <= 7
+                or isinstance(payload_length, bool)
+                or not isinstance(payload_length, int)
+                or payload_length < 0
+            ):
+                return None
+
+            item_count += 1
+            copied_field: dict[str, Any] = {
+                "field_number": field_number,
+                "wire_type": wire_type,
+                "payload_length": payload_length,
+            }
+            nested_fields = raw_field.get("nested_fields")
+            if nested_fields is not None:
+                if depth >= _CURSOR_PROTO_STRUCTURE_MAX_DEPTH:
+                    return None
+                copied_nested_fields = _copy_fields(
+                    nested_fields,
+                    depth=depth + 1,
+                )
+                if copied_nested_fields is None:
+                    return None
+                copied_field["nested_fields"] = copied_nested_fields
+            copied_fields.append(copied_field)
+        return copied_fields
+
+    copied_fields = _copy_fields(raw_fields, depth=0)
+    if copied_fields is None:
+        return None
+    return {"fields": copied_fields}
 
 
 def _validated_redispatch_terminal_metadata(
@@ -755,8 +836,21 @@ async def handle_alias_route(  # noqa: PLR0915
             == "interchangeable"
         )
 
-    def _raise_terminal_alias_failure(exc: Exception) -> Any:
+    def _raise_terminal_alias_failure(exc: Exception) -> Any:  # noqa: PLR0915
         last_attempt = attempts[-1] if attempts else {}
+        cursor_sanitized_proto_structure = (
+            _extract_cursor_sanitized_proto_structure(
+                exc,
+                candidate=candidate,
+            )
+        )
+        if (
+            cursor_sanitized_proto_structure is not None
+            and isinstance(last_attempt, dict)
+        ):
+            last_attempt[_CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD] = copy.deepcopy(
+                cursor_sanitized_proto_structure
+            )
         attempted_provider_call = last_attempt.get("attempted_provider_call")
         if attempted_provider_call is None:
             attempted_provider_call = getattr(exc, "attempted_provider_call", True)
@@ -858,6 +952,17 @@ async def handle_alias_route(  # noqa: PLR0915
                         "code": "all_candidates_unavailable",
                     }
                 },
+            )
+        if cursor_sanitized_proto_structure is not None:
+            terminal_detail = getattr(terminal_exc, "detail", None)
+            if isinstance(terminal_detail, dict):
+                terminal_detail[
+                    _CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD
+                ] = copy.deepcopy(cursor_sanitized_proto_structure)
+            setattr(
+                terminal_exc,
+                _CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD,
+                copy.deepcopy(cursor_sanitized_proto_structure),
             )
         last_attempt = attempts[-1] if attempts else None
         if isinstance(last_attempt, dict):
@@ -1771,6 +1876,16 @@ async def handle_alias_route(  # noqa: PLR0915
                 # --- failure handling (post-release) ---------------------------
                 failure_exc = probe_failure_exc
                 assert failure_exc is not None
+                cursor_sanitized_proto_structure = (
+                    _extract_cursor_sanitized_proto_structure(
+                        failure_exc,
+                        candidate=candidate,
+                    )
+                )
+                if cursor_sanitized_proto_structure is not None:
+                    attempt_record[
+                        _CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD
+                    ] = cursor_sanitized_proto_structure
                 if _is_cursor_session_continuation_failure(failure_exc):
                     _update_codex_auto_agent_retryable_attempt_record(
                         attempt_record=attempt_record,

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import ast
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -2577,6 +2578,253 @@ async def test_candidate_loop_cursor_full_history_continuation_uses_fresh_next_c
     assert replay_safe_classifier(candidate_bodies[1]) is True
     assert routing_state.codex.cooldown_until_monotonic_by_key == {}
     assert routing_state.codex.candidate_semantic_ineligibility_by_key == {}
+
+
+@pytest.mark.asyncio
+async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_and_terminal_audit(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.llms.cursor_agent.connect import (
+        CursorConnectProtocolError,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        codex_candidate_calls,
+    )
+
+    candidate = {
+        "provider": "cursor_agent",
+        "model": "cursor_agent/cursor-grok-4.6-high",
+        "route_family": "codex_cursor_agent_aiserver_adapter",
+    }
+    selection = {
+        "candidate": candidate,
+        "lane_key": "cursor_agent_cli",
+        "cooldown_key": "cursor_agent:cursor-grok-4.6-high",
+        "selection_reason": "first_available",
+        "skipped": [],
+    }
+    body = {"model": "work", "input": "run command", "stream": False}
+    expected_structure = {
+        "fields": [
+            {
+                "field_number": 1,
+                "wire_type": 0,
+                "payload_length": 1,
+            },
+            {
+                "field_number": 4,
+                "wire_type": 2,
+                "payload_length": 12,
+                "nested_fields": [
+                    {
+                        "field_number": 2,
+                        "wire_type": 2,
+                        "payload_length": 16,
+                    }
+                ],
+            },
+        ]
+    }
+    source_exc = CursorConnectProtocolError(
+        "Cursor Agent requested unsupported local exec operation field 4.",
+        body={
+            "fields": [
+                {
+                    "field_number": 1,
+                    "wire_type": 0,
+                    "payload_length": 1,
+                    "value": "secret-command",
+                },
+                {
+                    "field_number": 4,
+                    "wire_type": 2,
+                    "payload_length": 12,
+                    "nested_fields": [
+                        {
+                            "field_number": 2,
+                            "wire_type": 2,
+                            "payload_length": 16,
+                            "value": "/secret/workspace",
+                        }
+                    ],
+                },
+            ],
+            "raw": b"opaque-provider-bytes",
+        },
+    )
+    with pytest.raises(ProxyException) as mapped_exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=source_exc,
+            candidate=candidate,
+        )
+    mapped_exc = mapped_exc_info.value
+    field_name = codex_candidate_calls._CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD
+    assert mapped_exc.detail[field_name] == expected_structure
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/openai_passthrough/v1/responses",
+            "headers": [
+                (b"user-agent", b"codex-cli/1.0"),
+                (b"originator", b"codex_cli_rs"),
+            ],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    failure_records: list[dict[str, Any]] = []
+    persisted: list[list[dict[str, Any]]] = []
+    terminal_records: list[dict[str, Any]] = []
+
+    async def _select(**_kwargs: Any) -> dict[str, Any]:
+        return selection
+
+    async def _perform(**_kwargs: Any) -> object:
+        raise mapped_exc
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease: object) -> None:
+            return None
+
+    def _record_failure(**kwargs: Any) -> None:
+        failure_records.append(kwargs)
+
+    def _add_metadata(
+        candidate_body: dict[str, Any],
+        *,
+        attempts: list[dict[str, Any]],
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        return {
+            **candidate_body,
+            "litellm_metadata": {"codex_auto_agent_attempts": attempts},
+        }
+
+    session_affinity = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
+        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=lambda _request: None,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+        reset_released_request_session_owner_guard=lambda _request: False,
+        SessionOwnerMutationOutcome=SimpleNamespace(
+            CONFLICT="conflict",
+            ERROR="error",
+            NOT_HELD="not_held",
+        ),
+    )
+
+    class _Services(SimpleNamespace):
+        pass
+
+    services = _Services(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=lpe._resolve_auto_agent_cooldown_publication_plan,
+        publish_cooldown_memory_fn=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Cursor protocol ineligibility must not publish cooldown")
+        ),
+        persist_cooldown_fn=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Cursor protocol ineligibility must not persist cooldown")
+        ),
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=_add_metadata,
+        raise_redispatch_fn=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Cursor protocol ineligibility must not redispatch")
+        ),
+    )
+
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
+    monkeypatch.setattr(candidate_loop, "_session_affinity_mod", lambda: session_affinity)
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_failure",
+        _record_failure,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_persist_auto_agent_alias_audit_only_events_best_effort",
+        lambda events, *, request_body=None: persisted.append(events),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_route_event",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.aawm_runtime_error_logging.persist_agent_terminal_error",
+        lambda **kwargs: terminal_records.append(kwargs) or True,
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await candidate_loop.handle_alias_route(
+            services,
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=request,
+            prepared_request_body=body,
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_no_active_cooldown,
+            attempts_metadata_key="codex_auto_agent_attempts",
+            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    assert caught.value.status_code == 400
+    assert caught.value.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_candidate_ineligible"
+    )
+    assert caught.value.detail[field_name] == expected_structure
+    assert len(failure_records) == 1
+    attempt = failure_records[0]["attempt_record"]
+    assert attempt[field_name] == expected_structure
+    assert len(persisted) == 1
+    terminal_event = persisted[0][-1]
+    assert terminal_event["event_type"] == "no_candidate_available"
+    assert terminal_event["attempts"][0][field_name] == expected_structure
+    assert len(terminal_records) == 1
+    terminal_context = terminal_records[0]["error_context"]
+    assert terminal_context["attempts"][0][field_name] == expected_structure
+
+    serialized = json.dumps(
+        {
+            "attempt": attempt,
+            "terminal_event": terminal_event,
+            "terminal_context": terminal_context,
+            "terminal_detail": caught.value.detail,
+        }
+    )
+    assert "secret-command" not in serialized
+    assert "/secret/workspace" not in serialized
+    assert "opaque-provider-bytes" not in serialized
+    assert '"value"' not in serialized
+    assert '"raw"' not in serialized
 
 
 @pytest.mark.asyncio

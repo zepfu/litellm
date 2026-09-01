@@ -1527,6 +1527,84 @@ def test_cursor_unsupported_operation_protocol_error_maps_to_ineligible(
     )
 
 
+def test_cursor_protocol_structure_maps_without_raw_values() -> None:
+    from litellm.proxy._types import ProxyException
+
+    raw_command = "secret-command"
+    raw_workspace = "/secret/workspace"
+    raw_bytes = b"opaque-provider-bytes"
+    structure = {
+        "fields": [
+            {
+                "field_number": 1,
+                "wire_type": 0,
+                "payload_length": 1,
+                "value": raw_command,
+            },
+            {
+                "field_number": 4,
+                "wire_type": 2,
+                "payload_length": 12,
+                "nested_fields": [
+                    {
+                        "field_number": 2,
+                        "wire_type": 2,
+                        "payload_length": 16,
+                        "value": raw_workspace,
+                    }
+                ],
+            },
+        ],
+        "raw": raw_bytes,
+    }
+    expected_structure = {
+        "fields": [
+            {
+                "field_number": 1,
+                "wire_type": 0,
+                "payload_length": 1,
+            },
+            {
+                "field_number": 4,
+                "wire_type": 2,
+                "payload_length": 12,
+                "nested_fields": [
+                    {
+                        "field_number": 2,
+                        "wire_type": 2,
+                        "payload_length": 16,
+                    }
+                ],
+            },
+        ]
+    }
+    candidate = _candidate(provider="cursor_agent")
+    with pytest.raises(ProxyException) as exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=CursorConnectProtocolError(
+                "Cursor Agent requested unsupported local exec operation field 4.",
+                body=structure,
+            ),
+            candidate=candidate,
+        )
+
+    exc = exc_info.value
+    field_name = codex_candidate_calls._CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD
+    assert exc.status_code == 400
+    assert exc.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_candidate_ineligible"
+    )
+    assert exc.detail[field_name] == expected_structure
+    assert getattr(exc, field_name) == expected_structure
+    assert exc.detail[field_name] is not structure
+    serialized = json.dumps(exc.detail)
+    assert raw_command not in serialized
+    assert raw_workspace not in serialized
+    assert "opaque-provider-bytes" not in serialized
+    assert '"value"' not in serialized
+    assert '"raw"' not in serialized
+
+
 def test_cursor_unrelated_protocol_errors_keep_transient_502_semantics() -> None:
     from litellm.proxy._types import ProxyException
 
