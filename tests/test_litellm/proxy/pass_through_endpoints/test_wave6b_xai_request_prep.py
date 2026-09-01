@@ -561,8 +561,10 @@ def _assert_xai_agent_message_prepared_body(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["managed", "native"])
+@pytest.mark.parametrize("message_kind", ["final_answer", "new_task"])
 async def test_xai_responses_prep_should_rewrite_agent_messages_for_both_routes(
     route: str,
+    message_kind: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     (
@@ -574,6 +576,24 @@ async def test_xai_responses_prep_should_rewrite_agent_messages_for_both_routes(
         function_call_output_item,
         reasoning_item,
     ) = _xai_agent_message_prep_fixture()
+    if message_kind == "new_task":
+        new_task_envelope = (
+            "Message Type: NEW_TASK\n"
+            "Task name: inspect-xai\n"
+            "Sender: /root\n"
+            "Payload:\n"
+        )
+        ciphertext = "Preserve this exact child task payload."
+        agent_message_item = cast(Payload, request_body["input"][1])
+        agent_message_item["content"] = [
+            {"type": "input_text", "text": new_task_envelope},
+            {
+                "type": "encrypted_content",
+                "encrypted_content": ciphertext,
+            },
+        ]
+        visible_text = f"{new_task_envelope}{ciphertext}"
+
     request_body["model"] = (
         "oa_xai/grok-4.6" if route == "managed" else "xai/grok-4.6"
     )
