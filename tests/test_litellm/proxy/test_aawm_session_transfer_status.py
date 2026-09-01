@@ -571,6 +571,32 @@ class _RaisingRedisCache:
         return None
 
 
+class _RecoveringCache:
+    def __init__(self) -> None:
+        self.fail_reads = True
+        self.values = {}
+
+    async def async_get_cache(self, key, **kwargs):
+        if self.fail_reads:
+            raise ConnectionError("redis read failed")
+        return self.values.get(key)
+
+    async def async_set_cache(self, key, value, ttl=None, **kwargs):
+        self.values[key] = value
+
+
+class _IndexReadFailingCache(_RecoveringCache):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_reads = False
+        self.fail_index_reads = False
+
+    async def async_get_cache(self, key, **kwargs):
+        if self.fail_index_reads and ":idx:" in key:
+            raise ConnectionError("redis index read failed")
+        return await super().async_get_cache(key, **kwargs)
+
+
 def _routes_only_user() -> UserAPIKeyAuth:
     return UserAPIKeyAuth(
         user_id="transcript-routes",
@@ -701,8 +727,108 @@ async def test_rr103_failing_dualcache_write_does_not_report_registry_ok():
         "reachable": True,
     }
     await item.upsert(_identity())
-    result = await item.query(litellm_call_id="call-1")
-    assert result["registry"]["state"] != "ok"
+    assert item.registry_status()["state"] != "ok"
+
+
+@pytest.mark.asyncio
+async def test_d1677_query_read_failure_reports_degraded_in_same_response():
+    item = SessionTransferRegistry(
+        cache=_RecoveringCache(),
+        source_instance="worker-a",
+    )
+    item._redis_status = lambda: {
+        "mode": "redis",
+        "state_source": "durable_cache",
+        "reachable": True,
+    }
+
+    result = await item.query(litellm_call_id="missing-call")
+
+    assert result["result_count"] == 0
+    assert result["registry"]["state"] == "degraded"
+    assert result["registry"]["error_class"] == "ConnectionError"
+
+
+@pytest.mark.asyncio
+async def test_d1677_query_keeps_earlier_index_read_failure_degraded():
+    cache = _IndexReadFailingCache()
+    item = SessionTransferRegistry(cache=cache, source_instance="worker-a")
+    item._redis_status = lambda: {
+        "mode": "redis",
+        "state_source": "durable_cache",
+        "reachable": True,
+    }
+    await item.upsert(_identity(agent_id="agent-index-fallback"))
+    cache.fail_index_reads = True
+
+    result = await item.query(agent_id="agent-index-fallback")
+
+    assert result["result_count"] == 1
+    assert result["registry"]["state"] == "degraded"
+    assert result["registry"]["error_class"] == "ConnectionError"
+
+
+@pytest.mark.asyncio
+async def test_d1677_successful_durable_write_clears_prior_degradation():
+    cache = _RecoveringCache()
+    item = SessionTransferRegistry(cache=cache, source_instance="worker-a")
+    item._redis_status = lambda: {
+        "mode": "redis",
+        "state_source": "durable_cache",
+        "reachable": True,
+    }
+
+    degraded = await item.query(litellm_call_id="missing-call")
+    assert degraded["registry"]["state"] == "degraded"
+
+    cache.fail_reads = False
+    await item.upsert(_identity())
+    recovered = await item.query(litellm_call_id="call-1")
+
+    assert recovered["registry"]["state"] == "ok"
+    assert recovered["registry"]["error_class"] is None
+    assert recovered["result_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_d1677_missing_key_remains_an_ordinary_miss():
+    cache = _RecoveringCache()
+    cache.fail_reads = False
+    item = SessionTransferRegistry(cache=cache, source_instance="worker-a")
+    item._redis_status = lambda: {
+        "mode": "redis",
+        "state_source": "durable_cache",
+        "reachable": True,
+    }
+
+    result = await item.query(litellm_call_id="missing-call")
+
+    assert result["registry"]["state"] == "ok"
+    assert result["registry"]["error_class"] is None
+    assert result["result_count"] == 0
+    assert result["transfers"] == []
+
+
+@pytest.mark.asyncio
+async def test_d1677_successful_missing_key_read_clears_prior_degradation():
+    cache = _RecoveringCache()
+    item = SessionTransferRegistry(cache=cache, source_instance="worker-a")
+    item._redis_status = lambda: {
+        "mode": "redis",
+        "state_source": "durable_cache",
+        "reachable": True,
+    }
+
+    degraded = await item.query(litellm_call_id="missing-call")
+    assert degraded["registry"]["state"] == "degraded"
+
+    cache.fail_reads = False
+    recovered = await item.query(litellm_call_id="missing-call")
+
+    assert recovered["registry"]["state"] == "ok"
+    assert recovered["registry"]["error_class"] is None
+    assert recovered["result_count"] == 0
+    assert recovered["transfers"] == []
 
 
 @pytest.mark.asyncio
