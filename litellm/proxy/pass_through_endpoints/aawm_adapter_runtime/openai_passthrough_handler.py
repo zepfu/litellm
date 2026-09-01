@@ -75,6 +75,14 @@ def _identity_codex_tool_adapter(
     return request_body, []
 
 
+def _identity_codex_adapter_model_resolver(
+    request_body: dict[str, Any],
+    *,
+    endpoint: str,
+) -> Optional[str]:
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Typed runtime / dependency bundle
 # ---------------------------------------------------------------------------
@@ -159,6 +167,10 @@ class OpenAIPassThroughHandlerRuntime:
     adapt_codex_namespace_tools_to_functions_fn: Callable[
         [dict[str, Any]], tuple[dict[str, Any], Any]
     ] = _identity_codex_tool_adapter
+    # -- Direct Codex Kimi model resolution -------------------------------
+    resolve_codex_kimi_chat_completions_adapter_model_fn: Callable[
+        ..., Optional[str]
+    ] = _identity_codex_adapter_model_resolver
 
 
 # ---------------------------------------------------------------------------
@@ -442,15 +454,26 @@ class BaseOpenAIPassThroughHandler:
                 rt.request_uses_codex_native_auth_fn(request)
                 and rt.is_openai_responses_endpoint_fn(endpoint)
             ) or bound_codex_oauth_identity is not None
-            if (
+            codex_auto_agent_alias_model = (
                 rt.resolve_codex_auto_agent_alias_model_fn(
                     prepared_request_body,
                     endpoint=endpoint,
                     request=request,
                 )
-                is not None
-            ):
+            )
+            if codex_auto_agent_alias_model is not None:
                 is_codex_responses_request = True
+            direct_codex_kimi_adapter_model: Optional[str] = None
+            if (
+                is_codex_responses_request
+                and codex_auto_agent_alias_model is None
+            ):
+                direct_codex_kimi_adapter_model = (
+                    rt.resolve_codex_kimi_chat_completions_adapter_model_fn(
+                        prepared_request_body,
+                        endpoint=endpoint,
+                    )
+                )
             is_managed_oa_xai_request = rt.is_oa_xai_request_body_fn(
                 prepared_request_body
             )
@@ -488,7 +511,10 @@ class BaseOpenAIPassThroughHandler:
                     )
                 )
             if is_codex_responses_request or is_managed_oa_xai_request:
-                if is_managed_oa_xai_request:
+                if (
+                    is_managed_oa_xai_request
+                    or direct_codex_kimi_adapter_model is not None
+                ):
                     (
                         prepared_request_body,
                         _codex_adapted_custom_tools,
@@ -997,6 +1023,11 @@ def build_runtime_from_host() -> OpenAIPassThroughHandlerRuntime:
             _host,
             "llm_passthrough_endpoints",
             "_resolve_codex_auto_agent_alias_model",
+        ),
+        resolve_codex_kimi_chat_completions_adapter_model_fn=_late_bound_callback(
+            _host,
+            "llm_passthrough_endpoints",
+            "_resolve_codex_kimi_chat_completions_adapter_model",
         ),
         add_route_family_logging_metadata_fn=_late_bound_callback(
             _host,

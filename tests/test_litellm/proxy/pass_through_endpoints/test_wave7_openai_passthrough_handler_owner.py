@@ -143,6 +143,9 @@ def _synthetic_host() -> ModuleType:
         "_resolve_codex_auto_agent_alias_model": (
             lambda body, **kwargs: None
         ),
+        "_resolve_codex_kimi_chat_completions_adapter_model": (
+            lambda body, **kwargs: None
+        ),
         "_aresolve_auto_agent_alias_route_host_attribution": AsyncMock(
             return_value={
                 "client_ip": None,
@@ -245,6 +248,7 @@ class TestRuntimeDataclass:
             "join_grok_passthrough_url_fn",
             "request_uses_codex_native_auth_fn",
             "resolve_codex_auto_agent_alias_model_fn",
+            "resolve_codex_kimi_chat_completions_adapter_model_fn",
             "resolve_auto_agent_alias_route_host_attribution_fn",
             "add_route_family_logging_metadata_fn",
             "adapt_codex_custom_tools_to_functions_fn",
