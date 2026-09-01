@@ -597,6 +597,82 @@ class _IndexReadFailingCache(_RecoveringCache):
         return await super().async_get_cache(key, **kwargs)
 
 
+class _RedisResponseError(Exception):
+    """Stand-in for redis.exceptions.ResponseError."""
+
+
+class RedisSetIndexCache:
+    """Durable store whose identity indexes are Redis sets.
+
+    GET on a set or list key raises WRONGTYPE, matching live Redis. Index
+    members are only visible through SMEMBERS / LRANGE.
+    """
+
+    _WRONGTYPE = "WRONGTYPE Operation against a key holding the wrong kind of value"
+
+    def __init__(self) -> None:
+        self.values = {}
+        self.sets = {}
+        self.lists = {}
+        self.get_calls = []
+        self.smembers_calls = []
+        self.lrange_calls = []
+        self.fail_index_reads = False
+        self.redis_cache = self
+
+    def check_and_fix_namespace(self, key):
+        return key
+
+    def init_async_client(self):
+        return self
+
+    def _wrongtype(self):
+        return _RedisResponseError(self._WRONGTYPE)
+
+    async def smembers(self, key):
+        self.smembers_calls.append(key)
+        if self.fail_index_reads:
+            raise ConnectionError("redis index read failed")
+        if key in self.lists or (key in self.values and key not in self.sets):
+            raise self._wrongtype()
+        members = self.sets.get(key, set())
+        return {
+            item.encode("utf-8") if isinstance(item, str) else item
+            for item in members
+        }
+
+    async def lrange(self, key, start, end):
+        self.lrange_calls.append((key, start, end))
+        if self.fail_index_reads:
+            raise ConnectionError("redis index read failed")
+        if key in self.sets or (key in self.values and key not in self.lists):
+            raise self._wrongtype()
+        items = list(self.lists.get(key, []))
+        if not items:
+            return []
+        return items[start : None if end == -1 else end + 1]
+
+    async def async_get_cache(self, key, **kwargs):
+        self.get_calls.append(key)
+        if key in self.sets or key in self.lists:
+            raise self._wrongtype()
+        return self.values.get(key)
+
+    async def async_set_cache(self, key, value, ttl=None, **kwargs):
+        if key in self.sets or key in self.lists:
+            raise self._wrongtype()
+        self.values[key] = value
+
+    async def async_set_cache_sadd(self, key, value, ttl=None, **kwargs):
+        if key in self.lists or (key in self.values and key not in self.sets):
+            raise self._wrongtype()
+        members = value if isinstance(value, list) else [value]
+        self.sets.setdefault(key, set()).update(members)
+
+    async def async_batch_get_cache(self, keys, **kwargs):
+        return [await self.async_get_cache(key) for key in keys]
+
+
 def _routes_only_user() -> UserAPIKeyAuth:
     return UserAPIKeyAuth(
         user_id="transcript-routes",
@@ -829,6 +905,93 @@ async def test_d1677_successful_missing_key_read_clears_prior_degradation():
     assert recovered["registry"]["error_class"] is None
     assert recovered["result_count"] == 0
     assert recovered["transfers"] == []
+
+
+def _redis_status_ok():
+    return {
+        "mode": "redis",
+        "state_source": "durable_cache",
+        "reachable": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_d1677_codex_session_id_redis_set_index_returns_records():
+    store = RedisSetIndexCache()
+    item = SessionTransferRegistry(cache=store, source_instance="worker-a")
+    item._redis_status = _redis_status_ok
+    call_ids = [f"call-{index}" for index in range(1, 5)]
+    for call_id in call_ids:
+        await item.upsert(
+            _identity(litellm_call_id=call_id, agent_id=f"agent-{call_id}")
+        )
+
+    index_key = item._index_key("codex_session_id", "codex-sess-1")
+    assert index_key in store.sets
+    assert isinstance(store.sets[index_key], set)
+    assert store.sets[index_key] == set(call_ids)
+    sets_before = {key: set(members) for key, members in store.sets.items()}
+    values_before = dict(store.values)
+    store.get_calls.clear()
+    store.smembers_calls.clear()
+
+    result = await item.query(codex_session_id="codex-sess-1")
+
+    assert result["result_count"] == 4
+    returned_ids = {transfer["litellm_call_id"] for transfer in result["transfers"]}
+    assert returned_ids == set(call_ids)
+    assert {transfer["codex_session_id"] for transfer in result["transfers"]} == {
+        "codex-sess-1"
+    }
+    assert result["registry"]["state"] == "ok"
+    assert result["registry"]["error_class"] is None
+    assert store.smembers_calls == [index_key]
+    assert store.get_calls
+    assert all(":idx:" not in key for key in store.get_calls)
+    assert all(":call:" in key for key in store.get_calls)
+    assert store.sets == sets_before
+    assert all(isinstance(members, set) for members in store.sets.values())
+    assert store.values == values_before
+    assert_content_free(result)
+
+
+@pytest.mark.asyncio
+async def test_d1677_redis_set_index_read_failure_reports_degraded_in_same_response():
+    store = RedisSetIndexCache()
+    item = SessionTransferRegistry(cache=store, source_instance="worker-a")
+    item._redis_status = _redis_status_ok
+    await item.upsert(_identity())
+    store.fail_index_reads = True
+    store.get_calls.clear()
+
+    result = await item.query(codex_session_id="codex-sess-1")
+
+    assert result["result_count"] == 0
+    assert result["registry"]["state"] == "degraded"
+    assert result["registry"]["error_class"] == "ConnectionError"
+
+
+@pytest.mark.asyncio
+async def test_d1677_successful_durable_set_index_read_clears_prior_degradation():
+    store = RedisSetIndexCache()
+    item = SessionTransferRegistry(cache=store, source_instance="worker-a")
+    item._redis_status = _redis_status_ok
+    await item.upsert(_identity())
+    store.fail_index_reads = True
+
+    degraded = await item.query(codex_session_id="codex-sess-1")
+    assert degraded["registry"]["state"] == "degraded"
+    assert degraded["registry"]["error_class"] == "ConnectionError"
+    assert degraded["result_count"] == 0
+
+    store.fail_index_reads = False
+    recovered = await item.query(codex_session_id="codex-sess-1")
+
+    assert recovered["registry"]["state"] == "ok"
+    assert recovered["registry"]["error_class"] is None
+    assert recovered["result_count"] == 1
+    assert recovered["transfers"][0]["litellm_call_id"] == "call-1"
+    assert recovered["transfers"][0]["codex_session_id"] == "codex-sess-1"
 
 
 @pytest.mark.asyncio

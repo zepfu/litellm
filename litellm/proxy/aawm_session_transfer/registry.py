@@ -51,8 +51,8 @@ HEARTBEAT_MIN_INTERVAL_SECONDS = 0.75
 INDEX_TTL_SECONDS = 180
 # Single deadline for all best-effort Redis work in one registry operation. It
 # must stay shorter than the shared alias-routing Redis minimum socket timeout
-# so a blocked GET/SET/SADD/RPUSH degrades gracefully instead of holding the
-# serving request until the socket layer gives up.
+# so a blocked GET/SET/SADD/RPUSH/SMEMBERS degrades gracefully instead of
+# holding the serving request until the socket layer gives up.
 REDIS_OPERATION_DEADLINE_SECONDS = 0.5
 
 _registry_override: Optional["SessionTransferRegistry"] = None
@@ -109,6 +109,10 @@ async def _with_deadline(
     if remaining <= 0:
         raise asyncio.TimeoutError
     return await asyncio.wait_for(make_operation(), timeout=remaining)
+
+
+def _is_redis_wrongtype(exc: BaseException) -> bool:
+    return "WRONGTYPE" in str(exc).upper()
 
 
 class InMemoryTransferStore:
@@ -456,13 +460,84 @@ class SessionTransferRegistry:
             kept.extend(other[-remaining:])
         return kept
 
+    async def _read_redis_index_members(
+        self,
+        redis_cache: Any,
+        key: str,
+        deadline: Optional[float] = None,
+    ) -> Any:
+        """Read a durable identity index as a Redis set, then as a list.
+
+        Production indexes are written with SADD. GET on those keys raises
+        WRONGTYPE and must not be treated as an availability failure.
+        """
+        namespaced = key
+        fixer = getattr(redis_cache, "check_and_fix_namespace", None)
+        if callable(fixer):
+            try:
+                namespaced = fixer(key=key)
+            except TypeError:
+                namespaced = fixer(key)
+        init_client = getattr(redis_cache, "init_async_client", None)
+        if not callable(init_client):
+            raise AttributeError("init_async_client")
+        client = init_client()
+        smembers = getattr(client, "smembers", None)
+        if not callable(smembers):
+            raise AttributeError("smembers")
+        try:
+            return await _with_deadline(
+                deadline,
+                lambda: smembers(namespaced),
+            )
+        except Exception as exc:
+            if not _is_redis_wrongtype(exc):
+                raise
+            lrange = getattr(client, "lrange", None)
+            if not callable(lrange):
+                raise
+            return await _with_deadline(
+                deadline,
+                lambda: lrange(namespaced, 0, -1),
+            )
+
     async def _read_index(
         self,
         field: str,
         value: str,
         deadline: Optional[float] = None,
     ) -> List[str]:
-        raw = await self._read_raw(self._index_key(field, value), deadline=deadline)
+        key = self._index_key(field, value)
+        store = self._store()
+        raw: Any = None
+        redis_cache = getattr(store, "redis_cache", None)
+        if redis_cache is None:
+            redis_cache = store
+        can_read_typed_index = store is not self._memory and callable(
+            getattr(redis_cache, "init_async_client", None)
+        )
+        if can_read_typed_index:
+            try:
+                raw = await self._read_redis_index_members(
+                    redis_cache, key, deadline=deadline
+                )
+                self._clear_degraded()
+            except Exception as exc:
+                if _is_redis_wrongtype(exc) or isinstance(exc, AttributeError):
+                    raw = await self._read_raw(key, deadline=deadline)
+                else:
+                    self._mark_degraded(exc)
+                    self._record_query_read_failure(exc)
+                    logger.debug(
+                        "session-transfer registry index read failed",
+                        exc_info=True,
+                    )
+                    try:
+                        raw = await self._memory.async_get_cache(key=key)
+                    except Exception:
+                        raw = None
+        else:
+            raw = await self._read_raw(key, deadline=deadline)
         members = self._decode_index_members(raw)
         if len(members) > MAX_INDEX_MEMBERS:
             return await self._prefer_live_index_members(members, deadline=deadline)

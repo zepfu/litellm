@@ -158,6 +158,8 @@ suffix, or synthesizes a terminal event.
   failure reports `registry.state=degraded` in that same response, while a
   later successful durable read or write clears stale process-local
   degradation.
+- Identity indexes are Redis sets written with SADD and read with SMEMBERS,
+  not GET.
 - A worker crash or Redis outage produces `unavailable` / `stale` /
   `redis_degraded=true`. It never invents `completed`.
 
