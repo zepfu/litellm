@@ -24,7 +24,6 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
-    CODEX_AUTO_AGENT_ZAI_CODING_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
     CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.snapshot_select import (
