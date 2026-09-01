@@ -37,6 +37,9 @@ from litellm.proxy.aawm_route_logging import (
 from litellm.proxy.pass_through_endpoints import aawm_claude_control_plane
 from litellm.proxy.pass_through_endpoints import aawm_context_query
 from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
+from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.openai_passthrough_handler import (
+    build_runtime_from_host as build_openai_passthrough_handler_runtime,
+)
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     config_compiler as aawm_alias_config_compiler,
 )
@@ -13199,7 +13202,14 @@ def test_kimi_apply_patch_is_adapted_before_unsupported_hosted_tools_are_removed
 
 
 @pytest.mark.asyncio
-async def test_openai_passthrough_direct_kimi_k3_adapts_tools_before_hosted_tool_drop():
+async def test_openai_passthrough_direct_kimi_k3_adapts_tools_before_hosted_tool_drop(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        BaseOpenAIPassThroughHandler,
+        "_runtime",
+        build_openai_passthrough_handler_runtime(),
+    )
     collaboration_names = [
         "followup_task",
         "interrupt_agent",
@@ -13387,7 +13397,14 @@ async def test_openai_passthrough_direct_kimi_k3_adapts_tools_before_hosted_tool
 
 
 @pytest.mark.asyncio
-async def test_openai_passthrough_alias_path_does_not_pre_adapt_kimi_tools():
+async def test_openai_passthrough_alias_path_does_not_pre_adapt_kimi_tools(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        BaseOpenAIPassThroughHandler,
+        "_runtime",
+        build_openai_passthrough_handler_runtime(),
+    )
     namespace_tool = _codex_collaboration_namespace_tool_definition()
     request_body = {
         "model": "sota-moonshot",
