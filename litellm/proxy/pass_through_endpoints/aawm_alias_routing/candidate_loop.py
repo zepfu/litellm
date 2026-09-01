@@ -714,10 +714,16 @@ async def handle_alias_route(  # noqa: PLR0915
             and not bool(selection.get("in_flight_session"))
         )
 
-    def _cursor_session_continuation_is_replay_safe_fresh_dispatch() -> bool:
-        return (
-            account_failover_replay_safe
-        )
+    def _cursor_session_continuation_replay_safe_fresh_dispatch_body() -> Optional[
+        "Payload"
+    ]:
+        fresh_fallback_body = dict(prepared_request_body)
+        fresh_fallback_body.pop("previous_response_id", None)
+        if not _session_affinity_mod().is_replay_safe_session_owner_redispatch_body(
+            fresh_fallback_body
+        ):
+            return None
+        return fresh_fallback_body
 
     def _prefer_codex_oauth_account_failover(
         *,
@@ -1771,7 +1777,30 @@ async def handle_alias_route(  # noqa: PLR0915
                         error_class="candidate_deterministically_ineligible",
                         add_alias_metadata_fn=add_alias_metadata_fn,
                     )
-                    if _cursor_session_continuation_is_replay_safe_fresh_dispatch():
+                    fresh_fallback_body = (
+                        _cursor_session_continuation_replay_safe_fresh_dispatch_body()
+                    )
+                    if fresh_fallback_body is not None:
+                        prepared_request_body = fresh_fallback_body
+                        has_continuation_state = (
+                            _codex_auto_agent_request_has_continuation_state(
+                                prepared_request_body
+                            )
+                        )
+                        has_previous_response_id = bool(
+                            prepared_request_body.get("previous_response_id")
+                        )
+                        if replay_safety is not None:
+                            replay_safety = (
+                                _session_affinity_mod().classify_session_owner_replay_safety_body(
+                                    prepared_request_body
+                                )
+                            )
+                        account_failover_replay_safe = (
+                            replay_safety.safe
+                            if replay_safety is not None
+                            else True
+                        )
                         deterministically_ineligible_candidate_keys.add(cooldown_key)
                         last_retryable_exc = failure_exc
                         break
