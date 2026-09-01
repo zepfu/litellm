@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from litellm.proxy.pass_through_endpoints.aawm_alias_routing import selection
 from scripts import run_provider_status_observations_loop as loop
 
 
@@ -311,6 +312,7 @@ def _zai_coding_plan_quota_poll_config(**overrides):
 
 
 def _payload_fields(payload: tuple) -> dict:
+    evidence = json.loads(payload[17])
     return {
         "observed_at": payload[0],
         "client": payload[1],
@@ -327,7 +329,8 @@ def _payload_fields(payload: tuple) -> dict:
         "quota_used": payload[12],
         "quota_remaining": payload[13],
         "raw_provider_fields": json.loads(payload[16]),
-        "evidence": json.loads(payload[17]),
+        "evidence": evidence,
+        "environment": evidence.get("environment"),
         "source": payload[18],
     }
 
@@ -554,6 +557,8 @@ def test_tokens_limit_fixture_emits_5h_and_weekly_percent_windows() -> None:
         assert time_limit_rows[0]["remaining_pct"] == 100.0
     assert five_hour["quota_period"] == "5h"
     assert weekly["quota_period"] == "7d"
+    assert five_hour["evidence"]["window"] == five_hour["quota_period"]
+    assert weekly["evidence"]["window"] == weekly["quota_period"]
     assert by_period["5h"]["remaining_pct"] == 83.0
     assert by_period["7d"]["remaining_pct"] == 97.0
 
@@ -590,6 +595,16 @@ def test_credit_limit_fixture_emits_absolute_5h_and_weekly_windows() -> None:
     assert weekly["remaining_pct"] == 99.0
     assert weekly["provider"] == "zai_coding_plan"
     assert weekly["source"] == "zai_coding_plan_quota_poll"
+    for row in (five_hour, weekly):
+        assert row["evidence"]["window"] == row["quota_period"]
+        observation = selection._zai_coding_plan_quota_observation_from_row(
+            row,
+            expected_environment=row["environment"],
+            now_epoch=row["observed_at"].timestamp() + 1.0,
+        )
+        assert observation is not None
+        assert observation["quota_period"] == row["quota_period"]
+        assert observation["evidence"] == row["evidence"]
 
 
 def test_zero_usage_without_percentage_skips_unsafe_windows_and_keeps_valid_rows() -> None:
