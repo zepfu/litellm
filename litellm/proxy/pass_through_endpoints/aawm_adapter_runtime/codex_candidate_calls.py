@@ -39,6 +39,9 @@ _CURSOR_TOOL_CONTINUATION_CUE = (
     "Do not repeat completed tool calls."
 )
 _CURSOR_TOOL_CONTINUATION_CUE_MARKER = "_cursor_tool_continuation_cue"
+_CURSOR_SESSION_CONTINUATION_FAILURE_MARKER = (
+    "_cursor_session_continuation_failure"
+)
 _CURSOR_REPLAY_PRESERVED_STATUS_CODES = frozenset(
     {408, 500, 502, 503, 504, 529}
 )
@@ -188,6 +191,26 @@ def _take_cursor_replay_state(response_id: str) -> dict[str, Any]:
     state = _peek_cursor_replay_state(response_id)
     _consume_cursor_replay_state(response_id, expected_state=state)
     return state
+
+
+def _raise_cursor_session_continuation_unavailable(
+    *,
+    previous_response_id: str,
+    replay_state: dict[str, Any],
+) -> None:
+    from litellm.llms.cursor_agent.connect import CursorConnectError
+
+    _consume_cursor_replay_state(
+        previous_response_id,
+        expected_state=replay_state,
+    )
+    exc = CursorConnectError(
+        "Cursor Agent tool-output continuation cannot resume because its "
+        "live retained session is unavailable.",
+        status_code=409,
+    )
+    setattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, True)
+    raise exc
 
 
 def _cursor_replay_failure_is_transient(
@@ -1433,6 +1456,28 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     previous_response_id = request_body.get("previous_response_id")
     if isinstance(previous_response_id, str) and previous_response_id:
         replay_state = _peek_cursor_replay_state(previous_response_id)
+    request_tools = request_body.get("tools")
+    if not isinstance(request_tools, list) and isinstance(replay_state, dict):
+        request_tools = replay_state.get("tools")
+
+    retained_session = (
+        replay_state.get("retained_session")
+        if isinstance(replay_state, dict)
+        else None
+    )
+    cursor_tool_outputs = _cursor_function_call_outputs(request_body)
+    if (
+        isinstance(previous_response_id, str)
+        and previous_response_id
+        and isinstance(replay_state, dict)
+        and retained_session is None
+        and cursor_tool_outputs
+    ):
+        _raise_cursor_session_continuation_unavailable(
+            previous_response_id=previous_response_id,
+            replay_state=replay_state,
+        )
+
     messages = _responses_input_to_cursor_messages(
         request_body,
         prior_messages=(
@@ -1443,15 +1488,6 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         ),
     )
     optional_params: dict[str, Any] = {}
-    request_tools = request_body.get("tools")
-    if not isinstance(request_tools, list) and isinstance(replay_state, dict):
-        request_tools = replay_state.get("tools")
-
-    retained_session = (
-        replay_state.get("retained_session")
-        if isinstance(replay_state, dict)
-        else None
-    )
     if retained_session is not None:
         _consume_cursor_replay_state(
             previous_response_id,
@@ -1460,7 +1496,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
         )
         try:
             result = await retained_session.continue_with_tool_outputs(
-                _cursor_function_call_outputs(request_body)
+                cursor_tool_outputs
             )
             _validate_cursor_result_and_consume_replay_state(
                 result=result,
@@ -1621,7 +1657,7 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     )
 
 
-def _raise_cursor_agent_alias_error(
+def _raise_cursor_agent_alias_error(  # noqa: PLR0915
     *,
     exc: Exception,
     candidate: dict[str, Any],
@@ -1650,6 +1686,35 @@ def _raise_cursor_agent_alias_error(
     route_family = str(candidate.get("route_family") or "")
     attempted_provider_call: Optional[bool] = None
     ineligibility_summary = ""
+    if getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False):
+        detail_message = (
+            "Cursor Agent candidate is ineligible: the requested tool-output "
+            "continuation has no live retained session; "
+            f"model={model} route_family={route_family}; {message}"
+        )
+        proxy_exc = ProxyException(
+            message=detail_message,
+            type="invalid_request_error",
+            param="model",
+            code=409,
+        )
+        setattr(proxy_exc, "status_code", 409)
+        setattr(proxy_exc, "candidate_status", "ineligible")
+        setattr(proxy_exc, "ineligibility_reason", "preflight_skipped")
+        setattr(proxy_exc, "failure_phase", "cursor_session_continuation")
+        setattr(proxy_exc, "attempted_provider_call", False)
+        setattr(proxy_exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, True)
+        setattr(
+            proxy_exc,
+            "detail",
+            {
+                "error": {
+                    "message": detail_message,
+                    "code": "aawm_codex_auto_agent_candidate_ineligible",
+                }
+            },
+        )
+        raise proxy_exc from exc
     if isinstance(exc, CursorConnectProtocolError) and message.startswith(
         (
             "Cursor Agent requested unsupported external exec field ",
