@@ -18,6 +18,65 @@ else:
     LiteLLMLoggingObj = Any
 
 
+def rewrite_codex_agent_message_items_for_xai_responses(
+    request_body: Dict[str, Any],
+) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Replace Codex V2 child-result ``agent_message`` items with visible messages.
+
+    xAI Responses does not accept the opaque Codex-only ``agent_message`` input
+    item type.  Preserve the child FINAL_ANSWER text by promoting every
+    ``input_text`` content part into a plain ``user`` message item.  Any
+    ``encrypted_content`` sibling parts (opaque Codex account-bound state) are
+    dropped.  Returns ``(request_body, rewritten_items)``; when no
+    ``agent_message`` items are present the original body is returned unchanged.
+    """
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list):
+        return request_body, []
+
+    updated_items: List[Any] = []
+    rewritten: List[Dict[str, Any]] = []
+    for index, item in enumerate(input_items):
+        if not isinstance(item, dict) or item.get("type") != "agent_message":
+            updated_items.append(item)
+            continue
+
+        content = item.get("content")
+        if isinstance(content, list):
+            text_parts = [
+                part["text"]
+                for part in content
+                if isinstance(part, dict)
+                and part.get("type") == "input_text"
+                and isinstance(part.get("text"), str)
+            ]
+            visible_text = "\n".join(text_parts)
+        else:
+            visible_text = ""
+
+        rewritten_item: Dict[str, Any] = {
+            "type": "message",
+            "role": "user",
+            "content": visible_text,
+        }
+        rewritten.append(
+            {
+                "type": "agent_message",
+                "index": index,
+                "rewritten_type": rewritten_item["type"],
+                "rewritten_role": rewritten_item["role"],
+            }
+        )
+        updated_items.append(rewritten_item)
+
+    if not rewritten:
+        return request_body, []
+
+    updated_body = dict(request_body)
+    updated_body["input"] = updated_items
+    return updated_body, rewritten
+
+
 class XAIResponsesAPIConfig(OpenAIResponsesAPIConfig):
     """
     Configuration for XAI's Responses API.

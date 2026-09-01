@@ -31,7 +31,10 @@ from litellm.llms.xai.oauth import prepare_oa_xai_request as _prepare_oa_xai_req
 from litellm.llms.xai.oauth import (
     resolve_oa_xai_upstream_model as _resolve_oa_xai_upstream_model,
 )
-from litellm.llms.xai.responses.transformation import XAIResponsesAPIConfig
+from litellm.llms.xai.responses.transformation import (
+    XAIResponsesAPIConfig,
+    rewrite_codex_agent_message_items_for_xai_responses,
+)
 from litellm.responses.utils import ResponsesAPIRequestUtils
 from litellm.secret_managers.main import get_secret_str as _get_secret_str
 from litellm.types.llms.openai import ResponsesAPIOptionalRequestParams
@@ -507,6 +510,7 @@ async def _prepare_oa_xai_passthrough_request(
             request_body
         )
         runtime._replace_request_body_in_place(request_body, updated_body)
+        _rewrite_codex_agent_message_items_in_place(request_body)
         _rewrite_grok_native_unsupported_input_items_in_place(request_body)
         runtime._sanitize_xai_responses_request_body_in_place(request_body)
         (
@@ -730,6 +734,7 @@ async def _prepare_grok_native_oauth_passthrough_request(
     ) = runtime._drop_unsupported_codex_input_items_from_request_body(
         prepared_body
     )
+    _rewrite_codex_agent_message_items_in_place(prepared_body)
     _sanitize_grok_native_function_call_arguments_in_place(prepared_body)
     _rewrite_grok_native_unsupported_input_items_in_place(prepared_body)
     runtime._sanitize_xai_responses_request_body_in_place(prepared_body)
@@ -767,3 +772,61 @@ def _rewrite_grok_native_unsupported_input_items_in_place(
         _get_anthropic_grok_normalization_runtime(),
         request_body,
     )
+
+
+def _add_codex_agent_message_rewrite_logging_metadata(
+    request_body: Payload,
+    *,
+    rewritten_items: list[dict[str, Any]],
+) -> Payload:
+    runtime = _require_runtime()
+    rewritten_item_types = runtime._dedupe_sorted_str_list(
+        [
+            item_type
+            for item in rewritten_items
+            if isinstance((item_type := item.get("type")), str) and item_type
+        ]
+    )
+    return runtime._merge_litellm_metadata(
+        request_body,
+        tags_to_add=[
+            "xai-responses-agent-message-rewritten",
+            *(
+                f"xai-responses-agent-message:{item_type}"
+                for item_type in rewritten_item_types
+            ),
+        ],
+        extra_fields={
+            "xai_responses_agent_message_rewrite_count": len(rewritten_items),
+            "xai_responses_agent_message_rewrite_types": rewritten_item_types,
+            "langfuse_spans": [
+                runtime._build_langfuse_span_descriptor(
+                    name="xai.responses_agent_message_rewritten",
+                    metadata={
+                        "rewritten_count": len(rewritten_items),
+                        "rewritten_item_types": rewritten_item_types,
+                    },
+                )
+            ],
+        },
+    )
+
+
+def _rewrite_codex_agent_message_items_in_place(
+    request_body: dict[str, Any],
+) -> list[dict[str, Any]]:
+    updated_body, rewritten_items = (
+        rewrite_codex_agent_message_items_for_xai_responses(request_body)
+    )
+    if updated_body is not request_body:
+        request_body.clear()
+        request_body.update(updated_body)
+    if rewritten_items:
+        updated_body = _add_codex_agent_message_rewrite_logging_metadata(
+            request_body,
+            rewritten_items=rewritten_items,
+        )
+        if updated_body is not request_body:
+            request_body.clear()
+            request_body.update(updated_body)
+    return rewritten_items
