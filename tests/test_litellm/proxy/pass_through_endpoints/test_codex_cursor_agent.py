@@ -178,13 +178,43 @@ class _CountingRetainedSession:
 def test_cursor_codex_path_returns_native_function_call_and_replays_tool_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    continuation_cue = (
-        "Finish the original user request using the completed tool result above. "
-        "Do not repeat completed tool calls."
-    )
     assert codex_candidate_calls._responses_input_to_cursor_messages(
         {"input": "run pwd"}
     ) == [{"role": "user", "content": "run pwd"}]
+
+    class FakeRetainedSession:
+        def __init__(self) -> None:
+            self.outputs: list[list[tuple[str, Any]]] = []
+            self.close_calls = 0
+            self.results = [
+                CursorAgentRunResult(
+                    tool_calls=[
+                        {
+                            "id": "cursor-item-2",
+                            "call_id": "call-2",
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"date"}',
+                        }
+                    ],
+                    retained_session=self,
+                ),
+                CursorAgentRunResult(text="final answer", turn_ended=True),
+            ]
+
+        async def continue_with_tool_outputs(
+            self,
+            outputs: list[tuple[str, Any]],
+        ) -> CursorAgentRunResult:
+            self.outputs.append(outputs)
+            return self.results.pop(0)
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+        async def aclose(self) -> None:
+            self.close()
+
+    retained_session = FakeRetainedSession()
 
     class FakeCursorClient:
         calls: list[dict[str, Any]] = []
@@ -198,19 +228,9 @@ def test_cursor_codex_path_returns_native_function_call_and_replays_tool_history
                         "name": "exec_command",
                         "arguments": '{"cmd":"pwd"}',
                     }
-                ]
-            ),
-            CursorAgentRunResult(
-                tool_calls=[
-                    {
-                        "id": "cursor-item-2",
-                        "call_id": "call-2",
-                        "name": "exec_command",
-                        "arguments": '{"cmd":"date"}',
-                    }
-                ]
-            ),
-            CursorAgentRunResult(text="final answer", turn_ended=True),
+                ],
+                retained_session=retained_session,
+            )
         ]
 
         def __init__(self, **kwargs: Any) -> None:
@@ -307,121 +327,40 @@ def test_cursor_codex_path_returns_native_function_call_and_replays_tool_history
     assert first_run["mcpTools"]["mcpTools"][0]["name"] == "exec_command"
     assert "rootPromptMessagesJson" not in json.dumps(first_run)
 
-    second_run = FakeCursorClient.calls[1]["payload"]["runRequest"]
-    history = second_run["action"]["userMessageAction"]["conversationHistory"]
-    assert history == {
-        "messages": [
-            {"user": {"content": [{"text": {"text": "run pwd"}}]}},
-            {
-                "assistant": {
-                    "content": [
-                        {
-                            "toolCall": {
-                                "toolCallId": (
-                                    "call-3e993636-853f-474a-b20c-439984662b5d-0"
-                                ),
-                                "toolName": "exec_command",
-                                "argsJson": '{"cmd":"pwd"}',
-                            }
-                        }
-                    ]
-                }
-            },
-            {
-                "tool": {
-                    "toolCallId": (
-                        "call-3e993636-853f-474a-b20c-439984662b5d-0"
-                    ),
-                    "toolName": "exec_command",
-                    "content": [{"text": {"text": "pwd output"}}],
-                }
-            },
-        ]
-    }
-    assert "rootPromptMessagesJson" not in json.dumps(second_run)
-    assert (
-        second_run["action"]["userMessageAction"]["userMessage"]["text"]
-        == continuation_cue
-    )
-    assert second_run["mcpTools"]["mcpTools"][0]["name"] == "exec_command"
-    assert (
-        history["messages"][2]["tool"]["toolCallId"]
-        == first_body["output"][0]["call_id"]
-    )
-    assert (
-        history["messages"][2]["tool"]["toolCallId"]
-        != first_body["output"][0]["id"]
-    )
-
-    third_run = FakeCursorClient.calls[2]["payload"]["runRequest"]
-    assert third_run["action"]["userMessageAction"]["conversationHistory"] == {
-        "messages": [
-            {"user": {"content": [{"text": {"text": "run pwd"}}]}},
-            {
-                "assistant": {
-                    "content": [
-                        {
-                            "toolCall": {
-                                "toolCallId": (
-                                    "call-3e993636-853f-474a-b20c-439984662b5d-0"
-                                ),
-                                "toolName": "exec_command",
-                                "argsJson": '{"cmd":"pwd"}',
-                            }
-                        }
-                    ]
-                }
-            },
-            {
-                "tool": {
-                    "toolCallId": (
-                        "call-3e993636-853f-474a-b20c-439984662b5d-0"
-                    ),
-                    "toolName": "exec_command",
-                    "content": [{"text": {"text": "pwd output"}}],
-                }
-            },
-            {
-                "assistant": {
-                    "content": [
-                        {
-                            "toolCall": {
-                                "toolCallId": "call-2",
-                                "toolName": "exec_command",
-                                "argsJson": '{"cmd":"date"}',
-                            }
-                        }
-                    ]
-                }
-            },
-            {
-                "tool": {
-                    "toolCallId": "call-2",
-                    "toolName": "exec_command",
-                    "content": [{"text": {"text": "date output"}}],
-                }
-            },
-        ]
-    }
-    assert (
-        third_run["action"]["userMessageAction"]["userMessage"]["text"]
-        == continuation_cue
-    )
-    assert third_run["mcpTools"]["mcpTools"][0]["name"] == "exec_command"
-    message_ids = [
-        run["action"]["userMessageAction"]["userMessage"]["messageId"]
-        for run in (first_run, second_run, third_run)
+    assert len(FakeCursorClient.calls) == 1
+    assert retained_session.outputs == [
+        [
+            (
+                "call-3e993636-853f-474a-b20c-439984662b5d-0",
+                "pwd output",
+            )
+        ],
+        [("call-2", "date output")],
     ]
-    assert len(set(message_ids)) == 3
-    for field in ("conversationId", "conversationGroupId", "runId"):
-        assert len({first_run[field], second_run[field], third_run[field]}) == 3
-    for run in (first_run, second_run, third_run):
-        assert run["conversationGroupId"] == run["conversationId"]
+    assert retained_session.close_calls == 1
 
 
 def test_cursor_local_exec_function_call_replays_through_existing_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    class FakeRetainedSession:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def continue_with_tool_outputs(
+            self,
+            _outputs: list[tuple[str, Any]],
+        ) -> CursorAgentRunResult:
+            return CursorAgentRunResult(text="command completed", turn_ended=True)
+
+        def close(self) -> None:
+            self.closed = True
+
+        async def aclose(self) -> None:
+            self.close()
+
+    retained_session = FakeRetainedSession()
+
     class FakeCursorClient:
         calls: list[dict[str, Any]] = []
         results = [
@@ -433,9 +372,9 @@ def test_cursor_local_exec_function_call_replays_through_existing_state(
                         "name": "exec_command",
                         "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
                     }
-                ]
-            ),
-            CursorAgentRunResult(text="command completed", turn_ended=True),
+                ],
+                retained_session=retained_session,
+            )
         ]
 
         def __init__(self, **_kwargs: Any) -> None:
@@ -477,7 +416,7 @@ def test_cursor_local_exec_function_call_replays_through_existing_state(
     }
     assert codex_candidate_calls._peek_cursor_replay_state(
         first_body["id"]
-    )["retained_session"] is None
+    )["retained_session"] is retained_session
 
     second = _call(
         {
@@ -494,7 +433,94 @@ def test_cursor_local_exec_function_call_replays_through_existing_state(
     )
 
     assert json.loads(second.body)["output_text"] == "command completed"
-    assert len(FakeCursorClient.calls) == 2
+    assert len(FakeCursorClient.calls) == 1
+    assert retained_session.closed is True
+
+
+def test_cursor_unretained_tool_output_continuation_does_not_build_replacement_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.llms.cursor_agent import common_utils
+
+    build_calls: list[dict[str, Any]] = []
+    run_calls: list[dict[str, Any]] = []
+    real_build_run_request = common_utils.build_run_request
+
+    class FakeCursorClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self,
+            payload: dict[str, Any],
+            **kwargs: Any,
+        ) -> CursorAgentRunResult:
+            run_calls.append({"payload": payload, "kwargs": kwargs})
+            return CursorAgentRunResult(
+                tool_calls=[
+                    {
+                        "id": "cursor-item-1",
+                        "call_id": "call-1",
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"pwd"}',
+                    }
+                ]
+            )
+
+    def _build_run_request(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        build_calls.append({"args": args, "kwargs": kwargs})
+        return real_build_run_request(*args, **kwargs)
+
+    monkeypatch.setattr(common_utils, "build_run_request", _build_run_request)
+    monkeypatch.setattr(
+        "litellm.llms.cursor_agent.connect.CursorAgentConnectClient",
+        FakeCursorClient,
+    )
+
+    first = _call(
+        {
+            "model": "work",
+            "input": "run pwd",
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "exec_command"},
+                }
+            ],
+        }
+    )
+    first_body = json.loads(first.body)
+
+    with pytest.raises(CursorConnectError) as exc_info:
+        _call(
+            {
+                "model": "work",
+                "previous_response_id": first_body["id"],
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": first_body["output"][0]["call_id"],
+                        "output": "pwd output",
+                    }
+                ],
+            }
+        )
+
+    exc = exc_info.value
+    assert exc.status_code == 409
+    assert getattr(
+        exc,
+        codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+        False,
+    )
+    assert len(build_calls) == 1
+    assert len(run_calls) == 1
+    assert (
+        codex_candidate_calls._CURSOR_TOOL_CONTINUATION_CUE
+        not in json.dumps(build_calls[0])
+    )
+    with pytest.raises(CursorConnectError, match="missing"):
+        codex_candidate_calls._peek_cursor_replay_state(first_body["id"])
 
 
 def test_cursor_fresh_full_history_tool_output_emits_continuation_cue() -> None:
@@ -1482,7 +1508,13 @@ def test_cursor_transient_failures_preserve_replay_state(
     _store_replay_state()
 
     with pytest.raises(type(failure)):
-        _call(_replay_body())
+        _call(
+            {
+                "model": "work",
+                "previous_response_id": "resp-replay",
+                "input": "continue",
+            }
+        )
 
     state = codex_candidate_calls._peek_cursor_replay_state("resp-replay")
     assert state["messages"]
@@ -1508,7 +1540,13 @@ def test_cursor_success_consumes_replay_state(
     )
     _store_replay_state()
 
-    response = _call(_replay_body())
+    response = _call(
+        {
+            "model": "work",
+            "previous_response_id": "resp-replay",
+            "input": "continue",
+        }
+    )
 
     assert response.status_code == 200
     with pytest.raises(CursorConnectError, match="missing"):

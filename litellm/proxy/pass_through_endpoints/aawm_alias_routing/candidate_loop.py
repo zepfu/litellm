@@ -208,6 +208,9 @@ _IN_FLIGHT_REDISPATCH_ERROR_CODES = frozenset(
         "aawm_anthropic_auto_agent_in_flight_provider_cooling_down",
     }
 )
+_CURSOR_SESSION_CONTINUATION_FAILURE_MARKER = (
+    "_cursor_session_continuation_failure"
+)
 _TERMINAL_ERROR_ALREADY_EMITTED_REQUEST_STATE_KEY = (
     "aawm_terminal_error_emitted"
 )
@@ -238,6 +241,12 @@ def _mark_request_terminal_error_emitted(request: Any) -> None:
         setattr(state, _TERMINAL_ERROR_ALREADY_EMITTED_REQUEST_STATE_KEY, True)
     except Exception:
         pass
+
+
+def _is_cursor_session_continuation_failure(exc: Any) -> bool:
+    return bool(
+        getattr(exc, _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER, False)
+    )
 
 
 def _validated_redispatch_terminal_metadata(
@@ -742,6 +751,28 @@ async def handle_alias_route(  # noqa: PLR0915
             attempted_provider_call = getattr(exc, "attempted_provider_call", True)
         attempted_provider_call = bool(attempted_provider_call)
         terminal_exc: Optional[HTTPException] = None
+        if _is_cursor_session_continuation_failure(exc):
+            detail = getattr(exc, "detail", None)
+            if not isinstance(detail, dict):
+                detail = {
+                    "error": {
+                        "message": str(getattr(exc, "message", None) or exc),
+                        "type": "invalid_request_error",
+                        "code": "aawm_codex_auto_agent_candidate_ineligible",
+                    }
+                }
+            terminal_exc = HTTPException(
+                status_code=409,
+                detail=detail,
+            )
+            for field in (
+                "candidate_status",
+                "ineligibility_reason",
+                "failure_phase",
+                "attempted_provider_call",
+            ):
+                if hasattr(exc, field):
+                    setattr(terminal_exc, field, getattr(exc, field))
         kimi_failure_metadata = _get_safe_kimi_code_probe_failure_metadata(
             exc,
             candidate=candidate if isinstance(candidate, dict) else None,
@@ -1231,10 +1262,23 @@ async def handle_alias_route(  # noqa: PLR0915
                             attempts.append(attempt_record)
                             attempt_record["attempted_provider_call"] = True
                             attempted_provider_call = True
-                            return await perform_candidate_request_fn(
-                                candidate=candidate,
-                                candidate_body=candidate_body,
-                            )
+                            try:
+                                return await perform_candidate_request_fn(
+                                    candidate=candidate,
+                                    candidate_body=candidate_body,
+                                )
+                            except Exception as perform_exc:
+                                if (
+                                    getattr(
+                                        perform_exc,
+                                        "attempted_provider_call",
+                                        None,
+                                    )
+                                    is False
+                                ):
+                                    attempt_record["attempted_provider_call"] = False
+                                    attempted_provider_call = False
+                                raise
 
                         run_with_lease_renewal = getattr(
                             sa,
@@ -1565,6 +1609,10 @@ async def handle_alias_route(  # noqa: PLR0915
                     # --- Cooldown mutation: NO pre-held probe lock ------------
                     if (
                         probe_failure_plan is not None
+                        and (
+                            probe_failure_plan.memory_keys
+                            or probe_failure_plan.durable_keys
+                        )
                         and not skip_cooldown_for_same_account_retry
                         and not skip_cooldown_for_account_failover
                     ):
@@ -1688,6 +1736,28 @@ async def handle_alias_route(  # noqa: PLR0915
                 # --- failure handling (post-release) ---------------------------
                 failure_exc = probe_failure_exc
                 assert failure_exc is not None
+                if _is_cursor_session_continuation_failure(failure_exc):
+                    _update_codex_auto_agent_retryable_attempt_record(
+                        attempt_record=attempt_record,
+                        exc=failure_exc,
+                        error_class="candidate_deterministically_ineligible",
+                        cooldown_seconds=0.0,
+                        cooldown_scope="none",
+                        alias_model=alias_model,
+                        candidate=candidate,
+                    )
+                    _record_auto_agent_alias_attempt_failure(
+                        alias_family=alias_family,
+                        alias_model=alias_model,
+                        request=request,
+                        prepared_request_body=prepared_request_body,
+                        selection=selection,
+                        attempts=attempts,
+                        attempt_record=attempt_record,
+                        error_class="candidate_deterministically_ineligible",
+                        add_alias_metadata_fn=add_alias_metadata_fn,
+                    )
+                    _raise_terminal_alias_failure(failure_exc)
                 if attempted_provider_call:
                     failed_provider_candidate_keys.add(cooldown_key)
                 kimi_failure_metadata = _get_safe_kimi_code_probe_failure_metadata(
@@ -2196,7 +2266,12 @@ def _resolve_failure_plan(
     identifies a Codex configured alias, then resolves scope/target keys
     without cooldown-map or durable writes.
     """
-    if _error_signals._is_codex_auto_agent_candidate_deterministically_ineligible(exc):
+    if (
+        _is_cursor_session_continuation_failure(exc)
+        or _error_signals._is_codex_auto_agent_candidate_deterministically_ineligible(
+            exc
+        )
+    ):
         return CooldownPublicationPlan(
             memory_keys=(),
             durable_keys=(),

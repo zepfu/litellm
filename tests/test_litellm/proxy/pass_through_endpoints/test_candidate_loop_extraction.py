@@ -1944,6 +1944,231 @@ async def test_candidate_loop_ineligible_falls_through_without_request_local_sta
 
 
 @pytest.mark.asyncio
+async def test_candidate_loop_cursor_session_continuation_is_session_scoped(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from litellm.llms.cursor_agent.connect import CursorConnectError
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        codex_candidate_calls,
+    )
+
+    candidate = {
+        "provider": "cursor_agent",
+        "model": "cursor_agent/cursor-grok-4.6-high",
+        "route_family": "codex_cursor_agent_aiserver_adapter",
+    }
+    selection = {
+        "candidate": candidate,
+        "lane_key": "cursor_agent_cli",
+        "cooldown_key": "cursor_agent:cursor-grok-4.6-high",
+        "selection_reason": "first_available",
+    }
+    continuation_body = {
+        "model": "work",
+        "previous_response_id": "resp-unretained",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": "pwd output",
+            }
+        ],
+    }
+    fresh_body = {"model": "work", "input": "run pwd"}
+    source_exc = CursorConnectError(
+        "Cursor retained session unavailable",
+        status_code=409,
+    )
+    setattr(
+        source_exc,
+        codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+        True,
+    )
+    with pytest.raises(ProxyException) as mapped_exc_info:
+        codex_candidate_calls._raise_cursor_agent_alias_error(
+            exc=source_exc,
+            candidate=candidate,
+        )
+    mapped_exc = mapped_exc_info.value
+
+    routing_state = AliasRoutingStateManager()
+    monkeypatch.setattr(candidate_loop, "alias_routing_state", routing_state)
+    selection_calls: list[dict[str, Any]] = []
+    provider_calls: list[dict[str, Any]] = []
+    failure_records: list[dict[str, Any]] = []
+    terminal_events: list[dict[str, Any]] = []
+    publication_calls: list[dict[str, Any]] = []
+
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        selection_calls.append(kwargs)
+        return dict(selection)
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        provider_calls.append(
+            {"candidate": candidate, "body": candidate_body}
+        )
+        if "previous_response_id" in candidate_body:
+            raise mapped_exc
+        return {"candidate": candidate["model"]}
+
+    async def _no_active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    async def _owner_guard(**_kwargs: Any) -> object:
+        return SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+
+    class _Admission:
+        async def admit_selected_candidate(self, **_kwargs: Any) -> object:
+            return SimpleNamespace(allowed=True, lease=None)
+
+        async def release_provider_lane_admission(self, _lease: object) -> None:
+            return None
+
+    session_affinity = SimpleNamespace(
+        is_replay_safe_session_owner_redispatch_body=lambda _body: False,
+        resolve_canonical_session_identity=lambda *_args, **_kwargs: None,
+        get_request_codex_auto_review_parent_session_identity=lambda _request: None,
+        build_session_owner_attributes=lambda **_kwargs: {},
+        ensure_session_owner_guard_for_request=_owner_guard,
+        get_request_session_owner_lease=lambda _request: None,
+        finalize_session_owner_lease_on_success=_noop_async,
+        finalize_session_owner_lease_on_failure=_noop_async,
+        reset_released_request_session_owner_guard=lambda _request: False,
+        SessionOwnerMutationOutcome=SimpleNamespace(
+            CONFLICT="conflict",
+            ERROR="error",
+            NOT_HELD="not_held",
+        ),
+    )
+
+    def _record_failure(**kwargs: Any) -> None:
+        failure_records.append(kwargs)
+
+    def _fail_publication(**kwargs: Any) -> None:
+        publication_calls.append(kwargs)
+        raise AssertionError("session-scoped failure must not publish cooldown")
+
+    monkeypatch.setattr(candidate_loop, "_session_affinity_mod", lambda: session_affinity)
+    monkeypatch.setattr(candidate_loop, "_admission_mod", lambda: _Admission())
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_failure",
+        _record_failure,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_emit_auto_agent_alias_no_candidate_event",
+        lambda **kwargs: terminal_events.append(kwargs),
+    )
+    monkeypatch.setattr(lpe, "execute_cooldown_publication_transaction", _fail_publication)
+    monkeypatch.setattr(
+        lpe,
+        "_record_codex_failure_evidence",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("session-scoped failure must not record cooldown evidence")
+        ),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_exclude_codex_auto_agent_request_local_candidate_without_cooldown",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("session-scoped failure must not exclude the candidate")
+        ),
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_apply_request_local_cooldown_from_plan",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("session-scoped failure must not apply request-local state")
+        ),
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await candidate_loop.handle_alias_route(
+            SimpleNamespace(
+                select_candidate_fn=_select,
+                perform_candidate_request_fn=_perform,
+                resolve_cooldown_publication_fn=lpe._resolve_auto_agent_cooldown_publication_plan,
+                publish_cooldown_memory_fn=_fail_publication,
+                persist_cooldown_fn=_fail_publication,
+                set_session_affinity_fn=_noop_async,
+                add_alias_metadata_fn=lambda body, **_kwargs: body,
+                raise_redispatch_fn=lambda **_kwargs: (_ for _ in ()).throw(
+                    AssertionError("session-scoped failure must not redispatch")
+                ),
+            ),
+            alias_family="codex_auto_agent",
+            alias_model="work",
+            request=SimpleNamespace(state=SimpleNamespace()),
+            prepared_request_body=continuation_body,
+            max_candidate_attempts=1,
+            get_active_cooldown_state_fn=_no_active_cooldown,
+            attempts_metadata_key="attempts",
+            skipped_candidates_metadata_key="skipped",
+            no_candidate_detail="no candidates",
+            log_label="Codex",
+        )
+
+    assert caught.value.status_code == 409
+    assert caught.value.detail["error"]["code"] == (
+        "aawm_codex_auto_agent_candidate_ineligible"
+    )
+    assert caught.value.candidate_status == "ineligible"
+    assert caught.value.ineligibility_reason == "preflight_skipped"
+    assert caught.value.failure_phase == "cursor_session_continuation"
+    assert caught.value.attempted_provider_call is False
+    assert len(provider_calls) == 1
+    assert len(failure_records) == 1
+    assert failure_records[0]["error_class"] == (
+        "candidate_deterministically_ineligible"
+    )
+    assert publication_calls == []
+    assert terminal_events and terminal_events[0]["exc"].status_code == 409
+    assert routing_state.codex.cooldown_until_monotonic_by_key == {}
+    assert routing_state.codex.candidate_semantic_ineligibility_by_key == {}
+    assert selection_calls[0]["excluded_candidate_keys"] == frozenset()
+
+    fresh_response = await candidate_loop.handle_alias_route(
+        SimpleNamespace(
+            select_candidate_fn=_select,
+            perform_candidate_request_fn=_perform,
+            resolve_cooldown_publication_fn=lpe._resolve_auto_agent_cooldown_publication_plan,
+            publish_cooldown_memory_fn=_fail_publication,
+            persist_cooldown_fn=_fail_publication,
+            set_session_affinity_fn=_noop_async,
+            add_alias_metadata_fn=lambda body, **_kwargs: body,
+            raise_redispatch_fn=None,
+        ),
+        alias_family="codex_auto_agent",
+        alias_model="work",
+        request=SimpleNamespace(state=SimpleNamespace()),
+        prepared_request_body=fresh_body,
+        max_candidate_attempts=1,
+        get_active_cooldown_state_fn=_no_active_cooldown,
+        attempts_metadata_key="attempts",
+        skipped_candidates_metadata_key="skipped",
+        no_candidate_detail="no candidates",
+        log_label="Codex",
+    )
+
+    assert fresh_response == {"candidate": candidate["model"]}
+    assert len(provider_calls) == 2
+    assert selection_calls[1]["excluded_candidate_keys"] == frozenset()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", (400, 422))
 @pytest.mark.parametrize("include_failure_metadata", (True, False))
 async def test_candidate_loop_kimi_invalid_request_persists_terminal_inventory_before_raise(
