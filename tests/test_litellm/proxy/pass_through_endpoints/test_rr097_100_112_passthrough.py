@@ -25,7 +25,6 @@ from starlette.datastructures import Headers, QueryParams
 
 from litellm.integrations.aawm_agent_quality_rules import (
     is_malformed_composer_call_literal_text,
-    is_malformed_grok_literal_tool_label_transcript_text,
 )
 from litellm.llms.anthropic.experimental_pass_through.providers.grok import (
     composer_repair,
@@ -781,6 +780,126 @@ async def test_rr100_nonstream_success_terminalizes_immediately(
         expected_phase="completed",
     )
     assert writes == ["finalize:completed"]
+
+
+@pytest.mark.asyncio
+async def test_d1_677_header_identity_queries_child_transfer_without_upstream_leak(
+    transfer_registry: SessionTransferRegistry,
+):
+    child_id = "child-thread-d1-677"
+    call_id = "d1-677-header-identity"
+    request = _passthrough_request()
+    request.headers = Headers(
+        {
+            "content-type": "application/json",
+            "x-codex-thread-id": child_id,
+        }
+    )
+    request_body = {"model": "gpt-5.4", "input": "hello"}
+    upstream = httpx.Response(
+        status_code=200,
+        content=b'{"id":"resp-d1-677","status":"completed","output":[]}',
+        headers={"content-type": "application/json"},
+        request=httpx.Request("POST", "https://api.openai.com/v1/responses"),
+    )
+    captured_upstream: dict[str, Any] = {}
+
+    async def _capture_non_streaming_request(**kwargs: Any) -> httpx.Response:
+        captured_upstream["headers"] = kwargs["headers"]
+        captured_upstream["body"] = kwargs["_parsed_body"]
+        return upstream
+
+    logging_obj = MagicMock()
+    logging_obj.pre_call_hook = AsyncMock(side_effect=lambda **kwargs: kwargs["data"])
+    logging_obj.post_call_failure_hook = AsyncMock()
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.get_async_httpx_client",
+                return_value=MagicMock(client=MagicMock()),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+                "HttpPassThroughEndpointHelpers.non_streaming_http_request_handler",
+                new=_capture_non_streaming_request,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "litellm.proxy.proxy_server.proxy_logging_obj",
+                logging_obj,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+                "pass_through_endpoint_logging.pass_through_async_success_handler",
+                new=AsyncMock(),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+                "ProxyBaseLLMRequestProcessing.get_custom_headers",
+                return_value={},
+            )
+        )
+        stack.enter_context(
+            patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+                "_aawm_session_owner_pre_send_guard",
+                new=AsyncMock(),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+                "_aawm_session_owner_on_upstream_result",
+                new=AsyncMock(),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.capture_passthrough_shape",
+            )
+        )
+        stack.enter_context(
+            patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints.uuid.uuid4",
+                return_value=call_id,
+            )
+        )
+        stack.enter_context(
+            patch(
+                "litellm.proxy.pass_through_endpoints.pass_through_endpoints."
+                "_direct_capture_xai_passthrough_failure",
+                new=AsyncMock(),
+            )
+        )
+        response = await pass_through_request(
+            request=request,
+            target="https://api.openai.com/v1/responses",
+            custom_headers={"authorization": "Bearer test"},
+            user_api_key_dict=_user_api_key_dict(),
+            custom_body=request_body,
+            custom_llm_provider="openai",
+            stream=False,
+            caller_managed_hidden_retry=True,
+        )
+
+    assert isinstance(response, Response)
+    result = await transfer_registry.query(codex_session_id=child_id)
+    assert result["result_count"] == 1
+    transfer = result["transfers"][0]
+    assert transfer["codex_session_id"] == child_id
+    assert transfer["phase"] == "completed"
+    assert "x-codex-thread-id" not in {
+        str(name).lower() for name in captured_upstream["headers"]
+    }
+    assert "codex_session_id" not in captured_upstream["body"]
+    assert request_body == {"model": "gpt-5.4", "input": "hello"}
 
 
 @pytest.mark.asyncio
