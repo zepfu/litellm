@@ -7568,23 +7568,26 @@ def _hash_zai_coding_plan_account_identity(
     subscription_payload: Optional[Mapping[str, Any]] = None,
     api_key: Optional[str] = None,
 ) -> Optional[str]:
-    customer_id = None
+    """Return the canonical Z.AI account identity hash, or ``None``.
+
+    Hashed ``customerId`` is the only canonical account identity. The API key
+    is not an acceptable fallback for recovery-bearing observations: a missing
+    ``customerId`` yields no account hash and cannot clear cooldown.
+    """
+    customer_ids: set[str] = set()
     if isinstance(subscription_payload, Mapping):
         data = subscription_payload.get("data")
-        if isinstance(data, list) and data:
-            first = data[0]
-            if isinstance(first, Mapping):
-                raw_customer_id = first.get("customerId")
+        if isinstance(data, list):
+            for subscription in data:
+                if not isinstance(subscription, Mapping):
+                    continue
+                raw_customer_id = subscription.get("customerId")
                 if raw_customer_id is not None and str(raw_customer_id).strip():
-                    customer_id = str(raw_customer_id).strip()
-    if customer_id:
+                    customer_ids.add(str(raw_customer_id).strip())
+    if len(customer_ids) == 1:
+        customer_id = next(iter(customer_ids))
         return hashlib.sha256(
             f"zai_coding_plan|customerId={customer_id}".encode("utf-8")
-        ).hexdigest()
-    if isinstance(api_key, str) and api_key.strip():
-        fingerprint = hashlib.sha256(api_key.strip().encode("utf-8")).hexdigest()[:16]
-        return hashlib.sha256(
-            f"zai_coding_plan|api_key_fingerprint={fingerprint}".encode("utf-8")
         ).hexdigest()
     return None
 
@@ -7758,6 +7761,14 @@ def _build_zai_coding_plan_quota_rate_limit_payloads(  # noqa: PLR0915
             "signals": ["zai_coding_plan_quota_limit"],
             "limit_type": limit_type,
             "quota_period": period,
+            "account_hash": account_hash,
+            "customerId_sha256": account_hash,
+            "account_identity_source": "customerId_sha256",
+            "telemetry_status": "valid",
+            "fresh": True,
+            "complete": True,
+            "health_status": "healthy",
+            "environment": config.environment,
         }
         payloads.append(
             (

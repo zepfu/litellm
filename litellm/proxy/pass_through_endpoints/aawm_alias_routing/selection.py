@@ -40,6 +40,7 @@ from .policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER as _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+    CODEX_AUTO_AGENT_ZAI_CODING_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY as _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
     CODEX_AUTO_AGENT_ZAI_CODING_PLAN_LANE_KEY as _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_LANE_KEY,
     CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER as _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
     CODEX_AUTO_AGENT_COHERE_LANE_KEY as _CODEX_AUTO_AGENT_COHERE_LANE_KEY,
@@ -127,13 +128,26 @@ _CODEX_OAUTH_QUOTA_CLIENT = "codex"
 _CODEX_OAUTH_QUOTA_SOURCE = "codex_quota_poll"
 _CODEX_OAUTH_QUOTA_FAMILY_OVERALL = "overall"
 _CODEX_OAUTH_QUOTA_FAMILY_SPARK = "spark"
-_ALIBABA_TOKEN_PLAN_QUOTA_CACHE_TTL_SECONDS = 30.0
-_ALIBABA_TOKEN_PLAN_QUOTA_FAILURE_RETRY_SECONDS = 5.0
-_ALIBABA_TOKEN_PLAN_QUOTA_LOOKUP_TIMEOUT_SECONDS = 0.5
+_SHARED_ACCOUNT_QUOTA_CACHE_TTL_SECONDS = 30.0
+_SHARED_ACCOUNT_QUOTA_FAILURE_RETRY_SECONDS = 5.0
+_SHARED_ACCOUNT_QUOTA_LOOKUP_TIMEOUT_SECONDS = 0.5
 _ALIBABA_TOKEN_PLAN_QUOTA_CLIENT = "qwen-cloud-console"
 _ALIBABA_TOKEN_PLAN_QUOTA_SOURCE = "alibaba_token_plan_usage"
 _ALIBABA_TOKEN_PLAN_QUOTA_PARSER_VERSION = "alibaba_token_plan_usage_v3"
 _ALIBABA_TOKEN_PLAN_QUOTA_WINDOWS = frozenset({"5h", "7d"})
+_ALIBABA_TOKEN_PLAN_QUOTA_CACHE_TTL_SECONDS = _SHARED_ACCOUNT_QUOTA_CACHE_TTL_SECONDS
+_ALIBABA_TOKEN_PLAN_QUOTA_FAILURE_RETRY_SECONDS = (
+    _SHARED_ACCOUNT_QUOTA_FAILURE_RETRY_SECONDS
+)
+_ALIBABA_TOKEN_PLAN_QUOTA_LOOKUP_TIMEOUT_SECONDS = (
+    _SHARED_ACCOUNT_QUOTA_LOOKUP_TIMEOUT_SECONDS
+)
+_ZAI_CODING_PLAN_QUOTA_CLIENT = "zai-coding-plan"
+_ZAI_CODING_PLAN_QUOTA_SOURCE = "zai_coding_plan_quota_poll"
+_ZAI_CODING_PLAN_QUOTA_TYPES = frozenset({"credits", "percent", "count"})
+_ZAI_CODING_PLAN_QUOTA_WINDOWS = frozenset({"5h", "7d"})
+_ZAI_CODING_PLAN_QUOTA_MAX_AGE_SECONDS = 900.0
+_ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE = "customerId_sha256"
 _CODEX_OAUTH_QUOTA_CURRENT_ROWS_SQL = """
 SELECT DISTINCT ON (
     NULLIF(BTRIM(evidence->>'environment'), ''),
@@ -169,7 +183,7 @@ ORDER BY
     id DESC
 """
 
-_ALIBABA_TOKEN_PLAN_QUOTA_CURRENT_ROWS_SQL = """
+_SHARED_ACCOUNT_QUOTA_CURRENT_ROWS_SQL = """
 SELECT DISTINCT ON (
     NULLIF(BTRIM(evidence->>'environment'), ''),
     account_hash,
@@ -203,6 +217,9 @@ ORDER BY
     observed_at DESC,
     id DESC
 """
+
+
+_ALIBABA_TOKEN_PLAN_QUOTA_CURRENT_ROWS_SQL = _SHARED_ACCOUNT_QUOTA_CURRENT_ROWS_SQL
 
 
 def configure_selection_runtime(
@@ -1139,6 +1156,28 @@ async def _apply_codex_auto_agent_alibaba_token_plan_account_cooldown(
     return cooldown_seconds, cooldown_state_source, skip_reason
 
 
+async def _apply_codex_auto_agent_zai_coding_plan_account_cooldown(
+    *,
+    candidate: dict[str, Any],
+    cooldown_seconds: float,
+    cooldown_state_source: Optional[str],
+    skip_reason: Optional[str],
+    get_active_cooldown_state: Callable[[str], Awaitable[tuple[float, str]]],
+) -> tuple[float, Optional[str], Optional[str]]:
+    """Suppress every Z.AI Coding Plan candidate during shared account cooling."""
+    if candidate.get("provider") != _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER:
+        return cooldown_seconds, cooldown_state_source, skip_reason
+    account_seconds, account_source = await get_active_cooldown_state(
+        _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+    )
+    if account_seconds > cooldown_seconds:
+        cooldown_seconds = account_seconds
+        cooldown_state_source = f"zai_coding_plan_account:{account_source}"
+    if account_seconds > 0 and skip_reason is None:
+        skip_reason = "account_quota_cooldown"
+    return cooldown_seconds, cooldown_state_source, skip_reason
+
+
 def _alibaba_token_plan_quota_observation_from_row(
     row: Any,
     *,
@@ -1210,9 +1249,12 @@ def _alibaba_token_plan_quota_observation_from_row(
     }
 
 
-def _alibaba_token_plan_quota_row_account_hash(
+def _shared_account_quota_row_account_hash(
     row: Any,
     *,
+    provider: str,
+    client: str,
+    source: str,
     expected_environment: str,
 ) -> Optional[str]:
     """Retain exact row identity even when its telemetry is unusable."""
@@ -1223,18 +1265,41 @@ def _alibaba_token_plan_quota_row_account_hash(
     account_hash = str(values.get("account_hash") or "").strip()
     if (
         str(values.get("environment") or "").strip() != expected_environment
-        or values.get("provider")
-        != _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER
-        or values.get("client") != _ALIBABA_TOKEN_PLAN_QUOTA_CLIENT
-        or values.get("source") != _ALIBABA_TOKEN_PLAN_QUOTA_SOURCE
+        or values.get("provider") != provider
+        or values.get("client") != client
+        or values.get("source") != source
         or not account_hash
     ):
         return None
     return account_hash
 
 
-async def _hydrate_alibaba_token_plan_quota_observations() -> None:
-    """Hydrate exact-identity Alibaba rows for the configured environment."""
+def _alibaba_token_plan_quota_row_account_hash(
+    row: Any,
+    *,
+    expected_environment: str,
+) -> Optional[str]:
+    return _shared_account_quota_row_account_hash(
+        row,
+        provider=_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        client=_ALIBABA_TOKEN_PLAN_QUOTA_CLIENT,
+        source=_ALIBABA_TOKEN_PLAN_QUOTA_SOURCE,
+        expected_environment=expected_environment,
+    )
+
+
+async def _hydrate_shared_account_quota_observations(
+    *,
+    provider: str,
+    client: str,
+    source: str,
+    hydration_slot: str,
+    observation_from_row: Callable[..., Optional[dict[str, Any]]],
+    label: str,
+    state_manager: Optional[Any] = None,
+) -> None:
+    """Hydrate one shared-account source through the common durable query."""
+    state_manager = state_manager or alias_routing_state
     if (
         _get_codex_quota_observation_pool is None
         or _get_codex_quota_observation_environment is None
@@ -1246,58 +1311,52 @@ async def _hydrate_alibaba_token_plan_quota_observations() -> None:
         ).strip()
     except Exception as exc:
         verbose_proxy_logger.debug(
-            "Alibaba Token Plan quota environment resolution failed closed "
-            "(error_class=%s)",
+            "%s quota environment resolution failed closed (error_class=%s)",
+            label,
             exc.__class__.__name__,
         )
         return
-    if not environment:
+    slot = str(hydration_slot or "").strip()
+    if not environment or not slot:
         return
-    account_hash = "alibaba_token_plan"
-    due_account_hashes = (
-        alias_routing_state.codex_quota_hydration_due_account_hashes(
-            (account_hash,),
+    due_slots = state_manager.codex_quota_hydration_due_account_hashes(
+        (slot,),
+        environment=environment,
+    )
+    if not due_slots:
+        return
+    async with state_manager.codex_quota_hydration_lock:
+        due_slots = state_manager.codex_quota_hydration_due_account_hashes(
+            (slot,),
             environment=environment,
         )
-    )
-    if not due_account_hashes:
-        return
-    async with alias_routing_state.codex_quota_hydration_lock:
-        due_account_hashes = (
-            alias_routing_state.codex_quota_hydration_due_account_hashes(
-                (account_hash,),
-                environment=environment,
-            )
-        )
-        if not due_account_hashes:
+        if not due_slots:
             return
         try:
 
             async def _fetch_rows() -> Any:
                 pool = await _get_codex_quota_observation_pool()
                 return await pool.fetch(
-                    _ALIBABA_TOKEN_PLAN_QUOTA_CURRENT_ROWS_SQL,
-                    _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
-                    _ALIBABA_TOKEN_PLAN_QUOTA_CLIENT,
-                    _ALIBABA_TOKEN_PLAN_QUOTA_SOURCE,
+                    _SHARED_ACCOUNT_QUOTA_CURRENT_ROWS_SQL,
+                    provider,
+                    client,
+                    source,
                     environment,
                 )
 
             rows = await asyncio.wait_for(
                 _fetch_rows(),
-                timeout=_ALIBABA_TOKEN_PLAN_QUOTA_LOOKUP_TIMEOUT_SECONDS,
+                timeout=_SHARED_ACCOUNT_QUOTA_LOOKUP_TIMEOUT_SECONDS,
             )
         except Exception as exc:
-            alias_routing_state.defer_codex_quota_hydration(
-                due_account_hashes,
+            state_manager.defer_codex_quota_hydration(
+                due_slots,
                 environment=environment,
-                ttl_seconds=(
-                    _ALIBABA_TOKEN_PLAN_QUOTA_FAILURE_RETRY_SECONDS
-                ),
+                ttl_seconds=_SHARED_ACCOUNT_QUOTA_FAILURE_RETRY_SECONDS,
             )
             verbose_proxy_logger.debug(
-                "Alibaba Token Plan quota hydration failed closed "
-                "(error_class=%s)",
+                "%s quota hydration failed closed (error_class=%s)",
+                label,
                 exc.__class__.__name__,
             )
             return
@@ -1305,8 +1364,7 @@ async def _hydrate_alibaba_token_plan_quota_observations() -> None:
             observation
             for row in rows
             if (
-                observation
-                := _alibaba_token_plan_quota_observation_from_row(
+                observation := observation_from_row(
                     row,
                     expected_environment=environment,
                 )
@@ -1316,9 +1374,11 @@ async def _hydrate_alibaba_token_plan_quota_observations() -> None:
             row_account_hash
             for row in rows
             if (
-                row_account_hash
-                := _alibaba_token_plan_quota_row_account_hash(
+                row_account_hash := _shared_account_quota_row_account_hash(
                     row,
+                    provider=provider,
+                    client=client,
+                    source=source,
                     expected_environment=environment,
                 )
             )
@@ -1328,21 +1388,30 @@ async def _hydrate_alibaba_token_plan_quota_observations() -> None:
             for observation in observations
         )
         replacement_account_hashes.discard("")
-        alias_routing_state.replace_normalized_quota_observations(
-            observations,
-            provider=_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
-            source=_ALIBABA_TOKEN_PLAN_QUOTA_SOURCE,
-            account_hashes=(
-                replacement_account_hashes
-                if replacement_account_hashes
-                else (account_hash,)
-            ),
-        )
-        alias_routing_state.defer_codex_quota_hydration(
-            due_account_hashes,
+        if replacement_account_hashes:
+            state_manager.replace_normalized_quota_observations(
+                observations,
+                provider=provider,
+                source=source,
+                account_hashes=tuple(sorted(replacement_account_hashes)),
+            )
+        state_manager.defer_codex_quota_hydration(
+            due_slots,
             environment=environment,
-            ttl_seconds=_ALIBABA_TOKEN_PLAN_QUOTA_CACHE_TTL_SECONDS,
+            ttl_seconds=_SHARED_ACCOUNT_QUOTA_CACHE_TTL_SECONDS,
         )
+
+
+async def _hydrate_alibaba_token_plan_quota_observations() -> None:
+    """Hydrate exact-identity Alibaba rows for the configured environment."""
+    await _hydrate_shared_account_quota_observations(
+        provider=_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
+        client=_ALIBABA_TOKEN_PLAN_QUOTA_CLIENT,
+        source=_ALIBABA_TOKEN_PLAN_QUOTA_SOURCE,
+        hydration_slot=_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
+        observation_from_row=_alibaba_token_plan_quota_observation_from_row,
+        label="Alibaba Token Plan",
+    )
 
 
 def _alibaba_token_plan_quota_evidence(
@@ -1510,6 +1579,401 @@ async def _clear_alibaba_token_plan_account_quota_cooldown(
         canonical_aliases=[_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY],
         cooldown_keys=[
             _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        ],
+        delete_durable=delete_durable,
+    )
+    return bool(result)
+
+
+def _zai_coding_plan_quota_observation_from_row(
+    row: Any,
+    *,
+    expected_environment: str,
+    now_epoch: Optional[float] = None,
+) -> Optional[dict[str, Any]]:
+    """Normalize one already-ingested Z.AI observation row.
+
+    Durable observation loading belongs to the existing observation ingestion
+    path. This parser is deliberately provider-bound and fail-closed so the
+    normalized cache cannot accept evidence from another lane or identity
+    source.
+    """
+    try:
+        values = dict(row)
+    except Exception:
+        return None
+    environment = str(values.get("environment") or "").strip()
+    if not environment or environment != expected_environment:
+        return None
+    evidence = _codex_oauth_quota_json_mapping(values.get("evidence"))
+    evidence_environment = str(evidence.get("environment") or "").strip()
+    account_hash = str(values.get("account_hash") or "").strip()
+    if (
+        evidence_environment != expected_environment
+        or values.get("provider") != _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER
+        or values.get("client") != _ZAI_CODING_PLAN_QUOTA_CLIENT
+        or values.get("source") != _ZAI_CODING_PLAN_QUOTA_SOURCE
+        or evidence.get("account_hash") != account_hash
+        or evidence.get("customerId_sha256") != account_hash
+        or evidence.get("account_identity_source")
+        != _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE
+        or evidence.get("telemetry_status") != "valid"
+        or evidence.get("fresh") is not True
+        or evidence.get("complete") is not True
+        or evidence.get("health_status") != "healthy"
+        or not account_hash
+    ):
+        return None
+    row_window = str(values.get("quota_period") or "").strip()
+    evidence_window = str(evidence.get("window") or "").strip()
+    evidence_period = str(evidence.get("quota_period") or "").strip()
+    if (
+        not evidence_window
+        or evidence_window != row_window
+        or (evidence_period and evidence_period != row_window)
+        or row_window not in _ZAI_CODING_PLAN_QUOTA_WINDOWS
+    ):
+        return None
+    quota_type = str(values.get("quota_type") or "").strip().lower()
+    if (
+        quota_type not in _ZAI_CODING_PLAN_QUOTA_TYPES
+        or values.get("quota_key")
+        != f"zai_coding_plan_{row_window}:{quota_type}"
+    ):
+        return None
+    observed_at = alias_routing_state._quota_observation_timestamp(
+        values.get("observed_at")
+    )
+    expected_reset_at = alias_routing_state._quota_observation_timestamp(
+        values.get("expected_reset_at")
+    )
+    remaining_pct = values.get("remaining_pct")
+    if (
+        observed_at is None
+        or isinstance(remaining_pct, bool)
+        or not isinstance(remaining_pct, (int, float))
+        or not math.isfinite(float(remaining_pct))
+        or not 0.0 <= float(remaining_pct) <= 100.0
+    ):
+        return None
+    now = time.time() if now_epoch is None else float(now_epoch)
+    if now < observed_at or now - observed_at > _ZAI_CODING_PLAN_QUOTA_MAX_AGE_SECONDS:
+        return None
+    if expected_reset_at is not None and expected_reset_at <= now:
+        return None
+    return {
+        "provider": _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
+        "client": _ZAI_CODING_PLAN_QUOTA_CLIENT,
+        "model": values.get("model"),
+        "account_hash": account_hash,
+        "environment": environment,
+        "quota_key": values.get("quota_key"),
+        "quota_period": row_window,
+        "quota_type": quota_type,
+        "remaining_pct": float(remaining_pct),
+        "observed_at": observed_at,
+        "expected_reset_at": expected_reset_at,
+        "status": "fresh",
+        "exhausted": float(remaining_pct) <= 0.0,
+        "source": _ZAI_CODING_PLAN_QUOTA_SOURCE,
+        "evidence": evidence,
+    }
+
+
+async def _hydrate_zai_coding_plan_quota_observations(
+    *,
+    state_manager: Optional[Any] = None,
+) -> None:
+    """Hydrate Z.AI rows through the shared-account durable query."""
+    await _hydrate_shared_account_quota_observations(
+        provider=_CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
+        client=_ZAI_CODING_PLAN_QUOTA_CLIENT,
+        source=_ZAI_CODING_PLAN_QUOTA_SOURCE,
+        hydration_slot=_CODEX_AUTO_AGENT_ZAI_CODING_PLAN_LANE_KEY,
+        observation_from_row=_zai_coding_plan_quota_observation_from_row,
+        label="Z.AI Coding Plan",
+        state_manager=state_manager,
+    )
+
+
+def _zai_coding_plan_quota_evidence(
+    *,
+    state_manager: Optional[Any] = None,
+    now_epoch: Optional[float] = None,
+) -> tuple[Optional[dict[str, Any]], list[dict[str, Any]]]:
+    """Resolve one complete, fresh, healthy, single-account cache view."""
+    state_manager = state_manager or alias_routing_state
+    if _get_codex_quota_observation_environment is None:
+        return None, []
+    try:
+        configured_environment = str(
+            _get_codex_quota_observation_environment() or ""
+        ).strip()
+    except Exception:
+        return None, []
+    if not configured_environment:
+        return None, []
+    now = time.time() if now_epoch is None else float(now_epoch)
+    with state_manager._normalized_quota_observations_lock:
+        cached = [
+            dict(observation)
+            for key, observation in state_manager._normalized_quota_observations.items()
+            if (
+                key[0] == _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER
+                and key[4] == configured_environment
+                and observation.get("source") == _ZAI_CODING_PLAN_QUOTA_SOURCE
+            )
+        ]
+    usable: list[dict[str, Any]] = []
+    for observation in cached:
+        observed_at = state_manager._quota_observation_timestamp(
+            observation.get("observed_at")
+        )
+        period = str(observation.get("quota_period") or "").strip()
+        quota_type = str(observation.get("quota_type") or "").strip().lower()
+        account_hash = str(observation.get("account_hash") or "").strip()
+        quota_key = str(observation.get("quota_key") or "").strip()
+        remaining_pct = observation.get("remaining_pct")
+        evidence = _codex_oauth_quota_json_mapping(
+            observation.get("evidence")
+        )
+        evidence_environment = str(
+            evidence.get("environment") or ""
+        ).strip()
+        if (
+            observed_at is None
+            or now < observed_at
+            or now - observed_at > _ZAI_CODING_PLAN_QUOTA_MAX_AGE_SECONDS
+            or period not in _ZAI_CODING_PLAN_QUOTA_WINDOWS
+            or quota_type not in _ZAI_CODING_PLAN_QUOTA_TYPES
+            or quota_key != f"zai_coding_plan_{period}:{quota_type}"
+            or not account_hash
+            or observation.get("client") != _ZAI_CODING_PLAN_QUOTA_CLIENT
+            or str(observation.get("environment") or "").strip()
+            != configured_environment
+            or evidence_environment != configured_environment
+            or evidence.get("account_hash") != account_hash
+            or evidence.get("customerId_sha256") != account_hash
+            or evidence.get("account_identity_source")
+            != _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE
+            or evidence.get("telemetry_status") != "valid"
+            or evidence.get("fresh") is not True
+            or evidence.get("complete") is not True
+            or evidence.get("health_status") != "healthy"
+            or observation.get("status") != "fresh"
+            or observation.get("exhausted") not in {True, False}
+            or isinstance(remaining_pct, bool)
+            or not isinstance(remaining_pct, (int, float))
+            or not math.isfinite(float(remaining_pct))
+            or not 0.0 <= float(remaining_pct) <= 100.0
+            or observation.get("exhausted") is not (float(remaining_pct) <= 0.0)
+        ):
+            continue
+        reset_at = state_manager._quota_observation_timestamp(
+            observation.get("expected_reset_at")
+        )
+        if reset_at is not None and reset_at <= now:
+            continue
+        usable.append(
+            {
+                **observation,
+                "provider": _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
+                "client": _ZAI_CODING_PLAN_QUOTA_CLIENT,
+                "account_hash": account_hash,
+                "environment": configured_environment,
+                "quota_period": period,
+                "quota_type": quota_type,
+                "observed_at": observed_at,
+                "expected_reset_at": reset_at,
+                "remaining_pct": float(remaining_pct),
+                "source": _ZAI_CODING_PLAN_QUOTA_SOURCE,
+            }
+        )
+    account_hashes = {
+        str(observation["account_hash"]).strip() for observation in usable
+    }
+    if not usable or len(account_hashes) != 1:
+        return None, []
+    by_window: dict[str, list[dict[str, Any]]] = {}
+    for observation in usable:
+        by_window.setdefault(observation["quota_period"], []).append(observation)
+    if set(by_window) != set(_ZAI_CODING_PLAN_QUOTA_WINDOWS) or any(
+        len(window_observations) != 1
+        for window_observations in by_window.values()
+    ):
+        return None, []
+    windows = [by_window[period][0] for period in sorted(by_window)]
+    exhausted = [
+        window for window in windows if window.get("exhausted") is True
+    ]
+    if exhausted:
+        return None, exhausted
+    evidence = {
+        "provider": _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
+        "client": _ZAI_CODING_PLAN_QUOTA_CLIENT,
+        "source": _ZAI_CODING_PLAN_QUOTA_SOURCE,
+        "account_hash": next(iter(account_hashes)),
+        "customerId_sha256": next(iter(account_hashes)),
+        "account_identity_source": (
+            _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE
+        ),
+        "environment": configured_environment,
+        "telemetry_status": "valid",
+        "fresh": True,
+        "complete": True,
+        "health_status": "healthy",
+        "observation_age_seconds": max(
+            0.0,
+            now - max(window["observed_at"] for window in windows),
+        ),
+        "windows": windows,
+    }
+    return evidence, windows
+
+
+def _attach_zai_coding_plan_quota_state(
+    state: dict[str, Any],
+    *,
+    state_manager: Optional[Any] = None,
+    now_epoch: Optional[float] = None,
+) -> dict[str, Any]:
+    candidate = state.get("candidate")
+    if not isinstance(candidate, dict):
+        return state
+    if (
+        candidate.get("provider") != _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER
+        or state.get("skip_reason") is not None
+    ):
+        return state
+    observation, windows = _zai_coding_plan_quota_evidence(
+        state_manager=state_manager,
+        now_epoch=now_epoch,
+    )
+    if observation is None:
+        if windows:
+            state["quota_windows"] = windows
+            state["quota_exhausted_windows"] = windows
+            state["skip_reason"] = "quota_exhausted"
+            state["cooldown_state_source"] = "normalized_quota_observation"
+        return state
+    state["zai_coding_plan_quota_observation"] = observation
+    state["quota_windows"] = windows
+    state["quota_snapshot_age_seconds"] = round(
+        float(observation["observation_age_seconds"]),
+        3,
+    )
+    state["quota_remaining_pct"] = min(
+        float(window["remaining_pct"]) for window in windows
+    )
+    return state
+
+
+async def _clear_zai_coding_plan_account_quota_cooldown(
+    evidence: Mapping[str, Any],
+    *,
+    delete_durable: bool = True,
+) -> bool:
+    if (
+        evidence.get("provider") != _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER
+        or evidence.get("client") != _ZAI_CODING_PLAN_QUOTA_CLIENT
+        or evidence.get("source") != _ZAI_CODING_PLAN_QUOTA_SOURCE
+        or evidence.get("customerId_sha256") != evidence.get("account_hash")
+        or evidence.get("account_identity_source")
+        != _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE
+        or evidence.get("telemetry_status") != "valid"
+        or evidence.get("fresh") is not True
+        or evidence.get("complete") is not True
+        or evidence.get("health_status") != "healthy"
+    ):
+        return False
+    windows = evidence.get("windows")
+    account_hash = str(evidence.get("account_hash") or "").strip()
+    environment = str(evidence.get("environment") or "").strip()
+    if (
+        not isinstance(windows, list)
+        or len(windows) != len(_ZAI_CODING_PLAN_QUOTA_WINDOWS)
+        or not account_hash
+        or not environment
+        or _get_codex_quota_observation_environment is None
+    ):
+        return False
+    try:
+        configured_environment = str(
+            _get_codex_quota_observation_environment() or ""
+        ).strip()
+    except Exception:
+        return False
+    if not configured_environment or environment != configured_environment:
+        return False
+    now = time.time()
+    seen_windows: set[str] = set()
+    for window in windows:
+        if not isinstance(window, Mapping):
+            return False
+        window_evidence = _codex_oauth_quota_json_mapping(
+            window.get("evidence")
+        )
+        period = str(window.get("quota_period") or "").strip()
+        quota_type = str(window.get("quota_type") or "").strip().lower()
+        remaining_pct = window.get("remaining_pct")
+        reset_at = window.get("expected_reset_at")
+        observed_at = alias_routing_state._quota_observation_timestamp(
+            window.get("observed_at")
+        )
+        if (
+            period not in _ZAI_CODING_PLAN_QUOTA_WINDOWS
+            or period in seen_windows
+            or quota_type not in _ZAI_CODING_PLAN_QUOTA_TYPES
+            or window.get("quota_key")
+            != f"zai_coding_plan_{period}:{quota_type}"
+            or str(window.get("account_hash") or "").strip() != account_hash
+            or str(window.get("environment") or "").strip()
+            != configured_environment
+            or window.get("client", _ZAI_CODING_PLAN_QUOTA_CLIENT)
+            != _ZAI_CODING_PLAN_QUOTA_CLIENT
+            or window.get("source") != _ZAI_CODING_PLAN_QUOTA_SOURCE
+            or window_evidence.get("environment") != configured_environment
+            or window_evidence.get("account_hash") != account_hash
+            or window_evidence.get("customerId_sha256") != account_hash
+            or window_evidence.get("account_identity_source")
+            != _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE
+            or window_evidence.get("telemetry_status") != "valid"
+            or window_evidence.get("fresh") is not True
+            or window_evidence.get("complete") is not True
+            or window_evidence.get("health_status") != "healthy"
+            or window.get("status") != "fresh"
+            or window.get("exhausted") is not False
+            or isinstance(remaining_pct, bool)
+            or not isinstance(remaining_pct, (int, float))
+            or not math.isfinite(float(remaining_pct))
+            or float(remaining_pct) <= 0.0
+            or observed_at is None
+            or now < observed_at
+            or now - observed_at > _ZAI_CODING_PLAN_QUOTA_MAX_AGE_SECONDS
+        ):
+            return False
+        if reset_at is None:
+            if not (period == "5h" and quota_type == "credits"):
+                return False
+        elif (
+            isinstance(reset_at, bool)
+            or not isinstance(reset_at, (int, float))
+            or not math.isfinite(float(reset_at))
+            or float(reset_at) <= now
+        ):
+            return False
+        seen_windows.add(period)
+    if seen_windows != _ZAI_CODING_PLAN_QUOTA_WINDOWS:
+        return False
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.cooldown_state import (
+        clear_alias_family_cooldown_state,
+    )
+
+    result = await clear_alias_family_cooldown_state(
+        alias_family="codex",
+        canonical_aliases=[_CODEX_AUTO_AGENT_ZAI_CODING_PLAN_LANE_KEY],
+        cooldown_keys=[
+            _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
         ],
         delete_durable=delete_durable,
     )
@@ -2279,6 +2743,17 @@ async def _build_codex_auto_agent_candidate_state(  # noqa: PLR0915
         cooldown_seconds,
         cooldown_state_source,
         skip_reason,
+    ) = await _apply_codex_auto_agent_zai_coding_plan_account_cooldown(
+        candidate=candidate,
+        cooldown_seconds=cooldown_seconds,
+        cooldown_state_source=cooldown_state_source,
+        skip_reason=skip_reason,
+        get_active_cooldown_state=_get_codex_active_cooldown_state,
+    )
+    (
+        cooldown_seconds,
+        cooldown_state_source,
+        skip_reason,
         managed_account_cooldown_scope,
     ) = await _apply_kimi_code_managed_account_lane_cooldown(
         candidate=candidate,
@@ -2989,6 +3464,11 @@ async def _build_codex_auto_agent_affinity_candidate_state(
         ) == _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER:
             await _hydrate_alibaba_token_plan_quota_observations()
             return _attach_alibaba_token_plan_quota_state(candidate_state)
+        if candidate_template.get(
+            "provider"
+        ) == _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER:
+            await _hydrate_zai_coding_plan_quota_observations()
+            return _attach_zai_coding_plan_quota_state(candidate_state)
         return _attach_normalized_quota_state(candidate_state)
     contexts = await _resolve_codex_oauth_account_candidate_contexts(
         request,
@@ -3121,6 +3601,12 @@ async def _build_codex_auto_agent_candidate_states(
         for candidate in candidates
     ):
         await _hydrate_alibaba_token_plan_quota_observations()
+    if any(
+        candidate.get("provider")
+        == _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER
+        for candidate in candidates
+    ):
+        await _hydrate_zai_coding_plan_quota_observations()
     for candidate_template in candidates:
         if _candidate_uses_codex_oauth(candidate_template):
             contexts = await _resolve_codex_oauth_account_candidate_contexts(
@@ -3175,6 +3661,10 @@ async def _build_codex_auto_agent_candidate_states(
             candidate_state = _attach_alibaba_token_plan_quota_state(
                 candidate_state
             )
+        elif candidate_template.get(
+            "provider"
+        ) == _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER:
+            candidate_state = _attach_zai_coding_plan_quota_state(candidate_state)
         else:
             candidate_state = _attach_normalized_quota_state(candidate_state)
         states.append(candidate_state)
@@ -4405,6 +4895,15 @@ async def _select_codex_auto_agent_candidate(  # noqa: PLR0915
             await _clear_alibaba_token_plan_account_quota_cooldown(
                 alibaba_evidence
             )
+    if any(
+        candidate.get("provider")
+        == _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER
+        for candidate in candidates
+    ):
+        await _hydrate_zai_coding_plan_quota_observations()
+        zai_evidence, _zai_windows = _zai_coding_plan_quota_evidence()
+        if zai_evidence is not None:
+            await _clear_zai_coding_plan_account_quota_cooldown(zai_evidence)
     states = await _build_codex_auto_agent_candidate_states(
         request,
         alias_model=alias_model,
@@ -4978,12 +5477,19 @@ _HOST_FUNCTION_NAMES = (
     "_apply_codex_auto_agent_adapter_local_candidate_cooldown",
     "_apply_kimi_code_managed_account_lane_cooldown",
     "_apply_codex_auto_agent_grok_account_lane_cooldown",
+    "_hydrate_shared_account_quota_observations",
     "_apply_codex_auto_agent_alibaba_token_plan_account_cooldown",
+    "_apply_codex_auto_agent_zai_coding_plan_account_cooldown",
     "_alibaba_token_plan_quota_observation_from_row",
     "_hydrate_alibaba_token_plan_quota_observations",
     "_alibaba_token_plan_quota_evidence",
     "_attach_alibaba_token_plan_quota_state",
     "_clear_alibaba_token_plan_account_quota_cooldown",
+    "_zai_coding_plan_quota_observation_from_row",
+    "_hydrate_zai_coding_plan_quota_observations",
+    "_zai_coding_plan_quota_evidence",
+    "_attach_zai_coding_plan_quota_state",
+    "_clear_zai_coding_plan_account_quota_cooldown",
     "_find_codex_auto_agent_candidate",
     "_find_codex_auto_agent_affinity_candidate",
     "_find_anthropic_auto_agent_candidate",
@@ -5129,6 +5635,27 @@ def install(host_globals: dict) -> None:
         "_CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY": (
             _CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY
         ),
+        "_CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER": (
+            _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER
+        ),
+        "_CODEX_AUTO_AGENT_ZAI_CODING_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY": (
+            _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        ),
+        "_CODEX_AUTO_AGENT_ZAI_CODING_PLAN_LANE_KEY": (
+            _CODEX_AUTO_AGENT_ZAI_CODING_PLAN_LANE_KEY
+        ),
+        "_SHARED_ACCOUNT_QUOTA_CACHE_TTL_SECONDS": (
+            _SHARED_ACCOUNT_QUOTA_CACHE_TTL_SECONDS
+        ),
+        "_SHARED_ACCOUNT_QUOTA_FAILURE_RETRY_SECONDS": (
+            _SHARED_ACCOUNT_QUOTA_FAILURE_RETRY_SECONDS
+        ),
+        "_SHARED_ACCOUNT_QUOTA_LOOKUP_TIMEOUT_SECONDS": (
+            _SHARED_ACCOUNT_QUOTA_LOOKUP_TIMEOUT_SECONDS
+        ),
+        "_SHARED_ACCOUNT_QUOTA_CURRENT_ROWS_SQL": (
+            _SHARED_ACCOUNT_QUOTA_CURRENT_ROWS_SQL
+        ),
         "_ALIBABA_TOKEN_PLAN_QUOTA_CACHE_TTL_SECONDS": (
             _ALIBABA_TOKEN_PLAN_QUOTA_CACHE_TTL_SECONDS
         ),
@@ -5150,6 +5677,9 @@ def install(host_globals: dict) -> None:
         "_alibaba_token_plan_quota_row_account_hash": (
             _alibaba_token_plan_quota_row_account_hash
         ),
+        "_shared_account_quota_row_account_hash": (
+            _shared_account_quota_row_account_hash
+        ),
         "_codex_oauth_quota_json_mapping": _codex_oauth_quota_json_mapping,
         "_get_codex_quota_observation_pool": _get_codex_quota_observation_pool,
         "_get_codex_quota_observation_environment": (
@@ -5169,6 +5699,9 @@ def install(host_globals: dict) -> None:
         ),
         "_CODEX_OAUTH_QUOTA_VALIDITY_ENV": _CODEX_OAUTH_QUOTA_VALIDITY_ENV,
         "os": os,
+        "_hydrate_shared_account_quota_observations": (
+            _hydrate_shared_account_quota_observations
+        ),
         "_hydrate_alibaba_token_plan_quota_observations": (
             _hydrate_alibaba_token_plan_quota_observations
         ),
@@ -5181,6 +5714,29 @@ def install(host_globals: dict) -> None:
         ),
         "_clear_alibaba_token_plan_account_quota_cooldown": (
             _clear_alibaba_token_plan_account_quota_cooldown
+        ),
+        "_ZAI_CODING_PLAN_QUOTA_CLIENT": _ZAI_CODING_PLAN_QUOTA_CLIENT,
+        "_ZAI_CODING_PLAN_QUOTA_SOURCE": _ZAI_CODING_PLAN_QUOTA_SOURCE,
+        "_ZAI_CODING_PLAN_QUOTA_TYPES": _ZAI_CODING_PLAN_QUOTA_TYPES,
+        "_ZAI_CODING_PLAN_QUOTA_WINDOWS": _ZAI_CODING_PLAN_QUOTA_WINDOWS,
+        "_ZAI_CODING_PLAN_QUOTA_MAX_AGE_SECONDS": (
+            _ZAI_CODING_PLAN_QUOTA_MAX_AGE_SECONDS
+        ),
+        "_ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE": (
+            _ZAI_CODING_PLAN_QUOTA_ACCOUNT_IDENTITY_SOURCE
+        ),
+        "_zai_coding_plan_quota_observation_from_row": (
+            _zai_coding_plan_quota_observation_from_row
+        ),
+        "_hydrate_zai_coding_plan_quota_observations": (
+            _hydrate_zai_coding_plan_quota_observations
+        ),
+        "_zai_coding_plan_quota_evidence": _zai_coding_plan_quota_evidence,
+        "_attach_zai_coding_plan_quota_state": (
+            _attach_zai_coding_plan_quota_state
+        ),
+        "_clear_zai_coding_plan_account_quota_cooldown": (
+            _clear_zai_coding_plan_account_quota_cooldown
         ),
         "_is_kimi_code_candidate": _is_kimi_code_candidate,
         "_get_kimi_managed_account_cooldown_key": _get_kimi_managed_account_cooldown_key,
