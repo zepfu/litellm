@@ -43,9 +43,10 @@ def configure_cooldown_state_runtime(
     *,
     manager: AliasRoutingStateManager,
 ) -> None:
-    """Bind the process-local alias-routing state manager."""
+    """Bind the process-local alias-routing state manager once."""
     global _manager
-    _manager = manager
+    if _manager is None:
+        _manager = manager
 
 
 def _require_manager() -> AliasRoutingStateManager:
