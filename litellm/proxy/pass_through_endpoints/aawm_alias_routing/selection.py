@@ -2952,6 +2952,55 @@ def _codex_oauth_window_is_weekly(window: Mapping[str, Any]) -> bool:
     return period == "seven_day" or window_minutes == 10080
 
 
+def _codex_oauth_dual_family_remaining(
+    state: Mapping[str, Any],
+) -> dict[str, Optional[float]]:
+    remaining_by_family: dict[str, Optional[float]] = {
+        _CODEX_OAUTH_QUOTA_FAMILY_OVERALL: None,
+        _CODEX_OAUTH_QUOTA_FAMILY_SPARK: None,
+    }
+    candidate = state.get("candidate")
+    if not isinstance(candidate, Mapping):
+        return remaining_by_family
+    account_hash = str(
+        candidate.get("codex_oauth_account_hash") or ""
+    ).strip()
+    if not account_hash:
+        return remaining_by_family
+
+    windows = alias_routing_state.resolve_normalized_quota_windows_for_account(
+        provider=str(candidate.get("provider") or ""),
+        account_hash=account_hash,
+        max_age_seconds=_codex_oauth_quota_validity_horizon_seconds(),
+    )
+    expected_environment = _codex_oauth_expected_quota_environment()
+    for family in (
+        _CODEX_OAUTH_QUOTA_FAMILY_OVERALL,
+        _CODEX_OAUTH_QUOTA_FAMILY_SPARK,
+    ):
+        weekly_values: list[float] = []
+        for window in _filter_codex_oauth_quota_windows_for_family(
+            windows,
+            family=family,
+        ):
+            if not _codex_oauth_window_matches_environment(
+                window,
+                expected_environment=expected_environment,
+            ):
+                continue
+            status = str(window.get("status") or "").strip().lower()
+            if status and status != "fresh":
+                continue
+            if not _codex_oauth_window_is_weekly(window):
+                continue
+            remaining = _codex_oauth_window_remaining_pct(window)
+            if remaining is not None:
+                weekly_values.append(remaining)
+        if weekly_values:
+            remaining_by_family[family] = min(weekly_values)
+    return remaining_by_family
+
+
 def _select_first_available_codex_oauth_account_state(
     states: Sequence[dict[str, Any]],
 ) -> Optional[dict[str, Any]]:
@@ -5519,6 +5568,7 @@ _HOST_FUNCTION_NAMES = (
     "_filter_codex_oauth_quota_windows_for_family",
     "_codex_oauth_window_remaining_pct",
     "_codex_oauth_window_is_weekly",
+    "_codex_oauth_dual_family_remaining",
     "_select_first_available_codex_oauth_account_state",
     "_apply_codex_oauth_account_context_to_state",
     "_build_codex_auto_agent_affinity_candidate_state",
