@@ -1946,7 +1946,7 @@ async def test_candidate_loop_ineligible_falls_through_without_request_local_sta
 
 
 @pytest.mark.asyncio
-async def test_candidate_loop_preserves_cursor_ineligible_terminal_contract(
+async def test_candidate_loop_fresh_cursor_ineligible_does_not_consume_attempt_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from litellm.llms.cursor_agent.connect import CursorConnectProtocolError
@@ -1954,33 +1954,60 @@ async def test_candidate_loop_preserves_cursor_ineligible_terminal_contract(
         codex_candidate_calls,
     )
 
-    request = SimpleNamespace(state=SimpleNamespace())
-    candidate = {
+    cursor_candidate = {
         "provider": "cursor_agent",
         "model": "cursor_agent/cursor-grok-4.6-high",
         "route_family": "codex_cursor_agent_aiserver_adapter",
     }
-    selection = {
-        "candidate": candidate,
-        "lane_key": "cursor_agent_cli",
-        "cooldown_key": "cursor_agent:cursor-grok-4.6-high",
-        "selection_reason": "first_available",
-        "skipped": [],
+    xai_candidate = {
+        "provider": "xai",
+        "model": "xai/grok-4.6",
+        "route_family": "codex_responses",
     }
+    selections = [
+        {
+            "candidate": cursor_candidate,
+            "lane_key": "cursor_agent_cli",
+            "cooldown_key": "cursor_agent:cursor-grok-4.6-high",
+            "selection_reason": "first_available",
+            "skipped": [],
+        },
+        {
+            "candidate": xai_candidate,
+            "lane_key": "xai",
+            "cooldown_key": "xai:xai/grok-4.6",
+            "selection_reason": "next_available",
+            "skipped": [],
+        },
+    ]
+    request = SimpleNamespace(state=SimpleNamespace())
+    selection_calls: list[dict[str, Any]] = []
+    provider_calls: list[str] = []
+    failure_records: list[dict[str, Any]] = []
     with pytest.raises(ProxyException) as mapped_exc_info:
         codex_candidate_calls._raise_cursor_agent_alias_error(
             exc=CursorConnectProtocolError(
                 "Cursor Agent requested unsupported local exec operation field 4."
             ),
-            candidate=candidate,
+            candidate=cursor_candidate,
         )
     mapped_exc = mapped_exc_info.value
 
-    async def _select(**_kwargs: Any) -> dict[str, Any]:
-        return selection
+    async def _select(**kwargs: Any) -> dict[str, Any]:
+        selection_calls.append(kwargs)
+        if not selections:
+            raise AssertionError("candidate loop selected more than two candidates")
+        return selections.pop(0)
 
-    async def _perform(**_kwargs: Any) -> object:
-        raise mapped_exc
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        provider_calls.append(candidate["provider"])
+        if candidate["provider"] == "cursor_agent":
+            raise mapped_exc
+        return {"candidate": candidate["model"], "body": candidate_body}
 
     async def _no_active_cooldown(_key: str) -> tuple[float, str]:
         return 0.0, "memory"
@@ -2014,8 +2041,6 @@ async def test_candidate_loop_preserves_cursor_ineligible_terminal_contract(
         async def release_provider_lane_admission(self, _lease: object) -> None:
             return None
 
-    failure_records: list[dict[str, Any]] = []
-    terminal_events: list[dict[str, Any]] = []
     monkeypatch.setattr(candidate_loop, "alias_routing_state", AliasRoutingStateManager())
     monkeypatch.setattr(
         candidate_loop,
@@ -2033,11 +2058,18 @@ async def test_candidate_loop_preserves_cursor_ineligible_terminal_contract(
         "_record_auto_agent_alias_attempt_failure",
         lambda **kwargs: failure_records.append(kwargs),
     )
-    monkeypatch.setattr(
-        lpe,
-        "_emit_auto_agent_alias_no_candidate_event",
-        lambda **kwargs: terminal_events.append(kwargs),
-    )
+    def _fail_noop(_name: str):
+        def _noop(*_args: Any, **_kwargs: Any):
+            raise AssertionError(f"{_name} must not run")
+
+        return _noop
+
+    for name in (
+        "_record_codex_failure_evidence",
+        "_exclude_codex_auto_agent_request_local_candidate_without_cooldown",
+        "_apply_request_local_cooldown_from_plan",
+    ):
+        monkeypatch.setattr(lpe, name, _fail_noop(name))
     monkeypatch.setattr(
         lpe,
         "_plan_codex_oauth_account_failover",
@@ -2055,42 +2087,36 @@ async def test_candidate_loop_preserves_cursor_ineligible_terminal_contract(
         raise_redispatch_fn=None,
     )
 
-    with pytest.raises(HTTPException) as caught:
-        await candidate_loop.handle_alias_route(
-            services,
-            alias_family="codex_auto_agent",
-            alias_model="work",
-            request=request,
-            prepared_request_body={"model": "work", "input": "dispatch basic"},
-            max_candidate_attempts=1,
-            get_active_cooldown_state_fn=_no_active_cooldown,
-            attempts_metadata_key="codex_auto_agent_attempts",
-            skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
-            no_candidate_detail="no candidates",
-            log_label="Codex",
-        )
-
-    terminal_exc = caught.value
-    assert terminal_exc.status_code == 400
-    assert terminal_exc.detail is mapped_exc.detail
-    assert mapped_exc.type == "invalid_request_error"
-    assert (
-        terminal_exc.detail["error"]["code"]
-        == "aawm_codex_auto_agent_candidate_ineligible"
+    response = await candidate_loop.handle_alias_route(
+        services,
+        alias_family="codex_auto_agent",
+        alias_model="work",
+        request=request,
+        prepared_request_body={"model": "work", "input": "dispatch basic"},
+        max_candidate_attempts=1,
+        get_active_cooldown_state_fn=_no_active_cooldown,
+        attempts_metadata_key="codex_auto_agent_attempts",
+        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+        no_candidate_detail="no candidates",
+        log_label="Codex",
     )
-    assert terminal_exc.candidate_status == "ineligible"
-    assert terminal_exc.ineligibility_reason == "unsupported"
-    assert terminal_exc.failure_phase == "candidate_preflight"
-    assert terminal_exc.attempted_provider_call is True
+
+    assert response == {
+        "candidate": xai_candidate["model"],
+        "body": {"model": "work", "input": "dispatch basic"},
+    }
+    assert provider_calls == ["cursor_agent", "xai"]
+    assert selection_calls[0]["excluded_candidate_keys"] == frozenset()
+    assert selection_calls[1]["excluded_candidate_keys"] == frozenset(
+        {"cursor_agent:cursor-grok-4.6-high"}
+    )
+    assert mapped_exc.type == "invalid_request_error"
+    assert mapped_exc.attempted_provider_call is True
     assert len(failure_records) == 1
     assert failure_records[0]["attempt_record"]["error_class"] == (
         "candidate_deterministically_ineligible"
     )
-    assert len(terminal_events) == 1
-    assert terminal_events[0]["exc"].status_code == 400
-    assert terminal_events[0]["exc"].detail["error"]["code"] == (
-        "aawm_codex_auto_agent_candidate_ineligible"
-    )
+    assert failure_records[0]["attempt_record"]["attempted_provider_call"] is True
 
 
 @pytest.mark.asyncio
@@ -2603,7 +2629,12 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
         "selection_reason": "first_available",
         "skipped": [],
     }
-    body = {"model": "work", "input": "run command", "stream": False}
+    body = {
+        "model": "work",
+        "previous_response_id": "cursor-unretained",
+        "input": "run command",
+        "stream": False,
+    }
     expected_structure = {
         "fields": [
             {

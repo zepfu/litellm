@@ -2026,6 +2026,11 @@ async def handle_alias_route(  # noqa: PLR0915
                     fresh_dispatch
                     or (replay_safety is not None and replay_safety.safe)
                 ):
+                    if fresh_dispatch:
+                        provider_candidate_attempts = max(
+                            0,
+                            provider_candidate_attempts - 1,
+                        )
                     deterministically_ineligible_candidate_keys.add(cooldown_key)
                 last_retryable_exc = failure_exc
                 account_slot = _codex_oauth_candidate_slot(candidate)
