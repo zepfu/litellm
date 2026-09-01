@@ -2612,7 +2612,6 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
             "cohere/north-mini-code-1-0",
             "openrouter/cohere/north-mini-code:free",
             "big-pickle",
-            "alibaba_token_plan/deepseek-v4-flash-0731",
             "zai_coding_plan/glm-5.3-flash",
             "cursor_agent/composer-2.5",
             "gpt-5.6-luna",
@@ -2644,7 +2643,7 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
             ingress="codex",
             client_product_label=claude_product,
         ).candidates
-        assert len(claude_candidates) == 6
+        assert len(claude_candidates) == 5
         assert all(
             candidate["model"] != "gpt-5.6-luna"
             for candidate in claude_candidates
@@ -2660,7 +2659,6 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
             "cohere/north-mini-code-1-0",
             "openrouter/cohere/north-mini-code:free",
             "big-pickle",
-            "alibaba_token_plan/deepseek-v4-flash-0731",
             "zai_coding_plan/glm-5.3-flash",
             "cursor_agent/composer-2.5",
             "gpt-5.6-luna",
@@ -2673,11 +2671,10 @@ async def test_candidate_loop_compiled_basic_failure_matrix_reaches_luna_and_acc
             ("attempted", "candidate_deterministically_ineligible"),
             ("attempted", "provider_terminal_error"),
             ("attempted", "candidate_deterministically_ineligible"),
-            ("attempted", "candidate_deterministically_ineligible"),
             ("attempted", "upstream_timeout"),
             ("attempted", "rate_limited"),
         ]
         assert inventory[-1]["reasoning_effort"] == "low"
-        assert terminal_event["candidate_count"] == len(inventory) == 7
+        assert terminal_event["candidate_count"] == len(inventory) == 6
     finally:
         snapshot_select.set_active_routing_snapshot(previous_snapshot)
