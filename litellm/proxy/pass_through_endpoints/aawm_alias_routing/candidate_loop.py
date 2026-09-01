@@ -868,6 +868,22 @@ async def handle_alias_route(  # noqa: PLR0915
                     request,
                     attempts[-1],
                 )
+            selection_detail = exc.detail if isinstance(exc.detail, dict) else {}
+            selection_error = selection_detail.get("error")
+            selection_error_code = (
+                selection_error.get("code")
+                if isinstance(selection_error, dict)
+                else None
+            )
+            if (
+                exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+                and (
+                    getattr(exc, "redispatch_required", None) is True
+                    or selection_detail.get("redispatch_required") is True
+                )
+                and selection_error_code not in _IN_FLIGHT_REDISPATCH_ERROR_CODES
+            ):
+                raise
             if _emit_validated_redispatch_terminal_event(
                 exc=exc,
                 request=request,
@@ -881,13 +897,6 @@ async def handle_alias_route(  # noqa: PLR0915
             ):
                 raise
             if exc.status_code == 429:
-                selection_detail = exc.detail if isinstance(exc.detail, dict) else {}
-                selection_error = selection_detail.get("error")
-                selection_error_code = (
-                    selection_error.get("code")
-                    if isinstance(selection_error, dict)
-                    else None
-                )
                 if selection_error_code in {
                     "aawm_codex_auto_agent_in_flight_provider_cooling_down",
                     "aawm_anthropic_auto_agent_in_flight_provider_cooling_down",
@@ -1845,7 +1854,10 @@ async def handle_alias_route(  # noqa: PLR0915
                         attempt_record[
                             "candidate_semantic_ineligibility_remaining_seconds"
                         ] = semantic_marker.get("remaining_seconds")
-                if deterministically_ineligible and fresh_dispatch:
+                if deterministically_ineligible and (
+                    fresh_dispatch
+                    or (replay_safety is not None and replay_safety.safe)
+                ):
                     deterministically_ineligible_candidate_keys.add(cooldown_key)
                 last_retryable_exc = failure_exc
                 account_slot = _codex_oauth_candidate_slot(candidate)
