@@ -13198,6 +13198,285 @@ def test_kimi_apply_patch_is_adapted_before_unsupported_hosted_tools_are_removed
     ]
 
 
+@pytest.mark.asyncio
+async def test_openai_passthrough_direct_kimi_k3_adapts_tools_before_hosted_tool_drop():
+    collaboration_names = [
+        "followup_task",
+        "interrupt_agent",
+        "list_agents",
+        "send_message",
+        "spawn_agent",
+        "wait_agent",
+    ]
+    collaboration_namespace = _codex_collaboration_namespace_tool_definition()
+    collaboration_namespace["tools"] = [
+        {
+            "type": "function",
+            "name": name,
+            "parameters": {"type": "object", "properties": {}},
+        }
+        for name in collaboration_names
+    ]
+    request_body = {
+        "model": "kimi_code/k3",
+        "input": [
+            *[
+                {
+                    "type": "function_call",
+                    "call_id": f"call_{name}",
+                    "namespace": "collaboration",
+                    "name": name,
+                    "arguments": "{}",
+                }
+                for name in collaboration_names[:-1]
+            ],
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_wait_agent",
+                "namespace": "collaboration",
+                "name": "wait_agent",
+                "input": '{"timeout_ms":1000}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_wait_agent",
+                "output": "complete",
+            },
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "name": "read_file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            _codex_apply_patch_custom_tool_definition(),
+            {"type": "custom", "name": "exec_command"},
+            collaboration_namespace,
+            {
+                "type": "namespace",
+                "name": "unrelated",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "ignore_me",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            },
+            {"type": "tool_search", "name": "tool_search_tool"},
+            {"type": "web_search", "name": "web_search"},
+            {"type": "image_generation"},
+        ],
+        "tool_choice": {
+            "type": "function",
+            "namespace": "collaboration",
+            "name": "spawn_agent",
+        },
+    }
+    request = _build_codex_auto_agent_request("codex-session-kimi-direct")
+    dispatched_kwargs: dict[str, Any] = {}
+
+    async def capture_dispatch(**kwargs: Any) -> dict[str, Any]:
+        dispatched_kwargs.update(kwargs)
+        return {"ok": True}
+
+    with (
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=request_body),
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_alias_model",
+            return_value=None,
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._request_uses_codex_native_auth",
+            return_value=True,
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_oa_xai_passthrough_request",
+            new=AsyncMock(return_value=(False, None, None)),
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_grok_native_oauth_passthrough_request",
+            new=AsyncMock(return_value=(False, None, {}, {})),
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_request_body_for_passthrough_observability",
+            side_effect=lambda **kwargs: kwargs["request_body"],
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.try_dispatch_codex_request",
+            new=AsyncMock(side_effect=capture_dispatch),
+        ) as mock_dispatch,
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.create_pass_through_route"
+        ) as mock_create_route,
+    ):
+        result = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            base_target_url="https://chatgpt.com/backend-api/codex",
+            api_key=None,
+            custom_llm_provider=litellm.LlmProviders.OPENAI,
+            forward_headers=True,
+        )
+
+    assert result == {"ok": True}
+    mock_dispatch.assert_awaited_once()
+    mock_create_route.assert_not_called()
+    provider_body = dispatched_kwargs["prepared_request_body"]
+    provider_tools = provider_body["tools"]
+    assert [tool["name"] for tool in provider_tools] == [
+        "read_file",
+        "apply_patch",
+        *collaboration_names,
+    ]
+    assert all(tool["type"] == "function" for tool in provider_tools)
+    assert all(tool["name"] != "ignore_me" for tool in provider_tools)
+    assert not any(
+        tool["type"]
+        in {"custom", "namespace", "tool_search", "web_search", "image_generation"}
+        for tool in provider_tools
+    )
+
+    continuation_calls = [
+        item
+        for item in provider_body["input"]
+        if item.get("type") == "function_call"
+    ]
+    assert [item["name"] for item in continuation_calls] == collaboration_names
+    assert all("namespace" not in item for item in continuation_calls)
+    assert next(
+        item for item in continuation_calls if item["name"] == "wait_agent"
+    )["arguments"] == '{"timeout_ms":1000}'
+    assert provider_body["input"][-1] == {
+        "type": "function_call_output",
+        "call_id": "call_wait_agent",
+        "output": "complete",
+    }
+    assert provider_body["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "spawn_agent"},
+    }
+
+    metadata = provider_body["litellm_metadata"]
+    assert metadata["codex_namespace_tool_function_adapter_count"] == 6
+    assert set(metadata["codex_namespace_tool_function_adapter_names"]) == set(
+        collaboration_names
+    )
+    assert metadata["codex_namespace_tool_function_adapter_input_item_count"] == 6
+    assert metadata["codex_namespace_tool_function_adapter_tool_choice"] == {
+        "namespace": "collaboration",
+        "name": "spawn_agent",
+    }
+    assert set(metadata["codex_unsupported_hosted_tool_types_removed"]) == {
+        "custom",
+        "image_generation",
+        "namespace",
+        "tool_search",
+        "web_search",
+    }
+    assert request_body["tools"][3]["type"] == "namespace"
+    assert request_body["input"][-2]["type"] == "custom_tool_call"
+
+
+@pytest.mark.asyncio
+async def test_openai_passthrough_alias_path_does_not_pre_adapt_kimi_tools():
+    namespace_tool = _codex_collaboration_namespace_tool_definition()
+    request_body = {
+        "model": "sota-moonshot",
+        "tools": [namespace_tool, {"type": "custom", "name": "apply_patch"}],
+        "tool_choice": {
+            "type": "function",
+            "namespace": "collaboration",
+            "name": "spawn_agent",
+        },
+    }
+    request = _build_codex_auto_agent_request("codex-session-kimi-alias")
+    dispatched_kwargs: dict[str, Any] = {}
+    adapt_custom = MagicMock(side_effect=lambda body: (body, []))
+    adapt_namespace = MagicMock(side_effect=lambda body: (body, []))
+
+    async def capture_dispatch(**kwargs: Any) -> dict[str, Any]:
+        dispatched_kwargs.update(kwargs)
+        return {"ok": True}
+
+    with (
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.get_request_body",
+            new=AsyncMock(return_value=request_body),
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_auto_agent_alias_model",
+            return_value="sota-moonshot",
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._resolve_codex_kimi_chat_completions_adapter_model",
+            return_value="kimi_code/k3",
+        ) as mock_kimi_resolver,
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._adapt_codex_custom_tools_to_functions_from_request_body",
+            new=adapt_custom,
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._adapt_codex_namespace_tools_to_functions_from_request_body",
+            new=adapt_namespace,
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._apply_codex_tool_description_patches_to_request_body",
+            side_effect=lambda body: (body, []),
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._drop_unsupported_codex_hosted_tools_from_request_body",
+            side_effect=lambda body: (body, []),
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_oa_xai_passthrough_request",
+            new=AsyncMock(return_value=(False, None, None)),
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_grok_native_oauth_passthrough_request",
+            new=AsyncMock(return_value=(False, None, {}, {})),
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._prepare_request_body_for_passthrough_observability",
+            side_effect=lambda **kwargs: kwargs["request_body"],
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints._safe_set_request_parsed_body"
+        ),
+        patch(
+            "litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints.try_dispatch_codex_request",
+            new=AsyncMock(side_effect=capture_dispatch),
+        ),
+    ):
+        result = await BaseOpenAIPassThroughHandler._base_openai_pass_through_handler(
+            endpoint="/v1/responses",
+            request=request,
+            fastapi_response=MagicMock(spec=Response),
+            user_api_key_dict=MagicMock(),
+            base_target_url="https://chatgpt.com/backend-api/codex",
+            api_key=None,
+            custom_llm_provider=litellm.LlmProviders.OPENAI,
+            forward_headers=True,
+        )
+
+    assert result == {"ok": True}
+    mock_kimi_resolver.assert_not_called()
+    adapt_custom.assert_not_called()
+    adapt_namespace.assert_not_called()
+    assert dispatched_kwargs["prepared_request_body"]["tools"] == request_body["tools"]
+    assert dispatched_kwargs["prepared_request_body"]["tool_choice"] == request_body[
+        "tool_choice"
+    ]
+
+
 def test_kimi_custom_tool_output_is_normalized_before_unsupported_input_filter():
     request_body = {
         "model": "kimi_code/k3-high",
