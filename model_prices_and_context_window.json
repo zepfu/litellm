@@ -10009,6 +10009,9 @@
     },
     "cohere/north-mini-code-1-0": {
         "comment": "Cohere trial-key route; no verified production list price.",
+        "custom_tool_function_adapters": [
+            "apply_patch"
+        ],
         "litellm_provider": "cohere",
         "max_input_tokens": 256000,
         "max_output_tokens": 64000,
@@ -10050,7 +10053,14 @@
         "supports_native_streaming": true,
         "supports_reasoning": true,
         "supports_response_schema": true,
-        "supports_tool_choice": true
+        "supports_tool_choice": true,
+        "unsupported_hosted_tools": [
+            "custom"
+        ],
+        "unsupported_input_item_types": [
+            "custom_tool_call",
+            "custom_tool_call_output"
+        ]
     },
     "cursor_agent/composer-2.5": {
         "comment": "Cursor Agent CLI Composer 2.5 standard. Distinct from composer-2.5-fast and from xAI grok-composer-2.5-fast. Public Cursor list rates are reference-only; Cursor Models pool / subscription invoice cost is unknown.",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import importlib
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
@@ -24,6 +25,11 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
     adapter_driver,
     candidate_loop,
 )
+from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
+    _adapt_codex_custom_tools_to_functions_from_request_body,
+    _drop_unsupported_codex_hosted_tools_from_request_body,
+    _drop_unsupported_codex_input_items_from_request_body,
+)
 from litellm.proxy.pass_through_endpoints.providers.cohere import runtime as cohere_runtime
 
 
@@ -39,7 +45,7 @@ def _identity_drop(body):
     return body, []
 
 
-def _response_from_payload(payload):
+def _response_from_payload(payload, **_kwargs):
     return Response(
         content=json.dumps(payload),
         media_type="application/json",
@@ -161,13 +167,62 @@ def _request_body(*, stream=False):
     }
 
 
-async def _prepare(cohere, *, stream=False, body=None):
+def _bind_live_codex_tool_policy(cohere):
+    cohere.host.update(
+        {
+            "_adapt_codex_custom_tools_to_functions_from_request_body": (
+                _adapt_codex_custom_tools_to_functions_from_request_body
+            ),
+            "_drop_unsupported_codex_hosted_tools_from_request_body": (
+                _drop_unsupported_codex_hosted_tools_from_request_body
+            ),
+            "_drop_unsupported_codex_input_items_from_request_body": (
+                _drop_unsupported_codex_input_items_from_request_body
+            ),
+        }
+    )
+
+
+def _transform_cohere_request(**kwargs):
+    responses_api_request = kwargs["responses_api_request"]
+    transformed = {
+        "model": kwargs["model"],
+        "messages": [{"role": "user", "content": "translated"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool.get("description", ""),
+                    "parameters": tool["parameters"],
+                    "strict": False,
+                },
+            }
+            for tool in responses_api_request.get("tools", [])
+        ],
+    }
+    tool_choice = responses_api_request.get("tool_choice")
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        transformed["tool_choice"] = {
+            "type": "function",
+            "function": {"name": tool_choice["name"]},
+        }
+    return transformed
+
+
+async def _prepare(
+    cohere,
+    *,
+    stream=False,
+    body=None,
+    adapter_model=" cohere/command-r-plus ",
+):
     return await cohere.host[
         "_prepare_codex_cohere_chat_completions_adapter_route"
     ](
         request=MagicMock(),
         prepared_request_body=body or _request_body(stream=stream),
-        adapter_model=" cohere/command-r-plus ",
+        adapter_model=adapter_model,
         use_alias_candidate_probe=False,
     )
 
@@ -188,6 +243,171 @@ async def _perform(cohere, plan, *, body=None):
         client_requested_stream=plan.client_requested_stream,
         **plan.perform_kwargs,
     )
+
+
+def test_should_declare_direct_cohere_custom_tool_capabilities_in_catalogs():
+    for catalog_path in (
+        "model_prices_and_context_window.json",
+        "litellm/bundled_model_prices_and_context_window_fallback.json",
+    ):
+        catalog = json.loads(Path(catalog_path).read_text(encoding="utf-8"))
+        row = catalog["cohere/north-mini-code-1-0"]
+
+        assert row["custom_tool_function_adapters"] == ["apply_patch"]
+        assert row["unsupported_hosted_tools"] == ["custom"]
+        assert row["unsupported_input_item_types"] == [
+            "custom_tool_call",
+            "custom_tool_call_output",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_should_adapt_direct_cohere_apply_patch_and_preserve_tool_continuation(
+    cohere_host,
+):
+    _bind_live_codex_tool_policy(cohere_host)
+    patch_text = "*** Begin Patch\n*** End Patch"
+    body = {
+        "model": "cohere/north-mini-code-1-0",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Apply this patch"}],
+            },
+            {
+                "type": "custom_tool_call",
+                "id": "ctc_apply_patch",
+                "status": "completed",
+                "call_id": "call_apply_patch",
+                "name": "apply_patch",
+                "input": patch_text,
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_apply_patch",
+                "output": "Exit code: 0",
+            },
+            {
+                "type": "custom_tool_call",
+                "call_id": "call_unsupported",
+                "name": "exec_command",
+                "input": "pwd",
+            },
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_unsupported",
+                "output": "/workspace",
+            },
+        ],
+        "tools": [
+            {
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch to files in the workspace.",
+            },
+            {
+                "type": "custom",
+                "name": "exec_command",
+                "description": "Run a command in the workspace.",
+            },
+        ],
+        "tool_choice": {"type": "custom", "name": "apply_patch"},
+        "stream": False,
+    }
+    original_body = copy.deepcopy(body)
+    cohere_host.transform.transform_responses_api_request_to_chat_completion_request.side_effect = (
+        _transform_cohere_request
+    )
+
+    plan = await _prepare(
+        cohere_host,
+        body=body,
+        adapter_model=" cohere/north-mini-code-1-0 ",
+    )
+
+    assert body == original_body
+    assert plan.prepared_request_body is not body
+    assert plan.prepared_request_body["tools"] == [
+        {
+            "type": "function",
+            "name": "apply_patch",
+            "description": "Apply a patch to files in the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input": {
+                        "type": "string",
+                        "description": (
+                            "Raw input for the client-hosted custom tool. For "
+                            "apply_patch this must be the complete patch text."
+                        ),
+                    }
+                },
+                "required": ["input"],
+                "additionalProperties": False,
+            },
+        }
+    ]
+    assert plan.prepared_request_body["tool_choice"] == {
+        "type": "function",
+        "name": "apply_patch",
+    }
+    assert plan.perform_kwargs["request_input"] == [
+        body["input"][0],
+        {
+            "type": "function_call",
+            "id": "ctc_apply_patch",
+            "status": "completed",
+            "call_id": "call_apply_patch",
+            "name": "apply_patch",
+            "arguments": json.dumps(
+                {"input": patch_text},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_apply_patch",
+            "output": "Exit code: 0",
+        },
+    ]
+    assert plan.perform_kwargs["completion_kwargs"]["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "description": "Apply a patch to files in the workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "type": "string",
+                            "description": (
+                                "Raw input for the client-hosted custom tool. For "
+                                "apply_patch this must be the complete patch text."
+                            ),
+                        }
+                    },
+                    "required": ["input"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+    assert plan.perform_kwargs["completion_kwargs"]["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "apply_patch"},
+    }
+    metadata = plan.prepared_request_body["litellm_metadata"]
+    assert metadata["codex_custom_tool_function_adapter_names"] == ["apply_patch"]
+    assert metadata["codex_unsupported_hosted_tools_removed"] == [
+        {"type": "custom", "index": 1, "name": "exec_command"}
+    ]
+    assert metadata["codex_unsupported_input_items_removed"] == [
+        {"type": "custom_tool_call", "index": 3},
+        {"type": "custom_tool_call_output", "index": 4},
+    ]
 
 
 @pytest.mark.asyncio
