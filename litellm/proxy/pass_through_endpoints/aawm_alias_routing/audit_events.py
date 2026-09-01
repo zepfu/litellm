@@ -179,6 +179,7 @@ def _resolve_auto_agent_alias_terminal_candidates(
     request: Request,
     candidates: Any,
     attempts: Optional[list[dict[str, Any]]],
+    traversal_budget_exhausted: bool = False,
 ) -> list[dict[str, Any]]:
     ingress = "anthropic" if alias_family.startswith("anthropic") else "codex"
     return _build_auto_agent_terminal_candidate_inventory(
@@ -187,6 +188,7 @@ def _resolve_auto_agent_alias_terminal_candidates(
         ingress=ingress,
         attempts=attempts,
         skipped_candidates=candidates if isinstance(candidates, list) else None,
+        traversal_budget_exhausted=traversal_budget_exhausted,
     )
 
 
@@ -345,6 +347,7 @@ def _emit_auto_agent_alias_no_candidate_event(
     request_body: dict[str, Any],
     exc: HTTPException,
     attempts: Optional[list[dict[str, Any]]] = None,
+    traversal_budget_exhausted: bool = False,
 ) -> None:
     assert _get_auto_agent_alias_request_context is not None
     assert _attach_auto_agent_alias_terminal_context_fields is not None
@@ -374,6 +377,7 @@ def _emit_auto_agent_alias_no_candidate_event(
                 if isinstance(attempt, dict)
             ]
         ),
+        traversal_budget_exhausted=traversal_budget_exhausted,
     )
     context = _get_auto_agent_alias_request_context(
         request,

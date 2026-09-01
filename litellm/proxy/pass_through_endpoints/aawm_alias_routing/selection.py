@@ -552,6 +552,7 @@ def _build_auto_agent_terminal_candidate_inventory(
     ingress: str,
     attempts: Optional[list[dict[str, Any]]] = None,
     skipped_candidates: Optional[list[dict[str, Any]]] = None,
+    traversal_budget_exhausted: bool = False,
 ) -> list[dict[str, Any]]:
     """Account for every compiled candidate in one terminal inventory."""
 
@@ -601,6 +602,28 @@ def _build_auto_agent_terminal_candidate_inventory(
     skipped_by_identity = {
         _identity(candidate): candidate for candidate in normalized_skipped
     }
+    skip_metadata_fields = (
+        "account_label",
+        "account_hash",
+        "account_lane",
+        "account_display",
+        "account_priority",
+        "account_weight",
+        "credential_affinity",
+        "selection_strategy",
+        "lane_key",
+        "cooldown_seconds",
+        "cooldown_state_source",
+        "cooldown_scope",
+        "failure_phase",
+        "auth_status",
+        "quota_remaining_pct",
+        "quota_snapshot_age_seconds",
+        "quota_windows",
+        "candidate_semantic_ineligibility_reason",
+        "candidate_semantic_ineligibility_state_source",
+        "candidate_semantic_ineligibility_remaining_seconds",
+    )
 
     inventory: list[dict[str, Any]] = []
     for candidate in compiled_candidates:
@@ -628,12 +651,24 @@ def _build_auto_agent_terminal_candidate_inventory(
             if continue_reason is not None:
                 shaped["reason"] = continue_reason
         elif skipped is not None:
-            shaped.update(skipped)
+            for field in skip_metadata_fields:
+                if field in skipped:
+                    shaped[field] = skipped[field]
             shaped["terminal_disposition"] = "skipped"
-            shaped["reason"] = skipped.get("reason") or "unavailable"
+            shaped["attempted_provider_call"] = False
+            shaped["reason"] = (
+                skipped.get("reason")
+                or skipped.get("skip_reason")
+                or "unavailable"
+            )
         else:
             shaped["terminal_disposition"] = "skipped"
-            shaped["reason"] = "traversal_budget_exhausted"
+            shaped["attempted_provider_call"] = False
+            shaped["reason"] = (
+                "traversal_budget_exhausted"
+                if traversal_budget_exhausted
+                else "not_reached_before_terminal"
+            )
         inventory.append(shaped)
     return inventory
 

@@ -977,6 +977,9 @@ async def handle_alias_route(  # noqa: PLR0915
             request_body=prepared_request_body,
             exc=terminal_exc,
             attempts=attempts,
+            traversal_budget_exhausted=(
+                provider_candidate_attempts >= max_candidate_attempts
+            ),
         )
         raise terminal_exc from None
 

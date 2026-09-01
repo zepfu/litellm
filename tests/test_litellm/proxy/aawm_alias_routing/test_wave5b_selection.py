@@ -318,6 +318,70 @@ class TestSkippedShaping:
         assert skipped[0]["attempted_provider_call"] is False
 
 
+class TestTerminalCandidateInventory:
+    def test_explicit_skip_is_distinct_from_budget_exhaustion(self):
+        request = _make_request()
+        attempted_candidate = _candidate("openai", "gpt-4o")
+        explicit_skip_candidate = _candidate(
+            "cursor_agent",
+            "composer-2.5",
+        )
+        unvisited_candidate = _candidate("openai", "gpt-5.6-luna", last_resort=True)
+        _set_selection_candidates(
+            (
+                attempted_candidate,
+                explicit_skip_candidate,
+                unvisited_candidate,
+            )
+        )
+        explicit_skip = {
+            **explicit_skip_candidate,
+            "skip_reason": "candidate_ineligible",
+            "attempted_provider_call": True,
+            "status": "failed",
+            "error_class": "candidate_deterministically_ineligible",
+            "error_status_code": 409,
+            "error_type": "invalid_request_error",
+            "error_code": "cursor_candidate_ineligible",
+            "source_error": "Cursor continuation cannot be replayed",
+            "cursor_sanitized_proto_structure": {"fields": []},
+        }
+
+        def _build(*, budget_exhausted: bool) -> list[dict[str, Any]]:
+            return selection._build_auto_agent_terminal_candidate_inventory(
+                request=request,
+                alias_model="basic",
+                ingress="codex",
+                skipped_candidates=[explicit_skip],
+                traversal_budget_exhausted=budget_exhausted,
+            )
+
+        before_budget = _build(budget_exhausted=False)
+        explicit_inventory = before_budget[1]
+        assert explicit_inventory["terminal_disposition"] == "skipped"
+        assert explicit_inventory["attempted_provider_call"] is False
+        assert explicit_inventory["reason"] == "candidate_ineligible"
+        assert before_budget[2]["reason"] == "not_reached_before_terminal"
+        assert all(
+            field not in explicit_inventory
+            for field in (
+                "status",
+                "error_class",
+                "error_status_code",
+                "error_type",
+                "error_code",
+                "source_error",
+                "cursor_sanitized_proto_structure",
+            )
+        )
+
+        at_budget = _build(budget_exhausted=True)
+        assert at_budget[1]["reason"] == "candidate_ineligible"
+        assert at_budget[2]["terminal_disposition"] == "skipped"
+        assert at_budget[2]["attempted_provider_call"] is False
+        assert at_budget[2]["reason"] == "traversal_budget_exhausted"
+
+
 # ---------------------------------------------------------------------------
 # Request-local cooldown/exclusion
 # ---------------------------------------------------------------------------
