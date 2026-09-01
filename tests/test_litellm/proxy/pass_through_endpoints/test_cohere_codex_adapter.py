@@ -245,7 +245,7 @@ async def _perform(cohere, plan, *, body=None):
     )
 
 
-def test_should_declare_direct_cohere_custom_tool_capabilities_in_catalogs():
+def test_should_declare_direct_cohere_hosted_tool_capabilities_in_catalogs():
     for catalog_path in (
         "model_prices_and_context_window.json",
         "litellm/bundled_model_prices_and_context_window_fallback.json",
@@ -254,7 +254,7 @@ def test_should_declare_direct_cohere_custom_tool_capabilities_in_catalogs():
         row = catalog["cohere/north-mini-code-1-0"]
 
         assert row["custom_tool_function_adapters"] == ["apply_patch"]
-        assert row["unsupported_hosted_tools"] == ["custom"]
+        assert row["unsupported_hosted_tools"] == ["custom", "tool_search"]
         assert row["unsupported_input_item_types"] == [
             "custom_tool_call",
             "custom_tool_call_output",
@@ -408,6 +408,132 @@ async def test_should_adapt_direct_cohere_apply_patch_and_preserve_tool_continua
         {"type": "custom_tool_call", "index": 3},
         {"type": "custom_tool_call_output", "index": 4},
     ]
+
+
+@pytest.mark.asyncio
+async def test_should_drop_direct_cohere_tool_search_before_completion_transform(
+    cohere_host,
+):
+    _bind_live_codex_tool_policy(cohere_host)
+    body = {
+        "model": "cohere/north-mini-code-1-0",
+        "input": [
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Find and patch it"}],
+            }
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "name": "lookup",
+                "description": "Look up a value",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                },
+            },
+            {
+                "type": "custom",
+                "name": "apply_patch",
+                "description": "Apply a patch to files in the workspace.",
+                "format": {
+                    "type": "grammar",
+                    "syntax": "lark",
+                    "definition": "start: /.+/",
+                },
+            },
+            {"type": "tool_search", "name": "tool_search"},
+        ],
+        "tool_choice": {"type": "tool_search", "name": "tool_search"},
+        "stream": False,
+    }
+    original_body = copy.deepcopy(body)
+    cohere_host.transform.transform_responses_api_request_to_chat_completion_request.side_effect = (
+        _transform_cohere_request
+    )
+
+    plan = await _prepare(
+        cohere_host,
+        body=body,
+        adapter_model=" cohere/north-mini-code-1-0 ",
+    )
+
+    assert body == original_body
+    assert plan.prepared_request_body is not body
+    assert plan.prepared_request_body["tools"] == [
+        body["tools"][0],
+        {
+            "type": "function",
+            "name": "apply_patch",
+            "description": "Apply a patch to files in the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "input": {
+                        "type": "string",
+                        "description": (
+                            "Raw input for the client-hosted custom tool. For "
+                            "apply_patch this must be the complete patch text."
+                        ),
+                    }
+                },
+                "required": ["input"],
+                "additionalProperties": False,
+            },
+        },
+    ]
+    assert "tool_search" not in {tool["type"] for tool in plan.prepared_request_body["tools"]}
+    assert "tool_choice" not in plan.prepared_request_body
+    assert "tool_choice" not in plan.perform_kwargs["responses_api_request"]
+
+    completion_tools = plan.perform_kwargs["completion_kwargs"]["tools"]
+    assert completion_tools == [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look up a value",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "description": "Apply a patch to files in the workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "input": {
+                            "type": "string",
+                            "description": (
+                                "Raw input for the client-hosted custom tool. For "
+                                "apply_patch this must be the complete patch text."
+                            ),
+                        }
+                    },
+                    "required": ["input"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    ]
+    assert all(tool["type"] == "function" for tool in completion_tools)
+    assert "tool_search" not in {tool["function"]["name"] for tool in completion_tools}
+    assert "tool_choice" not in plan.perform_kwargs["completion_kwargs"]
+
+    metadata = plan.prepared_request_body["litellm_metadata"]
+    assert metadata["codex_unsupported_hosted_tools_removed"] == [
+        {"type": "tool_search", "index": 2, "name": "tool_search"}
+    ]
+    assert metadata["codex_unsupported_hosted_tool_choice_removed"] == {
+        "type": "tool_search",
+        "name": "tool_search",
+    }
 
 
 @pytest.mark.asyncio
