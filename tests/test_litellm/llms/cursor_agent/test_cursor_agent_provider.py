@@ -443,6 +443,56 @@ def test_transform_response_rejects_incomplete_text():
         )
 
 
+def test_transform_response_preserves_unknown_exec_structure_in_provider_error():
+    sensitive_command = "provider-sensitive-command"
+    sensitive_workspace = "/provider/sensitive/workspace"
+    nested_payload = (
+        cursor_connect._encode_proto_varint_field(1, 7)
+        + cursor_connect._encode_proto_varint_field(2, 9)
+    )
+    operation_payload = (
+        cursor_connect._encode_proto_string_field(1, sensitive_command)
+        + cursor_connect._encode_proto_message_field(2, nested_payload)
+        + cursor_connect._encode_proto_string_field(3, sensitive_workspace)
+    )
+    exec_request = (
+        cursor_connect._encode_proto_varint_field(1, 4)
+        + cursor_connect._encode_proto_message_field(4, operation_payload)
+        + cursor_connect._encode_proto_string_field(15, "provider-opaque-exec-id")
+    )
+    raw = httpx.Response(
+        200,
+        content=encode_connect_proto_frame(
+            cursor_connect._encode_proto_message_field(2, exec_request)
+        ),
+        headers={"content-type": "application/connect+proto"},
+        request=httpx.Request("POST", run_url()),
+        extensions={"http_version": b"HTTP/2"},
+    )
+
+    with pytest.raises(
+        CursorAgentError,
+        match="unsupported local exec operation field 4",
+    ) as exc_info:
+        CursorAgentConfig().transform_response(
+            model="composer-2.5",
+            raw_response=raw,
+            model_response=ModelResponse(),
+            logging_obj=None,
+            request_data={},
+            messages=[{"role": "user", "content": "hi"}],
+            optional_params={},
+            litellm_params={},
+            encoding=None,
+        )
+
+    assert "protobuf_structure=" in exc_info.value.message
+    assert '"field_number":4' in exc_info.value.message
+    assert sensitive_command not in exc_info.value.message
+    assert sensitive_workspace not in exc_info.value.message
+    assert "provider-opaque-exec-id" not in exc_info.value.message
+
+
 def test_get_llm_provider_resolves_cursor_agent():
     from litellm.litellm_core_utils.get_llm_provider_logic import get_llm_provider
 

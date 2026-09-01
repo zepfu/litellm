@@ -1384,6 +1384,107 @@ def test_proto_bidi_rejects_local_exec_without_advertised_command_tool(
         cursor_connect._process_agent_server_message(server_message, {})
 
 
+def test_proto_bidi_unknown_local_exec_field_attaches_sanitized_structure() -> None:
+    sensitive_command = "sensitive-command"
+    sensitive_workspace = "/sensitive/workspace"
+    nested_payload = _varint(1, 7) + _varint(2, 9)
+    operation_payload = (
+        _string(1, sensitive_command)
+        + _message(2, nested_payload)
+        + _string(3, sensitive_workspace)
+    )
+    exec_request = (
+        _varint(1, 4)
+        + _message(4, operation_payload)
+        + _string(15, "opaque-exec-id")
+    )
+
+    with pytest.raises(
+        CursorConnectProtocolError,
+        match="unsupported local exec operation field 4",
+    ) as exc_info:
+        cursor_connect._process_agent_server_message(_message(2, exec_request), {})
+
+    structure = exc_info.value.body
+    assert isinstance(structure, dict)
+    assert structure["fields"][0] == {
+        "field_number": 1,
+        "wire_type": 0,
+        "payload_length": 1,
+    }
+    field_four = next(
+        field for field in structure["fields"] if field["field_number"] == 4
+    )
+    assert field_four == {
+        "field_number": 4,
+        "wire_type": 2,
+        "payload_length": len(operation_payload),
+        "nested_fields": [
+            {
+                "field_number": 1,
+                "wire_type": 2,
+                "payload_length": len(sensitive_command.encode()),
+            },
+            {
+                "field_number": 2,
+                "wire_type": 2,
+                "payload_length": len(nested_payload),
+                "nested_fields": [
+                    {
+                        "field_number": 1,
+                        "wire_type": 0,
+                        "payload_length": 1,
+                    },
+                    {
+                        "field_number": 2,
+                        "wire_type": 0,
+                        "payload_length": 1,
+                    },
+                ],
+            },
+            {
+                "field_number": 3,
+                "wire_type": 2,
+                "payload_length": len(sensitive_workspace.encode()),
+            },
+        ],
+    }
+    assert structure["fields"][-1] == {
+        "field_number": 15,
+        "wire_type": 2,
+        "payload_length": len("opaque-exec-id"),
+    }
+    serialized_structure = json.dumps(
+        structure,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    assert f"protobuf_structure={serialized_structure}" in exc_info.value.message
+    assert sensitive_command not in serialized_structure
+    assert sensitive_workspace not in serialized_structure
+    assert "opaque-exec-id" not in serialized_structure
+    assert sensitive_command not in exc_info.value.message
+    assert sensitive_workspace not in exc_info.value.message
+    assert "opaque-exec-id" not in exc_info.value.message
+
+
+def test_proto_structure_capture_is_bounded_and_malformed_safe() -> None:
+    payload = b"".join(_message(field_number, b"") for field_number in range(1, 80))
+
+    structure = cursor_connect._capture_proto_structure(payload)
+
+    assert len(structure["fields"]) <= cursor_connect._CURSOR_PROTO_STRUCTURE_MAX_ITEMS
+    assert cursor_connect._capture_proto_structure(b"\x22\x05abc") == {
+        "fields": [
+            {
+                "field_number": 4,
+                "wire_type": 2,
+                "payload_length": 5,
+            }
+        ]
+    }
+
+
 @pytest.mark.parametrize("message_field", [2, 14])
 def test_proto_bidi_rejects_advertised_local_exec_without_command(
     message_field: int,

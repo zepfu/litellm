@@ -58,6 +58,9 @@ CONNECT_END_STREAM_FLAG = 0x02
 CONNECT_KNOWN_FLAGS = CONNECT_END_STREAM_FLAG | CONNECT_COMPRESSED_FLAG
 CURSOR_CONNECT_HEARTBEAT_SECONDS = 5.0
 CURSOR_CONNECT_TERMINAL_TIMEOUT_SECONDS = 120.0
+_CURSOR_PROTO_STRUCTURE_MAX_DEPTH = 3
+_CURSOR_PROTO_STRUCTURE_MAX_ITEMS = 64
+_CURSOR_PROTO_STRUCTURE_MAX_BYTES = 4096
 
 
 class CursorConnectError(Exception):
@@ -362,6 +365,120 @@ def _decode_proto_fields(data: bytes) -> List[tuple[int, int, Any]]:
             raise CursorConnectProtocolError(f"Cursor protobuf uses unsupported wire type {wire_type}.")
         fields.append((field_number, wire_type, value))
     return fields
+
+
+def _capture_proto_structure(data: bytes) -> Dict[str, Any]:  # noqa: PLR0915
+    """Capture bounded protobuf wire structure without retaining field values."""
+    scan_limit = min(len(data), _CURSOR_PROTO_STRUCTURE_MAX_BYTES)
+    item_count = 0
+
+    def read_varint(
+        offset: int,
+        scope_end: int,
+    ) -> tuple[Optional[int], int, Optional[str]]:
+        value = 0
+        shift = 0
+        readable_end = min(scope_end, scan_limit)
+        while offset < readable_end:
+            byte = data[offset]
+            offset += 1
+            value |= (byte & 0x7F) << shift
+            if not byte & 0x80:
+                return value, offset, None
+            shift += 7
+            if shift >= 70:
+                return None, offset, "malformed"
+        if readable_end < scope_end:
+            return None, offset, "truncated"
+        return None, offset, "malformed"
+
+    def parse_fields(  # noqa: PLR0915
+        start: int,
+        scope_end: int,
+        depth: int,
+    ) -> tuple[List[Dict[str, Any]], Optional[str]]:
+        nonlocal item_count
+        fields: List[Dict[str, Any]] = []
+        offset = start
+        readable_end = min(scope_end, scan_limit)
+        while offset < readable_end:
+            if item_count >= _CURSOR_PROTO_STRUCTURE_MAX_ITEMS:
+                return fields, "truncated"
+            item_count += 1
+            key, next_offset, status = read_varint(offset, scope_end)
+            if status is not None:
+                return fields, status
+            if key is None:
+                return fields, "malformed"
+            field_number = key >> 3
+            wire_type = key & 0x07
+            if field_number <= 0:
+                return fields, "malformed"
+
+            entry: Dict[str, Any] = {
+                "field_number": field_number,
+                "wire_type": wire_type,
+                "payload_length": 0,
+            }
+            offset = next_offset
+            if wire_type == 0:
+                _value, value_end, status = read_varint(offset, scope_end)
+                if status is not None:
+                    return fields, status
+                entry["payload_length"] = value_end - offset
+                offset = value_end
+            elif wire_type == 1:
+                payload_end = offset + 8
+                entry["payload_length"] = 8
+                if payload_end > scope_end:
+                    return fields, "malformed"
+                if payload_end > scan_limit:
+                    fields.append(entry)
+                    return fields, "truncated"
+                offset = payload_end
+            elif wire_type == 2:
+                length, payload_start, status = read_varint(offset, scope_end)
+                if status is not None:
+                    return fields, status
+                if length is None:
+                    return fields, "malformed"
+                payload_end = payload_start + length
+                entry["payload_length"] = length
+                if payload_end > scope_end:
+                    fields.append(entry)
+                    return fields, "malformed"
+                if payload_end > scan_limit:
+                    fields.append(entry)
+                    return fields, "truncated"
+                if depth < _CURSOR_PROTO_STRUCTURE_MAX_DEPTH:
+                    nested_fields, nested_status = parse_fields(
+                        payload_start,
+                        payload_end,
+                        depth + 1,
+                    )
+                    if nested_status in {None, "truncated"}:
+                        entry["nested_fields"] = nested_fields
+                offset = payload_end
+            elif wire_type == 5:
+                payload_end = offset + 4
+                entry["payload_length"] = 4
+                if payload_end > scope_end:
+                    return fields, "malformed"
+                if payload_end > scan_limit:
+                    fields.append(entry)
+                    return fields, "truncated"
+                offset = payload_end
+            else:
+                fields.append(entry)
+                return fields, "malformed"
+            fields.append(entry)
+
+        if readable_end < scope_end:
+            return fields, "truncated"
+        return fields, None
+
+    fields, _status = parse_fields(0, len(data), 0)
+    return {"fields": fields}
 
 
 def _proto_field_values(
@@ -2095,9 +2212,13 @@ def _process_agent_server_message(
                         message_field,
                     ),
                 )
+            structure = _capture_proto_structure(exec_server_message)
             raise CursorConnectProtocolError(
                 "Cursor Agent requested unsupported local exec operation "
-                f"field {message_field or 'unknown'}."
+                f"field {message_field or 'unknown'}; "
+                "protobuf_structure="
+                f"{json.dumps(structure, separators=(',', ':'), sort_keys=True)}",
+                body=structure,
             )
         return (
             decode_agent_server_message(payload),
