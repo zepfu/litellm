@@ -14,6 +14,7 @@ import logging
 import os
 import socket
 import time
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
 
@@ -56,6 +57,10 @@ REDIS_OPERATION_DEADLINE_SECONDS = 0.5
 
 _registry_override: Optional["SessionTransferRegistry"] = None
 _default_registry: Optional["SessionTransferRegistry"] = None
+_query_read_error_class: ContextVar[Optional[str]] = ContextVar(
+    "session_transfer_query_read_error_class",
+    default=None,
+)
 
 
 def _now() -> datetime:
@@ -175,6 +180,14 @@ class SessionTransferRegistry:
         self._degraded = True
         self._last_error_class = type(exc).__name__
 
+    def _record_query_read_failure(self, exc: BaseException) -> None:
+        if _query_read_error_class.get() is not None:
+            _query_read_error_class.set(type(exc).__name__)
+
+    def _clear_degraded(self) -> None:
+        self._degraded = False
+        self._last_error_class = None
+
     def _drop_heartbeat(self, call_id: Optional[str]) -> None:
         if call_id:
             self._last_heartbeat_mono.pop(call_id, None)
@@ -273,11 +286,20 @@ class SessionTransferRegistry:
         try:
             if store is self._memory:
                 return await store.async_get_cache(key=key)
-            return await _with_deadline(
-                deadline, lambda: store.async_get_cache(key=key)
+            durable_store = getattr(store, "redis_cache", None)
+            reader = getattr(durable_store, "async_get_cache", None)
+            if not callable(reader):
+                reader = store.async_get_cache
+            result = await _with_deadline(
+                deadline,
+                lambda: reader(key=key, raise_on_error=True),
             )
+            self._clear_degraded()
+            return result
         except Exception as exc:
             self._mark_degraded(exc)
+            if store is not self._memory:
+                self._record_query_read_failure(exc)
             logger.debug("session-transfer registry read failed", exc_info=True)
             if store is not self._memory:
                 try:
@@ -292,11 +314,18 @@ class SessionTransferRegistry:
         if not keys:
             return []
         store = self._store()
+        durable_store = getattr(store, "redis_cache", None)
+        if durable_store is not None and durable_store is not store:
+            durable_reader = getattr(durable_store, "async_get_cache", None)
+            if callable(durable_reader):
+                return [
+                    await self._read_raw(key, deadline=deadline) for key in keys
+                ]
         batch = getattr(store, "async_batch_get_cache", None)
         if callable(batch):
             async def _batch() -> Any:
                 try:
-                    return await batch(keys=keys)
+                    return await batch(keys=keys, raise_on_error=True)
                 except TypeError:
                     return await batch(keys)
 
@@ -304,11 +333,14 @@ class SessionTransferRegistry:
                 result = await _with_deadline(deadline, _batch)
             except Exception as exc:
                 self._mark_degraded(exc)
+                if store is not self._memory:
+                    self._record_query_read_failure(exc)
                 logger.debug(
                     "session-transfer registry batch read failed", exc_info=True
                 )
                 result = None
             if isinstance(result, list) and len(result) == len(keys):
+                self._clear_degraded()
                 return result
         return [await self._read_raw(key, deadline=deadline) for key in keys]
 
@@ -369,6 +401,7 @@ class SessionTransferRegistry:
                             key=key, value=encoded, ttl=ttl
                         )
                     return False
+                self._clear_degraded()
             else:
                 if store is self._memory:
                     await store.async_set_cache(key=key, value=encoded, ttl=ttl)
@@ -377,6 +410,7 @@ class SessionTransferRegistry:
                         deadline,
                         lambda: store.async_set_cache(key=key, value=encoded, ttl=ttl),
                     )
+                    self._clear_degraded()
             if store is not self._memory:
                 await self._memory.async_set_cache(key=key, value=encoded, ttl=ttl)
             return True
@@ -703,60 +737,70 @@ class SessionTransferRegistry:
         active_only: bool = False,
         limit: int = DEFAULT_QUERY_LIMIT,
     ) -> Dict[str, Any]:
-        status = self.registry_status()
-        wanted = clamp_limit(limit)
-        records: List[Dict[str, Any]] = []
-        seen: set[str] = set()
+        query_error_token = _query_read_error_class.set("")
+        try:
+            wanted = clamp_limit(limit)
+            records: List[Dict[str, Any]] = []
+            seen: set[str] = set()
 
-        async def _add(record: Optional[Dict[str, Any]]) -> None:
-            if record is None:
-                return
-            annotated = self._annotate_freshness(record)
-            call_id = sanitize_identity(annotated.get("litellm_call_id"))
-            if not call_id or call_id in seen:
-                return
-            if active_only and not annotated.get("active"):
-                return
-            seen.add(call_id)
-            records.append(annotated)
+            async def _add(record: Optional[Dict[str, Any]]) -> None:
+                if record is None:
+                    return
+                annotated = self._annotate_freshness(record)
+                call_id = sanitize_identity(annotated.get("litellm_call_id"))
+                if not call_id or call_id in seen:
+                    return
+                if active_only and not annotated.get("active"):
+                    return
+                seen.add(call_id)
+                records.append(annotated)
 
-        if litellm_call_id:
-            await _add(await self.get_by_call_id(litellm_call_id))
-        identity_filters = (
-            ("canonical_session_id", canonical_session_id),
-            ("codex_session_id", codex_session_id),
-            ("session_id", session_id),
-            ("agent_id", agent_id),
-        )
-        truncated = False
-        for field, value in identity_filters:
-            cleaned = sanitize_identity(value)
-            if not cleaned:
-                continue
-            members = await self._read_index(field, cleaned)
-            if len(members) > wanted:
-                truncated = True
-            for call_id in members:
-                if len(records) >= wanted:
+            if litellm_call_id:
+                await _add(await self.get_by_call_id(litellm_call_id))
+            identity_filters = (
+                ("canonical_session_id", canonical_session_id),
+                ("codex_session_id", codex_session_id),
+                ("session_id", session_id),
+                ("agent_id", agent_id),
+            )
+            truncated = False
+            for field, value in identity_filters:
+                cleaned = sanitize_identity(value)
+                if not cleaned:
+                    continue
+                members = await self._read_index(field, cleaned)
+                if len(members) > wanted:
                     truncated = True
+                for call_id in members:
+                    if len(records) >= wanted:
+                        truncated = True
+                        break
+                    await _add(await self.get_by_call_id(call_id))
+                if len(records) >= wanted:
                     break
-                await _add(await self.get_by_call_id(call_id))
-            if len(records) >= wanted:
-                break
 
-        records.sort(
-            key=lambda item: str(item.get("last_heartbeat_at") or item.get("received_at") or ""),
-            reverse=True,
-        )
-        bounded = records[:wanted]
-        public_records = [public_transfer_record(item) for item in bounded]
-        return {
-            "schema_version": SCHEMA_VERSION,
-            "registry": status,
-            "result_count": len(public_records),
-            "truncated": truncated or len(records) > wanted,
-            "transfers": public_records,
-        }
+            records.sort(
+                key=lambda item: str(
+                    item.get("last_heartbeat_at") or item.get("received_at") or ""
+                ),
+                reverse=True,
+            )
+            bounded = records[:wanted]
+            public_records = [public_transfer_record(item) for item in bounded]
+            status = self.registry_status()
+            query_error_class = _query_read_error_class.get()
+            if query_error_class:
+                status["state"] = "degraded"
+                status["error_class"] = query_error_class
+            return {
+                "schema_version": SCHEMA_VERSION,
+                "registry": status,
+                "result_count": len(public_records),
+                "truncated": truncated or len(records) > wanted,
+                "transfers": public_records,
+            }
+        finally:
+            _query_read_error_class.reset(query_error_token)
 
 
 def get_session_transfer_registry() -> SessionTransferRegistry:

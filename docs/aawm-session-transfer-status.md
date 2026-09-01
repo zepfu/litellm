@@ -154,6 +154,10 @@ suffix, or synthesizes a terminal event.
   not a terminal claim.
 - Terminal summaries are retained for 45 seconds.
 - Indexes are bounded to 64 call IDs per identity and 50 query results.
+- Query health is computed after its represented Redis reads. A Redis read
+  failure reports `registry.state=degraded` in that same response, while a
+  later successful durable read or write clears stale process-local
+  degradation.
 - A worker crash or Redis outage produces `unavailable` / `stale` /
   `redis_degraded=true`. It never invents `completed`.
 
