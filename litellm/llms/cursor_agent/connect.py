@@ -1125,6 +1125,7 @@ _LOCAL_EXEC_BRIDGE_FIELDS = {
     2: "shell_args",
     14: "shell_stream_args",
 }
+_RETAINED_EXTERNAL_EXEC_FIELDS = frozenset({2, 7, 14})
 _LOCAL_EXEC_TOOL_NAMES = (
     "exec_command",
     "shell",
@@ -1630,13 +1631,163 @@ def _encode_read_terminal_result(
     ]
 
 
+def _decode_cursor_shell_output(output: Any) -> Dict[str, Any]:
+    raw_output = output if isinstance(output, str) else str(output or "")
+    lines = raw_output.splitlines(keepends=True)
+    header_line_index = 0
+
+    def line_at(index: int) -> str:
+        return lines[index].rstrip("\r\n")
+
+    if lines and _CURSOR_EXEC_TRUNCATION_WARNING_RE.fullmatch(line_at(0)):
+        header_line_index = 1
+
+    process_line_index = header_line_index + 2
+    if (
+        len(lines) > process_line_index + 1
+        and _CURSOR_EXEC_CHUNK_ID_RE.fullmatch(line_at(header_line_index))
+        and _CURSOR_EXEC_WALL_TIME_RE.fullmatch(line_at(header_line_index + 1))
+    ):
+        if _CURSOR_EXEC_TOKEN_COUNT_RE.fullmatch(line_at(process_line_index)):
+            process_line_index += 1
+        process_match = _CURSOR_EXEC_PROCESS_EXIT_RE.fullmatch(
+            line_at(process_line_index)
+        )
+        output_marker_index = process_line_index + 1
+        if (
+            process_match is not None
+            and output_marker_index < len(lines)
+            and line_at(output_marker_index) in {"Final output:", "Output:"}
+        ):
+            return {
+                "stdout": "".join(lines[output_marker_index + 1 :]),
+                "stderr": "",
+                "exit_code": int(process_match.group(1)),
+            }
+
+    return {
+        "stdout": raw_output,
+        "stderr": "",
+        "exit_code": 0,
+    }
+
+
+def _encode_shell_terminal_result(
+    exec_request: Mapping[str, Any],
+    output: Any,
+) -> List[bytes]:
+    shell_output = _decode_cursor_shell_output(output)
+    command = str(exec_request.get("command") or "")
+    working_directory = str(exec_request.get("working_directory") or "")
+    exit_code = int(shell_output["exit_code"])
+    shell_outcome = b"".join(
+        (
+            _encode_proto_string_field(1, command, include_empty=True),
+            _encode_proto_string_field(
+                2,
+                working_directory,
+                include_empty=True,
+            ),
+            _encode_proto_varint_field(3, exit_code, include_default=True),
+            _encode_proto_string_field(4, "", include_empty=True),
+            _encode_proto_string_field(
+                5,
+                shell_output["stdout"],
+                include_empty=True,
+            ),
+            _encode_proto_string_field(
+                6,
+                shell_output["stderr"],
+                include_empty=True,
+            ),
+        )
+    )
+    result_field = 1 if exit_code == 0 else 2
+    shell_result = _encode_proto_message_field(
+        result_field,
+        shell_outcome,
+    )
+    exec_fields = cast(List[tuple[int, int, Any]], exec_request["exec_fields"])
+    return [
+        _encode_exec_client_message(
+            exec_fields,
+            message_field=2,
+            message_payload=shell_result,
+        ),
+        _encode_exec_stream_close(exec_fields),
+    ]
+
+
+def _encode_shell_stream_terminal_result(
+    exec_request: Mapping[str, Any],
+    output: Any,
+) -> List[bytes]:
+    shell_output = _decode_cursor_shell_output(output)
+    exec_fields = cast(List[tuple[int, int, Any]], exec_request["exec_fields"])
+    messages: List[bytes] = []
+    if shell_output["stdout"]:
+        stdout_event = _encode_proto_message_field(
+            1,
+            _encode_proto_string_field(1, shell_output["stdout"]),
+        )
+        messages.append(
+            _encode_exec_client_message(
+                exec_fields,
+                message_field=14,
+                message_payload=stdout_event,
+            )
+        )
+    if shell_output["stderr"]:
+        stderr_event = _encode_proto_message_field(
+            2,
+            _encode_proto_string_field(1, shell_output["stderr"]),
+        )
+        messages.append(
+            _encode_exec_client_message(
+                exec_fields,
+                message_field=14,
+                message_payload=stderr_event,
+            )
+        )
+    exit_event = _encode_proto_message_field(
+        3,
+        b"".join(
+            (
+                _encode_proto_varint_field(
+                    1,
+                    int(shell_output["exit_code"]),
+                    include_default=True,
+                ),
+                _encode_proto_string_field(
+                    2,
+                    str(exec_request.get("working_directory") or ""),
+                    include_empty=True,
+                ),
+            )
+        ),
+    )
+    messages.append(
+        _encode_exec_client_message(
+            exec_fields,
+            message_field=14,
+            message_payload=exit_event,
+        )
+    )
+    messages.append(_encode_exec_stream_close(exec_fields))
+    return messages
+
+
 def _encode_external_exec_terminal_result(
     exec_request: Mapping[str, Any],
     output: Any,
 ) -> List[bytes]:
     message_field = int(exec_request["message_field"])
+    if message_field == 2:
+        return _encode_shell_terminal_result(exec_request, output)
     if message_field == 7:
         return _encode_read_terminal_result(exec_request, output)
+    if message_field == 14:
+        return _encode_shell_stream_terminal_result(exec_request, output)
     raise CursorConnectProtocolError(
         f"Cursor Agent requested unsupported external exec field {message_field}."
     )
@@ -1922,6 +2073,8 @@ def _process_agent_server_message(
                     message_field=message_field,
                     tool_name=local_exec_tool_name,
                 )
+                if external_exec_requests is not None:
+                    external_exec_requests.append(local_exec_request["exec_request"])
                 return (
                     local_exec_request["normalized"],
                     [],
@@ -2002,7 +2155,8 @@ class CursorAgentRetainedSession:
     @property
     def can_continue(self) -> bool:
         return bool(self._external_exec_requests) and all(
-            int(request.get("message_field") or 0) == 7
+            int(request.get("message_field") or 0)
+            in _RETAINED_EXTERNAL_EXEC_FIELDS
             for request in self._external_exec_requests.values()
         ) and not self._closed
 
@@ -2012,9 +2166,9 @@ class CursorAgentRetainedSession:
             raise CursorConnectProtocolError(
                 "Cursor Agent external exec request does not contain a call id."
             )
-        if int(exec_request.get("message_field") or 0) != 7:
+        if int(exec_request.get("message_field") or 0) not in _RETAINED_EXTERNAL_EXEC_FIELDS:
             raise CursorConnectProtocolError(
-                "Cursor Agent retained continuation supports only field-7 read requests."
+                "Cursor Agent retained continuation supports only fields 2, 7, and 14."
             )
         self._external_exec_requests[call_id] = dict(exec_request)
 

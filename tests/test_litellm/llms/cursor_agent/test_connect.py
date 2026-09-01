@@ -534,11 +534,16 @@ class _H2McpExecPeer:
         self.decoder = cursor_connect._ProtoConnectFrameDecoder()
         self.client_payloads: list[bytes] = []
         self.stream_id = 0
+        self.connection_count = 0
         self.sent_tool_call = False
+        self.saw_exec_result = False
+        self.saw_stream_close = False
+        self.response_sent = False
         self.request_stream_ended = False
         self.closed = False
 
     async def open_connection(self, *_args: Any, **_kwargs: Any) -> tuple[Any, Any]:
+        self.connection_count += 1
         return self, self
 
     async def read(self, _size: int) -> bytes:
@@ -603,6 +608,31 @@ class _H2McpExecPeer:
         )
         self.sent_tool_call = True
 
+    def _record_local_exec_result(self, payload: bytes) -> None:
+        exec_message = _last_field(payload, 2, wire_type=2)
+        if isinstance(exec_message, bytes) and _last_field(
+            exec_message,
+            self.local_exec_field,
+            wire_type=2,
+        ) is not None:
+            self.saw_exec_result = True
+        exec_control = _last_field(payload, 5, wire_type=2)
+        if isinstance(exec_control, bytes):
+            stream_close = _last_field(exec_control, 1, wire_type=2)
+            self.saw_stream_close = (
+                isinstance(stream_close, bytes)
+                and _last_field(stream_close, 1, wire_type=0) == 11
+            )
+        if self.saw_exec_result and self.saw_stream_close and not self.response_sent:
+            self.response_sent = True
+            self.server.send_data(
+                self.stream_id,
+                _server_text_frame("local exec complete")
+                + _server_turn_ended_frame()
+                + _end_stream_frame(),
+                end_stream=True,
+            )
+
     def write(self, data: bytes) -> None:
         for event in self.server.receive_data(data):
             if isinstance(event, RequestReceived):
@@ -629,6 +659,8 @@ class _H2McpExecPeer:
                         is not None
                     ):
                         self._send_tool_call()
+                    elif self.local_exec and self.sent_tool_call:
+                        self._record_local_exec_result(frame.payload)
             elif isinstance(event, StreamEnded):
                 self.request_stream_ended = True
         outbound = self.server.data_to_send()
@@ -886,7 +918,7 @@ def test_h2_bidi_surfaces_mcp_exec_as_external_tool_call(
             url="https://cursor.test/agent.v1.AgentService/Run",
             timeout=0.5,
             stop_on_tool_call=True,
-            retain_on_tool_call=True,
+            retain_on_tool_call=False,
         )
     )
 
@@ -926,7 +958,7 @@ def test_h2_bidi_surfaces_local_shell_as_advertised_external_tool_call(
             url="https://cursor.test/agent.v1.AgentService/Run",
             timeout=0.5,
             stop_on_tool_call=True,
-            retain_on_tool_call=True,
+            retain_on_tool_call=False,
         )
     )
 
@@ -970,7 +1002,7 @@ def test_h2_bidi_surfaces_fragmented_shell_stream_as_external_tool_call(
             url="https://cursor.test/agent.v1.AgentService/Run",
             timeout=0.5,
             stop_on_tool_call=True,
-            retain_on_tool_call=True,
+            retain_on_tool_call=False,
         )
     )
 
@@ -1048,6 +1080,84 @@ def test_h2_bidi_retains_read_run_until_external_output_then_final_text(
     assert peer.closed is True
     assert second.text == "read complete"
     assert second.turn_ended is True
+
+
+@pytest.mark.parametrize("message_field", [2, 14])
+def test_h2_bidi_retains_local_exec_run_until_external_output(
+    monkeypatch: pytest.MonkeyPatch,
+    message_field: int,
+) -> None:
+    peer = _H2McpExecPeer(
+        local_exec=True,
+        local_exec_field=message_field,
+        fragment_local_exec=message_field == 14,
+    )
+    monkeypatch.setattr(asyncio, "open_connection", peer.open_connection)
+    client = CursorAgentConnectClient(auth=CursorAgentAuth("access-token"))
+    request = _run_request()
+    request["runRequest"]["mcpTools"] = {
+        "mcpTools": [{"name": "exec_command"}],
+    }
+
+    async def exercise() -> tuple[Any, Any]:
+        first = await client.run(
+            request,
+            url="https://cursor.test/agent.v1.AgentService/Run",
+            timeout=0.5,
+            stop_on_tool_call=True,
+            retain_on_tool_call=True,
+        )
+        session = first.retained_session
+        assert session is not None
+        assert peer.closed is False
+        second = await session.continue_with_tool_outputs(
+            [("exec-local", "shell output")],
+            timeout=0.5,
+        )
+        await session.aclose()
+        return first, second
+
+    first, second = asyncio.run(exercise())
+
+    assert peer.connection_count == 1
+    assert first.tool_calls[0]["call_id"] == "exec-local"
+    assert peer.saw_exec_result is True
+    assert peer.saw_stream_close is True
+    assert peer.request_stream_ended is False
+    assert peer.closed is True
+    assert second.text == "local exec complete"
+    assert second.turn_ended is True
+
+
+def test_h2_bidi_rejects_unknown_local_exec_field_without_replacement_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    peer = _H2McpExecPeer(local_exec=True, local_exec_field=4)
+    monkeypatch.setattr(asyncio, "open_connection", peer.open_connection)
+    client = CursorAgentConnectClient(auth=CursorAgentAuth("access-token"))
+    request = _run_request()
+    request["runRequest"]["mcpTools"] = {
+        "mcpTools": [{"name": "exec_command"}],
+    }
+
+    with pytest.raises(
+        CursorConnectProtocolError,
+        match="unsupported local exec operation field 4",
+    ):
+        asyncio.run(
+            client.run(
+                request,
+                url="https://cursor.test/agent.v1.AgentService/Run",
+                timeout=0.5,
+                stop_on_tool_call=True,
+                retain_on_tool_call=True,
+            )
+        )
+
+    assert peer.connection_count == 1
+    assert peer.sent_tool_call is True
+    assert peer.closed is True
+    assert peer.saw_exec_result is False
 
 
 @pytest.mark.parametrize("message_field", [2, 14])
