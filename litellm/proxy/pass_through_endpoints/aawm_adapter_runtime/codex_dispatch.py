@@ -56,6 +56,11 @@ if TYPE_CHECKING:
     def _apply_codex_auto_agent_prevention_guidance_to_request_body(
         request_body: dict[str, Any],
     ) -> tuple[dict[str, Any], Any]: ...
+    def _apply_codex_auto_review_decision_shaping_to_request_body(
+        request_body: dict[str, Any],
+        *,
+        alias: Optional[str],
+    ) -> dict[str, Any]: ...
     def _apply_aawm_read_agent_guidance_to_request_body(
         request_body: dict[str, Any],
         *,
@@ -564,17 +569,36 @@ async def try_dispatch_codex_request(  # noqa: PLR0915
             endpoint=endpoint,
         )
     if codex_auto_agent_alias is not None:
-        (
-            prepared_request_body,
-            _codex_auto_agent_guidance_changes,
-        ) = _apply_codex_auto_agent_prevention_guidance_to_request_body(prepared_request_body)
-        (
-            prepared_request_body,
-            _codex_read_guidance_changes,
-        ) = _apply_aawm_read_agent_guidance_to_request_body(
-            prepared_request_body,
-            target_field="instructions",
+        is_codex_auto_review_alias = (
+            isinstance(codex_auto_agent_alias, str)
+            and codex_auto_agent_alias.strip().casefold()
+            in {
+                "codex-auto-review",
+                "auto-review",
+                "chatgpt/codex-auto-review",
+            }
         )
+        if is_codex_auto_review_alias:
+            prepared_request_body = (
+                _apply_codex_auto_review_decision_shaping_to_request_body(
+                    prepared_request_body,
+                    alias=codex_auto_agent_alias,
+                )
+            )
+        else:
+            (
+                prepared_request_body,
+                _codex_auto_agent_guidance_changes,
+            ) = _apply_codex_auto_agent_prevention_guidance_to_request_body(
+                prepared_request_body
+            )
+            (
+                prepared_request_body,
+                _codex_read_guidance_changes,
+            ) = _apply_aawm_read_agent_guidance_to_request_body(
+                prepared_request_body,
+                target_field="instructions",
+            )
         prepared_request_body = _prepare_request_body_for_passthrough_observability(
             request=request,
             request_body=prepared_request_body,

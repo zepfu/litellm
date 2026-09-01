@@ -6832,6 +6832,9 @@ _apply_aawm_read_agent_guidance_to_request_body = (
 _apply_codex_auto_agent_prevention_guidance_to_request_body = (
     _aawm_alias_guidance._apply_codex_auto_agent_prevention_guidance_to_request_body
 )
+_apply_codex_auto_review_decision_shaping_to_request_body = (
+    _aawm_alias_guidance._apply_codex_auto_review_decision_shaping_to_request_body
+)
 
 _aawm_anthropic_body_prep.configure_anthropic_body_prep_runtime(
     expand_persisted_output=_expand_claude_persisted_output_in_anthropic_request_body,

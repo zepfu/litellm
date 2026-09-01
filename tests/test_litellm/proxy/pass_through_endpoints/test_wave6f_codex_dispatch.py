@@ -26,6 +26,9 @@ from fastapi import Request, Response
 
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import codex_dispatch
+from litellm.proxy.pass_through_endpoints.aawm_request_policy import (
+    alias_guidance,
+)
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -375,6 +378,117 @@ class TestSupportedDispatch:
         codex_dispatch.install(host)
         result = await host["try_dispatch_codex_request"](**_dispatch_kwargs())
         assert result is sentinel
+
+    @pytest.mark.asyncio
+    async def test_should_use_decision_shaping_without_other_guidance_for_auto_review_alias(
+        self,
+    ) -> None:
+        body = {
+            "model": "chatgpt/codex-auto-review",
+            "instructions": "existing",
+            "tools": [{"type": "function"}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+        }
+        kwargs = _dispatch_kwargs(prepared_request_body=body, request_body=body)
+        shaping_aliases: list[str] = []
+        guidance_calls: list[str] = []
+        seen: dict[str, Any] = {}
+
+        def _shape_review_body(
+            request_body: dict[str, Any],
+            *,
+            alias: Optional[str],
+        ) -> dict[str, Any]:
+            assert alias is not None
+            shaping_aliases.append(alias)
+            return (
+                alias_guidance._apply_codex_auto_review_decision_shaping_to_request_body(
+                    request_body,
+                    alias=alias,
+                )
+            )
+
+        async def _capture_alias_route(**route_kwargs: Any) -> Response:
+            seen["prepared_request_body"] = route_kwargs["prepared_request_body"]
+            return Response(content=b"review", status_code=200)
+
+        host, _sentinel = _make_dispatch_host(
+            matching_adapter="_resolve_codex_auto_agent_alias_model",
+            adapter_model="codex-auto-review",
+        )
+        host["_resolve_codex_auto_agent_alias_model"] = (
+            lambda request_body, *, endpoint, request: "chatgpt/codex-auto-review"
+        )
+        host[
+            "_apply_codex_auto_review_decision_shaping_to_request_body"
+        ] = _shape_review_body
+        host["_apply_codex_auto_agent_prevention_guidance_to_request_body"] = (
+            lambda request_body: (
+                guidance_calls.append("prevention"),
+                (request_body, {}),
+            )[1]
+        )
+        host["_apply_aawm_read_agent_guidance_to_request_body"] = (
+            lambda request_body, *, target_field: (
+                guidance_calls.append("read"),
+                (request_body, {}),
+            )[1]
+        )
+        host["_handle_codex_auto_agent_alias_route"] = _capture_alias_route
+        codex_dispatch.install(host)
+
+        result = await host["try_dispatch_codex_request"](**kwargs)
+
+        assert result.status_code == 200
+        assert shaping_aliases == ["chatgpt/codex-auto-review"]
+        assert guidance_calls == []
+        shaped_body = seen["prepared_request_body"]
+        assert shaped_body is not body
+        assert shaped_body["instructions"].startswith("existing\n\n")
+        assert all(
+            field not in shaped_body
+            for field in ("tools", "tool_choice", "parallel_tool_calls")
+        )
+
+    @pytest.mark.asyncio
+    async def test_should_keep_existing_guidance_path_for_non_review_alias(
+        self,
+    ) -> None:
+        guidance_calls: list[str] = []
+
+        def _unexpected_review_shaping(
+            request_body: dict[str, Any],
+            *,
+            alias: Optional[str],
+        ) -> dict[str, Any]:
+            pytest.fail(f"unexpected review shaping for {alias}")
+
+        host, sentinel = _make_dispatch_host(
+            matching_adapter="_resolve_codex_auto_agent_alias_model",
+            adapter_model="codex-auto-agent",
+        )
+        host["_apply_codex_auto_review_decision_shaping_to_request_body"] = (
+            _unexpected_review_shaping
+        )
+        host["_apply_codex_auto_agent_prevention_guidance_to_request_body"] = (
+            lambda request_body: (
+                guidance_calls.append("prevention"),
+                (request_body, {}),
+            )[1]
+        )
+        host["_apply_aawm_read_agent_guidance_to_request_body"] = (
+            lambda request_body, *, target_field: (
+                guidance_calls.append("read"),
+                (request_body, {}),
+            )[1]
+        )
+        codex_dispatch.install(host)
+
+        result = await host["try_dispatch_codex_request"](**_dispatch_kwargs())
+
+        assert result is sentinel
+        assert guidance_calls == ["prevention", "read"]
 
     @pytest.mark.asyncio
     async def test_opencode_zen_dispatch(self) -> None:

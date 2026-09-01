@@ -28,6 +28,18 @@ EXPECTED_READ_GUIDANCE = """AAWM read-only agent contract:
 - If the delegated prompt requires the exact final phrase `No files were modified.`, include that phrase truthfully in the final answer.
 - Return findings, evidence, coverage gaps, and recommended next steps. Do not return implementation summaries for read-only work."""
 
+EXPECTED_CODEX_AUTO_REVIEW_PROMPT = (
+    "Codex auto-review decision contract: the entire assistant `output_text` must "
+    "be exactly one JSON object using the existing `{outcome: allow|deny, "
+    "rationale?, risk_level?, user_authorization?}` schema. Do not use tools, "
+    "setup, exploration, task execution, wrapping, or commentary."
+)
+CODEX_AUTO_REVIEW_ALIASES = (
+    "codex-auto-review",
+    "auto-review",
+    "chatgpt/codex-auto-review",
+)
+
 
 class CallbackRecorder:
     def __init__(self) -> None:
@@ -140,6 +152,107 @@ def test_should_accept_god_call_site_signature_for_codex_guidance() -> None:
     updated_body, metadata = result
     assert updated_body["instructions"] == f"existing\n\n{EXPECTED_CODEX_GUIDANCE}"
     assert metadata["codex_auto_agent_prevention_guidance_applied"] is True
+
+
+@pytest.mark.parametrize("alias", CODEX_AUTO_REVIEW_ALIASES)
+def test_should_shape_codex_auto_review_alias_request_body_idempotently(
+    alias: str,
+) -> None:
+    body = {
+        "model": alias,
+        "instructions": "  existing  ",
+        "tools": [{"type": "function"}],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+        "untouched": True,
+    }
+
+    updated_body = (
+        guidance._apply_codex_auto_review_decision_shaping_to_request_body(
+            body,
+            alias=alias,
+        )
+    )
+
+    assert updated_body is not body
+    assert body["tools"] == [{"type": "function"}]
+    assert body["tool_choice"] == "auto"
+    assert body["parallel_tool_calls"] is True
+    assert updated_body["instructions"] == (
+        f"existing\n\n{EXPECTED_CODEX_AUTO_REVIEW_PROMPT}"
+    )
+    assert all(
+        field not in updated_body
+        for field in ("tools", "tool_choice", "parallel_tool_calls")
+    )
+    assert updated_body["untouched"] is True
+
+    second_body = (
+        guidance._apply_codex_auto_review_decision_shaping_to_request_body(
+            updated_body,
+            alias=alias,
+        )
+    )
+    assert second_body is not updated_body
+    assert second_body["instructions"] == updated_body["instructions"]
+    assert second_body["instructions"].count(EXPECTED_CODEX_AUTO_REVIEW_PROMPT) == 1
+
+
+def test_should_set_review_prompt_when_instructions_are_absent() -> None:
+    body = {
+        "model": "codex-auto-review",
+        "tools": [{"type": "function"}],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+    }
+
+    updated_body = (
+        guidance._apply_codex_auto_review_decision_shaping_to_request_body(body)
+    )
+
+    assert updated_body["instructions"] == EXPECTED_CODEX_AUTO_REVIEW_PROMPT
+    assert all(
+        field not in updated_body
+        for field in ("tools", "tool_choice", "parallel_tool_calls")
+    )
+
+
+def test_should_preserve_non_string_review_instructions_while_stripping_tools() -> None:
+    body = {
+        "model": "auto-review",
+        "instructions": {"type": "system"},
+        "tools": [{"type": "function"}],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+    }
+
+    updated_body = (
+        guidance._apply_codex_auto_review_decision_shaping_to_request_body(body)
+    )
+
+    assert updated_body is not body
+    assert updated_body["instructions"] == {"type": "system"}
+    assert all(
+        field not in updated_body
+        for field in ("tools", "tool_choice", "parallel_tool_calls")
+    )
+
+
+def test_should_noop_codex_auto_review_shaping_for_non_review_alias() -> None:
+    body = {
+        "model": "codex-auto-agent",
+        "instructions": "existing",
+        "tools": [{"type": "function"}],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+    }
+
+    updated_body = (
+        guidance._apply_codex_auto_review_decision_shaping_to_request_body(body)
+    )
+
+    assert updated_body is body
+    assert updated_body == body
 
 
 def test_should_have_callbacks_optional_in_both_signatures() -> None:
