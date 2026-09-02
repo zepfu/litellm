@@ -963,6 +963,83 @@ signals, source fields, and interpretation notes that explain how the snapshot
 was classified. These JSONB fields must not contain credentials, account ids,
 authorization headers, prompt bodies, response text, or raw tool arguments.
 
+### Rate-limit observation retention (D1-679)
+
+`public.rate_limit_observation_older` is the migration-owned archive for
+rate-limit observations that are no longer needed by the operational hot table.
+It preserves every column from `public.rate_limit_observations`, including the
+original source `id`; the archive does not allocate replacement observation
+identities. The archive has only an identity/latest index and an
+`observed_at`/`id` age index.
+
+The prepared daily PostgreSQL function selects at most 1,000 source rows whose
+age is strictly older than `NOW() - INTERVAL '45 days'`, ordered by
+`observed_at` and `id`. It takes the shared transaction advisory lock
+`aawm.rate_limit_observation_retention`, inserts each exact source row into the
+archive idempotently, and deletes a source row only when the archive insert or
+an exact existing archive row is confirmed by the same transaction. A failed
+insert or an archive identity/content mismatch leaves the source row in place
+for retry.
+
+The separate weekly PostgreSQL function selects at most 5,000 archive rows whose
+`observed_at` is strictly older than `NOW() - INTERVAL '6 months'` under the
+same advisory lock. It deletes only from
+`public.rate_limit_observation_older`; it never deletes from
+`public.rate_limit_observations`. The bounded functions may require multiple
+successful runs to drain a backlog. The hot table remains the operational
+latest-state surface, and D1-678 remains the owner of its latest lookup,
+index, and duplicate-write semantics. This change does not modify current
+previous-observation readers or add a combined reader. A report that requires
+more than 45 days must deliberately query the archive or an explicitly
+supported combined surface.
+
+The job definitions use low-traffic UTC schedules and explicit database/role
+targeting:
+
+- Daily archive: `17 3 * * *` UTC,
+  `SELECT public.aawm_archive_rate_limit_observations_daily(1000);`
+- Weekly archive expiry: `29 4 * * 0` UTC,
+  `SELECT public.aawm_expire_rate_limit_observation_archive_weekly(5000);`
+
+The migration owns the archive table and both `SECURITY DEFINER` functions
+through the supplied `owner_role`. The supplied `job_role` receives only
+`EXECUTE` on those functions. `owner_role` must already have the source-table
+`SELECT` and `DELETE` authority needed by the `SECURITY DEFINER` function; the
+migration makes it archive-table owner. The job installer must run from the
+configured pg_cron control database and uses `cron.schedule_in_database` with
+`target_database=aawm_tristore` and the same `job_role`. The pg_cron extension
+must already be installed through the authorized database path, and
+`cron.timezone` must already be `UTC`; these SQL files do not install the
+extension or alter server configuration.
+
+The definitions are prepared but unapplied. The separate migration and job
+installation commands are:
+
+```bash
+psql --set=ON_ERROR_STOP=1 \
+  --set=expected_database=aawm_tristore \
+  --set=owner_role=<retention-owner-role> \
+  --set=job_role=<retention-job-role> \
+  --dbname=aawm_tristore \
+  --file=scripts/apply_rate_limit_observation_retention_2026_09_02.sql
+
+psql --set=ON_ERROR_STOP=1 \
+  --set=cron_database=<configured-cron-database> \
+  --set=target_database=aawm_tristore \
+  --set=job_role=<retention-job-role> \
+  --dbname=<configured-cron-database> \
+  --file=scripts/install_rate_limit_observation_retention_jobs_2026_09_02.sql
+```
+
+Apply requires separate authorization and must be ordered after the archive
+schema/function migration. Before installation, record the read-only
+`aawm_tristore` row counts and estimated bytes for both age cutoffs. Afterward,
+monitor `cron.job` and `cron.job_run_details`, and reconcile source,
+archive, moved, and expired counts with duplicate `id` checks. Rollback first
+unschedules the two named jobs, then may revoke or drop the functions after
+both jobs stop; archive data is retained. Dropping the archive table is
+destructive and is never an automatic rollback step.
+
 Grok no-format `/v1/billing` monthly counter payloads (`monthlyLimit`,
 `used`) populate `quota_limit`, `quota_used`, `quota_remaining`, billing-period
 columns, and quota key `xai_grok_build_monthly_requests:requests` with
