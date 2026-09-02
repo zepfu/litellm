@@ -23,6 +23,7 @@ class ZAICodingPlanFailureKind(str, Enum):
     RATE = "rate"
     CAPACITY = "capacity"
     VALIDATION = "validation"
+    MODEL_UNAVAILABLE = "model_unavailable"
     ROUTING = "routing"
     UNKNOWN = "unknown"
 
@@ -49,12 +50,15 @@ _CODE_CLASSIFICATION: dict[int, tuple[ZAICodingPlanFailureKind, str]] = {
     1000: (ZAICodingPlanFailureKind.AUTH, "credentials_rejected"),
     1001: (ZAICodingPlanFailureKind.AUTH, "missing_authorization"),
     1113: (ZAICodingPlanFailureKind.ROUTING, "wrong_base_or_non_coding_key"),
-    1211: (ZAICodingPlanFailureKind.VALIDATION, "unknown_model"),
+    1211: (ZAICodingPlanFailureKind.MODEL_UNAVAILABLE, "unknown_model"),
     1302: (ZAICodingPlanFailureKind.RATE, "request_rate_limit"),
     1308: (ZAICodingPlanFailureKind.QUOTA, "time_window_exhausted"),
     1309: (ZAICodingPlanFailureKind.QUOTA, "subscription_expired"),
     1310: (ZAICodingPlanFailureKind.QUOTA, "plan_window_exhausted"),
-    1311: (ZAICodingPlanFailureKind.VALIDATION, "model_not_in_subscription"),
+    1311: (
+        ZAICodingPlanFailureKind.MODEL_UNAVAILABLE,
+        "model_not_in_subscription",
+    ),
     1313: (ZAICodingPlanFailureKind.QUOTA, "fair_use_restriction"),
     1316: (ZAICodingPlanFailureKind.QUOTA, "five_hour_window_exhausted"),
     1317: (ZAICodingPlanFailureKind.QUOTA, "seven_day_window_exhausted"),

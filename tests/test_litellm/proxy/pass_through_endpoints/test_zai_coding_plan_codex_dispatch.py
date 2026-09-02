@@ -8,11 +8,13 @@ this is not live Z.AI fanout.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import Response
+from starlette.requests import Request
 
 from litellm.llms.zai_coding_plan.chat.transformation import (
     ZAI_CODING_PLAN_CHAT_COMPLETIONS_URL,
@@ -31,6 +33,14 @@ from litellm.proxy.pass_through_endpoints.llm_passthrough_endpoints import (
 
 _ADAPTER_MODEL = "zai_coding_plan/glm-5.3"
 _CODEX_ZAI_ROUTE_FAMILY = "codex_zai_coding_plan_chat_completions_adapter"
+_ZAI_COOLDOWN_IDENTITY_TAG = (
+    "alias:sota-zai:zai_coding_plan:"
+    f"{_ADAPTER_MODEL}:{_CODEX_ZAI_ROUTE_FAMILY}"
+)
+_ZAI_COOLDOWN_KEY = (
+    f"h{_ZAI_COOLDOWN_IDENTITY_TAG}:zai_coding_plan:"
+    f"{_ADAPTER_MODEL}:zai_coding_plan"
+)
 
 
 def _request() -> MagicMock:
@@ -475,11 +485,16 @@ def test_should_map_coding_plan_1113_to_wrong_base_terminal_error() -> None:
 @pytest.mark.parametrize(
     ("error_code", "expected_class"),
     (
+        (1000, "provider_terminal_error"),
+        (1001, "provider_terminal_error"),
+        (1113, "provider_terminal_error"),
         (1211, "candidate_unavailable"),
         (1311, "candidate_unavailable"),
+        (1302, "rate_limited"),
         (1308, "usage_limit_reached"),
         (1309, "usage_limit_reached"),
         (1310, "usage_limit_reached"),
+        (1313, "usage_limit_reached"),
         (1316, "usage_limit_reached"),
         (1317, "usage_limit_reached"),
     ),
@@ -503,6 +518,274 @@ def test_should_map_coding_plan_business_codes_in_candidate_loop(
             },
         )
         == expected_class
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", (1211, 1311))
+async def test_should_fail_over_in_order_after_zai_model_admission_failure(  # noqa: PLR0915
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: int,
+) -> None:
+    from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as lpe
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        candidate_loop,
+    )
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing.state import (
+        AliasRoutingStateManager,
+    )
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"user-agent", b"codex-cli/1.0")],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("testclient", 123),
+            "scheme": "http",
+        }
+    )
+    zai_candidate = {
+        "provider": "zai_coding_plan",
+        "model": _ADAPTER_MODEL,
+        "route_family": _CODEX_ZAI_ROUTE_FAMILY,
+        "cooldown_identity_tag": _ZAI_COOLDOWN_IDENTITY_TAG,
+    }
+    alibaba_candidate = {
+        "provider": "alibaba_token_plan",
+        "model": "alibaba_token_plan/glm-5.2",
+        "route_family": "codex_alibaba_token_plan_chat_completions_adapter",
+    }
+    selections = [
+        {
+            "candidate": zai_candidate,
+            "lane_key": "zai_coding_plan",
+            "cooldown_key": _ZAI_COOLDOWN_KEY,
+            "selection_reason": "first_available",
+            "skipped": [],
+        },
+        {
+            "candidate": alibaba_candidate,
+            "lane_key": "alibaba_token_plan",
+            "cooldown_key": "alibaba_token_plan:alibaba_token_plan/glm-5.2:alibaba_token_plan",
+            "selection_reason": "failover",
+            "skipped": [],
+        },
+    ]
+    provider_calls: list[str] = []
+    publication_plans: list[Any] = []
+    failure_attempts: list[dict[str, Any]] = []
+
+    async def _select(
+        *,
+        request: Request,
+        request_body: dict[str, Any],
+        excluded_candidate_keys: object = None,
+    ) -> dict[str, Any]:
+        _ = request, request_body, excluded_candidate_keys
+        return selections.pop(0)
+
+    async def _perform(
+        *,
+        candidate: dict[str, Any],
+        candidate_body: dict[str, Any],
+    ) -> object:
+        _ = candidate_body
+        provider_calls.append(candidate["provider"])
+        if candidate["provider"] == "zai_coding_plan":
+            raise _StructuredCodingPlanError(
+                code=error_code,
+                message=f"model admission rejected: {error_code}",
+            )
+        return {"provider": candidate["provider"], "ok": True}
+
+    def _resolve_publication(**kwargs: Any) -> object:
+        resolver_kwargs = dict(kwargs)
+        resolver_kwargs["codex_failure_evidence_alias"] = None
+        plan = lpe._resolve_auto_agent_cooldown_publication_plan(**resolver_kwargs)
+        publication_plans.append(plan)
+        return plan
+
+    async def _execute_publication(
+        *,
+        plan: Any,
+        publish_cooldown_memory_fn: Any,
+        **_kwargs: Any,
+    ) -> None:
+        publish_cooldown_memory_fn(
+            keys=plan.memory_keys,
+            seconds=plan.duration_seconds,
+            allow_ttl_shrink=plan.allow_ttl_shrink,
+        )
+
+    async def _active_cooldown(_key: str) -> tuple[float, str]:
+        return 0.0, "memory"
+
+    async def _noop_async(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    session_affinity = MagicMock()
+    session_affinity.classify_session_owner_replay_safety_body.return_value = None
+    session_affinity.is_replay_safe_session_owner_redispatch_body.return_value = True
+    session_affinity.resolve_canonical_session_identity.return_value = None
+    session_affinity.get_request_codex_auto_review_parent_session_identity.return_value = None
+    session_affinity.build_session_owner_attributes.return_value = {}
+    session_affinity.ensure_session_owner_guard_for_request = AsyncMock(
+        return_value=SimpleNamespace(
+            decision=SimpleNamespace(value="no_session"),
+            reservation_token=None,
+            held_reservation=False,
+            provenance=None,
+        )
+    )
+    session_affinity.get_request_session_owner_lease.return_value = None
+    session_affinity.finalize_session_owner_lease_on_success = AsyncMock(
+        return_value=None
+    )
+    session_affinity.finalize_session_owner_lease_on_failure = AsyncMock(
+        return_value=None
+    )
+    session_affinity.run_with_session_owner_lease_renewal = None
+    session_affinity.SessionOwnerLeaseRenewalError = ()
+    session_affinity.SessionOwnerMutationOutcome = SimpleNamespace(
+        CONFLICT="conflict",
+        ERROR="error",
+        NOT_HELD="not_held",
+    )
+
+    admission = SimpleNamespace(
+        admit_selected_candidate=AsyncMock(
+            return_value=SimpleNamespace(allowed=True, lease=None)
+        ),
+        release_provider_lane_admission=AsyncMock(return_value=None),
+    )
+
+    def _record_failure(**kwargs: Any) -> dict[str, Any]:
+        failure_attempts.append(dict(kwargs["attempt_record"]))
+        return kwargs["prepared_request_body"]
+
+    monkeypatch.setattr(
+        candidate_loop,
+        "_admission_mod",
+        lambda: admission,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_failure",
+        _record_failure,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_auto_agent_alias_attempt_success",
+        lambda **kwargs: kwargs["prepared_request_body"],
+    )
+
+    monkeypatch.setattr(
+        candidate_loop,
+        "alias_routing_state",
+        AliasRoutingStateManager(),
+    )
+    monkeypatch.setattr(
+        candidate_loop,
+        "_session_affinity_mod",
+        lambda: session_affinity,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_record_codex_failure_evidence",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "_plan_codex_oauth_account_failover",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        lpe,
+        "execute_cooldown_publication_transaction",
+        _execute_publication,
+    )
+
+    services = SimpleNamespace(
+        select_candidate_fn=_select,
+        perform_candidate_request_fn=_perform,
+        resolve_cooldown_publication_fn=_resolve_publication,
+        publish_cooldown_memory_fn=lambda **_kwargs: None,
+        persist_cooldown_fn=_noop_async,
+        set_session_affinity_fn=_noop_async,
+        add_alias_metadata_fn=lambda body, **_kwargs: body,
+        raise_redispatch_fn=None,
+    )
+
+    response = await candidate_loop.handle_alias_route(
+        services,
+        alias_family="codex_auto_agent",
+        alias_model="sota-zai",
+        request=request,
+        prepared_request_body={"model": "sota-zai", "input": "hello"},
+        max_candidate_attempts=2,
+        get_active_cooldown_state_fn=_active_cooldown,
+        attempts_metadata_key="codex_auto_agent_attempts",
+        skipped_candidates_metadata_key="codex_auto_agent_skipped_candidates",
+        no_candidate_detail="no candidates",
+        log_label="Codex",
+    )
+
+    assert response == {"provider": "alibaba_token_plan", "ok": True}
+    assert provider_calls == ["zai_coding_plan", "alibaba_token_plan"]
+    assert len(publication_plans) == 1
+    assert publication_plans[0].memory_keys == (_ZAI_COOLDOWN_KEY,)
+    assert publication_plans[0].durable_keys == (_ZAI_COOLDOWN_KEY,)
+    assert len(failure_attempts) == 1
+    assert failure_attempts[0]["error_class"] == "candidate_unavailable"
+    assert failure_attempts[0]["error_code"] == str(error_code)
+    assert failure_attempts[0]["error_type"] == "invalid_request_error"
+    assert failure_attempts[0]["error_status_code"] == 429
+    assert failure_attempts[0]["cooldown_scope"] == "candidate"
+
+
+def test_should_keep_half_open_zai_cooldown_recovery() -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
+        classification,
+    )
+
+    event = classification.classify_failure(
+        status_code=429,
+        provider="zai_coding_plan",
+        message="model admission unavailable",
+    )
+    gate = classification.CooldownEvidenceGate(
+        base_seconds=1.0,
+        max_seconds=8.0,
+    )
+    decision = gate.record(
+        cooldown_key=_ZAI_COOLDOWN_KEY,
+        event=event,
+        now_monotonic=10.0,
+    )
+
+    assert decision.should_cool is True
+    assert gate.allow_half_open_probe(
+        cooldown_key=_ZAI_COOLDOWN_KEY,
+        now_monotonic=decision.cooled_until_monotonic + 0.01,
+    )
+    assert (
+        gate.allow_half_open_probe(
+            cooldown_key=_ZAI_COOLDOWN_KEY,
+            now_monotonic=decision.cooled_until_monotonic + 0.02,
+        )
+        is False
+    )
+
+    gate.record_probe_result(cooldown_key=_ZAI_COOLDOWN_KEY, success=True)
+    assert (
+        gate.is_cooled(
+            cooldown_key=_ZAI_COOLDOWN_KEY,
+            now_monotonic=decision.cooled_until_monotonic + 0.03,
+        )
+        is False
     )
 
 
