@@ -1924,7 +1924,7 @@ def _cursor_replay_stock_codex_function_call_item(
     item_id = item.get("id")
     item_id_match = (
         re.fullmatch(
-            r"fc_([0-9a-f-]{36})_(0|[1-9][0-9]*)",
+            r"fc_([0-9a-f-]{36})(?:_(?:0|[1-9][0-9]*))?",
             item_id,
         )
         if isinstance(item_id, str)
