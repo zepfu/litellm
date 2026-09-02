@@ -1170,6 +1170,28 @@ def _decode_interaction_update(payload: bytes) -> Dict[str, Any]:
     return {}
 
 
+_EXEC_SERVER_METADATA_FIELDS = frozenset({15, 19, 55})
+_EXEC_SERVER_KNOWN_OPERATION_FIELDS = frozenset({2, 5, 7, 10, 11, 14, 28})
+
+
+def _select_exec_message_field(
+    exec_fields: Iterable[tuple[int, int, Any]],
+) -> Optional[int]:
+    for field_number, wire_type, _value in exec_fields:
+        if (
+            wire_type == 2
+            and field_number in _EXEC_SERVER_KNOWN_OPERATION_FIELDS
+        ):
+            return field_number
+    for field_number, wire_type, _value in exec_fields:
+        if (
+            wire_type == 2
+            and field_number not in _EXEC_SERVER_METADATA_FIELDS
+        ):
+            return field_number
+    return None
+
+
 def decode_agent_server_message(payload: bytes) -> Dict[str, Any]:
     """Decode the AgentServerMessage variants used by the external adapter."""
     fields = _decode_proto_fields(payload)
@@ -1180,10 +1202,7 @@ def decode_agent_server_message(payload: bytes) -> Dict[str, Any]:
     exec_server_message = _proto_last_field(fields, 2, wire_type=2)
     if isinstance(exec_server_message, bytes):
         exec_fields = _decode_proto_fields(exec_server_message)
-        message_field = next(
-            (number for number, wire_type, _value in exec_fields if wire_type == 2 and number not in {15}),
-            None,
-        )
+        message_field = _select_exec_message_field(exec_fields)
         return {
             "execServerMessage": {
                 "id": _proto_last_field(exec_fields, 1, wire_type=0) or 0,
@@ -1242,13 +1261,37 @@ _LOCAL_EXEC_BRIDGE_FIELDS = {
     2: "shell_args",
     14: "shell_stream_args",
 }
-_RETAINED_EXTERNAL_EXEC_FIELDS = frozenset({2, 7, 14})
+_RETAINED_EXTERNAL_EXEC_FIELDS = frozenset({2, 7, 14, 28})
 _LOCAL_EXEC_TOOL_NAMES = (
     "exec_command",
     "shell",
     "bash",
     "run_shell_command",
 )
+_SPAWN_AGENT_TOOL_NAME = "spawn_agent"
+_SUBAGENT_PROHIBITED_FIELD_NAMES = {
+    6: "resume_agent_id",
+    7: "run_in_background",
+    8: "continuation_config",
+    9: "parent_conversation_id",
+    10: "credentials",
+    11: "credentials",
+    12: "credentials",
+    13: "interrupt",
+    14: "mode",
+    15: "fork_agent_id",
+    16: "root_parent_conversation_id",
+    17: "selected_context",
+    18: "direct_meta_parent_child_subagent",
+    19: "environment",
+    20: "cloud_base_branch",
+    21: "model_parameters",
+}
+_SPAWN_AGENT_SCHEMA_FIELD_ALIASES = {
+    "agent_type": frozenset({"agent_type", "subagent_type", "type"}),
+    "model": frozenset({"model", "model_id"}),
+    "message": frozenset({"message", "prompt"}),
+}
 _CURSOR_READ_ENVELOPE_PREFIX = "LITELLM_CURSOR_READ_V1:"
 _CURSOR_READ_MAX_OUTPUT_CHARS = 8 * 1024 * 1024
 _CURSOR_READ_ENVELOPE_MAX_BYTES = 16 * 1024 * 1024
@@ -1389,6 +1432,16 @@ def _exec_request_identity(
         _proto_last_field(exec_fields, 1, wire_type=0) or 0,
         _decode_proto_string(_proto_last_field(exec_fields, 15, wire_type=2)),
     )
+
+
+def _exec_identity_fields(
+    exec_fields: List[tuple[int, int, Any]],
+) -> List[tuple[int, int, Any]]:
+    request_id, exec_id = _exec_request_identity(exec_fields)
+    return [
+        (1, 0, request_id),
+        (15, 2, exec_id.encode("utf-8")),
+    ]
 
 
 def _encode_exec_client_message(
@@ -1894,6 +1947,190 @@ def _encode_shell_stream_terminal_result(
     return messages
 
 
+def _decode_subagent_result_output(output: Any) -> Dict[str, Any]:  # noqa: PLR0915
+    if isinstance(output, Mapping):
+        result_mapping: Any = output
+    else:
+        if isinstance(output, bytes):
+            try:
+                output = output.decode("utf-8")
+            except UnicodeDecodeError:
+                raise CursorConnectProtocolError(
+                    "Cursor Agent subagent result is not valid UTF-8 JSON."
+                ) from None
+        if not isinstance(output, str):
+            raise CursorConnectProtocolError(
+                "Cursor Agent subagent result must be a JSON object."
+            )
+        try:
+            result_mapping = json.loads(output)
+        except (TypeError, ValueError):
+            raise CursorConnectProtocolError(
+                "Cursor Agent subagent result must be a JSON object."
+            ) from None
+    if not isinstance(result_mapping, Mapping):
+        raise CursorConnectProtocolError(
+            "Cursor Agent subagent result must be a JSON object."
+        )
+
+    result_case: Optional[str] = None
+    result_value: Any = result_mapping
+    oneof_result = result_mapping.get("result")
+    if isinstance(oneof_result, Mapping):
+        case = oneof_result.get("case")
+        value = oneof_result.get("value")
+        if case in {"success", "error"} and isinstance(value, Mapping):
+            result_case = str(case)
+            result_value = value
+    if result_case is None and "success" in result_mapping:
+        success = result_mapping.get("success")
+        if isinstance(success, Mapping):
+            result_case = "success"
+            result_value = success
+    if result_case is None and "error" in result_mapping:
+        error = result_mapping.get("error")
+        if isinstance(error, Mapping):
+            result_case = "error"
+            result_value = error
+        elif isinstance(error, str):
+            result_case = "error"
+            result_value = result_mapping
+    if result_case is None:
+        status = result_mapping.get("status")
+        if status in {"success", "error"}:
+            result_case = str(status)
+            result_value = result_mapping
+    if result_case is None and any(
+        key in result_mapping for key in ("agent_id", "agentId")
+    ):
+        result_case = "success"
+    if result_case is None or not isinstance(result_value, Mapping):
+        raise CursorConnectProtocolError(
+            "Cursor Agent subagent result has no supported success or error case."
+        )
+
+    def optional_string(*keys: str) -> Optional[str]:
+        for key in keys:
+            if key not in result_value:
+                continue
+            value = result_value[key]
+            if not isinstance(value, str):
+                raise CursorConnectProtocolError(
+                    "Cursor Agent subagent result contains an invalid string field."
+                )
+            return value
+        return None
+
+    if result_case == "error":
+        error = optional_string("error")
+        if not error:
+            raise CursorConnectProtocolError(
+                "Cursor Agent subagent error result does not contain an error."
+            )
+        agent_id = optional_string("agent_id", "agentId")
+        return {
+            "case": "error",
+            "agent_id": agent_id,
+            "error": error,
+        }
+
+    agent_id = optional_string("agent_id", "agentId")
+    if not agent_id:
+        raise CursorConnectProtocolError(
+            "Cursor Agent subagent success result does not contain an agent_id."
+        )
+    tool_call_count_value = result_value.get("tool_call_count")
+    if tool_call_count_value is None:
+        tool_call_count_value = result_value.get("toolCallCount", 0)
+    if (
+        isinstance(tool_call_count_value, bool)
+        or not isinstance(tool_call_count_value, int)
+        or not 0 <= tool_call_count_value <= 0xFFFFFFFF
+    ):
+        raise CursorConnectProtocolError(
+            "Cursor Agent subagent result contains an invalid tool_call_count."
+        )
+    return {
+        "case": "success",
+        "agent_id": agent_id,
+        "final_message": optional_string("final_message", "finalMessage"),
+        "tool_call_count": tool_call_count_value,
+        "background_reason": optional_string(
+            "background_reason",
+            "backgroundReason",
+        ),
+        "transcript_path": optional_string(
+            "transcript_path",
+            "transcriptPath",
+        ),
+    }
+
+
+def _encode_subagent_terminal_result(
+    exec_request: Mapping[str, Any],
+    output: Any,
+) -> List[bytes]:
+    result = _decode_subagent_result_output(output)
+    if result["case"] == "success":
+        success = b"".join(
+            (
+                _encode_proto_string_field(1, result["agent_id"]),
+                _encode_proto_string_field(
+                    2,
+                    result["final_message"],
+                    include_empty=True,
+                )
+                if result["final_message"] is not None
+                else b"",
+                _encode_proto_varint_field(
+                    3,
+                    result["tool_call_count"],
+                    include_default=True,
+                ),
+                _encode_proto_string_field(
+                    4,
+                    result["background_reason"],
+                    include_empty=True,
+                )
+                if result["background_reason"] is not None
+                else b"",
+                _encode_proto_string_field(
+                    5,
+                    result["transcript_path"],
+                    include_empty=True,
+                )
+                if result["transcript_path"] is not None
+                else b"",
+            )
+        )
+        subagent_result = _encode_proto_message_field(1, success)
+    else:
+        error = _encode_proto_string_field(
+            2,
+            result["error"],
+            include_empty=True,
+        )
+        if result["agent_id"] is not None:
+            error = (
+                _encode_proto_string_field(
+                    1,
+                    result["agent_id"],
+                    include_empty=True,
+                )
+                + error
+            )
+        subagent_result = _encode_proto_message_field(2, error)
+    exec_fields = cast(List[tuple[int, int, Any]], exec_request["exec_fields"])
+    return [
+        _encode_exec_client_message(
+            exec_fields,
+            message_field=28,
+            message_payload=subagent_result,
+        ),
+        _encode_exec_stream_close(exec_fields),
+    ]
+
+
 def _encode_external_exec_terminal_result(
     exec_request: Mapping[str, Any],
     output: Any,
@@ -1905,6 +2142,8 @@ def _encode_external_exec_terminal_result(
         return _encode_read_terminal_result(exec_request, output)
     if message_field == 14:
         return _encode_shell_stream_terminal_result(exec_request, output)
+    if message_field == 28:
+        return _encode_subagent_terminal_result(exec_request, output)
     raise CursorConnectProtocolError(
         f"Cursor Agent requested unsupported external exec field {message_field}."
     )
@@ -1970,6 +2209,308 @@ def _advertised_local_exec_tool_name(
             if isinstance(name, str) and name.casefold() == preferred_name:
                 return name
     return None
+
+
+def _advertised_spawn_agent_tool_definition(
+    request_payload: Mapping[str, Any],
+) -> Optional[Mapping[str, Any]]:
+    run_request = _proto_mapping_value(
+        request_payload,
+        "runRequest",
+        "run_request",
+    )
+    if not isinstance(run_request, Mapping):
+        return None
+    mcp_tools = _proto_mapping_value(run_request, "mcpTools", "mcp_tools")
+    if not isinstance(mcp_tools, Mapping):
+        return None
+    definitions = _proto_mapping_value(mcp_tools, "mcpTools", "mcp_tools")
+    if not isinstance(definitions, list):
+        return None
+
+    matches: List[Mapping[str, Any]] = []
+    for definition in definitions:
+        if not isinstance(definition, Mapping):
+            continue
+        name = _proto_mapping_value(
+            definition,
+            "name",
+            "toolName",
+            "tool_name",
+        )
+        if isinstance(name, str) and name.casefold() == _SPAWN_AGENT_TOOL_NAME:
+            matches.append(definition)
+    if len(matches) != 1:
+        return None
+    return matches[0]
+
+
+def _spawn_agent_schema_parts(
+    definition: Mapping[str, Any],
+) -> tuple[str, Mapping[str, Any], List[str]]:
+    name = _proto_mapping_value(
+        definition,
+        "name",
+        "toolName",
+        "tool_name",
+    )
+    if not isinstance(name, str) or name.casefold() != _SPAWN_AGENT_TOOL_NAME:
+        raise CursorConnectProtocolError(
+            "Cursor Agent subagent operation requires the advertised spawn_agent tool."
+        )
+
+    raw_schema = _proto_mapping_value(
+        definition,
+        "inputSchemaJson",
+        "input_schema_json",
+    )
+    if raw_schema is None:
+        raw_schema = _proto_mapping_value(definition, "parameters")
+    if isinstance(raw_schema, str):
+        try:
+            schema = json.loads(raw_schema)
+        except (TypeError, ValueError):
+            raise CursorConnectProtocolError(
+                "Cursor Agent advertised spawn_agent has an invalid input schema."
+            ) from None
+    else:
+        schema = raw_schema
+    if not isinstance(schema, Mapping):
+        raise CursorConnectProtocolError(
+            "Cursor Agent advertised spawn_agent has no usable input schema."
+        )
+    properties = schema.get("properties")
+    if not isinstance(properties, Mapping):
+        raise CursorConnectProtocolError(
+            "Cursor Agent advertised spawn_agent has no usable input properties."
+        )
+    required = schema.get("required", [])
+    if not isinstance(required, list) or any(
+        not isinstance(value, str) for value in required
+    ):
+        raise CursorConnectProtocolError(
+            "Cursor Agent advertised spawn_agent has an invalid required-field list."
+        )
+    return name, properties, list(required)
+
+
+def _validate_spawn_agent_schema_property(
+    properties: Mapping[str, Any],
+    *,
+    field_name: str,
+    expected_type: str,
+    value: Any,
+) -> None:
+    aliases = _SPAWN_AGENT_SCHEMA_FIELD_ALIASES.get(
+        field_name,
+        frozenset({field_name}),
+    )
+    present_aliases = [alias for alias in aliases if alias in properties]
+    if len(present_aliases) > 1:
+        raise CursorConnectProtocolError(
+            "Cursor Agent advertised spawn_agent has an ambiguous "
+            f"{field_name} field mapping."
+        )
+    if field_name not in properties:
+        raise CursorConnectProtocolError(
+            "Cursor Agent advertised spawn_agent does not accept the required "
+            f"{field_name} value."
+        )
+    property_schema = properties[field_name]
+    if not isinstance(property_schema, Mapping):
+        raise CursorConnectProtocolError(
+            f"Cursor Agent advertised spawn_agent has an invalid {field_name} schema."
+        )
+    declared_type = property_schema.get("type")
+    if isinstance(declared_type, str):
+        accepts_type = declared_type == expected_type
+    elif isinstance(declared_type, list):
+        accepts_type = expected_type in declared_type
+    else:
+        accepts_type = False
+    if not accepts_type:
+        raise CursorConnectProtocolError(
+            f"Cursor Agent advertised spawn_agent has an unsupported {field_name} type."
+        )
+    enum = property_schema.get("enum")
+    if enum is not None and (not isinstance(enum, list) or value not in enum):
+        raise CursorConnectProtocolError(
+            f"Cursor Agent advertised spawn_agent rejects the explicit {field_name} value."
+        )
+    if "const" in property_schema and property_schema["const"] != value:
+        raise CursorConnectProtocolError(
+            f"Cursor Agent advertised spawn_agent rejects the explicit {field_name} value."
+        )
+
+
+def _build_spawn_agent_arguments(
+    definition: Optional[Mapping[str, Any]],
+    *,
+    subagent_type: str,
+    model_id: str,
+    prompt: str,
+    readonly: bool,
+    readonly_present: bool,
+) -> tuple[str, Dict[str, Any]]:
+    if definition is None:
+        raise CursorConnectProtocolError(
+            "Cursor Agent subagent operation requires an advertised spawn_agent tool."
+        )
+    tool_name, properties, required = _spawn_agent_schema_parts(definition)
+    arguments: Dict[str, Any] = {}
+    for field_name, expected_type, value in (
+        ("agent_type", "string", subagent_type),
+        ("model", "string", model_id),
+        ("message", "string", prompt),
+    ):
+        _validate_spawn_agent_schema_property(
+            properties,
+            field_name=field_name,
+            expected_type=expected_type,
+            value=value,
+        )
+        arguments[field_name] = value
+
+    if readonly_present:
+        if "readonly" in properties:
+            _validate_spawn_agent_schema_property(
+                properties,
+                field_name="readonly",
+                expected_type="boolean",
+                value=readonly,
+            )
+            arguments["readonly"] = readonly
+        elif readonly:
+            raise CursorConnectProtocolError(
+                "Cursor Agent subagent operation requests readonly execution, "
+                "but the advertised spawn_agent schema cannot represent it."
+            )
+
+    missing_required = [
+        field_name for field_name in required if field_name not in arguments
+    ]
+    if missing_required:
+        raise CursorConnectProtocolError(
+            "Cursor Agent advertised spawn_agent requires unsupported or "
+            "missing fields: "
+            + ", ".join(missing_required)
+            + "."
+        )
+    return tool_name, arguments
+
+
+def _decode_subagent_request(
+    exec_fields: List[tuple[int, int, Any]],
+    *,
+    spawn_agent_tool_definition: Optional[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    args_payload = _proto_last_field(exec_fields, 28, wire_type=2)
+    if not isinstance(args_payload, bytes):
+        raise CursorConnectProtocolError(
+            "Cursor Agent subagent operation does not contain subagent arguments."
+        )
+    args_fields = _decode_proto_fields(args_payload)
+    unsupported_fields = sorted(
+        {
+            field_number
+            for field_number, _wire_type, _value in args_fields
+            if field_number > 5
+        }
+    )
+    if unsupported_fields:
+        field_names = [
+            _SUBAGENT_PROHIBITED_FIELD_NAMES.get(
+                field_number,
+                f"field_{field_number}",
+            )
+            for field_number in unsupported_fields
+        ]
+        raise CursorConnectProtocolError(
+            "Cursor Agent subagent operation contains unsupported optional "
+            "field(s): "
+            + ", ".join(field_names)
+            + "."
+        )
+
+    for field_number in range(1, 6):
+        if len(_proto_field_values(args_fields, field_number)) > 1:
+            raise CursorConnectProtocolError(
+                "Cursor Agent subagent operation contains a repeated safe scalar field."
+            )
+
+    def required_string(field_number: int, field_name: str) -> str:
+        value = _proto_last_field(args_fields, field_number, wire_type=2)
+        decoded = _decode_proto_string(value)
+        if not decoded:
+            raise CursorConnectProtocolError(
+                "Cursor Agent subagent operation does not contain a non-empty "
+                f"{field_name}."
+            )
+        return decoded
+
+    tool_call_id = required_string(1, "tool_call_id")
+    subagent_type = required_string(2, "subagent_type")
+    model_id = required_string(3, "model_id")
+    prompt = required_string(4, "prompt")
+
+    readonly_entries = _proto_field_values(args_fields, 5)
+    readonly = False
+    readonly_present = bool(readonly_entries)
+    if readonly_entries:
+        _field_number, wire_type, value = readonly_entries[0]
+        if wire_type != 0:
+            raise CursorConnectProtocolError(
+                "Cursor Agent subagent operation contains an invalid readonly field."
+            )
+        if int(value) not in {0, 1}:
+            raise CursorConnectProtocolError(
+                "Cursor Agent subagent operation contains an invalid readonly value."
+            )
+        readonly = bool(value)
+
+    request_id, exec_id = _exec_request_identity(exec_fields)
+    if not request_id and not exec_id:
+        raise CursorConnectProtocolError(
+            "Cursor Agent subagent operation does not contain a replayable "
+            "request identity."
+        )
+    tool_name, arguments = _build_spawn_agent_arguments(
+        spawn_agent_tool_definition,
+        subagent_type=subagent_type,
+        model_id=model_id,
+        prompt=prompt,
+        readonly=readonly,
+        readonly_present=readonly_present,
+    )
+    normalized = {
+        "interactionUpdate": {
+            "toolCallCompleted": {
+                "callId": tool_call_id,
+                "toolName": tool_name,
+                "argsJson": json.dumps(
+                    arguments,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                "itemId": f"fc_{tool_call_id}",
+            }
+        }
+    }
+    return {
+        "normalized": normalized,
+        "exec_request": {
+            "call_id": tool_call_id,
+            "message_field": 28,
+            "exec_fields": _exec_identity_fields(exec_fields),
+            "request_id": request_id,
+            "exec_id": exec_id,
+            "tool_call_id": tool_call_id,
+            "subagent_type": subagent_type,
+            "model_id": model_id,
+            "prompt": prompt,
+            "readonly": readonly,
+        },
+    }
 
 
 def _decode_local_exec_tool_call(
@@ -2136,6 +2677,7 @@ def _process_agent_server_message(
     blobs: Dict[bytes, bytes],
     *,
     local_exec_tool_name: Optional[str] = None,
+    spawn_agent_tool_definition: Optional[Mapping[str, Any]] = None,
     external_exec_requests: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[Dict[str, Any], List[bytes]]:
     fields = _decode_proto_fields(payload)
@@ -2177,10 +2719,15 @@ def _process_agent_server_message(
             wire_type=2,
         )
         if not isinstance(request_context_args, bytes):
-            message_field = next(
-                (number for number, wire_type, _value in exec_fields if wire_type == 2 and number != 15),
-                None,
-            )
+            message_field = _select_exec_message_field(exec_fields)
+            if message_field == 28:
+                subagent_request = _decode_subagent_request(
+                    exec_fields,
+                    spawn_agent_tool_definition=spawn_agent_tool_definition,
+                )
+                if external_exec_requests is not None:
+                    external_exec_requests.append(subagent_request["exec_request"])
+                return subagent_request["normalized"], []
             if (
                 message_field in _LOCAL_EXEC_BRIDGE_FIELDS
                 and local_exec_tool_name
@@ -2257,6 +2804,7 @@ class CursorAgentRetainedSession:
         decoder: _ProtoConnectFrameDecoder,
         blobs: Dict[bytes, bytes],
         local_exec_tool_name: Optional[str],
+        spawn_agent_tool_definition: Optional[Mapping[str, Any]],
         saw_response_headers: bool,
     ) -> None:
         self.reader = reader
@@ -2266,6 +2814,7 @@ class CursorAgentRetainedSession:
         self.decoder = decoder
         self.blobs = blobs
         self.local_exec_tool_name = local_exec_tool_name
+        self.spawn_agent_tool_definition = spawn_agent_tool_definition
         self.saw_response_headers = saw_response_headers
         self.pending = bytearray()
         self._buffered_frames: List[CursorConnectProtoFrame] = []
@@ -2289,7 +2838,7 @@ class CursorAgentRetainedSession:
             )
         if int(exec_request.get("message_field") or 0) not in _RETAINED_EXTERNAL_EXEC_FIELDS:
             raise CursorConnectProtocolError(
-                "Cursor Agent retained continuation supports only fields 2, 7, and 14."
+                "Cursor Agent retained continuation supports only fields 2, 7, 14, and 28."
             )
         self._external_exec_requests[call_id] = dict(exec_request)
 
@@ -2394,6 +2943,7 @@ class CursorAgentRetainedSession:
             frame.payload,
             self.blobs,
             local_exec_tool_name=self.local_exec_tool_name,
+            spawn_agent_tool_definition=self.spawn_agent_tool_definition,
             external_exec_requests=external_exec_requests,
         )
         for exec_request in external_exec_requests:
@@ -3446,6 +3996,7 @@ class CursorAgentConnectClient:
         stop_on_tool_call: bool,
         timeout: Optional[float],
         local_exec_tool_name: Optional[str],
+        spawn_agent_tool_definition: Optional[Mapping[str, Any]],
         retain_on_tool_call: bool,
     ) -> CursorAgentRunResult:
         """Run Cursor's true bidi RPC without half-closing the request."""
@@ -3535,6 +4086,7 @@ class CursorAgentConnectClient:
                 decoder=_ProtoConnectFrameDecoder(),
                 blobs={},
                 local_exec_tool_name=local_exec_tool_name,
+                spawn_agent_tool_definition=spawn_agent_tool_definition,
                 saw_response_headers=False,
             )
             writer.write(connection.data_to_send())
@@ -3584,6 +4136,7 @@ class CursorAgentConnectClient:
         *,
         stop_on_tool_call: bool,
         local_exec_tool_name: Optional[str],
+        spawn_agent_tool_definition: Optional[Mapping[str, Any]],
     ) -> CursorAgentRunResult:
         self._require_http2(response)
         status_code = int(getattr(response, "status_code", 502))
@@ -3614,6 +4167,7 @@ class CursorAgentConnectClient:
                 frame.payload,
                 blobs,
                 local_exec_tool_name=local_exec_tool_name,
+                spawn_agent_tool_definition=spawn_agent_tool_definition,
             )
             if client_messages:
                 raise CursorConnectProtocolError(
@@ -3635,6 +4189,7 @@ class CursorAgentConnectClient:
         stop_on_tool_call: bool,
         timeout: Optional[float],
         local_exec_tool_name: Optional[str],
+        spawn_agent_tool_definition: Optional[Mapping[str, Any]],
         retain_on_tool_call: bool,
     ) -> CursorAgentRunResult:
         if self.http_client is None and self.client_factory is None:
@@ -3646,6 +4201,7 @@ class CursorAgentConnectClient:
                 stop_on_tool_call=stop_on_tool_call,
                 timeout=timeout,
                 local_exec_tool_name=local_exec_tool_name,
+                spawn_agent_tool_definition=spawn_agent_tool_definition,
                 retain_on_tool_call=retain_on_tool_call,
             )
 
@@ -3686,6 +4242,7 @@ class CursorAgentConnectClient:
                             response,
                             stop_on_tool_call=stop_on_tool_call,
                             local_exec_tool_name=local_exec_tool_name,
+                            spawn_agent_tool_definition=spawn_agent_tool_definition,
                         )
                 response = context
                 try:
@@ -3693,6 +4250,7 @@ class CursorAgentConnectClient:
                         response,
                         stop_on_tool_call=stop_on_tool_call,
                         local_exec_tool_name=local_exec_tool_name,
+                        spawn_agent_tool_definition=spawn_agent_tool_definition,
                     )
                 finally:
                     aclose = getattr(response, "aclose", None)
@@ -3703,6 +4261,7 @@ class CursorAgentConnectClient:
                 response,
                 stop_on_tool_call=stop_on_tool_call,
                 local_exec_tool_name=local_exec_tool_name,
+                spawn_agent_tool_definition=spawn_agent_tool_definition,
             )
         except CursorConnectError:
             raise
@@ -3741,6 +4300,9 @@ class CursorAgentConnectClient:
         run_request = request_payload.get("runRequest")
         run_id = str(run_request.get("runId") or "").strip() if isinstance(run_request, Mapping) else ""
         local_exec_tool_name = _advertised_local_exec_tool_name(request_payload)
+        spawn_agent_tool_definition = _advertised_spawn_agent_tool_definition(
+            request_payload
+        )
         turn_extra_headers = {str(key).lower(): value for key, value in dict(extra_headers or {}).items()}
         if run_id:
             turn_extra_headers.setdefault("x-original-request-id", run_id)
@@ -3766,6 +4328,7 @@ class CursorAgentConnectClient:
                 stop_on_tool_call=stop_on_tool_call,
                 timeout=timeout,
                 local_exec_tool_name=local_exec_tool_name,
+                spawn_agent_tool_definition=spawn_agent_tool_definition,
                 retain_on_tool_call=retain_on_tool_call,
             )
         except CursorConnectError as exc:
@@ -3792,6 +4355,7 @@ class CursorAgentConnectClient:
                 stop_on_tool_call=stop_on_tool_call,
                 timeout=timeout,
                 local_exec_tool_name=local_exec_tool_name,
+                spawn_agent_tool_definition=spawn_agent_tool_definition,
                 retain_on_tool_call=retain_on_tool_call,
             )
 

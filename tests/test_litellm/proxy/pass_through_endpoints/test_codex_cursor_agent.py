@@ -10,6 +10,7 @@ from fastapi.responses import Response, StreamingResponse
 from starlette.requests import Request
 
 from litellm.llms.cursor_agent.common_utils import run_url
+from litellm.llms.cursor_agent import connect as cursor_connect
 from litellm.llms.cursor_agent.connect import (
     CursorAgentRunResult,
     CursorConnectError,
@@ -162,6 +163,354 @@ def _replay_body(response_id: str = "resp-replay") -> dict[str, Any]:
             }
         ],
     }
+
+
+def _cursor_subagent_args(*, extra: bytes = b"") -> bytes:
+    return b"".join(
+        (
+            cursor_connect._encode_proto_string_field(1, "subagent-call"),
+            cursor_connect._encode_proto_string_field(2, "explorer"),
+            cursor_connect._encode_proto_string_field(3, "read"),
+            cursor_connect._encode_proto_string_field(
+                4,
+                "Inspect the requested files without changing them.",
+            ),
+            extra,
+        )
+    )
+
+
+def _cursor_subagent_server_message(
+    subagent_args: bytes,
+    *,
+    request_id: int = 314,
+    exec_id: str = "exec-014",
+    with_metadata: bool = False,
+) -> bytes:
+    exec_fields = cursor_connect._encode_proto_varint_field(1, request_id)
+    if with_metadata:
+        exec_fields += cursor_connect._encode_proto_message_field(
+            19,
+            b"span-context-secret",
+        )
+    exec_fields += cursor_connect._encode_proto_message_field(28, subagent_args)
+    if with_metadata:
+        exec_fields += cursor_connect._encode_proto_message_field(
+            55,
+            b"accept-context-secret",
+        )
+    exec_fields += cursor_connect._encode_proto_string_field(15, exec_id)
+    return cursor_connect._encode_proto_message_field(2, exec_fields)
+
+
+def _advertised_spawn_agent_definition() -> dict[str, Any]:
+    return {
+        "name": "spawn_agent",
+        "inputSchemaJson": json.dumps(
+            {
+                "type": "object",
+                "properties": {
+                    "agent_type": {"type": "string"},
+                    "model": {"type": "string"},
+                    "message": {"type": "string"},
+                },
+                "required": ["message"],
+            }
+        ),
+    }
+
+
+def test_cursor_subagent_operation_selection_ignores_exec_metadata() -> None:
+    payload = _cursor_subagent_server_message(
+        _cursor_subagent_args(),
+        with_metadata=True,
+    )
+
+    decoded = cursor_connect.decode_agent_server_message(payload)
+
+    assert decoded == {
+        "execServerMessage": {
+            "id": 314,
+            "execId": "exec-014",
+            "messageField": 28,
+        }
+    }
+    serialized = json.dumps(decoded)
+    assert "span-context-secret" not in serialized
+    assert "accept-context-secret" not in serialized
+
+
+def test_cursor_subagent_args_map_to_advertised_spawn_agent() -> None:
+    external_exec_requests: list[dict[str, Any]] = []
+
+    normalized, client_messages = cursor_connect._process_agent_server_message(
+        _cursor_subagent_server_message(_cursor_subagent_args()),
+        {},
+        spawn_agent_tool_definition=_advertised_spawn_agent_definition(),
+        external_exec_requests=external_exec_requests,
+    )
+
+    tool_call = normalized["interactionUpdate"]["toolCallCompleted"]
+    assert tool_call["callId"] == "subagent-call"
+    assert tool_call["toolName"] == "spawn_agent"
+    assert json.loads(tool_call["argsJson"]) == {
+        "agent_type": "explorer",
+        "model": "read",
+        "message": "Inspect the requested files without changing them.",
+    }
+    assert client_messages == []
+    assert len(external_exec_requests) == 1
+    request = external_exec_requests[0]
+    assert request["call_id"] == "subagent-call"
+    assert request["message_field"] == 28
+    assert request["request_id"] == 314
+    assert request["exec_id"] == "exec-014"
+    assert request["tool_call_id"] == "subagent-call"
+    assert request["exec_fields"] == [
+        (1, 0, 314),
+        (15, 2, b"exec-014"),
+    ]
+
+
+def test_cursor_subagent_requires_unambiguous_advertised_spawn_agent() -> None:
+    external_exec_requests: list[dict[str, Any]] = []
+    definition = _advertised_spawn_agent_definition()
+    schema = json.loads(definition["inputSchemaJson"])
+    schema["properties"]["subagent_type"] = {"type": "string"}
+    definition["inputSchemaJson"] = json.dumps(schema)
+
+    with pytest.raises(
+        CursorConnectProtocolError,
+        match="ambiguous agent_type field mapping",
+    ) as exc_info:
+        cursor_connect._process_agent_server_message(
+            _cursor_subagent_server_message(_cursor_subagent_args()),
+            {},
+            spawn_agent_tool_definition=definition,
+            external_exec_requests=external_exec_requests,
+        )
+
+    assert external_exec_requests == []
+    assert "subagent-call" not in exc_info.value.message
+
+
+def test_cursor_subagent_requires_advertised_spawn_agent() -> None:
+    external_exec_requests: list[dict[str, Any]] = []
+
+    with pytest.raises(
+        CursorConnectProtocolError,
+        match="advertised spawn_agent",
+    ) as exc_info:
+        cursor_connect._process_agent_server_message(
+            _cursor_subagent_server_message(_cursor_subagent_args()),
+            {},
+            external_exec_requests=external_exec_requests,
+        )
+
+    assert external_exec_requests == []
+    assert "Inspect the requested files" not in exc_info.value.message
+
+
+@pytest.mark.parametrize(
+    ("field_number", "secret"),
+    [
+        (6, "resume-secret"),
+        (7, "background-secret"),
+        (8, "continuation-secret"),
+        (9, "parent-conversation-secret"),
+        (10, "credential-one-secret"),
+        (11, "credential-two-secret"),
+        (12, "credential-three-secret"),
+        (13, "interrupt-secret"),
+        (14, "mode-secret"),
+        (15, "fork-secret"),
+        (16, "root-parent-secret"),
+        (17, "selected-context-secret"),
+        (18, "direct-parent-secret"),
+        (19, "environment-secret"),
+        (20, "cloud-branch-secret"),
+        (21, "model-parameters-secret"),
+    ],
+    ids=[
+        "resume",
+        "background",
+        "continuation",
+        "parent-conversation",
+        "credential-one",
+        "credential-two",
+        "credential-three",
+        "interrupt",
+        "mode",
+        "fork",
+        "root-parent",
+        "selected-context",
+        "direct-parent",
+        "environment",
+        "cloud-branch",
+        "model-parameters",
+    ],
+)
+def test_cursor_subagent_rejects_prohibited_optional_fields_without_dispatch(
+    field_number: int,
+    secret: str,
+) -> None:
+    external_exec_requests: list[dict[str, Any]] = []
+    prohibited_field = cursor_connect._encode_proto_message_field(
+        field_number,
+        cursor_connect._encode_proto_string_field(1, secret),
+    )
+
+    with pytest.raises(
+        CursorConnectProtocolError,
+        match="unsupported optional field",
+    ) as exc_info:
+        cursor_connect._process_agent_server_message(
+            _cursor_subagent_server_message(
+                _cursor_subagent_args(extra=prohibited_field)
+            ),
+            {},
+            spawn_agent_tool_definition=_advertised_spawn_agent_definition(),
+            external_exec_requests=external_exec_requests,
+        )
+
+    assert external_exec_requests == []
+    assert secret not in exc_info.value.message
+    assert secret not in json.dumps(exc_info.value.body or {})
+
+
+def test_cursor_subagent_result_encodes_success_and_error_with_identity() -> None:
+    exec_fields = cursor_connect._decode_proto_fields(
+        cursor_connect._encode_proto_varint_field(1, 314)
+        + cursor_connect._encode_proto_string_field(15, "exec-014")
+    )
+    exec_request = {
+        "call_id": "subagent-call",
+        "tool_call_id": "subagent-call",
+        "message_field": 28,
+        "exec_fields": exec_fields,
+    }
+
+    success_messages = cursor_connect._encode_subagent_terminal_result(
+        exec_request,
+        json.dumps(
+            {
+                "agent_id": "child-agent",
+                "final_message": "Child completed.",
+                "tool_call_count": 2,
+                "background_reason": "",
+                "transcript_path": "/tmp/child.jsonl",
+            }
+        ),
+    )
+    error_messages = cursor_connect._encode_subagent_terminal_result(
+        exec_request,
+        json.dumps(
+            {
+                "agent_id": "child-agent",
+                "error": "Child failed.",
+            }
+        ),
+    )
+
+    for messages in (success_messages, error_messages):
+        assert len(messages) == 2
+        exec_client_message = cursor_connect._proto_last_field(
+            cursor_connect._decode_proto_fields(messages[0]),
+            2,
+            wire_type=2,
+        )
+        assert isinstance(exec_client_message, bytes)
+        assert cursor_connect._proto_last_field(
+            cursor_connect._decode_proto_fields(exec_client_message),
+            1,
+            wire_type=0,
+        ) == 314
+        assert cursor_connect._proto_last_field(
+            cursor_connect._decode_proto_fields(exec_client_message),
+            15,
+            wire_type=2,
+        ) == b"exec-014"
+
+    success_exec = cursor_connect._proto_last_field(
+        cursor_connect._decode_proto_fields(success_messages[0]),
+        2,
+        wire_type=2,
+    )
+    assert isinstance(success_exec, bytes)
+    success_result = cursor_connect._proto_last_field(
+        cursor_connect._decode_proto_fields(success_exec),
+        28,
+        wire_type=2,
+    )
+    assert isinstance(success_result, bytes)
+    success = cursor_connect._proto_last_field(
+        cursor_connect._decode_proto_fields(success_result),
+        1,
+        wire_type=2,
+    )
+    assert isinstance(success, bytes)
+    assert cursor_connect._proto_last_field(
+        cursor_connect._decode_proto_fields(success),
+        1,
+        wire_type=2,
+    ) == b"child-agent"
+    assert cursor_connect._proto_last_field(
+        cursor_connect._decode_proto_fields(success),
+        2,
+        wire_type=2,
+    ) == b"Child completed."
+    assert cursor_connect._proto_last_field(
+        cursor_connect._decode_proto_fields(success),
+        3,
+        wire_type=0,
+    ) == 2
+    assert cursor_connect._proto_last_field(
+        cursor_connect._decode_proto_fields(success),
+        5,
+        wire_type=2,
+    ) == b"/tmp/child.jsonl"
+
+    error_exec = cursor_connect._proto_last_field(
+        cursor_connect._decode_proto_fields(error_messages[0]),
+        2,
+        wire_type=2,
+    )
+    assert isinstance(error_exec, bytes)
+    error_result = cursor_connect._proto_last_field(
+        cursor_connect._decode_proto_fields(error_exec),
+        28,
+        wire_type=2,
+    )
+    assert isinstance(error_result, bytes)
+    error = cursor_connect._proto_last_field(
+        cursor_connect._decode_proto_fields(error_result),
+        2,
+        wire_type=2,
+    )
+    assert isinstance(error, bytes)
+    assert cursor_connect._proto_last_field(
+        cursor_connect._decode_proto_fields(error),
+        1,
+        wire_type=2,
+    ) == b"child-agent"
+    assert cursor_connect._proto_last_field(
+        cursor_connect._decode_proto_fields(error),
+        2,
+        wire_type=2,
+    ) == b"Child failed."
+
+    for messages in (success_messages, error_messages):
+        stream_close = cursor_connect._proto_last_field(
+            cursor_connect._decode_proto_fields(messages[1]),
+            5,
+            wire_type=2,
+        )
+        assert isinstance(stream_close, bytes)
+        assert cursor_connect._proto_last_field(
+            cursor_connect._decode_proto_fields(stream_close),
+            1,
+            wire_type=2,
+        ) is not None
 
 
 class _CountingRetainedSession:
