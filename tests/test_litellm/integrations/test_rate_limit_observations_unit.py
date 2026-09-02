@@ -1061,6 +1061,10 @@ def test_d1_678_index_migration_matches_nullable_identity_order() -> None:
     assert "observed_at DESC,\n        id DESC" in create_block
     assert "model" not in create_block
     assert "indnkeyatts = 7" in migration
+    assert migration.count("(target.indoption[5]::integer & 1) = 1") == 4
+    assert migration.count("(target.indoption[6]::integer & 1) = 1") == 4
+    assert "observed_atdesc" not in migration
+    assert "iddesc" not in migration
     assert "pg_get_indexdef(target.indexrelid, 7, false)" in migration
 
 

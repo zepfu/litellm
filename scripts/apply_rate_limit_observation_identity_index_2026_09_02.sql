@@ -63,6 +63,9 @@ SELECT pg_advisory_lock(
 
 -- A completed prior run is a no-op. Validate the access method, readiness,
 -- exact seven keys, normalized nullable expressions, and descending tie-break.
+-- pg_index.indoption is a zero-based int2vector aligned with the one-based
+-- pg_get_indexdef column numbers: entries [5] and [6] are keys 6 and 7.
+-- For btree, bit 0 marks DESC; NULLS_FIRST is a separate bit.
 WITH target_index AS (
     SELECT ix.*, index_rel.relam
     FROM pg_catalog.pg_index AS ix
@@ -119,13 +122,15 @@ SELECT CASE
                   '[[:space:]]',
                   '',
                   'g'
-              ) = 'observed_atdesc'
+              ) = 'observed_at'
           AND regexp_replace(
                   lower(pg_get_indexdef(target.indexrelid, 7, false)),
                   '[[:space:]]',
                   '',
                   'g'
-              ) = 'iddesc'
+              ) = 'id'
+          AND (target.indoption[5]::integer & 1) = 1
+          AND (target.indoption[6]::integer & 1) = 1
     )
         THEN 'true'
     ELSE 'false'
@@ -192,13 +197,15 @@ SELECT CASE
                   '[[:space:]]',
                   '',
                   'g'
-              ) = 'observed_atdesc'
+              ) = 'observed_at'
           AND regexp_replace(
                   lower(pg_get_indexdef(target.indexrelid, 7, false)),
                   '[[:space:]]',
                   '',
                   'g'
-              ) = 'iddesc'
+              ) = 'id'
+          AND (target.indoption[5]::integer & 1) = 1
+          AND (target.indoption[6]::integer & 1) = 1
     )
         THEN 'true'
     ELSE 'false'
@@ -283,13 +290,15 @@ SELECT CASE
                   '[[:space:]]',
                   '',
                   'g'
-              ) = 'observed_atdesc'
+              ) = 'observed_at'
           AND regexp_replace(
                   lower(pg_get_indexdef(target.indexrelid, 7, false)),
                   '[[:space:]]',
                   '',
                   'g'
-              ) = 'iddesc'
+              ) = 'id'
+          AND (target.indoption[5]::integer & 1) = 1
+          AND (target.indoption[6]::integer & 1) = 1
     )
         THEN 'true'
     ELSE 'false'
@@ -371,13 +380,15 @@ SELECT CASE
                   '[[:space:]]',
                   '',
                   'g'
-              ) = 'observed_atdesc'
+              ) = 'observed_at'
           AND regexp_replace(
                   lower(pg_get_indexdef(target.indexrelid, 7, false)),
                   '[[:space:]]',
                   '',
                   'g'
-              ) = 'iddesc'
+              ) = 'id'
+          AND (target.indoption[5]::integer & 1) = 1
+          AND (target.indoption[6]::integer & 1) = 1
     )
         THEN 'true'
     ELSE 'false'
