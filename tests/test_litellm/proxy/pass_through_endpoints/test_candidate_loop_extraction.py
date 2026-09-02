@@ -3234,11 +3234,34 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
         "selection_reason": "first_available",
         "skipped": [],
     }
+    secret_prompt = "PROMPT_VALUE_MUST_NOT_APPEAR"
+    secret_output = "OUTPUT_VALUE_MUST_NOT_APPEAR"
+    secret_tool_description = "TOOL_SCHEMA_MUST_NOT_APPEAR"
     body = {
         "model": "work",
         "previous_response_id": "cursor-unretained",
-        "input": "run command",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": secret_prompt,
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call-opaque-secret",
+                "output": secret_output,
+            },
+        ],
         "stream": False,
+        "tools": [
+            {
+                "type": "function",
+                "name": "secret-tool",
+                "description": secret_tool_description,
+                "parameters": {"type": "object"},
+            },
+            {"type": "custom", "description": secret_tool_description},
+        ],
     }
     expected_structure = {
         "fields": [
@@ -3288,6 +3311,11 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
             "raw": b"opaque-provider-bytes",
         },
     )
+    setattr(
+        source_exc,
+        codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+        True,
+    )
     with pytest.raises(ProxyException) as mapped_exc_info:
         codex_candidate_calls._raise_cursor_agent_alias_error(
             exc=source_exc,
@@ -3296,6 +3324,10 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
     mapped_exc = mapped_exc_info.value
     field_name = codex_candidate_calls._CURSOR_SANITIZED_PROTO_STRUCTURE_FIELD
     assert mapped_exc.detail[field_name] == expected_structure
+    assert getattr(
+        mapped_exc,
+        codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+    )
 
     request = Request(
         {
@@ -3315,6 +3347,21 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
     failure_records: list[dict[str, Any]] = []
     persisted: list[list[dict[str, Any]]] = []
     terminal_records: list[dict[str, Any]] = []
+    builder_results: list[object] = []
+    original_builder = (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body
+    )
+
+    def _build_and_record(*args: Any, **kwargs: Any) -> object:
+        result = original_builder(*args, **kwargs)
+        builder_results.append(result)
+        return result
+
+    monkeypatch.setattr(
+        codex_candidate_calls,
+        "_build_cursor_replay_safe_fresh_dispatch_body",
+        _build_and_record,
+    )
 
     async def _select(**_kwargs: Any) -> dict[str, Any]:
         return selection
@@ -3432,11 +3479,12 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
             log_label="Codex",
         )
 
-    assert caught.value.status_code == 400
+    assert caught.value.status_code == 409
     assert caught.value.detail["error"]["code"] == (
         "aawm_codex_auto_agent_candidate_ineligible"
     )
     assert caught.value.detail[field_name] == expected_structure
+    assert builder_results == [None]
     assert len(failure_records) == 1
     attempt = failure_records[0]["attempt_record"]
     assert attempt[field_name] == expected_structure
@@ -3444,9 +3492,65 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
     terminal_event = persisted[0][-1]
     assert terminal_event["event_type"] == "no_candidate_available"
     assert terminal_event["attempts"][0][field_name] == expected_structure
+    expected_request_shape_summary = {
+        "body_container_type": "object",
+        "body_top_level_keys": [
+            "input",
+            "model",
+            "previous_response_id",
+            "stream",
+            "tools",
+        ],
+        "previous_response_id_state": "nonempty",
+        "input_container_type": "array",
+        "input_item_count": 2,
+        "input_item_type_counts": {
+            "function_call_output": 1,
+            "message": 1,
+        },
+        "input_item_shape_samples": [
+            {
+                "index": 0,
+                "container_type": "object",
+                "type": "message",
+                "keys": ["content", "role", "type"],
+            },
+            {
+                "index": 1,
+                "container_type": "object",
+                "type": "function_call_output",
+                "keys": ["call_id", "output", "type"],
+            },
+        ],
+        "tool_count": 2,
+        "tool_type_counts": {"custom": 1, "function": 1},
+    }
+    assert (
+        terminal_event["aawm_passthrough_request_shape_summary"]
+        == expected_request_shape_summary
+    )
     assert len(terminal_records) == 1
     terminal_context = terminal_records[0]["error_context"]
     assert terminal_context["attempts"][0][field_name] == expected_structure
+    assert (
+        terminal_context["aawm_passthrough_request_shape_summary"]
+        == expected_request_shape_summary
+    )
+    from litellm.proxy.aawm_runtime_error_logging import (
+        build_agent_terminal_error_record,
+    )
+
+    terminal_record = build_agent_terminal_error_record(
+        error_context=terminal_context,
+        terminal_outcome="agent_session_terminated",
+        fallback_result="no_candidate_available",
+        redispatch_required=False,
+        agent_session_killed=True,
+    )
+    assert (
+        terminal_record["context"]["aawm_passthrough_request_shape_summary"]
+        == expected_request_shape_summary
+    )
 
     serialized = json.dumps(
         {
@@ -3459,6 +3563,10 @@ async def test_candidate_loop_cursor_sanitized_proto_structure_reaches_attempt_a
     assert "secret-command" not in serialized
     assert "/secret/workspace" not in serialized
     assert "opaque-provider-bytes" not in serialized
+    assert secret_prompt not in serialized
+    assert secret_output not in serialized
+    assert secret_tool_description not in serialized
+    assert "cursor-unretained" not in serialized
     assert '"value"' not in serialized
     assert '"raw"' not in serialized
 

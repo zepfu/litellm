@@ -684,6 +684,9 @@ async def handle_alias_route(  # noqa: PLR0915
     """Shared Anthropic/Codex auto-agent alias candidate loop (RR-054 #10)."""
     # Late import to break the module-scope cycle with the god-module.
     from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints as _lpe
+    from litellm.proxy.pass_through_endpoints import (
+        pass_through_endpoints as _passthrough_helpers,
+    )
 
     _codex_auto_agent_request_has_continuation_state = _lpe._codex_auto_agent_request_has_continuation_state
     _get_codex_auto_agent_native_grok_continuation_transient_max_attempts = (
@@ -735,6 +738,12 @@ async def handle_alias_route(  # noqa: PLR0915
     )
     _get_codex_auto_agent_source_error_summary = _lpe._get_codex_auto_agent_source_error_summary
     _extract_adapter_exception_status_code = _lpe._extract_adapter_exception_status_code
+    _merge_passthrough_request_shape_metadata = (
+        _passthrough_helpers._merge_passthrough_request_shape_metadata
+    )
+    _build_passthrough_request_shape_summary = (
+        _passthrough_helpers._build_passthrough_request_shape_summary
+    )
     verbose_proxy_logger = _lpe.verbose_proxy_logger
     status = _lpe.status
     HTTPException = _lpe.HTTPException
@@ -795,13 +804,17 @@ async def handle_alias_route(  # noqa: PLR0915
             and not bool(selection.get("in_flight_session"))
         )
 
+    cursor_replay_rejection_request_shape_summary: Optional[dict[str, Any]] = None
+
     def _cursor_session_continuation_replay_safe_fresh_dispatch_body(
         continuation_exc: Exception,
     ) -> Optional["Payload"]:
+        nonlocal cursor_replay_rejection_request_shape_summary
         from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
             codex_candidate_calls,
         )
 
+        cursor_replay_rejection_request_shape_summary = None
         fresh_fallback_body = (
             codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
                 prepared_request_body,
@@ -809,6 +822,19 @@ async def handle_alias_route(  # noqa: PLR0915
             )
         )
         if fresh_fallback_body is None:
+            try:
+                request_shape_metadata: dict[str, Any] = {}
+                _merge_passthrough_request_shape_metadata(
+                    request_shape_metadata,
+                    request=request,
+                    parsed_body=prepared_request_body,
+                    provider_bound_body=prepared_request_body,
+                )
+                cursor_replay_rejection_request_shape_summary = (
+                    _build_passthrough_request_shape_summary(request_shape_metadata)
+                )
+            except Exception:
+                cursor_replay_rejection_request_shape_summary = None
             return None
         if not _session_affinity_mod().is_replay_safe_session_owner_redispatch_body(
             fresh_fallback_body
@@ -846,7 +872,11 @@ async def handle_alias_route(  # noqa: PLR0915
             == "interchangeable"
         )
 
-    def _raise_terminal_alias_failure(exc: Exception) -> Any:  # noqa: PLR0915
+    def _raise_terminal_alias_failure(  # noqa: PLR0915
+        exc: Exception,
+        *,
+        extra_fields: Optional[Mapping[str, Any]] = None,
+    ) -> Any:
         last_attempt = attempts[-1] if attempts else {}
         cursor_sanitized_proto_structure = (
             _extract_cursor_sanitized_proto_structure(
@@ -990,6 +1020,7 @@ async def handle_alias_route(  # noqa: PLR0915
             traversal_budget_exhausted=(
                 provider_candidate_attempts >= max_candidate_attempts
             ),
+            extra_fields=extra_fields,
         )
         raise terminal_exc from None
 
@@ -1953,7 +1984,18 @@ async def handle_alias_route(  # noqa: PLR0915
                         deterministically_ineligible_candidate_keys.add(cooldown_key)
                         last_retryable_exc = failure_exc
                         break
-                    _raise_terminal_alias_failure(failure_exc)
+                    _raise_terminal_alias_failure(
+                        failure_exc,
+                        extra_fields=(
+                            {
+                                "aawm_passthrough_request_shape_summary": (
+                                    cursor_replay_rejection_request_shape_summary
+                                )
+                            }
+                            if cursor_replay_rejection_request_shape_summary is not None
+                            else None
+                        ),
+                    )
                 if attempted_provider_call:
                     failed_provider_candidate_keys.add(cooldown_key)
                 kimi_failure_metadata = _get_safe_kimi_code_probe_failure_metadata(
