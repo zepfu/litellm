@@ -24,6 +24,7 @@ from litellm.proxy.pass_through_endpoints import llm_passthrough_endpoints
 from litellm.proxy.aawm_route_logging import (
     clear_aawm_route_rollups,
     flush_aawm_route_rollups,
+    record_aawm_route_rollup_failure,
 )
 
 
@@ -2760,7 +2761,9 @@ def test_cursor_stream_uses_responses_event_schema(
         },
     )
     assert isinstance(response, StreamingResponse)
-    assert flush_aawm_route_rollups(force=True) == []
+    flushed = flush_aawm_route_rollups(force=True)
+    assert len(flushed) == 2
+    rendered = "\n".join(flushed)
     _assert_cursor_route_context(captured)
 
     async def collect_events() -> list[dict[str, Any]]:
@@ -2773,9 +2776,7 @@ def test_cursor_stream_uses_responses_event_schema(
         return events
 
     events = asyncio.run(collect_events())
-    flushed = flush_aawm_route_rollups(force=True)
-    assert len(flushed) == 2
-    rendered = "\n".join(flushed)
+    assert flush_aawm_route_rollups(force=True) == []
     assert rendered.count("Turns: 1") == 1
     assert "selected@example.com" in rendered
     event_types = [event["type"] for event in events]
@@ -2790,6 +2791,141 @@ def test_cursor_stream_uses_responses_event_schema(
     assert events[1]["arguments"] == '{"cmd":"pwd"}'
     assert events[2]["output_index"] == 0
     assert events[2]["item"]["type"] == "function_call"
+
+
+def test_cursor_completed_tool_turn_survives_failed_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+    _route_rollup_state: None,
+) -> None:
+    from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime import (
+        anthropic_adapter_calls,
+    )
+
+    captured_rollup_kwargs: list[dict[str, Any]] = []
+    response_bodies: list[dict[str, Any]] = []
+    real_emit = anthropic_adapter_calls._emit_adapted_route_access_log
+    real_build_response_body = codex_candidate_calls._cursor_responses_response_body
+
+    def _capture_route_log(**kwargs: Any) -> None:
+        real_emit(**kwargs)
+        captured_rollup_kwargs.append(kwargs["rollup_kwargs"])
+
+    def _capture_response_body(**kwargs: Any) -> dict[str, Any]:
+        response_body = real_build_response_body(**kwargs)
+        response_bodies.append(response_body)
+        return response_body
+
+    monkeypatch.setattr(
+        anthropic_adapter_calls,
+        "_emit_adapted_route_access_log",
+        _capture_route_log,
+    )
+    monkeypatch.setattr(
+        codex_candidate_calls,
+        "_cursor_responses_response_body",
+        _capture_response_body,
+    )
+
+    class FakeCursorClient:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def run(
+            self,
+            _payload: dict[str, Any],
+            **_kwargs: Any,
+        ) -> CursorAgentRunResult:
+            return CursorAgentRunResult(
+                tool_calls=[
+                    {
+                        "id": "cursor-item-1",
+                        "call_id": "cursor-call-1",
+                        "name": "exec_command",
+                        "arguments": '{"cmd":"pwd"}',
+                    }
+                ]
+            )
+
+    monkeypatch.setattr(
+        "litellm.llms.cursor_agent.connect.CursorAgentConnectClient",
+        FakeCursorClient,
+    )
+
+    metadata = {
+        "codex_auto_agent_alias": "cursor-test",
+        "canonical_session_identity": "cursor-session-1",
+        "repository": "litellm",
+    }
+    selected_account = {
+        "provider": "openai",
+        "account_hash": "cursor-account",
+        "account_display": "selected@example.com",
+    }
+    first = _call(
+        {
+            "model": "work",
+            "input": "run pwd",
+            "stream": True,
+            "litellm_metadata": {
+                **metadata,
+                "litellm_call_id": "cursor-first-call",
+            },
+        },
+        selected_account=selected_account,
+    )
+    assert isinstance(first, StreamingResponse)
+    assert response_bodies
+    assert len(captured_rollup_kwargs) == 1
+
+    with pytest.raises(CursorConnectError, match="live retained session"):
+        _call(
+            {
+                "model": "work",
+                "previous_response_id": response_bodies[0]["id"],
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "cursor-call-1",
+                        "output": "pwd output",
+                    }
+                ],
+                "litellm_metadata": {
+                    **metadata,
+                    "litellm_call_id": "cursor-continuation-call",
+                },
+            },
+            selected_account=selected_account,
+        )
+
+    assert len(captured_rollup_kwargs) == 2
+    first_context = captured_rollup_kwargs[0]["litellm_params"]["metadata"][
+        "aawm_route_rollup_context"
+    ]
+    second_context = captured_rollup_kwargs[1]["litellm_params"]["metadata"][
+        "aawm_route_rollup_context"
+    ]
+    assert first_context["canonical_session_identity"] == "cursor-session-1"
+    assert second_context["canonical_session_identity"] == "cursor-session-1"
+    assert first_context["litellm_call_id"] == "cursor-first-call"
+    assert second_context["litellm_call_id"] == "cursor-continuation-call"
+
+    assert record_aawm_route_rollup_failure(
+        captured_rollup_kwargs[1],
+        message="Cursor Agent continuation state is unavailable.",
+        status="Failed",
+    )
+
+    async def consume_stream() -> None:
+        async for _chunk in first.body_iterator:
+            pass
+
+    asyncio.run(consume_stream())
+    flushed = flush_aawm_route_rollups(force=True)
+    rendered = "\n".join(flushed)
+    assert rendered.count("Turns: 1") == 1
+    assert rendered.count("Turns: 0") == 1
+    assert "Cursor Agent continuation state is unavailable." in rendered
+    assert response_bodies[0]["id"] not in rendered
 
 
 def test_cursor_non_stream_records_route_rollup_once(

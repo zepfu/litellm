@@ -2851,7 +2851,6 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
     from litellm.proxy.pass_through_endpoints.aawm_adapter_runtime.anthropic_adapter_calls import (
         _build_adapted_route_rollup_kwargs,
         _emit_adapted_route_access_log,
-        _record_adapted_completed_route_rollup_after_stream,
         _record_adapted_completed_route_rollup_turn,
     )
 
@@ -2956,22 +2955,18 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
                 await retained_session.aclose()
         else:
             await retained_session.aclose()
-        if bool(request_body.get("stream")):
-            return _record_adapted_completed_route_rollup_after_stream(
-                StreamingResponse(
-                    _responses_sse_from_repaired_response_body(
-                        response_body,
-                        request_body=request_body,
-                    ),
-                    media_type="text/event-stream",
-                ),
-                rollup_kwargs,
-                adapter_label="Cursor Agent",
-            )
         _record_adapted_completed_route_rollup_turn(
             rollup_kwargs,
             adapter_label="Cursor Agent",
         )
+        if bool(request_body.get("stream")):
+            return StreamingResponse(
+                _responses_sse_from_repaired_response_body(
+                    response_body,
+                    request_body=request_body,
+                ),
+                media_type="text/event-stream",
+            )
         return Response(
             content=json.dumps(response_body, ensure_ascii=False),
             media_type="application/json",
@@ -3060,22 +3055,18 @@ async def _perform_codex_auto_agent_cursor_agent_request(  # noqa: PLR0915
             tools=request_tools if isinstance(request_tools, list) else [],
             retained_session=result.retained_session,
         )
-    if bool(request_body.get("stream")):
-        return _record_adapted_completed_route_rollup_after_stream(
-            StreamingResponse(
-                _responses_sse_from_repaired_response_body(
-                    response_body,
-                    request_body=request_body,
-                ),
-                media_type="text/event-stream",
-            ),
-            rollup_kwargs,
-            adapter_label="Cursor Agent",
-        )
     _record_adapted_completed_route_rollup_turn(
         rollup_kwargs,
         adapter_label="Cursor Agent",
     )
+    if bool(request_body.get("stream")):
+        return StreamingResponse(
+            _responses_sse_from_repaired_response_body(
+                response_body,
+                request_body=request_body,
+            ),
+            media_type="text/event-stream",
+        )
     return Response(
         content=json.dumps(response_body, ensure_ascii=False),
         media_type="application/json",
