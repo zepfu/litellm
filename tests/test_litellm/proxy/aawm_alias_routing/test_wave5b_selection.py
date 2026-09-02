@@ -23,6 +23,7 @@ from litellm.proxy.pass_through_endpoints.aawm_alias_routing import (
 )
 from litellm.proxy.pass_through_endpoints.aawm_alias_routing.policy import (
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY,
+    CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
     CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_PROVIDER,
     CODEX_AUTO_AGENT_ZAI_CODING_PLAN_PROVIDER,
 )
@@ -1063,6 +1064,98 @@ class TestCodexSelectorFirstChoice:
         assert skipped["reason"] == "cooldown"
         assert skipped["cooldown_seconds"] == 60.0
         assert skipped["cooldown_state_source"] == "durable_cache"
+
+    @pytest.mark.asyncio
+    async def test_alibaba_model_cooldown_preserves_exact_route_and_order_on_repeated_selection(
+        self,
+    ) -> None:
+        candidates = _alibaba_candidates()
+        first_key = lane_keys._codex_auto_agent_candidate_key(
+            candidates[0],
+            CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
+        )
+        second_key = lane_keys._codex_auto_agent_candidate_key(
+            candidates[1],
+            CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
+        )
+        cooldown_keys: list[str] = []
+
+        async def _cooldown_state(key: str) -> tuple[float, str]:
+            cooldown_keys.append(key)
+            if key == first_key:
+                return (60.0, "memory")
+            return (0.0, "local_fallback")
+
+        _set_selection_candidates(candidates)
+        _set_selection_runtime("_get_codex_active_cooldown_state", _cooldown_state)
+
+        for _ in range(2):
+            result = await selection._select_codex_auto_agent_candidate(
+                request=_make_request(),
+                request_body={"model": "basic"},
+            )
+            assert result["candidate"] == candidates[1]
+            skipped = [
+                candidate
+                for candidate in result["skipped"]
+                if candidate["model"] == candidates[0]["model"]
+            ]
+            assert len(skipped) == 1
+            assert skipped[0]["provider"] == candidates[0]["provider"]
+            assert skipped[0]["route_family"] == candidates[0]["route_family"]
+            assert skipped[0]["last_resort"] is False
+            assert skipped[0]["cooldown_seconds"] == 60.0
+            assert skipped[0]["reason"] == "cooldown"
+            assert skipped[0]["lane_key"] == CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY
+
+        assert first_key in cooldown_keys
+        assert second_key in cooldown_keys
+        assert (
+            CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+            in cooldown_keys
+        )
+        assert first_key != CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+        assert second_key != CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_ACCOUNT_QUOTA_COOLDOWN_KEY
+
+    @pytest.mark.asyncio
+    async def test_alibaba_model_cooldown_recovers_at_expiry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        candidates = _alibaba_candidates()
+        first_key = lane_keys._codex_auto_agent_candidate_key(
+            candidates[0],
+            CODEX_AUTO_AGENT_ALIBABA_TOKEN_PLAN_LANE_KEY,
+        )
+        manager = AliasRoutingStateManager()
+        clock = [100.0]
+        monkeypatch.setattr(state_module.time, "monotonic", lambda: clock[0])
+        manager.codex.set_cooldown_memory(first_key, 10.0)
+
+        async def _cooldown_state(key: str) -> tuple[float, str]:
+            return (
+                manager.codex.get_memory_cooldown_remaining(key),
+                "memory",
+            )
+
+        _set_selection_candidates(candidates)
+        _set_selection_runtime("_get_codex_active_cooldown_state", _cooldown_state)
+
+        cooled = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body={"model": "basic"},
+        )
+        assert cooled["candidate"] == candidates[1]
+        assert cooled["skipped"][0]["model"] == candidates[0]["model"]
+
+        clock[0] = 110.0
+        recovered = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body={"model": "basic"},
+        )
+        assert recovered["candidate"] == candidates[0]
+        assert recovered["skipped"] == []
+        assert first_key not in manager.codex.cooldown_until_monotonic_by_key
 
     @pytest.mark.asyncio
     async def test_alibaba_account_cooldown_suppresses_both_models_including_last_resort(
