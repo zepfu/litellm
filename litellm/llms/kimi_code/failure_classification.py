@@ -230,7 +230,7 @@ def _classify_failure(
             KimiCodeFailureScope.MANAGED_ACCOUNT,
             reset_reason="refresh_required",
         )
-    if _contains_any(detail, _UNSUPPORTED_MODEL_MARKERS) or status_code == 404:
+    if _contains_any(detail, _UNSUPPORTED_MODEL_MARKERS):
         return _result(
             KimiCodeFailureKind.UNSUPPORTED_MODEL,
             KimiCodeFailureScope.CANDIDATE,
