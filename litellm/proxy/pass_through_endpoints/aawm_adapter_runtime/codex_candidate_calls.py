@@ -14,6 +14,7 @@ import re
 import time
 import uuid
 from collections import OrderedDict
+from collections.abc import Mapping
 from types import FunctionType
 from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
@@ -1296,22 +1297,162 @@ def _cursor_replay_function_call_output_items(
 
     outputs: list[dict[str, Any]] = []
     for raw_item in input_items:
-        item = _cursor_as_mapping(raw_item)
+        if not isinstance(raw_item, Mapping):
+            return None
+        item = dict(raw_item)
         if item.get("type") != "function_call_output":
             return None
-        call_id = item.get("call_id") or item.get("callId")
-        if not isinstance(call_id, str) or not call_id.strip():
+        if set(item) - {"type", "call_id", "callId", "output"}:
+            return None
+        snake_call_id = item.get("call_id")
+        camel_call_id = item.get("callId")
+        if snake_call_id is not None and (
+            not isinstance(snake_call_id, str) or not snake_call_id.strip()
+        ):
+            return None
+        if camel_call_id is not None and (
+            not isinstance(camel_call_id, str) or not camel_call_id.strip()
+        ):
+            return None
+        normalized_snake_call_id = (
+            snake_call_id.strip() if isinstance(snake_call_id, str) else None
+        )
+        normalized_camel_call_id = (
+            camel_call_id.strip() if isinstance(camel_call_id, str) else None
+        )
+        if (
+            normalized_snake_call_id is not None
+            and normalized_camel_call_id is not None
+            and normalized_snake_call_id != normalized_camel_call_id
+        ):
+            return None
+        call_id = normalized_snake_call_id or normalized_camel_call_id
+        if call_id is None:
             return None
         if "output" not in item:
             return None
+        output = item["output"]
+        if not isinstance(output, str):
+            return None
+        outputs.append(
+            {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            }
+        )
+    return outputs
+
+
+def _cursor_replay_unresolved_function_call_ids(
+    replayed_input: list[Any],
+) -> Optional[set[str]]:
+    seen_call_ids: set[str] = set()
+    seen_output_ids: set[str] = set()
+    unresolved_call_ids: set[str] = set()
+
+    for item in replayed_input:
+        if not isinstance(item, dict):
+            return None
+        item_type = item.get("type")
+        if item_type == "function_call":
+            call_id = item.get("call_id")
+            name = item.get("name")
+            if (
+                not isinstance(call_id, str)
+                or not call_id.strip()
+                or not isinstance(name, str)
+                or not name.strip()
+            ):
+                return None
+            call_id = call_id.strip()
+            if call_id in seen_call_ids:
+                return None
+            item["call_id"] = call_id
+            item["name"] = name.strip()
+            seen_call_ids.add(call_id)
+            unresolved_call_ids.add(call_id)
+        elif item_type == "function_call_output":
+            call_id = item.get("call_id")
+            if not isinstance(call_id, str) or not call_id.strip():
+                return None
+            call_id = call_id.strip()
+            if call_id in seen_output_ids or call_id not in unresolved_call_ids:
+                return None
+            item["call_id"] = call_id
+            seen_output_ids.add(call_id)
+            unresolved_call_ids.remove(call_id)
+
+    if not seen_call_ids:
+        return None
+    return unresolved_call_ids
+
+
+def _cursor_replay_provider_neutral_tools(
+    replay_tools: Any,
+) -> Optional[list[dict[str, Any]]]:
+    if not isinstance(replay_tools, list):
+        return None
+
+    try:
+        from openai.types.responses.response_create_params import ToolParam
+        from pydantic import TypeAdapter
+
+        from litellm.llms.openai.responses.count_tokens.transformation import (
+            OpenAICountTokensConfig,
+        )
+
+        tools = [
+            dict(tool) if isinstance(tool, Mapping) else None
+            for tool in replay_tools
+        ]
+        if any(tool is None for tool in tools):
+            return None
+        transformed_tools = OpenAICountTokensConfig._transform_tools_for_responses_api(
+            cast(list[dict[str, Any]], tools)
+        )
+        tool_adapter = TypeAdapter(ToolParam)
+    except Exception:  # noqa: BLE001
+        return None
+
+    provider_neutral_tools: list[dict[str, Any]] = []
+    for original_tool, transformed_tool in zip(tools, transformed_tools):
+        if not isinstance(original_tool, dict) or not isinstance(
+            transformed_tool, dict
+        ):
+            return None
+        validation_tool = dict(transformed_tool)
+        if validation_tool.get("type") == "function":
+            function = original_tool.get("function")
+            if function is not None:
+                if (
+                    set(original_tool) != {"type", "function"}
+                    or not isinstance(function, Mapping)
+                    or set(function)
+                    - {"name", "description", "parameters", "strict"}
+                ):
+                    return None
+            name = validation_tool.get("name")
+            if not isinstance(name, str) or not name.strip():
+                return None
+            validation_tool["name"] = name.strip()
+            validation_tool.setdefault("parameters", {})
+            validation_tool.setdefault("strict", None)
         try:
-            output_item = copy.deepcopy(item)
+            validated_tool = tool_adapter.validate_python(
+                validation_tool,
+                strict=True,
+            )
+            canonical_tool = json.loads(tool_adapter.dump_json(validated_tool))
         except Exception:  # noqa: BLE001
             return None
-        output_item["call_id"] = call_id
-        output_item.pop("callId", None)
-        outputs.append(output_item)
-    return outputs
+        if canonical_tool != validation_tool:
+            return None
+        try:
+            provider_neutral_tools.append(copy.deepcopy(original_tool))
+        except Exception:  # noqa: BLE001
+            return None
+    return provider_neutral_tools
 
 
 def _build_cursor_replay_safe_fresh_dispatch_body(
@@ -1374,45 +1515,29 @@ def _build_cursor_replay_safe_fresh_dispatch_body(
         return None
     if not isinstance(replayed_input, list):
         return None
-    function_call_ids = {
-        item.get("call_id")
-        for item in replayed_input
-        if isinstance(item, dict)
-        and item.get("type") == "function_call"
-        and isinstance(item.get("call_id"), str)
-        and item.get("call_id")
-    }
-    if not function_call_ids or any(
-        not isinstance(item, dict)
-        or item.get("type") == "function_call"
-        and (
-            not isinstance(item.get("call_id"), str)
-            or not item.get("call_id")
-            or not isinstance(item.get("name"), str)
-            or not item.get("name")
-        )
-        for item in replayed_input
-    ):
+    unresolved_call_ids = _cursor_replay_unresolved_function_call_ids(
+        replayed_input
+    )
+    if unresolved_call_ids is None:
         return None
     output_items = _cursor_replay_function_call_output_items(request_body)
     if output_items is None:
         return None
 
-    output_call_ids: set[str] = set()
     for output_item in output_items:
         call_id = output_item["call_id"]
-        if call_id in output_call_ids or call_id not in function_call_ids:
+        if call_id not in unresolved_call_ids:
             return None
-        output_call_ids.add(call_id)
+        unresolved_call_ids.remove(call_id)
 
-    replay_tools = replay_state.get("tools")
-    if not isinstance(replay_tools, list):
+    replay_tools = _cursor_replay_provider_neutral_tools(replay_state.get("tools"))
+    if replay_tools is None:
         return None
 
     try:
         fresh_body = copy.deepcopy(request_body)
         fresh_body["input"] = [*replayed_input, *output_items]
-        fresh_body["tools"] = copy.deepcopy(replay_tools)
+        fresh_body["tools"] = replay_tools
     except Exception:  # noqa: BLE001
         return None
     for field in _CURSOR_CONTINUATION_FIELDS:

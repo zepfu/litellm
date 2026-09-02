@@ -1615,6 +1615,217 @@ def test_cursor_fresh_replay_dispatch_fails_closed_without_complete_state() -> N
     )
 
 
+@pytest.mark.parametrize(
+    "messages",
+    [
+        [
+            {"role": "user", "content": "run commands"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "exec_command", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "exec_command", "arguments": "{}"},
+                    },
+                ],
+            },
+        ],
+        [
+            {"role": "user", "content": "run commands"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "exec_command", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "first"},
+            {"role": "tool", "tool_call_id": "call-1", "content": "duplicate"},
+        ],
+        [
+            {"role": "user", "content": "run commands"},
+            {"role": "tool", "tool_call_id": "call-1", "content": "orphan"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "exec_command", "arguments": "{}"},
+                    }
+                ],
+            },
+        ],
+    ],
+    ids=["duplicate-call", "duplicate-output", "output-before-call"],
+)
+def test_cursor_fresh_replay_dispatch_rejects_invalid_historical_call_state(
+    messages: list[dict[str, Any]],
+) -> None:
+    codex_candidate_calls._store_cursor_replay_state(
+        "resp-invalid-history",
+        messages=messages,
+        tools=[],
+    )
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            _replay_body("resp-invalid-history")
+        )
+        is None
+    )
+
+
+def test_cursor_fresh_replay_dispatch_rejects_completed_historical_output() -> None:
+    codex_candidate_calls._store_cursor_replay_state(
+        "resp-completed-output",
+        messages=[
+            {"role": "user", "content": "run pwd"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"pwd"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "old output"},
+        ],
+        tools=[],
+    )
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            _replay_body("resp-completed-output")
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "output_item",
+    [
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": "pwd output",
+            "message_id": "cursor-message",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "output": {"content": "pwd output"},
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+            "callId": "call-2",
+            "output": "pwd output",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-1",
+        },
+    ],
+    ids=[
+        "unknown-field",
+        "nested-output",
+        "conflicting-call-id-aliases",
+        "missing-output",
+    ],
+)
+def test_cursor_fresh_replay_dispatch_rejects_noncanonical_incremental_output(
+    output_item: dict[str, Any],
+) -> None:
+    _store_replay_state()
+    body = _replay_body()
+    body["input"] = [output_item]
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(body)
+        is None
+    )
+
+
+def test_cursor_fresh_replay_dispatch_canonicalizes_camel_call_id() -> None:
+    _store_replay_state()
+    body = _replay_body()
+    body["input"] = [
+        {
+            "type": "function_call_output",
+            "callId": " call-1 ",
+            "output": "pwd output",
+        }
+    ]
+
+    rebuilt = (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(body)
+    )
+
+    assert rebuilt is not None
+    assert rebuilt["input"][-1] == {
+        "type": "function_call_output",
+        "call_id": "call-1",
+        "output": "pwd output",
+    }
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [
+        ["not-a-tool"],
+        [{"type": "unsupported"}],
+        [{"type": "function", "function": {}}],
+        [{"type": "function", "function": {"name": "exec_command", "extra": 1}}],
+    ],
+    ids=["non-mapping", "unsupported-type", "missing-name", "unknown-field"],
+)
+def test_cursor_fresh_replay_dispatch_rejects_malformed_stored_tools(
+    tools: list[Any],
+) -> None:
+    codex_candidate_calls._store_cursor_replay_state(
+        "resp-malformed-tools",
+        messages=[
+            {"role": "user", "content": "run pwd"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"pwd"}',
+                        },
+                    }
+                ],
+            },
+        ],
+        tools=tools,
+    )
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            _replay_body("resp-malformed-tools")
+        )
+        is None
+    )
+
+
 def test_cursor_continuation_fails_for_missing_and_expired_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
