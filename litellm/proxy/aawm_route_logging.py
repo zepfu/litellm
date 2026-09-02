@@ -2091,6 +2091,7 @@ class AawmRouteRollupAccumulator:
         status: Optional[str] = None,
         message: Optional[str] = None,
         request_status: Optional[str] = None,
+        request_only: bool = False,
         origin_identity: Optional[_AawmRouteRollupOriginIdentity] = None,
         review_decision: Optional[AawmReviewDecision] = None,
         review_correlation: Optional[_AawmRouteRollupReviewCorrelation] = None,
@@ -2108,12 +2109,18 @@ class AawmRouteRollupAccumulator:
             not cleaned_group_header
             or not cleaned_incoming_endpoint
             or not cleaned_outgoing_target
-            or not cleaned_model_label
+            or (not cleaned_model_label and not request_only)
         ):
             return []
 
         normalized_status = _normalize_aawm_route_rollup_status(status)
         normalized_request_status = _normalize_aawm_route_rollup_status(request_status)
+        if (
+            request_only
+            and normalized_request_status
+            not in _AAWM_ROUTE_ROLLUP_REQUEST_TERMINAL_STATUS_VALUES
+        ):
+            return []
         emitted_lines: list[str] = []
         if (
             review_decision is not None
@@ -2141,6 +2148,22 @@ class AawmRouteRollupAccumulator:
                 incoming_endpoint=cleaned_incoming_endpoint,
             )
             self._groups[group_key] = group
+
+        if request_only:
+            assert normalized_request_status is not None
+            group.event_sequence += 1
+            group.record_request_terminal_status(
+                status=normalized_request_status,
+                sequence=group.event_sequence,
+                message=None,
+                request_identity=(
+                    origin_identity.litellm_call_id
+                    if origin_identity is not None
+                    else None
+                ),
+            )
+            emitted_lines.extend(self.flush_due(now=now))
+            return emitted_lines
 
         account_identity = (
             origin_identity.account_identity
@@ -2363,15 +2386,16 @@ class AawmRouteRollupAccumulator:
         early: bool = False,
         remove: bool,
     ) -> list[str]:
-        if not group.sublines:
+        request_terminal_state = group.effective_request_terminal_state()
+        if not group.sublines and request_terminal_state is None:
             return []
         lines = _format_aawm_route_rollup_lines(
             group_header_label=group.group_header_label,
             incoming_endpoint=group.incoming_endpoint,
             sublines=group.ordered_sublines(),
             request_outcome=(
-                group.effective_request_terminal_state().status
-                if group.effective_request_terminal_state() is not None
+                request_terminal_state.status
+                if request_terminal_state is not None
                 else None
             ),
             now=now,
@@ -2930,6 +2954,7 @@ def record_aawm_route_rollup(
     status: Optional[str] = None,
     message: Optional[str] = None,
     request_status: Optional[str] = None,
+    request_only: bool = False,
     origin_identity: Optional[_AawmRouteRollupOriginIdentity] = None,
     review_decision: Optional[AawmReviewDecision] = None,
     review_correlation: Optional[_AawmRouteRollupReviewCorrelation] = None,
@@ -2949,6 +2974,7 @@ def record_aawm_route_rollup(
             status=status,
             message=message,
             request_status=request_status,
+            request_only=request_only,
             origin_identity=origin_identity,
             review_decision=review_decision,
             review_correlation=review_correlation,

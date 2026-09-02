@@ -851,6 +851,48 @@ class TestRecordRouteStatusRollup:
         assert lines.count(" - Request: [Exhausted]") == 1
 
     @patch(
+        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.emit_aawm_route_status_event",
+    )
+    def test_terminal_inventory_with_only_unreached_candidates_renders_request_only(
+        self,
+        mock_emit,
+        accumulator: aawm_route_logging.AawmRouteRollupAccumulator,
+    ):
+        event = self._make_event(
+            model="cursor",
+            provider="cursor",
+            route_family="codex_cursor_agent_aiserver_adapter",
+            candidates=[
+                {
+                    "provider": "alibaba_token_plan",
+                    "model": "alibaba",
+                    "route_family": "codex_alibaba_chat_completions_adapter",
+                    "terminal_disposition": "skipped",
+                    "attempted_provider_call": False,
+                    "reason": "not_reached_before_terminal",
+                },
+                {
+                    "provider": "zai",
+                    "model": "zai",
+                    "route_family": "codex_zai_coding_plan_chat_completions_adapter",
+                    "terminal_disposition": "skipped",
+                    "attempted_provider_call": False,
+                    "reason": "not_reached_before_terminal",
+                },
+            ],
+        )
+
+        assert _auto_agent_alias_route_rollup_status(event) == "Exhausted"
+        _record_auto_agent_alias_route_status_rollup(event)
+
+        mock_emit.assert_not_called()
+        lines = accumulator.flush(force=True)
+        assert lines[1:] == [" - Request: [Exhausted]"]
+        assert not any(line.startswith(" - alibaba(basic)") for line in lines)
+        assert not any(line.startswith(" - zai(basic)") for line in lines)
+        assert lines.count(" - Request: [Exhausted]") == 1
+
+    @patch(
         "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.record_aawm_route_rollup",
     )
     @patch(
