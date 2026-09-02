@@ -313,8 +313,13 @@ class TestRollupStatus:
 
 class TestRouteRollupStatusValues:
     def test_new_status_values_are_accepted(self):
+        assert "Ineligible" in aawm_route_logging._AAWM_ROUTE_ROLLUP_STATUS_VALUES
         assert "Incomplete" in aawm_route_logging._AAWM_ROUTE_ROLLUP_STATUS_VALUES
         assert "Recovered" in aawm_route_logging._AAWM_ROUTE_ROLLUP_STATUS_VALUES
+        assert (
+            aawm_route_logging._normalize_aawm_route_rollup_status("ineligible")
+            == "Ineligible"
+        )
         assert (
             aawm_route_logging._normalize_aawm_route_rollup_status("incomplete")
             == "Incomplete"
@@ -771,15 +776,12 @@ class TestRecordRouteStatusRollup:
         assert emitted_labels == ["gpt-4o", "claude-sonnet-4-20250514", "grok-4"]
 
     @patch(
-        "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.record_aawm_route_rollup",
-    )
-    @patch(
         "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.emit_aawm_route_status_event",
     )
     def test_terminal_inventory_keeps_candidate_local_attribution(
         self,
         mock_emit,
-        mock_record,
+        accumulator: aawm_route_logging.AawmRouteRollupAccumulator,
     ):
         event = self._make_event(
             model="cursor",
@@ -837,17 +839,18 @@ class TestRecordRouteStatusRollup:
                 "candidate_status=ineligible"
             ),
         )
-        records = {
-            call.kwargs["model_label"]: call.kwargs for call in mock_record.call_args_list
-        }
-        assert list(records) == ["cursor(basic)", "alibaba(basic)", "zai(basic)"]
-        assert records["cursor(basic)"]["status"] == "Ineligible"
-        assert records["cursor(basic)"]["message"] == (
-            "Cursor continuation cannot be replayed"
-        )
-        for label in ("alibaba(basic)", "zai(basic)"):
-            assert records[label]["status"] is None
-            assert records[label]["message"] is None
+        lines = accumulator.flush(force=True)
+        assert lines[1:] == [
+            " - cursor(basic):none - Turns: 0 "
+            "[Cursor continuation cannot be replayed] [Ineligible]",
+            " - alibaba(basic):none - Turns: 0",
+            " - zai(basic):none - Turns: 0",
+            " - Request: [Exhausted]",
+        ]
+        assert sum(line.startswith(" - cursor(basic)") for line in lines) == 1
+        assert sum(line.startswith(" - alibaba(basic)") for line in lines) == 1
+        assert sum(line.startswith(" - zai(basic)") for line in lines) == 1
+        assert lines.count(" - Request: [Exhausted]") == 1
 
     @patch(
         "litellm.proxy.pass_through_endpoints.aawm_alias_routing.rollup.record_aawm_route_rollup",
