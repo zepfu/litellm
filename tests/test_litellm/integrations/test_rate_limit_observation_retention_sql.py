@@ -290,7 +290,7 @@ def test_should_delete_weekly_rows_from_archive_only() -> None:
     assert "session_history" not in weekly
 
 
-def test_should_define_explicit_utc_low_traffic_targeted_jobs() -> None:
+def test_should_define_explicit_utc_compatible_low_traffic_targeted_jobs() -> None:
     jobs = _jobs_sql()
 
     assert r"\set ON_ERROR_STOP on" in jobs
@@ -301,7 +301,10 @@ def test_should_define_explicit_utc_low_traffic_targeted_jobs() -> None:
     assert "aawm_rate_limit_observation_archive_weekly" in jobs
     assert ":'target_database'" in jobs
     assert ":'job_role'" in jobs
-    assert "current_setting('cron.timezone', true) = 'UTC'" in jobs
+    assert (
+        "current_setting('cron.timezone', true) IN ('UTC', 'GMT')" in jobs
+    )
+    assert "America/New_York" not in jobs
     assert "CREATE EXTENSION" not in jobs.upper()
     assert "ALTER SYSTEM" not in jobs.upper()
     assert "schedule IS DISTINCT FROM" in jobs

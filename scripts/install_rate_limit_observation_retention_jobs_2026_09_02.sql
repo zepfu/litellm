@@ -2,7 +2,7 @@
 --
 -- This file only installs the two named schedules when an operator runs it.
 -- pg_cron must already be installed in the configured cron control database,
--- with cron.timezone set to UTC. This file does not install or configure the
+-- with cron.timezone set to UTC or GMT. This file does not install or configure the
 -- extension and does not run either retention function immediately.
 --
 -- Run this file from the pg_cron control database. The target database is
@@ -100,7 +100,7 @@ END AS d1_679_pg_cron_present \gset
 :d1_679_pg_cron_guard_statement;
 
 SELECT CASE
-    WHEN current_setting('cron.timezone', true) = 'UTC'
+    WHEN current_setting('cron.timezone', true) IN ('UTC', 'GMT')
         THEN 'true'
     ELSE 'false'
 END AS d1_679_cron_timezone_utc \gset
@@ -108,7 +108,7 @@ END AS d1_679_cron_timezone_utc \gset
 \if :d1_679_cron_timezone_utc
 \set d1_679_cron_timezone_guard_statement 'SELECT 1'
 \else
-\echo 'D1-679 abort: cron.timezone must already be UTC'
+\echo 'D1-679 abort: cron.timezone must already be UTC or GMT'
 \set d1_679_cron_timezone_guard_statement 'SELECT 1 / 0 AS d1_679_cron_timezone_guard_failure'
 \endif
 

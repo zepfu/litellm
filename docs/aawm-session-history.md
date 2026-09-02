@@ -1101,7 +1101,7 @@ migration makes it archive-table owner. The job installer must run from the
 configured pg_cron control database and uses `cron.schedule_in_database` with
 `target_database=aawm_tristore` and the same `job_role`. The pg_cron extension
 must already be installed through the authorized database path, and
-`cron.timezone` must already be `UTC`; these SQL files do not install the
+`cron.timezone` must already be `UTC` or `GMT`; these SQL files do not install the
 extension or alter server configuration.
 
 The definitions are prepared but unapplied. The separate migration and job
