@@ -230,7 +230,7 @@ def _classify_failure(
             KimiCodeFailureScope.MANAGED_ACCOUNT,
             reset_reason="refresh_required",
         )
-    if _contains_any(detail, _UNSUPPORTED_MODEL_MARKERS):
+    if status_code in {400, 404} and _contains_any(detail, _UNSUPPORTED_MODEL_MARKERS):
         return _result(
             KimiCodeFailureKind.UNSUPPORTED_MODEL,
             KimiCodeFailureScope.CANDIDATE,
@@ -277,6 +277,12 @@ def _classify_failure(
             KimiCodeFailureKind.MALFORMED,
             malformed_scope,
             reset_reason="malformed_provider_response",
+        )
+    if status_code == 500 and _contains_any(detail, _UNSUPPORTED_MODEL_MARKERS):
+        return _result(
+            KimiCodeFailureKind.UNKNOWN,
+            KimiCodeFailureScope.NONE,
+            reset_reason="unclassified_failure",
         )
     if _contains_any(detail, _TRANSIENT_MARKERS) or status_code in {408, 425, 429, 500, 502, 503, 504}:
         return _result(

@@ -139,9 +139,12 @@ def test_should_classify_malformed_usages_as_telemetry_degradation():
     assert failure.reset_reason == "malformed_provider_response"
 
 
-def test_should_classify_structured_model_not_found_404_as_candidate_failure():
+@pytest.mark.parametrize("status_code", (400, 404))
+def test_should_classify_structured_model_not_found_400_or_404_as_candidate_failure(
+    status_code: int,
+):
     response = httpx.Response(
-        status_code=404,
+        status_code=status_code,
         json={
             "error": {
                 "code": "model_not_found",
@@ -156,6 +159,26 @@ def test_should_classify_structured_model_not_found_404_as_candidate_failure():
     assert failure.scope == KimiCodeFailureScope.CANDIDATE
     assert failure.metadata_gate == KimiCodeMetadataGate.MODEL_ID
     assert failure.reset_reason == "unsupported_model"
+
+
+def test_should_not_classify_500_model_not_found_as_candidate_failure():
+    response = httpx.Response(
+        status_code=500,
+        json={
+            "error": {
+                "code": "model_not_found",
+                "message": "The selected model is unavailable.",
+            }
+        },
+    )
+
+    failure = classify_kimi_code_http_failure(response, upstream_id="k3")
+
+    assert failure.kind == KimiCodeFailureKind.UNKNOWN
+    assert failure.scope == KimiCodeFailureScope.NONE
+    assert failure.metadata_gate == KimiCodeMetadataGate.NONE
+    assert failure.reset_reason == "unclassified_failure"
+    assert not failure.is_candidate_scoped
 
 
 def test_should_not_classify_generic_404_as_model_unavailable():
