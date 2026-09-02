@@ -1784,17 +1784,38 @@ def test_cursor_fresh_replay_dispatch_canonicalizes_camel_call_id() -> None:
     }
 
 
-def test_cursor_fresh_replay_dispatch_canonicalizes_stock_codex_output_metadata() -> None:
+@pytest.mark.parametrize(
+    ("item_id", "turn_id"),
+    [
+        (
+            "fco_01a06244-9f7f-7fe1-869b-23d587ad56f1",
+            "01a06244-8523-79c2-b8ff-59238c523de8",
+        ),
+        (
+            "fco_01a06244-9b3d-7722-a6ba-fbdd312c711b",
+            "01a06244-867a-75e0-8714-e6422f086d33",
+        ),
+        (
+            "fco_01a06244-b1e8-7453-bbb8-fb4c7663270b",
+            "01a06244-8756-7081-a4a2-4228ecbc5b92",
+        ),
+    ],
+    ids=["work", "expert", "sota-xai"],
+)
+def test_cursor_fresh_replay_dispatch_canonicalizes_stock_codex_output_metadata(
+    item_id: str,
+    turn_id: str,
+) -> None:
     _store_replay_state()
     body = _replay_body()
     body["input"] = [
         {
             "type": "function_call_output",
-            "id": "fco_01a06244-9f7f-7fe1-869b-23d587ad56f1",
+            "id": item_id,
             "call_id": "call-1",
             "output": "pwd output",
             "internal_chat_message_metadata_passthrough": {
-                "turn_id": "01a06244-8523-79c2-b8ff-59238c523de8",
+                "turn_id": turn_id,
                 "create_time": 1788355059.5830524,
             },
         }
@@ -1817,16 +1838,45 @@ def test_cursor_fresh_replay_dispatch_canonicalizes_stock_codex_output_metadata(
     [
         {"status": "completed"},
         {"id": "msg_not-a-function-call-output"},
+        {"id": "fco_"},
+        {"id": "fco_not-a-uuid"},
+        {"id": " fco_01a06244-9f7f-7fe1-869b-23d587ad56f1"},
+        {"id": "fco_01a06244-9f7f-7fe1-869b-23d587ad56f1 "},
+        {"id": "fco_01A06244-9F7F-7FE1-869B-23D587AD56F1"},
         {
             "internal_chat_message_metadata_passthrough": {
                 "turn_id": "turn-1",
+                "create_time": 1788355059.5830524,
+            }
+        },
+        {
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": " 01a06244-8523-79c2-b8ff-59238c523de8",
+                "create_time": 1788355059.5830524,
+            }
+        },
+        {
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a06244-8523-79c2-b8ff-59238c523de8 ",
+                "create_time": 1788355059.5830524,
+            }
+        },
+        {
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01A06244-8523-79C2-B8FF-59238C523DE8",
+                "create_time": 1788355059.5830524,
+            }
+        },
+        {
+            "internal_chat_message_metadata_passthrough": {
+                "turn_id": "01a06244-8523-79c2-b8ff-59238c523de8",
                 "create_time": 1788355059.5830524,
                 "opaque_state": {"provider": "cursor"},
             }
         },
         {
             "internal_chat_message_metadata_passthrough": {
-                "turn_id": "turn-1",
+                "turn_id": "01a06244-8523-79c2-b8ff-59238c523de8",
                 "create_time": float("inf"),
             }
         },
@@ -1834,6 +1884,15 @@ def test_cursor_fresh_replay_dispatch_canonicalizes_stock_codex_output_metadata(
     ids=[
         "unobserved-status",
         "wrong-id-kind",
+        "empty-id-suffix",
+        "arbitrary-id-suffix",
+        "id-leading-space",
+        "id-trailing-space",
+        "id-uppercase",
+        "arbitrary-turn-id",
+        "turn-id-leading-space",
+        "turn-id-trailing-space",
+        "turn-id-uppercase",
         "unknown-nested-metadata",
         "nonfinite-create-time",
     ],
@@ -1855,6 +1914,71 @@ def test_cursor_fresh_replay_dispatch_rejects_unsafe_output_metadata(
     }
     output_item.update(metadata_update)
     body["input"] = [output_item]
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(body)
+        is None
+    )
+
+
+def test_cursor_fresh_replay_dispatch_rejects_duplicate_output_item_ids() -> None:
+    codex_candidate_calls._store_cursor_replay_state(
+        "resp-duplicate-item-id",
+        messages=[
+            {"role": "user", "content": "run commands"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"pwd"}',
+                        },
+                    },
+                    {
+                        "id": "call-2",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"date"}',
+                        },
+                    },
+                ],
+            },
+        ],
+        tools=[],
+    )
+    duplicate_item_id = "fco_01a06244-9f7f-7fe1-869b-23d587ad56f1"
+    body = {
+        "model": "work",
+        "previous_response_id": "resp-duplicate-item-id",
+        "input": [
+            {
+                "type": "function_call_output",
+                "id": duplicate_item_id,
+                "call_id": call_id,
+                "output": output,
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                    "create_time": 1788355059.5830524,
+                },
+            }
+            for call_id, output, turn_id in (
+                (
+                    "call-1",
+                    "pwd output",
+                    "01a06244-8523-79c2-b8ff-59238c523de8",
+                ),
+                (
+                    "call-2",
+                    "date output",
+                    "01a06244-867a-75e0-8714-e6422f086d33",
+                ),
+            )
+        ],
+    }
 
     assert (
         codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(body)

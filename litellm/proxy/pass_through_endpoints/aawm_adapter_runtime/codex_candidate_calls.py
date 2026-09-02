@@ -1297,6 +1297,7 @@ def _cursor_replay_function_call_output_items(
         return None
 
     outputs: list[dict[str, Any]] = []
+    seen_item_ids: set[str] = set()
     for raw_item in input_items:
         if not isinstance(raw_item, Mapping):
             return None
@@ -1313,11 +1314,16 @@ def _cursor_replay_function_call_output_items(
         }:
             return None
         item_id = item.get("id")
-        if item_id is not None and (
-            not isinstance(item_id, str)
-            or not item_id.strip().startswith("fco_")
-        ):
-            return None
+        if item_id is not None:
+            if not isinstance(item_id, str) or not item_id.startswith("fco_"):
+                return None
+            try:
+                canonical_item_uuid = str(uuid.UUID(item_id.removeprefix("fco_")))
+            except (AttributeError, ValueError):
+                return None
+            if item_id != f"fco_{canonical_item_uuid}" or item_id in seen_item_ids:
+                return None
+            seen_item_ids.add(item_id)
         metadata = item.get("internal_chat_message_metadata_passthrough")
         if metadata is not None:
             if (
@@ -1327,9 +1333,15 @@ def _cursor_replay_function_call_output_items(
                 return None
             turn_id = metadata.get("turn_id")
             create_time = metadata.get("create_time")
+            try:
+                canonical_turn_id = (
+                    str(uuid.UUID(turn_id)) if isinstance(turn_id, str) else None
+                )
+            except (AttributeError, ValueError):
+                return None
             if (
                 not isinstance(turn_id, str)
-                or not turn_id.strip()
+                or turn_id != canonical_turn_id
                 or isinstance(create_time, bool)
                 or not isinstance(create_time, float)
                 or not math.isfinite(create_time)
