@@ -260,6 +260,8 @@ def _stock_codex_tools() -> list[dict[str, Any]]:
 def _stock_codex_full_history_body(
     *,
     include_metadata: bool = False,
+    function_call_item_id: str = "fc_a4335d9d-8539-9945-bdc7-f14243b0e9b8_0",
+    function_call_call_id: str = "call-8ef73738-1b5f-4aab-8789-fa1f309bb320-0",
 ) -> dict[str, Any]:
     turn_id = "01a06269-1662-7c02-a81a-031c450f8606"
     body = {
@@ -343,12 +345,12 @@ def _stock_codex_full_history_body(
             },
             {
                 "type": "function_call",
-                "id": "fc_a4335d9d-8539-9945-bdc7-f14243b0e9b8_0",
+                "id": function_call_item_id,
                 "name": "exec_command",
                 "arguments": (
                     '{"cmd":"pwd","workdir":"/home/zepfu/projects/litellm"}'
                 ),
-                "call_id": "call-8ef73738-1b5f-4aab-8789-fa1f309bb320-0",
+                "call_id": function_call_call_id,
                 "internal_chat_message_metadata_passthrough": {
                     "turn_id": turn_id,
                 },
@@ -356,7 +358,7 @@ def _stock_codex_full_history_body(
             {
                 "type": "function_call_output",
                 "id": "fco_01a06269-2d51-7de0-a7e3-bddda588ad80",
-                "call_id": "call-8ef73738-1b5f-4aab-8789-fa1f309bb320-0",
+                "call_id": function_call_call_id,
                 "output": (
                     "Chunk ID: 91fb25\n"
                     "Wall time: 0.0000 seconds\n"
@@ -2053,14 +2055,34 @@ def test_cursor_fresh_replay_dispatch_canonicalizes_stock_codex_output_metadata(
 
 
 @pytest.mark.parametrize(
+    ("function_call_item_id", "function_call_call_id"),
+    [
+        (
+            "fc_a4335d9d-8539-9945-bdc7-f14243b0e9b8_0",
+            "call-8ef73738-1b5f-4aab-8789-fa1f309bb320-0",
+        ),
+        (
+            "fc_79fe4188-5748-4b27-92ef-7c5b4d50e373",
+            "79fe4188-5748-4b27-92ef-7c5b4d50e373",
+        ),
+    ],
+    ids=["legacy-indexed-id", "current-stock-id"],
+)
+@pytest.mark.parametrize(
     "include_metadata",
     [False, True],
     ids=["metadata-omitted", "metadata-present"],
 )
 def test_cursor_fresh_replay_dispatch_accepts_stock_codex_full_history(
+    function_call_item_id: str,
+    function_call_call_id: str,
     include_metadata: bool,
 ) -> None:
-    body = _stock_codex_full_history_body(include_metadata=include_metadata)
+    body = _stock_codex_full_history_body(
+        include_metadata=include_metadata,
+        function_call_item_id=function_call_item_id,
+        function_call_call_id=function_call_call_id,
+    )
     expected_item_keys = [
         {"type", "id", "role", "content"},
         {"type", "id", "role", "content"},
@@ -2116,7 +2138,7 @@ def test_cursor_fresh_replay_dispatch_accepts_stock_codex_full_history(
     assert rebuilt["input"][-2:] == [
         {
             "type": "function_call",
-            "call_id": "call-8ef73738-1b5f-4aab-8789-fa1f309bb320-0",
+            "call_id": function_call_call_id,
             "name": "exec_command",
             "arguments": (
                 '{"cmd":"pwd","workdir":"/home/zepfu/projects/litellm"}'
@@ -2124,7 +2146,7 @@ def test_cursor_fresh_replay_dispatch_accepts_stock_codex_full_history(
         },
         {
             "type": "function_call_output",
-            "call_id": "call-8ef73738-1b5f-4aab-8789-fa1f309bb320-0",
+            "call_id": function_call_call_id,
             "output": (
                 "Chunk ID: 91fb25\n"
                 "Wall time: 0.0000 seconds\n"
