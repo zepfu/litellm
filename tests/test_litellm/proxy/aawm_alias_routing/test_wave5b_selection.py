@@ -925,6 +925,74 @@ class TestCodexSelectorFirstChoice:
         )
 
     @pytest.mark.asyncio
+    async def test_candidate_cooldown_excludes_only_exact_identity_until_expiry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        manager = AliasRoutingStateManager()
+        monkeypatch.setattr(
+            manager,
+            "get_candidate_semantic_ineligibility",
+            AsyncMock(return_value=None),
+        )
+        clock = [100.0]
+        monkeypatch.setattr(state_module.time, "monotonic", lambda: clock[0])
+        _set_selection_runtime_value("alias_routing_state", manager, monkeypatch)
+        candidates = (
+            _candidate("cursor_agent", "cursor-work"),
+            _candidate("cursor_agent", "cursor-sibling"),
+            _candidate("openrouter", "openrouter-work"),
+            _candidate("xai", "grok-work"),
+        )
+        _set_selection_candidates(candidates)
+
+        active_calls: list[str] = []
+
+        async def _active_cooldown(key: str) -> tuple[float, str]:
+            active_calls.append(key)
+            return manager.codex.peek_cooldown_remaining(key), "memory"
+
+        _set_selection_runtime_value(
+            "_get_codex_active_cooldown_state",
+            _active_cooldown,
+            monkeypatch,
+        )
+
+        first = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body={"model": "basic"},
+        )
+        selected_key = first["cooldown_key"]
+        manager.codex.set_cooldown_memory(selected_key, 300.0)
+
+        during_cooldown = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body={"model": "basic"},
+        )
+
+        assert during_cooldown["candidate"]["model"] == "cursor-sibling", (
+            selected_key,
+            active_calls,
+            manager.codex.cooldown_until_monotonic_by_key,
+            during_cooldown,
+        )
+        assert [
+            skipped["model"] for skipped in during_cooldown["skipped"]
+        ] == ["cursor-work"]
+        assert during_cooldown["skipped"][0]["cooldown_state_source"] == "memory"
+        assert during_cooldown["skipped"][0]["cooldown_seconds"] == 300.0
+
+        clock[0] = 401.0
+        after_expiry = await selection._select_codex_auto_agent_candidate(
+            request=_make_request(),
+            request_body={"model": "basic"},
+        )
+
+        assert after_expiry["candidate"]["model"] == "cursor-work"
+        assert after_expiry["skipped"] == []
+        assert manager.codex.get_memory_cooldown_remaining(selected_key) == 0.0
+
+    @pytest.mark.asyncio
     async def test_semantic_marker_durable_write_is_bounded_and_keyed_by_candidate(
         self,
         monkeypatch: pytest.MonkeyPatch,

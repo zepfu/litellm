@@ -785,6 +785,7 @@ _CODEX_AUTO_AGENT_DURABLE_COOLDOWN_ERROR_CLASSES = frozenset(
     {
         "capacity_exhausted",
         "candidate_unavailable",
+        _aawm_alias_policy_compat.CODEX_AUTO_AGENT_CONTINUATION_STATE_UNAVAILABLE_ERROR_CLASS,
         "malformed_tool_call_text",
         "provider_terminal_error",
         "rate_limited",
