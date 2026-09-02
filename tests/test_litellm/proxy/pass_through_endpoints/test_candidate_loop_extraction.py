@@ -2822,30 +2822,19 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
         "model": "oa_xai/grok-4.6",
         "route_family": "codex_xai_oauth_responses_adapter",
     }
-    replay_messages = [
-        {
-            "role": "user",
-            "content": "Complete the original assignment in /workspace.",
-        },
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": "pwd-call",
-                    "type": "function",
-                    "function": {
-                        "name": "exec_command",
-                        "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
-                    },
-                }
-            ],
-        },
-    ]
+    turn_id = "01a06269-1662-7c02-a81a-031c450f8606"
     replay_tools = [
         {
             "type": "function",
-            "function": {"name": "exec_command"},
+            "name": "exec_command",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"],
+                "additionalProperties": False,
+            },
+            "strict": False,
         }
     ]
     selections = [
@@ -2876,7 +2865,6 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
     ]
     prepared_body = {
         "model": "work",
-        "previous_response_id": "cursor-unretained",
         "tools": replay_tools,
         "message_id": "cursor-message-snake",
         "messageId": "cursor-message-camel",
@@ -2890,30 +2878,104 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
         "agentSessionId": "cursor-session-camel",
         "input": [
             {
+                "type": "message",
+                "id": "msg_01a06269-1827-79d2-b3a5-41d50a2fad1a",
+                "role": "developer",
+                "content": [
+                    {"type": "input_text", "text": "model instructions"},
+                    {"type": "input_text", "text": "developer instructions"},
+                    {"type": "input_text", "text": "memory instructions"},
+                    {"type": "input_text", "text": "skill instructions"},
+                    {"type": "input_text", "text": "permission instructions"},
+                    {"type": "input_text", "text": "app instructions"},
+                ],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                    "create_time": 1788357449.7673376,
+                    "content_item_kinds": [
+                        "model_switch.instructions",
+                        "generic.developer_instructions",
+                        "memories.instructions",
+                        "host_skills.instructions",
+                        "permissions.instructions",
+                        "apps.instructions",
+                    ],
+                },
+            },
+            {
+                "type": "message",
+                "id": "msg_01a06269-1827-79d2-b3a5-41ed4566fa70",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "plugin recommendations"},
+                    {"type": "input_text", "text": "AGENTS instructions"},
+                    {"type": "input_text", "text": "environment context"},
+                ],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                    "create_time": 1788357449.7673385,
+                    "content_item_kinds": [
+                        "plugins.recommendations",
+                        "agents_md.instructions",
+                        "environments.environment_context",
+                    ],
+                },
+            },
+            {
+                "type": "message",
+                "id": "msg_01a06269-1847-7802-a387-e9c9ef8d2032",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Complete the original assignment in /workspace.",
+                    }
+                ],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                    "create_time": 1788357449.79907,
+                    "content_item_kinds": ["user.text"],
+                },
+            },
+            {
+                "type": "message",
+                "id": "msg_resp_277feeae9f69433ab4e4ef2597a25db8",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "I will run pwd first.",
+                    }
+                ],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                    "content_item_kinds": ["unknown"],
+                },
+            },
+            {
+                "type": "function_call",
+                "id": "fc_a4335d9d-8539-9945-bdc7-f14243b0e9b8_0",
+                "name": "exec_command",
+                "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
+                "call_id": "call-8ef73738-1b5f-4aab-8789-fa1f309bb320-0",
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                },
+            },
+            {
                 "type": "function_call_output",
-                "id": "fco_01a06244-9f7f-7fe1-869b-23d587ad56f1",
-                "call_id": "pwd-call",
+                "id": "fco_01a06269-2d51-7de0-a7e3-bddda588ad80",
+                "call_id": "call-8ef73738-1b5f-4aab-8789-fa1f309bb320-0",
                 "output": "/workspace",
                 "internal_chat_message_metadata_passthrough": {
-                    "turn_id": "01a06244-8523-79c2-b8ff-59238c523de8",
-                    "create_time": 1788355059.5830524,
+                    "turn_id": turn_id,
+                    "create_time": 1788357455.1854475,
                 },
             },
         ],
     }
-    codex_candidate_calls._store_cursor_replay_state(
-        "cursor-unretained",
-        messages=replay_messages,
-        tools=replay_tools,
-    )
-    replay_state = codex_candidate_calls._peek_cursor_replay_state(
-        "cursor-unretained"
-    )
     with pytest.raises(CursorConnectError) as source_exc_info:
-        codex_candidate_calls._raise_cursor_session_continuation_unavailable(
-            previous_response_id="cursor-unretained",
-            replay_state=replay_state,
-        )
+        codex_candidate_calls._raise_cursor_session_continuation_unavailable()
     source_exc = source_exc_info.value
     with pytest.raises(ProxyException) as mapped_exc_info:
         codex_candidate_calls._raise_cursor_agent_alias_error(
@@ -2930,7 +2992,7 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
     assert rebuilt_request_body is not None
     assert rebuilt_request_body["input"][-1] == {
         "type": "function_call_output",
-        "call_id": "pwd-call",
+        "call_id": "call-8ef73738-1b5f-4aab-8789-fa1f309bb320-0",
         "output": "/workspace",
     }
     replay_safe_classifier = (
@@ -2961,13 +3023,9 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
         provider_calls.append(candidate["model"])
         candidate_bodies.append(candidate_body)
         if candidate["provider"] == "cursor_agent":
-            assert candidate_body["previous_response_id"] == "cursor-unretained"
+            assert "previous_response_id" not in candidate_body
+            assert candidate_body["input"] is prepared_body["input"]
             raise mapped_exc
-        if candidate["model"] == "xai/grok-4.6":
-            raise HTTPException(
-                status_code=429,
-                detail={"error": {"code": "rate_limit_exceeded"}},
-            )
         assert "previous_response_id" not in candidate_body
         assert candidate_body["input"] == rebuilt_request_body["input"]
         assert candidate_body["tools"] == replay_tools
@@ -2987,6 +3045,11 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
             )
         )
         assert replay_safe_classifier(candidate_body) is True
+        if candidate["model"] == "xai/grok-4.6":
+            raise HTTPException(
+                status_code=429,
+                detail={"error": {"code": "rate_limit_exceeded"}},
+            )
         return {"candidate": candidate["model"]}
 
     async def _no_active_cooldown(_key: str) -> tuple[float, str]:
@@ -3111,27 +3174,27 @@ async def test_candidate_loop_cursor_continuation_refunds_slot_before_xai_failov
     assert selection_calls[2]["excluded_candidate_keys"] == frozenset(
         {"cursor_agent:cursor-grok-4.6-high"}
     )
-    assert candidate_bodies[0]["previous_response_id"] == "cursor-unretained"
     assert all(
-        "previous_response_id" not in body for body in candidate_bodies[1:]
+        "previous_response_id" not in body for body in candidate_bodies
     )
-    assert candidate_bodies[1]["input"] == [
-        {
-            "role": "user",
-            "content": "Complete the original assignment in /workspace.",
-        },
+    assert candidate_bodies[1]["input"][-2:] == [
         {
             "type": "function_call",
-            "call_id": "pwd-call",
+            "call_id": "call-8ef73738-1b5f-4aab-8789-fa1f309bb320-0",
             "name": "exec_command",
             "arguments": '{"cmd":"pwd","workdir":"/workspace"}',
         },
         {
             "type": "function_call_output",
-            "call_id": "pwd-call",
+            "call_id": "call-8ef73738-1b5f-4aab-8789-fa1f309bb320-0",
             "output": "/workspace",
         },
     ]
+    assert all(
+        "id" not in item
+        and "internal_chat_message_metadata_passthrough" not in item
+        for item in candidate_bodies[1]["input"]
+    )
     assert candidate_bodies[2]["input"] == candidate_bodies[1]["input"]
     assert classifier_calls[0] is prepared_body
     assert classifier_calls[1] == rebuilt_request_body

@@ -1389,6 +1389,230 @@ def _cursor_replay_function_call_output_items(
     return outputs
 
 
+def _cursor_replay_is_canonical_uuid(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return value == str(uuid.UUID(value))
+    except (AttributeError, ValueError):
+        return False
+
+
+def _cursor_replay_stock_codex_message_item(
+    raw_item: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    item = dict(raw_item)
+    if set(item) != {
+        "type",
+        "id",
+        "role",
+        "content",
+        "internal_chat_message_metadata_passthrough",
+    }:
+        return None
+    role = item.get("role")
+    if role not in {"developer", "user", "assistant"}:
+        return None
+
+    item_id = item.get("id")
+    if not isinstance(item_id, str):
+        return None
+    if role == "assistant":
+        if re.fullmatch(r"msg_resp_[0-9a-f]{32}", item_id) is None:
+            return None
+    elif not item_id.startswith("msg_") or not _cursor_replay_is_canonical_uuid(
+        item_id.removeprefix("msg_")
+    ):
+        return None
+
+    metadata = item.get("internal_chat_message_metadata_passthrough")
+    expected_metadata_keys = (
+        {"turn_id", "content_item_kinds"}
+        if role == "assistant"
+        else {"turn_id", "create_time", "content_item_kinds"}
+    )
+    if not isinstance(metadata, Mapping) or set(metadata) != expected_metadata_keys:
+        return None
+    if not _cursor_replay_is_canonical_uuid(metadata.get("turn_id")):
+        return None
+    create_time = metadata.get("create_time")
+    if role != "assistant" and (
+        isinstance(create_time, bool)
+        or not isinstance(create_time, float)
+        or not math.isfinite(create_time)
+    ):
+        return None
+    content_item_kinds = metadata.get("content_item_kinds")
+    if (
+        not isinstance(content_item_kinds, list)
+        or not content_item_kinds
+        or any(
+            not isinstance(kind, str)
+            or not kind
+            or kind != kind.strip()
+            or re.fullmatch(r"[a-z][a-z0-9_.-]*", kind) is None
+            for kind in content_item_kinds
+        )
+        or len(content_item_kinds) != len(set(content_item_kinds))
+    ):
+        return None
+
+    content = item.get("content")
+    expected_content_type = "output_text" if role == "assistant" else "input_text"
+    if not isinstance(content, list) or not content:
+        return None
+    canonical_content_parts: list[str] = []
+    for raw_part in content:
+        if not isinstance(raw_part, Mapping):
+            return None
+        part = dict(raw_part)
+        if (
+            set(part) != {"type", "text"}
+            or part.get("type") != expected_content_type
+            or not isinstance(part.get("text"), str)
+        ):
+            return None
+        canonical_content_parts.append(part["text"])
+    return {
+        "role": role,
+        "content": "".join(canonical_content_parts),
+    }
+
+
+def _cursor_replay_stock_codex_function_call_item(
+    raw_item: Mapping[str, Any],
+) -> Optional[dict[str, Any]]:
+    item = dict(raw_item)
+    if set(item) != {
+        "type",
+        "id",
+        "name",
+        "arguments",
+        "call_id",
+        "internal_chat_message_metadata_passthrough",
+    }:
+        return None
+
+    item_id = item.get("id")
+    item_id_match = (
+        re.fullmatch(
+            r"fc_([0-9a-f-]{36})_(0|[1-9][0-9]*)",
+            item_id,
+        )
+        if isinstance(item_id, str)
+        else None
+    )
+    if item_id_match is None or not _cursor_replay_is_canonical_uuid(
+        item_id_match.group(1)
+    ):
+        return None
+
+    metadata = item.get("internal_chat_message_metadata_passthrough")
+    if (
+        not isinstance(metadata, Mapping)
+        or set(metadata) != {"turn_id"}
+        or not _cursor_replay_is_canonical_uuid(metadata.get("turn_id"))
+    ):
+        return None
+
+    call_id = item.get("call_id")
+    name = item.get("name")
+    arguments = item.get("arguments")
+    if (
+        not isinstance(call_id, str)
+        or not call_id
+        or call_id != call_id.strip()
+        or not isinstance(name, str)
+        or not name
+        or name != name.strip()
+        or not isinstance(arguments, str)
+    ):
+        return None
+    try:
+        parsed_arguments = json.loads(arguments)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed_arguments, dict):
+        return None
+    return {
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    }
+
+
+def _cursor_replay_stock_codex_full_history_input(
+    request_body: dict[str, Any],
+) -> Optional[list[dict[str, Any]]]:
+    input_items = request_body.get("input")
+    if not isinstance(input_items, list) or len(input_items) < 3:
+        return None
+
+    replayed_input: list[dict[str, Any]] = []
+    saw_nonempty_user_message = False
+    function_call_count = 0
+    output_count = 0
+    for item_index, raw_item in enumerate(input_items):
+        if not isinstance(raw_item, Mapping):
+            return None
+        item_type = raw_item.get("type")
+        if item_type == "message":
+            message_item = _cursor_replay_stock_codex_message_item(raw_item)
+            if message_item is None:
+                return None
+            if message_item["role"] == "user" and bool(
+                _cursor_response_content_text(message_item["content"]).strip()
+            ):
+                saw_nonempty_user_message = True
+            replayed_input.append(message_item)
+            continue
+        if item_type == "function_call":
+            if item_index != len(input_items) - 2 or function_call_count:
+                return None
+            function_call_item = _cursor_replay_stock_codex_function_call_item(
+                raw_item
+            )
+            if function_call_item is None:
+                return None
+            function_call_count += 1
+            replayed_input.append(function_call_item)
+            continue
+        if item_type == "function_call_output":
+            if (
+                item_index != len(input_items) - 1
+                or function_call_count != 1
+                or output_count
+                or set(raw_item)
+                != {
+                    "type",
+                    "id",
+                    "call_id",
+                    "output",
+                    "internal_chat_message_metadata_passthrough",
+                }
+            ):
+                return None
+            output_items = _cursor_replay_function_call_output_items(
+                {"input": [raw_item]}
+            )
+            if output_items is None or len(output_items) != 1:
+                return None
+            output_count += 1
+            replayed_input.extend(output_items)
+            continue
+        return None
+
+    if (
+        not saw_nonempty_user_message
+        or function_call_count != 1
+        or output_count != 1
+        or _cursor_replay_unresolved_function_call_ids(replayed_input) != set()
+    ):
+        return None
+    return replayed_input
+
+
 def _cursor_replay_unresolved_function_call_ids(
     replayed_input: list[Any],
 ) -> Optional[set[str]]:
@@ -1500,7 +1724,7 @@ def _cursor_replay_provider_neutral_tools(
     return provider_neutral_tools
 
 
-def _build_cursor_replay_safe_fresh_dispatch_body(
+def _build_cursor_replay_safe_fresh_dispatch_body(  # noqa: PLR0915
     request_body: Any,
     *,
     continuation_exc: Optional[BaseException] = None,
@@ -1514,74 +1738,96 @@ def _build_cursor_replay_safe_fresh_dispatch_body(
         None,
     )
     registry_state: Optional[dict[str, Any]] = None
+    replayed_input: Optional[list[dict[str, Any]]] = None
+    output_items: Optional[list[dict[str, Any]]] = None
+    instructions: Optional[str] = None
+    replay_tools_source: Any = None
     if not isinstance(replay_state, dict):
         previous_response_id = request_body.get("previous_response_id")
-        if not isinstance(previous_response_id, str) or not previous_response_id:
+        if isinstance(previous_response_id, str) and previous_response_id:
+            try:
+                registry_state = _peek_cursor_replay_state(previous_response_id)
+            except Exception:  # noqa: BLE001
+                return None
+            replay_state = _cursor_replay_state_snapshot(registry_state)
+        elif (
+            previous_response_id is None
+            and getattr(
+                continuation_exc,
+                _CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+                False,
+            )
+        ):
+            replayed_input = _cursor_replay_stock_codex_full_history_input(
+                request_body
+            )
+            replay_tools_source = request_body.get("tools")
+        else:
+            return None
+    if replayed_input is None:
+        if not isinstance(replay_state, dict):
+            return None
+        if replay_state.get("retained_session") is not None:
+            return None
+
+        messages = replay_state.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return None
+        if any(
+            str(_cursor_as_mapping(message).get("role") or "").strip().lower()
+            not in {"system", "developer", "user", "assistant", "tool"}
+            for message in messages
+        ):
+            return None
+        if not any(
+            str(_cursor_as_mapping(message).get("role") or "").strip().lower()
+            == "user"
+            and bool(
+                _cursor_response_content_text(
+                    _cursor_as_mapping(message).get("content")
+                ).strip()
+            )
+            for message in messages
+        ):
             return None
         try:
-            registry_state = _peek_cursor_replay_state(previous_response_id)
+            from litellm.llms.openai.responses.count_tokens.transformation import (
+                OpenAICountTokensConfig,
+            )
+
+            replayed_input, instructions = (
+                OpenAICountTokensConfig.messages_to_responses_input(messages)
+            )
         except Exception:  # noqa: BLE001
             return None
-        replay_state = _cursor_replay_state_snapshot(registry_state)
-    if not isinstance(replay_state, dict):
-        return None
-    if replay_state.get("retained_session") is not None:
-        return None
-
-    messages = replay_state.get("messages")
-    if not isinstance(messages, list) or not messages:
-        return None
-    if any(
-        str(_cursor_as_mapping(message).get("role") or "").strip().lower()
-        not in {"system", "developer", "user", "assistant", "tool"}
-        for message in messages
-    ):
-        return None
-    if not any(
-        str(_cursor_as_mapping(message).get("role") or "").strip().lower()
-        == "user"
-        and bool(
-            _cursor_response_content_text(
-                _cursor_as_mapping(message).get("content")
-            ).strip()
-        )
-        for message in messages
-    ):
-        return None
-    try:
-        from litellm.llms.openai.responses.count_tokens.transformation import (
-            OpenAICountTokensConfig,
-        )
-
-        replayed_input, instructions = (
-            OpenAICountTokensConfig.messages_to_responses_input(messages)
-        )
-    except Exception:  # noqa: BLE001
-        return None
-    if not isinstance(replayed_input, list):
-        return None
-    unresolved_call_ids = _cursor_replay_unresolved_function_call_ids(
-        replayed_input
-    )
-    if unresolved_call_ids is None:
-        return None
-    output_items = _cursor_replay_function_call_output_items(request_body)
-    if output_items is None:
-        return None
-
-    for output_item in output_items:
-        call_id = output_item["call_id"]
-        if call_id not in unresolved_call_ids:
+        if not isinstance(replayed_input, list):
             return None
-        unresolved_call_ids.remove(call_id)
+        unresolved_call_ids = _cursor_replay_unresolved_function_call_ids(
+            replayed_input
+        )
+        if unresolved_call_ids is None:
+            return None
+        output_items = _cursor_replay_function_call_output_items(request_body)
+        if output_items is None:
+            return None
 
-    replay_tools = _cursor_replay_provider_neutral_tools(replay_state.get("tools"))
+        for output_item in output_items:
+            call_id = output_item["call_id"]
+            if call_id not in unresolved_call_ids:
+                return None
+            unresolved_call_ids.remove(call_id)
+        replay_tools_source = replay_state.get("tools")
+
+    replay_tools = _cursor_replay_provider_neutral_tools(replay_tools_source)
     if replay_tools is None:
         return None
 
     try:
         fresh_body = copy.deepcopy(request_body)
-        fresh_body["input"] = [*replayed_input, *output_items]
+        fresh_body["input"] = [
+            *replayed_input,
+            *(output_items or []),
+        ]
         fresh_body["tools"] = replay_tools
     except Exception:  # noqa: BLE001
         return None

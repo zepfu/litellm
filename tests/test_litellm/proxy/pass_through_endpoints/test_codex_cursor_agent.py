@@ -165,6 +165,132 @@ def _replay_body(response_id: str = "resp-replay") -> dict[str, Any]:
     }
 
 
+def _stock_codex_full_history_body() -> dict[str, Any]:
+    turn_id = "01a06269-1662-7c02-a81a-031c450f8606"
+    return {
+        "model": "work",
+        "tools": [
+            {
+                "type": "function",
+                "name": "exec_command",
+                "description": "Run a shell command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"cmd": {"type": "string"}},
+                    "required": ["cmd"],
+                    "additionalProperties": False,
+                },
+                "strict": False,
+            }
+        ],
+        "input": [
+            {
+                "type": "message",
+                "id": "msg_01a06269-1827-79d2-b3a5-41d50a2fad1a",
+                "role": "developer",
+                "content": [
+                    {"type": "input_text", "text": "model instructions"},
+                    {"type": "input_text", "text": "developer instructions"},
+                    {"type": "input_text", "text": "memory instructions"},
+                    {"type": "input_text", "text": "skill instructions"},
+                    {"type": "input_text", "text": "permission instructions"},
+                    {"type": "input_text", "text": "app instructions"},
+                ],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                    "create_time": 1788357449.7673376,
+                    "content_item_kinds": [
+                        "model_switch.instructions",
+                        "generic.developer_instructions",
+                        "memories.instructions",
+                        "host_skills.instructions",
+                        "permissions.instructions",
+                        "apps.instructions",
+                    ],
+                },
+            },
+            {
+                "type": "message",
+                "id": "msg_01a06269-1827-79d2-b3a5-41ed4566fa70",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "plugin recommendations"},
+                    {"type": "input_text", "text": "AGENTS instructions"},
+                    {"type": "input_text", "text": "environment context"},
+                ],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                    "create_time": 1788357449.7673385,
+                    "content_item_kinds": [
+                        "plugins.recommendations",
+                        "agents_md.instructions",
+                        "environments.environment_context",
+                    ],
+                },
+            },
+            {
+                "type": "message",
+                "id": "msg_01a06269-1847-7802-a387-e9c9ef8d2032",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "Run pwd, then continue the original assignment.",
+                    }
+                ],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                    "create_time": 1788357449.79907,
+                    "content_item_kinds": ["user.text"],
+                },
+            },
+            {
+                "type": "message",
+                "id": "msg_resp_277feeae9f69433ab4e4ef2597a25db8",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "I will run pwd first.",
+                    }
+                ],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                    "content_item_kinds": ["unknown"],
+                },
+            },
+            {
+                "type": "function_call",
+                "id": "fc_a4335d9d-8539-9945-bdc7-f14243b0e9b8_0",
+                "name": "exec_command",
+                "arguments": (
+                    '{"cmd":"pwd","workdir":"/home/zepfu/projects/litellm"}'
+                ),
+                "call_id": "call-8ef73738-1b5f-4aab-8789-fa1f309bb320-0",
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                },
+            },
+            {
+                "type": "function_call_output",
+                "id": "fco_01a06269-2d51-7de0-a7e3-bddda588ad80",
+                "call_id": "call-8ef73738-1b5f-4aab-8789-fa1f309bb320-0",
+                "output": (
+                    "Chunk ID: 91fb25\n"
+                    "Wall time: 0.0000 seconds\n"
+                    "Process exited with code 0\n"
+                    "Final output:\n"
+                    "/home/zepfu/projects/litellm\n"
+                ),
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                    "create_time": 1788357455.1854475,
+                },
+            },
+        ],
+    }
+
+
 def _cursor_subagent_args(*, extra: bytes = b"") -> bytes:
     return b"".join(
         (
@@ -1831,6 +1957,89 @@ def test_cursor_fresh_replay_dispatch_canonicalizes_stock_codex_output_metadata(
         "call_id": "call-1",
         "output": "pwd output",
     }
+
+
+def test_cursor_fresh_replay_dispatch_accepts_stock_codex_full_history() -> None:
+    body = _stock_codex_full_history_body()
+    continuation_exc = CursorConnectError("missing retained session", status_code=409)
+    setattr(
+        continuation_exc,
+        codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+        True,
+    )
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(body)
+        is None
+    )
+    rebuilt = (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            body,
+            continuation_exc=continuation_exc,
+        )
+    )
+
+    assert rebuilt is not None
+    assert rebuilt["tools"] == body["tools"]
+    assert rebuilt["input"][:-2] == [
+        {
+            "role": item["role"],
+            "content": "".join(part["text"] for part in item["content"]),
+        }
+        for item in body["input"][:-2]
+    ]
+    assert rebuilt["input"][-2:] == [
+        {
+            "type": "function_call",
+            "call_id": "call-8ef73738-1b5f-4aab-8789-fa1f309bb320-0",
+            "name": "exec_command",
+            "arguments": (
+                '{"cmd":"pwd","workdir":"/home/zepfu/projects/litellm"}'
+            ),
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call-8ef73738-1b5f-4aab-8789-fa1f309bb320-0",
+            "output": (
+                "Chunk ID: 91fb25\n"
+                "Wall time: 0.0000 seconds\n"
+                "Process exited with code 0\n"
+                "Final output:\n"
+                "/home/zepfu/projects/litellm\n"
+            ),
+        },
+    ]
+    assert all(
+        "id" not in item
+        and "internal_chat_message_metadata_passthrough" not in item
+        for item in rebuilt["input"]
+    )
+
+
+def test_cursor_fresh_replay_dispatch_rejects_provider_owned_full_history() -> None:
+    body = _stock_codex_full_history_body()
+    body["input"].insert(
+        -2,
+        {
+            "type": "reasoning",
+            "id": "rs_provider-owned-state",
+            "encrypted_content": "opaque-provider-state",
+        },
+    )
+    continuation_exc = CursorConnectError("missing retained session", status_code=409)
+    setattr(
+        continuation_exc,
+        codex_candidate_calls._CURSOR_SESSION_CONTINUATION_FAILURE_MARKER,
+        True,
+    )
+
+    assert (
+        codex_candidate_calls._build_cursor_replay_safe_fresh_dispatch_body(
+            body,
+            continuation_exc=continuation_exc,
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
