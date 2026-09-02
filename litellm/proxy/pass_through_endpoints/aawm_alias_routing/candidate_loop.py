@@ -491,6 +491,7 @@ def _classify_codex_cohere_candidate_failure(
     *,
     candidate: Optional[dict[str, Any]],
     is_codex_alias: bool,
+    attempted_provider_call: bool = False,
 ) -> Optional[str]:
     """Translate direct Cohere failures into the enforced Codex vocabulary."""
 
@@ -502,11 +503,21 @@ def _classify_codex_cohere_candidate_failure(
     ):
         return None
 
+    selected_upstream_model = str(candidate.get("model") or "").strip()
+    cohere_model_prefix = f"{_CODEX_COHERE_PROVIDER}/"
+    if selected_upstream_model.casefold().startswith(cohere_model_prefix):
+        selected_upstream_model = selected_upstream_model[len(cohere_model_prefix) :]
     classification = classify_cohere_failure(
         url=_CODEX_COHERE_CHAT_V2_URL,
-        custom_llm_provider=_CODEX_COHERE_PROVIDER,
+        custom_llm_provider=str(candidate.get("provider") or ""),
         status_code=_error_signals._extract_adapter_exception_status_code(exc),
         exc=exc,
+        attempted_provider_call=attempted_provider_call,
+        provider_returned=(
+            getattr(exc, "_aawm_provider_returned", False) is True
+        ),
+        route_family=str(candidate.get("route_family") or ""),
+        selected_upstream_model=selected_upstream_model or None,
     )
     if (
         classification is None
@@ -1768,6 +1779,7 @@ async def handle_alias_route(  # noqa: PLR0915
                                 probe_failure_exc,
                                 candidate=candidate,
                                 is_codex_alias=codex_failure_evidence_alias is not None,
+                                attempted_provider_call=attempted_provider_call,
                             )
                         )
                     if early_pre_commit_error_class is None:
@@ -2102,6 +2114,7 @@ async def handle_alias_route(  # noqa: PLR0915
                         failure_exc,
                         candidate=candidate,
                         is_codex_alias=codex_failure_evidence_alias is not None,
+                        attempted_provider_call=attempted_provider_call,
                     )
                 if error_class is None:
                     error_class = _classify_codex_zai_coding_plan_candidate_failure(
@@ -2647,6 +2660,7 @@ def _resolve_failure_plan(
             exc,
             candidate=candidate,
             is_codex_alias=codex_failure_evidence_alias is not None,
+            attempted_provider_call=attempted_provider_call,
         )
     if error_class is None:
         error_class = _classify_codex_zai_coding_plan_candidate_failure(
