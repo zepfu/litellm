@@ -542,12 +542,14 @@ def _classify_codex_zai_coding_plan_candidate_failure(
     exc: Exception,
     *,
     candidate: Optional[dict[str, Any]],
+    attempted_provider_call: bool = True,
 ) -> Optional[str]:
     """Map Coding Plan business codes onto the shared Codex retry vocabulary.
 
     1113 on the coding base is a wrong-base / wrong-key routing defect, not
-    ordinary-balance recharge. Unknown codes return ``None`` so generic
-    classifiers can still inspect HTTP status.
+    ordinary-balance recharge. Model-unavailable business codes require both
+    an attempted call and explicit provider-return attribution. Unknown codes
+    return ``None`` so generic classifiers can still inspect HTTP status.
     """
 
     if (
@@ -567,6 +569,11 @@ def _classify_codex_zai_coding_plan_candidate_failure(
         error_code=error_code,
         upstream_id=candidate.get("model"),
     )
+    if failure.kind == ZAICodingPlanFailureKind.MODEL_UNAVAILABLE and (
+        not attempted_provider_call
+        or getattr(exc, "_aawm_provider_returned", False) is not True
+    ):
+        return "provider_terminal_error"
     if failure.kind != ZAICodingPlanFailureKind.UNKNOWN:
         return _ZAI_CODING_PLAN_KIND_TO_ERROR_CLASS.get(failure.kind)
     if _exception_chain_contains_type(exc, ZAICodingPlanAuthenticationError):
@@ -1768,6 +1775,7 @@ async def handle_alias_route(  # noqa: PLR0915
                             _classify_codex_zai_coding_plan_candidate_failure(
                                 probe_failure_exc,
                                 candidate=candidate,
+                                attempted_provider_call=attempted_provider_call,
                             )
                         )
                     if early_pre_commit_error_class is None:
@@ -2099,6 +2107,7 @@ async def handle_alias_route(  # noqa: PLR0915
                     error_class = _classify_codex_zai_coding_plan_candidate_failure(
                         failure_exc,
                         candidate=candidate,
+                        attempted_provider_call=attempted_provider_call,
                     )
                 if error_class is None:
                     error_class = _classify_codex_auto_agent_retryable_exhaustion(
@@ -2643,6 +2652,7 @@ def _resolve_failure_plan(
         error_class = _classify_codex_zai_coding_plan_candidate_failure(
             exc,
             candidate=candidate,
+            attempted_provider_call=attempted_provider_call,
         )
     if error_class is None:
         if _accepts_attempted_provider_call(classify_retryable_fn):
